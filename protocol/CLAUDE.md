@@ -39,5 +39,6 @@ Rune targets Aeron-class latency. **Every phase treats Aeron Cluster's Java impl
 - **Encoders:** flat SBE-style fixed-layout messages; reusable encoder/decoder instances held as fields (zero per-message allocation); zero-copy publication via `tryClaim`/`BufferClaim`.
 - **Fences / memory ordering:** correct release/acquire semantics — Agrona `putLongOrdered`/`putLongVolatile` ↔ C++ `std::atomic` release store / acquire load; single-writer release publish, consumer acquire read; cache-line padding vs false sharing.
 - **Low-level optimizations:** no hot-path allocation; pre-allocated scratch buffers; `NanoClock` sampled once per cycle; branch-predictable state machines; mechanical sympathy.
+- **Time & idling (NEVER busy-spin to pass time):** a single INJECTED, advanceable monotonic clock (Aeron `CachedNanoClock`). Tests ADVANCE the clock to the next deadline and call `doWork` once per expected transition — no wall-time waits, no `while(cond) doWork()`; any drive loop has a hard iteration cap and fails (not hangs) if progress stalls. Runtime idles via `IdleStrategy` (yield/park) when `doWork` returns 0 work — never a bare spin.
 
 Use Aeron's own ring buffers / `IdleStrategy` (the C++ client ships them) — do NOT pull in the `common` library for these.
