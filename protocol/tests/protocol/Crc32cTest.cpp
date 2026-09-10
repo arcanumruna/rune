@@ -33,31 +33,23 @@ TEST(Crc32c, EmptyBufferIsZero) {
 }
 
 TEST(Crc32c, SingleByteSelfConsistency) {
-    // Pin self-consistency for all 256 single-byte values.
-    // We pick a handful of boundary values and verify they are stable
-    // (self-consistency pins, not external authoritative vectors).
+    // Regression pins computed from the reference implementation, which is anchored
+    // to the external CRC-32C vector 0xE3069283 ("123456789") in KnownVectors.
     uint8_t b0 = 0x00;
     uint8_t bFF = 0xFF;
     uint8_t b01 = 0x01;
     uint8_t b7F = 0x7F;
     uint8_t b80 = 0x80;
 
-    uint32_t c00  = crc32c(&b0,  1);
-    uint32_t cFF  = crc32c(&bFF, 1);
-    uint32_t c01  = crc32c(&b01, 1);
-    uint32_t c7F  = crc32c(&b7F, 1);
-    uint32_t c80  = crc32c(&b80, 1);
-
-    // Recompute and ensure they are identical (stability).
-    EXPECT_EQ(crc32c(&b0,  1), c00);
-    EXPECT_EQ(crc32c(&bFF, 1), cFF);
-    EXPECT_EQ(crc32c(&b01, 1), c01);
-    EXPECT_EQ(crc32c(&b7F, 1), c7F);
-    EXPECT_EQ(crc32c(&b80, 1), c80);
+    EXPECT_EQ(crc32c(&b0,  1), 0x527D5351u);
+    EXPECT_EQ(crc32c(&bFF, 1), 0xFF000000u);
+    EXPECT_EQ(crc32c(&b01, 1), 0xA016D052u);
+    EXPECT_EQ(crc32c(&b7F, 1), 0x7DF63B78u);
+    EXPECT_EQ(crc32c(&b80, 1), 0xD08B6829u);
 
     // All single-byte values differ from empty.
-    EXPECT_NE(c00,  0x00000000u);
-    EXPECT_NE(cFF,  0x00000000u);
+    EXPECT_NE(0x527D5351u, 0x00000000u);
+    EXPECT_NE(0xFF000000u, 0x00000000u);
 }
 
 TEST(Crc32c, TwoByteBasics) {
@@ -113,19 +105,16 @@ TEST(Crc32c, IncrementalAllSplitPoints) {
 }
 
 TEST(Crc32c, AdditionalKnownVectors) {
-    // "The quick brown fox jumps over the lazy dog"
-    // Self-consistency pin (computed once by this impl; NOT an external RFC value).
+    // Regression pins computed from the reference implementation, which is anchored
+    // to the external CRC-32C vector 0xE3069283 ("123456789") in KnownVectors.
     const std::string fox = "The quick brown fox jumps over the lazy dog";
-    uint32_t foxCrc = crc32c(reinterpret_cast<const uint8_t*>(fox.data()), fox.size());
-    // Recompute to confirm stability.
-    EXPECT_EQ(crc32c(reinterpret_cast<const uint8_t*>(fox.data()), fox.size()), foxCrc);
-    EXPECT_NE(foxCrc, 0u);
+    EXPECT_EQ(crc32c(reinterpret_cast<const uint8_t*>(fox.data()), fox.size()), 0x22620404u);
+    EXPECT_NE(0x22620404u, 0u);
 
-    // "a" - self-consistency pin
+    // "a" - regression pin
     uint8_t a = 'a';
-    uint32_t aCrc = crc32c(&a, 1);
-    EXPECT_EQ(crc32c(&a, 1), aCrc);
-    EXPECT_NE(aCrc, 0u);
+    EXPECT_EQ(crc32c(&a, 1), 0xC1D04330u);
+    EXPECT_NE(0xC1D04330u, 0u);
 }
 
 TEST(Crc32c, OrderSensitivity) {

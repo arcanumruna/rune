@@ -491,6 +491,9 @@ TEST(RecordBatchEdge, BackToBackBatchesInOneBuffer) {
         r2.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t ts) {
             EXPECT_EQ(off, 2 + idx);
             EXPECT_EQ(ts, 2000 + idx);
+            // Check key and value match what was written to batch 2
+            EXPECT_EQ(std::string(k), "k" + std::to_string(idx + 2));
+            EXPECT_EQ(std::string(v), "v" + std::to_string(idx + 2));
             ++idx;
         });
         EXPECT_EQ(idx, 3);
