@@ -2,6 +2,7 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
+#include <algorithm>
 using namespace rune::storage; using namespace rune::protocol;
 
 class RetentionTest : public ::testing::Test {
@@ -87,23 +88,48 @@ TEST_F(RetentionTest, DeletedSegmentFilesRemovedFromDisk) {
         b.append("k", "payloadpayload" + std::to_string(i), i);
         off = log.append(b.build(), off);
     }
-    auto basesBefore = log.segmentBaseOffsets();
-    // Record the paths of segments that will be deleted
-    std::vector<std::filesystem::path> deletedPaths;
-    for (size_t i = 0; i < basesBefore.size() - 1; ++i) {
-        auto logPath = dir / ("log-" + std::to_string(basesBefore[i]) + ".log");
-        auto idxPath = dir / ("log-" + std::to_string(basesBefore[i]) + ".index");
-        deletedPaths.push_back(logPath);
-        deletedPaths.push_back(idxPath);
+
+    // Snapshot actual .log files on disk before deletion
+    std::vector<std::filesystem::path> logsBefore;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".log") {
+            logsBefore.push_back(entry.path());
+        }
+    }
+    std::sort(logsBefore.begin(), logsBefore.end());
+
+    // Baseline assertions: we have multiple segments and they exist
+    ASSERT_GT(logsBefore.size(), 1u);
+    for (const auto& p : logsBefore) {
+        EXPECT_TRUE(std::filesystem::exists(p));
     }
 
     int deleted = log.deleteOldSegments(/*retainBytes*/ 256);
     EXPECT_GT(deleted, 0);
 
-    // Verify deleted segment files no longer exist
-    for (const auto& p : deletedPaths) {
-        EXPECT_FALSE(std::filesystem::exists(p)) << "Path should not exist: " << p.string();
+    // Snapshot actual .log files after deletion
+    std::vector<std::filesystem::path> logsAfter;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".log") {
+            logsAfter.push_back(entry.path());
+        }
     }
+    std::sort(logsAfter.begin(), logsAfter.end());
+
+    // Assert count dropped by exactly deleted
+    EXPECT_EQ(logsAfter.size(), logsBefore.size() - deleted);
+
+    // Verify the oldest 'deleted' files are gone
+    for (size_t i = 0; i < static_cast<size_t>(deleted); ++i) {
+        const auto& oldestPath = logsBefore[i];
+        EXPECT_FALSE(std::filesystem::exists(oldestPath)) << "Oldest file should be deleted: " << oldestPath.string();
+        // Also check .index file is gone
+        auto indexPath = oldestPath.parent_path() / (oldestPath.stem().string() + ".index");
+        EXPECT_FALSE(std::filesystem::exists(indexPath)) << "Index file should be deleted: " << indexPath.string();
+    }
+
+    // Verify the newest file still exists
+    EXPECT_TRUE(std::filesystem::exists(logsBefore.back())) << "Newest file should remain: " << logsBefore.back().string();
 }
 
 TEST_F(RetentionTest, TotalBytesAccounting) {
@@ -120,13 +146,14 @@ TEST_F(RetentionTest, TotalBytesAccounting) {
 
     int deleted = log.deleteOldSegments(/*retainBytes*/ 256);
 
-    // totalBytes() should equal the sum of remaining segments' sizeBytes()
-    int64_t accountedBytes = 0;
-    auto bases = log.segmentBaseOffsets();
-    for (int64_t base : bases) {
-        // We need to access the segment's sizeBytes through the log's internal structure
-        // This is a bit tricky, so we verify that totalBytes() is consistent
+    // Compute expected totalBytes by summing on-disk .log file sizes
+    int64_t expectedBytes = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".log") {
+            expectedBytes += std::filesystem::file_size(entry.path());
+        }
     }
-    // For now, verify totalBytes() is within expected range
-    EXPECT_LE(log.totalBytes(), 256 + 128);
+
+    // Assert that totalBytes() matches the real on-disk data
+    EXPECT_EQ(log.totalBytes(), expectedBytes);
 }
