@@ -1,0 +1,609 @@
+// ConsensusPublisherAdapterTest.cpp — Publisher↔Adapter loopback integration tests.
+//
+// Strategy:
+//  - LoopbackSink captures (toMember, bytes) from SbeConsensusPublisher.
+//  - RecordingHandler captures each onXxx call's fields from ConsensusAdapter.
+//  - For each of the 6 messages: publish → capture → adapt → assert exact fields.
+//  - Additional: dispatch correctness, buffer reuse, toMember addressing.
+//
+// All 6 messages use distinct sentinel values per field to catch offset bugs.
+
+#include <gtest/gtest.h>
+#include <rune/consensus/SbeConsensusPublisher.h>
+#include <rune/consensus/ConsensusAdapter.h>
+#include <rune/consensus/MessageSink.h>
+#include <rune/consensus/ConsensusMessageHandler.h>
+
+#include <vector>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+
+using namespace rune::consensus;
+
+// ---------------------------------------------------------------------------
+// Test infrastructure
+// ---------------------------------------------------------------------------
+
+struct Capture {
+    NodeId              toMember{};
+    std::vector<uint8_t> bytes{};
+};
+
+/// In-memory sink: records the last send() call.
+class LoopbackSink final : public MessageSink {
+public:
+    void send(NodeId toMember, const uint8_t* buf, std::size_t len) override {
+        last_.toMember = toMember;
+        last_.bytes.assign(buf, buf + len);
+        callCount_++;
+    }
+
+    const Capture& last()    const { return last_; }
+    int            calls()   const { return callCount_; }
+
+private:
+    Capture last_{};
+    int     callCount_{0};
+};
+
+/// Tracks which handler method was called and with what fields.
+struct HandlerRecord {
+    enum class Which {
+        None, Canvass, RequestVote, Vote, NewLeadershipTerm, AppendPosition, CommitPosition
+    } which{Which::None};
+
+    // CanvassPosition fields
+    int64_t nowNs_canvass{};
+    Term    logLeadershipTermId_canvass{};
+    int64_t logPosition_canvass{};
+    Term    leadershipTermId_canvass{};
+    NodeId  followerMemberId_canvass{};
+    int32_t protocolVersion_canvass{};
+
+    // RequestVote fields
+    int64_t nowNs_rv{};
+    Term    logLeadershipTermId_rv{};
+    int64_t logPosition_rv{};
+    Term    candidateTermId_rv{};
+    NodeId  candidateMemberId_rv{};
+    int32_t protocolVersion_rv{};
+
+    // Vote fields
+    int64_t nowNs_vote{};
+    Term    candidateTermId_vote{};
+    Term    logLeadershipTermId_vote{};
+    int64_t logPosition_vote{};
+    NodeId  candidateMemberId_vote{};
+    NodeId  followerMemberId_vote{};
+    bool    vote_vote{};
+
+    // NewLeadershipTerm fields
+    int64_t nowNs_nlt{};
+    Term    logLeadershipTermId_nlt{};
+    Term    nextLeadershipTermId_nlt{};
+    int64_t nextTermBaseLogPosition_nlt{};
+    int64_t nextLogPosition_nlt{};
+    Term    leadershipTermId_nlt{};
+    int64_t termBaseLogPosition_nlt{};
+    int64_t logPosition_nlt{};
+    int64_t leaderRecordingId_nlt{};
+    int64_t timestamp_nlt{};
+    NodeId  leaderMemberId_nlt{};
+    int32_t logSessionId_nlt{};
+    int32_t appVersion_nlt{};
+    bool    isStartup_nlt{};
+    int64_t commitPosition_nlt{};
+
+    // AppendPosition fields
+    int64_t nowNs_ap{};
+    Term    leadershipTermId_ap{};
+    int64_t logPosition_ap{};
+    NodeId  followerMemberId_ap{};
+    uint8_t flags_ap{};
+
+    // CommitPosition fields
+    int64_t nowNs_cp{};
+    Term    leadershipTermId_cp{};
+    int64_t logPosition_cp{};
+    NodeId  leaderMemberId_cp{};
+};
+
+class RecordingHandler final : public ConsensusMessageHandler {
+public:
+    void onCanvassPosition(int64_t nowNs, Term logLeadershipTermId, int64_t logPosition,
+                           Term leadershipTermId, NodeId followerMemberId,
+                           int32_t protocolVersion) override {
+        r_.which = HandlerRecord::Which::Canvass;
+        r_.nowNs_canvass = nowNs;
+        r_.logLeadershipTermId_canvass = logLeadershipTermId;
+        r_.logPosition_canvass = logPosition;
+        r_.leadershipTermId_canvass = leadershipTermId;
+        r_.followerMemberId_canvass = followerMemberId;
+        r_.protocolVersion_canvass = protocolVersion;
+        callCount_++;
+    }
+
+    void onRequestVote(int64_t nowNs, Term logLeadershipTermId, int64_t logPosition,
+                       Term candidateTermId, NodeId candidateMemberId,
+                       int32_t protocolVersion) override {
+        r_.which = HandlerRecord::Which::RequestVote;
+        r_.nowNs_rv = nowNs;
+        r_.logLeadershipTermId_rv = logLeadershipTermId;
+        r_.logPosition_rv = logPosition;
+        r_.candidateTermId_rv = candidateTermId;
+        r_.candidateMemberId_rv = candidateMemberId;
+        r_.protocolVersion_rv = protocolVersion;
+        callCount_++;
+    }
+
+    void onVote(int64_t nowNs, Term candidateTermId, Term logLeadershipTermId,
+                int64_t logPosition, NodeId candidateMemberId, NodeId followerMemberId,
+                bool vote) override {
+        r_.which = HandlerRecord::Which::Vote;
+        r_.nowNs_vote = nowNs;
+        r_.candidateTermId_vote = candidateTermId;
+        r_.logLeadershipTermId_vote = logLeadershipTermId;
+        r_.logPosition_vote = logPosition;
+        r_.candidateMemberId_vote = candidateMemberId;
+        r_.followerMemberId_vote = followerMemberId;
+        r_.vote_vote = vote;
+        callCount_++;
+    }
+
+    void onNewLeadershipTerm(int64_t nowNs, Term logLeadershipTermId,
+                             Term nextLeadershipTermId, int64_t nextTermBaseLogPosition,
+                             int64_t nextLogPosition, Term leadershipTermId,
+                             int64_t termBaseLogPosition, int64_t logPosition,
+                             int64_t leaderRecordingId, int64_t timestamp,
+                             NodeId leaderMemberId, int32_t logSessionId,
+                             int32_t appVersion, bool isStartup,
+                             int64_t commitPosition) override {
+        r_.which = HandlerRecord::Which::NewLeadershipTerm;
+        r_.nowNs_nlt = nowNs;
+        r_.logLeadershipTermId_nlt = logLeadershipTermId;
+        r_.nextLeadershipTermId_nlt = nextLeadershipTermId;
+        r_.nextTermBaseLogPosition_nlt = nextTermBaseLogPosition;
+        r_.nextLogPosition_nlt = nextLogPosition;
+        r_.leadershipTermId_nlt = leadershipTermId;
+        r_.termBaseLogPosition_nlt = termBaseLogPosition;
+        r_.logPosition_nlt = logPosition;
+        r_.leaderRecordingId_nlt = leaderRecordingId;
+        r_.timestamp_nlt = timestamp;
+        r_.leaderMemberId_nlt = leaderMemberId;
+        r_.logSessionId_nlt = logSessionId;
+        r_.appVersion_nlt = appVersion;
+        r_.isStartup_nlt = isStartup;
+        r_.commitPosition_nlt = commitPosition;
+        callCount_++;
+    }
+
+    void onAppendPosition(int64_t nowNs, Term leadershipTermId, int64_t logPosition,
+                          NodeId followerMemberId, uint8_t flags) override {
+        r_.which = HandlerRecord::Which::AppendPosition;
+        r_.nowNs_ap = nowNs;
+        r_.leadershipTermId_ap = leadershipTermId;
+        r_.logPosition_ap = logPosition;
+        r_.followerMemberId_ap = followerMemberId;
+        r_.flags_ap = flags;
+        callCount_++;
+    }
+
+    void onCommitPosition(int64_t nowNs, Term leadershipTermId, int64_t logPosition,
+                          NodeId leaderMemberId) override {
+        r_.which = HandlerRecord::Which::CommitPosition;
+        r_.nowNs_cp = nowNs;
+        r_.leadershipTermId_cp = leadershipTermId;
+        r_.logPosition_cp = logPosition;
+        r_.leaderMemberId_cp = leaderMemberId;
+        callCount_++;
+    }
+
+    const HandlerRecord& record() const { return r_; }
+    int calls() const { return callCount_; }
+    void reset() { r_ = {}; callCount_ = 0; }
+
+private:
+    HandlerRecord r_{};
+    int           callCount_{0};
+};
+
+// Fixture providing a publisher + adapter backed by the same recording infrastructure.
+class PublisherAdapterFixture : public ::testing::Test {
+protected:
+    LoopbackSink      sink_{};
+    RecordingHandler  handler_{};
+    SbeConsensusPublisher publisher_{sink_};
+    ConsensusAdapter      adapter_{handler_};
+
+    static constexpr int64_t kNow = INT64_C(0xABCDEF0123456789);
+
+    void loopback() {
+        const auto& cap = sink_.last();
+        adapter_.onFragment(kNow, cap.bytes.data(), cap.bytes.size());
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 1. CanvassPosition round-trip
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, CanvassPosition_RoundTrip)
+{
+    publisher_.canvassPosition(
+        /*toMember=*/   7,
+        /*logLeadershipTermId=*/ INT64_C(0x1111111111111111),
+        /*logPosition=*/         INT64_C(0x2222222222222222),
+        /*leadershipTermId=*/    INT64_C(0x3333333333333333),
+        /*followerMemberId=*/    42);
+
+    loopback();
+
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Canvass);
+    EXPECT_EQ(handler_.record().nowNs_canvass,               kNow);
+    EXPECT_EQ(handler_.record().logLeadershipTermId_canvass, INT64_C(0x1111111111111111));
+    EXPECT_EQ(handler_.record().logPosition_canvass,         INT64_C(0x2222222222222222));
+    EXPECT_EQ(handler_.record().leadershipTermId_canvass,    INT64_C(0x3333333333333333));
+    EXPECT_EQ(handler_.record().followerMemberId_canvass,    42);
+}
+
+TEST_F(PublisherAdapterFixture, CanvassPosition_ToMemberPreserved)
+{
+    publisher_.canvassPosition(99, 0, 0, 0, 0);
+    EXPECT_EQ(sink_.last().toMember, 99);
+}
+
+TEST_F(PublisherAdapterFixture, CanvassPosition_DispatchesOnlyCanvass)
+{
+    publisher_.canvassPosition(1, 0, 0, 0, 0);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Canvass);
+}
+
+// ---------------------------------------------------------------------------
+// 2. RequestVote round-trip
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, RequestVote_RoundTrip)
+{
+    publisher_.requestVote(
+        /*toMember=*/           3,
+        /*logLeadershipTermId=*/INT64_C(0xAAAAAAAAAAAAAAAA),
+        /*logPosition=*/        INT64_C(0xBBBBBBBBBBBBBBBB),
+        /*candidateTermId=*/    INT64_C(0xCCCCCCCCCCCCCCCC),
+        /*candidateMemberId=*/  5);
+
+    loopback();
+
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::RequestVote);
+    EXPECT_EQ(handler_.record().nowNs_rv,               kNow);
+    EXPECT_EQ(handler_.record().logLeadershipTermId_rv, INT64_C(0xAAAAAAAAAAAAAAAA));
+    EXPECT_EQ(handler_.record().logPosition_rv,         INT64_C(0xBBBBBBBBBBBBBBBB));
+    EXPECT_EQ(handler_.record().candidateTermId_rv,     INT64_C(0xCCCCCCCCCCCCCCCC));
+    EXPECT_EQ(handler_.record().candidateMemberId_rv,   5);
+}
+
+TEST_F(PublisherAdapterFixture, RequestVote_ToMemberPreserved)
+{
+    publisher_.requestVote(17, 0, 0, 0, 0);
+    EXPECT_EQ(sink_.last().toMember, 17);
+}
+
+TEST_F(PublisherAdapterFixture, RequestVote_DispatchesOnlyRequestVote)
+{
+    publisher_.requestVote(1, 0, 0, 0, 0);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::RequestVote);
+}
+
+// ---------------------------------------------------------------------------
+// 3. placeVote (Vote) round-trip
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, PlaceVote_RoundTripTrue)
+{
+    publisher_.placeVote(
+        /*toMember=*/           2,
+        /*candidateTermId=*/    INT64_C(0x1234567890ABCDEF),
+        /*logLeadershipTermId=*/INT64_C(0xFEDCBA9876543210),
+        /*logPosition=*/        INT64_C(0x0102030405060708),
+        /*candidateMemberId=*/  8,
+        /*followerMemberId=*/   4,
+        /*vote=*/               true);
+
+    loopback();
+
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Vote);
+    EXPECT_EQ(handler_.record().nowNs_vote,               kNow);
+    EXPECT_EQ(handler_.record().candidateTermId_vote,     INT64_C(0x1234567890ABCDEF));
+    EXPECT_EQ(handler_.record().logLeadershipTermId_vote, INT64_C(0xFEDCBA9876543210));
+    EXPECT_EQ(handler_.record().logPosition_vote,         INT64_C(0x0102030405060708));
+    EXPECT_EQ(handler_.record().candidateMemberId_vote,   8);
+    EXPECT_EQ(handler_.record().followerMemberId_vote,    4);
+    EXPECT_EQ(handler_.record().vote_vote,                true);
+}
+
+TEST_F(PublisherAdapterFixture, PlaceVote_RoundTripFalse)
+{
+    publisher_.placeVote(1, 10, 20, 30, 1, 2, false);
+    loopback();
+    EXPECT_EQ(handler_.record().vote_vote, false);
+}
+
+TEST_F(PublisherAdapterFixture, PlaceVote_ToMemberPreserved)
+{
+    publisher_.placeVote(55, 0, 0, 0, 0, 0, true);
+    EXPECT_EQ(sink_.last().toMember, 55);
+}
+
+TEST_F(PublisherAdapterFixture, PlaceVote_DispatchesOnlyVote)
+{
+    publisher_.placeVote(1, 0, 0, 0, 0, 0, false);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Vote);
+}
+
+// ---------------------------------------------------------------------------
+// 4. NewLeadershipTerm round-trip
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, NewLeadershipTerm_RoundTrip)
+{
+    publisher_.newLeadershipTerm(
+        /*toMember=*/               11,
+        /*logLeadershipTermId=*/    INT64_C(0x0102030405060708),
+        /*nextLeadershipTermId=*/   INT64_C(0x1112131415161718),
+        /*nextTermBaseLogPosition=*/INT64_C(0x2122232425262728),
+        /*nextLogPosition=*/        INT64_C(0x3132333435363738),
+        /*leadershipTermId=*/       INT64_C(0x4142434445464748),
+        /*termBaseLogPosition=*/    INT64_C(0x5152535455565758),
+        /*logPosition=*/            INT64_C(0x6162636465666768),
+        /*leaderRecordingId=*/      INT64_C(0x7172737475767778),
+        /*timestamp=*/              INT64_C(0x8182838485868788),
+        /*leaderMemberId=*/         13,
+        /*logSessionId=*/           42,
+        /*isStartup=*/              true,
+        /*commitPosition=*/         INT64_C(0xC1C2C3C4C5C6C7C8));
+
+    loopback();
+
+    const auto& r = handler_.record();
+    EXPECT_EQ(r.which, HandlerRecord::Which::NewLeadershipTerm);
+    EXPECT_EQ(r.nowNs_nlt,                   kNow);
+    EXPECT_EQ(r.logLeadershipTermId_nlt,     INT64_C(0x0102030405060708));
+    EXPECT_EQ(r.nextLeadershipTermId_nlt,    INT64_C(0x1112131415161718));
+    EXPECT_EQ(r.nextTermBaseLogPosition_nlt, INT64_C(0x2122232425262728));
+    EXPECT_EQ(r.nextLogPosition_nlt,         INT64_C(0x3132333435363738));
+    EXPECT_EQ(r.leadershipTermId_nlt,        INT64_C(0x4142434445464748));
+    EXPECT_EQ(r.termBaseLogPosition_nlt,     INT64_C(0x5152535455565758));
+    EXPECT_EQ(r.logPosition_nlt,             INT64_C(0x6162636465666768));
+    EXPECT_EQ(r.leaderRecordingId_nlt,       INT64_C(0x7172737475767778));
+    EXPECT_EQ(r.timestamp_nlt,               INT64_C(0x8182838485868788));
+    EXPECT_EQ(r.leaderMemberId_nlt,          13);
+    EXPECT_EQ(r.logSessionId_nlt,            42);
+    EXPECT_EQ(r.isStartup_nlt,               true);
+    EXPECT_EQ(r.commitPosition_nlt,          INT64_C(0xC1C2C3C4C5C6C7C8));
+}
+
+TEST_F(PublisherAdapterFixture, NewLeadershipTerm_IsStartupFalse)
+{
+    publisher_.newLeadershipTerm(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0);
+    loopback();
+    EXPECT_EQ(handler_.record().isStartup_nlt, false);
+}
+
+TEST_F(PublisherAdapterFixture, NewLeadershipTerm_ToMemberPreserved)
+{
+    publisher_.newLeadershipTerm(77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0);
+    EXPECT_EQ(sink_.last().toMember, 77);
+}
+
+TEST_F(PublisherAdapterFixture, NewLeadershipTerm_DispatchesOnlyNLT)
+{
+    publisher_.newLeadershipTerm(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::NewLeadershipTerm);
+}
+
+// ---------------------------------------------------------------------------
+// 5. AppendPosition round-trip
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, AppendPosition_RoundTrip)
+{
+    publisher_.appendPosition(
+        /*toMember=*/       6,
+        /*leadershipTermId=*/INT64_C(0xAABBCCDDEEFF0011),
+        /*logPosition=*/    INT64_C(0x2233445566778899),
+        /*followerMemberId=*/9,
+        /*flags=*/          uint8_t{0x01});
+
+    loopback();
+
+    const auto& r = handler_.record();
+    EXPECT_EQ(r.which, HandlerRecord::Which::AppendPosition);
+    EXPECT_EQ(r.nowNs_ap,             kNow);
+    EXPECT_EQ(r.leadershipTermId_ap,  INT64_C(0xAABBCCDDEEFF0011));
+    EXPECT_EQ(r.logPosition_ap,       INT64_C(0x2233445566778899));
+    EXPECT_EQ(r.followerMemberId_ap,  9);
+    EXPECT_EQ(r.flags_ap,             uint8_t{0x01});
+}
+
+TEST_F(PublisherAdapterFixture, AppendPosition_FlagsZero)
+{
+    publisher_.appendPosition(1, 100, 200, 3, uint8_t{0x00});
+    loopback();
+    EXPECT_EQ(handler_.record().flags_ap, uint8_t{0x00});
+}
+
+TEST_F(PublisherAdapterFixture, AppendPosition_ToMemberPreserved)
+{
+    publisher_.appendPosition(33, 0, 0, 0, 0);
+    EXPECT_EQ(sink_.last().toMember, 33);
+}
+
+TEST_F(PublisherAdapterFixture, AppendPosition_DispatchesOnlyAppend)
+{
+    publisher_.appendPosition(1, 0, 0, 0, 0);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::AppendPosition);
+}
+
+// ---------------------------------------------------------------------------
+// 6. CommitPosition round-trip
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, CommitPosition_RoundTrip)
+{
+    publisher_.commitPosition(
+        /*toMember=*/       4,
+        /*leadershipTermId=*/INT64_C(0x1234567890ABCDEF),
+        /*logPosition=*/    INT64_C(0xFEDCBA0987654321),
+        /*leaderMemberId=*/ 12);
+
+    loopback();
+
+    const auto& r = handler_.record();
+    EXPECT_EQ(r.which, HandlerRecord::Which::CommitPosition);
+    EXPECT_EQ(r.nowNs_cp,            kNow);
+    EXPECT_EQ(r.leadershipTermId_cp, INT64_C(0x1234567890ABCDEF));
+    EXPECT_EQ(r.logPosition_cp,      INT64_C(0xFEDCBA0987654321));
+    EXPECT_EQ(r.leaderMemberId_cp,   12);
+}
+
+TEST_F(PublisherAdapterFixture, CommitPosition_ToMemberPreserved)
+{
+    publisher_.commitPosition(88, 0, 0, 0);
+    EXPECT_EQ(sink_.last().toMember, 88);
+}
+
+TEST_F(PublisherAdapterFixture, CommitPosition_DispatchesOnlyCommit)
+{
+    publisher_.commitPosition(1, 0, 0, 0);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::CommitPosition);
+}
+
+// ---------------------------------------------------------------------------
+// Buffer reuse: calling publisher twice produces correct bytes both times.
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, BufferReuse_CanvassThenCommit)
+{
+    // First: canvass
+    publisher_.canvassPosition(1,
+        INT64_C(0xAAAA), INT64_C(0xBBBB), INT64_C(0xCCCC), 5);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Canvass);
+    EXPECT_EQ(handler_.record().logLeadershipTermId_canvass, INT64_C(0xAAAA));
+
+    handler_.reset();
+
+    // Second (different message type): commitPosition — buffer reused
+    publisher_.commitPosition(2,
+        INT64_C(0x9999), INT64_C(0x8888), 7);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::CommitPosition);
+    EXPECT_EQ(handler_.record().leadershipTermId_cp, INT64_C(0x9999));
+    EXPECT_EQ(handler_.record().logPosition_cp,      INT64_C(0x8888));
+    EXPECT_EQ(handler_.record().leaderMemberId_cp,   7);
+}
+
+TEST_F(PublisherAdapterFixture, BufferReuse_SameMessageTwice)
+{
+    // First call
+    publisher_.appendPosition(1, INT64_C(0x1111), INT64_C(0x2222), 3, uint8_t{0xAB});
+    std::vector<uint8_t> firstBytes = sink_.last().bytes;
+
+    // Second call with different values
+    publisher_.appendPosition(2, INT64_C(0x3333), INT64_C(0x4444), 5, uint8_t{0xCD});
+    std::vector<uint8_t> secondBytes = sink_.last().bytes;
+
+    // Bytes differ (not stale)
+    EXPECT_NE(firstBytes, secondBytes);
+
+    // Second loopback decodes correctly
+    adapter_.onFragment(kNow, secondBytes.data(), secondBytes.size());
+    EXPECT_EQ(handler_.record().leadershipTermId_ap, INT64_C(0x3333));
+    EXPECT_EQ(handler_.record().logPosition_ap,      INT64_C(0x4444));
+    EXPECT_EQ(handler_.record().followerMemberId_ap, 5);
+    EXPECT_EQ(handler_.record().flags_ap,            uint8_t{0xCD});
+}
+
+// ---------------------------------------------------------------------------
+// peekTemplateId dispatch: each message routes to exactly its handler.
+// ---------------------------------------------------------------------------
+
+TEST_F(PublisherAdapterFixture, Dispatch_CanvassNotCallsOthers)
+{
+    publisher_.canvassPosition(1, 0, 0, 0, 0);
+    loopback();
+    EXPECT_EQ(handler_.calls(), 1);
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Canvass);
+}
+
+TEST_F(PublisherAdapterFixture, Dispatch_AllSixDistinctMessages)
+{
+    // Publish one of each and verify each dispatches to exactly the right method.
+    publisher_.canvassPosition(1, 10, 20, 30, 1);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Canvass);
+    handler_.reset();
+
+    publisher_.requestVote(1, 10, 20, 30, 1);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::RequestVote);
+    handler_.reset();
+
+    publisher_.placeVote(1, 10, 20, 30, 1, 2, true);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::Vote);
+    handler_.reset();
+
+    publisher_.newLeadershipTerm(1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 1, 2, false, 100);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::NewLeadershipTerm);
+    handler_.reset();
+
+    publisher_.appendPosition(1, 10, 20, 1, uint8_t{0x01});
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::AppendPosition);
+    handler_.reset();
+
+    publisher_.commitPosition(1, 10, 20, 1);
+    loopback();
+    EXPECT_EQ(handler_.record().which, HandlerRecord::Which::CommitPosition);
+}
+
+// ---------------------------------------------------------------------------
+// FRAGMENT_LIMIT constant mirrors Java
+// ---------------------------------------------------------------------------
+
+TEST(ConsensusAdapterConstants, FragmentLimitIs10)
+{
+    EXPECT_EQ(ConsensusAdapter::FRAGMENT_LIMIT, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Unknown templateId silently ignored (forward-compat)
+// ---------------------------------------------------------------------------
+
+TEST(ConsensusAdapterDispatch, UnknownTemplateIdIgnored)
+{
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // Craft a valid SBE header with an unknown templateId (e.g., 99).
+    std::array<uint8_t, 8> buf{};
+    ConsensusMessageHeader::encode(buf.data(), 0, 0, /*templateId=*/99);
+
+    adapter.onFragment(0, buf.data(), buf.size());
+
+    EXPECT_EQ(handler.calls(), 0); // nothing dispatched
+}
