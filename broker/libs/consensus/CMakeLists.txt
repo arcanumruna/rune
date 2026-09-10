@@ -40,3 +40,24 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests)
 endif()
+
+option(BUILD_INTEGRATION_TESTING "Build integration tests" OFF)
+if(BUILD_INTEGRATION_TESTING)
+    if(NOT BUILD_TESTING)
+        find_package(GTest REQUIRED)
+        include(GoogleTest)
+    endif()
+    set(CLUSTER_INTEGRATION_TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/integration)
+    add_executable(rune_consensus_integration_tests
+        ${CLUSTER_INTEGRATION_TEST_DIR}/ClusterDisasterRecoveryIntegrationTest.cpp)
+    target_include_directories(rune_consensus_integration_tests PRIVATE
+        ${CLUSTER_INTEGRATION_TEST_DIR})
+    target_link_libraries(rune_consensus_integration_tests PRIVATE
+        rune_consensus
+        GTest::gtest_main)
+    if(aeron_FOUND)
+        target_link_libraries(rune_consensus_integration_tests PRIVATE aeron::aeron)
+    endif()
+    gtest_discover_tests(rune_consensus_integration_tests
+        PROPERTIES TIMEOUT 40)
+endif()
