@@ -164,12 +164,11 @@ TEST(PartitionApi, ConsumeAcrossManyReadChunks) {
             expectedVals.push_back("value_" + std::to_string(i) + "_x" + std::string(16, static_cast<char>('a' + (i % 26))));
         }
 
-        // Use maxBytes=16384 to force multiple log_.read() chunks and multiple
-        // mid-chunk batch boundaries — reproducing the truncation bug.
-        // (16384 < ~50KB total log, so the outer while loop must iterate
-        // multiple times; before the fix it returns only the first chunk's
-        // worth of records and silently drops the rest.)
-        constexpr int32_t kSmallMax = 16384;
+        // Use maxBytes=4096 — equal to the default index interval — to stress both the
+        // consume() multi-chunk loop and LogSegment::read()'s grow-and-retry window.
+        // Before the read() fix, read(250, 4096) returned {} when the sparse index
+        // pointed to a position more than 4096 bytes before offset 250's batch.
+        constexpr int32_t kSmallMax = 4096;
         auto recs = api.consume(0, kSmallMax);
         ASSERT_EQ(static_cast<int>(recs.size()), N)
             << "consume(0, " << kSmallMax << ") returned " << recs.size() << " instead of " << N;

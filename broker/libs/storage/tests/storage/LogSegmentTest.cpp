@@ -375,3 +375,52 @@ TEST(LogSegment, ManyBatchesSmallIntervalMidLogRead) {
 
     std::filesystem::remove_all(dir);
 }
+
+// Regression: read() with tiny maxBytes grows its window and still finds the target batch
+// even when maxBytes < skip-distance from the sparse index entry to startOffset's batch.
+TEST(LogSegment, ReadWithTinyMaxBytesAcrossManyIndexEntries) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_seg_tiny";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    // Small indexIntervalBytes=256 creates many index entries; 200 single-record batches
+    // means the skip distance from the nearest index entry can be many batch-widths.
+    LogSegment seg(dir.string(), 0, 256);
+
+    const int N = 200;
+    for (int i = 0; i < N; ++i) {
+        auto batch = makeBatch(static_cast<int64_t>(i), 10000 + i, 1);
+        seg.append(batch, static_cast<int64_t>(i));
+    }
+    EXPECT_EQ(seg.nextOffset(), N);
+
+    // read(150, 64) — tiny window (64 bytes) far smaller than the skip distance.
+    // Before the fix this returned {} spuriously.
+    {
+        auto buf = seg.read(150, 64);
+        ASSERT_FALSE(buf.empty()) << "read(150, 64) returned empty — grow-and-retry not working";
+        RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_TRUE(r.ensureValid());
+        int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
+        EXPECT_GE(batchLast, 150);
+    }
+
+    // read(0, 64) returns the first batch.
+    {
+        auto buf = seg.read(0, 64);
+        ASSERT_FALSE(buf.empty()) << "read(0, 64) returned empty";
+        RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+
+    // read(199, 64) returns the last batch.
+    {
+        auto buf = seg.read(199, 64);
+        ASSERT_FALSE(buf.empty()) << "read(199, 64) returned empty";
+        RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_TRUE(r.ensureValid());
+        int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
+        EXPECT_GE(batchLast, 199);
+    }
+
+    std::filesystem::remove_all(dir);
+}

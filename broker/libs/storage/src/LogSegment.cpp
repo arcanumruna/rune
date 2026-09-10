@@ -41,22 +41,39 @@ int64_t LogSegment::append(const std::vector<uint8_t>& batch, int64_t lastOffset
 }
 std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
     OffsetPosition op = index_->lookup(startOffset);
-    log_.seekg(op.position, std::ios::beg);
     int64_t remaining = logSize_ - op.position;
     // Guard: clamp negative remaining (if index is out of sync) to prevent huge allocation
     if (remaining < 0) remaining = 0;
     int64_t toRead = std::min<int64_t>(remaining, maxBytes);
-    std::vector<uint8_t> buf(static_cast<size_t>(toRead));
-    if (toRead > 0) log_.read(reinterpret_cast<char*>(buf.data()), toRead);
-    // Skip batches whose lastOffset < startOffset (index is sparse -> may start earlier).
-    size_t pos = 0;
-    while (pos < buf.size()) {
-        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
-        int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
-        if (batchLast >= startOffset) { return std::vector<uint8_t>(buf.begin() + pos, buf.end()); }
-        pos += r.totalLength();
+    // Grow-and-retry loop: the sparse index may point up to indexIntervalBytes_ before
+    // startOffset's batch. If maxBytes is smaller than that skip distance the initial
+    // window is too small to reach the target — double the window until we either find
+    // the batch or exhaust the segment.
+    for (;;) {
+        std::vector<uint8_t> buf(static_cast<size_t>(toRead));
+        log_.seekg(op.position, std::ios::beg);
+        if (toRead > 0) log_.read(reinterpret_cast<char*>(buf.data()), toRead);
+        // Skip batches whose lastOffset < startOffset (index is sparse -> may start earlier).
+        // Guard: require at least kRecordBatchOverhead bytes before constructing a reader.
+        size_t pos = 0;
+        while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+            int32_t total = r.totalLength();
+            // Batch cut off by window boundary — stop; outer loop will grow the window.
+            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
+            if (batchLast >= startOffset) {
+                return std::vector<uint8_t>(buf.begin() + static_cast<ptrdiff_t>(pos), buf.end());
+            }
+            pos += static_cast<size_t>(total);
+        }
+        // If we already read the entire segment, the offset is genuinely absent.
+        if (toRead >= remaining) return {};
+        // Grow: at minimum jump by one full index interval + overhead so we always make progress.
+        int64_t minGrow = toRead + static_cast<int64_t>(indexIntervalBytes_) +
+                          static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead);
+        toRead = std::min(remaining, std::max(toRead * 2, minGrow));
     }
-    return {};
 }
 int64_t LogSegment::recover() {
     log_.seekg(0, std::ios::end);
