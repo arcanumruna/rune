@@ -17,7 +17,9 @@ option(BUILD_TESTING "Build tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
     find_package(GTest REQUIRED)
-    add_executable(rune_protocol_tests tests/protocol/SmokeTest.cpp)
+    add_executable(rune_protocol_tests
+            tests/protocol/SmokeTest.cpp
+            tests/protocol/Crc32cTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(rune_protocol_tests PRIVATE GTest::gtest_main)
     include(GoogleTest)
