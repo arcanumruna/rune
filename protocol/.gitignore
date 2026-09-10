@@ -1,0 +1,6 @@
+build/
+cmake-build-*/
+CMakeUserPresets.json
+conan-graph.json
+conan-pkglist.json
+*.log
