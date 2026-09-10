@@ -31,3 +31,16 @@ Derived from studying Aeron Cluster's Java consensus module (`aeron-cluster/src/
 - **P2-g codecs**: flat fixed-offset layout, encode via reusable encoder into a provided buffer (tryClaim-ready), CRC-32C + varint from rune-protocol; decode as zero-copy views.
 - **P2-h transport**: Aeron `tryClaim` zero-copy send + `IdleStrategy` agent loop + embedded media driver; feasibility spike first.
 - **P2-i harness**: single-writer nodes stepped by a manual nano clock over an in-memory bus; assert Election Safety, Leader Completeness, State Machine Safety.
+
+## D. Inter-thread plumbing — Agrona ring buffers (MANDATORY at thread crossings)
+
+`common` already wraps Aeron/Agrona's lock-free ring buffers with the usual semantics — USE THEM for every thread boundary in the running node:
+- `common` `include/concurrent/agrona/O2ORingBuffer.h` — **one-to-one (SPSC)**, `tryClaim(msgTypeId,len)`+`commit(index)` zero-copy, `read(handler,limit)`; built on `aeron::ringbuffer::RingBufferDescriptor`/`RecordDescriptor` (TRAILER, tail/head cache positions, padding records, cache-line alignment).
+- `common` `M2ORingBuffer.h` — **many-to-one (MPSC)**; `M2OConcurrentArrayQueue.h` for object queues.
+
+**Design rule:** the `RaftNode` state machine stays single-writer and, for deterministic UNIT tests, is driven with a plain reusable `Outbox`/`Inbox` (`std::vector`) — no threads, no rings. The rings live at the **agent/transport boundary**:
+- **Ingress** (network receiver thread(s) → the single RaftNode agent thread): an **`M2ORingBuffer`** (MPSC) — receivers `tryClaim`+`commit` encoded messages; the agent `read`s them each `doWork`.
+- **Egress** (agent → sender/publication): an **`O2ORingBuffer`** (SPSC) or a direct Aeron `Publication::tryClaim`.
+- The agent loop uses an **`IdleStrategy`** on the drained work count. Encode/decode via the P2-g flat codecs directly into the ring's claimed slot (zero copy, zero allocation).
+
+Applies to: **P2-k** (RaftAgent runner over `common`'s O2O/M2O rings — the runtime that wraps `RaftNode`; threaded integration tests: multiple producer threads → single agent consumer, no loss/reorder-within-producer) and **P2-h** (Aeron transport: `tryClaim` publication + the ingress M2O ring). The pure algorithm units (P2-a…P2-g) do not depend on the rings; they are wired in at P2-k/P2-h.
