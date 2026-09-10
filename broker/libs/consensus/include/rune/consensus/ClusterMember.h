@@ -39,9 +39,9 @@ struct ClusterMember {
     Term    candidateTermId           = kNullValue;
     // ClusterMember.java:54  private long logPosition = NULL_POSITION;
     int64_t logPosition               = kNullPosition;
-    // logLeadershipTermId is the term-id carried in the log entries for this member
-    // (used as primary key in compareLog); initialised from the last log entry.
-    // Corresponds to what the spec §2.1 calls logLeadershipTermId.
+    // logLeadershipTermId holds the leadership term of this member's most-recently-appended
+    // log entry; consumed by the Election layer's 4-arg compareLog(logLeadershipTermId, logPosition, ...)
+    // for canvass/up-to-date checks (NOT by the 2-arg member overload).
     Term    logLeadershipTermId       = kNullValue;
     // ClusterMember.java:55  private long timeOfLastAppendPositionNs = NULL_VALUE;
     int64_t timeOfLastAppendPositionNs = kNullValue;
@@ -56,7 +56,8 @@ struct ClusterMember {
     // member.isActive(nowNs, timeoutNs):
     //   return timeOfLastAppendPositionNs + timeoutNs > nowNs;
     bool isActive(int64_t nowNs, int64_t timeoutNs) const noexcept {
-        return timeOfLastAppendPositionNs + timeoutNs > nowNs;
+        // overflow-safe form of (timeOfLastAppendPositionNs + timeoutNs > nowNs)
+        return nowNs - timeoutNs < timeOfLastAppendPositionNs;
     }
 
     // ClusterMember.java:1300-1303

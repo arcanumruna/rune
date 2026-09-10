@@ -3,6 +3,7 @@
 // Source: aeron-cluster/src/main/java/io/aeron/cluster/ElectionState.java:26-115
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace rune::consensus {
 
