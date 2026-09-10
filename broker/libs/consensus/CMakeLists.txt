@@ -1,4 +1,4 @@
-add_library(rune_consensus src/PersistentState.cpp src/RaftLog.cpp src/RaftNode.cpp)
+add_library(rune_consensus src/PersistentState.cpp src/RaftLog.cpp src/RaftNode.cpp src/NodeStateFile.cpp)
 target_include_directories(rune_consensus PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         ${RUNE_PROTOCOL_INCLUDE})
@@ -13,7 +13,8 @@ if(BUILD_TESTING)
         tests/consensus/ElectionTest.cpp
         tests/consensus/ReplicationTest.cpp
         tests/consensus/ElectionStateTest.cpp
-        tests/consensus/ClusterMemberTest.cpp)
+        tests/consensus/ClusterMemberTest.cpp
+        tests/consensus/NodeStateFileTest.cpp)
     target_link_libraries(rune_consensus_tests PRIVATE rune_consensus GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests)
