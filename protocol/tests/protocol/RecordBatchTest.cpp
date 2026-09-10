@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/Crc32c.h>
+#include <functional>
 namespace b = rune::protocol::batch;
 
 static uint32_t beU32(const std::vector<uint8_t>& b, int off) {
@@ -41,4 +42,35 @@ TEST(RecordBatchBuilder, EncodesHeaderAndCrc) {
     uint32_t expect = crc32c(bytes.data() + batch::kAttributesOffset,
                              bytes.size() - batch::kAttributesOffset);
     EXPECT_EQ(beU32(bytes, batch::kCrcOffset), expect);
+}
+
+TEST(RecordBatchReader, RoundTripAndValidation) {
+    using namespace rune::protocol;
+    RecordBatchBuilder rb(100, 5000);
+    rb.append("k1", "v1", 5000);
+    rb.append("k2", "v2", 5001);
+    auto bytes = rb.build();
+
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 100);
+    EXPECT_EQ(r.recordCount(), 2);
+    EXPECT_EQ(r.totalLength(), (int)bytes.size());
+
+    std::vector<std::pair<std::string,int64_t>> seen;
+    r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t){
+        seen.emplace_back(std::string(v), off);
+    });
+    ASSERT_EQ(seen.size(), 2u);
+    EXPECT_EQ(seen[0].first, "v1"); EXPECT_EQ(seen[0].second, 100);
+    EXPECT_EQ(seen[1].first, "v2"); EXPECT_EQ(seen[1].second, 101);
+
+    // Stamping the (CRC-excluded) leader epoch must NOT invalidate the batch.
+    RecordBatchReader::stampLeaderEpoch(bytes.data(), 7);
+    RecordBatchReader r2(bytes.data(), bytes.size());
+    EXPECT_TRUE(r2.ensureValid());
+
+    // Corrupt a value byte -> ensureValid() fails.
+    bytes.back() ^= 0xFF;
+    EXPECT_FALSE(RecordBatchReader(bytes.data(), bytes.size()).ensureValid());
 }
