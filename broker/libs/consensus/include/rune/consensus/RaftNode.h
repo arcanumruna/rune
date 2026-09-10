@@ -5,6 +5,7 @@
 #include <rune/consensus/RaftLog.h>
 #include <cstdint>
 #include <random>
+#include <vector>
 
 namespace rune::consensus {
 
@@ -40,6 +41,9 @@ public:
     /// Exposed for tests to verify deterministic jitter.
     int64_t electionDeadlineNs() const noexcept { return electionDeadlineNs_; }
 
+    /// Number of votes granted to this node in the current term (including self).
+    int grantedVoteCount() const noexcept { return static_cast<int>(votesGranted_.size()); }
+
     // ------------------------------------------------------------------
     // Single-writer agent entry point.
     // Returns workCount = (messages emitted) + (role transitions performed).
@@ -67,6 +71,21 @@ public:
     /// Handlers in P2-d/P2-e call this on every inbound message.
     void observeTerm(Term term, int64_t nowNs);
 
+    // ------------------------------------------------------------------
+    // P2-d: Vote handlers
+    // ------------------------------------------------------------------
+
+    /// Handle an inbound RequestVote RPC.
+    /// Grants or denies per §A.3; persists vote before replying (§A.4).
+    /// Appends a RequestVoteResult to `out` addressed to rv.candidateId,
+    /// and also returns the result struct for convenient testing.
+    RequestVoteResult handleRequestVote(const RequestVote& rv, int64_t nowNs, Outbox& out);
+
+    /// Handle an inbound RequestVoteResult (response to our RequestVote).
+    /// Tallies granted votes; transitions to Leader when majority reached.
+    void handleRequestVoteResult(NodeId from, const RequestVoteResult& res,
+                                 int64_t nowNs, Outbox& out);
+
 private:
     /// Draw a fresh randomized election deadline: nowNs + base + U[0, jitter].
     void resetElectionDeadline(int64_t nowNs);
@@ -85,6 +104,10 @@ private:
 
     std::mt19937_64 rng_;
     std::uniform_int_distribution<int64_t> jitterDist_;
+
+    /// NodeIds that granted a vote to us in the current term (including self).
+    /// Cleared and re-seeded with self on becomeCandidate; cleared on step-down.
+    std::vector<NodeId> votesGranted_;
 };
 
 } // namespace rune::consensus

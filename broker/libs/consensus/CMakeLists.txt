@@ -9,7 +9,8 @@ if(BUILD_TESTING)
         tests/consensus/TypesTest.cpp
         tests/consensus/PersistentStateTest.cpp
         tests/consensus/RaftLogTest.cpp
-        tests/consensus/RaftNodeTest.cpp)
+        tests/consensus/RaftNodeTest.cpp
+        tests/consensus/ElectionTest.cpp)
     target_link_libraries(rune_consensus_tests PRIVATE rune_consensus GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests)
