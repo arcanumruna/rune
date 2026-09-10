@@ -381,3 +381,87 @@ TEST(TermLog, SingleEntry_NextLeadershipTermId) {
     log.appendTerm(10, 7, 0, 1000);
     EXPECT_EQ(log.nextLeadershipTermId(), 8);
 }
+
+// ---------------------------------------------------------------------------
+// 8. Out-of-order append regression tests
+//    These tests would FAIL against the old sorted-insertion code because
+//    commitLogPosition/invalidateEntry used idx*kRecordSize as the file offset
+//    where idx was the sorted position, not the file-record position.
+// ---------------------------------------------------------------------------
+
+TEST(TermLog, OutOfOrderAppendCommitTargetsCorrectRecord) {
+    // Append term=2 FIRST (file record 0), then term=0 SECOND (file record 1).
+    // The old sorted-insertion code would store term=0 at entries_[0] and
+    // term=2 at entries_[1], making commitLogPosition(0,…) patch file record 0
+    // (which actually holds term=2) — the wrong record.
+    const std::string path = tmpPath("ooo_commit");
+
+    {
+        TermLog log(path);
+        log.appendTerm(1, 2, 0, 100); // term=2 appended first → file record 0
+        log.appendTerm(2, 0, 0, 200); // term=0 appended second → file record 1
+
+        log.commitLogPosition(0, 555); // must patch file record 1 (term=0)
+        log.commitLogPosition(2, 999); // must patch file record 0 (term=2)
+
+        // In-memory: each term's logPosition updated correctly.
+        ASSERT_TRUE(log.getTermEntry(0).has_value());
+        ASSERT_TRUE(log.getTermEntry(2).has_value());
+        EXPECT_EQ(log.getTermEntry(0)->logPosition, 555);
+        EXPECT_EQ(log.getTermEntry(2)->logPosition, 999);
+
+        // lastTermEntry returns highest leadershipTermId (term=2), even though it was appended first.
+        const auto last = log.lastTermEntry();
+        ASSERT_TRUE(last.has_value());
+        EXPECT_EQ(last->leadershipTermId, 2);
+    }
+
+    // Reopen: verify the on-disk file offsets were correct (commits hit the right records).
+    {
+        TermLog log(path);
+        ASSERT_TRUE(log.getTermEntry(0).has_value());
+        ASSERT_TRUE(log.getTermEntry(2).has_value());
+        EXPECT_EQ(log.getTermEntry(0)->logPosition, 555);
+        EXPECT_EQ(log.getTermEntry(2)->logPosition, 999);
+
+        const auto last = log.lastTermEntry();
+        ASSERT_TRUE(last.has_value());
+        EXPECT_EQ(last->leadershipTermId, 2);
+        EXPECT_EQ(log.nextLeadershipTermId(), 3);
+    }
+
+    fs::remove(path);
+}
+
+TEST(TermLog, OutOfOrderAppendInvalidateTargetsCorrectRecord) {
+    // Same out-of-order setup: term=2 at file record 0, term=0 at file record 1.
+    // invalidateEntry(2) must flip the invalid-flag bit on file record 0, not record 1.
+    const std::string path = tmpPath("ooo_invalidate");
+
+    {
+        TermLog log(path);
+        log.appendTerm(1, 2, 0, 100); // term=2 → file record 0
+        log.appendTerm(2, 0, 0, 200); // term=0 → file record 1
+
+        log.invalidateEntry(2); // must patch file record 0
+
+        EXPECT_FALSE(log.getTermEntry(2).has_value()); // invalidated
+        EXPECT_TRUE(log.getTermEntry(0).has_value());  // still valid
+    }
+
+    // Reopen: verify invalidation was persisted to the correct file record.
+    {
+        TermLog log(path);
+        EXPECT_FALSE(log.getTermEntry(2).has_value()); // still invalid after reopen
+        EXPECT_TRUE(log.getTermEntry(0).has_value());  // still valid after reopen
+        EXPECT_EQ(log.validTermEntries().size(), 1u);
+        EXPECT_EQ(log.validTermEntries()[0].leadershipTermId, 0);
+
+        // lastTermEntry: only term=0 remains valid
+        const auto last = log.lastTermEntry();
+        ASSERT_TRUE(last.has_value());
+        EXPECT_EQ(last->leadershipTermId, 0);
+    }
+
+    fs::remove(path);
+}

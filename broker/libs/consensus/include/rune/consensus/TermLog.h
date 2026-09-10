@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::consensus {
@@ -55,6 +56,8 @@ struct TermEntry {
     int32_t  serviceId;            ///< kTermServiceId (-1) sentinel for term entries
     int32_t  entryType;            ///< kEntryTypeTerm (0), or with high bit = invalid
     bool     isValid;              ///< false when marked invalid via invalidateEntry
+    int64_t  fileOffset = 0;       ///< Byte offset of this record in the backing file
+                                   ///<   (mirrors RecordingLog.Entry.position)
 };
 
 /**
@@ -182,7 +185,8 @@ private:
 
     std::string            path_;
     int                    fd_ = -1;
-    std::vector<TermEntry> entries_;  ///< in-memory cache, ascending leadershipTermId order
+    std::vector<TermEntry> entries_;  ///< in-memory cache, in APPEND/insertion order (index i == file record i)
+    std::unordered_map<Term, std::size_t> indexByTerm_;  ///< leadershipTermId → entries_ index (O(1) lookup)
 
     // Load all records from the backing file into entries_.
     void loadEntries();
@@ -200,8 +204,8 @@ private:
     // Serialise one record into a 64-byte little-endian buffer.
     static void serialiseRecord(uint8_t buf[kRecordSize], const TermEntry& entry);
 
-    // Find the linear index of the entry with the given leadershipTermId
-    // in entries_ (both valid and invalid). Returns -1 if not found.
+    // Find the entries_ index for the given leadershipTermId via indexByTerm_.
+    // Returns -1 if not found. The returned index IS the file-record index.
     [[nodiscard]] int findIndex(Term leadershipTermId) const noexcept;
 };
 

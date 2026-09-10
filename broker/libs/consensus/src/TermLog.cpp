@@ -12,7 +12,6 @@
 
 #include <rune/consensus/TermLog.h>
 
-#include <algorithm>
 #include <bit>
 #include <cerrno>
 #include <cstring>
@@ -162,6 +161,7 @@ TermLog::~TermLog() {
 
 void TermLog::loadEntries() {
     entries_.clear();
+    indexByTerm_.clear();
 
     // Determine file size.
     struct stat st{};
@@ -210,16 +210,13 @@ void TermLog::loadEntries() {
         e.serviceId           = getInt32LE(buf, kServiceIdOffset);
         e.entryType           = type;
         e.isValid             = isValid;
+        e.fileOffset          = offset;  // mirrors RecordingLog.Entry.position
 
+        indexByTerm_[e.leadershipTermId] = entries_.size();
         entries_.push_back(e);
     }
-
-    // Sort by leadershipTermId ascending.
-    // RecordingLog.java:685: entriesCache.sort(ENTRY_COMPARATOR)
-    std::sort(entries_.begin(), entries_.end(),
-              [](const TermEntry& a, const TermEntry& b) {
-                  return a.leadershipTermId < b.leadershipTermId;
-              });
+    // NOTE: no sort — entries_ is in append/file-record order, matching Aeron's ArrayList.
+    // indexByTerm_ provides O(1) lookup by leadershipTermId.
 }
 
 // ---------------------------------------------------------------------------
@@ -270,12 +267,11 @@ void TermLog::patchInt32(int64_t recordOffset, std::size_t fieldOffset, int32_t 
 // ---------------------------------------------------------------------------
 
 int TermLog::findIndex(Term leadershipTermId) const noexcept {
-    for (int i = 0; i < static_cast<int>(entries_.size()); ++i) {
-        if (entries_[static_cast<std::size_t>(i)].leadershipTermId == leadershipTermId) {
-            return i;
-        }
+    const auto it = indexByTerm_.find(leadershipTermId);
+    if (it == indexByTerm_.end()) {
+        return -1;
     }
-    return -1;
+    return static_cast<int>(it->second);
 }
 
 // ---------------------------------------------------------------------------
@@ -287,10 +283,12 @@ void TermLog::appendTerm(int64_t recordingId, Term leadershipTermId,
 {
     // RecordingLog.java:959: if (cacheIndexByLeadershipTermIdMap.containsKey(leadershipTermId))
     //   throw new ClusterException("duplicate TERM entry");
-    const int existing = findIndex(leadershipTermId);
-    if (existing >= 0 && entries_[static_cast<std::size_t>(existing)].isValid) {
-        throw std::runtime_error("TermLog: duplicate TERM entry for leadershipTermId=" +
-                                 std::to_string(leadershipTermId));
+    if (indexByTerm_.count(leadershipTermId) > 0) {
+        const TermEntry& existing = entries_[indexByTerm_.at(leadershipTermId)];
+        if (existing.isValid) {
+            throw std::runtime_error("TermLog: duplicate TERM entry for leadershipTermId=" +
+                                     std::to_string(leadershipTermId));
+        }
     }
 
     TermEntry e{};
@@ -303,16 +301,12 @@ void TermLog::appendTerm(int64_t recordingId, Term leadershipTermId,
     e.entryType           = kEntryTypeTerm;  // 0
     e.isValid             = true;
 
-    // Persist to file.
-    writeRecord(e);
+    // Persist to file first; writeRecord returns the file offset of this record.
+    e.fileOffset = writeRecord(e);
 
-    // Update in-memory cache in ascending leadershipTermId order.
-    // RecordingLog.java:1533–1584 (sorted insertion).
-    const auto pos = std::lower_bound(entries_.begin(), entries_.end(), e,
-                                      [](const TermEntry& a, const TermEntry& b) {
-                                          return a.leadershipTermId < b.leadershipTermId;
-                                      });
-    entries_.insert(pos, e);
+    // Append in insertion order, matching Aeron's ArrayList (never sorted on append).
+    indexByTerm_[leadershipTermId] = entries_.size();
+    entries_.push_back(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,17 +328,11 @@ void TermLog::commitLogPosition(Term leadershipTermId, int64_t logPosition) {
         return;
     }
 
-    // Determine the file offset of this record (record idx in sorted order).
-    // Since records are appended in the same order as entries_ (ascending termId),
-    // the file offset of the i-th entry is idx * kRecordSize.
-    // We recompute from the file to be safe: scan to find the matching leadershipTermId.
-    // Simpler: records are stored in append order = insertion order = sorted order.
-    const int64_t recordOffset = static_cast<int64_t>(static_cast<std::size_t>(idx) * kRecordSize);
-
     // RecordingLog.java:1096–1097:
     //   buffer.putLong(0, logPosition, LITTLE_ENDIAN);
     //   persistToStorage(entry.position, LOG_POSITION_OFFSET, SIZE_OF_LONG);
-    patchInt64(recordOffset, kLogPositionOffset, logPosition);
+    // Use the stored file offset (entry.position in Java) — correct regardless of append order.
+    patchInt64(e.fileOffset, kLogPositionOffset, logPosition);
 
     e.logPosition = logPosition;
 }
@@ -371,15 +359,23 @@ std::optional<TermEntry> TermLog::getTermEntry(Term leadershipTermId) const {
 // ---------------------------------------------------------------------------
 
 std::optional<TermEntry> TermLog::lastTermEntry() const {
-    // RecordingLog.java:720–728:
-    //   for (int i = entriesCache.size()-1; i>=0; i--)
-    //     if (isValidTerm(entry)) return entry;
-    for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
-        if (it->isValid && it->entryType == kEntryTypeTerm) {
-            return *it;
+    // Aeron's RecordingLog.java:718–730 findLastTerm() iterates in reverse and
+    // returns the first valid TERM entry. In Aeron, entries are in insertion order
+    // and terms are always appended in increasing order — so reverse == highest term first.
+    // Here we preserve that semantic while also handling out-of-order appends:
+    // scan all entries and return the valid TERM entry with the highest leadershipTermId.
+    const TermEntry* best = nullptr;
+    for (const auto& e : entries_) {
+        if (e.isValid && e.entryType == kEntryTypeTerm) {
+            if (best == nullptr || e.leadershipTermId > best->leadershipTermId) {
+                best = &e;
+            }
         }
     }
-    return std::nullopt;
+    if (best == nullptr) {
+        return std::nullopt;
+    }
+    return *best;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,8 +398,7 @@ void TermLog::invalidateEntry(Term leadershipTermId) {
     //   buffer.putInt(0, invalidEntryType, LITTLE_ENDIAN);
     //   persistToStorage(invalidEntry.position, ENTRY_TYPE_OFFSET, SIZE_OF_INT);
     const int32_t invalidEntryType = kEntryTypeInvalidFlag | e.entryType;
-    const int64_t recordOffset = static_cast<int64_t>(static_cast<std::size_t>(idx) * kRecordSize);
-    patchInt32(recordOffset, kEntryTypeOffset, invalidEntryType);
+    patchInt32(e.fileOffset, kEntryTypeOffset, invalidEntryType);
 
     e.entryType = invalidEntryType;
     e.isValid   = false;
