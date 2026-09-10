@@ -19,6 +19,7 @@
 #include <string_view>
 #include <cassert>
 #include <climits>
+#include <bit>
 
 namespace rune::consensus {
 
@@ -112,6 +113,10 @@ inline uint16_t peekTemplateId(const uint8_t* buf, std::size_t offset = 0) noexc
 // ---------------------------------------------------------------------------
 namespace detail {
 
+// Enforce little-endian at compile time (schema 111 is little-endian SBE)
+static_assert(std::endian::native == std::endian::little,
+              "rune::consensus SBE codecs assume a little-endian host (schema 111 is little-endian SBE)");
+
 template<typename T>
 inline void write_le(uint8_t* p, T v) noexcept {
     std::memcpy(p, &v, sizeof(T));
@@ -125,7 +130,7 @@ inline T read_le(const uint8_t* p) noexcept {
 
 // ===========================================================================
 // 1. CanvassPosition  (templateId = 50)
-//    blockLength = 28
+//    blockLength = 32
 //    Fields (wire order):
 //      logLeadershipTermId : int64   @ +0
 //      logPosition         : int64   @ +8
@@ -293,7 +298,8 @@ struct VoteMsg {
 
 // ===========================================================================
 // 4. NewLeadershipTerm  (templateId = 53)
-//    blockLength = 104  (schema field 14 commitPosition is sinceVersion=15, included)
+//    blockLength = 96 (payload; total on-wire = 104 incl. 8-byte header)
+//    (schema field 14 commitPosition is sinceVersion=15, included)
 //    Fields (wire order, exact schema field order):
 //      logLeadershipTermId    : int64   @ +0
 //      nextLeadershipTermId   : int64   @ +8
