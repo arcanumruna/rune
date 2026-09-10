@@ -584,11 +584,12 @@ TEST(ElectionBallot, OnRequestVote_UpToDate_GrantsVote_PlaceVoteEmitted) {
     TermLog       tl(tlFile.str());
     FakeConsensusPublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-    e.doWork(1'000'000LL); // INIT → CANVASS
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
 
     pub.clear();
     // Candidate 1 with term=1 (higher than our candidateTermId=0), log equal to us
-    e.onRequestVote(/*logLeadershipTermId=*/0, /*logPosition=*/0, /*candidateTermId=*/1, /*candidateId=*/1);
+    e.onRequestVote(/*logLeadershipTermId=*/0, /*logPosition=*/0, /*candidateTermId=*/1, /*candidateId=*/1, nowNs);
 
     ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
     auto& pv = pub.placeVoteCalls[0];
@@ -605,9 +606,10 @@ TEST(ElectionBallot, OnRequestVote_Grant_GoesToFollowerBallot) {
     TermLog       tl(tlFile.str());
     FakeConsensusPublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-    e.doWork(1'000'000LL);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
 
-    e.onRequestVote(0, 0, 1, 1);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
 
     EXPECT_EQ(e.state(), ElectionState::FollowerBallot);
 }
@@ -620,8 +622,9 @@ TEST(ElectionBallot, OnRequestVote_Grant_CandidateTermId_PersistsAcrossReopen) {
         TermLog       tl(tlFile.str());
         FakeConsensusPublisher pub;
         auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-        e.doWork(1'000'000LL);
-        e.onRequestVote(0, 0, /*candidateTermId=*/3, 1);
+        int64_t nowNs = 1'000'000LL;
+        e.doWork(nowNs);
+        e.onRequestVote(0, 0, /*candidateTermId=*/3, 1, nowNs);
         EXPECT_EQ(e.candidateTermId(), 3);
     }
     // Reopen — persisted term must be >= 3
@@ -647,8 +650,9 @@ TEST(ElectionBallot, OnRequestVote_OurLogMoreRecent_Denies) {
     e.doWork(1'000'000LL); // INIT → CANVASS
 
     pub.clear();
+    int64_t nowNs = 1'000'000LL;
     // Candidate 1 with lower log (logLeadershipTermId=3, logPosition=50)
-    e.onRequestVote(/*logLeadershipTermId=*/3, /*logPosition=*/50, /*candidateTermId=*/6, 1);
+    e.onRequestVote(/*logLeadershipTermId=*/3, /*logPosition=*/50, /*candidateTermId=*/6, 1, nowNs);
 
     ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
     EXPECT_FALSE(pub.placeVoteCalls[0].vote);
@@ -662,11 +666,12 @@ TEST(ElectionBallot, OnRequestVote_StaleCandidateTerm_Denies) {
     TermLog tl(tlFile.str());
     FakeConsensusPublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-    e.doWork(1'000'000LL);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
 
     pub.clear();
     // Candidate with term=5 (== ours) → deny
-    e.onRequestVote(0, 0, /*candidateTermId=*/5, 1);
+    e.onRequestVote(0, 0, /*candidateTermId=*/5, 1, nowNs);
 
     ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
     EXPECT_FALSE(pub.placeVoteCalls[0].vote);
@@ -682,7 +687,8 @@ TEST(ElectionBallot, OnRequestVote_InInitState_Ignored) {
 
     // Don't call doWork — stays in INIT
     ASSERT_EQ(e.state(), ElectionState::Init);
-    e.onRequestVote(0, 0, 1, 1);
+    int64_t nowNs = 1'000'000LL;
+    e.onRequestVote(0, 0, 1, 1, nowNs);
 
     EXPECT_TRUE(pub.placeVoteCalls.empty());
 }
@@ -698,12 +704,13 @@ TEST(ElectionBallot, FollowerBallot_Timeout_GoesToCanvass) {
     TermLog       tl(tlFile.str());
     FakeConsensusPublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-    e.doWork(1'000'000LL); // INIT → CANVASS
-    e.onRequestVote(0, 0, 1, 1); // → FOLLOWER_BALLOT (nowNs=0)
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    e.onRequestVote(0, 0, 1, 1, nowNs); // → FOLLOWER_BALLOT
     ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
 
-    // Advance past election timeout (timeOfLastStateChangeNs = 0 from onRequestVote impl)
-    e.doWork(kElectionTimeoutNs + 1LL);
+    // Advance past election timeout (timeOfLastStateChangeNs = nowNs from onRequestVote)
+    e.doWork(nowNs + kElectionTimeoutNs + 1LL);
     EXPECT_EQ(e.state(), ElectionState::Canvass);
 }
 
@@ -714,11 +721,12 @@ TEST(ElectionBallot, FollowerBallot_BeforeTimeout_StaysInState) {
     TermLog       tl(tlFile.str());
     FakeConsensusPublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-    e.doWork(1'000'000LL);
-    e.onRequestVote(0, 0, 1, 1);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
     ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
 
-    e.doWork(1LL); // well before timeout (timeOfLastStateChangeNs=0, timeout=150ms; 1ns < 150ms)
+    e.doWork(nowNs + 1LL); // well before timeout (timeOfLastStateChangeNs=nowNs, timeout=150ms; 1ns < 150ms)
     EXPECT_EQ(e.state(), ElectionState::FollowerBallot);
 }
 
@@ -737,15 +745,16 @@ TEST(ElectionBallot, StateCode_UpdatedOnEveryTransition) {
     // Initial: INIT = code 0
     EXPECT_EQ(e.stateCode(), 0);
 
-    e.doWork(1'000'000LL); // → CANVASS = code 1
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // → CANVASS = code 1
     EXPECT_EQ(e.stateCode(), 1);
 
     // Trigger vote to FOLLOWER_BALLOT = code 4
-    e.onRequestVote(0, 0, 1, 1);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
     EXPECT_EQ(e.stateCode(), 4);
 
     // Timeout → CANVASS = code 1
-    e.doWork(kElectionTimeoutNs + 1LL);
+    e.doWork(nowNs + kElectionTimeoutNs + 1LL);
     EXPECT_EQ(e.stateCode(), 1);
 }
 

@@ -118,7 +118,7 @@ public:
                        int64_t logPosition,
                        Term    candidateTermId,
                        NodeId  candidateId,
-                       int64_t nowNs = 0);
+                       int64_t nowNs);
 
     // Election.java:383-409
     void onVote(Term    logLeadershipTermId,
