@@ -11,6 +11,7 @@ public:
     LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096);
     int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset); // returns nextOffset
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
+    int64_t recover();
     int64_t baseOffset() const noexcept { return baseOffset_; }
     int64_t sizeBytes() const noexcept { return logSize_; }
     int64_t nextOffset() const noexcept { return nextOffset_; }

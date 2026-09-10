@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <iomanip>
 #include <sstream>
+#include <filesystem>
 namespace rune::storage {
 std::string LogSegment::fname(std::string dir, int64_t base, const char* ext) {
     std::ostringstream os; os << dir << "/" << std::setw(20) << std::setfill('0') << base << ext;
@@ -56,5 +57,31 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
         pos += r.totalLength();
     }
     return {};
+}
+int64_t LogSegment::recover() {
+    log_.seekg(0, std::ios::end);
+    int64_t fileSize = log_.tellg();
+    std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
+    log_.seekg(0, std::ios::beg);
+    if (fileSize > 0) log_.read(reinterpret_cast<char*>(buf.data()), fileSize);
+    index_ = std::make_unique<OffsetIndex>(
+        logPath_.substr(0, logPath_.size()-4) + ".index2", baseOffset_, 8*1024*1024); // rebuild fresh
+    size_t pos = 0; int64_t validBytes = 0; int64_t next = baseOffset_; bytesSinceIndex_ = indexIntervalBytes_;
+    using rune::protocol::RecordBatchReader;
+    while (pos + rune::protocol::batch::kRecordBatchOverhead <= buf.size()) {
+        RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<size_t>(total) > buf.size() || !r.ensureValid()) break;
+        if (bytesSinceIndex_ >= indexIntervalBytes_) { index_->append(r.baseOffset(), static_cast<int32_t>(validBytes)); bytesSinceIndex_ = 0; }
+        validBytes += total; bytesSinceIndex_ += total;
+        next = r.baseOffset() + r.lastOffsetDelta() + 1;
+        pos += total;
+    }
+    // Truncate torn tail.
+    std::filesystem::resize_file(logPath_, static_cast<uintmax_t>(validBytes));
+    log_.close();
+    log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary);
+    logSize_ = validBytes; nextOffset_ = next;
+    return nextOffset_;
 }
 } // namespace rune::storage

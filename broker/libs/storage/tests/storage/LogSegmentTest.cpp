@@ -214,6 +214,125 @@ TEST(LogSegment, NonZeroBaseOffsetSegment) {
     std::filesystem::remove_all(dir);
 }
 
+// ---- Recovery tests ----
+
+#include <fstream>
+TEST(LogSegment, RecoverTruncatesTornTail) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    std::string logPath;
+    {
+        LogSegment seg(dir.string(), 0);
+        RecordBatchBuilder b0(0, 1000); b0.append("k","v0",1000); seg.append(b0.build(), 0);
+        RecordBatchBuilder b1(1, 1001); b1.append("k","v1",1001); seg.append(b1.build(), 1);
+        logPath = seg.logPath();
+    }
+    // Append 9 bytes of garbage to simulate a torn write.
+    { std::ofstream f(logPath, std::ios::binary | std::ios::app); const char junk[9] = {1,2,3,4,5,6,7,8,9}; f.write(junk, 9); }
+    LogSegment seg2(dir.string(), 0);
+    int64_t next = seg2.recover();
+    EXPECT_EQ(next, 2);                          // both good batches kept, junk dropped
+    auto tail = seg2.read(1, 1<<20);
+    EXPECT_TRUE(RecordBatchReader(tail.data(), tail.size()).ensureValid());
+    std::filesystem::remove_all(dir);
+}
+
+// Recovery: clean segment (no corruption) — recover() keeps all batches, file size unchanged.
+TEST(LogSegment, RecoverCleanSegmentKeepsAllBatches) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_clean";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    std::string logPath;
+    int64_t sizeAfterAppend = 0;
+    {
+        LogSegment seg(dir.string(), 0);
+        RecordBatchBuilder b0(0, 2000); b0.append("k","v0",2000); seg.append(b0.build(), 0);
+        RecordBatchBuilder b1(1, 2001); b1.append("k","v1",2001); seg.append(b1.build(), 1);
+        RecordBatchBuilder b2(2, 2002); b2.append("k","v2",2002); seg.append(b2.build(), 2);
+        logPath = seg.logPath();
+        sizeAfterAppend = seg.sizeBytes();
+    }
+    uintmax_t sizeBefore = std::filesystem::file_size(logPath);
+    LogSegment seg2(dir.string(), 0);
+    int64_t next = seg2.recover();
+    EXPECT_EQ(next, 3);
+    EXPECT_EQ(std::filesystem::file_size(logPath), sizeBefore); // nothing truncated
+    for (int64_t i = 0; i < 3; ++i) {
+        auto buf = seg2.read(i, 1 << 20);
+        ASSERT_FALSE(buf.empty());
+        EXPECT_TRUE(RecordBatchReader(buf.data(), buf.size()).ensureValid());
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// Recovery: empty segment file — recover() returns baseOffset, no throw.
+TEST(LogSegment, RecoverEmptySegment) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_empty";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 42);
+    int64_t next = seg.recover();
+    EXPECT_EQ(next, 42); // baseOffset
+    std::filesystem::remove_all(dir);
+}
+
+// Recovery: mid-log corruption — first batch valid, second batch CRC-corrupted, third discarded.
+TEST(LogSegment, RecoverMidLogCorruptionKeepsOnlyFirstBatch) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_mid";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    std::string logPath;
+    size_t batch0Size = 0;
+    {
+        LogSegment seg(dir.string(), 0);
+        RecordBatchBuilder b0(0, 3000); b0.append("k","v0",3000); auto bb0 = b0.build(); batch0Size = bb0.size(); seg.append(bb0, 0);
+        RecordBatchBuilder b1(1, 3001); b1.append("k","v1",3001); seg.append(b1.build(), 1);
+        RecordBatchBuilder b2(2, 3002); b2.append("k","v2",3002); seg.append(b2.build(), 2);
+        logPath = seg.logPath();
+    }
+    // Corrupt a byte inside the second batch's CRC field (offset batch0Size + kCrcOffset)
+    {
+        std::fstream f(logPath, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(static_cast<std::streamoff>(batch0Size) + rune::protocol::batch::kCrcOffset);
+        char bad = 0xFF;
+        f.write(&bad, 1);
+    }
+    LogSegment seg2(dir.string(), 0);
+    int64_t next = seg2.recover();
+    EXPECT_EQ(next, 1); // only first batch kept
+    auto buf = seg2.read(0, 1 << 20);
+    ASSERT_FALSE(buf.empty());
+    RecordBatchReader r(buf.data(), buf.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+    std::filesystem::remove_all(dir);
+}
+
+// Recovery: index rebuilt — after recover() on multi-batch segment, read() at mid offset returns correct batch.
+TEST(LogSegment, RecoverRebuildsIndexForMidOffsetRead) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_idx";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    std::string logPath;
+    {
+        // indexIntervalBytes=1 so every batch gets an index entry
+        LogSegment seg(dir.string(), 0, 1);
+        for (int i = 0; i < 5; ++i) {
+            RecordBatchBuilder b(i, 4000 + i); b.append("k", "v", 4000 + i);
+            seg.append(b.build(), i);
+        }
+        logPath = seg.logPath();
+    }
+    // Append junk so recover() truncates (exercises the full rebuild path)
+    { std::ofstream f(logPath, std::ios::binary | std::ios::app); const char junk[5] = {0,1,2,3,4}; f.write(junk, 5); }
+    LogSegment seg2(dir.string(), 0, 1);
+    int64_t next = seg2.recover();
+    EXPECT_EQ(next, 5);
+    // read at offset 3 should return the batch with baseOffset=3
+    auto buf = seg2.read(3, 1 << 20);
+    ASSERT_FALSE(buf.empty());
+    RecordBatchReader r(buf.data(), buf.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 3);
+    std::filesystem::remove_all(dir);
+}
+
 // Edge: many batches with small index interval; verify multiple index entries and mid-log reads.
 TEST(LogSegment, ManyBatchesSmallIntervalMidLogRead) {
     auto dir = std::filesystem::temp_directory_path() / "rune_seg_many";
