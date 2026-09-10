@@ -140,6 +140,63 @@ TEST(PartitionApi, ValuesRoundTripExactly) {
     std::filesystem::remove_all(dir);
 }
 
+// ---- Test 7: consume across many small maxBytes chunks (regression for return-vs-break bug) ----
+TEST(PartitionApi, ConsumeAcrossManyReadChunks) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_api_t7";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    {
+        constexpr int N = 500;
+        PartitionApi api(dir.string());
+        // Produce N records with deterministic, unique values.
+        for (int i = 0; i < N; ++i) {
+            std::string key = "key" + std::to_string(i);
+            std::string val = "value_" + std::to_string(i) + "_x" + std::string(16, static_cast<char>('a' + (i % 26)));
+            api.produce(key, val, 7000 + i);
+        }
+        EXPECT_EQ(api.highWatermark(), static_cast<int64_t>(N));
+
+        // Rebuild expected values in the same order.
+        std::vector<std::string> expectedKeys, expectedVals;
+        expectedKeys.reserve(N);
+        expectedVals.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            expectedKeys.push_back("key" + std::to_string(i));
+            expectedVals.push_back("value_" + std::to_string(i) + "_x" + std::string(16, static_cast<char>('a' + (i % 26))));
+        }
+
+        // Use maxBytes=16384 to force multiple log_.read() chunks and multiple
+        // mid-chunk batch boundaries — reproducing the truncation bug.
+        // (16384 < ~50KB total log, so the outer while loop must iterate
+        // multiple times; before the fix it returns only the first chunk's
+        // worth of records and silently drops the rest.)
+        constexpr int32_t kSmallMax = 16384;
+        auto recs = api.consume(0, kSmallMax);
+        ASSERT_EQ(static_cast<int>(recs.size()), N)
+            << "consume(0, " << kSmallMax << ") returned " << recs.size() << " instead of " << N;
+        for (int i = 0; i < N; ++i) {
+            EXPECT_EQ(recs[static_cast<size_t>(i)].offset, static_cast<int64_t>(i))
+                << "offset mismatch at i=" << i;
+            EXPECT_EQ(recs[static_cast<size_t>(i)].key, expectedKeys[static_cast<size_t>(i)])
+                << "key mismatch at i=" << i;
+            EXPECT_EQ(recs[static_cast<size_t>(i)].value, expectedVals[static_cast<size_t>(i)])
+                << "value mismatch at i=" << i;
+        }
+
+        // consume(250, kSmallMax) must return exactly records 250..499.
+        auto tail = api.consume(250, kSmallMax);
+        ASSERT_EQ(static_cast<int>(tail.size()), N - 250)
+            << "consume(250, " << kSmallMax << ") returned " << tail.size() << " instead of " << (N - 250);
+        for (int i = 0; i < N - 250; ++i) {
+            int absIdx = 250 + i;
+            EXPECT_EQ(tail[static_cast<size_t>(i)].offset, static_cast<int64_t>(absIdx))
+                << "offset mismatch at absIdx=" << absIdx;
+            EXPECT_EQ(tail[static_cast<size_t>(i)].value, expectedVals[static_cast<size_t>(absIdx)])
+                << "value mismatch at absIdx=" << absIdx;
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
 // ---- Test 6: restart mid-stream (proves recover() sets logEndOffset correctly) ----
 TEST(PartitionApi, RestartMidStream) {
     auto dir = std::filesystem::temp_directory_path() / "rune_api_t6";

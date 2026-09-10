@@ -21,7 +21,11 @@ std::vector<ConsumedRecord> PartitionApi::consume(int64_t fromOffset, int32_t ma
         bool advanced = false;
         while (pos < bytes.size()) {
             rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
-            if (!r.ensureValid()) return out;
+            // A batch that fails validation here is one cut off by the maxBytes read
+            // boundary (the on-disk log is clean post-recover). Stop consuming this
+            // chunk; the outer loop re-reads from `cursor` (the last complete batch's
+            // end) so the truncated batch is returned whole next pass.
+            if (!r.ensureValid()) break;
             r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t ts) {
                 if (off >= fromOffset && off < hw) out.push_back({std::string(k), std::string(v), off, ts});
             });
