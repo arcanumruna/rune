@@ -364,6 +364,17 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // Public raw inject — delivers bytes directly into node `to`'s IngressRing,
+    // bypassing partition/kill/drop/delay policies.  Used by tests to inject
+    // crafted (e.g. stale) messages that a peer would otherwise not send.
+    // -----------------------------------------------------------------------
+    void injectRaw(NodeId to, const uint8_t* buf, std::size_t len) {
+        if (to < 0 || to >= nodeCount_) return;
+        if (!nodes_[to].alive)         return;
+        nodes_[to].ring->write(buf, len);
+    }
+
+    // -----------------------------------------------------------------------
     // Bus delivery — called by BusSink::send
     // -----------------------------------------------------------------------
     void deliver(NodeId from, NodeId to, const uint8_t* buf, std::size_t len) {
@@ -650,7 +661,7 @@ private:
     std::deque<PendingMsg> pendingMsgs_;
 
     // Seeded RNG for determinism.
-    mutable std::mt19937_64 rng_;
+    std::mt19937_64 rng_;
 
     // Step counter (for delay policy).
     int step_{0};

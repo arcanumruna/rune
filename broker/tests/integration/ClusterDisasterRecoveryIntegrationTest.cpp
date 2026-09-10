@@ -410,12 +410,11 @@ TEST(ClusterDisasterRecovery, OldLeaderStepsDown_AfterHeal) {
         EXPECT_TRUE(h.checkElectionSafety());
     }
 
-    // Old leader must NOT still be a leader in its old term.
-    if (h.isLeader(oldLeader)) {
-        // If it's still a leader, it must be in a higher term (it re-ran for election).
-        EXPECT_GT(h.termOf(oldLeader), oldTerm)
-            << "If old leader is still leader, it must have won a new term";
-    }
+    // Old leader MUST have stepped down from its old term.
+    // It may be a follower or a leader only at a strictly-higher term.
+    EXPECT_FALSE(h.isLeader(oldLeader) && h.termOf(oldLeader) == oldTerm)
+        << "Old leader must not still be leader in its old term after heal; "
+        << "it must step down or win a new (higher) term";
     // Exactly one leader globally.
     EXPECT_EQ(h.leaderCount(), 1);
 }
@@ -425,7 +424,7 @@ TEST(ClusterDisasterRecovery, OldLeaderStepsDown_AfterHeal) {
 // Kill a node during election, restart it (from persisted NodeStateFile).
 // The restarted node must not grant a second vote in the same term.
 // ===========================================================================
-TEST(ClusterDisasterRecovery, Restart_NoPersistence_NodouleVote) {
+TEST(ClusterDisasterRecovery, Restart_NoPersistence_NoDoubleVote) {
     ClusterHarness h(3);
     int64_t now = h.startNs();
 
@@ -563,111 +562,169 @@ TEST(ClusterDisasterRecovery, MessageDelay_2Steps) {
 
 // ===========================================================================
 // TEST 17: Stale CanvassPosition with old term is silently ignored.
-// Node must not regress its leadershipTermId when receiving a stale canvass.
+// After a leader is elected at term T, we inject a stale CanvassPosition
+// (leadershipTermId = T-1) directly into a live follower's IngressRing and
+// drive bounded steps.  The follower's Election must NOT regress its term or
+// state — proving that Election::onCanvassPosition ignores stale terms.
 // ===========================================================================
 TEST(ClusterDisasterRecovery, StaleTerm_CanvassIgnored) {
-    // Build a single-node harness so we have a fully accessible election object.
     ClusterHarness h(3);
     int64_t now = h.startNs();
 
-    // Drive to an initial state (CANVASS or beyond).
-    for (int s = 0; s < 20; ++s) {
-        now += ClusterHarness::kStepQuantumNs;
-        h.step(now);
+    // Phase 1: elect a leader so we have a real term T to work with.
+    ASSERT_TRUE(h.driveUntil(predExactlyOneLeader(h), now, 500))
+        << "Must elect a leader before injecting stale message";
+
+    auto ls = h.leaders();
+    ASSERT_EQ(ls.size(), 1u);
+    NodeId leaderNode = ls[0];
+    Term   leaderTerm = h.termOf(leaderNode);  // term T
+
+    // Pick a live follower to receive the stale message.
+    NodeId target = -1;
+    for (int i = 0; i < h.nodeCount(); ++i) {
+        if (h.isAlive(i) && !h.isLeader(i)) { target = i; break; }
     }
+    ASSERT_NE(target, -1) << "Need at least one live follower";
 
-    // Record the current state of node 0.
-    ElectionState stateBefore = h.stateOf(0);
-    Term termBefore           = h.termOf(0);
+    // Record the follower's state before the injection.
+    Term          termBefore  = h.termOf(target);
+    ElectionState stateBefore = h.stateOf(target);
+    ASSERT_GE(termBefore, leaderTerm) << "Follower term must be >= leader term";
 
-    // Inject a stale CanvassPosition with a very old term (term=0) into node 0's ring.
-    // We do this by encoding the message manually using SbeConsensusPublisher + a NullSink.
-    // (The harness BusSink would route it; here we bypass partition/kill logic
-    //  and inject directly to simulate a "network stale replay" scenario.)
-    // We'll use a custom local approach: encode via SbeConsensusPublisher and write directly.
+    // Phase 2: encode a stale CanvassPosition (leadershipTermId = T-1) using
+    // SbeConsensusPublisher into a local capture sink, then injectRaw it into
+    // the follower's IngressRing, bypassing all bus policies.
     {
-        struct LocalCaptureSink : rune::consensus::MessageSink {
+        struct CaptureSink : rune::consensus::MessageSink {
             std::vector<uint8_t> bytes;
             void send(NodeId, const uint8_t* buf, std::size_t len) override {
                 bytes.assign(buf, buf + len);
             }
         } cap;
+
         rune::consensus::SbeConsensusPublisher encPub{cap};
-        // Send a CanvassPosition with leadershipTermId=0 (stale) from node 1.
-        encPub.canvassPosition(/*to=*/0,
-                               /*logLeadershipTermId=*/0,
+        Term staleLeadershipTerm = (leaderTerm > 0) ? leaderTerm - 1 : 0;
+        // Encode as if node 1 is sending a stale canvass to target.
+        encPub.canvassPosition(/*to=*/target,
+                               /*logLeadershipTermId=*/staleLeadershipTerm,
                                /*logPosition=*/0,
-                               /*leadershipTermId=*/0,
+                               /*leadershipTermId=*/staleLeadershipTerm,
                                /*followerMemberId=*/1);
 
-        // Write directly into node 0's ring (bypassing the bus).
-        // We access the ring through the harness's step mechanism:
-        // just inject at the next step.  Since ClusterHarness doesn't expose
-        // the ring directly, we rely on the BusSink path and
-        // temporarily force delivery by making node 1 send the message
-        // (it does so as part of its canvass broadcast).
-        //
-        // For a direct stale-inject test, we note that Election::onCanvassPosition
-        // only updates follower's logPosition — it does NOT change the election state
-        // unless the node is in INIT (in which case it returns early).
-        // So we only need to verify the state didn't regress.
-        (void)cap; // encoding done above; direct ring write below.
-
-        // The harness doesn't expose the ring directly, but we can drive
-        // the cluster a few steps and check that the state doesn't regress.
-        // A stale canvass from a peer merely updates that peer's perceived position;
-        // it cannot drive a state machine regression.
+        ASSERT_FALSE(cap.bytes.empty()) << "Encoded bytes must not be empty";
+        // Deliver directly into the follower's ring — bypasses partition/kill/drop.
+        h.injectRaw(target, cap.bytes.data(), cap.bytes.size());
     }
 
-    // Drive a few more steps.
-    for (int s = 0; s < 30; ++s) {
+    // Phase 3: drive a bounded number of steps so the follower processes the message.
+    for (int s = 0; s < 50; ++s) {
         now += ClusterHarness::kStepQuantumNs;
         h.step(now);
     }
 
-    // State must not regress to a lower-numbered state than before.
-    ElectionState stateAfter = h.stateOf(0);
-    // State codes are monotonically increasing through the election lifecycle.
-    // A stale message must not move us BACK.
-    EXPECT_GE(static_cast<int32_t>(stateAfter), static_cast<int32_t>(stateBefore))
-        << "Node state regressed after stale canvass: was "
-        << static_cast<int32_t>(stateBefore) << " now " << static_cast<int32_t>(stateAfter);
+    // Assertions: the stale canvass must have been silently ignored.
+    Term          termAfter  = h.termOf(target);
+    ElectionState stateAfter = h.stateOf(target);
 
-    // leadershipTermId must not decrease.
-    EXPECT_GE(h.termOf(0), termBefore)
-        << "LeadershipTermId regressed after stale canvass";
+    EXPECT_GE(termAfter, termBefore)
+        << "LeadershipTermId must not regress after stale CanvassPosition: "
+        << "was " << termBefore << " now " << termAfter;
+    EXPECT_GE(static_cast<int32_t>(stateAfter), static_cast<int32_t>(stateBefore))
+        << "ElectionState must not regress after stale CanvassPosition: "
+        << "was " << static_cast<int32_t>(stateBefore)
+        << " now " << static_cast<int32_t>(stateAfter);
+
+    // Cluster-level safety: still exactly one leader, same term.
+    EXPECT_EQ(h.leaderCount(), 1);
+    EXPECT_EQ(h.termOf(leaderNode), leaderTerm)
+        << "Leader term must be unchanged after stale canvass injection";
+    EXPECT_TRUE(h.checkElectionSafety());
 }
 
 // ===========================================================================
-// TEST 18: Stale RequestVote with old term doesn't cause state regression.
+// TEST 18: Stale RequestVote with old term is silently ignored.
+// After a leader is elected at term T, we inject a stale RequestVote
+// (candidateTermId <= T, i.e. older than the follower's persisted term) into
+// a live FOLLOWER's IngressRing and drive bounded steps.
+// The follower must NOT grant a vote and must NOT regress its persisted
+// candidateTermId — proving that Election::onRequestVote rejects stale ballots.
 // ===========================================================================
 TEST(ClusterDisasterRecovery, StaleTerm_RequestVoteIgnored) {
     ClusterHarness h(3);
     int64_t now = h.startNs();
 
-    // Elect a leader first to establish a real term.
+    // Phase 1: elect a leader to establish a real term T.
     ASSERT_TRUE(h.driveUntil(predExactlyOneLeader(h), now, 500));
 
     auto ls = h.leaders();
     ASSERT_EQ(ls.size(), 1u);
     NodeId leaderNode = ls[0];
-    Term   leaderTerm = h.termOf(leaderNode);
+    Term   leaderTerm = h.termOf(leaderNode);  // term T
 
-    // Leader is in LeaderReady or Closed state (isLeader() checks both).
     EXPECT_TRUE(h.isLeader(leaderNode));
 
-    // Now drive more steps — stale messages would arrive if nodes re-broadcast.
-    // Since leader is Closed, any RequestVote with an old term should be ignored.
-    for (int s = 0; s < 100; ++s) {
-        now += ClusterHarness::kStepQuantumNs;
-        h.step(now);
-        // Safety: still no two leaders in same term.
-        EXPECT_TRUE(h.checkElectionSafety());
+    // Pick a live follower to receive the stale RequestVote.
+    NodeId follower = -1;
+    for (int i = 0; i < h.nodeCount(); ++i) {
+        if (h.isAlive(i) && !h.isLeader(i)) { follower = i; break; }
+    }
+    ASSERT_NE(follower, -1) << "Need at least one live follower";
+
+    // Record the follower's state before the injection.
+    Term preCandidateTerm = h.candidateTermOf(follower);
+    Term preLeaderTerm    = h.termOf(follower);
+    ASSERT_GE(preCandidateTerm, leaderTerm)
+        << "Follower's candidateTermId must be >= leader term after a successful election";
+
+    // Phase 2: encode a stale RequestVote (candidateTermId = T-1, stale log)
+    // from a fake "stale candidate" (node 2 pretending to be in an old term).
+    {
+        struct CaptureSink : rune::consensus::MessageSink {
+            std::vector<uint8_t> bytes;
+            void send(NodeId, const uint8_t* buf, std::size_t len) override {
+                bytes.assign(buf, buf + len);
+            }
+        } cap;
+
+        rune::consensus::SbeConsensusPublisher encPub{cap};
+        Term staleCandidate = (leaderTerm > 0) ? leaderTerm - 1 : 0;
+        // Encode a RequestVote with a stale candidateTermId and stale log position.
+        // The fake candidate is node 2; the message is addressed to the follower.
+        encPub.requestVote(/*to=*/follower,
+                           /*logLeadershipTermId=*/staleCandidate,
+                           /*logPosition=*/0,
+                           /*candidateTermId=*/staleCandidate,
+                           /*candidateMemberId=*/2);
+
+        ASSERT_FALSE(cap.bytes.empty()) << "Encoded bytes must not be empty";
+        // Deliver directly into the follower's ring — bypasses all bus policies.
+        h.injectRaw(follower, cap.bytes.data(), cap.bytes.size());
     }
 
-    // Leader term must not decrease (it's in CLOSED so it won't change anyway).
-    EXPECT_EQ(h.termOf(leaderNode), leaderTerm);
+    // Phase 3: drive bounded steps so the follower processes the stale message.
+    for (int s = 0; s < 50; ++s) {
+        now += ClusterHarness::kStepQuantumNs;
+        h.step(now);
+    }
+
+    // Assertions: the stale RequestVote must have been silently denied.
+    // The follower's persisted candidateTermId must NOT decrease.
+    Term postCandidateTerm = h.candidateTermOf(follower);
+    Term postLeaderTerm    = h.termOf(follower);
+
+    EXPECT_GE(postCandidateTerm, preCandidateTerm)
+        << "Follower's candidateTermId must not regress after stale RequestVote: "
+        << "was " << preCandidateTerm << " now " << postCandidateTerm;
+    EXPECT_GE(postLeaderTerm, preLeaderTerm)
+        << "Follower's leadershipTermId must not regress after stale RequestVote: "
+        << "was " << preLeaderTerm << " now " << postLeaderTerm;
+
+    // Cluster-level safety: still exactly one leader, same term.
     EXPECT_EQ(h.leaderCount(), 1);
+    EXPECT_EQ(h.termOf(leaderNode), leaderTerm)
+        << "Leader term must be unchanged after stale RequestVote injection";
+    EXPECT_TRUE(h.checkElectionSafety());
 }
 
 // ===========================================================================
