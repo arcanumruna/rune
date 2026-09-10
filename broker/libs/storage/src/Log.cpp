@@ -39,4 +39,20 @@ int64_t Log::recover() {
 std::vector<int64_t> Log::segmentBaseOffsets() const {
     std::vector<int64_t> v; for (auto& [b, _] : segments_) v.push_back(b); return v;
 }
+int64_t Log::totalBytes() const {
+    int64_t t = 0; for (auto& [b, seg] : segments_) t += seg->sizeBytes(); return t;
+}
+int Log::deleteOldSegments(int64_t retainBytes) {
+    int deleted = 0;
+    while (segments_.size() > 1 && totalBytes() > retainBytes) {
+        auto it = segments_.begin();
+        std::string base = it->second->logPath();
+        std::string idx = base.substr(0, base.size()-4) + ".index";
+        segments_.erase(it);
+        std::filesystem::remove(base);
+        std::filesystem::remove(idx);
+        ++deleted;
+    }
+    return deleted;
+}
 } // namespace rune::storage

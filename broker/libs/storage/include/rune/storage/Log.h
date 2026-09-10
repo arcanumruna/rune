@@ -12,6 +12,8 @@ public:
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     int64_t recover();
     std::vector<int64_t> segmentBaseOffsets() const;
+    int64_t totalBytes() const;
+    int deleteOldSegments(int64_t retainBytes);
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();
