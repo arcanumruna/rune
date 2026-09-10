@@ -51,8 +51,6 @@ static void BM_Retention_DeleteOldSegments(benchmark::State& state) {
     auto dir = fs::temp_directory_path() /
                ("rune_bench_retention_" + std::to_string(segCount));
 
-    int64_t totalDeleted = 0;
-
     for (auto _ : state) {
         // ---- setup: rebuild log outside timed region ----
         state.PauseTiming();
@@ -77,10 +75,11 @@ static void BM_Retention_DeleteOldSegments(benchmark::State& state) {
         int deleted = log.deleteOldSegments(/*retainBytes=*/0);
         benchmark::DoNotOptimize(deleted);
         benchmark::ClobberMemory();
-        totalDeleted += deleted;
     }
 
-    state.SetItemsProcessed(totalDeleted);
+    // Report throughput as segments-deleted-per-second.
+    // Each iteration deletes exactly segCount sealed segments.
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(segCount));
     state.counters["segs_per_iter"] = benchmark::Counter(static_cast<double>(segCount));
     fs::remove_all(dir);
 }
