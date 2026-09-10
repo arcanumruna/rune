@@ -127,23 +127,27 @@ protected:
     // -----------------------------------------------------------------------
     // Helper: corruptFileByte
     //   Flips one byte at `pos` in the file at `path`.
-    //   pos == -1  → last byte of the file.
+    //   pos == -1  → last byte of the file (default).
+    //   Any non-negative value targets that exact byte offset.
     // -----------------------------------------------------------------------
-    static void corruptFileByte(const fs::path& path, std::streampos pos = -1) {
+    static void corruptFileByte(const fs::path& path, std::streamoff pos = -1) {
         std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
         ASSERT_TRUE(f.is_open()) << "corruptFileByte: cannot open " << path;
 
-        if (pos < std::streampos(0)) {
+        std::streampos seekPos;
+        if (pos < 0) {
             f.seekg(0, std::ios::end);
             std::streampos size = f.tellg();
             ASSERT_GT(size, 0) << "corruptFileByte: file is empty";
-            pos = size - std::streampos(1);
+            seekPos = size - std::streampos(1);
+        } else {
+            seekPos = static_cast<std::streampos>(pos);
         }
-        f.seekg(pos);
+        f.seekg(seekPos);
         char byte;
         f.get(byte);
         byte = static_cast<char>(~static_cast<uint8_t>(byte)); // flip all bits
-        f.seekp(pos);
+        f.seekp(seekPos);
         f.put(byte);
     }
 

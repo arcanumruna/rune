@@ -140,9 +140,9 @@ TEST_F(IntegrationTestBase, CorruptLastBatchDropsItPreservesEarlier) {
 
     // Corrupt kAttributesOffset (byte 21) within the last batch — this is the
     // first byte covered by the CRC-32C checksum.
-    std::streampos corruptPos =
-        static_cast<std::streampos>(lastBatchPos) +
-        static_cast<std::streampos>(rune::protocol::batch::kAttributesOffset);
+    std::streamoff corruptPos =
+        static_cast<std::streamoff>(lastBatchPos) +
+        static_cast<std::streamoff>(rune::protocol::batch::kAttributesOffset);
     corruptFileByte(activePath, corruptPos);
 
     {

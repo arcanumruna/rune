@@ -17,7 +17,10 @@ if(BUILD_INTEGRATION_TESTING)
     add_executable(rune_storage_integration_tests
         tests/integration/EndToEndProduceConsumeIntegrationTest.cpp
         tests/integration/RestartRecoveryIntegrationTest.cpp
-        tests/integration/CrashTornTailIntegrationTest.cpp)
+        tests/integration/CrashTornTailIntegrationTest.cpp
+        tests/integration/RetentionIntegrationTest.cpp
+        tests/integration/RollingStressIntegrationTest.cpp
+        tests/integration/MixedWorkloadIntegrationTest.cpp)
     target_include_directories(rune_storage_integration_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration
         ${RUNE_PROTOCOL_INCLUDE})
