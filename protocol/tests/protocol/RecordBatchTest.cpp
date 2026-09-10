@@ -1,6 +1,11 @@
 #include <gtest/gtest.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/Crc32c.h>
 namespace b = rune::protocol::batch;
+
+static uint32_t beU32(const std::vector<uint8_t>& b, int off) {
+    return (b[off]<<24)|(b[off+1]<<16)|(b[off+2]<<8)|b[off+3];
+}
 
 TEST(RecordBatchLayout, FieldOffsetsMatchKafkaV2) {
     EXPECT_EQ(b::kBaseOffsetOffset, 0);
@@ -18,4 +23,22 @@ TEST(RecordBatchLayout, FieldOffsetsMatchKafkaV2) {
     EXPECT_EQ(b::kRecordCountOffset, 57);
     EXPECT_EQ(b::kRecordBatchOverhead, 61);
     EXPECT_EQ(b::kMagicValue, 2);
+}
+
+TEST(RecordBatchBuilder, EncodesHeaderAndCrc) {
+    using namespace rune::protocol;
+    RecordBatchBuilder rb(100 /*baseOffset*/, 5000 /*baseTs*/);
+    rb.append("k1", "v1", 5000);
+    rb.append("k2", "v2", 5001);
+    auto bytes = rb.build();
+
+    EXPECT_EQ(bytes[batch::kMagicOffset], batch::kMagicValue);
+    EXPECT_EQ(beU32(bytes, batch::kRecordCountOffset), 2u);
+    EXPECT_EQ(beU32(bytes, batch::kLastOffsetDeltaOffset), 1u); // 2 records -> delta 1
+    // LENGTH = total - (baseOffset(8) + lengthField(4))
+    EXPECT_EQ(beU32(bytes, batch::kLengthOffset), bytes.size() - 12);
+    // CRC covers [attributes .. end]
+    uint32_t expect = crc32c(bytes.data() + batch::kAttributesOffset,
+                             bytes.size() - batch::kAttributesOffset);
+    EXPECT_EQ(beU32(bytes, batch::kCrcOffset), expect);
 }
