@@ -1,6 +1,6 @@
 # rune-protocol
 
-Header-only C++ protocol definitions and type contracts for the Rune message broker: record-batch v2 with CRC-32C, leader-epoch stamping, offset indexing, and retention policy configuration.
+Header-only C++ protocol definitions and type contracts for the Rune message broker: shared wire/on-disk record-batch v2 format with CRC-32C, zigzag varint, batch encode/decode, and error codes.
 
 ## Build
 
