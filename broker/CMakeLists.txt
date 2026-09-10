@@ -42,7 +42,10 @@ if(BUILD_BENCHMARKS)
         benchmark/RetentionBenchmark.cpp
         benchmark/PartitionApiBenchmark.cpp
         benchmark/LeaderEpochCacheBenchmark.cpp
-        benchmark/ProducerStateBenchmark.cpp)
+        benchmark/ProducerStateBenchmark.cpp
+        benchmark/ClusterMemberBenchmark.cpp
+        benchmark/NodeStateFileBenchmark.cpp
+        benchmark/TermLogBenchmark.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage benchmark::benchmark)
+    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus benchmark::benchmark)
 endif()
