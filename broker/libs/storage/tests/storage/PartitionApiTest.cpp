@@ -63,6 +63,7 @@ TEST(PartitionApi, OrderingAndOffsets) {
             EXPECT_EQ(recs[i].offset, i) << "offset mismatch at i=" << i;
             EXPECT_EQ(recs[i].value, "val" + std::to_string(i)) << "value mismatch at i=" << i;
             EXPECT_EQ(recs[i].key, "k" + std::to_string(i)) << "key mismatch at i=" << i;
+            EXPECT_EQ(recs[i].timestamp, 3000 + i) << "timestamp mismatch at i=" << i;
         }
     }
     std::filesystem::remove_all(dir);

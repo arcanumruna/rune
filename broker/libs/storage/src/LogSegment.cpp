@@ -64,6 +64,8 @@ int64_t LogSegment::recover() {
     std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
     log_.seekg(0, std::ios::beg);
     if (fileSize > 0) log_.read(reinterpret_cast<char*>(buf.data()), fileSize);
+    // TODO(phase3): rebuilding into ".index2" orphans the original ".index" on disk.
+    // Phase 3 should rename .index2 -> .index (or delete + rebuild) after a successful recover.
     index_ = std::make_unique<OffsetIndex>(
         logPath_.substr(0, logPath_.size()-4) + ".index2", baseOffset_, 8*1024*1024); // rebuild fresh
     size_t pos = 0; int64_t validBytes = 0; int64_t next = baseOffset_; bytesSinceIndex_ = indexIntervalBytes_;
