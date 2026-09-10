@@ -37,7 +37,11 @@ if(BUILD_BENCHMARKS)
         benchmark/MappedFileBenchmark.cpp
         benchmark/OffsetIndexBenchmark.cpp
         benchmark/LogSegmentBenchmark.cpp
-        benchmark/LogBenchmark.cpp)
+        benchmark/LogBenchmark.cpp
+        benchmark/RetentionBenchmark.cpp
+        benchmark/PartitionApiBenchmark.cpp
+        benchmark/LeaderEpochCacheBenchmark.cpp
+        benchmark/ProducerStateBenchmark.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage benchmark::benchmark)
 endif()
