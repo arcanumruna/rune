@@ -1,10 +1,10 @@
-# aeronmq — Ultra-Low-Latency, Durable, Kafka-Semantics Message Broker on Aeron
+# Rune — Ultra-Low-Latency, Durable, Kafka-Semantics Message Broker on Aeron
 
 **Status:** Design (approved foundation, pending spec review)
 **Date:** 2026-09-10
-**Working codename:** `aeronmq` (placeholder — rename freely)
-**Language:** C++ (C++20/23)
-**Reference sources studied:** `apache/kafka` (log/index/record internals), `aeron-io/aeron` (transport, Archive, Cluster/KRaft designs)
+**Codename:** `Rune` (inscribing runes = append-only log writes)
+**Language:** C++23
+**Reference sources studied:** `apache/kafka` (log/index/record internals), `aeron-io/aeron` (transport, Archive, Cluster/KRaft designs), `world-server` + `common` (project/packaging conventions)
 
 ---
 
@@ -218,26 +218,86 @@ Kafka-*like* mental model, C++-native and Aeron-framed (not wire-compatible).
 
 ---
 
-## 11. Testing strategy
+## 11. Project structure, packaging & tooling
 
-- **Deterministic unit tests** for pure state machines: log/segment/index (offset & warm search), Raft quorum state, producer-state, high-watermark advancement.
-- **Fault-injection harness (Jepsen-style):** kill leaders, partition the network, pause/stall nodes; assert invariants: **no committed-message loss**, **no order violation per partition**, **no split-brain double-commit**.
-- **Latency benchmarks** gating **p99 < 100 µs** for majority-durable produce, enforced from Phase 3 onward in CI.
-- **Recovery tests:** cold start, follower rejoin + truncation correctness, snapshot + tail replay equivalence.
+The workspace is **three sibling projects** under `~/Projects`, following the exact `world-server`/`common` conventions (Conan 2, CMake ≥3.31, C++23, `conan_provider.cmake`, `VERSION.txt` + `set_version`, packages published `name/x.y.z@vradu/dev` to the `artifactory` remote via Woodpecker CI). Splitting is minimal — only where it earns reuse or independent release.
+
+```
+~/Projects/
+  rune-protocol/   # Conan library — shared wire + record-batch v2 format, offsets,
+                   #   error codes, SBE-style codecs. Single source of truth for the
+                   #   on-disk AND on-wire encoding. Released independently.
+                   #   deps: common@vradu/dev (Agrona buffers), aeron
+  rune-client/     # Conan library — standalone, INDEPENDENTLY RELEASABLE C++ client
+                   #   (producer, consumer, consumer-group member, admin). The only
+                   #   package downstream apps (e.g. world-server) consume.
+                   #   deps: rune-protocol, common, aeron
+  rune-broker/     # Conan application — the broker binary. Internally split into
+                   #   CMake library targets, each independently unit-tested:
+                   #     librune_storage      (segments, indexes, log, retention, recover)
+                   #     librune_consensus    (C++ Raft metadata quorum, election)
+                   #     librune_replication  (ISR, high-watermark, failover, catch-up)
+                   #     librune_gateway      (Aeron ingress, session/auth, routing)
+                   #     librune_archive      (Aeron Archive integration, snapshots)
+                   #   deps: rune-protocol, common, aeron, gtest, benchmark, spdlog
+```
+
+**Per-project files (mirrored from `common`/`world-server`):** `conanfile.py`, `conandata.yml`, `CMakeLists.txt`, `conan_provider.cmake`, `VERSION.txt`, `build.sh`, `build_docker.sh` (broker only), `release.sh`, `update-deps.sh`, `bump_version.py`, `.woodpecker/`, `Dockerfile` (broker only), `include/`, `src/`, `tests/`, `benchmark/`, `docs/`.
+
+**Aeron dependency:** `aeron/1.51.0` from ConanCenter (world-server already ships `aeron/1.41.4`). Builds cross-compile to `x86_64` on ARM Macs for Aeron compatibility, exactly as `world-server/build.sh` does.
+
+**Dockerization:** `rune-broker` ships a `Dockerfile` (BuildKit, Artifactory build-args — same shape as world-server). A top-level `docker-compose.cluster.yml` brings up a **3-node Rune cluster** (+ Aeron media driver / Archive per node) for local runs and as the substrate the Testcontainers cluster tests drive.
+
+**Publishing rule:** all `conan create/export/upload` and image pushes happen **only** through Woodpecker CI. The agent writes these scripts but never runs them locally.
 
 ---
 
-## 12. Open questions / to resolve during planning
+## 12. Testing strategy (mandatory, first-class)
+
+Testing is a hard requirement of every phase, not an afterthought. A phase is "done" only when its tests below are green.
+
+**12.1 Unit tests — full coverage, all scenarios**
+- Every pure component fully covered: segment append/roll/read, offset & time index (incl. **warm-section search** boundary cases, relative-offset overflow), record-batch v2 encode/decode + **CRC-32C** validation, `recover()` on truncated/torn/corrupt tails, Raft quorum state transitions, election timeouts, high-watermark advancement, producer-state/sequence dedup, retention & compaction key-selection.
+- Deterministic (injected clocks, seeded RNG, in-memory fakes for Aeron/disk). Coverage gate enforced in CI (target: **100% of lines/branches on core libraries**; justified exclusions documented).
+- Framework: `gtest` (as in world-server), coverage via `llvm-cov`/`gcovr`.
+
+**12.2 Integration tests (single-node & pair)**
+- Real Aeron media driver + real Aeron Archive on disk. End-to-end produce→replicate→ack→fetch→commit-offset→re-consume; retention deletes; compaction round-trips; cold restart replays Archive + snapshot and reproduces identical state (byte-for-byte log equivalence).
+- Client library integration: `rune-client` against a live single broker — producer acks modes, consumer seek (earliest/latest/offset/timestamp), consumer-group join/rebalance/commit.
+
+**12.3 Cluster tests via Testcontainers (the core of the mandate)**
+- Driver spins up a **3-node (and 5-node) Rune cluster** from the Docker image using **Testcontainers**, plus `rune-client` driving real traffic.
+- **Failure scenarios exercised, each with a state-assertion after recovery:**
+  - Kill the **partition leader** mid-produce → assert failover elects an ISR member, **no committed message lost**, per-partition order intact, client transparently retries and continues.
+  - Kill a **follower** → ISR shrinks, producer continues at required acks; follower **rejoins** → truncates to leader epoch, catches up, **re-enters ISR**; assert logs converge.
+  - Kill the **control-plane leader** (Raft) → new metadata leader elected; assignments preserved.
+  - **Network partition** (isolate minority) → minority cannot commit (fencing by leader epoch); on heal, stale leader steps down, no split-brain / no double-commit.
+  - **Pause/stall** a node (SIGSTOP / clock skew) → detected as failed, healed; on resume it is fenced and re-syncs.
+  - **Rolling restart** of all nodes → cluster stays available throughout; zero committed loss.
+  - **Cold full-cluster restart** → recovers from Archive + snapshots; committed data and offsets intact.
+  - **Under-replication repair** → a new node is assigned as follower and bootstraps to ISR.
+- **Assertion framework:** after each scenario, a verifier reads every partition from every replica and asserts invariants: (1) **no committed-message loss**, (2) **strict per-partition/per-key order**, (3) **no split-brain double-commit**, (4) **replica log convergence** (identical committed prefix), (5) **consumer-group offsets monotonic & correct**, (6) **client observable behavior** (retries, metadata refresh, no duplicate delivery beyond configured semantics).
+- A **linearizability/consistency check** (Knossos/Jepsen-style history checker) over the recorded client history validates ordering and no-loss under concurrency.
+
+**12.4 Performance/latency tests**
+- Bench harness (`benchmark`, as in world-server) gating **p99 < 100 µs** majority-durable produce, plus throughput and fetch-latency baselines. Enforced in CI from Phase 3; regressions fail the build.
+
+**12.5 CI wiring (Woodpecker)**
+- Per-project pipelines run unit + integration + coverage on every push; cluster (Testcontainers) + latency suites run on the broker pipeline (and nightly for the long chaos runs).
+
+---
+
+## 13. Open questions / to resolve during planning
 
 - **Threading model per node:** one leader thread per partition vs. a sharded thread-per-core model multiplexing many partitions (likely the latter for scale — decide in Phase 1/3).
 - **Aeron Archive granularity:** one recording per partition vs. shared recordings; impact on replay and retention deletes.
 - **Replication factor default** and min-ISR policy (unclean-leader-election allowed? default **no**).
 - **Segment/index sizing defaults** tuned for small MMORPG messages.
-- **Codename / package naming** before Phase 1.
+- **Testcontainers driver language:** the world ecosystem uses **py-testinfra** (Python) for C++ integration vs. real Redis/Postgres — reuse that Python+Testcontainers harness for Rune cluster tests, or a C++/gtest Testcontainers driver? (Lean Python for parity.)
 
 ---
 
-## 13. Feature summary
+## 14. Feature summary
 
 **Messaging model:** topics; partitions; key→partition hashing with strict **per-key ordering**; batch-oriented append.
 **Durability:** majority-in-memory commit (survives any single node); async Aeron Archive to disk; periodic snapshots; CRC-32C integrity; crash recovery with tail truncation.
@@ -248,3 +308,7 @@ Kafka-*like* mental model, C++-native and Aeron-framed (not wire-compatible).
 **Performance:** p99 < 100 µs durable ack; Aeron busy-spin transport; single-writer per partition; pinned/`mlock`'d hot memory; hardware CRC; zero-copy Aeron-native framing end-to-end; no GC.
 **Admin/ops:** topic create/delete/alter, partition/ISR/leadership introspection, configurable replication factor & min-ISR.
 **Deployment:** single 3–5 node cluster, one datacenter (tolerates 1 of 3 / 2 of 5 failures); async off-site backup and multi-DC as later phases.
+**Client library:** standalone, independently releasable `rune-client` Conan package (producer/consumer/group/admin) — the only artifact downstream apps consume.
+**Packaging & tooling:** three Conan 2 projects (`rune-protocol`, `rune-client`, `rune-broker`) mirroring `world-server`/`common` conventions (C++23, CMake ≥3.31, `VERSION.txt`, `build.sh`/`release.sh`/`update-deps.sh`, Woodpecker CI); Aeron via ConanCenter.
+**Dockerization:** broker `Dockerfile` + `docker-compose.cluster.yml` for a local 3-node cluster.
+**Testing:** full-coverage unit tests; single/pair integration tests on real Aeron+Archive; **Testcontainers cluster chaos tests** (leader/follower/controller kills, partitions, stalls, rolling & cold restarts) with post-recovery state assertions (no loss, order, convergence, offsets, client behavior) + linearizability history checking; p99<100µs latency gates.
