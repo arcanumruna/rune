@@ -74,3 +74,13 @@ TEST(RecordBatchReader, RoundTripAndValidation) {
     bytes.back() ^= 0xFF;
     EXPECT_FALSE(RecordBatchReader(bytes.data(), bytes.size()).ensureValid());
 }
+
+TEST(RecordBatchReader, TruncatedBatchIsInvalid) {
+    using namespace rune::protocol;
+    RecordBatchBuilder rb(0, 1000);
+    rb.append("k", "value", 1000);
+    auto bytes = rb.build();
+    // Claim the full length but only expose fewer bytes than totalLength():
+    RecordBatchReader r(bytes.data(), bytes.size() - 3);
+    EXPECT_FALSE(r.ensureValid());
+}

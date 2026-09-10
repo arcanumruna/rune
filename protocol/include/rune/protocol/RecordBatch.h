@@ -41,7 +41,7 @@ inline void appendBE32(std::vector<uint8_t>& b, int32_t v) {
 inline void appendBE16(std::vector<uint8_t>& b, int16_t v) {
     b.push_back(static_cast<uint8_t>(v>>8)); b.push_back(static_cast<uint8_t>(v));
 }
-inline uint32_t getBE32(const uint8_t* p){ return (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3]; }
+inline uint32_t getBE32(const uint8_t* p){ return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|uint32_t(p[3]); }
 inline uint64_t getBE64(const uint8_t* p){ uint64_t v=0; for(int i=0;i<8;++i) v=(v<<8)|p[i]; return v; }
 } // namespace detail
 
@@ -114,6 +114,7 @@ public:
 
     bool ensureValid() const {
         if (len_ < static_cast<size_t>(batch::kRecordBatchOverhead)) return false;
+        if (static_cast<size_t>(totalLength()) > len_) return false;
         uint32_t stored = detail::getBE32(d_ + batch::kCrcOffset);
         uint32_t actual = crc32c(d_ + batch::kAttributesOffset, totalLength() - batch::kAttributesOffset);
         return stored == actual;
