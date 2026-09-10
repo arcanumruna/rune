@@ -30,3 +30,14 @@ updated** as it works. Three habits, always:
 
 Push token/URL default to dev values in the helper; override with `RUNE_PUSH_TOKEN` /
 `RUNE_LIVE_URL`. API + payload formats: `rune-live/README.md`.
+
+## 4. Engineering — Aeron/Agrona is the bible (ALL phases, non-negotiable)
+
+Rune targets Aeron-class latency. **Every phase treats Aeron Cluster's Java implementation as the reference to follow EXACTLY** — threading model, encoders, fences, and low-level optimizations. When in doubt, read the Aeron Java source and mirror it.
+
+- **Threading model:** single-writer agents driven by a `doWork(nowNs)` loop under an `IdleStrategy`; no locks on the hot path; each piece of state owned by exactly one thread; inter-thread handoff ONLY via Aeron/Agrona lock-free ring buffers (`ManyToOne`/`OneToOne`/`Broadcast`) — never shared mutexes.
+- **Encoders:** flat SBE-style fixed-layout messages; reusable encoder/decoder instances held as fields (zero per-message allocation); zero-copy publication via `tryClaim`/`BufferClaim`.
+- **Fences / memory ordering:** correct release/acquire semantics — Agrona `putLongOrdered`/`putLongVolatile` ↔ C++ `std::atomic` release store / acquire load; single-writer release publish, consumer acquire read; cache-line padding vs false sharing.
+- **Low-level optimizations:** no hot-path allocation; pre-allocated scratch buffers; `NanoClock` sampled once per cycle; branch-predictable state machines; mechanical sympathy.
+
+Use Aeron's own ring buffers / `IdleStrategy` (the C++ client ships them) — do NOT pull in the `common` library for these.
