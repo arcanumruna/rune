@@ -70,11 +70,43 @@ struct PlaceVoteCall {
     NodeId  followerMemberId;
     bool    vote;
 };
+struct NewLeadershipTermCall {
+    NodeId  toMember;
+    Term    logLeadershipTermId;
+    Term    nextLeadershipTermId;
+    int64_t nextTermBaseLogPosition;
+    int64_t nextLogPosition;
+    Term    leadershipTermId;
+    int64_t termBaseLogPosition;
+    int64_t logPosition;
+    int64_t leaderRecordingId;
+    int64_t timestamp;
+    NodeId  leaderMemberId;
+    int32_t logSessionId;
+    bool    isStartup;
+    int64_t commitPosition;
+};
+struct AppendPositionCall {
+    NodeId  toMember;
+    Term    leadershipTermId;
+    int64_t logPosition;
+    NodeId  followerMemberId;
+    uint8_t flags;
+};
+struct CommitPositionCall {
+    NodeId  toMember;
+    Term    leadershipTermId;
+    int64_t logPosition;
+    NodeId  leaderMemberId;
+};
 
 struct FakeConsensusPublisher : ConsensusPublisher {
-    std::vector<CanvassCall>     canvassCalls;
-    std::vector<RequestVoteCall> requestVoteCalls;
-    std::vector<PlaceVoteCall>   placeVoteCalls;
+    std::vector<CanvassCall>           canvassCalls;
+    std::vector<RequestVoteCall>       requestVoteCalls;
+    std::vector<PlaceVoteCall>         placeVoteCalls;
+    std::vector<NewLeadershipTermCall> newLeadershipTermCalls;
+    std::vector<AppendPositionCall>    appendPositionCalls;
+    std::vector<CommitPositionCall>    commitPositionCalls;
 
     void canvassPosition(NodeId toMember, Term logLeadershipTermId, int64_t logPosition,
                          Term leadershipTermId, NodeId followerMemberId) override {
@@ -89,7 +121,32 @@ struct FakeConsensusPublisher : ConsensusPublisher {
         placeVoteCalls.push_back({toMember, candidateTermId, logLeadershipTermId, logPosition,
                                    candidateMemberId, followerMemberId, vote});
     }
-    void clear() { canvassCalls.clear(); requestVoteCalls.clear(); placeVoteCalls.clear(); }
+    void newLeadershipTerm(NodeId toMember, Term logLeadershipTermId, Term nextLeadershipTermId,
+                           int64_t nextTermBaseLogPosition, int64_t nextLogPosition,
+                           Term leadershipTermId, int64_t termBaseLogPosition, int64_t logPosition,
+                           int64_t leaderRecordingId, int64_t timestamp, NodeId leaderMemberId,
+                           int32_t logSessionId, bool isStartup, int64_t commitPosition) override {
+        newLeadershipTermCalls.push_back({toMember, logLeadershipTermId, nextLeadershipTermId,
+            nextTermBaseLogPosition, nextLogPosition, leadershipTermId, termBaseLogPosition,
+            logPosition, leaderRecordingId, timestamp, leaderMemberId, logSessionId,
+            isStartup, commitPosition});
+    }
+    void appendPosition(NodeId toMember, Term leadershipTermId, int64_t logPosition,
+                        NodeId followerMemberId, uint8_t flags) override {
+        appendPositionCalls.push_back({toMember, leadershipTermId, logPosition, followerMemberId, flags});
+    }
+    void commitPosition(NodeId toMember, Term leadershipTermId, int64_t logPosition,
+                        NodeId leaderMemberId) override {
+        commitPositionCalls.push_back({toMember, leadershipTermId, logPosition, leaderMemberId});
+    }
+    void clear() {
+        canvassCalls.clear();
+        requestVoteCalls.clear();
+        placeVoteCalls.clear();
+        newLeadershipTermCalls.clear();
+        appendPositionCalls.clear();
+        commitPositionCalls.clear();
+    }
 };
 
 // ---------------------------------------------------------------------------

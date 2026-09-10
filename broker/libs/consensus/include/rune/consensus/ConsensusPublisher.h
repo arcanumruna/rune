@@ -48,7 +48,46 @@ struct ConsensusPublisher {
         NodeId  followerMemberId,
         bool    vote) = 0;
 
-    // NOTE: newLeadershipTerm / appendPosition / commitPosition added in P2P-5b.
+    // ConsensusPublisher.java:172-232  newLeadershipTerm(Publication, ...)
+    // Emitted by: LEADER_LOG_REPLICATION, LEADER_REPLAY, LEADER_READY (on heartbeat interval).
+    // Template ID 53 per §3.1. Fields match SBE schema.
+    // Election.java:809-825 (LEADER_LOG_REPLICATION), 877-894 (LEADER_READY).
+    virtual void newLeadershipTerm(
+        NodeId  toMember,
+        Term    logLeadershipTermId,
+        Term    nextLeadershipTermId,
+        int64_t nextTermBaseLogPosition,
+        int64_t nextLogPosition,
+        Term    leadershipTermId,
+        int64_t termBaseLogPosition,
+        int64_t logPosition,
+        int64_t leaderRecordingId,
+        int64_t timestamp,
+        NodeId  leaderMemberId,
+        int32_t logSessionId,
+        bool    isStartup,
+        int64_t commitPosition) = 0;
+
+    // ConsensusPublisher.java:234-271  appendPosition(Publication, ...)
+    // Emitted by: FOLLOWER_READY (once, on election complete path).
+    // Template ID 54 per §3.1.
+    // Election.java:1166-1179 (FOLLOWER_READY).
+    virtual void appendPosition(
+        NodeId  toMember,
+        Term    leadershipTermId,
+        int64_t logPosition,
+        NodeId  followerMemberId,
+        uint8_t flags) = 0;
+
+    // ConsensusPublisher.java:273-306  commitPosition(Publication, ...)
+    // Emitted by: LEADER_LOG_REPLICATION, LEADER_REPLAY (on heartbeat interval).
+    // Template ID 55 per §3.1.
+    // Election.java:809-825 (LEADER_LOG_REPLICATION).
+    virtual void commitPosition(
+        NodeId  toMember,
+        Term    leadershipTermId,
+        int64_t logPosition,
+        NodeId  leaderMemberId) = 0;
 };
 
 } // namespace rune::consensus

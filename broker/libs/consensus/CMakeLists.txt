@@ -17,7 +17,8 @@ if(BUILD_TESTING)
         tests/consensus/NodeStateFileTest.cpp
         tests/consensus/TermLogTest.cpp
         tests/consensus/ConsensusMessagesTest.cpp
-        tests/consensus/ElectionBallotTest.cpp)
+        tests/consensus/ElectionBallotTest.cpp
+        tests/consensus/ElectionLogTest.cpp)
     target_link_libraries(rune_consensus_tests PRIVATE rune_consensus GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests)
