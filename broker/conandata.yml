@@ -1,0 +1,8 @@
+requirements:
+  # rune-protocol is consumed via sibling include path in Phase 1 (not yet conan-published);
+  # reintroduce as a conan `requires` once CI publishes it.
+  - "common/1.0.10@vradu/dev"
+  - "aeron/1.41.4"
+  - "spdlog/1.14.0"
+  - "gtest/1.16.0"
+  - "benchmark/1.8.2"
