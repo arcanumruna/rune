@@ -90,7 +90,7 @@ TEST(MappedFile, TwoSequentialWritableInstancesSamePath) {
         mf.sync();
     }
     {
-        // Second writable instance: ftruncate will re-zero, then we write
+        // Second writable instance: ftruncate to same size preserves content, then we write
         MappedFile mf(p.string(), 4096, true);
         // Overwrite byte 0 to a different value
         mf.data()[0] = 0xFF;

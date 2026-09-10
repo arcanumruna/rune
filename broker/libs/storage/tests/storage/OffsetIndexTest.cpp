@@ -177,19 +177,26 @@ TEST(OffsetIndex, WarmBoundary1024Entries) {
     std::filesystem::remove(p);
 }
 
-TEST(OffsetIndex, WarmBoundary1025Entries) {
-    auto p = uniqueIdx("1025");
+TEST(OffsetIndex, WarmBoundary1026Entries) {
+    auto p = uniqueIdx("1026");
     std::filesystem::remove(p);
-    const int N = 1025; // one beyond kWarmEntries — warm tail starts at entry 1
+    const int N = 1026; // kWarmEntries=1024; firstWarm = N-1-1024 = 1, so cold region is [0,1) and warm tail is [1, N)
     OffsetIndex idx(p, 0, 64 * 1024);
     for (int i = 0; i < N; ++i) idx.append(i * 10LL, i * 4);
     EXPECT_EQ(idx.entries(), N);
-    // Cold region (entry 0)
-    EXPECT_EQ(idx.lookup(3LL).offset, 0LL);
-    // Warm boundary
-    EXPECT_EQ(idx.lookup(10LL * (N - 1025)).offset, 10LL * (N - 1025));
-    // Warm tail
-    EXPECT_EQ(idx.lookup(10LL * (N-1)).offset, 10LL * (N-1));
+
+    // Cold region: target < entry[1].offset (entry[1] has offset 10)
+    // Lookup between entry[0] and entry[1]: should find entry[0]
+    auto cold_result = idx.lookup(5LL);
+    EXPECT_EQ(cold_result.offset, 0LL);
+    EXPECT_EQ(idx.lastSearchLow(), 0);  // cold branch searches [0, 1), begins at 0
+
+    // Warm tail: target near end, definitely >= entry[1].offset
+    // Lookup near tail: should find last entry
+    auto warm_result = idx.lookup(10LL * (N-1));
+    EXPECT_EQ(warm_result.offset, 10LL * (N-1));
+    EXPECT_GE(idx.lastSearchLow(), 1);  // warm branch begins at firstWarm=1
+
     std::filesystem::remove(p);
 }
 
