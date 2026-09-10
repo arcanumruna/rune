@@ -9,12 +9,30 @@ set(RUNE_PROTOCOL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include)
 find_package(aeron)
 find_package(spdlog REQUIRED)
 
+option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
+if(ENABLE_COVERAGE)
+    add_compile_options(--coverage -O0 -g)
+    add_link_options(--coverage)
+endif()
+
 option(BUILD_TESTING "Build tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
+endif()
+
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+if(BUILD_BENCHMARKS)
+    find_package(benchmark REQUIRED)
 endif()
 
 add_subdirectory(libs/storage)
 
 add_executable(rune_broker src/main.cpp)
 target_link_libraries(rune_broker PRIVATE rune_storage spdlog::spdlog)
+
+if(BUILD_BENCHMARKS)
+    add_executable(rune_broker_benchmark
+        benchmark/StorageBenchmark.cpp
+        benchmark/BenchmarkMain.cpp)
+    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage benchmark::benchmark)
+endif()
