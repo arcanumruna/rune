@@ -111,6 +111,7 @@ protected:
     // Apply retention using a Log directly (same directory) so we can control
     // segment roll size; updates retainedFromOffset_.
     void applyRetention(int64_t ROLL, int64_t retainFraction) {
+        ASSERT_FALSE(api_) << "applyRetention requires api_ reset first";
         // Re-open as Log to call deleteOldSegments.
         rune::storage::Log log(testDir_.string(), ROLL);
         int64_t budget = log.totalBytes() / retainFraction;

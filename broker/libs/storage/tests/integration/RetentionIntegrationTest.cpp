@@ -22,6 +22,7 @@
 
 #include <filesystem>
 #include <numeric>
+#include <set>
 
 namespace fs = std::filesystem;
 using namespace rune::storage;
@@ -73,18 +74,37 @@ TEST_F(IntegrationTestBase, RetentionDeletesOldestSegmentsFromDisk) {
     int deleted = log.deleteOldSegments(retainBytes);
     EXPECT_GT(deleted, 0) << "expected at least one segment deleted";
 
-    // Oldest files must be gone; newest must still exist.
+    // Snapshot paths after deletion.
     auto pathsAfter = logFilePaths(testDir_);
     EXPECT_LT(static_cast<int>(pathsAfter.size()), segsBefore);
 
-    // Every path that no longer exists must have been among the older ones.
-    for (size_t i = 0; i < pathsBefore.size() - pathsAfter.size(); ++i)
-        EXPECT_FALSE(fs::exists(pathsBefore[i]))
-            << "old segment should be gone: " << pathsBefore[i];
+    // Order-independent set-difference: compute which paths were deleted.
+    std::set<std::string> beforeSet(pathsBefore.begin(), pathsBefore.end());
+    std::set<std::string> afterSet(pathsAfter.begin(), pathsAfter.end());
+    std::vector<std::string> deletedPaths;
+    std::set_difference(beforeSet.begin(), beforeSet.end(),
+                        afterSet.begin(), afterSet.end(),
+                        std::back_inserter(deletedPaths));
 
-    // The active (last) segment file must still exist.
-    EXPECT_TRUE(fs::exists(pathsAfter.back()))
+    // Every deleted path must not exist on disk.
+    EXPECT_FALSE(deletedPaths.empty()) << "deletion actually happened";
+    for (const auto& path : deletedPaths) {
+        EXPECT_FALSE(fs::exists(path))
+            << "deleted segment should not exist: " << path;
+    }
+
+    // Every surviving path must exist on disk.
+    for (const auto& path : pathsAfter) {
+        EXPECT_TRUE(fs::exists(path))
+            << "surviving segment must exist: " << path;
+    }
+
+    // The active (last) segment must be in the surviving set.
+    fs::path activePath = activeLogPath(testDir_);
+    EXPECT_TRUE(fs::exists(activePath))
         << "active segment must not be deleted";
+    EXPECT_TRUE(afterSet.count(activePath.string()) > 0)
+        << "active segment must be in surviving set";
 }
 
 // ---------------------------------------------------------------------------

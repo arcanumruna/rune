@@ -184,6 +184,31 @@ TEST_F(IntegrationTestBase, RollingStress_RandomOffsetSpotChecks) {
             << "sample " << s << ": batch baseOffset must be non-negative";
         EXPECT_LE(reader.baseOffset(), static_cast<int64_t>(N))
             << "sample " << s << ": batch baseOffset must be within produced range";
+
+        // Verify the first record's content matches ground truth.
+        int64_t firstRecordOffset = -1;
+        std::string firstRecordKey;
+        std::string firstRecordValue;
+        reader.forEach([&](std::string_view key, std::string_view value,
+                           int64_t offset, int64_t timestamp) {
+            (void)timestamp; // unused
+            if (firstRecordOffset < 0) {
+                firstRecordOffset = offset;
+                firstRecordKey = std::string(key);
+                firstRecordValue = std::string(value);
+            }
+        });
+
+        ASSERT_GE(firstRecordOffset, 0)
+            << "sample " << s << ": failed to extract first record";
+        ASSERT_LT(firstRecordOffset, N)
+            << "sample " << s << ": first record offset out of range";
+        EXPECT_EQ(firstRecordKey, produced[static_cast<size_t>(firstRecordOffset)].key)
+            << "sample " << s << ": first record key mismatch at offset "
+            << firstRecordOffset;
+        EXPECT_EQ(firstRecordValue, produced[static_cast<size_t>(firstRecordOffset)].value)
+            << "sample " << s << ": first record value mismatch at offset "
+            << firstRecordOffset;
     }
 }
 
