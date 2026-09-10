@@ -21,12 +21,17 @@ OffsetPosition OffsetIndex::parseEntry(int slot) const {
 }
 int OffsetIndex::slotFor(int64_t target) const {
     if (entries_ == 0) return -1;
-    int lo = 0, hi = entries_ - 1;
-    if (parseEntry(0).offset > target) return -1;
-    while (lo < hi) {
-        int mid = (lo + hi + 1) >> 1;
-        if (parseEntry(mid).offset <= target) lo = mid; else hi = mid - 1;
+    int firstWarm = entries_ - 1 - kWarmEntries; if (firstWarm < 0) firstWarm = 0;
+    int begin, end;
+    if (parseEntry(firstWarm).offset < target) { begin = firstWarm; end = entries_ - 1; }
+    else {
+        if (parseEntry(0).offset > target) { lastSearchLow_ = 0; return -1; }
+        begin = 0; end = firstWarm;
     }
+    lastSearchLow_ = begin;
+    int lo = begin, hi = end;
+    while (lo < hi) { int mid = (lo + hi + 1) >> 1;
+        if (parseEntry(mid).offset <= target) lo = mid; else hi = mid - 1; }
     return lo;
 }
 OffsetPosition OffsetIndex::lookup(int64_t target) const {
