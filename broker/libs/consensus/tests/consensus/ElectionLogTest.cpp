@@ -942,3 +942,52 @@ TEST(ElectionLog, ThreeMember_Leader_ClosesInFewSteps) {
     // Should complete in very few steps since quorum is immediate
     EXPECT_LT(steps, 20);
 }
+
+// ===========================================================================
+// GROUP 8: Follower TermLog persistence on election close
+// ===========================================================================
+
+// L31: Follower persists term entry on election close; entry survives reopen.
+// This test validates the fix for the follower persistence gap: before close,
+// follower must call appendTerm so the TermLog entry survives recovery.
+TEST(ElectionLog, FollowerPersistsTermEntryOnClose) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    int64_t nowNs = 1'000'000LL;
+
+    // Drive follower to CLOSED via onNewLeadershipTerm → follower path.
+    e.doWork(nowNs); // → CANVASS
+    e.onRequestVote(0, 0, 1, 1, nowNs); // → FOLLOWER_BALLOT
+    ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+
+    // Feed NLT from leader (node 1) for term 1
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, /*leadershipTermId=*/1, 0, 0, 0, 0, /*leaderMemberId=*/1, 0, true, 0);
+
+    // Drive to CLOSED with bounded driver
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.state(), ElectionState::Closed);
+
+    Term closedTermId = e.leadershipTermId();
+    int64_t closedLogPosition = e.logPosition();
+
+    // Assertion 1: TermLog entry exists and is committed (not NULL_POSITION).
+    auto entry = tl.getTermEntry(closedTermId);
+    ASSERT_TRUE(entry.has_value()) << "Follower TermLog missing entry for term " << closedTermId;
+    EXPECT_EQ(entry->leadershipTermId, closedTermId);
+    EXPECT_NE(entry->logPosition, kNullPosition) << "TermLog entry not committed (still NULL_POSITION)";
+    EXPECT_EQ(entry->logPosition, closedLogPosition) << "TermLog logPosition mismatch";
+
+    // Assertion 2: Close and reopen the TermLog — entry must persist on disk.
+    // Destroy the old TermLog and create a fresh one over the same path.
+    {
+        TermLog tlReopen(tlFile.str());
+        auto reopenEntry = tlReopen.getTermEntry(closedTermId);
+        ASSERT_TRUE(reopenEntry.has_value()) << "Reopened TermLog lost entry for term " << closedTermId;
+        EXPECT_EQ(reopenEntry->leadershipTermId, closedTermId);
+        EXPECT_EQ(reopenEntry->logPosition, closedLogPosition);
+    }
+}

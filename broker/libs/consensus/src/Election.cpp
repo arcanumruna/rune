@@ -844,11 +844,21 @@ void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
 // ---------------------------------------------------------------------------
 void Election::electionComplete(int64_t nowNs)
 {
-    // Commit the term in TermLog if we haven't already (follower path).
-    // Leader does this in leaderInit; follower does it here.
-    if (termLog_.getTermEntry(leadershipTermId_)) {
-        termLog_.commitLogPosition(leadershipTermId_, logPosition_);
+    // Aeron Election.java:1200+, electionComplete: leader appends term in leaderInit,
+    // but follower must persist the accepted leadership term here for Phase-3 recovery.
+    // See: Election.java:1200 (electionComplete), tryJoinLogAsFollower comment at 1116.
+    if (!termLog_.getTermEntry(leadershipTermId_)) {
+        // Follower path: append the term if not already present (leader appended in leaderInit).
+        // Use phase-2 sentinels: recordingId=-1, termBaseLogPosition=0 if not captured.
+        termLog_.appendTerm(
+            /*recordingId=*/-1,
+            leadershipTermId_,
+            /*termBaseLogPosition=*/0,
+            /*timestamp=*/nowNs);
     }
+
+    // Commit the term's log position (both paths).
+    termLog_.commitLogPosition(leadershipTermId_, logPosition_);
 
     state(ElectionState::Closed, nowNs, "electionComplete");
 }
