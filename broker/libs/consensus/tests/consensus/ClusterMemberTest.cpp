@@ -523,3 +523,83 @@ TEST(ClusterMember, Reset_ClearsFields) {
     // id and timeOfLastAppendPositionNs are NOT reset by Java reset()
     EXPECT_EQ(m.id, 1);
 }
+
+// ---------------------------------------------------------------------------
+// P2P-5a additions — Task 1
+// ---------------------------------------------------------------------------
+
+// becomeCandidate: self gets vote=For+candidateTermId+isBallotSent=true; others cleared
+TEST(ClusterMember, BecomeCandidate_SetsCorrectState) {
+    std::vector<ClusterMember> members(3);
+    members[0].id = 0; members[1].id = 1; members[2].id = 2;
+    for (auto& m : members) m.logPosition = 0;
+
+    ClusterMember::becomeCandidate(members, /*candidateTermId=*/5, /*candidateMemberId=*/0);
+
+    EXPECT_EQ(members[0].vote, Vote::For);
+    EXPECT_EQ(members[0].candidateTermId, 5);
+    EXPECT_TRUE(members[0].isBallotSent);
+
+    EXPECT_EQ(members[1].vote, Vote::None);
+    EXPECT_EQ(members[1].candidateTermId, kNullValue);
+    EXPECT_FALSE(members[1].isBallotSent);
+
+    EXPECT_EQ(members[2].vote, Vote::None);
+    EXPECT_EQ(members[2].candidateTermId, kNullValue);
+    EXPECT_FALSE(members[2].isBallotSent);
+}
+
+// reset() clears isBallotSent
+TEST(ClusterMember, Reset_ClearsBallotSent) {
+    ClusterMember m;
+    m.id = 1; m.isBallotSent = true; m.vote = Vote::For; m.candidateTermId = 3; m.logPosition = 10;
+    m.reset();
+    EXPECT_FALSE(m.isBallotSent);
+    EXPECT_EQ(m.vote, Vote::None);
+    EXPECT_EQ(m.candidateTermId, kNullValue);
+    EXPECT_EQ(m.logPosition, kNullPosition);
+}
+
+// isUnanimousCandidate: all willVoteFor candidate → true
+TEST(ClusterMember, IsUnanimousCandidate_AllWillVote_True) {
+    std::vector<ClusterMember> members(3);
+    for (int i = 0; i < 3; i++) {
+        members[i].id = i;
+        members[i].logPosition = 0;
+        members[i].leadershipTermId = 0;
+        members[i].logLeadershipTermId = 0;
+    }
+    ClusterMember candidate; candidate.id = 0; candidate.logPosition = 0; candidate.leadershipTermId = 0; candidate.logLeadershipTermId = 0;
+    EXPECT_TRUE(ClusterMember::isUnanimousCandidate(members, candidate, /*gracefulClosedLeaderId=*/-1));
+}
+
+// isUnanimousCandidate: one member has higher log → false
+TEST(ClusterMember, IsUnanimousCandidate_OneMemberAhead_False) {
+    std::vector<ClusterMember> members(3);
+    for (int i = 0; i < 3; i++) { members[i].id = i; members[i].logPosition = 0; members[i].logLeadershipTermId = 0; }
+    members[1].logPosition = 100;    // member 1 is ahead via leadershipTermId comparison (but leadershipTermId=kNullValue default)
+    members[1].leadershipTermId = 1; // higher leadershipTermId → won't vote for candidate at term=0
+    ClusterMember candidate; candidate.id = 0; candidate.logPosition = 0; candidate.leadershipTermId = 0; candidate.logLeadershipTermId = 0;
+    EXPECT_FALSE(ClusterMember::isUnanimousCandidate(members, candidate, -1));
+}
+
+// isQuorumCandidate: majority willVoteFor → true
+TEST(ClusterMember, IsQuorumCandidate_Majority_True) {
+    std::vector<ClusterMember> members(3);
+    for (int i = 0; i < 3; i++) { members[i].id = i; members[i].logPosition = 0; members[i].leadershipTermId = 0; members[i].logLeadershipTermId = 0; }
+    // member[2] has higher leadershipTermId → won't vote; but 0 and 1 will (majority=2 of 3)
+    members[2].leadershipTermId = 5; // higher term → compareLog returns +1 → won't vote
+    ClusterMember candidate; candidate.id = 0; candidate.logPosition = 0; candidate.leadershipTermId = 0; candidate.logLeadershipTermId = 0;
+    EXPECT_TRUE(ClusterMember::isQuorumCandidate(members, candidate));
+}
+
+// isQuorumCandidate: minority willVoteFor → false
+TEST(ClusterMember, IsQuorumCandidate_Minority_False) {
+    std::vector<ClusterMember> members(3);
+    for (int i = 0; i < 3; i++) { members[i].id = i; members[i].logPosition = 0; members[i].leadershipTermId = 0; members[i].logLeadershipTermId = 0; }
+    members[0].logPosition = kNullPosition; // won't vote (logPosition == NULL)
+    members[1].logPosition = kNullPosition; // won't vote
+    // only member[2] would vote (logPosition=0 >= candidate 0); but 1 < quorumThreshold(3)=2
+    ClusterMember candidate; candidate.id = 3; candidate.logPosition = 0; candidate.leadershipTermId = 0; candidate.logLeadershipTermId = 0;
+    EXPECT_FALSE(ClusterMember::isQuorumCandidate(members, candidate));
+}

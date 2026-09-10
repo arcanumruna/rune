@@ -26,7 +26,12 @@ enum class Vote : int8_t {
 // io.aeron.Aeron.NULL_VALUE == Long.MIN_VALUE (-2^63)
 // io.aeron.archive.client.AeronArchive.NULL_POSITION == Long.MIN_VALUE
 static constexpr int64_t kNullValue    = INT64_MIN; // Aeron.NULL_VALUE
+// Note: kNullPosition is also defined in TermLog.h; guard prevents redefinition
+// when both headers appear in the same translation unit (e.g. via Election.h).
+#ifndef RUNE_CONSENSUS_K_NULL_POSITION_DEFINED
+#define RUNE_CONSENSUS_K_NULL_POSITION_DEFINED
 static constexpr int64_t kNullPosition = INT64_MIN; // AeronArchive.NULL_POSITION
+#endif
 
 // ClusterMember — represents one member of the cluster from this node's perspective.
 // Fields mirror ClusterMember.java:44-66.
@@ -73,6 +78,7 @@ struct ClusterMember {
         candidateTermId   = kNullValue;
         leadershipTermId  = kNullValue;
         logPosition       = kNullPosition;
+        isBallotSent      = false;  // ClusterMember.java:142
     }
 
     // -----------------------------------------------------------------------
@@ -228,6 +234,59 @@ struct ClusterMember {
     static bool willVoteFor(const ClusterMember& voter, const ClusterMember& candidate) noexcept {
         return voter.logPosition != kNullPosition &&
                compareLog(voter, candidate) <= 0;
+    }
+
+    // ClusterMember.java:45  private boolean isBallotSent;
+    // Set on the self-member by becomeCandidate; marks that RequestVote was sent to a peer.
+    bool isBallotSent = false;
+
+    // ClusterMember.java:947-964  becomeCandidate(ClusterMember[], long, int)
+    // Self gets vote=For, candidateTermId=given, isBallotSent=true. Others cleared.
+    static void becomeCandidate(
+        std::span<ClusterMember> members,
+        Term                     candidateTermId,
+        NodeId                   candidateMemberId) noexcept
+    {
+        for (auto& member : members) {
+            if (member.id == candidateMemberId) {
+                member.vote            = Vote::For;
+                member.candidateTermId = candidateTermId;
+                member.isBallotSent    = true;
+            } else {
+                member.vote            = Vote::None;
+                member.candidateTermId = kNullValue;
+                member.isBallotSent    = false;
+            }
+        }
+    }
+
+    // ClusterMember.java:1117-1138  isUnanimousCandidate(ClusterMember[], ClusterMember, int)
+    // All non-excluded members must willVoteFor candidate; count >= quorumThreshold.
+    static bool isUnanimousCandidate(
+        std::span<const ClusterMember> members,
+        const ClusterMember&           candidate,
+        NodeId                         gracefulClosedLeaderId) noexcept
+    {
+        int possibleVotes = 0;
+        for (const auto& member : members) {
+            if (member.id == gracefulClosedLeaderId) continue;
+            if (!willVoteFor(member, candidate)) return false;
+            possibleVotes++;
+        }
+        return possibleVotes >= quorumThreshold(static_cast<int>(members.size()));
+    }
+
+    // ClusterMember.java:1147-1160  isQuorumCandidate(ClusterMember[], ClusterMember)
+    // Majority of members willVoteFor candidate (no exclusions).
+    static bool isQuorumCandidate(
+        std::span<const ClusterMember> members,
+        const ClusterMember&           candidate) noexcept
+    {
+        int possibleVotes = 0;
+        for (const auto& member : members) {
+            if (willVoteFor(member, candidate)) ++possibleVotes;
+        }
+        return possibleVotes >= quorumThreshold(static_cast<int>(members.size()));
     }
 };
 

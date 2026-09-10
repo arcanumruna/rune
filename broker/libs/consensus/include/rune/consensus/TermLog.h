@@ -34,7 +34,12 @@ static constexpr int32_t kEntryTypeInvalidFlag = static_cast<int32_t>(1u << 31u)
 // NULL_POSITION sentinel: log position for an OPEN (uncommitted) term entry.
 // Matches AeronArchive.NULL_POSITION = Long.MIN_VALUE in Java.
 // RecordingLog.java:955: long logPosition = NULL_POSITION;
+// Note: kNullPosition is also defined in ClusterMember.h; guard against redefinition
+// when both headers appear in the same translation unit (e.g. via Election.h).
+#ifndef RUNE_CONSENSUS_K_NULL_POSITION_DEFINED
+#define RUNE_CONSENSUS_K_NULL_POSITION_DEFINED
 static constexpr int64_t kNullPosition = std::numeric_limits<int64_t>::min();
+#endif
 
 /**
  * In-memory representation of a single term entry in the TermLog.
