@@ -20,6 +20,8 @@ class RuneProtocolConan(ConanFile):
     def build_requirements(self):
         for r in self.conan_data.get("test_requirements", []):
             self.test_requires(r)
+        for r in self.conan_data.get("benchmark_requirements", []):
+            self.test_requires(r)
 
     def generate(self):
         CMakeDeps(self).generate()

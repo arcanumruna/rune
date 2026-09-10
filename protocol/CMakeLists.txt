@@ -27,3 +27,17 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(rune_protocol_tests)
 endif()
+
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+if(BUILD_BENCHMARKS)
+    find_package(benchmark REQUIRED)
+    add_executable(rune_protocol_benchmark
+            benchmark/BenchmarkMain.cpp
+            benchmark/Crc32cBenchmark.cpp
+            benchmark/VarintBenchmark.cpp
+            benchmark/RecordBatchBenchmark.cpp)
+    target_include_directories(rune_protocol_benchmark PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmark)
+    target_link_libraries(rune_protocol_benchmark PRIVATE benchmark::benchmark)
+endif()

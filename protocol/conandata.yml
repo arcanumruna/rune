@@ -3,3 +3,5 @@ requirements:
   - "aeron/1.41.4"
 test_requirements:
   - "gtest/1.16.0"
+benchmark_requirements:
+  - "benchmark/1.8.2"
