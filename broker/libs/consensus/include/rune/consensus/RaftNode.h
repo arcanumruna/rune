@@ -5,6 +5,7 @@
 #include <rune/consensus/RaftLog.h>
 #include <cstdint>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::consensus {
@@ -44,6 +45,10 @@ public:
     /// Number of votes granted to this node in the current term (including self).
     int grantedVoteCount() const noexcept { return static_cast<int>(votesGranted_.size()); }
 
+    /// Per-peer leader state accessors (valid only when role==Leader).
+    Index nextIndexFor(NodeId peer)  const;
+    Index matchIndexFor(NodeId peer) const;
+
     // ------------------------------------------------------------------
     // Single-writer agent entry point.
     // Returns workCount = (messages emitted) + (role transitions performed).
@@ -63,8 +68,8 @@ public:
     /// reset election deadline, emit RequestVote to every peer != self.
     void becomeCandidate(int64_t nowNs, Outbox& out);
 
-    /// Become Leader: set heartbeatDeadlineNs = nowNs so next doWork heartbeats
-    /// immediately.
+    /// Become Leader: initializes nextIndex/matchIndex per peer, emits first
+    /// AppendEntries (with any entries the peer might be missing) to all peers.
     void becomeLeader(int64_t nowNs, Outbox& out);
 
     /// If term > currentTerm, step down to Follower and adopt the new term.
@@ -86,12 +91,37 @@ public:
     void handleRequestVoteResult(NodeId from, const RequestVoteResult& res,
                                  int64_t nowNs, Outbox& out);
 
+    // ------------------------------------------------------------------
+    // P2-e: Replication handlers
+    // ------------------------------------------------------------------
+
+    /// Leader: append a command to the log and replicate to all peers.
+    /// Returns the new lastIndex, or -1 if not leader (no-op).
+    Index propose(std::string command, int64_t nowNs, Outbox& out);
+
+    /// Follower: handle an AppendEntries RPC from the leader.
+    /// Appends result to `out` (to=ae.leaderId) and also returns it.
+    AppendEntriesResult handleAppendEntries(const AppendEntries& ae,
+                                            int64_t nowNs, Outbox& out);
+
+    /// Leader: handle a response to a previously-sent AppendEntries.
+    void handleAppendEntriesResult(NodeId from, const AppendEntriesResult& res,
+                                   int64_t nowNs, Outbox& out);
+
 private:
     /// Draw a fresh randomized election deadline: nowNs + base + U[0, jitter].
     void resetElectionDeadline(int64_t nowNs);
 
-    /// Emit empty AppendEntries heartbeats to all peers.
+    /// Build and emit an AppendEntries to a single peer (carries entries if
+    /// the peer is behind; otherwise an empty heartbeat).
+    void emitAppendEntriesTo(NodeId peer, int64_t nowNs, Outbox& out);
+
+    /// Emit AppendEntries to all peers (replaces old empty-heartbeat helper).
     int emitHeartbeats(int64_t nowNs, Outbox& out);
+
+    /// Advance commitIndex as leader when a majority of nodes (incl. self)
+    /// have matchIndex >= N AND log.termAt(N) == currentTerm (Figure-8 rule).
+    void tryAdvanceCommitIndex();
 
     ClusterConfig   cfg_;
     PersistentState& ps_;
@@ -108,6 +138,12 @@ private:
     /// NodeIds that granted a vote to us in the current term (including self).
     /// Cleared and re-seeded with self on becomeCandidate; cleared on step-down.
     std::vector<NodeId> votesGranted_;
+
+    /// Per-peer leader replication state (valid while role==Leader).
+    /// nextIndex[peer]  — next log index to send to that peer (init: lastIndex+1).
+    /// matchIndex[peer] — highest index known to be replicated on that peer (init: 0).
+    std::unordered_map<NodeId, Index> nextIndex_;
+    std::unordered_map<NodeId, Index> matchIndex_;
 };
 
 } // namespace rune::consensus

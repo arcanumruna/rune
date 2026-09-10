@@ -1,4 +1,5 @@
 #include <rune/consensus/RaftNode.h>
+#include <algorithm>
 #include <cassert>
 
 namespace rune::consensus {
@@ -98,9 +99,26 @@ void RaftNode::becomeCandidate(int64_t nowNs, Outbox& out)
 void RaftNode::becomeLeader(int64_t nowNs, Outbox& out)
 {
     role_ = RaftRole::Leader;
+
+    // Initialize per-peer replication state (Raft §5.3).
+    // nextIndex[peer]  = leader's lastIndex + 1
+    // matchIndex[peer] = 0 (nothing confirmed yet)
+    // matchIndex[self] = leader's lastIndex (leader already has everything)
+    Index leaderLast = log_.lastIndex();
+    nextIndex_.clear();
+    matchIndex_.clear();
+    for (NodeId peer : cfg_.members) {
+        if (peer != cfg_.self) {
+            nextIndex_[peer]  = leaderLast + 1;
+            matchIndex_[peer] = 0;
+        }
+    }
+    // Leader's own match is its lastIndex (used for commit majority counting).
+    matchIndex_[cfg_.self] = leaderLast;
+
     // Set deadline to nowNs so the very next doWork call emits heartbeats.
     heartbeatDeadlineNs_ = nowNs;
-    // Emit initial heartbeats immediately.
+    // Emit initial AppendEntries to all peers immediately.
     emitHeartbeats(nowNs, out);
     heartbeatDeadlineNs_ = nowNs + opts_.heartbeatIntervalNs;
 }
@@ -198,6 +216,145 @@ void RaftNode::handleRequestVoteResult(NodeId from, const RequestVoteResult& res
 }
 
 // ---------------------------------------------------------------------------
+// handleAppendEntries (P2-e) — follower side, Raft §5.3 / notes §A.5
+// ---------------------------------------------------------------------------
+AppendEntriesResult RaftNode::handleAppendEntries(const AppendEntries& ae,
+                                                   int64_t nowNs, Outbox& out)
+{
+    // 1. Always observe the sender's term first (may step us down).
+    observeTerm(ae.term, nowNs);
+
+    AppendEntriesResult reply{ .term = ps_.currentTerm(), .success = false, .matchIndex = 0 };
+
+    // 2. Stale leader → reject.
+    if (ae.term < ps_.currentTerm()) {
+        out.push_back(OutboundMessage{ .to = ae.leaderId, .msg = reply });
+        return reply;
+    }
+
+    // 3. Valid current-term leader: reset election deadline; step down if Candidate.
+    resetElectionDeadline(nowNs);
+    if (role_ == RaftRole::Candidate) {
+        // Same-term leader beats us — revert to follower without changing term.
+        role_ = RaftRole::Follower;
+        votesGranted_.clear();
+    }
+
+    // 4. Consistency check: prevLogIndex must exist and term must match.
+    if (ae.prevLogIndex > 0) {
+        if (ae.prevLogIndex > log_.lastIndex() ||
+            log_.termAt(ae.prevLogIndex) != ae.prevLogTerm) {
+            out.push_back(OutboundMessage{ .to = ae.leaderId, .msg = reply });
+            return reply;
+        }
+    }
+
+    // 5. Append with conflict resolution (idempotent: do NOT truncate on match).
+    Index lastNewIndex = ae.prevLogIndex + static_cast<Index>(ae.entries.size());
+    for (Index i = 0; i < static_cast<Index>(ae.entries.size()); ++i) {
+        Index idx = ae.prevLogIndex + 1 + i;
+        if (idx <= log_.lastIndex()) {
+            if (log_.termAt(idx) != ae.entries[i].term) {
+                // Conflict: truncate this and all following entries, then append.
+                log_.truncateFrom(idx);
+                for (Index j = i; j < static_cast<Index>(ae.entries.size()); ++j) {
+                    log_.append(ae.entries[j].term, ae.entries[j].command);
+                }
+                break;
+            }
+            // Terms match at idx — skip (idempotent re-delivery, preserve entry).
+        } else {
+            // Beyond current log end — append this and remaining entries.
+            for (Index j = i; j < static_cast<Index>(ae.entries.size()); ++j) {
+                log_.append(ae.entries[j].term, ae.entries[j].command);
+            }
+            break;
+        }
+    }
+
+    // 6. Advance commit index.
+    if (ae.leaderCommit > log_.commitIndex()) {
+        log_.setCommitIndex(std::min(ae.leaderCommit, lastNewIndex));
+    }
+
+    reply.success    = true;
+    reply.matchIndex = lastNewIndex;
+    out.push_back(OutboundMessage{ .to = ae.leaderId, .msg = reply });
+    return reply;
+}
+
+// ---------------------------------------------------------------------------
+// handleAppendEntriesResult (P2-e) — leader side
+// ---------------------------------------------------------------------------
+void RaftNode::handleAppendEntriesResult(NodeId from, const AppendEntriesResult& res,
+                                          int64_t nowNs, Outbox& out)
+{
+    // Observe term — if higher, we step down (observeTerm calls becomeFollower).
+    observeTerm(res.term, nowNs);
+
+    // Ignore if we've stepped down or term mismatch.
+    if (role_ != RaftRole::Leader || res.term != ps_.currentTerm()) {
+        return;
+    }
+
+    if (res.success) {
+        // Update peer's replication progress.
+        matchIndex_[from] = std::max(matchIndex_[from], res.matchIndex);
+        nextIndex_[from]  = matchIndex_[from] + 1;
+
+        // Update our own matchIndex (leader always has everything it proposed).
+        matchIndex_[cfg_.self] = log_.lastIndex();
+
+        // Try to advance commitIndex (Leader Completeness / Figure-8 rule).
+        tryAdvanceCommitIndex();
+    } else {
+        // Rejected: back off nextIndex and retry with lower prevLogIndex.
+        nextIndex_[from] = std::max(Index{1}, nextIndex_[from] - 1);
+        emitAppendEntriesTo(from, nowNs, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// propose (P2-e) — leader appends + replicates a command
+// ---------------------------------------------------------------------------
+Index RaftNode::propose(std::string command, int64_t nowNs, Outbox& out)
+{
+    if (role_ != RaftRole::Leader) {
+        return -1; // not leader — no-op
+    }
+
+    // Append to own log.
+    Index newIndex = log_.append(ps_.currentTerm(), std::move(command));
+
+    // Update leader's own matchIndex immediately.
+    matchIndex_[cfg_.self] = newIndex;
+
+    // Replicate to all peers.
+    for (NodeId peer : cfg_.members) {
+        if (peer != cfg_.self) {
+            emitAppendEntriesTo(peer, nowNs, out);
+        }
+    }
+
+    return newIndex;
+}
+
+// ---------------------------------------------------------------------------
+// Observers for per-peer leader state
+// ---------------------------------------------------------------------------
+Index RaftNode::nextIndexFor(NodeId peer) const
+{
+    auto it = nextIndex_.find(peer);
+    return (it != nextIndex_.end()) ? it->second : 0;
+}
+
+Index RaftNode::matchIndexFor(NodeId peer) const
+{
+    auto it = matchIndex_.find(peer);
+    return (it != matchIndex_.end()) ? it->second : 0;
+}
+
+// ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
 void RaftNode::resetElectionDeadline(int64_t nowNs)
@@ -206,25 +363,62 @@ void RaftNode::resetElectionDeadline(int64_t nowNs)
     electionDeadlineNs_ = nowNs + opts_.electionTimeoutBaseNs + jitter;
 }
 
-int RaftNode::emitHeartbeats(int64_t /*nowNs*/, Outbox& out)
+void RaftNode::emitAppendEntriesTo(NodeId peer, int64_t /*nowNs*/, Outbox& out)
 {
-    int count = 0;
-    AppendEntries hb{
+    Index  ni        = nextIndex_.count(peer) ? nextIndex_[peer] : log_.lastIndex() + 1;
+    Index  prevIdx   = ni - 1;
+    Term   prevTerm  = log_.termAt(prevIdx); // returns 0 for idx<=0
+
+    AppendEntries ae{
         .term         = ps_.currentTerm(),
         .leaderId     = cfg_.self,
-        .prevLogIndex = log_.lastIndex(),
-        .prevLogTerm  = log_.lastTerm(),
-        .entries      = {},            // empty heartbeat
+        .prevLogIndex = prevIdx,
+        .prevLogTerm  = prevTerm,
+        .entries      = log_.entriesFrom(ni),  // empty if peer is caught up
         .leaderCommit = log_.commitIndex(),
     };
+    out.push_back(OutboundMessage{ .to = peer, .msg = std::move(ae) });
+}
 
+int RaftNode::emitHeartbeats(int64_t nowNs, Outbox& out)
+{
+    int count = 0;
     for (NodeId peer : cfg_.members) {
         if (peer != cfg_.self) {
-            out.push_back(OutboundMessage{ .to = peer, .msg = hb });
+            emitAppendEntriesTo(peer, nowNs, out);
             ++count;
         }
     }
     return count;
+}
+
+void RaftNode::tryAdvanceCommitIndex()
+{
+    // Figure-8 rule: only advance commit to an entry of the CURRENT term.
+    // Walk from the highest possible index down to commitIndex+1 and find
+    // the highest N where:
+    //   (a) log.termAt(N) == currentTerm
+    //   (b) a majority of nodes (leader included) have matchIndex >= N
+    Index lastIdx = log_.lastIndex();
+    Term  curTerm = ps_.currentTerm();
+
+    for (Index n = lastIdx; n > log_.commitIndex(); --n) {
+        if (log_.termAt(n) != curTerm) {
+            continue; // Figure-8: only commit own-term entries by count
+        }
+        // Count nodes (including self) with matchIndex >= n.
+        int count = 0;
+        for (NodeId node : cfg_.members) {
+            auto it = matchIndex_.find(node);
+            if (it != matchIndex_.end() && it->second >= n) {
+                ++count;
+            }
+        }
+        if (count >= cfg_.majority()) {
+            log_.setCommitIndex(n);
+            break; // highest such N found; prior entries commit transitively
+        }
+    }
 }
 
 } // namespace rune::consensus
