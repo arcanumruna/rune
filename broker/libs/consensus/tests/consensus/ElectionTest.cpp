@@ -55,12 +55,11 @@ static Options makeOpts(uint64_t seed = 42) {
     };
 }
 
-/// Advance node to Candidate at nowNs.
-static void electToCandidate(RaftNode& node, int64_t nowNs, Outbox& out) {
+/// Advance node to Candidate.
+static void electToCandidate(RaftNode& node, Outbox& out) {
     out.clear();
     node.doWork(node.electionDeadlineNs(), out); // triggers becomeCandidate
     out.clear();
-    (void)nowNs;
 }
 
 /// Count RequestVoteResult messages in the outbox with voteGranted==true.
@@ -356,6 +355,34 @@ TEST(Election, OneVotePerTerm_SecondCandidateDenied) {
 }
 
 // ---------------------------------------------------------------------------
+// 13b. Dueling candidates: node becomes Candidate, denies same-term RequestVote
+//      from another candidate (votedFor==self != candidateId).
+// ---------------------------------------------------------------------------
+TEST(Election, CandidateReceivesSameTermRequestVoteDenies) {
+    TempFile tmp;
+    PersistentState ps(tmp.str());
+    RaftLog log;
+    auto node = RaftNode(makeConfig3(0), ps, log, makeOpts());
+
+    Outbox out;
+    electToCandidate(node, out);
+    ASSERT_EQ(node.role(), RaftRole::Candidate);
+    Term candidateTerm = node.currentTerm();
+    EXPECT_EQ(ps.votedFor(), 0); // self-vote
+
+    // A same-term RequestVote from candidate 1, with its log that would otherwise be grantable
+    out.clear();
+    RequestVote rv{ .candidateTerm = candidateTerm, .candidateId = 1,
+                    .lastLogIndex = 0, .lastLogTerm = 0 };
+    auto res = node.handleRequestVote(rv, 2'000'000LL, out);
+
+    EXPECT_FALSE(res.voteGranted); // denied: votedFor==0 (self) != 1
+    EXPECT_EQ(res.term, candidateTerm);
+    EXPECT_EQ(node.role(), RaftRole::Candidate); // stays Candidate
+    EXPECT_EQ(ps.votedFor(), 0); // self-vote unchanged
+}
+
+// ---------------------------------------------------------------------------
 // 14. Election deadline resets on grant, NOT on denial
 // ---------------------------------------------------------------------------
 TEST(Election, ElectionDeadlineResetOnGrant_NotOnDeny) {
@@ -398,7 +425,7 @@ TEST(Election, VoteTally_3Member_OneExternalGrant_BecomesLeader) {
     auto node = RaftNode(makeConfig3(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
     // Self-vote already counted (1/3). Need 2 more for majority=2.
     // Actually majority=2; self=1, so one external grant suffices.
@@ -421,13 +448,13 @@ TEST(Election, VoteTally_5Member_OneGrant_StillCandidate) {
     auto node = RaftNode(makeConfig5(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
 
     RequestVoteResult res{ .term = node.currentTerm(), .voteGranted = true };
     node.handleRequestVoteResult(1, res, 1'000'000LL, out);
 
-    EXPECT_EQ(node.role(), RaftRole::Candidate); // still candidate (2/3 needed, have 2/3... wait majority=3)
+    EXPECT_EQ(node.role(), RaftRole::Candidate); // 5-member majority=3; self + 1 grant = 2 < 3, still Candidate
     EXPECT_EQ(node.grantedVoteCount(), 2);
 }
 
@@ -441,7 +468,7 @@ TEST(Election, VoteTally_5Member_TwoGrants_BecomesLeader) {
     auto node = RaftNode(makeConfig5(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
     Term term = node.currentTerm();
 
@@ -464,7 +491,7 @@ TEST(Election, DuplicateGrantFromSameNode_CountedOnce) {
     auto node = RaftNode(makeConfig5(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
     Term term = node.currentTerm();
 
@@ -487,7 +514,7 @@ TEST(Election, StaleResult_LowerTerm_Ignored) {
     auto node = RaftNode(makeConfig3(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
     Term term = node.currentTerm();
 
@@ -511,7 +538,7 @@ TEST(Election, ResultHigherTerm_StepDown) {
     auto node = RaftNode(makeConfig3(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
     Term term = node.currentTerm();
 
@@ -553,7 +580,7 @@ TEST(Election, BecomeCandidate_ClearsPriorVotes_AddsSelf) {
 
     Outbox out;
     // First election: become candidate, get two more grants
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     Term firstTerm = node.currentTerm();
     RequestVoteResult res{ .term = firstTerm, .voteGranted = true };
     node.handleRequestVoteResult(1, res, 1'000'000LL, out);
@@ -641,7 +668,7 @@ TEST(Election, StepDownViaRequestVote_ClearsVoteSet) {
     auto node = RaftNode(makeConfig5(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     ASSERT_EQ(node.role(), RaftRole::Candidate);
     EXPECT_EQ(node.grantedVoteCount(), 1); // self
 
@@ -711,7 +738,7 @@ TEST(Election, AfterLeader_StepDown_VoteSetCleared) {
     auto node = RaftNode(makeConfig3(0), ps, log, makeOpts());
 
     Outbox out;
-    electToCandidate(node, 0, out);
+    electToCandidate(node, out);
     Term term = node.currentTerm();
 
     // Promote to Leader
