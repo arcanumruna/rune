@@ -1,0 +1,279 @@
+#include <rune/node/BrokerNode.h>
+
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace fs = std::filesystem;
+using namespace rune::consensus;
+
+namespace rune::node {
+
+// ---------------------------------------------------------------------------
+// Timing constants — mirror ConsensusAgentTest (§6) exactly so a 1-node
+// cluster self-elects within ms, not seconds.
+// ---------------------------------------------------------------------------
+static constexpr int64_t kElectionTimeoutNs        = 150'000'000LL; // 150 ms
+static constexpr int64_t kStatusIntervalNs         =  50'000'000LL; //  50 ms
+static constexpr int64_t kStartupCanvassTimeoutNs  = 300'000'000LL; // 300 ms
+static constexpr int      kIngressCapacity          = 64 * 1024;    //  64 KiB
+
+// ---------------------------------------------------------------------------
+// BrokerNode::BrokerNode
+// ---------------------------------------------------------------------------
+BrokerNode::BrokerNode(NodeConfig config)
+    : config_{std::move(config)}
+{}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::~BrokerNode
+// ---------------------------------------------------------------------------
+BrokerNode::~BrokerNode() {
+    stop();
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::start
+// ---------------------------------------------------------------------------
+void BrokerNode::start() {
+    bool expected = false;
+    if (!started_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return; // idempotent
+    }
+
+    // 1. Create dataDir if missing.
+    fs::path dataDir{config_.dataDir};
+    std::error_code ec;
+    fs::create_directories(dataDir, ec);
+    if (ec) {
+        throw std::runtime_error("BrokerNode: cannot create dataDir '" +
+                                 config_.dataDir + "': " + ec.message());
+    }
+
+    // 2. Start embedded Aeron media driver.
+    startEmbeddedDriver();
+
+    // 3. Connect Aeron client — must point at the same dir as the driver.
+    {
+        const std::string aeronDir =
+            (fs::path{config_.dataDir} / "aeron").string();
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        aeron_ = aeron::Aeron::connect(ctx);
+        if (!aeron_) {
+            throw std::runtime_error("BrokerNode: failed to connect Aeron client");
+        }
+    }
+
+    // 4. Build all consensus objects (NodeStateFile, TermLog, Election, …).
+    buildConsensusObjects();
+
+    // 5. Start the agent runner thread.
+    agentRunner_->start();
+
+    spdlog::info("BrokerNode: node {} started, dataDir={}", config_.nodeId, config_.dataDir);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildConsensusObjects
+// ---------------------------------------------------------------------------
+void BrokerNode::buildConsensusObjects() {
+    const fs::path dataDir{config_.dataDir};
+
+    // Durable persistence files.
+    nodeStateFile_ = std::make_unique<NodeStateFile>(
+        (dataDir / "node-state.dat").string());
+    termLog_ = std::make_unique<TermLog>(
+        (dataDir / "term.log").string());
+
+    // Publisher (outbound transport: NullSink for 1-node).
+    publisher_ = std::make_unique<SbeConsensusPublisher>(nullSink_);
+
+    // Cluster members — one entry per peer in config_.peers.
+    clusterMembers_.clear();
+    clusterMembers_.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) {
+        ClusterMember m;
+        m.id                = peer.id;
+        m.logPosition       = 0;
+        m.logLeadershipTermId = 0;
+        m.leadershipTermId  = 0;
+        clusterMembers_.push_back(m);
+    }
+
+    // IngressRing (MPSC; 64 KiB payload).
+    ingressRing_ = std::make_unique<IngressRing>(kIngressCapacity);
+
+    // Election — startup values matching the single-member test fixture.
+    election_ = std::make_unique<Election>(
+        /*isNodeStartup=*/true,
+        /*gracefulClosedLeaderId=*/-1,
+        /*leadershipTermId=*/0,
+        /*logLeadershipTermId=*/0,
+        /*logPosition=*/0,
+        /*appendPosition=*/0,
+        clusterMembers_,                // copied into Election
+        static_cast<NodeId>(config_.nodeId),
+        *publisher_,
+        *nodeStateFile_,
+        *termLog_,
+        kElectionTimeoutNs,
+        kStatusIntervalNs,
+        kStartupCanvassTimeoutNs,
+        /*rngSeed=*/42u);
+
+    // ConsensusAgent.
+    agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
+
+    // AgentRunner (references must outlive the runner).
+    agentRunner_ = std::make_unique<AgentRunner>(*agent_, idleStrategy_, clock_);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::awaitLeader
+// ---------------------------------------------------------------------------
+bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + timeout;
+
+    while (clock::now() < deadline) {
+        if (isLeader()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return isLeader(); // one final check at deadline
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::isLeader
+// ---------------------------------------------------------------------------
+bool BrokerNode::isLeader() const noexcept {
+    if (!election_) return false;
+    const auto s = election_->state();
+    return s == ElectionState::LeaderReady ||
+           s == ElectionState::LeaderLogReplication ||
+           s == ElectionState::Closed;
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::leaderId
+// ---------------------------------------------------------------------------
+NodeId BrokerNode::leaderId() const noexcept {
+    if (!election_) return -1;
+    return election_->leaderMemberId();
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::stop
+// ---------------------------------------------------------------------------
+void BrokerNode::stop() {
+    bool expected = false;
+    if (!stopped_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        return; // idempotent
+    }
+
+    // Stop the agent runner (signal + join).
+    if (agentRunner_) {
+        agentRunner_->stopAndJoin();
+    }
+
+    // Close the Aeron client.
+    if (aeron_) {
+        aeron_.reset();
+    }
+
+    // Stop the embedded driver.
+    stopEmbeddedDriver();
+
+    spdlog::info("BrokerNode: node {} stopped", config_.nodeId);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::startEmbeddedDriver
+// ---------------------------------------------------------------------------
+void BrokerNode::startEmbeddedDriver() {
+    if (aeron_driver_context_init(&driverCtx_) < 0) {
+        throw std::runtime_error(
+            std::string("BrokerNode: aeron_driver_context_init failed: ") +
+            aeron_errmsg());
+    }
+
+    // Use a node-specific aeron dir to avoid collisions in tests.
+    const std::string aeronDir =
+        (fs::path{config_.dataDir} / "aeron").string();
+    aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
+
+    // SHARED threading: one background thread for sender+receiver+conductor.
+    aeron_driver_context_set_threading_mode(driverCtx_,
+                                            AERON_THREADING_MODE_SHARED);
+    // Clean up on start/shutdown so tests don't leave stale shm files.
+    aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
+    aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
+    // Lightweight idle in the driver thread.
+    aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
+    // Small term buffers — plenty for a 1-node broker.
+    aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
+    aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
+
+    if (aeron_driver_init(&driver_, driverCtx_) < 0) {
+        aeron_driver_context_close(driverCtx_);
+        driverCtx_ = nullptr;
+        throw std::runtime_error(
+            std::string("BrokerNode: aeron_driver_init failed: ") +
+            aeron_errmsg());
+    }
+
+    // manual_main_loop=true: we drive it from our own thread.
+    if (aeron_driver_start(driver_, /*manual_main_loop=*/true) < 0) {
+        aeron_driver_close(driver_);
+        aeron_driver_context_close(driverCtx_);
+        driver_    = nullptr;
+        driverCtx_ = nullptr;
+        throw std::runtime_error(
+            std::string("BrokerNode: aeron_driver_start failed: ") +
+            aeron_errmsg());
+    }
+
+    driverRunning_.store(true, std::memory_order_release);
+    driverThread_ = std::thread([this]() {
+        while (driverRunning_.load(std::memory_order_acquire)) {
+            aeron_driver_main_idle_strategy(
+                driver_,
+                aeron_driver_main_do_work(driver_));
+        }
+    });
+
+    // Give the driver a moment to fully initialise before we connect the client.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    spdlog::info("BrokerNode: embedded Aeron driver started (dir={})",
+                 aeron_driver_context_get_dir(driverCtx_));
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::stopEmbeddedDriver
+// ---------------------------------------------------------------------------
+void BrokerNode::stopEmbeddedDriver() noexcept {
+    // Signal the driver loop to stop.
+    if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
+        if (driverThread_.joinable()) {
+            driverThread_.join();
+        }
+    }
+    if (driver_) {
+        aeron_driver_close(driver_);
+        driver_ = nullptr;
+    }
+    if (driverCtx_) {
+        aeron_driver_context_close(driverCtx_);
+        driverCtx_ = nullptr;
+    }
+}
+
+} // namespace rune::node

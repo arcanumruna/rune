@@ -33,7 +33,10 @@ add_subdirectory(libs/transaction)
 add_subdirectory(libs/node)
 
 add_executable(rune_broker src/main.cpp)
-target_link_libraries(rune_broker PRIVATE rune_storage spdlog::spdlog)
+target_link_libraries(rune_broker PRIVATE rune_node rune_storage spdlog::spdlog)
+if(aeron_FOUND)
+    target_link_libraries(rune_broker PRIVATE aeron::aeron)
+endif()
 
 if(BUILD_BENCHMARKS)
     add_executable(rune_broker_benchmark
