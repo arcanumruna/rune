@@ -1158,3 +1158,74 @@ TEST_F(PartitionReplayMultiRecordTest, ReplayIntoLog_MultiRecord_MatchesLogAppen
         << "BUG 2: replayIntoLog LEO must match direct append LEO for multi-record batch";
     EXPECT_EQ(freshLog.logEndOffset(), static_cast<int64_t>(N));
 }
+
+// ============================================================================
+// S3 fix: recorder byte-budget — large-payload batches fully recorded
+// ============================================================================
+
+TEST_F(PartitionRecorderMultiRecordTest, S3_LargePayloadBatch_FullyRecorded) {
+    // S3 regression: previously the byte budget was endOffset - recordFrom
+    // (offset count), which for a batch with 1 large-payload record is 1 byte
+    // budget vs potentially thousands of bytes of actual batch data.
+    // The fix uses a proper 64 MiB byte budget.
+    //
+    // This test creates a batch with a large value payload (4 KiB) at offset 0
+    // (so offset count = 1 but byte size >> 1).  onCommitted(0, 1) must record
+    // the FULL batch — not truncate at byte 1.
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder  recorder(0, &log, &store);
+
+    // Build and append a batch with a 4 KiB value payload.
+    constexpr std::size_t kValueSize = 4096;
+    auto batch = makeBatch(0, 0xBE, kValueSize); // 4 KiB value
+    log.append(batch, /*lastOffset=*/0); // single-record: baseOffset=0, lastOffsetDelta=0
+
+    ASSERT_GT(static_cast<int64_t>(batch.size()), 1)
+        << "Batch size must be >> 1 byte to exercise the S3 bug";
+
+    recorder.startRecording(0);
+    recorder.onCommitted(0, 1); // offset range = 1, but batch is >> 1 byte
+
+    // S3 fix: the full batch must be recorded (not just 1 byte).
+    EXPECT_EQ(store.batchCount(), 1)
+        << "S3: large-payload batch must be fully recorded; byte-budget bug causes 0 batches";
+    EXPECT_EQ(recorder.getRecordingPosition(), 1)
+        << "S3: recording position must be 1 after recording offset 0..0";
+
+    // Verify the stored batch is byte-equal to what we appended.
+    int batchesSeen = 0;
+    store.scan(0, INT64_MAX, [&](int64_t baseOffset, std::span<const uint8_t> data) {
+        EXPECT_EQ(baseOffset, 0);
+        EXPECT_EQ(data.size(), batch.size())
+            << "S3: stored batch size must match original; got " << data.size()
+            << " want " << batch.size();
+        EXPECT_TRUE(std::equal(data.begin(), data.end(), batch.begin()))
+            << "S3: stored batch content must be byte-equal to original";
+        ++batchesSeen;
+        return true;
+    });
+    EXPECT_EQ(batchesSeen, 1);
+}
+
+TEST_F(PartitionRecorderMultiRecordTest, S3_MultipleLargePayloadBatches_AllRecorded) {
+    // S3: multiple batches each with a large payload, committed in one call.
+    // Each batch occupies far more bytes than its offset count = 1.
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder  recorder(0, &log, &store);
+
+    constexpr int     kBatches   = 5;
+    constexpr std::size_t kValue = 2048; // 2 KiB per batch
+
+    for (int i = 0; i < kBatches; ++i) {
+        auto batch = makeBatch(static_cast<int64_t>(i), static_cast<uint8_t>(i + 1), kValue);
+        log.append(batch, static_cast<int64_t>(i));
+    }
+
+    recorder.startRecording(0);
+    recorder.onCommitted(0, kBatches); // offset count = 5; each batch >> 5 bytes
+
+    EXPECT_EQ(store.batchCount(), kBatches)
+        << "S3: all " << kBatches << " large-payload batches must be recorded";
+    EXPECT_EQ(recorder.getRecordingPosition(), kBatches)
+        << "S3: recording position must be " << kBatches;
+}

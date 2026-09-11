@@ -302,6 +302,10 @@ public:
     void addFollower(NodeId id, PartitionReplica* follower) {
         followers_[id] = follower;
     }
+    /// Remove a follower from the transport (simulates network partition/crash).
+    void removeFollower(NodeId id) {
+        followers_.erase(id);
+    }
 
     // PartitionTransport implementation
     void sendFetchRequest(const FetchRequestMsg& req) override {

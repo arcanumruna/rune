@@ -64,46 +64,66 @@ void PartitionRecorder::onCommitted(int64_t startOffset, int64_t endOffset)
     //   (b) recordingPosition() advances by the batch's true lastOffsetDelta
     //       (not just +1) for multi-record batches.
     //
-    // This fixes BUG 1: previously only the first batch was recorded when
-    // the committed range spanned more than one batch.
-    int32_t maxBytes = static_cast<int32_t>(
-        std::min<int64_t>(endOffset - recordFrom, 64LL * 1024 * 1024));
-    if (maxBytes <= 0) {
-        return;
-    }
+    // S3 fix: use a proper BYTE budget (64 MiB) rather than the offset count
+    // (endOffset - recordFrom), which is much smaller than the actual byte
+    // length of multi-record or large-payload batches and caused silent
+    // under-recording when batch sizes exceeded the offset count.
+    // If the committed range spans more bytes than the 64 MiB cap we loop,
+    // advancing recordFrom past each chunk we've successfully processed.
+    static constexpr int32_t kMaxReadBytes = 64 * 1024 * 1024; // 64 MiB
 
-    auto rawBytes = log_->read(recordFrom, maxBytes);
-    if (rawBytes.empty()) {
-        return;
-    }
-
-    // Walk individual RecordBatch frames within the flat read buffer.
-    std::size_t pos = 0;
-    while (pos < rawBytes.size()) {
-        if (rawBytes.size() - pos <
-                static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-            break;  // truncated — stop
+    int64_t scanFrom = recordFrom;
+    while (scanFrom < endOffset) {
+        auto rawBytes = log_->read(scanFrom, kMaxReadBytes);
+        if (rawBytes.empty()) {
+            break;
         }
 
-        rune::protocol::RecordBatchReader reader(rawBytes.data() + pos,
-                                                  rawBytes.size() - pos);
-        int32_t batchLen = reader.totalLength();
-        if (batchLen <= 0 ||
-            pos + static_cast<std::size_t>(batchLen) > rawBytes.size()) {
-            break;  // incomplete frame — stop
+        // Walk individual RecordBatch frames within the flat read buffer.
+        std::size_t pos = 0;
+        bool advanced = false;
+        while (pos < rawBytes.size()) {
+            if (rawBytes.size() - pos <
+                    static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+                break;  // truncated — stop
+            }
+
+            rune::protocol::RecordBatchReader reader(rawBytes.data() + pos,
+                                                      rawBytes.size() - pos);
+            int32_t batchLen = reader.totalLength();
+            if (batchLen <= 0 ||
+                pos + static_cast<std::size_t>(batchLen) > rawBytes.size()) {
+                break;  // incomplete frame — stop
+            }
+
+            int64_t batchBase = reader.baseOffset();
+
+            if (batchBase >= endOffset) {
+                // Past the committed range — stop reading.
+                goto done_reading; // NOLINT(cppcoreguidelines-avoid-goto)
+            }
+
+            // Only record batches that start within [recordFrom, endOffset).
+            if (batchBase >= recordFrom && batchBase < endOffset) {
+                store_->append(batchBase,
+                               std::span<const uint8_t>(rawBytes.data() + pos,
+                                                         static_cast<std::size_t>(batchLen)));
+                // Advance scanFrom past this batch for the next read iteration.
+                rune::protocol::RecordBatchReader r2(rawBytes.data() + pos,
+                                                      rawBytes.size() - pos);
+                scanFrom = r2.baseOffset() + r2.lastOffsetDelta() + 1;
+                advanced = true;
+            }
+
+            pos += static_cast<std::size_t>(batchLen);
         }
 
-        int64_t batchBase = reader.baseOffset();
-
-        // Only record batches that start within [recordFrom, endOffset).
-        if (batchBase >= recordFrom && batchBase < endOffset) {
-            store_->append(batchBase,
-                           std::span<const uint8_t>(rawBytes.data() + pos,
-                                                     static_cast<std::size_t>(batchLen)));
+        if (!advanced) {
+            // No progress in this chunk — stop to avoid an infinite loop.
+            break;
         }
-
-        pos += static_cast<std::size_t>(batchLen);
     }
+    done_reading:;
 }
 
 // ---------------------------------------------------------------------------

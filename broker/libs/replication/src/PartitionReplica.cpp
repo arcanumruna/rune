@@ -100,6 +100,13 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     leaderState_.setIsr(isr);
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
 
+    // B2 fix: restore the HW floor to the committed offset this new leader
+    // already holds.  A node elected from the ISR holds all committed data
+    // (ISR invariant), so its LEO is a safe lower bound for the committed HW.
+    // Without this, the new leader reports HW=0 until followers re-ack,
+    // making the committed prefix momentarily unreadable (EOS regression).
+    leaderState_.setHighWatermarkFloor(log_->logEndOffset());
+
     epochCache_.assign(static_cast<int32_t>(epoch_), log_->logEndOffset());
 
     lastIsrCheckNs_ = 0;
@@ -112,11 +119,25 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     // belt-and-suspenders path). Compute the boundary using the PRE-transition
     // epoch so the cache lookup is correct.
     if (leaderEpoch > epoch_) {
-        // Capture the high-watermark NOW (while role may still be Leader and
-        // leaderState_ is valid) to use as the floor for truncation.
+        // C2: Capture the committed HW NOW (while the old role is still valid)
+        // as the safety floor for truncation.
+        //
+        // For a node that WAS leader:   highWatermark() returns leaderState_.highWatermark()
+        //                                which is the exact committed offset (accurate).
+        // For a node that WAS follower: highWatermark() returns followerHw_ =
+        //                                min(localLeo, lastKnownLeaderHw) — conservative;
+        //                                may be below the true committed offset if the
+        //                                follower missed a HW-only update, but is never
+        //                                above it, so truncating here never drops committed
+        //                                data and at worst causes a re-fetch of a small
+        //                                committed tail (safe).
+        //
+        // A full OffsetsForLeaderEpoch exchange with the new leader (Kafka P3)
+        // would give a precise boundary, but is out of scope for this phase.
+        // Truncating to committedHw is the documented safe fallback.
         Offset committedHw = highWatermark();
 
-        // Try epoch-cache boundary first (Kafka OffsetsForLeaderEpoch path).
+        // Try epoch-cache boundary first (Kafka OffsetsForLeaderEpoch-style).
         Offset truncOff = truncationOffsetForEpochChange(epochCache_, leaderEpoch);
 
         // If the cache returns -1 (no epoch >= leaderEpoch in our cache, which
@@ -128,6 +149,8 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
         }
 
         // Safety clamp: never truncate below the committed prefix.
+        // This ensures C2: we never drop committed data regardless of what the
+        // epoch-cache returns.
         if (truncOff < committedHw) {
             truncOff = committedHw;
         }
@@ -250,7 +273,32 @@ std::vector<uint8_t> PartitionReplica::read(Offset fetchOffset,
     if (fetchOffset >= hw) {
         return {}; // nothing committed at this position
     }
-    return log_->read(fetchOffset, maxBytes);
+    // C1 fix: clamp read to [fetchOffset, HW) so consumers never receive
+    // records with offset >= HW (uncommitted).  Walk the batches returned by
+    // the log and drop any that start at or beyond HW.
+    auto raw = log_->read(fetchOffset, maxBytes);
+    if (raw.empty()) return {};
+
+    // Walk individual RecordBatch frames and stop before any batch whose
+    // baseOffset >= HW (exclusive upper bound on committed data).
+    std::size_t pos = 0;
+    std::size_t committedEnd = 0;
+    while (pos < raw.size()) {
+        std::size_t rem = raw.size() - pos;
+        if (rem < static_cast<std::size_t>(
+                rune::protocol::batch::kRecordBatchOverhead)) break;
+        rune::protocol::RecordBatchReader r(raw.data() + pos, rem);
+        int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > raw.size()) break;
+        int64_t batchBase = r.baseOffset();
+        if (batchBase >= hw) break; // this batch starts at or beyond HW — stop
+        committedEnd = pos + static_cast<std::size_t>(total);
+        pos = committedEnd;
+    }
+
+    if (committedEnd == 0) return {};
+    raw.resize(committedEnd);
+    return raw;
 }
 
 // ---------------------------------------------------------------------------
@@ -412,23 +460,11 @@ const std::vector<NodeId>& PartitionReplica::isr() const noexcept
 
 void PartitionReplica::recomputeHw()
 {
-    // Ensure leader LEO is current before computing.
+    // S1/C4 fix: setLeaderLogEndOffset now eagerly recomputes HW internally,
+    // so a single call is sufficient.  We no longer call
+    // updateFollowerFetchOffset(selfId, ...) — that was an incorrect hack that
+    // polluted the follower LEO map with the leader's own entry.
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
-    // ReplicaLeaderState recomputes HW internally on the next follower update
-    // or when we force it via setLeaderLogEndOffset.  Because HW is only
-    // recomputed inside updateFollowerFetchOffset() and setLeaderLogEndOffset
-    // doesn't trigger it, we force a recompute by re-issuing the leader's own
-    // LEO update which calls recomputeHw() inside the state object.
-    //
-    // Actually ReplicaLeaderState::setLeaderLogEndOffset does NOT call
-    // recomputeHw() — only updateFollowerFetchOffset does. For a 1-member ISR
-    // (leader only), we can force recompute by pretending the leader fetched:
-    // But that's wrong for a multi-member ISR.
-    //
-    // Solution: we expose a public recompute trigger by calling
-    // updateFollowerFetchOffset for the leader itself with the current LEO.
-    // This is semantically correct: the leader "fetched" its own LEO.
-    leaderState_.updateFollowerFetchOffset(cfg_.selfId, log_->logEndOffset());
 }
 
 void PartitionReplica::syncIsrToLeaderState()

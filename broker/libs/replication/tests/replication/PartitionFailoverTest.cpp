@@ -1381,3 +1381,232 @@ TEST_F(FailoverTest3, DoWork_SignalButLeaderStillAlive_NoElection) {
     EXPECT_EQ(coord_->currentLeader(), kL)
         << "Leader must not change when liveness oracle contradicts the signal";
 }
+
+// ===========================================================================
+// Audit fix tests: C3, B1-failover, B2-failover committed-read
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// C3: Election must reject candidates that don't hold the committed prefix.
+//     A node with LEO < committedHw must not be elected.
+// ---------------------------------------------------------------------------
+
+TEST(ElectionC3Test, CandidateWithLEOBelowCommittedHW_NotElected) {
+    // 3-replica ISR: kL=leader, kF2=caught-up follower, kF3=lagging follower.
+    // kF3 has LEO < committedHw — must NOT be elected as new leader.
+    TempDir dL("c3_L"), dF2("c3_F2"), dF3("c3_F3");
+    rune::storage::Log logL(dL.path), logF2(dF2.path), logF3(dF3.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF2 = 2, kF3 = 3;
+    std::vector<NodeId> replicas = {kL, kF2, kF3};
+    std::vector<NodeId> isr      = {kL, kF2, kF3};
+
+    PartitionReplica leader(makeConfig(kL),  Role::Leader,   1, replicas, isr, &logL,  &transport);
+    PartitionReplica f2    (makeConfig(kF2), Role::Follower, 1, replicas, isr, &logF2, &transport);
+    PartitionReplica f3    (makeConfig(kF3), Role::Follower, 1, replicas, isr, &logF3, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF2, &f2);
+    transport.addFollower(kF3, &f3);
+
+    // Fully replicate 5 records to f2 and f3 (HW=5).
+    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i)));
+    Offset hw = leader.logEndOffset();
+    int64_t clock = 0;
+    bool committed = false;
+    for (int i = 0; i < kDriverCap && !committed; ++i) {
+        clock += kStep1ms;
+        leader.doWork(clock); f2.doWork(clock); f3.doWork(clock);
+        transport.pump(clock);
+        committed = (leader.highWatermark() >= hw && f2.logEndOffset() >= hw && f3.logEndOffset() >= hw);
+    }
+    ASSERT_TRUE(committed) << "All must commit 5 records";
+
+    // Now simulate f3 lagging by truncating its log to LEO=2 (below committedHw=5).
+    // We can't call f3.truncateTo directly, but we can rebuild f3 with an empty log.
+    // Build a coordinator where kF3 has LEO < committed HW.
+    TempDir dL2("c3_L2"), dF2b("c3_F2b"), dF3b("c3_F3b");
+    rune::storage::Log logL2(dL2.path), logF2b(dF2b.path), logF3b(dF3b.path);
+    InMemoryTransport t2;
+
+    // logF3b starts empty (LEO=0, which is < committedHw).
+    PartitionReplica leader2(makeConfig(kL),  Role::Leader,   1, replicas, isr, &logL2,  &t2);
+    PartitionReplica f2b    (makeConfig(kF2), Role::Follower, 1, replicas, isr, &logF2b, &t2);
+    PartitionReplica f3b    (makeConfig(kF3), Role::Follower, 1, replicas, isr, &logF3b, &t2);
+    t2.setLeader(&leader2);
+    t2.addFollower(kF2, &f2b);
+    t2.addFollower(kF3, &f3b);
+
+    // Produce and commit 5 records; f2b and f3b replicate.
+    for (int i = 0; i < 5; ++i) leader2.append(makePayload(static_cast<uint8_t>(i)));
+    Offset hw2 = leader2.logEndOffset();
+    clock = 0;
+    committed = false;
+    for (int i = 0; i < kDriverCap && !committed; ++i) {
+        clock += kStep1ms;
+        leader2.doWork(clock); f2b.doWork(clock); f3b.doWork(clock);
+        t2.pump(clock);
+        committed = (leader2.highWatermark() >= hw2 && f2b.logEndOffset() >= hw2 && f3b.logEndOffset() >= hw2);
+    }
+    ASSERT_TRUE(committed) << "All must replicate 5 records";
+    ASSERT_EQ(leader2.highWatermark(), 5);
+
+    // Now build a coordinator where f3b's LEO is forced below committedHw by
+    // creating a "behind" replica for f3.  We simulate this with a separate
+    // behind-log that was never replicated.
+    TempDir dF3c("c3_F3c");
+    rune::storage::Log logF3c(dF3c.path); // empty log (LEO=0) — behind
+    InMemoryTransport t3;
+    PartitionReplica f3behind(makeConfig(kF3), Role::Follower, 1, replicas, isr, &logF3c, &t3);
+    ASSERT_EQ(f3behind.logEndOffset(), 0) << "f3behind must have LEO=0 (below committedHw=5)";
+
+    // Election: kL is dead. Candidates: kF2 (LEO=5, >= committedHw=5) and kF3behind (LEO=0).
+    // C3 fix: f3behind has LEO < committedHw → must be rejected.
+    // Expected result: kF2 wins (only eligible candidate).
+    PartitionMetadata meta;
+    meta.partitionId = 0; meta.leader = kL; meta.replicas = replicas;
+    meta.isr = isr; meta.leaderEpoch = 1;
+    SimpleNodeLiveness liveness;
+    PartitionFailoverCoordinator coord(meta, &liveness);
+    coord.registerReplica(kL,  &leader2);     // leader (dead)
+    coord.registerReplica(kF2, &f2b);          // caught up (LEO=5)
+    coord.registerReplica(kF3, &f3behind);     // lagging (LEO=0 < committedHw=5)
+
+    bool elected = coord.electNewLeader();
+    ASSERT_TRUE(elected) << "Election must succeed (kF2 is eligible)";
+    EXPECT_EQ(coord.currentLeader(), kF2)
+        << "C3: only kF2 (LEO=5 >= committedHw=5) must be elected; "
+           "kF3 (LEO=0 < committedHw=5) must be rejected";
+}
+
+// ---------------------------------------------------------------------------
+// B2 + T1: After failover, new leader's read() returns committed prefix
+//           IMMEDIATELY (no re-drive required) — byte-equality check.
+// ---------------------------------------------------------------------------
+
+TEST_F(FailoverTest3, AfterFailover_NewLeader_CommittedReadImmediateByteEqual) {
+    // T1/B2 strengthened: produce+commit K records on the old leader.
+    // After failover, the new leader's read(0, big) must return EXACTLY the
+    // committed bytes — not empty and not containing uncommitted records.
+    constexpr int K = 4;
+    Offset committedHw = produceAndCommit(K);
+    ASSERT_GE(committedHw, 1);
+
+    // Capture committed bytes from the old leader.
+    auto oldLeaderBytes = leader_->read(0, 1 << 20);
+    ASSERT_FALSE(oldLeaderBytes.empty()) << "Old leader must have committed reads";
+
+    // Kill old leader; elect new one.
+    liveness_.markDead(kL);
+    coord_->signalLeaderDead();
+    bool elected = coord_->electNewLeader();
+    ASSERT_TRUE(elected);
+
+    NodeId newLeader = coord_->currentLeader();
+    PartitionReplica* nlReplica = (newLeader == kF2) ? follower2_.get() : follower3_.get();
+
+    // B2 fix: HW must be >= committedHw IMMEDIATELY after becomeLeader.
+    EXPECT_GE(nlReplica->highWatermark(), committedHw)
+        << "B2: new leader HW must be >= committedHw immediately (was 0 before fix)";
+
+    // T1 strengthened: byte-equality of committed prefix — not just non-empty.
+    auto newLeaderBytes = nlReplica->read(0, 1 << 20);
+    ASSERT_FALSE(newLeaderBytes.empty())
+        << "B2: new leader must serve committed reads immediately after failover";
+    EXPECT_EQ(newLeaderBytes, oldLeaderBytes)
+        << "T1/B2: new leader committed read must be byte-equal to old leader's data";
+}
+
+// ---------------------------------------------------------------------------
+// B1 + T4: Strengthened fencing — follower re-fetches from lower offset after
+//           truncation; leader must not count stale pre-truncation LEO.
+// ---------------------------------------------------------------------------
+
+TEST_F(FailoverTest3, B1_T4_OldLeaderTruncatesAndRefetchesLower_HWNotStale) {
+    // T4 strengthened: after failover, the old leader (now follower) truncates
+    // and re-fetches from a LOWER offset.  The new leader must NOT treat the
+    // old leader's stale pre-truncation LEO as counting toward majority HW.
+    //
+    // Scenario:
+    //   1. Commit 5 records (HW=5) across 3 replicas.
+    //   2. Old leader (kL) appends 3 more uncommitted records (LEO=8, HW=5).
+    //   3. Failover: kL becomes follower, kF2 becomes new leader (epoch 2).
+    //   4. Old leader kL truncates its uncommitted tail → LEO=5.
+    //   5. kL sends FetchRequest to new leader at fetchOffset=5.
+    //   6. New leader (kF2) must update its tracked kL LEO to 5 (not keep 8).
+    //   7. HW of new leader must not advance past 5 until kL re-acks at 5+.
+
+    constexpr int K = 5;
+    Offset hw = produceAndCommit(K);
+    ASSERT_EQ(hw, K);
+
+    // All replicas must have full log.
+    bool allCaughtUp = false;
+    for (int i = 0; i < kDriverCap && !allCaughtUp; ++i) {
+        clock_ += kStep1ms;
+        leader_->doWork(clock_); follower2_->doWork(clock_); follower3_->doWork(clock_);
+        transport_.pump(clock_);
+        allCaughtUp = (follower2_->logEndOffset() >= hw && follower3_->logEndOffset() >= hw);
+    }
+    ASSERT_TRUE(allCaughtUp);
+
+    // Old leader appends 3 uncommitted records (majority ISR won't ack them
+    // because we disconnect followers before producing).
+    transport_.removeFollower(kF2);
+    transport_.removeFollower(kF3);
+    for (int i = 0; i < 3; ++i)
+        leader_->append(makePayload(static_cast<uint8_t>(i + 10)));
+    ASSERT_EQ(leader_->logEndOffset(), 8); // 5 committed + 3 uncommitted
+
+    // Failover: elect kF2 (has LEO=5).
+    liveness_.markDead(kL);
+    coord_->signalLeaderDead();
+    bool elected = coord_->electNewLeader();
+    ASSERT_TRUE(elected);
+    ASSERT_EQ(coord_->currentLeader(), kF2);
+
+    // B2: kF2's HW must be >= 5 immediately.
+    EXPECT_GE(follower2_->highWatermark(), hw)
+        << "B2: new leader kF2 HW must be >= committed hw immediately";
+
+    // kL (old leader, now follower) truncated to HW=5 on becomeFollower.
+    EXPECT_LE(leader_->logEndOffset(), hw)
+        << "Old leader must truncate uncommitted tail to <= committedHw";
+
+    // Old leader sends a FetchRequest from LEO=5 (post-truncation) to new leader kF2.
+    transport_.setLeader(follower2_.get());
+    transport_.addFollower(kL, leader_.get());
+
+    FetchRequestMsg lowerReq{};
+    lowerReq.leaderEpoch = static_cast<Epoch>(coord_->currentEpoch());
+    lowerReq.partition   = 0;
+    lowerReq.followerId  = kL;
+    lowerReq.fetchOffset = leader_->logEndOffset(); // should be 5
+    lowerReq.maxBytes    = 1 << 20;
+
+    int16_t err = follower2_->onFetchRequest(lowerReq, clock_);
+    ASSERT_EQ(err, kErrNone) << "Fetch at post-truncation LEO must be accepted";
+
+    // B1 fix: new leader kF2's HW must still be >= committedHw=5.
+    EXPECT_GE(follower2_->highWatermark(), hw)
+        << "B1: HW must not regress after old leader re-fetches at lower LEO";
+
+    // Produce 3 more records on the new leader.
+    follower2_->append(makePayload(0xAA));
+    follower2_->append(makePayload(0xBB));
+    follower2_->append(makePayload(0xCC));
+    Offset newLeo = follower2_->logEndOffset();
+
+    // HW must NOT advance to newLeo without the old leader re-acking.
+    // (ISR={kF2,kF3} after election — kL was removed; majority = 2 of kF2+kF3)
+    // Drive kF3 to ack the new records.
+    transport_.addFollower(kF3, follower3_.get());
+    bool hwAdvanced = false;
+    for (int i = 0; i < kDriverCap && !hwAdvanced; ++i) {
+        clock_ += kStep1ms;
+        follower2_->doWork(clock_); follower3_->doWork(clock_);
+        transport_.pump(clock_);
+        hwAdvanced = (follower2_->highWatermark() >= newLeo);
+    }
+    ASSERT_TRUE(hwAdvanced) << "HW must advance with kF2+kF3 majority";
+    EXPECT_GE(follower2_->highWatermark(), newLeo);
+}

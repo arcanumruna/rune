@@ -15,7 +15,7 @@
 //   1. Collect the logEndOffset (LEO) of each ISR member:
 //        – Leader: its own logEndOffset (always up-to-date; updated via
 //          setLeaderLogEndOffset()).
-//        – Follower: the fetchOffset last reported in its FetchRequest
+//        – Follower: the fetchOffset MOST RECENTLY reported in its FetchRequest
 //          (updated via updateFollowerFetchOffset()).  Unknown followers
 //          default to 0 (conservative: they haven't confirmed anything).
 //   2. Sort LEOs descending.
@@ -23,8 +23,10 @@
 //   4. HW = LEOs[majority - 1]  (the majority-th highest = the value that
 //      at least `majority` members have reached or exceeded).
 //   5. HW is monotonic: store max(prevHW, computed).  Once advanced, it
-//      never regresses even if a follower's tracked LEO becomes stale or a
-//      late-arriving update attempts to lower it.
+//      never regresses even if a follower truncates and re-fetches from a
+//      lower offset — the per-follower LEO tracks the LATEST reported value
+//      (may decrease on truncation), but the global HW floor prevHw_ never
+//      goes below the highest committed point.
 //
 // This differs from Kafka's ISR-min HW (which is all-ISR minimum, not
 // majority). Our spec §4 requires majority-ack for durability, consistent
@@ -38,12 +40,22 @@
 // computation uses the leader's LEO (not the followerLeo map) for the leader's
 // ISR slot.
 //
-// ## Monotonicity
+// ## Per-follower LEO semantics
 //
-// updateFollowerFetchOffset() is monotonic per follower: a smaller value than
-// previously recorded is ignored (e.g. a late-arriving message).
-// highWatermark() additionally stores the running max, so the returned value
-// never decreases.
+// updateFollowerFetchOffset() tracks the LATEST reported fetch offset per
+// follower — it is NOT monotonic per-follower.  When a follower truncates and
+// re-fetches from a lower offset, the leader must use the lower value so HW
+// is recomputed from what a majority CURRENTLY holds, not from a stale
+// pre-truncation value.  The GLOBAL HW floor (prevHw_) remains monotonic:
+// once HW reaches X it never drops below X, preserving the committed prefix
+// guarantee.
+//
+// ## Recomputation
+//
+// highWatermark() always returns the monotonic floor prevHw_, which is
+// recomputed eagerly inside every mutator (setLeaderLogEndOffset, setIsr,
+// updateFollowerFetchOffset).  Callers do not need to call a separate
+// recompute() method.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -71,11 +83,11 @@ public:
 
     /// Replace the ISR with the given set.
     /// The ISR is the authoritative membership list for HW computation.
-    /// After a setIsr() call, highWatermark() recomputes from scratch on the
-    /// next call (the monotonic floor prevHw_ is preserved, so HW never
-    /// regresses due to a configuration change).
+    /// Eagerly recomputes and advances the monotonic HW floor so that
+    /// highWatermark() is never stale after a membership change.
     void setIsr(std::vector<NodeId> isr) {
         isr_ = std::move(isr);
+        recomputeHw(); // S1: recompute on every mutator
     }
 
     // -----------------------------------------------------------------------
@@ -84,8 +96,10 @@ public:
 
     /// Advance the leader's own logEndOffset.
     /// Called after each successful append to the leader's in-memory log.
+    /// Eagerly recomputes HW so highWatermark() is never stale.
     void setLeaderLogEndOffset(Offset leo) noexcept {
         leaderLeo_ = leo;
+        recomputeHw(); // S1: recompute on every mutator
     }
 
     /// Record that a follower has confirmed it has fetched up to `fetchOffset`.
@@ -94,27 +108,45 @@ public:
     /// (the next offset it wants), which means it holds all records up to
     /// fetchOffset - 1.  For HW purposes, we treat it as the follower's LEO.
     ///
-    /// Monotonic: a value smaller than the current tracked LEO for this
-    /// follower is silently ignored (late-arriving message protection).
+    /// Per-follower LEO tracks the LATEST (most recently) reported value and
+    /// is NOT monotonically clamped.  When a follower truncates and re-fetches
+    /// from a lower offset, the lower value must be recorded so HW is
+    /// recomputed from what the follower CURRENTLY holds — not a stale
+    /// pre-truncation value that could cause HW to advance past data only a
+    /// pre-truncation minority held (B1 fix).
+    ///
+    /// The GLOBAL HW floor (prevHw_) remains monotonic: once committed, HW
+    /// never regresses, so the committed prefix is never exposed as
+    /// uncommitted.
     void updateFollowerFetchOffset(NodeId followerId, Offset fetchOffset) {
-        auto& current = followerLeo_[followerId];
-        if (fetchOffset > current) {
-            current = fetchOffset;
-        }
-        // Recompute and cache HW monotonically.
+        followerLeo_[followerId] = fetchOffset; // B1 fix: SET not max
+        // Recompute and advance the monotonic committed floor.
         recomputeHw();
+    }
+
+    /// Expose a public recompute trigger for callers that need to force an
+    /// HW recalculation (e.g., after setLeaderLogEndOffset when the ISR is
+    /// leader-only and no follower fetch triggers recomputation).
+    void recompute() noexcept { recomputeHw(); }
+
+    /// Set the initial high-watermark floor (B2 fix: called by becomeLeader to
+    /// restore the committed offset so HW never regresses to 0 on failover).
+    /// The floor is applied monotonically: only advances if `floor` > prevHw_.
+    void setHighWatermarkFloor(Offset floor) noexcept {
+        if (floor > prevHw_) {
+            prevHw_ = floor;
+        }
     }
 
     // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
 
-    /// Compute the majority high-watermark (spec §4).
+    /// Return the majority high-watermark (spec §4).
     ///
-    /// Algorithm:
-    ///   1. Build a list of LEOs for all ISR members.
-    ///   2. Sort descending.
-    ///   3. Return LEOs[majority - 1], clamped to the monotonic floor prevHw_.
+    /// Returns the monotonic floor prevHw_, which is eagerly updated by every
+    /// mutator (setLeaderLogEndOffset, setIsr, updateFollowerFetchOffset).
+    /// The value is always current — no separate recompute() call required.
     ///
     /// If the ISR is empty, returns 0 (safe: no commit possible).
     Offset highWatermark() const noexcept {

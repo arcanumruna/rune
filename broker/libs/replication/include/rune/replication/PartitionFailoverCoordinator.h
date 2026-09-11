@@ -255,8 +255,13 @@ public:
 
     /// Elect a new leader from the current ISR immediately.
     ///
+    /// C3 fix: only elects candidates that (a) are registered and (b) hold
+    /// the committed prefix (LEO >= last committed HW).  Hard-errors if an
+    /// ISR member is unregistered — defaulting to LEO=0 would silently make
+    /// a node appear safe to elect while actually having no data.
+    ///
     /// \returns true if a new leader was elected; false if ISR is empty or
-    ///          leader is already alive.
+    ///          no candidate holds the committed prefix.
     bool electNewLeader()
     {
         // Collect ISR candidates (exclude the dead leader).
@@ -271,11 +276,9 @@ public:
 
         if (candidates.empty()) {
             // Cannot elect — no ISR members besides the dead leader.
-            // (If ISR has only the leader, we can't safely elect.)
             return false;
         }
 
-        // Deterministic election: highest LEO, tie-break by smallest NodeId.
         // Refresh LEOs from registered replicas.
         for (auto& e : entries_) {
             if (e.replica != nullptr) {
@@ -283,9 +286,47 @@ public:
             }
         }
 
-        NodeId chosen = candidates[0];
-        Offset chosenLeo = leoOf(chosen);
+        // Determine the committed HW from the current leader's replica (if still
+        // registered).  Used as the minimum LEO a candidate must hold.
+        Offset committedHw = 0;
+        for (const auto& e : entries_) {
+            if (e.nodeId == oldLeader && e.replica != nullptr) {
+                committedHw = e.replica->highWatermark();
+                break;
+            }
+        }
+
+        // C3 fix: filter candidates to those registered with LEO >= committedHw.
+        // An ISR member that is not registered is a hard assertion violation —
+        // the invariant is that all ISR members are registered before election.
+        std::vector<NodeId> eligible;
+        eligible.reserve(candidates.size());
         for (NodeId n : candidates) {
+            bool found = false;
+            for (const auto& e : entries_) {
+                if (e.nodeId == n) {
+                    found = true;
+                    // Reject candidates that don't hold the committed prefix.
+                    if (e.knownLeo >= committedHw) {
+                        eligible.push_back(n);
+                    }
+                    break;
+                }
+            }
+            // C3 fix: assert ISR member is registered; defaulting to 0 is unsafe.
+            assert(found && "ISR member not registered with coordinator — call registerReplica before electNewLeader");
+            (void)found;
+        }
+
+        if (eligible.empty()) {
+            // No candidate holds the committed prefix — cannot safely elect.
+            return false;
+        }
+
+        // Deterministic election: highest LEO, tie-break by smallest NodeId.
+        NodeId chosen = eligible[0];
+        Offset chosenLeo = leoOf(chosen);
+        for (NodeId n : eligible) {
             Offset nLeo = leoOf(n);
             if (nLeo > chosenLeo || (nLeo == chosenLeo && n < chosen)) {
                 chosen    = n;
@@ -296,9 +337,8 @@ public:
         // Bump epoch.
         Epoch newEpoch = meta_.leaderEpoch + 1;
 
-        // New ISR = all current ISR members except the dead leader (they all
-        // hold all committed data ≤ HW by ISR invariant).
-        std::vector<NodeId> newIsr = candidates;
+        // New ISR = all ELIGIBLE ISR members (they all hold committed data).
+        std::vector<NodeId> newIsr = eligible;
 
         // Ensure the new leader is in the ISR.
         if (!inVec(newIsr, chosen)) {
