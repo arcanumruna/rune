@@ -38,6 +38,7 @@ int64_t Log::recover() {
     logEndOffset_ = next;
     return next;
 }
+void Log::sync() { activeSegment().sync(); }
 std::vector<int64_t> Log::segmentBaseOffsets() const {
     std::vector<int64_t> v; for (auto& [b, _] : segments_) v.push_back(b); return v;
 }

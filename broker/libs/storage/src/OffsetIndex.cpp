@@ -39,4 +39,19 @@ OffsetPosition OffsetIndex::lookup(int64_t target) const {
     if (slot < 0) return { baseOffset_, 0 };
     return parseEntry(slot);
 }
+void OffsetIndex::rebuildEntries() {
+    entries_ = 0;
+    const uint8_t* p = file_->data();
+    size_t cap = file_->size() / static_cast<size_t>(kEntrySize);
+    for (size_t i = 0; i < cap; ++i) {
+        int32_t rel = 0, pos = 0;
+        std::memcpy(&rel, p + i * static_cast<size_t>(kEntrySize), 4);
+        std::memcpy(&pos, p + i * static_cast<size_t>(kEntrySize) + 4, 4);
+        // The mmap is zero-filled beyond written entries.
+        // The first entry may legitimately have rel==0 and pos==0 (baseOffset, position 0).
+        // Subsequent entries with both fields == 0 mark the end of written data.
+        if (i > 0 && rel == 0 && pos == 0) break;
+        ++entries_;
+    }
+}
 } // namespace rune::storage

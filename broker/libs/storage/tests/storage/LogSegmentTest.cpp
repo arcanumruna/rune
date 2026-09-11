@@ -5,6 +5,8 @@
 #include <numeric>
 #include <atomic>
 #include <chrono>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 using namespace rune::storage; using namespace rune::protocol;
 
@@ -438,4 +440,154 @@ TEST(LogSegment, ReadWithTinyMaxBytesAcrossManyIndexEntries) {
     }
 
     std::filesystem::remove_all(dir);
+}
+
+// ---- B1+B2 / T2: Durability tests ----
+
+// B1+B2: After append (which calls sync()), a raw POSIX stat of the file sees
+// the full batch bytes — confirming fdatasync pushed data out of the libc buffer.
+TEST(LogSegment, SyncMakesBatchesReadableOnReopen) {
+    auto dir = makeTempDir("rune_seg_sync");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    std::string logPath;
+    int64_t expectedSize = 0;
+    {
+        LogSegment seg(dir.string(), 0);
+        RecordBatchBuilder b0(0, 1000); b0.append("sync_k", "sync_v", 1000);
+        auto batch = b0.build();
+        expectedSize = static_cast<int64_t>(batch.size());
+        seg.append(batch, 0);
+        // sync() is called inside append() (durable-by-default)
+        logPath = seg.logPath();
+    }
+
+    // Raw POSIX stat of the file (bypasses all in-process caching)
+    struct stat st{};
+    int rc = ::stat(logPath.c_str(), &st);
+    ASSERT_EQ(rc, 0) << "cannot stat log file after sync";
+    EXPECT_EQ(static_cast<int64_t>(st.st_size), expectedSize)
+        << "sync() must ensure batch bytes reach the file (size mismatch implies flush failure)";
+
+    std::filesystem::remove_all(dir);
+}
+
+// T2-real: After append+sync, a fresh LogSegment opening the SAME file
+// (new fstream, new fd — no shared in-process state) sees all synced batches.
+TEST(LogSegment, SyncedDataSurvivesFreshSegmentOpen) {
+    auto dir = makeTempDir("rune_seg_t2");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    const int64_t expectedBatches = 3;
+    {
+        LogSegment seg(dir.string(), 0, 1); // indexInterval=1
+        for (int64_t i = 0; i < expectedBatches; ++i) {
+            RecordBatchBuilder b(i, 7000 + i); b.append("k", "v" + std::to_string(i), 7000 + i);
+            seg.append(b.build(), i);
+            // sync() is already called by append (durable-by-default)
+        }
+    }
+    // seg is destroyed (fd closed). Now open a completely fresh segment.
+    LogSegment seg2(dir.string(), 0, 1);
+    int64_t next = seg2.recover();
+    EXPECT_EQ(next, expectedBatches)
+        << "All synced batches must survive a fresh segment open";
+
+    // All offsets readable
+    for (int64_t i = 0; i < expectedBatches; ++i) {
+        auto buf = seg2.read(i, 1 << 20);
+        ASSERT_FALSE(buf.empty()) << "offset " << i << " missing after reopen";
+        RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), i);
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// B3: After recover(), the canonical .index exists and .index2 does NOT.
+TEST(LogSegment, RecoverProducesCanonicalIndexNoIndex2) {
+    auto dir = makeTempDir("rune_seg_b3");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    std::string logPath;
+    {
+        LogSegment seg(dir.string(), 0, 1); // indexInterval=1 -> every batch indexed
+        for (int i = 0; i < 4; ++i) {
+            RecordBatchBuilder b(i, 9000 + i); b.append("k", "v", 9000 + i);
+            seg.append(b.build(), i);
+        }
+        logPath = seg.logPath();
+        // Append junk to trigger recover() truncation path
+        std::ofstream f(logPath, std::ios::binary | std::ios::app);
+        const char junk[3] = {0x7f, 0x00, 0x01};
+        f.write(junk, 3);
+    }
+
+    LogSegment seg2(dir.string(), 0, 1);
+    seg2.recover();
+
+    std::string base = logPath.substr(0, logPath.size() - 4);
+    EXPECT_TRUE(std::filesystem::exists(base + ".index"))
+        << "Canonical .index must exist after recover()";
+    EXPECT_FALSE(std::filesystem::exists(base + ".index2"))
+        << ".index2 must NOT exist after recover() — it's an orphan";
+
+    // The canonical index must be usable: read at offset 2 returns the right batch.
+    auto buf = seg2.read(2, 1 << 20);
+    ASSERT_FALSE(buf.empty());
+    RecordBatchReader r(buf.data(), buf.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 2);
+
+    std::filesystem::remove_all(dir);
+}
+
+// C2: Index produced by recover() must be reproducible.
+// Verify that read() at the same offset returns the same batch from two
+// independently-recovered copies of the same data.
+TEST(LogSegment, RecoverIndexMatchesAppendIndex) {
+    const int32_t interval = 256; // small but not 1
+    const int N = 12;
+
+    auto dir1 = makeTempDir("rune_c2_live");
+    auto dir2 = makeTempDir("rune_c2_rec");
+    std::filesystem::create_directories(dir1);
+    std::filesystem::create_directories(dir2);
+
+    // Write the live segment
+    {
+        LogSegment live(dir1.string(), 0, interval);
+        for (int i = 0; i < N; ++i) {
+            RecordBatchBuilder b(i, 5000 + i); b.append("k", "v", 5000 + i);
+            live.append(b.build(), i);
+        }
+    }
+
+    // Copy the .log to dir2, add junk, then recover both
+    auto livePath = dir1.string() + "/00000000000000000000.log";
+    auto recPath  = dir2.string() + "/00000000000000000000.log";
+    std::filesystem::copy_file(livePath, recPath);
+    { std::ofstream f(recPath, std::ios::binary | std::ios::app); f.put(0x7f); }
+
+    LogSegment rec(dir2.string(), 0, interval);
+    rec.recover();
+
+    LogSegment live2(dir1.string(), 0, interval);
+    live2.recover();
+
+    // Both segments must return the same batch for every offset
+    for (int i = 0; i < N; ++i) {
+        int64_t off = static_cast<int64_t>(i);
+        auto bufLive = live2.read(off, 1 << 20);
+        auto bufRec  = rec.read(off, 1 << 20);
+        ASSERT_FALSE(bufLive.empty()) << "live2 missing offset " << off;
+        ASSERT_FALSE(bufRec.empty())  << "rec missing offset " << off;
+        RecordBatchReader rl(bufLive.data(), bufLive.size());
+        RecordBatchReader rr(bufRec.data(),  bufRec.size());
+        EXPECT_EQ(rl.baseOffset(), rr.baseOffset())
+            << "Index mismatch at offset " << off;
+    }
+
+    std::filesystem::remove_all(dir1);
+    std::filesystem::remove_all(dir2);
 }

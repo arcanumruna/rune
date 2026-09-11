@@ -4,6 +4,14 @@
 #include <memory>
 #include <vector>
 namespace rune::storage {
+
+/// On-disk append-only log: a sequence of LogSegment files in a directory.
+///
+/// IMPORTANT: A Log constructed by the default constructor is NOT fully usable
+/// until recover() is called. Before recover(), logEndOffset() returns the base
+/// offset of the last segment (not the true LEO) and the in-memory index for
+/// each segment is empty (reads fall back to O(segment) scan from position 0).
+/// PartitionApi always calls recover() — any other user must do the same.
 class Log {
 public:
     Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024);
@@ -11,6 +19,11 @@ public:
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     int64_t recover();
+    /// Flush + fdatasync the active segment's .log and msync its .index.
+    /// append() already calls this (durable-by-default). External group-commit
+    /// callers may batch appends and call sync() once — but MUST NOT advance
+    /// the high-watermark past an offset before sync() returns for that offset.
+    void sync();
     /// Truncate all records with baseOffset >= truncateOffset.
     /// The log's logEndOffset is reset to truncateOffset.
     /// Segments entirely beyond truncateOffset are deleted.

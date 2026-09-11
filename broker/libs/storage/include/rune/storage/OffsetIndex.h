@@ -9,6 +9,11 @@ public:
     OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes);
     void append(int64_t offset, int32_t position);
     OffsetPosition lookup(int64_t targetOffset) const;
+    void sync() { file_->sync(); }  // msync the mmap to disk
+    /// Rescan the mmap to count valid entries written by a previous process.
+    /// Call after opening an existing index file (e.g. after recover() renames
+    /// .index.tmp → .index and reopens from the canonical path).
+    void rebuildEntries();
     int entries() const noexcept { return entries_; }
     int64_t baseOffset() const noexcept { return baseOffset_; }
     int lastSearchLow() const { return lastSearchLow_; }
