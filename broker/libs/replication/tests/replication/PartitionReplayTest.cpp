@@ -68,6 +68,18 @@ static std::vector<uint8_t> makeBatch(int64_t offset, uint8_t fill,
     return b.build();
 }
 
+/// Build a multi-record RecordBatch at the given baseOffset.
+static std::vector<uint8_t> makeMultiRecordBatch(int64_t baseOffset, int32_t recordCount)
+{
+    rune::protocol::RecordBatchBuilder b(baseOffset, 0);
+    for (int32_t i = 0; i < recordCount; ++i) {
+        std::string key = "k" + std::to_string(i);
+        std::string val(8, static_cast<char>(static_cast<uint8_t>(i + 1)));
+        b.append(key, val, static_cast<int64_t>(i));
+    }
+    return b.build();
+}
+
 // Populate a FileRecordingStore with N batches at offsets 0..N-1.
 static void populateStore(FileRecordingStore& store, int n, std::size_t batchSize = 16)
 {
@@ -530,4 +542,99 @@ TEST(PartitionReplay, ReplayAll_Convenience_DeliversAll)
     for (int i = 0; i < 7; ++i) {
         EXPECT_EQ(offsets[i], i);
     }
+}
+
+// ============================================================================
+// Multi-record batch tests — BUG 2 regression guards in PartitionReplay
+// ============================================================================
+
+TEST(PartitionReplay_MultiRecord, ReplayIntoLog_SingleMultiRecordBatch_LEOCorrect)
+{
+    // BUG 2 regression: replayIntoLog used to advance by +1, giving LEO=1.
+    // With 4 records, correct LEO is 4.
+    TempFile f("rp_mr_single");
+    TempDir  logDir("rp_mr_log1");
+    FileRecordingStore store(f.path);
+
+    auto b = makeMultiRecordBatch(0, 4);
+    store.append(0, std::span<const uint8_t>(b.data(), b.size()));
+
+    rune::storage::Log targetLog(logDir.path);
+    PartitionReplay replay(&store);
+
+    int64_t batches = replay.replayIntoLog(targetLog, 0, INT64_MAX);
+    EXPECT_EQ(batches, 1);
+    EXPECT_EQ(targetLog.logEndOffset(), 4)
+        << "BUG 2: LEO must be baseOffset+lastOffsetDelta+1=4, not 1";
+}
+
+TEST(PartitionReplay_MultiRecord, ReplayIntoLog_TwoMultiRecordBatches_ContiguousOffsets)
+{
+    // batch0: baseOffset=0, 3 records (offsets 0,1,2) → after: LEO=3
+    // batch1: baseOffset=3, 4 records (offsets 3,4,5,6) → after: LEO=7
+    // Replay both: LEO must be 7.
+    TempFile f("rp_mr_two");
+    TempDir  logDir("rp_mr_log2");
+    FileRecordingStore store(f.path);
+
+    auto b0 = makeMultiRecordBatch(0, 3);
+    auto b1 = makeMultiRecordBatch(3, 4);
+    store.append(0, std::span<const uint8_t>(b0.data(), b0.size()));
+    store.append(3, std::span<const uint8_t>(b1.data(), b1.size()));
+
+    rune::storage::Log targetLog(logDir.path);
+    PartitionReplay replay(&store);
+
+    int64_t batches = replay.replayIntoLog(targetLog, 0, INT64_MAX);
+    EXPECT_EQ(batches, 2);
+    EXPECT_EQ(targetLog.logEndOffset(), 7)
+        << "BUG 2: LEO after replaying two multi-record batches must be 7";
+}
+
+TEST(PartitionReplay_MultiRecord, PartialRange_MultiRecord_OnlyCorrectBatch)
+{
+    // Replay [3, 6) where batches are at baseOffsets 0 (3 recs), 3 (3 recs), 6 (3 recs).
+    // Only batch at baseOffset=3 should be in range.
+    TempFile f("rp_mr_partial");
+    FileRecordingStore store(f.path);
+
+    auto b0 = makeMultiRecordBatch(0, 3);
+    auto b1 = makeMultiRecordBatch(3, 3);
+    auto b2 = makeMultiRecordBatch(6, 3);
+    store.append(0, std::span<const uint8_t>(b0.data(), b0.size()));
+    store.append(3, std::span<const uint8_t>(b1.data(), b1.size()));
+    store.append(6, std::span<const uint8_t>(b2.data(), b2.size()));
+
+    PartitionReplay replay(&store);
+
+    std::vector<int64_t> seen;
+    int64_t count = replay.replay(3, 6, [&](int64_t baseOffset, std::span<const uint8_t>) {
+        seen.push_back(baseOffset);
+        return true;
+    });
+
+    EXPECT_EQ(count, 1);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0], 3)
+        << "partial range [3,6) must return only batch at baseOffset=3";
+}
+
+TEST(PartitionReplay_MultiRecord, ByteExact_MultiRecord)
+{
+    // Verify byte-exact replay of a multi-record batch.
+    TempFile f("rp_mr_bytes");
+    FileRecordingStore store(f.path);
+
+    auto original = makeMultiRecordBatch(0, 5);
+    store.append(0, std::span<const uint8_t>(original.data(), original.size()));
+
+    PartitionReplay replay(&store);
+
+    std::vector<uint8_t> replayed;
+    replay.replayAll([&](int64_t, std::span<const uint8_t> data) {
+        replayed.assign(data.begin(), data.end());
+        return true;
+    });
+
+    EXPECT_EQ(replayed, original) << "replayed bytes must be byte-identical to original";
 }

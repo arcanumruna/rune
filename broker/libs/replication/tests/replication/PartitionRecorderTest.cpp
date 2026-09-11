@@ -67,6 +67,21 @@ static std::vector<uint8_t> makeBatch(int64_t offset, uint8_t fill, std::size_t 
     return b.build();
 }
 
+/// Build a RecordBatch at the given baseOffset containing recordCount records.
+/// Each record has a distinct value byte to ensure content uniqueness.
+/// lastOffsetDelta = recordCount - 1, so the batch covers offsets
+///   [baseOffset, baseOffset + recordCount - 1].
+static std::vector<uint8_t> makeMultiRecordBatch(int64_t baseOffset, int32_t recordCount)
+{
+    rune::protocol::RecordBatchBuilder b(baseOffset, /*baseTimestamp=*/0);
+    for (int32_t i = 0; i < recordCount; ++i) {
+        std::string key = "k" + std::to_string(i);
+        std::string val(8, static_cast<char>(static_cast<uint8_t>(i + 1)));
+        b.append(key, val, static_cast<int64_t>(i));
+    }
+    return b.build();
+}
+
 // Append a properly-formatted RecordBatch to a Log.
 // Returns the Log's new logEndOffset (= offset + 1 for single-record batch).
 static int64_t appendToLog(rune::storage::Log& log, uint8_t fill, int64_t offset,
@@ -74,6 +89,15 @@ static int64_t appendToLog(rune::storage::Log& log, uint8_t fill, int64_t offset
 {
     auto batch = makeBatch(offset, fill, valueSize);
     return log.append(batch, offset);
+}
+
+/// Append a multi-record batch to a Log.
+/// Returns the Log's new logEndOffset (= baseOffset + recordCount).
+static int64_t appendMultiToLog(rune::storage::Log& log, int64_t baseOffset, int32_t recordCount)
+{
+    auto batch = makeMultiRecordBatch(baseOffset, recordCount);
+    int64_t lastOffset = baseOffset + recordCount - 1;
+    return log.append(batch, lastOffset);
 }
 
 // ============================================================================
@@ -813,4 +837,313 @@ TEST_F(RecorderReplayRoundTripTest, RecordingPosition_NeverRegresses)
         EXPECT_GE(pos, lastPosition) << "position regressed at offset " << i;
         lastPosition = pos;
     }
+}
+
+// ============================================================================
+// Multi-record batch tests — BUG 1 and BUG 2 regression guards
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// FileRecordingStore: multi-record batch recordingPosition correctness
+// ---------------------------------------------------------------------------
+
+TEST(FileRecordingStore_MultiRecord, RecordingPosition_MultiRecordBatch)
+{
+    // A batch with 4 records at baseOffset=0 covers offsets 0,1,2,3.
+    // recordingPosition() must be 4, not 1.
+    TempFile f("mr_pos");
+    FileRecordingStore store(f.path);
+
+    auto batch = makeMultiRecordBatch(0, 4);
+    store.append(0, std::span<const uint8_t>(batch.data(), batch.size()));
+
+    EXPECT_EQ(store.recordingPosition(), 4)
+        << "BUG: recordingPosition should be baseOffset + lastOffsetDelta + 1 = 4";
+    EXPECT_EQ(store.batchCount(), 1);
+}
+
+TEST(FileRecordingStore_MultiRecord, RecordingPosition_MultipleMultiRecordBatches)
+{
+    // batch0: baseOffset=0, 3 records → covers 0,1,2 → position after = 3
+    // batch1: baseOffset=3, 2 records → covers 3,4   → position after = 5
+    TempFile f("mr_multi_pos");
+    FileRecordingStore store(f.path);
+
+    auto b0 = makeMultiRecordBatch(0, 3);
+    auto b1 = makeMultiRecordBatch(3, 2);
+    store.append(0, std::span<const uint8_t>(b0.data(), b0.size()));
+    store.append(3, std::span<const uint8_t>(b1.data(), b1.size()));
+
+    EXPECT_EQ(store.batchCount(), 2);
+    EXPECT_EQ(store.recordingPosition(), 5);
+}
+
+TEST(FileRecordingStore_MultiRecord, Durability_RecordingPosition_RestoredOnReopen)
+{
+    // After reopen, recordingPosition_ must reflect lastOffsetDelta, not +1 per batch.
+    TempFile f("mr_reopen");
+    {
+        FileRecordingStore store(f.path);
+        auto b = makeMultiRecordBatch(0, 5);  // covers offsets 0..4
+        store.append(0, std::span<const uint8_t>(b.data(), b.size()));
+        EXPECT_EQ(store.recordingPosition(), 5);
+    }
+
+    FileRecordingStore store2(f.path);
+    EXPECT_EQ(store2.batchCount(), 1);
+    EXPECT_EQ(store2.recordingPosition(), 5)
+        << "BUG: reopen must restore position to baseOffset+lastOffsetDelta+1";
+}
+
+// ---------------------------------------------------------------------------
+// PartitionRecorder: BUG 1 — all batches in committed range are recorded
+// ---------------------------------------------------------------------------
+
+class PartitionRecorderMultiRecordTest : public ::testing::Test {
+protected:
+    PartitionRecorderMultiRecordTest()
+        : logDir("mr_recorder_log")
+        , storeFile("mr_recorder_store")
+        , log(logDir.path)
+    {}
+
+    TempDir             logDir;
+    TempFile            storeFile;
+    rune::storage::Log  log;
+};
+
+TEST_F(PartitionRecorderMultiRecordTest, OnCommitted_MultiBatch_AllBatchesRecorded)
+{
+    // BUG 1 regression test:
+    // Append 3 single-record batches to the log (offsets 0, 1, 2).
+    // Call onCommitted(0, 3) ONCE spanning all 3.
+    // All 3 batches must be in the store; position must be 3.
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder  recorder(0, &log, &store);
+
+    appendToLog(log, 0x01, 0);
+    appendToLog(log, 0x02, 1);
+    appendToLog(log, 0x03, 2);
+
+    recorder.startRecording(0);
+    recorder.onCommitted(0, 3);  // one call spanning 3 batches
+
+    EXPECT_EQ(store.batchCount(), 3)
+        << "BUG 1: onCommitted spanning 3 batches must record all 3, not just the first";
+    EXPECT_EQ(recorder.getRecordingPosition(), 3)
+        << "BUG 1: getRecordingPosition must equal toOffset after recording all batches";
+}
+
+TEST_F(PartitionRecorderMultiRecordTest, OnCommitted_MultiRecordBatches_AllRecorded)
+{
+    // Append multi-record batches and commit them all at once.
+    // batch0: baseOffset=0, 3 records → covers 0,1,2
+    // batch1: baseOffset=3, 2 records → covers 3,4
+    // Call onCommitted(0, 5) — must record both batches; position = 5.
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder  recorder(0, &log, &store);
+
+    appendMultiToLog(log, 0, 3);   // baseOffset=0, 3 records, lastOffset=2
+    appendMultiToLog(log, 3, 2);   // baseOffset=3, 2 records, lastOffset=4
+
+    recorder.startRecording(0);
+    recorder.onCommitted(0, 5);
+
+    EXPECT_EQ(store.batchCount(), 2)
+        << "BUG 1+2: multi-record batches in committed range must each be separately recorded";
+    EXPECT_EQ(recorder.getRecordingPosition(), 5)
+        << "BUG 1: position must be 5 (last batch ends at offset 4, next = 5)";
+}
+
+TEST_F(PartitionRecorderMultiRecordTest, OnCommitted_FiveBatches_SingleCall_AllRecorded)
+{
+    // Worst-case: 5 multi-record batches committed in a single onCommitted call.
+    // Each batch has 4 records:
+    //   b0: offsets 0-3   (baseOffset=0,  lastOffsetDelta=3)
+    //   b1: offsets 4-7   (baseOffset=4,  lastOffsetDelta=3)
+    //   b2: offsets 8-11  (baseOffset=8,  lastOffsetDelta=3)
+    //   b3: offsets 12-15 (baseOffset=12, lastOffsetDelta=3)
+    //   b4: offsets 16-19 (baseOffset=16, lastOffsetDelta=3)
+    // onCommitted(0, 20) must record all 5 and position = 20.
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder  recorder(0, &log, &store);
+
+    int64_t base = 0;
+    const int32_t recsPerBatch = 4;
+    const int numBatches = 5;
+    for (int i = 0; i < numBatches; ++i) {
+        appendMultiToLog(log, base, recsPerBatch);
+        base += recsPerBatch;
+    }
+
+    recorder.startRecording(0);
+    recorder.onCommitted(0, base);  // base = 20
+
+    EXPECT_EQ(store.batchCount(), numBatches)
+        << "BUG 1: all " << numBatches << " batches must be stored";
+    EXPECT_EQ(recorder.getRecordingPosition(), base)
+        << "BUG 1: position must equal toOffset = " << base;
+
+    // Verify each batch's baseOffset is stored correctly.
+    std::vector<int64_t> storedOffsets;
+    store.scan(0, INT64_MAX, [&](int64_t off, std::span<const uint8_t>) {
+        storedOffsets.push_back(off);
+        return true;
+    });
+    ASSERT_EQ(static_cast<int>(storedOffsets.size()), numBatches);
+    for (int i = 0; i < numBatches; ++i) {
+        EXPECT_EQ(storedOffsets[i], static_cast<int64_t>(i * recsPerBatch))
+            << "wrong baseOffset at stored batch " << i;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartitionReplay: BUG 2 — multi-record batches replay with correct offsets
+// ---------------------------------------------------------------------------
+
+class PartitionReplayMultiRecordTest : public ::testing::Test {
+protected:
+    PartitionReplayMultiRecordTest()
+        : logDir("mr_replay_log")
+        , storeFile("mr_replay_store")
+        , log(logDir.path)
+    {}
+
+    TempDir             logDir;
+    TempFile            storeFile;
+    rune::storage::Log  log;
+};
+
+TEST_F(PartitionReplayMultiRecordTest, ReplayIntoLog_MultiRecordBatch_CorrectLEO)
+{
+    // A single batch with 4 records at baseOffset=0.
+    // After replayIntoLog, logEndOffset must be 4 (not 1).
+    TempDir freshDir("mr_fresh1");
+    rune::storage::Log freshLog(freshDir.path);
+
+    FileRecordingStore store(storeFile.path);
+    PartitionReplay    replay(&store);
+
+    auto b = makeMultiRecordBatch(0, 4);
+    store.append(0, std::span<const uint8_t>(b.data(), b.size()));
+
+    int64_t batches = replay.replayIntoLog(freshLog, 0, INT64_MAX);
+    EXPECT_EQ(batches, 1);
+    EXPECT_EQ(freshLog.logEndOffset(), 4)
+        << "BUG 2: replayIntoLog must set LEO to baseOffset+lastOffsetDelta+1=4, not 1";
+}
+
+TEST_F(PartitionReplayMultiRecordTest, ReplayIntoLog_MultiBatches_ContiguousLEO)
+{
+    // batch0: baseOffset=0, 3 records → LEO after = 3
+    // batch1: baseOffset=3, 2 records → LEO after = 5
+    // After replayIntoLog, logEndOffset must be 5.
+    TempDir freshDir("mr_fresh2");
+    rune::storage::Log freshLog(freshDir.path);
+
+    FileRecordingStore store(storeFile.path);
+    PartitionReplay    replay(&store);
+
+    auto b0 = makeMultiRecordBatch(0, 3);
+    auto b1 = makeMultiRecordBatch(3, 2);
+    store.append(0, std::span<const uint8_t>(b0.data(), b0.size()));
+    store.append(3, std::span<const uint8_t>(b1.data(), b1.size()));
+
+    int64_t batches = replay.replayIntoLog(freshLog, 0, INT64_MAX);
+    EXPECT_EQ(batches, 2);
+    EXPECT_EQ(freshLog.logEndOffset(), 5)
+        << "BUG 2: LEO after replaying two multi-record batches must be 5";
+}
+
+TEST_F(PartitionReplayMultiRecordTest, FullRoundTrip_MultiRecord_ByteExact_LEOCorrect)
+{
+    // Record multi-record batches via PartitionRecorder with a single onCommitted call,
+    // then replay into a fresh log; assert byte-exact match and correct LEO.
+    TempDir freshDir("mr_rt_fresh");
+    rune::storage::Log freshLog(freshDir.path);
+
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder  recorder(0, &log, &store);
+    PartitionReplay    replay(&store);
+
+    // 4 batches of 3 records each: offsets 0-2, 3-5, 6-8, 9-11.
+    int64_t base = 0;
+    const int32_t recsPerBatch = 3;
+    const int numBatches = 4;
+    for (int i = 0; i < numBatches; ++i) {
+        appendMultiToLog(log, base, recsPerBatch);
+        base += recsPerBatch;
+    }
+    // base = 12
+
+    recorder.startRecording(0);
+    recorder.onCommitted(0, base);  // single call spanning all 4 batches
+
+    EXPECT_EQ(store.batchCount(), numBatches);
+    EXPECT_EQ(recorder.getRecordingPosition(), base);
+
+    // Replay into fresh log.
+    int64_t batches = replay.replayIntoLog(freshLog, 0, INT64_MAX);
+    EXPECT_EQ(batches, numBatches);
+    EXPECT_EQ(freshLog.logEndOffset(), base)
+        << "LEO after replay must equal total offsets = " << base;
+
+    // Byte-exact check.
+    auto origBytes  = log.read(0, 1 << 20);
+    auto freshBytes = freshLog.read(0, 1 << 20);
+    EXPECT_FALSE(origBytes.empty());
+    EXPECT_EQ(origBytes, freshBytes) << "log content mismatch after multi-record replay";
+}
+
+TEST_F(PartitionReplayMultiRecordTest, PartialRange_MultiRecordBatch_BoundaryCorrect)
+{
+    // Batches at baseOffsets 0 (3 recs), 3 (3 recs), 6 (3 recs).
+    // Replay [3, 6): only batch at baseOffset=3 should be delivered.
+    FileRecordingStore store(storeFile.path);
+    PartitionReplay    replay(&store);
+
+    auto b0 = makeMultiRecordBatch(0, 3);  // covers 0,1,2
+    auto b1 = makeMultiRecordBatch(3, 3);  // covers 3,4,5
+    auto b2 = makeMultiRecordBatch(6, 3);  // covers 6,7,8
+    store.append(0, std::span<const uint8_t>(b0.data(), b0.size()));
+    store.append(3, std::span<const uint8_t>(b1.data(), b1.size()));
+    store.append(6, std::span<const uint8_t>(b2.data(), b2.size()));
+
+    std::vector<int64_t> seen;
+    int64_t count = replay.replay(3, 6, [&](int64_t baseOffset, std::span<const uint8_t>) {
+        seen.push_back(baseOffset);
+        return true;
+    });
+
+    EXPECT_EQ(count, 1);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0], 3)
+        << "partial range [3,6) on multi-record batches must return only batch at baseOffset=3";
+}
+
+TEST_F(PartitionReplayMultiRecordTest, ReplayIntoLog_MultiRecord_MatchesLogAppend)
+{
+    // Verify that replaying a multi-record batch into a fresh log produces the same
+    // logEndOffset as directly appending the same batch to a log.
+    TempDir freshDir("mr_direct");
+    rune::storage::Log freshLog(freshDir.path);
+
+    TempDir directDir("mr_direct2");
+    rune::storage::Log directLog(directDir.path);
+
+    FileRecordingStore store(storeFile.path);
+    PartitionReplay    replay(&store);
+
+    const int32_t N = 7;
+    auto batch = makeMultiRecordBatch(0, N);
+    // Directly append to directLog.
+    directLog.append(batch, N - 1);  // lastOffset = baseOffset + N - 1
+
+    // Record and replay into freshLog.
+    store.append(0, std::span<const uint8_t>(batch.data(), batch.size()));
+    replay.replayIntoLog(freshLog, 0, INT64_MAX);
+
+    EXPECT_EQ(freshLog.logEndOffset(), directLog.logEndOffset())
+        << "BUG 2: replayIntoLog LEO must match direct append LEO for multi-record batch";
+    EXPECT_EQ(freshLog.logEndOffset(), static_cast<int64_t>(N));
 }

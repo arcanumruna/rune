@@ -9,6 +9,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/replication/FileRecordingStore.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
 #include <cstring>
@@ -142,9 +143,17 @@ int64_t FileRecordingStore::recoverFromFile()
             // Compute position from headerPos + kHeaderSize + length.
             afterFrame = headerPos + static_cast<std::streamoff>(kHeaderSize + length);
         }
-        lastCompleteEnd    = static_cast<int64_t>(afterFrame);
-        batchCount_        += 1;
-        recordingPosition_ = baseOffset + 1;  // next expected offset (exclusive)
+        lastCompleteEnd = static_cast<int64_t>(afterFrame);
+        batchCount_     += 1;
+
+        // Decode lastOffsetDelta from the batch header so multi-record batches
+        // advance recordingPosition_ to baseOffset + lastOffsetDelta + 1.
+        int32_t lastOffsetDelta = 0;
+        if (length >= static_cast<uint64_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            rune::protocol::RecordBatchReader r(payload.data(), payload.size());
+            lastOffsetDelta = r.lastOffsetDelta();
+        }
+        recordingPosition_ = baseOffset + lastOffsetDelta + 1;  // next expected offset (exclusive)
 
         // If eof was reached after reading the payload, we're done.
         if (file_.eof()) {
@@ -189,9 +198,17 @@ void FileRecordingStore::append(int64_t baseOffset,
                 static_cast<std::streamsize>(bytes.size()));
     file_.flush();
 
-    batchCount_        += 1;
-    // recordingPosition_ = baseOffset + 1 (next expected offset).
-    recordingPosition_ = baseOffset + 1;
+    batchCount_ += 1;
+
+    // Decode lastOffsetDelta from the RecordBatch header so multi-record batches
+    // advance recordingPosition_ to baseOffset + lastOffsetDelta + 1 (exclusive).
+    // For single-record batches lastOffsetDelta == 0, giving baseOffset + 1.
+    int32_t lastOffsetDelta = 0;
+    if (bytes.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+        lastOffsetDelta = r.lastOffsetDelta();
+    }
+    recordingPosition_ = baseOffset + lastOffsetDelta + 1;
 }
 
 // ---------------------------------------------------------------------------

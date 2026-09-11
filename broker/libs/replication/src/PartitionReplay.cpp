@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/replication/PartitionReplay.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
 #include <climits>
@@ -62,21 +63,23 @@ int64_t PartitionReplay::replayIntoLog(rune::storage::Log& log,
     int64_t count = 0;
     replay(fromOffset, toOffset, [&](int64_t baseOffset,
                                       std::span<const uint8_t> bytes) -> bool {
-        // Determine the last offset in this batch.
-        // We use baseOffset + 1 - 1 = baseOffset as the last offset
-        // (simplest: one logical batch = one offset slot).
-        // For real RecordBatches the last offset = baseOffset + lastOffsetDelta;
-        // but since PartitionRecorder stores raw Log reads which are already
-        // framed RecordBatches, we just use the Log's append API which tracks
-        // offsets internally.  We pass lastOffset = baseOffset so the Log
-        // stores this at the correct position.
+        // Decode lastOffsetDelta from the RecordBatch header so that
+        // multi-record batches advance the log's LEO by the correct amount.
+        // For a batch with N records: lastOffset = baseOffset + lastOffsetDelta.
+        // For single-record batches lastOffsetDelta == 0, so lastOffset == baseOffset.
         //
-        // Note: Log::append(batch, lastOffset) uses lastOffset to set the
-        // segment's logEndOffset.  We pass baseOffset as a proxy; for real
-        // multi-record batches the caller should decode lastOffsetDelta.
-        // In tests, every batch has exactly one record so lastOffset==baseOffset.
+        // Passing the wrong lastOffset (e.g. just baseOffset for multi-record batches)
+        // would cause the Log to set logEndOffset = baseOffset + 1 instead of
+        // baseOffset + lastOffsetDelta + 1, producing gaps on replay.
+        int64_t lastOffset = baseOffset;  // default for single-record or undecodable
+        if (bytes.size() >=
+                static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            rune::protocol::RecordBatchReader reader(bytes.data(), bytes.size());
+            lastOffset = baseOffset + reader.lastOffsetDelta();
+        }
+
         std::vector<uint8_t> buf(bytes.begin(), bytes.end());
-        log.append(buf, baseOffset);
+        log.append(buf, lastOffset);
         ++count;
         return true;
     });

@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/replication/PartitionRecorder.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
 #include <stdexcept>
@@ -55,24 +56,54 @@ void PartitionRecorder::onCommitted(int64_t startOffset, int64_t endOffset)
         return;  // nothing to record in range
     }
 
-    // Read committed batches from the Log in [recordFrom, endOffset).
-    // Log::read returns a flat concatenation of batches; we record them as a
-    // single append per onCommitted call (batches are already framed inside).
+    // Read all committed bytes from the Log in [recordFrom, endOffset).
+    // Log::read returns a flat concatenation of RecordBatch frames.
+    // We must walk them one-by-one and append each individually to the
+    // RecordingStore so that:
+    //   (a) Each batch gets the correct baseOffset in the store, and
+    //   (b) recordingPosition() advances by the batch's true lastOffsetDelta
+    //       (not just +1) for multi-record batches.
     //
-    // We record from recordFrom up to endOffset, capped by what the Log holds.
+    // This fixes BUG 1: previously only the first batch was recorded when
+    // the committed range spanned more than one batch.
     int32_t maxBytes = static_cast<int32_t>(
         std::min<int64_t>(endOffset - recordFrom, 64LL * 1024 * 1024));
     if (maxBytes <= 0) {
         return;
     }
 
-    auto bytes = log_->read(recordFrom, maxBytes);
-    if (bytes.empty()) {
+    auto rawBytes = log_->read(recordFrom, maxBytes);
+    if (rawBytes.empty()) {
         return;
     }
 
-    // Append to store.  baseOffset = recordFrom (the start of this recorded chunk).
-    store_->append(recordFrom, std::span<const uint8_t>(bytes.data(), bytes.size()));
+    // Walk individual RecordBatch frames within the flat read buffer.
+    std::size_t pos = 0;
+    while (pos < rawBytes.size()) {
+        if (rawBytes.size() - pos <
+                static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            break;  // truncated — stop
+        }
+
+        rune::protocol::RecordBatchReader reader(rawBytes.data() + pos,
+                                                  rawBytes.size() - pos);
+        int32_t batchLen = reader.totalLength();
+        if (batchLen <= 0 ||
+            pos + static_cast<std::size_t>(batchLen) > rawBytes.size()) {
+            break;  // incomplete frame — stop
+        }
+
+        int64_t batchBase = reader.baseOffset();
+
+        // Only record batches that start within [recordFrom, endOffset).
+        if (batchBase >= recordFrom && batchBase < endOffset) {
+            store_->append(batchBase,
+                           std::span<const uint8_t>(rawBytes.data() + pos,
+                                                     static_cast<std::size_t>(batchLen)));
+        }
+
+        pos += static_cast<std::size_t>(batchLen);
+    }
 }
 
 // ---------------------------------------------------------------------------
