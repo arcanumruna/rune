@@ -871,3 +871,76 @@ TEST(ElectionBallot, FiveMember_TwoVotes_NotEnoughQuorum_Canvass) {
     e.doWork(nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 20);
     EXPECT_EQ(e.state(), ElectionState::Canvass);
 }
+
+// ============================================================================
+// C2: onRequestVote same-term shorter-log boundary (audit T3/C2)
+// The classic off-by-one "elect a leader with a shorter log" must be denied.
+// ============================================================================
+
+// C2: onRequestVote — same logLeadershipTermId, candidate position < our appendPosition → deny.
+// This is the off-by-one case: candidate in same term but shorter log must not win our vote.
+TEST(ElectionBallot, OnRequestVote_SameTerm_CandidateShorterLog_Denies) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // Self has logLeadershipTermId=5, appendPosition=100
+    std::vector<ClusterMember> ms(3);
+    for (int i = 0; i < 3; i++) {
+        ms[i].id = i;
+        ms[i].logPosition = 0;
+        ms[i].logLeadershipTermId = 0;
+        ms[i].leadershipTermId = 0;
+    }
+    Election e(true, -1,
+               /*leadershipTermId=*/5, /*logLeadershipTermId=*/5,
+               /*logPosition=*/100, /*appendPosition=*/100,
+               std::move(ms), 0, pub, nsf, tl,
+               kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 42);
+    e.doWork(1'000'000LL); // INIT → CANVASS
+
+    pub.clear();
+    int64_t nowNs = 1'000'000LL;
+    // Candidate 1: SAME logLeadershipTermId=5 but logPosition=99 (one entry behind)
+    // Election.cpp compareLog(5,100, 5,99) = +1 → our log is more recent → deny.
+    e.onRequestVote(/*logLeadershipTermId=*/5, /*logPosition=*/99,
+                    /*candidateTermId=*/6, /*candidateId=*/1, nowNs);
+
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote)
+        << "Candidate with same term but shorter log (pos=99 < 100) must be denied";
+}
+
+// C2b: onRequestVote — same logLeadershipTermId, equal position → grant.
+TEST(ElectionBallot, OnRequestVote_SameTerm_EqualPosition_Grants) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // Self has logLeadershipTermId=5, appendPosition=100
+    std::vector<ClusterMember> ms(3);
+    for (int i = 0; i < 3; i++) {
+        ms[i].id = i;
+        ms[i].logPosition = 0;
+        ms[i].logLeadershipTermId = 0;
+        ms[i].leadershipTermId = 0;
+    }
+    Election e(true, -1,
+               /*leadershipTermId=*/5, /*logLeadershipTermId=*/5,
+               /*logPosition=*/100, /*appendPosition=*/100,
+               std::move(ms), 0, pub, nsf, tl,
+               kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 42);
+    e.doWork(1'000'000LL); // INIT → CANVASS
+
+    pub.clear();
+    int64_t nowNs = 1'000'000LL;
+    // Candidate 1: SAME logLeadershipTermId=5, SAME logPosition=100 → grant.
+    e.onRequestVote(/*logLeadershipTermId=*/5, /*logPosition=*/100,
+                    /*candidateTermId=*/6, /*candidateId=*/1, nowNs);
+
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_TRUE(pub.placeVoteCalls[0].vote)
+        << "Candidate with same term and equal log position must be granted";
+}

@@ -657,3 +657,50 @@ TEST(ClusterMember, HasQuorumAtPosition_AllMatchingBranch_True) {
         /*nowNs=*/2000, /*timeoutNs=*/5000);
     EXPECT_TRUE(q);
 }
+
+// ===========================================================================
+// C2: compareLog same-term boundary tests (audit T3/C2)
+// The classic off-by-one "elect a shorter log" case was untested.
+// ===========================================================================
+
+// C2a: same term, candidate strictly behind on position → compareLog returns +1 (voter more recent).
+TEST(ClusterMember, CompareLog_SameTerm_ShorterCandidateIsBehind) {
+    // Voter (term=5, pos=100) vs candidate (term=5, pos=99) — one behind.
+    EXPECT_EQ(ClusterMember::compareLog(5, 100, 5, 99),  1)
+        << "Same term, voter longer: must return +1";
+    EXPECT_EQ(ClusterMember::compareLog(5,  99, 5, 100), -1)
+        << "Same term, voter shorter: must return -1";
+    EXPECT_EQ(ClusterMember::compareLog(5, 100, 5, 100),  0)
+        << "Same term, equal position: must return 0";
+}
+
+// C2b: willVoteFor — same term, candidate strictly behind → willVoteFor = false.
+TEST(ClusterMember, WillVoteFor_SameTerm_ShorterCandidate_ReturnsFalse) {
+    ClusterMember voter;
+    voter.leadershipTermId = 5;
+    voter.logPosition      = 100;
+    voter.logLeadershipTermId = 5;
+
+    ClusterMember candidate;
+    candidate.leadershipTermId = 5;
+    candidate.logPosition      = 99; // one entry shorter
+    candidate.logLeadershipTermId = 5;
+
+    EXPECT_FALSE(ClusterMember::willVoteFor(voter, candidate))
+        << "Voter with longer log must NOT vote for a same-term shorter-log candidate";
+}
+
+// C2c: willVoteFor — same term, equal position → willVoteFor = true.
+TEST(ClusterMember, WillVoteFor_SameTerm_EqualPosition_ReturnsTrue) {
+    ClusterMember voter;
+    voter.leadershipTermId = 5;
+    voter.logPosition      = 100;
+    voter.logLeadershipTermId = 5;
+
+    ClusterMember candidate;
+    candidate.leadershipTermId = 5;
+    candidate.logPosition      = 100;
+    candidate.logLeadershipTermId = 5;
+
+    EXPECT_TRUE(ClusterMember::willVoteFor(voter, candidate));
+}

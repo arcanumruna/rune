@@ -554,7 +554,9 @@ TEST(ElectionLog, OnAppendPosition_WrongTerm_DoesNotUpdateMember) {
     EXPECT_NE(e.state(), ElectionState::Closed);
 }
 
-// L15: onAppendPosition from self-member is processed (self always counts in quorum).
+// L15: onAppendPosition from self-member is processed.
+//      T5 fix: add real assertion — onAppendPosition is an in-place update,
+//      not a state transition trigger; doWork drives transitions.
 TEST(ElectionLog, OnAppendPosition_FromSelf_Processed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
@@ -565,10 +567,13 @@ TEST(ElectionLog, OnAppendPosition_FromSelf_Processed) {
     int64_t nowNs = 1'000'000LL;
     bringToLeaderLogReplication(e, nowNs);
 
-    // onAppendPosition doesn't crash or corrupt state for self-member id
+    // T5 fix: assert that state does not change on self AppendPosition.
+    // onAppendPosition is an in-place member update; state transitions happen in doWork.
+    ElectionState stateBefore = e.state();
     Term ltid = e.leadershipTermId();
     e.onAppendPosition(nowNs, ltid, 0, 0, 0);
-    // No assertion on state; just confirm no crash.
+    EXPECT_EQ(e.state(), stateBefore)
+        << "onAppendPosition for self must not trigger a state transition (doWork does that)";
 }
 
 // ===========================================================================
@@ -997,8 +1002,42 @@ TEST(ElectionLog, FollowerPersistsTermEntryOnClose) {
 }
 
 // ===========================================================================
-// GROUP 7: Leader-Completeness safety tests (audit B2/T1)
+// GROUP 7: Leader-Completeness safety tests (audit B2/T1/T4)
 // ===========================================================================
+
+// T4: Leader does NOT close when a follower reports an AppendPosition with a stale
+//     leadershipTermId (wrong term → onAppendPosition ignores it → quorum not met).
+//     Tests the hasQuorumAtPosition gate: follower at wrong term is not counted.
+TEST(ElectionLog, Leader_FollowerWrongTerm_DoesNotAdvanceQuorum) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    // seed=0 so bringToLeaderLogReplication nominates immediately
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+
+    Term    ltid      = e.leadershipTermId();
+    int64_t leaderPos = e.appendPosition();
+
+    // Feed follower 1 with WRONG leadershipTermId (stale term).
+    // onAppendPosition filters on leadershipTermId → this follower is ignored.
+    // Only self counts at (ltid, leaderPos). Quorum for 3 members = 2 → not met.
+    e.onAppendPosition(nowNs, /*leadershipTermId=*/ltid - 1, leaderPos,
+                       /*followerMemberId=*/1, 0);
+
+    // Give the leader a heartbeat tick
+    nowNs = e.nextDeadlineNs() + 1;
+    e.doWork(nowNs);
+
+    // Leader must still be in LEADER_LOG_REPLICATION or LEADER_REPLAY (not CLOSED or LEADER_READY)
+    // because only self (1 member) has reported — quorum (2) not reached.
+    EXPECT_NE(e.state(), ElectionState::Closed)
+        << "Leader must not close with stale-term follower AppendPosition (quorum not met)";
+}
 
 // LC1: NLT for a HIGHER term that this node never voted in IS adopted (audit B2/T1).
 //      Per Aeron Election.java:433-437: if nextLeadershipTermId > candidateTermId_,
