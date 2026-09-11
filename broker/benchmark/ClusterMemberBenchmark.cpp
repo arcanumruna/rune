@@ -112,31 +112,50 @@ BENCHMARK(BM_ClusterMember_QuorumPosition)
 // and compares against the quorum threshold.  Called by the leader on every
 // incoming append-position acknowledgement.
 //
-// Uses a 5-member cluster so exactly 3 members satisfy the condition (quorum).
+// Parameterised over cluster sizes 3/5/7.  The members vector is built OUTSIDE
+// the loop from state.range(0).  logPositions are varied so the compiler cannot
+// constant-fold the result: half the members (rounded up) have the target
+// position; the rest lag.  Both the bool result AND the size are DoNotOptimize'd
+// to block DCE.  This ensures a realistic scan of N live ClusterMember objects.
 // ---------------------------------------------------------------------------
 static void BM_ClusterMember_HasQuorumAtPosition(benchmark::State& state) {
-    constexpr int     N             = 5;
-    constexpr int64_t kNowNs        = 2'000'000'000LL;
-    constexpr int64_t kTimeoutNs    = 500'000'000LL;
-    constexpr rune::consensus::Term kLeaderTerm = 3;
-    constexpr int64_t kTargetPos    = 2048;
+    const int     N          = static_cast<int>(state.range(0));
+    const int64_t kNowNs     = 2'000'000'000LL;
+    const int64_t kTimeoutNs = 500'000'000LL;
+    const rune::consensus::Term kLeaderTerm = 3;
+    const int64_t kTargetPos = 2048LL;
 
-    std::array<ClusterMember, N> members{};
+    // Build N members: quorum members have reached kTargetPos; remainder lag.
+    // Use a vector so size is runtime-determined (prevents loop unrolling / folding).
+    std::vector<ClusterMember> members(static_cast<std::size_t>(N));
+    const int quorum = ClusterMember::quorumThreshold(N);
     for (int i = 0; i < N; ++i) {
-        members[static_cast<std::size_t>(i)].id                         = i;
-        members[static_cast<std::size_t>(i)].leadershipTermId           = kLeaderTerm;
-        members[static_cast<std::size_t>(i)].timeOfLastAppendPositionNs = kNowNs - kTimeoutNs + 1LL;
-        // First 3 members have reached the target position; last 2 lag behind.
-        members[static_cast<std::size_t>(i)].logPosition = (i < 3) ? kTargetPos : kTargetPos / 2;
+        auto idx = static_cast<std::size_t>(i);
+        members[idx].id                         = i;
+        members[idx].leadershipTermId           = kLeaderTerm;
+        members[idx].timeOfLastAppendPositionNs = kNowNs - kTimeoutNs + 1LL; // active
+        // First `quorum` members have reached target; others lag behind by varying amounts
+        // so positions aren't constant (compiler can't fold the individual comparisons).
+        members[idx].logPosition = (i < quorum)
+            ? kTargetPos + static_cast<int64_t>(i * 64)   // at or past target
+            : kTargetPos / 2 - static_cast<int64_t>(i * 32); // behind
     }
 
     for (auto _ : state) {
+        // Read size from state so the compiler sees it as non-constant.
+        int sz = static_cast<int>(state.range(0));
+        benchmark::DoNotOptimize(sz);
+
         bool result = ClusterMember::hasQuorumAtPosition(
-            members, kLeaderTerm, kTargetPos, kNowNs, kTimeoutNs);
+            std::span<const ClusterMember>(members.data(), static_cast<std::size_t>(sz)),
+            kLeaderTerm, kTargetPos, kNowNs, kTimeoutNs);
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations());
+    state.counters["members"] = benchmark::Counter(static_cast<double>(N));
 }
-BENCHMARK(BM_ClusterMember_HasQuorumAtPosition)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_ClusterMember_HasQuorumAtPosition)
+    ->Arg(3)->Arg(5)->Arg(7)
+    ->Unit(benchmark::kNanosecond);
 
 } // namespace
