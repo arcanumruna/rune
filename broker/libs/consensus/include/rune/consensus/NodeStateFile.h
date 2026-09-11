@@ -41,7 +41,11 @@ public:
      * @param path          absolute path to the node-state file.
      * @param fileSyncLevel 0 = no msync; >0 = msync(MS_SYNC) on each write.
      */
-    explicit NodeStateFile(std::string path, int fileSyncLevel = 0);
+    // Default fileSyncLevel=1: msync+fsync on every candidateTermId write.
+    // Mirrors Aeron ConsensusModule which always uses ctx.fileSyncLevel()>0.
+    // Pass fileSyncLevel=0 ONLY in benchmarks / tests where crash-durability
+    // is explicitly not needed (B1 fix: audit 2026-09-11).
+    explicit NodeStateFile(std::string path, int fileSyncLevel = 1);
     ~NodeStateFile();
 
     NodeStateFile(const NodeStateFile&) = delete;

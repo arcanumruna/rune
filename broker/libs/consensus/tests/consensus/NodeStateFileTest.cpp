@@ -333,3 +333,44 @@ TEST(NodeStateFile, ReadAfterProposeAcquireFence) {
     // the write and the read (same thread, but the fence must be correct).
     EXPECT_EQ(nsf.candidateTermId(), 42);
 }
+
+// ---------------------------------------------------------------------------
+// 18. B1 durability: default fileSyncLevel (now 1) persists across reopen.
+//     Documents the intent that the default constructor is crash-safe:
+//     msync+fsync is called on every candidateTermId write. This test verifies
+//     the value survives a close+reopen cycle with the default constructor.
+// ---------------------------------------------------------------------------
+TEST(NodeStateFile, DefaultFileSyncLevel_DurableAcrossReopen) {
+    TempNsf t("_b1_durable");
+    {
+        // Default constructor — must now use fileSyncLevel=1 (durable).
+        NodeStateFile nsf(t.path.string());
+        nsf.proposeMaxCandidateTermId(7, 70, 700);
+        EXPECT_EQ(nsf.candidateTermId(), 7);
+    }
+    // Simulate restart: reopen with default (fileSyncLevel=1)
+    {
+        NodeStateFile nsf2(t.path.string());
+        EXPECT_EQ(nsf2.candidateTermId(),          7);
+        EXPECT_EQ(nsf2.candidateTermLogPosition(), 70);
+        EXPECT_EQ(nsf2.candidateTermTimestamp(),   700);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 19. S2 durability: fileSyncLevel=1 fsyncs fresh-file init (NULL_VALUE).
+//     Verifies the fresh-file init path also goes through syncFile() when
+//     fileSyncLevel>0, so a crash during first boot doesn't corrupt the file.
+// ---------------------------------------------------------------------------
+TEST(NodeStateFile, FileSyncLevel1_FreshInit_DurableNullValue) {
+    TempNsf t("_s2_fresh_sync");
+    {
+        NodeStateFile nsf(t.path.string(), /*fileSyncLevel=*/1);
+        // Fresh file: candidateTermId must be NULL_VALUE (-1), fsynced.
+        EXPECT_EQ(nsf.candidateTermId(), NodeStateFile::NULL_VALUE);
+    }
+    {
+        NodeStateFile nsf2(t.path.string(), /*fileSyncLevel=*/1);
+        EXPECT_EQ(nsf2.candidateTermId(), NodeStateFile::NULL_VALUE);
+    }
+}

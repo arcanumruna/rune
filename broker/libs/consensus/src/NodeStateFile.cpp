@@ -157,7 +157,20 @@ Term NodeStateFile::proposeMaxCandidateTermId(
 
 void NodeStateFile::syncFile() const {
     if (fileSyncLevel_ > 0) {
-        ::msync(mapped_, kFileSize, MS_SYNC);
+        // S3 fix: propagate msync errors — EIO on writeback must not be silenced.
+        // An msync failure means the data may not reach stable storage.
+        if (::msync(mapped_, kFileSize, MS_SYNC) != 0) {
+            throw std::system_error(errno, std::system_category(),
+                                    "NodeStateFile: msync " + path_);
+        }
+        // B1 fix: fsync the fd after msync to guarantee the data reaches stable
+        // storage before the vote is granted. Mirrors Aeron ConsensusModule which
+        // runs with fileSyncLevel>0 for exactly this reason.
+        // Reference: phase2-notes §A.4 "Never grant two votes in one term across a crash".
+        if (::fsync(fd_) != 0) {
+            throw std::system_error(errno, std::system_category(),
+                                    "NodeStateFile: fsync " + path_);
+        }
     }
 }
 
