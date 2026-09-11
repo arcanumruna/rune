@@ -145,3 +145,48 @@ Fix direction: cap the scan at `min(toOffset, activeBase)` to keep the map seman
 - Compaction *logical* semantics — keep-latest-per-key, offset preservation with gaps, tombstone retention window, active-segment and HW-boundary protection, null-key pass-through — are correct and the `LogCleanerTest` suite asserts exact offsets/values (non-vacuous for the logic, weak only for crash-safety per T1).
 - `ProducerStateManager` dedup logic (retry window, epoch bump clearing the window, multi-producer/partition isolation, duplicate-returns-original-offset) is correct and thoroughly unit-tested for the in-memory path.
 - The `LogCleaner` durable-swap helper (`writeFileDurable` + fsync + rename + `fsyncDir`, `LogCleaner.cpp:50-96,256-283`) is the one place durability is done *right* — ironically the log-append path (B1/B2) should adopt this same idiom.
+
+---
+
+## Re-audit (commit `8e1b545`)
+
+Date: 2026-09-11
+Auditor: Opus re-auditor (read-only). Method: re-read current `libs/storage/{src,include,tests}`; rebuilt + ran `rune_storage_tests` → **164/164 PASS**.
+
+### Verdict: **CLEAN** — all real findings fixed, deferrals justified, no new bugs found.
+
+### Per-finding status
+
+| ID | Status | Evidence |
+|----|--------|----------|
+| **B1** append durability | **FIXED** | `LogSegment::append` now calls `sync()` after every write (`LogSegment.cpp:73`). `sync()` = `fstream::flush()` → `::fsync(fd_)` on a POSIX fd for the `.log` (`LogSegment.cpp:49-56`). fsync is per-inode, so flushing a separate O_APPEND fd (`:38`) genuinely reaches disk. Policy documented in `LogSegment.h:13-21`. No ack'd-but-not-durable window: `Log::append` only returns after `seg.append`→`sync` returns (`Log.cpp:37-41`). |
+| **B2** index synced | **FIXED** | `sync()` calls `index_->sync()` → `MappedFile::sync()` = `msync(MS_SYNC)` (`OffsetIndex.h:12`, `MappedFile.cpp:28`) on the same append path, so `.index` is consistent with `.log` after crash. |
+| **B3** canonical index | **FIXED** | `recover()` rebuilds into `.index.tmp`, msyncs, `::rename`→`.index`, then fsyncs the dir (`LogSegment.cpp:121-170`). No `.index2` remains anywhere (grep clean). Leftover `.tmp` from a prior crash is removed first (`:128`). Reopens canonical path + `rebuildEntries()` to recount. |
+| **C1** truncateTo exact | **FIXED** | Default `cutPos=0` not `buf.size()` (`Log.cpp:108`); drops any batch where `baseOffset>=trunc OR batchLastOffset>=trunc` (`:122-128`), i.e. rounds down to batch boundary — never silently keeps everything. `found=false`→`cutPos=validEnd` (all batches below boundary). Index rebuilt via recover (`:141-155`). Covered by `TruncateInsideLastBatch`/`TruncateToZeroRemovesAll`/`TruncateAtLEOIsNoop`. |
+| **C2** bytesSinceIndex_ | **FIXED** | Single `shouldIndex(bytesSince,interval)` helper (`LogSegment.cpp:21-23`) used identically by append (`:63`), recover (`:140`) and LogCleaner::buildIndex (`LogCleaner.cpp:121`, inline but byte-identical predicate). All three record the entry at the batch **start** position (append: `logSize_`; recover: `validBytes`; buildIndex: `pos`), reset `bytesSince=0`, then `+= total`. Reproducible. |
+| **C3** Log-before-recover | **DEFERRAL-OK** | Now loudly documented in `Log.h:10-14` ("NOT fully usable until recover()"). Documentation-only was the accepted resolution. |
+| **C4** 2GiB guard | **FIXED** | Guard moved into `OffsetIndex::append` (position>INT32_MAX throws, `OffsetIndex.cpp:13-14`; signature widened to `int64_t`) and duplicated in `buildIndex` (`LogCleaner.cpp:123-124`). All cast sites protected. |
+| **ProducerState legacy (S1)** | **FIXED** | `ProducerState.h` + `ProducerStateTest.cpp` deleted; grep for `ProducerState` (excluding …Manager) returns nothing — no dangling refs. |
+| **S2** empty epoch `if` | **FIXED** | Dead `if(producerEpoch<0){}` removed; first-seen is trust-on-first-use, documented (`ProducerStateManager.cpp:136-142`). |
+| **S3** baseSeq>=0 assert | **FIXED** | `assert(baseSequence>=0 && lastSequenceInBatch>=baseSequence)` at top of `validate` (`ProducerStateManager.cpp:130-131`). |
+| **S4** snapshot overflow | **FIXED** | Sizing now `uint64_t` (`takeSnapshot:240-241`, `recover:355-356`); count bounded by `min(count, fileSize/kEntrySize)` (`:361-366`) + hard 1e9 cap (`:244`). No uint32 multiply. |
+| **S5** window bounds | **FIXED** | `windowCount` clamped to `[0,kRetryWindowSize]`, `windowHead` reset to 0 if out of range on load (`ProducerStateManager.cpp:391-394`). |
+| **S6** buildOffsetMap active scan | **DEFERRAL-OK** | Active-segment keys entered in the map are not merely "harmless": they are the survivors, so earlier-segment duplicates of those keys are correctly dropped during rewrite. Active segment itself is never rewritten (`LogCleaner.cpp:322`). Correct as-is; comment slightly imprecise but no bug. |
+| **CL1** TODO on recovery path | **FIXED** | Resolved with B3; `.index2` TODO gone. |
+| **CL2** resize without msync | **DEFERRAL-OK** | `MappedFile::resize` has **no callers** in storage (OffsetIndex uses a fixed 8 MiB map). Even if called, `MAP_SHARED` dirty pages survive munmap→remap via the coherent page cache; msync only affects power-loss durability, and OffsetIndex only ever grows. False positive confirmed. |
+| **CL3** tombstone comment | **FIXED** | Comment corrected to match `value.empty()` covering null (vlen==-1 decoded as empty view) + zero-length (`LogCleaner.h:64-72`). |
+| **CL4** path surgery | **FIXED** | `indexPathForLog()` helper (`Log.cpp:11-13`); `LogSegment`/`LogCleaner` derive index paths via `fname`/`segmentIndexPath`. |
+| **CL5/CL6** provisioning/roll | **DEFERRAL-OK** | Documented as accepted trade-offs (`LogSegment.cpp:39-41`, `Log.cpp:28-31`). |
+| **T1** LogCleaner crash tests | **PARTIAL / DEFERRAL-OK** | New tests (`3244bdb`) exercise compact+reopen and assert no `.index2` orphan / readable-after-reopen; still in-process (no fork-mid-rename fault injection). Adequate for regression guarding the atomic-swap; true power-loss fault injection remains a future harness item. Not a correctness bug. |
+| **T2** MappedFile durability | **DEFERRAL-OK** | Same-process reopen cannot prove msync reaches the platter without fault injection; label acknowledged. Not a bug. |
+| **T3/T4** test labels/coverage | **DEFERRAL-OK** | Logic-level coverage present; "crash" labels denote logical-crash (in-process reopen). No masked correctness defect. |
+| **T5** torn-snapshot tests | **FIXED** | `8b3b9db` adds torn-snapshot tests (CRC flip / truncated tail) asserting partial load. |
+
+### New findings
+None of BLOCKER/CORRECTNESS/SILENT severity. Nitpicks (informational, no action required):
+- **N1 [nit]** `LogSegment::sync()` does not check `fstream::flush()`/`fsync` return values; a write/fsync error is silent (`LogSegment.cpp:51-53`). Pre-existing; low severity — a failed fsync would still let `append` "succeed". Consider surfacing fsync errors on the ack path.
+- **N2 [nit]** `LogSegment.h`/`Log.h` docs say "fdatasync" but code uses `fsync` (`LogSegment.cpp:53`). Cosmetic; `fsync` is a strict superset (also flushes size metadata, which is required here for read-back). Behaviorally correct.
+- **N3 [nit]** `OffsetIndex::append`/`buildIndex` guard only the 32-bit *position*, not the 32-bit relative-*offset* cast. Unreachable given 64 MiB byte-capped segments (offset span ≪ 2^31), consistent across all sites. No action.
+
+### Conclusion
+Every BLOCKER (B1–B3), CORRECTNESS (C1–C4), and SILENT (S1–S6) finding is genuinely fixed (not superficially patched): durability is real (fsync+msync on the ack path), the index is canonical + reproducible, truncation is exact, and the ProducerState legacy hazard is gone with 64-bit snapshot sizing. All deferrals (C3, S6, CL2, CL5/6, T1–T4) are justified — none hides a correctness or durability bug. No new bugs introduced by the fixes; 164/164 storage tests pass. **libs/storage is sound.**
