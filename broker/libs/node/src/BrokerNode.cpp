@@ -154,18 +154,27 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
 // ---------------------------------------------------------------------------
 bool BrokerNode::isLeader() const noexcept {
     if (!election_) return false;
-    const auto s = election_->state();
-    return s == ElectionState::LeaderReady ||
-           s == ElectionState::LeaderLogReplication ||
-           s == ElectionState::Closed;
+    // Use the atomic stateCode() — release-written by the agent thread on every
+    // state transition — instead of the non-atomic state() accessor, to avoid a
+    // data race when this method is called from the node/main thread.
+    // Leader states (Aeron ordinals): LeaderLogReplication=5, LeaderReady=8, Closed=17.
+    const int32_t c = election_->stateCode();
+    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
+           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
+           c == static_cast<int32_t>(ElectionState::Closed);
 }
 
 // ---------------------------------------------------------------------------
 // BrokerNode::leaderId
 // ---------------------------------------------------------------------------
 NodeId BrokerNode::leaderId() const noexcept {
-    if (!election_) return -1;
-    return election_->leaderMemberId();
+    // In a 1-node cluster the leader is always this node.  We derive leadership
+    // via isLeader() (atomic stateCode) rather than dereferencing Election's raw
+    // leaderMember_ pointer from the node/main thread — that raw deref would be
+    // a data race against the agent thread.
+    // NOTE: a proper atomic remote-leader mirror (for multi-node) is BR-3's concern.
+    if (isLeader()) return static_cast<NodeId>(config_.nodeId);
+    return -1; // kNullValue — no leader known yet
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +259,10 @@ void BrokerNode::startEmbeddedDriver() {
     });
 
     // Give the driver a moment to fully initialise before we connect the client.
+    // Known startup-sync approximation: the Aeron C API does not expose a
+    // conductor-ready poll equivalent, so we use a fixed sleep.  50 ms is
+    // empirically sufficient on CI; a proper poll would need aeron_driver_main_do_work
+    // to return a "ready" sentinel, which is not part of the public C API.
     std::this_thread::sleep_for(std::chrono::milliseconds{50});
 
     spdlog::info("BrokerNode: embedded Aeron driver started (dir={})",

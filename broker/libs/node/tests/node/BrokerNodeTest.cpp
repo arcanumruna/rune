@@ -19,7 +19,9 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -181,6 +183,89 @@ TEST(BrokerNodeTest, Stop_IsPrompt_AfterLeadership) {
 
     EXPECT_LT(elapsed, 3s)
         << "stop() should return within 3 s after leadership is established";
+}
+
+// ===========================================================================
+// TEST 6: awaitLeader timeout → false (never started → no leader)
+// ===========================================================================
+TEST(BrokerNodeTest, AwaitLeader_Timeout_ReturnsFalse) {
+    TempDir tmp{"t6_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    // Do NOT call start() — no agent thread, no election → leadership never reached.
+    BrokerNode node{cfg};
+
+    using sclock = std::chrono::steady_clock;
+    const auto before = sclock::now();
+    const bool result = node.awaitLeader(50ms);
+    const auto elapsed = sclock::now() - before;
+
+    EXPECT_FALSE(result) << "awaitLeader() must return false when node is not started";
+    // The wait must have actually elapsed (bounded check — should be ≥ 50 ms and < 5 s).
+    EXPECT_GE(elapsed, 50ms) << "awaitLeader() must not return before timeout";
+    EXPECT_LT(elapsed, 5s)   << "awaitLeader() must not block beyond its timeout";
+}
+
+// ===========================================================================
+// TEST 7: double-start is idempotent — second start() is a no-op
+// ===========================================================================
+TEST(BrokerNodeTest, DoubleStart_Idempotent) {
+    TempDir tmp{"t7_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    BrokerNode node{cfg};
+    node.start();  // first start — launches driver + agent
+    node.start();  // second start — must be a no-op (no second driver, no crash)
+
+    // Node must still reach leadership normally — only one election running.
+    ASSERT_TRUE(node.awaitLeader(2s))
+        << "After double-start, node should still self-elect within 2 s";
+
+    EXPECT_TRUE(node.isLeader());
+    EXPECT_EQ(node.leaderId(), static_cast<rune::consensus::NodeId>(cfg.nodeId));
+
+    // Clean stop must succeed exactly once.
+    node.stop();
+}
+
+// ===========================================================================
+// TEST 8: start() failure — bad dataDir → error surfaces; stop()/dtor clean
+// ===========================================================================
+TEST(BrokerNodeTest, Start_BadDataDir_ErrorAndCleanShutdown) {
+    // Use a path where a regular FILE exists where the directory should be,
+    // making create_directories fail deterministically.
+    TempDir tmp{"t8_parent_"};
+    // Create the parent so we can plant a file.
+    std::error_code ec;
+    fs::create_directories(tmp.path, ec);
+    ASSERT_FALSE(ec) << "Could not create parent for test: " << ec.message();
+
+    // Plant a regular file where BrokerNode would need to create a directory.
+    const fs::path badDataDir = tmp.path / "blocker";
+    {
+        std::ofstream f(badDataDir);
+        ASSERT_TRUE(f.is_open()) << "Could not create blocker file";
+        f << "blocker";
+    }
+    ASSERT_TRUE(fs::is_regular_file(badDataDir))
+        << "Precondition: blocker must be a regular file";
+
+    NodeConfig cfg = makeSingleNodeConfig(badDataDir);
+
+    // start() must throw (cannot create dataDir because it exists as a file).
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error)
+        << "start() must throw when dataDir cannot be created";
+
+    // stop() and dtor must not hang or crash after a failed start().
+    using sclock = std::chrono::steady_clock;
+    const auto before = sclock::now();
+    node.stop(); // explicit stop after failed start — must be clean
+    const auto elapsed = sclock::now() - before;
+
+    EXPECT_LT(elapsed, 5s)
+        << "stop() after failed start() must return promptly (no hang)";
+    // Dtor runs here — also must not hang.
 }
 
 } // namespace rune::node
