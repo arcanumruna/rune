@@ -26,6 +26,27 @@ namespace fs = std::filesystem;
 namespace {
 
 // ---------------------------------------------------------------------------
+// Local CRC32C (Castagnoli) — matches TransactionLog's internal implementation.
+// Used in tests that need to re-stamp the checksum after mutating a raw record.
+// ---------------------------------------------------------------------------
+static uint32_t testLogCrc32c(const uint8_t* data, std::size_t len) noexcept {
+    static uint32_t tbl[256];
+    static bool init = false;
+    if (!init) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) c = (c >> 1) ^ (0x82F63B78u & -(c & 1u));
+            tbl[i] = c;
+        }
+        init = true;
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < len; ++i)
+        crc = (crc >> 8) ^ tbl[(crc ^ data[i]) & 0xFFu];
+    return crc ^ 0xFFFFFFFFu;
+}
+
+// ---------------------------------------------------------------------------
 // Unique temp path helper
 // ---------------------------------------------------------------------------
 static std::atomic<int> g_counter{0};
@@ -725,4 +746,187 @@ TEST(TransactionLogTest, PendingNewProducerIdRoundTrips) {
     EXPECT_EQ(m->producerId, 100);              // OLD pid persisted on the abort
     EXPECT_EQ(m->pendingNewProducerId, 777);    // deferred fresh pid recovered
     EXPECT_EQ(m->pendingNewProducerEpoch, 0);
+}
+
+// ===========================================================================
+// L1 — invalid state byte (CRC recomputed to be valid) → recovery rejects it
+//
+// A CRC-valid record with stateRaw > 7 (out-of-range for TxnState) must be
+// treated as corrupt and cause replay to stop, just like a CRC failure. The
+// record must NOT be applied to the in-memory map, and the log must be
+// truncated at the last known-good position.
+// ===========================================================================
+TEST(TransactionLogTest, InvalidStateByteRejectedEvenWithValidCrc) {
+    auto path = tmpPath();
+    TempFile tf{path};
+
+    // Write a good record first so we can verify it survives the re-open.
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-good", 1, 0, TxnState::Ongoing,
+                              {tp("t", 0)}, /*startNs=*/100));
+    }
+
+    // Append a second raw record with stateRaw = 0xFF (invalid), but with a
+    // correctly recomputed CRC so the CRC check passes.  We do this by:
+    //   1. Writing the record through the normal API (valid state),
+    //   2. Reading the raw file,
+    //   3. Flipping the state byte to 0xFF,
+    //   4. Recomputing the CRC over the modified bytes, and
+    //   5. Writing the modified record directly.
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-bad-state", 2, 0, TxnState::Empty));
+    }
+
+    // Find the second record and corrupt its state byte, recomputing the CRC.
+    {
+        // Read the file.
+        int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+
+        // File = record1 + record2.  Skip record1.
+        // Record header: magic(4)+totalLen(4)+txnStartNs(8)+pid(8)+epoch(2)+state(1)+...
+        // Read totalLength of record1.
+        uint8_t hdr4[4];
+        ASSERT_EQ(::pread(fd, hdr4, 4, 4), 4); // totalLength of record1
+        uint32_t rec1Len;
+        std::memcpy(&rec1Len, hdr4, sizeof(rec1Len));
+
+        // Record2 starts at rec1Len. State byte is at offset 26 within the record.
+        off_t rec2Start = static_cast<off_t>(rec1Len);
+
+        // Read totalLength of record2.
+        ASSERT_EQ(::pread(fd, hdr4, 4, rec2Start + 4), 4);
+        uint32_t rec2Len;
+        std::memcpy(&rec2Len, hdr4, sizeof(rec2Len));
+
+        // Read the entire second record.
+        std::vector<uint8_t> rec2(rec2Len);
+        ASSERT_EQ(::pread(fd, rec2.data(), rec2Len, rec2Start),
+                  static_cast<ssize_t>(rec2Len));
+
+        // Corrupt state byte (offset 26 within the record).
+        rec2[26] = 0xFF; // out-of-range (max valid = 7 = PrepareEpochFence)
+
+        // Recompute CRC over bytes [0 .. totalLength - 4).
+        // Use TransactionLog's own crc32c (accessible via static public interface).
+        uint32_t newCrc = testLogCrc32c(rec2.data(), rec2Len - 4);
+        std::memcpy(rec2.data() + rec2Len - 4, &newCrc, 4);
+
+        // Write the modified record back.
+        ASSERT_EQ(::pwrite(fd, rec2.data(), rec2Len, rec2Start),
+                  static_cast<ssize_t>(rec2Len));
+        ::close(fd);
+    }
+
+    // Reopen: the invalid-state record must be rejected; only the first good
+    // record survives (the log is truncated at the first-record boundary).
+    TransactionLog log3(path);
+    EXPECT_EQ(log3.size(), 1u)
+        << "The corrupted-state record must be rejected by replay";
+    EXPECT_NE(log3.metadata("txn-good"), nullptr)
+        << "The good record before the corrupt one must still be present";
+    EXPECT_EQ(log3.metadata("txn-bad-state"), nullptr)
+        << "The record with an invalid state byte must not be applied";
+
+    // The log must remain writable after truncation.
+    log3.append(makeEntry("txn-after", 3, 0, TxnState::Empty));
+    EXPECT_EQ(log3.size(), 2u);
+    EXPECT_NE(log3.metadata("txn-after"), nullptr);
+}
+
+// ===========================================================================
+// Round-2 Residual-7: CRC-valid header with an in-body topicLen that overruns
+// totalLength → rejected as corrupt (no over-read / no bogus metadata applied).
+//
+// Strategy: write a record with one partition (short topic "x"), then in the
+// raw bytes change the topicLen in the variable body to 65535 (far beyond the
+// actual record size), recompute the CRC over the modified bytes (same total
+// size), and write it back. Replay must detect the overrun and stop.
+// ===========================================================================
+TEST(TransactionLogTest, TopicLenOverrunsTotalLengthRejected) {
+    auto path = tmpPath();
+    TempFile tf{path};
+
+    // Write a "good" record first so we can confirm it survives.
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-pre", 1, 0, TxnState::Empty));
+    }
+
+    // Append a record with a single short-topic partition; we will corrupt the
+    // topicLen in the body but keep totalLength (and CRC) consistent.
+    const std::string kTxnId = "txn-tlen";
+    const std::string kTopic  = "x";  // length 1 → topicLen = 1
+
+    {
+        TransactionLog log(path);
+        log.append(makeEntry(kTxnId, 2, 0, TxnState::Ongoing,
+                              {tp(kTopic, 7)}, /*startNs=*/1));
+    }
+
+    // Now corrupt the appended record's topicLen field.
+    {
+        // Read the file to find record2.
+        int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+
+        // totalLength of record1 tells us where record2 starts.
+        uint8_t tmp4[4];
+        ASSERT_EQ(::pread(fd, tmp4, 4, 4), 4);
+        uint32_t rec1Len;
+        std::memcpy(&rec1Len, tmp4, sizeof(rec1Len));
+        off_t rec2Start = static_cast<off_t>(rec1Len);
+
+        // Read totalLength of record2.
+        ASSERT_EQ(::pread(fd, tmp4, 4, rec2Start + 4), 4);
+        uint32_t rec2Len;
+        std::memcpy(&rec2Len, tmp4, sizeof(rec2Len));
+
+        // Read the full record.
+        std::vector<uint8_t> rec(rec2Len);
+        ASSERT_EQ(::pread(fd, rec.data(), rec2Len, rec2Start),
+                  static_cast<ssize_t>(rec2Len));
+
+        // The variable body starts at kFixedHeaderSize (52) within the record.
+        // Layout of the variable body:
+        //   [0 .. txnIdLen)   : txnId bytes
+        //   [txnIdLen .. +2)  : topicLen (uint16) of first partition
+        //   ...
+        constexpr std::size_t kFixedHdr = 52;
+        const std::size_t txnIdOff = kFixedHdr; // txnId starts here
+        const std::size_t txnIdLen = kTxnId.size();
+        const std::size_t topicLenOff = txnIdOff + txnIdLen; // topicLen of partition0
+
+        // Sanity: verify we are at the right position (existing topic is "x" = 0x0001).
+        ASSERT_LT(topicLenOff + 2, rec2Len);
+        uint16_t existingTopicLen;
+        std::memcpy(&existingTopicLen, rec.data() + topicLenOff, 2);
+        ASSERT_EQ(existingTopicLen, static_cast<uint16_t>(kTopic.size()))
+            << "Sanity: topicLen in the record must match the written topic length";
+
+        // Set topicLen to 0xFFFF (65535) — way beyond totalLength.
+        uint16_t bigLen = 0xFFFFu;
+        std::memcpy(rec.data() + topicLenOff, &bigLen, 2);
+
+        // Recompute the CRC: covers bytes [0 .. rec2Len-4).
+        uint32_t newCrc = testLogCrc32c(rec.data(), rec2Len - 4);
+        std::memcpy(rec.data() + rec2Len - 4, &newCrc, 4);
+
+        // Write the modified record back.
+        ASSERT_EQ(::pwrite(fd, rec.data(), rec2Len, rec2Start),
+                  static_cast<ssize_t>(rec2Len));
+        ::close(fd);
+    }
+
+    // Reopen: the corrupt record (topicLen overrun) must be rejected.
+    // Only the first good record must survive.
+    TransactionLog log3(path);
+    EXPECT_EQ(log3.size(), 1u)
+        << "Record with topicLen overrunning totalLength must be rejected";
+    EXPECT_NE(log3.metadata("txn-pre"), nullptr)
+        << "The preceding good record must still be present";
+    EXPECT_EQ(log3.metadata(kTxnId), nullptr)
+        << "The corrupt record must not be applied to the metadata map";
 }

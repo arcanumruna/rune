@@ -626,6 +626,67 @@ TEST(ControlMarkerTest, ExtractAtNonZeroOffset) {
     EXPECT_EQ(p.coordinatorEpoch, 11);
 }
 
+// ===========================================================================
+// Round-2 Residual-6: ControlMarker CRC region off-by-one boundary.
+//
+// (a) avail = ENCODED_SIZE-1 (1-byte short of full) → isControlBatch rejects,
+//     extract rejects — no over-read.
+// (b) A valid batch with its last CRC-covered byte (index ENCODED_SIZE-CRC_DATA_START-1
+//     within the covered region, i.e. byte ENCODED_SIZE-1 overall) flipped → CRC
+//     mismatch → both functions cleanly reject.
+// (c) avail = ENCODED_SIZE+1 (1-byte longer buffer) with valid content at
+//     [0..ENCODED_SIZE-1] and garbage at ENCODED_SIZE → succeeds (extra byte
+//     beyond the fixed ENCODED_SIZE region is not read).
+// ===========================================================================
+TEST(ControlMarkerTest, CrcBoundaryOffByOneHandledCorrectly) {
+    auto good = ControlMarker::build(3, 1, ControlType::Commit, 7);
+    ASSERT_EQ(good.size(), ControlMarker::ENCODED_SIZE);
+
+    // (a) One byte short: isControlBatch must reject (< ENCODED_SIZE), extract too.
+    {
+        ControlMarkerPayload p;
+        EXPECT_FALSE(ControlMarker::isControlBatch(
+            good.data(), 0, ControlMarker::ENCODED_SIZE - 1))
+            << "(a) avail=ENCODED_SIZE-1 must be rejected";
+        EXPECT_FALSE(ControlMarker::extract(
+            good.data(), 0, p, ControlMarker::ENCODED_SIZE - 1))
+            << "(a) extract avail=ENCODED_SIZE-1 must be rejected";
+    }
+
+    // (b) Flip the very last byte of the CRC-covered region (byte ENCODED_SIZE-1)
+    //     and re-verify: CRC check must catch the single-bit flip and reject.
+    {
+        auto bad = good;
+        bad[ControlMarker::ENCODED_SIZE - 1] ^= 0x01; // flip last covered byte
+        // Do NOT re-stamp the CRC — the CRC is now stale (wrong).
+        EXPECT_FALSE(ControlMarker::isControlBatch(
+            bad.data(), 0, ControlMarker::ENCODED_SIZE))
+            << "(b) last-byte flip must be caught by CRC check";
+        ControlMarkerPayload p;
+        EXPECT_FALSE(ControlMarker::extract(
+            bad.data(), 0, p, ControlMarker::ENCODED_SIZE))
+            << "(b) extract with last-byte CRC mismatch must return false";
+    }
+
+    // (c) avail = ENCODED_SIZE+1: the extra byte is beyond the fixed record;
+    //     the valid content in [0..ENCODED_SIZE-1] must decode successfully.
+    {
+        std::vector<uint8_t> wider(ControlMarker::ENCODED_SIZE + 1);
+        std::memcpy(wider.data(), good.data(), good.size());
+        wider[ControlMarker::ENCODED_SIZE] = 0xFF; // garbage beyond record
+        EXPECT_TRUE(ControlMarker::isControlBatch(
+            wider.data(), 0, ControlMarker::ENCODED_SIZE + 1))
+            << "(c) extra byte at the end must not affect a valid decode";
+        ControlMarkerPayload p;
+        ASSERT_TRUE(ControlMarker::extract(
+            wider.data(), 0, p, ControlMarker::ENCODED_SIZE + 1));
+        EXPECT_EQ(p.producerId,       3);
+        EXPECT_EQ(p.producerEpoch,    1);
+        EXPECT_EQ(p.controlType,      ControlType::Commit);
+        EXPECT_EQ(p.coordinatorEpoch, 7);
+    }
+}
+
 // #21 — build at extreme producerId / epoch values round-trips.
 TEST(ControlMarkerTest, BuildExtremeProducerIdEpochRoundTrips) {
     for (ProducerId pid : {INT64_MIN, ProducerId{-1}, INT64_MAX}) {

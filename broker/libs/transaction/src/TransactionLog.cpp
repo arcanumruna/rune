@@ -322,6 +322,14 @@ void TransactionLog::replayAndTruncate() {
         }
         if (bad) break;
 
+        // L1: Validate state byte before casting to enum. Values 0..7 are legal
+        // (Empty through PrepareEpochFence). A byte outside this range means the
+        // record is corrupt even though the CRC passed (e.g. deliberate tampering
+        // with a recalculated CRC). Treat as corrupt: stop replay here.
+        static constexpr uint8_t kMaxValidState =
+            static_cast<uint8_t>(TxnState::PrepareEpochFence);
+        if (stateRaw > kMaxValidState) break;
+
         // Apply to in-memory map.
         TxnLogEntry entry;
         entry.txnId            = std::move(txnId);

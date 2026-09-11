@@ -633,3 +633,91 @@ TEST(TransactionMessagesTest, EncodeRejectsOverLongTxnIdAndAcceptsMax) {
     ASSERT_TRUE(m.has_value());
     EXPECT_EQ(m->transactionalId.size(), 65535u);
 }
+
+// ===========================================================================
+// L2 — bounds-checked Response decode() overloads (avail-based, returns
+// optional). These are the coordinator→client response decoders: templateId
+// 2 (InitProducerIdResponse), 4 (AddPartitionsToTxnResponse), 6 (EndTxnResponse).
+//
+// All three are fixed-size-only (no var-length fields). Tests verify:
+//   (a) a fully-present buffer decodes correctly (same values as existing decode),
+//   (b) every truncation (avail in [0, full_size-1]) returns nullopt — no over-read.
+// ===========================================================================
+
+TEST(TransactionMessagesTest, L2InitProducerIdResponseDecodeBoundsChecked) {
+    uint8_t buf[kBufSize] = {};
+    // Encode a valid response.
+    auto n = InitProducerIdResponseMsg::encode(buf, 0, /*pid=*/42LL,
+                                               /*epoch=*/7, /*err=*/0);
+    ASSERT_GT(n, 0u);
+
+    // (a) Full buffer: avail = n → decodes correctly.
+    auto opt = InitProducerIdResponseMsg::decode(buf, 0, n);
+    ASSERT_TRUE(opt.has_value()) << "full-buffer decode must succeed";
+    EXPECT_EQ(opt->producerId,    42LL);
+    EXPECT_EQ(opt->producerEpoch, 7);
+    EXPECT_EQ(opt->errorCode,     0);
+
+    // (b) Truncated: every avail in [0, n-1] must return nullopt.
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto bad = InitProducerIdResponseMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(bad.has_value()) << "truncated at avail=" << avail;
+    }
+}
+
+TEST(TransactionMessagesTest, L2AddPartitionsToTxnResponseDecodeBoundsChecked) {
+    uint8_t buf[kBufSize] = {};
+    auto n = AddPartitionsToTxnResponseMsg::encode(buf, 0, /*errorCode=*/3);
+    ASSERT_GT(n, 0u);
+
+    // (a) Full buffer decodes.
+    auto opt = AddPartitionsToTxnResponseMsg::decode(buf, 0, n);
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->errorCode, 3);
+
+    // (b) Every truncation → nullopt.
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto bad = AddPartitionsToTxnResponseMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(bad.has_value()) << "truncated at avail=" << avail;
+    }
+}
+
+TEST(TransactionMessagesTest, L2EndTxnResponseDecodeBoundsChecked) {
+    uint8_t buf[kBufSize] = {};
+    auto n = EndTxnResponseMsg::encode(buf, 0, /*errorCode=*/5);
+    ASSERT_GT(n, 0u);
+
+    // (a) Full buffer decodes.
+    auto opt = EndTxnResponseMsg::decode(buf, 0, n);
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->errorCode, 5);
+
+    // (b) Every truncation → nullopt.
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto bad = EndTxnResponseMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(bad.has_value()) << "truncated at avail=" << avail;
+    }
+}
+
+// L2: existing callers use the 2-param (no-avail) decode; verify they still
+// compile and return the expected values (behaviour-preservation).
+TEST(TransactionMessagesTest, L2LegacyTwoParamDecodeUnchanged) {
+    uint8_t buf[kBufSize] = {};
+    {
+        InitProducerIdResponseMsg::encode(buf, 0, 99LL, 3, 0);
+        auto m = InitProducerIdResponseMsg::decode(buf, 0);
+        EXPECT_EQ(m.producerId,    99LL);
+        EXPECT_EQ(m.producerEpoch, 3);
+        EXPECT_EQ(m.errorCode,     0);
+    }
+    {
+        AddPartitionsToTxnResponseMsg::encode(buf, 0, 7);
+        auto m = AddPartitionsToTxnResponseMsg::decode(buf, 0);
+        EXPECT_EQ(m.errorCode, 7);
+    }
+    {
+        EndTxnResponseMsg::encode(buf, 0, 2);
+        auto m = EndTxnResponseMsg::decode(buf, 0);
+        EXPECT_EQ(m.errorCode, 2);
+    }
+}

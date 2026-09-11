@@ -329,6 +329,24 @@ struct InitProducerIdResponseMsg {
         m.errorCode     = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
         return m;
     }
+
+    /// L2: bounds-checked decode. @p avail is the readable byte count at buf+bufOffset.
+    /// Returns std::nullopt on truncation (no over-read). Symmetric with the Request
+    /// decoder's avail-based signature.
+    static std::optional<InitProducerIdResponseMsg> decode(const uint8_t* buf,
+                                                            std::size_t    bufOffset,
+                                                            std::size_t    avail) noexcept
+    {
+        const std::size_t end = bufOffset + avail;
+        std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        // Need 12 bytes for the fixed block (int64 + int16 + int16).
+        if (pos + BLOCK_LENGTH > end) return std::nullopt;
+        InitProducerIdResponseMsg m{};
+        m.producerId    = txn_detail::read_le<int64_t>(buf + pos); pos += 8;
+        m.producerEpoch = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
+        m.errorCode     = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
+        return m;
+    }
 };
 
 // ===========================================================================
@@ -427,6 +445,20 @@ struct AddPartitionsToTxnResponseMsg {
         m.errorCode = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
         return m;
     }
+
+    /// L2: bounds-checked decode. Returns std::nullopt on truncation (no over-read).
+    static std::optional<AddPartitionsToTxnResponseMsg> decode(const uint8_t* buf,
+                                                                std::size_t    bufOffset,
+                                                                std::size_t    avail) noexcept
+    {
+        const std::size_t end = bufOffset + avail;
+        std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        // Need 2 bytes for the fixed block (int16 errorCode).
+        if (pos + BLOCK_LENGTH > end) return std::nullopt;
+        AddPartitionsToTxnResponseMsg m{};
+        m.errorCode = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
+        return m;
+    }
 };
 
 // ===========================================================================
@@ -518,6 +550,20 @@ struct EndTxnResponseMsg {
                                      std::size_t    bufOffset) noexcept
     {
         std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        EndTxnResponseMsg m{};
+        m.errorCode = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
+        return m;
+    }
+
+    /// L2: bounds-checked decode. Returns std::nullopt on truncation (no over-read).
+    static std::optional<EndTxnResponseMsg> decode(const uint8_t* buf,
+                                                    std::size_t    bufOffset,
+                                                    std::size_t    avail) noexcept
+    {
+        const std::size_t end = bufOffset + avail;
+        std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        // Need 2 bytes for the fixed block (int16 errorCode).
+        if (pos + BLOCK_LENGTH > end) return std::nullopt;
         EndTxnResponseMsg m{};
         m.errorCode = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
         return m;

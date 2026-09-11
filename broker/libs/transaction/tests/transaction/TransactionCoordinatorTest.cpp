@@ -2279,4 +2279,167 @@ TEST(TxnCoordAuditA8Test, DoWorkTimeoutBoundaryAndHugeTimeoutNoOverflow)
     }
 }
 
+// ===========================================================================
+// Round-2 residual edge-case tests (7 niche interactions — belt-and-suspenders)
+// ===========================================================================
+
+// Residual-1: Allocator reseed when recovered max producerId == INT64_MAX.
+// After replaying a log whose highest producerId == INT64_MAX, the next
+// initProducerId call must return kExhausted (pid == -1), never a reused or
+// wrapped negative pid.
+TEST(TxnCoordRound2Residual1Test, ReseedWhenMaxRecoveredPidIsInt64Max)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "txn-maxpid";
+        e.producerId    = INT64_MAX;    // highest possible pid
+        e.producerEpoch = 0;
+        e.state         = TxnState::Empty;
+        e.txnTimeoutMs  = 60'000;
+        log.append(e);
+    }
+
+    // Recover: default allocator (starts at 0) must be reseeded past INT64_MAX.
+    TransactionLog log2(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log2);
+    ASSERT_EQ(coord.state("txn-maxpid"), TxnState::Empty);
+
+    // Allocating a new transactionalId must report exhaustion, not a recycled id.
+    auto r = coord.initProducerId("txn-new", 60'000, 0LL);
+    EXPECT_EQ(r.producerId, ProducerIdAllocator::kExhausted)
+        << "allocator must be exhausted when max recovered pid == INT64_MAX";
+}
+
+// Residual-2: overflow-fence + crash + reseed in ONE combined flow.
+// Recover a PrepareAbort whose pendingNewProducerId is also the recovered max;
+// a FRESH txnId allocation after resolution must land strictly above the
+// deferred pid and never equal it.
+TEST(TxnCoordRound2Residual2Test, OverflowFenceCrashReseedCombinedFlow)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    constexpr ProducerId kOldPid   = 10;
+    constexpr ProducerId kFreshPid = 100;   // what the overflow-fence would allocate
+
+    // Inject a PrepareAbort (as-if crash mid-overflow-fence) with the deferred
+    // fresh pid recorded in pendingNewProducerId.
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId                  = "txn-r2";
+        e.producerId             = kOldPid;
+        e.producerEpoch          = INT16_MAX;   // was at overflow boundary
+        e.state                  = TxnState::PrepareAbort;
+        e.txnTimeoutMs           = 60'000;
+        e.txnStartNs             = 1'000;
+        e.partitions             = { tp("t", 0) };
+        e.pendingNewProducerId   = kFreshPid;   // the deferred fresh pid
+        e.pendingNewProducerEpoch = 0;
+        log.append(e);
+    }
+
+    // Recover: the allocator is reseeded past max(kOldPid, kFreshPid)=kFreshPid.
+    TransactionLog log2(path);
+    // Allocator starting at 0 — reseed must advance it beyond kFreshPid.
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, /*coordEpoch=*/3);
+    ASSERT_EQ(coord2.state("txn-r2"), TxnState::PrepareAbort);
+    ASSERT_EQ(coord2.pidOf("txn-r2"), kOldPid);
+
+    // The pending descriptor still carries the OLD pid (correct abort semantics).
+    auto pending = coord2.pendingMarkerTransactions();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(pending[0].producerId, kOldPid);
+    EXPECT_EQ(pending[0].producerEpoch, static_cast<ProducerEpoch>(INT16_MAX));
+    EXPECT_FALSE(pending[0].commit);
+
+    // Resolve: abort marker written under OLD pid; coordinator adopts the SAME
+    // deferred fresh pid.
+    MarkerMap markers;
+    int written = ControlMarker::resolvePendingMarkers(coord2, makeCollector(markers));
+    EXPECT_EQ(written, 1);
+    EXPECT_EQ(markers[tp("t", 0)].front().producerId, kOldPid);
+
+    EXPECT_EQ(coord2.state("txn-r2"), TxnState::Empty);
+    EXPECT_EQ(coord2.pidOf("txn-r2"), kFreshPid)
+        << "coordinator must adopt the persisted deferred fresh pid on recovery";
+
+    // Now a genuinely fresh txnId allocation must land strictly above kFreshPid
+    // (allocator was reseeded past it).
+    auto r = coord2.initProducerId("txn-brand-new", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    EXPECT_GT(r.producerId, kFreshPid)
+        << "fresh allocation after recovery must be strictly above the deferred pid";
+    EXPECT_NE(r.producerId, kOldPid)
+        << "fresh allocation must not collide with the old pid";
+}
+
+// Residual-3: Idempotent re-resolve — marker written → crash → recover →
+// resolve AGAIN → NO duplicate markers.
+// resolvePendingMarkers ran (CompleteAbort persisted), SAME log reopened →
+// pendingMarkerTransactions() is empty → zero markers on second resolve.
+TEST(TxnCoordRound2Residual3Test, IdempotentReResolveNoDuplicateMarkers)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-idem-re", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("txn-idem-re", r.producerId, r.producerEpoch,
+                        tps({tp("part", 0), tp("part", 1)}), 10);
+
+    // Trigger PrepareAbort via fence.
+    coord.initProducerId("txn-idem-re", 60'000, 0LL);
+    ASSERT_EQ(coord.state("txn-idem-re"), TxnState::PrepareAbort);
+
+    // First resolve: writes ABORT markers and persists CompleteAbort then Empty.
+    MarkerMap markers1;
+    int w1 = ControlMarker::resolvePendingMarkers(coord, makeCollector(markers1));
+    EXPECT_EQ(w1, 2) << "two ABORT markers expected (one per partition)";
+    EXPECT_EQ(coord.state("txn-idem-re"), TxnState::Empty);
+
+    // Simulate crash-and-reopen: the log now contains CompleteAbort (or Empty).
+    // Re-open a new coordinator from the SAME log file.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2);
+
+    // After recovery, there must be NO pending markers (markers already written).
+    auto pending = coord2.pendingMarkerTransactions();
+    EXPECT_TRUE(pending.empty())
+        << "after CompleteAbort/Empty recovery, pendingMarkerTransactions must be empty";
+
+    // Second resolve pass must emit ZERO markers (no duplicates).
+    MarkerMap markers2;
+    int w2 = ControlMarker::resolvePendingMarkers(coord2, makeCollector(markers2));
+    EXPECT_EQ(w2, 0) << "no duplicate ABORT markers on second resolve after recovery";
+    EXPECT_TRUE(markers2.empty());
+}
+
+// Residual-4: addPartitions rejected in CompleteAbort AND PrepareEpochFence
+// states (correct kInvalidTransition error).
+TEST(TxnCoordRound2Residual4Test, AddPartitionsRejectedInCompleteAbortAndPrepareEpochFence)
+{
+    for (TxnState st : { TxnState::CompleteAbort, TxnState::PrepareEpochFence }) {
+        auto path = coordTmpPath();
+        CoordTempFile tf{path};
+        injectState(path, "txn-rej", 5, 0, st);
+        TransactionLog log2(path);
+        TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
+        ASSERT_EQ(coord.state("txn-rej"), st);
+
+        auto ar = coord.addPartitions("txn-rej", /*pid=*/5, /*epoch=*/0,
+                                      tps({tp("t", 0)}), 0LL);
+        EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidTransition)
+            << "addPartitions must be rejected in state " << txnStateName(st);
+    }
+}
+
+// Residual-5 and Residual-6 are in ControlMarkerTest.cpp (non-zero offset and
+// CRC boundary). They are added there to keep marker-specific tests grouped.
+
 } // anonymous namespace

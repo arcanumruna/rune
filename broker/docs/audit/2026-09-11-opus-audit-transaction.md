@@ -489,3 +489,108 @@ SBE messages:
   NEW SILENT: 2 (A3/A4 unsafe SBE decode over-read). CLEAN/latent: A6 (CRC init race), A7 (nits, Dead dead-code).
 - Part B: 24 concrete missing edge-case tests (most impactful: #1 allocator reseed, #2 crash-seam swap, #A3 ASAN decode).
 - Verdict: **BUGS REMAIN** — not CLEAN. A1 is a silent exactly-once break on the documented default failover path.
+
+---
+
+# Full re-audit round 2 (commit dcd1bb0)
+
+Fresh-eyes pass over the ENTIRE `libs/transaction/**` + cross-ref `libs/storage/ProducerStateManager.h`.
+Verifying A1–A7 hold with no regression, plus an independent edge-case coverage assessment.
+
+## Part A — full bug audit
+
+### Verdict: **CLEAN** (no atomicity / PID-reuse / unresolved-txn / unsafe-decode / durability hole found)
+
+### A1–A7 re-verification (all HOLD, no regressions)
+- **A1 (allocator reseed on replay)** — `TransactionCoordinator.cpp:43-58`. The recovery loop scans `txnLog_->all()`,
+  tracks `max(producerId, pendingNewProducerId)`, and calls `allocator_.reseedAtLeast(maxPid)`. Covers ALL recovery
+  paths: Empty, Ongoing, Prepare*, Complete*, and the deferred `pendingNewProducerId`. `reseedAtLeast` is monotone
+  (`if (next_ < target)`) so an injected allocator already past maxPid is not moved back — the transactionalId→PID
+  map is untouched, no pids skipped. HOLDS.
+- **A2 (52-byte header + deferred PID swap round-trips)** — `TransactionLog.cpp:216-217` (write @40/@48),
+  `:301-302` (read @40/@48), `:335-336`+`:140-141` (apply). `kFixedHeaderSize=52`; layout is internally consistent
+  (writer/reader/replay all agree). `pendingNewProducerId/Epoch` persist and recover exactly; the A2 crash-seam test
+  confirms a mid-overflow-fence crash re-adopts the SAME fresh PID. HOLDS.
+- **A3/A4 (bounds-checked public decode)** — all four INGRESS request decoders (`InitProducerIdRequest`,
+  `AddPartitionsToTxnRequest`, `EndTxnRequest`, `WriteTxnMarkersRequest`) take `avail`, check the fixed block against
+  `end`, and use `read_str_safe`/`read_partitions_safe` (all-or-nothing, per-tuple bounds). No ingress decode path
+  uses an unchecked reader. The unsafe `read_str`/`read_partitions` remain ONLY in the three Response decoders
+  (coordinator→client, template 2/4/6), which are not the network-ingress attack surface. HOLDS.
+- **A5 (over-long rejection)** — `TransactionLog.cpp:173-185` throws `std::length_error` for txnId/partCount/topic
+  over `kMaxUint16`; every SBE `encode()` returns 0 for the same. No silent-truncation path remains. HOLDS.
+- **A6 (call_once CRC init)** — `TransactionLog.cpp:54-56` and `ControlMarker.cpp:92-94` both wrap the lazy table
+  fill in `std::call_once`; static crc32c can be called cross-thread safely. HOLDS.
+- **A7 (justified dead-code)** — `Dead`/`PrepareEpochFence` retained for enum/on-disk stability; `endTransaction`'s
+  unused `nowNs` documented (deadline owned solely by `doWork`). Justified, not bugs. HOLDS.
+
+### State-machine / EOS correctness (fresh review — no findings)
+- Zombie fencing keyed by exact `(producerId, producerEpoch)` in `validateEpochAndPid` (`:450-463`): a stale epoch
+  (`<`) is fenced as InvalidProducerEpoch; a spurious higher epoch is also rejected (conservative). No path lets a
+  fenced producer mutate state.
+- Concurrent-txn guard (`:125-133`) returns `kConcurrentTransactions` for re-init during Prepare*/Complete*/
+  PrepareEpochFence — no silent epoch bump mid-resolution.
+- NEW-1 overflow-fence (`:163-184`): on Ongoing-fence with epoch==INT16_MAX, the OLD PID/epoch are KEPT on the
+  PrepareAbort (so the ABORT marker matches in-flight data, which ProducerStateManager keys by producerId —
+  confirmed in `ProducerStateManager.h:26-30,104-113`), and the fresh PID is deferred to `pendingNewProducerId`,
+  adopted only in `completeTransaction` (`:333-338`) AFTER the abort resolves. Non-overflow path bumps epoch on the
+  same PID (also marker-consistent). Correct per KIP-98.
+- Durable-before-side-effect ordering holds everywhere: `endTransaction` fsyncs PrepareCommit/PrepareAbort before
+  returning partitions (`:288`); `completeTransaction` persists a DISTINCT Complete* record BEFORE clearing to Empty
+  (`:308-316`, `:325-340`) — a crash between marker-write and Empty recovers as Complete* (not re-resolved).
+- `doWork` (`:350-369`) samples nowNs once, transitions only Ongoing→PrepareAbort, sets markersPending, persists;
+  no spin. Timeout math `int64_t * 1'000'000LL` cannot overflow for the clamped `[1, 900000]` ms range.
+- Recovered Prepare* sets `markersPending=true` (`:48-50`); `pendingMarkerTransactions` + `resolvePendingMarkers`
+  re-drive to Complete*→Empty idempotently (recovered CompleteCommit/Empty are NOT re-emitted — markersPending only
+  set for Prepare*).
+
+### Durability / wire safety (fresh review — no findings)
+- Replay bounds checks (`TransactionLog.cpp:279-323`) are correct: `totalLength >= kFixedHeaderSize+kChecksumSize`
+  guards the `totalLength - kChecksumSize` subtraction; per-field `vpos + len > totalLength - kChecksumSize` cannot
+  under/overflow (size_t promotion). CRC verified before any field is trusted; first corrupt/torn record stops
+  replay and ftruncates the remainder (append-only-correct). pwrite+fsync on every append.
+- SBE `read_partitions_safe` reserves at most 65535 tuples (bounded) and validates each tuple's bytes before
+  committing — a crafted count that fits uint16 but exceeds the buffer is rejected with no over-read.
+- `ControlMarker::extract` caps reads at `end = ENCODED_SIZE` relative to `p`; varints are bounds-checked
+  (`read_varint_zigzag_safe`, max 10 bytes). CRC verified in `isControlBatch` before trusting the CONTROL bit.
+
+### LOW / non-blocking observations (not bugs)
+- **L1** `TransactionLog.cpp:330` casts `stateRaw` straight to `TxnState` with no range check (values 0–7 legal).
+  A CRC-valid record with a byte >7 yields an out-of-range enum. Only reachable via deliberate tampering that also
+  fixes the CRC; recovery of a genuinely corrupt byte is already blocked by CRC. Cosmetic hardening at most.
+- **L2** Response decoders (template 2/4/6) remain unchecked-reader — acceptable (client-side, non-ingress), but
+  if a future path decodes a response from an untrusted peer it would need an `avail` overload. Documented risk only.
+
+## Part B — edge-case test coverage assessment
+
+Coverage is strong (106 coordinator tests + full log/messages/marker suites; the 24 round-1 gaps are now closed:
+ASAN-worthy truncated public decodes #531-591, crafted-huge-count #556, mid-record CRC corruption #578,
+torn-tail-mid-Complete #625, embedded-NUL topic #693, empty-txnId+partitions #677, reseed/INT64_MAX #231, epoch
+walk 32766→overflow #2181, NEW-1 overflow-fence #1520, marker scope #2229, doWork boundary #2248).
+
+Residual niche gaps still NOT covered (low severity — hardening, not correctness holes):
+1. **Coordinator: reseed when recovered max == INT64_MAX** — the ALLOCATOR unit test parks-at-exhausted (#231), but
+   no coordinator-level test recovers a log whose highest producerId == INT64_MAX and asserts the next
+   `initProducerId(no-txnId)` returns `kExhausted` (pid -1) instead of a reused/negative pid.
+2. **Interaction: overflow-fence + crash + reseed in ONE flow** — A2 covers crash-seam PID re-adoption and A1
+   covers reseed, but not the combined path (recover a `pendingNewProducerId` that is also the recovered max, then
+   confirm a *fresh* txnId allocation lands strictly above it and never equals the deferred pid).
+3. **Idempotent re-resolve: marker written → crash → recover → resolve again** — recovered Prepare* resolvability is
+   tested, but not a full "resolvePendingMarkers ran, then the SAME log is reopened (Complete* now persisted)" pass
+   asserting `pendingMarkerTransactions()` is empty (no duplicate ABORT markers).
+4. **Concurrent addPartitions during Prepare*** — `AddPartitionsWhenPrepareCommit/AbortIsInvalidTransition` cover
+   the two Prepare states, but NOT addPartitions during `CompleteAbort` / `PrepareEpochFence` (CompleteCommit is
+   covered by T2Test); a table-driven "addPartitions rejected in every non-{Empty,Ongoing} state" would close it.
+5. **isControlBatch/extract at a non-zero offset** — noted round 1 (#20) and still open: all marker tests pass
+   offset 0; a test at offset>0 would lock the relative-vs-absolute index contract in `extract` (`end=ENCODED_SIZE`).
+6. **ControlMarker CRC boundary** — a batch whose CRC-covered region is exactly ENCODED_SIZE-CRC_DATA_START with a
+   single flipped byte at the last covered index (off-by-one at the CRC region boundary) is not explicitly tested.
+7. **Log record with partitionCount > 0 but a topic longer than the record body claims** — the replay per-tuple
+   bounds break (`:315-317`) is exercised only via generic torn-tail; a hand-crafted CRC-valid header with an
+   in-body topicLen that overruns `totalLength` is not directly tested.
+
+### Round-2 conclusion
+- Part A: **CLEAN** — A1–A7 and all prior fixes (B1,B2,C1,C2,C3,C4,S1,S2,NEW-1) hold; no new atomicity, PID-reuse,
+  unresolved-txn, unsafe-ingress-decode, or durability defect. Two LOW hardening notes (L1 enum range, L2 response
+  decoders) are non-blocking.
+- Part B: coverage adequate for correctness; 7 residual niche/interaction tests listed above would raise it from
+  "strong" to "exhaustive" (none guards an unproven correctness property — all are belt-and-suspenders).
