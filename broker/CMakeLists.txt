@@ -49,7 +49,8 @@ if(BUILD_BENCHMARKS)
         benchmark/TermLogBenchmark.cpp
         benchmark/ConsensusMessagesBenchmark.cpp
         benchmark/ElectionBenchmark.cpp
-        benchmark/ConsensusAgentBenchmark.cpp)
+        benchmark/ConsensusAgentBenchmark.cpp
+        benchmark/ReplicationBenchmark.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus benchmark::benchmark)
+    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication benchmark::benchmark)
 endif()
