@@ -66,9 +66,17 @@ struct ClusterMember {
     }
 
     // ClusterMember.java:1300-1303
-    // hasReachedPosition used inside hasQuorumAtPosition
-    bool hasReachedPosition(Term ltId, int64_t position, int64_t nowNs, int64_t timeoutNs) const noexcept {
-        return isActive(nowNs, timeoutNs) && ltId == leadershipTermId && logPosition >= position;
+    // C6 fix: also requires logLeadershipTermId match to prevent counting a member
+    // whose log tail is on a different branch toward the same position quorum.
+    // Two members can share leadershipTermId (current term) yet have divergent
+    // log tails (different logLeadershipTermId of their last appended entry).
+    // Audit finding C6: without this check, quorum can be over-counted across branches.
+    bool hasReachedPosition(Term ltId, Term logLtId, int64_t position,
+                            int64_t nowNs, int64_t timeoutNs) const noexcept {
+        return isActive(nowNs, timeoutNs)
+            && ltId    == leadershipTermId
+            && logLtId == logLeadershipTermId
+            && logPosition >= position;
     }
 
     // ClusterMember.java:140-149  reset()
@@ -169,20 +177,22 @@ struct ClusterMember {
     }
 
     // ClusterMember.java:907-925  hasQuorumAtPosition(ClusterMember[], long, long, long, long)
-    // Counts members with isActive && leadershipTermId==given && logPosition>=position.
-    // Returns true when count >= quorumThreshold.
-    // Note: the Java signature also takes nowNs/timeoutNs for the isActive check inside
-    // hasReachedPosition.  The spec deliverable omits those; we mirror the Java exactly.
+    // Counts members with isActive && leadershipTermId==given && logLeadershipTermId==given
+    // && logPosition>=position. Returns true when count >= quorumThreshold.
+    // C6 fix: added logLeadershipTermId parameter — both leadershipTermId AND
+    // logLeadershipTermId must match to prevent over-counting across log branches.
     static bool hasQuorumAtPosition(
         std::span<const ClusterMember> clusterMembers,
         Term                           leadershipTermId,
+        Term                           logLeadershipTermId,
         int64_t                        position,
         int64_t                        nowNs,
         int64_t                        timeoutNs) noexcept
     {
         int votes = 0;
         for (const auto& member : clusterMembers) {
-            if (member.hasReachedPosition(leadershipTermId, position, nowNs, timeoutNs)) {
+            if (member.hasReachedPosition(leadershipTermId, logLeadershipTermId,
+                                          position, nowNs, timeoutNs)) {
                 ++votes;
             }
         }

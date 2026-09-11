@@ -133,6 +133,7 @@ static void BM_ClusterMember_HasQuorumAtPosition(benchmark::State& state) {
         auto idx = static_cast<std::size_t>(i);
         members[idx].id                         = i;
         members[idx].leadershipTermId           = kLeaderTerm;
+        members[idx].logLeadershipTermId        = kLeaderTerm; // same branch (C6 fix)
         members[idx].timeOfLastAppendPositionNs = kNowNs - kTimeoutNs + 1LL; // active
         // First `quorum` members have reached target; others lag behind by varying amounts
         // so positions aren't constant (compiler can't fold the individual comparisons).
@@ -148,7 +149,7 @@ static void BM_ClusterMember_HasQuorumAtPosition(benchmark::State& state) {
 
         bool result = ClusterMember::hasQuorumAtPosition(
             std::span<const ClusterMember>(members.data(), static_cast<std::size_t>(sz)),
-            kLeaderTerm, kTargetPos, kNowNs, kTimeoutNs);
+            kLeaderTerm, kLeaderTerm, kTargetPos, kNowNs, kTimeoutNs);
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations());

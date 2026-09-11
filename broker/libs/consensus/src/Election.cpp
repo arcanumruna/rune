@@ -471,8 +471,10 @@ int Election::leaderReady(int64_t nowNs)
     }
 
     // Election.java:890-893: hasQuorumAtPosition → appendNewLeadershipTermEvent → electionComplete
+    // C6 fix: pass logLeadershipTermId_ so quorum only counts followers on the same log branch.
     if (ClusterMember::hasQuorumAtPosition(
-            clusterMembers_, leadershipTermId_, logPosition_, nowNs, electionTimeoutNs_)) {
+            clusterMembers_, leadershipTermId_, logLeadershipTermId_,
+            logPosition_, nowNs, electionTimeoutNs_)) {
         // Election.java:891: appendNewLeadershipTermEvent (Phase 2: no-op / already in TermLog)
         electionComplete(nowNs);
         workCount++;
