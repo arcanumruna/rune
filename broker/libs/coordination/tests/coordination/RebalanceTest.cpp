@@ -696,6 +696,88 @@ TEST(Rebalance, AutoAssignRoundRobin_Stable) {
 }
 
 // ===========================================================================
+// AUDIT B-9: More members than partitions — exactly 2 members get 1 partition
+// each, the others get empty lists. Kafka-exact placement verified.
+// ===========================================================================
+TEST(Rebalance, MoreMembersThanPartitions_ExcessMembersGetEmpty) {
+    GroupCoordinator gc("test-group", 0);
+    TopicPartitionCounts partCounts = {{"t", 2}};
+
+    // 5 members, 2 partitions.
+    gc.join("m1", kTimeout, {"t"}, 0);
+    gc.join("m2", kTimeout, {"t"}, 0);
+    gc.join("m3", kTimeout, {"t"}, 0);
+    gc.join("m4", kTimeout, {"t"}, 0);
+    gc.join("m5", kTimeout, {"t"}, 0);
+
+    // All 5 re-join.
+    gc.join("m1", kTimeout, {"t"}, 10);
+    gc.join("m2", kTimeout, {"t"}, 20);
+    gc.join("m3", kTimeout, {"t"}, 30);
+    gc.join("m4", kTimeout, {"t"}, 40);
+    gc.join("m5", kTimeout, {"t"}, 50);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    auto sr = gc.autoAssignAndSync(partCounts, AssignorType::Range, 100);
+    EXPECT_EQ(sr.errorCode, 0);
+    ASSERT_EQ(gc.state(), GroupState::Stable);
+
+    // Exactly 2 members must get 1 partition each; the other 3 get none.
+    int membersWithPartition = 0;
+    int membersWithEmpty     = 0;
+    for (const auto& m : gc.members()) {
+        auto af = gc.assignmentFor(m.memberId);
+        if (af.empty()) {
+            ++membersWithEmpty;
+        } else {
+            EXPECT_EQ(static_cast<int32_t>(af.size()), 1)
+                << "Member " << m.memberId << " should have exactly 1 partition";
+            ++membersWithPartition;
+        }
+    }
+    EXPECT_EQ(membersWithPartition, 2)
+        << "Exactly 2 members must receive partitions when 5 members share 2 partitions";
+    EXPECT_EQ(membersWithEmpty, 3)
+        << "Exactly 3 members must receive empty assignments";
+
+    // Union must cover both partitions.
+    Assignment stable;
+    for (const auto& m : gc.members()) stable[m.memberId] = m.assignment;
+    EXPECT_EQ(unionOfAssignment(stable), allPartitions("t", 2));
+}
+
+// ===========================================================================
+// AUDIT B-10: Member subscribing to no known topic — gets empty assignment,
+// never receives a partition, does not block the rebalance.
+// ===========================================================================
+TEST(Rebalance, MemberSubscribingToNoKnownTopic_GetsEmptyAssignment) {
+    GroupCoordinator gc("test-group", 0);
+    TopicPartitionCounts partCounts = {{"t", 4}};
+
+    // member-a subscribes to "t"; member-b subscribes to nothing known.
+    gc.join("member-a", kTimeout, {"t"}, 0);
+    gc.join("member-b", kTimeout, {} /*empty*/,   0);
+
+    gc.join("member-a", kTimeout, {"t"}, 10);
+    gc.join("member-b", kTimeout, {},   20);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    auto sr = gc.autoAssignAndSync(partCounts, AssignorType::Range, 100);
+    EXPECT_EQ(sr.errorCode, 0);
+    ASSERT_EQ(gc.state(), GroupState::Stable);
+
+    // member-a must have all 4 partitions of "t".
+    auto afA = gc.assignmentFor("member-a");
+    EXPECT_EQ(static_cast<int32_t>(afA.size()), 4)
+        << "member-a (sole subscriber of t) must get all 4 partitions";
+
+    // member-b has no subscriptions → must appear as a key with empty list.
+    auto afB = gc.assignmentFor("member-b");
+    EXPECT_TRUE(afB.empty())
+        << "member-b (no subscribed topics) must receive an empty assignment";
+}
+
+// ===========================================================================
 // Test 22: syncGroup wrong state (not CompletingRebalance) → kErrWrongState
 // ===========================================================================
 TEST(Rebalance, SyncGroupWrongState_Rejected) {

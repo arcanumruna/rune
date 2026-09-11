@@ -1044,3 +1044,296 @@ TEST(GroupCoordinator, SyncGroupLeaderInStable_NoClobber) {
             << " must not be clobbered by a duplicate leader SyncGroup in Stable";
     }
 }
+
+// ===========================================================================
+// AUDIT A1 [CORRECTNESS]: Existing-member re-join while Stable → PreparingRebalance
+//
+// The state table (GroupCoordinator.h:24) says:
+//   "Stable + join/leave → PreparingRebalance (generation bumped)"
+// An existing member re-joining while Stable must trigger a rebalance,
+// NOT be silently absorbed. This is the standard Kafka subscription-change
+// flow (consumer calls rejoin to change subscriptions or request reassignment).
+// ===========================================================================
+
+TEST(GroupCoordinator, ExistingMemberRejoinWhileStable_TriggersRebalance) {
+    GroupCoordinator gc("test-group", 0);
+
+    // Reach Stable: single member, auto-assign.
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 0);
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 100);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    TopicPartitionCounts partCounts = {{"t", 2}};
+    RangeAssignor ra;
+    {
+        auto subs = gc.members();
+        std::vector<MemberSubscription> ms;
+        for (const auto& m : subs) ms.push_back({m.memberId, m.subscribedTopics});
+        Assignment comp = ra.assign(ms, partCounts);
+        gc.syncGroup("member-a", gc.generationId(), comp, 200);
+    }
+    ASSERT_EQ(gc.state(), GroupState::Stable);
+
+    Generation genStable = gc.generationId();
+
+    // Existing member re-joins while Stable — must trigger rebalance.
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 300);
+
+    EXPECT_EQ(gc.state(), GroupState::PreparingRebalance)
+        << "Existing-member re-join while Stable must transition to PreparingRebalance";
+    EXPECT_GT(gc.generationId(), genStable)
+        << "Existing-member re-join while Stable must bump generation";
+}
+
+// ===========================================================================
+// AUDIT A1 [CORRECTNESS]: Subscription-change on re-join while Stable →
+// reassignment reflects the new subscription.
+//
+// A member that changes its subscribedTopics on rejoin while Stable must
+// cause a rebalance whose final assignment reflects the NEW subscription,
+// not the stale one.
+// ===========================================================================
+
+TEST(GroupCoordinator, SubscriptionChangeOnRejoin_ReassignmentReflectsChange) {
+    GroupCoordinator gc("test-group", 0);
+
+    // Set up: member-a subscribes to {"t1"}; reach Stable.
+    gc.join("member-a", kDefaultTimeoutMs, {"t1"}, 0);
+    gc.join("member-a", kDefaultTimeoutMs, {"t1"}, 100);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    TopicPartitionCounts partCounts = {{"t1", 2}, {"t2", 2}};
+    RangeAssignor ra;
+    {
+        auto subs = gc.members();
+        std::vector<MemberSubscription> ms;
+        for (const auto& m : subs) ms.push_back({m.memberId, m.subscribedTopics});
+        Assignment comp = ra.assign(ms, partCounts);
+        gc.syncGroup("member-a", gc.generationId(), comp, 200);
+    }
+    ASSERT_EQ(gc.state(), GroupState::Stable);
+
+    // Existing member re-joins while Stable with a DIFFERENT subscription.
+    gc.join("member-a", kDefaultTimeoutMs, {"t1", "t2"}, 300);
+    ASSERT_EQ(gc.state(), GroupState::PreparingRebalance)
+        << "Subscription-change re-join while Stable must trigger rebalance";
+
+    // The member's stored subscribedTopics must reflect the new subscription.
+    bool foundMember = false;
+    for (const auto& m : gc.members()) {
+        if (m.memberId == "member-a") {
+            foundMember = true;
+            std::vector<std::string> expected = {"t1", "t2"};
+            EXPECT_EQ(m.subscribedTopics, expected)
+                << "Updated subscription must be stored after rejoin";
+        }
+    }
+    EXPECT_TRUE(foundMember) << "member-a must still be in the group";
+
+    // Re-join (phase 2) and complete the rebalance; the new assignment must
+    // include t2 since member-a now subscribes to it.
+    gc.join("member-a", kDefaultTimeoutMs, {"t1", "t2"}, 400);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    {
+        auto subs = gc.members();
+        std::vector<MemberSubscription> ms;
+        for (const auto& m : subs) ms.push_back({m.memberId, m.subscribedTopics});
+        Assignment comp = ra.assign(ms, partCounts);
+        gc.syncGroup("member-a", gc.generationId(), comp, 500);
+    }
+    ASSERT_EQ(gc.state(), GroupState::Stable);
+
+    // member-a must now have t2 partitions (new subscription).
+    auto af = gc.assignmentFor("member-a");
+    bool hasT2 = false;
+    for (const auto& tp : af) {
+        if (tp.topic == "t2") { hasT2 = true; break; }
+    }
+    EXPECT_TRUE(hasT2) << "After subscription-change rebalance, member-a must be assigned t2 partitions";
+}
+
+// ===========================================================================
+// AUDIT A2 [SILENT]: Multiple members expire in the same doWork tick →
+// generation bumps by exactly 1 (not N).
+//
+// Kafka collapses a batch of same-tick session expirations into a SINGLE
+// rebalance / generation bump. The current per-member loop bumps N times.
+// ===========================================================================
+
+TEST(GroupCoordinator, TwoMembersExpireInSameTick_GenerationBumpsOnce) {
+    GroupCoordinator gc("test-group", 0);
+    constexpr int32_t shortTimeout = 1'000; // 1 s
+
+    // Add two members with identical short timeouts.
+    gc.join("member-a", shortTimeout, {}, 0);
+    gc.join("member-b", shortTimeout, {}, 0);
+
+    Generation genBeforeExpiry = gc.generationId();
+    ASSERT_GE(genBeforeExpiry, 1);
+
+    // Advance clock so BOTH members have expired.
+    int64_t expiry = static_cast<int64_t>(shortTimeout) * 1'000'000LL + 1;
+    int work = gc.doWork(expiry);
+
+    // Both members must have been reaped.
+    EXPECT_EQ(gc.memberCount(), 0u)
+        << "Both members must be evicted in the same doWork tick";
+    EXPECT_GE(work, 2) << "doWork must report at least 2 units of work (2 reaps)";
+
+    // Generation must increment by EXACTLY 1 (one batch rebalance), not 2.
+    EXPECT_EQ(gc.generationId(), genBeforeExpiry + 1)
+        << "Batch expiry of 2 members must produce exactly ONE generation bump, not two";
+}
+
+TEST(GroupCoordinator, ThreeMembersExpireInSameTick_GenerationBumpsOnce) {
+    GroupCoordinator gc("test-group", 0);
+    constexpr int32_t shortTimeout = 500; // 500 ms
+
+    gc.join("ma", shortTimeout, {}, 0);
+    gc.join("mb", shortTimeout, {}, 0);
+    gc.join("mc", shortTimeout, {}, 0);
+
+    Generation genBefore = gc.generationId();
+
+    int64_t expiry = static_cast<int64_t>(shortTimeout) * 1'000'000LL + 1;
+    gc.doWork(expiry);
+
+    EXPECT_EQ(gc.memberCount(), 0u);
+    // Three expirations → Empty. Must be exactly genBefore+1.
+    EXPECT_EQ(gc.generationId(), genBefore + 1)
+        << "Three simultaneous expirations must produce exactly ONE generation bump";
+    EXPECT_EQ(gc.state(), GroupState::Empty);
+}
+
+// ===========================================================================
+// PART B — Additional coverage tests
+// ===========================================================================
+
+// B-7: Join during CompletingRebalance — NEW member should re-Prepare.
+TEST(GroupCoordinator, NewMemberJoinDuringCompletingRebalance_Reprepares) {
+    GroupCoordinator gc("test-group", 0);
+
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 0);
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 100);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    Generation genBefore = gc.generationId();
+    // A NEW member joins during CompletingRebalance.
+    gc.join("member-b", kDefaultTimeoutMs, {"t"}, 200);
+
+    EXPECT_EQ(gc.state(), GroupState::PreparingRebalance)
+        << "New join during CompletingRebalance must re-trigger rebalance (PreparingRebalance)";
+    EXPECT_GT(gc.generationId(), genBefore)
+        << "New join during CompletingRebalance must bump generation";
+    EXPECT_EQ(gc.memberCount(), 2u);
+}
+
+// B-7b: Existing member re-joins during CompletingRebalance — should also re-Prepare (A1 fix).
+TEST(GroupCoordinator, ExistingMemberRejoinDuringCompletingRebalance_Reprepares) {
+    GroupCoordinator gc("test-group", 0);
+
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 0);
+    gc.join("member-b", kDefaultTimeoutMs, {"t"}, 0);
+    gc.join("member-a", kDefaultTimeoutMs, {"t"}, 100);
+    gc.join("member-b", kDefaultTimeoutMs, {"t"}, 200);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    Generation genBefore = gc.generationId();
+    // An EXISTING member re-joins during CompletingRebalance (inert before fix).
+    gc.join("member-a", kDefaultTimeoutMs, {"t", "t2"}, 250);
+
+    EXPECT_EQ(gc.state(), GroupState::PreparingRebalance)
+        << "Existing-member re-join during CompletingRebalance must re-trigger rebalance";
+    EXPECT_GT(gc.generationId(), genBefore)
+        << "Re-join during CompletingRebalance must bump generation";
+}
+
+// B-8: Empty-group operations — no crash, appropriate error codes.
+TEST(GroupCoordinator, EmptyGroup_SyncGroupReturnsWrongState) {
+    GroupCoordinator gc("test-group", 0);
+    ASSERT_EQ(gc.state(), GroupState::Empty);
+    auto sr = gc.syncGroup("nobody", 0, {}, 0);
+    EXPECT_NE(sr.errorCode, SyncResult::kOk)
+        << "syncGroup on empty group must not return kOk";
+}
+
+TEST(GroupCoordinator, EmptyGroup_HeartbeatReturnsUnknownMember) {
+    GroupCoordinator gc("test-group", 0);
+    auto hb = gc.heartbeat("nobody", 0, 0);
+    EXPECT_EQ(hb.errorCode, HeartbeatResult::kErrUnknownMember);
+}
+
+TEST(GroupCoordinator, EmptyGroup_DoWorkReturnsZero) {
+    GroupCoordinator gc("test-group", 0);
+    EXPECT_EQ(gc.doWork(1'000'000'000LL), 0)
+        << "doWork on empty group must return 0 (no work)";
+    EXPECT_EQ(gc.state(), GroupState::Empty);
+    EXPECT_EQ(gc.generationId(), 0);
+}
+
+TEST(GroupCoordinator, EmptyGroup_LeaveIsNoOp) {
+    GroupCoordinator gc("test-group", 0);
+    // Must not crash or change state.
+    gc.leave("nobody", 0, 0);
+    EXPECT_EQ(gc.state(), GroupState::Empty);
+    EXPECT_EQ(gc.generationId(), 0);
+}
+
+// B-11: Generation wrap safety — drive many rebalances, assert monotonic fencing holds.
+TEST(GroupCoordinator, LargeGenerationChurn_FencingStillHolds) {
+    GroupCoordinator gc("test-group", 0);
+    constexpr int kChurns = 200;
+
+    for (int i = 0; i < kChurns; ++i) {
+        gc.join("m1", kDefaultTimeoutMs, {}, static_cast<int64_t>(i));
+        gc.join("m2", kDefaultTimeoutMs, {}, static_cast<int64_t>(i) + 1);
+        gc.leave("m1", gc.generationId(), static_cast<int64_t>(i) + 2);
+        gc.leave("m2", gc.generationId(), static_cast<int64_t>(i) + 3);
+    }
+
+    Generation finalGen = gc.generationId();
+    EXPECT_GT(finalGen, kChurns) << "Generation must have grown from churn";
+
+    // Heartbeat with a stale generation (0) must be rejected.
+    gc.join("sentinel", kDefaultTimeoutMs, {}, kChurns * 10LL);
+    auto hb = gc.heartbeat("sentinel", 0, kChurns * 10LL + 1);
+    EXPECT_EQ(hb.errorCode, HeartbeatResult::kErrStaleGeneration)
+        << "Fencing must still reject stale generation after large churn";
+}
+
+// B-12: Concurrent join + timeout in one doWork window — no double-eviction,
+// membership stays consistent.
+TEST(GroupCoordinator, ConcurrentJoinAndTimeout_ConsistentState) {
+    GroupCoordinator gc("test-group", 0);
+    constexpr int32_t shortTimeout = 100; // 100 ms
+
+    // member-a has a very short timeout; member-b has a long one.
+    gc.join("member-a", shortTimeout, {"t"}, 0);
+    gc.join("member-b", kDefaultTimeoutMs, {"t"}, 0);
+
+    Generation genBefore = gc.generationId();
+    std::size_t countBefore = gc.memberCount();
+    ASSERT_EQ(countBefore, 2u);
+
+    // Advance past member-a's timeout only. member-b should survive.
+    int64_t expiry = static_cast<int64_t>(shortTimeout) * 1'000'000LL + 1;
+    int work = gc.doWork(expiry);
+
+    // member-a expired; member-b is alive.
+    EXPECT_EQ(gc.memberCount(), 1u)
+        << "Only the expired member must be evicted";
+    EXPECT_GE(work, 1);
+
+    // Check member-b is still present.
+    bool foundB = false;
+    for (const auto& m : gc.members()) {
+        if (m.memberId == "member-b") foundB = true;
+        EXPECT_NE(m.memberId, "member-a") << "member-a must have been evicted";
+    }
+    EXPECT_TRUE(foundB) << "member-b must still be present after member-a expired";
+
+    // Generation must have advanced (one rebalance for the one eviction).
+    EXPECT_GT(gc.generationId(), genBefore)
+        << "Generation must advance after a member expires";
+}

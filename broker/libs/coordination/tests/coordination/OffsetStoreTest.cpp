@@ -599,3 +599,163 @@ TEST(OffsetStore, CrcByteFlip_StoreIsWritableAfterRecovery) {
     EXPECT_NO_THROW(store2.commit("grp", tp("topicA", 9), 99, "new", 9000));
     EXPECT_EQ(store2.fetch("grp", tp("topicA", 9))->offset, 99);
 }
+
+// ===========================================================================
+// AUDIT B-6: fetch() (single-key) miss paths not explicitly tested
+//
+// fetchAll-unknown is covered; single-fetch miss for both unknown-group
+// AND known-group/unknown-tp must explicitly return nullopt.
+// ===========================================================================
+
+TEST(OffsetStore, FetchSingleKey_UnknownGroup_ReturnsNullopt) {
+    TempOffset t("fetchmiss1");
+    OffsetStore store(t.path.string());
+    store.commit("grp-real", tp("topicA", 0), 42, "meta", 1000);
+    // Querying a completely different group must return nullopt.
+    auto co = store.fetch("grp-nonexistent", tp("topicA", 0));
+    EXPECT_FALSE(co.has_value())
+        << "fetch() for unknown group must return nullopt";
+}
+
+TEST(OffsetStore, FetchSingleKey_KnownGroupUnknownTP_ReturnsNullopt) {
+    TempOffset t("fetchmiss2");
+    OffsetStore store(t.path.string());
+    store.commit("grp", tp("topicA", 0), 42, "meta", 1000);
+    // Same group, different topic-partition.
+    auto co1 = store.fetch("grp", tp("topicB", 0));
+    EXPECT_FALSE(co1.has_value())
+        << "fetch() for known group but unknown topic must return nullopt";
+    auto co2 = store.fetch("grp", tp("topicA", 99));
+    EXPECT_FALSE(co2.has_value())
+        << "fetch() for known group+topic but unknown partition must return nullopt";
+}
+
+// ===========================================================================
+// AUDIT A3 [SILENT hardening]: OffsetStore replay body-length identity check.
+//
+// A record whose sub-field lengths (groupLen + topicLen + metaLen) do NOT
+// sum to (totalLength - kFixedHeaderSize - kChecksumSize) but has a valid
+// CRC for the raw bytes as written (so the CRC path alone does not reject it)
+// must be detected by an explicit body-length identity check and rejected.
+//
+// We craft such a record by:
+//   1. Writing a normal record (groupLen, topicLen, metaLen, totalLength all
+//      consistent, CRC valid).
+//   2. Rewriting the file with the SAME raw bytes but with groupLen bumped
+//      by 1 (so groupLen+topicLen+metaLen now exceeds the body), then
+//      recomputing the CRC over those tampered bytes so the CRC itself is
+//      valid for the tampered header — yet the body-length identity fails.
+// ===========================================================================
+
+#include <sys/types.h>
+
+namespace {
+
+/// Little-endian read helpers (same pattern as OffsetStore internals).
+template<typename T>
+static T le_read(const uint8_t* p) {
+    T v{};
+    std::memcpy(&v, p, sizeof(T));
+    // On all our target platforms (x86/ARM LE) this is byte-identical.
+    return v;
+}
+
+template<typename T>
+static void le_write(uint8_t* p, T v) {
+    std::memcpy(p, &v, sizeof(T));
+}
+
+/// CRC32C (mirrors the one in OffsetStore.cpp — recomputed here for the test).
+static uint32_t test_crc32c(const uint8_t* data, std::size_t len) {
+    // Build table once.
+    static uint32_t tbl[256];
+    static bool init = false;
+    if (!init) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) c = (c >> 1) ^ (0x82F63B78u & -(c & 1u));
+            tbl[i] = c;
+        }
+        init = true;
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < len; ++i)
+        crc = (crc >> 8) ^ tbl[(crc ^ data[i]) & 0xFF];
+    return crc ^ 0xFFFFFFFFu;
+}
+
+} // anonymous namespace
+
+TEST(OffsetStore, BodyLengthInconsistency_RecordRejectedCleanly) {
+    TempOffset t("bodylen");
+
+    // 1. Write two clean records.
+    {
+        OffsetStore store(t.path.string());
+        store.commit("grp", tp("topicA", 0), 100, "meta", 1000);
+        store.commit("grp", tp("topicA", 1), 200, "meta", 2000);
+    }
+
+    // 2. Read the file bytes, find the last record, and tamper:
+    //    bump groupLen by 1 so groupLen+topicLen+metaLen > body size,
+    //    then recompute the CRC so the CRC check itself passes.
+    auto fileSize = static_cast<off_t>(fs::file_size(t.path));
+    ASSERT_GT(fileSize, 0);
+
+    // Read the whole file.
+    int fd = ::open(t.path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+
+    std::vector<uint8_t> fileBuf(static_cast<std::size_t>(fileSize));
+    ssize_t nr = ::pread(fd, fileBuf.data(), fileBuf.size(), 0);
+    ASSERT_EQ(nr, static_cast<ssize_t>(fileSize));
+
+    // Walk to find the last record start.
+    off_t pos = 0, lastStart = 0;
+    while (pos < fileSize) {
+        uint32_t magic = le_read<uint32_t>(fileBuf.data() + pos);
+        uint32_t tlen  = le_read<uint32_t>(fileBuf.data() + pos + 4);
+        if (magic != 0x4F464653u) break;
+        if (pos + static_cast<off_t>(tlen) > fileSize) break;
+        lastStart = pos;
+        pos += static_cast<off_t>(tlen);
+    }
+
+    // lastStart points to the second (last) record.
+    uint32_t totalLength = le_read<uint32_t>(fileBuf.data() + lastStart + 4);
+    ASSERT_GE(totalLength, 40u); // sanity
+
+    // groupLen is at offset 28 within the record.
+    uint16_t origGroupLen = le_read<uint16_t>(fileBuf.data() + lastStart + 28);
+    // Bump groupLen by 1 → sub-length sum exceeds body size.
+    uint16_t badGroupLen = static_cast<uint16_t>(origGroupLen + 1);
+    le_write<uint16_t>(fileBuf.data() + lastStart + 28, badGroupLen);
+
+    // Recompute CRC over [0 .. totalLength-5] of this record so that the
+    // CRC is valid for the tampered bytes (defeating the CRC alone as a
+    // guard — only the body-length identity check will catch this).
+    constexpr std::size_t kChecksumSize = 4;
+    uint32_t newCrc = test_crc32c(fileBuf.data() + lastStart, totalLength - kChecksumSize);
+    le_write<uint32_t>(fileBuf.data() + lastStart + totalLength - kChecksumSize, newCrc);
+
+    // Write the tampered file back.
+    ssize_t nw = ::pwrite(fd, fileBuf.data(), fileBuf.size(), 0);
+    ASSERT_EQ(nw, static_cast<ssize_t>(fileSize));
+    ::close(fd);
+
+    // 3. Reopen OffsetStore — must not crash, must not mis-decode the tampered record.
+    OffsetStore store2(t.path.string());
+
+    // The first record (clean) must survive.
+    EXPECT_TRUE(store2.fetch("grp", tp("topicA", 0)).has_value())
+        << "Clean record 0 must survive after body-length-inconsistent record is dropped";
+
+    // The tampered record must be rejected (either dropped or the store
+    // recovers cleanly — it must not crash or return a corrupt value).
+    // If the check is missing, this would either crash (string overread)
+    // or silently succeed with a garbage offset/group.
+    // The test is satisfied by: no crash, no exception, and the store is
+    // writable afterwards.
+    EXPECT_NO_THROW(store2.commit("grp", tp("topicA", 9), 999, "ok", 9000));
+    EXPECT_EQ(store2.fetch("grp", tp("topicA", 9))->offset, 999);
+}

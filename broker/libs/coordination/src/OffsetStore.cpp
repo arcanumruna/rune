@@ -310,6 +310,21 @@ void OffsetStore::replayAndTruncate() {
         uint16_t metaLen    = read_le<uint16_t>(recBuf.data() + 32);
         // [34..35] is padding
 
+        // Defense-in-depth: verify body-length identity before slicing.
+        // The CRC catches random bit-flips in well-formed records, but an
+        // adversarially-crafted record can have a valid CRC for the tampered
+        // header bytes while sub-lengths sum to more than the body (audit A3).
+        // totalLength = kFixedHeaderSize + groupLen + topicLen + metaLen + kChecksumSize
+        // → body size = totalLength - kFixedHeaderSize - kChecksumSize
+        // → must equal groupLen + topicLen + metaLen.
+        uint32_t bodySize = totalLength - kFixedHeaderSize - kChecksumSize;
+        uint32_t subLenSum = static_cast<uint32_t>(groupLen)
+                           + static_cast<uint32_t>(topicLen)
+                           + static_cast<uint32_t>(metaLen);
+        if (subLenSum != bodySize) {
+            break; // body-length inconsistency — reject as corrupt
+        }
+
         const uint8_t* body = recBuf.data() + kFixedHeaderSize;
         std::string group_str{reinterpret_cast<const char*>(body),                   groupLen};
         std::string topic_str{reinterpret_cast<const char*>(body + groupLen),        topicLen};

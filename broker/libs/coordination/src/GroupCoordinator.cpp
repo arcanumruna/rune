@@ -62,14 +62,27 @@ JoinResult GroupCoordinator::join(const std::string&              memberId,
         existing->subscribedTopics = subscribedTopics;
         existing->lastHeartbeatNs  = nowNs;
 
-        // Track that this member has re-joined during the current rebalance.
         if (state_ == GroupState::PreparingRebalance) {
+            // Track that this member has re-joined during the current rebalance.
             rejoinedMembers_.insert(effectiveMemberId);
             // If all expected members have re-joined, advance to CompletingRebalance.
             if (rejoinedMembers_.size() >= expectedMemberCount_) {
                 transitionToCompletingRebalance(nowNs);
             }
+        } else if (state_ == GroupState::Stable ||
+                   state_ == GroupState::CompletingRebalance) {
+            // Kafka-faithful: an existing member re-joining while Stable or
+            // CompletingRebalance (e.g. to change subscription or request a
+            // new assignment) must trigger a rebalance — exactly as documented
+            // in the state table ("Stable + join/leave → PreparingRebalance").
+            // Without this, a subscription change is silently ignored and the
+            // group stays Stable with a stale assignment (audit A1).
+            triggerRebalance(nowNs);
+            // Count this member as already re-joined in the new rebalance.
+            rejoinedMembers_.insert(effectiveMemberId);
+            electLeader();
         }
+        // (Empty / Dead states: no special handling needed for re-joins.)
     } else {
         // New member: add to the group.
         MemberInfo info;
@@ -183,10 +196,16 @@ int GroupCoordinator::doWork(int64_t nowNs)
             }
         }
 
+        // Batch all evictions first, then do ONE rebalance/generation-bump.
+        // Kafka collapses a same-tick batch of expirations into a single
+        // rebalance — bumping generation N times (once per member) is a
+        // Kafka-fidelity deviation (audit A2).
         for (const auto& id : toEvict) {
             if (!removeMember(id)) continue;
             ++work;
+        }
 
+        if (work > 0) {
             if (members_.empty()) {
                 ++generationId_;
                 state_    = GroupState::Empty;
