@@ -1062,3 +1062,170 @@ The item-5 "doc nit" is upgraded to a fixed EOS durability bug. Offsets are now
 applied BEFORE the terminal CompleteCommit persist; the commit resolution is
 idempotent under re-drive; no committed-offset-loss in either crash sub-window;
 abort still discards. EOS capstone remains **CLEAN** with this correction applied.
+
+---
+
+## P5-5 final full re-audit (commit 6c7141a)
+
+Fresh full-library pass over `libs/transaction/**` (Coordinator, ProducerIdAllocator,
+TransactionLog, ControlMarker, ReadCommittedView, TransactionMessages, Types) plus
+integration tests. Focus: the offset-apply ordering fix and any symmetric ordering
+bug on every resolution path, plus edge-case coverage.
+
+### Part A verdict: **BUGS REMAIN** (1 liveness; EOS *safety* is CLEAN)
+
+**Offset-apply ordering fix [6c7141a] — CONFIRMED CORRECT.**
+`completeTransaction` PrepareCommit branch (TransactionCoordinator.cpp:369-389)
+applies `offsetApplyCb_` FIRST (still logically PrepareCommit), THEN persists the
+terminal CompleteCommit, THEN clears + Empty. pendingOffsets are durable from
+add-time and ride every subsequent record incl. the PrepareCommit record
+(appendFromMetadata copies meta.pendingOffsets — TransactionLog.cpp:113,207-269;
+replayed :367-394; recovered into metadata :143-145). Constructor marks a recovered
+PrepareCommit markersPending (TransactionCoordinator.cpp:50-51) so the re-drive
+re-runs this exact path. OffsetStore::commit is an idempotent overwrite and
+resolvePendingMarkers re-writes markers idempotently. Both crash sub-windows
+(before/after the CompleteCommit persist) are loss-free. No committed offset lost.
+
+**No symmetric offset/marker ordering bug on the abort/fence/timeout/recovered
+paths.** Abort discards pendingOffsets at a single site (PrepareAbort branch,
+:400-402) and never calls offsetApplyCb_. Markers are always written by the caller
+(writeMarkers/resolvePendingMarkers) BEFORE completeTransaction, i.e.
+durable-marker-before-terminal-state on every path. addOffsetsToTxn is epoch/PID
+fenced (:313) and Ongoing-only (:318); pendingOffsets persisted before any
+OffsetStore write (:331). NEW-1 overflow keeps OLD pid/epoch on the abort marker
+and adopts the deferred fresh PID only in the CompleteAbort branch (:408-415),
+persisted (A2) so a crash mid-abort keeps the handed-out identity. Allocator
+reseed past max(producerId, pendingNewProducerId) on recovery (:46-60) — no PID
+reuse. LE control-batch format + read_committed LSO/aborted-index all correct;
+control batches never returned; LSO clamped to [0,hw].
+
+**BUG (MEDIUM, liveness — NOT an EOS safety break): recovered terminal Complete*
+state is non-resolvable → transactionalId wedged.**
+`completeTransaction` persists CompleteCommit (`:379`) / CompleteAbort (`:398`) as a
+FIRST record, then a SECOND record for the reset to Empty (`:388` / `:417`). A crash
+in that two-write window leaves a durable Complete* state. On recovery the
+constructor sets markersPending ONLY for Prepare* (`:50`), so a recovered Complete*
+is never surfaced by pendingMarkerTransactions() and completeTransaction() on it
+returns kInvalidTransition (`:421`). initProducerId for that txnId then returns
+kConcurrentTransactions FOREVER (`:127-135`) — the producer can never make progress
+on that transactionalId again. Safety is intact (offsets + markers already durable
+before the Complete* record; nothing lost/leaked), but it is a permanent
+availability hole and violates "every recovered state is resolvable." Kafka treats
+Complete* as transient and collapses to Empty on load. Fix: either (a) on recovery
+treat a recovered CompleteCommit/CompleteAbort as Empty (adopting any deferred PID
+for CompleteAbort), or (b) fold the Empty reset into the SAME persisted record as
+the Complete* transition (single write), removing the window. File:line:
+TransactionCoordinator.cpp:378-388 and :397-417; constructor :49-55.
+
+(Minor, non-bug) addOffsetsToTxn appends to a vector without de-duping repeated
+(group,tp); on commit both apply in insertion order, last-write-wins via OffsetStore
+overwrite — correct but unbounded-growth if a client re-adds the same key many times
+in one txn. Not an EOS issue.
+
+### Part B — edge-case coverage: 8 missing (top listed)
+Existing suite (~48 tests across ExactlyOnce + LeaderFailoverEos + unit) already
+covers: crash mid-PrepareCommit re-applies pending offsets (F3-c
+AddOffsetsToTxn_FailoverRecoversPendingOffsets), abort-discards-across-recovery,
+marker-durability leader failover, timeout/fence abort, zombie fencing on
+add/end, PID reseed. MISSING:
+1. **Crash BETWEEN the CompleteCommit persist and the Empty-reset persist** — would
+   expose the wedged-txnId liveness bug above (no test drives a crash in this exact
+   two-write window; F3-c crashes only at PrepareCommit). HIGHEST value.
+2. Crash BETWEEN COMMIT-marker write and offset-apply, then re-drive → offsets
+   applied exactly once AND duplicate COMMIT markers on the partition log resolve
+   idempotently in LsoTracker (no double effect, read_committed still correct).
+3. Crash BETWEEN offset-apply and CompleteCommit-persist with a REAL reopen (F3-c
+   models the window but never actually crashes inside it via a throwing callback +
+   reopen the way the unit-level durability test does).
+4. addOffsetsToTxn epoch-fenced by a zombie (old epoch) — asserted for
+   addPartitions/endTxn but NOT for addOffsetsToTxn.
+5. Abort AFTER addOffsetsToTxn THEN coordinator recovery → recovered PrepareAbort
+   resolve still discards the (durably-recovered) pendingOffsets.
+6. Multi-GROUP offsets bound in one txn (two distinct groups) applied atomically on
+   commit / all discarded on abort.
+7. Same (group,tp) added twice in one txn with different offsets → last-write-wins
+   after commit (dedup/ordering semantics pinned).
+8. Interleaved commit+abort of two txns that BOTH carry pending offsets → only the
+   committed txn's offsets land.
+
+### Bottom line
+Offset-apply ordering fix is correct and EOS SAFETY is proven end-to-end: no
+crash-window loses a committed effect or leaks an aborted one on any resolution
+path. However Part A is NOT fully CLEAN — a recovered terminal Complete* state is
+non-resolvable (permanent txnId wedge; liveness), so the "every recovered state is
+resolvable" gate fails. Recommend fixing the two-write Complete*→Empty window (or
+collapsing recovered Complete* to Empty) and adding edge-case test #1 before
+declaring P5-5 CLEAN.
+
+---
+
+## P5-5 wedge-fix confirm (commit 539bd32)
+
+**Verdict: CLEAN — libs/transaction fully sound, EOS proven end-to-end,
+coverage-adequate. P5-5 / libs/transaction CERTIFIED.**
+
+Fresh whole-library re-audit at `539bd32`. Diff is surgical: only
+`TransactionCoordinator.cpp` (+27, the ctor collapse) and the test file changed
+(`git show --stat 539bd32`). No touch to TransactionLog / ControlMarker /
+ReadCommittedView / LSO — every prior fix is untouched and still holds.
+
+### 1. Wedge fix correct (TransactionCoordinator.cpp:53-79)
+The ctor replay loop now collapses a recovered `CompleteCommit`/`CompleteAbort`
+to `Empty`. Verified byte-for-byte against `completeTransaction`'s Empty reset:
+- CompleteCommit collapse (`:73-78`) clears partitions/pendingOffsets/txnStartNs/
+  fencingEpoch/markersPending, sets Empty — identical to `:409-414`, and (correctly)
+  does NOT touch producerId/epoch.
+- CompleteAbort collapse (`:67-72`) adopts `pendingNewProducerId`/Epoch (NEW-1/A2
+  overflow path) exactly as `completeTransaction` `:437-442` does before Empty.
+- **Offsets NOT re-applied:** `offsetApplyCb_` is never invoked anywhere in the ctor
+  (`:40-88`); the callback fires only in `completeTransaction` `:396-400`. Confirmed
+  by `RecoveredCompleteCommitCollapsedToEmpty_NotWedged` asserting `applyCount==0`
+  (:2784).
+- **Markers NOT re-written / not duplicated:** collapse is in-memory only — no
+  `persistTransition` in the replay loop; collapsed Empty is not in
+  `pendingMarkerTransactions()` (state guard `:484-485`), and
+  `RecoveryDoesNotDuplicateMarkersOnCompleteCommitState` asserts 0 markers on a
+  resolve pass (:1442).
+- **No safety regression:** a recovered Complete* had all effects (markers +
+  offsets) durable before the Complete* record; collapse only restores liveness.
+- **Reseed intact:** `:80-81` samples `producerId` and `pendingNewProducerId` for
+  maxPid; after CompleteAbort adoption `pendingNewProducerId=-1` but the adopted PID
+  is now in `producerId`, so it is still counted — no reseed gap (verified by
+  `RecoveredCompleteAbortWithPendingNewPid_AdoptsDeferredPid`, allocator{500} > 200).
+
+### 2. No symmetric hole — every recovered state resolvable/terminal
+- Empty → terminal/usable. Ongoing → `doWork` times out to PrepareAbort (:463-468).
+- PrepareCommit/PrepareAbort → ctor sets `markersPending` (:50-51), resolved via
+  `completeTransaction` (idempotent re-drive of offsets + markers).
+- CompleteCommit/CompleteAbort → collapsed to Empty (this fix). The only two-record
+  windows (Prepare*→Complete* and Complete*→Empty) are now BOTH covered: the first
+  by markersPending re-drive, the second by collapse.
+- Dead → `initProducerId` re-create fall-through. PrepareEpochFence → never assigned
+  by any code path (grep: no `state = PrepareEpochFence` anywhere), so not a reachable
+  recovered state. No stuck window remains.
+
+### 3. The 8 edge tests are real (not vacuous)
+Verified each drives real state and asserts the claimed invariant:
+wedge collapse + applyCount==0 + reusability (:2704/:2798/:2837); addOffsetsToTxn
+zombie-fenced → kInvalidProducerEpoch (:2892); multi-group apply-on-commit /
+discard-on-abort (:2930/:2970); abort-after-addOffsets recovery discards (:3012);
+same-(group,tp) last-write-wins offset=99 (:3060); interleaved commit+abort — only
+committed lands (:3105). Crash-between-persist-and-offset-apply exactly-once is a
+throwing-callback + reopen re-drive (:2552-2637) proving no committed-offset loss.
+All would fail under old code (recovered Complete* stayed wedged / collapse absent).
+
+### 4. Whole-library re-scan
+EOS safety holds on every crash window: durable-before-visible ordering
+(addOffsets persist before OffsetStore `:356-358`; PrepareCommit persist before
+markers `:315-317`; offsets applied while still PrepareCommit, BEFORE terminal
+CompleteCommit `:396-406`). Aborted-effect leak impossible (offsets discarded on
+CompleteAbort `:429`, incl. across recovery — `AbortAfterAddOffsetsRecovery`).
+Zombie fencing (validateEpochAndPid), PID-reuse reseed (A1/A2), epoch-overflow
+fresh-PID (C1), LE control-batch/read_committed/LSO clamp — all unchanged and
+covered by the existing ~48-test EOS suite + integration harness. Suite reports
+1585/1585 pass (sequential and -j4).
+
+**Bottom line:** the recovered-Complete*-wedge liveness bug (the sole MEDIUM finding
+from the 6c7141a re-audit) is fully fixed with no safety regression; every recovered
+state is now resolvable or terminal-collapsed; no crash window loses a committed
+effect or leaks an aborted one. P5-5 / libs/transaction is CLEAN and CERTIFIED.
