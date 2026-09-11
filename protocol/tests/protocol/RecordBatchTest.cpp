@@ -8,28 +8,30 @@
 #include <climits>
 namespace b = rune::protocol::batch;
 
-static uint32_t beU32(const std::vector<uint8_t>& b, int off) {
-    return (b[off]<<24)|(b[off+1]<<16)|(b[off+2]<<8)|b[off+3];
+// Little-endian field readers (all fixed header fields are LE after the BE→LE unification).
+static uint32_t leU32(const std::vector<uint8_t>& buf, int off) {
+    return uint32_t(buf[off]) | (uint32_t(buf[off+1]) << 8)
+         | (uint32_t(buf[off+2]) << 16) | (uint32_t(buf[off+3]) << 24);
 }
 
-static int64_t beS64(const std::vector<uint8_t>& buf, int off) {
+static int64_t leS64(const std::vector<uint8_t>& buf, int off) {
     uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v = (v << 8) | buf[off + i];
+    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(buf[off + i]) << (i * 8);
     return static_cast<int64_t>(v);
 }
 
-static int32_t beS32(const std::vector<uint8_t>& buf, int off) {
-    return static_cast<int32_t>(beU32(buf, off));
+static int32_t leS32(const std::vector<uint8_t>& buf, int off) {
+    return static_cast<int32_t>(leU32(buf, off));
 }
 
-// Helper: read the partitionLeaderEpoch field from raw bytes.
+// Helper: read the partitionLeaderEpoch field from raw bytes (LE int32).
 static int32_t readEpoch(const std::vector<uint8_t>& buf) {
-    return beS32(buf, b::kPartitionLeaderEpochOffset);
+    return leS32(buf, b::kPartitionLeaderEpochOffset);
 }
 
-// Helper: read maxTimestamp field.
+// Helper: read maxTimestamp field (LE int64).
 static int64_t readMaxTimestamp(const std::vector<uint8_t>& buf) {
-    return beS64(buf, b::kMaxTimestampOffset);
+    return leS64(buf, b::kMaxTimestampOffset);
 }
 
 TEST(RecordBatchLayout, FieldOffsetsMatchKafkaV2) {
@@ -58,14 +60,14 @@ TEST(RecordBatchBuilder, EncodesHeaderAndCrc) {
     auto bytes = rb.build();
 
     EXPECT_EQ(bytes[batch::kMagicOffset], batch::kMagicValue);
-    EXPECT_EQ(beU32(bytes, batch::kRecordCountOffset), 2u);
-    EXPECT_EQ(beU32(bytes, batch::kLastOffsetDeltaOffset), 1u); // 2 records -> delta 1
+    EXPECT_EQ(leU32(bytes, batch::kRecordCountOffset), 2u);
+    EXPECT_EQ(leU32(bytes, batch::kLastOffsetDeltaOffset), 1u); // 2 records -> delta 1
     // LENGTH = total - (baseOffset(8) + lengthField(4))
-    EXPECT_EQ(beU32(bytes, batch::kLengthOffset), bytes.size() - 12);
+    EXPECT_EQ(leU32(bytes, batch::kLengthOffset), bytes.size() - 12);
     // CRC covers [attributes .. end]
     uint32_t expect = crc32c(bytes.data() + batch::kAttributesOffset,
                              bytes.size() - batch::kAttributesOffset);
-    EXPECT_EQ(beU32(bytes, batch::kCrcOffset), expect);
+    EXPECT_EQ(leU32(bytes, batch::kCrcOffset), expect);
 }
 
 TEST(RecordBatchReader, RoundTripAndValidation) {
