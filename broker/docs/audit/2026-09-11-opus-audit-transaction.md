@@ -202,3 +202,117 @@ abort entry points that bypass `endTransaction` (fence + timeout): they leave pa
 unmarked (B1) and, with no log wiring + no persisted epoch (B2/T3), are unrecoverable after
 a crash/failover. Epoch overflow (C1) and the never-returned `kConcurrentTransactions`
 (C3/C4) are the remaining correctness gaps.
+
+---
+
+# Re-audit (commit e66a07e)
+
+Date: 2026-09-11. Mode: read-only, no code modified. Built + ran the suite:
+`rune_transaction_tests` — **196/196 PASS**. Verified each fix against current source.
+
+## Verdict: **FINDINGS REMAIN** — 1 NEW CORRECTNESS (narrow but reachable atomicity hole)
+
+## Per-finding status
+
+### B1 — FIXED
+`initProducerId` Ongoing-fence (`TransactionCoordinator.cpp:136-150`) and `doWork` timeout
+(`:299-318`) both set `state=PrepareAbort`, `markersPending=true`, and persist PrepareAbort
+BEFORE any marker. `ControlMarker::resolvePendingMarkers` (`ControlMarker.cpp:307-331`) walks
+`pendingMarkerTransactions()` and writes an ABORT batch to EVERY persisted partition using the
+PERSISTED `producerEpoch`+`coordinatorEpoch` (`pendingMarkerTransactions`, `:323-342`), then
+`completeTransaction` advances PrepareAbort→CompleteAbort→Empty. Tests are real and assert one
+ABORT marker per partition with correct type + no-partition-left-unmarked
+(`FenceAbortResolvePendingWritesAbortMarkersToAllPartitions`, `TimeoutAbort…`, `…NoPartitionLeftUnmarked`,
+`_T1` upgrades). Resolve path is driven by the caller and reachable.
+
+### B2 — FIXED
+Coordinator ctor replays `txnLog_->all()` and stamps recovered PrepareAbort/PrepareCommit with
+`markersPending=true` (`:38-47`). Recovered epochs are the PERSISTED ones (`applyEntry` sets
+`coordinatorEpoch`, `TransactionLog.cpp:129`; producerEpoch `:124`). Failover tests
+(`TxnCoordAuditB2Test.RecoveredPrepare{Abort,Commit}ResolvableWithPersistedEpochs`) assert the
+pending descriptor + emitted marker carry the persisted producerEpoch AND coordinatorEpoch, not a
+live request. Real.
+
+### C1 — PARTIAL (see NEW-1)
+At INT16_MAX a fresh PID (epoch 0) is allocated and the old PID is retired
+(`:126-134`; tests `EpochOverflowAllocatesNewPid`, `EpochOverflowOldPidRetired` → old PID → kInvalidPid).
+No wrap-to-0 on the same PID. BUT the overflow branch runs before the Ongoing-fence branch and,
+when both fire together, stamps the ABORT marker with the NEW pid — see NEW-1.
+
+### C2 — FIXED
+`completeTransaction` (`:256-294`) writes CompleteCommit/CompleteAbort as a DISTINCT persisted
+record before writing Empty. Recovery of a CompleteCommit state does NOT re-mark: it is not
+Prepare*, so `pendingMarkerTransactions` skips it (`:329-330`) →
+`RecoveryDoesNotDuplicateMarkersOnCompleteCommitState` asserts 0 markers on re-resolve. Real,
+idempotent completion.
+
+### C3/C4 — FIXED
+`initProducerId` returns `kConcurrentTransactions` (=6) for Prepare*/Complete*(/PrepareEpochFence)
+re-init without mutating state/epoch (`:113-121`). Tests: `ReInitWhilePrepareCommit…`,
+`…PrepareAbort…`, `…CompleteCommit…ReturnsConcurrentTransactions` (state+epoch unchanged),
+`ReInitAfterResolveSucceeds`. In-flight commit no longer stranded by silent epoch bump.
+(Note: `PrepareEpochFence` is listed in the guard but never assigned anywhere — dead-but-harmless.)
+
+### S1 — FIXED
+`isControlBatch` (`ControlMarker.cpp:196-212`) requires `avail>=ENCODED_SIZE`, verifies CRC32C over
+[21..75) BEFORE trusting the CONTROL bit, then checks the CONTROL bit. A normal DATA batch has the
+CONTROL bit clear → rejected; a bit-flipped/garbage batch fails CRC → rejected. `extract`
+(`:217-266`) uses bounds-checked zig-zag varints (`read_varint_zigzag_safe`, `:52-71`, 10-byte cap +
+`pos>=end` guard) and length-guards every field. Adversarial tests real: Truncated, CrcCorrupted,
+DataBatchWithControlBitButWrongCrc, ExtractTruncated/CrcFlipped. S2 (bit-6 dual source) also removed
+(`ControlMarker.h:118-125` — bit 6 not set, not read).
+Residual (LOW, pre-existing API shape): `isControlBatch`/`extract` default `avail = ENCODED_SIZE`
+(`ControlMarker.h:163,180`); a caller that omits `avail` on a <75-byte buffer would over-read. All
+in-tree callers pass full-size batches, so not exploitable today — but the default invites misuse.
+
+## Deferral
+
+### S3 — DEFERRAL-OK
+Claim scrutinized: a recovered Ongoing with `txnStartNs==0` would be instantly timeout-aborted by
+`doWork`. In practice (a) `txnStartNs` IS persisted and recovered (`TransactionLog.cpp:176,261,127`),
+and `addPartitions` always sets it before persisting Empty→Ongoing (`:193-204`), so a real Ongoing
+carries a non-zero start; `txnStartNs==0`+Ongoing is not reachable through the public API. (b) Even
+if it occurred, aborting is SAFE and EOS-correct: `Ongoing` means `endTransaction` was never called,
+so the client was never told commit began — the coordinator is free to abort and the client retries.
+Atomicity is only at risk once state≥PrepareCommit, and those recover as Prepare* (resolved with
+markers), never as Ongoing. No EOS/atomicity violation. Aggressive-but-correct stands. DEFERRAL-OK.
+
+## Regression sweep (new fixes)
+
+- Double markers (client path vs resolve): NONE in a single coordinator lifetime — `endTransaction`
+  sets `markersPending=false`, so a client-driven txn never appears in `pendingMarkerTransactions`.
+  A crash mid-marker-write re-emits markers to all partitions on recovery (markersPending derived from
+  recovered Prepare* state), which is at-least-once/idempotent marker delivery (Kafka-faithful; consumer
+  dedups by pid+epoch). Not a corruption path.
+- Persisting Complete*: the normal EndTxn path never lands on Complete* via addPartitions/endTransaction
+  (both reject non-Empty/non-Ongoing); Complete* is only produced by `completeTransaction` then
+  immediately superseded by Empty in memory. No mishandling.
+- Epoch-overflow→new-PID and txnId→PID mapping: mapping is by txnId key (unchanged); old PID fenced by
+  `validateEpochAndPid` PID check. Fine EXCEPT the marker-stamping edge in NEW-1.
+- Invalid transitions: none newly reachable (addPartitions/endTransaction/completeTransaction guards intact).
+
+## NEW findings
+
+### NEW-1 — Epoch-overflow DURING an Ongoing-fence stamps the ABORT marker with the NEW PID → in-flight data not aborted (CORRECTNESS / atomicity)
+`TransactionCoordinator.cpp:126-150`. The overflow branch (`:128-131`) allocates `newPid` and sets
+`newEpoch=0` BEFORE the Ongoing-fence branch (`:136-150`), which then sets `meta->producerId=newPid`,
+`meta->producerEpoch=0`, `markersPending=true`. The subsequent ABORT marker is therefore built with
+`newPid` (`pendingMarkerTransactions` reads `meta.producerId`), but the in-flight data on the involved
+partitions was written under the OLD producerId. A read-committed consumer keys aborted-txn tracking by
+producerId, so an ABORT marker carrying `newPid` does NOT abort the old PID's uncommitted records →
+they can leak as committed (or the LSO logic misbehaves). Kafka avoids this: on overflow with an ongoing
+txn it aborts using the EXISTING producerId (bumped/last epoch) and issues the new PID only after the
+abort completes. Here the fresh PID is adopted before the abort marker is emitted.
+Reachability: needs `producerEpoch==INT16_MAX` while `Ongoing` (≈32767 re-inits to exhaust the epoch,
+then addPartitions, then one more init) — narrow but legitimately reachable for a long-lived
+transactionalId; UNTESTED (C1 tests inject only `Empty` at INT16_MAX).
+Fix direction: when fencing an Ongoing txn, emit the ABORT marker with the OLD producerId and the
+old-epoch-derived fencing epoch FIRST (retain old pid for the pending-marker descriptor), and only
+allocate/adopt the new PID after resolution — i.e. don't overwrite `meta->producerId` until the abort
+markers for the old PID are done. Severity: CORRECTNESS (atomicity hole, narrow trigger).
+
+## Re-audit counts
+- FIXED: B1, B2, C2, C3, C4, S1(+S2)   PARTIAL: C1 (marker-PID edge)   DEFERRAL-OK: S3
+- NEW CORRECTNESS: 1 (NEW-1)   NEW LOW: 1 (default `avail` over-read shape, S1 residual)
+- Tests: real and asserting the right invariants; 196/196 pass.
+Not CLEAN: NEW-1 is a reachable atomicity/leak path (abort marker with wrong producerId).

@@ -41,12 +41,12 @@ TEST(ControlMarkerTest, BuildReturnsCorrectSize) {
 
 TEST(ControlMarkerTest, BuildCommitIsControlBatch) {
     auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
-    EXPECT_TRUE(ControlMarker::isControlBatch(batch.data()));
+    EXPECT_TRUE(ControlMarker::isControlBatch(batch.data(), 0, ControlMarker::ENCODED_SIZE));
 }
 
 TEST(ControlMarkerTest, BuildAbortIsControlBatch) {
     auto batch = ControlMarker::build(1, 0, ControlType::Abort, 0);
-    EXPECT_TRUE(ControlMarker::isControlBatch(batch.data()));
+    EXPECT_TRUE(ControlMarker::isControlBatch(batch.data(), 0, ControlMarker::ENCODED_SIZE));
 }
 
 TEST(ControlMarkerTest, BuildMagicByte) {
@@ -80,18 +80,18 @@ TEST(ControlMarkerTest, NormalBatchNotControl) {
     buf[16] = 2; // magic
     int16_t attrs = 0x0010; // transactional but NOT control
     std::memcpy(buf + 21, &attrs, 2);
-    EXPECT_FALSE(ControlMarker::isControlBatch(buf));
+    EXPECT_FALSE(ControlMarker::isControlBatch(buf, 0, ControlMarker::ENCODED_SIZE));
 }
 
 TEST(ControlMarkerTest, WrongMagicNotControl) {
     auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
     batch[16] = 1; // corrupt magic
-    EXPECT_FALSE(ControlMarker::isControlBatch(batch.data()));
+    EXPECT_FALSE(ControlMarker::isControlBatch(batch.data(), 0, ControlMarker::ENCODED_SIZE));
 }
 
 TEST(ControlMarkerTest, ZeroBytesNotControl) {
     uint8_t buf[ControlMarker::ENCODED_SIZE] = {};
-    EXPECT_FALSE(ControlMarker::isControlBatch(buf));
+    EXPECT_FALSE(ControlMarker::isControlBatch(buf, 0, ControlMarker::ENCODED_SIZE));
 }
 
 // ===========================================================================
@@ -102,7 +102,7 @@ TEST(ControlMarkerTest, ExtractCommitMarker) {
     auto batch = ControlMarker::build(/*pid=*/42, /*epoch=*/3,
                                        ControlType::Commit, /*coordEpoch=*/7);
     ControlMarkerPayload payload{};
-    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, payload));
+    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, payload, ControlMarker::ENCODED_SIZE));
     EXPECT_EQ(payload.controlType,       ControlType::Commit);
     EXPECT_EQ(payload.coordinatorEpoch,  7);
     EXPECT_EQ(payload.producerId,        42);
@@ -112,7 +112,7 @@ TEST(ControlMarkerTest, ExtractCommitMarker) {
 TEST(ControlMarkerTest, ExtractAbortMarker) {
     auto batch = ControlMarker::build(99, 1, ControlType::Abort, 12);
     ControlMarkerPayload payload{};
-    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, payload));
+    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, payload, ControlMarker::ENCODED_SIZE));
     EXPECT_EQ(payload.controlType,      ControlType::Abort);
     EXPECT_EQ(payload.coordinatorEpoch, 12);
     EXPECT_EQ(payload.producerId,       99);
@@ -122,7 +122,7 @@ TEST(ControlMarkerTest, ExtractAbortMarker) {
 TEST(ControlMarkerTest, ExtractFailsOnNonControlBatch) {
     uint8_t buf[ControlMarker::ENCODED_SIZE] = {};
     ControlMarkerPayload payload{};
-    EXPECT_FALSE(ControlMarker::extract(buf, 0, payload));
+    EXPECT_FALSE(ControlMarker::extract(buf, 0, payload, ControlMarker::ENCODED_SIZE));
 }
 
 TEST(ControlMarkerTest, CommitAndAbortMarkersDistinguishable) {
@@ -130,8 +130,8 @@ TEST(ControlMarkerTest, CommitAndAbortMarkersDistinguishable) {
     auto abort  = ControlMarker::build(1, 0, ControlType::Abort,  0);
 
     ControlMarkerPayload cp{}, ap{};
-    ASSERT_TRUE(ControlMarker::extract(commit.data(), 0, cp));
-    ASSERT_TRUE(ControlMarker::extract(abort.data(),  0, ap));
+    ASSERT_TRUE(ControlMarker::extract(commit.data(), 0, cp, ControlMarker::ENCODED_SIZE));
+    ASSERT_TRUE(ControlMarker::extract(abort.data(),  0, ap, ControlMarker::ENCODED_SIZE));
 
     EXPECT_EQ(cp.controlType, ControlType::Commit);
     EXPECT_EQ(ap.controlType, ControlType::Abort);
@@ -141,14 +141,14 @@ TEST(ControlMarkerTest, CommitAndAbortMarkersDistinguishable) {
 TEST(ControlMarkerTest, ExtractWithNonZeroCoordinatorEpoch) {
     auto batch = ControlMarker::build(1, 0, ControlType::Commit, 999);
     ControlMarkerPayload p{};
-    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, p));
+    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, p, ControlMarker::ENCODED_SIZE));
     EXPECT_EQ(p.coordinatorEpoch, 999);
 }
 
 TEST(ControlMarkerTest, ExtractWithLargeProducerId) {
     auto batch = ControlMarker::build(INT64_MAX / 2, INT16_MAX, ControlType::Abort, 42);
     ControlMarkerPayload p{};
-    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, p));
+    ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, p, ControlMarker::ENCODED_SIZE));
     EXPECT_EQ(p.producerId,       INT64_MAX / 2);
     EXPECT_EQ(p.producerEpoch,    INT16_MAX);
     EXPECT_EQ(p.controlType,      ControlType::Abort);
@@ -189,7 +189,7 @@ TEST(ControlMarkerTest, WriteMarkersCommitThreePartitions) {
     for (auto& [partition, batches] : captured) {
         ASSERT_EQ(batches.size(), 1u);
         ControlMarkerPayload p{};
-        ASSERT_TRUE(ControlMarker::extract(batches[0].data(), 0, p));
+        ASSERT_TRUE(ControlMarker::extract(batches[0].data(), 0, p, ControlMarker::ENCODED_SIZE));
         EXPECT_EQ(p.controlType, ControlType::Commit);
     }
 
@@ -219,7 +219,7 @@ TEST(ControlMarkerTest, WriteMarkersAbortThreePartitions) {
     EXPECT_EQ(count, 3);
     for (auto& [partition, batch] : captured) {
         ControlMarkerPayload pl{};
-        ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, pl));
+        ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, pl, ControlMarker::ENCODED_SIZE));
         EXPECT_EQ(pl.controlType, ControlType::Abort);
     }
 
@@ -301,7 +301,7 @@ TEST(ControlMarkerTest, WriteMarkersCoordEpochPropagated) {
 
     ControlMarkerPayload captured{};
     auto appendFn = [&](const TopicPartition&, const std::vector<uint8_t>& b) {
-        ControlMarker::extract(b.data(), 0, captured);
+        ControlMarker::extract(b.data(), 0, captured, ControlMarker::ENCODED_SIZE);
     };
 
     ControlMarker::writeMarkers(coord, txnId, pid, epoch, true, /*coordEpoch=*/42, kNow, appendFn);
@@ -325,7 +325,7 @@ TEST(ControlMarkerTest, IntegrationCommitPath) {
     std::vector<std::pair<TopicPartition, ControlMarkerPayload>> captured;
     auto appendFn = [&](const TopicPartition& p, const std::vector<uint8_t>& b) {
         ControlMarkerPayload pl{};
-        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl, ControlMarker::ENCODED_SIZE));
         captured.emplace_back(p, pl);
     };
 
@@ -351,7 +351,7 @@ TEST(ControlMarkerTest, IntegrationAbortPath) {
     std::vector<ControlMarkerPayload> captured;
     auto appendFn = [&](const TopicPartition&, const std::vector<uint8_t>& b) {
         ControlMarkerPayload pl{};
-        ControlMarker::extract(b.data(), 0, pl);
+        ControlMarker::extract(b.data(), 0, pl, ControlMarker::ENCODED_SIZE);
         captured.push_back(pl);
     };
 
@@ -404,7 +404,7 @@ TEST(ControlMarkerTest, RoundTripByteExact) {
         auto batch = ControlMarker::build(/*pid=*/12345678LL, /*epoch=*/9,
                                            ct, /*coordEpoch=*/3);
         ControlMarkerPayload p{};
-        ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, p));
+        ASSERT_TRUE(ControlMarker::extract(batch.data(), 0, p, ControlMarker::ENCODED_SIZE));
         EXPECT_EQ(p.producerId,        12345678LL);
         EXPECT_EQ(p.producerEpoch,     9);
         EXPECT_EQ(p.controlType,       ct);
@@ -421,8 +421,8 @@ TEST(ControlMarkerTest, ControlBatchNotMistakennForDataBatch) {
 
     auto control = ControlMarker::build(1, 0, ControlType::Commit, 0);
 
-    EXPECT_FALSE(ControlMarker::isControlBatch(normalBuf));
-    EXPECT_TRUE(ControlMarker::isControlBatch(control.data()));
+    EXPECT_FALSE(ControlMarker::isControlBatch(normalBuf, 0, ControlMarker::ENCODED_SIZE));
+    EXPECT_TRUE(ControlMarker::isControlBatch(control.data(), 0, ControlMarker::ENCODED_SIZE));
 }
 
 // ===========================================================================
@@ -439,6 +439,25 @@ TEST(ControlMarkerTest, TruncatedBufferRejectedByIsControlBatch) {
     // Pass avail < ENCODED_SIZE — must return false (no over-read).
     EXPECT_FALSE(ControlMarker::isControlBatch(batch.data(), 0,
                                                 ControlMarker::ENCODED_SIZE - 1));
+}
+
+TEST(ControlMarkerTest, ShortBufferWithRealLengthNotControlNoOverRead) {
+    // LOW fix (avail now REQUIRED): a genuinely short allocation (smaller than
+    // ENCODED_SIZE) whose real length is passed must be rejected WITHOUT reading
+    // past its end.  Under ASAN this catches any over-read.  Sizing the buffer to
+    // exactly the available bytes means an over-read would touch unowned heap.
+    constexpr std::size_t kShort = ControlMarker::ENCODED_SIZE - 5;
+    std::vector<uint8_t> buf(kShort, 0u);
+    buf[16] = 2;  // magic — looks batch-like
+    int16_t attrs = static_cast<int16_t>(ControlMarker::kAttrControl |
+                                          ControlMarker::kAttrTransactional);
+    std::memcpy(buf.data() + 21, &attrs, 2);
+    // Real available length is kShort (< ENCODED_SIZE) → must be rejected.
+    EXPECT_FALSE(ControlMarker::isControlBatch(buf.data(), 0, buf.size()))
+        << "a buffer shorter than ENCODED_SIZE must not be treated as a control batch";
+    ControlMarkerPayload pl{};
+    EXPECT_FALSE(ControlMarker::extract(buf.data(), 0, pl, buf.size()))
+        << "extract must reject a short buffer without over-reading";
 }
 
 TEST(ControlMarkerTest, ControlBitSetButBadCrcRejected) {
@@ -464,7 +483,7 @@ TEST(ControlMarkerTest, ExtractCrcFlippedReturnsFalse) {
     auto batch = ControlMarker::build(42, 2, ControlType::Abort, 5);
     batch[17] ^= 0xFFu;  // corrupt 1 byte of CRC
     ControlMarkerPayload pl{};
-    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl));
+    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl, ControlMarker::ENCODED_SIZE));
 }
 
 TEST(ControlMarkerTest, DataBatchWithControlBitAndBadCrcNotExtracted) {

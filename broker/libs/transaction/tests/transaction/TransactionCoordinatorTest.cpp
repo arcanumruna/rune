@@ -1161,7 +1161,7 @@ static std::function<void(const TopicPartition&, const std::vector<uint8_t>&)>
 makeCollector(MarkerMap& out) {
     return [&out](const TopicPartition& p, const std::vector<uint8_t>& b) {
         ControlMarkerPayload pl{};
-        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl, ControlMarker::ENCODED_SIZE));
         out[p].push_back(pl);
     };
 }
@@ -1329,7 +1329,7 @@ TEST(TxnCoordAuditB2Test, RecoveredPrepareAbortResolvableWithPersistedEpochs)
     MarkerMap captured;
     auto appendFn = [&](const TopicPartition& p, const std::vector<uint8_t>& b) {
         ControlMarkerPayload pl{};
-        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl, ControlMarker::ENCODED_SIZE));
         captured[p].push_back(pl);
     };
     int total = ControlMarker::resolvePendingMarkers(coord2, appendFn);
@@ -1380,7 +1380,7 @@ TEST(TxnCoordAuditB2Test, RecoveredPrepareCommitResolvableWithPersistedEpochs)
     MarkerMap captured;
     auto appendFn = [&](const TopicPartition& p, const std::vector<uint8_t>& b) {
         ControlMarkerPayload pl{};
-        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl, ControlMarker::ENCODED_SIZE));
         captured[p].push_back(pl);
     };
     int total = ControlMarker::resolvePendingMarkers(coord2, appendFn);
@@ -1507,6 +1507,94 @@ TEST(TxnCoordAuditC1Test, EpochOverflowOldPidRetired)
                                     tps({tp("t", 0)}), 0LL);
     EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidPid)
         << "Old PID must be fenced after epoch-overflow new-PID allocation";
+}
+
+// ===========================================================================
+// NEW-1 — epoch overflow DURING an Ongoing-fence must abort the in-flight txn
+//         under the OLD producerId (matching the in-flight data), and only adopt
+//         the fresh PID AFTER the abort resolves.  Under the buggy e66a07e code the
+//         ABORT marker was stamped with the NEW pid → the old PID's uncommitted
+//         records would leak (atomicity/EOS violation).
+// ===========================================================================
+
+TEST(TxnCoordAuditNew1Test, EpochOverflowOngoingFenceAbortsUnderOldPid)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    constexpr ProducerId   kOldPid = 42;
+    const     TopicPartition p0 = tp("t", 0);
+    const     TopicPartition p1 = tp("t", 1);
+
+    // Inject an ONGOING txn at INT16_MAX (epoch exhausted) with two partitions.
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "txn-new1";
+        e.producerId    = kOldPid;
+        e.producerEpoch = INT16_MAX;
+        e.state         = TxnState::Ongoing;
+        e.txnTimeoutMs  = 60'000;
+        e.txnStartNs    = 1'000;
+        e.partitions    = { p0, p1 };
+        log.append(e);
+    }
+
+    TransactionLog log2(path);
+    // Allocator starts at 100 so the fresh PID (>=100) is clearly != kOldPid (42).
+    TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2, /*coordEpoch=*/3);
+    ASSERT_EQ(coord.state("txn-new1"), TxnState::Ongoing);
+    ASSERT_EQ(coord.pidOf("txn-new1"), kOldPid);
+
+    // Re-init: epoch overflow (INT16_MAX) coincident with fencing an Ongoing txn.
+    auto r = coord.initProducerId("txn-new1", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+
+    // (b) A NEW producerId (epoch 0) is allocated for the NEXT transaction and
+    //     returned to the caller.
+    const ProducerId newPid = r.producerId;
+    EXPECT_NE(newPid, kOldPid) << "epoch overflow must allocate a fresh PID";
+    EXPECT_EQ(r.producerEpoch, static_cast<ProducerEpoch>(0));
+
+    // The in-flight txn must be pending an ABORT marker.
+    ASSERT_EQ(coord.state("txn-new1"), TxnState::PrepareAbort);
+
+    // (a) The pending ABORT descriptor + emitted markers MUST carry the OLD pid
+    //     (matching the in-flight data written under kOldPid), NOT the new pid.
+    auto pending = coord.pendingMarkerTransactions();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(pending[0].producerId, kOldPid)
+        << "ABORT marker must be stamped with the OLD producerId (matches in-flight data)";
+    EXPECT_EQ(pending[0].producerEpoch, static_cast<ProducerEpoch>(INT16_MAX))
+        << "ABORT marker must carry the OLD producerEpoch";
+    EXPECT_FALSE(pending[0].commit);
+
+    MarkerMap markers;
+    int written = ControlMarker::resolvePendingMarkers(coord, makeCollector(markers));
+    EXPECT_EQ(written, 2) << "one ABORT marker per involved partition";
+
+    // Both partitions got an ABORT marker stamped with the OLD pid.
+    for (const auto& part : { p0, p1 }) {
+        ASSERT_EQ(markers[part].size(), 1u) << "partition must have exactly one marker";
+        const auto& pl = markers[part].front();
+        EXPECT_EQ(pl.controlType, ControlType::Abort);
+        EXPECT_EQ(pl.producerId, kOldPid)
+            << "the ABORT batch on the partition must carry the OLD pid, not the new pid";
+        EXPECT_EQ(pl.producerEpoch, static_cast<ProducerEpoch>(INT16_MAX));
+    }
+
+    // After resolution the txn returns to Empty and the coordinator ADOPTS the
+    // fresh PID for the next transaction.
+    EXPECT_EQ(coord.state("txn-new1"), TxnState::Empty);
+    EXPECT_EQ(coord.pidOf("txn-new1"), newPid)
+        << "after the abort resolves, the coordinator adopts the fresh PID";
+    EXPECT_EQ(coord.epochOf("txn-new1"), static_cast<ProducerEpoch>(0));
+
+    // (c) The OLD pid is retired: it can no longer add partitions (PID-fenced).
+    auto ar = coord.addPartitions("txn-new1", kOldPid, INT16_MAX,
+                                  tps({tp("t", 9)}), 0LL);
+    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidPid)
+        << "old PID must be retired after epoch-overflow new-PID adoption";
 }
 
 // ===========================================================================
@@ -1645,7 +1733,7 @@ TEST(ControlMarkerAuditS1Test, ExtractCrcCorruptedReturnsFalse)
     // Corrupt the CRC field.
     batch[17] ^= 0xFFu;
     ControlMarkerPayload pl{};
-    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl))
+    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl, ControlMarker::ENCODED_SIZE))
         << "extract on CRC-corrupted batch must return false";
 }
 

@@ -188,6 +188,18 @@ struct TransactionMetadata {
     /// ABORT markers and advance to CompleteAbort → Empty.  Also set when a
     /// Prepare* state is recovered from the log (failover resolution path, B2).
     bool markersPending{false};
+
+    /// NEW-1: epoch-overflow-during-Ongoing-fence deferred PID swap.
+    ///
+    /// When an InitProducerId fences an Ongoing transaction AND the producerEpoch
+    /// has overflowed (== INT16_MAX), Kafka aborts the in-flight txn under the
+    /// EXISTING producerId/epoch first, and only adopts the freshly-allocated PID
+    /// AFTER the abort completes.  We therefore keep producerId/producerEpoch as the
+    /// OLD values through the PrepareAbort (so the ABORT marker MATCHES the in-flight
+    /// data's PID), and stash the new PID/epoch here.  completeTransaction() adopts
+    /// them when the PrepareAbort resolves to Empty.  Sentinel -1 == no pending swap.
+    ProducerId    pendingNewProducerId{-1};
+    ProducerEpoch pendingNewProducerEpoch{-1};
 };
 
 // ---------------------------------------------------------------------------

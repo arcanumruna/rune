@@ -157,10 +157,15 @@ public:
     // \param offset  Byte offset within buf where the batch starts.
     // \param avail   Number of bytes available starting at buf+offset.
     //                Must be >= ENCODED_SIZE; returns false otherwise.
+    //
+    // LOW fix (audit re-audit): `avail` is a REQUIRED parameter — no default.
+    // A default of ENCODED_SIZE invited an over-read when a caller passed a short
+    // buffer but omitted the length; every caller must now pass the real available
+    // bytes.
     // -----------------------------------------------------------------------
     static bool isControlBatch(const uint8_t* buf,
-                                std::size_t    offset = 0,
-                                std::size_t    avail  = ENCODED_SIZE) noexcept;
+                                std::size_t    offset,
+                                std::size_t    avail) noexcept;
 
     // -----------------------------------------------------------------------
     // extract — decode the ControlMarkerPayload from a control batch.
@@ -172,12 +177,15 @@ public:
     // \param buf     Buffer.
     // \param offset  Start of batch in buf.
     // \param out     Decoded payload on success.
-    // \param avail   Available bytes from buf+offset. Defaults to ENCODED_SIZE.
+    // \param avail   Available bytes from buf+offset.
+    //
+    // LOW fix (audit re-audit): `avail` is a REQUIRED parameter — no default — so a
+    // caller can never accidentally over-read a short buffer by omitting the length.
     // -----------------------------------------------------------------------
     static bool extract(const uint8_t*       buf,
                          std::size_t          offset,
                          ControlMarkerPayload& out,
-                         std::size_t          avail = ENCODED_SIZE) noexcept;
+                         std::size_t          avail) noexcept;
 
     // -----------------------------------------------------------------------
     // writeMarkers — on EndTxn, produce a control batch for every partition

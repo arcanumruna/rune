@@ -137,15 +137,38 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         // Drive ongoing txn to PrepareAbort (epoch-fence path, B1).
         // The partitions are captured in meta->partitions; markersPending is set so
         // pendingMarkerTransactions() exposes them to the caller for marker emission.
+        //
+        // NEW-1: the in-flight data on these partitions was written under the OLD
+        // producerId/producerEpoch.  A read-committed consumer keys aborted-txn
+        // tracking by producerId, so the ABORT marker MUST carry the OLD PID (and
+        // an old-PID-consistent epoch) to match that data.  Therefore:
+        //   - overflow case: keep OLD producerId + OLD producerEpoch on the
+        //     PrepareAbort (so the marker matches in-flight data); stash the fresh
+        //     PID/epoch to be adopted only AFTER the abort resolves (completeTxn).
+        //   - non-overflow case: same PID with a bumped epoch is Kafka-faithful —
+        //     consumers key by PID, which is unchanged, so the bumped-epoch abort
+        //     still matches the in-flight data.
+        const bool overflow = (newPid != meta->producerId);
+        if (overflow) {
+            // Keep the OLD identity for the abort marker; defer the new PID.
+            meta->pendingNewProducerId    = newPid;
+            meta->pendingNewProducerEpoch = newEpoch;   // 0
+            // meta->producerId / meta->producerEpoch stay OLD (matches in-flight data).
+        } else {
+            meta->producerId    = newPid;
+            meta->producerEpoch = newEpoch;             // bumped, same PID
+        }
         meta->state              = TxnState::PrepareAbort;
-        meta->producerId         = newPid;
-        meta->producerEpoch      = newEpoch;
         meta->fencingEpoch       = true;
         meta->txnTimeoutMs       = effectiveTimeout;
         meta->coordinatorEpoch   = coordinatorEpoch_;
         meta->markersPending     = true;   // B1: caller must write ABORT markers
         // Persist PrepareAbort to log (durable-before-markers ordering).
+        // NOTE: for the overflow case this persists the OLD producerId/epoch, which
+        // is exactly what resolvePendingMarkers must stamp on the ABORT batch.
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
+        // Return the NEW identity to the caller for its NEXT transaction; the OLD
+        // PID is retired once the deferred swap is adopted in completeTransaction().
         return { .producerId = newPid, .producerEpoch = newEpoch, .errorCode = 0 };
     }
 
@@ -278,13 +301,24 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
     }
 
     if (meta->state == TxnState::PrepareAbort) {
-        // C2: persist CompleteAbort before clearing.
+        // C2: persist CompleteAbort before clearing.  The ABORT markers were
+        // stamped with the CURRENT producerId/epoch — for the NEW-1 overflow case
+        // that is still the OLD identity, matching the in-flight data.  We adopt the
+        // deferred new PID ONLY here, after the abort has been fully resolved.
         meta->state = TxnState::CompleteAbort;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
         meta->partitions.clear();
         meta->txnStartNs     = 0;
         meta->fencingEpoch   = false;
         meta->markersPending = false;
+        // NEW-1: adopt the deferred fresh PID (epoch 0) now that the OLD PID's ABORT
+        // markers are done.  The OLD PID is thereby retired.
+        if (meta->pendingNewProducerId >= 0) {
+            meta->producerId            = meta->pendingNewProducerId;
+            meta->producerEpoch         = meta->pendingNewProducerEpoch;
+            meta->pendingNewProducerId    = -1;
+            meta->pendingNewProducerEpoch = -1;
+        }
         meta->state          = TxnState::Empty;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
