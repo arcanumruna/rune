@@ -164,3 +164,27 @@ Not targeted by this fix commit; all were latent/style/doc-level in the original
 `GroupCoordinator.cpp:359,477` — `syncedMembers_` is cleared in `triggerRebalance`/`transitionToCompletingRebalance` but never inserted into or read; completion is driven solely by `leaderSynced_`. Harmless, but should be removed (the original C4 note flagged it; the fix chose the `leaderSynced_` gate but left the field). Cosmetic.
 
 **Bottom line:** All eight targeted findings are resolved or confirmed false-positive; the RoundRobin false-positive claim is upheld by independent trace + exhaustive differential test. Only two low-severity cosmetic notes remain (N1-a residual leader-ordering surprise on generated global-seq; N1-b dead field). Coordination is CLEAN.
+
+---
+
+# Re-audit 2 (commit 991670f)
+
+Date: 2026-09-11. Scope: focused confirmation of the two residuals N1-a and N1-b from the previous re-audit. Method: read current `src/GroupCoordinator.cpp` + header + tests at `991670f` (HEAD); `grep` for all `syncedMembers_`/`leaderSynced_` references; extracted the exact `memberIdLess` (new + old) into a standalone harness and ran an exhaustive strict-weak-ordering check (irreflexivity, antisymmetry, transitivity of `<` and of equivalence) plus a distinct-id-collision check under ASan+UBSan. (Note: `cmake` is unavailable in this environment, and the checked-in `build/` binary predates the commit, so the full gtest suite was not re-run here; the comparator was validated in isolation against copied-verbatim source.)
+
+## Verdict: **CLEAN** (libs/coordination fully clean — zero remaining findings)
+
+### N1-a — numeric tuple ordering across ALL fields → **FIXED**
+`memberIdLess` (`src/GroupCoordinator.cpp:306-352`) is now a natural-order comparator: it walks both ids run-by-run, comparing digit runs numerically (leading zeros skipped, then by significant-digit count `:329`, then char-order `:330-332`, then raw-run length `:335-336`) and non-digit runs lexicographically (`:339-342`), with digit-runs sorting before non-digit runs at a mismatch (`:343-346`) and the shorter id first on a shared prefix (`:351`). This orders both the `<global>` and `<local>` fields of `<group>-g<global>-<local>` numerically, so `grp-g2-3 < grp-g10-2` (independently confirmed = `true`; the old trailing-field-only comparator returns `false` here and would elect `grp-g10-2`). **Valid strict-weak ordering:** 0 violations over a corpus spanning power-of-ten boundaries, leading zeros (`00`, `007`, `g010`), empty string, and non-conforming ids (`member-a`, `abc`) — irreflexive, antisymmetric, transitive (both `<` and `~`); `std::sort` runs clean under ASan+UBSan with no crash/UB on non-conforming ids; no two distinct generated ids compare equivalent (leader determinism preserved). The new test `LeaderElection_NumericAcrossGlobalFieldPowerOfTen` (`tests/coordination/GroupCoordinatorTest.cpp:963-996`) spans g2 vs g10/g11 in the GLOBAL field and asserts `grp-g2-3` leads, with a same-global local-field tie (g5-2 vs g5-10) — independently confirmed to **FAIL under the old comparator** and pass under the new one. No new determinism bug.
+
+### N1-b — dead `syncedMembers_` removed → **FIXED**
+Field and both former clear-sites are gone: header declaration removed (only a historical mention survives in the `leaderSynced_` doc comment at `GroupCoordinator.h:344`), and the two `syncedMembers_.clear()` calls in `triggerRebalance`/`transitionToCompletingRebalance` are deleted. `grep -rn syncedMembers_ libs/coordination` returns only that comment — no live references. `<unordered_set>` is still legitimately included (used by `rejoinedMembers_`). The `CompletingRebalance→Stable` completion path is unchanged and driven solely by `leaderSynced_`: set in the leader branch (`src/GroupCoordinator.cpp:412`) and `autoAssignAndSync` (`:472`), reset in `triggerRebalance` (`:377`) and `transitionToCompletingRebalance` (`:494`), gating both the leader clobber-guard (`:410`) and the follower retry signal (`:420`). Rebalance/sync tests unaffected.
+
+### Regression checks (previously-fixed items)
+This commit touches ONLY `memberIdLess` and the `syncedMembers_` removal (verified via `git show 991670f`); no other logic changed. Confirmed intact at HEAD:
+- **C1 leave() fencing** (`:105-133`): stale/future generation is a no-op, unknown member no-op, current-gen leave shrinks/goes-Empty. Untouched.
+- **C3 syncGroup Stable-guard** (`:409-417`): leader assignment stored only under `CompletingRebalance && !leaderSynced_`; Stable re-sync is a no-op ack. Untouched.
+- **C4 follower retry** (`:420-423`): returns `kErrRebalanceInProgress` when leader hasn't synced. Untouched.
+- **S4 memberId uniqueness:** id FORMAT is unchanged (still `<group>-g<global>-<local>`); only the comparator changed. `findMember` uses string `==`, so lookups/uniqueness are unaffected — confirmed no distinct-id equivalence collision. A memberId order change did not break uniqueness or lookups.
+- **T1 CRC byte-flip test / T5 double-consume cursor:** in unrelated files (`OffsetStoreTest.cpp`, `ConsumerGroupHarness.h`), not in this commit's diff. Unaffected.
+
+**Bottom line:** N1-a and N1-b both FIXED with a correct, distinguishing test for N1-a; no regression to any previously-fixed item. Zero remaining findings. **libs/coordination is CLEAN — section closed.**
