@@ -655,3 +655,167 @@ LOWER:
 18. Coordinator `signalLeaderDead` for a node that is neither current leader nor in ISR
     ("unknown" node) followed by doWork — assert no election, no crash (unknown-node signal).
 
+---
+
+## Full re-audit 2 (commit ef92c25)
+
+Date: 2026-09-11 · Scope: fresh whole-library pass over `libs/replication/**` at
+`ef92c25` (the commit that fixed A-NEW-1..A-NEW-5 + A10 + 12 tests). Read all headers,
+src, and tests. `cmake`/`ctest` unavailable → reasoning from code + test structure.
+
+### Verdict: **CLEAN** — libs/replication fully sound; certified for the audited surface.
+
+All five A-NEW findings and A10 are genuinely fixed with real, distinguishing tests. No
+new committed-loss / HW-regression / uncommitted-read / duplicate-offset / bad-election
+path. All prior fixes still hold. None of the 6 deferred Part-B tests hides a reachable
+bug.
+
+### Per-finding status
+
+- **A-NEW-1 — RESOLVED.** `applyReplicated` (`PartitionReplica.cpp:412-448`) is now
+  idempotent: it walks the response batch-by-batch, skips every batch with
+  `baseOffset < currentLeo` (already held), stops on a gap (`baseOffset > currentLeo`),
+  and appends only the strictly-new contiguous tail with the correct final `lastOff`.
+  Two overlapping/pipelined FetchResponses at the same fetchOffset produce NO duplicate
+  offsets and stay byte-identical to the leader; the old `lastOff >= LEO` guard is gone.
+  No valid record is dropped — a skipped batch is genuinely already held (leader serves
+  verbatim single-record frames). `Log::append` writing a multi-frame buffer is safe
+  (LogSegment writes the blob, sets `nextOffset=lastOff+1`, sparse-indexes frame 0;
+  recover() re-walks all frames). Test `ANEW1_PipelinedFetchResponseNoDuplicateOffsets`
+  (`PartitionReplicaTest.cpp:1868`) injects an overlap-AND-extend response and asserts
+  LEO≤5 + byte-identity — fails under the old guard. Distinguishing.
+
+- **A-NEW-2 — RESOLVED.** `computeHw` (`HighWatermark.h:176-226`) now sizes the LEO
+  buffer dynamically (stack `smallBuf[32]` for ISR≤32, heap vector otherwise) and fills
+  all `n=isrSize` slots. `majority=isrSize/2+1 ≤ isrSize`, so `majority-1 ∈ [0,n-1]` is
+  always in-bounds — no OOB at 64/65, no zero-slot under-count at 33/63. Majority is
+  derived from the full isrSize and agrees with the array size. (Minor doc nit: the
+  comment says "majority clamped to n"; the actual fix is sizing the buffer to n — result
+  is correct either way.) Test `PartB15_ANEW2_ComputeHwLargeIsr...` covers 33/64/65.
+
+- **A-NEW-3 — RESOLVED.** `FileRecordingStore::append` (`FileRecordingStore.cpp:210-240`)
+  now `flush()`es the libc buffer AND `fsync(fd_)`s the shared POSIX fd, matching
+  LogSegment durability. Recovery (`recoverFromFile:109-187`) reads payloads to detect
+  torn tails and `resize_file`s to the last complete frame — no partial frame surfaces;
+  no new corruption path. In-place truncate on recovery is non-atomic but converges on
+  next open (safe).
+
+- **A-NEW-4 — RESOLVED, no liveness regression.** `maybeExpandIsr` (`IsrManager.h:175-195`)
+  gates on `offsetOk && timeOk` where `timeOk = (nowNs - lastFetchTimeNs) <=
+  replicaLagMaxNs_` (seeded from config, 10s default). A legitimately caught-up replica
+  has just fetched (recent `lastFetchTimeNs`) so `timeOk` is true → it IS re-admitted.
+  The gate only refuses replicas whose last fetch is ancient (exactly a stale replica).
+  No caught-up replica is wrongly refused.
+
+- **A-NEW-5 — RESOLVED.** The `mustStepDown` arm (`PartitionReplica.cpp:250-272`) returns
+  `kErrNotLeader` (correct: follower is ahead) AND actually steps down —
+  `role_=Follower`, `epoch_=req.leaderEpoch`, `followerHw_=committedHw` captured before
+  the flip, `lastFetchEmitNs_=0`. `mustStepDown = observedEpoch > localEpoch`
+  (`EpochFencing.h:86-90`). Test `PartB_14` asserts both the code and the role flip.
+
+- **A10 — RESOLVED, every truncation site covered.** All three (and only three)
+  truncation sites call `epochCache_.truncateFromEnd(off)` BEFORE `log_->truncateTo(off)`:
+  `becomeFollower:180-181`, `truncateLog:578-580` (used by `applyReplicated:369`), and
+  `applyReplicated` routes through `truncateLog`. Grep confirms no other `truncateTo`.
+  This prunes stale high-startOffset epoch entries so a subsequent lower-offset
+  `assign()` is not dropped by LeaderEpochCache's monotonic-startOffset guard
+  (`LeaderEpochCache.h:23-31,50-59`) — the truncate-then-lower-epoch-assign is accepted.
+
+### Prior fixes — re-verified WHOLE-LIBRARY (all HOLD, no regression)
+
+- **B1 (per-follower SET-not-max)** `HighWatermark.h:121-125`; global floor monotone.
+- **B2/NB1 (becomeLeader floor=committed, not LEO)** `PartitionReplica.cpp:94-124`;
+  captured before role flip, applied before setIsr/setLeaderLeo.
+- **C1 (read clamp `baseOffset>=hw`)** `PartitionReplica.cpp:309-338`; unchanged.
+- **C2 (becomeFollower + applyReplicated truncation floor `max(truncOff,committedHw)`)**
+  `:167-172`, `:361-369`.
+- **C3 (election committed-prefix filter + crashed-leader HW derivation + assert on
+  unregistered ISR)** `PartitionFailoverCoordinator.h:289-342`.
+- **S1 (eager recompute on every mutator)** `HighWatermark.h:88-124`.
+- **S3 (recorder 64 MiB byte budget + multi-chunk outer loop)** `PartitionRecorder.cpp:73-125`.
+- **C4 (selfId recompute-hack removed)** `PartitionReplica.cpp:546-553`.
+
+### Deferred Part-B tests — does any hide a real bug? NO.
+
+- **#6 epoch-mid-flight ordering** — non-correctness: the `applyReplicated` epoch branch
+  is unreachable in the coordinated flow (becomeFollower bumps epoch_ first) and is
+  guarded by the committedFloor clamp regardless of ordering. No bug.
+- **#7 recorder 64 MiB chunk loop** — the outer `while(scanFrom<endOffset)` loop with the
+  `advanced` no-progress guard is present and correct; only untested at scale. No bug.
+- **#8 recorder segment-roll** — `Log::read` returns bytes from ONE segment; the outer
+  loop re-reads from the advanced `scanFrom` (which lands in the next segment). A batch is
+  NOT lost across a roll; scanFrom advances to the next segment's base with no skip. No bug.
+- **#9 replay partial range mid-batch** — `scan` includes a batch iff `baseOffset ∈
+  [from,to)`; consistent whole-batch semantics, `replayIntoLog` decodes lastOffsetDelta.
+  Documentation gap only. No bug.
+- **#11 election tie-with-unregistered** — an unregistered ISR member hits `assert(found)`
+  (debug) / in release is skipped from `eligible` → simply not elected (safe). No
+  committed-loss. No bug.
+- **#13 straddling-HW multi-record read clamp (NB3)** — the clamp uses `batchBase >= hw`,
+  so a multi-record batch [base,base+N) with base<HW≤base+N would leak offsets ≥HW.
+  UNREACHABLE today: the leader appends single-record batches (`makeBatch` →
+  lastOffsetDelta=0), and follower logs contain only those same single-record frames
+  (verbatim), so `batchBase` is the batch's only offset and the clamp is exact. Latent,
+  correctly deferred — MUST fix `read()` to `batchBase + lastOffsetDelta >= hw` before
+  multi-record batching lands. Not a current bug.
+
+### Still-open deferrals (unchanged, accepted — unreachable today)
+
+- **S5** `FetchResponseMsg::decode` unbounded `records` length
+  (`ReplicationMessages.h:262-266`) — all callers decode a self-encoded buffer; no
+  untrusted Aeron transport wired. MUST bound-check before wiring one.
+- **S2 / S4** — `becomeLeader replicas==isr` breadth-only; `looksLikeRecordBatch`
+  test-only sniff. No committed-loss.
+
+### New findings from this fix
+
+- None of BLOCKER/CORRECTNESS/SILENT severity. The diff is surgical; no collateral
+  regression to the C1/C2/S1/S3/election paths. No busy-spin (all `doWork` cadence-gated).
+
+
+---
+
+## NB3 confirm (commit c1a5936)
+
+Focused confirmation re-audit of the committed-read clamp fix. **Verdict: CLEAN —
+libs/replication remains fully certified; NB3 (finding #13) is RESOLVED.**
+
+### 1. read() clamp now uses batch LAST offset
+`PartitionReplica::read()` (`libs/replication/src/PartitionReplica.cpp:330-339`) now
+decodes `lastOffsetDelta` and stops the batch walk when
+`batchBase + lastOffDelta >= hw` (was `batchBase >= hw`). A batch is returnable only
+when its LAST record is strictly below HW.
+- **Decoder correctness:** `RecordBatchReader::lastOffsetDelta()`
+  (`rune-protocol/include/rune/protocol/RecordBatch.h:110`) reads BE32 at
+  `kLastOffsetDeltaOffset = 23` (RecordBatch.h:18) — the Kafka-faithful field. The
+  builder writes `recordCount_ - 1` at the same offset 23 (RecordBatch.h:83).
+  `baseOffset()` reads BE64@0 (RecordBatch.h:109). Both fields decode correctly.
+- **Single-record byte-identity:** for single-record batches `lastOffsetDelta == 0`,
+  so the guard reduces to `batchBase + 0 >= hw` == `batchBase >= hw` — byte-identical
+  to the prior behaviour. The `total`/bounds/`committedEnd` logic is untouched.
+
+### 2. No other committed-read boundary exposes records ≥ HW
+- `onFetchRequest` (`PartitionReplica.cpp:281-294`) sends raw log bytes bounded by
+  `logEndOffset()` to a **follower** (replication path), carrying HW in the response
+  so the follower clamps its own committed reads. Kafka-faithful and unchanged — not a
+  consumer committed-read boundary.
+- The second `RecordBatchReader` use (`PartitionReplica.cpp:428`) is inside
+  `applyReplicated` — a follower **write** path (appends strictly-new tail at
+  `currentLeo`), not a read boundary. Unchanged.
+- `read()` is the only consumer-facing committed-read boundary, and it is now correct.
+
+### 3. Tests are distinguishing; no regression
+- `NB3_CommittedReadClamp.MultiRecordBatchStradlingHwNotReturned`
+  (`PartitionReplicaTest.cpp:2624`) injects a 4-record batch [3..6] via
+  `applyReplicated` with HW=5. Old clamp `batchBase>=hw` = `3>=5` is FALSE → batch
+  returned → test FAILS; new clamp `3+3>=5` is TRUE → STOP → test PASSES. Genuinely
+  distinguishing. Also asserts the 3 committed single-record batches [0..2] still read.
+- `NB3_CommittedReadClamp.SingleRecordBatchBehaviorUnchanged`
+  (`PartitionReplicaTest.cpp:2766`) confirms all 5 single-record batches still return
+  under HW=5, and `read(5)` is empty — no regression to single-record semantics.
+- Prior C1 clamp test (`PartitionReplicaTest.cpp:1330-1351`) and B2/B1 read/HW/
+  committed-loss tests are unaffected (all use single-record batches, where the guard
+  is byte-identical). ctest not run here; reasoned from code — the guard change cannot
+  alter single-record outcomes.
+
+**No BLOCKER/CORRECTNESS/SILENT findings. Finding #13 (NB3) resolved.**

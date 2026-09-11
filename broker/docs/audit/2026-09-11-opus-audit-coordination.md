@@ -230,3 +230,46 @@ Well-covered already: offset overwrite-with-lower-value (`OffsetStoreTest Overwr
 
 ## Bottom line
 Whole-library re-audit at HEAD is **not fully clean**: one real (latent) correctness divergence (A1: existing-member re-join outside PreparingRebalance never rebalances — contradicts the coordinator's own state table), plus two low-severity items (A2 per-member generation inflation on batch reap; A3 offset-record body-length hardening). Durable OffsetStore, SBE codecs, Range/RoundRobin, leave/heartbeat/sync fencing, and leader determinism all re-verified correct. Test suite is strong but 12 niche edge cases remain unexercised — the top three (A1 Stable-rejoin, A1 subscription-change, A2 batch-reap generation) also serve as regression tests for the Part A findings.
+
+---
+
+# Full re-audit 2 (commit f995b14)
+
+Fresh whole-library confirmation pass over `libs/coordination` after the commit that fixed A1/A2/A3 + added 17 tests. Code read in full; no code modified. cmake/ctest not run — reasoned from source (commit body reports 1451/1451 seq and -j4).
+
+## Part A findings — status
+
+### A1 (CORRECTNESS) existing-member re-join while Stable/CompletingRebalance → **FIXED (correct + defensible)**
+`src/GroupCoordinator.cpp:72-84`. `join()` now branches on state: an existing member re-joining while `Stable` **or** `CompletingRebalance` calls `triggerRebalance(nowNs)` (`:80`) → `++generationId_` + `state_=PreparingRebalance` + `expectedMemberCount_=members_.size()` + `rejoinedMembers_.clear()`, then inserts the caller into `rejoinedMembers_` (`:82`) and re-elects the leader (`:83`). This exactly realizes the header state-table row "Stable + join/leave → PreparingRebalance". The updated `subscribedTopics` are written before the branch (`:61-62`), so a subscription change is captured and reflected in the next assignor run (verified by `SubscriptionChangeOnRejoin_ReassignmentReflectsChange`, which asserts `member-a` receives `t2` partitions post-rebalance).
+- **Over-trigger / thrash check:** an *identical* re-join while Stable DOES trigger a rebalance. This is Kafka-faithful (a JoinGroup request while Stable always moves the group to PreparingRebalance) and is defensible; it cannot loop infinitely because `Stable` is reached only via `syncGroup`/`autoAssignAndSync`, and each re-join deterministically advances state (Stable→Preparing) or satisfies it (Preparing→Completing). Generation monotonicity is preserved (always `++`).
+- **Single-member subtlety (verified benign):** the Stable/Completing branch intentionally does NOT run the `rejoinedMembers_.size() >= expectedMemberCount_` auto-advance that the PreparingRebalance branch does (`:65-71`). So a lone member that re-joins while Stable lands in PreparingRebalance and must issue a *second* JoinGroup to reach CompletingRebalance — symmetric with the new-member path and with `SubscriptionChangeOnRejoin` (which joins again at t=400). Correct; no stuck state, no thrash.
+- **`expectedMemberCount_` (S2) not regressed:** set to live `members_.size()` at rebalance start, so it always matches actual membership.
+
+### A2 (SILENT) batch-collapse of same-tick session-timeout reaps → **FIXED (correct, no member lost)**
+`src/GroupCoordinator.cpp:190-221`. `doWork` now collects ALL expired members into `toEvict` first (`:191-197`), removes them counting `work` per removal (`:203-206`), then performs **exactly one** post-batch transition (`:208-220`): either `++generationId_`→Empty (all gone) or a single `triggerRebalance`+`electLeader` (some remain) — one generation bump for the whole batch. No member is dropped from the batch (every id in `toEvict` is passed to `removeMember`). Verified by `TwoMembersExpireInSameTick_GenerationBumpsOnce` (gen == before+1) and `ThreeMembers…` (before+1 + state Empty).
+- **No double-bump with the join-timeout block:** the reap path sets `rebalanceStartNs_=nowNs` via `triggerRebalance`, so the subsequent join-timeout block (`:228-256`) evaluates `nowNs - nowNs > timeout` = false and does nothing this tick. `ConcurrentJoinAndTimeout_ConsistentState` confirms a single-member expiry evicts only the expired member and bumps once.
+
+### A3 (SILENT hardening) OffsetStore body-length identity check → **FIXED (correct, no false-reject)**
+`src/OffsetStore.cpp:320-326`. Before slicing the body into three `std::string`s (`:328-331`), replay now verifies `groupLen + topicLen + metaLen == totalLength - kFixedHeaderSize - kChecksumSize` and `break`s (torn) on mismatch. The identity is computed with `uint32_t` widening of the three `uint16_t` fields (no overflow). Because `appendRecord` derives `totalLength` from exactly those three lengths (`:189-191`), a well-formed record always satisfies the identity → **zero false-rejects** of valid records. The check runs BEFORE the pointer-arithmetic slicing, so it also closes the over-read window on an adversarial-but-valid-CRC record. Verified by `BodyLengthInconsistency_RecordRejectedCleanly` (bumps `groupLen` by 1, recomputes a valid CRC over the tampered bytes; clean record survives, tampered record dropped, store remains writable).
+
+## Regression checks (prior fixes, re-verified in current source)
+- **C1 leave() fencing** — `:124-130` rejects stale/future generation and unknown member; last-member-leave path bumps generation → Empty (`:132-136`). Intact.
+- **C3 syncGroup Stable clobber-guard** — leader re-sync honored only in `CompletingRebalance && !leaderSynced_` (`:428-435`); Stable re-sync ack'd without rewrite. `SyncGroupLeaderInStable_NoClobber` passes. Intact.
+- **C4 follower retry / transition** — follower before leader gets `kErrRebalanceInProgress` (`:439-443`); reads assignment once Stable/leaderSynced. Intact.
+- **S1 rejoinedMembers_ pruning** — `removeMember` erases from `rejoinedMembers_` (`:303`). Intact; matters now that the A1 path seeds that set.
+- **S3/N1-a numeric leader ordering** — `memberIdLess` (`:325-371`) natural-order over every numeric run; valid strict-weak ordering (digit-run vs non-digit-run tiebreak at `:365`, raw-length tiebreak at `:355`). Intact.
+- **S4 cross-instance unique memberIds** — global `s_memberSeq` folded into id (`:275-277`). Intact.
+- **N1-b dead `syncedMembers_`** — absent; completion driven solely by `leaderSynced_`. Intact.
+- **C2 RoundRobin cursor-advance** — `Assignor.cpp:170-190` advances the ring cursor past the assigned subscriber (Kafka-exact); confirmed false-positive still holds. Range base/extras split (`:84-96`) exact.
+- **Assignment disjointness / union** — Range and RoundRobin each emit every (topic,partition) to exactly one subscriber; `disjoint()`+`unionOfAssignment` asserted across Rebalance tests 3/12/20/21 and B-9/B-10.
+
+## Fresh whole-library scan (nothing new)
+- **Rebalance state machine:** every membership mutation (new join, existing re-join, leave, expire, batch expire, join-timeout) routes through `triggerRebalance`/Empty-path with a single generation bump; monotonic and complete against the header state table.
+- **Generation monotonicity:** `generationId_` only ever `++` (never assigned/decremented); heartbeat/leave/syncGroup fence non-current generations. `GenerationMonotonicAcrossRebalanceChurn`, `LargeGenerationChurn_FencingStillHolds` cover it. (Epoch is int32/uint — wrap remains theoretical/out-of-scope, previously documented.)
+- **Durability:** commit = append → fsync → advance `writePos_` (`OffsetStore.cpp:222-235`); replay CRC over `[0,totalLength-4)`, torn-tail ftruncate to last-good, now plus body-length identity. Integration `CoordinatorFailover.*` re-forms group + recovers offsets across reopen.
+
+## Remaining coverage gaps (non-blocking)
+- Part B items 4 (torn-tail at each field boundary) and 11 (generation wrap near INT32) remain unexercised — both niche/robustness, not correctness of any current path. Items 1,2,3,5,6,7,8,9,10,12 are now covered by the 17 new tests.
+
+## Verdict: **CLEAN** — libs/coordination fully sound and coverage-adequate. **CERTIFIED — section closed.**
+A1 (correct + Kafka-defensible, no thrash/no infinite loop), A2 (exactly one gen-bump per batch, no member lost), A3 (correct identity check, zero false-rejects) all FIXED with distinguishing regression tests. No regression to any prior fix. Only two niche robustness coverage gaps remain (torn-tail-per-field, int32 wrap) — neither is a material finding.
