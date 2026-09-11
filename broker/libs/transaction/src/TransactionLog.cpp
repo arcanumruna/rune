@@ -110,6 +110,7 @@ void TransactionLog::appendFromMetadata(const TransactionMetadata& meta,
     e.txnTimeoutMs     = meta.txnTimeoutMs;
     e.pendingNewProducerId    = meta.pendingNewProducerId;    // A2
     e.pendingNewProducerEpoch = meta.pendingNewProducerEpoch; // A2
+    e.pendingOffsets          = meta.pendingOffsets;           // F3
     append(e);
 }
 
@@ -139,6 +140,9 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
     // fresh identity the client was already handed.
     meta.pendingNewProducerId    = entry.pendingNewProducerId;
     meta.pendingNewProducerEpoch = entry.pendingNewProducerEpoch;
+    // F3: recover pending consumer-group offsets so a recovered PrepareCommit
+    // can re-apply them on resolve (durable-before-visible ordering).
+    meta.pendingOffsets          = entry.pendingOffsets;
     // fencingEpoch is not persisted; reset to false on recover
     meta.fencingEpoch      = false;
 }
@@ -194,9 +198,27 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
         partBytes += 2 + tp.topic.size() + 4; // topicLen:uint16 + topic + partition:int32
     }
 
+    // F3: Compute pending-offset section bytes.
+    // Layout: offsetCount:uint16 + per-offset: groupLen:uint16 topicLen:uint16 partition:int32 offset:int64 + group bytes + topic bytes
+    if (entry.pendingOffsets.size() > kMaxUint16) {
+        throw std::length_error("TransactionLog: pendingOffsets count exceeds uint16 field");
+    }
+    std::size_t offsetSectionBytes = 2; // offsetCount:uint16
+    for (const auto& po : entry.pendingOffsets) {
+        if (po.group.size() > kMaxUint16) {
+            throw std::length_error("TransactionLog: pending offset group id exceeds uint16");
+        }
+        if (po.tp.topic.size() > kMaxUint16) {
+            throw std::length_error("TransactionLog: pending offset topic exceeds uint16");
+        }
+        // groupLen:uint16 + topicLen:uint16 + partition:int32 + offset:int64 + group + topic
+        offsetSectionBytes += 2 + 2 + 4 + 8 + po.group.size() + po.tp.topic.size();
+    }
+
     const uint32_t totalLength = kFixedHeaderSize
                                  + txnIdLen
                                  + static_cast<uint32_t>(partBytes)
+                                 + static_cast<uint32_t>(offsetSectionBytes)
                                  + kChecksumSize;
 
     std::vector<uint8_t> buf(totalLength);
@@ -226,6 +248,24 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
         write_le<uint16_t>(p + pos, topicLen); pos += 2;
         std::memcpy(p + pos, tp.topic.data(), topicLen); pos += topicLen;
         write_le<int32_t>(p + pos, tp.partition); pos += 4;
+    }
+
+    // F3: Pending-offset section (after partition tuples, before CRC).
+    // offsetCount : uint16
+    // per offset  : groupLen:uint16 topicLen:uint16 partition:int32 offset:int64 group:bytes topic:bytes
+    {
+        auto offsetCount = static_cast<uint16_t>(entry.pendingOffsets.size());
+        write_le<uint16_t>(p + pos, offsetCount); pos += 2;
+        for (const auto& po : entry.pendingOffsets) {
+            auto groupLen = static_cast<uint16_t>(po.group.size());
+            auto topicLen = static_cast<uint16_t>(po.tp.topic.size());
+            write_le<uint16_t>(p + pos, groupLen);    pos += 2;
+            write_le<uint16_t>(p + pos, topicLen);    pos += 2;
+            write_le<int32_t> (p + pos, po.tp.partition); pos += 4;
+            write_le<int64_t> (p + pos, po.offset);   pos += 8;
+            std::memcpy(p + pos, po.group.data(), groupLen);  pos += groupLen;
+            std::memcpy(p + pos, po.tp.topic.data(), topicLen); pos += topicLen;
+        }
     }
 
     assert(pos + kChecksumSize == totalLength);
@@ -309,16 +349,48 @@ void TransactionLog::replayAndTruncate() {
         std::string txnId{reinterpret_cast<const char*>(rb + vpos), txnIdLen};
         vpos += txnIdLen;
 
+        const std::size_t bodyEnd = totalLength - kChecksumSize;
+
         std::set<TopicPartition> partitions;
         bool bad = false;
         for (uint16_t i = 0; i < partCount; ++i) {
-            if (vpos + 2 > totalLength - kChecksumSize) { bad = true; break; }
+            if (vpos + 2 > bodyEnd) { bad = true; break; }
             uint16_t topicLen = read_le<uint16_t>(rb + vpos); vpos += 2;
-            if (vpos + topicLen + 4 > totalLength - kChecksumSize) { bad = true; break; }
+            if (vpos + topicLen + 4 > bodyEnd) { bad = true; break; }
             std::string topic{reinterpret_cast<const char*>(rb + vpos), topicLen};
             vpos += topicLen;
             int32_t partition = read_le<int32_t>(rb + vpos); vpos += 4;
             partitions.insert(TopicPartition{std::move(topic), partition});
+        }
+        if (bad) break;
+
+        // F3: Decode pending-offset section.
+        // offsetCount : uint16
+        // per offset  : groupLen:uint16 topicLen:uint16 partition:int32 offset:int64 group:bytes topic:bytes
+        std::vector<PendingTxnOffset> pendingOffsets;
+        // Older records (written before F3) will not have this section — if vpos is
+        // already at bodyEnd there are no pending offsets.  This is forward-compatible:
+        // a missing section is treated as an empty pendingOffsets (correct for all
+        // pre-F3 states).
+        if (vpos < bodyEnd) {
+            if (vpos + 2 > bodyEnd) { bad = true; }
+            else {
+                uint16_t offsetCount = read_le<uint16_t>(rb + vpos); vpos += 2;
+                for (uint16_t oi = 0; oi < offsetCount && !bad; ++oi) {
+                    // groupLen(2) + topicLen(2) + partition(4) + offset(8) = 16 bytes fixed
+                    if (vpos + 16 > bodyEnd) { bad = true; break; }
+                    uint16_t gLen = read_le<uint16_t>(rb + vpos); vpos += 2;
+                    uint16_t tLen = read_le<uint16_t>(rb + vpos); vpos += 2;
+                    int32_t  part = read_le<int32_t> (rb + vpos); vpos += 4;
+                    int64_t  off  = read_le<int64_t> (rb + vpos); vpos += 8;
+                    if (vpos + gLen + tLen > bodyEnd) { bad = true; break; }
+                    std::string grp{reinterpret_cast<const char*>(rb + vpos), gLen}; vpos += gLen;
+                    std::string tpc{reinterpret_cast<const char*>(rb + vpos), tLen}; vpos += tLen;
+                    pendingOffsets.push_back({std::move(grp),
+                                              rune::coordination::TopicPartition{std::move(tpc), part},
+                                              off});
+                }
+            }
         }
         if (bad) break;
 
@@ -342,6 +414,7 @@ void TransactionLog::replayAndTruncate() {
         entry.txnTimeoutMs     = txnTimeoutMs;
         entry.pendingNewProducerId    = pendingNewPid;                              // A2
         entry.pendingNewProducerEpoch = static_cast<ProducerEpoch>(pendingNewEpoch);// A2
+        entry.pendingOffsets          = std::move(pendingOffsets);                   // F3
         applyEntry(entry);
 
         pos         += static_cast<int64_t>(totalLength);

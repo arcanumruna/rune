@@ -12,7 +12,7 @@ target_include_directories(rune_transaction PUBLIC
 # TransactionCoordinator (already in rune_transaction).
 # ReadCommittedView scans rune::storage::Log — link rune_storage (no cycle:
 # rune_storage has no dep on rune_transaction).
-target_link_libraries(rune_transaction PUBLIC rune_storage)
+target_link_libraries(rune_transaction PUBLIC rune_storage rune_coordination)
 
 # ---------------------------------------------------------------------------
 # Exactly-once EOS end-to-end integration tests (P5-5).
@@ -28,12 +28,14 @@ if(BUILD_TRANSACTION_INTEGRATION_TESTING)
     endif()
     set(TXN_INTEG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
     add_executable(rune_transaction_integration_tests
-        ${TXN_INTEG_DIR}/ExactlyOnceIntegrationTest.cpp)
+        ${TXN_INTEG_DIR}/ExactlyOnceIntegrationTest.cpp
+        ${TXN_INTEG_DIR}/LeaderFailoverEosTest.cpp)
     target_include_directories(rune_transaction_integration_tests PRIVATE
         ${TXN_INTEG_DIR}
         ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_transaction_integration_tests PRIVATE
         rune_transaction
+        rune_replication
         rune_coordination
         GTest::gtest_main)
     gtest_discover_tests(rune_transaction_integration_tests

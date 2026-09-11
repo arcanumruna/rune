@@ -218,6 +218,19 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 }
 
 // ---------------------------------------------------------------------------
+// Leader: reconcile after an external direct-to-Log append
+// ---------------------------------------------------------------------------
+
+void PartitionReplica::onLeaderLogAppended() noexcept
+{
+    if (role_ != Role::Leader) return;   // follower LEO/HW driven by applyReplicated()
+    // Re-read the log's LEO and recompute HW (leader always in ISR, so with the
+    // ISR satisfied the HW advances to cover the newly-appended bytes exactly as
+    // it would after append()).
+    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+}
+
+// ---------------------------------------------------------------------------
 // Leader: onFetchRequest
 // ---------------------------------------------------------------------------
 

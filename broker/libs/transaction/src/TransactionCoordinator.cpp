@@ -25,11 +25,13 @@ static constexpr int32_t kMaxTxnTimeoutMs = 900'000;  // 15 minutes (matches Kaf
 TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
                                                int32_t             defaultTxnTimeoutMs,
                                                TransactionLog*     txnLog,
-                                               int32_t             coordinatorEpoch)
+                                               int32_t             coordinatorEpoch,
+                                               OffsetApplyCallback offsetApplyCb)
     : allocator_(std::move(allocator))
     , defaultTxnTimeoutMs_(defaultTxnTimeoutMs)
     , txnLog_(txnLog)
     , coordinatorEpoch_(coordinatorEpoch)
+    , offsetApplyCb_(std::move(offsetApplyCb))
 {
     // Replay the durable log to rebuild in-memory txnMap_ (P5-3 failover recovery).
     // Any entry in Prepare* state on recovery is treated as needing marker resolution
@@ -291,6 +293,47 @@ EndTransactionResult TransactionCoordinator::endTransaction(
 }
 
 // ---------------------------------------------------------------------------
+// addOffsetsToTxn — transactional consumer-group offset commit (F3)
+// ---------------------------------------------------------------------------
+AddPartitionsResult TransactionCoordinator::addOffsetsToTxn(
+    const TransactionalId&                                              txnId,
+    ProducerId                                                           producerId,
+    ProducerEpoch                                                        producerEpoch,
+    const std::string&                                                   group,
+    const std::map<rune::coordination::TopicPartition,
+                   rune::coordination::Offset>&                          offsets,
+    int64_t                                                              /*nowNs*/)
+{
+    TransactionMetadata* meta = findMetadata(txnId);
+    if (meta == nullptr) {
+        return { .errorCode = AddPartitionsResult::kUnknownTxnId };
+    }
+
+    // Fence stale epoch / wrong PID (same guard as addPartitions).
+    if (int e = validateEpochAndPid(*meta, producerId, producerEpoch); e != 0) {
+        return { .errorCode = e };
+    }
+
+    // Only valid while the transaction is Ongoing.
+    if (meta->state != TxnState::Ongoing) {
+        return { .errorCode = AddPartitionsResult::kInvalidTransition };
+    }
+
+    // Record each offset as PENDING within the transaction.
+    // Persisted to the TransactionLog so they survive a coordinator failover
+    // while in PrepareCommit: a recovered PrepareCommit re-applies them on resolve.
+    for (const auto& [tp, off] : offsets) {
+        meta->pendingOffsets.push_back({group, tp, off});
+    }
+
+    // Durable-before-visible: persist the updated metadata (including pendingOffsets)
+    // BEFORE any OffsetStore write can occur.
+    persistTransition(txnLog_, *meta, coordinatorEpoch_);
+
+    return { .errorCode = AddPartitionsResult::kOk };
+}
+
+// ---------------------------------------------------------------------------
 // completeTransaction
 // ---------------------------------------------------------------------------
 CompleteTransactionResult TransactionCoordinator::completeTransaction(
@@ -307,7 +350,19 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
         // coordinator sees CompleteCommit and knows markers were already written.
         meta->state = TxnState::CompleteCommit;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
+
+        // F3: Apply pending consumer-group offsets atomically with the commit.
+        // Durable-before-visible ordering holds: CompleteCommit is already persisted
+        // above, THEN we write to the OffsetStore — so a crash between the two leaves
+        // a CompleteCommit record that re-applies the offsets on recovery.
+        if (offsetApplyCb_) {
+            for (const auto& po : meta->pendingOffsets) {
+                offsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0);
+            }
+        }
+
         // Transition to Empty (ready for next txn, same epoch).
+        meta->pendingOffsets.clear();
         meta->partitions.clear();
         meta->txnStartNs     = 0;
         meta->fencingEpoch   = false;
@@ -324,6 +379,11 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
         // deferred new PID ONLY here, after the abort has been fully resolved.
         meta->state = TxnState::CompleteAbort;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
+
+        // F3: Discard pending consumer-group offsets — they must NEVER be written
+        // to the OffsetStore on an aborted transaction (EOS invariant).
+        meta->pendingOffsets.clear();
+
         meta->partitions.clear();
         meta->txnStartNs     = 0;
         meta->fencingEpoch   = false;

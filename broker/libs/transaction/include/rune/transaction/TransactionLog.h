@@ -70,6 +70,11 @@ struct TxnLogEntry {
     /// not lose the fresh identity the client was already handed. -1 == none.
     ProducerId             pendingNewProducerId{-1};
     ProducerEpoch          pendingNewProducerEpoch{-1};
+
+    /// F3: pending consumer-group offsets bound to this transaction.
+    /// Applied to OffsetStore on commit resolution; discarded on abort.
+    /// Persisted so a recovered PrepareCommit re-applies them on resolve.
+    std::vector<PendingTxnOffset> pendingOffsets;
 };
 
 // ---------------------------------------------------------------------------

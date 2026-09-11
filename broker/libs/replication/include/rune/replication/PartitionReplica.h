@@ -150,6 +150,18 @@ public:
     /// to pump follower fetches which advance the HW.
     Offset append(std::span<const uint8_t> records, bool acksAll = true);
 
+    /// Reconcile the leader's tracked LEO with the underlying Log and recompute HW.
+    ///
+    /// Called after a batch is appended DIRECTLY to the leader's partition Log by
+    /// a co-located writer that bypasses append() — e.g. the transaction layer
+    /// stamping already-framed transactional data batches or control (COMMIT/ABORT)
+    /// markers into the same partition log the replica owns.  Without this call the
+    /// leader's ReplicaLeaderState would still hold the pre-append LEO and HW would
+    /// never advance to cover the externally-written bytes.
+    ///
+    /// No-op on a follower (follower LEO/HW are driven by applyReplicated()).
+    void onLeaderLogAppended() noexcept;
+
     /// Handle an inbound FetchRequest from a follower.
     ///
     /// Epoch-fences (rejects stale leaderEpoch with kErrStaleEpoch).

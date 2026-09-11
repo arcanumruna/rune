@@ -66,6 +66,8 @@
 #include <rune/coordination/Types.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <map>
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -226,14 +228,17 @@ public:
         allPartitions_.reserve(static_cast<std::size_t>(numPartitions));
         for (auto& p : parts_) allPartitions_.push_back(p->tp());
 
-        // Build coordinator + log.
+        // Build durable offset store (must be constructed before coordinator so
+        // the OffsetApplyCallback lambda can capture it).
+        offsetStore_ = std::make_unique<rune::coordination::OffsetStore>(offsetStorePath_);
+
+        // Build coordinator + log, wiring the OffsetApplyCallback so that
+        // completeTransaction(COMMIT) atomically applies pending offsets.
         txnLog_  = std::make_unique<TransactionLog>(txnLogPath_);
         coord_   = std::make_unique<TransactionCoordinator>(
                        ProducerIdAllocator{}, txnTimeoutMs_,
-                       txnLog_.get(), /*coordinatorEpoch=*/0);
-
-        // Build durable offset store.
-        offsetStore_ = std::make_unique<rune::coordination::OffsetStore>(offsetStorePath_);
+                       txnLog_.get(), /*coordinatorEpoch=*/0,
+                       makeOffsetApplyCallback());
     }
 
     // -----------------------------------------------------------------------
@@ -277,10 +282,11 @@ public:
             alloc.reseedAtLeast(meta.producerId);
         }
 
-        // Reconstruct coordinator with recovered log.
+        // Reconstruct coordinator with recovered log, wiring the same callback.
         coord_ = std::make_unique<TransactionCoordinator>(
                      std::move(alloc), txnTimeoutMs_,
-                     txnLog_.get(), newCoordEpoch);
+                     txnLog_.get(), newCoordEpoch,
+                     makeOffsetApplyCallback());
     }
 
     // -----------------------------------------------------------------------
@@ -488,6 +494,19 @@ public:
         return offsetStore_->fetch(group, tp);
     }
 
+    /// Bind consumer-group offsets to the current transaction (F3).
+    /// Records them as PENDING within the txn; applied on commit, discarded on abort.
+    AddPartitionsResult addOffsetsToTxn(
+        const TransactionalId& txnId,
+        ProducerId             pid,
+        ProducerEpoch          epoch,
+        const std::string&     group,
+        const std::map<rune::coordination::TopicPartition,
+                       rune::coordination::Offset>& offsets)
+    {
+        return coord_->addOffsetsToTxn(txnId, pid, epoch, group, offsets, clock_);
+    }
+
     // -----------------------------------------------------------------------
     // Invariant assertions
     // -----------------------------------------------------------------------
@@ -625,6 +644,19 @@ public:
     void advanceClock(int64_t ns) noexcept { clock_ += ns; }
 
 private:
+    // -----------------------------------------------------------------------
+    // Build the OffsetApplyCallback that routes committed offsets from the
+    // coordinator's completeTransaction(COMMIT) path into the OffsetStore.
+    // -----------------------------------------------------------------------
+    OffsetApplyCallback makeOffsetApplyCallback() {
+        return [this](const std::string& group,
+                      const rune::coordination::TopicPartition& tp,
+                      rune::coordination::Offset offset,
+                      int64_t /*timestampNs*/) {
+            offsetStore_->commit(group, tp, offset, "", clock_);
+        };
+    }
+
     HarnessDir   txnLogDir_;
     HarnessDir   offsetStoreDir_;
     std::string  txnLogPath_;

@@ -79,9 +79,12 @@
 
 #include <rune/transaction/Types.h>
 #include <rune/transaction/ProducerIdAllocator.h>
+#include <rune/coordination/Types.h>
 
 #include <cassert>
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -156,6 +159,19 @@ struct CompleteTransactionResult {
 };
 
 // ---------------------------------------------------------------------------
+// PendingTxnOffset — one consumer-group offset bound to a transaction (F3).
+// Part of the transaction's state; applied to OffsetStore on commit,
+// discarded on abort.  Mirrors Kafka TxnOffsetCommit / sendOffsetsToTransaction
+// (KIP-98).  Defined before TransactionMetadata because TransactionMetadata
+// holds a std::vector<PendingTxnOffset>.
+// ---------------------------------------------------------------------------
+struct PendingTxnOffset {
+    std::string                        group;
+    rune::coordination::TopicPartition tp;
+    rune::coordination::Offset         offset{0};
+};
+
+// ---------------------------------------------------------------------------
 // TransactionMetadata — per-transactionalId state held by the coordinator.
 //
 // Structured so P5-3 can persist/replay: all fields are plain types, no
@@ -200,6 +216,12 @@ struct TransactionMetadata {
     /// them when the PrepareAbort resolves to Empty.  Sentinel -1 == no pending swap.
     ProducerId    pendingNewProducerId{-1};
     ProducerEpoch pendingNewProducerEpoch{-1};
+
+    /// Pending consumer-group offsets bound to this transaction (F3).
+    /// Accumulated by addOffsetsToTxn(); applied to the OffsetStore on COMMIT
+    /// (via OffsetApplyCallback), discarded on ABORT.
+    /// Persisted to TransactionLog so a recovered PrepareCommit can re-apply them.
+    std::vector<PendingTxnOffset> pendingOffsets;
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +239,18 @@ struct PendingMarkerTxn {
 };
 
 // ---------------------------------------------------------------------------
+// OffsetApplyCallback — injected into TransactionCoordinator to write pending
+// consumer-group offsets to the OffsetStore atomically on commit.
+//
+// Signature: (group, tp, offset, timestampNs) → void.
+// nullptr = no-op (in-memory / unit-test mode without an OffsetStore).
+// ---------------------------------------------------------------------------
+using OffsetApplyCallback = std::function<void(const std::string&                        group,
+                                                const rune::coordination::TopicPartition& tp,
+                                                rune::coordination::Offset                offset,
+                                                int64_t                                   timestampNs)>;
+
+// ---------------------------------------------------------------------------
 // TransactionCoordinator
 // ---------------------------------------------------------------------------
 class TransactionCoordinator {
@@ -232,10 +266,13 @@ public:
     ///                             to the log BEFORE the transition's side effects are done.
     ///                             On construction, the log is replayed to rebuild txnMap_.
     /// \param coordinatorEpoch     This coordinator's epoch (P5-3/P5-5 failover fencing).
+    /// \param offsetApplyCb        Optional callback called on COMMIT to apply pending consumer
+    ///                             offsets to the OffsetStore (nullptr = no-op).
     explicit TransactionCoordinator(ProducerIdAllocator  allocator = ProducerIdAllocator{},
                                     int32_t              defaultTxnTimeoutMs = 60'000,
                                     TransactionLog*      txnLog = nullptr,
-                                    int32_t              coordinatorEpoch = 0);
+                                    int32_t              coordinatorEpoch = 0,
+                                    OffsetApplyCallback  offsetApplyCb = nullptr);
 
     // Non-copyable (holds monotonic state).
     TransactionCoordinator(const TransactionCoordinator&)            = delete;
@@ -313,6 +350,39 @@ public:
                                         ProducerEpoch           producerEpoch,
                                         bool                    commit,
                                         int64_t                 nowNs);
+
+    // -----------------------------------------------------------------------
+    // addOffsetsToTxn — transactional consumer-group offset commit (F3)
+    // -----------------------------------------------------------------------
+
+    /// Bind consumer-group offsets to the current transaction (Kafka
+    /// addOffsetsToTxn / TxnOffsetCommit, KIP-98).
+    ///
+    /// Records each offset as PENDING within the transaction's state,
+    /// persisted to the TransactionLog so they survive a coordinator failover.
+    ///
+    /// On completeTransaction(COMMIT): pending offsets are applied to the
+    ///   OffsetStore via the OffsetApplyCallback (atomically with the commit).
+    /// On completeTransaction(ABORT) or any abort path (fence / timeout /
+    ///   recovered PrepareAbort): pending offsets are DISCARDED (never written).
+    ///
+    /// Valid states: Ongoing only (same guard as addPartitions).
+    /// Epoch/PID fenced like addPartitions.
+    ///
+    /// \param txnId         Transactional id.
+    /// \param producerId    Must match.
+    /// \param producerEpoch Must match.
+    /// \param group         Consumer group id.
+    /// \param offsets       Map of TopicPartition → offset to commit.
+    /// \param nowNs         Injected clock.
+    AddPartitionsResult addOffsetsToTxn(
+        const TransactionalId&                                              txnId,
+        ProducerId                                                           producerId,
+        ProducerEpoch                                                        producerEpoch,
+        const std::string&                                                   group,
+        const std::map<rune::coordination::TopicPartition,
+                       rune::coordination::Offset>&                          offsets,
+        int64_t                                                              nowNs);
 
     // -----------------------------------------------------------------------
     // completeTransaction
@@ -407,6 +477,10 @@ private:
 
     /// This coordinator's epoch (persisted with each log entry for fencing).
     int32_t             coordinatorEpoch_{0};
+
+    /// Optional callback: called on COMMIT to apply pending consumer-group offsets
+    /// to the OffsetStore atomically with the transaction completion (F3).
+    OffsetApplyCallback offsetApplyCb_;
 
     /// Primary state: transactionalId → TransactionMetadata.
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;

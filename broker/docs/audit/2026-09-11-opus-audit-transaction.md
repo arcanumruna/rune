@@ -891,3 +891,37 @@ in-flight(4) hidden by LSO=4, controls(1,3) never emitted. ✅
 
 **Bottom line:** on-disk LE record format is byte-correct everywhere, no BE straggler, the
 marker-in-log regression is genuinely covered, and existing tests were correctly migrated to LE.
+
+---
+
+## P5-5 review (commit dbe03b7)
+
+Reviewer: Opus. Scope: `libs/transaction/tests/integration/{ExactlyOnceHarness.h,ExactlyOnceIntegrationTest.cpp}` + CMake target `rune_transaction_integration_tests`. No code modified.
+
+### Verdict: FINDINGS (not CLEAN) — one weak proxy (txn-offset atomicity) + one real coverage hole (leader failover).
+
+The bulk of the suite exercises REAL Phase-5 components and asserts on their real output. But two of the eight required guarantees are not genuinely proven end-to-end.
+
+### Per-item
+
+1. **Real components ✅** — Harness wires actual `TransactionCoordinator`+`TransactionLog` (Harness.h:230-236), real `ProducerStateManager` (PartitionState.psm, :126; validate/update at :334-345), real `rune::storage::Log`, real `ReadCommittedView`+`LsoTracker`+`AbortedTxnIndex` (:124-133), real `OffsetStore` (:236), real `ControlMarker::resolvePendingMarkers` (:431). `read()` does its OWN LSO clamp + control-strip + aborted filter (ReadCommittedView.cpp:228-278); `parseOffsets` (Harness.h:184) only parses what read() returned — no re-implementation of the logic under test.
+
+2. **Atomic visibility ✅** — Cross-partition all-or-nothing genuinely asserted: test 1 checks read_committed empty on all 3 partitions BEFORE commit (Test.cpp:102-105) then visible on all after (:111-113); markers written only to `endRes.partitions` from the real coordinator (Harness.h:361-368). LSO-pinned-before-commit (test 2), read_uncommitted-sees-in-flight (test 3), abort-invisible cross-partition (test 4), LSO-advances-after-abort (test 6). Concrete, not single-partition.
+
+3. **read-process-write EOS ⚠️ WEAK PROXY** — Output visibility/invisibility IS real (real output-log read via read_committed). But the txn-offset-commit half is NOT atomically bound to the txn: `commitOffset` is a bare unconditional `OffsetStore::commit` call SEPARATE from `commitTxn` (Test.cpp:364-368, :940-942), and the abort tests (12,32) merely OMIT the call by test-author choice with a comment "Offset NOT committed on abort path" (Test.cpp:962-965). There is NO transactional offset-commit API in the system (`grep txnOffsetCommit|addOffsetsToTxn` → none; only plain consumer OffsetCommit in coordination). So tests 11/12/31/32 would still pass even if the real broker committed offsets on an aborted txn — the atomicity they claim is simulated in the test body, not exercised in a component. Not false-green for output; IS a weak proxy for the "…AND offsets advanced atomically" clause.
+
+4. **Idempotent retry ✅** — Test 14 asserts the LOG, not just validate(): dup returns original offset AND `hw()` unchanged (Test.cpp:453-454) via real PSM validate→isDuplicate→retryBaseOffset (Harness.h:336) with no log append. Test 15 same-offset. Genuine.
+
+5. **Zombie fencing ✅** — Old epoch rejected and asserted on all three paths: addPartitions → `kInvalidProducerEpoch` (tests 18,19,28), endTransaction → `kInvalidProducerEpoch` (test 20). Real coordinator error codes, actually attempted.
+
+6. **Coordinator failover mid-txn ✅** — `recreateCoordinator` (Harness.h:267-284) does a REAL destroy (`coord_.reset(); txnLog_.reset()`) + reopen `TransactionLog` from the same on-disk path (real `::open`+`replayAndTruncate`, TransactionLog.cpp:70-78). Recovery replays Prepare* and sets markersPending (TransactionCoordinator.cpp:44-52); `resolvePendingMarkers` writes markers with PERSISTED epochs (ControlMarker.cpp:377-388). Tests 22/23/25 assert recovered state == Prepare*, then committed fully visible / aborted fully invisible after rebuildAllViews. Genuine durable failover.
+
+7. **Leader-failover gap (ADJUDICATE) → REAL HOLE (narrow).** PartitionReplica / ISR / replication are ENTIRELY absent from harness+test (`grep PartitionReplica|ISR|replication` in tests/integration → zero hits). HW is faked as `log.logEndOffset()` (Harness.h:138) — every appended batch is instantly "committed to HW," so there is no HW < LEO window and no notion of a marker replicated to fewer than ISR replicas. The layering argument (replication atomicity proven in P3, txn atomicity here) is *mostly* sound for the common case, BUT it does NOT compose across one concrete EOS-critical interaction: **a data batch that is replicated + acked (advances HW) while its COMMIT/ABORT marker is written but NOT yet replicated when the partition leader fails.** On failover to a new leader, the marker can be lost while the data survives above the old HW — the new leader must recompute LSO and either re-drive the marker or hold LSO. Neither P3 (which knows nothing of markers/LSO) nor P5-5 (which has no replica/HW-lag) tests this seam. This is a plausible place for a cross-layer EOS bug (committed data briefly readable then retracted, or permanently-pinned LSO). **Verdict: acceptable to defer for the *coordinator*-failover story, but a REAL hole for *partition-leader* failover.** Missing test: a two-replica PartitionReplica harness where (a) data batch acked to HW, (b) COMMIT marker appended to leader only (HW not yet advanced past marker), (c) leader fails → follower promoted, (d) assert read_committed on the new leader is atomic — either marker survives and data is visible, or marker is re-driven from the coordinator's durable Prepare* and LSO holds until then; never a state where data is visible without a durable marker. The suite's own header/commit msg disclose this ("leader failover tested only via log durability + marker atomicity after coordinator restart"), so it is a known/documented boundary, not a silent gap.
+
+8. **Vacuous / false-green scan ✅ (mostly clean).** All 3 `driveUntil` returns are captured + `ASSERT_TRUE`'d (Test.cpp:742,887,916) — no silent stall. `assertLsoLeHw`/`assertCommittedVisible`/`assertAbortedInvisible` are non-tautological (assert real read() output). The one intentional `EXPECT_TRUE(vr.isOos() || vr.isDuplicate())` (test 16, Test.cpp:503) is JUSTIFIED: with kRetryWindowSize=5 and 6 batches, batch 0 is evicted → OOS; crucially the disjunction EXCLUDES `isAccept()`, so a spurious re-accept (the actual EOS-violating double-append) would FAIL the test. Not masking a bug. Caveat tying back to item 3: tests 12/32 are structurally near-vacuous for the offset clause (they assert `fetch()` empty on a group that was never written under ANY path), so they cannot fail on an offset-atomicity regression.
+
+### Report path
+`docs/audit/2026-09-11-opus-audit-transaction.md`
+
+### Bottom line
+Atomic visibility, idempotent dedup, zombie fencing, and coordinator-failover recovery are genuinely proven against real components. NOT CLEAN because: (a) transactional-offset-commit atomicity (item 3) is simulated in the test body with no system-level binding — a weak proxy that cannot catch an offset-on-abort regression; (b) partition-leader failover (item 7) is a real, though documented, coverage hole for the marker-lost-above-HW seam. Recommend: add a PartitionReplica-backed leader-failover EOS test, and either add a real txn-offset-commit API bound to endTransaction or downgrade the item-3 test claims.

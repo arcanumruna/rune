@@ -326,7 +326,9 @@ TEST(AtomicVisibility, LsoNeverExposesOpenTxn)
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// 11. read-process-write: COMMIT makes output visible AND advances offsets.
+// 11. read-process-write: COMMIT makes output visible AND advances offset via
+//     real addOffsetsToTxn (KIP-98).  The consumer-group offset must NOT
+//     appear before commit (durable-before-visible) and MUST appear after.
 // ---------------------------------------------------------------------------
 TEST(ExactlyOnce, ReadProcessWrite_CommitAtomicOutputAndOffsets)
 {
@@ -334,9 +336,6 @@ TEST(ExactlyOnce, ReadProcessWrite_CommitAtomicOutputAndOffsets)
     ExactlyOnceHarness h(2, "topic");
 
     // Produce some non-transactional input data to partition 0.
-    // (Use producerId=-1 to indicate non-transactional; the harness's Log
-    //  accepts any batch via appendTxnData with pid=-1 bypassing PSM.)
-    // For simplicity, directly append to the log.
     rune::protocol::RecordBatchBuilder inputBatch(0, 0);
     inputBatch.setProducerId(-1);
     inputBatch.append({}, "input-record", 0);
@@ -344,40 +343,45 @@ TEST(ExactlyOnce, ReadProcessWrite_CommitAtomicOutputAndOffsets)
     h.partition(0).log.append(inputBytes, 0);
     h.partition(0).lsoTracker.onProduceBatch(-1, 0); // non-txn → no open txn
 
-    // Processor: initProducer, begin txn on output partition + offset commit.
+    // Processor: initProducer, begin txn on output partition.
     auto ir = h.initProducer("rpw-txn");
     ASSERT_TRUE(ir.ok());
     ProducerId pid = ir.producerId;
     ProducerEpoch epoch = ir.producerEpoch;
 
-    // Add output partition (p1) + transaction.
     ASSERT_TRUE(h.addAllPartitions("rpw-txn", pid, epoch).ok());
 
-    // Produce output to partition 1.
+    // Produce output to partition 1 (transactional).
     int64_t outOff = h.appendTxnData(pid, epoch, 1, 0, "output-record");
     ASSERT_GE(outOff, 0);
 
-    // Output not yet visible.
-    EXPECT_TRUE(parseOffsets(h.readCommitted(1)).empty());
-
-    // Commit the txn — output + offset commit are atomic.
-    ASSERT_TRUE(h.commitTxn("rpw-txn", pid, epoch));
-
-    // Commit offset (simulates transactional offset commit).
+    // Register the input offset 1 as PENDING within the transaction (real KIP-98).
     rcoord::TopicPartition inputTp{"topic", 0};
-    h.commitOffset("group-A", inputTp, 1); // consumed up to offset 1
+    std::map<rcoord::TopicPartition, rcoord::Offset> pendingOffsets{{inputTp, 1}};
+    ASSERT_TRUE(h.addOffsetsToTxn("rpw-txn", pid, epoch, "group-A", pendingOffsets).ok());
+
+    // BEFORE commit: output hidden, offset not yet in store.
+    EXPECT_TRUE(parseOffsets(h.readCommitted(1)).empty());
+    EXPECT_FALSE(h.fetchOffset("group-A", inputTp).has_value())
+        << "Offset must NOT be in OffsetStore before commit (durable-before-visible)";
+
+    // Commit: output becomes visible AND consumer offset is applied atomically.
+    ASSERT_TRUE(h.commitTxn("rpw-txn", pid, epoch));
 
     // Output is now visible.
     h.assertCommittedVisible(1, {outOff});
 
-    // Offset is committed.
+    // Consumer offset MUST reflect the value registered with addOffsetsToTxn.
     auto co = h.fetchOffset("group-A", inputTp);
-    ASSERT_TRUE(co.has_value());
-    EXPECT_GE(co->offset, 1LL);
+    ASSERT_TRUE(co.has_value()) << "Offset must be in OffsetStore after commit";
+    EXPECT_EQ(co->offset, 1LL);
 }
 
 // ---------------------------------------------------------------------------
 // 12. read-process-write ABORT: no output visible, offset NOT advanced.
+//     Uses real addOffsetsToTxn so the pending offset is recorded inside the
+//     transaction and MUST be discarded (never written) on abort.
+//     THIS TEST MUST FAIL if the abort path applies the pending offset.
 // ---------------------------------------------------------------------------
 TEST(ExactlyOnce, ReadProcessWrite_Abort_NoDuplicateOutput_OffsetNotAdvanced)
 {
@@ -390,16 +394,22 @@ TEST(ExactlyOnce, ReadProcessWrite_Abort_NoDuplicateOutput_OffsetNotAdvanced)
     int64_t outOff = h.appendTxnData(ir.producerId, ir.producerEpoch, 1, 0, "spurious");
     ASSERT_GE(outOff, 0);
 
-    // Abort instead of commit.
+    // Register offset 3 as PENDING within the transaction.
+    rcoord::TopicPartition inputTp{"topic", 0};
+    std::map<rcoord::TopicPartition, rcoord::Offset> pendingOffsets{{inputTp, 3}};
+    ASSERT_TRUE(h.addOffsetsToTxn("rpw-abort", ir.producerId, ir.producerEpoch,
+                                   "group-B", pendingOffsets).ok());
+
+    // Abort: pending offset must be discarded; output must be invisible.
     ASSERT_TRUE(h.abortTxn("rpw-abort", ir.producerId, ir.producerEpoch));
 
     // Output is invisible.
     h.assertAbortedInvisible(1, {outOff});
 
-    // Offset was never committed.
-    rcoord::TopicPartition inputTp{"topic", 0};
-    auto co = h.fetchOffset("group-B", inputTp);
-    EXPECT_FALSE(co.has_value()) << "Offset must not be committed on abort";
+    // Offset MUST NOT be in OffsetStore.  This assertion MUST FAIL if the
+    // abort path incorrectly calls offsetApplyCb_.
+    EXPECT_FALSE(h.fetchOffset("group-B", inputTp).has_value())
+        << "INVARIANT VIOLATED: offset was committed to OffsetStore on abort";
 }
 
 // ---------------------------------------------------------------------------
@@ -924,7 +934,9 @@ TEST(DisasterRecovery, TimeoutAbort_LsoAdvancesAfterAbort)
 }
 
 // ---------------------------------------------------------------------------
-// 31. Transactional offset commit: atomically with txn commit.
+// 31. Transactional offset commit (real addOffsetsToTxn): commit → offset
+//     advanced atomically.  Offset must NOT appear before commit
+//     (durable-before-visible) and MUST appear after commit.
 // ---------------------------------------------------------------------------
 TEST(DisasterRecovery, TxnOffsetCommit_AtomicWithTxn_CommitAdvancesOffset)
 {
@@ -935,20 +947,29 @@ TEST(DisasterRecovery, TxnOffsetCommit_AtomicWithTxn_CommitAdvancesOffset)
     ASSERT_TRUE(h.addAllPartitions("toc-commit", ir.producerId, ir.producerEpoch).ok());
     h.appendTxnData(ir.producerId, ir.producerEpoch, 0, 0, "rec");
 
-    // Commit offset as part of the transaction (simulated atomically).
+    // Register offset 1 as PENDING within the transaction via addOffsetsToTxn.
     rcoord::TopicPartition tp{"topic", 0};
-    h.commitOffset("group-toc", tp, 1);
+    std::map<rcoord::TopicPartition, rcoord::Offset> offsets{{tp, 1}};
+    ASSERT_TRUE(h.addOffsetsToTxn("toc-commit", ir.producerId, ir.producerEpoch,
+                                   "group-toc", offsets).ok());
 
+    // BEFORE commit: OffsetStore must NOT have the offset (PENDING, not applied).
+    EXPECT_FALSE(h.fetchOffset("group-toc", tp).has_value())
+        << "Offset must NOT appear in OffsetStore before txn commit";
+
+    // Commit the transaction — addOffsetsToTxn offset is applied atomically.
     ASSERT_TRUE(h.commitTxn("toc-commit", ir.producerId, ir.producerEpoch));
 
+    // AFTER commit: OffsetStore MUST show offset 1.
     auto co = h.fetchOffset("group-toc", tp);
-    ASSERT_TRUE(co.has_value());
-    EXPECT_GE(co->offset, 1LL)
-        << "Committed offset must reflect txn offset commit";
+    ASSERT_TRUE(co.has_value())
+        << "Committed offset must be in OffsetStore after txn commit";
+    EXPECT_EQ(co->offset, 1LL);
 }
 
 // ---------------------------------------------------------------------------
-// 32. Transactional offset commit: abort → offset NOT advanced.
+// 32. Transactional offset commit (real addOffsetsToTxn): abort → offset
+//     NEVER advanced.  THIS TEST MUST FAIL if offsets were applied on abort.
 // ---------------------------------------------------------------------------
 TEST(DisasterRecovery, TxnOffsetCommit_AbortDoesNotAdvanceOffset)
 {
@@ -959,15 +980,19 @@ TEST(DisasterRecovery, TxnOffsetCommit_AbortDoesNotAdvanceOffset)
     ASSERT_TRUE(h.addAllPartitions("toc-abort", ir.producerId, ir.producerEpoch).ok());
     h.appendTxnData(ir.producerId, ir.producerEpoch, 0, 0, "rec");
 
-    // Simulate: we would commit offset here, but since we abort, we do NOT
-    // commit to the offset store (atomic with transaction).
+    // Register offset 99 as PENDING within the transaction via addOffsetsToTxn.
     rcoord::TopicPartition tp{"topic", 0};
-    // Offset NOT committed on abort path.
+    std::map<rcoord::TopicPartition, rcoord::Offset> offsets{{tp, 99}};
+    ASSERT_TRUE(h.addOffsetsToTxn("toc-abort", ir.producerId, ir.producerEpoch,
+                                   "group-toc-abort", offsets).ok());
+
+    // Abort the transaction — pending offsets must be DISCARDED (never written).
     ASSERT_TRUE(h.abortTxn("toc-abort", ir.producerId, ir.producerEpoch));
 
-    auto co = h.fetchOffset("group-toc-abort", tp);
-    EXPECT_FALSE(co.has_value())
-        << "Offset must NOT be committed on transaction abort";
+    // AFTER abort: OffsetStore must NOT have the offset.
+    // This assertion MUST FAIL if offsetApplyCb_ is incorrectly called on abort.
+    EXPECT_FALSE(h.fetchOffset("group-toc-abort", tp).has_value())
+        << "INVARIANT VIOLATED: offset was applied to OffsetStore on abort";
 }
 
 // ===========================================================================
@@ -1188,4 +1213,122 @@ TEST(AtomicVisibility, AddPartitions_EmptyToOngoing_StateTransition)
     auto stOngoing = h.coordinator().state("state-check");
     ASSERT_TRUE(stOngoing.has_value());
     EXPECT_EQ(*stOngoing, TxnState::Ongoing);
+}
+
+// ===========================================================================
+// F3: Real transactional offset commit (addOffsetsToTxn)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// F3-a. addOffsetsToTxn: commit → OffsetStore shows advanced offset.
+//       Offset must NOT be in store before commit (pre-commit assertion).
+//       Offset MUST be in store after commit (post-commit assertion).
+// ---------------------------------------------------------------------------
+TEST(TxnOffsetCommit, AddOffsetsToTxn_CommitAppliesOffset)
+{
+    ExactlyOnceHarness h(1, "topic");
+    auto ir = h.initProducer("ato-commit");
+    ASSERT_TRUE(ir.ok());
+    ASSERT_TRUE(h.addAllPartitions("ato-commit", ir.producerId, ir.producerEpoch).ok());
+    h.appendTxnData(ir.producerId, ir.producerEpoch, 0, 0, "data");
+
+    rcoord::TopicPartition inputTp{"input", 0};
+    std::map<rcoord::TopicPartition, rcoord::Offset> offsets{{inputTp, 5}};
+
+    // addOffsetsToTxn records offset 5 as PENDING (not yet written to OffsetStore).
+    ASSERT_TRUE(h.addOffsetsToTxn("ato-commit", ir.producerId, ir.producerEpoch,
+                                   "grp-commit", offsets).ok());
+
+    // BEFORE commit: OffsetStore must NOT have the offset (durable-before-visible).
+    EXPECT_FALSE(h.fetchOffset("grp-commit", inputTp).has_value())
+        << "Offset must NOT be in OffsetStore before txn commit";
+
+    ASSERT_TRUE(h.commitTxn("ato-commit", ir.producerId, ir.producerEpoch));
+
+    // AFTER commit: OffsetStore MUST have offset 5.
+    auto co = h.fetchOffset("grp-commit", inputTp);
+    ASSERT_TRUE(co.has_value()) << "Offset must be in OffsetStore after commit";
+    EXPECT_EQ(co->offset, 5LL);
+}
+
+// ---------------------------------------------------------------------------
+// F3-b. addOffsetsToTxn: abort → OffsetStore NOT advanced.
+//       THIS TEST MUST FAIL if offsets were applied on abort (invariant check).
+// ---------------------------------------------------------------------------
+TEST(TxnOffsetCommit, AddOffsetsToTxn_AbortDiscardsOffset)
+{
+    ExactlyOnceHarness h(1, "topic");
+    auto ir = h.initProducer("ato-abort");
+    ASSERT_TRUE(ir.ok());
+    ASSERT_TRUE(h.addAllPartitions("ato-abort", ir.producerId, ir.producerEpoch).ok());
+    h.appendTxnData(ir.producerId, ir.producerEpoch, 0, 0, "data");
+
+    rcoord::TopicPartition inputTp{"input", 0};
+    std::map<rcoord::TopicPartition, rcoord::Offset> offsets{{inputTp, 5}};
+    ASSERT_TRUE(h.addOffsetsToTxn("ato-abort", ir.producerId, ir.producerEpoch,
+                                   "grp-abort", offsets).ok());
+
+    ASSERT_TRUE(h.abortTxn("ato-abort", ir.producerId, ir.producerEpoch));
+
+    // AFTER abort: OffsetStore must NOT have offset 5 (invariant).
+    // This assertion MUST FAIL if offsetApplyCb_ is called on the abort path.
+    EXPECT_FALSE(h.fetchOffset("grp-abort", inputTp).has_value())
+        << "INVARIANT VIOLATED: offset was applied to OffsetStore on abort";
+}
+
+// ---------------------------------------------------------------------------
+// F3-c. addOffsetsToTxn: coordinator failover mid-PrepareCommit recovers
+//        pending offsets and applies them on resolve.
+// ---------------------------------------------------------------------------
+TEST(TxnOffsetCommit, AddOffsetsToTxn_FailoverRecoversPendingOffsets)
+{
+    ExactlyOnceHarness h(1, "topic");
+    auto ir = h.initProducer("ato-failover");
+    ASSERT_TRUE(ir.ok());
+    ASSERT_TRUE(h.addAllPartitions("ato-failover", ir.producerId, ir.producerEpoch).ok());
+    h.appendTxnData(ir.producerId, ir.producerEpoch, 0, 0, "data");
+
+    rcoord::TopicPartition inputTp{"input", 0};
+    std::map<rcoord::TopicPartition, rcoord::Offset> offsets{{inputTp, 7}};
+    ASSERT_TRUE(h.addOffsetsToTxn("ato-failover", ir.producerId, ir.producerEpoch,
+                                   "grp-failover", offsets).ok());
+
+    // Drive to PrepareCommit (endTransaction commit), then crash BEFORE markers.
+    {
+        auto endRes = h.coordinator().endTransaction(
+            "ato-failover", ir.producerId, ir.producerEpoch, /*commit=*/true, h.clock());
+        ASSERT_TRUE(endRes.ok());
+        // Do NOT write markers or call completeTransaction — simulate crash here.
+    }
+
+    // Crash + restart coordinator (recovered state = PrepareCommit, markersPending=false
+    // because it was client-driven; but the coordinator still holds PrepareCommit durably).
+    h.recreateCoordinator(1);
+
+    // After recovery: pending offsets must NOT be in OffsetStore yet.
+    EXPECT_FALSE(h.fetchOffset("grp-failover", inputTp).has_value())
+        << "Pending offsets must NOT be applied before resolution";
+
+    // Verify the coordinator recovered PrepareCommit state.
+    auto recoveredState = h.coordinator().state("ato-failover");
+    ASSERT_TRUE(recoveredState.has_value());
+    EXPECT_EQ(*recoveredState, TxnState::PrepareCommit)
+        << "Coordinator must recover PrepareCommit from durable log";
+
+    // Simulate resolving: write COMMIT markers manually and call completeTransaction.
+    // (In production this would be driven by writeMarkers.)
+    for (int i = 0; i < h.numPartitions(); ++i) {
+        appendControlMarker(h.partition(i), ir.producerId, ir.producerEpoch,
+                            ControlType::Commit, /*coordEpoch=*/1);
+    }
+    ASSERT_TRUE(h.coordinator().completeTransaction("ato-failover").ok());
+
+    // After resolution: offset MUST be in OffsetStore.
+    auto co = h.fetchOffset("grp-failover", inputTp);
+    ASSERT_TRUE(co.has_value()) << "Offset must be applied after recovered commit resolve";
+    EXPECT_EQ(co->offset, 7LL);
+
+    // Data must be visible under read_committed.
+    h.rebuildAllViews();
+    EXPECT_FALSE(parseOffsets(h.readCommitted(0)).empty());
 }
