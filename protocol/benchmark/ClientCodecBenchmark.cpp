@@ -1,8 +1,8 @@
-// ClientCodecBenchmark.cpp — CP-2 + CP-3 codec benchmarks.
+// ClientCodecBenchmark.cpp — CP-2 + CP-3 + CP-4 codec benchmarks.
 //
-// Benchmarks the ConnectRequest, ConnectResponse, Keepalive, Disconnect, and
-// ErrorResponse encode + decode paths.  Inputs are pre-built outside the timed
-// loop; DoNotOptimize guards outputs.
+// Benchmarks the ConnectRequest, ConnectResponse, Keepalive, Disconnect,
+// ErrorResponse, Ping, and Pong encode + decode paths.  Inputs are pre-built
+// outside the timed loop; DoNotOptimize guards outputs.
 //
 //   BM_ConnectRequest_Encode    — encode a realistic ConnectRequest into a stack buffer
 //   BM_ConnectRequest_Decode    — decode a pre-encoded ConnectRequest frame
@@ -14,6 +14,11 @@
 //   BM_Disconnect_Decode        — decode a pre-encoded Disconnect frame
 //   BM_ErrorResponse_Encode     — encode an ErrorResponse with realistic message
 //   BM_ErrorResponse_Decode     — decode a pre-encoded ErrorResponse frame
+//   BM_Ping_Encode              — encode a Ping with 32-byte echo payload
+//   BM_Ping_Decode              — decode a pre-encoded Ping frame (32-byte echo)
+//   BM_Ping_Encode_Empty        — encode a Ping with empty echo (baseline)
+//   BM_Pong_Encode              — encode a Pong with 32-byte echo payload
+//   BM_Pong_Decode              — decode a pre-encoded Pong frame (32-byte echo)
 //
 // CP-5/6: extend this file with the new message types following the same pattern.
 
@@ -24,6 +29,7 @@
 #include <string>
 
 #include "rune/protocol/client/ControlMessages.h"
+#include "rune/protocol/client/PingMessages.h"
 
 namespace rpc = rune::protocol::client;
 
@@ -59,6 +65,10 @@ rpc::ConnectResponse makeResponse() {
 // A realistic ErrorResponse message payload.
 constexpr std::string_view kErrorMsg = "cluster not available — redirect to leader";
 
+// A representative Ping/Pong echo payload: 32 bytes of opaque data.
+// 32 bytes is a representative round-trip payload (e.g., a small request ID + nonce).
+static const std::string kEchoPayload(32, '\xAB');
+
 rpc::Keepalive makeKeepalive() {
     rpc::Keepalive ka;
     ka.sessionId     = 0xABCDEF0123456789LL;
@@ -81,6 +91,22 @@ rpc::ErrorResponse makeErrorResponse() {
     err.code          = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
     err.message       = kErrorMsg;
     return err;
+}
+
+rpc::Ping makePing() {
+    rpc::Ping ping;
+    ping.sessionId     = 0xDEADBEEFCAFEBABELL;
+    ping.correlationId = 0x0102030405060708LL;
+    ping.echo          = kEchoPayload;
+    return ping;
+}
+
+rpc::Pong makePong() {
+    rpc::Pong pong;
+    pong.sessionId     = 0xDEADBEEFCAFEBABELL;
+    pong.correlationId = 0x0102030405060708LL;
+    pong.echo          = kEchoPayload;
+    return pong;
 }
 
 // Pre-encoded frames (built once; reused across iterations).
@@ -107,12 +133,22 @@ struct Frames {
     std::array<uint8_t, kErrBufSize> errBuf{};
     std::size_t errLen = 0;
 
+    // Ping encoded frame: 24 + 2 + 32 = 58 bytes
+    std::array<uint8_t, 128> pingBuf{};
+    std::size_t pingLen = 0;
+
+    // Pong encoded frame: 24 + 2 + 32 = 58 bytes
+    std::array<uint8_t, 128> pongBuf{};
+    std::size_t pongLen = 0;
+
     Frames() {
         reqLen  = makeRequest().encode(reqBuf.data());
         respLen = makeResponse().encode(respBuf.data());
         kaLen   = makeKeepalive().encode(kaBuf.data());
         disLen  = makeDisconnect().encode(disBuf.data());
         errLen  = makeErrorResponse().encode(errBuf.data());
+        pingLen = makePing().encode(pingBuf.data());
+        pongLen = makePong().encode(pongBuf.data());
     }
 };
 
@@ -303,3 +339,97 @@ static void BM_ErrorResponse_Decode(benchmark::State& state) {
                             static_cast<int64_t>(f.errLen));
 }
 BENCHMARK(BM_ErrorResponse_Decode)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_Ping_Encode  — 32-byte echo payload
+// ---------------------------------------------------------------------------
+static void BM_Ping_Encode(benchmark::State& state) {
+    const rpc::Ping ping = makePing();
+    std::array<uint8_t, 128> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = ping.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(frames().pingLen));
+}
+BENCHMARK(BM_Ping_Encode)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_Ping_Decode  — 32-byte echo payload
+// ---------------------------------------------------------------------------
+static void BM_Ping_Decode(benchmark::State& state) {
+    const Frames& f = frames();
+
+    for (auto _ : state) {
+        auto result = rpc::Ping::decode(f.pingBuf.data(), f.pingLen);
+        benchmark::DoNotOptimize(result);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(f.pingLen));
+}
+BENCHMARK(BM_Ping_Decode)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_Ping_Encode_Empty  — empty echo (baseline / lower bound)
+// ---------------------------------------------------------------------------
+static void BM_Ping_Encode_Empty(benchmark::State& state) {
+    rpc::Ping ping;
+    ping.sessionId     = 0xDEADBEEFCAFEBABELL;
+    ping.correlationId = 0x0102030405060708LL;
+    // echo is empty (default)
+    std::array<uint8_t, 64> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = ping.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    // empty Ping is 26 bytes
+    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(26));
+}
+BENCHMARK(BM_Ping_Encode_Empty)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_Pong_Encode  — 32-byte echo payload
+// ---------------------------------------------------------------------------
+static void BM_Pong_Encode(benchmark::State& state) {
+    const rpc::Pong pong = makePong();
+    std::array<uint8_t, 128> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = pong.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(frames().pongLen));
+}
+BENCHMARK(BM_Pong_Encode)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_Pong_Decode  — 32-byte echo payload
+// ---------------------------------------------------------------------------
+static void BM_Pong_Decode(benchmark::State& state) {
+    const Frames& f = frames();
+
+    for (auto _ : state) {
+        auto result = rpc::Pong::decode(f.pongBuf.data(), f.pongLen);
+        benchmark::DoNotOptimize(result);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(f.pongLen));
+}
+BENCHMARK(BM_Pong_Decode)->Unit(benchmark::kNanosecond);
