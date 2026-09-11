@@ -10,6 +10,25 @@ target_include_directories(rune_replication PUBLIC
 # consumers of rune_replication also get rune_storage headers transitively.
 target_link_libraries(rune_replication PUBLIC rune_storage)
 
+option(BUILD_REPLICATION_INTEGRATION_TESTING
+    "Build replication cluster disaster/recovery integration tests (P3-6)" OFF)
+if(BUILD_REPLICATION_INTEGRATION_TESTING)
+    if(NOT BUILD_TESTING)
+        find_package(GTest REQUIRED)
+        include(GoogleTest)
+    endif()
+    set(REPLICATION_INTEG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    add_executable(rune_replication_integration_tests
+        ${REPLICATION_INTEG_DIR}/ClusterDisasterRecoveryIntegrationTest.cpp)
+    target_include_directories(rune_replication_integration_tests PRIVATE
+        ${REPLICATION_INTEG_DIR})
+    target_link_libraries(rune_replication_integration_tests PRIVATE
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_replication_integration_tests
+        PROPERTIES TIMEOUT 60)
+endif()
+
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_replication_tests
