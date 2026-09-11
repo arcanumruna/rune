@@ -567,3 +567,162 @@ TEST(TransactionLogTest, FencingEpochNotPersisted) {
     ASSERT_NE(m, nullptr);
     EXPECT_FALSE(m->fencingEpoch); // must be false after recovery
 }
+
+// ===========================================================================
+// Part B (durable log) — additional edge-case coverage
+// ===========================================================================
+
+// #23 — CRC corruption in a MIDDLE record (not the tail): a good record, a
+// CRC-flipped record, then a good record. Replay must stop at the first bad one
+// and truncate everything after (recover only the leading good record).
+TEST(TransactionLogTest, MiddleRecordCrcCorruptionTruncatesRest) {
+    auto path = tmpPath();
+    TempFile tf{path};
+
+    // Write three complete records; capture the byte offset of record #2's start.
+    int64_t rec2Start = 0, rec2Len = 0;
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-a", 1, 0, TxnState::Empty));               // rec0
+        rec2Start = static_cast<int64_t>(fs::file_size(path));
+        log.append(makeEntry("txn-b", 2, 0, TxnState::Ongoing, {tp("t", 0)}, 5)); // rec1 (the middle)
+        rec2Len = static_cast<int64_t>(fs::file_size(path)) - rec2Start;
+        log.append(makeEntry("txn-c", 3, 0, TxnState::Empty));               // rec2
+    }
+
+    // Flip a byte in the MIDDLE record's payload (before its CRC) to break CRC.
+    {
+        int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        // Corrupt a byte well inside the middle record's fixed header (offset +16
+        // is producerId, definitely covered by CRC and not the magic/length).
+        off_t corruptAt = static_cast<off_t>(rec2Start + 16);
+        uint8_t b = 0;
+        ASSERT_EQ(::pread(fd, &b, 1, corruptAt), 1);
+        b ^= 0xFF;
+        ASSERT_EQ(::pwrite(fd, &b, 1, corruptAt), 1);
+        ::close(fd);
+    }
+    (void)rec2Len;
+
+    // Reopen: only the FIRST good record survives; the corrupt middle and the
+    // trailing good record are truncated away.
+    {
+        TransactionLog log(path);
+        EXPECT_EQ(log.size(), 1u);
+        EXPECT_NE(log.metadata("txn-a"), nullptr);
+        EXPECT_EQ(log.metadata("txn-b"), nullptr);
+        EXPECT_EQ(log.metadata("txn-c"), nullptr);
+        // Writable after truncation.
+        log.append(makeEntry("txn-d", 4, 0, TxnState::Empty));
+        EXPECT_NE(log.metadata("txn-d"), nullptr);
+    }
+}
+
+// #22 — Torn tail straddling a Complete* transition: Ongoing + PrepareCommit
+// fully written, then a partial CompleteCommit record. Reopen → recovers to
+// PrepareCommit (resolvable), never a half-applied Complete.
+TEST(TransactionLogTest, TornTailMidCompleteRecoversToPrepare) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-p", 9, 2, TxnState::Empty));
+        log.append(makeEntry("txn-p", 9, 2, TxnState::Ongoing, {tp("x", 0)}, 100));
+        log.append(makeEntry("txn-p", 9, 2, TxnState::PrepareCommit, {tp("x", 0)}, 100));
+    }
+    // Append a partial CompleteCommit record (torn — only a few bytes).
+    {
+        int fd = ::open(path.c_str(), O_WRONLY | O_APPEND);
+        ASSERT_GE(fd, 0);
+        // Valid magic but truncated body (not a full record).
+        uint8_t partial[8] = {0x4C, 0x4E, 0x4B, 0x54, 0xFF, 0xFF, 0x00, 0x00};
+        ::write(fd, partial, sizeof(partial));
+        ::close(fd);
+    }
+    {
+        TransactionLog log(path);
+        const auto* m = log.metadata("txn-p");
+        ASSERT_NE(m, nullptr);
+        EXPECT_EQ(m->state, TxnState::PrepareCommit);
+    }
+}
+
+// A5 — over-long txnId is REJECTED loudly (std::length_error), never silently
+// truncated/dropped.
+TEST(TransactionLogTest, AppendRejectsOverLongTxnId) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    TransactionLog log(path);
+    TxnLogEntry e = makeEntry(std::string(65536, 'z'), 1, 0, TxnState::Empty);
+    EXPECT_THROW(log.append(e), std::length_error);
+    // Nothing persisted.
+    EXPECT_EQ(log.size(), 0u);
+}
+
+// A5 — over-long partition count is REJECTED loudly. (Constructing 65536 real
+// partitions is wasteful; assert the topic-length guard instead, same code path
+// class: an over-long length-prefixed field is rejected, not truncated.)
+TEST(TransactionLogTest, AppendRejectsOverLongTopicName) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    TransactionLog log(path);
+    TxnLogEntry e = makeEntry("txn-x", 1, 0, TxnState::Ongoing);
+    e.partitions.insert(TopicPartition{std::string(65536, 't'), 0});
+    EXPECT_THROW(log.append(e), std::length_error);
+}
+
+// #24 — partitionCount > 0 with an EMPTY txnId round-trips (length-prefixed
+// empty txnId is handled correctly alongside partitions).
+TEST(TransactionLogTest, EmptyTxnIdWithPartitionsRoundTrips) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("", 55, 0, TxnState::Ongoing, {tp("t", 0), tp("t", 1)}, 7));
+    }
+    TransactionLog log2(path);
+    const auto* m = log2.metadata("");
+    ASSERT_NE(m, nullptr);
+    EXPECT_EQ(m->producerId, 55);
+    EXPECT_EQ(m->partitions.size(), 2u);
+}
+
+// #24 — a topic string containing embedded NUL bytes survives the round-trip
+// (length-prefixed, not NUL-terminated).
+TEST(TransactionLogTest, TopicWithEmbeddedNulRoundTrips) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    std::string binTopic("a\0b\0c", 5);
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-bin", 1, 0, TxnState::Ongoing,
+                              {TopicPartition{binTopic, 3}}, 1));
+    }
+    TransactionLog log2(path);
+    const auto* m = log2.metadata("txn-bin");
+    ASSERT_NE(m, nullptr);
+    ASSERT_EQ(m->partitions.size(), 1u);
+    EXPECT_EQ(m->partitions.begin()->topic.size(), 5u);
+    EXPECT_EQ(m->partitions.begin()->topic, binTopic);
+}
+
+// A2 — pendingNewProducerId/Epoch survive a persist→replay round-trip in the log.
+TEST(TransactionLogTest, PendingNewProducerIdRoundTrips) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    {
+        TransactionLog log(path);
+        TxnLogEntry e = makeEntry("txn-swap", 100, INT16_MAX, TxnState::PrepareAbort,
+                                  {tp("t", 0)}, 42);
+        e.pendingNewProducerId    = 777;
+        e.pendingNewProducerEpoch = 0;
+        log.append(e);
+    }
+    TransactionLog log2(path);
+    const auto* m = log2.metadata("txn-swap");
+    ASSERT_NE(m, nullptr);
+    EXPECT_EQ(m->producerId, 100);              // OLD pid persisted on the abort
+    EXPECT_EQ(m->pendingNewProducerId, 777);    // deferred fresh pid recovered
+    EXPECT_EQ(m->pendingNewProducerEpoch, 0);
+}

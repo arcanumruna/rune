@@ -50,7 +50,18 @@ enum class TxnState : uint8_t {
     PrepareAbort,
     CompleteCommit,
     CompleteAbort,
+    // A7 (justified): Dead is the KIP-98 terminal state for an EXPIRED
+    // transactionalId. Rune does not yet implement txnId-expiry reaping, so no
+    // code path transitions INTO Dead. It is retained (a) for on-disk/enum
+    // compatibility with the persisted `state` byte and Kafka's lifecycle, and
+    // (b) because initProducerId already handles a recovered/injected Dead state
+    // as "re-create" (fall-through to the Empty re-init branch). Removing it now
+    // would renumber the persisted enum. Wiring the expiry path is a separate
+    // lifecycle feature, not a bug fix.
     Dead,
+    // PrepareEpochFence: reserved transient state named in initProducerId's
+    // concurrent-txn guard; not assigned by any current path (the Ongoing-fence
+    // uses PrepareAbort directly). Kept for the same enum-stability reason.
     PrepareEpochFence,  // used internally during epoch-bump for zombie fencing
 };
 

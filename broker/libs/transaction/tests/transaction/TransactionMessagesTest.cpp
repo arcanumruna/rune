@@ -70,7 +70,9 @@ TEST(TransactionMessagesTest, InitProducerIdRequestRoundTrip) {
     auto n = InitProducerIdRequestMsg::encode(buf, 0, 30'000, "my-txn-id");
     EXPECT_GT(n, 0u);
 
-    auto m = InitProducerIdRequestMsg::decode(buf, 0);
+    auto mOpt = InitProducerIdRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.txnTimeoutMs, 30'000);
     EXPECT_EQ(m.transactionalId, "my-txn-id");
 }
@@ -79,7 +81,9 @@ TEST(TransactionMessagesTest, InitProducerIdRequestEmptyTxnId) {
     uint8_t buf[kBufSize] = {};
     InitProducerIdRequestMsg::encode(buf, 0, 60'000, "");
 
-    auto m = InitProducerIdRequestMsg::decode(buf, 0);
+    auto mOpt = InitProducerIdRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.txnTimeoutMs, 60'000);
     EXPECT_EQ(m.transactionalId, "");
 }
@@ -89,7 +93,9 @@ TEST(TransactionMessagesTest, InitProducerIdRequestLongTxnId) {
     std::string longId(200, 'x');
     InitProducerIdRequestMsg::encode(buf, 0, 1'000, longId);
 
-    auto m = InitProducerIdRequestMsg::decode(buf, 0);
+    auto mOpt = InitProducerIdRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.transactionalId, longId);
 }
 
@@ -156,7 +162,9 @@ TEST(TransactionMessagesTest, AddPartitionsRoundTripEmpty) {
     std::vector<TopicPartition> parts;
     AddPartitionsToTxnRequestMsg::encode(buf, 0, 99LL, 2, "txn-x", parts);
 
-    auto m = AddPartitionsToTxnRequestMsg::decode(buf, 0);
+    auto mOpt = AddPartitionsToTxnRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.producerId,       99LL);
     EXPECT_EQ(m.producerEpoch,    2);
     EXPECT_EQ(m.transactionalId,  "txn-x");
@@ -168,7 +176,9 @@ TEST(TransactionMessagesTest, AddPartitionsRoundTripOne) {
     std::vector<TopicPartition> parts = {tp("my-topic", 5)};
     AddPartitionsToTxnRequestMsg::encode(buf, 0, 1LL, 0, "txn-y", parts);
 
-    auto m = AddPartitionsToTxnRequestMsg::decode(buf, 0);
+    auto mOpt = AddPartitionsToTxnRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     ASSERT_EQ(m.partitions.size(), 1u);
     EXPECT_EQ(m.partitions[0].topic,     "my-topic");
     EXPECT_EQ(m.partitions[0].partition, 5);
@@ -182,7 +192,9 @@ TEST(TransactionMessagesTest, AddPartitionsRoundTripMany) {
     }
     AddPartitionsToTxnRequestMsg::encode(buf, 0, 5LL, 1, "txn-many", parts);
 
-    auto m = AddPartitionsToTxnRequestMsg::decode(buf, 0);
+    auto mOpt = AddPartitionsToTxnRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     ASSERT_EQ(m.partitions.size(), 20u);
     for (int i = 0; i < 20; ++i) {
         EXPECT_EQ(m.partitions[i].partition, i);
@@ -236,7 +248,9 @@ TEST(TransactionMessagesTest, EndTxnRequestRoundTripCommit) {
     uint8_t buf[kBufSize] = {};
     EndTxnRequestMsg::encode(buf, 0, 42LL, 3, /*commit=*/true, "txn-commit");
 
-    auto m = EndTxnRequestMsg::decode(buf, 0);
+    auto mOpt = EndTxnRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.producerId,       42LL);
     EXPECT_EQ(m.producerEpoch,    3);
     EXPECT_TRUE(m.isCommit());
@@ -247,7 +261,9 @@ TEST(TransactionMessagesTest, EndTxnRequestRoundTripAbort) {
     uint8_t buf[kBufSize] = {};
     EndTxnRequestMsg::encode(buf, 0, 42LL, 3, /*commit=*/false, "txn-abort");
 
-    auto m = EndTxnRequestMsg::decode(buf, 0);
+    auto mOpt = EndTxnRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_FALSE(m.isCommit());
 }
 
@@ -300,7 +316,9 @@ TEST(TransactionMessagesTest, WriteTxnMarkersRequestRoundTripCommit) {
     WriteTxnMarkersRequestMsg::encode(buf, 0, 77LL, 2, ControlType::Commit, 5,
                                        "txn-mark", parts);
 
-    auto m = WriteTxnMarkersRequestMsg::decode(buf, 0);
+    auto mOpt = WriteTxnMarkersRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.producerId,        77LL);
     EXPECT_EQ(m.producerEpoch,     2);
     EXPECT_EQ(m.controlTypeEnum(), ControlType::Commit);
@@ -317,7 +335,9 @@ TEST(TransactionMessagesTest, WriteTxnMarkersRequestRoundTripAbort) {
     WriteTxnMarkersRequestMsg::encode(buf, 0, 1LL, 0, ControlType::Abort, 0,
                                        "t", parts);
 
-    auto m = WriteTxnMarkersRequestMsg::decode(buf, 0);
+    auto mOpt = WriteTxnMarkersRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.controlTypeEnum(), ControlType::Abort);
 }
 
@@ -325,7 +345,9 @@ TEST(TransactionMessagesTest, WriteTxnMarkersRequestEmpty) {
     uint8_t buf[kBufSize] = {};
     WriteTxnMarkersRequestMsg::encode(buf, 0, 1LL, 0, ControlType::Commit, 0, "t", {});
 
-    auto m = WriteTxnMarkersRequestMsg::decode(buf, 0);
+    auto mOpt = WriteTxnMarkersRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     EXPECT_EQ(m.partitions.size(), 0u);
 }
 
@@ -346,7 +368,9 @@ TEST(TransactionMessagesTest, WriteTxnMarkersLargePartitionList) {
     }
     WriteTxnMarkersRequestMsg::encode(buf, 0, 1LL, 0, ControlType::Commit, 0, "t", parts);
 
-    auto m = WriteTxnMarkersRequestMsg::decode(buf, 0);
+    auto mOpt = WriteTxnMarkersRequestMsg::decode(buf, 0, kBufSize);
+    ASSERT_TRUE(mOpt.has_value());
+    auto& m = *mOpt;
     ASSERT_EQ(m.partitions.size(), 50u);
     for (int i = 0; i < 50; ++i) {
         EXPECT_EQ(m.partitions[i].partition, i);
@@ -493,4 +517,119 @@ TEST(TransactionMessagesTest, ReadPartitionsSafeValidBufferSucceeds) {
     EXPECT_EQ(parts[0].topic, "abc");
     EXPECT_EQ(parts[0].partition, 42);
     EXPECT_EQ(pos, sz);
+}
+
+// ===========================================================================
+// A3/A4 — PUBLIC decode() bounds-safety (Part B: ASAN/truncated public decode).
+//
+// Decode a truncated frame via the PUBLIC decode() of EACH var-length request
+// message and assert a clean nullopt (no over-read). Under ASAN these trip on
+// any heap-buffer-overflow; without ASAN they still assert the all-or-nothing
+// failure contract. Every field boundary is exercised.
+// ===========================================================================
+
+TEST(TransactionMessagesTest, PublicDecodeInitProducerIdTruncatedPerField) {
+    uint8_t buf[kBufSize] = {};
+    auto n = InitProducerIdRequestMsg::encode(buf, 0, 30'000, "my-txn-id");
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(InitProducerIdRequestMsg::decode(buf, 0, n).has_value());
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto m = InitProducerIdRequestMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(m.has_value()) << "avail=" << avail;
+    }
+    EXPECT_FALSE(InitProducerIdRequestMsg::decode(buf, 0, 3).has_value());
+}
+
+TEST(TransactionMessagesTest, PublicDecodeAddPartitionsTruncatedPerField) {
+    uint8_t buf[kBufSize] = {};
+    std::vector<TopicPartition> parts = {tp("topic-a", 1), tp("topic-b", 2)};
+    auto n = AddPartitionsToTxnRequestMsg::encode(buf, 0, 7LL, 3, "txn", parts);
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(AddPartitionsToTxnRequestMsg::decode(buf, 0, n).has_value());
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto m = AddPartitionsToTxnRequestMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(m.has_value()) << "avail=" << avail;
+    }
+}
+
+// Crafted huge partition count with a short body must NOT over-read.
+TEST(TransactionMessagesTest, PublicDecodeAddPartitionsCraftedHugeCount) {
+    uint8_t buf[kBufSize] = {};
+    auto n = AddPartitionsToTxnRequestMsg::encode(buf, 0, 1LL, 0, "t",
+                                                  std::vector<TopicPartition>{});
+    ASSERT_GT(n, 0u);
+    buf[n - 2] = 0xFF; buf[n - 1] = 0xFF;   // partition-count prefix := 0xFFFF
+    auto m = AddPartitionsToTxnRequestMsg::decode(buf, 0, n);
+    EXPECT_FALSE(m.has_value());
+}
+
+TEST(TransactionMessagesTest, PublicDecodeEndTxnTruncatedPerField) {
+    uint8_t buf[kBufSize] = {};
+    auto n = EndTxnRequestMsg::encode(buf, 0, 9LL, 1, true, "txn-e");
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(EndTxnRequestMsg::decode(buf, 0, n).has_value());
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto m = EndTxnRequestMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(m.has_value()) << "avail=" << avail;
+    }
+}
+
+TEST(TransactionMessagesTest, PublicDecodeWriteTxnMarkersTruncatedPerField) {
+    uint8_t buf[kBufSize] = {};
+    std::vector<TopicPartition> parts = {tp("p1", 0), tp("p2", 1)};
+    auto n = WriteTxnMarkersRequestMsg::encode(buf, 0, 5LL, 2, ControlType::Abort,
+                                               3, "txn-m", parts);
+    ASSERT_GT(n, 0u);
+    ASSERT_TRUE(WriteTxnMarkersRequestMsg::decode(buf, 0, n).has_value());
+    for (std::size_t avail = 0; avail < n; ++avail) {
+        auto m = WriteTxnMarkersRequestMsg::decode(buf, 0, avail);
+        EXPECT_FALSE(m.has_value()) << "avail=" << avail;
+    }
+}
+
+// Empty txnId round-trips on each var-length request (Part B: empty txnId).
+TEST(TransactionMessagesTest, PublicDecodeEmptyTxnIdRoundTrips) {
+    uint8_t buf[kBufSize] = {};
+    {
+        auto n = EndTxnRequestMsg::encode(buf, 0, 1LL, 0, false, "");
+        auto m = EndTxnRequestMsg::decode(buf, 0, n);
+        ASSERT_TRUE(m.has_value());
+        EXPECT_EQ(m->transactionalId, "");
+    }
+    {
+        std::memset(buf, 0, sizeof(buf));
+        auto n = AddPartitionsToTxnRequestMsg::encode(buf, 0, 1LL, 0, "",
+                     std::vector<TopicPartition>{tp("t", 0)});
+        auto m = AddPartitionsToTxnRequestMsg::decode(buf, 0, n);
+        ASSERT_TRUE(m.has_value());
+        EXPECT_EQ(m->transactionalId, "");
+        ASSERT_EQ(m->partitions.size(), 1u);
+    }
+    {
+        std::memset(buf, 0, sizeof(buf));
+        auto n = WriteTxnMarkersRequestMsg::encode(buf, 0, 1LL, 0, ControlType::Commit,
+                     0, "", std::vector<TopicPartition>{});
+        auto m = WriteTxnMarkersRequestMsg::decode(buf, 0, n);
+        ASSERT_TRUE(m.has_value());
+        EXPECT_EQ(m->transactionalId, "");
+    }
+}
+
+// A5: SBE encode REJECTS an over-long txnId (>65535) rather than truncate; a
+// max-legal 65535-byte txnId round-trips (Part B: SBE max fields).
+TEST(TransactionMessagesTest, EncodeRejectsOverLongTxnIdAndAcceptsMax) {
+    std::vector<uint8_t> buf(200000, 0);
+    std::string huge(65536, 'z');  // one past uint16 max
+    EXPECT_EQ(InitProducerIdRequestMsg::encode(buf.data(), 0, 1000, huge), 0u);
+    EXPECT_EQ(EndTxnRequestMsg::encode(buf.data(), 0, 1LL, 0, true, huge), 0u);
+    EXPECT_EQ(AddPartitionsToTxnRequestMsg::encode(buf.data(), 0, 1LL, 0, huge, {}), 0u);
+    EXPECT_EQ(WriteTxnMarkersRequestMsg::encode(buf.data(), 0, 1LL, 0,
+                 ControlType::Commit, 0, huge, {}), 0u);
+
+    std::string maxId(65535, 'q');
+    auto n = InitProducerIdRequestMsg::encode(buf.data(), 0, 1000, maxId);
+    ASSERT_GT(n, 0u);
+    auto m = InitProducerIdRequestMsg::decode(buf.data(), 0, n);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->transactionalId.size(), 65535u);
 }

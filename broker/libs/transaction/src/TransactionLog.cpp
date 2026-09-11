@@ -13,6 +13,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <system_error>
 
@@ -34,11 +35,10 @@ static T read_le(const uint8_t* p) noexcept { T v; std::memcpy(&v, p, sizeof(T))
 // ---------------------------------------------------------------------------
 // CRC32C software table (Castagnoli)
 // ---------------------------------------------------------------------------
-static uint32_t crc32c_tbl[256];
-static bool     crc32c_tbl_init = false;
+static uint32_t     crc32c_tbl[256];
+static std::once_flag crc32c_tbl_once;
 
-static void init_crc32c_table() {
-    if (crc32c_tbl_init) return;
+static void build_crc32c_table() noexcept {
     for (uint32_t i = 0; i < 256; ++i) {
         uint32_t crc = i;
         for (int j = 0; j < 8; ++j) {
@@ -46,7 +46,13 @@ static void init_crc32c_table() {
         }
         crc32c_tbl[i] = crc;
     }
-    crc32c_tbl_init = true;
+}
+
+// A6: thread-safe one-time table init. build/extract are static and could be
+// called from a non-writer thread (e.g. a read-committed consumer verifying a
+// batch); std::call_once removes the data race on the lazy table fill.
+static void init_crc32c_table() noexcept {
+    std::call_once(crc32c_tbl_once, build_crc32c_table);
 }
 
 /*static*/
@@ -102,6 +108,8 @@ void TransactionLog::appendFromMetadata(const TransactionMetadata& meta,
     e.txnStartNs       = meta.txnStartNs;
     e.coordinatorEpoch = coordinatorEpoch;
     e.txnTimeoutMs     = meta.txnTimeoutMs;
+    e.pendingNewProducerId    = meta.pendingNewProducerId;    // A2
+    e.pendingNewProducerEpoch = meta.pendingNewProducerEpoch; // A2
     append(e);
 }
 
@@ -127,6 +135,10 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
     meta.txnStartNs        = entry.txnStartNs;
     meta.txnTimeoutMs      = entry.txnTimeoutMs;
     meta.coordinatorEpoch  = entry.coordinatorEpoch;   // FIX 2: persist+recover coordinatorEpoch
+    // A2: recover the deferred overflow PID swap so a crash mid-abort keeps the
+    // fresh identity the client was already handed.
+    meta.pendingNewProducerId    = entry.pendingNewProducerId;
+    meta.pendingNewProducerEpoch = entry.pendingNewProducerEpoch;
     // fencingEpoch is not persisted; reset to false on recover
     meta.fencingEpoch      = false;
 }
@@ -146,13 +158,32 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
 //   [32..35]  int32   txnTimeoutMs
 //   [36..37]  uint16  txnIdLen
 //   [38..39]  uint16  partitionCount
-//   [40..41]  uint16  _pad = 0
-//   [42..43]  uint16  _pad2 = 0     → kFixedHeaderSize = 44
-//   [44..]    bytes   txnId
+//   [40..47]  int64   pendingNewProducerId    (A2; -1 = none)
+//   [48..49]  int16   pendingNewProducerEpoch (A2; -1 = none)
+//   [50..51]  uint16  _pad = 0     → kFixedHeaderSize = 52
+//   [52..]    bytes   txnId
 //   [..]      tuples  { topicLen:uint16, topic bytes, partition:int32 } × partitionCount
 //   [..]      uint32  CRC32C
 // ---------------------------------------------------------------------------
 void TransactionLog::appendRecord(const TxnLogEntry& entry) {
+    // A5: REJECT (loudly) any length-prefixed field that would not fit its uint16
+    // wire width, instead of silently truncating it. A silent truncation would
+    // encode a corrupt shorter length and, on replay, either mis-parse or fail CRC
+    // and get discarded as a torn tail — losing a real state transition.
+    if (entry.txnId.size() > kMaxUint16) {
+        throw std::length_error("TransactionLog: txnId exceeds uint16 length field ("
+                                + std::to_string(entry.txnId.size()) + " > 65535)");
+    }
+    if (entry.partitions.size() > kMaxUint16) {
+        throw std::length_error("TransactionLog: partition count exceeds uint16 field ("
+                                + std::to_string(entry.partitions.size()) + " > 65535)");
+    }
+    for (const auto& tp : entry.partitions) {
+        if (tp.topic.size() > kMaxUint16) {
+            throw std::length_error("TransactionLog: topic name exceeds uint16 length field");
+        }
+    }
+
     // Compute variable-length sizes.
     const auto txnIdLen      = static_cast<uint16_t>(entry.txnId.size());
     const auto partCount     = static_cast<uint16_t>(entry.partitions.size());
@@ -182,8 +213,9 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
     write_le<int32_t> (p + 32, entry.txnTimeoutMs);
     write_le<uint16_t>(p + 36, txnIdLen);
     write_le<uint16_t>(p + 38, partCount);
-    write_le<uint16_t>(p + 40, 0u); // pad
-    write_le<uint16_t>(p + 42, 0u); // pad2
+    write_le<int64_t> (p + 40, entry.pendingNewProducerId);     // A2
+    write_le<int16_t> (p + 48, entry.pendingNewProducerEpoch);  // A2
+    write_le<uint16_t>(p + 50, 0u); // pad (align to kFixedHeaderSize = 52)
 
     std::size_t pos = kFixedHeaderSize;
     std::memcpy(p + pos, entry.txnId.data(), txnIdLen);
@@ -266,6 +298,8 @@ void TransactionLog::replayAndTruncate() {
         int32_t txnTimeoutMs      = read_le<int32_t> (rb + 32);
         uint16_t txnIdLen         = read_le<uint16_t>(rb + 36);
         uint16_t partCount        = read_le<uint16_t>(rb + 38);
+        int64_t  pendingNewPid    = read_le<int64_t> (rb + 40);   // A2
+        int16_t  pendingNewEpoch  = read_le<int16_t> (rb + 48);   // A2
 
         // Decode variable body.
         std::size_t vpos = kFixedHeaderSize;
@@ -298,6 +332,8 @@ void TransactionLog::replayAndTruncate() {
         entry.txnStartNs       = txnStartNs;
         entry.coordinatorEpoch = coordinatorEpoch;
         entry.txnTimeoutMs     = txnTimeoutMs;
+        entry.pendingNewProducerId    = pendingNewPid;                              // A2
+        entry.pendingNewProducerEpoch = static_cast<ProducerEpoch>(pendingNewEpoch);// A2
         applyEntry(entry);
 
         pos         += static_cast<int64_t>(totalLength);

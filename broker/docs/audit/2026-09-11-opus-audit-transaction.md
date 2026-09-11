@@ -316,3 +316,176 @@ markers for the old PID are done. Severity: CORRECTNESS (atomicity hole, narrow 
 - NEW CORRECTNESS: 1 (NEW-1)   NEW LOW: 1 (default `avail` over-read shape, S1 residual)
 - Tests: real and asserting the right invariants; 196/196 pass.
 Not CLEAN: NEW-1 is a reachable atomicity/leak path (abort marker with wrong producerId).
+
+---
+
+# Full re-audit + coverage (commit 207410f)
+
+Date: 2026-09-11 · Mode: read-only, whole-library fresh audit (not a diff review) · Auditor: Opus
+Scope: `libs/transaction/{include/rune/transaction/*.h, src/*.cpp, tests/**}` + cross-ref
+`libs/storage/include/rune/storage/ProducerStateManager.h`.
+
+## Part A — Bug audit (verdict: BUGS REMAIN)
+
+Re-verified prior fixes: **B1, B2, C1, C2, C3/C4, S1/S2, NEW-1 all HOLD** with no regression.
+The client-driven commit/abort path, fence-abort, timeout-abort, recovered-Prepare* resolution,
+CompleteCommit/CompleteAbort persist-before-Empty, control-batch CRC/bounds/varint safety, and the
+NEW-1 deferred-PID-swap-in-memory all behave as documented for the in-process (no-crash) case.
+The findings below are whole-library issues, most NOT near the prior fixes.
+
+### A1 — Allocator is NOT reseeded from the recovered log ⇒ producerId REUSE after failover (BLOCKER / EOS)
+`TransactionCoordinator.cpp:25-48` (ctor) + `:86,95,130` (allocate calls).
+The ctor replays `txnLog_->all()` into `txnMap_` but NEVER advances/seeds `allocator_` past the highest
+recovered `producerId`. A production coordinator constructed as `TransactionCoordinator(ProducerIdAllocator{}, …, &log)`
+(the default allocator starts at 0) will, after recovering a log whose live txns hold producerIds
+0..N, hand out producerId 0,1,2,… AGAIN from `initProducerId` (new-txnId branch `:95`, overflow branch `:130`,
+no-txnId branch `:86`). Two distinct producer sessions then share a producerId. `ProducerStateManager`
+keys idempotent-dedup and aborted-txn tracking by `producerId` (ProducerStateManager.h:104-113, 163-168),
+so a reused PID silently corrupts sequence/epoch dedup and read-committed LSO tracking → duplicate or
+dropped records = exactly-once violation. The `ProducerIdAllocator` header even documents "P5-3 passes
+recovered watermark" (`ProducerIdAllocator.h:44`) but no code computes or passes it — the wiring is absent.
+The C1 overflow tests dodge this by hand-injecting `ProducerIdAllocator{100}`/`{200}`, which MASKS the bug
+rather than exercising the default path. Fix direction: in the replay loop compute
+`max(producerId)+1` (and ideally persist a durable PID high-water/next-block record) and seed
+`allocator_` to it before serving any request. Severity: **BLOCKER** — silent EOS break on the core
+failover path, reachable with the documented default construction.
+
+### A2 — NEW-1 deferred PID swap (`pendingNewProducerId`) is in-memory only ⇒ lost across a crash mid-abort (CORRECTNESS)
+`TransactionCoordinator.h:201-202`, set at `TransactionCoordinator.cpp:154-155`, consumed at `:316-321`;
+NOT a field of `TxnLogEntry` (`TransactionLog.h:59-68`) and NOT written by `appendRecord`
+(`TransactionLog.cpp:155-218`). Sequence: an epoch-overflow-during-Ongoing fence returns the FRESH pid to
+the client (`:172`) and persists PrepareAbort under the OLD pid, stashing the fresh pid only in memory.
+If the coordinator crashes before `completeTransaction`, recovery rebuilds PrepareAbort with the OLD pid and
+`pendingNewProducerId == -1` (default). `resolvePendingMarkers`→`completeTransaction` then does NOT adopt
+the fresh pid (`:316` guard false) and lands in Empty holding the OLD pid at epoch INT16_MAX. The client
+(which was told it now owns the fresh pid) is fenced by `kInvalidPid` on its next call and must re-init;
+the fresh pid returned pre-crash is orphaned and a subsequent re-init allocates yet another new pid
+(compounding A1's leak). No aborted-record leak (the ABORT marker is correctly stamped with the OLD pid),
+so this is CORRECTNESS not BLOCKER — but it is a stuck/ambiguous identity across the crash seam that Kafka
+avoids by persisting the "next producer" intent. Fix: persist `pendingNewProducerId/Epoch` in the log
+entry (or derive/adopt deterministically on recovery). UNTESTED (no crash-seam test injects Ongoing@INT16_MAX
+then crashes before complete).
+
+### A3 — Public SBE `decode()` methods use the UNSAFE readers ⇒ over-read on a truncated/corrupt frame (SILENT)
+`TransactionMessages.h`: `AddPartitionsToTxnRequestMsg::decode` (`:359-369`), `EndTxnRequestMsg::decode`
+(`:445-455`), `WriteTxnMarkersRequestMsg::decode` (`:542-554`), `InitProducerIdRequestMsg::decode`
+(`:264-272`) all call the UNCHECKED `read_le`/`read_str`/`read_partitions` (`:84-131`) with no `end`/length
+argument. The bounds-checked `read_str_safe`/`read_partitions_safe` (`:141-191`) exist but are wired into
+NOTHING except direct unit tests. A short or malicious wire frame reaching any public `decode()` reads past
+the buffer (heap over-read / crash / info leak). ControlMarker was hardened for exactly this class (S1) but
+the SBE request decoders — the actual network ingress — were left on the unsafe path. Severity: SILENT
+(over-read); becomes CORRECTNESS/DoS at the network boundary. Fix: give `decode()` a buffer length and route
+through the `_safe` readers (return `optional`/bool), or delete the unsafe readers so they can't be called.
+
+### A4 — `read_str` / `read_partitions` also unchecked against `blockLength`/header (SILENT, same root as A3)
+`TransactionMessages.h:96-102, 118-131`. Even absent truncation, `read_partitions` trusts a wire-supplied
+`uint16 count` and loops that many tuples with no cap; a crafted `count=65535` with a short body walks off
+the buffer. Folded into A3's fix (route all decodes through the all-or-nothing `_safe` scan).
+
+### A5 — Silent uint16 truncation of `txnIdLen` / `partitionCount` in the durable log and SBE (CORRECTNESS, boundary)
+`TransactionLog.cpp:157-158` casts `txnId.size()`/`partitions.size()` to `uint16_t`; `TransactionMessages.h:90,108`
+do the same for strings/partition counts. A txnId ≥ 65536 bytes or a partition set ≥ 65536 silently wraps the
+length prefix → the record/message encodes a corrupt shorter length; on replay `crc32c` will (usually) reject
+it as torn-tail and SILENTLY DISCARD the transition (data loss of a real state change, not a torn write).
+No guard/assert rejects oversize inputs. Kafka bounds these; here it is unenforced. Severity: CORRECTNESS at
+the (large but legal) boundary; SILENT truncation with no error return. Fix: validate sizes and fail loudly
+before encoding.
+
+### A6 — `crc32c` table init is not thread-safe; `crc32c_tbl_init`/`cm_crc32c_init` are plain `bool` (CLEAN-ish / latent)
+`TransactionLog.cpp:37-50`, `ControlMarker.cpp:78-90`. Lazy one-time table fill guarded by a non-atomic bool.
+The library is documented single-writer, so today this is benign; but `ControlMarker::build/extract` are
+`static` and could plausibly be called from a non-writer thread (e.g. a read-committed consumer verifying a
+batch), which would race the table init (torn table → wrong CRC → valid markers rejected). Prefer a
+`static const` table built at load or a `std::once_flag`. Severity: CLEAN (latent; no current multi-thread caller found).
+
+### A7 — Clean-code / invariant nits (CLEAN)
+- `endTransaction` ignores `nowNs` (`TransactionCoordinator.cpp:240` param commented out): a commit/abort does
+  NOT refresh/停 the timeout, and there is no re-validation that the txn hasn't already blown its deadline in
+  the same tick. Harmless given doWork ordering, but the unused clock is a latent trap — document or use it.
+- `doWork` mutates `meta` in place while iterating `txnMap_` (`:338-349`) — safe (no insert/erase), but relies
+  on that invariant implicitly; a future "erase Dead txns" here would invalidate the iterator. Worth a comment.
+- `InitProducerIdResult`/`AddPartitionsResult`/… duplicate the same error-code constants across four structs
+  with slightly different subsets (e.g. `kConcurrentTransactions` only on Init) — a single shared enum would
+  prevent divergence. Cosmetic.
+- `TxnState::Dead` is defined, named, and handled as "re-create" in `initProducerId` (`:175` comment) but is
+  NEVER entered anywhere (no expiry path). Dead code / unimplemented lifecycle. Not a bug, but the state
+  machine is incomplete vs. the documented KIP-98 lifecycle (txnId expiry → Dead).
+
+## Part B — Missing edge-case tests (count: 24 concrete gaps)
+
+TransactionCoordinator / recovery:
+1. **Allocator reseed after replay** (A1): construct `TransactionCoordinator(ProducerIdAllocator{}, …, &log)` over
+   a log holding pid 0..N in a live txn, then `initProducerId(newTxnId)` — assert the new pid does NOT collide
+   with any recovered pid. NO test (all durable tests inject non-colliding bases or use one txnId).
+2. **Crash mid-overflow-fence before complete** (A2): inject Ongoing@INT16_MAX, `initProducerId` (returns fresh
+   pid), destroy coordinator WITHOUT completeTransaction, reopen from log, resolvePendingMarkers — assert final
+   pid/epoch and that the client-returned fresh pid is handled deterministically. NO test.
+3. **re-init in EVERY state**: Empty✓, Ongoing✓, PrepareCommit✓(C3), PrepareAbort✓(C4), CompleteCommit✓, but
+   **CompleteAbort**, **PrepareEpochFence**, and **Dead** re-init are UNTESTED.
+4. **completeTransaction in CompleteCommit / CompleteAbort / PrepareEpochFence / Dead** — only Empty/Ongoing
+   invalid-transition cases tested; the Complete*/Fence states are not.
+5. **endTransaction with wrong `commit` after recovery** (recovered PrepareCommit, client sends abort) — mixed
+   commit/abort intent on a recovered txn. NO test.
+6. **resolvePendingMarkers with ZERO pending** returns 0 (tested indirectly) but **interleaved commit+abort**
+   pending set (some txns PrepareCommit, some PrepareAbort in one resolve pass) is UNTESTED — verify each gets
+   the correct control type.
+7. **resolvePendingMarkers with MANY pending** (e.g. 100 txns) — throughput/ordering; only ≤4 tested.
+8. **doWork abort where txnStartNs==0** (a Prepare* left Ongoing-like) and **doWork on a txn whose timeout is
+   INT32_MAX ms** (overflow of `txnTimeoutMs * 1'000'000LL`?) — `int64_t` mul of INT32_MAX*1e6 ≈ 2.1e15 fits,
+   but a boundary test is absent.
+9. **timeout exactly at INT64 nowNs near overflow** / negative `nowNs` — clock-injection edge, untested.
+10. **addPartitions with an EMPTY partition vector** — does Empty→Ongoing still fire and set txnStartNs with no
+    partitions? (Kafka: AddPartitions with empty set.) UNTESTED.
+11. **addPartitions idempotency**: same partition added twice across two calls returns kOk and does not
+    re-persist a redundant Ongoing? Dedup at set-level tested; the second-call idempotent kOk is not asserted
+    against the persisted log.
+12. **endTransaction with a partition set that changed vs. what was persisted** — n/a to API but recovered-txn
+    partition fidelity beyond size (exact set contents) is only checked in a couple tests.
+
+Epoch / producerId boundaries:
+13. **Epoch overflow at exactly INT16_MAX-1 (32766)** → next re-init yields 32767 (still same pid), and the
+    32767→overflow step. Only the INT16_MAX (already-exhausted) injection is tested; the 32766→32767→overflow
+    walk is not.
+14. **Non-overflow Ongoing fence at a normal epoch** asserting the marker carries OLD pid + BUMPED epoch (the
+    NEW-1 non-overflow branch, `:157-160`) — NEW-1 test only covers the overflow branch.
+15. **ProducerIdAllocator exhaustion / wrap near INT64_MAX** (`allocate()` at `next_==INT64_MAX` overflows to
+    negative) — no guard, no test. Block-boundary crossing IS tested; the int64 wrap is not.
+16. **Allocator starting base at a block boundary** (`startingBase == kBlockSize`) and `startingBase` negative —
+    untested corner of the ceiling math.
+
+Control batch / marker format:
+17. **extract with keyLength varint != 2** (e.g. 0, 4, or a max-size 10-byte varint) — the `keyLen==2` else-branch
+    returns false; only the happy path + CRC-corruption is tested.
+18. **extract with valueLength varint != 6**, and a **max-size (10-byte) varint** in each varint field — the
+    `read_varint_zigzag_safe` 10-byte cap (`ControlMarker.cpp:59-70`) is never exercised at its limit.
+19. **extract truncated at EACH field boundary** (after magic, after CRC, mid-key, mid-value, mid-headers-count) —
+    only a couple of "avail = ENCODED_SIZE-5/-10" truncations are tested, not per-field.
+20. **isControlBatch/extract at a non-zero `offset`** into a larger buffer (all tests pass offset 0) — verify no
+    absolute-vs-relative index bug (note `extract` computes `end = ENCODED_SIZE` as if relative to `p`, which is
+    correct only because reads use `p + …`; a test at offset>0 would lock this in).
+21. **build at producerId = INT64_MIN / -1 and epoch = INT16_MIN** round-trip — only INT64_MAX/2 & INT16_MAX tested.
+
+Durable log:
+22. **Torn tail mid-`Complete*`**: write Ongoing+PrepareCommit fully, then a partial CompleteCommit record;
+    reopen → assert state recovers to PrepareCommit (resolvable), not a half-applied Complete. Torn-tail is
+    tested generically but not specifically straddling a Complete* transition.
+23. **CRC corruption in the MIDDLE record** (not the tail): a good record, a CRC-flipped record, then a good
+    record — replay must stop at the first bad one and truncate everything after (currently untested; only
+    tail garbage is tested).
+24. **Record with partitionCount > 0 but txnIdLen=0**, and **a topic string containing embedded NUL bytes** —
+    length-prefixed handling of empty txnId is tested, but empty-txnId-with-partitions and binary topics are not.
+
+SBE messages:
+- (covered by A3/A4) **every `decode()` against a truncated frame** — the `_safe` readers are unit-tested in
+  isolation but NO test decodes a real truncated `AddPartitions/EndTxn/WriteTxnMarkers` message through the
+  public `decode()` and asserts no over-read (run under ASAN). This is the single most valuable missing test.
+- **SBE messages with max fields**: 65535-byte txnId / 65535 partitions round-trip (truncation guard A5).
+- **empty partition list on WriteTxnMarkers** IS tested; **empty txnId on AddPartitions/EndTxn/WriteTxnMarkers**
+  is not.
+
+## Re-audit counts (207410f)
+- Prior fixes: B1,B2,C1,C2,C3,C4,S1,S2,NEW-1 — all HOLD, no regressions.
+- NEW BLOCKER: 1 (A1 allocator-reuse-on-failover). NEW CORRECTNESS: 2 (A2 crash-seam PID swap, A5 uint16 trunc).
+  NEW SILENT: 2 (A3/A4 unsafe SBE decode over-read). CLEAN/latent: A6 (CRC init race), A7 (nits, Dead dead-code).
+- Part B: 24 concrete missing edge-case tests (most impactful: #1 allocator reseed, #2 crash-seam swap, #A3 ASAN decode).
+- Verdict: **BUGS REMAIN** — not CLEAN. A1 is a silent exactly-once break on the documented default failover path.

@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -519,5 +520,124 @@ TEST(ControlMarkerTest, ExactlyOneMarkerPerPartition) {
     EXPECT_EQ(markerCount.size(), static_cast<std::size_t>(N));
     for (int i = 0; i < N; ++i) {
         EXPECT_EQ(markerCount[tp("t", i)], 1) << "partition " << i;
+    }
+}
+
+// ===========================================================================
+// Part B (control batch / marker format) — additional edge-case coverage
+// ===========================================================================
+namespace {
+
+// Test-local CRC32C (Castagnoli) so we can re-stamp a batch after mutating a
+// field, exercising extract() branches PAST the CRC gate.
+static uint32_t testCrc32c(const uint8_t* data, std::size_t len) noexcept {
+    static uint32_t tbl[256];
+    static bool init = false;
+    if (!init) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) c = (c >> 1) ^ (0x82F63B78u & -(c & 1u));
+            tbl[i] = c;
+        }
+        init = true;
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < len; ++i)
+        crc = (crc >> 8) ^ tbl[(crc ^ data[i]) & 0xFFu];
+    return crc ^ 0xFFFFFFFFu;
+}
+
+// Re-stamp the batch CRC at [17..20] over bytes [21..ENCODED_SIZE).
+static void restampCrc(std::vector<uint8_t>& b) {
+    uint32_t c = testCrc32c(b.data() + ControlMarker::CRC_DATA_START,
+                            ControlMarker::ENCODED_SIZE - ControlMarker::CRC_DATA_START);
+    std::memcpy(b.data() + ControlMarker::CRC_OFFSET, &c, 4);
+}
+
+// Offsets inside the record (record starts at BATCH_HEADER_SIZE = 61):
+//   [61] attrs, [62] tsDelta, [63] offDelta, [64] keyLen varint,
+//   [65..66] key(int16), [67] valLen varint, [68..69] version,
+//   [70..73] coordinatorEpoch, [74] hdrCount varint.
+constexpr std::size_t kKeyLenOff = 64;
+constexpr std::size_t kValLenOff = 67;
+
+} // anonymous namespace
+
+// #17 — extract with keyLength varint != 2 → clean false (the keyLen==2 else
+// branch). We set keyLen's zig-zag varint to encode 0 (0x00) and re-stamp CRC so
+// the CRC gate passes and we actually reach the keyLen check.
+TEST(ControlMarkerTest, ExtractKeyLenNotTwoFails) {
+    auto b = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    b[kKeyLenOff] = 0x00;   // zig-zag(0) = 0 → keyLen 0, != 2
+    restampCrc(b);
+    ASSERT_TRUE(ControlMarker::isControlBatch(b.data(), 0, ControlMarker::ENCODED_SIZE));
+    ControlMarkerPayload p;
+    EXPECT_FALSE(ControlMarker::extract(b.data(), 0, p, ControlMarker::ENCODED_SIZE));
+}
+
+// keyLen encoded as a MAX-size (10-byte) varint continuation → exercises the
+// read_varint_zigzag_safe 10-byte cap. All-0x80 bytes never terminate → false.
+TEST(ControlMarkerTest, ExtractKeyLenMaxSizeVarintFails) {
+    auto b = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    // Fill from keyLen offset onward with continuation bytes (0x80) so the varint
+    // never terminates within its 10-byte budget.
+    for (std::size_t i = kKeyLenOff; i < ControlMarker::ENCODED_SIZE; ++i) b[i] = 0x80;
+    restampCrc(b);
+    ControlMarkerPayload p;
+    EXPECT_FALSE(ControlMarker::extract(b.data(), 0, p, ControlMarker::ENCODED_SIZE));
+}
+
+// #18 — extract with valueLength varint != 6 → clean false.
+TEST(ControlMarkerTest, ExtractValLenNotSixFails) {
+    auto b = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    b[kValLenOff] = 0x08;   // zig-zag(4) = 8 → valLen 4, != 6
+    restampCrc(b);
+    ASSERT_TRUE(ControlMarker::isControlBatch(b.data(), 0, ControlMarker::ENCODED_SIZE));
+    ControlMarkerPayload p;
+    EXPECT_FALSE(ControlMarker::extract(b.data(), 0, p, ControlMarker::ENCODED_SIZE));
+}
+
+// #19 — extract truncated at EACH field boundary in the record. Every avail in
+// [BATCH_HEADER_SIZE .. ENCODED_SIZE) must fail cleanly (no over-read).
+TEST(ControlMarkerTest, ExtractTruncatedPerFieldFails) {
+    auto b = ControlMarker::build(1, 0, ControlType::Commit, 5);
+    for (std::size_t avail = 0; avail < ControlMarker::ENCODED_SIZE; ++avail) {
+        ControlMarkerPayload p;
+        EXPECT_FALSE(ControlMarker::extract(b.data(), 0, p, avail)) << "avail=" << avail;
+    }
+    // Full length succeeds.
+    ControlMarkerPayload ok;
+    EXPECT_TRUE(ControlMarker::extract(b.data(), 0, ok, ControlMarker::ENCODED_SIZE));
+}
+
+// #20 — isControlBatch / extract at a NON-ZERO offset into a larger buffer.
+TEST(ControlMarkerTest, ExtractAtNonZeroOffset) {
+    constexpr std::size_t kPad = 37;
+    auto batch = ControlMarker::build(9, 3, ControlType::Abort, 11);
+    std::vector<uint8_t> buf(kPad + ControlMarker::ENCODED_SIZE + kPad, 0xAB);
+    std::memcpy(buf.data() + kPad, batch.data(), batch.size());
+
+    EXPECT_TRUE(ControlMarker::isControlBatch(buf.data(), kPad, ControlMarker::ENCODED_SIZE));
+    ControlMarkerPayload p;
+    ASSERT_TRUE(ControlMarker::extract(buf.data(), kPad, p, ControlMarker::ENCODED_SIZE));
+    EXPECT_EQ(p.producerId, 9);
+    EXPECT_EQ(p.producerEpoch, 3);
+    EXPECT_EQ(p.controlType, ControlType::Abort);
+    EXPECT_EQ(p.coordinatorEpoch, 11);
+}
+
+// #21 — build at extreme producerId / epoch values round-trips.
+TEST(ControlMarkerTest, BuildExtremeProducerIdEpochRoundTrips) {
+    for (ProducerId pid : {INT64_MIN, ProducerId{-1}, INT64_MAX}) {
+        for (ProducerEpoch ep : {ProducerEpoch{INT16_MIN}, ProducerEpoch{-1},
+                                 ProducerEpoch{INT16_MAX}}) {
+            auto b = ControlMarker::build(pid, ep, ControlType::Commit, -7);
+            ControlMarkerPayload p;
+            ASSERT_TRUE(ControlMarker::extract(b.data(), 0, p, ControlMarker::ENCODED_SIZE))
+                << "pid=" << pid << " ep=" << ep;
+            EXPECT_EQ(p.producerId, pid);
+            EXPECT_EQ(p.producerEpoch, ep);
+            EXPECT_EQ(p.coordinatorEpoch, -7);
+        }
     }
 }

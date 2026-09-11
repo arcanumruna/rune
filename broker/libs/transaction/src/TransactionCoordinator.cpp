@@ -36,6 +36,11 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
     // (B2): the original request no longer exists; set markersPending so the caller
     // can drive resolution via pendingMarkerTransactions().
     if (txnLog_ != nullptr) {
+        // A1: track the highest producerId seen across ALL recovered metadata so
+        // we can reseed the allocator past it. This includes the deferred
+        // pendingNewProducerId (A2), which was already handed to a client and must
+        // never be re-allocated to a different session.
+        ProducerId maxPid = -1;
         for (const auto& [id, meta] : txnLog_->all()) {
             txnMap_[id] = meta;
             auto& m = txnMap_[id];
@@ -43,6 +48,13 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
             if (m.state == TxnState::PrepareAbort || m.state == TxnState::PrepareCommit) {
                 m.markersPending = true;
             }
+            if (m.producerId > maxPid)            maxPid = m.producerId;
+            if (m.pendingNewProducerId > maxPid)  maxPid = m.pendingNewProducerId;
+        }
+        // A1: reseed so the next allocation is strictly greater than any live pid.
+        // No-op if the injected allocator already starts above maxPid.
+        if (maxPid >= 0) {
+            allocator_.reseedAtLeast(maxPid);
         }
     }
 }
@@ -239,6 +251,11 @@ EndTransactionResult TransactionCoordinator::endTransaction(
     bool                    commit,
     int64_t                 /*nowNs*/)
 {
+    // A7 (justified): nowNs is intentionally unused here. endTransaction only
+    // advances Ongoing→Prepare*; the deadline is enforced solely by doWork()
+    // (single source of truth for timeout aborts), and re-checking the deadline
+    // here would race that path and could reject a commit the client already
+    // began. The parameter is kept for API symmetry with the other entry points.
     TransactionMetadata* meta = findMetadata(txnId);
     if (meta == nullptr) {
         return { .errorCode = EndTransactionResult::kUnknownTxnId };

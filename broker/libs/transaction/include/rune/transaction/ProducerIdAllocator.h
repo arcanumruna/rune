@@ -41,6 +41,13 @@ public:
     /// before any ids in the block are used. Default 1000 matches common usage.
     static constexpr ProducerId kBlockSize = 1000;
 
+    /// Sentinel returned by allocate() when the producerId space is exhausted
+    /// (next_ has reached INT64_MAX). Callers must treat this as an allocation
+    /// failure — NEVER wrap to a negative producerId (Kafka treats producerId as
+    /// a non-negative int64; a negative value would collide with the -1 "no PID"
+    /// sentinel and corrupt dedup keying).
+    static constexpr ProducerId kExhausted = -1;
+
     /// Construct with a starting base (defaults to 0; P5-3 passes recovered watermark).
     explicit ProducerIdAllocator(ProducerId startingBase = 0) noexcept
         : next_(startingBase)
@@ -63,9 +70,18 @@ public:
     // ceiling is persisted before handing out ids — that's P5-3's job.
     // -----------------------------------------------------------------------
     [[nodiscard]] ProducerId allocate() noexcept {
+        // Exhaustion guard (Part B #15): never wrap past INT64_MAX into negative.
+        if (next_ == INT64_MAX) {
+            return kExhausted;
+        }
         if (next_ >= blockCeiling_) {
-            // Replenish from the next block.
-            blockCeiling_ = next_ + kBlockSize;
+            // Replenish from the next block, clamping the ceiling at INT64_MAX so
+            // next_ + kBlockSize cannot overflow to a negative value.
+            if (next_ > INT64_MAX - kBlockSize) {
+                blockCeiling_ = INT64_MAX;
+            } else {
+                blockCeiling_ = next_ + kBlockSize;
+            }
         }
         return next_++;
     }
@@ -73,6 +89,34 @@ public:
     // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // reseedAtLeast() — advance the allocator so the NEXT allocation is strictly
+    // greater than @p maxSeen.
+    //
+    // A1 fix: after replaying the durable TransactionLog, the coordinator must
+    // reseed the allocator past the highest recovered producerId; otherwise the
+    // default allocator (starting at 0) would re-hand-out producerIds that are
+    // still live in the recovered metadata → two sessions share a PID → silent
+    // EOS break (ProducerStateManager dedup/LSO is keyed by producerId).
+    //
+    // Idempotent and monotone: never moves the allocator backwards. Guards
+    // against INT64_MAX overflow (leaves next_ at INT64_MAX rather than wrapping
+    // negative).
+    // -----------------------------------------------------------------------
+    void reseedAtLeast(ProducerId maxSeen) noexcept {
+        // We want next_ > maxSeen, i.e. next_ >= maxSeen + 1.
+        if (maxSeen == INT64_MAX) {
+            // Cannot represent maxSeen+1; park at INT64_MAX (allocate() then
+            // detects exhaustion — see the overflow guard there).
+            if (next_ < INT64_MAX) next_ = INT64_MAX;
+        } else {
+            ProducerId target = maxSeen + 1;
+            if (next_ < target) next_ = target;
+        }
+        // Re-arm the block ceiling so the next allocate() replenishes cleanly.
+        if (blockCeiling_ < next_) blockCeiling_ = next_;
+    }
 
     /// The next id that will be allocated (monotonically increasing).
     [[nodiscard]] ProducerId nextId() const noexcept { return next_; }

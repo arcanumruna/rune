@@ -33,6 +33,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -249,11 +250,15 @@ struct InitProducerIdRequestMsg {
 
     static_assert(BLOCK_LENGTH == 4, "InitProducerIdRequest fixed block must be 4 bytes");
 
+    /// A5: returns 0 (nothing encoded) if transactionalId exceeds the uint16
+    /// length field — the caller must treat 0 as an encode failure, never a
+    /// silent truncation.
     static std::size_t encode(uint8_t*         buf,
                                std::size_t      bufOffset,
                                int32_t          txnTimeoutMs_,
                                std::string_view transactionalId_) noexcept
     {
+        if (transactionalId_.size() > 0xFFFFu) return 0;  // A5 reject
         std::size_t pos = bufOffset;
         pos += TxnMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
         txn_detail::write_le<int32_t>(buf + pos, txnTimeoutMs_); pos += 4;
@@ -261,13 +266,21 @@ struct InitProducerIdRequestMsg {
         return pos - bufOffset;
     }
 
-    static InitProducerIdRequestMsg decode(const uint8_t* buf,
-                                            std::size_t    bufOffset) noexcept
+    /// A3/A4: bounds-checked decode. @p avail is the number of readable bytes at
+    /// buf+bufOffset. Returns std::nullopt on any truncation/over-read (no unsafe
+    /// reads). This is the ONLY public decode — the network ingress path.
+    static std::optional<InitProducerIdRequestMsg> decode(const uint8_t* buf,
+                                                          std::size_t    bufOffset,
+                                                          std::size_t    avail) noexcept
     {
+        const std::size_t end = bufOffset + avail;
         std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        if (pos + 4 > end) return std::nullopt;
         InitProducerIdRequestMsg m{};
-        m.txnTimeoutMs    = txn_detail::read_le<int32_t>(buf + pos); pos += 4;
-        m.transactionalId = txn_detail::read_str(buf, pos);
+        m.txnTimeoutMs = txn_detail::read_le<int32_t>(buf + pos); pos += 4;
+        std::string_view sv;
+        if (!txn_detail::read_str_safe(buf, pos, end, &sv)) return std::nullopt;
+        m.transactionalId = sv;
         return m;
     }
 };
@@ -347,6 +360,10 @@ struct AddPartitionsToTxnRequestMsg {
                                std::string_view                    transactionalId_,
                                const std::vector<TopicPartition>&  partitions_) noexcept
     {
+        if (transactionalId_.size() > 0xFFFFu) return 0;         // A5 reject
+        if (partitions_.size() > 0xFFFFu)      return 0;         // A5 reject
+        for (const auto& tp : partitions_)
+            if (tp.topic.size() > 0xFFFFu) return 0;             // A5 reject
         std::size_t pos = bufOffset;
         pos += TxnMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
         txn_detail::write_le<int64_t>(buf + pos, producerId_);    pos += 8;
@@ -356,15 +373,22 @@ struct AddPartitionsToTxnRequestMsg {
         return pos - bufOffset;
     }
 
-    static AddPartitionsToTxnRequestMsg decode(const uint8_t* buf,
-                                                std::size_t    bufOffset)
+    /// A3/A4: bounds-checked decode. Returns nullopt on any truncation/over-read.
+    static std::optional<AddPartitionsToTxnRequestMsg> decode(const uint8_t* buf,
+                                                             std::size_t    bufOffset,
+                                                             std::size_t    avail)
     {
+        const std::size_t end = bufOffset + avail;
         std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        if (pos + 10 > end) return std::nullopt;
         AddPartitionsToTxnRequestMsg m{};
         m.producerId    = txn_detail::read_le<int64_t>(buf + pos); pos += 8;
         m.producerEpoch = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
-        m.transactionalId = txn_detail::read_str(buf, pos);
-        m.partitions    = txn_detail::read_partitions(buf, pos);
+        std::string_view sv;
+        if (!txn_detail::read_str_safe(buf, pos, end, &sv)) return std::nullopt;
+        m.transactionalId = sv;
+        if (!txn_detail::read_partitions_safe(buf, pos, end, m.partitions))
+            return std::nullopt;
         return m;
     }
 };
@@ -433,6 +457,7 @@ struct EndTxnRequestMsg {
                                bool             commit_,
                                std::string_view transactionalId_) noexcept
     {
+        if (transactionalId_.size() > 0xFFFFu) return 0;          // A5 reject
         std::size_t pos = bufOffset;
         pos += TxnMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
         txn_detail::write_le<int64_t>(buf + pos, producerId_);         pos += 8;
@@ -442,15 +467,21 @@ struct EndTxnRequestMsg {
         return pos - bufOffset;
     }
 
-    static EndTxnRequestMsg decode(const uint8_t* buf,
-                                    std::size_t    bufOffset) noexcept
+    /// A3/A4: bounds-checked decode. Returns nullopt on any truncation/over-read.
+    static std::optional<EndTxnRequestMsg> decode(const uint8_t* buf,
+                                                  std::size_t    bufOffset,
+                                                  std::size_t    avail) noexcept
     {
+        const std::size_t end = bufOffset + avail;
         std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        if (pos + 12 > end) return std::nullopt;
         EndTxnRequestMsg m{};
         m.producerId    = txn_detail::read_le<int64_t>(buf + pos); pos += 8;
         m.producerEpoch = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
         m.commit        = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
-        m.transactionalId = txn_detail::read_str(buf, pos);
+        std::string_view sv;
+        if (!txn_detail::read_str_safe(buf, pos, end, &sv)) return std::nullopt;
+        m.transactionalId = sv;
         return m;
     }
 
@@ -528,6 +559,10 @@ struct WriteTxnMarkersRequestMsg {
                                std::string_view                    transactionalId_,
                                const std::vector<TopicPartition>&  partitions_) noexcept
     {
+        if (transactionalId_.size() > 0xFFFFu) return 0;         // A5 reject
+        if (partitions_.size() > 0xFFFFu)      return 0;         // A5 reject
+        for (const auto& tp : partitions_)
+            if (tp.topic.size() > 0xFFFFu) return 0;             // A5 reject
         std::size_t pos = bufOffset;
         pos += TxnMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
         txn_detail::write_le<int64_t>(buf + pos, producerId_);                   pos += 8;
@@ -539,17 +574,24 @@ struct WriteTxnMarkersRequestMsg {
         return pos - bufOffset;
     }
 
-    static WriteTxnMarkersRequestMsg decode(const uint8_t* buf,
-                                             std::size_t    bufOffset)
+    /// A3/A4: bounds-checked decode. Returns nullopt on any truncation/over-read.
+    static std::optional<WriteTxnMarkersRequestMsg> decode(const uint8_t* buf,
+                                                          std::size_t    bufOffset,
+                                                          std::size_t    avail)
     {
+        const std::size_t end = bufOffset + avail;
         std::size_t pos = bufOffset + TxnMessageHeader::ENCODED_SIZE;
+        if (pos + 14 > end) return std::nullopt;
         WriteTxnMarkersRequestMsg m{};
         m.producerId       = txn_detail::read_le<int64_t>(buf + pos); pos += 8;
         m.producerEpoch    = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
         m.controlType      = txn_detail::read_le<int16_t>(buf + pos); pos += 2;
         m.coordinatorEpoch = txn_detail::read_le<int32_t>(buf + pos); pos += 4;
-        m.transactionalId  = txn_detail::read_str(buf, pos);
-        m.partitions       = txn_detail::read_partitions(buf, pos);
+        std::string_view sv;
+        if (!txn_detail::read_str_safe(buf, pos, end, &sv)) return std::nullopt;
+        m.transactionalId = sv;
+        if (!txn_detail::read_partitions_safe(buf, pos, end, m.partitions))
+            return std::nullopt;
         return m;
     }
 

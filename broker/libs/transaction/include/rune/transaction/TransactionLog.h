@@ -28,13 +28,14 @@
 //   [32..35]  int32   txnTimeoutMs
 //   [36..37]  uint16  txnIdLen
 //   [38..39]  uint16  partitionCount  (number of {topicLen:uint16, topic:bytes, partition:int32} tuples)
-//   [40..41]  uint16  _pad = 0
-//   [42..43]  uint16  _pad2 = 0      (align to kFixedHeaderSize = 44)
-//   [44..]    bytes   txnId (txnIdLen bytes)
+//   [40..47]  int64   pendingNewProducerId    (A2: deferred overflow PID swap; -1 = none)
+//   [48..49]  int16   pendingNewProducerEpoch (A2: deferred overflow epoch;   -1 = none)
+//   [50..51]  uint16  _pad = 0        (align to kFixedHeaderSize = 52)
+//   [52..]    bytes   txnId (txnIdLen bytes)
 //   [..]      tuples  { topicLen:uint16, topic:topicLen bytes, partition:int32 } × partitionCount
 //   [..]      uint32  CRC32C of all bytes before this field
 //
-// kFixedHeaderSize = 44
+// kFixedHeaderSize = 52
 //
 // ## Recovery
 // On open: scan records; stop on torn header / magic mismatch / CRC mismatch;
@@ -65,6 +66,10 @@ struct TxnLogEntry {
     int64_t                txnStartNs{0};
     int32_t                coordinatorEpoch{0};
     int32_t                txnTimeoutMs{60'000};
+    /// A2: deferred overflow PID swap (NEW-1). Persisted so a crash mid-abort does
+    /// not lose the fresh identity the client was already handed. -1 == none.
+    ProducerId             pendingNewProducerId{-1};
+    ProducerEpoch          pendingNewProducerEpoch{-1};
 };
 
 // ---------------------------------------------------------------------------
@@ -114,8 +119,12 @@ public:
     // Constants
     // -----------------------------------------------------------------------
     static constexpr uint32_t kMagic           = 0x544B4E4Cu; // "TKNL" little-endian
-    static constexpr uint32_t kFixedHeaderSize  = 44u;
+    static constexpr uint32_t kFixedHeaderSize  = 52u;
     static constexpr uint32_t kChecksumSize     = 4u;
+
+    /// A5: hard cap on length-prefixed fields (uint16 wire width). Inputs that
+    /// exceed this are REJECTED (never silently truncated).
+    static constexpr std::size_t kMaxUint16 = 0xFFFFu;
 
 private:
     // -----------------------------------------------------------------------

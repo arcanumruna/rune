@@ -162,4 +162,77 @@ TEST(ProducerIdAllocatorTest, TwoAllocatorsAreIndependent)
     EXPECT_EQ(p2, 10'000);
 }
 
+// ---------------------------------------------------------------------------
+// Part B #15 — exhaustion / wrap near INT64_MAX. allocate() at next_==INT64_MAX
+// must NOT wrap to a negative producerId; it returns kExhausted.
+// ---------------------------------------------------------------------------
+TEST(ProducerIdAllocatorTest, AllocateNearInt64MaxDoesNotWrapNegative)
+{
+    // Start one below INT64_MAX: one good allocation, then exhaustion.
+    ProducerIdAllocator a(INT64_MAX - 1);
+    ProducerId p1 = a.allocate();
+    EXPECT_EQ(p1, INT64_MAX - 1);
+    // next_ is now INT64_MAX → allocate() must signal exhaustion, never negative.
+    ProducerId p2 = a.allocate();
+    EXPECT_EQ(p2, ProducerIdAllocator::kExhausted);
+    EXPECT_LT(p2, 0);
+    // Still exhausted on subsequent calls (idempotent, never wraps).
+    EXPECT_EQ(a.allocate(), ProducerIdAllocator::kExhausted);
+}
+
+// Block-ceiling math must not overflow when starting near INT64_MAX.
+TEST(ProducerIdAllocatorTest, BlockCeilingNoOverflowNearMax)
+{
+    ProducerIdAllocator a(INT64_MAX - 3);
+    // Three good allocations within the clamped block, then exhaustion.
+    EXPECT_EQ(a.allocate(), INT64_MAX - 3);
+    EXPECT_EQ(a.allocate(), INT64_MAX - 2);
+    EXPECT_EQ(a.allocate(), INT64_MAX - 1);
+    EXPECT_EQ(a.allocate(), ProducerIdAllocator::kExhausted);
+}
+
+// ---------------------------------------------------------------------------
+// Part B #16 — startingBase exactly at a block boundary.
+// ---------------------------------------------------------------------------
+TEST(ProducerIdAllocatorTest, StartingBaseAtBlockBoundary)
+{
+    ProducerIdAllocator a(ProducerIdAllocator::kBlockSize); // == 1000
+    EXPECT_EQ(a.allocate(), ProducerIdAllocator::kBlockSize);
+    EXPECT_EQ(a.allocate(), ProducerIdAllocator::kBlockSize + 1);
+}
+
+// ---------------------------------------------------------------------------
+// A1 — reseedAtLeast advances the allocator past a recovered max; never
+// backwards; idempotent; guards INT64_MAX.
+// ---------------------------------------------------------------------------
+TEST(ProducerIdAllocatorTest, ReseedAtLeastAdvancesPastMax)
+{
+    ProducerIdAllocator a;                 // default: next_ == 0
+    a.reseedAtLeast(41);
+    EXPECT_EQ(a.allocate(), 42);           // strictly greater than 41
+}
+
+TEST(ProducerIdAllocatorTest, ReseedAtLeastNeverMovesBackward)
+{
+    ProducerIdAllocator a(500);
+    a.reseedAtLeast(10);                   // below current → no-op
+    EXPECT_EQ(a.allocate(), 500);
+}
+
+TEST(ProducerIdAllocatorTest, ReseedAtLeastIdempotent)
+{
+    ProducerIdAllocator a;
+    a.reseedAtLeast(100);
+    a.reseedAtLeast(100);
+    a.reseedAtLeast(50);
+    EXPECT_EQ(a.allocate(), 101);
+}
+
+TEST(ProducerIdAllocatorTest, ReseedAtLeastInt64MaxParksAtExhausted)
+{
+    ProducerIdAllocator a;
+    a.reseedAtLeast(INT64_MAX);            // cannot represent max+1
+    EXPECT_EQ(a.allocate(), ProducerIdAllocator::kExhausted);
+}
+
 } // anonymous namespace
