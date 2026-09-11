@@ -393,19 +393,46 @@ TEST(CompactionIntegration, WhileProducing_BelowHWCompacted_AboveHWIntact) {
 
     auto recs = readAllRecords(log, 0);
 
-    // Records at or above hw must exist (offsets 4, 5 must still be present).
+    // FIX 3 — EXACT counts, split by zone.
+    //
+    // Layout produced above:
+    //   offsets 0-5: k0@0, k1@1, k0@2, k1@3, k0@4, k1@5
+    //   offsets 6-29: "pad" (24 records)
+    //   HW = 4 → compacted zone = [0,4), above-HW zone = [4,30)
+    //
+    // After compaction of [0,hw):
+    //   Compacted zone [0,4): k0@2 survives (latest), k1@3 survives (latest).
+    //                         Each key must appear EXACTLY once in this zone.
+    //   Above-HW zone [4,6):  k0@4, k1@5 — untouched.  Exactly 2 records.
+    //   Above-HW zone [6,30): 24 "pad" records — untouched. Exactly 24.
+
+    // Count per zone for k0 and k1.
+    int k0Compacted = 0, k1Compacted = 0;
+    int k0AboveHw   = 0, k1AboveHw   = 0;
     int countAboveHw = 0;
     for (auto& r : recs) {
-        if (r.offset >= hw) ++countAboveHw;
+        if (r.offset < hw) {
+            if (r.key == "k0") ++k0Compacted;
+            if (r.key == "k1") ++k1Compacted;
+        } else {
+            ++countAboveHw;
+            if (r.key == "k0") ++k0AboveHw;
+            if (r.key == "k1") ++k1AboveHw;
+        }
     }
-    EXPECT_GE(countAboveHw, 2) << "Records at/above HW must not be compacted";
 
-    // Compacted range: k0 and k1 should each appear at most once (latest only).
-    int countK0 = countKey(recs, "k0");
-    int countK1 = countKey(recs, "k1");
-    // Within [0,4): k0 at offsets 0,2 → latest=2; k1 at offsets 1,3 → latest=3.
-    EXPECT_LE(countK0, 2) << "k0 at most appears once in compacted + once in uncompacted zones";
-    EXPECT_LE(countK1, 2) << "k1 at most appears once in compacted + once in uncompacted zones";
+    // Compacted zone: each key must appear EXACTLY once (no over-compaction, no dup).
+    EXPECT_EQ(k0Compacted, 1)
+        << "k0 must appear exactly once in the compacted zone [0,hw): latest@2 only";
+    EXPECT_EQ(k1Compacted, 1)
+        << "k1 must appear exactly once in the compacted zone [0,hw): latest@3 only";
+
+    // Above-HW zone: k0@4 and k1@5 are untouched. Exactly 2 k0/k1 records.
+    EXPECT_EQ(k0AboveHw, 1) << "k0@4 above HW must be untouched (exactly 1)";
+    EXPECT_EQ(k1AboveHw, 1) << "k1@5 above HW must be untouched (exactly 1)";
+
+    // Total records at/above hw: k0@4, k1@5 + 24 "pad" records = 26 exactly.
+    EXPECT_EQ(countAboveHw, 26) << "Records at/above HW must be untouched (exact count: 2+24=26)";
 
     fs::remove_all(dir);
 }

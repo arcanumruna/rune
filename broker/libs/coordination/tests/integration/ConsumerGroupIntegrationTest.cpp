@@ -293,6 +293,33 @@ TEST(MemberCrash, N3P6_SurvivorResumesFromCrashedCommit) {
     // Crashed member's committed offsets MUST still be present.
     h.assertCommittedOffsetNotLost(tp4, 77);
     h.assertCommittedOffsetNotLost(tp5, 88);
+
+    // FIX 1 — LOG-LEVEL RESUME: prove no double-consume.
+    // Fetch the committed offsets from the REAL OffsetStore and verify the
+    // log is positioned correctly: the next record after the committed offset
+    // must have offset >= committed (i.e., the survivor does NOT re-read
+    // records that were already committed).
+    {
+        auto co4 = h.fetchOffset(tp4);
+        ASSERT_TRUE(co4.has_value()) << "Committed offset for tp4 must be durable";
+        Offset committedOffset4 = co4->offset;
+        EXPECT_EQ(committedOffset4, 77) << "Committed offset for tp4 must be exactly 77";
+        // The log is inside the harness; the assertion is that the committed
+        // offset exactly equals what consumer 2 wrote — proving durability.
+        // Also verify the store returns >= committed (the assertNoDoubleConsume
+        // contract): after reassignment the survivor would resume from
+        // committedOffset4, not from 0.
+        h.assertNoDoubleConsume(2, tp4, 77);
+
+        auto co5 = h.fetchOffset(tp5);
+        ASSERT_TRUE(co5.has_value()) << "Committed offset for tp5 must be durable";
+        EXPECT_EQ(co5->offset, 88) << "Committed offset for tp5 must be exactly 88";
+        h.assertNoDoubleConsume(2, tp5, 88);
+    }
+
+    // FIX 1 — COVERED-ONCE: every partition is still covered exactly once
+    // after the crash+rebalance (no partition is double-assigned or lost).
+    h.assertPartitionsCoveredOnce(parts("t", 6));
 }
 
 // Test 11: No partition covered more than once after crash+rebalance.
@@ -514,22 +541,50 @@ TEST(CoordinatorFailover, GroupReformsAfterRestart) {
     h.assertPartitionsCoveredOnce(parts("t", 6));
 }
 
-// Test 19: generationId is monotonic across coordinator restart.
-// (New coordinator starts at 0 + joins bump it; the new generation must be ≥ 1.)
-TEST(CoordinatorFailover, GenerationMonotonicAfterRestart) {
+// Test 19: generationId behavior across coordinator DESTROY+recreate.
+//
+// Design: GroupCoordinator does NOT persist generationId to durable storage
+// (only OffsetStore is persisted).  A fresh coordinator starts at generation 0.
+// After coordinator failover, ALL members must re-join (their stale memberIds
+// are no longer known), so the new coordinator goes through PreparingRebalance
+// and bumps its own generation counter starting from 0.
+//
+// This is correct by design: the new coordinator starts a new epoch.  Members
+// detect the failover because their heartbeats return kErrUnknownMember (stale
+// memberIds) and they re-join from scratch.  The reset generation is safe
+// because the new coordinator starts with an empty group — there are no stale
+// assignments that could conflict with old-generation members.
+//
+// What we assert:
+//   1. After rejoin the new coordinator's generation is >= 1 (at least one
+//      rebalance happened in the new coordinator's lifetime).
+//   2. Within the new coordinator's lifetime, generation is monotonic across
+//      a second membership change (strictly increases on another join).
+TEST(CoordinatorFailover, GenerationResetsAndMonotonicAfterRestart) {
     ConsumerGroupHarness h("failover3", 3, {"t"});
     auto pc = counts1("t", 6);
     ASSERT_TRUE(h.joinAll(pc));
-    // Generation before restart.
-    Generation genBefore = h.coordinator().generationId();
-    (void)genBefore;
+    // Record generation before restart (intentionally not compared after
+    // restart — generationId is not durable across coordinator failover).
+    // genBefore is unused: the new coordinator starts its own epoch from 0.
 
     h.recreateCoordinator();
 
-    // Rejoin → generation must be >= 1.
+    // All members must rejoin with fresh memberIds (coordinator lost its state).
     ASSERT_TRUE(h.rejoinAndAssign(pc));
-    Generation genAfter = h.coordinator().generationId();
-    EXPECT_GE(genAfter, 1);
+
+    // After at least one full rebalance in the new coordinator's lifetime the
+    // generation must be >= 1.
+    Generation genAfterRestart = h.coordinator().generationId();
+    EXPECT_GE(genAfterRestart, 1)
+        << "New coordinator must have bumped generation at least once during re-formation";
+
+    // Within-lifetime monotonicity: a second membership change must bump gen.
+    // (Trigger by having consumer 0 leave, which causes another rebalance.)
+    h.coordinator().leave(h.consumer(0).memberId, h.clock());
+    Generation genAfterLeave = h.coordinator().generationId();
+    EXPECT_GT(genAfterLeave, genAfterRestart)
+        << "Generation must be strictly monotonic within a single coordinator's lifetime";
 }
 
 // Test 20: No committed offset lost across coordinator restart (multi-partition).
@@ -836,9 +891,11 @@ TEST(RollingRestart, N3P6_GenerationMonotonic) {
                 h.consumer(i).subscribedTopics, h.clock());
             if (res.errorCode == 0) h.consumer(i).memberId = res.memberId;
         }
-        h.driveUntil(
+        // FIX 2: ASSERT_TRUE so a stall fails the test instead of silently passing.
+        ASSERT_TRUE(h.driveUntil(
             [&]{ return h.coordinator().state() == GroupState::CompletingRebalance
-                     || h.coordinator().state() == GroupState::Stable; }, kCap);
+                     || h.coordinator().state() == GroupState::Stable; }, kCap))
+            << "Round " << round << ": survivors must reach CompletingRebalance/Stable";
         if (h.coordinator().state() != GroupState::Stable) {
             h.coordinator().autoAssignAndSync(pc, AssignorType::Range, h.clock());
         }
@@ -859,9 +916,11 @@ TEST(RollingRestart, N3P6_GenerationMonotonic) {
                                              h.consumer(i).subscribedTopics, h.clock());
             if (res.errorCode == 0) h.consumer(i).memberId = res.memberId;
         }
-        h.driveUntil(
+        // FIX 2: ASSERT_TRUE so a stall fails the test instead of silently passing.
+        ASSERT_TRUE(h.driveUntil(
             [&]{ return h.coordinator().state() == GroupState::CompletingRebalance
-                     || h.coordinator().state() == GroupState::Stable; }, kCap);
+                     || h.coordinator().state() == GroupState::Stable; }, kCap))
+            << "Round " << round << ": revived group must reach CompletingRebalance/Stable";
         if (h.coordinator().state() != GroupState::Stable) {
             h.coordinator().autoAssignAndSync(pc, AssignorType::Range, h.clock());
         }
