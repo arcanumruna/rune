@@ -2,8 +2,10 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <array>
 #include <cstdint>
+#include <climits>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace rpc = rune::protocol::client;
 
@@ -321,4 +323,259 @@ TEST(VarFieldHelper, GetVarBytesLengthPrefixTruncated) {
     std::size_t pos = 0;
     bool ok = rpc::getVarBytes(buf.data(), 1, pos, outData, outLen);
     EXPECT_FALSE(ok);
+}
+
+// ===========================================================================
+// CP-2 exhaustive edge-case additions
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 1. Max-length egressChannel = u16 max (65535 bytes)
+//    encode→decode round-trips exactly; total size == 34 + 65535 == 65569.
+// ---------------------------------------------------------------------------
+TEST(ConnectRequestCodec, MaxU16EgressChannelRoundTrip) {
+    // 65535 bytes — the maximum a uint16 length prefix can encode.
+    const std::size_t kMaxLen = 65535u;
+
+    // Build channel string outside the heap path; use a vector for the backing
+    // store so the string_view remains valid.
+    const std::string bigChannel(kMaxLen, 'A');
+
+    rpc::ConnectRequest req;
+    req.sessionId      = 0xDEADBEEFCAFEBABELL;
+    req.correlationId  = 0x0102030405060708LL;
+    req.egressStreamId = 12345;
+    req.clientVersion  = 99;
+    req.egressChannel  = bigChannel;
+
+    // Total: header(24) + fixed(8) + var-prefix(2) + data(65535) = 65569
+    constexpr std::size_t kExpected = 24u + 8u + 2u + 65535u;
+    ASSERT_EQ(kExpected, 65569u);
+
+    std::vector<uint8_t> buf(kExpected, 0u);
+    const std::size_t written = req.encode(buf.data());
+    EXPECT_EQ(written, kExpected);
+
+    // The var-length prefix at byte 32 must be 65535 (0xFFFF LE).
+    EXPECT_EQ(leU16(buf.data(), 32), static_cast<uint16_t>(65535u));
+
+    // Round-trip decode.
+    auto decoded = rpc::ConnectRequest::decode(buf.data(), written);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->sessionId,      req.sessionId);
+    EXPECT_EQ(decoded->correlationId,  req.correlationId);
+    EXPECT_EQ(decoded->egressStreamId, req.egressStreamId);
+    EXPECT_EQ(decoded->clientVersion,  req.clientVersion);
+    EXPECT_EQ(decoded->egressChannel.size(), kMaxLen);
+    EXPECT_EQ(decoded->egressChannel,  bigChannel);
+}
+
+// ---------------------------------------------------------------------------
+// 2. getVarBytes exact-fit off-by-one boundary:
+//    (a) prefix value == exactly remaining bytes → ACCEPTED, full run returned.
+//    (b) prefix value == remaining bytes + 1     → REJECTED.
+// ---------------------------------------------------------------------------
+TEST(VarFieldHelper, GetVarBytesExactFitAccepted) {
+    // Build: 2-byte length prefix (=5) + 5 bytes of data, total 7 bytes.
+    // When pos=0, avail=7: prefix says 5, remaining after reading prefix = 5 → exact fit.
+    std::array<uint8_t, 7> buf{};
+    buf[0] = 5; buf[1] = 0;   // LE uint16 = 5
+    buf[2] = 'h'; buf[3] = 'e'; buf[4] = 'l'; buf[5] = 'l'; buf[6] = 'o';
+
+    const uint8_t* outData = nullptr;
+    uint16_t outLen = 0;
+    std::size_t pos = 0;
+    bool ok = rpc::getVarBytes(buf.data(), buf.size(), pos, outData, outLen);
+    ASSERT_TRUE(ok);                          // exact fit → accepted
+    EXPECT_EQ(outLen, 5u);
+    EXPECT_EQ(pos, 7u);                       // consumed everything
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(outData), outLen), "hello");
+}
+
+TEST(VarFieldHelper, GetVarBytesOnePastExactFitRejected) {
+    // prefix says 6, but only 5 bytes of data follow (total buf = 7 bytes).
+    // pos+2 = 2, remaining after length read = 7-2 = 5 < 6 → rejected.
+    std::array<uint8_t, 7> buf{};
+    buf[0] = 6; buf[1] = 0;   // LE uint16 = 6
+    buf[2] = 'h'; buf[3] = 'e'; buf[4] = 'l'; buf[5] = 'l'; buf[6] = 'o';
+
+    const uint8_t* outData = nullptr;
+    uint16_t outLen = 0;
+    std::size_t pos = 0;
+    bool ok = rpc::getVarBytes(buf.data(), buf.size(), pos, outData, outLen);
+    EXPECT_FALSE(ok);    // one-past-exact → rejected
+}
+
+// ---------------------------------------------------------------------------
+// 3. Full integer boundary values — all round-trip byte-exact.
+// ---------------------------------------------------------------------------
+TEST(ConnectResponseCodec, IntBoundaryValuesAllExtrema) {
+    struct TestCase {
+        int16_t  code;
+        int32_t  leaderMemberId;
+        int64_t  assignedSessionId;
+    };
+
+    const TestCase cases[] = {
+        { INT16_MIN,  INT32_MIN,  INT64_MIN },
+        { INT16_MAX,  INT32_MAX,  INT64_MAX },
+        { 0,         -1,          0         },
+        { INT16_MIN,  INT32_MAX,  INT64_MIN },
+        { INT16_MAX,  INT32_MIN,  INT64_MAX },
+    };
+
+    for (const auto& tc : cases) {
+        rpc::ConnectResponse resp;
+        resp.sessionId         = 0x123456789ABCDEF0LL;
+        resp.correlationId     = -42LL;
+        resp.code              = tc.code;
+        resp.leaderMemberId    = tc.leaderMemberId;
+        resp.assignedSessionId = tc.assignedSessionId;
+
+        std::array<uint8_t, 64> buf{};
+        const std::size_t written = resp.encode(buf.data());
+        ASSERT_EQ(written, 38u) << "code=" << tc.code;
+
+        // Byte-level verification of field positions.
+        EXPECT_EQ(leS16(buf.data(), 24), tc.code)              << "code byte check";
+        EXPECT_EQ(leS32(buf.data(), 26), tc.leaderMemberId)    << "leaderMemberId byte check";
+        EXPECT_EQ(leS64(buf.data(), 30), tc.assignedSessionId) << "assignedSessionId byte check";
+
+        auto decoded = rpc::ConnectResponse::decode(buf.data(), written);
+        ASSERT_TRUE(decoded.has_value()) << "decode failed for code=" << tc.code;
+        EXPECT_EQ(decoded->code,              tc.code);
+        EXPECT_EQ(decoded->leaderMemberId,    tc.leaderMemberId);
+        EXPECT_EQ(decoded->assignedSessionId, tc.assignedSessionId);
+    }
+}
+
+TEST(ConnectRequestCodec, IntBoundaryValuesFixedFields) {
+    struct TestCase {
+        int32_t egressStreamId;
+        int32_t clientVersion;
+    };
+
+    const TestCase cases[] = {
+        { INT32_MIN, INT32_MIN },
+        { INT32_MAX, INT32_MAX },
+        { INT32_MIN, INT32_MAX },
+        { INT32_MAX, INT32_MIN },
+        { 0,         -1        },
+    };
+
+    for (const auto& tc : cases) {
+        rpc::ConnectRequest req;
+        req.sessionId      = INT64_MIN;
+        req.correlationId  = INT64_MAX;
+        req.egressStreamId = tc.egressStreamId;
+        req.clientVersion  = tc.clientVersion;
+        req.egressChannel  = "x";   // 1-byte channel so we have a var field
+
+        constexpr std::size_t kExpected = 24u + 8u + 2u + 1u;
+        std::array<uint8_t, 64> buf{};
+        const std::size_t written = req.encode(buf.data());
+        ASSERT_EQ(written, kExpected);
+
+        // Byte-level verification.
+        EXPECT_EQ(leS32(buf.data(), 24), tc.egressStreamId) << "egressStreamId byte check";
+        EXPECT_EQ(leS32(buf.data(), 28), tc.clientVersion)  << "clientVersion byte check";
+
+        auto decoded = rpc::ConnectRequest::decode(buf.data(), written);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->egressStreamId, tc.egressStreamId);
+        EXPECT_EQ(decoded->clientVersion,  tc.clientVersion);
+        EXPECT_EQ(decoded->sessionId,      INT64_MIN);
+        EXPECT_EQ(decoded->correlationId,  INT64_MAX);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. ConnectResponse schema mismatch (schemaId != 120) → nullopt.
+//    Also ConnectRequest with wrong schemaId → nullopt.
+// ---------------------------------------------------------------------------
+TEST(ConnectResponseCodec, SchemaMismatchReturnsNullopt) {
+    rpc::ConnectResponse resp;
+    resp.code              = 0;
+    resp.leaderMemberId    = 1;
+    resp.assignedSessionId = 2;
+
+    std::array<uint8_t, 64> buf{};
+    resp.encode(buf.data());
+
+    // Corrupt schemaId (bytes 4-5) to 111 (internal broker schema).
+    buf[4] = 111;
+    buf[5] = 0;
+
+    EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), 38u).has_value());
+}
+
+TEST(ConnectRequestCodec, SchemaMismatchExplicitValue) {
+    // Same as existing SchemaMismatchReturnsNullopt but tests schemaId = 111 explicitly
+    // (the internal broker schema, distinct from client 120).
+    rpc::ConnectRequest req;
+    req.egressChannel = "aeron:udp?endpoint=10.0.0.1:9000";
+
+    const std::size_t kLen = 24u + 8u + 2u + req.egressChannel.size();
+    std::vector<uint8_t> buf(kLen, 0u);
+    req.encode(buf.data());
+
+    buf[4] = 111;  // schemaId = 111 ≠ 120
+    buf[5] = 0;
+
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), kLen).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 5a. Header carries correct templateId but blockLength inconsistent with
+//     BODY_FIXED.  The codec trusts its own BODY_FIXED constant (not the
+//     header's blockLength field), so a corrupted blockLength does NOT cause
+//     rejection — the decode succeeds.  Document this.
+// ---------------------------------------------------------------------------
+TEST(ConnectResponseCodec, CorruptBlockLengthStillDecodes) {
+    // Current behavior: ConnectResponse::decode uses a hard-coded BODY_FIXED
+    // constant and does NOT re-validate blockLength from the header.
+    // A corrupt blockLength field therefore does not cause rejection.
+    rpc::ConnectResponse resp;
+    resp.code              = 0;
+    resp.leaderMemberId    = 7;
+    resp.assignedSessionId = 99;
+
+    std::array<uint8_t, 64> buf{};
+    resp.encode(buf.data());
+
+    // Corrupt blockLength (bytes 0-1) to 0 instead of 14.
+    buf[0] = 0;
+    buf[1] = 0;
+
+    // Expected behavior: decode still succeeds because it reads fixed body at
+    // a compile-time offset, independent of the header's blockLength field.
+    auto decoded = rpc::ConnectResponse::decode(buf.data(), 38u);
+    ASSERT_TRUE(decoded.has_value())
+        << "Documented: corrupt blockLength not detected — fixed-offset read wins";
+    EXPECT_EQ(decoded->leaderMemberId,    7);
+    EXPECT_EQ(decoded->assignedSessionId, 99);
+}
+
+// ---------------------------------------------------------------------------
+// 5b. avail == ENCODED_SIZE with a var field whose prefix claims more bytes
+//     than available (ConnectRequest with 0 data bytes but prefix says 1).
+// ---------------------------------------------------------------------------
+TEST(ConnectRequestCodec, VarFieldClaimsMoreThanAvailAtExactHeaderPlusFixed) {
+    // Build a valid ConnectRequest with an empty channel.
+    rpc::ConnectRequest req;
+    req.egressStreamId = 1;
+    req.clientVersion  = 1;
+    req.egressChannel  = "";
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t written = req.encode(buf.data());
+    // written == 34 (header24 + fixed8 + var2)
+
+    // Corrupt the var-length prefix at byte 32 to claim 1 byte (but none follow).
+    buf[32] = 1;
+    buf[33] = 0;
+
+    // avail == 34: the prefix claims 1 byte but pos after reading prefix is 34,
+    // leaving 0 bytes — rejected.
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), written).has_value());
 }

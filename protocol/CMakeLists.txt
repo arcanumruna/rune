@@ -37,7 +37,8 @@ if(BUILD_BENCHMARKS)
             benchmark/BenchmarkMain.cpp
             benchmark/Crc32cBenchmark.cpp
             benchmark/VarintBenchmark.cpp
-            benchmark/RecordBatchBenchmark.cpp)
+            benchmark/RecordBatchBenchmark.cpp
+            benchmark/ClientCodecBenchmark.cpp)
     target_include_directories(rune_protocol_benchmark PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/benchmark)
