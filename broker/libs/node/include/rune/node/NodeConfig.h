@@ -1,5 +1,5 @@
 #pragma once
-// NodeConfig.h — env-driven broker node configuration (BR-1)
+// NodeConfig.h — env-driven broker node configuration (BR-1, BR-3b)
 //
 // Environment variables:
 //   RUNE_NODE_ID           — int32, this node's id. Required. Must equal some peer's id.
@@ -12,6 +12,13 @@
 //   RUNE_CLIENT_STREAM_ID  — int32, default 1.
 //   RUNE_CONSENSUS_STREAM_ID — int32, default 10.
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
+//
+// Election timing (all optional; defaults are fast-but-safe for co-located clusters):
+//   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
+//   RUNE_ELECTION_STATUS_INTERVAL_MS — int64 ms, default 20. Canvass/heartbeat cadence.
+//   RUNE_STARTUP_CANVASS_TIMEOUT_MS — int64 ms, default 100. Extended canvass on first boot.
+//
+// For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
@@ -43,6 +50,13 @@ struct NodeConfig {
     ClientEndpoint      clientEndpoint;
     std::string         dataDir;
     int32_t             consensusStreamId = 0;
+
+    // Election timing — configurable via env (BR-3b).
+    // Defaults are fast-but-safe for co-located / test clusters.
+    // Increase for cross-datacenter deployments.
+    int64_t electionTimeoutMs        = 150;  // default 150 ms
+    int64_t electionStatusIntervalMs =  20;  // default  20 ms
+    int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 
     /// Returns the peer entry whose id == nodeId.
     /// Precondition: parse succeeded (peers non-empty, nodeId in peers).

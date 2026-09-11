@@ -34,6 +34,27 @@ static bool parseInt32(std::string_view sv, int32_t& out) {
     return ec == std::errc{} && ptr == sv.data() + sv.size();
 }
 
+/// Parse a positive int64_t from sv using from_chars. Returns false on failure.
+static bool parseInt64Positive(std::string_view sv, int64_t& out) {
+    sv = trim(sv);
+    if (sv.empty()) return false;
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
+    if (ec != std::errc{} || ptr != sv.data() + sv.size()) return false;
+    return out > 0;
+}
+
+/// Parse an optional int64_t env var (positive); leave 'out' unchanged if var is unset/empty.
+static std::string parseOptionalInt64Ms(
+    const std::function<const char*(const char*)>& getenv_fn,
+    const char* varName, int64_t& out)
+{
+    const char* raw = getenv_fn(varName);
+    if (!raw || std::string_view(raw).empty()) return {}; // use default
+    if (!parseInt64Positive(raw, out))
+        return std::string(varName) + " must be a positive integer (ms), got: " + raw;
+    return {};
+}
+
 /// Parse a uint16_t port from sv using from_chars. Returns false on failure
 /// (also rejects 0 and values > 65535).
 static bool parsePort(std::string_view sv, uint16_t& out) {
@@ -202,7 +223,8 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_CONSENSUS_STREAM_ID is not a valid integer: ") + rawConsStream};
     }
 
-    // --- Build result ---
+    // --- Election timing (optional, positive ms, env-overridable) ---
+    // Defaults set in NodeConfig field initializers; only override if env var present.
     NodeConfig cfg;
     cfg.nodeId           = nodeId;
     cfg.peers            = std::move(peers);
@@ -211,6 +233,21 @@ ConfigResult parseNodeConfig(
 
     cfg.clientEndpoint.channel  = std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
+
+    {
+        std::string err;
+        err = parseOptionalInt64Ms(getenv_fn, "RUNE_ELECTION_TIMEOUT_MS",
+                                   cfg.electionTimeoutMs);
+        if (!err.empty()) return {{}, err};
+
+        err = parseOptionalInt64Ms(getenv_fn, "RUNE_ELECTION_STATUS_INTERVAL_MS",
+                                   cfg.electionStatusIntervalMs);
+        if (!err.empty()) return {{}, err};
+
+        err = parseOptionalInt64Ms(getenv_fn, "RUNE_STARTUP_CANVASS_TIMEOUT_MS",
+                                   cfg.startupCanvassTimeoutMs);
+        if (!err.empty()) return {{}, err};
+    }
 
     return {std::move(cfg), {}};
 }

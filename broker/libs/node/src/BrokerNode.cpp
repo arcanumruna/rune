@@ -16,13 +16,10 @@ using namespace rune::consensus;
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
-// Timing constants — mirror ConsensusAgentTest (§6) exactly so a 1-node
-// cluster self-elects within ms, not seconds.
+// Timing constants — used ONLY for single-node (BR-2) path where NodeConfig
+// fields are not yet wired. Multi-node path reads from config_.
 // ---------------------------------------------------------------------------
-static constexpr int64_t kElectionTimeoutNs        = 150'000'000LL; // 150 ms
-static constexpr int64_t kStatusIntervalNs         =  50'000'000LL; //  50 ms
-static constexpr int64_t kStartupCanvassTimeoutNs  = 300'000'000LL; // 300 ms
-static constexpr int      kIngressCapacity          = 64 * 1024;    //  64 KiB
+static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 
 // ---------------------------------------------------------------------------
 // BrokerNode::BrokerNode
@@ -48,6 +45,9 @@ void BrokerNode::start() {
         return; // idempotent
     }
 
+    using sclock = std::chrono::steady_clock;
+    const auto t0 = sclock::now();
+
     // 1. Create dataDir if missing.
     fs::path dataDir{config_.dataDir};
     std::error_code ec;
@@ -59,6 +59,7 @@ void BrokerNode::start() {
 
     // 2. Start embedded Aeron media driver.
     startEmbeddedDriver();
+    const auto t1 = sclock::now();
 
     // 3. Connect Aeron client — must point at the same dir as the driver.
     {
@@ -71,14 +72,24 @@ void BrokerNode::start() {
             throw std::runtime_error("BrokerNode: failed to connect Aeron client");
         }
     }
+    const auto t2 = sclock::now();
 
     // 4. Build all consensus objects (NodeStateFile, TermLog, Election, …).
     buildConsensusObjects();
+    const auto t3 = sclock::now();
 
     // 5. Start the agent runner thread.
     agentRunner_->start();
 
-    spdlog::info("BrokerNode: node {} started, dataDir={}", config_.nodeId, config_.dataDir);
+    const auto t_start = sclock::now();
+    spdlog::info(
+        "BrokerNode: node {} started (dataDir={}) "
+        "| driver_start={:.1f}ms aeron_connect={:.1f}ms consensus_build={:.1f}ms total={:.1f}ms",
+        config_.nodeId, config_.dataDir,
+        std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        std::chrono::duration<double, std::milli>(t2 - t1).count(),
+        std::chrono::duration<double, std::milli>(t3 - t2).count(),
+        std::chrono::duration<double, std::milli>(t_start - t0).count());
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +133,14 @@ void BrokerNode::buildSingleNodeConsensus() {
     // Publisher (outbound transport: NullSink — no peers).
     publisher_ = std::make_unique<SbeConsensusPublisher>(nullSink_);
 
-    // Election — startup values matching the single-member test fixture.
+    // Election — use configurable timing from NodeConfig.
+    const int64_t electionTimeoutNs =
+        config_.electionTimeoutMs * 1'000'000LL;
+    const int64_t statusIntervalNs =
+        config_.electionStatusIntervalMs * 1'000'000LL;
+    const int64_t canvassTimeoutNs =
+        config_.startupCanvassTimeoutMs * 1'000'000LL;
+
     election_ = std::make_unique<Election>(
         /*isNodeStartup=*/true,
         /*gracefulClosedLeaderId=*/-1,
@@ -135,9 +153,9 @@ void BrokerNode::buildSingleNodeConsensus() {
         *publisher_,
         *nodeStateFile_,
         *termLog_,
-        kElectionTimeoutNs,
-        kStatusIntervalNs,
-        kStartupCanvassTimeoutNs,
+        electionTimeoutNs,
+        statusIntervalNs,
+        canvassTimeoutNs,
         /*rngSeed=*/42u);
 
     // ConsensusAgent (plain — no ingress polling needed for 1-node).
@@ -151,9 +169,31 @@ void BrokerNode::buildSingleNodeConsensus() {
 // BrokerNode::buildMultiNodeConsensus — BR-3 path (UDP per-peer + ingress)
 // ---------------------------------------------------------------------------
 void BrokerNode::buildMultiNodeConsensus() {
+    using sclock = std::chrono::steady_clock;
     const NodeId selfId = static_cast<NodeId>(config_.nodeId);
 
-    // Build per-peer UDP sink (publish to each OTHER peer's consensus endpoint).
+    // -----------------------------------------------------------------------
+    // Step A: Create AeronIngress FIRST (subscribe on self's consensus endpoint).
+    // This ensures the subscription is active before peer publications connect,
+    // minimizing dropped canvass frames and SETUP-handshake latency.
+    // -----------------------------------------------------------------------
+    const auto& selfPeer = config_.self();
+    const auto t_ingress_start = sclock::now();
+    aeronIngress_ = std::make_unique<AeronIngress>(
+        aeron_,
+        selfPeer.consensusChannel(),
+        config_.consensusStreamId,
+        *ingressRing_);
+    const auto t_ingress_end = sclock::now();
+    spdlog::debug(
+        "BrokerNode[{}]: AeronIngress resolved in {:.1f}ms",
+        config_.nodeId,
+        std::chrono::duration<double, std::milli>(t_ingress_end - t_ingress_start).count());
+
+    // -----------------------------------------------------------------------
+    // Step B: Build per-peer UDP sink (publish to each OTHER peer's endpoint).
+    // Subscriptions are now live — publication SETUP handshakes can succeed sooner.
+    // -----------------------------------------------------------------------
     std::unordered_map<NodeId, UdpMessageSink::PeerEndpoint> peerEndpoints;
     for (const auto& peer : config_.peers) {
         if (peer.id == config_.nodeId) continue; // skip self
@@ -163,12 +203,27 @@ void BrokerNode::buildMultiNodeConsensus() {
                 config_.consensusStreamId
             };
     }
+    const auto t_sink_start = sclock::now();
     udpSink_ = std::make_unique<UdpMessageSink>(aeron_, peerEndpoints);
+    const auto t_sink_end = sclock::now();
+    spdlog::debug(
+        "BrokerNode[{}]: UdpMessageSink publications resolved in {:.1f}ms",
+        config_.nodeId,
+        std::chrono::duration<double, std::milli>(t_sink_end - t_sink_start).count());
 
     // Publisher over the UDP sink.
     publisher_ = std::make_unique<SbeConsensusPublisher>(*udpSink_);
 
-    // Election (multi-member).
+    // -----------------------------------------------------------------------
+    // Step C: Election with configurable timing from NodeConfig.
+    // -----------------------------------------------------------------------
+    const int64_t electionTimeoutNs =
+        config_.electionTimeoutMs * 1'000'000LL;
+    const int64_t statusIntervalNs =
+        config_.electionStatusIntervalMs * 1'000'000LL;
+    const int64_t canvassTimeoutNs =
+        config_.startupCanvassTimeoutMs * 1'000'000LL;
+
     election_ = std::make_unique<Election>(
         /*isNodeStartup=*/true,
         /*gracefulClosedLeaderId=*/-1,
@@ -181,18 +236,10 @@ void BrokerNode::buildMultiNodeConsensus() {
         *publisher_,
         *nodeStateFile_,
         *termLog_,
-        kElectionTimeoutNs,
-        kStatusIntervalNs,
-        kStartupCanvassTimeoutNs,
+        electionTimeoutNs,
+        statusIntervalNs,
+        canvassTimeoutNs,
         /*rngSeed=*/static_cast<uint64_t>(42u + selfId));
-
-    // AeronIngress — subscribe on THIS node's own consensus endpoint.
-    const auto& selfPeer = config_.self();
-    aeronIngress_ = std::make_unique<AeronIngress>(
-        aeron_,
-        selfPeer.consensusChannel(),
-        config_.consensusStreamId,
-        *ingressRing_);
 
     // Inner ConsensusAgent (drives Election, drains IngressRing).
     agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
@@ -277,17 +324,31 @@ void BrokerNode::stop() {
         return; // idempotent
     }
 
-    // Stop the agent runner (signal + join).
+    // 1. Stop the agent runner (signal + join the duty-cycle thread first).
     if (agentRunner_) {
         agentRunner_->stopAndJoin();
     }
 
-    // Close the Aeron client.
+    // 2. Release consensus objects that own Aeron publications / subscription.
+    //    Must happen BEFORE closing the Aeron client and media driver so the
+    //    client shuts down cleanly (publications/subscriptions deregistered while
+    //    the conductor is still running).
+    nodeAgent_.reset();      // composite agent (holds refs to aeronIngress_ + agent_)
+    udpSink_.reset();        // ExclusivePublications (deregisters from conductor)
+    aeronIngress_.reset();   // Subscription (deregisters from conductor)
+    agent_.reset();          // ConsensusAgent (refs election_ + ingressRing_)
+    election_.reset();
+    publisher_.reset();
+    ingressRing_.reset();
+    nodeStateFile_.reset();
+    termLog_.reset();
+
+    // 3. Close the Aeron client (sends close command to conductor).
     if (aeron_) {
         aeron_.reset();
     }
 
-    // Stop the embedded driver.
+    // 4. Stop the embedded media driver (after client is fully closed).
     stopEmbeddedDriver();
 
     spdlog::info("BrokerNode: node {} stopped", config_.nodeId);
@@ -348,12 +409,46 @@ void BrokerNode::startEmbeddedDriver() {
         }
     });
 
-    // Give the driver a moment to fully initialise before we connect the client.
-    // Known startup-sync approximation: the Aeron C API does not expose a
-    // conductor-ready poll equivalent, so we use a fixed sleep.  50 ms is
-    // empirically sufficient on CI; a proper poll would need aeron_driver_main_do_work
-    // to return a "ready" sentinel, which is not part of the public C API.
-    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    // -----------------------------------------------------------------------
+    // Driver-ready bounded poll: pump aeron_driver_main_do_work() until the
+    // conductor has written its CnC file and is accepting commands, then
+    // wait for Aeron::connect() to succeed.  This replaces the fixed 50 ms
+    // sleep and is bounded so it never spins indefinitely.
+    //
+    // The Aeron C API does not expose a public "conductor ready" predicate, so
+    // we probe by attempting to connect the Aeron client.  connect() returns
+    // nullptr only when the CnC file is not yet present / valid; once it
+    // returns non-null the conductor is ready.
+    //
+    // We warm-pump the driver loop from THIS thread in 1 ms slices (up to
+    // kDriverReadyMaxMs) so the conductor's init work is done before the
+    // Aeron client constructor blocks waiting for the CnC file.
+    // -----------------------------------------------------------------------
+    static constexpr int kDriverReadyMaxMs    = 200; // absolute upper bound
+    static constexpr int kDriverReadySliceUs  = 500; // poll granularity (0.5 ms)
+
+    const std::string aeronDirStr =
+        (fs::path{config_.dataDir} / "aeron").string();
+
+    const auto readyDeadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds{kDriverReadyMaxMs};
+
+    // The CnC file is created by the driver during init. Poll until it appears.
+    while (std::chrono::steady_clock::now() < readyDeadline) {
+        // Pump the driver loop from this thread.
+        aeron_driver_main_do_work(driver_);
+
+        // Check if the CnC file has appeared.
+        const std::string cncPath = aeronDirStr + "/cnc.dat";
+        if (fs::exists(cncPath)) {
+            // Give the conductor a couple more pumps to finish writing the file.
+            aeron_driver_main_do_work(driver_);
+            aeron_driver_main_do_work(driver_);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds{kDriverReadySliceUs});
+    }
 
     spdlog::info("BrokerNode: embedded Aeron driver started (dir={})",
                  aeron_driver_context_get_dir(driverCtx_));

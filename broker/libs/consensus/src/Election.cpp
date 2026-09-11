@@ -132,6 +132,12 @@ int64_t Election::nextDeadlineNs() const noexcept {
             return INT64_MIN;
 
         case ElectionState::Closed:
+            // Multi-node leader in Closed state continues heartbeat for late joiners.
+            if (leaderMember_ != nullptr &&
+                leaderMember_->id == thisMemberId_ &&
+                clusterMembers_.size() > 1) {
+                return timeOfLastUpdateNs_ + electionStatusIntervalNs_;
+            }
             return INT64_MIN;
     }
     return INT64_MIN;
@@ -200,6 +206,7 @@ int Election::doWork(int64_t nowNs)
             workCount += followerReady(nowNs);
             break;
         case ElectionState::Closed:
+            workCount += closedLeaderHeartbeat(nowNs);
             break;
     }
     return workCount;
@@ -863,6 +870,42 @@ void Election::onCommitPosition(int64_t nowNs,
     if (logPositionArg > notifiedCommitPosition_) {
         notifiedCommitPosition_ = logPositionArg;
     }
+}
+
+// ---------------------------------------------------------------------------
+// CLOSED leader heartbeat — post-election NLT broadcast.
+//
+// After the election reaches CLOSED, the leader continues broadcasting
+// NewLeadershipTerm on the heartbeat interval so late-joining nodes that
+// start their own Canvass phase can receive an NLT, call
+// onNewLeadershipTerm(), and converge to the existing leader without waiting
+// for a full re-election.  Followers in CLOSED are silent (no heartbeat).
+//
+// Safety: this does NOT re-open the election.  The NLT carries the SAME
+// leadershipTermId_; late-joiners accept it because nextLeadershipTermId >
+// their initial candidateTermId_(0) → they adopt the existing leader via the
+// B2 path in onNewLeadershipTerm().  Single-leader invariant is unaffected.
+// ---------------------------------------------------------------------------
+int Election::closedLeaderHeartbeat(int64_t nowNs)
+{
+    // Only the leader broadcasts; followers in Closed are silent.
+    if (leaderMember_ == nullptr || leaderMember_->id != thisMemberId_) {
+        return 0;
+    }
+
+    // Single-node clusters have no peers to broadcast to — no work.
+    const bool hasPeers = (clusterMembers_.size() > 1);
+    if (!hasPeers) {
+        return 0;
+    }
+
+    if (!hasUpdateIntervalExpired(nowNs, electionStatusIntervalNs_)) {
+        return 0;
+    }
+
+    timeOfLastUpdateNs_ = nowNs;
+    publishNewLeadershipTermToAll(nowNs);
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

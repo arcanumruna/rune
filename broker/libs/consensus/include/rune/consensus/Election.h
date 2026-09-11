@@ -207,6 +207,11 @@ private:
     int followerLogAwait(int64_t nowNs);      // Election.java:1134-1163 (pass-through, no Aeron image)
     int followerReady(int64_t nowNs);         // Election.java:1166-1179
 
+    // Closed-state leader heartbeat: if this node is the leader, continue
+    // broadcasting NLT on the heartbeat interval so late-joining nodes can
+    // discover the existing leader and converge.  No-op for followers.
+    int closedLeaderHeartbeat(int64_t nowNs);
+
     // -----------------------------------------------------------------------
     // Transition helper — Election.java:1385-1438
     // -----------------------------------------------------------------------

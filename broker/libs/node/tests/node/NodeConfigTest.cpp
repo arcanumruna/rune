@@ -334,4 +334,53 @@ TEST(NodeConfigTest, ClientEndpointChannelFormat) {
     EXPECT_EQ(r.config->clientEndpoint.channel, "aeron:udp?endpoint=rune-2:50001");
 }
 
+// ---------------------------------------------------------------------------
+// Election timing env vars (BR-3b)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, ElectionTimingDefaultsWhenUnset) {
+    auto r = parseNodeConfig(fakeEnv(base3node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    // Defaults: 150 ms / 20 ms / 100 ms
+    EXPECT_EQ(r.config->electionTimeoutMs,        150LL);
+    EXPECT_EQ(r.config->electionStatusIntervalMs,  20LL);
+    EXPECT_EQ(r.config->startupCanvassTimeoutMs,  100LL);
+}
+
+TEST(NodeConfigTest, ElectionTimingOverriddenWhenSet) {
+    auto env = base3node();
+    env["RUNE_ELECTION_TIMEOUT_MS"]         = "1000";
+    env["RUNE_ELECTION_STATUS_INTERVAL_MS"] = "200";
+    env["RUNE_STARTUP_CANVASS_TIMEOUT_MS"]  = "2000";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->electionTimeoutMs,        1000LL);
+    EXPECT_EQ(r.config->electionStatusIntervalMs,  200LL);
+    EXPECT_EQ(r.config->startupCanvassTimeoutMs,  2000LL);
+}
+
+TEST(NodeConfigTest, ElectionTimeoutZeroIsError) {
+    auto env = base3node();
+    env["RUNE_ELECTION_TIMEOUT_MS"] = "0";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_NE(r.error.find("RUNE_ELECTION_TIMEOUT_MS"), std::string::npos);
+}
+
+TEST(NodeConfigTest, ElectionStatusIntervalNonIntIsError) {
+    auto env = base3node();
+    env["RUNE_ELECTION_STATUS_INTERVAL_MS"] = "abc";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_NE(r.error.find("RUNE_ELECTION_STATUS_INTERVAL_MS"), std::string::npos);
+}
+
+TEST(NodeConfigTest, StartupCanvassTimeoutNegativeIsError) {
+    auto env = base3node();
+    env["RUNE_STARTUP_CANVASS_TIMEOUT_MS"] = "-1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_NE(r.error.find("RUNE_STARTUP_CANVASS_TIMEOUT_MS"), std::string::npos);
+}
+
 } // namespace rune::node

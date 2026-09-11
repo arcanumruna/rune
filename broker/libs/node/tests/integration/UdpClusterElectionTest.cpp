@@ -1,12 +1,21 @@
-// UdpClusterElectionTest.cpp — 3-node consensus over aeron:udp (BR-3).
+// UdpClusterElectionTest.cpp — 3-node consensus over aeron:udp (BR-3, BR-3b).
 //
 // Tests:
 //   1. ThreeNodeUdpCluster_ElectsOneLeader:
 //      Starts 3 BrokerNodes each with their own embedded Aeron driver (distinct
-//      temp dirs), all on 127.0.0.1 with distinct consensus UDP ports.
-//      Waits for all three to report a leader within 10 s.
+//      temp dirs), all on 127.0.0.1 with dynamically-discovered free UDP ports.
+//      Waits for all three to report a leader within 5 s.
 //      Asserts exactly ONE node reports isLeader() and all three agree on the
-//      same leaderId().
+//      same leaderId(), which must be a valid member id (0, 1, or 2).
+//      Loops 5 times to confirm no split-brain under reduced timeouts.
+//
+//   2. ThreeNodeUdpCluster_LateJoin:
+//      Nodes 0 and 1 start and elect a leader; node 2 joins 300 ms later.
+//      All three must converge to the same leader.
+//
+// Port discovery: bind UDP socket to 127.0.0.1:0, read assigned port, close,
+// use. Accepts the tiny TOCTOU window — ports are ephemeral and the test
+// binds them immediately after discovery.
 //
 // Unique temp paths: getpid() + atomic counter.
 // All waits hard-capped with ASSERT (no infinite spin).
@@ -19,9 +28,15 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+// UDP port discovery
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -54,55 +69,169 @@ struct TempDir {
 };
 
 // ---------------------------------------------------------------------------
+// discoverFreeUdpPort — bind to 127.0.0.1:0, read the assigned port, close.
+// Accepts the small TOCTOU window; call immediately before use.
+// ---------------------------------------------------------------------------
+static uint16_t discoverFreeUdpPort() {
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        throw std::runtime_error("UdpClusterElectionTest: socket() failed");
+    }
+
+    struct sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = 0;          // let OS pick
+    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
+
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::close(fd);
+        throw std::runtime_error("UdpClusterElectionTest: bind() for port discovery failed");
+    }
+
+    socklen_t addrLen = sizeof(addr);
+    if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) < 0) {
+        ::close(fd);
+        throw std::runtime_error("UdpClusterElectionTest: getsockname() failed");
+    }
+
+    // sin_port is network byte order; swap manually to avoid macro issues.
+    const uint16_t netPort = addr.sin_port;
+    const uint16_t port =
+        static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
+    ::close(fd);
+    return port;
+}
+
+// ---------------------------------------------------------------------------
+// discoverFreePorts — discover N distinct free UDP ports.
+// ---------------------------------------------------------------------------
+static std::vector<uint16_t> discoverFreePorts(int n) {
+    std::vector<uint16_t> ports;
+    ports.reserve(n);
+    while (static_cast<int>(ports.size()) < n) {
+        uint16_t p = discoverFreeUdpPort();
+        // Reject duplicates (highly unlikely but defensive).
+        bool dup = false;
+        for (uint16_t existing : ports) { if (existing == p) { dup = true; break; } }
+        if (!dup) ports.push_back(p);
+    }
+    return ports;
+}
+
+// ---------------------------------------------------------------------------
 // Build a 3-node NodeConfig for a given node index (0, 1, or 2).
 // All 3 nodes have the same peer list but each reports a different nodeId.
-// Ports: consensus 40111+nodeId (distinct), client 50101+nodeId (distinct).
+// Consensus ports supplied externally (discovered at test start).
 // ---------------------------------------------------------------------------
 static NodeConfig makeThreeNodeConfig(
     int nodeId,
     const fs::path& dataDir,
-    int baseConsensusPort = 40211,  // Use high ports to avoid conflicts with BrokerNodeTest
-    int baseClientPort    = 50201)
+    const std::vector<uint16_t>& consensusPorts,  // 3 ports, one per node
+    const std::vector<uint16_t>& clientPorts)     // 3 ports, one per node
 {
     NodeConfig cfg;
     cfg.nodeId            = nodeId;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;
 
+    // Fast-but-safe election timing for co-located test clusters (BR-3b).
+    // These values are already the NodeConfig defaults; set explicitly for clarity.
+    cfg.electionTimeoutMs        = 150;
+    cfg.electionStatusIntervalMs =  20;
+    cfg.startupCanvassTimeoutMs  = 100;
+
     // All 3 peers on 127.0.0.1.
     for (int i = 0; i < 3; ++i) {
         PeerConfig p;
         p.id            = i;
         p.host          = "127.0.0.1";
-        p.consensusPort = static_cast<uint16_t>(baseConsensusPort + i);
+        p.consensusPort = consensusPorts[static_cast<std::size_t>(i)];
         cfg.peers.push_back(p);
     }
 
     cfg.clientEndpoint.channel =
         "aeron:udp?endpoint=127.0.0.1:" +
-        std::to_string(baseClientPort + nodeId);
+        std::to_string(clientPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 1;
 
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// Helper: assert single-leader invariants on 3 started nodes.
+// Used by the loop test so the assertion logic is not duplicated.
+// ---------------------------------------------------------------------------
+static void assertSingleLeader(
+    BrokerNode& node0, BrokerNode& node1, BrokerNode& node2,
+    const NodeConfig& cfg0, const NodeConfig& cfg1, const NodeConfig& cfg2,
+    int iteration = 0)
+{
+    // Wait for all three nodes to know the leader (deadline: 5 s).
+    const auto kDeadline = 5s;
+
+    bool ok0 = node0.awaitLeader(kDeadline);
+    bool ok1 = node1.awaitLeader(kDeadline);
+    bool ok2 = node2.awaitLeader(kDeadline);
+
+    ASSERT_TRUE(ok0) << "[iter " << iteration << "] node0 did not converge to a leader";
+    ASSERT_TRUE(ok1) << "[iter " << iteration << "] node1 did not converge to a leader";
+    ASSERT_TRUE(ok2) << "[iter " << iteration << "] node2 did not converge to a leader";
+
+    rune::consensus::NodeId lid0 = node0.leaderId();
+    rune::consensus::NodeId lid1 = node1.leaderId();
+    rune::consensus::NodeId lid2 = node2.leaderId();
+
+    // (a) Each leaderId must be a valid member id (0, 1, or 2).
+    EXPECT_GE(lid0, 0) << "[iter " << iteration << "] node0 leaderId not in {0,1,2}: " << lid0;
+    EXPECT_LE(lid0, 2) << "[iter " << iteration << "] node0 leaderId not in {0,1,2}: " << lid0;
+    EXPECT_GE(lid1, 0) << "[iter " << iteration << "] node1 leaderId not in {0,1,2}: " << lid1;
+    EXPECT_LE(lid1, 2) << "[iter " << iteration << "] node1 leaderId not in {0,1,2}: " << lid1;
+    EXPECT_GE(lid2, 0) << "[iter " << iteration << "] node2 leaderId not in {0,1,2}: " << lid2;
+    EXPECT_LE(lid2, 2) << "[iter " << iteration << "] node2 leaderId not in {0,1,2}: " << lid2;
+
+    // All three must agree on the same leader.
+    EXPECT_EQ(lid0, lid1)
+        << "[iter " << iteration << "] node0 and node1 disagree: " << lid0 << " vs " << lid1;
+    EXPECT_EQ(lid1, lid2)
+        << "[iter " << iteration << "] node1 and node2 disagree: " << lid1 << " vs " << lid2;
+
+    // Exactly one node must report isLeader() == true.
+    int leaderCount = 0;
+    if (node0.isLeader()) ++leaderCount;
+    if (node1.isLeader()) ++leaderCount;
+    if (node2.isLeader()) ++leaderCount;
+
+    EXPECT_EQ(leaderCount, 1)
+        << "[iter " << iteration << "] Expected exactly 1 leader, got " << leaderCount
+        << " (leaderId=" << lid0 << ")";
+
+    // The self-reported leader must match the agreed leaderId.
+    rune::consensus::NodeId selfReportedLeader = -1;
+    if (node0.isLeader()) selfReportedLeader = static_cast<rune::consensus::NodeId>(cfg0.nodeId);
+    if (node1.isLeader()) selfReportedLeader = static_cast<rune::consensus::NodeId>(cfg1.nodeId);
+    if (node2.isLeader()) selfReportedLeader = static_cast<rune::consensus::NodeId>(cfg2.nodeId);
+
+    EXPECT_EQ(selfReportedLeader, lid0)
+        << "[iter " << iteration << "] Leader self-reports id=" << selfReportedLeader
+        << " but peers see leaderId=" << lid0;
+}
+
 } // namespace
 
 // ===========================================================================
-// TEST: 3-node UDP cluster elects exactly one leader; all agree on leaderId
+// TEST 1: 3-node UDP cluster elects exactly one leader; looped 5x (no split-brain)
 // ===========================================================================
 TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_ElectsOneLeader) {
     // Unique dirs per run (pid + counter).
     TempDir dir0{"n0_"}, dir1{"n1_"}, dir2{"n2_"};
 
-    // Build configs — each node has all 3 peers in its peer list.
-    // Use unique port range so this test doesn't clash with BrokerNodeTest's ports.
-    const int BASE_CONSENSUS = 40311 + (static_cast<int>(::getpid()) % 100) * 3;
-    const int BASE_CLIENT    = 50311 + (static_cast<int>(::getpid()) % 100) * 3;
+    // Discover 6 free UDP ports at test start (3 consensus + 3 client).
+    const auto cPorts = discoverFreePorts(3);
+    const auto kPorts = discoverFreePorts(3);
 
-    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, BASE_CONSENSUS, BASE_CLIENT);
-    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, BASE_CONSENSUS, BASE_CLIENT);
-    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, BASE_CONSENSUS, BASE_CLIENT);
+    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
+    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
+    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
 
     // Construct all 3 nodes.
     BrokerNode node0{cfg0};
@@ -114,51 +243,88 @@ TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_ElectsOneLeader) {
     node1.start();
     node2.start();
 
-    // --- Wait for ALL nodes to report a leader (hard deadline: 10 s) ---
-    // awaitLeader() returns true as soon as leaderId() >= 0 (any node, leader OR follower).
-    const auto kDeadline = 10s;
-
-    bool ok0 = node0.awaitLeader(kDeadline);
-    bool ok1 = node1.awaitLeader(kDeadline);
-    bool ok2 = node2.awaitLeader(kDeadline);
-
-    // Hard assertions — do NOT proceed if any node timed out (no fake pass).
-    ASSERT_TRUE(ok0) << "node0 did not converge to a leader within " << kDeadline.count() << " s";
-    ASSERT_TRUE(ok1) << "node1 did not converge to a leader within " << kDeadline.count() << " s";
-    ASSERT_TRUE(ok2) << "node2 did not converge to a leader within " << kDeadline.count() << " s";
-
-    // Query each node's view of the leader.
-    rune::consensus::NodeId lid0 = node0.leaderId();
-    rune::consensus::NodeId lid1 = node1.leaderId();
-    rune::consensus::NodeId lid2 = node2.leaderId();
-
-    // All three must agree on the same leader.
-    EXPECT_EQ(lid0, lid1)
-        << "node0 and node1 disagree on leader: " << lid0 << " vs " << lid1;
-    EXPECT_EQ(lid1, lid2)
-        << "node1 and node2 disagree on leader: " << lid1 << " vs " << lid2;
-
-    // Exactly one node must report isLeader() == true.
-    int leaderCount = 0;
-    if (node0.isLeader()) ++leaderCount;
-    if (node1.isLeader()) ++leaderCount;
-    if (node2.isLeader()) ++leaderCount;
-
-    EXPECT_EQ(leaderCount, 1)
-        << "Expected exactly 1 leader, got " << leaderCount
-        << " (leaderId=" << lid0 << ")";
-
-    // The self-reported leader must match the agreed leaderId.
-    rune::consensus::NodeId selfReportedLeader = -1;
-    if (node0.isLeader()) selfReportedLeader = static_cast<rune::consensus::NodeId>(cfg0.nodeId);
-    if (node1.isLeader()) selfReportedLeader = static_cast<rune::consensus::NodeId>(cfg1.nodeId);
-    if (node2.isLeader()) selfReportedLeader = static_cast<rune::consensus::NodeId>(cfg2.nodeId);
-
-    EXPECT_EQ(selfReportedLeader, lid0)
-        << "Leader self-reports id=" << selfReportedLeader
-        << " but peers see leaderId=" << lid0;
+    // Assert single-leader invariants (includes leaderId-valid + agree checks).
+    assertSingleLeader(node0, node1, node2, cfg0, cfg1, cfg2, /*iteration=*/0);
 
     // Clean stop — must not hang (bounded by ctest TIMEOUT).
+    node0.stop();
+    node1.stop();
+    node2.stop();
+}
+
+// ===========================================================================
+// TEST 2: Safety loop — elect 5 independent times; no split-brain allowed.
+// Each iteration uses fresh dirs + freshly-discovered ports.
+// ===========================================================================
+TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_NoSplitBrain_LoopedFiveTimes) {
+    static constexpr int kIterations = 5;
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        SCOPED_TRACE("iteration " + std::to_string(iter));
+
+        TempDir dir0{"lp0_"}, dir1{"lp1_"}, dir2{"lp2_"};
+
+        // Fresh ports each iteration — eliminates port-reuse races.
+        const auto cPorts = discoverFreePorts(3);
+        const auto kPorts = discoverFreePorts(3);
+
+        NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
+        NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
+        NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+
+        BrokerNode node0{cfg0};
+        BrokerNode node1{cfg1};
+        BrokerNode node2{cfg2};
+
+        node0.start();
+        node1.start();
+        node2.start();
+
+        assertSingleLeader(node0, node1, node2, cfg0, cfg1, cfg2, iter);
+
+        node0.stop();
+        node1.stop();
+        node2.stop();
+    }
+}
+
+// ===========================================================================
+// TEST 3: Late-joining node converges to existing leader.
+// Nodes 0 and 1 start; node 2 joins ~300 ms later.
+// All must agree on the same leader.
+// ===========================================================================
+TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_LateJoin_Converges) {
+    TempDir dir0{"lj0_"}, dir1{"lj1_"}, dir2{"lj2_"};
+
+    const auto cPorts = discoverFreePorts(3);
+    const auto kPorts = discoverFreePorts(3);
+
+    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
+    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
+    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+
+    BrokerNode node0{cfg0};
+    BrokerNode node1{cfg1};
+    BrokerNode node2{cfg2};
+
+    // Start nodes 0 and 1 first — they will elect a leader between themselves.
+    node0.start();
+    node1.start();
+
+    // Wait a bit so 0+1 have time to start their election round.
+    std::this_thread::sleep_for(300ms);
+
+    // Node 2 joins late.
+    node2.start();
+
+    // All three must converge to a single leader.
+    assertSingleLeader(node0, node1, node2, cfg0, cfg1, cfg2, /*iteration=*/0);
+
+    // Confirm the late-joiner (node2) reports a valid leader id.
+    const rune::consensus::NodeId lid2 = node2.leaderId();
+    EXPECT_GE(lid2, 0) << "Late-joining node2 did not acquire a valid leaderId";
+    EXPECT_LE(lid2, 2) << "Late-joining node2 leaderId out of range: " << lid2;
+
     node0.stop();
     node1.stop();
     node2.stop();
