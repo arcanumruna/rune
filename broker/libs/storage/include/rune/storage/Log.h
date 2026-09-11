@@ -11,6 +11,11 @@ public:
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     int64_t recover();
+    /// Truncate all records with baseOffset >= truncateOffset.
+    /// The log's logEndOffset is reset to truncateOffset.
+    /// Segments entirely beyond truncateOffset are deleted.
+    /// The active segment is physically truncated at the correct byte boundary.
+    void truncateTo(int64_t truncateOffset);
     std::vector<int64_t> segmentBaseOffsets() const;
     int64_t totalBytes() const;
     int deleteOldSegments(int64_t retainBytes);
