@@ -506,3 +506,96 @@ TEST(OffsetStore, LongStringsDurableAcrossReopen) {
     EXPECT_EQ(co->offset, 77777);
     EXPECT_EQ(co->metadata, longMeta);
 }
+
+// ===========================================================================
+// 12. CRC byte-flip — middle byte of record body corrupted
+//
+// This is the regression test for T1 (audit): torn-tail tests previously
+// only ftruncated, never flipped a byte.  The CRC path in replayAndTruncate
+// must reject a record whose body byte was corrupted (magic and length still
+// match; only the checksum fails).
+// ===========================================================================
+
+/// Write N commits, then flip one body byte of the last complete record.
+/// The body starts at offset kFixedHeaderSize (36) inside each record.
+/// We flip a byte at position (fileSize - totalLength_of_last_record + 36)
+/// — the first byte of the group-id field — leaving magic/length intact so
+/// the CRC path is actually exercised (not just the truncation path).
+static void commitThenFlipBodyByte(const fs::path& path, int nCommits)
+{
+    // Write the records.
+    {
+        OffsetStore store(path.string());
+        for (int i = 0; i < nCommits; ++i) {
+            store.commit("grp", tp("topicA", i), i * 10LL, "meta", i * 100LL);
+        }
+    }
+
+    // Determine the file size and the start of the last record.
+    // Each record for group="grp" (3 bytes), topic="topicA" (6 bytes),
+    // meta="meta" (4 bytes):
+    //   totalLength = 36 + 3 + 6 + 4 + 4 = 53 bytes
+    // We open the file, seek to (fileSize - 53 + 36) and flip a byte.
+    auto fileSize = static_cast<off_t>(fs::file_size(path));
+    ASSERT_GT(fileSize, 0);
+
+    // We don't hardcode the record size — read it from the last-record header.
+    int fd = ::open(path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+
+    // Walk forward from offset 0 to find where the last record starts.
+    // Each record has its totalLength at bytes [4..7].
+    off_t pos = 0;
+    off_t lastRecordStart = 0;
+    while (pos < fileSize) {
+        uint32_t magic = 0, totalLen = 0;
+        if (::pread(fd, &magic, 4, pos) != 4) break;
+        if (::pread(fd, &totalLen, 4, pos + 4) != 4) break;
+        // Little-endian: on little-endian hosts this reads directly.
+        // (We target x86/ARM; safe for this test.)
+        if (static_cast<off_t>(pos + totalLen) > fileSize) break;
+        lastRecordStart = pos;
+        pos += static_cast<off_t>(totalLen);
+    }
+
+    // Flip one byte inside the body (offset 36 from record start) of the
+    // last record.  This leaves magic, length, and all header fields intact
+    // but makes the CRC mismatch → the recovery must detect it and drop the
+    // record.
+    off_t flipPos = lastRecordStart + 36; // first byte of group-id field
+    uint8_t b = 0;
+    ssize_t nr = ::pread(fd, &b, 1, flipPos);
+    ASSERT_EQ(nr, 1);
+    b ^= 0xFF;
+    ssize_t nw = ::pwrite(fd, &b, 1, flipPos);
+    ASSERT_EQ(nw, 1);
+    ::close(fd);
+}
+
+TEST(OffsetStore, CrcByteFlip_CorruptedLastRecordDropped) {
+    TempOffset t("crcflip");
+    // Write 3 commits, corrupt the last one's body byte.
+    ASSERT_NO_FATAL_FAILURE(commitThenFlipBodyByte(t.path, 3));
+
+    // Reopen — must not throw and must drop the corrupted last record.
+    OffsetStore store2(t.path.string());
+
+    // The first 2 records (partition 0 and 1) must survive.
+    EXPECT_TRUE(store2.fetch("grp", tp("topicA", 0)).has_value())
+        << "Record 0 (clean) must survive CRC recovery";
+    EXPECT_TRUE(store2.fetch("grp", tp("topicA", 1)).has_value())
+        << "Record 1 (clean) must survive CRC recovery";
+
+    // The last record (partition 2) had its body corrupted — must be absent.
+    EXPECT_FALSE(store2.fetch("grp", tp("topicA", 2)).has_value())
+        << "Record 2 (CRC-corrupted) must be dropped by recovery";
+}
+
+TEST(OffsetStore, CrcByteFlip_StoreIsWritableAfterRecovery) {
+    TempOffset t("crcflip2");
+    ASSERT_NO_FATAL_FAILURE(commitThenFlipBodyByte(t.path, 2));
+    OffsetStore store2(t.path.string());
+    // Must be able to commit after CRC-based recovery.
+    EXPECT_NO_THROW(store2.commit("grp", tp("topicA", 9), 99, "new", 9000));
+    EXPECT_EQ(store2.fetch("grp", tp("topicA", 9))->offset, 99);
+}

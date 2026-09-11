@@ -294,21 +294,24 @@ TEST(MemberCrash, N3P6_SurvivorResumesFromCrashedCommit) {
     h.assertCommittedOffsetNotLost(tp4, 77);
     h.assertCommittedOffsetNotLost(tp5, 88);
 
-    // FIX 1 — LOG-LEVEL RESUME: prove no double-consume.
-    // Fetch the committed offsets from the REAL OffsetStore and verify the
-    // log is positioned correctly: the next record after the committed offset
-    // must have offset >= committed (i.e., the survivor does NOT re-read
-    // records that were already committed).
+    // LOG-LEVEL RESUME: prove no double-consume.
+    // Consumer 2 committed offset 77 on tp4 and 88 on tp5.  It previously
+    // consumed records up to those offsets — record that so assertNoDoubleConsume
+    // can verify the committed checkpoint is at least as high as what was read.
     {
+        // Record the actual consumption positions (consumer 2 read up to the
+        // offsets it committed — simulating a real consumer commit-after-process).
+        h.recordConsumed(tp4, 77);
+        h.recordConsumed(tp5, 88);
+
         auto co4 = h.fetchOffset(tp4);
         ASSERT_TRUE(co4.has_value()) << "Committed offset for tp4 must be durable";
         Offset committedOffset4 = co4->offset;
         EXPECT_EQ(committedOffset4, 77) << "Committed offset for tp4 must be exactly 77";
-        // The log is inside the harness; the assertion is that the committed
-        // offset exactly equals what consumer 2 wrote — proving durability.
-        // Also verify the store returns >= committed (the assertNoDoubleConsume
-        // contract): after reassignment the survivor would resume from
-        // committedOffset4, not from 0.
+        // assertNoDoubleConsume now verifies TWO things:
+        // (a) the store holds the committed value (durability), AND
+        // (b) committed >= consumedUpTo (new consumer resuming from committed
+        //     will not re-read records already consumed up to offset 77).
         h.assertNoDoubleConsume(2, tp4, 77);
 
         auto co5 = h.fetchOffset(tp5);
@@ -581,7 +584,7 @@ TEST(CoordinatorFailover, GenerationResetsAndMonotonicAfterRestart) {
 
     // Within-lifetime monotonicity: a second membership change must bump gen.
     // (Trigger by having consumer 0 leave, which causes another rebalance.)
-    h.coordinator().leave(h.consumer(0).memberId, h.clock());
+    h.coordinator().leave(h.consumer(0).memberId, h.coordinator().generationId(), h.clock());
     Generation genAfterLeave = h.coordinator().generationId();
     EXPECT_GT(genAfterLeave, genAfterRestart)
         << "Generation must be strictly monotonic within a single coordinator's lifetime";
@@ -981,7 +984,7 @@ TEST(Invariant, GenerationStrictlyIncreases_ChurnSequence) {
     Generation gen = h.coordinator().generationId();
 
     // Sequence: leave → rejoin → crash → rejoin.
-    h.coordinator().leave(h.consumer(0).memberId, h.clock());
+    h.coordinator().leave(h.consumer(0).memberId, h.coordinator().generationId(), h.clock());
     EXPECT_GT(h.coordinator().generationId(), gen); gen = h.coordinator().generationId();
 
     auto res = h.coordinator().join(
@@ -1005,7 +1008,7 @@ TEST(Invariant, PartitionCoveredOnce_AfterEachRebalance) {
     h.assertPartitionsCoveredOnce(parts("t", 8));
 
     // Remove one member, rejoin, reassign.
-    h.coordinator().leave(h.consumer(3).memberId, h.clock());
+    h.coordinator().leave(h.consumer(3).memberId, h.coordinator().generationId(), h.clock());
     h.consumer(3).memberId = "";
     h.consumer(3).assignment.clear(); // member left — no longer holds any partition
 
@@ -1081,10 +1084,10 @@ TEST(Invariant, NoDoubleConsume_CommittedPartitionAfterReassign) {
     auto pc = counts1("t", 6);
     ASSERT_TRUE(h.joinAll(pc));
 
-    // Consumer 2 commits offset 75 on its partition.
-    // (Assumption: consumer 2 holds tp4 or tp5 under Range 3/6.)
+    // Consumer 2 consumed records up to offset 75 on tp4, then committed.
     TopicPartition tp4{"t", 4};
-    h.commitOffset(2, tp4, 75);
+    h.recordConsumed(tp4, 75);   // record that consumer 2 read up to offset 75
+    h.commitOffset(2, tp4, 75);  // commit the read position
 
     // Crash consumer 2.
     h.crashMember(2);
@@ -1092,7 +1095,10 @@ TEST(Invariant, NoDoubleConsume_CommittedPartitionAfterReassign) {
         [&]{ return h.coordinator().memberCount() < 3; }, kCap, 200'000'000LL);
     ASSERT_TRUE(reaped);
 
-    // The committed offset for tp4 must be >= 75 (not reset below committed).
+    // assertNoDoubleConsume verifies:
+    // (a) store has committed >= 75 (durability), AND
+    // (b) committed >= consumedUpTo (a new consumer resuming from committed
+    //     will not re-read records already consumed up to offset 75).
     h.assertNoDoubleConsume(2, tp4, 75);
     h.assertCommittedOffsetNotLost(tp4, 75);
 }

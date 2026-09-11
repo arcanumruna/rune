@@ -48,8 +48,10 @@
 
 #include <gtest/gtest.h>
 #include <rune/coordination/GroupCoordinator.h>
+#include <rune/coordination/Assignor.h>
 
 #include <cassert>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -280,7 +282,7 @@ TEST(GroupCoordinator, LeaveShrinksMembershipAndBumpsGeneration) {
     auto r2 = gc.join("", kDefaultTimeoutMs, {}, 0);
     ASSERT_EQ(gc.memberCount(), 2u);
     Generation genBefore = gc.generationId();
-    gc.leave(r2.memberId, 1'000);
+    gc.leave(r2.memberId, gc.generationId(), 1'000);
     EXPECT_EQ(gc.memberCount(), 1u);
     EXPECT_GT(gc.generationId(), genBefore);
 }
@@ -301,7 +303,7 @@ TEST(GroupCoordinator, LeaderLeavesNewLeaderElected) {
     // Identify the non-leader.
     std::string remaining = (r1.memberId == oldLeaderId) ? r2.memberId : r1.memberId;
 
-    gc.leave(oldLeaderId, 1'000);
+    gc.leave(oldLeaderId, gc.generationId(), 1'000);
     EXPECT_EQ(gc.memberCount(), 1u);
     // New leader should be the only remaining member.
     EXPECT_EQ(gc.leaderId(), remaining);
@@ -318,7 +320,7 @@ TEST(GroupCoordinator, LeaderElectionDeterministic_AlphabeticallySmallest) {
     EXPECT_EQ(gc.leaderId(), "member-a");
     auto rB = gc.join("member-b", kDefaultTimeoutMs, {}, 0);
     EXPECT_EQ(gc.leaderId(), "member-a"); // still smallest
-    gc.leave("member-a", 1'000);
+    gc.leave("member-a", gc.generationId(), 1'000);
     EXPECT_EQ(gc.leaderId(), "member-b"); // next smallest
 }
 
@@ -330,7 +332,7 @@ TEST(GroupCoordinator, LastMemberLeavesTransitionsToEmpty) {
     GroupCoordinator gc("test-group", 0);
     auto r = gc.join("", kDefaultTimeoutMs, {}, 0);
     Generation genBefore = gc.generationId();
-    gc.leave(r.memberId, 1'000);
+    gc.leave(r.memberId, gc.generationId(), 1'000);
     EXPECT_EQ(gc.state(), GroupState::Empty);
     EXPECT_TRUE(gc.isEmpty());
     EXPECT_GT(gc.generationId(), genBefore);
@@ -346,7 +348,7 @@ TEST(GroupCoordinator, LeaveUnknownMemberNoOp) {
     auto r = gc.join("", kDefaultTimeoutMs, {}, 0);
     Generation genBefore = gc.generationId();
     std::size_t countBefore = gc.memberCount();
-    gc.leave("not-a-member", 0);
+    gc.leave("not-a-member", gc.generationId(), 0);
     EXPECT_EQ(gc.generationId(), genBefore);
     EXPECT_EQ(gc.memberCount(), countBefore);
 }
@@ -365,7 +367,7 @@ TEST(GroupCoordinator, GenerationMonotonicAcrossChurn) {
     auto r2 = gc.join("member-y", kDefaultTimeoutMs, {}, 0);
     EXPECT_EQ(gc.generationId(), 2); // join 2
 
-    gc.leave("member-y", 1'000);
+    gc.leave("member-y", gc.generationId(), 1'000);
     EXPECT_EQ(gc.generationId(), 3); // leave
 
     // Expire member-x.
@@ -484,7 +486,7 @@ TEST(GroupCoordinator, LeaderAlphabeticallySmallestAfterChurn) {
     gc.join("member-a", kDefaultTimeoutMs, {}, 0);
     EXPECT_EQ(gc.leaderId(), "member-a");
 
-    gc.leave("member-a", 1'000);
+    gc.leave("member-a", gc.generationId(), 1'000);
     EXPECT_EQ(gc.leaderId(), "member-m");
 }
 
@@ -610,10 +612,10 @@ TEST(GroupCoordinator, GenerationExactValuesChurn) {
     gc.join("b", kDefaultTimeoutMs, {}, 0);
     EXPECT_EQ(gc.generationId(), 2);
 
-    gc.leave("b", 0);
+    gc.leave("b", gc.generationId(), 0);
     EXPECT_EQ(gc.generationId(), 3);
 
-    gc.leave("a", 0); // last → Empty, also bumps
+    gc.leave("a", gc.generationId(), 0); // last → Empty, also bumps
     EXPECT_EQ(gc.generationId(), 4);
 
     gc.join("c", kDefaultTimeoutMs, {}, 0);
@@ -639,8 +641,8 @@ TEST(GroupCoordinator, StateEmptyAfterAllLeave) {
     GroupCoordinator gc("test-group", 0);
     auto r1 = gc.join("", kDefaultTimeoutMs, {}, 0);
     auto r2 = gc.join("", kDefaultTimeoutMs, {}, 0);
-    gc.leave(r1.memberId, 0);
-    gc.leave(r2.memberId, 0);
+    gc.leave(r1.memberId, gc.generationId(), 0);
+    gc.leave(r2.memberId, gc.generationId(), 0);
     EXPECT_EQ(gc.state(), GroupState::Empty);
 }
 
@@ -749,10 +751,10 @@ TEST(GroupCoordinator, GenerationNeverDecreases) {
     auto r2 = gc.join("y", kDefaultTimeoutMs, {}, 0);
     EXPECT_GE(gc.generationId(), prev); prev = gc.generationId();
 
-    gc.leave("y", 0);
+    gc.leave("y", gc.generationId(), 0);
     EXPECT_GE(gc.generationId(), prev); prev = gc.generationId();
 
-    gc.leave("x", 0);
+    gc.leave("x", gc.generationId(), 0);
     EXPECT_GE(gc.generationId(), prev); prev = gc.generationId();
 
     gc.join("z", kDefaultTimeoutMs, {}, 0);
@@ -769,7 +771,7 @@ TEST(GroupCoordinator, LeaderIdEmptyWhenGroupEmpty) {
 
     // After all members leave.
     auto r = gc.join("", kDefaultTimeoutMs, {}, 0);
-    gc.leave(r.memberId, 0);
+    gc.leave(r.memberId, gc.generationId(), 0);
     EXPECT_TRUE(gc.leaderId().empty());
 }
 
@@ -780,7 +782,7 @@ TEST(GroupCoordinator, LeaderIdEmptyWhenGroupEmpty) {
 TEST(GroupCoordinator, JoinAfterEmptyStartsFresh) {
     GroupCoordinator gc("test-group", 0);
     auto r1 = gc.join("member-1", kDefaultTimeoutMs, {}, 0);
-    gc.leave(r1.memberId, 0);
+    gc.leave(r1.memberId, gc.generationId(), 0);
     ASSERT_EQ(gc.state(), GroupState::Empty);
     Generation genAfterEmpty = gc.generationId();
 
@@ -837,4 +839,162 @@ TEST(GroupCoordinator, JoinResultGenerationMatchesCoordinatorGeneration) {
 
     auto r2 = gc.join("m2", kDefaultTimeoutMs, {}, 0);
     EXPECT_EQ(r2.generationId, gc.generationId());
+}
+
+// ===========================================================================
+// AUDIT: C1 regression — leave() with stale generationId is a no-op
+// A zombie consumer that was fenced out (heartbeat → stale) must NOT be able
+// to force a rebalance of the live group via a stale-generation leave.
+// ===========================================================================
+
+TEST(GroupCoordinator, StaleGenerationLeave_IsNoOp) {
+    GroupCoordinator gc("test-group", 0);
+    auto r1 = gc.join("member-a", kDefaultTimeoutMs, {}, 0);
+    auto r2 = gc.join("member-b", kDefaultTimeoutMs, {}, 0);
+
+    // Both members form a stable group (PreparingRebalance after two joins).
+    // The current generationId is the live one.
+    Generation liveGen  = gc.generationId();
+    Generation staleGen = liveGen - 1;
+    ASSERT_GE(liveGen, 1); // sanity
+
+    std::size_t membersBefore = gc.memberCount();
+    GroupState  stateBefore   = gc.state();
+
+    // A stale-generation leave must be silently ignored.
+    gc.leave("member-b", staleGen, 1'000);
+
+    EXPECT_EQ(gc.memberCount(), membersBefore)
+        << "Stale-generation leave must not shrink membership";
+    EXPECT_EQ(gc.state(), stateBefore)
+        << "Stale-generation leave must not trigger a rebalance";
+    EXPECT_EQ(gc.generationId(), liveGen)
+        << "Stale-generation leave must not bump generationId";
+}
+
+TEST(GroupCoordinator, CurrentGenerationLeave_ShrinksMembership) {
+    GroupCoordinator gc("test-group", 0);
+    gc.join("member-a", kDefaultTimeoutMs, {}, 0);
+    gc.join("member-b", kDefaultTimeoutMs, {}, 0);
+    Generation liveGen = gc.generationId();
+
+    // A correctly-fenced leave (current gen) must take effect.
+    gc.leave("member-b", liveGen, 1'000);
+    EXPECT_EQ(gc.memberCount(), 1u)
+        << "Current-generation leave must shrink membership";
+    EXPECT_GT(gc.generationId(), liveGen)
+        << "Current-generation leave must bump generationId";
+}
+
+// ===========================================================================
+// AUDIT: S4 regression — memberIds are truly unique across coordinator instances
+// Two GroupCoordinator instances must never mint the same memberId.
+// ===========================================================================
+
+TEST(GroupCoordinator, GeneratedMemberIds_UniqueWithinInstance) {
+    GroupCoordinator gc("grp", 0);
+    auto r1 = gc.join("", kDefaultTimeoutMs, {}, 0);
+    auto r2 = gc.join("", kDefaultTimeoutMs, {}, 0);
+    auto r3 = gc.join("", kDefaultTimeoutMs, {}, 0);
+
+    EXPECT_NE(r1.memberId, r2.memberId) << "memberIds must be unique within one instance";
+    EXPECT_NE(r1.memberId, r3.memberId);
+    EXPECT_NE(r2.memberId, r3.memberId);
+}
+
+TEST(GroupCoordinator, GeneratedMemberIds_UniqueAcrossInstances) {
+    // Two coordinators with the same groupId must not mint identical memberIds.
+    GroupCoordinator gc1("grp", 0);
+    GroupCoordinator gc2("grp", 0);
+
+    auto r1 = gc1.join("", kDefaultTimeoutMs, {}, 0);
+    auto r2 = gc2.join("", kDefaultTimeoutMs, {}, 0);
+
+    EXPECT_NE(r1.memberId, r2.memberId)
+        << "Two coordinator instances must produce distinct memberIds even for same groupId";
+}
+
+// ===========================================================================
+// AUDIT: S3 regression — leader election is stable across power-of-ten boundaries
+// Members whose sequence numbers span e.g. 9→10 must still elect the
+// numerically-smallest member, not the lexicographically-smallest.
+// ===========================================================================
+
+TEST(GroupCoordinator, LeaderElection_NumericallyCorrectAcrossPowerOfTen) {
+    // Build a scenario with explicit (non-generated) memberIds whose unpadded
+    // decimal sorting would be wrong lexicographically.
+    // "test-group-2"  < "test-group-10" numerically but
+    // "test-group-10" < "test-group-2"  lexicographically.
+    GroupCoordinator gc("test-group", 0);
+
+    // Joins: first add "test-group-10" then "test-group-2".
+    gc.join("test-group-10", kDefaultTimeoutMs, {}, 0);
+    gc.join("test-group-2",  kDefaultTimeoutMs, {}, 0);
+
+    // Numerically "test-group-2" < "test-group-10" (the 2 is earlier in the
+    // sequence).  The leader must be "test-group-2".
+    EXPECT_EQ(gc.leaderId(), "test-group-2")
+        << "Leader election must be numerically correct "
+           "(test-group-2 < test-group-10 numerically)";
+
+    // Add "test-group-9" and "test-group-11".
+    gc.join("test-group-9",  kDefaultTimeoutMs, {}, 0);
+    gc.join("test-group-11", kDefaultTimeoutMs, {}, 0);
+    // "test-group-2" is still the numerically smallest.
+    EXPECT_EQ(gc.leaderId(), "test-group-2");
+
+    // Remove "test-group-2"; next smallest should be "test-group-9".
+    gc.leave("test-group-2", gc.generationId(), 100);
+    EXPECT_EQ(gc.leaderId(), "test-group-9")
+        << "After removing test-group-2, test-group-9 must win (not test-group-10 or test-group-11)";
+}
+
+// ===========================================================================
+// AUDIT: C3 regression — syncGroup re-submission in Stable does not clobber assignments
+// A leader re-sending a non-empty assignment map while the group is already
+// Stable must be ignored (ack'd, but assignments must not change).
+// ===========================================================================
+
+TEST(GroupCoordinator, SyncGroupLeaderInStable_NoClobber) {
+    GroupCoordinator gc("test-group", 0);
+    using namespace rune::coordination;
+
+    // Get to Stable with 2 members.
+    gc.join("member-a", kDefaultTimeoutMs, {"topic"}, 0);
+    gc.join("member-b", kDefaultTimeoutMs, {"topic"}, 0);
+    gc.join("member-a", kDefaultTimeoutMs, {"topic"}, 100);
+    gc.join("member-b", kDefaultTimeoutMs, {"topic"}, 200);
+    ASSERT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    TopicPartitionCounts partCounts = {{"topic", 4}};
+    RangeAssignor ra;
+
+    // Leader submits the real assignment.
+    auto subs = gc.members();
+    std::vector<MemberSubscription> ms;
+    for (const auto& m : subs) ms.push_back({m.memberId, m.subscribedTopics});
+    Assignment computed = ra.assign(ms, partCounts);
+
+    std::string lid = gc.leaderId();
+    Generation gen  = gc.generationId();
+    auto sr1 = gc.syncGroup(lid, gen, computed, 300);
+    EXPECT_EQ(sr1.errorCode, 0);
+    ASSERT_EQ(gc.state(), GroupState::Stable);
+
+    // Save the original assignment for each member.
+    std::map<std::string, std::vector<TopicPartition>> origAssign;
+    for (const auto& m : gc.members()) origAssign[m.memberId] = m.assignment;
+
+    // Leader re-submits a different assignment while Stable (e.g. bogus single-member).
+    Assignment bogus;
+    bogus[lid] = {{{"topic", 0}}, {{"topic", 1}}, {{"topic", 2}}, {{"topic", 3}}};
+    auto sr2 = gc.syncGroup(lid, gen, bogus, 400);
+    EXPECT_EQ(sr2.errorCode, 0) << "Re-sync in Stable must be ack'd (not rejected)";
+    // But the state and assignments must NOT change.
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+    for (const auto& m : gc.members()) {
+        EXPECT_EQ(m.assignment, origAssign.at(m.memberId))
+            << "Assignment for " << m.memberId
+            << " must not be clobbered by a duplicate leader SyncGroup in Stable";
+    }
 }

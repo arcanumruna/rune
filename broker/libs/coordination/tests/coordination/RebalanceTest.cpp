@@ -247,7 +247,7 @@ TEST(Rebalance, MemberLeavesWhileStable_PartitionsReassigned) {
 
     // member-b leaves → rebalance.
     Generation genBefore = gc.generationId();
-    gc.leave("member-b", 400);
+    gc.leave("member-b", gc.generationId(), 400);
     EXPECT_EQ(gc.state(), GroupState::PreparingRebalance);
     EXPECT_GT(gc.generationId(), genBefore);
 
@@ -304,9 +304,9 @@ TEST(Rebalance, SyncGroupFutureGeneration_Rejected) {
 }
 
 // ===========================================================================
-// Test 8: Follower syncGroup before leader completes — group stays CompletingRebalance
+// Test 8: Follower syncGroup before leader completes — gets retry signal
 // ===========================================================================
-TEST(Rebalance, FollowerSyncBeforeLeader_GroupStaysCompleting) {
+TEST(Rebalance, FollowerSyncBeforeLeader_GetsRetrySignal) {
     GroupCoordinator gc("test-group", 0);
 
     gc.join("member-a", kTimeout, {"t"}, 0);
@@ -323,11 +323,25 @@ TEST(Rebalance, FollowerSyncBeforeLeader_GroupStaysCompleting) {
 
     Generation gen = gc.generationId();
 
-    // Follower syncs first (empty assignment map — not the leader).
+    // Follower syncs before leader: must receive the retry signal.
     auto fsr = gc.syncGroup(fid, gen, {}, 250);
-    EXPECT_EQ(fsr.errorCode, SyncResult::kOk);
+    EXPECT_EQ(fsr.errorCode, SyncResult::kErrRebalanceInProgress)
+        << "Follower syncing before leader must receive kErrRebalanceInProgress (retry)";
     // State stays CompletingRebalance (leader hasn't submitted yet).
     EXPECT_EQ(gc.state(), GroupState::CompletingRebalance);
+
+    // Now leader submits — group transitions to Stable.
+    TopicPartitionCounts partCounts = {{"t", 2}};
+    RangeAssignor ra;
+    auto subs = buildSubscriptions(gc);
+    auto computed = ra.assign(subs, partCounts);
+    auto lsr = gc.syncGroup(lid, gen, computed, 300);
+    EXPECT_EQ(lsr.errorCode, SyncResult::kOk);
+    EXPECT_EQ(gc.state(), GroupState::Stable);
+
+    // Follower retries after leader — now succeeds.
+    auto fsr2 = gc.syncGroup(fid, gen, {}, 350);
+    EXPECT_EQ(fsr2.errorCode, SyncResult::kOk);
 }
 
 // ===========================================================================
@@ -548,7 +562,7 @@ TEST(Rebalance, AfterLeaderLeaves_NewLeaderElected) {
     ASSERT_EQ(gc.state(), GroupState::Stable);
 
     std::string oldLeader = gc.leaderId();
-    gc.leave(oldLeader, 500);
+    gc.leave(oldLeader, gc.generationId(), 500);
     ASSERT_EQ(gc.state(), GroupState::PreparingRebalance);
 
     EXPECT_FALSE(gc.leaderId().empty());

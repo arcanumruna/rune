@@ -641,6 +641,83 @@ TEST_P(BothAssignors, ZeroPartitionTopicAssignsNothing) {
 }
 
 // ---------------------------------------------------------------------------
+// AUDIT T2: RoundRobin partial-subscription — exact Kafka placement (3 members,
+// heterogeneous subscriptions, interleaved non-subscriber).
+//
+// Members: m0→{t0,t1}, m1→{t1}, m2→{t0,t1}
+// Topics: t0:4 parts, t1:4 parts
+// allMembers sorted: [m0,m1,m2]
+// pairs sorted: (t0,0),(t0,1),(t0,2),(t0,3),(t1,0),(t1,1),(t1,2),(t1,3)
+// subs: t0→{m0,m2}, t1→{m0,m1,m2}
+//
+// Kafka trace (cursor advances past assigned member):
+//   (t0,0): cursor=0  → m0∈t0 → m0.  cursor=1
+//   (t0,1): cursor=1  → m1∉t0 → skip; cursor=2 → m2∈t0 → m2.  cursor=0
+//   (t0,2): cursor=0  → m0∈t0 → m0.  cursor=1
+//   (t0,3): cursor=1  → m1∉t0 → skip; cursor=2 → m2∈t0 → m2.  cursor=0
+//   (t1,0): cursor=0  → m0∈t1 → m0.  cursor=1
+//   (t1,1): cursor=1  → m1∈t1 → m1.  cursor=2
+//   (t1,2): cursor=2  → m2∈t1 → m2.  cursor=0
+//   (t1,3): cursor=0  → m0∈t1 → m0.  cursor=1
+//
+// Expected: m0→{(t0,0),(t0,2),(t1,0),(t1,3)},
+//           m1→{(t1,1)},
+//           m2→{(t0,1),(t0,3),(t1,2)}
+// ---------------------------------------------------------------------------
+TEST(RoundRobinAssignor, KafkaExact_ThreeMember_HeterogeneousSubscriptions) {
+    RoundRobinAssignor rr;
+    std::vector<MemberSubscription> members = {
+        {"m0", {"t0", "t1"}},
+        {"m1", {"t1"}},
+        {"m2", {"t0", "t1"}},
+    };
+    TopicPartitionCounts counts = {{"t0", 4}, {"t1", 4}};
+    auto a = rr.assign(members, counts);
+
+    // m0 gets (t0,0),(t0,2),(t1,0),(t1,3)
+    EXPECT_EQ(partitionsFor(a, "m0", "t0"), (std::vector<int32_t>{0, 2}));
+    EXPECT_EQ(partitionsFor(a, "m0", "t1"), (std::vector<int32_t>{0, 3}));
+    // m1 gets only (t1,1)
+    EXPECT_EQ(partitionsFor(a, "m1", "t0"), (std::vector<int32_t>{}));
+    EXPECT_EQ(partitionsFor(a, "m1", "t1"), (std::vector<int32_t>{1}));
+    // m2 gets (t0,1),(t0,3),(t1,2)
+    EXPECT_EQ(partitionsFor(a, "m2", "t0"), (std::vector<int32_t>{1, 3}));
+    EXPECT_EQ(partitionsFor(a, "m2", "t1"), (std::vector<int32_t>{2}));
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT T2: Another exact-placement check — m0→{t0,t1}, m1→{t1},
+// single-subscriber topic t0: verifies pointer doesn't bias toward m0 on t1.
+// Topics: t0:2 parts, t1:3 parts
+// allMembers: [m0,m1]
+// pairs: (t0,0),(t0,1),(t1,0),(t1,1),(t1,2)
+// subs: t0→{m0}, t1→{m0,m1}
+//
+// Kafka trace:
+//   (t0,0): cursor=0 → m0∈t0 → m0.  cursor=1
+//   (t0,1): cursor=1 → m1∉t0; cursor=0 → m0∈t0 → m0.  cursor=1
+//   (t1,0): cursor=1 → m1∈t1 → m1.  cursor=0
+//   (t1,1): cursor=0 → m0∈t1 → m0.  cursor=1
+//   (t1,2): cursor=1 → m1∈t1 → m1.  cursor=0
+//
+// Expected: m0→{(t0,0),(t0,1),(t1,1)}, m1→{(t1,0),(t1,2)}
+// ---------------------------------------------------------------------------
+TEST(RoundRobinAssignor, KafkaExact_TwoMember_SingleSubscriberTopic) {
+    RoundRobinAssignor rr;
+    std::vector<MemberSubscription> members = {
+        {"m0", {"t0", "t1"}},
+        {"m1", {"t1"}},
+    };
+    TopicPartitionCounts counts = {{"t0", 2}, {"t1", 3}};
+    auto a = rr.assign(members, counts);
+
+    EXPECT_EQ(partitionsFor(a, "m0", "t0"), (std::vector<int32_t>{0, 1}));
+    EXPECT_EQ(partitionsFor(a, "m0", "t1"), (std::vector<int32_t>{1}));
+    EXPECT_EQ(partitionsFor(a, "m1", "t0"), (std::vector<int32_t>{}));
+    EXPECT_EQ(partitionsFor(a, "m1", "t1"), (std::vector<int32_t>{0, 2}));
+}
+
+// ---------------------------------------------------------------------------
 // Inv_8: large assignment (5 members, 2 topics, 12+7 partitions) — correctness
 // ---------------------------------------------------------------------------
 TEST_P(BothAssignors, LargeAssignmentCorrect) {

@@ -156,9 +156,18 @@ Assignment RoundRobinAssignor::assign(
         }
     }
 
-    // Round-robin: maintain a per-topic rotating index into allMembers.
-    // For each pair, advance the global index until we find a subscriber.
-    int32_t idx = 0; // rotating index into allMembers
+    // Round-robin: single monotonic cursor over allMembers.
+    //
+    // Kafka's canonical RoundRobinAssignor (Java source):
+    //   for each (topic,partition) in sorted order:
+    //     while current member does not subscribe to topic: advance cursor
+    //     assign to current member; advance cursor
+    //
+    // Implementation: start at idx; scan forward (at most M positions) for
+    // the next subscribed member; assign; advance cursor past the subscriber.
+    // Non-subscribing members are skipped but the cursor lands on (and then
+    // advances past) the first subscriber — matching Kafka exactly.
+    int32_t idx = 0; // rotating cursor into allMembers
     int32_t M   = static_cast<int32_t>(allMembers.size());
 
     for (const auto& tp : pairs) {
@@ -166,12 +175,14 @@ Assignment RoundRobinAssignor::assign(
         if (subs.empty()) continue;
 
         // Find next member (starting from idx) that subscribes to tp.topic.
-        // Scan at most M positions (bounded).
+        // Scan at most M positions (bounded, guaranteed to find one for
+        // non-empty subs).
         for (int32_t attempt = 0; attempt < M; ++attempt) {
             int32_t candidate = (idx + attempt) % M;
             if (subs.count(allMembers[candidate])) {
                 result[allMembers[candidate]].push_back(tp);
-                // Advance idx to candidate+1 for the next pair.
+                // Advance idx to candidate+1 (past the assigned member),
+                // matching Kafka's ring-iterator advance.
                 idx = (candidate + 1) % M;
                 break;
             }

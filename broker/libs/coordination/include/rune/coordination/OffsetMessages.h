@@ -288,12 +288,11 @@ struct OffsetFetchRequestMsg {
 //
 // Coordinator → Consumer: committed offset value (or -1 if not found).
 //
-// Fixed block (14 bytes):
+// Fixed block (22 bytes):
 //   offset              : int64  @ +0
 //   commitTimestampNs   : int64  @ +8  (0 if not found)
 //   errorCode           : int16  @ +16 (0 = OK, 1 = NOT_FOUND)
 //   partition           : int32  @ +18 (for correlation)
-// Wait — re-count: int64 + int64 + int16 + int32 = 22 bytes
 // Total fixed = 22 bytes
 //
 // Var-length: group, topic, metadata

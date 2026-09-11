@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace rune::coordination {
@@ -100,8 +102,16 @@ JoinResult GroupCoordinator::join(const std::string&              memberId,
 // ---------------------------------------------------------------------------
 // leave
 // ---------------------------------------------------------------------------
-void GroupCoordinator::leave(const std::string& memberId, int64_t nowNs)
+void GroupCoordinator::leave(const std::string& memberId,
+                              Generation         generationId,
+                              int64_t            nowNs)
 {
+    // Kafka LeaveGroup fencing: a stale-generation leave is silently ignored.
+    // An unknown member is also a no-op (handled by removeMember below).
+    if (generationId != generationId_) {
+        return; // stale or future generation — no-op, do NOT rebalance
+    }
+
     if (!removeMember(memberId)) {
         return; // unknown member — no-op
     }
@@ -235,12 +245,17 @@ int GroupCoordinator::doWork(int64_t nowNs)
 
 std::string GroupCoordinator::generateMemberId()
 {
-    // Use per-instance counter first, fall back to global for uniqueness across
-    // coordinator instances in the same process.
-    uint64_t seq = ++memberSeq_;
+    // Incorporate the GLOBAL atomic seq so that memberIds are unique across
+    // multiple GroupCoordinator instances in the same process.  Without this,
+    // two coordinators with the same groupId produce identical ids
+    // ("grp-1", "grp-2", ...).
+    //
+    // Format: "<groupId>-g<globalSeq>-<localSeq>"
+    //   globalSeq: monotonically increasing across ALL coordinators in the process.
+    //   localSeq:  per-instance counter (extra disambiguation + readability).
+    uint64_t local  = ++memberSeq_;
     uint64_t global = s_memberSeq.fetch_add(1, std::memory_order_relaxed);
-    (void)global; // used implicitly: unique within process
-    return groupId_ + "-" + std::to_string(seq);
+    return groupId_ + "-g" + std::to_string(global) + "-" + std::to_string(local);
 }
 
 MemberInfo* GroupCoordinator::findMember(const std::string& memberId)
@@ -265,7 +280,57 @@ bool GroupCoordinator::removeMember(const std::string& memberId)
                            [&](const MemberInfo& m) { return m.memberId == memberId; });
     if (it == members_.end()) return false;
     members_.erase(it);
+    // Keep rejoinedMembers_ consistent with live membership (S1 fix).
+    rejoinedMembers_.erase(memberId);
     return true;
+}
+
+/// Compare two memberIds for deterministic leader election.
+///
+/// Generated ids have the form "<group>-g<globalSeq>-<localSeq>".
+/// Pure lexicographic comparison is wrong when sequences cross a power-of-ten
+/// boundary ("grp-g10" < "grp-g2" lexicographically).
+///
+/// Strategy: compare by the numeric suffix(es).  Extract the trailing decimal
+/// run from each id and compare numerically; fall back to full string
+/// lexicographic order for hand-supplied non-generated ids (which is fine
+/// because those are typically stable names like "member-a").
+///
+/// This ensures "grp-g2" < "grp-g10" (earliest-joined wins) regardless of
+/// digit count.
+static bool memberIdLess(const std::string& a, const std::string& b)
+{
+    // Try to extract leading numeric sequences after the last '-'.
+    auto trailingNum = [](const std::string& id) -> std::optional<uint64_t> {
+        if (id.empty()) return std::nullopt;
+        std::size_t i = id.size();
+        while (i > 0 && std::isdigit(static_cast<unsigned char>(id[i-1]))) --i;
+        if (i == id.size()) return std::nullopt; // no trailing digits
+        // Must be preceded by '-'.
+        if (i == 0 || id[i-1] != '-') return std::nullopt;
+        try {
+            return std::stoull(id.substr(i));
+        } catch (...) {
+            return std::nullopt;
+        }
+    };
+
+    auto na = trailingNum(a);
+    auto nb = trailingNum(b);
+
+    // Both have numeric suffixes: compare the prefix (everything before the
+    // trailing number) first, then numeric suffix.
+    if (na.has_value() && nb.has_value()) {
+        std::size_t da = a.rfind('-');
+        std::size_t db = b.rfind('-');
+        std::string pa = a.substr(0, da);
+        std::string pb = b.substr(0, db);
+        if (pa != pb) return pa < pb;          // different group prefixes
+        return *na < *nb;                       // same prefix → numeric order
+    }
+
+    // Fallback: plain lexicographic (for hand-supplied ids like "member-a").
+    return a < b;
 }
 
 void GroupCoordinator::electLeader()
@@ -274,10 +339,10 @@ void GroupCoordinator::electLeader()
         leaderId_ = "";
         return;
     }
-    // Deterministic: alphabetically smallest memberId.
+    // Deterministic: numerically-correct smallest memberId.
     const std::string* smallest = &members_[0].memberId;
     for (const auto& m : members_) {
-        if (m.memberId < *smallest) {
+        if (memberIdLess(m.memberId, *smallest)) {
             smallest = &m.memberId;
         }
     }
@@ -305,7 +370,8 @@ SyncResult GroupCoordinator::syncGroup(const std::string& memberId,
                                         int64_t            /*nowNs*/)
 {
     // Wrong state: must be in CompletingRebalance or Stable to sync.
-    // (Stable is allowed so followers can call after leader already transitioned.)
+    // (Stable is allowed so followers can retrieve their assignment after
+    // the leader already transitioned the group.)
     if (state_ != GroupState::CompletingRebalance && state_ != GroupState::Stable) {
         return SyncResult{ .errorCode = SyncResult::kErrWrongState };
     }
@@ -321,28 +387,40 @@ SyncResult GroupCoordinator::syncGroup(const std::string& memberId,
         return SyncResult{ .errorCode = SyncResult::kErrUnknownMember };
     }
 
-    // If this is the leader AND they provided a non-empty assignment map,
-    // store the assignments and mark leader as synced.
-    if (!assignmentsPerMember.empty()) {
-        // Only accept from the leader.
-        if (memberId == leaderId_) {
-            // Store each member's assignment.
-            for (auto& [mid, tps] : assignmentsPerMember) {
-                MemberInfo* m = findMember(mid);
-                if (m != nullptr) {
-                    m->assignment = tps;
-                }
-            }
+    // Leader branch: only honored during CompletingRebalance (not Stable).
+    // A leader re-sync while Stable is silently ack'd (no clobber).
+    if (!assignmentsPerMember.empty() && memberId == leaderId_) {
+        if (state_ == GroupState::CompletingRebalance && !leaderSynced_) {
+            storeAssignments(assignmentsPerMember);   // shared helper (no CL3 duplication)
             leaderSynced_ = true;
-            // Transition to Stable now that leader has submitted the assignment.
-            applyAssignmentAndTransitionStable(assignmentsPerMember);
+            transitionToStable();
         }
+        // In Stable (or leaderSynced_ already): ack without re-writing assignments.
+        return SyncResult{ .errorCode = SyncResult::kOk };
     }
 
-    // Track this member as having called syncGroup.
-    syncedMembers_.insert(memberId);
+    // Follower branch.
+    if (state_ == GroupState::CompletingRebalance && !leaderSynced_) {
+        // Leader hasn't submitted the assignment yet.  Tell the follower to
+        // retry (Kafka holds the SyncGroup response; we return a retry signal).
+        return SyncResult{ .errorCode = SyncResult::kErrRebalanceInProgress };
+    }
 
+    // Stable or leader already synced: follower can read its assignment.
     return SyncResult{ .errorCode = SyncResult::kOk };
+}
+
+// ---------------------------------------------------------------------------
+// P4-3: storeAssignments (shared helper — eliminates CL3 duplication)
+// ---------------------------------------------------------------------------
+void GroupCoordinator::storeAssignments(const Assignment& a)
+{
+    for (auto& [mid, tps] : a) {
+        MemberInfo* m = findMember(mid);
+        if (m != nullptr) {
+            m->assignment = tps;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,18 +451,10 @@ SyncResult GroupCoordinator::autoAssignAndSync(const TopicPartitionCounts& partC
         computed = rr.assign(subs, partCounts);
     }
 
-    // Store each member's assignment.
-    for (auto& m : members_) {
-        auto it = computed.find(m.memberId);
-        if (it != computed.end()) {
-            m.assignment = it->second;
-        }
-    }
-
+    storeAssignments(computed);   // shared with syncGroup — no duplication
     leaderSynced_ = true;
-    state_ = GroupState::Stable;
+    transitionToStable();
     (void)nowNs;
-
     return SyncResult{ .errorCode = SyncResult::kOk };
 }
 
@@ -409,11 +479,11 @@ void GroupCoordinator::transitionToCompletingRebalance(int64_t /*nowNs*/)
 }
 
 // ---------------------------------------------------------------------------
-// P4-3: applyAssignmentAndTransitionStable
+// P4-3: transitionToStable
 // ---------------------------------------------------------------------------
-void GroupCoordinator::applyAssignmentAndTransitionStable(const Assignment& /*a*/)
+void GroupCoordinator::transitionToStable()
 {
-    // Assignments were already stored in syncGroup() before calling this.
+    // Assignments were already stored by the caller (syncGroup / autoAssignAndSync).
     state_ = GroupState::Stable;
 }
 

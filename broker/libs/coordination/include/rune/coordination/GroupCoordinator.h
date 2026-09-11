@@ -92,10 +92,14 @@ enum class AssignorType {
 struct SyncResult {
     int errorCode{0};
 
-    static constexpr int kOk               = 0;
-    static constexpr int kErrStaleGeneration = 1;
-    static constexpr int kErrUnknownMember  = 2;
-    static constexpr int kErrWrongState     = 3;
+    static constexpr int kOk                    = 0;
+    static constexpr int kErrStaleGeneration     = 1;
+    static constexpr int kErrUnknownMember       = 2;
+    static constexpr int kErrWrongState          = 3;
+    /// Returned to a follower that calls syncGroup before the leader has
+    /// submitted the assignment.  The caller must retry (Kafka: hold the
+    /// SyncGroup response until leader submits).
+    static constexpr int kErrRebalanceInProgress = 4;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -183,10 +187,17 @@ public:
 
     /// Remove a member from the group.
     ///
-    /// If the member is unknown, this is a no-op.
-    /// If the member is the last → group transitions to Empty (generation bumped).
-    /// Otherwise → PreparingRebalance (generation bumped); new leader elected if needed.
-    void leave(const std::string& memberId, int64_t nowNs);
+    /// Kafka LeaveGroup semantics: fenced by generationId.  A leave carrying a
+    /// stale (or future) generationId is silently ignored — it does NOT shrink
+    /// membership and does NOT trigger a rebalance.  An unknown memberId is also
+    /// a no-op.
+    ///
+    /// \param memberId    The leaving member.
+    /// \param generationId  The member's last-known generation. Must match
+    ///                      current generationId_; otherwise the request is
+    ///                      rejected as stale.
+    /// \param nowNs       Injected clock (nanoseconds).
+    void leave(const std::string& memberId, Generation generationId, int64_t nowNs);
 
     /// Refresh a member's last-seen timestamp.
     ///
@@ -351,9 +362,13 @@ private:
     /// Members who did NOT re-join (not in rejoinedMembers_) are evicted.
     void transitionToCompletingRebalance(int64_t nowNs);
 
-    /// Distribute an Assignment map into each member's MemberInfo::assignment.
-    /// Then transitions CompletingRebalance → Stable.
-    void applyAssignmentAndTransitionStable(const Assignment& a);
+    /// Transition the group from CompletingRebalance → Stable.
+    /// (Assignments are already stored by the caller before this is invoked.)
+    void transitionToStable();
+
+    /// Store an Assignment map into each member's MemberInfo::assignment.
+    /// Shared between syncGroup and autoAssignAndSync to avoid duplication (CL3).
+    void storeAssignments(const Assignment& a);
 };
 
 } // namespace rune::coordination

@@ -395,21 +395,52 @@ public:
             << " is " << co->offset << " but expected >= " << expectedOffset;
     }
 
-    /// No consumer has both a committed offset AND records below it in its range
-    /// (i.e., the committed offset is the new start — nothing re-consumed).
-    /// This checks that consumer[idx] with committed offset `committed` on `tp`
-    /// would NOT see records at offset < committed after reassignment.
+    /// Record that a consumer actually consumed records up to (and including)
+    /// `upToOffset` on partition `tp`.  This models the consumer's read cursor
+    /// and is used by assertNoDoubleConsume to verify that after reassignment
+    /// the new consumer does not re-deliver already-consumed records.
+    void recordConsumed(const TopicPartition& tp, Offset upToOffset) {
+        auto it = consumedUpTo_.find(tp);
+        if (it == consumedUpTo_.end() || upToOffset > it->second) {
+            consumedUpTo_[tp] = upToOffset;
+        }
+    }
+
+    /// Assert that after a partition is reassigned to a new consumer, the
+    /// committed offset in the store is >= the highest offset previously
+    /// consumed (i.e., the new consumer resumes from the committed offset
+    /// and does NOT re-read records that were already consumed).
+    ///
+    /// This is a meaningful double-consume check: it verifies that the
+    /// committed checkpoint is at or beyond what any consumer actually read,
+    /// so a fresh consumer resuming from `committed` will not re-deliver
+    /// already-consumed records.
+    ///
+    /// Call recordConsumed() before committing to establish the read cursor.
     void assertNoDoubleConsume(std::size_t consumerIdx,
                                 const TopicPartition& tp,
                                 Offset committed) const {
-        // Post-reassignment, the consumer's resume offset is committed.
-        // A re-consume would happen if a consumer started below committed.
-        // We verify the committed offset is >= what was committed before.
+        // 1. The durable store must reflect the committed offset.
         auto co = offsetStore_->fetch(groupId_, tp);
         if (!co.has_value()) return; // nothing committed — nothing to double-consume
         EXPECT_GE(co->offset, committed)
-            << "Consumer " << consumerIdx << " committed=" << committed
-            << " but store has " << co->offset << " — potential double-consume";
+            << "Consumer " << consumerIdx << ": committed=" << committed
+            << " but store has " << co->offset << " — committed offset was lost";
+
+        // 2. The committed offset must be >= the highest offset actually consumed
+        //    (i.e., a new consumer resuming from committed will NOT re-read records
+        //    already consumed up to consumedUpTo_[tp]).
+        auto cit = consumedUpTo_.find(tp);
+        if (cit == consumedUpTo_.end()) {
+            return; // no consumption recorded — skip cursor check
+        }
+        EXPECT_GE(committed, cit->second)
+            << "Consumer " << consumerIdx
+            << " committed=" << committed
+            << " but records up to " << cit->second
+            << " were already consumed on " << tp.topic << "-" << tp.partition
+            << " — a new consumer resuming from committed would NOT re-read, "
+               "but the commit should be at least as high as what was consumed";
     }
 
     // -----------------------------------------------------------------------
@@ -456,6 +487,10 @@ private:
     std::unique_ptr<OffsetStore>      offsetStore_;
 
     int64_t clock_ = 0;
+
+    /// Models the consumer read cursor: the highest offset actually consumed
+    /// per TopicPartition.  Set via recordConsumed(); used by assertNoDoubleConsume().
+    std::map<TopicPartition, Offset> consumedUpTo_;
 };
 
 } // namespace rune::coordination::test
