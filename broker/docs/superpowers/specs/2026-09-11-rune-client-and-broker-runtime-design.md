@@ -212,6 +212,6 @@ auto tp = client.producer({ .transactionalId = "match-worker-7" });   // InitPro
 
 ## 10. Open decisions (to settle in the implementation plan)
 
-- **Repo layout:** protocol message schema in `rune-protocol` (sibling-header pattern, already used for `RecordBatch`); C++ client as a new `libs/client` in `rune-broker` for v1 (co-located, shares the codec), extractable to a `rune-client` repo later. *(Recommended; confirm in planning.)*
+- **Repo layout (settled):** the shared codec + the new client-facing message schema stay in **`rune-protocol`** (sibling-header pattern, already used for `RecordBatch`; depended on by both the broker and every client — NOT renamed). The C++ client is a **new repo, `rune-client-cpp`**, depending on `rune-protocol`; the future Node client is a parallel new repo **`rune-client-nodejs`**. The broker runtime + ClientGateway stay in `rune-broker`.
 - **v1 partition count / topic bootstrap:** start with a small static topic+partition config to prove the path; dynamic topic creation is a follow-on.
 - **Milestone C scope:** whether consumer-group consume + offset commit is in the first plan or a follow-on.
