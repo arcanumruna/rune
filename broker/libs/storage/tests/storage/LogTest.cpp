@@ -455,3 +455,77 @@ TEST(Log, CrashRecoveryAfterTruncate) {
 
     std::filesystem::remove_all(dir);
 }
+
+// ---- C1: Exact truncateTo tests ----
+
+// C1-a: truncateOffset lands INSIDE a multi-record batch — entire batch must be dropped.
+// The old code with cutPos=buf.size() default would keep the batch silently.
+TEST(Log, TruncateInsideLastBatch) {
+    auto dir = makeTempDir("rune_trunc_c1a");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 1024 * 1024); // large roll so everything is one segment
+
+    // Batch 0: single record at offset 0
+    RecordBatchBuilder b0(0, 100); b0.append("k", "v0", 100);
+    log.append(b0.build(), 0); // LEO=1
+
+    // Batch 1: two records at offsets 1 and 2 (lastOffset=2, LEO=3)
+    RecordBatchBuilder b1(1, 101); b1.append("k", "v1", 101); b1.append("k", "v2", 102);
+    log.append(b1.build(), 2); // LEO=3
+
+    ASSERT_EQ(log.logEndOffset(), 3);
+
+    // Truncate at offset 2 — offset 2 is INSIDE batch1 (base=1, last=2).
+    // Documented semantics: truncation rounds down to batch boundary.
+    // After truncation LEO must be <= 2 (batch1 dropped entirely).
+    log.truncateTo(2);
+
+    EXPECT_LE(log.logEndOffset(), 2)
+        << "truncateTo(2) must drop the batch that spans [1,2]; LEO must be <= 2";
+
+    // Offset 0 must still be readable.
+    auto buf0 = log.read(0, 1 << 20);
+    EXPECT_FALSE(buf0.empty()) << "offset 0 must survive truncateTo(2)";
+
+    // Offset >= 2 must not be readable.
+    auto buf2 = log.read(2, 1 << 20);
+    EXPECT_TRUE(buf2.empty()) << "offset 2 must be gone after truncateTo(2)";
+
+    std::filesystem::remove_all(dir);
+}
+
+// C1-b: truncateOffset == LEO -> no-op (guard already correct, regression test).
+TEST(Log, TruncateAtLEOIsNoop) {
+    auto dir = makeTempDir("rune_trunc_c1b");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 1024 * 1024);
+    RecordBatchBuilder b(0, 200); b.append("k", "v", 200);
+    int64_t leo = log.append(b.build(), 0);
+
+    log.truncateTo(leo); // no-op
+    EXPECT_EQ(log.logEndOffset(), leo);
+
+    std::filesystem::remove_all(dir);
+}
+
+// C1-c: truncateOffset = 0 on a multi-batch single-segment log -> removes everything.
+TEST(Log, TruncateToZeroRemovesAll) {
+    auto dir = makeTempDir("rune_trunc_c1c");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 1024 * 1024);
+    for (int i = 0; i < 5; ++i) {
+        RecordBatchBuilder b(i, 300 + i); b.append("k", "v", 300 + i);
+        log.append(b.build(), i);
+    }
+    ASSERT_EQ(log.logEndOffset(), 5);
+
+    log.truncateTo(0);
+    EXPECT_EQ(log.logEndOffset(), 0);
+    auto buf = log.read(0, 1 << 20);
+    EXPECT_TRUE(buf.empty()) << "after truncateTo(0) no data must remain";
+
+    std::filesystem::remove_all(dir);
+}

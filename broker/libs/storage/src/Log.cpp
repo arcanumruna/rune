@@ -82,19 +82,45 @@ void Log::truncateTo(int64_t truncateOffset) {
     if (fileSize > 0) f.read(reinterpret_cast<char*>(buf.data()), fileSize);
     f.close();
 
-    // Walk batches to find the byte offset where baseOffset >= truncateOffset.
-    std::size_t cutPos = buf.size(); // default: keep everything (shouldn't happen)
+    // Walk batches to find the byte position to truncate.
+    //
+    // cutPos: the physical byte boundary where we cut the file.
+    //   Initialized to 0 (safe: truncate everything) rather than buf.size()
+    //   (which would silently keep everything if no batch is found — C1 fix).
+    // validEnd: byte position after the last batch whose baseOffset < truncateOffset.
+    //   Updated as we walk forward past pre-boundary batches.
+    //
+    // Semantics: truncation rounds DOWN to the batch boundary. A truncateOffset
+    // that lands inside a multi-record batch drops that entire batch (same as Kafka).
+    std::size_t cutPos  = 0;
+    std::size_t validEnd = 0;
+    bool found = false;
     std::size_t pos = 0;
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
         if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
-        if (r.baseOffset() >= truncateOffset) {
+
+        // A batch must be dropped if ANY of its records is at offset >= truncateOffset.
+        // Since records in a batch are contiguous [baseOffset .. baseOffset+lastOffsetDelta],
+        // we drop the batch if baseOffset >= truncateOffset (pure overlap from the start),
+        // OR if the batch CONTAINS records at >= truncateOffset (i.e. mid-batch cut is
+        // impossible, so we round down to the batch's start — drop the whole batch).
+        int64_t batchLastOffset = r.baseOffset() + r.lastOffsetDelta();
+        if (r.baseOffset() >= truncateOffset || batchLastOffset >= truncateOffset) {
+            // This batch contains at least one record at offset >= truncateOffset — cut here.
             cutPos = pos;
+            found = true;
             break;
         }
-        pos += static_cast<std::size_t>(total);
-        cutPos = pos; // valid end so far
+        // This batch is fully before the truncation boundary.
+        validEnd = pos + static_cast<std::size_t>(total);
+        pos = validEnd;
+    }
+    if (!found) {
+        // No batch containing any record at offset >= truncateOffset was found.
+        // All existing batches are fully below the boundary: keep them all.
+        cutPos = validEnd;
     }
 
     // Truncate the file at cutPos.
