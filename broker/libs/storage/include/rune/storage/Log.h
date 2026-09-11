@@ -19,6 +19,12 @@ public:
     std::vector<int64_t> segmentBaseOffsets() const;
     int64_t totalBytes() const;
     int deleteOldSegments(int64_t retainBytes);
+    /// Directory that contains this log's segment files.
+    const std::string& dir() const noexcept { return dir_; }
+    /// Reload all segments from disk (close + reopen every LogSegment).
+    /// Used by LogCleaner after atomically rewriting segment files on disk,
+    /// so that in-memory file handles reflect the new file contents.
+    void reloadSegments();
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();

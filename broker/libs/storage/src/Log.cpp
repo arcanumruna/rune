@@ -115,6 +115,23 @@ void Log::truncateTo(int64_t truncateOffset) {
     logEndOffset_ = activeSegment().nextOffset();
 }
 
+void Log::reloadSegments() {
+    // Destroy all in-memory segments (closes open file handles).
+    segments_.clear();
+    // Re-discover segment files on disk (same logic as the constructor).
+    std::vector<int64_t> bases;
+    for (auto& e : std::filesystem::directory_iterator(dir_))
+        if (e.path().extension() == ".log")
+            bases.push_back(std::stoll(e.path().stem().string()));
+    std::sort(bases.begin(), bases.end());
+    if (bases.empty()) bases.push_back(0);
+    for (int64_t b : bases) segments_[b] = std::make_unique<LogSegment>(dir_, b);
+    // Run recover() to rebuild indices and set nextOffset_ for each segment.
+    int64_t next = 0;
+    for (auto& [base, seg] : segments_) next = seg->recover();
+    logEndOffset_ = next;
+}
+
 int Log::deleteOldSegments(int64_t retainBytes) {
     int deleted = 0;
     while (segments_.size() > 1 && totalBytes() > retainBytes) {
