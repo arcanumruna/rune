@@ -50,6 +50,33 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
             if (m.state == TxnState::PrepareAbort || m.state == TxnState::PrepareCommit) {
                 m.markersPending = true;
             }
+            // LIVENESS FIX (P5-5): a recovered Complete* means all side-effects
+            // (markers + offsets) were already durably applied before the Complete*
+            // record was persisted.  The only remaining step was the Empty reset,
+            // which crashed before it could be written.  Collapsing to Empty here
+            // makes the transactionalId immediately reusable — consistent with Kafka
+            // treating Complete* as transient.  We do NOT re-apply offsets or
+            // re-write markers (both already durable).
+            //
+            // For CompleteAbort we must also adopt any deferred pendingNewProducerId
+            // (NEW-1/A2 overflow path): completeTransaction would have swapped the
+            // identity before writing Empty, so we replicate that swap here to keep
+            // the recovered PID consistent with what completeTransaction would have
+            // produced.
+            if (m.state == TxnState::CompleteCommit || m.state == TxnState::CompleteAbort) {
+                if (m.state == TxnState::CompleteAbort && m.pendingNewProducerId >= 0) {
+                    m.producerId            = m.pendingNewProducerId;
+                    m.producerEpoch         = m.pendingNewProducerEpoch;
+                    m.pendingNewProducerId    = -1;
+                    m.pendingNewProducerEpoch = -1;
+                }
+                m.state          = TxnState::Empty;
+                m.partitions.clear();
+                m.pendingOffsets.clear();
+                m.txnStartNs     = 0;
+                m.fencingEpoch   = false;
+                m.markersPending = false;
+            }
             if (m.producerId > maxPid)            maxPid = m.producerId;
             if (m.pendingNewProducerId > maxPid)  maxPid = m.pendingNewProducerId;
         }

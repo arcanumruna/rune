@@ -1400,8 +1400,15 @@ TEST(TxnCoordAuditB2Test, RecoveredPrepareCommitResolvableWithPersistedEpochs)
 
 TEST(TxnCoordAuditB2Test, RecoveryDoesNotDuplicateMarkersOnCompleteCommitState)
 {
-    // C2 complementary: if a coordinator crashed AFTER persisting CompleteCommit
-    // but BEFORE persisting Empty, recovery must NOT re-write markers.
+    // C2 complementary + P5-5 liveness fix:
+    //
+    // If a coordinator crashed AFTER persisting CompleteCommit but BEFORE
+    // persisting Empty, recovery must NOT re-write markers.  With the P5-5
+    // liveness fix the constructor collapses a recovered CompleteCommit to Empty
+    // in-memory (no second log write during replay — the txnId is merely made
+    // immediately reusable).  The invariant "no duplicate markers" is preserved
+    // because Empty is also not in pendingMarkerTransactions, and resolvePending
+    // emits zero markers.
     auto path = coordTmpPath();
     CoordTempFile tf{path};
 
@@ -1418,20 +1425,21 @@ TEST(TxnCoordAuditB2Test, RecoveryDoesNotDuplicateMarkersOnCompleteCommitState)
         log.append(e);
     }
 
-    // Recover: CompleteCommit is NOT in pending markers.
+    // Recover: liveness fix collapses CompleteCommit → Empty in-memory.
     TransactionLog log2(path);
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 5);
 
-    ASSERT_EQ(coord2.state("txn-c2-nodup"), TxnState::CompleteCommit);
+    // State is now Empty (collapsed from CompleteCommit).
+    ASSERT_EQ(coord2.state("txn-c2-nodup"), TxnState::Empty);
     auto pending = coord2.pendingMarkerTransactions();
     EXPECT_TRUE(pending.empty())
-        << "CompleteCommit state must NOT appear in pendingMarkerTransactions";
+        << "Collapsed CompleteCommit (now Empty) must NOT appear in pendingMarkerTransactions";
 
-    // No markers written on a second resolve pass.
+    // No markers written on a resolve pass (Empty is not pending).
     int count = 0;
     auto appendFn = [&](const TopicPartition&, const std::vector<uint8_t>&) { ++count; };
     ControlMarker::resolvePendingMarkers(coord2, appendFn);
-    EXPECT_EQ(count, 0) << "No markers must be re-written for CompleteCommit";
+    EXPECT_EQ(count, 0) << "No markers must be re-written for a recovered CompleteCommit";
 }
 
 // ===========================================================================
@@ -1639,9 +1647,19 @@ TEST_F(TxnCoordTest, ReInitWhilePrepareAbortReturnsConcurrentTransactions)
 
 TEST_F(TxnCoordTest, ReInitWhileCompleteCommitReturnsConcurrentTransactions)
 {
-    // CompleteCommit is now a persistent state (C2 fix).  Re-init during it must
-    // return kConcurrentTransactions (C4).  Drive to CompleteCommit by directly
-    // injecting that state via a durable log.
+    // P5-5 LIVENESS FIX: A recovered CompleteCommit is now collapsed to Empty in
+    // the constructor (crash-in-two-write-window fix).  A LIVE (in-memory-only)
+    // CompleteCommit — reached by running completeTransaction without crashing —
+    // is immediately overwritten by Empty in the same call, so it is also
+    // effectively never observable by a caller between the two writes.
+    //
+    // The original test injected a CompleteCommit via the durable log to simulate
+    // a crash in the two-write window, then asserted kConcurrentTransactions on
+    // re-init.  After the liveness fix that crash-seam is healed: the recovered
+    // state is Empty (not CompleteCommit), and re-init must succeed.
+    //
+    // We keep the test but update the assertions to match the corrected behaviour:
+    // a recovered CompleteCommit → Empty → re-init returns ok (not Concurrent).
     auto path = coordTmpPath();
     CoordTempFile tf{path};
     {
@@ -1656,11 +1674,15 @@ TEST_F(TxnCoordTest, ReInitWhileCompleteCommitReturnsConcurrentTransactions)
     }
     TransactionLog log2(path);
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0);
-    ASSERT_EQ(coord2.state("txn-cc"), TxnState::CompleteCommit);
+    // Liveness fix: recovered CompleteCommit → Empty.
+    ASSERT_EQ(coord2.state("txn-cc"), TxnState::Empty);
 
+    // re-init on Empty → succeeds (not kConcurrentTransactions).
     auto r2 = coord2.initProducerId("txn-cc", 60'000, 0LL);
-    EXPECT_EQ(r2.errorCode, InitProducerIdResult::kConcurrentTransactions);
-    EXPECT_EQ(coord2.state("txn-cc"), TxnState::CompleteCommit);
+    EXPECT_TRUE(r2.ok())
+        << "Recovered CompleteCommit must be collapsed to Empty; re-init must succeed";
+    EXPECT_NE(r2.errorCode, InitProducerIdResult::kConcurrentTransactions)
+        << "txnId must NOT be wedged after CompleteCommit collapse";
 }
 
 TEST_F(TxnCoordTest, ReInitAfterResolveSucceeds)
@@ -1824,8 +1846,16 @@ TEST_F(TxnCoordTest, TimeoutAbortWritesAbortMarkersToAllPartitions_T1)
 
 TEST(TxnCoordAuditT2Test, AddPartitionsWhenCompleteCommitIsInvalidTransition)
 {
-    // C2 fix made CompleteCommit a real persistent state.  Injecting it via the
-    // log, verify that addPartitions rejects it with kInvalidTransition.
+    // P5-5 LIVENESS FIX: a recovered CompleteCommit is now collapsed to Empty.
+    // This means addPartitions is now a VALID transition (Empty→Ongoing), not
+    // kInvalidTransition.  The original test was probing the now-fixed crash-seam
+    // scenario where the txnId would be permanently wedged.  After the fix the
+    // txnId is immediately reusable.  We update to assert the corrected behavior.
+    //
+    // The invariant "addPartitions while a Complete* is IN-FLIGHT" (i.e. within a
+    // live coordinator run, not across a crash) still holds because completeTransaction
+    // atomically transitions CompleteCommit→Empty in memory, so there is never a
+    // window where a live caller can call addPartitions on a CompleteCommit state.
     auto path = coordTmpPath();
     CoordTempFile tf{path};
     {
@@ -1840,12 +1870,14 @@ TEST(TxnCoordAuditT2Test, AddPartitionsWhenCompleteCommitIsInvalidTransition)
     }
     TransactionLog log2(path);
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0);
-    ASSERT_EQ(coord2.state("txn-t2"), TxnState::CompleteCommit);
+    // Liveness fix: recovered CompleteCommit → Empty.
+    ASSERT_EQ(coord2.state("txn-t2"), TxnState::Empty);
 
+    // addPartitions on Empty is a valid transition (Empty→Ongoing).
     auto ar = coord2.addPartitions("txn-t2", /*pid=*/7, /*epoch=*/0,
                                     tps({tp("t", 0)}), 0LL);
-    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidTransition)
-        << "addPartitions while CompleteCommit must be an invalid transition";
+    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kOk)
+        << "addPartitions on a recovered CompleteCommit (now Empty) must succeed";
 }
 
 // ===========================================================================
@@ -2022,16 +2054,21 @@ static void injectState(const std::string& path, const std::string& txnId,
 
 TEST(TxnCoordAuditA3StateTest, ReInitInCompleteAbortReturnsConcurrent)
 {
+    // P5-5 LIVENESS FIX: a recovered CompleteAbort is now collapsed to Empty in
+    // the constructor (crash-in-two-write-window fix).  The txnId is NOT wedged.
+    // re-init succeeds (state is Empty), not kConcurrentTransactions.
     auto path = coordTmpPath();
     CoordTempFile tf{path};
     injectState(path, "txn-ca", 7, 2, TxnState::CompleteAbort);
     TransactionLog log2(path);
     TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
+    // Liveness fix: collapsed to Empty.
+    EXPECT_EQ(coord.state("txn-ca"), TxnState::Empty);
     auto r = coord.initProducerId("txn-ca", 60'000, 0LL);
-    EXPECT_EQ(r.errorCode, InitProducerIdResult::kConcurrentTransactions);
-    // State/epoch unchanged.
-    EXPECT_EQ(coord.state("txn-ca"), TxnState::CompleteAbort);
-    EXPECT_EQ(coord.epochOf("txn-ca"), static_cast<ProducerEpoch>(2));
+    EXPECT_TRUE(r.ok())
+        << "Recovered CompleteAbort must be collapsed to Empty; re-init must succeed";
+    EXPECT_NE(r.errorCode, InitProducerIdResult::kConcurrentTransactions)
+        << "txnId must NOT be wedged after CompleteAbort collapse";
 }
 
 TEST(TxnCoordAuditA3StateTest, ReInitInPrepareEpochFenceReturnsConcurrent)
@@ -2423,23 +2460,42 @@ TEST(TxnCoordRound2Residual3Test, IdempotentReResolveNoDuplicateMarkers)
     EXPECT_TRUE(markers2.empty());
 }
 
-// Residual-4: addPartitions rejected in CompleteAbort AND PrepareEpochFence
-// states (correct kInvalidTransition error).
-TEST(TxnCoordRound2Residual4Test, AddPartitionsRejectedInCompleteAbortAndPrepareEpochFence)
+// Residual-4: addPartitions rejected in PrepareEpochFence state.
+// P5-5 LIVENESS FIX: CompleteAbort is now collapsed to Empty on recovery, so
+// addPartitions on a recovered CompleteAbort succeeds (not kInvalidTransition).
+// PrepareEpochFence is not a Complete* state so it is NOT collapsed and still
+// rejects addPartitions with kInvalidTransition.
+TEST(TxnCoordRound2Residual4Test, AddPartitionsRejectedInPrepareEpochFence)
 {
-    for (TxnState st : { TxnState::CompleteAbort, TxnState::PrepareEpochFence }) {
-        auto path = coordTmpPath();
-        CoordTempFile tf{path};
-        injectState(path, "txn-rej", 5, 0, st);
-        TransactionLog log2(path);
-        TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
-        ASSERT_EQ(coord.state("txn-rej"), st);
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    injectState(path, "txn-rej-pef", 5, 0, TxnState::PrepareEpochFence);
+    TransactionLog log2(path);
+    TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
+    ASSERT_EQ(coord.state("txn-rej-pef"), TxnState::PrepareEpochFence);
 
-        auto ar = coord.addPartitions("txn-rej", /*pid=*/5, /*epoch=*/0,
-                                      tps({tp("t", 0)}), 0LL);
-        EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidTransition)
-            << "addPartitions must be rejected in state " << txnStateName(st);
-    }
+    auto ar = coord.addPartitions("txn-rej-pef", /*pid=*/5, /*epoch=*/0,
+                                  tps({tp("t", 0)}), 0LL);
+    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidTransition)
+        << "addPartitions must be rejected in PrepareEpochFence";
+}
+
+// After liveness fix: recovered CompleteAbort collapses to Empty, so
+// addPartitions SUCCEEDS (Empty→Ongoing is a valid transition).
+TEST(TxnCoordRound2Residual4Test, AddPartitionsAcceptedInRecoveredCompleteAbort)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    injectState(path, "txn-rej-ca", 5, 0, TxnState::CompleteAbort);
+    TransactionLog log2(path);
+    TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
+    // Liveness fix: CompleteAbort → Empty.
+    ASSERT_EQ(coord.state("txn-rej-ca"), TxnState::Empty);
+
+    auto ar = coord.addPartitions("txn-rej-ca", /*pid=*/5, /*epoch=*/0,
+                                  tps({tp("t", 0)}), 0LL);
+    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kOk)
+        << "addPartitions on recovered CompleteAbort (now Empty) must succeed";
 }
 
 // Residual-5 and Residual-6 are in ControlMarkerTest.cpp (non-zero offset and
@@ -2616,6 +2672,487 @@ TEST(TxnCoordEosDurabilityTest, NormalCommitAppliesPendingOffsets)
     ASSERT_TRUE(co.has_value());
     EXPECT_EQ(*co, 7);
     EXPECT_EQ(coord.state("ok-txn"), TxnState::Empty);
+}
+
+// ===========================================================================
+// P5-5 final re-audit liveness fix: recovered Complete* → Empty (txnId no wedge).
+//
+// Bug: completeTransaction writes CompleteCommit (or CompleteAbort) as one
+// persisted record, then Empty as a SECOND persisted record.  A crash BETWEEN
+// those two writes leaves a durable Complete* state.  The constructor only sets
+// markersPending for Prepare*, so a recovered Complete* is never re-driven;
+// initProducerId returns kConcurrentTransactions forever → the transactionalId
+// is PERMANENTLY WEDGED.  Safety holds (offsets + markers were already durable
+// before the Complete* record was written), but "every recovered state is
+// resolvable" is violated.
+//
+// Fix: in the constructor replay loop, collapse a recovered CompleteCommit /
+// CompleteAbort to Empty (with pendingNewProducerId adoption for CompleteAbort,
+// mirroring what completeTransaction would have done).  No offsets are
+// re-applied (already in the OffsetStore), no markers are re-written (already
+// on disk, deduplicated by consumers).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 1 (MUST FAIL under old code): crash BETWEEN CompleteCommit-persist and
+// Empty-reset → txnId must NOT be wedged, initProducerId succeeds and begins a
+// NEW transaction (not kConcurrentTransactions forever).
+//
+// Also asserts: offsets are NOT re-applied on recovery (already in OffsetStore),
+// and no duplicate markers were written.
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55LivenessTest, RecoveredCompleteCommitCollapsedToEmpty_NotWedged)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    // Track how many times the offset callback fires.
+    int applyCount = 0;
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        ++applyCount;
+        store.commit(g, t, off);
+    };
+
+    // Simulate the crash window: persist CompleteCommit to the log WITHOUT the
+    // subsequent Empty record.  This is exactly what happens when the coordinator
+    // crashes after the first persistTransition in completeTransaction() but
+    // before the second.
+    ProducerId    savedPid{};
+    ProducerEpoch savedEpoch{};
+    {
+        TransactionLog log(path);
+        // Phase 1: run the txn all the way to PrepareCommit.
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log,
+                                     /*coordinatorEpoch=*/0, cb);
+        auto r = coord.initProducerId("wedge-txn", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        savedPid   = r.producerId;
+        savedEpoch = r.producerEpoch;
+
+        rune::coordination::TopicPartition inputTp{"in", 0};
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs;
+        offs[inputTp] = 77;
+        coord.addPartitions("wedge-txn", savedPid, savedEpoch, tps({tp("out", 0)}), 1LL);
+        ASSERT_TRUE(coord.addOffsetsToTxn("wedge-txn", savedPid, savedEpoch,
+                                          "grp", offs, 2LL).ok());
+        coord.endTransaction("wedge-txn", savedPid, savedEpoch, /*commit=*/true, 3LL);
+        ASSERT_EQ(coord.state("wedge-txn"), TxnState::PrepareCommit);
+        // The coordinator is destroyed here WITHOUT calling completeTransaction.
+        // The durable log holds Ongoing→PrepareCommit; we'll inject CompleteCommit
+        // manually below to model the crash-in-window scenario.
+    }
+    applyCount = 0; // reset: we will inject state manually
+
+    // Inject a CompleteCommit record (without an Empty follow-up) directly into
+    // the log — this is the state left by a crash after the first write in
+    // completeTransaction.
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "wedge-txn";
+        e.producerId    = savedPid;
+        e.producerEpoch = savedEpoch;
+        e.state         = TxnState::CompleteCommit;
+        e.txnTimeoutMs  = 60'000;
+        // pendingOffsets are NOT on this entry (already applied before CompleteCommit
+        // in the current code; mirroring that here).
+        log.append(e);
+    }
+
+    // Phase 2: recover from the log.  The recovered CompleteCommit must be
+    // collapsed to Empty — not wedge the transactionalId.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2,
+                                  /*coordinatorEpoch=*/0, cb);
+
+    // KEY ASSERTION 1: state must be Empty (not CompleteCommit).
+    ASSERT_TRUE(coord2.state("wedge-txn").has_value());
+    EXPECT_EQ(coord2.state("wedge-txn"), TxnState::Empty)
+        << "Recovered CompleteCommit MUST be collapsed to Empty (liveness fix)";
+
+    // KEY ASSERTION 2: initProducerId must succeed (not kConcurrentTransactions).
+    auto r2 = coord2.initProducerId("wedge-txn", 60'000, 100LL);
+    EXPECT_NE(r2.errorCode, InitProducerIdResult::kConcurrentTransactions)
+        << "txnId must NOT be wedged: initProducerId must not return kConcurrentTransactions";
+    EXPECT_TRUE(r2.ok())
+        << "initProducerId on a recovered CompleteCommit txnId must succeed";
+
+    // KEY ASSERTION 3: offsets NOT re-applied on recovery collapse (already in store).
+    EXPECT_EQ(applyCount, 0)
+        << "Offsets must NOT be re-applied when collapsing CompleteCommit→Empty on recovery";
+
+    // KEY ASSERTION 4: the txnId is usable for a NEW transaction.
+    auto addRes = coord2.addPartitions("wedge-txn", r2.producerId, r2.producerEpoch,
+                                       tps({tp("new-part", 0)}), 200LL);
+    EXPECT_EQ(addRes.errorCode, AddPartitionsResult::kOk)
+        << "txnId must be fully reusable after CompleteCommit collapse";
+}
+
+// ---------------------------------------------------------------------------
+// Test 2 (MUST FAIL under old code): crash BETWEEN CompleteAbort-persist and
+// Empty-reset → txnId not wedged, pendingNewProducerId correctly adopted.
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55LivenessTest, RecoveredCompleteAbortCollapsedToEmpty_NotWedged)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    // Inject a CompleteAbort directly, without a following Empty.
+    ProducerId    oldPid   = 42;
+    ProducerEpoch oldEpoch = 3;
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "abort-wedge";
+        e.producerId    = oldPid;
+        e.producerEpoch = oldEpoch;
+        e.state         = TxnState::CompleteAbort;
+        e.txnTimeoutMs  = 60'000;
+        log.append(e);
+    }
+
+    TransactionLog log2(path);
+    TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2, 0);
+
+    // State must be Empty.
+    ASSERT_TRUE(coord.state("abort-wedge").has_value());
+    EXPECT_EQ(coord.state("abort-wedge"), TxnState::Empty)
+        << "Recovered CompleteAbort MUST be collapsed to Empty";
+
+    // initProducerId must succeed.
+    auto r = coord.initProducerId("abort-wedge", 60'000, 0LL);
+    EXPECT_TRUE(r.ok())
+        << "txnId must NOT be wedged after CompleteAbort collapse";
+    EXPECT_NE(r.errorCode, InitProducerIdResult::kConcurrentTransactions);
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 (MUST FAIL under old code): crash between CompleteAbort and Empty when
+// pendingNewProducerId was set (NEW-1/A2 overflow path) → recovered state must
+// adopt the deferred PID, matching what completeTransaction would have done.
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55LivenessTest, RecoveredCompleteAbortWithPendingNewPid_AdoptsDeferredPid)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    ProducerId    oldPid   = 55;
+    ProducerEpoch oldEpoch = static_cast<ProducerEpoch>(INT16_MAX);  // overflow was triggered
+    ProducerId    freshPid = 200;
+    ProducerEpoch freshEpoch = 0;
+
+    // Inject a CompleteAbort that still carries pendingNewProducerId (the deferred
+    // PID was NOT yet adopted — crash happened before the Empty write).
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId                  = "overflow-abort-wedge";
+        e.producerId             = oldPid;
+        e.producerEpoch          = oldEpoch;
+        e.state                  = TxnState::CompleteAbort;
+        e.txnTimeoutMs           = 60'000;
+        e.pendingNewProducerId   = freshPid;
+        e.pendingNewProducerEpoch = freshEpoch;
+        log.append(e);
+    }
+
+    // Recover: allocator starts past freshPid so no reuse.
+    TransactionLog log2(path);
+    TransactionCoordinator coord(ProducerIdAllocator{500}, 60'000, &log2, 0);
+
+    // State must be Empty.
+    ASSERT_TRUE(coord.state("overflow-abort-wedge").has_value());
+    EXPECT_EQ(coord.state("overflow-abort-wedge"), TxnState::Empty)
+        << "Recovered CompleteAbort+pendingNewPid MUST be collapsed to Empty";
+
+    // The PID must be the DEFERRED fresh PID (not the old one), matching what
+    // completeTransaction would have installed before writing Empty.
+    EXPECT_EQ(coord.pidOf("overflow-abort-wedge"), freshPid)
+        << "Recovered CompleteAbort must adopt pendingNewProducerId";
+    EXPECT_EQ(coord.epochOf("overflow-abort-wedge"), freshEpoch)
+        << "Recovered CompleteAbort must adopt pendingNewProducerEpoch";
+
+    // initProducerId must succeed and not be wedged.
+    auto r = coord.initProducerId("overflow-abort-wedge", 60'000, 0LL);
+    EXPECT_TRUE(r.ok())
+        << "txnId must be reusable after CompleteAbort+pendingNewPid collapse";
+}
+
+// ===========================================================================
+// Part-B edge tests: addOffsetsToTxn fencing, multi-group, abort recovery,
+// dedup, interleaved commit+abort with offsets.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Edge 4: addOffsetsToTxn epoch-fenced by a zombie (old epoch) → rejected.
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55EdgeTest, AddOffsetsToTxnFencedByZombieOldEpoch)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, 0);
+
+    // Create producer, bump epoch via re-init, then try addOffsetsToTxn with the
+    // old (zombie) epoch.
+    auto r1 = coord.initProducerId("fenced-offs", 60'000, 0LL);
+    ASSERT_TRUE(r1.ok());
+    // Re-init bumps epoch.
+    auto r2 = coord.initProducerId("fenced-offs", 60'000, 1LL);
+    ASSERT_TRUE(r2.ok());
+    EXPECT_GT(r2.producerEpoch, r1.producerEpoch);
+
+    // Begin a new txn with the CURRENT epoch.
+    coord.addPartitions("fenced-offs", r2.producerId, r2.producerEpoch,
+                        tps({tp("t", 0)}), 10LL);
+    ASSERT_EQ(coord.state("fenced-offs"), TxnState::Ongoing);
+
+    rune::coordination::TopicPartition inputTp{"input", 0};
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs;
+    offs[inputTp] = 5;
+
+    // OLD (zombie) epoch → must be fenced.
+    auto res = coord.addOffsetsToTxn("fenced-offs", r1.producerId, r1.producerEpoch,
+                                      "grp", offs, 20LL);
+    EXPECT_NE(res.errorCode, AddPartitionsResult::kOk)
+        << "addOffsetsToTxn with a zombie epoch must be rejected";
+    EXPECT_EQ(res.errorCode, AddPartitionsResult::kInvalidProducerEpoch)
+        << "zombie addOffsetsToTxn must return kInvalidProducerEpoch";
+}
+
+// ---------------------------------------------------------------------------
+// Edge 5: multi-group offsets in one txn → ALL applied on commit /
+//         ALL discarded on abort (two distinct groups, two distinct TPs).
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55EdgeTest, MultiGroupOffsetsAppliedAtomicallyOnCommit)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);
+    };
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, 0, cb);
+
+    auto r = coord.initProducerId("multi-grp", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("multi-grp", r.producerId, r.producerEpoch,
+                        tps({tp("out", 0)}), 1LL);
+
+    rune::coordination::TopicPartition tpA{"in", 0};
+    rune::coordination::TopicPartition tpB{"in", 1};
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offsA{{tpA, 11}};
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offsB{{tpB, 22}};
+
+    ASSERT_TRUE(coord.addOffsetsToTxn("multi-grp", r.producerId, r.producerEpoch,
+                                       "group-A", offsA, 2LL).ok());
+    ASSERT_TRUE(coord.addOffsetsToTxn("multi-grp", r.producerId, r.producerEpoch,
+                                       "group-B", offsB, 3LL).ok());
+
+    coord.endTransaction("multi-grp", r.producerId, r.producerEpoch, /*commit=*/true, 4LL);
+    ASSERT_TRUE(coord.completeTransaction("multi-grp").ok());
+
+    // Both groups' offsets must be in the store.
+    auto coA = store.fetch("group-A", "in", 0);
+    auto coB = store.fetch("group-B", "in", 1);
+    ASSERT_TRUE(coA.has_value()) << "group-A offset must be applied on commit";
+    ASSERT_TRUE(coB.has_value()) << "group-B offset must be applied on commit";
+    EXPECT_EQ(*coA, 11);
+    EXPECT_EQ(*coB, 22);
+}
+
+TEST(TxnCoordP55EdgeTest, MultiGroupOffsetsDiscardedOnAbort)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);
+    };
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, 0, cb);
+
+    auto r = coord.initProducerId("multi-grp-abort", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("multi-grp-abort", r.producerId, r.producerEpoch,
+                        tps({tp("out", 0)}), 1LL);
+
+    rune::coordination::TopicPartition tpA{"in", 0};
+    rune::coordination::TopicPartition tpB{"in", 1};
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offsA{{tpA, 11}};
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offsB{{tpB, 22}};
+
+    ASSERT_TRUE(coord.addOffsetsToTxn("multi-grp-abort", r.producerId, r.producerEpoch,
+                                       "grp-A", offsA, 2LL).ok());
+    ASSERT_TRUE(coord.addOffsetsToTxn("multi-grp-abort", r.producerId, r.producerEpoch,
+                                       "grp-B", offsB, 3LL).ok());
+
+    coord.endTransaction("multi-grp-abort", r.producerId, r.producerEpoch, /*commit=*/false, 4LL);
+    ASSERT_TRUE(coord.completeTransaction("multi-grp-abort").ok());
+
+    // Neither group's offsets must be in the store.
+    EXPECT_FALSE(store.fetch("grp-A", "in", 0).has_value())
+        << "grp-A offset must be discarded on abort";
+    EXPECT_FALSE(store.fetch("grp-B", "in", 1).has_value())
+        << "grp-B offset must be discarded on abort";
+}
+
+// ---------------------------------------------------------------------------
+// Edge 6: abort AFTER addOffsetsToTxn THEN coordinator recovery →
+//         recovered PrepareAbort resolve still discards pendingOffsets.
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55EdgeTest, AbortAfterAddOffsetsRecovery_OffsetsDiscarded)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);   // must NEVER fire
+    };
+
+    // Phase 1: addOffsetsToTxn, then abort, then crash (without completeTransaction).
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, 0, cb);
+        auto r = coord.initProducerId("abort-offs-rec", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        coord.addPartitions("abort-offs-rec", r.producerId, r.producerEpoch,
+                            tps({tp("out", 0)}), 1LL);
+
+        rune::coordination::TopicPartition tp0{"in", 0};
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs{{tp0, 99}};
+        ASSERT_TRUE(coord.addOffsetsToTxn("abort-offs-rec", r.producerId, r.producerEpoch,
+                                           "g", offs, 2LL).ok());
+        // Abort (drive to PrepareAbort), then crash before completeTransaction.
+        coord.endTransaction("abort-offs-rec", r.producerId, r.producerEpoch,
+                             /*commit=*/false, 3LL);
+        ASSERT_EQ(coord.state("abort-offs-rec"), TxnState::PrepareAbort);
+        // Coordinator destroyed here (crash).
+    }
+
+    // Phase 2: recover and resolve.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0, cb);
+    // markersPending is set for the recovered PrepareAbort.
+    for (const auto& p : coord2.pendingMarkerTransactions()) {
+        (void)p;
+        coord2.completeTransaction("abort-offs-rec");
+    }
+
+    EXPECT_FALSE(store.fetch("g", "in", 0).has_value())
+        << "Offsets from an aborted txn must NEVER appear in the OffsetStore, even after recovery";
+}
+
+// ---------------------------------------------------------------------------
+// Edge 7: same (group,tp) added twice in one txn with DIFFERENT offsets →
+//         last-write-wins after commit (OffsetStore overwrites idempotently).
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55EdgeTest, SameGroupTpAddedTwice_LastWriteWinsOnCommit)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);
+    };
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, 0, cb);
+
+    auto r = coord.initProducerId("dup-offs", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("dup-offs", r.producerId, r.producerEpoch,
+                        tps({tp("out", 0)}), 1LL);
+
+    rune::coordination::TopicPartition inp{"in", 0};
+
+    // First addOffsetsToTxn: offset=5.
+    {
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs{{inp, 5}};
+        ASSERT_TRUE(coord.addOffsetsToTxn("dup-offs", r.producerId, r.producerEpoch,
+                                           "g", offs, 2LL).ok());
+    }
+    // Second addOffsetsToTxn with same key: offset=99 (last-write-wins).
+    {
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs{{inp, 99}};
+        ASSERT_TRUE(coord.addOffsetsToTxn("dup-offs", r.producerId, r.producerEpoch,
+                                           "g", offs, 3LL).ok());
+    }
+
+    coord.endTransaction("dup-offs", r.producerId, r.producerEpoch, /*commit=*/true, 4LL);
+    ASSERT_TRUE(coord.completeTransaction("dup-offs").ok());
+
+    auto co = store.fetch("g", "in", 0);
+    ASSERT_TRUE(co.has_value()) << "Offset must be in store after commit";
+    EXPECT_EQ(*co, 99) << "Last-write-wins: second addOffsetsToTxn offset must win";
+}
+
+// ---------------------------------------------------------------------------
+// Edge 8: interleaved commit+abort txns with offsets → committed group's
+//         offsets present, aborted group's offsets absent.
+// ---------------------------------------------------------------------------
+TEST(TxnCoordP55EdgeTest, InterleavedCommitAbort_OnlyCommittedOffsetsApplied)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);
+    };
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, 0, cb);
+
+    rune::coordination::TopicPartition tp0{"in", 0};
+
+    // Txn-A: commit with offset 10 for group-commit.
+    {
+        auto r = coord.initProducerId("txn-a-commit", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        coord.addPartitions("txn-a-commit", r.producerId, r.producerEpoch,
+                            tps({tp("out", 0)}), 1LL);
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs{{tp0, 10}};
+        ASSERT_TRUE(coord.addOffsetsToTxn("txn-a-commit", r.producerId, r.producerEpoch,
+                                           "group-commit", offs, 2LL).ok());
+        coord.endTransaction("txn-a-commit", r.producerId, r.producerEpoch,
+                             /*commit=*/true, 3LL);
+        ASSERT_TRUE(coord.completeTransaction("txn-a-commit").ok());
+    }
+
+    // Txn-B: abort with offset 20 for group-abort.
+    {
+        auto r = coord.initProducerId("txn-b-abort", 60'000, 10LL);
+        ASSERT_TRUE(r.ok());
+        coord.addPartitions("txn-b-abort", r.producerId, r.producerEpoch,
+                            tps({tp("out", 1)}), 11LL);
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs{{tp0, 20}};
+        ASSERT_TRUE(coord.addOffsetsToTxn("txn-b-abort", r.producerId, r.producerEpoch,
+                                           "group-abort", offs, 12LL).ok());
+        coord.endTransaction("txn-b-abort", r.producerId, r.producerEpoch,
+                             /*commit=*/false, 13LL);
+        ASSERT_TRUE(coord.completeTransaction("txn-b-abort").ok());
+    }
+
+    // Committed group's offset present.
+    auto coCommit = store.fetch("group-commit", "in", 0);
+    ASSERT_TRUE(coCommit.has_value()) << "Committed group offset must be applied";
+    EXPECT_EQ(*coCommit, 10);
+
+    // Aborted group's offset absent.
+    EXPECT_FALSE(store.fetch("group-abort", "in", 0).has_value())
+        << "Aborted group offset must NOT be applied";
 }
 
 // Abort MUST still discard pending offsets — they are never written on abort,
