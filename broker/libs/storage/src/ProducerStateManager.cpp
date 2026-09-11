@@ -37,6 +37,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <bit>
 #include <cassert>
 #include <cstring>
@@ -125,15 +126,17 @@ ProducerStateManager::validate(int64_t producerId,
                                int32_t baseSequence,
                                int32_t lastSequenceInBatch) const noexcept
 {
+    // Protocol invariant: sequence numbers are non-negative.
+    assert(baseSequence >= 0 && "baseSequence must be >= 0 per protocol");
+    assert(lastSequenceInBatch >= baseSequence && "lastSequence must be >= baseSequence");
+
     const ProducerPartitionKey key{producerId, partition};
     auto it = map_.find(key);
 
     if (it == map_.end()) {
-        // Brand-new producer on this partition.
-        if (producerEpoch < 0) {
-            // An epoch of -1 (unset) is treated as 0 for a new producer.
-            // Still, baseSequence must be 0.
-        }
+        // Brand-new producer on this partition — trust-on-first-use.
+        // Epoch is accepted as-is for the first appearance of a (producerId, partition)
+        // pair on this node. Cross-node epoch fencing requires a coordinator.
         if (baseSequence != 0) return ValidationResult::oos();
         return ValidationResult::accept();
     }
@@ -233,16 +236,21 @@ ProducerStateManager::entry(int64_t producerId, int32_t partition) const noexcep
 void ProducerStateManager::takeSnapshot(const std::string& path) const
 {
     // Build the full file in memory first.
-    const uint32_t count = static_cast<uint32_t>(map_.size());
-    const std::size_t totalSize = kFileHdrSize + count * kEntrySize;
+    // S4: use 64-bit arithmetic to avoid uint32 overflow for large producer counts.
+    const uint64_t count     = static_cast<uint64_t>(map_.size());
+    const uint64_t totalSize = static_cast<uint64_t>(kFileHdrSize) +
+                               count * static_cast<uint64_t>(kEntrySize);
+    // Guard against pathological producer counts (> 1 billion would be a bug).
+    if (count > 1'000'000'000ULL)
+        throw std::runtime_error("ProducerStateManager: snapshot count unreasonably large");
 
-    std::vector<uint8_t> buf(totalSize, 0u);
+    std::vector<uint8_t> buf(static_cast<std::size_t>(totalSize), 0u);
     uint8_t* p = buf.data();
 
     // File header.
     wle<uint32_t>(p,      kFileMagic);
     wle<uint32_t>(p + 4,  kFileVersion);
-    wle<uint32_t>(p + 8,  count);
+    wle<uint32_t>(p + 8,  static_cast<uint32_t>(count));
     wle<uint32_t>(p + 12, 0u); // pad
     p += kFileHdrSize;
 
@@ -281,7 +289,7 @@ void ProducerStateManager::takeSnapshot(const std::string& path) const
                                 "ProducerStateManager::takeSnapshot open " + tmp);
     }
 
-    ssize_t written = ::write(fd, buf.data(), totalSize);
+    ssize_t written = ::write(fd, buf.data(), static_cast<std::size_t>(totalSize));
     if (written != static_cast<ssize_t>(totalSize)) {
         ::close(fd);
         throw std::system_error(errno, std::system_category(),
@@ -343,15 +351,21 @@ int ProducerStateManager::recover(const std::string& path)
     const uint32_t count = rle<uint32_t>(p + 8);
     p += kFileHdrSize;
 
-    const std::size_t needed = kFileHdrSize + static_cast<std::size_t>(count) * kEntrySize;
-    if (fileSize < needed) {
+    // S4: 64-bit arithmetic to prevent overflow for large count values from disk.
+    const uint64_t needed = static_cast<uint64_t>(kFileHdrSize) +
+                            static_cast<uint64_t>(count) * static_cast<uint64_t>(kEntrySize);
+    if (static_cast<uint64_t>(fileSize) < needed) {
         return 0; // file truncated
     }
+    // Bound count against fileSize to prevent over-read if count is forged.
+    const uint32_t maxEntries = static_cast<uint32_t>((fileSize - kFileHdrSize) / kEntrySize);
 
     map_.clear();
     int loaded = 0;
+    // Use min(count, maxEntries) to guard against forged count on disk (S4).
+    const uint32_t safeCount = std::min(count, maxEntries);
 
-    for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i < safeCount; ++i) {
         const uint8_t* ep = p + static_cast<std::size_t>(i) * kEntrySize;
 
         // CRC check.
@@ -372,6 +386,12 @@ int ProducerStateManager::recover(const std::string& path)
         e.windowHead    = rle<int32_t>(ep + 20);
         e.windowCount   = rle<int32_t>(ep + 24);
         // [28..31] pad
+
+        // S5: clamp windowHead/windowCount to valid ranges (defense against corrupt snapshots).
+        if (e.windowCount < 0 || e.windowCount > kRetryWindowSize)
+            e.windowCount = std::clamp(e.windowCount, 0, kRetryWindowSize);
+        if (e.windowHead < 0 || e.windowHead >= kRetryWindowSize)
+            e.windowHead = 0;
 
         const uint8_t* wp = ep + kEntryFixedSize;
         for (int j = 0; j < kRetryWindowSize; ++j) {

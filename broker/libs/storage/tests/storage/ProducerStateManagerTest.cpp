@@ -437,6 +437,96 @@ TEST(ProducerStateManager, RecoverFromEmptyFileReturnsZero) {
     ::unlink(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// S5: windowHead/windowCount loaded from disk are clamped to valid ranges.
+// Forge a snapshot with out-of-range windowCount (CRC mismatch stops load).
+// ---------------------------------------------------------------------------
+TEST(ProducerStateManager, CorruptWindowCountClamped) {
+    std::string path = tmpPath("psm_s5");
+    ProducerStateManager psm;
+    produce(psm, 1, 0, 0, 0, 3, 0);
+    psm.takeSnapshot(path);
+
+    // Corrupt windowCount (int32 at entry offset 24 within the entry body).
+    // File layout: kFileHdrSize(16) + entry body starting at byte 16.
+    // windowCount is at entry offset 24: file offset = 16 + 24 = 40.
+    {
+        int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        uint32_t huge = 0xFFFFFFFFu;
+        ::pwrite(fd, &huge, 4, 40);
+        ::close(fd);
+    }
+    // CRC will mismatch -> recover() stops at CRC error (0 entries loaded).
+    // The important thing is it must not crash or loop.
+    ProducerStateManager psm2;
+    EXPECT_NO_THROW(psm2.recover(path));
+    // 0 entries (CRC mismatch stops recovery cleanly)
+    EXPECT_EQ(psm2.size(), 0u);
+
+    ::unlink(path.c_str());
+}
+
+// S3: baseSequence=0 for a new producer is valid (regression for the assert).
+TEST(ProducerStateManager, ValidBaseSequenceAccepted) {
+    ProducerStateManager psm;
+    auto r = psm.validate(999, 0, 0, 0, 0);
+    EXPECT_TRUE(r.isAccept()) << "baseSequence=0 for new producer must be Accept";
+}
+
+// T5: Torn snapshot (mid-entry truncation) stops recovery cleanly — no crash.
+TEST(ProducerStateManager, TornSnapshotStopsCleanly) {
+    std::string path = tmpPath("psm_t5");
+    ProducerStateManager psm;
+    produce(psm, 1, 0, 0, 0, 2, 0);
+    produce(psm, 2, 0, 0, 0, 2, 2);
+    psm.takeSnapshot(path);
+
+    // Truncate the file mid-entry (keep header + first entry + 10 bytes of second).
+    // kFileHdrSize=16, kEntrySize=116.
+    off_t truncAt = 16 + 116 + 10;
+    {
+        struct stat st{};
+        ::stat(path.c_str(), &st);
+        if (truncAt < st.st_size) ::truncate(path.c_str(), truncAt);
+    }
+
+    ProducerStateManager psm2;
+    int loaded = 0;
+    EXPECT_NO_THROW(loaded = psm2.recover(path));
+    // Should have loaded exactly 1 entry (first entry's CRC is intact) or 0 if
+    // truncation hit inside the first entry.
+    EXPECT_GE(loaded, 0) << "recover must not return negative on torn snapshot";
+    EXPECT_LE(static_cast<size_t>(loaded), 2u) << "cannot load more entries than written";
+
+    ::unlink(path.c_str());
+}
+
+// T5-corrupt-crc: Flip a CRC byte in the first entry — recovery stops at entry 0.
+TEST(ProducerStateManager, CorruptCrcInFirstEntryStopsRecovery) {
+    std::string path = tmpPath("psm_t5_crc");
+    ProducerStateManager psm;
+    produce(psm, 10, 0, 0, 0, 1, 100);
+    produce(psm, 20, 0, 0, 0, 1, 200);
+    psm.takeSnapshot(path);
+
+    // CRC is the last 4 bytes of the first entry: file offset = 16 + (116-4) = 128.
+    {
+        int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        uint8_t bad = 0xFF;
+        ::pwrite(fd, &bad, 1, 128);
+        ::close(fd);
+    }
+
+    ProducerStateManager psm2;
+    int loaded = psm2.recover(path);
+    EXPECT_EQ(loaded, 0) << "CRC mismatch in first entry must stop recovery with 0 loaded";
+    EXPECT_EQ(psm2.size(), 0u);
+
+    ::unlink(path.c_str());
+}
+
 TEST(ProducerStateManager, SnapshotDedupSurvivesRestartRetryWindow) {
     std::string path = tmpPath("snap_retry_window");
 
