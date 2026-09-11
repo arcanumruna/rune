@@ -221,18 +221,32 @@ bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len
 // ---------------------------------------------------------------------------
 // resolvePublication — bounded wait for ExclusivePublication, mirrors
 // AeronMessageSink::resolvePublications().
+//
+// Exception-safe: if Aeron rejects the channel (malformed URI, unknown
+// transport, etc.) the conductor stores an error and findExclusivePublication
+// throws on the next poll.  We catch that and return nullptr so the caller can
+// treat it identically to a timeout (log-and-drop, no session created).
 // ---------------------------------------------------------------------------
 std::shared_ptr<aeron::ExclusivePublication>
 ClientGateway::resolvePublication(const std::string& channel, int32_t streamId)
 {
-    const int64_t regId = aeron_->addExclusivePublication(channel, streamId);
+    int64_t regId;
+    try {
+        regId = aeron_->addExclusivePublication(channel, streamId);
+    } catch (...) {
+        return nullptr; // channel rejected by the media driver
+    }
 
     using clock = std::chrono::steady_clock;
     auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
 
     while (clock::now() < deadline) {
-        auto pub = aeron_->findExclusivePublication(regId);
-        if (pub) return pub;
+        try {
+            auto pub = aeron_->findExclusivePublication(regId);
+            if (pub) return pub;
+        } catch (...) {
+            return nullptr; // conductor signalled an error (bad channel, etc.)
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
     }
     return nullptr; // timed out

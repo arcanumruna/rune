@@ -24,6 +24,12 @@
 //  10.  Ping for unknown session: no crash, no response
 //  11.  Wrong schemaId frame: gateway drops cleanly
 //  12.  Multiple Pings in sequence: all Pongs received, echo matches each time
+//  13.  Unresolvable egress channel (error path): ConnectRequest with bad channel →
+//       no session created, no crash, gateway keeps serving (BR-4 coverage top-up)
+//  14.  UnsupportedVersion frame dropped: version > kProtocolVersion → dropped;
+//       subsequent valid Ping still gets Pong (BR-4 coverage top-up)
+//  15.  correlationId distinctness: two Pings with different correlationIds →
+//       Pongs echo each id correctly (BR-4 coverage top-up)
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -936,6 +942,237 @@ TEST_F(GatewayLoopbackFixture, MultiplePings_AllPongsReceived) {
         EXPECT_EQ(recvEchoes[i],  echoes[i])
             << "Echo mismatch at index " << i;
     }
+}
+
+// ===========================================================================
+// TEST 13: Unresolvable egress channel — no session created, no crash,
+//          gateway keeps serving (BR-4 coverage top-up).
+//
+// Strategy: send a ConnectRequest whose egressChannel is "aeron:bogus" — a
+// syntactically parseable-but-invalid channel that Aeron's media driver will
+// reject.  resolvePublication() catches the resulting exception and returns
+// nullptr; handleConnect() sees nullptr and returns early (no session added).
+//
+// Note on timing: Aeron rejects the channel at the driver level without
+// waiting the full kResolveMaxMs=5s timeout, so the test completes quickly.
+// In the unlikely event the rejection is delayed, this test is still bounded
+// by a single occurrence of the resolve path and by the outer pump() deadline.
+// ===========================================================================
+TEST_F(GatewayLoopbackFixture, UnresolvableEgressChannel_NoSession_GatewayKeepsServing) {
+    // We need a raw ingress publication to send the bad ConnectRequest.
+    // No doConnect() helper here since we expect NO response.
+    int64_t badPubRegId = aeron_->addPublication("aeron:ipc", kIngressStream);
+    std::shared_ptr<aeron::Publication> ingressPub;
+    pump([&]() {
+            if (!ingressPub) ingressPub = aeron_->findPublication(badPubRegId);
+            return ingressPub != nullptr;
+         }, nullptr, nullptr, kPumpIter, "badEgress ingressPub resolve");
+
+    pump([&]() { return ingressPub->isConnected(); },
+         nullptr, nullptr, kPumpIter, "badEgress ingressPub connected");
+
+    // Build a ConnectRequest pointing at an invalid egress channel.
+    // "aeron:bogus" is parseable (valid URI prefix) but Aeron will reject it.
+    pc::ConnectRequest req;
+    req.sessionId      = 0;
+    req.correlationId  = 999;
+    req.egressStreamId = kEgressBase + 13;
+    req.clientVersion  = 1;
+    req.egressChannel  = "aeron:bogus";
+    const std::size_t reqLen = req.encode(scratch_);
+    offerBounded(*ingressPub, scratch_, reqLen, "BadEgressConnectRequest");
+
+    // Give gateway ample time to process — it must not crash.
+    {
+        int idle = 0;
+        pump([&]() { ++idle; return idle >= 2000; }, nullptr, nullptr, 3000, "BadEgressProcess");
+    }
+
+    // No session must have been created.
+    EXPECT_EQ(gw_->sessionCount(), 0u) << "Gateway must not create a session for an unresolvable egress";
+
+    // Gateway must keep serving: connect a valid second client and ping it.
+    auto goodClient = makeClient(kEgressBase + 14);
+    uint8_t scratch2[512] = {};
+    auto respGood = doConnect(*goodClient.ingressPub, *goodClient.egressSub,
+                              goodClient.egressStreamId, goodClient.egressChannel,
+                              /*correlationId=*/888, scratch2);
+    ASSERT_EQ(respGood.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_GE(respGood.assignedSessionId, 1);
+    EXPECT_EQ(gw_->sessionCount(), 1u);
+
+    uint8_t scratch3[512] = {};
+    pc::Ping ping;
+    ping.sessionId     = respGood.assignedSessionId;
+    ping.correlationId = 777;
+    ping.echo          = "after-bad-egress";
+    const std::size_t pingLen = ping.encode(scratch3);
+    offerBounded(*goodClient.ingressPub, scratch3, pingLen, "PingAfterBadEgress");
+
+    std::optional<pc::Pong> pong;
+    std::string             pongEcho;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                     aeron::util::index_t offset,
+                                     aeron::util::index_t len,
+                                     aeron::Header&) {
+        auto dec = pc::Pong::decode(
+            reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+            static_cast<std::size_t>(len));
+        if (dec) {
+            pongEcho = std::string(dec->echo);
+            pong = *dec;
+        }
+    });
+
+    pump([&]() { return pong.has_value(); }, &*goodClient.egressSub, &asm_,
+         kPumpIter, "PongAfterBadEgress");
+
+    ASSERT_TRUE(pong.has_value());
+    EXPECT_EQ(pongEcho, "after-bad-egress");
+}
+
+// ===========================================================================
+// TEST 14: UnsupportedVersion frame dropped — gateway keeps serving.
+//          (BR-4 coverage top-up)
+//
+// Sends a frame whose header version = kProtocolVersion + 1 (= 2).
+// checkFrame() returns FrameStatus::UnsupportedVersion → gateway drops it.
+// A subsequent valid Ping still produces a Pong.
+// ===========================================================================
+TEST_F(GatewayLoopbackFixture, UnsupportedVersionFrame_DroppedGatewayKeepsServing) {
+    auto client = makeClient(kEgressBase + 15);
+    auto resp = doConnect(*client.ingressPub, *client.egressSub,
+                          client.egressStreamId, client.egressChannel, 11, scratch_);
+    const int64_t sid = resp.assignedSessionId;
+
+    // Craft a Ping-shaped frame with version = kProtocolVersion + 1.
+    {
+        pc::MessageHeader hdr;
+        hdr.blockLength   = 0;
+        hdr.templateId    = static_cast<uint16_t>(pc::TemplateId::Ping);
+        hdr.schemaId      = pc::kSchemaId;
+        hdr.version       = static_cast<uint16_t>(pc::kProtocolVersion + 1); // 2 — unsupported
+        hdr.sessionId     = sid;
+        hdr.correlationId = 0;
+        hdr.encode(scratch_);
+        // Append minimal var-bytes (echo length = 0) so the buffer is well-formed length-wise.
+        scratch_[pc::MessageHeader::ENCODED_SIZE]     = 0;
+        scratch_[pc::MessageHeader::ENCODED_SIZE + 1] = 0;
+        offerBounded(*client.ingressPub, scratch_,
+                     pc::MessageHeader::ENCODED_SIZE + 2, "UnsupportedVersionFrame");
+    }
+
+    // Give gateway time to drop the bad frame.
+    {
+        int idle = 0;
+        pump([&]() { ++idle; return idle >= 300; }, nullptr, nullptr, 600, "UnsupportedVersionProcess");
+    }
+
+    // Session must still be alive.
+    EXPECT_EQ(gw_->sessionCount(), 1u);
+
+    // Valid Ping must still get a Pong.
+    uint8_t scratch2[512] = {};
+    pc::Ping ping;
+    ping.sessionId     = sid;
+    ping.correlationId = 50;
+    ping.echo          = "after-unsupported-version";
+    const std::size_t pingLen = ping.encode(scratch2);
+    offerBounded(*client.ingressPub, scratch2, pingLen, "PingAfterUnsupportedVersion");
+
+    std::optional<pc::Pong> pong;
+    std::string pongEcho;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                     aeron::util::index_t offset,
+                                     aeron::util::index_t len,
+                                     aeron::Header&) {
+        auto dec = pc::Pong::decode(
+            reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+            static_cast<std::size_t>(len));
+        if (dec) {
+            pongEcho = std::string(dec->echo);
+            pong = *dec;
+        }
+    });
+
+    pump([&]() { return pong.has_value(); }, &*client.egressSub, &asm_,
+         kPumpIter, "PongAfterUnsupportedVersion");
+
+    ASSERT_TRUE(pong.has_value());
+    EXPECT_EQ(pong->correlationId, 50);
+    EXPECT_EQ(pongEcho, "after-unsupported-version");
+}
+
+// ===========================================================================
+// TEST 15: correlationId distinctness — two Pings with different correlationIds
+//          produce Pongs that each echo the correct id.  (BR-4 coverage top-up)
+//
+// Verifies that the gateway does not carry over a stale correlationId between
+// consecutive Ping/Pong pairs on the same session.
+// ===========================================================================
+TEST_F(GatewayLoopbackFixture, CorrelationId_Distinctness_TwoPings) {
+    auto client = makeClient(kEgressBase + 16);
+    auto resp = doConnect(*client.ingressPub, *client.egressSub,
+                          client.egressStreamId, client.egressChannel, 12, scratch_);
+    const int64_t sid = resp.assignedSessionId;
+
+    constexpr int64_t kCorrId1 = 1001;
+    constexpr int64_t kCorrId2 = 2002;
+
+    std::vector<int64_t> recvCorrIds;
+    std::vector<std::string> recvEchoes;
+
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                     aeron::util::index_t offset,
+                                     aeron::util::index_t len,
+                                     aeron::Header&) {
+        auto dec = pc::Pong::decode(
+            reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+            static_cast<std::size_t>(len));
+        if (dec) {
+            recvCorrIds.push_back(dec->correlationId);
+            recvEchoes.push_back(std::string(dec->echo));
+        }
+    });
+
+    // --- First Ping (correlationId = C1) ---
+    {
+        uint8_t sc[512] = {};
+        pc::Ping ping;
+        ping.sessionId     = sid;
+        ping.correlationId = kCorrId1;
+        ping.echo          = "echo-C1";
+        const std::size_t pingLen = ping.encode(sc);
+        offerBounded(*client.ingressPub, sc, pingLen, "Ping-C1");
+    }
+    // Wait for first Pong.
+    pump([&]() { return recvCorrIds.size() >= 1u; },
+         &*client.egressSub, &asm_, kPumpIter, "Pong-C1");
+
+    ASSERT_EQ(recvCorrIds.size(), 1u);
+    EXPECT_EQ(recvCorrIds[0], kCorrId1) << "First Pong must carry C1";
+    EXPECT_EQ(recvEchoes[0],  "echo-C1");
+
+    // --- Second Ping (correlationId = C2, different from C1) ---
+    {
+        uint8_t sc[512] = {};
+        pc::Ping ping;
+        ping.sessionId     = sid;
+        ping.correlationId = kCorrId2;
+        ping.echo          = "echo-C2";
+        const std::size_t pingLen = ping.encode(sc);
+        offerBounded(*client.ingressPub, sc, pingLen, "Ping-C2");
+    }
+    // Wait for second Pong.
+    pump([&]() { return recvCorrIds.size() >= 2u; },
+         &*client.egressSub, &asm_, kPumpIter, "Pong-C2");
+
+    ASSERT_EQ(recvCorrIds.size(), 2u);
+    EXPECT_EQ(recvCorrIds[1], kCorrId2) << "Second Pong must carry C2, not C1";
+    EXPECT_EQ(recvEchoes[1],  "echo-C2");
+
+    // Extra distinctness guard: the two correlationIds must be different.
+    EXPECT_NE(recvCorrIds[0], recvCorrIds[1]);
 }
 
 } // namespace
