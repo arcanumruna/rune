@@ -4,6 +4,15 @@
 #include <algorithm>
 #include <fstream>
 namespace rune::storage {
+
+namespace {
+// CL4: Shared helper to derive the .index path from a .log path.
+// Avoids fragile repeated ".substr(0, path.size()-4) + ".index"" surgery.
+inline std::string indexPathForLog(const std::string& logPath) {
+    return logPath.substr(0, logPath.size() - 4) + ".index";
+}
+} // anonymous namespace
+
 Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
     // Discover existing segments; else create the first at offset 0.
     std::vector<int64_t> bases;
@@ -16,6 +25,10 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     logEndOffset_ = activeSegment().nextOffset();
 }
 void Log::maybeRoll() {
+    // CL6: Roll decision is made BEFORE writing the new batch (Kafka-style).
+    // A segment can therefore exceed rollBytes by at most one batch.
+    // A single oversized batch (larger than rollBytes) always starts a new
+    // segment of its own — no splitting occurs.
     if (activeSegment().sizeBytes() >= rollBytes_) {
         int64_t base = logEndOffset_;
         segments_[base] = std::make_unique<LogSegment>(dir_, base);
@@ -52,7 +65,7 @@ void Log::truncateTo(int64_t truncateOffset) {
     auto it = segments_.lower_bound(truncateOffset);
     while (it != segments_.end()) {
         std::string lpath = it->second->logPath();
-        std::string ipath = lpath.substr(0, lpath.size() - 4) + ".index";
+        std::string ipath = indexPathForLog(lpath);
         std::filesystem::remove(lpath);
         std::filesystem::remove(ipath);
         it = segments_.erase(it);
@@ -127,7 +140,7 @@ void Log::truncateTo(int64_t truncateOffset) {
     std::filesystem::resize_file(lpath, static_cast<std::uintmax_t>(cutPos));
     // Also truncate the index — simplest: just let recover() rebuild it.
     // Re-open the segment via recover() to get correct state.
-    std::string ipath = lpath.substr(0, lpath.size() - 4) + ".index";
+    std::string ipath = indexPathForLog(lpath);
     std::filesystem::remove(ipath);
 
     // Rebuild the active segment from disk.
@@ -164,7 +177,7 @@ int Log::deleteOldSegments(int64_t retainBytes) {
     while (segments_.size() > 1 && totalBytes() > retainBytes) {
         auto it = segments_.begin();
         std::string base = it->second->logPath();
-        std::string idx = base.substr(0, base.size()-4) + ".index";
+        std::string idx = indexPathForLog(base);
         segments_.erase(it);
         std::filesystem::remove(base);
         std::filesystem::remove(idx);

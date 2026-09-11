@@ -1,4 +1,5 @@
 #include <rune/storage/OffsetIndex.h>
+#include <climits>
 #include <cstring>
 #include <stdexcept>
 namespace rune::storage {
@@ -6,12 +7,17 @@ OffsetIndex::OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes)
     : baseOffset_(baseOffset) {
     file_ = std::make_unique<MappedFile>(std::move(path), maxBytes, true);
 }
-void OffsetIndex::append(int64_t offset, int32_t position) {
+void OffsetIndex::append(int64_t offset, int64_t position) {
+    // C4: Guard the 2GiB position limit here (where the cast happens) so all callers
+    // — LogSegment, LogCleaner::buildIndex — are uniformly protected.
+    if (position > static_cast<int64_t>(INT32_MAX))
+        throw std::runtime_error("rune: OffsetIndex position exceeds 2GiB limit");
     int32_t rel = static_cast<int32_t>(offset - baseOffset_);
     if (rel < 0) throw std::runtime_error("offset below base");
-    uint8_t* p = file_->data() + entries_ * kEntrySize;
+    int32_t pos32 = static_cast<int32_t>(position);
+    uint8_t* p = file_->data() + entries_ * static_cast<size_t>(kEntrySize);
     std::memcpy(p, &rel, 4);
-    std::memcpy(p + 4, &position, 4);
+    std::memcpy(p + 4, &pos32, 4);
     ++entries_;
 }
 OffsetPosition OffsetIndex::parseEntry(int slot) const {

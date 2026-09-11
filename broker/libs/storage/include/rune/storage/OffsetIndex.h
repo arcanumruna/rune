@@ -7,7 +7,7 @@ struct OffsetPosition { int64_t offset; int32_t position; };
 class OffsetIndex {
 public:
     OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes);
-    void append(int64_t offset, int32_t position);
+    void append(int64_t offset, int64_t position);
     OffsetPosition lookup(int64_t targetOffset) const;
     void sync() { file_->sync(); }  // msync the mmap to disk
     /// Rescan the mmap to count valid entries written by a previous process.

@@ -61,9 +61,11 @@ public:
                int64_t nowNs, int64_t deleteRetentionMs);
 
 private:
-    /// Is a record a tombstone?  The protocol encodes null/empty value as
-    /// vlen == -1; we also treat vlen == 0 (empty string) as a tombstone for
-    /// compaction purposes (matches Kafka behaviour: empty value = delete marker).
+    /// Is a record a tombstone?
+    /// Treats empty value (vlen == 0) as a delete marker, matching Kafka behaviour.
+    /// Note: the protocol vlen==-1 (null value) is decoded by RecordBatchReader as
+    /// an empty string_view, so this check covers both the null-value and zero-length
+    /// cases transparently. The builder never emits a literal vlen==-1 in the output.
     static bool isTombstone(std::string_view value) noexcept {
         return value.empty();
     }

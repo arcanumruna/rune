@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -108,14 +109,20 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
     if (!idx.is_open()) throw std::runtime_error("LogCleaner: cannot open index " + indexPath);
 
     size_t pos = 0;
-    int32_t bytesSince = indexIntervalBytes; // trigger first entry immediately
+    // C2: seed bytesSince = 0 (matching the shouldIndex() rule in LogSegment):
+    //   index the first batch (bytesSince == 0) and then every indexIntervalBytes.
+    int64_t bytesSince = 0;
     while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead) <= logData.size()) {
         rune::protocol::RecordBatchReader r(logData.data() + pos, logData.size() - pos);
         int32_t total = r.totalLength();
         if (total <= 0 || pos + static_cast<size_t>(total) > logData.size()) break;
 
-        if (bytesSince >= indexIntervalBytes) {
-            int32_t relOff = static_cast<int32_t>(r.baseOffset() - baseOffset);
+        // C2: unified shouldIndex predicate (bytesSince==0 || bytesSince>=interval).
+        if (bytesSince == 0 || bytesSince >= static_cast<int64_t>(indexIntervalBytes)) {
+            // C4: guard 2GiB position limit before cast.
+            if (pos > static_cast<size_t>(INT32_MAX))
+                throw std::runtime_error("LogCleaner: buildIndex position exceeds 2GiB limit");
+            int32_t relOff  = static_cast<int32_t>(r.baseOffset() - baseOffset);
             int32_t physPos = static_cast<int32_t>(pos);
             // Native byte order — matches OffsetIndex::append() which uses memcpy.
             idx.write(reinterpret_cast<const char*>(&relOff),  4);
@@ -123,7 +130,7 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
             bytesSince = 0;
         }
 
-        bytesSince += total;
+        bytesSince += static_cast<int64_t>(total);
         pos += static_cast<size_t>(total);
     }
     idx.flush();
@@ -142,6 +149,13 @@ void LogCleaner::buildOffsetMap(Log& log, Offset fromOffset, Offset toOffset,
     auto bases = log.segmentBaseOffsets();
     const std::string& dir = log.dir();
 
+    // S6: The final segment's "end" is toOffset. Records in the active segment
+    // at offsets < toOffset are scanned and their keys entered into the map; these
+    // map entries match nothing during rewrite (the active segment is never
+    // compacted), so they are harmlessly wasteful. The record-level filter below
+    // (`offset >= toOffset`) already correctly gates on the compaction boundary.
+    // Note: segEnd is only used for the "skip segment entirely" range check below;
+    // the record filter uses the toOffset parameter directly.
     for (size_t i = 0; i < bases.size(); ++i) {
         int64_t segBase = bases[i];
         int64_t segEnd = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;

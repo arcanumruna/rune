@@ -62,7 +62,7 @@ int64_t LogSegment::append(const std::vector<uint8_t>& batch, int64_t lastOffset
 
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
         rune::protocol::RecordBatchReader r(batch.data(), batch.size());
-        index_->append(r.baseOffset(), static_cast<int32_t>(logSize_));
+        index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
     log_.seekp(0, std::ios::end);
@@ -138,7 +138,7 @@ int64_t LogSegment::recover() {
         if (total <= 0 || pos + static_cast<size_t>(total) > buf.size() || !r.ensureValid()) break;
         // C2: use the same shouldIndex() predicate as append()
         if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
-            index_->append(r.baseOffset(), static_cast<int32_t>(validBytes));
+            index_->append(r.baseOffset(), validBytes); // C4: OffsetIndex::append guards 2GiB
             bytesSinceIndex_ = 0;
         }
         validBytes += total; bytesSinceIndex_ += total;
