@@ -1,7 +1,4 @@
 add_library(rune_consensus
-        src/PersistentState.cpp
-        src/RaftLog.cpp
-        src/RaftNode.cpp
         src/NodeStateFile.cpp
         src/TermLog.cpp
         src/Election.cpp
@@ -20,11 +17,6 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_consensus_tests
         tests/consensus/TypesTest.cpp
-        tests/consensus/PersistentStateTest.cpp
-        tests/consensus/RaftLogTest.cpp
-        tests/consensus/RaftNodeTest.cpp
-        tests/consensus/ElectionTest.cpp
-        tests/consensus/ReplicationTest.cpp
         tests/consensus/ElectionStateTest.cpp
         tests/consensus/ClusterMemberTest.cpp
         tests/consensus/NodeStateFileTest.cpp
