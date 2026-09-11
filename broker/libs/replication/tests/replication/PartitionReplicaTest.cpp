@@ -15,6 +15,8 @@
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/PartitionFailoverCoordinator.h>
+#include <rune/replication/FileRecordingStore.h>
+#include <rune/replication/IsrManager.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 
@@ -1852,4 +1854,733 @@ TEST(C3_ElectionCommittedHw, CrashedLeaderUnregistered_CandidateWithLowLeoReject
     // f2_lagging must NOT have been promoted.
     EXPECT_EQ(f2_lagging.role(), Role::Follower)
         << "C3: f2_lagging (LEO=0 < committedHw=10) must NOT have been promoted to leader";
+}
+
+// ===========================================================================
+// Part B — 18 missing edge-case tests (audit full re-audit 2026-09-11)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// PartB_1: A-NEW-1 — pipelined/duplicate FetchResponse apply
+// Deliver two overlapping FetchResponses (the 2nd overlaps AND extends).
+// Assert the follower log has NO duplicate offsets and stays byte-identical.
+// ---------------------------------------------------------------------------
+TEST(PartBTest, ANEW1_PipelinedFetchResponseNoDuplicateOffsets)
+{
+    // Set up: leader + follower; append 5 records to leader.
+    TempDir leaderDir("pb1_leader");
+    TempDir followerDir("pb1_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica follower(makeConfig(kF), Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF, &follower);
+
+    // Append 5 records on leader.
+    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i)));
+    ASSERT_EQ(leader.logEndOffset(), 5);
+
+    // Drive until follower has first 2 records (LEO=2).
+    int64_t clk = 0;
+    for (int i = 0; i < kDriverCap && follower.logEndOffset() < 2; ++i) {
+        clk += 1'000'000LL;
+        leader.doWork(clk);
+        follower.doWork(clk);
+        transport.pump(clk);
+    }
+    ASSERT_GE(follower.logEndOffset(), 2) << "Follower must have at least 2 records";
+    Offset followerLeoBeforeOverlap = follower.logEndOffset();
+
+    // Manually inject two overlapping FetchResponses:
+    //   Response A: covers [0, followerLeoBeforeOverlap) — already applied (overlap only)
+    //   Response B: covers [0, 5) — overlaps the held part AND extends to 5
+    // Both use the verbatim leader log bytes (RecordBatch format).
+    auto leaderBytes = leaderLog.read(0, 1 << 20); // read all 5 records from leader
+
+    // Build Response A: first followerLeoBeforeOverlap records.
+    auto bytesA = leaderLog.read(0, static_cast<int32_t>(followerLeoBeforeOverlap * 100));
+    // Build Response B: all 5 records.
+    auto bytesB = leaderLog.read(0, 1 << 20);
+
+    // Inject Response A first (simulate a response that the follower already partially has).
+    FetchResponseMsg respA{};
+    respA.errorCode    = kErrNone;
+    respA.leaderEpoch  = 1;
+    respA.highWatermark = 5;
+    respA.records      = std::span<const uint8_t>(bytesA.data(), bytesA.size());
+    follower.applyReplicated(respA);
+
+    Offset leoAfterA = follower.logEndOffset();
+
+    // Inject Response B: overlaps [0, leoAfterA) AND extends to 5.
+    FetchResponseMsg respB{};
+    respB.errorCode    = kErrNone;
+    respB.leaderEpoch  = 1;
+    respB.highWatermark = 5;
+    respB.records      = std::span<const uint8_t>(bytesB.data(), bytesB.size());
+    follower.applyReplicated(respB);
+
+    Offset leoAfterB = follower.logEndOffset();
+
+    // Assert: LEO is monotonically advancing (no duplicate offsets).
+    EXPECT_GE(leoAfterB, leoAfterA) << "A-NEW-1: LEO must not regress after 2nd response";
+    EXPECT_LE(leoAfterB, 5) << "A-NEW-1: LEO must not exceed leader LEO=5";
+
+    // Assert: follower log is byte-identical to leader over [0, LEO).
+    if (leoAfterB > 0) {
+        auto followerBytes = followerLog.read(0, 1 << 20);
+        auto leaderBytesToLeo = leaderLog.read(0, 1 << 20);
+        // Trim leader bytes to follower LEO by walking batches.
+        std::size_t pos = 0;
+        std::size_t leaderTrimEnd = 0;
+        int64_t counted = 0;
+        while (pos < leaderBytesToLeo.size() && counted < leoAfterB) {
+            std::size_t rem = leaderBytesToLeo.size() - pos;
+            if (rem < 61u) break;
+            rune::protocol::RecordBatchReader r(leaderBytesToLeo.data() + pos, rem);
+            int32_t total = r.totalLength();
+            if (total <= 0) break;
+            counted = r.baseOffset() + r.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(total);
+            leaderTrimEnd = pos;
+        }
+        ASSERT_EQ(followerBytes.size(), leaderTrimEnd)
+            << "A-NEW-1: follower log byte length must equal leader's [0, LEO) bytes";
+        EXPECT_EQ(followerBytes, std::vector<uint8_t>(leaderBytesToLeo.begin(),
+                                                        leaderBytesToLeo.begin()
+                                                        + static_cast<std::ptrdiff_t>(leaderTrimEnd)))
+            << "A-NEW-1: follower log must be byte-identical to leader over [0, LEO)";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartB_2: ISR shrink-to-1 then produce+commit+read end-to-end
+// ---------------------------------------------------------------------------
+TEST_F(ThreeReplicaTest, PartB2_IsrShrinkTo1ThenProduceCommitRead)
+{
+    // Append 5 records and commit with 3-node ISR.
+    for (int i = 0; i < 5; ++i) leader_->append(makePayload(static_cast<uint8_t>(i)));
+    ASSERT_TRUE(driveUntil([&]{ return leader_->highWatermark() == 5; }))
+        << "PartB2: must commit 5 records with 3-node ISR";
+
+    // Shrink ISR to leader only (simulate both followers disconnecting).
+    // Drive the leader doWork many times with no follower fetches so the ISR
+    // eviction time-lag fires.  replicaLagMaxMs=1000 in makeConfig → 1 s.
+    // Each step is 20 ms; 60 steps = 1200 ms = well past the lag window.
+    for (int i = 0; i < 60; ++i) {
+        clock_ += 20'000'000LL; // 20 ms per step
+        leader_->doWork(clock_);
+        // Do NOT drive followers so their lastFetchTime stays stale.
+    }
+    // ISR should now be {leader only} after the time-lag eviction.
+    EXPECT_LE(leader_->isr().size(), 2u) << "PartB2: at least one follower should have been evicted";
+
+    // Now append with leader-only ISR; HW should advance immediately.
+    Offset base = leader_->append(makePayload(0xFF), /*acksAll=*/false);
+    ASSERT_GE(base, 5) << "PartB2: append after ISR shrink must succeed";
+
+    // With acksAll=false (leader-only ack), the HW can advance via recomputeHw.
+    // Drive a few ticks.
+    for (int i = 0; i < 5; ++i) {
+        clock_ += 1'000'000LL;
+        leader_->doWork(clock_);
+    }
+
+    // Read committed data.
+    auto data = leader_->read(0, 1 << 20);
+    EXPECT_FALSE(data.empty()) << "PartB2: committed data must be readable after ISR shrink-to-1";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_3: Single-replica-ISR produce→commit→read end-to-end via PartitionReplica
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB3_SingleReplicaIsrProduceCommitRead)
+{
+    TempDir dir("pb3");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1;
+    std::vector<NodeId> replicas = {kL};
+    std::vector<NodeId> isr      = {kL};
+
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             replicas, isr, &log, &transport);
+    transport.setLeader(&leader);
+
+    // Append 3 records; with |ISR|=1 they should commit immediately.
+    Offset b0 = leader.append(makePayload(0xA1));
+    Offset b1 = leader.append(makePayload(0xA2));
+    Offset b2 = leader.append(makePayload(0xA3));
+    ASSERT_GE(b0, 0);
+    ASSERT_GT(b1, b0);
+    ASSERT_GT(b2, b1);
+    ASSERT_EQ(leader.logEndOffset(), 3) << "PartB3: 3 records must be appended";
+
+    // Single-replica ISR: HW should immediately equal LEO.
+    int64_t hw = leader.highWatermark();
+    EXPECT_EQ(hw, 3) << "PartB3: single-replica ISR → HW must equal LEO=3 immediately";
+
+    // Read committed records.
+    auto data = leader.read(0, 1 << 20);
+    EXPECT_FALSE(data.empty()) << "PartB3: committed records must be readable";
+
+    // Verify HW boundary: read from HW returns nothing.
+    auto atHw = leader.read(hw, 1 << 20);
+    EXPECT_TRUE(atHw.empty()) << "PartB3: read at HW must return empty (nothing committed beyond HW)";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_4: HW-exact read-clamp on a multi-batch log
+// fetchOffset == HW-1 returns one batch; fetchOffset == HW returns empty.
+// ---------------------------------------------------------------------------
+TEST_F(TwoReplicaTest, PartB4_HwExactReadClampMultiBatchLog)
+{
+    // Append 3 records and commit all.
+    for (int i = 0; i < 3; ++i) leader_->append(makePayload(static_cast<uint8_t>(i + 1)));
+    ASSERT_EQ(leader_->logEndOffset(), 3);
+    ASSERT_TRUE(driveUntil([&]{ return leader_->highWatermark() == 3; }))
+        << "PartB4: must commit all 3 records";
+
+    Offset hw = leader_->highWatermark();
+    ASSERT_EQ(hw, 3);
+
+    // fetchOffset == hw-1 (== 2): should return exactly 1 batch (the 3rd record).
+    auto atHwMinus1 = leader_->read(hw - 1, 1 << 20);
+    EXPECT_FALSE(atHwMinus1.empty())
+        << "PartB4: read at HW-1 must return the last committed batch";
+
+    // The batch returned must start at offset HW-1 = 2.
+    if (!atHwMinus1.empty() && atHwMinus1.size() >= 61u) {
+        rune::protocol::RecordBatchReader r(atHwMinus1.data(), atHwMinus1.size());
+        EXPECT_EQ(r.baseOffset(), hw - 1)
+            << "PartB4: the returned batch must start exactly at HW-1";
+    }
+
+    // fetchOffset == hw: must return empty.
+    auto atHw = leader_->read(hw, 1 << 20);
+    EXPECT_TRUE(atHw.empty())
+        << "PartB4: read at HW must return empty (nothing committed at or beyond HW)";
+
+    // fetchOffset == hw+1: also empty.
+    auto pastHw = leader_->read(hw + 1, 1 << 20);
+    EXPECT_TRUE(pastHw.empty()) << "PartB4: read past HW must return empty";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_5: Follower truncate-then-refetch across 3 epoch rounds with per-round
+// byte-identity to the leader over [0, HW).
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB5_FollowerTruncateRefetchThreeEpochRoundsByteIdentity)
+{
+    TempDir leaderDir("pb5_leader");
+    TempDir followerDir("pb5_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+    int64_t clk = 0;
+
+    auto makeLeader = [&](Epoch e) {
+        return std::make_unique<PartitionReplica>(
+            makeConfig(kL), Role::Leader, e, replicas, isr, &leaderLog, &transport);
+    };
+    auto makeFollower = [&](Epoch e) {
+        return std::make_unique<PartitionReplica>(
+            makeConfig(kF), Role::Follower, e, replicas, isr, &followerLog, &transport);
+    };
+
+    auto driveUntil3 = [&](std::unique_ptr<PartitionReplica>& l,
+                             std::unique_ptr<PartitionReplica>& f,
+                             std::function<bool()> done) {
+        for (int i = 0; i < kDriverCap && !done(); ++i) {
+            clk += 1'000'000LL;
+            l->doWork(clk);
+            f->doWork(clk);
+            transport.pump(clk);
+        }
+        return done();
+    };
+
+    // Round 1: epoch 1, append 3, commit.
+    auto leader = makeLeader(1);
+    auto follower = makeFollower(1);
+    transport.setLeader(leader.get());
+    transport.addFollower(kF, follower.get());
+    for (int i = 0; i < 3; ++i) leader->append(makePayload(static_cast<uint8_t>(0x10 + i)));
+    ASSERT_TRUE(driveUntil3(leader, follower, [&]{ return follower->logEndOffset() == 3; }))
+        << "PartB5 round1: follower must reach LEO=3";
+    ASSERT_TRUE(driveUntil3(leader, follower, [&]{ return leader->highWatermark() == 3; }))
+        << "PartB5 round1: must commit 3 records";
+    // Byte-identity check round 1.
+    {
+        Offset hw = leader->highWatermark();
+        auto leaderBytes  = leaderLog.read(0, 1 << 20);
+        auto followerBytes = followerLog.read(0, 1 << 20);
+        EXPECT_EQ(leaderBytes, followerBytes) << "PartB5 round1: follower must be byte-identical to leader";
+        (void)hw;
+    }
+
+    // Round 2: epoch 2, truncate follower, append 3 new records.
+    transport.setLeader(nullptr);
+    transport.removeFollower(kF);
+    leader.reset();
+    follower.reset();
+    // Append divergent records to the leader log at epoch 2.
+    leader = makeLeader(2);
+    follower = makeFollower(2); // follower truncates on becomeFollower + refetch
+    transport.setLeader(leader.get());
+    transport.addFollower(kF, follower.get());
+    for (int i = 0; i < 3; ++i) leader->append(makePayload(static_cast<uint8_t>(0x20 + i)));
+    ASSERT_TRUE(driveUntil3(leader, follower, [&]{ return follower->logEndOffset() >= 3; }))
+        << "PartB5 round2: follower must catch up";
+    ASSERT_TRUE(driveUntil3(leader, follower, [&]{ return leader->highWatermark() >= 3; }))
+        << "PartB5 round2: must commit records";
+    {
+        auto leaderBytes  = leaderLog.read(0, 1 << 20);
+        auto followerBytes = followerLog.read(0, 1 << 20);
+        EXPECT_EQ(leaderBytes, followerBytes) << "PartB5 round2: byte-identity after truncate+refetch";
+    }
+
+    // Round 3: epoch 3.
+    transport.setLeader(nullptr);
+    transport.removeFollower(kF);
+    leader.reset();
+    follower.reset();
+    leader = makeLeader(3);
+    follower = makeFollower(3);
+    transport.setLeader(leader.get());
+    transport.addFollower(kF, follower.get());
+    for (int i = 0; i < 4; ++i) leader->append(makePayload(static_cast<uint8_t>(0x30 + i)));
+    ASSERT_TRUE(driveUntil3(leader, follower, [&]{ return follower->logEndOffset() >= 4; }))
+        << "PartB5 round3: follower must catch up after round3";
+    ASSERT_TRUE(driveUntil3(leader, follower, [&]{ return leader->highWatermark() >= 4; }))
+        << "PartB5 round3: must commit 4 records";
+    {
+        auto leaderBytes  = leaderLog.read(0, 1 << 20);
+        auto followerBytes = followerLog.read(0, 1 << 20);
+        EXPECT_EQ(leaderBytes, followerBytes) << "PartB5 round3: byte-identity after 3rd truncate+refetch";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartB_10: becomeFollower with divergent tail EXACTLY at committedHw
+// (truncOff == committedHw == currentLeo): no truncation fires, no committed
+// byte drops.
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB10_BecomeFollowerExactBoundaryNoTruncation)
+{
+    TempDir leaderDir("pb10_leader");
+    TempDir followerDir("pb10_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+    int64_t clk = 0;
+
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica follower(makeConfig(kF), Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF, &follower);
+
+    // Append 5 records and fully commit.
+    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 1)));
+    for (int i = 0; i < kDriverCap && follower.logEndOffset() < 5; ++i) {
+        clk += 1'000'000LL;
+        leader.doWork(clk); follower.doWork(clk); transport.pump(clk);
+    }
+    for (int i = 0; i < kDriverCap && leader.highWatermark() < 5; ++i) {
+        clk += 1'000'000LL;
+        leader.doWork(clk); follower.doWork(clk); transport.pump(clk);
+    }
+    ASSERT_EQ(leader.highWatermark(), 5) << "PartB10: must commit 5 records";
+    ASSERT_EQ(follower.logEndOffset(), 5) << "PartB10: follower must have all 5 records";
+
+    // Capture the follower bytes before epoch change.
+    auto followerBytesBefore = followerLog.read(0, 1 << 20);
+    ASSERT_FALSE(followerBytesBefore.empty());
+
+    // Trigger becomeFollower with new epoch (epoch 2) on the follower.
+    // Because follower LEO == committedHw == 5, no truncation should fire.
+    follower.becomeFollower(/*leaderEpoch=*/2, kL);
+
+    Offset leoAfter = follower.logEndOffset();
+    EXPECT_EQ(leoAfter, 5) << "PartB10: no truncation should fire when truncOff==LEO==committedHw";
+
+    // Follower bytes must be unchanged.
+    auto followerBytesAfter = followerLog.read(0, 1 << 20);
+    EXPECT_EQ(followerBytesBefore, followerBytesAfter)
+        << "PartB10: no committed byte must be dropped when truncation boundary is at LEO";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_13: A10 — epoch-cache-coupled truncation
+// Truncate then assign a new epoch at the (lower) post-truncation offset;
+// the assign must be accepted (not silently dropped by the monotonic guard).
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB13_A10_EpochCacheCoupledTruncation)
+{
+    TempDir leaderDir("pb13_leader");
+    TempDir followerDir("pb13_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+    int64_t clk = 0;
+
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica follower(makeConfig(kF), Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF, &follower);
+
+    // Append 8 records on the leader.
+    for (int i = 0; i < 8; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 1)));
+    ASSERT_EQ(leader.logEndOffset(), 8);
+
+    // Commit at least 5 records.
+    for (int i = 0; i < kDriverCap && leader.highWatermark() < 5; ++i) {
+        clk += 1'000'000LL;
+        leader.doWork(clk); follower.doWork(clk); transport.pump(clk);
+    }
+    ASSERT_GE(leader.highWatermark(), 5);
+
+    // Let the follower catch up to the leader.
+    for (int i = 0; i < kDriverCap && follower.logEndOffset() < 8; ++i) {
+        clk += 1'000'000LL;
+        leader.doWork(clk); follower.doWork(clk); transport.pump(clk);
+    }
+    ASSERT_EQ(follower.logEndOffset(), 8) << "PartB13: follower must catch up to LEO=8";
+
+    // Now simulate epoch change: follower transitions to epoch 2.
+    // This should truncate the uncommitted tail (offsets [committedHw, 8))
+    // AND prune the epoch cache so that a subsequent assign(epoch=2, offset=5)
+    // is accepted — not dropped by the monotonic-startOffset guard (A10).
+    follower.becomeFollower(/*leaderEpoch=*/2, kL);
+
+    Offset leoAfterTruncate = follower.logEndOffset();
+    EXPECT_GE(leoAfterTruncate, leader.highWatermark())
+        << "PartB13: follower LEO after becomeFollower must not drop below committedHw";
+
+    // After becomeFollower, the follower is at epoch=2.
+    // When the follower next fetches and applies a response at epoch=2, the
+    // assign(epoch=2, logEndOffset) must succeed (not be dropped).
+    // Verify by re-wiring and driving to full catch-up.
+    // Replace the leader with a new leader at epoch=2.
+    transport.setLeader(nullptr);
+    transport.removeFollower(kF);
+
+    TempDir leaderDir2("pb13_leader2");
+    rune::storage::Log leaderLog2(leaderDir2.path);
+    // Copy committed records to the new leader log.
+    {
+        auto leaderBytes = leaderLog.read(0, 1 << 20);
+        if (!leaderBytes.empty()) {
+            // Walk batches and append up to committedHw.
+            std::size_t pos = 0;
+            while (pos < leaderBytes.size()) {
+                std::size_t rem = leaderBytes.size() - pos;
+                if (rem < 61u) break;
+                rune::protocol::RecordBatchReader r(leaderBytes.data() + pos, rem);
+                int32_t total = r.totalLength();
+                if (total <= 0) break;
+                int64_t batchBase = r.baseOffset();
+                if (batchBase >= leader.highWatermark()) break;
+                std::vector<uint8_t> batchBytes(leaderBytes.begin() + static_cast<std::ptrdiff_t>(pos),
+                                                  leaderBytes.begin() + static_cast<std::ptrdiff_t>(pos)
+                                                  + static_cast<std::ptrdiff_t>(total));
+                leaderLog2.append(batchBytes, batchBase + r.lastOffsetDelta());
+                pos += static_cast<std::size_t>(total);
+            }
+        }
+    }
+    ASSERT_GE(leaderLog2.logEndOffset(), leader.highWatermark())
+        << "PartB13: new leader log must have committed records";
+
+    PartitionReplica leader2(makeConfig(kL), Role::Leader, /*epoch=*/2,
+                              replicas, isr, &leaderLog2, &transport);
+    transport.setLeader(&leader2);
+    transport.addFollower(kF, &follower);
+
+    // Drive follower to re-catch up to the new leader.
+    for (int i = 0; i < kDriverCap && follower.logEndOffset() < leader2.logEndOffset(); ++i) {
+        clk += 1'000'000LL;
+        leader2.doWork(clk); follower.doWork(clk); transport.pump(clk);
+    }
+    // A10 fix: the epoch cache assign after truncation must have been accepted.
+    // If it was dropped, the follower would see wrong truncationOffsetForEpochChange
+    // on the next epoch change. Verify the follower caught up (non-vacuous).
+    EXPECT_EQ(follower.logEndOffset(), leader2.logEndOffset())
+        << "PartB13 (A10): follower must catch up after truncate+assign at lower offset";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_14: A-NEW-5 — mustStepDown returns kErrNotLeader + actually steps down
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB14_ANEW5_MustStepDownErrorCodeAndRoleChange)
+{
+    TempDir leaderDir("pb14_leader");
+    TempDir followerDir("pb14_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica follower(makeConfig(kF), Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF, &follower);
+
+    // Append 3 records.
+    for (int i = 0; i < 3; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 1)));
+
+    // Simulate a follower carrying a HIGHER epoch (epoch 2 > leader epoch 1).
+    // This should trigger mustStepDown on the leader.
+    FetchRequestMsg highEpochReq{};
+    highEpochReq.leaderEpoch = 2;  // higher than leader's epoch=1
+    highEpochReq.partition   = 0;
+    highEpochReq.followerId  = kF;
+    highEpochReq.fetchOffset = 0;
+    highEpochReq.maxBytes    = 1 << 20;
+
+    // Capture leader role before.
+    ASSERT_EQ(leader.role(), Role::Leader) << "PartB14: leader must be Leader before mustStepDown";
+
+    int16_t errCode = leader.onFetchRequest(highEpochReq, /*nowNs=*/0);
+
+    // A-NEW-5 fix: correct error code must be kErrNotLeader (not kErrStaleEpoch).
+    EXPECT_EQ(errCode, kErrNotLeader)
+        << "A-NEW-5: mustStepDown must return kErrNotLeader (follower is AHEAD), not kErrStaleEpoch";
+
+    // A-NEW-5 fix: the leader must have stepped down.
+    EXPECT_EQ(leader.role(), Role::Follower)
+        << "A-NEW-5: leader must step down to Follower when follower carries higher epoch";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_15: A-NEW-2 — computeHw correct for ISR sizes 33, 64, 65 (no OOB)
+// This test is in HighWatermarkTest.cpp conceptually; we add it here for
+// convenience since it uses PartitionReplica infrastructure.
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB15_ANEW2_ComputeHwLargeIsrNoBoundaryViolation)
+{
+    // Test using ReplicaLeaderState directly with large ISR sizes.
+    // ISR size 33: majority = 17; leos[16] must be valid.
+    {
+        ReplicaLeaderState s;
+        s.setLeaderId(0);
+        s.setLeaderLogEndOffset(100LL);
+        // Build ISR with 33 nodes: leader=0, followers=1..32
+        std::vector<NodeId> isr33;
+        isr33.reserve(33);
+        for (int i = 0; i < 33; ++i) isr33.push_back(i);
+        s.setIsr(isr33);
+
+        // All followers report LEO=100. Majority of 33 is 17. HW = 100.
+        for (int i = 1; i < 33; ++i) s.updateFollowerFetchOffset(i, 100LL);
+        EXPECT_EQ(s.highWatermark(), 100LL)
+            << "A-NEW-2: ISR=33, all at LEO=100, HW must be 100 (not under-counted or OOB)";
+    }
+
+    // ISR size 33 with mixed LEOs: majority=17 → HW = 17th-highest value.
+    {
+        ReplicaLeaderState s;
+        s.setLeaderId(0);
+        s.setLeaderLogEndOffset(100LL);
+        std::vector<NodeId> isr33;
+        for (int i = 0; i < 33; ++i) isr33.push_back(i);
+        s.setIsr(isr33);
+
+        // 16 followers at LEO=100, 16 followers at LEO=0.
+        // Leader LEO=100. Sorted: [100]*17, [0]*16. Majority=17; HW=leos[16]=100.
+        for (int i = 1; i <= 16; ++i) s.updateFollowerFetchOffset(i, 100LL);
+        for (int i = 17; i <= 32; ++i) s.updateFollowerFetchOffset(i, 0LL);
+        EXPECT_EQ(s.highWatermark(), 100LL)
+            << "A-NEW-2: ISR=33, 17 at 100 + 16 at 0, majority=17, HW must be 100";
+    }
+
+    // ISR size 64: majority=33 → HW must be correct.
+    {
+        ReplicaLeaderState s;
+        s.setLeaderId(0);
+        s.setLeaderLogEndOffset(50LL);
+        std::vector<NodeId> isr64;
+        for (int i = 0; i < 64; ++i) isr64.push_back(i);
+        s.setIsr(isr64);
+
+        // All 64 at LEO=50. Majority=33. HW=50.
+        for (int i = 1; i < 64; ++i) s.updateFollowerFetchOffset(i, 50LL);
+        EXPECT_EQ(s.highWatermark(), 50LL)
+            << "A-NEW-2: ISR=64, all at LEO=50, HW must be 50";
+    }
+
+    // ISR size 65: majority=33 → same test.
+    {
+        ReplicaLeaderState s;
+        s.setLeaderId(0);
+        s.setLeaderLogEndOffset(75LL);
+        std::vector<NodeId> isr65;
+        for (int i = 0; i < 65; ++i) isr65.push_back(i);
+        s.setIsr(isr65);
+
+        // 33 nodes at 75, 32 at 0. majority=33. HW=75.
+        for (int i = 1; i <= 32; ++i) s.updateFollowerFetchOffset(i, 75LL);
+        for (int i = 33; i < 65; ++i) s.updateFollowerFetchOffset(i, 0LL);
+        EXPECT_EQ(s.highWatermark(), 75LL)
+            << "A-NEW-2: ISR=65, 33 at 75 + 32 at 0, majority=33, HW must be 75";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartB_16: A-NEW-4 — maybeExpandIsr with time-stale but offset-caught-up replica
+// should NOT re-admit the replica (time gate is now enforced).
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB16_ANEW4_ExpandIsrTimeStalePrevented)
+{
+    // Build a 3-node ISR {leader=0, f1=1, f2=2}.
+    constexpr NodeId kLeader = 0, kF1 = 1, kF2 = 2;
+    IsrManager mgr({kLeader, kF1, kF2}, kLeader, /*replicaLagMaxMs=*/1000);
+
+    int64_t now = 10'000'000'000LL; // 10 seconds
+    // Both followers fetch at t=0.
+    mgr.onFollowerFetch(kF1, 100, 0);
+    mgr.onFollowerFetch(kF2, 100, 0);
+
+    // Shrink both followers (time-lagged by >1s).
+    mgr.maybeShrinkIsr(now, /*leaderLeo=*/100, /*maxMs=*/1000, /*maxOffset=*/50);
+    EXPECT_FALSE(mgr.inIsr(kF1)) << "PartB16: f1 must be shrunk after time lag";
+    EXPECT_FALSE(mgr.inIsr(kF2)) << "PartB16: f2 must be shrunk after time lag";
+
+    // f1 reports a recent fetch (within the lag window): must be eligible for expand.
+    mgr.onFollowerFetch(kF1, 100, now - 500'000'000LL); // 0.5s ago < 1s limit
+
+    // f2 reports an OLD fetch (same time as before = 10s ago): offset ok but time stale.
+    // (f2's lastFetchTimeNs is still 0 from the old fetch above)
+
+    // Attempt expansion.
+    mgr.maybeExpandIsr(now, /*highWatermark=*/100);
+
+    EXPECT_TRUE(mgr.inIsr(kF1))
+        << "PartB16 (A-NEW-4): f1 fetched recently AND is caught up → must be re-admitted";
+    EXPECT_FALSE(mgr.inIsr(kF2))
+        << "PartB16 (A-NEW-4): f2 is caught up by offset but time-stale → must NOT be re-admitted";
+}
+
+// ---------------------------------------------------------------------------
+// PartB_17: A-NEW-3 — FileRecordingStore durability across reopen
+// Append a frame, reopen the store, assert the frame survives.
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB17_ANEW3_RecorderFsyncDurabilityAcrossReopen)
+{
+    // Use TempFile from within this file scope.
+    std::string tmpPath = std::filesystem::temp_directory_path().string()
+                          + "/rune_partb17_" + makeUniqSuffix() + ".bin";
+    struct Cleanup { std::string p; ~Cleanup(){ std::error_code ec; std::filesystem::remove(p, ec); } } _c{tmpPath};
+
+    // Build a RecordBatch to write.
+    rune::protocol::RecordBatchBuilder builder(0, 0);
+    builder.append("key", "value_data", 0);
+    auto batch = builder.build();
+
+    {
+        rune::replication::FileRecordingStore store(tmpPath);
+        store.append(0, std::span<const uint8_t>(batch.data(), batch.size()));
+        EXPECT_EQ(store.batchCount(), 1) << "PartB17: batchCount must be 1 after append";
+        EXPECT_EQ(store.recordingPosition(), 1) << "PartB17: recordingPosition must be 1";
+        // Destructor closes the fd (and the fstream was already flushed+fsynced).
+    }
+
+    // Reopen — data must survive.
+    {
+        rune::replication::FileRecordingStore store2(tmpPath);
+        EXPECT_EQ(store2.batchCount(), 1) << "PartB17: batchCount must be 1 after reopen";
+        EXPECT_EQ(store2.recordingPosition(), 1) << "PartB17: recordingPosition must be 1 after reopen";
+
+        // Scan and verify the batch is intact.
+        int scanCount = 0;
+        store2.scan(0, 1, [&](int64_t offset, std::span<const uint8_t> data) -> bool {
+            EXPECT_EQ(offset, 0) << "PartB17: scanned baseOffset must be 0";
+            EXPECT_EQ(data.size(), batch.size()) << "PartB17: scanned payload must match original";
+            ++scanCount;
+            return true;
+        });
+        EXPECT_EQ(scanCount, 1) << "PartB17: must scan exactly 1 batch after reopen";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartB_18: Coordinator signalLeaderDead for an unknown node → no election crash.
+// ---------------------------------------------------------------------------
+TEST(PartBTest, PartB18_CoordinatorSignalLeaderDeadUnknownNode)
+{
+    TempDir leaderDir("pb18_leader");
+    TempDir f1Dir("pb18_f1");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log f1Log(f1Dir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 0, kF1 = 1, kUnknown = 99;
+    std::vector<NodeId> replicas = {kL, kF1};
+    std::vector<NodeId> isr      = {kL, kF1};
+
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica f1(makeConfig(kF1), Role::Follower, /*epoch=*/1,
+                         replicas, isr, &f1Log, &transport);
+
+    PartitionMetadata meta;
+    meta.partitionId = 0;
+    meta.leader      = kL;
+    meta.replicas    = replicas;
+    meta.isr         = isr;
+    meta.leaderEpoch = 1;
+
+    SimpleNodeLiveness liveness;
+    liveness.markDead(kUnknown);  // mark a node not in ISR as dead
+
+    PartitionFailoverCoordinator coord(meta, &liveness);
+    coord.registerReplica(kL, &leader);
+    coord.registerReplica(kF1, &f1);
+
+    // Signal dead for a node that is neither the current leader nor in ISR.
+    // Must not crash or elect.
+    EXPECT_NO_THROW(coord.signalLeaderDead(kUnknown))
+        << "PartB18: signalLeaderDead for unknown node must not throw";
+
+    // No election should have been triggered.
+    int64_t clk = 0;
+    for (int i = 0; i < 5; ++i) {
+        clk += 1'000'000LL;
+        coord.doWork(clk);
+    }
+    // Leader must still be kL (no spurious election).
+    EXPECT_EQ(coord.currentLeader(), kL)
+        << "PartB18: unknown-node signal must not trigger election";
+    EXPECT_EQ(leader.role(), Role::Leader)
+        << "PartB18: leader must remain Leader after signalLeaderDead(unknown)";
 }

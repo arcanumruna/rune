@@ -63,17 +63,22 @@ public:
 
     /// Initialise with the full replica set and the leader's NodeId.
     ///
-    /// \param replicas   All NodeIds assigned to this partition (including leader).
-    /// \param leaderId   The current leader; always kept in ISR.
+    /// \param replicas          All NodeIds assigned to this partition (including leader).
+    /// \param leaderId          The current leader; always kept in ISR.
+    /// \param replicaLagMaxMs   Max lag (ms) before shrink; also used as the
+    ///                          time gate for expand (A-NEW-4).  Defaults to
+    ///                          10 000 ms (10 s) matching the config default.
     ///
     /// On construction the ISR is initialised to contain ALL replicas (they are
     /// assumed in-sync at startup/leader-election time).  Callers may pass an
     /// explicit initial ISR via setIsr() right after construction if a known ISR
     /// is being restored from metadata.
-    IsrManager(std::vector<NodeId> replicas, NodeId leaderId)
+    IsrManager(std::vector<NodeId> replicas, NodeId leaderId,
+               int64_t replicaLagMaxMs = 10'000)
         : replicas_(std::move(replicas))
         , leaderId_(leaderId)
         , isr_(replicas_)   // start fully in-sync
+        , replicaLagMaxNs_(replicaLagMaxMs * 1'000'000LL)
         , isrChanged_(false)
     {
         // Seed follower state so existing replicas are known.
@@ -156,21 +161,30 @@ public:
     }
 
     /// Evaluate all replicas NOT currently in the ISR and add back any that
-    /// have caught up: lastFetchOffset >= highWatermark.
+    /// have caught up: lastFetchOffset >= highWatermark AND fetched recently.
     ///
-    /// \param nowNs         Current wall-clock time in nanoseconds (reserved for
-    ///                      future time-based gating; not applied in this version
-    ///                      because catching up to HW is the primary criterion).
+    /// A-NEW-4 fix: re-admitting a caught-up-by-offset-only replica that has
+    /// not fetched recently can re-add a stale/disconnected replica the same
+    /// tick a shrink would (or should) evict it.  Kafka gates expansion on
+    /// both offset AND time (the replica must have fetched within the lag
+    /// window).  We mirror that here: expand only when BOTH conditions hold.
+    ///
+    /// \param nowNs         Current wall-clock time in nanoseconds.
     /// \param highWatermark The partition high-watermark (committed prefix).
     /// \returns The new ISR vector (same as isr() after the call).
-    std::vector<NodeId> maybeExpandIsr(int64_t /*nowNs*/, Offset highWatermark) {
+    std::vector<NodeId> maybeExpandIsr(int64_t nowNs, Offset highWatermark) {
         std::vector<NodeId> newIsr = isr_;
 
         for (NodeId node : replicas_) {
             if (inIsr(node)) continue; // already in ISR
 
             const auto& s = followerState_[node];
-            if (s.lastFetchOffset >= highWatermark) {
+            // A-NEW-4: require recent fetch (within the shrink lag window)
+            // in addition to offset catch-up, matching Kafka's expand gate.
+            // replicaLagMaxMs_ is stored so we can check the time gate here.
+            bool offsetOk = (s.lastFetchOffset >= highWatermark);
+            bool timeOk   = (nowNs - s.lastFetchTimeNs) <= replicaLagMaxNs_;
+            if (offsetOk && timeOk) {
                 newIsr.push_back(node);
             }
         }
@@ -224,6 +238,7 @@ private:
     std::vector<NodeId>                 replicas_;
     std::vector<NodeId>                 isr_;
     std::unordered_map<NodeId, FollowerState> followerState_;
+    int64_t                             replicaLagMaxNs_ = 10'000'000'000LL; ///< A-NEW-4 time gate
     bool                                isrChanged_ = false;
 };
 

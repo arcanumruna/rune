@@ -482,3 +482,176 @@ verification is by code + test reasoning (commit claims 1280/1280 pass).
 - **NB3 (MINOR, latent, carried) — UNCHANGED.** read-clamp uses `baseOffset >= hw`, not
   `baseOffset+lastOffsetDelta >= hw`. Unreachable while leaders append single-record
   batches; fix when batching lands. (`PartitionReplica.cpp:310`.)
+
+---
+
+# Full re-audit + coverage (HEAD)
+
+Date: 2026-09-11 · Scope: ENTIRE `libs/replication/**` at HEAD, fresh eyes (not a
+fix-check). Read all headers + src + tests. `cmake`/`ctest` unavailable → reasoning from
+code. Prior committed-loss/HW-regression/uncommitted-read fixes re-verified as WHOLE-library
+(all HOLD, see per-finding below). Focus of this pass: paths NOT covered by earlier rounds.
+
+## Part A verdict: BUGS REMAIN (1 CORRECTNESS latent + 2 SILENT latent + minors).
+No NEW happy-path or reachable EOS violation. All findings are transport/scale-latent, i.e.
+unreachable under the current single-record, serialized-pump, ISR≤5 regime, but real defects
+in the shipped code that WILL bite when (a) fetches pipeline over async Aeron, (b) batching
+lands, or (c) ISR grows. Prior BLOCKER/CORRECTNESS fixes all still hold.
+
+### A-NEW-1. `applyReplicated` verbatim-append can DUPLICATE / de-monotonize the log on a
+###          pipelined (multi-in-flight) fetch — CORRECTNESS (latent; async-transport)
+`PartitionReplica.cpp:363-391`. The follower emits a fetch every `fetchIntervalNs` in
+`doWork` (`:451-459`) UNCONDITIONALLY — it does not wait for the previous response. So two
+FetchRequests can be in flight, both carrying the SAME `fetchOffset=F` (the LEO at emit
+time). The leader answers each from `F` (`onFetchRequest` reads `log_->read(req.fetchOffset,…)`
+`:262-264`). Suppose the leader grew between the two responses:
+  - Response A carries batches [F,F+2), `lastOff=F+1`. Applied → LEO=F+2.
+  - Response B carries batches [F,F+5), `lastOff=F+4`. The dedup guard is
+    `if (lastOff >= log_->logEndOffset())` (`:388`) → `F+4 >= F+2` TRUE → it appends the
+    ENTIRE B span verbatim, re-appending [F,F+2). `rune::storage::Log::append`
+    (`Log.h:18`) blindly writes and sets `logEndOffset_=lastOff+1` with NO
+    contiguity/dedup check → the log now contains [0,F+2)+[F,F+5): duplicated offsets and a
+    non-monotonic base-offset sequence. This breaks the "replica logs byte-identical over
+    [0,HW)" invariant and can corrupt subsequent reads/recording.
+The `lastOff>=LEO` guard only defends the case where B is a strict PREFIX of what's held;
+it fails whenever B both overlaps AND extends. Reachable only with pipelined fetches — the
+in-memory harness pumps after every tick (`ReplicationClusterHarness.h:145-174`,
+`PartitionReplica.h:335`) so responses are always consumed before the next fetch, hiding it.
+Fix: gate append on offset-contiguity — reject/trim any batch whose `baseOffset < LEO`
+(skip already-held prefix), or stamp responses with the requested fetchOffset and drop a
+response whose start != current LEO. Do NOT rely on `lastOff>=LEO`.
+
+### A-NEW-2. `computeHw()` out-of-bounds read for ISR > 63 — SILENT (latent; scale)
+`HighWatermark.h:176-206`. `majority = isrSize/2 + 1` uses the FULL `isrSize`, but the LEO
+scratch array is `Offset leos[kMaxIsr]` with `kMaxIsr=32` and is filled only up to
+`n = min(isrSize,32)` (`:186-198`). The return is `leos[majority-1]` (`:205`). For
+`isrSize >= 64`, `majority-1 >= 32` indexes PAST the 32-element array → UB stack read; for
+`33 <= isrSize <= 63` it silently reads a zero-initialized slot (HW under-computed, not UB).
+Either way the cap is applied to the ARRAY but NOT to `majority`, so the two disagree above
+32. Practically unreachable (ISR is 3–5) but it is an unchecked buffer index, not merely a
+"magic cap". Fix: clamp `majority` to `n`, or `static_assert`/reject ISR>kMaxIsr, or size the
+majority index off `n`.
+
+### A-NEW-3. `FileRecordingStore` durability: `flush()` only, no `fsync`; non-atomic
+###          truncate-in-place on recovery — SILENT (durability; documented trade-off)
+`FileRecordingStore.cpp:199` `append` calls `file_.flush()` (stdio→OS buffer) but never
+`fsync`/`fdatasync`, and there is no rename/atomic-swap. A crash after `flush` but before
+OS write-back loses the tail; the frame is then recovered as a torn tail (safe: no partial
+frame surfaces, `recoverFromFile` `:88-166` reads payloads to detect truncation). This is
+consistent with the header's stated "async archive, majority-in-memory durability" contract
+(`FileRecordingStore.h:19-24`), UNLIKE `rune::storage::Log` which fdatasyncs per append
+(`Log.h:22-26`). Acceptable as documented, but flagged: the recorder is therefore NOT a
+crash-durable source of truth on its own — the recovery guarantee is "no torn frame", not
+"no lost committed tail". The recovery path's in-place `resize_file` (`:60-74`) is also
+non-atomic (crash mid-truncate could re-torn), but converges on next open. No committed-loss
+in the replication EOS sense (that rides the Log + majority, not the recorder).
+
+### A-NEW-4 (MINOR). `IsrManager::maybeExpandIsr` re-adds a caught-up replica with NO
+epoch/liveness gate and `nowNs` is unused (`IsrManager.h:166-181`). A replica that reaches
+`lastFetchOffset >= HW` is re-admitted even if its last fetch is ancient (only offset, not
+time, is checked on expand). Under-replication-repair leans on the coordinator instead, so
+this is latent, but expand-without-time-check can re-admit a stale replica the same tick a
+shrink would evict it. Carried from CL4/prior. Not a committed-loss.
+
+### A-NEW-5 (MINOR/CLEAN). Duplicate epoch-fence branches in `onFetchRequest`
+(`PartitionReplica.cpp:225-251`): the `isStaleEpoch` and `mustStepDown` arms build the
+identical `kErrStaleEpoch` response; `mustStepDown` (follower carries a HIGHER epoch) sends
+`kErrStaleEpoch` to the follower and does NOT actually step the leader down despite the
+comment "fence ourselves" — it just rejects. Harmless today (self-heals via control plane)
+but the error code is semantically wrong (should signal "you are ahead", not "you are
+stale") and the leader keeps leading at a lower epoch until the coordinator demotes it.
+
+### Prior fixes — re-verified WHOLE-LIBRARY (all HOLD)
+- **B1 (per-follower LEO SET-not-max) — HOLDS.** `updateFollowerFetchOffset`
+  (`HighWatermark.h:121-125`) sets, not max; `onFetchRequest` feeds live `req.fetchOffset`
+  (`:257`). Global floor `prevHw_` monotone via `recomputeHw` (`:169-174`). No stale-LEO HW
+  inflation anywhere in the library.
+- **B2 / NB1 (becomeLeader floor = committed, not LEO) — HOLDS.** `becomeLeader` captures
+  `committedHw = highWatermark()` BEFORE the role flip (`PartitionReplica.cpp:94-98`), applies
+  `setHighWatermarkFloor` BEFORE `setIsr`/`setLeaderLogEndOffset` (`:121-124`). All three
+  entry paths (was-follower→followerHw_, was-leader→leaderState HW, repair re-propagate) give
+  a ≤-committed floor. No HW=0 window, no uncommitted-tail exposure.
+- **C1 (read clamp) — HOLDS.** `read()` walks batches, stops at `baseOffset >= hw`
+  (`:294-317`). NB3 (multi-record straddle) still latent (single-record appends).
+- **C2 (becomeFollower / applyReplicated truncation floor) — HOLDS.** Both clamp
+  `truncOff = max(truncOff, committedHw/followerHw_)` (`:170-172`, `:343-348`); never
+  truncate below committed.
+- **C3 (election committed-prefix + crashed-leader HW derivation) — HOLDS.** `electNewLeader`
+  rejects `LEO < committedHw`, derives committedHw from surviving ISR when old leader
+  unregistered, `assert(found)` on unregistered ISR members (`PartitionFailoverCoordinator.h:264-401`).
+- **S1 (eager recompute) — HOLDS.** Every mutator recomputes (`HighWatermark.h:88-124`).
+- **S3 (recorder byte-budget) — HOLDS.** 64 MiB byte budget + multi-chunk loop
+  (`PartitionRecorder.cpp:73-125`); recordingPosition uses `lastOffsetDelta`
+  (`FileRecordingStore.cpp:206-211,149-156`, `PartitionReplay.cpp:74-82`). Multi-record
+  well-covered.
+- **C4 / recomputeHw selfId-hack — REMOVED.** `recomputeHw` now calls
+  `setLeaderLogEndOffset` only (`PartitionReplica.cpp:489-496`); no selfId pollution.
+
+### Clean / non-findings confirmed this pass
+- SBE codecs (`ReplicationMessages.h`) round-trip correctly; S5 unbounded `len` on
+  `FetchResponseMsg::decode` (`:262-267`) remains — DEFERRAL-OK, unreachable until an
+  untrusted Aeron frame is wired; MUST bound-check before then.
+- `EpochFencing.h` helpers correct; `truncationOffsetForEpochChange(e→e-1)` boundary sound
+  and well-tested.
+- No busy-spin: every `doWork` is cadence-gated and returns 0 when idle
+  (`PartitionReplica.cpp:428-462`, `PartitionFailoverCoordinator.h:213-250`). Single-writer
+  documented and respected. `looksLikeRecordBatch` sniff (S4) unchanged, test-only artifact.
+- `Types.h::RecordBatchRef` still dead/unused (CL4). Redundant `isrManager_`+`isrManagerOwned_`
+  aliasing (CL3) unchanged.
+
+## Part B — edge-case test-coverage assessment (18 gaps)
+
+Overall coverage is STRONG (335 tests across 8 files; multi-record, byte-equality, failover,
+partition-safety, torn-tail all covered). Missing niche cases, ranked:
+
+TOP (highest value):
+1. **Pipelined/duplicate FetchResponse apply** (A-NEW-1): two in-flight fetches at the same
+   fetchOffset where the 2nd both overlaps and extends → assert log stays monotonic /
+   byte-identical. No test emits a 2nd fetch before pumping the 1st. HIGHEST.
+2. **ISR shrink-to-1 then produce** then re-expand: HW must jump to leaderLeo (leader-only
+   quorum) then re-clamp on rejoin. `IsrShrinkFrom3To1` tests HW only, not a produce+read
+   cycle through the replica after shrink-to-1.
+3. **Single-replica-ISR produce→commit→read end-to-end** via `PartitionReplica` (not just
+   `ReplicaLeaderState`): append with |ISR|=1 should commit immediately and `read` return it.
+4. **HW exactly at the majority index boundary** on `PartitionReplica.read` — a committed
+   read where `fetchOffset == HW-1` returns exactly one batch and `fetchOffset == HW` empty
+   with a MULTI-batch log (straddle-adjacent), to lock the clamp at the exact boundary.
+5. **Follower truncate-then-refetch across MULTIPLE epoch rounds** (≥3 successive epoch
+   bumps with divergent tails each time) asserting byte-identity to leader over [0,HW) after
+   each round. Current tests do a single truncation round.
+
+MEDIUM:
+6. Epoch change arriving DURING an in-flight fetch (response with higher epoch applied while
+   an older-epoch response is still queued) — ordering/idempotency of `applyReplicated` epoch
+   branch (`:332-352`) is untested for out-of-order delivery.
+7. Recorder over a range whose bytes exceed the 64 MiB budget → forces the multi-chunk
+   outer loop (`PartitionRecorder.cpp:76-125`); only small payloads exercise a single chunk.
+8. Recorder / large multi-record batch straddling the RecordingStore at a segment-roll
+   boundary of the underlying Log (interaction of Log segment roll with recorder read).
+9. `PartitionReplay` partial range whose `[from,to)` starts and ends INSIDE distinct
+   multi-record batches (boundary lands mid-batch) — assert whole-batch inclusion semantics.
+10. `becomeFollower` with a divergent tail at the EXACT committed boundary (truncOff ==
+    committedHw == currentLeo): assert NO truncation fires and no committed byte drops.
+11. Election TIE where two eligible candidates share the max LEO AND one is unregistered
+    (assert-path) vs both registered (smallest-NodeId tiebreak) — the assert/`leoOf`=0 unknown
+    path is only indirectly covered.
+12. Election where committedHw is derived from surviving ISR and candidates are EQUAL to
+    committedHw (boundary `LEO == committedHw` accepted, `LEO == committedHw-1` rejected).
+13. Straddling-HW MULTI-record read clamp (NB3): a single batch [base,base+N) with base<HW
+    but base+N>HW — assert clamp (currently latent; add a test that constructs a multi-record
+    batch directly to prove/deny the gap before batching lands).
+14. `computeHw` with ISR size 33–64 (A-NEW-2) — assert HW computed correctly (or rejected)
+    above kMaxIsr; no test exceeds 5.
+
+LOWER:
+15. `FileRecordingStore` crash between `flush` and write-back (A-NEW-3) simulated by not
+    fsyncing then reopening a byte-truncated file — assert torn-tail recovery, not silent
+    accept of a half-frame.
+16. `maybeExpandIsr` re-admitting a caught-up-by-offset but time-stale replica (A-NEW-4) —
+    assert whether that is intended.
+17. `onFetchRequest` `mustStepDown` branch (follower carries higher epoch): assert the
+    returned error code / that the leader's behavior is sane (A-NEW-5). Only the stale-epoch
+    branch is tested (`StaleEpochFetchRejected`).
+18. Coordinator `signalLeaderDead` for a node that is neither current leader nor in ISR
+    ("unknown" node) followed by doWork — assert no election, no crash (unknown-node signal).
+

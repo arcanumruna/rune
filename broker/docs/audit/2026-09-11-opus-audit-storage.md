@@ -190,3 +190,230 @@ None of BLOCKER/CORRECTNESS/SILENT severity. Nitpicks (informational, no action 
 
 ### Conclusion
 Every BLOCKER (B1–B3), CORRECTNESS (C1–C4), and SILENT (S1–S6) finding is genuinely fixed (not superficially patched): durability is real (fsync+msync on the ack path), the index is canonical + reproducible, truncation is exact, and the ProducerState legacy hazard is gone with 64-bit snapshot sizing. All deferrals (C3, S6, CL2, CL5/6, T1–T4) are justified — none hides a correctness or durability bug. No new bugs introduced by the fixes; 164/164 storage tests pass. **libs/storage is sound.**
+
+---
+
+## Full re-audit + coverage (HEAD)
+
+Date: 2026-09-11 (second pass) · Auditor: Opus (read-only, whole-library, fresh eyes)
+Scope re-read in full: all `include/rune/storage/*.h`, all `src/*.cpp`, all `tests/**`.
+Protocol reference: `rune-protocol/include/rune/protocol/RecordBatch.h` (kRecordBatchOverhead=61,
+single/multi-record v2 batches, CRC over [attributes..end]).
+
+### Part A — verdict: **CLEAN** (no BLOCKER / no data-loss bug)
+
+All prior B1–B3 / C1–C4 / S1–S6 fixes verified still in place and correct:
+- Durability real: `LogSegment::append` → `sync()` = `fstream::flush` + `fsync(fd_)` + `index_->msync`
+  on the ack path (`LogSegment.cpp:58-74,49-56`). fsync targets the same inode as the fstream write,
+  so page-cache data reaches disk even though writes go through `log_` and fsync through `fd_`. OK.
+- Canonical index: `recover()` rebuilds into `.index.tmp`, msync, atomic `rename`→`.index`,
+  fsync dir, reopen + `rebuildEntries()` (`LogSegment.cpp:114-173`). No `.index2` orphan. OK.
+- Reproducible sparse index: single `shouldIndex()` predicate shared by append/recover/buildIndex
+  (`LogSegment.cpp:21-23,63,140`; `LogCleaner.cpp:121`). OK.
+- Exact truncate: `truncateTo` cutPos defaults to `validEnd` (not buf.size()), rounds down to batch
+  start, derives LEO from the physically-truncated file via `recover()` (`Log.cpp:61-156`). OK.
+- Legacy `ProducerState.h` deleted; snapshot sizing is 64-bit with count clamp and `min(count,maxEntries)`
+  on load; window/head clamped (`ProducerStateManager.cpp:240-247,354-366,390-394`). OK.
+
+No new BLOCKER/CORRECTNESS bugs found on the whole-library sweep. Remaining items are SILENT/CLEAN
+edge-only, none causes acknowledged-then-lost or corrupted data on the single-writer happy path.
+
+Findings (file:line — severity):
+
+- **A1 [SILENT]** `ProducerStateManager::validate` is `noexcept` and guards `baseSequence>=0` /
+  `lastSequence>=baseSequence` with `assert` only (`ProducerStateManager.cpp:130-131`). In `NDEBUG`
+  builds the asserts vanish; a negative `baseSequence` (protocol-illegal, but not enforced at this
+  layer) flows into the window scan where empty slots are `{-1,-1,-1}`. `windowCount` gating prevents
+  a false-dup in practice, but the "protocol invariant enforced" comment overstates release behavior.
+  Prefer a hard early-return `oos()` for out-of-range inputs.
+- **A2 [SILENT]** Compaction strips producer identity: `rewriteSegment::keep()` rebuilds every surviving
+  record via `RecordBatchBuilder`, which hard-codes `producerId=-1, epoch=-1, baseSequence=-1`
+  (`LogCleaner.cpp:231-236`; builder `RecordBatch.h:86-88`). Post-compaction the log no longer carries
+  idempotence metadata. Harmless today (dedup state lives in the fsync'd PSM snapshot, not re-derived
+  from the log), but it is a real semantic divergence from Kafka and would break any future
+  rebuild-producer-state-from-log path. Document as an explicit invariant.
+- **A3 [SILENT]** Batch-walk trust without CRC in the compaction/truncate paths:
+  `Log::truncateTo` (`Log.cpp:112-115`), `LogCleaner::buildOffsetMap` (`LogCleaner.cpp:172-176`) and
+  `rewriteSegment` (`LogCleaner.cpp:214-218`) advance by `totalLength()` with no `ensureValid()` CRC
+  check (unlike `LogSegment::recover` `:138` and `PartitionApi::consume` `:28`). Safe on the
+  post-recover clean on-disk image they assume, but a corrupt-but-plausible-length batch mid-segment
+  would silently desync the walk. Defense-in-depth: CRC-gate these walks too.
+- **A4 [SILENT]** Empty compacted segment leaves a permanent zero-byte `.log`: if every record in a
+  non-active segment is superseded, `outBuf` is empty and `writeFileDurable` writes a 0-byte file that
+  is renamed into place (`LogCleaner.cpp:284-287`). `recover()` handles it (nextOffset=baseOffset, LEO
+  from the active segment is unaffected — no data loss), but the empty segment file lingers forever and
+  is never GC'd. Consider deleting a fully-emptied non-active segment instead of writing it back.
+- **A5 [SILENT]** `LeaderEpochCache` is unenforced and unwired: `assign()` accepts non-monotonic epochs
+  and non-monotonic startOffsets and silently overwrites (`LeaderEpochCache.h:7`); there is no
+  `truncateFromOffset()` and no coupling to `Log::truncateTo`, so after a log truncation the epoch map
+  is not pruned. In-memory only (no persistence). Standalone today; must be wired + made monotonic
+  before replication (Phase 3) relies on it.
+- **A6 [CLEAN]** `MappedFile::resize` munmaps then ftruncates then remaps; if `ftruncate` throws, the
+  object is left with `data_==dangling`/stale `size_` (`MappedFile.cpp:21-27`). Not reachable from the
+  8 MiB fixed-size index (never resized), but the primitive is not exception-safe.
+- **A7 [CLEAN]** `OffsetIndex::rebuildEntries` end-of-data heuristic relies on
+  "`i>0 && rel==0 && pos==0` ⇒ unwritten" (`OffsetIndex.cpp:48-62`). Correct given strictly-increasing
+  rel and pos, but it is an implicit invariant with no assert; a future non-monotonic writer would
+  mis-count. Add an assert or a written-entry count.
+- **A8 [CLEAN]** `PartitionApi::consume` stalls (returns fewer than available) rather than progressing
+  if a single record exceeds `maxBytes`: `Log::read` grows only to locate the start batch, then returns
+  a `maxBytes`-sized window whose sole batch may be truncated → `ensureValid()` fails → `advanced=false`
+  → outer break (`PartitionApi.cpp:17-37`, `LogSegment.cpp:87-111`). No infinite loop, no corruption;
+  just under-delivery for pathologically small maxBytes. Consider a "return at least one whole batch"
+  guarantee.
+- **A9 [CLEAN]** `LogSegment` keeps two independent handles to the same inode (`log_` fstream for writes,
+  `fd_` for fsync). Correct but fragile; a single POSIX-backed writer (as in `LogCleaner::writeFileDurable`)
+  would remove the dual-handle foot-gun and the append-mode/seekp interplay.
+
+### Part B — edge-case test-coverage assessment
+
+Coverage is strong (≈170 tests). Missing niche cases (component: case), 24:
+
+1. **LogCleaner: empty-output segment** — every record in a non-active segment superseded ⇒ 0-byte
+   `.log` written; assert recover survives, LEO intact, offsets after the gap read correctly (A4). None.
+2. **LogCleaner: compaction then recover-from-log** — after compact, verify a *fresh process* recovering
+   only from segment bytes reproduces LEO/index (no reliance on in-memory state); catches A2/A3 desync.
+3. **LogCleaner: multi-record batch input** — all current fixtures are single-record. Feed a real
+   multi-record batch and assert per-record survivors + preserved offsets/timestamps after rewrite.
+4. **LogCleaner: corrupt-but-plausible-length batch mid dirty segment** — buildOffsetMap/rewrite should
+   not silently walk past garbage (A3).
+5. **LogCleaner: crash exactly between `rename(.new→.log)` and `fsyncDir`** — assert the renamed content
+   is what survives (current tests plant stale `.new`, never exercise the post-rename pre-dirfsync window).
+6. **LogCleaner: tombstone exactly at `nowNs - ts == deleteRetentionNs`** — boundary (`>` vs `>=`) at
+   `LogCleaner.cpp:258`; only strictly-before / strictly-after are tested.
+7. **LogCleaner: key survives only in the active segment** while an earlier segment holds an older copy —
+   assert the earlier copy is dropped and the active copy is the survivor (S6 region).
+8. **LogSegment: append that makes logSize cross INT32_MAX** — exercise the 2 GiB `OffsetIndex::append`
+   guard (`OffsetIndex.cpp:13`) with a >2 GiB `rollBytes`; currently only reasoned, never run.
+9. **LogSegment: recover of a torn tail whose partial batch has a valid length prefix but bad CRC** —
+   confirm `ensureValid()` (not just length) drops it (`LogSegment.cpp:138`).
+10. **LogSegment: recover twice in a row** (idempotence of the `.index.tmp`→`.index` rename; leftover
+    `.index.tmp` from a prior crash is removed at `LogSegment.cpp:128`).
+11. **LogSegment: read with `maxBytes < kRecordBatchOverhead`** and with `maxBytes==0` — grow-loop
+    progress / non-crash.
+12. **LogSegment: read for an offset in the sparse gap** just below an index entry across ≥2 grow
+    iterations at a segment boundary.
+13. **Log: truncateTo into the middle of a multi-record batch** — assert whole-batch round-down (C1
+    semantics) with an actual multi-record batch, not single-record.
+14. **Log: truncateTo exactly at a non-first segment base** (already have base-boundary; add the case
+    where the boundary segment is deleted and the prior becomes active with all-kept).
+15. **Log: truncateTo to 0 then append** — reuse offset 0, verify contiguity (partial coverage exists;
+    add the append-after step + reopen).
+16. **Log: maybeRoll with a single batch larger than rollBytes** — assert the oversized batch gets its
+    own segment and reads back (`Log.cpp:27-36`).
+17. **Log/PartitionApi: consume when one record > maxBytes** — document/assert the under-delivery
+    behavior (A8) so a future "≥1 batch" fix is a deliberate change.
+18. **PartitionApi: consume with fromOffset == highWatermark and > highWatermark** — empty, no crash.
+19. **OffsetIndex: lookup for target < baseOffset** (returns base/position 0) and target ==
+    lastEntry.offset exactly (largest-lower-bound inclusivity).
+20. **ProducerStateManager: negative baseSequence in an NDEBUG build** — assert graceful `oos()` rather
+    than assert-abort / false-dup (A1).
+21. **ProducerStateManager: snapshot with count field forged larger than file** — verify `safeCount`
+    clamp path (`:361-366`) loads only the real entries (a corrupt-count test, distinct from torn-CRC).
+22. **ProducerStateManager: duplicate detection across a window wrap** (windowHead wrapped past 0) —
+    exercise the circular `(windowHead-windowCount+N+i)%N` index (`:163`) after >kRetryWindowSize batches.
+23. **ProducerStateManager: epoch bump then a replay of a pre-bump baseSequence** — must be `oos`/not a
+    stale duplicate (window cleared on bump, `:195-202`).
+24. **LeaderEpochCache: non-monotonic assign / truncation coupling** — once wired, assert an out-of-order
+    or lower-offset `assign` is rejected and that a log truncation prunes epochs (A5).
+
+### Re-audit conclusion
+Part A: **CLEAN** — durability, index canonicality/reproducibility, exact truncation, and idempotent
+dedup all hold; the 9 remaining items are SILENT/CLEAN edge/quality issues, none a data-loss or
+corruption bug on the single-writer path. Part B: **24** missing edge-case tests; the highest-value
+gaps are the empty-compacted-segment (A4), multi-record-batch compaction/truncation semantics, the
+post-rename/pre-dirfsync crash window, and the NDEBUG negative-sequence path.
+
+---
+
+## Full re-audit 2 (commit 22762a3)
+
+Fresh whole-library confirmation pass on `libs/storage` after the A1–A5 fixes + 32 edge-case tests.
+Read the current code end-to-end; reasoned from source (ctest not run). Verdict below.
+
+### Per-finding status
+
+- **A1 — FIXED.** `ProducerStateManager::validate` now has a hard runtime early-return
+  `if (baseSequence < 0 || lastSequenceInBatch < baseSequence) return oos();`
+  (`ProducerStateManager.cpp:132-133`), unconditional (not `assert`) so it holds under NDEBUG. The
+  brand-new-producer path still requires `baseSequence == 0`. Verified no false-dup: the window scan is
+  now unreachable for negative baseSequence. Tests `NegativeBaseSequenceIsOos` / `...NotFalseDup` /
+  `LastSeqBelowBaseSeqIsOos` are real and assert `isOos() && !isDuplicate()`.
+
+- **A2 — FIXED, correct.** `rewriteSegment::keep()` reads origProducerId/Epoch/BaseSequence from the raw
+  source batch (offsets 43/51/53, all big-endian) and patches them into each rebuilt single-record
+  batch, using per-record sequence `origBaseSequence + (offset - batchBaseOffset)`
+  (`LogCleaner.cpp:231-292`). CRC is recomputed over `[kAttributesOffset(21)..end]` — byte-identical to
+  `RecordBatchBuilder::build()`'s own `crc32c(b+21, size-21)` (`RecordBatch.h:93`). Because
+  producerId/epoch/baseSequence (43/51/53) all lie *after* offset 21, they are inside the CRC region;
+  the recompute is required and correct. **No regression for normal (pid=-1) compaction**: when the
+  source carries -1/-1/-1 the patch writes -1/-1/-1 back and recomputes the same CRC → output identical
+  to the builder. `CompactionPreservesProducerIdentity` reads the surviving batch back, asserts
+  `ensureValid()` AND preserved pid/epoch/seq — a genuine end-to-end check.
+
+- **A3 — FIXED.** `ensureValid()` CRC-gate added to all three batch-walks after the length bounds check:
+  `Log::truncateTo` (`Log.cpp:118`), `LogCleaner::buildOffsetMap` (`LogCleaner.cpp:179`),
+  `rewriteSegment` (`LogCleaner.cpp:224`) — matching `LogSegment::recover` (`:138`). A corrupt
+  totalLength or body now stops the walk instead of misparsing. **No false rejection of valid batches**:
+  `ensureValid()` (`RecordBatch.h:115-121`) only fails on true CRC/length mismatch; the compaction path
+  writes freshly-CRC'd batches (A2) so the subsequent `reloadSegments()→recover()` re-parse passes.
+  `CorruptBatchInBuildOffsetMapStopsWalk` plants a bit-flip in the *second* (mid-segment) batch's CRC
+  and asserts the walk stops gracefully with the first key still mapped — real.
+
+- **A4 — FIXED.** When `outBuf` is empty after compaction, `rewriteSegment` `remove()`s both `.log` and
+  `.index` and `fsyncDir`s (`LogCleaner.cpp:336-341`) rather than writing a 0-byte file. `reloadSegments()`
+  re-discovers only `.log` files (`Log.cpp:161-176`), so a deleted intermediate segment is simply absent;
+  LEO comes from the active (never-compacted) segment. `EmptyCompactedSegmentDeletedNotLeft` asserts no
+  0-byte `.log` survives and LEO/key survivors are intact — real.
+
+- **A5 — FIXED at the primitive level.** `LeaderEpochCache::assign` now drops any `epoch <= latest` or
+  `startOffset < latestStartOffset` (`LeaderEpochCache.h:23-31`); `truncateFromEnd` prunes entries with
+  `startOffset >= truncateOffset` (`:50-59`). Six real tests (B24a–e) cover non-monotonic epoch/offset
+  rejection, truncate-prune, truncate-to-0, and assign-after-truncate. Storage-lib primitive is sound.
+
+### New finding (from the "must not break existing callers" check)
+
+- **A10 [CORRECTNESS — latent, replication layer]** `libs/replication/PartitionReplica` uses the newly
+  *monotonic* `LeaderEpochCache::assign` WITHOUT the compensating `truncateFromEnd`. `truncateLog`
+  (`PartitionReplica.cpp:503-514`) and `becomeFollower` (`:131-187`) truncate the log but never prune the
+  epoch cache. Then `applyReplicated` (`:350-351`) does `epochCache_.assign(epoch_, log_->logEndOffset())`
+  after a truncation. If a stale higher-offset epoch entry remains in the cache and the post-truncation
+  LEO regresses below it, the new (higher-epoch) assign is now **silently dropped** by the A5
+  `startOffset < latest` guard — pre-fix it would have overwritten. The cache then retains an entry whose
+  startOffset is *above* the actual log end, and a later `truncationOffsetForEpochChange` can return a
+  wrong (too-high) boundary. `truncateFromEnd` exists but is called nowhere in the tree
+  (grep: only tests). Not reachable in the current suite (existing epoch-truncation tests use equal or
+  higher offsets, so 1406/1406 still pass), hence *latent*; but it is a real coupling regression the A5
+  change introduced in an existing caller. **Fix direction:** call
+  `epochCache_.truncateFromEnd(truncateOffset)` inside `PartitionReplica::truncateLog` (and in the
+  `becomeFollower` truncation branch) so cache and log truncate together — exactly the coupling A5's own
+  doc-comment and test B24e anticipate. This is outside `libs/storage`; the storage primitive itself is
+  correct.
+
+### No new storage-lib findings
+
+Fresh sweep of `LogSegment` (unchanged; `recover` already CRC-gated at `:138`), `OffsetIndex`,
+`OffsetMap`, `MappedFile`, `PartitionApi`, `RetentionPolicy`, `ProducerStateManager` snapshot/recover
+(64-bit sizing + `safeCount` clamp intact): no new material issue. The prior SILENT/CLEAN items A6–A9
+are unchanged and remain non-data-loss quality notes.
+
+### Coverage
+
+32 new tests confirmed real and on-point (not tautological): B1 empty-segment recovery, B2 fresh-process
+reopen LEO, B3 multi-record-batch compaction + B3-pid producer-identity round-trip, B4 mid-segment
+corrupt-CRC stops walk, B5 post-rename/pre-dirfsync content survives, B6 tombstone exactly at retention
+boundary retained, B7 key-only-in-active drops earlier copy, B8 >2GiB index guard, B9 torn tail good-len
+bad-CRC dropped, B10 recover-twice idempotent, B11 tiny-maxBytes grow loop, B13 mid-batch truncate rounds
+down, B14 at-segment-base truncate, B15 truncateTo(0)+append, B16 oversized batch > rollBytes, B18
+consume at/past HWM, B19 index lookup below-base/at-last/above-last, B20 NDEBUG negative-seq OOS, B21
+forged-count clamp, B22 window-wrap dup, B23 epoch-bump then pre-bump replay OOS, B24a–e epoch-cache
+monotonicity + truncateFromEnd. Remaining Part-B gaps (from list of 24) still open, none blocking:
+mostly the storage-side items are now covered; the untested residual is the **A10 replication coupling**
+(a truncate-then-higher-epoch-with-regressed-offset failover test in `libs/replication`).
+
+### Re-audit 2 conclusion
+`libs/storage` in isolation: **CLEAN** — A1–A5 fixed correctly, no regression to normal compaction /
+CRC walks / dedup, coverage adequate. One cross-cutting **latent CORRECTNESS** issue (**A10**) sits in
+`libs/replication` where the A5 monotonic-`assign` change was not paired with `truncateFromEnd`; it is
+out of the storage section's scope but was surfaced by the required "existing callers" check and should
+be fixed before Phase-3 replication relies on the epoch cache.

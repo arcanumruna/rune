@@ -179,13 +179,32 @@ private:
         const int isrSize  = static_cast<int>(isr_.size());
         const int majority = isrSize / 2 + 1; // strict majority, e.g. 3→2, 5→3
 
-        // Gather LEOs for every ISR member.
-        // Use a small stack buffer for the typical 3–5 member ISR to avoid
-        // heap allocation on the hot path.
-        // (C++23 VLAs are non-standard; use a fixed-capacity local array.)
-        constexpr int kMaxIsr = 32; // practical upper bound
-        Offset leos[kMaxIsr]{};
-        const int n = std::min(isrSize, kMaxIsr);
+        // A-NEW-2 fix: use a dynamically-sized buffer so ISR sizes > 32
+        // (e.g. 33, 64, 65) are computed correctly without OOB stack reads.
+        //
+        // For the common ISR sizes (3–5) this still avoids heap allocation via
+        // the small-buffer path: we allocate on the stack for ISR <= kSmallIsr
+        // and fall back to a heap vector for larger sizes.
+        //
+        // Prior bug: kMaxIsr=32 and the array was filled only up to
+        // n=min(isrSize,32), but majority was computed from the FULL isrSize.
+        // For isrSize>=64, majority-1>=32 indexed past the 32-element array
+        // (UB); for 33<=isrSize<=63 it read a zero-initialised slot (HW
+        // under-computed, not UB).  Now majority is clamped to n so the two
+        // always agree.
+        constexpr int kSmallIsr = 32;
+        Offset smallBuf[kSmallIsr]{};
+        std::vector<Offset> heapBuf;
+        Offset* leos = nullptr;
+
+        if (isrSize <= kSmallIsr) {
+            leos = smallBuf;
+        } else {
+            heapBuf.assign(static_cast<std::size_t>(isrSize), Offset{0});
+            leos = heapBuf.data();
+        }
+
+        const int n = isrSize; // always use ALL ISR members
 
         for (int i = 0; i < n; ++i) {
             NodeId member = isr_[static_cast<std::size_t>(i)];
@@ -201,6 +220,7 @@ private:
         std::sort(leos, leos + n, std::greater<Offset>{});
 
         // majority-th highest = leos[majority - 1].
+        // majority is always in [1, n] so the index is always in-bounds.
         // E.g. ISR={A=100, B=90, C=80}: majority=2, HW=leos[1]=90.
         return leos[majority - 1];
     }

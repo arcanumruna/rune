@@ -16,6 +16,8 @@
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace rune::replication {
 
@@ -36,6 +38,22 @@ static int64_t readLE64s(const uint8_t* p) {
 // ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
+
+// A-NEW-3 helper: open or reopen the POSIX fd for fsync, closing any prior one.
+static int openFdForFsync(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        throw std::runtime_error("FileRecordingStore: cannot open fd: " + path);
+    }
+    return fd;
+}
+
+FileRecordingStore::~FileRecordingStore() {
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
 
 FileRecordingStore::FileRecordingStore(const std::string& path)
     : path_(path)
@@ -72,6 +90,9 @@ FileRecordingStore::FileRecordingStore(const std::string& path)
             throw std::runtime_error("FileRecordingStore: reopen after truncate failed: " + path_);
         }
     }
+
+    // A-NEW-3: open a POSIX fd for fsync on the same file.
+    fd_ = openFdForFsync(path_);
 
     // Seek write pointer to end of file.
     file_.seekp(0, std::ios::end);
@@ -196,7 +217,14 @@ void FileRecordingStore::append(int64_t baseOffset,
     writeLE64s(baseOffset);
     file_.write(reinterpret_cast<const char*>(bytes.data()),
                 static_cast<std::streamsize>(bytes.size()));
+    // A-NEW-3 fix: flush libc buffer to OS then fsync to durable storage.
+    // The fstream (file_) and the POSIX fd_ refer to the same inode, so
+    // flush() + fsync(fd_) ensures the written bytes reach disk before this
+    // call returns (matching the durability guarantee of storage::LogSegment).
     file_.flush();
+    if (fd_ >= 0) {
+        ::fsync(fd_);
+    }
 
     batchCount_ += 1;
 

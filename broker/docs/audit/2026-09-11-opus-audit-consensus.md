@@ -206,3 +206,90 @@ B1's new `throw` on msync/fsync EIO is fail-stop during construction/vote (safe,
 - **S1** (ConsensusAgent silent-drop observability gap) and **T2** (duplicate-at-old-position fencing test) remain as noted in Re-audit 1 — observability/coverage only, no safety or liveness impact.
 
 **Overall:** no split-brain, no double-vote, no behind-leader win, and no election deadlock. libs/consensus is genuinely safe **and** live for Phase-2. **CLEAN.**
+
+---
+
+## Full re-audit + coverage (HEAD)
+
+**Date:** 2026-09-11
+**Auditor:** Opus (read-only, no code modified)
+**Scope:** whole-library fresh re-review of `libs/consensus/**` (ElectionState, ClusterMember, NodeStateFile, TermLog, ConsensusMessages SBE, Election, ConsensusPublisher/Adapter, ConsensusAgent/AgentRunner/IdleStrategy) + edge-case test-coverage assessment. Not a fix-check; independent whole-library pass.
+
+### Part A — verdict: **BUGS REMAIN** (no Raft-safety split-brain/double-vote; 3 correctness/durability findings, all latent for the no-Archive Phase-2 config)
+
+Prior fixes re-verified and still hold: durable vote (`NodeStateFile` msync+fsync, default level 1 — `NodeStateFile.cpp:158-175`, `.h:44-48`); NLT gate on `candidateTermId` + leader-log-freshness (`Election.cpp:743-766`); Aeron-faithful quorum predicate = leadershipTermId+logPosition only (`ClusterMember.h:83-88,193-208`); dead vanilla-Raft core removed. Quorum math, `compareLog`, insertion-sort `quorumPosition`, release/acquire fences, SBE byte layouts (all 10 templates: offsets/BLOCK_LENGTHs verified against §3.1), `ElectionState` ordinals, single-writer discipline, and AgentRunner/IdleStrategy no-busy-spin are all correct. One-vote-per-term is preserved by the monotonic `candidateTermId_` bump (grant sets it to T; any later same-term request hits `candidateTermId <= candidateTermId_` → deny) — Aeron-faithful, safe across crash via the fsync'd NodeStateFile.
+
+New findings this pass (not raised in prior rounds):
+
+- **A1 (CORRECTNESS / latent-safety, MEDIUM). Higher-term NLT/CommitPosition in a LEADER (non-accepting) state is silently dropped — no step-down / re-election.**
+  `Election.cpp:720-728` (NLT non-accepting branch) and `Election.cpp:816-828` (`onCommitPosition`). Both act only when `leadershipTermIdArg == leadershipTermId_`. A message with `leadershipTermIdArg > leadershipTermId_` arriving while this node is in `LeaderLogReplication/LeaderReplay/LeaderInit/LeaderReady` (or after `Closed`, `:711`) falls through to a bare `return`. Aeron's `Election.java:517-533` and the port reference (`…-reference.md:146`: "if LEADER_READY and higher termId → enter new election") require the stale would-be leader to abandon leadership and re-enter election on a strictly-higher term. Not an *immediately* exploitable split-brain in the election-only Phase-2 scope (two leaders can't both hold a majority in an intact cluster; a competing higher term only appears post-partition-heal, often after this node already Closed), but it is a genuine deviation from the Aeron step-down rule and the exact hook where a two-leaders window is supposed to be closed. Fix direction: in the non-accepting branch, if `leadershipTermIdArg > leadershipTermId_` (NLT) or the higher-term case in `onCommitPosition`, drive back to CANVASS/re-election (adopt the term via `proposeMaxCandidateTermId`), per Aeron.
+
+- **A2 (DURABILITY, MEDIUM). `TermLog` never fsyncs — committed term entries can be lost on crash.**
+  `TermLog.cpp` — `writeRecord`/`patchInt64`/`patchInt32` all go through `fullPwrite` (pwrite only); there is **no** `fsync`/`fdatasync` anywhere in the file (grep-confirmed), and the destructor just `close`s. Aeron's `RecordingLog.persistToStorage` calls `fileChannel.force(false)` after each write. So `appendTerm` (`:281-310`) and `commitLogPosition` (`:316-338`) leave the record only in the page cache; a power loss before writeback loses the last leadership-term entry and its committed `logPosition`. Consequence on recovery: `nextLeadershipTermId()`/`lastTermEntry()` regress. Double-voting is still prevented (the durable vote lives in the fsync'd `NodeStateFile`, and `init()` clamps `candidateTermId_ = max(persistedTerm, leadershipTermId_)` at `Election.cpp:214-215`), so this is **not** a split-brain, but the committed term/position for an already-decided term can vanish — a Leader-Completeness/recovery gap the moment Phase-3 has real log positions. Header comment ("survives process restart", `TermLog.h:70-74`) overstates the guarantee. Fix direction: `fsync(fd_)` after each `writeRecord`/patch (or a sync level mirroring NodeStateFile), and add a crash-injection reopen test.
+
+- **A3 (SBE ROBUSTNESS, MEDIUM). `ConsensusAdapter::onFragment` ignores the frame length → out-of-bounds read on a truncated/undersized frame.**
+  `ConsensusAdapter.cpp:5` takes `len` but marks it `/*len*/` and never checks it; `peekTemplateId` reads `buf[+2..+4]` and every `decode()` reads fixed offsets up to `TOTAL_SIZE` (e.g. NLT reads to +96) with no `len >= header/TOTAL_SIZE` guard. A short or corrupt ingress frame (bug upstream, schema mismatch, partial ring record) causes an OOB read / UB. In Phase-2 frames come from a trusted internal ring so this is defense-in-depth, but it is a real SBE-decode safety gap and the natural place the audit-mandated "truncated/oversized frame" guard belongs. Relatedly S1 (prior audit) is unchanged: `ConsensusAgent.cpp:47-57` still counts unknown/mis-sized templates as "processed" with no ignored/error counter. Fix direction: validate `len >= ConsensusMessageHeader::ENCODED_SIZE` before peek and `len >= Msg::TOTAL_SIZE` (or fixed-block + var length) before each decode; bump an ignored counter otherwise.
+
+Deferrals re-confirmed OK (unchanged): C3 (re-canvass term-inflation, liveness-only, documented `Election.cpp:246-250`), C4 (roster-id uniqueness = construction invariant), C5/N1 (Phase-2 pass-through replays guarded by `assert(logPosition_==appendPosition_)` at `Election.cpp:431,513`; quorum predicate stays Aeron-faithful). No deadlock: `leaderReady` reaches quorum because followers' single `onAppendPosition` sets their `leadershipTermId` to the leader's term (`Election.cpp:806`) and `hasQuorumAtPosition` no longer requires `logLeadershipTermId`.
+
+### Part B — edge-case test-coverage assessment
+
+Coverage is strong (350+ tests; 5-node split, exact-threshold quorum, same-term one-behind vs equal, NLT-higher-term-adopt, NLT-leader-behind, N1 anti-regression, vote-persist-across-reopen, out-of-order TermLog append/commit/invalidate all present). Missing niche cases, highest-value first:
+
+1. **Higher-term NLT / CommitPosition while in a LEADER state** (covers A1): node in `LeaderReady` receives NLT `leadershipTermId > current` → assert it abandons leadership / re-enters election. Entirely untested; masks A1.
+2. **TermLog crash-durability** (covers A2): append+commit a term, reopen from the same bytes with writeback dropped/no-fsync semantics, assert the last term + committed logPosition survive. No fsync-durability test exists (only same-process reopen, which the page cache satisfies).
+3. **Truncated / oversized SBE frame into the adapter** (covers A3): feed `onFragment` a `len` shorter than `TOTAL_SIZE` (and an oversized/garbage frame) → assert no OOB read and the frame is ignored/counted. `UnknownTemplateId_SilentlyIgnored` exists but every frame is full-length; no undersized/oversized case.
+4. **NLT `nextLeadershipTermId < candidateTermId_` (stale-ballot reject)** — the `Election.cpp:747-750` reject branch is uncovered (existing NLT tests use equal or higher next-term).
+5. **Vote persistence across restart *per Election state*** — a reopen test after voting specifically in `FollowerBallot` (and after a deny-path term bump in `onRequestVote`, `Election.cpp:644-646`) asserting `candidateTermId` survives; current NodeStateFile tests exercise the store directly, not via a re-constructed `Election` in each vote state.
+6. **Election-timeout boundary** — `candidateBallot`/`followerBallot`/`canvass` at `nowNs == timeOfLastStateChangeNs_ + electionTimeoutNs_` exactly (the `>=` edge), and the extended-vs-normal canvass timeout switch after the first Canvass exit (`isExtendedCanvass_` cleared, `state():838-840`).
+7. **Duplicate/old-position fencing** (prior T2, still open) — a valid-looking same-term AppendPosition/Vote from the wrong sender or at an old position.
+8. **Catch-up/replay pass-through guards** — a test that drives a follower with `logPosition_ != appendPosition_` to assert the C5 `assert` fires (documents the Phase-2 precondition rather than leaving it only compiled-in).
+
+**Count: 8 missing-test areas.** TOP 3: #1 (higher-term-NLT step-down, ties A1), #2 (TermLog fsync-durability, ties A2), #3 (truncated-SBE-frame bounds, ties A3).
+
+**Report:** this file.
+
+---
+
+## Full re-audit 2 (commit 06eef94)
+
+**Date:** 2026-09-11
+**Auditor:** Opus (read-only, no code modified)
+**Fix reviewed:** `06eef94` — A1 (higher-term step-down in LEADER states), A2 (TermLog fsync), A3 (SBE frame bounds) + 16 tests.
+**Method:** fresh whole-library pass over `libs/consensus/**` (src + include + tests). cmake/ctest not run; reasoned from code.
+
+### Verdict: **CLEAN** — A1/A2/A3 all fixed, Aeron-faithful, no regression introduced. libs/consensus is safe and live for Phase-2.
+
+### Per-finding status
+
+- **A1 — FIXED (Aeron-faithful, cannot be bypassed, does not over-trigger).**
+  NLT non-accepting branch `Election.cpp:732-740` and `onCommitPosition` `:844-857` now step down on `leadershipTermIdArg > leadershipTermId_`: durably adopt the term via `proposeMaxCandidateTermId` (before the transition, so the one-vote-per-term invariant carries across the step-down), set `leadershipTermId_`, and `state(Canvass)`. Mirrors Aeron `Election.java:517-533` / ref line 146.
+  - **No self-step-down / no spurious step-down (liveness safe):** guard is strictly `>`. Equal term → NLT branch only bumps `notifiedCommitPosition_` (`:742-746`); `onCommitPosition` equal term → falls through to the normal `logPositionArg > notifiedCommitPosition_` update (`:860-865`). Lower term → ignored. A leader never steps down on its own term.
+  - **Cannot be bypassed:** `Closed` returns first (`:711`); every non-accepting state (all four LEADER states plus the transient follower-log states) flows through the `> ` guard. `onCommitPosition` gates the step-down on `inLeaderState` specifically — a higher-term commit to a *non-leader* correctly falls through to the `!= term → return` gate (commits only matter within your own term), so it does not over-fire outside LEADER states.
+  - **No C6/N1 re-introduction:** A1 touches only term/state, not the quorum predicate (`hasReachedPosition`/`hasQuorumAtPosition` unchanged, still Aeron-faithful leadershipTermId+logPosition only). Adopt-higher in the *accepting* NLT path (`:762-765`) is unchanged and still followed by the compareLog leader-freshness gate (`:781-785`), so B2 still holds.
+  - **Tests real:** `PartB1_HigherTermNLT_WhileLeaderReady_StepsDownToCanvass` (`ElectionLogTest.cpp:1247`) and `PartB1b_HigherTermCommit_…_StepsDown` (`:1311`) drive a genuine 3-node Election into a LEADER state, inject a strictly-higher-term NLT/Commit, and assert `state()==Canvass` + `leadershipTermId()==higherTerm`. Both FAIL under the old silent-drop behaviour. `PartB4` (`:1352`) covers the `nextLeadershipTermId < candidateTermId_` stale-ballot reject (previously uncovered).
+
+- **A2 — FIXED (fsync before durable, ordering correct, no init break).**
+  `writeRecord` (`TermLog.cpp:252-255`), `patchInt64` (`:271-274`), `patchInt32` (`:282-285`) each `::fsync(fd_)` after `fullPwrite` and **throw** on EIO — so the record is on stable storage before the call returns, i.e. before `appendTerm`/`commitLogPosition` are treated as complete. Mirrors `RecordingLog.persistToStorage force(false)`. Ordering is correct: pwrite → fsync → return. No init regression (constructor only `open`s + `loadEntries`; no fsync on the read path; empty-file path untouched). Header comment (`TermLog.h:74`) says "fdatasync()" while the code uses the stronger `fsync()` — cosmetic doc mismatch only, not a bug.
+  - **Test caveat (coverage, not a fix defect):** `PartB2_FsyncCrashDurability_…` (`TermLogTest.cpp:498`) is a same-process append→close→reopen test. As its own comment (`:484-492`) concedes, the page cache satisfies a same-process reopen even without fsync, so this test **cannot fail if fsync were removed** — it proves the fsync path does not corrupt/regress data (no `nextLeadershipTermId` regression, committed logPosition preserved) but is not a true crash-injection proof. The A2 *code* is correct; genuine durability would need page-cache drop / separate-process death. Logged as a residual coverage gap below.
+
+- **A3 — FIXED (every decode path bounds-checked, no OOB, valid frames not rejected).**
+  `ConsensusAdapter::onFragment` (`ConsensusAdapter.cpp:15-108`): rejects `len < ConsensusMessageHeader::ENCODED_SIZE(8)` before `peekTemplateId` (which reads bytes +2..+4, inside 8) and rejects `len < Msg::TOTAL_SIZE` before each `decode`. All six decoded templates (Canvass 50, RequestVote 51, Vote 52, NLT 53, AppendPosition 54, CommitPosition 55) are guarded; each `TOTAL_SIZE` = header + fixed BLOCK_LENGTH (verified `ConsensusMessages.h:148-617`). The var-length CatchupPosition (56) and other templates fall to `default → ignoredFrameCount_++` (not decoded here). `ignoredFrameCount_` increments on every rejected/unknown frame with an accessor for monitoring.
+  - **Does not reject valid frames:** `PartB3_OversizedFrame_DecodedCorrectly` (`:675`) proves a frame *larger* than TOTAL_SIZE is still dispatched (trailing bytes ignored, ignoredCount stays 0) — the guard is `>=`, so future-schema/padded frames pass. `PartB3_ExactSizeFrame_Dispatched` (`:738`) pins the boundary. Truncated AppendPosition/NLT/Vote and too-short-for-header all rejected with ignoredCount increment (`:610-757`). Coverage is complete across all decode paths + the boundary + accumulation.
+
+### No regression (confirmed)
+- **A1 did not re-open C6/N1 or cause self-step-down:** quorum predicate untouched; strictly-`>` guard prevents own-term step-down; `driveLeaderToClosed`-style leader→Closed paths still reach quorum (followers' `onAppendPosition` set `leadershipTermId` to the leader term; `hasQuorumAtPosition` needs term+position only). B1 durable-vote and B2 NLT gates byte-for-byte unchanged.
+- **A2 fsync did not break init:** construction/read paths carry no fsync; only mutating writes fsync. `Election::leaderInit`/`electionComplete` append/commit paths are unaffected in ordering.
+- **A3 bounds check did not reject valid frames:** oversized-accepted + exact-size tests prove it; `>=` semantics correct.
+
+### Fresh whole-library scan — no new material findings
+Re-verified this pass: quorum math / `compareLog` / insertion-sort `quorumPosition` (`ClusterMember.h`) Aeron-faithful; SBE header + 6 fixed layouts LE-correct with compile-time little-endian `static_assert` (`ConsensusMessages.h:117`); `ElectionState` ordinals; `NodeStateFile` release/acquire + msync+fsync durable vote (unchanged); single-writer duty-cycle discipline; AgentRunner/IdleStrategy no-busy-spin. One-vote-per-term holds across the new step-down (durable term bump precedes the Canvass transition). No split-brain, no double-vote, no behind-leader win, no election deadlock, no term regression, no OOB read.
+
+### Residual (non-blocking, unchanged severity)
+- **A2 test is not a true crash-injection test** (coverage only; code correct). Recommend a page-cache-drop / separate-process reopen test in Phase-3.
+- **S1 (observability) — partial.** `ConsensusAdapter` now tracks `ignoredFrameCount()` (improvement), but `ConsensusAgent::doWork` (`ConsensusAgent.cpp:47-56`) still counts every drained ring frame as "processed" and does not aggregate/surface `adapter_.ignoredFrameCount()` at the agent level. No safety impact (A3 closed the OOB read); pure monitoring gap.
+- **T2 (duplicate-at-old-position fencing)** and **C3/C4/C5 deferrals** — unchanged from prior rounds, all liveness/observability/Phase-2-precondition only.
+
+**Overall:** A1/A2/A3 are genuine, Aeron-faithful fixes with real (non-vacuous, except the noted A2 same-process caveat) tests and no introduced regression. libs/consensus is certified **CLEAN** for Phase-2.
+
+**Report:** this file.

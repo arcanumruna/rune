@@ -30,6 +30,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 namespace rune::replication {
 
@@ -57,7 +58,8 @@ public:
     /// complete frame boundary.
     explicit FileRecordingStore(const std::string& path);
 
-    ~FileRecordingStore() override = default;
+    ~FileRecordingStore() override;
+
 
     // Non-copyable, movable.
     FileRecordingStore(const FileRecordingStore&)            = delete;
@@ -113,6 +115,7 @@ private:
     // -----------------------------------------------------------------------
     std::string   path_;
     mutable std::fstream file_;          ///< read+write, binary
+    int           fd_ = -1;             ///< POSIX fd for fsync (A-NEW-3)
     int64_t recordingPosition_ = 0;      ///< next expected offset (exclusive)
     int64_t batchCount_        = 0;
 };
