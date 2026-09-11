@@ -1,21 +1,25 @@
 #pragma once
-// BrokerNode.h — Single-node consensus runtime (BR-2).
+// BrokerNode.h — Broker node consensus runtime (BR-2 + BR-3).
 //
 // Assembles the full consensus engine from a NodeConfig:
 //   NodeStateFile + TermLog (durable, in config.dataDir)
-//   NullSink → SbeConsensusPublisher
+//   1-node: NullSink → SbeConsensusPublisher (BR-2 path, unchanged)
+//   N-node: UdpMessageSink (per-peer ExclusivePublications) + AeronIngress +
+//           NodeConsensusAgent (composite: poll ingress + doWork) (BR-3 path)
 //   ClusterMember vector (built from config.peers)
-//   Election (startup values, same as ConsensusAgentTest fixture)
+//   Election (startup values)
 //   IngressRing
-//   ConsensusAgent (agent duty-cycle)
+//   ConsensusAgent (inner duty-cycle agent)
 //   MonotonicNanoClock + BackoffIdleStrategy
 //   AgentRunner (one thread, no busy-spin)
 //   Embedded Aeron media driver + Aeron client
 //
-// For a 1-node config the single member self-elects without any outbound
-// messaging; the NullSink is sufficient.  Multi-node UDP wiring is BR-3.
+// Single-node: self-elects via NullSink, no UDP.
+// Multi-node: real per-peer UDP publications + ingress subscription.
 
 #include <rune/node/NodeConfig.h>
+#include <rune/node/UdpMessageSink.h>
+#include <rune/node/NodeConsensusAgent.h>
 
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
@@ -25,6 +29,7 @@
 #include <rune/consensus/Election.h>
 #include <rune/consensus/IngressRing.h>
 #include <rune/consensus/ConsensusAgent.h>
+#include <rune/consensus/AeronIngress.h>
 #include <rune/consensus/NanoClock.h>
 #include <rune/consensus/IdleStrategy.h>
 #include <rune/consensus/AgentRunner.h>
@@ -97,6 +102,8 @@ private:
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;
     void buildConsensusObjects();
+    void buildSingleNodeConsensus();
+    void buildMultiNodeConsensus();
 
     // -----------------------------------------------------------------------
     // Configuration (immutable after construction)
@@ -111,9 +118,15 @@ private:
     std::unique_ptr<rune::consensus::NodeStateFile> nodeStateFile_;
     std::unique_ptr<rune::consensus::TermLog>       termLog_;
 
-    // Outbound transport (NullSink for 1-node; BR-3 replaces)
+    // 1-node path: NullSink (BR-2)
     NullSink nullSink_;
     std::unique_ptr<rune::consensus::SbeConsensusPublisher> publisher_;
+
+    // N-node path: UDP sink + ingress (BR-3)
+    std::unique_ptr<UdpMessageSink>             udpSink_;
+    std::unique_ptr<rune::consensus::AeronIngress> aeronIngress_;
+    // Composite agent wrapping ingress poll + ConsensusAgent (multi-node only)
+    std::unique_ptr<NodeConsensusAgent>         nodeAgent_;
 
     // Cluster membership
     std::vector<rune::consensus::ClusterMember> clusterMembers_;

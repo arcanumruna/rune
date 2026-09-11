@@ -46,4 +46,27 @@ if(BUILD_TESTING)
                 PROPERTIES TIMEOUT 60)
         endif()
     endif()
+
+    # ---------------------------------------------------------------------------
+    # UDP cluster election integration test (BR-3) — 3 nodes over aeron:udp.
+    # Gated behind BUILD_NODE_UDP_TESTS (default ON when BUILD_BROKER_NODE_TESTS=ON).
+    # Set to OFF if 3 in-process embedded drivers prove infeasible in the environment.
+    # ---------------------------------------------------------------------------
+    option(BUILD_NODE_UDP_TESTS
+        "Build 3-node UDP cluster election test (3 embedded Aeron drivers in-process)" ON)
+    if(BUILD_NODE_UDP_TESTS)
+        if(NOT aeron_FOUND)
+            message(WARNING
+                "BUILD_NODE_UDP_TESTS=ON requires aeron; disabling UdpClusterElectionTest")
+        else()
+            add_executable(rune_udp_cluster_tests
+                tests/integration/UdpClusterElectionTest.cpp)
+            target_link_libraries(rune_udp_cluster_tests PRIVATE
+                rune_node
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_udp_cluster_tests
+                PROPERTIES TIMEOUT 120)
+        endif()
+    endif()
 endif()

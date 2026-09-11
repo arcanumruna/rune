@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 using namespace rune::consensus;
@@ -81,7 +82,7 @@ void BrokerNode::start() {
 }
 
 // ---------------------------------------------------------------------------
-// BrokerNode::buildConsensusObjects
+// BrokerNode::buildConsensusObjects — dispatches to single/multi-node path
 // ---------------------------------------------------------------------------
 void BrokerNode::buildConsensusObjects() {
     const fs::path dataDir{config_.dataDir};
@@ -91,9 +92,6 @@ void BrokerNode::buildConsensusObjects() {
         (dataDir / "node-state.dat").string());
     termLog_ = std::make_unique<TermLog>(
         (dataDir / "term.log").string());
-
-    // Publisher (outbound transport: NullSink for 1-node).
-    publisher_ = std::make_unique<SbeConsensusPublisher>(nullSink_);
 
     // Cluster members — one entry per peer in config_.peers.
     clusterMembers_.clear();
@@ -110,6 +108,20 @@ void BrokerNode::buildConsensusObjects() {
     // IngressRing (MPSC; 64 KiB payload).
     ingressRing_ = std::make_unique<IngressRing>(kIngressCapacity);
 
+    if (config_.isSingleNode()) {
+        buildSingleNodeConsensus();
+    } else {
+        buildMultiNodeConsensus();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildSingleNodeConsensus — BR-2 path (NullSink, self-elect)
+// ---------------------------------------------------------------------------
+void BrokerNode::buildSingleNodeConsensus() {
+    // Publisher (outbound transport: NullSink — no peers).
+    publisher_ = std::make_unique<SbeConsensusPublisher>(nullSink_);
+
     // Election — startup values matching the single-member test fixture.
     election_ = std::make_unique<Election>(
         /*isNodeStartup=*/true,
@@ -118,7 +130,7 @@ void BrokerNode::buildConsensusObjects() {
         /*logLeadershipTermId=*/0,
         /*logPosition=*/0,
         /*appendPosition=*/0,
-        clusterMembers_,                // copied into Election
+        clusterMembers_,
         static_cast<NodeId>(config_.nodeId),
         *publisher_,
         *nodeStateFile_,
@@ -128,11 +140,69 @@ void BrokerNode::buildConsensusObjects() {
         kStartupCanvassTimeoutNs,
         /*rngSeed=*/42u);
 
-    // ConsensusAgent.
+    // ConsensusAgent (plain — no ingress polling needed for 1-node).
     agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
 
-    // AgentRunner (references must outlive the runner).
+    // AgentRunner drives the ConsensusAgent directly.
     agentRunner_ = std::make_unique<AgentRunner>(*agent_, idleStrategy_, clock_);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildMultiNodeConsensus — BR-3 path (UDP per-peer + ingress)
+// ---------------------------------------------------------------------------
+void BrokerNode::buildMultiNodeConsensus() {
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+    // Build per-peer UDP sink (publish to each OTHER peer's consensus endpoint).
+    std::unordered_map<NodeId, UdpMessageSink::PeerEndpoint> peerEndpoints;
+    for (const auto& peer : config_.peers) {
+        if (peer.id == config_.nodeId) continue; // skip self
+        peerEndpoints[static_cast<NodeId>(peer.id)] =
+            UdpMessageSink::PeerEndpoint{
+                peer.consensusChannel(),
+                config_.consensusStreamId
+            };
+    }
+    udpSink_ = std::make_unique<UdpMessageSink>(aeron_, peerEndpoints);
+
+    // Publisher over the UDP sink.
+    publisher_ = std::make_unique<SbeConsensusPublisher>(*udpSink_);
+
+    // Election (multi-member).
+    election_ = std::make_unique<Election>(
+        /*isNodeStartup=*/true,
+        /*gracefulClosedLeaderId=*/-1,
+        /*leadershipTermId=*/0,
+        /*logLeadershipTermId=*/0,
+        /*logPosition=*/0,
+        /*appendPosition=*/0,
+        clusterMembers_,
+        selfId,
+        *publisher_,
+        *nodeStateFile_,
+        *termLog_,
+        kElectionTimeoutNs,
+        kStatusIntervalNs,
+        kStartupCanvassTimeoutNs,
+        /*rngSeed=*/static_cast<uint64_t>(42u + selfId));
+
+    // AeronIngress — subscribe on THIS node's own consensus endpoint.
+    const auto& selfPeer = config_.self();
+    aeronIngress_ = std::make_unique<AeronIngress>(
+        aeron_,
+        selfPeer.consensusChannel(),
+        config_.consensusStreamId,
+        *ingressRing_);
+
+    // Inner ConsensusAgent (drives Election, drains IngressRing).
+    agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
+
+    // Composite NodeConsensusAgent (polls ingress THEN runs ConsensusAgent).
+    nodeAgent_ = std::make_unique<NodeConsensusAgent>(
+        *aeronIngress_, *agent_, *election_, selfId);
+
+    // AgentRunner drives the composite agent.
+    agentRunner_ = std::make_unique<AgentRunner>(*nodeAgent_, idleStrategy_, clock_);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +212,20 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + timeout;
 
+    // For single-node: wait for isLeader().
+    // For multi-node: wait for leaderId() >= 0 (any leader, leader or follower).
+    auto hasLeader = [this]() -> bool {
+        if (nodeAgent_) {
+            return nodeAgent_->leaderId() >= 0;
+        }
+        return isLeader();
+    };
+
     while (clock::now() < deadline) {
-        if (isLeader()) return true;
+        if (hasLeader()) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
-    return isLeader(); // one final check at deadline
+    return hasLeader(); // one final check at deadline
 }
 
 // ---------------------------------------------------------------------------
@@ -159,20 +238,31 @@ bool BrokerNode::isLeader() const noexcept {
     // data race when this method is called from the node/main thread.
     // Leader states (Aeron ordinals): LeaderLogReplication=5, LeaderReady=8, Closed=17.
     const int32_t c = election_->stateCode();
-    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
-           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
-           c == static_cast<int32_t>(ElectionState::Closed);
+    const bool leaderState =
+        c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
+        c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
+        c == static_cast<int32_t>(ElectionState::Closed);
+
+    if (!leaderState) return false;
+
+    // In the multi-node case a node may transition through Closed as a FOLLOWER.
+    // Distinguish by checking the observed leader id: if it equals self, we are leader.
+    if (nodeAgent_) {
+        return nodeAgent_->leaderId() == static_cast<NodeId>(config_.nodeId);
+    }
+    // Single-node: Closed always means self-elected.
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // BrokerNode::leaderId
 // ---------------------------------------------------------------------------
 NodeId BrokerNode::leaderId() const noexcept {
-    // In a 1-node cluster the leader is always this node.  We derive leadership
-    // via isLeader() (atomic stateCode) rather than dereferencing Election's raw
-    // leaderMember_ pointer from the node/main thread — that raw deref would be
-    // a data race against the agent thread.
-    // NOTE: a proper atomic remote-leader mirror (for multi-node) is BR-3's concern.
+    // Multi-node path: read the atomic mirror updated by NodeConsensusAgent.
+    if (nodeAgent_) {
+        return nodeAgent_->leaderId();
+    }
+    // Single-node (BR-2) path: derive from atomic stateCode.
     if (isLeader()) return static_cast<NodeId>(config_.nodeId);
     return -1; // kNullValue — no leader known yet
 }
