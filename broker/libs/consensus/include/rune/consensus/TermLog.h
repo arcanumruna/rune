@@ -70,7 +70,11 @@ struct TermEntry {
  *
  * Faithful port of RecordingLog restricted to TERM entries (SNAPSHOT / STANDBY_SNAPSHOT
  * are Phase-3 concerns). Each mutation writes / rewrites the affected record(s) directly
- * to the backing file so the log survives process restart.
+ * to the backing file AND calls fdatasync() before returning, so the record survives a
+ * power loss / kernel crash (not just a process restart).
+ * Mirrors RecordingLog.java:1590-1630 persistToStorage() which calls fileChannel.force(false).
+ * A2 fix (audit 2026-09-11): previously pwrite-only (no fsync); committed leadershipTermId
+ * and logPosition could be lost if the OS page cache was not flushed before a crash.
  *
  * On-disk record layout (little-endian, fixed 64 bytes per record):
  *   [0 .. 7]   int64_t  recordingId

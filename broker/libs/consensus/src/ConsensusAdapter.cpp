@@ -2,13 +2,26 @@
 
 namespace rune::consensus {
 
-void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t /*len*/)
+void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t len)
 {
-    // Peek the templateId from the 8-byte SBE header (bytes 2-3).
+    // A3 fix (audit 2026-09-11): Aeron ConsensusAdapter always receives complete,
+    // framed SBE messages from a ring buffer, so short frames should not occur in
+    // production — but a schema mismatch, corruption, or test error can produce a
+    // truncated buffer.  Reading past 'len' is undefined behaviour.  Guard every
+    // decode path by checking the required minimum size before reading any field.
+    // Mirrors the defensive posture in Aeron's own message decoders.
+
+    // Step 1: need at least a full SBE header to peek the templateId.
+    if (len < ConsensusMessageHeader::ENCODED_SIZE) {
+        ignoredFrameCount_++;
+        return;
+    }
+
     const uint16_t tid = peekTemplateId(buf, 0);
 
     switch (tid) {
     case CanvassPositionMsg::TEMPLATE_ID: {
+        if (len < CanvassPositionMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
         const auto m = CanvassPositionMsg::decode(buf, 0);
         handler_.onCanvassPosition(
             nowNs,
@@ -20,6 +33,7 @@ void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t
         break;
     }
     case RequestVoteMsg::TEMPLATE_ID: {
+        if (len < RequestVoteMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
         const auto m = RequestVoteMsg::decode(buf, 0);
         handler_.onRequestVote(
             nowNs,
@@ -31,6 +45,7 @@ void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t
         break;
     }
     case VoteMsg::TEMPLATE_ID: {
+        if (len < VoteMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
         const auto m = VoteMsg::decode(buf, 0);
         handler_.onVote(
             nowNs,
@@ -43,6 +58,7 @@ void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t
         break;
     }
     case NewLeadershipTermMsg::TEMPLATE_ID: {
+        if (len < NewLeadershipTermMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
         const auto m = NewLeadershipTermMsg::decode(buf, 0);
         handler_.onNewLeadershipTerm(
             nowNs,
@@ -63,6 +79,7 @@ void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t
         break;
     }
     case AppendPositionMsg::TEMPLATE_ID: {
+        if (len < AppendPositionMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
         const auto m = AppendPositionMsg::decode(buf, 0);
         handler_.onAppendPosition(
             nowNs,
@@ -73,6 +90,7 @@ void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t
         break;
     }
     case CommitPositionMsg::TEMPLATE_ID: {
+        if (len < CommitPositionMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
         const auto m = CommitPositionMsg::decode(buf, 0);
         handler_.onCommitPosition(
             nowNs,
@@ -85,6 +103,7 @@ void ConsensusAdapter::onFragment(int64_t nowNs, const uint8_t* buf, std::size_t
         // Unknown or unhandled templateId — silently ignore for forward-compat.
         // (CatchupPosition, StopCatchup, TerminationPosition, TerminationAck
         //  are handled by other adapters in the full Aeron port.)
+        ignoredFrameCount_++;
         break;
     }
 }

@@ -1232,3 +1232,418 @@ TEST(ElectionLog, N1_NonZeroLogLeadershipTermId_QuorumStillReached) {
            "A regression to the C6 deadlock predicate would stall here (follower->logLeadershipTermId=0 != 3).";
     EXPECT_EQ(leader.state(), ElectionState::Closed);
 }
+
+// ===========================================================================
+// Part B — 8 missing-test areas (audit 2026-09-11 full re-audit)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// B-1 (covers A1): Higher-term NLT received while node is in LEADER_READY →
+//     node must step down and re-enter CANVASS (two-leaders-window close).
+//     Aeron ref: Election.java:517-533; ref spec line 146.
+//     Without the A1 fix the higher-term NLT was silently dropped and the
+//     node kept leading — this test would FAIL in that case.
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB1_HigherTermNLT_WhileLeaderReady_StepsDownToCanvass) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+
+    // Bring to LEADER_READY via the standard sequence.
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+
+    // Drive leader through LEADER_REPLAY → LEADER_INIT → LEADER_READY by feeding
+    // AppendPosition from both followers (quorum) and advancing the clock.
+    Term ltid = e.leadershipTermId();
+    e.onAppendPosition(nowNs, ltid, e.appendPosition(), 1, 0);
+    e.onAppendPosition(nowNs, ltid, e.appendPosition(), 2, 0);
+
+    for (int i = 0; i < 20 && e.state() != ElectionState::LeaderReady && e.state() != ElectionState::Closed; ++i) {
+        int64_t d = e.nextDeadlineNs();
+        nowNs = (d > nowNs) ? d : nowNs + 1;
+        e.doWork(nowNs);
+    }
+    // Must be in LEADER_READY or LEADER_LOG_REPLICATION (either is a LEADER state).
+    const bool inLeaderState =
+        (e.state() == ElectionState::LeaderReady          ||
+         e.state() == ElectionState::LeaderLogReplication  ||
+         e.state() == ElectionState::LeaderReplay          ||
+         e.state() == ElectionState::LeaderInit);
+    ASSERT_TRUE(inLeaderState) << "Setup failed: leader not in a LEADER state before higher-term NLT";
+
+    Term currentLeaderTerm = e.leadershipTermId();
+    Term higherTerm        = currentLeaderTerm + 5;
+
+    // Inject a NewLeadershipTerm from peer node 2 carrying a strictly-higher term.
+    // A1 fix: this must trigger a step-down to CANVASS.
+    e.onNewLeadershipTerm(nowNs,
+        /*logLeadershipTermId=*/0,
+        /*nextLeadershipTermId=*/higherTerm,
+        /*nextTermBaseLogPosition=*/0,
+        /*nextLogPosition=*/0,
+        /*leadershipTermId=*/higherTerm,
+        /*termBaseLogPosition=*/0,
+        /*logPosition=*/0,
+        /*leaderRecordingId=*/0,
+        /*timestamp=*/0,
+        /*leaderMemberId=*/2,
+        /*logSessionId=*/0,
+        /*isStartup=*/false,
+        /*commitPosition=*/0);
+
+    // Must have left LEADER state and entered CANVASS.
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "A1: higher-term NLT in LEADER state must trigger step-down to CANVASS "
+           "(Aeron Election.java:517-533; ref spec line 146)";
+    EXPECT_EQ(e.leadershipTermId(), higherTerm)
+        << "A1: leadershipTermId_ must be updated to the higher term on step-down";
+}
+
+// ---------------------------------------------------------------------------
+// B-1b (covers A1): Higher-term CommitPosition while in LEADER_READY also
+//     triggers step-down (same A1 fix, onCommitPosition path).
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB1b_HigherTermCommit_WhileLeaderReady_StepsDown) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+
+    // Advance to LEADER_READY.
+    Term ltid = e.leadershipTermId();
+    e.onAppendPosition(nowNs, ltid, e.appendPosition(), 1, 0);
+    e.onAppendPosition(nowNs, ltid, e.appendPosition(), 2, 0);
+    for (int i = 0; i < 20 && e.state() != ElectionState::LeaderReady && e.state() != ElectionState::Closed; ++i) {
+        int64_t d = e.nextDeadlineNs();
+        nowNs = (d > nowNs) ? d : nowNs + 1;
+        e.doWork(nowNs);
+    }
+    // Accept LEADER_LOG_REPLICATION too if LEADER_READY not yet reached.
+    const bool inLeader = (e.state() == ElectionState::LeaderReady ||
+                           e.state() == ElectionState::LeaderLogReplication ||
+                           e.state() == ElectionState::LeaderReplay ||
+                           e.state() == ElectionState::LeaderInit);
+    ASSERT_TRUE(inLeader);
+
+    Term higherTerm = e.leadershipTermId() + 3;
+    e.onCommitPosition(nowNs, higherTerm, /*logPosition=*/0, /*leaderMemberId=*/2);
+
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "A1: higher-term CommitPosition in LEADER state must trigger step-down to CANVASS";
+    EXPECT_EQ(e.leadershipTermId(), higherTerm);
+}
+
+// ---------------------------------------------------------------------------
+// B-4 (audit Part B #4): NLT with nextLeadershipTermId < candidateTermId_ is
+//     rejected (stale-ballot reject).  The Election.cpp:747-750 path that
+//     returns early when nextLeadershipTermId < candidateTermId_ was previously
+//     uncovered by any test.
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB4_NLT_StaleBallotReject_IgnoredWhenNextTermBehindCandidate) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+
+    // Vote in term 10 to advance candidateTermId_ to 10.
+    e.onRequestVote(/*logLeadershipTermId=*/0, /*logPosition=*/0,
+                    /*candidateTermId=*/10, /*candidateId=*/1, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+    ASSERT_EQ(e.candidateTermId(), 10);
+
+    // Now inject an NLT with nextLeadershipTermId=5 < candidateTermId_=10.
+    // This is a stale-ballot NLT — the node has already advanced past term 5.
+    // Election.cpp:747-750: must be rejected (return early without following).
+    e.onNewLeadershipTerm(nowNs,
+        /*logLeadershipTermId=*/0,
+        /*nextLeadershipTermId=*/5,   // < candidateTermId_=10 → REJECT
+        /*nextTermBaseLogPosition=*/0,
+        /*nextLogPosition=*/0,
+        /*leadershipTermId=*/5,
+        /*termBaseLogPosition=*/0,
+        /*logPosition=*/0,
+        /*leaderRecordingId=*/0,
+        /*timestamp=*/0,
+        /*leaderMemberId=*/1,
+        /*logSessionId=*/0,
+        /*isStartup=*/true,
+        /*commitPosition=*/0);
+
+    // Must still be in FOLLOWER_BALLOT — stale-ballot NLT must be ignored.
+    EXPECT_EQ(e.state(), ElectionState::FollowerBallot)
+        << "B-4: NLT with nextLeadershipTermId=5 < candidateTermId_=10 must be rejected "
+           "(Election.cpp:747-750 stale-ballot reject branch)";
+    EXPECT_EQ(e.candidateTermId(), 10) << "B-4: candidateTermId must not regress on stale NLT";
+}
+
+// ---------------------------------------------------------------------------
+// B-5 (audit Part B #5): Vote-persist-across-restart in FollowerBallot.
+//     After granting a vote in FOLLOWER_BALLOT via onRequestVote, the
+//     candidateTermId must be durable: a freshly-reconstructed Election with the
+//     same NodeStateFile must see candidateTermId >= the granted term.
+//     This tests the durable-vote path via a real Election object (not just the
+//     NodeStateFile directly), covering the B1 fix end-to-end.
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB5_VotePersistAcrossRestart_FollowerBallotPath) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    Term grantedTerm = 7;
+
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        FakeConsensusPublisher pub;
+        auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+        int64_t nowNs = 1'000'000LL;
+        e.doWork(nowNs); // INIT → CANVASS
+
+        // Grant vote for term 7 — this must durably store candidateTermId=7 via
+        // NodeStateFile (B1 fix: fsync before grant).
+        e.onRequestVote(/*logLeadershipTermId=*/0, /*logPosition=*/0,
+                        /*candidateTermId=*/grantedTerm, /*candidateId=*/1, nowNs);
+        ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+        ASSERT_EQ(e.candidateTermId(), grantedTerm);
+        // Election and NodeStateFile destroyed here; fd closed.
+    }
+
+    // Reconstruct — NodeStateFile must remember candidateTermId >= grantedTerm.
+    NodeStateFile nsf2(nsfFile.str());
+    EXPECT_GE(nsf2.candidateTermId(), grantedTerm)
+        << "B-5: candidateTermId must survive a process restart; "
+           "NodeStateFile must fsync before vote is granted (B1 fix).";
+
+    // Reconstruct a full Election — it must clamp candidateTermId_ to the persisted value.
+    TermLog       tl2(tlFile.str());
+    FakeConsensusPublisher pub2;
+    Election e2(/*isNodeStartup=*/false, /*gracefulClosedLeaderId=*/-1,
+                /*leadershipTermId=*/grantedTerm, /*logLeadershipTermId=*/0,
+                /*logPosition=*/0, /*appendPosition=*/0,
+                makeMembers3(0), /*self=*/0, pub2, nsf2, tl2,
+                kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 42);
+    int64_t nowNs2 = 1'000'000LL;
+    e2.doWork(nowNs2); // INIT
+
+    // The reconstructed election must not grant a vote for the same term it already voted in.
+    // candidateTermId_ = max(persistedTerm≥7, leadershipTermId=7) = ≥7.
+    // A vote request for term=7 (== candidateTermId_) must be denied.
+    FakeConsensusPublisher pub3;
+    NodeStateFile nsf3(nsfFile.str());
+    TermLog       tl3(tlFile.str());
+    Election e3(/*isNodeStartup=*/false, /*gracefulClosedLeaderId=*/-1,
+                /*leadershipTermId=*/0, /*logLeadershipTermId=*/0,
+                /*logPosition=*/0, /*appendPosition=*/0,
+                makeMembers3(0), /*self=*/0, pub3, nsf3, tl3,
+                kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 42);
+    int64_t nowNs3 = 1'000'000LL;
+    e3.doWork(nowNs3); // INIT → CANVASS
+    ASSERT_EQ(e3.state(), ElectionState::Canvass);
+
+    // Same term as previously voted (grantedTerm=7) — must be denied because
+    // candidateTermId_ was loaded from the persisted NodeStateFile (>= 7).
+    // onRequestVote denies if candidateTermId ≤ candidateTermId_.
+    pub3.placeVoteCalls.clear();
+    e3.onRequestVote(/*logLeadershipTermId=*/0, /*logPosition=*/0,
+                     /*candidateTermId=*/grantedTerm, /*candidateId=*/2, nowNs3);
+    ASSERT_FALSE(pub3.placeVoteCalls.empty());
+    EXPECT_FALSE(pub3.placeVoteCalls[0].vote)
+        << "B-5: reconstructed Election must deny a vote for the same term previously "
+           "voted in (candidateTermId persisted via NodeStateFile fsync).";
+}
+
+// ---------------------------------------------------------------------------
+// B-6 (audit Part B #6): Election-timeout >= boundary: candidateBallot/followerBallot
+//     at nowNs == timeOfLastStateChangeNs_ + electionTimeoutNs_ exactly (the
+//     >= edge) should transition, not stay.
+//     Also tests that isExtendedCanvass_ is cleared after first CANVASS exit.
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB6_ElectionTimeoutAtExactBoundary_Transitions) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS (extended timeout on startup)
+
+    // Vote → FOLLOWER_BALLOT (timeOfLastStateChangeNs_ = nowNs at this point)
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+
+    // At exactly boundary: nowNs + electionTimeoutNs_ — must transition (>= check).
+    int64_t exactBoundary = nowNs + kElectionTimeoutNs;
+    e.doWork(exactBoundary);
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "B-6: FollowerBallot timeout at exact boundary (>= edge) must transition to CANVASS";
+
+    // After first CANVASS exit, isExtendedCanvass_ must be cleared.
+    // The next canvass timeout should use electionTimeoutNs_ (not startupCanvassTimeoutNs_).
+    // nextDeadlineNs() for CANVASS with isExtendedCanvass_=false uses electionTimeoutNs_.
+    // We don't inspect the private field directly — instead verify the deadline is within
+    // [nowNs, nowNs + startupCanvassTimeoutNs_) (shorter than startup canvass timeout).
+    int64_t canvassNow = exactBoundary;
+    int64_t d = e.nextDeadlineNs();
+    // After the first Canvass exit, timeout should be ≤ electionTimeoutNs_ from state-change.
+    // The state change happened at exactBoundary, so deadline ≤ exactBoundary + electionTimeoutNs_.
+    EXPECT_LE(d, exactBoundary + kElectionTimeoutNs)
+        << "B-6: after first CANVASS exit, extended canvass must be cleared "
+           "(deadline must use electionTimeoutNs_, not startupCanvassTimeoutNs_)";
+    (void)canvassNow;
+}
+
+// ---------------------------------------------------------------------------
+// B-7 (audit Part B #7): Duplicate/old-position fencing — an AppendPosition
+//     from a known follower with a stale (lower) logPosition must not advance
+//     quorum to a position the followers have not actually reached.
+//     This covers the T2 "duplicate/old-position" fencing case still open.
+//
+//     Setup: construct a leader with appendPosition=1000 (non-zero) so that
+//     "stale position=0" is genuinely behind the quorum threshold.
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB7_DuplicateOldPositionAppend_DoesNotAdvanceQuorum) {
+    // Use a non-zero appendPosition so "position=0" from followers is genuinely stale.
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    std::vector<ClusterMember> ms(3);
+    for (int i = 0; i < 3; i++) {
+        ms[i].id = i; ms[i].logPosition = 0; ms[i].logLeadershipTermId = 0; ms[i].leadershipTermId = 0;
+    }
+    // Leader starts at appendPosition=1000 (simulates a node with real log entries).
+    // C5 assert requires logPosition == appendPosition, so set both to 1000.
+    const int64_t kLeaderPos = 1000;
+    Election leader(/*isNodeStartup=*/true, /*gracefulClosedLeaderId=*/-1,
+                    /*leadershipTermId=*/0, /*logLeadershipTermId=*/0,
+                    /*logPosition=*/kLeaderPos, /*appendPosition=*/kLeaderPos,
+                    std::move(ms), /*self=*/0, pub, nsf, tl,
+                    kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+    // Drive to LeaderLogReplication.
+    bringToLeaderLogReplication(leader, nowNs);
+    ASSERT_EQ(leader.state(), ElectionState::LeaderLogReplication);
+
+    Term    ltid      = leader.leadershipTermId();
+    int64_t leaderPos = leader.appendPosition();
+    ASSERT_EQ(leaderPos, kLeaderPos) << "Setup: leader must have appendPosition=1000";
+
+    // Feed STALE AppendPositions (logPosition=0, well below leaderPos=1000) from both followers.
+    // Quorum requires 2 members at logPosition >= leaderPos=1000.
+    // Self is at leaderPos=1000, but followers report position=0 → only self qualifies.
+    // quorumPosition for 3-member cluster (threshold=2): must see 2 members at >=1000.
+    // With both followers at 0, quorumPosition = max of the 2 lowest = 0 → no quorum.
+    leader.onAppendPosition(nowNs, ltid, /*logPosition=*/0, /*followerMemberId=*/1, 0);
+    leader.onAppendPosition(nowNs, ltid, /*logPosition=*/0, /*followerMemberId=*/2, 0);
+
+    // Drive for a few heartbeats — leader must NOT close without quorum.
+    for (int i = 0; i < 5 && !leader.isClosed(); ++i) {
+        int64_t d = leader.nextDeadlineNs();
+        nowNs = (d > nowNs) ? d : nowNs + 1;
+        leader.doWork(nowNs);
+    }
+    EXPECT_NE(leader.state(), ElectionState::Closed)
+        << "B-7: stale-position AppendPosition (pos=0 < leaderPos=" << leaderPos
+        << ") from both followers must not count toward quorum; "
+           "leader must not close without a real majority at leaderPos";
+    EXPECT_NE(leader.state(), ElectionState::LeaderReady)
+        << "B-7: leader must not reach LeaderReady (quorum gate) with stale-position followers";
+
+    // Confirm: feeding the CORRECT position from one follower (quorum met) DOES close.
+    leader.onAppendPosition(nowNs, ltid, kLeaderPos, /*followerMemberId=*/1, 0);
+    bool closed = driveLeaderToClosed(leader, nowNs, pub, {});
+    EXPECT_TRUE(closed)
+        << "B-7: after feeding correct-position from follower 1, leader must close "
+           "(self + follower1 = 2 of 3 → quorum)";
+}
+
+// ---------------------------------------------------------------------------
+// B-8 (audit Part B #8): C5 pass-through guard positive-path coverage.
+//     When logPosition_ == appendPosition_ (the Phase-2 precondition), the
+//     follower replay pass-through must succeed and advance to FollowerLogInit.
+//     This exercises the guard branch in followerReplay() and leaderReplay()
+//     without triggering the fatal assert, documenting the Phase-2 precondition.
+//
+//     The NEGATIVE case (logPosition != appendPosition) fires an assert() that
+//     terminates the process — it cannot be tested here without EXPECT_DEATH.
+//     The assert text "PHASE-2-DEFERRED" is the intended signal for Phase-3 wiring.
+// ---------------------------------------------------------------------------
+TEST(ElectionLog, PartB8_C5_PassthroughGuard_PositivePath_FollowerReachesLogInit) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // logPosition == appendPosition == 0: Phase-2 precondition holds.
+    // followerReplay() must pass through to FollowerLogInit without asserting.
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+
+    // Grant vote → FOLLOWER_BALLOT
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+
+    // NLT from leader → FOLLOWER_REPLAY (then pass-through to FollowerLogInit)
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, /*leadershipTermId=*/1, 0, 0, 0, 0,
+                          /*leaderMemberId=*/1, 0, true, 0);
+    // After NLT: state should be FOLLOWER_REPLAY; doWork advances it.
+    ASSERT_EQ(e.state(), ElectionState::FollowerReplay);
+
+    // doWork in FOLLOWER_REPLAY must not crash (logPosition_ == appendPosition_ == 0)
+    // and must advance to FollowerLogInit (or beyond, via pass-through chain).
+    e.doWork(nowNs);
+
+    // Must have passed through FollowerReplay → FollowerLogInit → ... → Closed
+    // (all follower pass-throughs are immediate; the bounded driver closes it).
+    const bool pastFollowerReplay = (e.state() != ElectionState::FollowerReplay);
+    EXPECT_TRUE(pastFollowerReplay)
+        << "B-8/C5: Phase-2 followerReplay pass-through (logPos==appendPos) must advance "
+           "past FollowerReplay without triggering the PHASE-2-DEFERRED assert";
+}
+
+// B-8b: C5 positive path — leaderReplay pass-through also must not crash when
+//       logPosition_ == appendPosition_.
+TEST(ElectionLog, PartB8b_C5_PassthroughGuard_LeaderReplay_PositivePath) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+
+    // Feed AppendPosition from both followers → quorum → transitions through
+    // LeaderLogReplication → LeaderReplay (guarded assert) → LeaderInit → LeaderReady.
+    Term ltid = e.leadershipTermId();
+    e.onAppendPosition(nowNs, ltid, e.appendPosition(), 1, 0);
+    e.onAppendPosition(nowNs, ltid, e.appendPosition(), 2, 0);
+
+    // Advance clock — leader transitions through LEADER_REPLAY (assert must not fire).
+    for (int i = 0; i < 10 && e.state() == ElectionState::LeaderLogReplication; ++i) {
+        int64_t d = e.nextDeadlineNs();
+        nowNs = (d > nowNs) ? d : nowNs + 1;
+        e.doWork(nowNs);
+    }
+    EXPECT_NE(e.state(), ElectionState::LeaderLogReplication)
+        << "B-8b/C5: leaderReplay pass-through (logPos==appendPos) must advance past "
+           "LeaderLogReplication without triggering the PHASE-2-DEFERRED assert";
+}

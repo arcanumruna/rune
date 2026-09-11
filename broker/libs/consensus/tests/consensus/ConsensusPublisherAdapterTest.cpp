@@ -591,6 +591,173 @@ TEST(ConsensusAdapterConstants, FragmentLimitIs10)
 }
 
 // ---------------------------------------------------------------------------
+// Part B-3 (covers A3): Truncated / oversized SBE frame into onFragment.
+//
+// Without the A3 fix, 'len' was ignored (/*len*/ comment) so a frame shorter
+// than TOTAL_SIZE caused an OOB read / UB when decode() accessed fixed offsets
+// past the end of the buffer.  With the fix every decode path is guarded by
+// len >= Msg::TOTAL_SIZE.
+//
+// These tests verify:
+//   a) A frame shorter than ConsensusMessageHeader::ENCODED_SIZE is rejected
+//      without dispatching to any handler.
+//   b) A frame shorter than Msg::TOTAL_SIZE (but >= header) is rejected.
+//   c) An oversized frame (extra trailing bytes beyond TOTAL_SIZE) is accepted
+//      and decoded correctly (trailing bytes are ignored, as in Aeron).
+//   d) ignoredFrameCount() is incremented on each rejected frame.
+// ---------------------------------------------------------------------------
+
+TEST(ConsensusAdapterBounds, PartB3_TooShortForHeader_Rejected) {
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // 3 bytes — shorter than the 8-byte SBE header.
+    std::array<uint8_t, 3> buf{};
+    adapter.onFragment(0, buf.data(), buf.size());
+
+    EXPECT_EQ(handler.calls(), 0)
+        << "A3/B-3: frame shorter than header must not dispatch to any handler";
+    EXPECT_EQ(adapter.ignoredFrameCount(), 1)
+        << "A3/B-3: ignoredFrameCount must increment on header-too-short rejection";
+}
+
+TEST(ConsensusAdapterBounds, PartB3_TruncatedAppendPosition_Rejected) {
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // Build a full-size AppendPosition then truncate by 5 bytes.
+    std::array<uint8_t, AppendPositionMsg::TOTAL_SIZE> fullBuf{};
+    AppendPositionMsg::encode(fullBuf.data(), 0,
+        /*leadershipTermId=*/INT64_C(0x1234),
+        /*logPosition=*/     INT64_C(0x5678),
+        /*followerMemberId=*/1,
+        /*flags=*/           uint8_t{0x00});
+
+    const std::size_t truncLen = AppendPositionMsg::TOTAL_SIZE - 5;
+    adapter.onFragment(0, fullBuf.data(), truncLen);
+
+    EXPECT_EQ(handler.calls(), 0)
+        << "A3/B-3: truncated AppendPosition must not dispatch (OOB read guard)";
+    EXPECT_EQ(adapter.ignoredFrameCount(), 1)
+        << "A3/B-3: ignoredFrameCount must increment on truncated-body rejection";
+}
+
+TEST(ConsensusAdapterBounds, PartB3_TruncatedNLT_Rejected) {
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // Build a valid NLT then truncate to header-only (no payload at all).
+    std::array<uint8_t, NewLeadershipTermMsg::TOTAL_SIZE> fullBuf{};
+    NewLeadershipTermMsg::encode(fullBuf.data(), 0,
+        /*logLeadershipTermId=*/   0,
+        /*nextLeadershipTermId=*/  0,
+        /*nextTermBaseLogPos=*/    0,
+        /*nextLogPosition=*/       0,
+        /*leadershipTermId=*/      0,
+        /*termBaseLogPosition=*/   0,
+        /*logPosition=*/           0,
+        /*leaderRecordingId=*/     0,
+        /*timestamp=*/             0,
+        /*leaderMemberId=*/        0,
+        /*logSessionId=*/          0,
+        /*appVersion=*/            0,
+        /*isStartup=*/             BooleanType::FALSE_VALUE,
+        /*commitPosition=*/        0);
+
+    // len = header size only (payload missing).
+    adapter.onFragment(0, fullBuf.data(), ConsensusMessageHeader::ENCODED_SIZE);
+
+    EXPECT_EQ(handler.calls(), 0)
+        << "A3/B-3: NLT truncated to header-only must not dispatch";
+    EXPECT_EQ(adapter.ignoredFrameCount(), 1);
+}
+
+TEST(ConsensusAdapterBounds, PartB3_OversizedFrame_DecodedCorrectly) {
+    // An oversized frame (extra trailing bytes beyond TOTAL_SIZE) must be accepted
+    // and the known fields decoded correctly — Aeron ignores trailing bytes.
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // Allocate a buffer larger than TOTAL_SIZE by 32 bytes (simulates future schema fields).
+    constexpr std::size_t kExtra = 32;
+    std::array<uint8_t, CommitPositionMsg::TOTAL_SIZE + kExtra> bigBuf{};
+    CommitPositionMsg::encode(bigBuf.data(), 0,
+        /*leadershipTermId=*/INT64_C(0xABCDEF),
+        /*logPosition=*/     INT64_C(0x123456),
+        /*leaderMemberId=*/  7);
+
+    // Pass the full oversized length.
+    adapter.onFragment(0, bigBuf.data(), bigBuf.size());
+
+    EXPECT_EQ(handler.calls(), 1)
+        << "A3/B-3: oversized frame must be dispatched (trailing bytes ignored)";
+    EXPECT_EQ(handler.record().which,             HandlerRecord::Which::CommitPosition);
+    EXPECT_EQ(handler.record().leadershipTermId_cp, INT64_C(0xABCDEF));
+    EXPECT_EQ(handler.record().logPosition_cp,      INT64_C(0x123456));
+    EXPECT_EQ(handler.record().leaderMemberId_cp,   7);
+    EXPECT_EQ(adapter.ignoredFrameCount(), 0)
+        << "A3/B-3: oversized frame must NOT increment ignoredFrameCount";
+}
+
+TEST(ConsensusAdapterBounds, PartB3_MultipleShortFrames_IgnoredCountAccumulates) {
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // Inject 3 short frames in sequence — count must accumulate.
+    std::array<uint8_t, 4> tinyBuf{};
+    adapter.onFragment(0, tinyBuf.data(), 4);
+    adapter.onFragment(0, tinyBuf.data(), 0);
+    adapter.onFragment(0, tinyBuf.data(), 2);
+
+    EXPECT_EQ(handler.calls(), 0);
+    EXPECT_EQ(adapter.ignoredFrameCount(), 3)
+        << "A3/B-3: ignoredFrameCount must accumulate across multiple rejected frames";
+}
+
+TEST(ConsensusAdapterBounds, PartB3_TruncatedVote_Rejected) {
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    // VoteMsg: truncate to exactly 1 byte short of TOTAL_SIZE.
+    std::array<uint8_t, VoteMsg::TOTAL_SIZE> fullBuf{};
+    VoteMsg::encode(fullBuf.data(), 0,
+        /*candidateTermId=*/    1,
+        /*logLeadershipTermId=*/2,
+        /*logPosition=*/        3,
+        /*candidateMemberId=*/  4,
+        /*followerMemberId=*/   5,
+        /*vote=*/               BooleanType::TRUE_VALUE);
+
+    adapter.onFragment(0, fullBuf.data(), VoteMsg::TOTAL_SIZE - 1);
+
+    EXPECT_EQ(handler.calls(), 0)
+        << "A3/B-3: truncated Vote must not dispatch";
+    EXPECT_EQ(adapter.ignoredFrameCount(), 1);
+}
+
+TEST(ConsensusAdapterBounds, PartB3_ExactSizeFrame_Dispatched) {
+    // Verify that a frame at exactly TOTAL_SIZE passes the guard (boundary test).
+    RecordingHandler handler;
+    ConsensusAdapter adapter{handler};
+
+    std::array<uint8_t, RequestVoteMsg::TOTAL_SIZE> buf{};
+    RequestVoteMsg::encode(buf.data(), 0,
+        /*logLeadershipTermId=*/INT64_C(0x11),
+        /*logPosition=*/        INT64_C(0x22),
+        /*candidateTermId=*/    INT64_C(0x33),
+        /*candidateMemberId=*/  5,
+        /*protocolVersion=*/    17);
+
+    adapter.onFragment(0, buf.data(), buf.size());
+
+    EXPECT_EQ(handler.calls(), 1)
+        << "A3/B-3: frame at exactly TOTAL_SIZE must be dispatched (>= boundary)";
+    EXPECT_EQ(handler.record().which, HandlerRecord::Which::RequestVote);
+    EXPECT_EQ(handler.record().logLeadershipTermId_rv, INT64_C(0x11));
+    EXPECT_EQ(adapter.ignoredFrameCount(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Unknown templateId silently ignored (forward-compat)
 // ---------------------------------------------------------------------------
 

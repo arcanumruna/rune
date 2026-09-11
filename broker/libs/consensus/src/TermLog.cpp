@@ -243,6 +243,17 @@ int64_t TermLog::writeRecord(const TermEntry& entry) {
     serialiseRecord(buf, entry);
 
     fullPwrite(fd_, buf, kRecordSize, static_cast<off_t>(recordOffset));
+
+    // A2 fix (audit 2026-09-11): Aeron RecordingLog.persistToStorage() calls
+    // fileChannel.force(false) after every write.  Without fsync/fsync the record
+    // sits only in the page cache; a power loss before OS writeback loses the committed
+    // leadershipTermId and its logPosition, causing nextLeadershipTermId() to regress
+    // on recovery.  Mirrors RecordingLog.java:1590-1630.
+    if (::fsync(fd_) < 0) {
+        throw std::system_error(errno, std::system_category(),
+                                "TermLog: fsync after writeRecord");
+    }
+
     return recordOffset;
 }
 
@@ -254,12 +265,24 @@ void TermLog::patchInt64(int64_t recordOffset, std::size_t fieldOffset, int64_t 
     uint8_t buf[8];
     putInt64LE(buf, 0, value);
     fullPwrite(fd_, buf, 8, static_cast<off_t>(recordOffset + static_cast<int64_t>(fieldOffset)));
+    // A2 fix: fsync after patch — mirrors RecordingLog.java persistToStorage() force(false).
+    // Committed logPosition must survive a crash; leaving it only in the page cache
+    // allows nextLeadershipTermId() to regress on recovery.
+    if (::fsync(fd_) < 0) {
+        throw std::system_error(errno, std::system_category(),
+                                "TermLog: fsync after patchInt64");
+    }
 }
 
 void TermLog::patchInt32(int64_t recordOffset, std::size_t fieldOffset, int32_t value) {
     uint8_t buf[4];
     putInt32LE(buf, 0, value);
     fullPwrite(fd_, buf, 4, static_cast<off_t>(recordOffset + static_cast<int64_t>(fieldOffset)));
+    // A2 fix: fsync after patch — same rationale as patchInt64.
+    if (::fsync(fd_) < 0) {
+        throw std::system_error(errno, std::system_category(),
+                                "TermLog: fsync after patchInt32");
+    }
 }
 
 // ---------------------------------------------------------------------------

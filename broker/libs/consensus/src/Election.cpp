@@ -718,8 +718,27 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
          state_ == ElectionState::Nominate);
 
     if (!inAcceptingState) {
-        // Election.java:517-533: if in leader states and higher term → re-election
-        // For Phase 2 we just update notifiedCommitPosition if matching term.
+        // Election.java:517-533: in a non-accepting (LEADER) state, a strictly-higher
+        // leadershipTermId means another node won a new election while this node was
+        // leading.  The Aeron step-down rule requires this node to abandon leadership
+        // and re-enter election with the new term (two-leaders-window close).
+        // Ref: docs/specs/…-reference.md line 146 "if LEADER_READY and higher termId →
+        // new election"; Election.java:517-533.
+        //
+        // A1 fix (audit 2026-09-11): previously, a higher-term NLT/commit in a LEADER
+        // state was silently dropped.  Now we adopt the higher term and transition back
+        // to CANVASS so the node participates in the new election rather than holding a
+        // stale leadership.
+        if (leadershipTermIdArg > leadershipTermId_) {
+            // Adopt the new term durably (mirrors Aeron proposeMaxCandidateTermId).
+            candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
+                leadershipTermIdArg, logPosition_, /*timestampMs=*/0);
+            leadershipTermId_ = leadershipTermIdArg;
+            // Step down: return to CANVASS to re-participate in the new election.
+            state(ElectionState::Canvass, nowNs, "A1: higher-term NLT in LEADER state → step down");
+            return;
+        }
+        // Matching term: update notifiedCommitPosition from the commit field.
         if (leadershipTermIdArg == leadershipTermId_) {
             if (commitPositionArg > notifiedCommitPosition_) {
                 notifiedCommitPosition_ = commitPositionArg;
@@ -813,11 +832,30 @@ void Election::onAppendPosition(int64_t nowNs,
 // Called when a follower receives a CommitPosition from the leader.
 // Updates notifiedCommitPosition_ and extends any pending replication deadline.
 // ---------------------------------------------------------------------------
-void Election::onCommitPosition(int64_t /*nowNs*/,
+void Election::onCommitPosition(int64_t nowNs,
                                 Term    leadershipTermIdArg,
                                 int64_t logPositionArg,
                                 NodeId  /*leaderMemberIdArg*/)
 {
+    // A1 fix (audit 2026-09-11): a CommitPosition with a strictly-higher term while
+    // this node is in a LEADER state signals a new election has concluded elsewhere.
+    // Step down and re-enter CANVASS to participate, per Aeron Election.java:517-533
+    // and ref docs/specs/…-reference.md line 146.
+    if (leadershipTermIdArg > leadershipTermId_) {
+        const bool inLeaderState =
+            (state_ == ElectionState::LeaderLogReplication ||
+             state_ == ElectionState::LeaderReplay         ||
+             state_ == ElectionState::LeaderInit           ||
+             state_ == ElectionState::LeaderReady);
+        if (inLeaderState) {
+            candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
+                leadershipTermIdArg, logPosition_, /*timestampMs=*/0);
+            leadershipTermId_ = leadershipTermIdArg;
+            state(ElectionState::Canvass, nowNs, "A1: higher-term CommitPosition in LEADER state → step down");
+            return;
+        }
+    }
+
     // Election.java:563-565: ignore if wrong term
     if (leadershipTermIdArg != leadershipTermId_) return;
 
