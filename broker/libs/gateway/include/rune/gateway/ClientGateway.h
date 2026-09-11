@@ -1,0 +1,122 @@
+#pragma once
+// ClientGateway.h — Client-facing session gateway (BR-4).
+//
+// Design:
+//   - Subscribes to a single Aeron ingress stream (clientChannel/clientStreamId).
+//   - FragmentAssembler reassembles multi-frame messages before dispatch.
+//   - doWork(nowNs) polls ingress and dispatches:
+//       Connect      → allocate sessionId, resolve egress ExclusivePublication,
+//                      send ConnectResponse
+//       Keepalive    → touch session (update lastSeenNs)
+//       Ping         → echo Pong on session egress
+//       Disconnect   → remove session
+//       Unknown/bad  → drop (never crash)
+//   - Single-writer: doWork() must be called from ONE thread only.
+//   - Zero-alloc on the hot path: encode scratch is a fixed member buffer.
+//   - NO busy-spin.
+
+#include <rune/gateway/SessionTable.h>
+
+#include <Aeron.h>
+#include <Subscription.h>
+#include <ExclusivePublication.h>
+#include <FragmentAssembler.h>
+#include <concurrent/AtomicBuffer.h>
+#include <concurrent/logbuffer/BufferClaim.h>
+#include <util/Index.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace rune::gateway {
+
+// ---------------------------------------------------------------------------
+// ClientGateway
+// ---------------------------------------------------------------------------
+class ClientGateway {
+public:
+    // @param aeron          Shared Aeron client (connected to a media driver).
+    // @param clientChannel  Aeron channel the gateway listens on (clients publish here).
+    // @param clientStreamId Stream ID on clientChannel.
+    // @param thisNodeId     This node's id; echoed in ConnectResponse.leaderMemberId.
+    ClientGateway(std::shared_ptr<aeron::Aeron> aeron,
+                  std::string                   clientChannel,
+                  int32_t                       clientStreamId,
+                  int32_t                       thisNodeId);
+
+    ~ClientGateway() = default;
+
+    // Non-copyable, non-movable
+    ClientGateway(const ClientGateway&)            = delete;
+    ClientGateway& operator=(const ClientGateway&) = delete;
+
+    // -----------------------------------------------------------------------
+    // doWork — poll ingress (bounded fragment limit) + dispatch.
+    // Returns number of fragments processed (work count).
+    // Must be called from ONE thread only.
+    // -----------------------------------------------------------------------
+    int doWork(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // sessionCount — number of active sessions.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t sessionCount() const {
+        return sessions_.size();
+    }
+
+private:
+    // -----------------------------------------------------------------------
+    // Fragment handler — called by FragmentAssembler for each reassembled frame.
+    // -----------------------------------------------------------------------
+    void onFragment(aeron::concurrent::AtomicBuffer& buffer,
+                    aeron::util::index_t             offset,
+                    aeron::util::index_t             length,
+                    aeron::Header&                   header);
+
+    // -----------------------------------------------------------------------
+    // Dispatch helpers
+    // -----------------------------------------------------------------------
+    void handleConnect   (const uint8_t* buf, std::size_t len, int64_t nowNs);
+    void handleKeepalive (const uint8_t* buf, std::size_t len, int64_t nowNs);
+    void handlePing      (const uint8_t* buf, std::size_t len);
+    void handleDisconnect(const uint8_t* buf, std::size_t len);
+
+    // -----------------------------------------------------------------------
+    // Egress send helper — tryClaim first, fallback to offer.
+    // Returns true if the frame was sent (or offered).
+    // -----------------------------------------------------------------------
+    bool sendTo(Session& session, const uint8_t* buf, std::size_t len);
+
+    // -----------------------------------------------------------------------
+    // Resolve a new ExclusivePublication (bounded wait).
+    // Returns nullptr if the publication cannot be resolved within the deadline.
+    // -----------------------------------------------------------------------
+    std::shared_ptr<aeron::ExclusivePublication>
+    resolvePublication(const std::string& channel, int32_t streamId);
+
+    // -----------------------------------------------------------------------
+    // Members
+    // -----------------------------------------------------------------------
+    std::shared_ptr<aeron::Aeron>        aeron_;
+    std::string                          clientChannel_;
+    int32_t                              clientStreamId_;
+    int32_t                              thisNodeId_;
+
+    std::shared_ptr<aeron::Subscription> sub_;
+    aeron::FragmentAssembler             assembler_;
+
+    SessionTable                         sessions_;
+
+    // Reusable encode scratch — 64 KiB covers any Milestone-A frame.
+    // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB)
+    static constexpr std::size_t kScratchSize = 68 * 1024;
+    std::array<uint8_t, kScratchSize>    scratch_{};
+
+    // Cached nowNs for the current doWork() invocation (passed into handlers).
+    int64_t                              nowNs_ = 0;
+};
+
+} // namespace rune::gateway

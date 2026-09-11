@@ -31,6 +31,7 @@ add_subdirectory(libs/replication)
 add_subdirectory(libs/coordination)
 add_subdirectory(libs/transaction)
 add_subdirectory(libs/node)
+add_subdirectory(libs/gateway)
 
 add_executable(rune_broker src/main.cpp)
 target_link_libraries(rune_broker PRIVATE rune_node rune_storage spdlog::spdlog)
