@@ -383,7 +383,8 @@ TEST(TransactionLogTest, EmptyTxnId) {
 }
 
 // ---------------------------------------------------------------------------
-// TEST: coordinatorEpoch is persisted and recovered
+// TEST: coordinatorEpoch is persisted and RECOVERED (FIX 2)
+// Destroy the log and reopen — recovered coordinatorEpoch must equal what was written.
 // ---------------------------------------------------------------------------
 TEST(TransactionLogTest, CoordinatorEpochPersisted) {
     auto path = tmpPath();
@@ -391,17 +392,104 @@ TEST(TransactionLogTest, CoordinatorEpochPersisted) {
 
     {
         TransactionLog log(path);
-        TxnLogEntry e = makeEntry("txn-ep", 1, 0, TxnState::Empty, {}, 0, 42);
+        TxnLogEntry e = makeEntry("txn-ep", 1, 0, TxnState::PrepareCommit, {tp("t", 0)}, 500, 42);
         log.append(e);
     }
 
+    // Reopen — coordinatorEpoch 42 must survive.
     TransactionLog log2(path);
     const auto* meta = log2.metadata("txn-ep");
     ASSERT_NE(meta, nullptr);
-    // coordinatorEpoch is not in TransactionMetadata directly, but
-    // the TxnLogEntry held it — verify the metadata state is correct.
     EXPECT_EQ(meta->producerId, 1);
-    EXPECT_EQ(meta->state, TxnState::Empty);
+    EXPECT_EQ(meta->state, TxnState::PrepareCommit);
+    // FIX 2: coordinatorEpoch must be stored in TransactionMetadata and recovered.
+    EXPECT_EQ(meta->coordinatorEpoch, 42);
+}
+
+// ---------------------------------------------------------------------------
+// TEST: crash-seam recovery — PrepareCommit survives coordinator restart (FIX 4)
+// ---------------------------------------------------------------------------
+TEST(TransactionLogTest, CrashSeamRecoveryPrepareCommit) {
+    auto path = tmpPath();
+    TempFile tf{path};
+
+    ProducerId    pid    = 77;
+    ProducerEpoch epoch  = 3;
+    int32_t       coordE = 7;
+
+    // Phase 1: drive txn to PrepareCommit and durably append that state.
+    {
+        TransactionLog log(path);
+        // Simulate coordinator appending each transition.
+        log.append(makeEntry("txn-crash", pid, epoch, TxnState::Empty,
+                              {}, 0, coordE, 30'000));
+        log.append(makeEntry("txn-crash", pid, epoch, TxnState::Ongoing,
+                              {tp("orders", 0), tp("payments", 1)}, 1000, coordE, 30'000));
+        log.append(makeEntry("txn-crash", pid, epoch, TxnState::PrepareCommit,
+                              {tp("orders", 0), tp("payments", 1)}, 1000, coordE, 30'000));
+        // Crash here — completeTransaction is NEVER called.
+    }
+
+    // Phase 2: a new coordinator reconstructs from the log.
+    TransactionLog log2(path);
+    ASSERT_EQ(log2.size(), 1u);
+    const auto* meta = log2.metadata("txn-crash");
+    ASSERT_NE(meta, nullptr);
+
+    // Must recover exact PrepareCommit state.
+    EXPECT_EQ(meta->state,           TxnState::PrepareCommit);
+    EXPECT_EQ(meta->producerId,       pid);
+    EXPECT_EQ(meta->producerEpoch,    epoch);
+    EXPECT_EQ(meta->coordinatorEpoch, coordE);
+    EXPECT_EQ(meta->txnTimeoutMs,     30'000);
+    EXPECT_EQ(meta->partitions.size(), 2u);
+    EXPECT_TRUE(meta->partitions.contains(tp("orders", 0)));
+    EXPECT_TRUE(meta->partitions.contains(tp("payments", 1)));
+
+    // Can resolve: complete the commit from recovered state.
+    log2.append(makeEntry("txn-crash", pid, epoch, TxnState::CompleteCommit,
+                           {}, 0, coordE, 30'000));
+    const auto* meta2 = log2.metadata("txn-crash");
+    ASSERT_NE(meta2, nullptr);
+    EXPECT_EQ(meta2->state, TxnState::CompleteCommit);
+}
+
+// ---------------------------------------------------------------------------
+// TEST: crash-seam recovery — PrepareAbort survives coordinator restart (FIX 4)
+// ---------------------------------------------------------------------------
+TEST(TransactionLogTest, CrashSeamRecoveryPrepareAbort) {
+    auto path = tmpPath();
+    TempFile tf{path};
+
+    ProducerId    pid    = 55;
+    ProducerEpoch epoch  = 1;
+    int32_t       coordE = 3;
+
+    {
+        TransactionLog log(path);
+        log.append(makeEntry("txn-crash-abort", pid, epoch, TxnState::Empty,
+                              {}, 0, coordE, 60'000));
+        log.append(makeEntry("txn-crash-abort", pid, epoch, TxnState::Ongoing,
+                              {tp("alpha", 0)}, 2000, coordE, 60'000));
+        log.append(makeEntry("txn-crash-abort", pid, epoch, TxnState::PrepareAbort,
+                              {tp("alpha", 0)}, 2000, coordE, 60'000));
+        // Crash — completeTransaction never called.
+    }
+
+    TransactionLog log2(path);
+    const auto* meta = log2.metadata("txn-crash-abort");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state,           TxnState::PrepareAbort);
+    EXPECT_EQ(meta->producerId,       pid);
+    EXPECT_EQ(meta->producerEpoch,    epoch);
+    EXPECT_EQ(meta->coordinatorEpoch, coordE);
+    EXPECT_EQ(meta->partitions.size(), 1u);
+    EXPECT_TRUE(meta->partitions.contains(tp("alpha", 0)));
+
+    // Resolve by completing the abort.
+    log2.append(makeEntry("txn-crash-abort", pid, epoch, TxnState::CompleteAbort,
+                           {}, 0, coordE, 60'000));
+    EXPECT_EQ(log2.metadata("txn-crash-abort")->state, TxnState::CompleteAbort);
 }
 
 // ---------------------------------------------------------------------------

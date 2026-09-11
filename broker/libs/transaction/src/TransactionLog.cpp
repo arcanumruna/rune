@@ -119,15 +119,16 @@ const TransactionMetadata* TransactionLog::metadata(const TransactionalId& txnId
 // ---------------------------------------------------------------------------
 void TransactionLog::applyEntry(const TxnLogEntry& entry) {
     auto& meta = txnMap_[entry.txnId];
-    meta.txnId          = entry.txnId;
-    meta.producerId     = entry.producerId;
-    meta.producerEpoch  = entry.producerEpoch;
-    meta.state          = entry.state;
-    meta.partitions     = entry.partitions;
-    meta.txnStartNs     = entry.txnStartNs;
-    meta.txnTimeoutMs   = entry.txnTimeoutMs;
+    meta.txnId             = entry.txnId;
+    meta.producerId        = entry.producerId;
+    meta.producerEpoch     = entry.producerEpoch;
+    meta.state             = entry.state;
+    meta.partitions        = entry.partitions;
+    meta.txnStartNs        = entry.txnStartNs;
+    meta.txnTimeoutMs      = entry.txnTimeoutMs;
+    meta.coordinatorEpoch  = entry.coordinatorEpoch;   // FIX 2: persist+recover coordinatorEpoch
     // fencingEpoch is not persisted; reset to false on recover
-    meta.fencingEpoch   = false;
+    meta.fencingEpoch      = false;
 }
 
 // ---------------------------------------------------------------------------

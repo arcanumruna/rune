@@ -404,3 +404,93 @@ TEST(TransactionMessagesTest, ControlTypeValues) {
     EXPECT_EQ(static_cast<int16_t>(ControlType::Commit), 0);
     EXPECT_EQ(static_cast<int16_t>(ControlType::Abort),  1);
 }
+
+// ===========================================================================
+// FIX 3 — SBE bounds-checked read_str / read_partitions (truncated buffer)
+// A malformed/short buffer must not over-read; must return error/empty/false.
+// ===========================================================================
+
+// read_str_safe: reads a uint16-prefixed string from buf[pos..end).
+// If the declared length extends past end, returns false and does NOT advance pos.
+TEST(TransactionMessagesTest, ReadStrSafeTruncatedHeaderReturnsError) {
+    // Only 1 byte in buffer — not enough for the uint16 length prefix.
+    uint8_t buf[1] = {0xFF};
+    std::size_t pos = 0;
+    std::size_t end = 1;
+    bool ok = txn_detail::read_str_safe(buf, pos, end, /*out*/ nullptr);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(pos, 0u); // pos must not advance on error
+}
+
+TEST(TransactionMessagesTest, ReadStrSafeTruncatedBodyReturnsError) {
+    // Declare length=10, but only 3 bytes of body present.
+    uint8_t buf[2 + 3] = {};
+    // write length prefix = 10
+    buf[0] = 10; buf[1] = 0;
+    // only 3 bytes of body follow
+    buf[2] = 'a'; buf[3] = 'b'; buf[4] = 'c';
+    std::size_t pos = 0;
+    std::size_t end = sizeof(buf);
+    std::string_view sv;
+    bool ok = txn_detail::read_str_safe(buf, pos, end, &sv);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(pos, 0u);
+}
+
+TEST(TransactionMessagesTest, ReadStrSafeValidBufferSucceeds) {
+    uint8_t buf[2 + 5] = {};
+    buf[0] = 5; buf[1] = 0; // length = 5
+    buf[2] = 'h'; buf[3] = 'e'; buf[4] = 'l'; buf[5] = 'l'; buf[6] = 'o';
+    std::size_t pos = 0;
+    std::size_t end = sizeof(buf);
+    std::string_view sv;
+    bool ok = txn_detail::read_str_safe(buf, pos, end, &sv);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(sv, "hello");
+    EXPECT_EQ(pos, 7u);
+}
+
+TEST(TransactionMessagesTest, ReadPartitionsSafeTruncatedCountReturnsError) {
+    // Only 1 byte — not enough for uint16 count.
+    uint8_t buf[1] = {0xFF};
+    std::size_t pos = 0;
+    std::size_t end = 1;
+    std::vector<TopicPartition> parts;
+    bool ok = txn_detail::read_partitions_safe(buf, pos, end, parts);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(pos, 0u);
+    EXPECT_TRUE(parts.empty());
+}
+
+TEST(TransactionMessagesTest, ReadPartitionsSafeTruncatedTupleReturnsError) {
+    // count = 1, but tuple is incomplete (only 2 bytes of the 2+topicLen+4 tuple).
+    uint8_t buf[4] = {};
+    buf[0] = 1; buf[1] = 0;  // count = 1
+    buf[2] = 5; buf[3] = 0;  // topicLen = 5, but no topic bytes follow
+    std::size_t pos = 0;
+    std::size_t end = sizeof(buf);
+    std::vector<TopicPartition> parts;
+    bool ok = txn_detail::read_partitions_safe(buf, pos, end, parts);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(pos, 0u);
+    EXPECT_TRUE(parts.empty());
+}
+
+TEST(TransactionMessagesTest, ReadPartitionsSafeValidBufferSucceeds) {
+    // count=1, topicLen=3, topic="abc", partition=42
+    constexpr std::size_t sz = 2 + 2 + 3 + 4; // count + topicLen + "abc" + int32
+    uint8_t buf[sz] = {};
+    buf[0] = 1;  buf[1] = 0;  // count = 1
+    buf[2] = 3;  buf[3] = 0;  // topicLen = 3
+    buf[4] = 'a'; buf[5] = 'b'; buf[6] = 'c';
+    buf[7] = 42; buf[8] = 0; buf[9] = 0; buf[10] = 0; // partition = 42 LE
+    std::size_t pos = 0;
+    std::size_t end = sz;
+    std::vector<TopicPartition> parts;
+    bool ok = txn_detail::read_partitions_safe(buf, pos, end, parts);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(parts.size(), 1u);
+    EXPECT_EQ(parts[0].topic, "abc");
+    EXPECT_EQ(parts[0].partition, 42);
+    EXPECT_EQ(pos, sz);
+}

@@ -6,17 +6,37 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/TransactionCoordinator.h>
+#include <rune/transaction/TransactionLog.h>
+#include <rune/transaction/ControlMarker.h>
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cassert>
 #include <optional>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace rune::transaction;
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// Unique temp path helper (for durable log tests — FIX 1/4)
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_coord_counter{0};
+
+static std::string coordTmpPath() {
+    return "/tmp/txncoord_" + std::to_string(::getpid())
+         + "_" + std::to_string(g_coord_counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+struct CoordTempFile {
+    std::string path;
+    explicit CoordTempFile(std::string p) : path(std::move(p)) {}
+    ~CoordTempFile() { ::unlink(path.c_str()); }
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -835,6 +855,299 @@ TEST_F(TxnCoordTest, ZombieCannotEndTransactionAfterEpochBump)
     auto er = coord_.endTransaction("txn-z", r1.producerId, r1.producerEpoch,
                                     true, nowNs_);
     EXPECT_EQ(er.errorCode, EndTransactionResult::kInvalidProducerEpoch);
+}
+
+// ===========================================================================
+// FIX 1 — TransactionLog wired into coordinator (durable transitions)
+// ===========================================================================
+
+// Helper: a coordinator that owns a TransactionLog (injectable ptr).
+// We test that after each state transition, the log reflects the new state.
+
+TEST(TxnCoordDurableTest, InitProducerIdPersistedToLog)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-durable-1", 60'000, 0);
+    ASSERT_TRUE(r.ok());
+
+    // The log must have an entry for this txnId with state Empty.
+    const auto* meta = log.metadata("txn-durable-1");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state,        TxnState::Empty);
+    EXPECT_EQ(meta->producerId,   r.producerId);
+    EXPECT_EQ(meta->producerEpoch, r.producerEpoch);
+}
+
+TEST(TxnCoordDurableTest, AddPartitionsPersistedToLog)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-dur-ap", 60'000, 0);
+    ASSERT_TRUE(r.ok());
+
+    coord.addPartitions("txn-dur-ap", r.producerId, r.producerEpoch,
+                        tps({tp("orders", 0), tp("payments", 1)}), 1000LL);
+
+    const auto* meta = log.metadata("txn-dur-ap");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, TxnState::Ongoing);
+    EXPECT_EQ(meta->partitions.size(), 2u);
+}
+
+TEST(TxnCoordDurableTest, EndTransactionPrepareCommitPersistedBeforeComplete)
+{
+    // CRITICAL: the PrepareCommit entry must be in the log before completeTransaction.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-dur-end", 60'000, 0);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("txn-dur-end", r.producerId, r.producerEpoch,
+                        tps({tp("t", 0)}), 500LL);
+    coord.endTransaction("txn-dur-end", r.producerId, r.producerEpoch,
+                         /*commit=*/true, 1000LL);
+
+    // Log must show PrepareCommit at this point (before any completeTransaction).
+    const auto* meta = log.metadata("txn-dur-end");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, TxnState::PrepareCommit);
+}
+
+TEST(TxnCoordDurableTest, EndTransactionPrepareAbortPersistedBeforeComplete)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-dur-abort", 60'000, 0);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("txn-dur-abort", r.producerId, r.producerEpoch,
+                        tps({tp("t", 0)}), 500LL);
+    coord.endTransaction("txn-dur-abort", r.producerId, r.producerEpoch,
+                         /*commit=*/false, 1000LL);
+
+    const auto* meta = log.metadata("txn-dur-abort");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, TxnState::PrepareAbort);
+}
+
+TEST(TxnCoordDurableTest, CompleteTransactionPersistedToLog)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-dur-complete", 60'000, 0);
+    coord.addPartitions("txn-dur-complete", r.producerId, r.producerEpoch,
+                        tps({tp("t", 0)}), 0LL);
+    coord.endTransaction("txn-dur-complete", r.producerId, r.producerEpoch,
+                         true, 0LL);
+    coord.completeTransaction("txn-dur-complete");
+
+    // Log must reflect Empty after complete.
+    const auto* meta = log.metadata("txn-dur-complete");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, TxnState::Empty);
+}
+
+TEST(TxnCoordDurableTest, ReplayRebuildsMetadataOnConstruction)
+{
+    // Destroy coordinator; reconstruct from same log path — state restored.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    ProducerId    savedPid{};
+    ProducerEpoch savedEpoch{};
+
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+        auto r = coord.initProducerId("txn-replay", 30'000, 0);
+        ASSERT_TRUE(r.ok());
+        savedPid   = r.producerId;
+        savedEpoch = r.producerEpoch;
+        coord.addPartitions("txn-replay", savedPid, savedEpoch,
+                            tps({tp("t0", 0), tp("t1", 1)}), 1000LL);
+        coord.endTransaction("txn-replay", savedPid, savedEpoch, true, 2000LL);
+        // Crash — completeTransaction never called. PrepareCommit is durable.
+    }
+
+    // New coordinator + new log opened at same path — replays the log.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2);
+
+    // The coordinator must have reconstructed the PrepareCommit state.
+    ASSERT_EQ(coord2.state("txn-replay"), TxnState::PrepareCommit);
+    EXPECT_EQ(coord2.pidOf("txn-replay"),   savedPid);
+    EXPECT_EQ(coord2.epochOf("txn-replay"), savedEpoch);
+    auto parts = coord2.partitionsOf("txn-replay");
+    EXPECT_EQ(parts.size(), 2u);
+
+    // Can resolve the recovered transaction.
+    auto cr = coord2.completeTransaction("txn-replay");
+    EXPECT_TRUE(cr.ok());
+    EXPECT_EQ(coord2.state("txn-replay"), TxnState::Empty);
+}
+
+// ===========================================================================
+// FIX 4 — crash-seam: coordinator built from existing log + resolves Prepare*
+// ===========================================================================
+
+TEST(TxnCoordCrashSeamTest, RecoveredPrepareCommitIsResolvable)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    ProducerId    pid{};
+    ProducerEpoch epoch{};
+    int32_t       coordEpoch = 5;
+
+    // Phase 1: run txn to PrepareCommit, crash (coordinator destroyed).
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, coordEpoch);
+        auto r = coord.initProducerId("txn-cs-commit", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        pid   = r.producerId;
+        epoch = r.producerEpoch;
+        coord.addPartitions("txn-cs-commit", pid, epoch,
+                            tps({tp("foo", 0), tp("bar", 1)}), 100LL);
+        coord.endTransaction("txn-cs-commit", pid, epoch, /*commit=*/true, 200LL);
+        ASSERT_EQ(coord.state("txn-cs-commit"), TxnState::PrepareCommit);
+        // Crash here — completeTransaction never called.
+    }
+
+    // Phase 2: new coordinator from same log path.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, coordEpoch);
+
+    ASSERT_EQ(coord2.state("txn-cs-commit"), TxnState::PrepareCommit);
+    EXPECT_EQ(coord2.pidOf("txn-cs-commit"),   pid);
+    EXPECT_EQ(coord2.epochOf("txn-cs-commit"), epoch);
+    auto parts = coord2.partitionsOf("txn-cs-commit");
+    EXPECT_EQ(parts.size(), 2u);
+
+    // Verify coordinatorEpoch stored in the recovered metadata.
+    const auto* meta = coord2.metadata("txn-cs-commit");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->coordinatorEpoch, coordEpoch);
+
+    // Resolve.
+    auto cr = coord2.completeTransaction("txn-cs-commit");
+    EXPECT_TRUE(cr.ok());
+    EXPECT_EQ(coord2.state("txn-cs-commit"), TxnState::Empty);
+}
+
+TEST(TxnCoordCrashSeamTest, RecoveredPrepareAbortIsResolvable)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    ProducerId    pid{};
+    ProducerEpoch epoch{};
+    int32_t       coordEpoch = 9;
+
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, coordEpoch);
+        auto r = coord.initProducerId("txn-cs-abort", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        pid   = r.producerId;
+        epoch = r.producerEpoch;
+        coord.addPartitions("txn-cs-abort", pid, epoch,
+                            tps({tp("x", 0)}), 100LL);
+        coord.endTransaction("txn-cs-abort", pid, epoch, /*commit=*/false, 200LL);
+        ASSERT_EQ(coord.state("txn-cs-abort"), TxnState::PrepareAbort);
+        // Crash.
+    }
+
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, coordEpoch);
+
+    ASSERT_EQ(coord2.state("txn-cs-abort"), TxnState::PrepareAbort);
+    EXPECT_EQ(coord2.pidOf("txn-cs-abort"),   pid);
+    EXPECT_EQ(coord2.epochOf("txn-cs-abort"), epoch);
+
+    const auto* meta = coord2.metadata("txn-cs-abort");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->coordinatorEpoch, coordEpoch);
+
+    auto cr = coord2.completeTransaction("txn-cs-abort");
+    EXPECT_TRUE(cr.ok());
+    EXPECT_EQ(coord2.state("txn-cs-abort"), TxnState::Empty);
+}
+
+// ===========================================================================
+// FIX 1 + FIX 4 — writeMarkers with durable log: prepare fsynced before markers
+// ===========================================================================
+
+TEST(TxnCoordDurableTest, WriteMarkersWithLogPreparePersistedBeforeMarkers)
+{
+    // This is the critical atomicity test:
+    // endTransaction must persist PrepareCommit to log BEFORE appendFn is called.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-wm-durable", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("txn-wm-durable", r.producerId, r.producerEpoch,
+                        tps({tp("p0", 0), tp("p1", 1)}), 0LL);
+
+    // Track whether PrepareCommit was in log when first appendFn was called.
+    bool prepareInLogBeforeMarker = false;
+    auto appendFn = [&](const TopicPartition&, const std::vector<uint8_t>&) {
+        const auto* m = log.metadata("txn-wm-durable");
+        if (m && m->state == TxnState::PrepareCommit) {
+            prepareInLogBeforeMarker = true;
+        }
+    };
+
+    int count = ControlMarker::writeMarkers(coord, "txn-wm-durable",
+                                             r.producerId, r.producerEpoch,
+                                             /*commit=*/true, /*coordEpoch=*/0,
+                                             0LL, appendFn);
+    EXPECT_EQ(count, 2);
+    EXPECT_TRUE(prepareInLogBeforeMarker)
+        << "PrepareCommit must be durably appended to log before any marker is written";
+}
+
+// ===========================================================================
+// FIX 2 — coordinatorEpoch in metadata + getter
+// ===========================================================================
+
+TEST(TxnCoordDurableTest, CoordinatorEpochInMetadata)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    int32_t coordEpoch = 13;
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, coordEpoch);
+    auto r = coord.initProducerId("txn-ce", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+
+    const auto* meta = coord.metadata("txn-ce");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->coordinatorEpoch, coordEpoch);
+
+    // After round-trip through log, coordinatorEpoch must match.
+    TransactionLog log2(path);
+    const auto* logMeta = log2.metadata("txn-ce");
+    ASSERT_NE(logMeta, nullptr);
+    EXPECT_EQ(logMeta->coordinatorEpoch, coordEpoch);
 }
 
 } // anonymous namespace

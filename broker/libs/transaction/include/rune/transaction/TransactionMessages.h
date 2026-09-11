@@ -130,6 +130,66 @@ inline std::vector<TopicPartition> read_partitions(const uint8_t* buf, std::size
     return parts;
 }
 
+// ---------------------------------------------------------------------------
+// FIX 3 — bounds-checked variants (reject malformed/short buffers)
+//
+// read_str_safe: reads uint16-prefixed string from buf[pos..end).
+//   Returns true and advances pos on success.
+//   Returns false (pos unchanged) if declared length would read past end.
+//   If out != nullptr, sets *out to the string_view on success.
+// ---------------------------------------------------------------------------
+inline bool read_str_safe(const uint8_t* buf,
+                           std::size_t&   pos,
+                           std::size_t    end,
+                           std::string_view* out) noexcept
+{
+    // Need at least 2 bytes for the length prefix.
+    if (pos + 2 > end) return false;
+    uint16_t len = read_le<uint16_t>(buf + pos);
+    // Check that body fits in the buffer.
+    if (pos + 2 + static_cast<std::size_t>(len) > end) return false;
+    if (out != nullptr) {
+        *out = std::string_view{reinterpret_cast<const char*>(buf + pos + 2),
+                                static_cast<std::size_t>(len)};
+    }
+    pos += 2 + static_cast<std::size_t>(len);
+    return true;
+}
+
+// read_partitions_safe: reads uint16 count + tuples from buf[pos..end).
+//   Returns true and fills parts on success.
+//   Returns false (pos unchanged, parts empty) on any truncation.
+inline bool read_partitions_safe(const uint8_t*             buf,
+                                  std::size_t&               pos,
+                                  std::size_t                end,
+                                  std::vector<TopicPartition>& parts) noexcept
+{
+    // Need at least 2 bytes for count prefix.
+    if (pos + 2 > end) return false;
+    uint16_t count = read_le<uint16_t>(buf + pos);
+
+    // Validate all tuples before committing to any mutation (all-or-nothing).
+    std::size_t scan = pos + 2;
+    std::vector<TopicPartition> tmp;
+    tmp.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        // topicLen prefix
+        if (scan + 2 > end) return false;
+        uint16_t tlen = read_le<uint16_t>(buf + scan); scan += 2;
+        // topic body + partition int32
+        if (scan + static_cast<std::size_t>(tlen) + 4 > end) return false;
+        std::string topic{reinterpret_cast<const char*>(buf + scan),
+                          static_cast<std::size_t>(tlen)};
+        scan += tlen;
+        int32_t partition = read_le<int32_t>(buf + scan); scan += 4;
+        tmp.push_back(TopicPartition{std::move(topic), partition});
+    }
+    // Commit.
+    parts = std::move(tmp);
+    pos   = scan;
+    return true;
+}
+
 } // namespace txn_detail
 
 // ---------------------------------------------------------------------------

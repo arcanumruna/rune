@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/TransactionCoordinator.h>
+#include <rune/transaction/TransactionLog.h>
 
 #include <cassert>
 #include <cstdint>
@@ -22,10 +23,35 @@ static constexpr int32_t kMaxTxnTimeoutMs = 900'000;  // 15 minutes (matches Kaf
 // Construction
 // ---------------------------------------------------------------------------
 TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
-                                               int32_t             defaultTxnTimeoutMs)
+                                               int32_t             defaultTxnTimeoutMs,
+                                               TransactionLog*     txnLog,
+                                               int32_t             coordinatorEpoch)
     : allocator_(std::move(allocator))
     , defaultTxnTimeoutMs_(defaultTxnTimeoutMs)
-{}
+    , txnLog_(txnLog)
+    , coordinatorEpoch_(coordinatorEpoch)
+{
+    // Replay the durable log to rebuild in-memory txnMap_ (P5-3 failover recovery).
+    if (txnLog_ != nullptr) {
+        for (const auto& [id, meta] : txnLog_->all()) {
+            txnMap_[id] = meta;
+            // Restore coordinatorEpoch from the log entry (held in meta.coordinatorEpoch).
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: persist transition to the durable log (fsync before return).
+// ---------------------------------------------------------------------------
+namespace {
+void persistTransition(TransactionLog* log,
+                       const TransactionMetadata& meta,
+                       int32_t coordinatorEpoch) noexcept
+{
+    if (log == nullptr) return;
+    log->appendFromMetadata(meta, coordinatorEpoch);
+}
+} // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // initProducerId
@@ -61,13 +87,16 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         // Unknown txnId → create new metadata (Empty, epoch 0).
         ProducerId pid = allocator_.allocate();
         TransactionMetadata newMeta;
-        newMeta.txnId        = id;
-        newMeta.producerId   = pid;
-        newMeta.producerEpoch = 0;
-        newMeta.txnTimeoutMs = effectiveTimeout;
-        newMeta.state        = TxnState::Empty;
-        newMeta.txnStartNs   = 0;
+        newMeta.txnId             = id;
+        newMeta.producerId        = pid;
+        newMeta.producerEpoch     = 0;
+        newMeta.txnTimeoutMs      = effectiveTimeout;
+        newMeta.state             = TxnState::Empty;
+        newMeta.txnStartNs        = 0;
+        newMeta.coordinatorEpoch  = coordinatorEpoch_;
         txnMap_.emplace(id, std::move(newMeta));
+        // FIX 1: persist Empty state to log (append+fsync) before returning.
+        persistTransition(txnLog_, txnMap_.at(id), coordinatorEpoch_);
         return { .producerId = pid, .producerEpoch = 0, .errorCode = 0 };
     }
 
@@ -87,10 +116,13 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         // Drive ongoing txn to PrepareAbort (epoch-fence path).
         // We stash the new epoch in the metadata but keep PrepareAbort as the
         // state — completeTransaction will finalise and reset to Empty.
-        meta->state        = TxnState::PrepareAbort;
-        meta->producerEpoch = newEpoch;
-        meta->fencingEpoch  = true;
-        meta->txnTimeoutMs  = effectiveTimeout;
+        meta->state              = TxnState::PrepareAbort;
+        meta->producerEpoch      = newEpoch;
+        meta->fencingEpoch       = true;
+        meta->txnTimeoutMs       = effectiveTimeout;
+        meta->coordinatorEpoch   = coordinatorEpoch_;
+        // FIX 1: persist PrepareAbort to log (append+fsync) before returning.
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
         // Return the new PID + epoch immediately so the new producer can start
         // as soon as the abort is complete (mirrors Kafka behaviour).
         return { .producerId = meta->producerId, .producerEpoch = newEpoch, .errorCode = 0 };
@@ -105,19 +137,23 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         // apply here (Kafka does the same: bump epoch regardless, assign the
         // new epoch, and once the in-flight transitions complete the next txn
         // will use the new epoch). But we don't re-drive the state machine.
-        meta->producerEpoch = newEpoch;
-        meta->txnTimeoutMs  = effectiveTimeout;
+        meta->producerEpoch      = newEpoch;
+        meta->txnTimeoutMs       = effectiveTimeout;
+        meta->coordinatorEpoch   = coordinatorEpoch_;
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .producerId = meta->producerId, .producerEpoch = newEpoch, .errorCode = 0 };
     }
 
     // State is Empty (or Dead — treat Dead as re-create).
     // Simply bump epoch and reset to Empty.
-    meta->producerEpoch = newEpoch;
-    meta->txnTimeoutMs  = effectiveTimeout;
-    meta->state         = TxnState::Empty;
+    meta->producerEpoch      = newEpoch;
+    meta->txnTimeoutMs       = effectiveTimeout;
+    meta->state              = TxnState::Empty;
     meta->partitions.clear();
-    meta->txnStartNs    = 0;
-    meta->fencingEpoch  = false;
+    meta->txnStartNs         = 0;
+    meta->fencingEpoch       = false;
+    meta->coordinatorEpoch   = coordinatorEpoch_;
+    persistTransition(txnLog_, *meta, coordinatorEpoch_);
 
     return { .producerId = meta->producerId, .producerEpoch = newEpoch, .errorCode = 0 };
 }
@@ -158,6 +194,9 @@ AddPartitionsResult TransactionCoordinator::addPartitions(
         meta->partitions.insert(tp);
     }
 
+    // FIX 1: persist Ongoing state (with accumulated partitions) to log.
+    persistTransition(txnLog_, *meta, coordinatorEpoch_);
+
     return { .errorCode = AddPartitionsResult::kOk };
 }
 
@@ -195,6 +234,13 @@ EndTransactionResult TransactionCoordinator::endTransaction(
         meta->state = TxnState::PrepareAbort;
     }
 
+    // FIX 1 — CRITICAL atomicity:
+    // PrepareCommit/PrepareAbort MUST be persisted+fsynced to the log HERE,
+    // BEFORE any markers are written and BEFORE completeTransaction is called.
+    // A crash after this point but before markers are written leaves a durable
+    // Prepare* entry that a recovering coordinator can replay and resolve.
+    persistTransition(txnLog_, *meta, coordinatorEpoch_);
+
     return { .errorCode = EndTransactionResult::kOk, .partitions = std::move(parts) };
 }
 
@@ -210,22 +256,28 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
     }
 
     if (meta->state == TxnState::PrepareCommit) {
+        // FIX 1: persist CompleteCommit to log before clearing in-memory state.
         meta->state = TxnState::CompleteCommit;
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
         // Immediately transition to Empty (ready for next txn, same epoch).
         meta->partitions.clear();
-        meta->txnStartNs  = 0;
+        meta->txnStartNs   = 0;
         meta->fencingEpoch = false;
-        meta->state       = TxnState::Empty;
+        meta->state        = TxnState::Empty;
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
     }
 
     if (meta->state == TxnState::PrepareAbort) {
+        // FIX 1: persist CompleteAbort to log.
         meta->state = TxnState::CompleteAbort;
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
         // Transition to Empty (ready for next txn).
         meta->partitions.clear();
-        meta->txnStartNs  = 0;
+        meta->txnStartNs   = 0;
         meta->fencingEpoch = false;
-        meta->state       = TxnState::Empty;
+        meta->state        = TxnState::Empty;
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
     }
 

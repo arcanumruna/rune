@@ -70,6 +70,10 @@
 #include <unordered_map>
 #include <vector>
 
+// Forward-declare TransactionLog to avoid circular include
+// (TransactionLog.h includes TransactionCoordinator.h).
+namespace rune::transaction { class TransactionLog; }
+
 namespace rune::transaction {
 
 // ---------------------------------------------------------------------------
@@ -148,6 +152,11 @@ struct TransactionMetadata {
     TxnState        state{TxnState::Empty};
     int64_t         txnStartNs{0};          ///< set on Ongoing entry; 0 otherwise
 
+    /// Coordinator epoch — bumped on coordinator failover (P5-3/P5-5).
+    /// Persisted to TransactionLog so a recovering coordinator can verify it
+    /// owns a given transaction (stale-coordinator fencing).
+    int32_t         coordinatorEpoch{0};
+
     /// Set of partitions currently in the transaction.
     /// std::set gives us sorted order + automatic dedup.
     std::set<TopicPartition> partitions;
@@ -165,10 +174,17 @@ public:
     // Construction
     // -----------------------------------------------------------------------
 
-    /// \param allocator   ProducerIdAllocator (injected for testability).
+    /// \param allocator            ProducerIdAllocator (injected for testability).
     /// \param defaultTxnTimeoutMs  Default timeout when none specified (or ≤0).
+    /// \param txnLog               Optional durable TransactionLog (nullptr = in-memory only).
+    ///                             When non-null, every state transition is appended+fsynced
+    ///                             to the log BEFORE the transition's side effects are done.
+    ///                             On construction, the log is replayed to rebuild txnMap_.
+    /// \param coordinatorEpoch     This coordinator's epoch (P5-3/P5-5 failover fencing).
     explicit TransactionCoordinator(ProducerIdAllocator  allocator = ProducerIdAllocator{},
-                                    int32_t              defaultTxnTimeoutMs = 60'000);
+                                    int32_t              defaultTxnTimeoutMs = 60'000,
+                                    TransactionLog*      txnLog = nullptr,
+                                    int32_t              coordinatorEpoch = 0);
 
     // Non-copyable (holds monotonic state).
     TransactionCoordinator(const TransactionCoordinator&)            = delete;
@@ -314,6 +330,12 @@ private:
     // -----------------------------------------------------------------------
     ProducerIdAllocator allocator_;
     int32_t             defaultTxnTimeoutMs_;
+
+    /// Optional durable log. Non-null → every transition is appended+fsynced.
+    TransactionLog*     txnLog_{nullptr};
+
+    /// This coordinator's epoch (persisted with each log entry for fencing).
+    int32_t             coordinatorEpoch_{0};
 
     /// Primary state: transactionalId → TransactionMetadata.
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;
