@@ -227,16 +227,11 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
         // records can carry the same producerId / producerEpoch / baseSequence.
         // Kafka's LogCleaner preserves these fields when rewriting compacted segments
         // so idempotent/transactional dedup state remains valid after compaction.
-        // We read them directly from the raw bytes using the known v2 batch offsets.
-        const uint8_t* batchBase = buf.data() + pos;
-        int64_t origProducerId    = static_cast<int64_t>(
-            rune::protocol::detail::getBE64(batchBase + rune::protocol::batch::kProducerIdOffset));
-        // producerEpoch is int16 (2 bytes, big-endian) at kProducerEpochOffset.
-        int16_t origProducerEpoch = static_cast<int16_t>(
-            (static_cast<uint16_t>(batchBase[rune::protocol::batch::kProducerEpochOffset]) << 8) |
-             static_cast<uint16_t>(batchBase[rune::protocol::batch::kProducerEpochOffset + 1]));
+        // All-LE: use RecordBatchReader accessors (LE) for producerId/epoch/seq.
+        int64_t origProducerId    = r.producerId();
+        int16_t origProducerEpoch = r.producerEpoch();
         int32_t origBaseSequence  = static_cast<int32_t>(
-            rune::protocol::detail::getBE32(batchBase + rune::protocol::batch::kBaseSequenceOffset));
+            rune::protocol::detail::getLE32(buf.data() + pos + rune::protocol::batch::kBaseSequenceOffset));
         int64_t batchBaseOffset   = r.baseOffset();
 
         // Collect records to keep from this batch.
@@ -265,30 +260,38 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
                 // We always patch (even when producerId == -1) to faithfully
                 // preserve whatever producer identity the original batch carried.
                 {
-                    // producerId at offset 43 (int64 big-endian)
-                    int64_t pid = origProducerId;
-                    for (int i = 7; i >= 0; --i)
-                        batch[rune::protocol::batch::kProducerIdOffset + (7 - i)] =
-                            static_cast<uint8_t>((static_cast<uint64_t>(pid) >> (i * 8)) & 0xFF);
-                    // producerEpoch at offset 51 (int16 big-endian)
-                    int16_t ep = origProducerEpoch;
-                    batch[rune::protocol::batch::kProducerEpochOffset]     = static_cast<uint8_t>((static_cast<uint16_t>(ep) >> 8) & 0xFF);
-                    batch[rune::protocol::batch::kProducerEpochOffset + 1] = static_cast<uint8_t>(static_cast<uint16_t>(ep) & 0xFF);
-                    // baseSequence at offset 53 (int32 big-endian):
+                    // All-LE: patch producerId/producerEpoch/baseSequence as LE.
+                    // producerId at offset 43 (int64 little-endian)
+                    {
+                        uint64_t u = static_cast<uint64_t>(origProducerId);
+                        for (int i = 0; i < 8; ++i)
+                            batch[rune::protocol::batch::kProducerIdOffset + i] =
+                                static_cast<uint8_t>(u >> (i * 8));
+                    }
+                    // producerEpoch at offset 51 (int16 little-endian)
+                    {
+                        uint16_t u = static_cast<uint16_t>(origProducerEpoch);
+                        batch[rune::protocol::batch::kProducerEpochOffset]     = static_cast<uint8_t>(u);
+                        batch[rune::protocol::batch::kProducerEpochOffset + 1] = static_cast<uint8_t>(u >> 8);
+                    }
+                    // baseSequence at offset 53 (int32 little-endian):
                     // record's sequence = origBaseSequence + offsetDelta within original batch.
-                    int32_t recSeq = origBaseSequence + static_cast<int32_t>(offset - batchBaseOffset);
-                    for (int i = 3; i >= 0; --i)
-                        batch[rune::protocol::batch::kBaseSequenceOffset + (3 - i)] =
-                            static_cast<uint8_t>((static_cast<uint32_t>(recSeq) >> (i * 8)) & 0xFF);
+                    {
+                        int32_t recSeq = origBaseSequence + static_cast<int32_t>(offset - batchBaseOffset);
+                        uint32_t u = static_cast<uint32_t>(recSeq);
+                        for (int i = 0; i < 4; ++i)
+                            batch[rune::protocol::batch::kBaseSequenceOffset + i] =
+                                static_cast<uint8_t>(u >> (i * 8));
+                    }
                     // Recompute CRC over [attributes..end] since we changed fields
-                    // in the CRC-covered region.
+                    // in the CRC-covered region.  Store CRC as LE uint32.
                     uint32_t newCrc = rune::protocol::crc32c(
                         batch.data() + rune::protocol::batch::kAttributesOffset,
                         batch.size() - rune::protocol::batch::kAttributesOffset);
-                    batch[rune::protocol::batch::kCrcOffset]     = static_cast<uint8_t>(newCrc >> 24);
-                    batch[rune::protocol::batch::kCrcOffset + 1] = static_cast<uint8_t>(newCrc >> 16);
-                    batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(newCrc >> 8);
-                    batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(newCrc);
+                    batch[rune::protocol::batch::kCrcOffset]     = static_cast<uint8_t>(newCrc);
+                    batch[rune::protocol::batch::kCrcOffset + 1] = static_cast<uint8_t>(newCrc >> 8);
+                    batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(newCrc >> 16);
+                    batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(newCrc >> 24);
                 }
 
                 outBuf.insert(outBuf.end(), batch.begin(), batch.end());

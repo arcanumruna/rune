@@ -292,19 +292,13 @@ private:
     LsoTracker*      tracker_;
     AbortedTxnIndex* abortedIndex_;
 
-    // Helper: extract producerId from a raw batch buffer at offset `pos`.
-    // The batch is in rune-protocol big-endian format OR ControlMarker
-    // little-endian format.  We detect via the CONTROL bit in attributes.
-    // For the ReadCommittedView scan we need producerId for:
+    // Helper: extract producerId from a raw LE batch buffer at offset `pos`.
+    // All-LE: both data batches and control batches use the unified
+    // rune-protocol little-endian RecordBatch format.
+    // producerId at kProducerIdOffset(43) is LE int64 in both cases.
+    // Used for:
     //   (a) LsoTracker::onProduceBatch / onControlMarker
     //   (b) AbortedTxnIndex::isAborted
-    // The producerId field lives at the same logical position in both formats
-    // (batch header offset 43..50) but the endianness differs:
-    //   rune-protocol (BE): producerId at kProducerIdOffset(43) in big-endian
-    //   ControlMarker  (LE): producerId at [43..50] in little-endian
-    // We unify by checking the CONTROL bit first (ControlMarker batch) and
-    // using ControlMarker::extract(), then falling back to rune-protocol BE
-    // reading for data batches.
 };
 
 } // namespace rune::transaction

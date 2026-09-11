@@ -16,22 +16,26 @@
 // appended directly to a partition's log.  A reader identifies a control
 // batch by checking the CONTROL bit; it then extracts the marker payload.
 //
-// ## Batch wire layout (subset of Kafka RecordBatch §6.4, little-endian)
+// ## Batch wire layout (rune-protocol RecordBatch, LITTLE-endian — all-LE)
 //
-//   [0..7]   int64  baseOffset         = 0 (filled by log on append)
-//   [8..11]  int32  batchLengthBytes   = total bytes from [12..]
-//   [12..15] int32  partitionLeaderEpoch = -1
-//   [16]     int8   magic               = 2
-//   [17..20] int32  crc                 = CRC32C of [21..]
-//   [21..22] int16  attributes          = 0x20 (CONTROL flag, LE)
-//   [23..26] int32  lastOffsetDelta     = 0 (single record)
-//   [27..34] int64  firstTimestamp      = 0
-//   [35..42] int64  maxTimestamp        = 0
-//   [43..50] int64  producerId
-//   [51..52] int16  producerEpoch
-//   [53..56] int32  baseSequence        = -1
-//   [57..60] int32  numRecords          = 1
-//   [61..]   record
+// Control batches are encoded in the SAME little-endian RecordBatch format
+// as data batches so that RecordBatchReader can walk them correctly.
+// This removes the last BE outlier; Rune is now uniformly LE.
+//
+//   [0..7]   int64 LE  baseOffset         = 0 (log stamps on append)
+//   [8..11]  int32 LE  batchLengthBytes   = total bytes from [12..]
+//   [12..15] int32 LE  partitionLeaderEpoch = -1
+//   [16]     int8      magic               = 2
+//   [17..20] uint32 LE crc                 = CRC32C of [21..]
+//   [21..22] int16 LE  attributes          = 0x0030 (CONTROL|TRANSACTIONAL)
+//   [23..26] int32 LE  lastOffsetDelta     = 0 (single record)
+//   [27..34] int64 LE  firstTimestamp      = 0
+//   [35..42] int64 LE  maxTimestamp        = 0
+//   [43..50] int64 LE  producerId
+//   [51..52] int16 LE  producerEpoch
+//   [53..56] int32 LE  baseSequence        = -1
+//   [57..60] int32 LE  numRecords          = 1
+//   [61..]   record (varint-encoded, endian-neutral)
 //
 // ## Record wire layout (Kafka variable-length record, per §6.4)
 //

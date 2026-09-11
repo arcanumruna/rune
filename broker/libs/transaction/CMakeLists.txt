@@ -22,7 +22,8 @@ if(BUILD_TESTING)
         tests/transaction/TransactionLogTest.cpp
         tests/transaction/TransactionMessagesTest.cpp
         tests/transaction/ControlMarkerTest.cpp
-        tests/transaction/ReadCommittedViewTest.cpp)
+        tests/transaction/ReadCommittedViewTest.cpp
+        tests/transaction/ControlBatchBeFormatTest.cpp)
     target_link_libraries(rune_transaction_tests PRIVATE
         rune_transaction
         GTest::gtest_main)

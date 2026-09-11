@@ -58,16 +58,18 @@ TEST(ControlMarkerTest, BuildMagicByte) {
 
 TEST(ControlMarkerTest, BuildControlBitSet) {
     auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
-    // attributes at [21..22]: bit 5 (0x20) must be set
-    int16_t attrs;
-    std::memcpy(&attrs, batch.data() + 21, 2);
+    // attributes at [21..22]: bit 5 (0x20) must be set.
+    // All-LE: attributes are little-endian — read as LE int16.
+    int16_t attrs = static_cast<int16_t>(static_cast<uint16_t>(batch[21])
+                                        | (static_cast<uint16_t>(batch[22]) << 8));
     EXPECT_NE(attrs & ControlMarker::kAttrControl, 0);
 }
 
 TEST(ControlMarkerTest, BuildTransactionalBitSet) {
     auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
-    int16_t attrs;
-    std::memcpy(&attrs, batch.data() + 21, 2);
+    // All-LE: attributes are little-endian — read as LE int16.
+    int16_t attrs = static_cast<int16_t>(static_cast<uint16_t>(batch[21])
+                                        | (static_cast<uint16_t>(batch[22]) << 8));
     EXPECT_NE(attrs & ControlMarker::kAttrTransactional, 0);
 }
 
@@ -548,10 +550,16 @@ static uint32_t testCrc32c(const uint8_t* data, std::size_t len) noexcept {
 }
 
 // Re-stamp the batch CRC at [17..20] over bytes [21..ENCODED_SIZE).
+// All-LE: CRC is stored LITTLE-ENDIAN (matching unified LE RecordBatch format).
 static void restampCrc(std::vector<uint8_t>& b) {
     uint32_t c = testCrc32c(b.data() + ControlMarker::CRC_DATA_START,
                             ControlMarker::ENCODED_SIZE - ControlMarker::CRC_DATA_START);
-    std::memcpy(b.data() + ControlMarker::CRC_OFFSET, &c, 4);
+    // Store LE.
+    std::size_t off = ControlMarker::CRC_OFFSET;
+    b[off + 0] = static_cast<uint8_t>(c);
+    b[off + 1] = static_cast<uint8_t>(c >>  8);
+    b[off + 2] = static_cast<uint8_t>(c >> 16);
+    b[off + 3] = static_cast<uint8_t>(c >> 24);
 }
 
 // Offsets inside the record (record starts at BATCH_HEADER_SIZE = 61):

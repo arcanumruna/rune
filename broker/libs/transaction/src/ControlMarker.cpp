@@ -3,9 +3,16 @@
 //
 // Namespace: rune::transaction
 // C++23. NO locks. NO hot-path alloc. Single-writer.
+//
+// All-LE: control batches are now encoded in the SAME little-endian
+// RecordBatch format as data batches (rune-protocol RecordBatch.h unified).
+// Under the old BE+LE mismatch, RecordBatchReader::totalLength() misread the
+// LE batchLength as ~1 GiB, making data after a marker unreachable and
+// recover() treating markers as torn tails (silent truncation).
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/ControlMarker.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
 #include <cstring>
@@ -16,13 +23,40 @@ namespace rune::transaction {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Little-endian helpers (UB-free via memcpy)
+// Little-endian helpers — matching rune-protocol RecordBatch (LE) layout.
 // ---------------------------------------------------------------------------
-template<typename T>
-static void write_le(uint8_t* p, T v) noexcept { std::memcpy(p, &v, sizeof(T)); }
 
-template<typename T>
-static T read_le(const uint8_t* p) noexcept { T v; std::memcpy(&v, p, sizeof(T)); return v; }
+static void write_le64(uint8_t* p, int64_t v) noexcept {
+    uint64_t u = static_cast<uint64_t>(v);
+    for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(u >> (i * 8));
+}
+
+static void write_le32(uint8_t* p, int32_t v) noexcept {
+    uint32_t u = static_cast<uint32_t>(v);
+    for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(u >> (i * 8));
+}
+
+static void write_le16(uint8_t* p, int16_t v) noexcept {
+    uint16_t u = static_cast<uint16_t>(v);
+    p[0] = static_cast<uint8_t>(u);
+    p[1] = static_cast<uint8_t>(u >> 8);
+}
+
+static int64_t read_le64(const uint8_t* p) noexcept {
+    uint64_t u = 0;
+    for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(p[i]) << (i * 8);
+    return static_cast<int64_t>(u);
+}
+
+static int32_t read_le32(const uint8_t* p) noexcept {
+    uint32_t u = uint32_t(p[0]) | (uint32_t(p[1]) << 8)
+               | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+    return static_cast<int32_t>(u);
+}
+
+static int16_t read_le16(const uint8_t* p) noexcept {
+    return static_cast<int16_t>(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+}
 
 // ---------------------------------------------------------------------------
 // Zig-zag varint encoding helpers (for Kafka record format)
@@ -103,41 +137,45 @@ uint32_t ControlMarker::crc32c(const uint8_t* data, std::size_t len) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// build — encode a control batch.
+// build — encode a control batch in LITTLE-ENDIAN RecordBatch format.
 //
-// Batch wire layout (all LE, 75 bytes total):
-//   [0..7]   int64  baseOffset         = 0
-//   [8..11]  int32  batchLengthBytes   = 63  (bytes from [12..74])
-//   [12..15] int32  partitionLeaderEpoch = -1
-//   [16]     int8   magic              = 2
-//   [17..20] int32  crc (CRC32C of bytes [21..74])
-//   [21..22] int16  attributes
-//   [23..26] int32  lastOffsetDelta    = 0
-//   [27..34] int64  firstTimestamp     = 0
-//   [35..42] int64  maxTimestamp       = 0
-//   [43..50] int64  producerId
-//   [51..52] int16  producerEpoch
-//   [53..56] int32  baseSequence       = -1
-//   [57..60] int32  numRecords         = 1
-//   [61..74] record (14 bytes)
+// All-LE unification: control batches now use the SAME little-endian byte
+// layout as data batches (rune-protocol RecordBatch), so RecordBatchReader
+// can walk them without misreading the batchLength field.
 //
-// Record layout (14 bytes):
+// Batch wire layout (all LE, 75 bytes total — same offsets as Kafka v2):
+//   [0..7]   int64 LE  baseOffset         = 0 (log stamps on append)
+//   [8..11]  int32 LE  batchLengthBytes   = 63  (ENCODED_SIZE - 12)
+//   [12..15] int32 LE  partitionLeaderEpoch = -1
+//   [16]     int8      magic              = 2
+//   [17..20] uint32 LE crc (CRC32C of bytes [21..74], same coverage as RecordBatch)
+//   [21..22] int16 LE  attributes         = 0x0030 (CONTROL|TRANSACTIONAL)
+//   [23..26] int32 LE  lastOffsetDelta    = 0
+//   [27..34] int64 LE  firstTimestamp     = 0
+//   [35..42] int64 LE  maxTimestamp       = 0
+//   [43..50] int64 LE  producerId
+//   [51..52] int16 LE  producerEpoch
+//   [53..56] int32 LE  baseSequence       = -1
+//   [57..60] int32 LE  numRecords         = 1
+//   [61..74] record (14 bytes, varint-encoded — endian-neutral)
+//
+// Record layout (14 bytes, same varint scheme as RecordBatchBuilder::append):
 //   [0]     int8   attributes  = 0
-//   [1]     varint timestampDelta = 0  (encodes to 0x00, 1 byte)
-//   [2]     varint offsetDelta   = 0  (encodes to 0x00, 1 byte)
-//   [3]     varint keyLength     = 2  (encodes to 0x04, zig-zag(2)=4, 1 byte)
-//   [4..5]  int16  key          = controlType (0=commit, 1=abort)
-//   [6]     varint valueLength  = 6  (encodes to 0x0C, zig-zag(6)=12, 1 byte)
-//   [7..8]  int16  version      = 1
-//   [9..12] int32  coordinatorEpoch
-//   [13]    varint headersCount = 0  (encodes to 0x00, 1 byte)
+//   [1]     varint timestampDelta = 0
+//   [2]     varint offsetDelta   = 0
+//   [3]     varint keyLength     = 2  (zig-zag(2) = 0x04)
+//   [4..5]  int16 LE  key       = controlType (0=Commit, 1=Abort)
+//   [6]     varint valueLength  = 6  (zig-zag(6) = 0x0C)
+//   [7..8]  int16 LE  version   = 1
+//   [9..12] int32 LE  coordinatorEpoch
+//   [13]    varint headersCount = 0
 //
-// Total record = 14 bytes. ENCODED_SIZE = 61 + 14 = 75. ✓
+// Total = 61 + 14 = 75 bytes = ENCODED_SIZE. ✓
 //
-// attributes:
+// attributes (bit field, same as RecordBatchBuilder):
 //   bit 4 (0x0010) = isTransactional
-//   bit 5 (0x0020) = isControl
-//   => base = 0x0030
+//   bit 5 (0x0020) = isControl  ← identifies this as a control batch
+//   => 0x0030
 // ---------------------------------------------------------------------------
 /*static*/
 std::vector<uint8_t> ControlMarker::build(ProducerId    producerId,
@@ -148,75 +186,91 @@ std::vector<uint8_t> ControlMarker::build(ProducerId    producerId,
     std::vector<uint8_t> buf(ENCODED_SIZE, 0u);
     uint8_t* p = buf.data();
 
-    // Batch header
-    write_le<int64_t>(p +  0, int64_t{0});                      // baseOffset
-    write_le<int32_t>(p +  8, int32_t{ENCODED_SIZE - 12});       // batchLengthBytes = 75-12=63
-    write_le<int32_t>(p + 12, int32_t{-1});                     // partitionLeaderEpoch
-    p[16] = static_cast<uint8_t>(kMagicByte);                   // magic = 2
-    // CRC at [17..20] — filled after body is encoded
-    int16_t attrs = kAttrControl | kAttrTransactional;           // 0x0030
-    write_le<int16_t>(p + 21, attrs);                            // attributes
-    write_le<int32_t>(p + 23, int32_t{0});                      // lastOffsetDelta
-    write_le<int64_t>(p + 27, int64_t{0});                      // firstTimestamp
-    write_le<int64_t>(p + 35, int64_t{0});                      // maxTimestamp
-    write_le<int64_t>(p + 43, producerId);                       // producerId
-    write_le<int16_t>(p + 51, producerEpoch);                    // producerEpoch
-    write_le<int32_t>(p + 53, int32_t{-1});                     // baseSequence
-    write_le<int32_t>(p + 57, int32_t{1});                      // numRecords
+    // Batch header — LITTLE-ENDIAN (matches rune-protocol RecordBatch layout).
+    write_le64(p +  0, int64_t{0});                           // baseOffset (log stamps)
+    write_le32(p +  8, int32_t(ENCODED_SIZE - 12));           // batchLengthBytes = 63
+    write_le32(p + 12, int32_t{-1});                          // partitionLeaderEpoch
+    p[16] = static_cast<uint8_t>(kMagicByte);                 // magic = 2
+    // CRC at [17..20] — filled after body is encoded.
+    int16_t attrs = kAttrControl | kAttrTransactional;        // 0x0030
+    write_le16(p + 21, attrs);                                 // attributes (LE)
+    write_le32(p + 23, int32_t{0});                           // lastOffsetDelta
+    write_le64(p + 27, int64_t{0});                           // firstTimestamp
+    write_le64(p + 35, int64_t{0});                           // maxTimestamp
+    write_le64(p + 43, producerId);                            // producerId
+    write_le16(p + 51, static_cast<int16_t>(producerEpoch));  // producerEpoch
+    write_le32(p + 53, int32_t{-1});                          // baseSequence
+    write_le32(p + 57, int32_t{1});                           // numRecords
 
-    // Record at [61..]
+    // Record at [61..74] — varint fields are byte-stream (endian-neutral).
     std::size_t rpos = BATCH_HEADER_SIZE; // = 61
-    p[rpos++] = 0u;                                              // attributes
+    p[rpos++] = 0u;                                            // record attributes
 
-    // timestampDelta = 0 (zig-zag varint)
-    rpos += write_varint_zigzag(p, rpos, 0);
-    // offsetDelta = 0 (zig-zag varint)
-    rpos += write_varint_zigzag(p, rpos, 0);
-    // keyLength = 2 (zig-zag varint; zig-zag(2) = 4 = 0x04)
-    rpos += write_varint_zigzag(p, rpos, 2);
-    // key = controlType as int16
-    write_le<int16_t>(p + rpos, static_cast<int16_t>(controlType)); rpos += 2;
-    // valueLength = 6 (zig-zag varint; zig-zag(6) = 12 = 0x0C)
-    rpos += write_varint_zigzag(p, rpos, 6);
-    // value: version(int16=1) + coordinatorEpoch(int32)
-    write_le<int16_t>(p + rpos, int16_t{1});           rpos += 2;
-    write_le<int32_t>(p + rpos, coordinatorEpoch);     rpos += 4;
-    // headersCount = 0 (zig-zag varint)
-    rpos += write_varint_zigzag(p, rpos, 0);
+    rpos += write_varint_zigzag(p, rpos, 0);  // timestampDelta = 0
+    rpos += write_varint_zigzag(p, rpos, 0);  // offsetDelta = 0
+    rpos += write_varint_zigzag(p, rpos, 2);  // keyLength = 2 (zig-zag(2)=4=0x04)
+
+    // key = controlType as int16 LE
+    write_le16(p + rpos, static_cast<int16_t>(controlType));
+    rpos += 2;
+
+    rpos += write_varint_zigzag(p, rpos, 6);  // valueLength = 6 (zig-zag(6)=12=0x0C)
+
+    // value: version(int16 LE = 1) + coordinatorEpoch(int32 LE)
+    write_le16(p + rpos, int16_t{1});          rpos += 2;
+    write_le32(p + rpos, coordinatorEpoch);    rpos += 4;
+
+    rpos += write_varint_zigzag(p, rpos, 0);  // headersCount = 0
 
     assert(rpos == ENCODED_SIZE);
 
-    // Compute CRC32C over bytes [CRC_DATA_START..ENCODED_SIZE).
+    // CRC32C over bytes [CRC_DATA_START..ENCODED_SIZE) — same range as
+    // RecordBatchBuilder::build() which covers [kAttributesOffset..end].
     uint32_t cksum = crc32c(p + CRC_DATA_START, ENCODED_SIZE - CRC_DATA_START);
-    write_le<uint32_t>(p + CRC_OFFSET, cksum);
+    // Store CRC little-endian (matching RecordBatch).
+    p[CRC_OFFSET + 0] = static_cast<uint8_t>(cksum);
+    p[CRC_OFFSET + 1] = static_cast<uint8_t>(cksum >>  8);
+    p[CRC_OFFSET + 2] = static_cast<uint8_t>(cksum >> 16);
+    p[CRC_OFFSET + 3] = static_cast<uint8_t>(cksum >> 24);
 
     return buf;
 }
 
 // ---------------------------------------------------------------------------
-// isControlBatch — S1 fix: bounds check + CRC verify + magic + CONTROL bit.
+// isControlBatch — reads the LE RecordBatch format (all-LE unification).
+//
+// Checks: avail >= ENCODED_SIZE, magic == 2, CRC32C valid (LE-stored),
+// CONTROL attribute bit set in LE int16 at [21..22].
 // ---------------------------------------------------------------------------
 /*static*/
 bool ControlMarker::isControlBatch(const uint8_t* buf,
                                     std::size_t    offset,
                                     std::size_t    avail) noexcept {
-    // S1: must have at least ENCODED_SIZE bytes available.
+    // Must have at least ENCODED_SIZE bytes available.
     if (avail < ENCODED_SIZE) return false;
     const uint8_t* p = buf + offset;
     // Check magic byte at [16].
     if (p[16] != static_cast<uint8_t>(kMagicByte)) return false;
-    // S1: verify CRC32C before trusting any other field (including the CONTROL bit).
-    // CRC covers bytes [CRC_DATA_START..ENCODED_SIZE).
-    uint32_t stored   = read_le<uint32_t>(p + CRC_OFFSET);
+    // Verify CRC32C before trusting any other field.
+    // CRC stored as LE uint32 at [17..20]; covers bytes [21..ENCODED_SIZE).
+    uint32_t stored   = uint32_t(p[CRC_OFFSET])
+                      | (uint32_t(p[CRC_OFFSET + 1]) <<  8)
+                      | (uint32_t(p[CRC_OFFSET + 2]) << 16)
+                      | (uint32_t(p[CRC_OFFSET + 3]) << 24);
     uint32_t computed = crc32c(p + CRC_DATA_START, ENCODED_SIZE - CRC_DATA_START);
     if (stored != computed) return false;
-    // Check CONTROL bit (bit 5) in attributes at [21..22].
-    int16_t attrs = read_le<int16_t>(p + 21);
+    // Check CONTROL bit (bit 5 = 0x0020) in LE int16 attributes at [21..22].
+    int16_t attrs = read_le16(p + 21);
     return (attrs & kAttrControl) != 0;
 }
 
 // ---------------------------------------------------------------------------
-// extract — S1 fix: bounds-checked varint reads + isControlBatch check.
+// extract — decode ControlMarkerPayload from a LE control batch.
+//
+// Reads batch header fields as LE (producerId at [43..50], producerEpoch at
+// [51..52]) and record key/value using bounds-checked varint reads.
+// The record key (int16 LE) encodes controlType; the record value (6 bytes)
+// encodes version(int16 LE) + coordinatorEpoch(int32 LE).
 // ---------------------------------------------------------------------------
 /*static*/
 bool ControlMarker::extract(const uint8_t*       buf,
@@ -227,43 +281,44 @@ bool ControlMarker::extract(const uint8_t*       buf,
     if (!isControlBatch(buf, offset, avail)) return false;
 
     const uint8_t* p   = buf + offset;
-    // avail is already >= ENCODED_SIZE at this point (isControlBatch checked).
+    // avail >= ENCODED_SIZE (isControlBatch verified).
     const std::size_t end = ENCODED_SIZE; // relative to p
 
-    out.producerId    = read_le<int64_t>(p + 43);
-    out.producerEpoch = read_le<int16_t>(p + 51);
+    // Read batch header fields — LITTLE-ENDIAN.
+    out.producerId    = read_le64(p + 43);
+    out.producerEpoch = read_le16(p + 51);
 
-    // Decode the record starting at [61].
-    std::size_t rpos = BATCH_HEADER_SIZE; // 61
-    // attributes (1 byte)
+    // Decode the record starting at [BATCH_HEADER_SIZE = 61].
+    std::size_t rpos = BATCH_HEADER_SIZE;
+    // record attributes (1 byte)
     if (rpos + 1 > end) return false;
     rpos += 1;
 
-    // timestampDelta (varint) — bounds-checked
+    // timestampDelta (varint)
     int64_t dummy{};
     if (!read_varint_zigzag_safe(p, rpos, end, dummy)) return false;
     // offsetDelta (varint)
     if (!read_varint_zigzag_safe(p, rpos, end, dummy)) return false;
-    // keyLength (varint)
+    // keyLength (varint): must be 2
     int64_t keyLen{};
     if (!read_varint_zigzag_safe(p, rpos, end, keyLen)) return false;
-    // key = controlType (int16)
     if (keyLen == 2) {
         if (rpos + 2 > end) return false;
-        int16_t ct = read_le<int16_t>(p + rpos);
+        // key = controlType as int16 LE
+        int16_t ct = read_le16(p + rpos);
         out.controlType = static_cast<ControlType>(ct);
         rpos += 2;
     } else {
         return false;
     }
-    // valueLength (varint)
+    // valueLength (varint): must be 6
     int64_t valLen{};
     if (!read_varint_zigzag_safe(p, rpos, end, valLen)) return false;
     if (valLen != 6) return false;
     if (rpos + 6 > end) return false;
-    // value: version(int16) + coordinatorEpoch(int32)
+    // value: version(int16 LE) + coordinatorEpoch(int32 LE)
     rpos += 2; // skip version
-    out.coordinatorEpoch = read_le<int32_t>(p + rpos);
+    out.coordinatorEpoch = read_le32(p + rpos);
     rpos += 4;
 
     return true;

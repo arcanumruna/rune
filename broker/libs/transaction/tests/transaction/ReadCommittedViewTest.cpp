@@ -6,8 +6,9 @@
 // Strategy:
 //   - Log-independent tests for LsoTracker and AbortedTxnIndex (pure in-memory).
 //   - Log-based tests build real rune::storage::Log instances in unique tmp dirs,
-//     write data batches (BE via RecordBatchBuilder) and control batches (LE via
-//     ControlMarker::build), then call ReadCommittedView::rebuild() + read().
+//     write data batches (LE via RecordBatchBuilder) and control batches (LE via
+//     ControlMarker::build — all-LE unification: both use the same LE
+//     RecordBatch format), then call ReadCommittedView::rebuild() + read().
 //
 // Unique temp paths: /tmp/rune_rcv_<pid>_<counter>
 // ---------------------------------------------------------------------------
@@ -48,70 +49,16 @@ static std::string makeTmpDir()
     return dir;
 }
 
-/// Build a big-endian data batch with a specific producerId (overrides the
-/// RecordBatchBuilder's default -1 at kProducerIdOffset=43 BE).
-///
-/// The producerId field at bytes [43..50] in the BE batch header.
+/// Build a little-endian data batch with a specific producerId.
+/// Uses RecordBatchBuilder's setProducerId() for clean LE encoding.
 static std::vector<uint8_t> makeDataBatch(int64_t baseOffset,
                                            int64_t producerId,
                                            std::string_view value = "payload")
 {
     rune::protocol::RecordBatchBuilder builder(baseOffset, 0);
+    builder.setProducerId(producerId);
     builder.append({}, value, 0);
-    auto batch = builder.build();
-
-    // Patch producerId at kProducerIdOffset (43), big-endian.
-    constexpr int kPidOff = rune::protocol::batch::kProducerIdOffset; // 43
-    for (int i = 0; i < 8; ++i) {
-        batch[kPidOff + i] = static_cast<uint8_t>(
-            producerId >> ((7 - i) * 8));
-    }
-
-    // Recompute CRC (CRC covers [kAttributesOffset..end], stored at kCrcOffset).
-    using namespace rune::protocol;
-    // The CRC field and its dependencies:
-    //   CRC covers bytes [kAttributesOffset..end].
-    //   CRC stored at kCrcOffset (17), as big-endian uint32.
-    //   We patch producerId which is inside the CRC region — recompute.
-    //
-    // Use the same crc32c as rune-protocol (defined inline in Crc32c.h).
-    // We can use RecordBatchReader::ensureValid() to verify after patching.
-    // But we need to actually recompute the CRC. Use RecordBatchBuilder's
-    // own logic by rebuilding. But that would reset producerId.
-    //
-    // Alternative: use the ControlMarker::crc32c (private) — can't access it.
-    //
-    // Best approach: Patch the CRC manually using the same polynomial.
-    // CRC32C polynomial = 0x82F63B78.
-    auto crc32c_fn = [](const uint8_t* data, std::size_t len) -> uint32_t {
-        static uint32_t tbl[256] = {};
-        static bool init = false;
-        if (!init) {
-            for (uint32_t i = 0; i < 256; ++i) {
-                uint32_t c = i;
-                for (int j = 0; j < 8; ++j) c = (c >> 1) ^ (0x82F63B78u & -(c & 1u));
-                tbl[i] = c;
-            }
-            init = true;
-        }
-        uint32_t crc = 0xFFFFFFFFu;
-        for (std::size_t i = 0; i < len; ++i)
-            crc = (crc >> 8) ^ tbl[(crc ^ data[i]) & 0xFFu];
-        return crc ^ 0xFFFFFFFFu;
-    };
-
-    constexpr int kCrcOff   = batch::kCrcOffset;       // 17
-    constexpr int kAttrOff  = batch::kAttributesOffset; // 21 — CRC starts here
-
-    uint32_t crc = crc32c_fn(batch.data() + kAttrOff,
-                               batch.size() - static_cast<std::size_t>(kAttrOff));
-    // Store as big-endian.
-    batch[kCrcOff + 0] = static_cast<uint8_t>(crc >> 24);
-    batch[kCrcOff + 1] = static_cast<uint8_t>(crc >> 16);
-    batch[kCrcOff + 2] = static_cast<uint8_t>(crc >>  8);
-    batch[kCrcOff + 3] = static_cast<uint8_t>(crc);
-
-    return batch;
+    return builder.build();
 }
 
 /// Append a data batch for producerId to a Log and return the assigned offset.
@@ -131,19 +78,18 @@ static int64_t appendControlMarker(rune::storage::Log& log, int64_t producerId,
 {
     int64_t off = log.logEndOffset();
     auto batch = ControlMarker::build(producerId, 0, ct, coordEpoch);
-    // Set the baseOffset in the batch (bytes [0..7] LE int64).
-    std::memcpy(batch.data(), &off, 8);
-    // Note: ControlMarker::isControlBatch() does a CRC check. We must re-CRC
-    // after patching the baseOffset.  But baseOffset is EXCLUDED from the
-    // ControlMarker CRC (bytes [17..20] cover [21..end]).  Actually per the
-    // ControlMarker header the CRC covers bytes [21..end] (CRC_DATA_START=21).
-    // baseOffset is at [0..7] — outside the CRC region. Safe to patch.
+    // Stamp the baseOffset at [0..7] LITTLE-ENDIAN (all-LE unification:
+    // baseOffset is excluded from the CRC region [21..end], so patching
+    // [0..7] does not invalidate the CRC).
+    uint64_t u = static_cast<uint64_t>(off);
+    for (int i = 0; i < 8; ++i)
+        batch[i] = static_cast<uint8_t>(u >> (i * 8));
     log.append(batch, off); // lastOffset = off
     return off;
 }
 
 /// Read all batch base offsets from a view result.
-/// This parses the BE data batches returned by ReadCommittedView::read().
+/// Parses the LE data batches returned by ReadCommittedView::read().
 static std::vector<int64_t> readOffsets(const std::vector<uint8_t>& raw)
 {
     std::vector<int64_t> result;
@@ -1168,14 +1114,9 @@ TEST(ReadCommittedEdgeTest, AbortedRangeBoundaryOffByOneViaRead)
 // unknown/untracked producer).  rebuild() must not crash or produce a spurious
 // aborted range.
 //
-// Note on LogSegment::read() and control-batch-first logs: the storage layer's
-// LogSegment::read() uses RecordBatchReader (BE format) to walk the on-disk
-// buffer for offset-skipping, which cannot parse LE control batches.  When the
-// very first batch in a segment is a control batch, log->read(0,...) returns
-// empty — the committed data at offset 1 is unreachable via read().  This is a
-// known storage-layer limitation (control batches are LE, RecordBatchReader is
-// BE-only). The test therefore focuses on rebuild() robustness (which uses its
-// own LE-aware walk) and does NOT assert on read() output for this layout.
+// P5-4 fix: control batches are now BE RecordBatch format, so LogSegment::read()
+// CAN walk past a control batch at offset 0.  The test now also verifies that
+// read() returns committed data after a leading control marker.
 TEST(ReadCommittedEdgeTest, ControlBatchAtOffsetZeroHandledCorrectly)
 {
     RcvFixture f;

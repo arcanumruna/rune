@@ -1505,28 +1505,12 @@ TEST(LogCleaner, CompactionPreservesProducerIdentity) {
     auto buildProducerBatch = [&](int64_t baseOffset, std::string_view key,
                                   std::string_view val, int64_t ts) {
         RecordBatchBuilder b(baseOffset, ts);
+        // All-LE: use builder setters so the CRC is recomputed correctly.
+        b.setProducerId(expectedPid);
+        b.setProducerEpoch(expectedEpoch);
+        b.setBaseSequence(expectedBaseSeq);
         b.append(key, val, ts);
-        auto batch = b.build();
-        // Patch producerId (offset 43, int64 BE).
-        for (int i = 7; i >= 0; --i)
-            batch[rune::protocol::batch::kProducerIdOffset + (7 - i)] =
-                static_cast<uint8_t>((expectedPid >> (i * 8)) & 0xFF);
-        // Patch producerEpoch (offset 51, int16 BE).
-        batch[rune::protocol::batch::kProducerEpochOffset]     = static_cast<uint8_t>((expectedEpoch >> 8) & 0xFF);
-        batch[rune::protocol::batch::kProducerEpochOffset + 1] = static_cast<uint8_t>(expectedEpoch & 0xFF);
-        // Patch baseSequence (offset 53, int32 BE).
-        for (int i = 3; i >= 0; --i)
-            batch[rune::protocol::batch::kBaseSequenceOffset + (3 - i)] =
-                static_cast<uint8_t>((expectedBaseSeq >> (i * 8)) & 0xFF);
-        // Recompute CRC.
-        uint32_t crc = rune::protocol::crc32c(
-            batch.data() + rune::protocol::batch::kAttributesOffset,
-            batch.size() - rune::protocol::batch::kAttributesOffset);
-        batch[rune::protocol::batch::kCrcOffset]     = static_cast<uint8_t>(crc >> 24);
-        batch[rune::protocol::batch::kCrcOffset + 1] = static_cast<uint8_t>(crc >> 16);
-        batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(crc >> 8);
-        batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(crc);
-        return batch;
+        return b.build();
     };
 
     // k1@0 (superseded) and k1@1 (latest) — both with producer identity.
@@ -1547,26 +1531,36 @@ TEST(LogCleaner, CompactionPreservesProducerIdentity) {
     RecordBatchReader r(bytes.data(), bytes.size());
     EXPECT_TRUE(r.ensureValid()) << "Compacted batch must have a valid CRC";
 
-    // Read raw producer fields from the batch bytes.
-    int64_t gotPid = 0;
-    for (int i = 0; i < 8; ++i)
-        gotPid = (gotPid << 8) | bytes[rune::protocol::batch::kProducerIdOffset + i];
-    EXPECT_EQ(gotPid, expectedPid) << "producerId must be preserved through compaction";
+    // Read raw producer fields from the batch bytes — all-LE (little-endian).
+    // RecordBatch fixed-header fields are LE after the BE→LE unification.
+    auto leRead64 = [&](std::size_t off) -> int64_t {
+        uint64_t u = 0;
+        for (int i = 0; i < 8; ++i)
+            u |= static_cast<uint64_t>(bytes[off + i]) << (i * 8);
+        return static_cast<int64_t>(u);
+    };
+    auto leRead16 = [&](std::size_t off) -> int16_t {
+        return static_cast<int16_t>(
+            static_cast<uint16_t>(bytes[off]) |
+            (static_cast<uint16_t>(bytes[off + 1]) << 8));
+    };
+    auto leRead32 = [&](std::size_t off) -> int32_t {
+        return static_cast<int32_t>(
+            uint32_t(bytes[off]) |
+            (uint32_t(bytes[off + 1]) << 8) |
+            (uint32_t(bytes[off + 2]) << 16) |
+            (uint32_t(bytes[off + 3]) << 24));
+    };
+    int64_t gotPid   = leRead64(rune::protocol::batch::kProducerIdOffset);
+    int16_t gotEpoch = leRead16(rune::protocol::batch::kProducerEpochOffset);
+    int32_t gotSeq   = leRead32(rune::protocol::batch::kBaseSequenceOffset);
 
-    int16_t gotEpoch = static_cast<int16_t>(
-        (static_cast<uint16_t>(bytes[rune::protocol::batch::kProducerEpochOffset]) << 8) |
-         static_cast<uint16_t>(bytes[rune::protocol::batch::kProducerEpochOffset + 1]));
-    EXPECT_EQ(gotEpoch, expectedEpoch) << "producerEpoch must be preserved through compaction";
-
-    int32_t gotSeq = static_cast<int32_t>(
-        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset])     << 24) |
-        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset + 1]) << 16) |
-        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset + 2]) << 8)  |
-        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset + 3])));
+    EXPECT_EQ(gotPid,   expectedPid)     << "producerId must be preserved through compaction";
+    EXPECT_EQ(gotEpoch, expectedEpoch)   << "producerEpoch must be preserved through compaction";
     // The record's sequence = origBaseSequence + offsetDelta within its original batch.
     // For k1@1 in a single-record batch with baseOffset=1: offsetDelta = 1-1 = 0.
     // So expectedSeq = expectedBaseSeq + 0 = 7.
-    EXPECT_EQ(gotSeq, expectedBaseSeq) << "baseSequence must be preserved through compaction";
+    EXPECT_EQ(gotSeq,   expectedBaseSeq) << "baseSequence must be preserved through compaction";
 
     std::filesystem::remove_all(dir);
 }

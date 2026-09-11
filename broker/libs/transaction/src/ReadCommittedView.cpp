@@ -1,22 +1,26 @@
 // ---------------------------------------------------------------------------
 // ReadCommittedView.cpp — LSO tracking + aborted-txn index + read_committed
-//                          filtering. (P5-4)
+//                          filtering. (P5-4, all-LE)
 //
 // Namespace: rune::transaction
 // C++23. NO locks. NO busy-spin. NO hot-path alloc beyond scan buffers.
 // Single-writer.
+//
+// All-LE: RecordBatch fixed-header fields are now little-endian.
+// RecordBatchReader is the unified LE reader for both data and control batches.
+// The private extractProducerId() helper now uses RecordBatchReader::producerId()
+// (LE) directly — the old BE dual-path has been removed.
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/transaction/ControlMarker.h>
 
 #include <rune/storage/Log.h>
-// rune-protocol RecordBatch: big-endian field accessors.
+// rune-protocol RecordBatch: little-endian field accessors (unified).
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
 #include <cassert>
-#include <cstring>
 #include <limits>
 
 namespace rune::transaction {
@@ -27,90 +31,26 @@ namespace rune::transaction {
 
 namespace {
 
-// Extract producerId from a raw batch buffer at position `pos` within `buf`.
-// The buffer may contain:
-//   (a) a rune-protocol RecordBatch (big-endian, magic=2, CONTROL bit clear)
-//   (b) a ControlMarker batch (little-endian, magic=2, CONTROL bit set)
-//
-// We detect (b) via ControlMarker::isControlBatch() and use ControlMarker::extract().
-// For (a) we read big-endian at the kProducerIdOffset.
-//
-// Returns -1 if extraction fails or the batch is malformed.
+// All-LE: RecordBatch fixed-header fields are now little-endian for BOTH
+// data batches and control batches.  RecordBatchReader provides the unified
+// LE reader; RecordBatchReader::producerId() reads the LE int64 at offset 43.
+// Control batches are identified by RecordBatchReader::isControl() which checks
+// the CONTROL attribute bit (0x0020) in the LE int16 at [21..22].
+// ControlMarker::isControlBatch() also does CRC verification (stronger check).
+
+// Extract producerId from a raw LE batch at position `pos`.
+// Works for both data batches and LE control batches (unified header layout).
+// Returns -1 if extraction fails.
 inline int64_t extractProducerId(const uint8_t* buf, std::size_t pos,
                                   std::size_t avail) noexcept
 {
-    if (avail < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
-        return -1;
+    using namespace rune::protocol::batch;
+    if (avail < static_cast<std::size_t>(kRecordBatchOverhead)) return -1;
+    if (avail < static_cast<std::size_t>(kProducerIdOffset + 8)) return -1;
 
-    if (ControlMarker::isControlBatch(buf, pos, avail)) {
-        ControlMarkerPayload payload;
-        if (!ControlMarker::extract(buf, pos, payload, avail)) return -1;
-        return payload.producerId;
-    }
-
-    // rune-protocol big-endian: producerId at kProducerIdOffset (43..50).
-    using namespace rune::protocol;
-    if (avail < static_cast<std::size_t>(batch::kProducerIdOffset + 8)) return -1;
-    const uint8_t* p = buf + pos + batch::kProducerIdOffset;
-    int64_t pid = 0;
-    for (int i = 0; i < 8; ++i)
-        pid = (pid << 8) | static_cast<uint8_t>(p[i]);
-    return pid;
-}
-
-// Walk the batch stream in `raw` and invoke `fn` for each batch.
-// fn(const uint8_t* batchStart, std::size_t batchBytes, int64_t baseOffset,
-//    int32_t lastOffsetDelta, bool isControl, int64_t producerId)
-// Returns false from fn to stop early.
-template<typename Fn>
-static void walkBatches(const uint8_t* raw, std::size_t rawSize, Fn&& fn)
-{
-    std::size_t pos = 0;
-    while (pos < rawSize) {
-        std::size_t rem = rawSize - pos;
-        if (rem < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
-            break;
-
-        bool ctrl = ControlMarker::isControlBatch(raw, pos, rem);
-
-        // Read batch length.
-        int32_t totalLen = 0;
-        if (ctrl) {
-            // ControlMarker: fixed size.
-            totalLen = static_cast<int32_t>(ControlMarker::ENCODED_SIZE);
-        } else {
-            // rune-protocol big-endian: length at [8..11] = batchLengthBytes, total = +12.
-            using namespace rune::protocol;
-            rune::protocol::RecordBatchReader reader(raw + pos, rem);
-            totalLen = reader.totalLength();
-        }
-
-        if (totalLen <= 0 || pos + static_cast<std::size_t>(totalLen) > rawSize)
-            break;
-
-        // Extract baseOffset.
-        int64_t baseOffset = 0;
-        int32_t lastOffDelta = 0;
-        if (ctrl) {
-            // ControlMarker: baseOffset at [0..7] little-endian int64.
-            std::memcpy(&baseOffset, raw + pos, 8);
-            // lastOffsetDelta at [23..26] little-endian int32 — always 0 for control.
-            lastOffDelta = 0;
-        } else {
-            using namespace rune::protocol;
-            rune::protocol::RecordBatchReader reader(raw + pos, rem);
-            baseOffset   = reader.baseOffset();
-            lastOffDelta = reader.lastOffsetDelta();
-        }
-
-        int64_t pid = extractProducerId(raw, pos, rem);
-
-        bool cont = fn(raw + pos, static_cast<std::size_t>(totalLen),
-                       baseOffset, lastOffDelta, ctrl, pid);
-        if (!cont) break;
-
-        pos += static_cast<std::size_t>(totalLen);
-    }
+    // All fields are LE — use the unified RecordBatchReader.
+    rune::protocol::RecordBatchReader r(buf + pos, avail);
+    return r.producerId();
 }
 
 } // anonymous namespace
@@ -217,9 +157,10 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     auto raw = log->read(0, kMaxScanBytes);
     if (raw.empty()) return;
 
-    // Single-pass scan: walk batches, handling both data and control batches
-    // correctly.  A previous two-pass approach (dead first pass whose results
-    // were discarded by a clear()) doubled rebuild I/O and was removed (P5-4-C1).
+    // Single-pass scan using the unified BE RecordBatchReader for ALL batches.
+    // P5-4 fix: control batches are now BE, so RecordBatchReader can walk them.
+    // Control batches are identified by ControlMarker::isControlBatch() which
+    // reads the CONTROL attribute bit from the BE attributes field [21..22].
     {
         std::size_t pos = 0;
         const uint8_t* data = raw.data();
@@ -230,48 +171,40 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
             if (rem < static_cast<std::size_t>(
                     rune::protocol::batch::kRecordBatchOverhead)) break;
 
-            bool ctrl = ControlMarker::isControlBatch(data, pos, rem);
-
-            int32_t totalLen = 0;
-            int64_t baseOffset = 0;
-            int64_t producerId = -1;
-
-            if (ctrl) {
-                totalLen = static_cast<int32_t>(ControlMarker::ENCODED_SIZE);
-                // LE baseOffset at [0..7].
-                std::memcpy(&baseOffset, data + pos, 8);
-                ControlMarkerPayload payload;
-                if (ControlMarker::extract(data, pos, payload, rem)) {
-                    producerId = payload.producerId;
-
-                    if (baseOffset < hw) {
-                        bool commit = (payload.controlType == ControlType::Commit);
-                        int64_t firstOff = tracker_->onControlMarker(producerId,
-                                                                       baseOffset,
-                                                                       commit);
-                        if (!commit && firstOff >= 0) {
-                            abortedIndex_->onAbortMarker(producerId,
-                                                          firstOff,
-                                                          baseOffset);
-                        }
-                    }
-                }
-            } else {
-                rune::protocol::RecordBatchReader reader(data + pos, rem);
-                totalLen   = reader.totalLength();
-                baseOffset = reader.baseOffset();
-                producerId = extractProducerId(data, pos, rem);
-
-                if (baseOffset < hw && producerId >= 0) {
-                    tracker_->onProduceBatch(producerId, baseOffset);
-                }
-            }
+            // Use RecordBatchReader for ALL batches (data + control both BE now).
+            rune::protocol::RecordBatchReader reader(data + pos, rem);
+            int32_t totalLen   = reader.totalLength();
+            int64_t baseOffset = reader.baseOffset();
 
             if (totalLen <= 0 || pos + static_cast<std::size_t>(totalLen) > rawSize)
                 break;
 
             // Stop scanning beyond HW.
             if (baseOffset >= hw) break;
+
+            bool ctrl = ControlMarker::isControlBatch(data, pos, rem);
+            int64_t producerId = extractProducerId(data, pos, rem);
+
+            if (ctrl) {
+                // Control batch: decode the marker payload and update LSO/aborted index.
+                ControlMarkerPayload payload;
+                if (ControlMarker::extract(data, pos, payload, rem)) {
+                    bool commit = (payload.controlType == ControlType::Commit);
+                    int64_t firstOff = tracker_->onControlMarker(payload.producerId,
+                                                                   baseOffset,
+                                                                   commit);
+                    if (!commit && firstOff >= 0) {
+                        abortedIndex_->onAbortMarker(payload.producerId,
+                                                      firstOff,
+                                                      baseOffset);
+                    }
+                }
+            } else {
+                // Data batch: track open transactions.
+                if (producerId >= 0) {
+                    tracker_->onProduceBatch(producerId, baseOffset);
+                }
+            }
 
             pos += static_cast<std::size_t>(totalLen);
         }
@@ -316,28 +249,14 @@ std::vector<uint8_t> ReadCommittedView::read(rune::storage::Log* log,
         if (rem < static_cast<std::size_t>(
                 rune::protocol::batch::kRecordBatchOverhead)) break;
 
+        // Unified BE reader for both data and control batches (P5-4 fix).
+        rune::protocol::RecordBatchReader reader(data + pos, rem);
+        int32_t totalLen     = reader.totalLength();
+        int64_t baseOffset   = reader.baseOffset();
+        int32_t lastOffDelta = reader.lastOffsetDelta();
+        int64_t producerId   = extractProducerId(data, pos, rem);
+
         bool ctrl = ControlMarker::isControlBatch(data, pos, rem);
-
-        int32_t totalLen = 0;
-        int64_t baseOffset = 0;
-        int32_t lastOffDelta = 0;
-        int64_t producerId = -1;
-
-        if (ctrl) {
-            totalLen     = static_cast<int32_t>(ControlMarker::ENCODED_SIZE);
-            std::memcpy(&baseOffset, data + pos, 8); // LE
-            lastOffDelta = 0;
-            ControlMarkerPayload payload;
-            if (ControlMarker::extract(data, pos, payload, rem)) {
-                producerId = payload.producerId;
-            }
-        } else {
-            rune::protocol::RecordBatchReader reader(data + pos, rem);
-            totalLen     = reader.totalLength();
-            baseOffset   = reader.baseOffset();
-            lastOffDelta = reader.lastOffsetDelta();
-            producerId   = extractProducerId(data, pos, rem);
-        }
 
         if (totalLen <= 0 || pos + static_cast<std::size_t>(totalLen) > rawSize)
             break;
