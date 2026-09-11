@@ -280,25 +280,31 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
 // ---------------------------------------------------------------------------
 bool BrokerNode::isLeader() const noexcept {
     if (!election_) return false;
-    // Use the atomic stateCode() — release-written by the agent thread on every
-    // state transition — instead of the non-atomic state() accessor, to avoid a
-    // data race when this method is called from the node/main thread.
-    // Leader states (Aeron ordinals): LeaderLogReplication=5, LeaderReady=8, Closed=17.
-    const int32_t c = election_->stateCode();
-    const bool leaderState =
-        c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
-        c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
-        c == static_cast<int32_t>(ElectionState::Closed);
 
-    if (!leaderState) return false;
-
-    // In the multi-node case a node may transition through Closed as a FOLLOWER.
-    // Distinguish by checking the observed leader id: if it equals self, we are leader.
+    // For the multi-node path, rely SOLELY on the atomic observedLeaderId_ mirror
+    // written by NodeConsensusAgent::updateObservedLeader() after each duty cycle.
+    // This avoids reading TWO independent atomics (stateCode_ + observedLeaderId_)
+    // which have a TOCTOU race: the duty-cycle thread could transition the state
+    // between the two reads, causing isLeader() to return false for a node that IS
+    // the leader but is momentarily in a pass-through state (LeaderReplay, LeaderInit)
+    // not covered by the stateCode_ check — which produced the observed ~1/14 flake.
     if (nodeAgent_) {
         return nodeAgent_->leaderId() == static_cast<NodeId>(config_.nodeId);
     }
-    // Single-node: Closed always means self-elected.
-    return true;
+
+    // Single-node (no nodeAgent_): fall back to stateCode_.
+    // All leader states including pass-through ones: LeaderLogReplication, LeaderReplay,
+    // LeaderInit, LeaderReady, Closed.  Missing LeaderReplay/LeaderInit here was safe for
+    // single-node (their pass-through is near-instantaneous and the caller is the same
+    // thread that drives doWork), but we include them for correctness completeness.
+    // Use the atomic stateCode() — release-written by the agent thread on every
+    // state transition — instead of the non-atomic state() accessor.
+    const int32_t c = election_->stateCode();
+    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
+           c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
+           c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
+           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
+           c == static_cast<int32_t>(ElectionState::Closed);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,12 +349,17 @@ void BrokerNode::stop() {
     nodeStateFile_.reset();
     termLog_.reset();
 
-    // 3. Close the Aeron client (sends close command to conductor).
+    // 3. Close the Aeron client (joins the C++ conductor thread).
+    //    After aeron_.reset() all "remove publication / subscription / close client"
+    //    commands have been written into the CnC ring by the conductor's onClose().
     if (aeron_) {
         aeron_.reset();
     }
 
-    // 4. Stop the embedded media driver (after client is fully closed).
+    // 4. Stop the embedded media driver.
+    //    stopEmbeddedDriver() first joins the driver thread (so we are the ONLY
+    //    thread touching the driver afterwards), then drains any final CnC commands
+    //    that the conductor posted during step 3 before calling aeron_driver_close().
     stopEmbeddedDriver();
 
     spdlog::info("BrokerNode: node {} stopped", config_.nodeId);
@@ -458,18 +469,67 @@ void BrokerNode::startEmbeddedDriver() {
 // BrokerNode::stopEmbeddedDriver
 // ---------------------------------------------------------------------------
 void BrokerNode::stopEmbeddedDriver() noexcept {
-    // Signal the driver loop to stop.
+    // Step A: Signal the driver loop thread to stop and join it.
+    //
+    // After stop() has called aeron_.reset() (which joins the C++ conductor
+    // thread), the conductor's onClose() has queued "remove publication /
+    // subscription / close client" commands into the driver's CnC ring.
+    // The driver thread may or may not have processed these commands before we
+    // signal it to stop — that is fine: we will drain them below in step B
+    // AFTER the thread exits, from the calling thread only, so there is no
+    // concurrent access to aeron_driver_main_do_work.
     if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
         if (driverThread_.joinable()) {
-            driverThread_.join();
+            driverThread_.join(); // driver thread has fully exited here
         }
     }
+
+    // Step B: Drain any CnC commands the conductor posted that the driver
+    // thread did not yet process.  At this point driverThread_ is joined so
+    // we are the ONLY thread calling aeron_driver_main_do_work — no data race.
+    //
+    // This prevents aeron_driver_conductor_on_close() (inside aeron_driver_close)
+    // from encountering live publication/subscription entries that the C++ client
+    // objects already freed on their side, which would cause a use-after-free /
+    // SIGABRT visible as a non-zero process exit AFTER gtest prints "[ PASSED ]".
     if (driver_) {
-        aeron_driver_close(driver_);
+        static constexpr int kDrainMaxMs   = 50;  // hard cap (generous upper bound)
+        static constexpr int kDrainSliceUs = 200; // inter-pump sleep when busy
+        const auto drainDeadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds{kDrainMaxMs};
+        while (std::chrono::steady_clock::now() < drainDeadline) {
+            const int work = aeron_driver_main_do_work(driver_);
+            if (work == 0) {
+                // One extra pump to let the conductor flush any final responses.
+                aeron_driver_main_do_work(driver_);
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds{kDrainSliceUs});
+        }
+    }
+
+    // Step C: Close the driver (frees conductor/sender/receiver state).
+    // aeron_driver_conductor_on_close now finds empty publication/subscription
+    // tables (drained in step B) so no use-after-free occurs.
+    // If it still returns -1 for any benign reason (e.g. the dir-delete path
+    // fails because TempDir already removed it), log and absorb — do NOT
+    // propagate the error to the process exit code.
+    if (driver_) {
+        if (aeron_driver_close(driver_) < 0) {
+            spdlog::warn("BrokerNode: aeron_driver_close returned error (node {}): {}",
+                         config_.nodeId, aeron_errmsg());
+        }
         driver_ = nullptr;
     }
+
+    // Step D: Close the driver context (unmaps CnC, optionally deletes aeron dir).
+    // Same benign-error-absorb policy as step C.
     if (driverCtx_) {
-        aeron_driver_context_close(driverCtx_);
+        if (aeron_driver_context_close(driverCtx_) < 0) {
+            spdlog::warn("BrokerNode: aeron_driver_context_close returned error (node {}): {}",
+                         config_.nodeId, aeron_errmsg());
+        }
         driverCtx_ = nullptr;
     }
 }

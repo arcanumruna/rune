@@ -1618,6 +1618,196 @@ TEST(ElectionLog, PartB8_C5_PassthroughGuard_PositivePath_FollowerReachesLogInit
            "past FollowerReplay without triggering the PHASE-2-DEFERRED assert";
 }
 
+// ===========================================================================
+// GROUP 9: Multi-node CLOSED leader heartbeat (closedLeaderHeartbeat shim)
+//          BR-3b fix: lock the shim against regression.
+// ===========================================================================
+
+// CH-1: Single-member Election in CLOSED emits NOTHING on doWork (no-op path).
+//       nextDeadlineNs() returns INT64_MIN for single-member CLOSED.
+//       Extends the existing L6 test with explicit sink assertion.
+TEST(ElectionLog, ClosedHeartbeat_SingleMember_IsNoop) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
+    int64_t nowNs = 1'000'000LL;
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.state(), ElectionState::Closed);
+
+    pub.clear();
+    Term termBefore = e.leadershipTermId();
+
+    // Advance past many status intervals and pump repeatedly — must produce no NLT.
+    for (int i = 0; i < 10; ++i) {
+        nowNs += kStatusIntervalNs + 1;
+        int work = e.doWork(nowNs);
+        EXPECT_EQ(work, 0)
+            << "CH-1: single-member CLOSED doWork must return 0 (no-op), got " << work;
+    }
+    EXPECT_TRUE(pub.nltCalls.empty())
+        << "CH-1: single-member CLOSED leader must not emit any NLT";
+    EXPECT_EQ(e.leadershipTermId(), termBefore)
+        << "CH-1: leadershipTermId must not change in CLOSED (no re-election)";
+    // nextDeadlineNs must remain INT64_MIN — no pending deadline for single-member CLOSED.
+    EXPECT_EQ(e.nextDeadlineNs(), INT64_MIN)
+        << "CH-1: nextDeadlineNs() must be INT64_MIN for single-member CLOSED";
+}
+
+// CH-2: 3-member leader in CLOSED re-emits NLT at the status interval with the
+//       SAME leadershipTermId (no term increment).  This is the core safety
+//       property of closedLeaderHeartbeat: late joiners receive the existing
+//       leader's term so they can converge without re-triggering a new election.
+TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Leader_EmitsNLT_SameTermId) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    // seed=0: bringToLeaderLogReplication nominates immediately.
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+
+    // Drive node 0 through canvass/ballot to LeaderLogReplication, then to CLOSED.
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication)
+        << "CH-2 setup: must reach LeaderLogReplication first";
+    ASSERT_TRUE(driveLeaderToClosed(e, nowNs, pub, {1, 2}))
+        << "CH-2 setup: 3-member leader (node 0) must reach CLOSED";
+    ASSERT_EQ(e.state(), ElectionState::Closed);
+    ASSERT_EQ(e.leaderMemberId(), 0) << "CH-2 setup: node 0 must be the leader";
+
+    const Term leaderTerm = e.leadershipTermId();
+    pub.clear();
+
+    // --- Verify nextDeadlineNs() returns a real heartbeat deadline (not INT64_MIN) ---
+    int64_t deadline = e.nextDeadlineNs();
+    EXPECT_NE(deadline, INT64_MIN)
+        << "CH-2: multi-node leader in CLOSED must have a pending heartbeat deadline";
+    EXPECT_LE(deadline, nowNs + kStatusIntervalNs + 1)
+        << "CH-2: heartbeat deadline must be within one status interval";
+
+    // Advance past the status interval and call doWork.
+    nowNs = deadline + 1;  // exactly past the deadline
+    int work = e.doWork(nowNs);
+    EXPECT_GT(work, 0)
+        << "CH-2: multi-node leader CLOSED doWork past status interval must return > 0";
+
+    // Exactly two NLT messages must have been emitted: one to peer 1, one to peer 2.
+    ASSERT_EQ(pub.nltCalls.size(), 2u)
+        << "CH-2: leader in CLOSED must emit NLT to both peers (2 NLTs for 3-member cluster)";
+
+    std::vector<NodeId> targets;
+    for (auto& nlt : pub.nltCalls) targets.push_back(nlt.toMember);
+    std::sort(targets.begin(), targets.end());
+    EXPECT_EQ(targets[0], 1) << "CH-2: NLT must be addressed to peer 1";
+    EXPECT_EQ(targets[1], 2) << "CH-2: NLT must be addressed to peer 2";
+
+    // Key safety property: leadershipTermId in the NLT must match the original term.
+    // The shim MUST NOT increment the term — that would start a new election.
+    for (auto& nlt : pub.nltCalls) {
+        EXPECT_EQ(nlt.leadershipTermId, leaderTerm)
+            << "CH-2: NLT leadershipTermId must equal the original CLOSED term (no increment)";
+        EXPECT_EQ(nlt.nextLeadershipTermId, leaderTerm)
+            << "CH-2: NLT nextLeadershipTermId must equal the original CLOSED term";
+        EXPECT_EQ(nlt.leaderMemberId, 0)
+            << "CH-2: NLT leaderMemberId must identify node 0 as leader";
+    }
+    // The election's own leadershipTermId must not have changed.
+    EXPECT_EQ(e.leadershipTermId(), leaderTerm)
+        << "CH-2: Election::leadershipTermId_ must not change during CLOSED heartbeat";
+}
+
+// CH-3: 3-member leader in CLOSED emits MULTIPLE heartbeats on successive
+//       clock advances, each carrying the SAME term.  Each heartbeat is
+//       bounded by the status interval (no skipping).
+TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Leader_MultipleHeartbeats_SameTerm) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+    ASSERT_TRUE(driveLeaderToClosed(e, nowNs, pub, {1, 2}));
+    ASSERT_EQ(e.state(), ElectionState::Closed);
+    ASSERT_EQ(e.leaderMemberId(), 0);
+
+    const Term leaderTerm = e.leadershipTermId();
+    pub.clear();
+
+    // Fire 3 heartbeat intervals.
+    static constexpr int kHeartbeats = 3;
+    for (int h = 0; h < kHeartbeats; ++h) {
+        pub.clear();
+        int64_t d = e.nextDeadlineNs();
+        ASSERT_NE(d, INT64_MIN) << "CH-3: heartbeat deadline must be valid at interval " << h;
+        nowNs = d + 1;
+        int work = e.doWork(nowNs);
+        EXPECT_GT(work, 0) << "CH-3: doWork must report work at interval " << h;
+        ASSERT_EQ(pub.nltCalls.size(), 2u)
+            << "CH-3: 2 NLTs expected per heartbeat at interval " << h;
+        for (auto& nlt : pub.nltCalls) {
+            EXPECT_EQ(nlt.leadershipTermId, leaderTerm)
+                << "CH-3: NLT leadershipTermId must remain " << leaderTerm
+                << " at interval " << h;
+            EXPECT_EQ(nlt.nextLeadershipTermId, leaderTerm)
+                << "CH-3: NLT nextLeadershipTermId must remain " << leaderTerm
+                << " at interval " << h;
+        }
+    }
+
+    // Election state must still be CLOSED — heartbeat must not transition the state.
+    EXPECT_EQ(e.state(), ElectionState::Closed)
+        << "CH-3: CLOSED state must be preserved across " << kHeartbeats << " heartbeat intervals";
+    EXPECT_EQ(e.leadershipTermId(), leaderTerm)
+        << "CH-3: leadershipTermId must remain " << leaderTerm << " after " << kHeartbeats << " heartbeats";
+}
+
+// CH-4: 3-member FOLLOWER in CLOSED emits no NLT (only the leader heartbeats).
+//       Drive node 0 to CLOSED as a follower (leader = node 1).
+TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Follower_IsNoop) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // Node 0 is a follower that voted for node 1.
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    e.onRequestVote(0, 0, 1, /*candidateId=*/1, nowNs); // vote for node 1 → FOLLOWER_BALLOT
+    ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+
+    // Leader 1 sends NLT → follower path → CLOSED.
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, /*leadershipTermId=*/1, 0, 0, 0, 0,
+                          /*leaderMemberId=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.state(), ElectionState::Closed);
+    ASSERT_EQ(e.leaderMemberId(), 1) << "CH-4 setup: leader must be node 1, not node 0";
+
+    pub.clear();
+
+    // nextDeadlineNs must be INT64_MIN for a follower in CLOSED (no heartbeat).
+    EXPECT_EQ(e.nextDeadlineNs(), INT64_MIN)
+        << "CH-4: follower in CLOSED must return INT64_MIN deadline (no heartbeat)";
+
+    // Advance past multiple status intervals — no NLT must be emitted.
+    for (int i = 0; i < 5; ++i) {
+        nowNs += kStatusIntervalNs + 1;
+        int work = e.doWork(nowNs);
+        EXPECT_EQ(work, 0)
+            << "CH-4: follower CLOSED doWork must return 0 at step " << i;
+    }
+    EXPECT_TRUE(pub.nltCalls.empty())
+        << "CH-4: follower in CLOSED must never emit NLT";
+}
+
 // B-8b: C5 positive path — leaderReplay pass-through also must not crash when
 //       logPosition_ == appendPosition_.
 TEST(ElectionLog, PartB8b_C5_PassthroughGuard_LeaderReplay_PositivePath) {
