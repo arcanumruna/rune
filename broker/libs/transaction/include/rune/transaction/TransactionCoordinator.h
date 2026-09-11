@@ -27,9 +27,8 @@
 //   Ongoing     + endTransaction(commit) → PrepareCommit
 //   Ongoing     + endTransaction(abort)  → PrepareAbort
 //   Ongoing     + timeout (doWork)       → PrepareAbort
-//   PrepareCommit + completeTransaction  → CompleteCommit
-//   PrepareAbort  + completeTransaction  → CompleteAbort
-//   CompleteCommit/CompleteAbort + next init/addPartitions → (via initProducerId bump) → Empty
+//   PrepareCommit + completeTransaction  → CompleteCommit → Empty
+//   PrepareAbort  + completeTransaction  → CompleteAbort  → Empty
 //
 // ## InitProducerId / Zombie Fencing
 //
@@ -38,12 +37,31 @@
 //   Known txnId (re-init) → BUMP epoch (epoch++; zombie producer with old epoch fenced);
 //                           if Ongoing, first drive to PrepareAbort (mirror Kafka's
 //                           "PrepareEpochFence" path), then reset to Empty.
+//   Known txnId in PrepareCommit/PrepareAbort/CompleteCommit/CompleteAbort →
+//                           kConcurrentTransactions (Kafka EOS: reject, let in-flight finish).
 //
 // ## Transaction Timeout
 //
 //   doWork(nowNs) reaps Ongoing transactions where
-//   nowNs - txnStartNs > txnTimeoutMs * 1_000_000 by transitioning to PrepareAbort.
+//   nowNs - txnStartNs > txnTimeoutMs * 1_000_000 by transitioning to PrepareAbort
+//   and persisting the transition to the log.
 //   Samples nowNs ONCE per call. Returns work count. 0 when idle. NEVER spins.
+//
+// ## Internally-initiated aborts (fence + timeout) — B1/B2 resolution
+//
+//   Both fence-abort (initProducerId on Ongoing) and timeout-abort (doWork)
+//   transition to PrepareAbort without a live client request.  The coordinator
+//   exposes pendingMarkerTransactions() which returns all PrepareAbort/PrepareCommit
+//   entries that were internally initiated (markersPending == true).
+//   The caller MUST call ControlMarker::resolvePendingMarkers() and then
+//   completeTransaction() for each such entry to write ABORT markers and advance
+//   to CompleteAbort → Empty.  A recovered PrepareAbort (from the log) also sets
+//   markersPending so the same code path resolves it after failover.
+//
+// ## Epoch overflow
+//
+//   When producerEpoch == INT16_MAX, a new producerId is allocated (epoch resets
+//   to 0), matching Kafka's behaviour — never wrap to 0 on the same PID.
 //
 // ## Error Codes (returned in result structs)
 //
@@ -53,7 +71,7 @@
 //   kInvalidTransition    = 3   (state machine rejects the operation)
 //   kUnknownTxnId         = 4   (transactionalId not found)
 //   kInvalidTxnTimeout    = 5   (txnTimeoutMs out of range)
-//   kConcurrentTransactions = 6 (InitProducerId while non-terminal state, after abort)
+//   kConcurrentTransactions = 6 (InitProducerId while Prepare*/Complete* in flight)
 //
 // ## Single-writer, no locks, no hot-path allocation.
 //   (In-memory only here; P5-3 adds durable transaction log + replay.)
@@ -163,6 +181,27 @@ struct TransactionMetadata {
 
     /// True while in PrepareEpochFence (transient bump state).
     bool fencingEpoch{false};
+
+    /// True when this PrepareAbort/PrepareCommit was entered by an internally-
+    /// initiated path (timeout-abort or epoch-fence-abort) that did NOT go through
+    /// endTransaction().  The caller must call resolvePendingMarkers() to write
+    /// ABORT markers and advance to CompleteAbort → Empty.  Also set when a
+    /// Prepare* state is recovered from the log (failover resolution path, B2).
+    bool markersPending{false};
+};
+
+// ---------------------------------------------------------------------------
+// PendingMarkerTxn — descriptor returned by pendingMarkerTransactions().
+// Contains everything needed for ControlMarker::build() without a live client
+// request (B1 / B2 resolution).
+// ---------------------------------------------------------------------------
+struct PendingMarkerTxn {
+    TransactionalId          txnId;
+    ProducerId               producerId{-1};
+    ProducerEpoch            producerEpoch{0};
+    int32_t                  coordinatorEpoch{0};
+    bool                     commit{false};          ///< false = abort
+    std::vector<TopicPartition> partitions;
 };
 
 // ---------------------------------------------------------------------------
@@ -285,9 +324,29 @@ public:
     /// Abort Ongoing transactions whose timeout has elapsed:
     ///   nowNs - txnStartNs > txnTimeoutMs * 1_000_000 → PrepareAbort.
     ///
+    /// Each timed-out txn is persisted to the log (PrepareAbort) and added to
+    /// the internal pending-markers set.  Call pendingMarkerTransactions() then
+    /// ControlMarker::resolvePendingMarkers() to write the ABORT markers.
+    ///
     /// Samples nowNs ONCE per call. Returns number of transitions performed.
     /// Returns 0 when there is no work. NEVER spins.
     int doWork(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // pendingMarkerTransactions — B1/B2 resolution API
+    // -----------------------------------------------------------------------
+
+    /// Return all PrepareAbort/PrepareCommit transactions that need markers
+    /// written via an internally-initiated path (fence-abort, timeout-abort,
+    /// or recovered Prepare* after failover).
+    ///
+    /// The caller MUST iterate the result, call ControlMarker::build() for each
+    /// partition in each entry, and then call completeTransaction() for each
+    /// txnId.  This is the only correct path for these entries — they do NOT
+    /// go through endTransaction().
+    ///
+    /// After completeTransaction() the entry is removed from the pending set.
+    [[nodiscard]] std::vector<PendingMarkerTxn> pendingMarkerTransactions() const;
 
     // -----------------------------------------------------------------------
     // Accessors

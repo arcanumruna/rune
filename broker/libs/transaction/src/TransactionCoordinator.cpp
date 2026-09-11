@@ -32,10 +32,17 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
     , coordinatorEpoch_(coordinatorEpoch)
 {
     // Replay the durable log to rebuild in-memory txnMap_ (P5-3 failover recovery).
+    // Any entry in Prepare* state on recovery is treated as needing marker resolution
+    // (B2): the original request no longer exists; set markersPending so the caller
+    // can drive resolution via pendingMarkerTransactions().
     if (txnLog_ != nullptr) {
         for (const auto& [id, meta] : txnLog_->all()) {
             txnMap_[id] = meta;
-            // Restore coordinatorEpoch from the log entry (held in meta.coordinatorEpoch).
+            auto& m = txnMap_[id];
+            // B2: recovered Prepare* needs marker resolution after failover.
+            if (m.state == TxnState::PrepareAbort || m.state == TxnState::PrepareCommit) {
+                m.markersPending = true;
+            }
         }
     }
 }
@@ -95,67 +102,67 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         newMeta.txnStartNs        = 0;
         newMeta.coordinatorEpoch  = coordinatorEpoch_;
         txnMap_.emplace(id, std::move(newMeta));
-        // FIX 1: persist Empty state to log (append+fsync) before returning.
         persistTransition(txnLog_, txnMap_.at(id), coordinatorEpoch_);
         return { .producerId = pid, .producerEpoch = 0, .errorCode = 0 };
     }
 
-    // Known txnId — bump the epoch to fence the previous producer.
-    // Mirror Kafka's handleInitProducerId:
-    //   If state is Ongoing → must complete the abort before assigning new epoch.
-    //   Kafka uses PrepareEpochFence as an intermediate state; here we transition
-    //   directly to PrepareAbort (the "fencing abort") and let the caller drive
-    //   completeTransaction() once markers are written (P5-3).
-    //   After completeTransaction() the metadata is Empty and the new epoch is set.
+    // Known txnId — check if a Prepare* or Complete* is in flight.
+    // C3/C4: mirror Kafka — return kConcurrentTransactions instead of silently
+    // bumping the epoch mid-Prepare*.  The new producer must retry until the
+    // in-flight transaction resolves.
+    if (meta->state == TxnState::PrepareCommit  ||
+        meta->state == TxnState::PrepareAbort   ||
+        meta->state == TxnState::CompleteCommit ||
+        meta->state == TxnState::CompleteAbort  ||
+        meta->state == TxnState::PrepareEpochFence) {
+        return { .producerId    = meta->producerId,
+                 .producerEpoch = meta->producerEpoch,
+                 .errorCode     = InitProducerIdResult::kConcurrentTransactions };
+    }
 
-    // Compute the new epoch (saturating at INT16_MAX to avoid overflow).
-    ProducerEpoch newEpoch = static_cast<ProducerEpoch>(
-        (meta->producerEpoch == INT16_MAX) ? 0 : meta->producerEpoch + 1);
+    // Compute the new epoch.
+    // C1: Per Kafka, when epoch == INT16_MAX, allocate a NEW producerId (fresh PID,
+    // epoch 0) instead of wrapping.  Wrapping to 0 would un-fence epoch-0 zombies.
+    ProducerEpoch newEpoch;
+    ProducerId    newPid = meta->producerId;
+    if (meta->producerEpoch == INT16_MAX) {
+        // Epoch space exhausted — allocate a fresh PID.
+        newPid   = allocator_.allocate();
+        newEpoch = 0;
+    } else {
+        newEpoch = static_cast<ProducerEpoch>(meta->producerEpoch + 1);
+    }
 
     if (meta->state == TxnState::Ongoing) {
-        // Drive ongoing txn to PrepareAbort (epoch-fence path).
-        // We stash the new epoch in the metadata but keep PrepareAbort as the
-        // state — completeTransaction will finalise and reset to Empty.
+        // Drive ongoing txn to PrepareAbort (epoch-fence path, B1).
+        // The partitions are captured in meta->partitions; markersPending is set so
+        // pendingMarkerTransactions() exposes them to the caller for marker emission.
         meta->state              = TxnState::PrepareAbort;
+        meta->producerId         = newPid;
         meta->producerEpoch      = newEpoch;
         meta->fencingEpoch       = true;
         meta->txnTimeoutMs       = effectiveTimeout;
         meta->coordinatorEpoch   = coordinatorEpoch_;
-        // FIX 1: persist PrepareAbort to log (append+fsync) before returning.
+        meta->markersPending     = true;   // B1: caller must write ABORT markers
+        // Persist PrepareAbort to log (durable-before-markers ordering).
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
-        // Return the new PID + epoch immediately so the new producer can start
-        // as soon as the abort is complete (mirrors Kafka behaviour).
-        return { .producerId = meta->producerId, .producerEpoch = newEpoch, .errorCode = 0 };
-    }
-
-    if (meta->state == TxnState::PrepareAbort ||
-        meta->state == TxnState::PrepareCommit ||
-        meta->state == TxnState::CompleteAbort ||
-        meta->state == TxnState::CompleteCommit ||
-        meta->state == TxnState::PrepareEpochFence) {
-        // A previous commit/abort is in flight — the epoch bump is safe to
-        // apply here (Kafka does the same: bump epoch regardless, assign the
-        // new epoch, and once the in-flight transitions complete the next txn
-        // will use the new epoch). But we don't re-drive the state machine.
-        meta->producerEpoch      = newEpoch;
-        meta->txnTimeoutMs       = effectiveTimeout;
-        meta->coordinatorEpoch   = coordinatorEpoch_;
-        persistTransition(txnLog_, *meta, coordinatorEpoch_);
-        return { .producerId = meta->producerId, .producerEpoch = newEpoch, .errorCode = 0 };
+        return { .producerId = newPid, .producerEpoch = newEpoch, .errorCode = 0 };
     }
 
     // State is Empty (or Dead — treat Dead as re-create).
     // Simply bump epoch and reset to Empty.
+    meta->producerId         = newPid;
     meta->producerEpoch      = newEpoch;
     meta->txnTimeoutMs       = effectiveTimeout;
     meta->state              = TxnState::Empty;
     meta->partitions.clear();
     meta->txnStartNs         = 0;
     meta->fencingEpoch       = false;
+    meta->markersPending     = false;
     meta->coordinatorEpoch   = coordinatorEpoch_;
     persistTransition(txnLog_, *meta, coordinatorEpoch_);
 
-    return { .producerId = meta->producerId, .producerEpoch = newEpoch, .errorCode = 0 };
+    return { .producerId = newPid, .producerEpoch = newEpoch, .errorCode = 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +201,6 @@ AddPartitionsResult TransactionCoordinator::addPartitions(
         meta->partitions.insert(tp);
     }
 
-    // FIX 1: persist Ongoing state (with accumulated partitions) to log.
     persistTransition(txnLog_, *meta, coordinatorEpoch_);
 
     return { .errorCode = AddPartitionsResult::kOk };
@@ -233,12 +239,12 @@ EndTransactionResult TransactionCoordinator::endTransaction(
     } else {
         meta->state = TxnState::PrepareAbort;
     }
+    // Client-driven: markers will be written by the caller using the returned
+    // partitions, NOT via the pending-markers path.
+    meta->markersPending = false;
 
-    // FIX 1 — CRITICAL atomicity:
-    // PrepareCommit/PrepareAbort MUST be persisted+fsynced to the log HERE,
-    // BEFORE any markers are written and BEFORE completeTransaction is called.
-    // A crash after this point but before markers are written leaves a durable
-    // Prepare* entry that a recovering coordinator can replay and resolve.
+    // CRITICAL atomicity: PrepareCommit/PrepareAbort MUST be persisted+fsynced
+    // to the log HERE, BEFORE any markers are written and BEFORE completeTransaction.
     persistTransition(txnLog_, *meta, coordinatorEpoch_);
 
     return { .errorCode = EndTransactionResult::kOk, .partitions = std::move(parts) };
@@ -256,27 +262,30 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
     }
 
     if (meta->state == TxnState::PrepareCommit) {
-        // FIX 1: persist CompleteCommit to log before clearing in-memory state.
+        // C2: persist CompleteCommit as a distinct record BEFORE clearing to Empty.
+        // A crash between marker-write and Empty is recoverable: the recovered
+        // coordinator sees CompleteCommit and knows markers were already written.
         meta->state = TxnState::CompleteCommit;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
-        // Immediately transition to Empty (ready for next txn, same epoch).
+        // Transition to Empty (ready for next txn, same epoch).
         meta->partitions.clear();
-        meta->txnStartNs   = 0;
-        meta->fencingEpoch = false;
-        meta->state        = TxnState::Empty;
+        meta->txnStartNs     = 0;
+        meta->fencingEpoch   = false;
+        meta->markersPending = false;
+        meta->state          = TxnState::Empty;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
     }
 
     if (meta->state == TxnState::PrepareAbort) {
-        // FIX 1: persist CompleteAbort to log.
+        // C2: persist CompleteAbort before clearing.
         meta->state = TxnState::CompleteAbort;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
-        // Transition to Empty (ready for next txn).
         meta->partitions.clear();
-        meta->txnStartNs   = 0;
-        meta->fencingEpoch = false;
-        meta->state        = TxnState::Empty;
+        meta->txnStartNs     = 0;
+        meta->fencingEpoch   = false;
+        meta->markersPending = false;
+        meta->state          = TxnState::Empty;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
     }
@@ -297,12 +306,39 @@ int TransactionCoordinator::doWork(int64_t nowNs)
 
         int64_t timeoutNs = static_cast<int64_t>(meta.txnTimeoutMs) * 1'000'000LL;
         if (nowNs - meta.txnStartNs > timeoutNs) {
-            meta.state = TxnState::PrepareAbort;
+            meta.state           = TxnState::PrepareAbort;
+            meta.markersPending  = true;   // B1: caller must write ABORT markers
+            // Persist PrepareAbort to log (durable-before-markers ordering).
+            persistTransition(txnLog_, meta, coordinatorEpoch_);
             ++work;
         }
     }
 
     return work;
+}
+
+// ---------------------------------------------------------------------------
+// pendingMarkerTransactions — B1/B2 resolution API
+// ---------------------------------------------------------------------------
+std::vector<PendingMarkerTxn> TransactionCoordinator::pendingMarkerTransactions() const
+{
+    std::vector<PendingMarkerTxn> result;
+    for (const auto& [id, meta] : txnMap_) {
+        if (!meta.markersPending) continue;
+        // Only PrepareAbort and PrepareCommit can be pending.
+        if (meta.state != TxnState::PrepareAbort &&
+            meta.state != TxnState::PrepareCommit) continue;
+
+        PendingMarkerTxn p;
+        p.txnId            = id;
+        p.producerId       = meta.producerId;
+        p.producerEpoch    = meta.producerEpoch;
+        p.coordinatorEpoch = meta.coordinatorEpoch;
+        p.commit           = (meta.state == TxnState::PrepareCommit);
+        p.partitions.assign(meta.partitions.begin(), meta.partitions.end());
+        result.push_back(std::move(p));
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

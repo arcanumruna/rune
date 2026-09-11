@@ -17,13 +17,13 @@
 //
 // ## On-disk record layout (all fields little-endian)
 //
-//   [0..3]    uint32  magic         = kMagic (0x54584E4C = "TXNL")
+//   [0..3]    uint32  magic         = kMagic (0x544B4E4C = "TKNL" LE)
 //   [4..7]    uint32  totalLength   = kFixedHeaderSize + varFields + 4(CRC)
 //   [8..15]   int64   txnStartNs    (0 when state is not Ongoing)
 //   [16..23]  int64   producerId
 //   [24..25]  int16   producerEpoch
 //   [26..26]  uint8   state         (TxnState enum cast to uint8_t)
-//   [27..27]  uint8   coordinatorEpoch (truncated to uint8 for log; full int32 in P5-3)
+//   [27..27]  uint8   _pad = 0
 //   [28..31]  int32   coordinatorEpoch (full 32-bit)
 //   [32..35]  int32   txnTimeoutMs
 //   [36..37]  uint16  txnIdLen

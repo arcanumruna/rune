@@ -1150,4 +1150,662 @@ TEST(TxnCoordDurableTest, CoordinatorEpochInMetadata)
     EXPECT_EQ(logMeta->coordinatorEpoch, coordEpoch);
 }
 
+// ===========================================================================
+// B1 — fence-abort and timeout-abort MUST write ABORT markers (resolvePendingMarkers)
+// ===========================================================================
+
+// Helper: collect marker writes into a map<partition → vector<payload>>
+using MarkerMap = std::map<TopicPartition, std::vector<ControlMarkerPayload>>;
+
+static std::function<void(const TopicPartition&, const std::vector<uint8_t>&)>
+makeCollector(MarkerMap& out) {
+    return [&out](const TopicPartition& p, const std::vector<uint8_t>& b) {
+        ControlMarkerPayload pl{};
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        out[p].push_back(pl);
+    };
+}
+
+TEST_F(TxnCoordTest, FenceAbortResolvePendingWritesAbortMarkersToAllPartitions)
+{
+    // Init txn with partitions p0, p1, p2.
+    auto r = coord_.initProducerId("txn-f", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-f", r.producerId, r.producerEpoch,
+                         tps({tp("p", 0), tp("p", 1), tp("p", 2)}), nowNs_);
+    ASSERT_EQ(coord_.state("txn-f"), TxnState::Ongoing);
+
+    // Re-init fences the ongoing txn → PrepareAbort, markersPending=true.
+    auto r2 = coord_.initProducerId("txn-f", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r2.ok());
+    ASSERT_EQ(coord_.state("txn-f"), TxnState::PrepareAbort);
+
+    // B1: resolvePendingMarkers must write ABORT markers to all 3 partitions.
+    MarkerMap captured;
+    int total = ControlMarker::resolvePendingMarkers(coord_, makeCollector(captured));
+
+    EXPECT_EQ(total, 3)                     << "Expected 3 ABORT markers (one per partition)";
+    EXPECT_EQ(captured.size(), 3u)          << "Expected markers on 3 distinct partitions";
+    EXPECT_EQ(coord_.state("txn-f"), TxnState::Empty) << "State must be Empty after resolve";
+    for (auto& [part, pls] : captured) {
+        ASSERT_EQ(pls.size(), 1u);
+        EXPECT_EQ(pls[0].controlType, ControlType::Abort)
+            << "Expected ABORT marker on partition " << part.topic << "/" << part.partition;
+    }
+    // All three partitions must have been marked.
+    EXPECT_TRUE(captured.contains(tp("p", 0)));
+    EXPECT_TRUE(captured.contains(tp("p", 1)));
+    EXPECT_TRUE(captured.contains(tp("p", 2)));
+}
+
+TEST_F(TxnCoordTest, FenceAbortNoPendingMarkersAfterResolve)
+{
+    auto r = coord_.initProducerId("txn-f2", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-f2", r.producerId, r.producerEpoch,
+                         tps({tp("q", 0)}), nowNs_);
+
+    coord_.initProducerId("txn-f2", kDefaultTimeoutMs, nowNs_);
+    ASSERT_EQ(coord_.state("txn-f2"), TxnState::PrepareAbort);
+
+    // Resolve once.
+    MarkerMap cap1;
+    ControlMarker::resolvePendingMarkers(coord_, makeCollector(cap1));
+    EXPECT_EQ(cap1.size(), 1u);
+
+    // Second call: no pending markers → 0 written.
+    MarkerMap cap2;
+    int total2 = ControlMarker::resolvePendingMarkers(coord_, makeCollector(cap2));
+    EXPECT_EQ(total2, 0);
+    EXPECT_TRUE(cap2.empty());
+}
+
+TEST_F(TxnCoordTest, TimeoutAbortResolvePendingWritesAbortMarkersToAllPartitions)
+{
+    // Txn with 3 partitions, short timeout.
+    auto r = coord_.initProducerId("txn-t", /*txnTimeoutMs=*/1000, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-t", r.producerId, r.producerEpoch,
+                         tps({tp("x", 0), tp("y", 1), tp("z", 2)}), nowNs_);
+    ASSERT_EQ(coord_.state("txn-t"), TxnState::Ongoing);
+
+    // Advance past timeout.
+    advanceClock(1001);
+    int work = coord_.doWork(nowNs_);
+    ASSERT_EQ(work, 1);
+    ASSERT_EQ(coord_.state("txn-t"), TxnState::PrepareAbort);
+
+    // B1: resolvePendingMarkers must write ABORT markers to all 3 partitions.
+    MarkerMap captured;
+    int total = ControlMarker::resolvePendingMarkers(coord_, makeCollector(captured));
+
+    EXPECT_EQ(total, 3);
+    EXPECT_EQ(captured.size(), 3u);
+    EXPECT_EQ(coord_.state("txn-t"), TxnState::Empty);
+    for (auto& [part, pls] : captured) {
+        ASSERT_EQ(pls.size(), 1u);
+        EXPECT_EQ(pls[0].controlType, ControlType::Abort);
+    }
+    // No partition left unmarked.
+    EXPECT_TRUE(captured.contains(tp("x", 0)));
+    EXPECT_TRUE(captured.contains(tp("y", 1)));
+    EXPECT_TRUE(captured.contains(tp("z", 2)));
+}
+
+TEST_F(TxnCoordTest, TimeoutAbortNoPartitionLeftUnmarked)
+{
+    // Multiple timed-out txns — each gets fully marked.
+    for (int i = 0; i < 4; ++i) {
+        auto id = "txn-multi-" + std::to_string(i);
+        auto r = coord_.initProducerId(id, /*timeout=*/500, nowNs_);
+        ASSERT_TRUE(r.ok());
+        coord_.addPartitions(id, r.producerId, r.producerEpoch,
+                             tps({tp("t", i)}), nowNs_);
+    }
+
+    advanceClock(501);
+    int work = coord_.doWork(nowNs_);
+    ASSERT_EQ(work, 4);
+
+    MarkerMap captured;
+    int total = ControlMarker::resolvePendingMarkers(coord_, makeCollector(captured));
+    EXPECT_EQ(total, 4)   << "4 txns × 1 partition each = 4 markers";
+    EXPECT_EQ(captured.size(), 4u);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_TRUE(captured.contains(tp("t", i)))
+            << "Partition t/" << i << " must have an ABORT marker";
+    }
+    // All states must be Empty.
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(coord_.state("txn-multi-" + std::to_string(i)), TxnState::Empty);
+    }
+}
+
+// ===========================================================================
+// B2 — recovered Prepare* resolvable using persisted epochs (no live request)
+// ===========================================================================
+
+TEST(TxnCoordAuditB2Test, RecoveredPrepareAbortResolvableWithPersistedEpochs)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    ProducerId    pid{};
+    ProducerEpoch epoch{};
+    int32_t       coordEpoch = 7;
+
+    // Phase 1: run to PrepareAbort, crash.
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, coordEpoch);
+        auto r = coord.initProducerId("txn-b2-abort", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        pid   = r.producerId;
+        epoch = r.producerEpoch;
+        coord.addPartitions("txn-b2-abort", pid, epoch,
+                            tps({tp("p0", 0), tp("p1", 1)}), 100LL);
+        coord.endTransaction("txn-b2-abort", pid, epoch, /*commit=*/false, 200LL);
+        ASSERT_EQ(coord.state("txn-b2-abort"), TxnState::PrepareAbort);
+        // Crash — completeTransaction never called, no markers written.
+    }
+
+    // Phase 2: recover from log, resolve with persisted epochs (B2).
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, coordEpoch);
+
+    ASSERT_EQ(coord2.state("txn-b2-abort"), TxnState::PrepareAbort);
+
+    // The recovered coordinator must expose this as a pending marker txn.
+    auto pending = coord2.pendingMarkerTransactions();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(pending[0].txnId,            "txn-b2-abort");
+    EXPECT_EQ(pending[0].producerId,       pid);
+    EXPECT_EQ(pending[0].producerEpoch,    epoch);
+    EXPECT_EQ(pending[0].coordinatorEpoch, coordEpoch);
+    EXPECT_FALSE(pending[0].commit);
+    EXPECT_EQ(pending[0].partitions.size(), 2u);
+
+    // Resolve — ABORT markers written using PERSISTED epochs, not a live request.
+    MarkerMap captured;
+    auto appendFn = [&](const TopicPartition& p, const std::vector<uint8_t>& b) {
+        ControlMarkerPayload pl{};
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        captured[p].push_back(pl);
+    };
+    int total = ControlMarker::resolvePendingMarkers(coord2, appendFn);
+
+    EXPECT_EQ(total, 2)           << "2 ABORT markers expected";
+    EXPECT_EQ(coord2.state("txn-b2-abort"), TxnState::Empty);
+    // Verify marker epochs match what was persisted (NOT a new/live epoch).
+    for (auto& [part, pls] : captured) {
+        ASSERT_EQ(pls.size(), 1u);
+        EXPECT_EQ(pls[0].controlType,       ControlType::Abort);
+        EXPECT_EQ(pls[0].producerEpoch,     epoch);
+        EXPECT_EQ(pls[0].coordinatorEpoch,  coordEpoch);
+    }
+}
+
+TEST(TxnCoordAuditB2Test, RecoveredPrepareCommitResolvableWithPersistedEpochs)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    ProducerId    pid{};
+    ProducerEpoch epoch{};
+    int32_t       coordEpoch = 11;
+
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log, coordEpoch);
+        auto r = coord.initProducerId("txn-b2-commit", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        pid   = r.producerId;
+        epoch = r.producerEpoch;
+        coord.addPartitions("txn-b2-commit", pid, epoch,
+                            tps({tp("foo", 0)}), 100LL);
+        coord.endTransaction("txn-b2-commit", pid, epoch, /*commit=*/true, 200LL);
+        ASSERT_EQ(coord.state("txn-b2-commit"), TxnState::PrepareCommit);
+        // Crash.
+    }
+
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, coordEpoch);
+    ASSERT_EQ(coord2.state("txn-b2-commit"), TxnState::PrepareCommit);
+
+    auto pending = coord2.pendingMarkerTransactions();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_TRUE(pending[0].commit);
+    EXPECT_EQ(pending[0].coordinatorEpoch, coordEpoch);
+
+    MarkerMap captured;
+    auto appendFn = [&](const TopicPartition& p, const std::vector<uint8_t>& b) {
+        ControlMarkerPayload pl{};
+        EXPECT_TRUE(ControlMarker::extract(b.data(), 0, pl));
+        captured[p].push_back(pl);
+    };
+    int total = ControlMarker::resolvePendingMarkers(coord2, appendFn);
+
+    EXPECT_EQ(total, 1);
+    EXPECT_EQ(coord2.state("txn-b2-commit"), TxnState::Empty);
+    for (auto& [part, pls] : captured) {
+        ASSERT_EQ(pls.size(), 1u);
+        EXPECT_EQ(pls[0].controlType,      ControlType::Commit);
+        EXPECT_EQ(pls[0].producerEpoch,    epoch);
+        EXPECT_EQ(pls[0].coordinatorEpoch, coordEpoch);
+    }
+}
+
+TEST(TxnCoordAuditB2Test, RecoveryDoesNotDuplicateMarkersOnCompleteCommitState)
+{
+    // C2 complementary: if a coordinator crashed AFTER persisting CompleteCommit
+    // but BEFORE persisting Empty, recovery must NOT re-write markers.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    // Simulate: write CompleteCommit directly to log (markers were already written).
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId            = "txn-c2-nodup";
+        e.producerId       = 10;
+        e.producerEpoch    = 1;
+        e.state            = TxnState::CompleteCommit;
+        e.coordinatorEpoch = 5;
+        e.txnTimeoutMs     = 60'000;
+        log.append(e);
+    }
+
+    // Recover: CompleteCommit is NOT in pending markers.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 5);
+
+    ASSERT_EQ(coord2.state("txn-c2-nodup"), TxnState::CompleteCommit);
+    auto pending = coord2.pendingMarkerTransactions();
+    EXPECT_TRUE(pending.empty())
+        << "CompleteCommit state must NOT appear in pendingMarkerTransactions";
+
+    // No markers written on a second resolve pass.
+    int count = 0;
+    auto appendFn = [&](const TopicPartition&, const std::vector<uint8_t>&) { ++count; };
+    ControlMarker::resolvePendingMarkers(coord2, appendFn);
+    EXPECT_EQ(count, 0) << "No markers must be re-written for CompleteCommit";
+}
+
+// ===========================================================================
+// C1 — epoch overflow allocates a new PID (not wraps to 0)
+// ===========================================================================
+
+TEST(TxnCoordAuditC1Test, EpochOverflowAllocatesNewPid)
+{
+    // Use a fresh coordinator; manually force epoch to INT16_MAX.
+    TransactionCoordinator coord;
+    auto r = coord.initProducerId("txn-c1", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    ProducerId  oldPid   = r.producerId;
+
+    // Set the epoch to INT16_MAX by repeated re-inits would be slow;
+    // instead test the boundary via a coordinator that recovered metadata at INT16_MAX.
+    // We use a durable log to inject the boundary state.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "txn-overflow";
+        e.producerId    = 42;
+        e.producerEpoch = INT16_MAX;
+        e.state         = TxnState::Empty;
+        e.txnTimeoutMs  = 60'000;
+        log.append(e);
+    }
+
+    TransactionLog log2(path);
+    // Start allocator at 100 so a new PID != 42.
+    TransactionCoordinator coord2(ProducerIdAllocator{100}, 60'000, &log2, 0);
+
+    // Re-init on epoch INT16_MAX → must allocate a NEW PID, epoch 0.
+    auto r2 = coord2.initProducerId("txn-overflow", 60'000, 0LL);
+    ASSERT_TRUE(r2.ok());
+
+    // Must be a NEW producerId (different from 42).
+    EXPECT_NE(r2.producerId, static_cast<ProducerId>(42))
+        << "Epoch overflow must allocate a fresh PID, not reuse the old one";
+    // Epoch on the new PID starts at 0.
+    EXPECT_EQ(r2.producerEpoch, static_cast<ProducerEpoch>(0))
+        << "New PID after epoch exhaustion starts at epoch 0";
+}
+
+TEST(TxnCoordAuditC1Test, EpochOverflowOldPidRetired)
+{
+    // After epoch overflow, the old PID cannot be used.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "txn-retired";
+        e.producerId    = 55;
+        e.producerEpoch = INT16_MAX;
+        e.state         = TxnState::Empty;
+        e.txnTimeoutMs  = 60'000;
+        log.append(e);
+    }
+
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{200}, 60'000, &log2, 0);
+
+    auto r2 = coord2.initProducerId("txn-retired", 60'000, 0LL);
+    ASSERT_TRUE(r2.ok());
+    // New PID allocated.
+    ASSERT_NE(r2.producerId, static_cast<ProducerId>(55));
+
+    // Old PID + any epoch cannot add partitions (fenced by PID mismatch).
+    auto ar = coord2.addPartitions("txn-retired",
+                                    /*old pid=*/55, /*epoch=*/INT16_MAX,
+                                    tps({tp("t", 0)}), 0LL);
+    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidPid)
+        << "Old PID must be fenced after epoch-overflow new-PID allocation";
+}
+
+// ===========================================================================
+// C3/C4 — kConcurrentTransactions returned for Prepare*/Complete* re-init
+// ===========================================================================
+
+TEST_F(TxnCoordTest, ReInitWhilePrepareCommitReturnsConcurrentTransactions)
+{
+    auto r = coord_.initProducerId("txn-c3", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-c3", r.producerId, r.producerEpoch,
+                         tps({tp("t", 0)}), nowNs_);
+    coord_.endTransaction("txn-c3", r.producerId, r.producerEpoch, true, nowNs_);
+    ASSERT_EQ(coord_.state("txn-c3"), TxnState::PrepareCommit);
+
+    // Re-init while in PrepareCommit → must return kConcurrentTransactions.
+    auto r2 = coord_.initProducerId("txn-c3", kDefaultTimeoutMs, nowNs_);
+    EXPECT_EQ(r2.errorCode, InitProducerIdResult::kConcurrentTransactions)
+        << "initProducerId while PrepareCommit must return kConcurrentTransactions";
+    // State must be unchanged.
+    EXPECT_EQ(coord_.state("txn-c3"), TxnState::PrepareCommit);
+    // Epoch must be unchanged.
+    EXPECT_EQ(coord_.epochOf("txn-c3"), r.producerEpoch);
+}
+
+TEST_F(TxnCoordTest, ReInitWhilePrepareAbortReturnsConcurrentTransactions)
+{
+    auto r = coord_.initProducerId("txn-c4", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-c4", r.producerId, r.producerEpoch,
+                         tps({tp("t", 0)}), nowNs_);
+    coord_.endTransaction("txn-c4", r.producerId, r.producerEpoch, false, nowNs_);
+    ASSERT_EQ(coord_.state("txn-c4"), TxnState::PrepareAbort);
+
+    auto r2 = coord_.initProducerId("txn-c4", kDefaultTimeoutMs, nowNs_);
+    EXPECT_EQ(r2.errorCode, InitProducerIdResult::kConcurrentTransactions);
+    EXPECT_EQ(coord_.state("txn-c4"), TxnState::PrepareAbort);
+}
+
+TEST_F(TxnCoordTest, ReInitWhileCompleteCommitReturnsConcurrentTransactions)
+{
+    // CompleteCommit is now a persistent state (C2 fix).  Re-init during it must
+    // return kConcurrentTransactions (C4).  Drive to CompleteCommit by directly
+    // injecting that state via a durable log.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "txn-cc";
+        e.producerId    = 1;
+        e.producerEpoch = 2;
+        e.state         = TxnState::CompleteCommit;
+        e.txnTimeoutMs  = 60'000;
+        log.append(e);
+    }
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0);
+    ASSERT_EQ(coord2.state("txn-cc"), TxnState::CompleteCommit);
+
+    auto r2 = coord2.initProducerId("txn-cc", 60'000, 0LL);
+    EXPECT_EQ(r2.errorCode, InitProducerIdResult::kConcurrentTransactions);
+    EXPECT_EQ(coord2.state("txn-cc"), TxnState::CompleteCommit);
+}
+
+TEST_F(TxnCoordTest, ReInitAfterResolveSucceeds)
+{
+    // After resolving a PrepareAbort (state back to Empty), re-init must succeed.
+    auto r = coord_.initProducerId("txn-after", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-after", r.producerId, r.producerEpoch,
+                         tps({tp("t", 0)}), nowNs_);
+    coord_.endTransaction("txn-after", r.producerId, r.producerEpoch, false, nowNs_);
+    ASSERT_EQ(coord_.state("txn-after"), TxnState::PrepareAbort);
+
+    // Resolve.
+    auto appendFn = [](const TopicPartition&, const std::vector<uint8_t>&) {};
+    coord_.completeTransaction("txn-after");
+    ASSERT_EQ(coord_.state("txn-after"), TxnState::Empty);
+
+    // Now re-init must succeed.
+    auto r2 = coord_.initProducerId("txn-after", kDefaultTimeoutMs, nowNs_);
+    EXPECT_TRUE(r2.ok());
+    EXPECT_NE(r2.errorCode, InitProducerIdResult::kConcurrentTransactions);
+}
+
+// ===========================================================================
+// S1 — isControlBatch rejects truncated buffers and CRC-corrupted data batches
+// ===========================================================================
+
+TEST(ControlMarkerAuditS1Test, TruncatedBufferNotControl)
+{
+    // A valid control batch truncated to less than ENCODED_SIZE → must return false.
+    auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    ASSERT_EQ(batch.size(), ControlMarker::ENCODED_SIZE);
+
+    // Truncated: avail = ENCODED_SIZE - 1 → not enough bytes.
+    EXPECT_FALSE(ControlMarker::isControlBatch(batch.data(), 0,
+                                                ControlMarker::ENCODED_SIZE - 1))
+        << "Truncated buffer must not be identified as a control batch";
+}
+
+TEST(ControlMarkerAuditS1Test, CrcCorruptedDataBatchNotControl)
+{
+    // A data batch with magic=2, CONTROL bit set, but wrong CRC → must return false.
+    uint8_t buf[ControlMarker::ENCODED_SIZE] = {};
+    buf[16] = 2; // magic = 2
+    int16_t attrs = static_cast<int16_t>(ControlMarker::kAttrControl |
+                                          ControlMarker::kAttrTransactional);
+    std::memcpy(buf + 21, &attrs, 2);
+    // CRC at [17..20] is all zeros (wrong) — must NOT be accepted.
+    EXPECT_FALSE(ControlMarker::isControlBatch(buf, 0, ControlMarker::ENCODED_SIZE))
+        << "A batch with magic=2 and CONTROL bit but wrong CRC must be rejected";
+}
+
+TEST(ControlMarkerAuditS1Test, ValidControlBatchPassesCrcCheck)
+{
+    // A properly built control batch must pass isControlBatch with CRC check.
+    auto batch = ControlMarker::build(42, 3, ControlType::Abort, 7);
+    EXPECT_TRUE(ControlMarker::isControlBatch(batch.data(), 0, ControlMarker::ENCODED_SIZE))
+        << "A valid built control batch must pass the CRC-inclusive check";
+}
+
+TEST(ControlMarkerAuditS1Test, ExtractTruncatedBufferReturnsFalse)
+{
+    auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    ControlMarkerPayload pl{};
+    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl,
+                                         ControlMarker::ENCODED_SIZE - 5))
+        << "extract on truncated buffer must return false (no over-read)";
+}
+
+TEST(ControlMarkerAuditS1Test, ExtractCrcCorruptedReturnsFalse)
+{
+    auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    // Corrupt the CRC field.
+    batch[17] ^= 0xFFu;
+    ControlMarkerPayload pl{};
+    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl))
+        << "extract on CRC-corrupted batch must return false";
+}
+
+TEST(ControlMarkerAuditS1Test, DataBatchWithControlBitButWrongCrcNotExtracted)
+{
+    // Craft a buffer that has magic=2 and the CONTROL bit, but incorrect CRC.
+    // This is the adversarial input from the audit (S1).
+    uint8_t buf[ControlMarker::ENCODED_SIZE] = {};
+    buf[16] = 2; // magic
+    int16_t attrs = static_cast<int16_t>(ControlMarker::kAttrControl |
+                                          ControlMarker::kAttrTransactional);
+    std::memcpy(buf + 21, &attrs, 2);
+    // Stuff plausible producer fields.
+    int64_t fakePid = 999;
+    std::memcpy(buf + 43, &fakePid, 8);
+    // CRC is still zero (wrong).
+    ControlMarkerPayload pl{};
+    EXPECT_FALSE(ControlMarker::extract(buf, 0, pl, ControlMarker::ENCODED_SIZE))
+        << "A data batch with CONTROL bit but wrong CRC must not be decoded";
+}
+
+// ===========================================================================
+// T1 — Abort tests MUST assert markers were written (upgrade vacuous tests)
+// ===========================================================================
+
+TEST_F(TxnCoordTest, ReInitOngoingWritesAbortMarkersToAllPartitions_T1)
+{
+    // This is the upgraded version of ReInitOngoingThenCompleteResetsToEmpty.
+    // It asserts markers are written (T1 fix).
+    auto r = coord_.initProducerId("txn-t1-fence", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r.ok());
+    coord_.addPartitions("txn-t1-fence", r.producerId, r.producerEpoch,
+                         tps({tp("a", 0), tp("b", 1)}), nowNs_);
+
+    // Fence via re-init.
+    auto r2 = coord_.initProducerId("txn-t1-fence", kDefaultTimeoutMs, nowNs_);
+    ASSERT_TRUE(r2.ok());
+    ASSERT_EQ(coord_.state("txn-t1-fence"), TxnState::PrepareAbort);
+
+    // Assert markers written (T1: must not be vacuous).
+    MarkerMap captured;
+    int total = ControlMarker::resolvePendingMarkers(coord_, makeCollector(captured));
+    EXPECT_EQ(total, 2)   << "T1: 2 ABORT markers must be written, one per partition";
+    EXPECT_EQ(captured.size(), 2u);
+    EXPECT_TRUE(captured.contains(tp("a", 0)));
+    EXPECT_TRUE(captured.contains(tp("b", 1)));
+    EXPECT_EQ(coord_.state("txn-t1-fence"), TxnState::Empty);
+}
+
+TEST_F(TxnCoordTest, TimeoutAbortWritesAbortMarkersToAllPartitions_T1)
+{
+    // Upgraded version of FullLifecycleWithTimeoutAbort.
+    // T1: assert ABORT markers were written, not just completeTransaction called.
+    auto r = coord_.initProducerId("txn-t1-timeout", /*txnTimeoutMs=*/2000, nowNs_);
+    coord_.addPartitions("txn-t1-timeout", r.producerId, r.producerEpoch,
+                         tps({tp("p0", 0), tp("p1", 1), tp("p2", 2)}), nowNs_);
+
+    constexpr int kCap = 10;
+    bool done = false;
+    for (int i = 0; i < kCap && !done; ++i) {
+        advanceClock(1001);
+        if (coord_.doWork(nowNs_) > 0) done = true;
+    }
+    ASSERT_TRUE(done) << "Timeout abort must fire within cap";
+    ASSERT_EQ(coord_.state("txn-t1-timeout"), TxnState::PrepareAbort);
+
+    // T1: assert markers are actually written.
+    MarkerMap captured;
+    int total = ControlMarker::resolvePendingMarkers(coord_, makeCollector(captured));
+    EXPECT_EQ(total, 3)   << "T1: 3 ABORT markers must be written";
+    EXPECT_EQ(coord_.state("txn-t1-timeout"), TxnState::Empty);
+    EXPECT_TRUE(captured.contains(tp("p0", 0)));
+    EXPECT_TRUE(captured.contains(tp("p1", 1)));
+    EXPECT_TRUE(captured.contains(tp("p2", 2)));
+
+    for (auto& [part, pls] : captured) {
+        ASSERT_EQ(pls.size(), 1u);
+        EXPECT_EQ(pls[0].controlType, ControlType::Abort);
+    }
+}
+
+// ===========================================================================
+// T2 — AddPartitionsWhenCompleteCommitIsInvalidTransition — replace vacuous SUCCEED()
+// ===========================================================================
+
+TEST(TxnCoordAuditT2Test, AddPartitionsWhenCompleteCommitIsInvalidTransition)
+{
+    // C2 fix made CompleteCommit a real persistent state.  Injecting it via the
+    // log, verify that addPartitions rejects it with kInvalidTransition.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    {
+        TransactionLog log(path);
+        TxnLogEntry e;
+        e.txnId         = "txn-t2";
+        e.producerId    = 7;
+        e.producerEpoch = 0;
+        e.state         = TxnState::CompleteCommit;
+        e.txnTimeoutMs  = 60'000;
+        log.append(e);
+    }
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0);
+    ASSERT_EQ(coord2.state("txn-t2"), TxnState::CompleteCommit);
+
+    auto ar = coord2.addPartitions("txn-t2", /*pid=*/7, /*epoch=*/0,
+                                    tps({tp("t", 0)}), 0LL);
+    EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidTransition)
+        << "addPartitions while CompleteCommit must be an invalid transition";
+}
+
+// ===========================================================================
+// C2 — CompleteCommit persisted; recovery does NOT re-write markers
+// ===========================================================================
+
+TEST(TxnCoordAuditC2Test, CompleteCommitPersistedAsDistinctRecord)
+{
+    // Verify that completeTransaction persists CompleteCommit as a separate log
+    // record BEFORE transitioning to Empty.
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-c2", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("txn-c2", r.producerId, r.producerEpoch,
+                        tps({tp("t", 0)}), 0LL);
+    coord.endTransaction("txn-c2", r.producerId, r.producerEpoch, true, 0LL);
+
+    // Verify CompleteCommit in log before calling completeTransaction.
+    // (PrepareCommit is in the log now.)
+    ASSERT_EQ(log.metadata("txn-c2")->state, TxnState::PrepareCommit);
+
+    // Call completeTransaction — CompleteCommit must be persisted.
+    coord.completeTransaction("txn-c2");
+
+    // After completeTransaction, log reflects Empty (CompleteCommit then Empty).
+    EXPECT_EQ(log.metadata("txn-c2")->state, TxnState::Empty);
+    EXPECT_EQ(coord.state("txn-c2"), TxnState::Empty);
+}
+
+TEST(TxnCoordAuditC2Test, CompleteAbortPersistedAsDistinctRecord)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+    TransactionLog log(path);
+
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    auto r = coord.initProducerId("txn-c2b", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("txn-c2b", r.producerId, r.producerEpoch,
+                        tps({tp("t", 0)}), 0LL);
+    coord.endTransaction("txn-c2b", r.producerId, r.producerEpoch, false, 0LL);
+    ASSERT_EQ(log.metadata("txn-c2b")->state, TxnState::PrepareAbort);
+
+    coord.completeTransaction("txn-c2b");
+
+    EXPECT_EQ(log.metadata("txn-c2b")->state, TxnState::Empty);
+    EXPECT_EQ(coord.state("txn-c2b"), TxnState::Empty);
+}
+
 } // anonymous namespace

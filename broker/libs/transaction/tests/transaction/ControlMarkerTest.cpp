@@ -429,6 +429,55 @@ TEST(ControlMarkerTest, ControlBatchNotMistakennForDataBatch) {
 // Multiple partitions: each partition gets exactly one marker
 // ===========================================================================
 
+// ===========================================================================
+// S1 — CRC + bounds checks in isControlBatch / extract (adversarial buffers)
+// ===========================================================================
+
+TEST(ControlMarkerTest, TruncatedBufferRejectedByIsControlBatch) {
+    auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    ASSERT_EQ(batch.size(), ControlMarker::ENCODED_SIZE);
+    // Pass avail < ENCODED_SIZE — must return false (no over-read).
+    EXPECT_FALSE(ControlMarker::isControlBatch(batch.data(), 0,
+                                                ControlMarker::ENCODED_SIZE - 1));
+}
+
+TEST(ControlMarkerTest, ControlBitSetButBadCrcRejected) {
+    // Craft a batch with magic=2 and CONTROL bit, but wrong CRC.
+    uint8_t buf[ControlMarker::ENCODED_SIZE] = {};
+    buf[16] = 2;
+    int16_t attrs = static_cast<int16_t>(ControlMarker::kAttrControl |
+                                          ControlMarker::kAttrTransactional);
+    std::memcpy(buf + 21, &attrs, 2);
+    // CRC field (bytes 17-20) is zero — incorrect.
+    EXPECT_FALSE(ControlMarker::isControlBatch(buf, 0, ControlMarker::ENCODED_SIZE));
+}
+
+TEST(ControlMarkerTest, ExtractTruncatedBufferReturnsFalse) {
+    auto batch = ControlMarker::build(1, 0, ControlType::Commit, 0);
+    ControlMarkerPayload pl{};
+    // Pass 10 bytes less than needed.
+    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl,
+                                         ControlMarker::ENCODED_SIZE - 10));
+}
+
+TEST(ControlMarkerTest, ExtractCrcFlippedReturnsFalse) {
+    auto batch = ControlMarker::build(42, 2, ControlType::Abort, 5);
+    batch[17] ^= 0xFFu;  // corrupt 1 byte of CRC
+    ControlMarkerPayload pl{};
+    EXPECT_FALSE(ControlMarker::extract(batch.data(), 0, pl));
+}
+
+TEST(ControlMarkerTest, DataBatchWithControlBitAndBadCrcNotExtracted) {
+    // Adversarial: magic=2, CONTROL bit set, but fabricated CRC → must fail.
+    uint8_t buf[ControlMarker::ENCODED_SIZE] = {};
+    buf[16] = 2;
+    int16_t attrs = static_cast<int16_t>(ControlMarker::kAttrControl);
+    std::memcpy(buf + 21, &attrs, 2);
+    // CRC is zero: wrong.
+    ControlMarkerPayload pl{};
+    EXPECT_FALSE(ControlMarker::extract(buf, 0, pl, ControlMarker::ENCODED_SIZE));
+}
+
 TEST(ControlMarkerTest, ExactlyOneMarkerPerPartition) {
     std::string txnId = "txn-one-each";
     constexpr int N = 8;

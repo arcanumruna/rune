@@ -42,17 +42,32 @@ static std::size_t write_varint_zigzag(uint8_t* buf, std::size_t pos, int64_t v)
     return written;
 }
 
-/// Read a zig-zag varint from buf[pos]; advance pos. Returns decoded value.
-static int64_t read_varint_zigzag(const uint8_t* buf, std::size_t& pos) noexcept {
+/// Read a zig-zag varint from buf[pos..end]; advance pos.
+/// S1 fix: bounds-checked — returns false via out-parameter if end is exceeded.
+/// \param buf  Buffer start.
+/// \param pos  Current position (advanced on success).
+/// \param end  One-past-the-last-valid byte index.
+/// \param out  Decoded value on success.
+/// \returns true on success, false if buffer would be over-read.
+static bool read_varint_zigzag_safe(const uint8_t* buf,
+                                     std::size_t&   pos,
+                                     std::size_t    end,
+                                     int64_t&       out) noexcept {
     uint64_t uv = 0;
     int shift = 0;
-    while (true) {
+    // Maximum 10 bytes for a 64-bit varint (7 bits per byte).
+    constexpr int kMaxVarintBytes = 10;
+    for (int i = 0; i < kMaxVarintBytes; ++i) {
+        if (pos >= end) return false;
         uint8_t b = buf[pos++];
         uv |= static_cast<uint64_t>(b & 0x7Fu) << shift;
-        if ((b & 0x80u) == 0) break;
+        if ((b & 0x80u) == 0) {
+            out = static_cast<int64_t>((uv >> 1) ^ -(uv & 1u));
+            return true;
+        }
         shift += 7;
     }
-    return static_cast<int64_t>((uv >> 1) ^ -(uv & 1u));
+    return false; // varint too long (malformed)
 }
 
 } // anonymous namespace
@@ -175,28 +190,41 @@ std::vector<uint8_t> ControlMarker::build(ProducerId    producerId,
 }
 
 // ---------------------------------------------------------------------------
-// isControlBatch
+// isControlBatch — S1 fix: bounds check + CRC verify + magic + CONTROL bit.
 // ---------------------------------------------------------------------------
 /*static*/
-bool ControlMarker::isControlBatch(const uint8_t* buf, std::size_t offset) noexcept {
+bool ControlMarker::isControlBatch(const uint8_t* buf,
+                                    std::size_t    offset,
+                                    std::size_t    avail) noexcept {
+    // S1: must have at least ENCODED_SIZE bytes available.
+    if (avail < ENCODED_SIZE) return false;
     const uint8_t* p = buf + offset;
     // Check magic byte at [16].
     if (p[16] != static_cast<uint8_t>(kMagicByte)) return false;
+    // S1: verify CRC32C before trusting any other field (including the CONTROL bit).
+    // CRC covers bytes [CRC_DATA_START..ENCODED_SIZE).
+    uint32_t stored   = read_le<uint32_t>(p + CRC_OFFSET);
+    uint32_t computed = crc32c(p + CRC_DATA_START, ENCODED_SIZE - CRC_DATA_START);
+    if (stored != computed) return false;
     // Check CONTROL bit (bit 5) in attributes at [21..22].
     int16_t attrs = read_le<int16_t>(p + 21);
     return (attrs & kAttrControl) != 0;
 }
 
 // ---------------------------------------------------------------------------
-// extract
+// extract — S1 fix: bounds-checked varint reads + isControlBatch check.
 // ---------------------------------------------------------------------------
 /*static*/
-bool ControlMarker::extract(const uint8_t* buf, std::size_t offset,
-                              ControlMarkerPayload& out) noexcept
+bool ControlMarker::extract(const uint8_t*       buf,
+                              std::size_t          offset,
+                              ControlMarkerPayload& out,
+                              std::size_t          avail) noexcept
 {
-    if (!isControlBatch(buf, offset)) return false;
+    if (!isControlBatch(buf, offset, avail)) return false;
 
-    const uint8_t* p = buf + offset;
+    const uint8_t* p   = buf + offset;
+    // avail is already >= ENCODED_SIZE at this point (isControlBatch checked).
+    const std::size_t end = ENCODED_SIZE; // relative to p
 
     out.producerId    = read_le<int64_t>(p + 43);
     out.producerEpoch = read_le<int16_t>(p + 51);
@@ -204,15 +232,20 @@ bool ControlMarker::extract(const uint8_t* buf, std::size_t offset,
     // Decode the record starting at [61].
     std::size_t rpos = BATCH_HEADER_SIZE; // 61
     // attributes (1 byte)
+    if (rpos + 1 > end) return false;
     rpos += 1;
-    // timestampDelta (varint)
-    read_varint_zigzag(p, rpos);
+
+    // timestampDelta (varint) — bounds-checked
+    int64_t dummy{};
+    if (!read_varint_zigzag_safe(p, rpos, end, dummy)) return false;
     // offsetDelta (varint)
-    read_varint_zigzag(p, rpos);
+    if (!read_varint_zigzag_safe(p, rpos, end, dummy)) return false;
     // keyLength (varint)
-    int64_t keyLen = read_varint_zigzag(p, rpos);
+    int64_t keyLen{};
+    if (!read_varint_zigzag_safe(p, rpos, end, keyLen)) return false;
     // key = controlType (int16)
     if (keyLen == 2) {
+        if (rpos + 2 > end) return false;
         int16_t ct = read_le<int16_t>(p + rpos);
         out.controlType = static_cast<ControlType>(ct);
         rpos += 2;
@@ -220,10 +253,11 @@ bool ControlMarker::extract(const uint8_t* buf, std::size_t offset,
         return false;
     }
     // valueLength (varint)
-    int64_t valLen = read_varint_zigzag(p, rpos);
+    int64_t valLen{};
+    if (!read_varint_zigzag_safe(p, rpos, end, valLen)) return false;
     if (valLen != 6) return false;
+    if (rpos + 6 > end) return false;
     // value: version(int16) + coordinatorEpoch(int32)
-    // int16 version = read_le<int16_t>(p + rpos);
     rpos += 2; // skip version
     out.coordinatorEpoch = read_le<int32_t>(p + rpos);
     rpos += 4;
@@ -265,6 +299,35 @@ int ControlMarker::writeMarkers(
     coordinator.completeTransaction(txnId);
 
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// resolvePendingMarkers — B1/B2: resolve all internally-initiated aborts.
+// ---------------------------------------------------------------------------
+/*static*/
+int ControlMarker::resolvePendingMarkers(
+    TransactionCoordinator& coordinator,
+    const std::function<void(const TopicPartition&,
+                              const std::vector<uint8_t>&)>& appendFn)
+{
+    // Snapshot the pending list — we must not iterate while completing txns
+    // (completing modifies markersPending and coordinator state).
+    auto pending = coordinator.pendingMarkerTransactions();
+
+    int total = 0;
+    for (const auto& p : pending) {
+        const ControlType ct = p.commit ? ControlType::Commit : ControlType::Abort;
+        // Write a control batch for each partition using the PERSISTED epochs.
+        for (const auto& tp : p.partitions) {
+            auto batch = ControlMarker::build(p.producerId, p.producerEpoch,
+                                               ct, p.coordinatorEpoch);
+            appendFn(tp, batch);
+            ++total;
+        }
+        // Advance state machine: PrepareAbort/PrepareCommit → Complete* → Empty.
+        coordinator.completeTransaction(p.txnId);
+    }
+    return total;
 }
 
 } // namespace rune::transaction

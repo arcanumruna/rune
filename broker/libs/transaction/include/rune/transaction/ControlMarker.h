@@ -115,13 +115,12 @@ public:
     // Batch constants
     // -----------------------------------------------------------------------
     static constexpr int8_t  kMagicByte         = 2;
-    static constexpr int16_t kAttrControl        = 0x0020; // bit 5
-    static constexpr int16_t kAttrTransactional  = 0x0010; // bit 4
-    static constexpr int16_t kAttrCommit         = 0x0040; // bit 6: 0=commit,1=abort
-    // combined attributes for a control batch:
-    //   CONTROL | TRANSACTIONAL | (commit=0 : no extra bit, abort=1 : bit 6)
-    // We use: attrs = 0x30 | (abort ? 0x40 : 0x00)
-    // But to keep decoding simple we store controlType in the record key (2 bytes).
+    static constexpr int16_t kAttrControl        = 0x0020; // bit 5: isControl
+    static constexpr int16_t kAttrTransactional  = 0x0010; // bit 4: isTransactional
+    // S2 fix: kAttrCommit (bit 6) is NOT set during build and NOT checked during
+    // extract.  controlType is stored ONLY in the record key (2-byte int16).
+    // Using both would create two sources of truth — we pick the record key
+    // exclusively (matches the authoritative Kafka KIP-98 definition).
 
     /// Total encoded size of a control batch in bytes.
     static constexpr std::size_t ENCODED_SIZE = 75;
@@ -147,20 +146,38 @@ public:
                                        int32_t       coordinatorEpoch) noexcept;
 
     // -----------------------------------------------------------------------
-    // isControlBatch — true if the batch at buf[offset] has the CONTROL flag.
+    // isControlBatch — true if the batch at buf[offset] has the CONTROL flag
+    // AND passes CRC32C verification AND the buffer has sufficient length.
     //
-    // Checks magic byte (must be 2) and the CONTROL bit in attributes.
-    // buf must contain at least ENCODED_SIZE bytes from offset.
+    // S1 fix: verifies magic byte, available length, the CRC32C, and then
+    // the CONTROL bit so a corrupt/truncated data batch cannot be mistaken
+    // for a control batch.
+    //
+    // \param buf     Buffer containing the batch bytes.
+    // \param offset  Byte offset within buf where the batch starts.
+    // \param avail   Number of bytes available starting at buf+offset.
+    //                Must be >= ENCODED_SIZE; returns false otherwise.
     // -----------------------------------------------------------------------
-    static bool isControlBatch(const uint8_t* buf, std::size_t offset = 0) noexcept;
+    static bool isControlBatch(const uint8_t* buf,
+                                std::size_t    offset = 0,
+                                std::size_t    avail  = ENCODED_SIZE) noexcept;
 
     // -----------------------------------------------------------------------
     // extract — decode the ControlMarkerPayload from a control batch.
     //
-    // Returns false if the batch is not a valid control batch.
+    // S1 fix: performs full bounds-checking on every field and varint read.
+    // Returns false if the batch fails isControlBatch() or any field would
+    // read past avail bytes.
+    //
+    // \param buf     Buffer.
+    // \param offset  Start of batch in buf.
+    // \param out     Decoded payload on success.
+    // \param avail   Available bytes from buf+offset. Defaults to ENCODED_SIZE.
     // -----------------------------------------------------------------------
-    static bool extract(const uint8_t* buf, std::size_t offset,
-                         ControlMarkerPayload& out) noexcept;
+    static bool extract(const uint8_t*       buf,
+                         std::size_t          offset,
+                         ControlMarkerPayload& out,
+                         std::size_t          avail = ENCODED_SIZE) noexcept;
 
     // -----------------------------------------------------------------------
     // writeMarkers — on EndTxn, produce a control batch for every partition
@@ -183,6 +200,26 @@ public:
                              int64_t                   nowNs,
                              const std::function<void(const TopicPartition&,
                                                        const std::vector<uint8_t>&)>& appendFn);
+
+    // -----------------------------------------------------------------------
+    // resolvePendingMarkers — B1/B2: resolve all internally-initiated aborts.
+    //
+    // Iterates coordinator.pendingMarkerTransactions(), builds a COMMIT or
+    // ABORT control batch for each partition using the PERSISTED epochs from
+    // the coordinator metadata (not a live client request), and calls appendFn.
+    // After all markers are written, calls completeTransaction() for each txnId.
+    //
+    // This is the correct resolution path for:
+    //   - epoch-fence aborts (initProducerId on Ongoing)
+    //   - timeout aborts (doWork)
+    //   - recovered Prepare* after coordinator failover (B2)
+    //
+    // Returns the total number of markers written across all resolved txns.
+    // -----------------------------------------------------------------------
+    static int resolvePendingMarkers(
+        TransactionCoordinator& coordinator,
+        const std::function<void(const TopicPartition&,
+                                  const std::vector<uint8_t>&)>& appendFn);
 
 private:
     // CRC32C (Castagnoli)
