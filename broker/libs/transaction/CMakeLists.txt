@@ -1,13 +1,18 @@
 add_library(rune_transaction
     src/TransactionCoordinator.cpp
     src/TransactionLog.cpp
-    src/ControlMarker.cpp)
+    src/ControlMarker.cpp
+    src/ReadCommittedView.cpp)
 target_include_directories(rune_transaction PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${RUNE_PROTOCOL_INCLUDE})
 # TransactionLog uses POSIX I/O (open/pread/pwrite/fsync/ftruncate).
 # No additional link targets needed on Linux/macOS.
 # TransactionMessages.h is header-only. ControlMarker depends on
 # TransactionCoordinator (already in rune_transaction).
+# ReadCommittedView scans rune::storage::Log — link rune_storage (no cycle:
+# rune_storage has no dep on rune_transaction).
+target_link_libraries(rune_transaction PUBLIC rune_storage)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -16,7 +21,8 @@ if(BUILD_TESTING)
         tests/transaction/ProducerIdAllocatorTest.cpp
         tests/transaction/TransactionLogTest.cpp
         tests/transaction/TransactionMessagesTest.cpp
-        tests/transaction/ControlMarkerTest.cpp)
+        tests/transaction/ControlMarkerTest.cpp
+        tests/transaction/ReadCommittedViewTest.cpp)
     target_link_libraries(rune_transaction_tests PRIVATE
         rune_transaction
         GTest::gtest_main)
