@@ -995,3 +995,113 @@ TEST(ElectionLog, FollowerPersistsTermEntryOnClose) {
         EXPECT_EQ(reopenEntry->logPosition, closedLogPosition);
     }
 }
+
+// ===========================================================================
+// GROUP 7: Leader-Completeness safety tests (audit B2/T1)
+// ===========================================================================
+
+// LC1: NLT for a HIGHER term that this node never voted in IS adopted (audit B2/T1).
+//      Per Aeron Election.java:433-437: if nextLeadershipTermId > candidateTermId_,
+//      the node adopts the new term via proposeMaxCandidateTermId and follows the leader.
+//      This is the correct Aeron behavior: a node that missed a ballot round still
+//      follows the winning leader by adopting the winning term.
+//      A STALE (lower term) NLT is what must be rejected — tested by the existing
+//      OnNewLeadershipTerm_Stale_Ignored test and the LC2 log-freshness test below.
+TEST(ElectionLog, NLT_HigherTerm_IsAdoptedAndFollowed) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+    // candidateTermId_ after init = 1
+
+    // Inject NLT for term=99 — node 0 never voted in term 99 but term is higher.
+    // Per Aeron Election.java:433-437: adopt the new term and follow the leader.
+    e.onNewLeadershipTerm(nowNs,
+        /*logLeadershipTermId=*/0,
+        /*nextLeadershipTermId=*/99,
+        /*nextTermBaseLogPosition=*/0,
+        /*nextLogPosition=*/0,
+        /*leadershipTermId=*/99,
+        /*termBaseLogPosition=*/0,
+        /*logPosition=*/0,
+        /*leaderRecordingId=*/0,
+        /*timestamp=*/0,
+        /*leaderMemberId=*/1,
+        /*logSessionId=*/0,
+        /*isStartup=*/true,
+        /*commitPosition=*/0);
+
+    // Must have left CANVASS — higher-term NLT is adopted and the node follows.
+    EXPECT_NE(e.state(), ElectionState::Canvass)
+        << "NLT for higher term must be adopted per Aeron Election.java:433-437";
+    // candidateTermId must have been updated to 99
+    EXPECT_EQ(e.candidateTermId(), 99)
+        << "candidateTermId must be adopted to nextLeadershipTermId=99";
+}
+
+// LC2: NLT where leader log is BEHIND follower's appendPosition is rejected (audit B2).
+//      Node 0 has appendPosition=200, logLeadershipTermId=5. After voting in term 6,
+//      leader sends NLT with logPosition=50, logLtId=3 → must be rejected.
+TEST(ElectionLog, NLT_LeaderLogBehindFollower_IsIgnored) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    // nodeStateFile starts fresh (candidateTermId=NULL_VALUE=-1) so init will
+    // set candidateTermId_ = max(-1, leadershipTermId=5) = 5, then onRequestVote
+    // for term=6 (>5) will grant the vote and set candidateTermId_=6.
+    NodeStateFile nsf(nsfFile.str());
+    TermLog tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // Node 0 with logLeadershipTermId=5, appendPosition=200
+    std::vector<ClusterMember> ms(3);
+    for (int i = 0; i < 3; i++) {
+        ms[i].id = i;
+        ms[i].logPosition = 0;
+        ms[i].logLeadershipTermId = 0;
+        ms[i].leadershipTermId = 0;
+    }
+    Election e(true, -1,
+               /*leadershipTermId=*/5, /*logLeadershipTermId=*/5,
+               /*logPosition=*/200, /*appendPosition=*/200,
+               std::move(ms), 0, pub, nsf, tl,
+               kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 42);
+
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    // After init: candidateTermId_ = max(NULL_VALUE=-1 → treated as 5, leadershipTermId=5) = 5
+
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+
+    // Vote for member 1 in term 6 (6 > candidateTermId_=5) → grants vote,
+    // proposes term 6, state → FOLLOWER_BALLOT
+    e.onRequestVote(/*logLeadershipTermId=*/5, /*logPosition=*/200,
+                    /*candidateTermId=*/6, /*candidateId=*/1, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::FollowerBallot)
+        << "node must have voted for candidate in term 6 (candidateTermId was 5)";
+
+    // Now candidateTermId_=6. Leader 1 sends NLT for term=6 but its log is
+    // (logLtId=3, logPos=50) which is BEHIND our (5, 200).
+    // compareLog(5,200, 3,50) > 0 → must be rejected (log-freshness check).
+    e.onNewLeadershipTerm(nowNs,
+        /*logLeadershipTermId=*/3,
+        /*nextLeadershipTermId=*/6,
+        /*nextTermBaseLogPosition=*/0,
+        /*nextLogPosition=*/50,
+        /*leadershipTermId=*/6,
+        /*termBaseLogPosition=*/0,
+        /*logPosition=*/50,
+        /*leaderRecordingId=*/0,
+        /*timestamp=*/0,
+        /*leaderMemberId=*/1,
+        /*logSessionId=*/0,
+        /*isStartup=*/true,
+        /*commitPosition=*/0);
+
+    // Must still be in FOLLOWER_BALLOT — behind-log NLT must be rejected
+    EXPECT_EQ(e.state(), ElectionState::FollowerBallot)
+        << "NLT with leader log (term=3,pos=50) behind follower (term=5,pos=200) must be ignored";
+}

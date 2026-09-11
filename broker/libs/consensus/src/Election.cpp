@@ -689,12 +689,6 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     // Election.java:430: if CLOSED ignore
     if (state_ == ElectionState::Closed) return;
 
-    // Election.java:433-437: stale term check
-    // Accept if nextLeadershipTermId matches our candidateTermId (or is newer).
-    // In Aeron:  if (leadershipTermId != candidateTermId_) return; for exact match.
-    // We implement the faithful version: accept if leadershipTermId >= our leadershipTermId
-    // AND the message is from the ballot/canvass states (state check below).
-
     // Election.java:440-450: state gate — only accept from ballot/canvass states
     bool inAcceptingState =
         (state_ == ElectionState::FollowerBallot   ||
@@ -718,9 +712,37 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
         return;
     }
 
+    // B2 fix: Aeron Election.java:433-437 — gate on candidateTermId.
+    // A follower only follows the leader of the term it participated in.
+    // If nextLeadershipTermId > candidateTermId_, the node was partitioned and
+    // missed a ballot round; adopt the new term via proposeMaxCandidateTermId
+    // (same as Aeron's logic at Election.java:443-448).
+    // If nextLeadershipTermId < candidateTermId_, the NLT is for a stale ballot
+    // this node already advanced past — ignore.
+    if (nextLeadershipTermId > candidateTermId_) {
+        // Adopt the higher term — node missed its ballot round.
+        candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
+            nextLeadershipTermId, logPosition_, /*timestampMs=*/0);
+    } else if (nextLeadershipTermId < candidateTermId_) {
+        // Stale ballot — this node has already advanced past nextLeadershipTermId.
+        return;
+    }
+    // nextLeadershipTermId == candidateTermId_: this node participated; continue.
+
     // Election.java:456-458: locate the sending leader member
     ClusterMember* leaderM = memberById(leaderMemberIdArg);
     if (leaderM == nullptr) return;
+
+    // B2 fix: leader log-freshness check — Aeron Election.java:460-470.
+    // Reject the NLT if the leader's log is strictly behind this node's log.
+    // compareLog > 0 means our log is more recent than the leader's → reject.
+    // This prevents following a leader whose log is shorter than our own
+    // (Leader-Completeness violation). Audit finding B2 / ref §3.1 row NLT.
+    if (ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
+                                  logLeadershipTermIdArg, logPositionArg) > 0) {
+        // Leader's log is behind ours. Do not follow.
+        return;
+    }
 
     // Election.java:460-470: set leader member + leadership term
     leaderMember_     = leaderM;
@@ -739,10 +761,7 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     // We always go to FollowerReplay (which immediately passes through to FollowerLogInit).
     state(ElectionState::FollowerReplay, nowNs, "onNewLeadershipTerm follower path");
 
-    (void)logLeadershipTermIdArg;
-    (void)nextLeadershipTermId;
     (void)nextTermBaseLogPosition;
-    (void)logPositionArg;
 }
 
 // ---------------------------------------------------------------------------
