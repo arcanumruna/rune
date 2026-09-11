@@ -39,3 +39,22 @@ pip-wheel-metadata/
 
 # --- Superpowers scratch ---
 .superpowers/
+
+# --- Patterns from the initial repository template ---
+node_modules/
+dist/
+*.class
+*.py[cod]
+*.jar
+target/
+TEST*.xml
+Thumbs.db
+*.app
+*.exe
+*.war
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
