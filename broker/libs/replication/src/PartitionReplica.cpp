@@ -105,6 +105,39 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 {
+    // Truncate uncommitted tail BEFORE adopting the new epoch so that
+    // applyReplicated()'s ">" check still fires on the first fetch (and as a
+    // belt-and-suspenders path). Compute the boundary using the PRE-transition
+    // epoch so the cache lookup is correct.
+    if (leaderEpoch > epoch_) {
+        // Capture the high-watermark NOW (while role may still be Leader and
+        // leaderState_ is valid) to use as the floor for truncation.
+        Offset committedHw = highWatermark();
+
+        // Try epoch-cache boundary first (Kafka OffsetsForLeaderEpoch path).
+        Offset truncOff = truncationOffsetForEpochChange(epochCache_, leaderEpoch);
+
+        // If the cache returns -1 (no epoch >= leaderEpoch in our cache, which
+        // is the common case when all records share the same old epoch), fall
+        // back to the committed boundary: everything above HW is uncommitted
+        // and potentially divergent from the new leader's timeline.
+        if (truncOff < 0) {
+            truncOff = committedHw;
+        }
+
+        // Safety clamp: never truncate below the committed prefix.
+        if (truncOff < committedHw) {
+            truncOff = committedHw;
+        }
+
+        // Only truncate if there is actually an uncommitted tail to drop.
+        Offset currentLeo = log_->logEndOffset();
+        if (truncOff < currentLeo) {
+            log_->truncateTo(truncOff);
+            // followerHw_ will be reset below; no need to cap it here.
+        }
+    }
+
     epoch_    = leaderEpoch;
     role_     = Role::Follower;
     leaderId_ = leaderId;

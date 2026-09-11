@@ -445,19 +445,21 @@ TEST_F(FailoverTest3, OldLeader_BecomeFollower_TruncatesUncommittedTail) {
     Offset leoBeforeFailover = leader_->logEndOffset();
     ASSERT_GT(leoBeforeFailover, committed);
 
-    // Failover.
+    // Failover: electNewLeader() calls becomeFollower(newEpoch) on the old leader.
     coord_->signalLeaderDead();
     coord_->electNewLeader();
     // Old leader is now follower with new epoch.
     ASSERT_EQ(leader_->role(), Role::Follower);
 
-    // Old leader truncates on becomeFollower (epoch set to newEpoch).
-    // At minimum: no committed data is lost on the old leader.
-    // The old leader's log might still have the uncommitted record since
-    // becomeFollower() itself doesn't truncate — truncation happens on
-    // applyReplicated() with a new epoch response. The old leader's LEO
-    // may still be >= leoBeforeFailover until it fetches.
-    // What we assert here: the committed offsets are intact.
+    // FIX 2: becomeFollower MUST truncate the uncommitted tail immediately at
+    // transition time.  The old leader's LEO must equal exactly the committed
+    // boundary — NOT leoBeforeFailover.  A no-truncation bug would leave LEO at
+    // leoBeforeFailover (> committed) and this assertion would fail.
+    EXPECT_EQ(leader_->logEndOffset(), committed)
+        << "becomeFollower must truncate uncommitted tail: LEO must equal committed="
+        << committed << " not staleLeo=" << leoBeforeFailover;
+
+    // Committed data must survive (we never truncate below HW).
     auto bytes = leader_->log()->read(0, 1 << 20);
     EXPECT_FALSE(bytes.empty()) << "Committed data must survive on old leader";
 }
@@ -528,15 +530,25 @@ TEST_F(FailoverTest3, OldLeader_TailTruncation_ExactOffset) {
     resp.errorCode      = kErrNone;
     resp.records        = {};  // no records — epoch-change signal
 
-    Offset leoBeforeTrunc = leader_->logEndOffset();
-    leader_->applyReplicated(resp);
-    Offset leoAfterTrunc  = leader_->logEndOffset();
+    // FIX 2: becomeFollower already truncated the tail at transition time.
+    // LEO must already equal `committed` before applyReplicated fires.
+    Offset leoAfterBecomeFollower = leader_->logEndOffset();
+    EXPECT_EQ(leoAfterBecomeFollower, committed)
+        << "becomeFollower must truncate tail immediately: LEO must equal committed="
+        << committed << " before any applyReplicated call";
 
-    // The old leader's LEO must be <= its committed prefix (truncated to epoch boundary).
-    // It should not exceed staleLeo.
-    EXPECT_LE(leoAfterTrunc, staleLeo)
-        << "Old leader must not have more than staleLeo=" << staleLeo << " after truncation";
-    (void)leoBeforeTrunc;
+    // applyReplicated with same-epoch response (leaderEpoch == epoch_ now)
+    // must leave LEO at the committed boundary (no secondary truncation needed,
+    // tail is already gone).
+    leader_->applyReplicated(resp);
+    Offset leoAfterTrunc = leader_->logEndOffset();
+
+    // FIX 2: exact equality — must equal committed, not merely <= staleLeo.
+    // A no-truncation bug would leave leoAfterTrunc == staleLeo (> committed).
+    EXPECT_EQ(leoAfterTrunc, committed)
+        << "After truncation LEO must be EXACTLY committed=" << committed
+        << "; staleLeo was=" << staleLeo;
+    (void)staleLeo;
 }
 
 // ===========================================================================
@@ -753,6 +765,25 @@ TEST(UnderReplicationRepairTest, RepairFollower_BootstrapsAndRejoinsISR) {
     // F3 log must match leader's committed prefix.
     EXPECT_GE(f3.logEndOffset(), hw)
         << "Repaired follower must hold all committed data (LEO >= hw)";
+
+    // FIX 3: byte + offset equality over [0, hw).
+    // A wrong/partial replay must fail here — it's not enough to just have LEO >= hw.
+    auto leaderBytes = logL.read(0, 1 << 20);
+    auto f3Bytes     = logF3.read(0, 1 << 20);
+    ASSERT_FALSE(leaderBytes.empty()) << "Leader log must be non-empty";
+    ASSERT_FALSE(f3Bytes.empty())     << "Repair follower log must be non-empty";
+
+    // The repaired follower's log bytes over [0, hw) must be byte-identical to
+    // the leader's committed prefix.  Read exactly hw worth of log bytes using
+    // a large-enough maxBytes that captures all committed batches.
+    // Because both logs were written with the same RecordBatch framing
+    // (via replay + live fetch), their raw bytes must match over [0, hw).
+    auto leaderCommitted = logL.read(0, static_cast<int32_t>(hw * 512 + 4096));
+    auto f3Committed     = logF3.read(0, static_cast<int32_t>(hw * 512 + 4096));
+    EXPECT_EQ(leaderCommitted.size(), f3Committed.size())
+        << "Repair follower committed prefix byte-length must match leader";
+    EXPECT_EQ(leaderCommitted, f3Committed)
+        << "Repair follower log bytes [0, hw) must be byte-identical to leader";
 }
 
 TEST(UnderReplicationRepairTest, RepairFollower_ISRSizeRestored) {
