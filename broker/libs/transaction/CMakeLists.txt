@@ -14,6 +14,32 @@ target_include_directories(rune_transaction PUBLIC
 # rune_storage has no dep on rune_transaction).
 target_link_libraries(rune_transaction PUBLIC rune_storage)
 
+# ---------------------------------------------------------------------------
+# Exactly-once EOS end-to-end integration tests (P5-5).
+# Gated behind BUILD_TRANSACTION_INTEGRATION_TESTING (OFF by default) to
+# mirror the replication / coordination integration target pattern.
+# ---------------------------------------------------------------------------
+option(BUILD_TRANSACTION_INTEGRATION_TESTING
+    "Build exactly-once EOS end-to-end integration tests (P5-5)" OFF)
+if(BUILD_TRANSACTION_INTEGRATION_TESTING)
+    if(NOT BUILD_TESTING)
+        find_package(GTest REQUIRED)
+        include(GoogleTest)
+    endif()
+    set(TXN_INTEG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    add_executable(rune_transaction_integration_tests
+        ${TXN_INTEG_DIR}/ExactlyOnceIntegrationTest.cpp)
+    target_include_directories(rune_transaction_integration_tests PRIVATE
+        ${TXN_INTEG_DIR}
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_transaction_integration_tests PRIVATE
+        rune_transaction
+        rune_coordination
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transaction_integration_tests
+        PROPERTIES TIMEOUT 60)
+endif()
+
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_transaction_tests
