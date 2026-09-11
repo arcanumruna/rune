@@ -1060,3 +1060,86 @@ TEST(LogCleaner, OffsetMapSizeMatchesDistinctKeys) {
     EXPECT_EQ(map.size(), 3u) << "Map must contain exactly 3 distinct keys";
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// T1-real: Real crash-durability tests for LogCleaner.
+// After compact (writeFileDurable + fsync + rename), a fresh Log reopened
+// from disk (simulating power loss) must see the correct compacted content.
+// ---------------------------------------------------------------------------
+
+// T1-real: Compact, then "power-loss reopen" — fresh Log sees correct content.
+TEST(LogCleaner, CompactedLogIsReadableAfterReopen) {
+    auto dir = makeTempDir("lc_t1_real");
+    std::filesystem::create_directories(dir);
+
+    // Write: k1 twice (only offset 1 should survive), k2 once.
+    {
+        Log log(dir.string(), 512);
+        log.append(makeBatch(0, "k1", "old", 1000), 0); // superseded
+        log.append(makeBatch(1, "k1", "new", 1001), 1); // latest
+        log.append(makeBatch(2, "k2", "v2",  1002), 2);
+        for (int i = 3; i < 15; ++i)
+            log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+    } // Log destructor closes all handles
+
+    // Compact (this does writeFileDurable + rename + fsyncDir)
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        LogCleaner cleaner;
+        cleaner.clean(log, 0, 3, 0, 1'000'000);
+    }
+
+    // "Power-loss reopen": brand-new Log from the directory.
+    Log log3(dir.string(), 512);
+    log3.recover();
+
+    auto recs = readAllRecords(log3, 0);
+
+    // k1 must appear exactly once with the latest value.
+    int k1count = 0; bool k1Latest = false;
+    for (auto& r : recs) {
+        if (r.key == "k1") {
+            ++k1count;
+            if (r.value == "new" && r.offset == 1) k1Latest = true;
+        }
+    }
+    EXPECT_EQ(k1count, 1) << "k1 must appear exactly once after compact+reopen";
+    EXPECT_TRUE(k1Latest) << "k1@1=new must be the surviving record";
+    EXPECT_EQ(countKey(recs, "k2"), 1);
+
+    std::filesystem::remove_all(dir);
+}
+
+// T1-index: After compact + reopen, no .index2 orphan files; reads via index work.
+TEST(LogCleaner, CompactedIndexConsistentWithLog) {
+    auto dir = makeTempDir("lc_t1_idx");
+    std::filesystem::create_directories(dir);
+
+    {
+        Log log(dir.string(), 1024);
+        for (int i = 0; i < 10; ++i)
+            log.append(makeBatch(i, "k" + std::to_string(i % 3), "v", 5000 + i), i);
+    }
+
+    {
+        Log log(dir.string(), 1024);
+        log.recover();
+        LogCleaner cleaner;
+        cleaner.clean(log, 0, 10, 0, 1'000'000);
+    }
+
+    // Check no .index2 files exist anywhere in the directory.
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        EXPECT_NE(e.path().extension(), ".index2")
+            << "No .index2 orphan files must exist after compact: " << e.path();
+    }
+
+    // Reopen and verify reads work (index is consistent).
+    Log log3(dir.string(), 1024);
+    log3.recover();
+    auto recs = readAllRecords(log3, 0);
+    EXPECT_FALSE(recs.empty()) << "Log must be readable after compact+reopen";
+
+    std::filesystem::remove_all(dir);
+}
