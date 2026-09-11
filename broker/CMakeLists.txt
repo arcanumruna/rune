@@ -27,6 +27,7 @@ endif()
 
 add_subdirectory(libs/storage)
 add_subdirectory(libs/consensus)
+add_subdirectory(libs/replication)
 
 add_executable(rune_broker src/main.cpp)
 target_link_libraries(rune_broker PRIVATE rune_storage spdlog::spdlog)

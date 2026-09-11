@@ -1,0 +1,271 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// ReplicationMessages.h — SBE-style flat little-endian codecs for the Rune
+// data-plane replication protocol (schema id = 112, version = 1).
+//
+// Protocol model: Kafka-style FETCH replication.
+//   • Follower → Leader: FetchRequest  (follower asks for records from fetchOffset)
+//   • Leader  → Follower: FetchResponse (leader sends records + high-watermark)
+//
+// Wire format: 8-byte SBE message header followed by a fixed-size payload.
+// FetchResponse additionally carries a variable-length records blob
+// (int32 length prefix + raw bytes).
+//
+// All integers are little-endian (native on x86; static_assert enforced).
+// NO internal allocation — encode/decode work on caller-provided buffers.
+// Zero-copy: FetchResponseMsg::records is a std::span<const uint8_t> view
+// into the decode buffer.
+//
+// 8-byte SBE message header (identical structure to consensus schema 111):
+//   blockLength : uint16   (fixed-field payload bytes, excluding header)
+//   templateId  : uint16
+//   schemaId    : uint16   (= 112)
+//   version     : uint16   (= 1)
+// ---------------------------------------------------------------------------
+
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <cassert>
+#include <bit>
+
+#include <rune/replication/Types.h>
+
+namespace rune::replication {
+
+// ---------------------------------------------------------------------------
+// Schema constants
+// ---------------------------------------------------------------------------
+inline constexpr uint16_t kSchemaId      = 112;
+inline constexpr uint16_t kSchemaVersion = 1;
+
+// ---------------------------------------------------------------------------
+// Template IDs (assigned for the replication protocol)
+// ---------------------------------------------------------------------------
+enum class ReplicationTemplateId : uint16_t {
+    FetchRequest  = 1,
+    FetchResponse = 2,
+};
+
+// ---------------------------------------------------------------------------
+// Internal little-endian helpers (UB-free via memcpy; optimises to mov)
+// ---------------------------------------------------------------------------
+namespace detail {
+
+// Enforce little-endian at compile time: schema 112 is little-endian SBE.
+static_assert(std::endian::native == std::endian::little,
+    "rune::replication SBE codecs assume a little-endian host "
+    "(schema 112 is little-endian SBE)");
+
+template<typename T>
+inline void write_le(uint8_t* p, T v) noexcept {
+    std::memcpy(p, &v, sizeof(T));
+}
+
+template<typename T>
+inline T read_le(const uint8_t* p) noexcept {
+    T v; std::memcpy(&v, p, sizeof(T)); return v;
+}
+
+} // namespace detail
+
+// ---------------------------------------------------------------------------
+// ReplicationMessageHeader — 8 bytes, little-endian
+// Identical layout to ConsensusMessageHeader (schema 111) but with
+// schemaId = 112.
+// ---------------------------------------------------------------------------
+struct ReplicationMessageHeader {
+    uint16_t blockLength;
+    uint16_t templateId;
+    uint16_t schemaId;
+    uint16_t version;
+
+    static constexpr std::size_t ENCODED_SIZE = 8;
+
+    /// Encode header into buf[offset..offset+8). Returns 8 (bytes written).
+    static std::size_t encode(uint8_t* buf, std::size_t offset,
+                              uint16_t blockLen,
+                              uint16_t tmplId) noexcept
+    {
+        uint8_t* p = buf + offset;
+        detail::write_le<uint16_t>(p + 0, blockLen);
+        detail::write_le<uint16_t>(p + 2, tmplId);
+        detail::write_le<uint16_t>(p + 4, kSchemaId);
+        detail::write_le<uint16_t>(p + 6, kSchemaVersion);
+        return ENCODED_SIZE;
+    }
+
+    /// Decode header from buf[offset..offset+8).
+    static ReplicationMessageHeader decode(const uint8_t* buf,
+                                           std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset;
+        ReplicationMessageHeader h{};
+        h.blockLength = detail::read_le<uint16_t>(p + 0);
+        h.templateId  = detail::read_le<uint16_t>(p + 2);
+        h.schemaId    = detail::read_le<uint16_t>(p + 4);
+        h.version     = detail::read_le<uint16_t>(p + 6);
+        return h;
+    }
+};
+
+/// Peek the templateId from a buffer without decoding the full header.
+inline uint16_t peekTemplateId(const uint8_t* buf,
+                                std::size_t offset = 0) noexcept
+{
+    return detail::read_le<uint16_t>(buf + offset + 2);
+}
+
+// ===========================================================================
+// 1. FetchRequest  (templateId = 1)
+//
+// A follower sends FetchRequest to the partition leader to:
+//   (a) Fetch records it is missing (from fetchOffset onward, up to maxBytes).
+//   (b) Report its own logEndOffset (= fetchOffset) so the leader can
+//       compute the high-watermark.
+//
+// Wire layout (fixed block, 28 bytes):
+//   leaderEpoch   : Epoch       (int64)  @ +0   leader epoch the follower expects
+//   partition     : PartitionId (int32)  @ +8
+//   followerId    : NodeId      (int32)  @ +12
+//   fetchOffset   : Offset      (int64)  @ +16  follower logEndOffset / next wanted offset
+//   maxBytes      : int32       @ +24   max bytes of records wanted (0 = position-only)
+// Total: 8 + 4 + 4 + 8 + 4 = 28 bytes
+// ===========================================================================
+struct FetchRequestMsg {
+    Epoch       leaderEpoch;
+    PartitionId partition;
+    NodeId      followerId;
+    Offset      fetchOffset;
+    int32_t     maxBytes;
+
+    static constexpr uint16_t TEMPLATE_ID  = 1;
+    static constexpr uint16_t BLOCK_LENGTH = 28; // 2×int64 + 3×int32 = 16 + 12 = 28
+    static constexpr std::size_t TOTAL_SIZE =
+        ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    /// Encode FetchRequest into buf[offset]. Returns total bytes written.
+    static std::size_t encode(uint8_t* buf, std::size_t offset,
+                              Epoch       leaderEpoch_,
+                              PartitionId partition_,
+                              NodeId      followerId_,
+                              Offset      fetchOffset_,
+                              int32_t     maxBytes_) noexcept
+    {
+        std::size_t pos = offset;
+        pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, leaderEpoch_);
+        detail::write_le<int32_t>(p +  8, partition_);
+        detail::write_le<int32_t>(p + 12, followerId_);
+        detail::write_le<int64_t>(p + 16, fetchOffset_);
+        detail::write_le<int32_t>(p + 24, maxBytes_);
+        return TOTAL_SIZE;
+    }
+
+    /// Decode FetchRequest from buf[offset].
+    static FetchRequestMsg decode(const uint8_t* buf,
+                                  std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
+        FetchRequestMsg m{};
+        m.leaderEpoch  = detail::read_le<int64_t>(p +  0);
+        m.partition    = detail::read_le<int32_t>(p +  8);
+        m.followerId   = detail::read_le<int32_t>(p + 12);
+        m.fetchOffset  = detail::read_le<int64_t>(p + 16);
+        m.maxBytes     = detail::read_le<int32_t>(p + 24);
+        return m;
+    }
+};
+
+// ===========================================================================
+// 2. FetchResponse  (templateId = 2)  — variable-length
+//
+// The leader sends FetchResponse to a follower in reply to FetchRequest.
+// It carries the high-watermark (= committed offset, safe to deliver to
+// consumers), the logStartOffset (earliest offset available in this epoch),
+// an error code, and a variable-length records blob.
+//
+// Fixed block (30 bytes):
+//   leaderEpoch    : Epoch       (int64)  @ +0
+//   partition      : PartitionId (int32)  @ +8
+//   highWatermark  : Offset      (int64)  @ +12
+//   logStartOffset : Offset      (int64)  @ +20
+//   errorCode      : int16       @ +28
+// Total fixed: 8 + 4 + 8 + 8 + 2 = 30 bytes
+//
+// Followed by variable-length records blob:
+//   recordsLength  : int32       @ +30  (can be 0 for HW-only updates)
+//   recordsData    : uint8[]     @ +34  (recordsLength bytes)
+//
+// Total on-wire = 8 (header) + 30 (fixed) + 4 (length prefix) + recordsLength
+// ===========================================================================
+struct FetchResponseMsg {
+    Epoch                    leaderEpoch;
+    PartitionId              partition;
+    Offset                   highWatermark;
+    Offset                   logStartOffset;
+    int16_t                  errorCode;
+    std::span<const uint8_t> records;   ///< Zero-copy view into the decode buf.
+
+    static constexpr uint16_t TEMPLATE_ID        = 2;
+    static constexpr uint16_t BLOCK_LENGTH_FIXED = 30; // fixed fields only
+    static constexpr std::size_t VAR_HEADER_SIZE  = 4;  // int32 length prefix
+
+    /// Encode FetchResponse into buf[offset].
+    /// records_ may be empty (size == 0) for high-watermark-only updates.
+    /// Returns total bytes written (header + fixed + length prefix + records).
+    static std::size_t encode(uint8_t* buf, std::size_t offset,
+                              Epoch                    leaderEpoch_,
+                              PartitionId              partition_,
+                              Offset                   highWatermark_,
+                              Offset                   logStartOffset_,
+                              int16_t                  errorCode_,
+                              std::span<const uint8_t> records_) noexcept
+    {
+        std::size_t pos = offset;
+        pos += ReplicationMessageHeader::encode(buf, pos,
+                                                BLOCK_LENGTH_FIXED, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, leaderEpoch_);
+        detail::write_le<int32_t>(p +  8, partition_);
+        detail::write_le<int64_t>(p + 12, highWatermark_);
+        detail::write_le<int64_t>(p + 20, logStartOffset_);
+        detail::write_le<int16_t>(p + 28, errorCode_);
+        pos += BLOCK_LENGTH_FIXED;
+
+        // Variable-length records blob: int32 length + raw bytes
+        auto len = static_cast<int32_t>(records_.size());
+        detail::write_le<int32_t>(buf + pos, len);
+        pos += VAR_HEADER_SIZE;
+        if (len > 0) {
+            std::memcpy(buf + pos, records_.data(), static_cast<std::size_t>(len));
+            pos += static_cast<std::size_t>(len);
+        }
+        return pos - offset;
+    }
+
+    /// Decode FetchResponse from buf[offset].
+    /// FetchResponseMsg::records is a zero-copy view into buf — caller must
+    /// keep buf alive while using the returned msg.
+    static FetchResponseMsg decode(const uint8_t* buf,
+                                   std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
+        FetchResponseMsg m{};
+        m.leaderEpoch    = detail::read_le<int64_t>(p +  0);
+        m.partition      = detail::read_le<int32_t>(p +  8);
+        m.highWatermark  = detail::read_le<int64_t>(p + 12);
+        m.logStartOffset = detail::read_le<int64_t>(p + 20);
+        m.errorCode      = detail::read_le<int16_t>(p + 28);
+
+        const uint8_t* vp = p + BLOCK_LENGTH_FIXED;
+        int32_t len = detail::read_le<int32_t>(vp);
+        m.records = std::span<const uint8_t>{
+            vp + VAR_HEADER_SIZE,
+            static_cast<std::size_t>(len < 0 ? 0 : len)};
+        return m;
+    }
+};
+
+} // namespace rune::replication
