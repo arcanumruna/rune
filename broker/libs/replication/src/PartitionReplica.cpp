@@ -24,6 +24,7 @@ namespace rune::replication {
 // ---------------------------------------------------------------------------
 // Helper: build a minimal RecordBatch wrapping raw bytes as a single record.
 // Uses the protocol builder so the batch header is valid (CRC stamped etc).
+// Used by the LEADER path (append from producer).
 // ---------------------------------------------------------------------------
 static std::vector<uint8_t> makeBatch(int64_t baseOffset,
                                        std::span<const uint8_t> payload)
@@ -36,6 +37,7 @@ static std::vector<uint8_t> makeBatch(int64_t baseOffset,
     builder.append(keyView, valView, /*timestamp=*/0);
     return builder.build();
 }
+
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -274,10 +276,50 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     }
 
     // Append replicated records if any.
+    // In normal operation resp.records is a sequence of valid RecordBatch frames
+    // copied verbatim from the leader's log.  Write them directly so the follower's
+    // log is byte-identical to the leader's over [0, HW) — avoiding double-framing.
+    //
+    // Detection: a valid RecordBatch sequence starts with a 61-byte header whose
+    // magic byte at position kMagicOffset == kMagicValue (2).  Raw user payloads
+    // injected in unit tests may not carry this magic, in which case we fall back
+    // to the old makeBatch() wrapping so those tests continue to pass.
     if (!resp.records.empty()) {
-        Offset baseOffset = log_->logEndOffset();
-        auto batch = makeBatch(baseOffset, resp.records);
-        log_->append(batch, baseOffset);
+        const std::size_t kMagicOff = static_cast<std::size_t>(
+            rune::protocol::batch::kMagicOffset);
+        const uint8_t kMagic = static_cast<uint8_t>(
+            rune::protocol::batch::kMagicValue);
+
+        bool looksLikeRecordBatch =
+            resp.records.size() > kMagicOff
+            && resp.records[kMagicOff] == kMagic;
+
+        if (looksLikeRecordBatch) {
+            // Walk all batches in the span to find the last offset.
+            int64_t lastOff = -1;
+            std::size_t pos = 0;
+            while (pos < resp.records.size()) {
+                std::size_t rem = resp.records.size() - pos;
+                if (rem < static_cast<std::size_t>(
+                        rune::protocol::batch::kRecordBatchOverhead)) break;
+                rune::protocol::RecordBatchReader r(resp.records.data() + pos, rem);
+                int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total)
+                                  > resp.records.size()) break;
+                lastOff = r.baseOffset() + r.lastOffsetDelta();
+                pos    += static_cast<std::size_t>(total);
+            }
+            if (lastOff >= log_->logEndOffset()) {
+                std::vector<uint8_t> raw(resp.records.begin(), resp.records.end());
+                log_->append(raw, lastOff);
+            }
+        } else {
+            // Fallback: raw user bytes (e.g. injected by unit tests) — wrap in
+            // a RecordBatch so the log segment scanner can parse them.
+            Offset baseOffset = log_->logEndOffset();
+            auto batch = makeBatch(baseOffset, resp.records);
+            log_->append(batch, baseOffset);
+        }
     }
 
     // Advance local HW = min(localLeo, leader's HW).

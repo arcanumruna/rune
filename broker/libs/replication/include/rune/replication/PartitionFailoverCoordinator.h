@@ -142,13 +142,24 @@ public:
     // Leader-death signal
     // -----------------------------------------------------------------------
 
-    /// Inject a leader-death signal: triggers ISR election on next doWork()
-    /// (or immediately if callElect=true).
+    /// Inject a leader-death signal for a specific dead node.
+    ///
+    /// Records which node died so doWork() can ignore stale signals about
+    /// already-replaced leaders.  If the signaled node is NOT the current
+    /// leader (meta_.leader) at the time of the signal, the signal is
+    /// recorded anyway; doWork() will re-check and discard it.
     ///
     /// In production this is called by the Aeron-session-timeout handler.
     /// In tests call it directly, then doWork() once.
+    void signalLeaderDead(NodeId deadNode) noexcept {
+        deadNodeSignaled_    = deadNode;
+        leaderDeadSignaled_  = true;
+    }
+
+    /// Convenience overload: records the CURRENT leader as dead.
+    /// Use when the caller only knows "leader died" but not the NodeId.
     void signalLeaderDead() noexcept {
-        leaderDeadSignaled_ = true;
+        signalLeaderDead(meta_.leader);
     }
 
     // -----------------------------------------------------------------------
@@ -203,12 +214,30 @@ public:
     {
         int work = 0;
 
-        // 1. Leader-death: elect from ISR.
+        // 1. Leader-death: elect from ISR — only if the signaled dead node is
+        //    STILL the current leader AND the liveness oracle confirms it is
+        //    NOT alive.  This prevents a stale/leftover death signal from
+        //    firing a second election and demoting a healthy new leader.
+        //
+        //    Invariants guaranteed:
+        //      (a) leaderDeadSignaled_ is ALWAYS cleared when consumed, even
+        //          if no election happens (leader turned out to be alive).
+        //      (b) If liveness_ is nullptr we conservatively trust the signal.
+        //      (c) If the signaled node is no longer the current leader (it was
+        //          already replaced), the signal is a no-op.
         if (leaderDeadSignaled_) {
-            leaderDeadSignaled_ = false;
-            if (electNewLeader()) {
-                ++work;
+            leaderDeadSignaled_ = false;   // consume — idempotency guarantee (a)
+            NodeId signaledDead = deadNodeSignaled_;
+            bool isCurrentLeader = (signaledDead == meta_.leader);
+            bool confirmedDead   = (liveness_ == nullptr)
+                                 ? true
+                                 : !liveness_->isAlive(signaledDead);
+            if (isCurrentLeader && confirmedDead) {
+                if (electNewLeader()) {
+                    ++work;
+                }
             }
+            // else: stale signal (wrong node or leader recovered) → ignore.
         }
 
         // 2. ISR-repair check (cadenced).
@@ -422,6 +451,7 @@ private:
     int64_t                  lastIsrCheckNs_ = 0;
 
     bool                     leaderDeadSignaled_ = false;
+    NodeId                   deadNodeSignaled_   = -1; ///< NodeId carried by last signalLeaderDead()
 
     std::vector<ReplicaEntry> entries_;          ///< registered replicas
     std::vector<NodeId>       repairCandidates_; ///< followers in bootstrap phase

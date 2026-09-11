@@ -612,6 +612,14 @@ TEST(CatchUp, FollowerFallsBehind_DroppedFromISR_ThenResumes_RejoinsISR) {
         h.coordinator().doWork(h.clock());
         expanded = (ldr->isr().size() == 3u || ldr->isr().size() >= 2u);
     }
+    // FIX 3: assert ISR actually re-expanded (was vacuous before — ISR re-entry
+    // was set in `expanded` but never checked).
+    ASSERT_TRUE(expanded) << "Follower must rejoin ISR after catching up";
+    // At least one follower must be back in the ISR.
+    const auto& isr = ldr->isr();
+    bool followerInIsr = (std::find(isr.begin(), isr.end(), h.nodeId(1)) != isr.end())
+                      || (std::find(isr.begin(), isr.end(), h.nodeId(2)) != isr.end());
+    ASSERT_TRUE(followerInIsr) << "At least one follower must be back in leader's ISR";
 
     // At minimum, all followers should have caught up to leader LEO.
     bool catchupOk = h.driveUntil([&]{
@@ -646,7 +654,10 @@ TEST(CatchUp, FollowerCatchesUp_LogByteEqualToLeader) {
     });
     ASSERT_TRUE(allCaughtUp) << "All followers must converge to leader LEO=" << leaderLeo;
 
-    // Verify both followers have reached leaderLeo and their logs are non-empty.
+    // FIX 3: Verify byte-equality of the committed log between leader and followers.
+    // Both leader and follower logs must contain byte-identical RecordBatch data
+    // over [0, HW) after full convergence.
+    ASSERT_GT(hw, 0) << "HW must be > 0 after commit";
     auto leaderBytes = h.logAt(0)->read(0, 1 << 20);
     ASSERT_FALSE(leaderBytes.empty()) << "Leader log must be non-empty";
 
@@ -656,6 +667,11 @@ TEST(CatchUp, FollowerCatchesUp_LogByteEqualToLeader) {
         auto followerBytes = h.logAt(i)->read(0, 1 << 20);
         EXPECT_FALSE(followerBytes.empty())
             << "Follower " << i << " log must be non-empty after full replication";
+        // FIX 3: byte-equality over [0, HW) — de-vacuouses the !empty() check.
+        // The follower writes RecordBatch data received verbatim from the leader's
+        // log, so the physical segment bytes must match.
+        EXPECT_EQ(leaderBytes, followerBytes)
+            << "Follower " << i << " log bytes must be byte-identical to leader over [0, HW)";
     }
 }
 

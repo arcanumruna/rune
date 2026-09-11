@@ -1285,3 +1285,99 @@ TEST_F(FailoverTest3, CoordMetadata_AfterElection) {
     bool found = std::find(meta.isr.begin(), meta.isr.end(), meta.leader) != meta.isr.end();
     EXPECT_TRUE(found);
 }
+
+// ===========================================================================
+// Test group 13: doWork stale-signal / double-election protection (FIX 1)
+// ===========================================================================
+
+// (a) A stale death signal AFTER a successful election does NOT re-elect /
+//     does NOT demote the live new leader.
+TEST_F(FailoverTest3, DoWork_StaleSignalAfterElection_DoesNotReelect) {
+    produceAndCommit(2);
+    liveness_.markDead(kL);
+
+    // First death signal → first election.
+    coord_->signalLeaderDead(kL);
+    int work1 = coord_->doWork(clock_ + kStep1ms);
+    ASSERT_GT(work1, 0) << "First doWork must elect a new leader";
+
+    NodeId firstNewLeader = coord_->currentLeader();
+    Epoch  firstEpoch     = coord_->currentEpoch();
+    ASSERT_NE(firstNewLeader, kL) << "New leader must differ from the dead leader";
+
+    // Now fire a SECOND stale death signal for kL (the already-dead node).
+    // doWork() must NOT elect again — kL is no longer the current leader.
+    coord_->signalLeaderDead(kL);
+    int work2 = coord_->doWork(clock_ + kStep1ms * 2);
+    EXPECT_EQ(work2, 0)
+        << "Stale death signal for replaced leader must not trigger re-election";
+
+    // New leader must be unchanged.
+    EXPECT_EQ(coord_->currentLeader(), firstNewLeader)
+        << "Stale signal must not demote the live new leader";
+    EXPECT_EQ(coord_->currentEpoch(), firstEpoch)
+        << "Epoch must not increase on a stale/no-op signal";
+}
+
+// (b) A death signal for a node that is NOT the current leader is a no-op.
+TEST_F(FailoverTest3, DoWork_SignalForNonLeader_IsNoOp) {
+    produceAndCommit(2);
+
+    // Signal death of a FOLLOWER (kF2), not the current leader (kL).
+    coord_->signalLeaderDead(kF2);
+    int work = coord_->doWork(clock_ + kStep1ms);
+    EXPECT_EQ(work, 0)
+        << "Death signal for a non-leader node must be a no-op";
+
+    // Leader must remain unchanged.
+    EXPECT_EQ(coord_->currentLeader(), kL)
+        << "Leader must not change when a non-leader death signal is processed";
+    EXPECT_EQ(coord_->currentEpoch(), 1)
+        << "Epoch must not change for a non-leader death signal";
+}
+
+// (c) One death → exactly one election: two doWork() ticks after one signal
+//     must elect at most once (flag cleared after first consumption).
+TEST_F(FailoverTest3, DoWork_OneDeath_ExactlyOneElection) {
+    produceAndCommit(2);
+    liveness_.markDead(kL);
+
+    // Fire exactly one signal.
+    coord_->signalLeaderDead(kL);
+
+    // First tick: should elect.
+    int work1 = coord_->doWork(clock_ + kStep1ms);
+    EXPECT_GT(work1, 0) << "First doWork tick must perform the election";
+
+    NodeId leader1 = coord_->currentLeader();
+    Epoch  epoch1  = coord_->currentEpoch();
+    ASSERT_NE(leader1, kL);
+
+    // Second tick: signal was cleared — no further election.
+    int work2 = coord_->doWork(clock_ + kStep1ms * 2);
+    EXPECT_EQ(work2, 0)
+        << "Second doWork tick must be idle after flag is cleared";
+
+    // State unchanged.
+    EXPECT_EQ(coord_->currentLeader(), leader1)
+        << "Leader must not change on second tick";
+    EXPECT_EQ(coord_->currentEpoch(), epoch1)
+        << "Epoch must not change on second tick";
+}
+
+// (d) Signal for dead leader that liveness oracle reports still alive → no election.
+//     (Covers the case where liveness_ guards against a premature signal.)
+TEST_F(FailoverTest3, DoWork_SignalButLeaderStillAlive_NoElection) {
+    produceAndCommit(2);
+
+    // Signal leader dead WITHOUT marking it dead in the liveness oracle.
+    // (liveness_ still reports kL as alive.)
+    coord_->signalLeaderDead(kL);
+    int work = coord_->doWork(clock_ + kStep1ms);
+    EXPECT_EQ(work, 0)
+        << "Death signal must not cause election when liveness oracle says leader is alive";
+
+    // Leader remains kL.
+    EXPECT_EQ(coord_->currentLeader(), kL)
+        << "Leader must not change when liveness oracle contradicts the signal";
+}

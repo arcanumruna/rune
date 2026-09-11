@@ -304,15 +304,18 @@ public:
 
     int killLeader() {
         int idx = currentLeaderIdx_;
+        NodeId deadId = nodeIds_[idx];
         alive_[idx] = false;
-        liveness_.markDead(nodeIds_[idx]);
-        // NOTE: Do NOT call coord_->signalLeaderDead() here.
-        // signalLeaderDead() sets a flag that coord_->doWork() consumes by
-        // triggering a second election inside driveUntil — leading to a
-        // double-election bug.  Tests drive election explicitly via
-        // electNewLeader(); the doWork path is the production auto-elect path.
+        liveness_.markDead(deadId);
+        // Signal through the REAL production path: mark the node dead in the
+        // liveness oracle (above) AND call signalLeaderDead(deadId) so that
+        // the subsequent driveUntil inside electNewLeader() will trigger the
+        // election via coord_->doWork().  FIX 1 guarantees exactly one
+        // election per signal: the liveness guard ensures a stale/leftover
+        // signal can never demote a healthy new leader.
+        coord_->signalLeaderDead(deadId);
         // Isolate in transport so it doesn't receive messages.
-        transport_.isolate(nodeIds_[idx]);
+        transport_.isolate(deadId);
         return idx;
     }
 
@@ -338,8 +341,27 @@ public:
         }
     }
 
+    // Drive election through the REAL signal path: coord_->doWork() consumes
+    // the leaderDeadSignaled_ flag set by killLeader() and elects via
+    // electNewLeader().  FIX 2: kill-leader scenarios go through this path
+    // instead of calling coord_->electNewLeader() directly.
     bool electNewLeader() {
-        bool ok = coord_->electNewLeader();
+        // If the signal was already consumed by a previous doWork() tick (e.g.
+        // an earlier driveUntil already triggered the election), check whether
+        // a live leader is already in place — if so, we're done.
+        auto alreadyElected = [&]() -> bool {
+            NodeId nl = coord_->currentLeader();
+            for (int i = 0; i < n_; ++i)
+                if (nodeIds_[i] == nl && alive_[i]) return true;
+            return false;
+        };
+
+        if (!alreadyElected()) {
+            // Drive until doWork() processes the death signal and elects.
+            driveUntil(alreadyElected);
+        }
+
+        bool ok = alreadyElected();
         if (ok) {
             NodeId nl = coord_->currentLeader();
             transport_.setCurrentLeader(nl);
