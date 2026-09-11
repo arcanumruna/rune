@@ -157,10 +157,10 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     auto raw = log->read(0, kMaxScanBytes);
     if (raw.empty()) return;
 
-    // Single-pass scan using the unified BE RecordBatchReader for ALL batches.
-    // P5-4 fix: control batches are now BE, so RecordBatchReader can walk them.
-    // Control batches are identified by ControlMarker::isControlBatch() which
-    // reads the CONTROL attribute bit from the BE attributes field [21..22].
+    // Single-pass scan using the unified little-endian RecordBatchReader for ALL batches.
+    // all-LE fix: control batches share the LE record-batch format, so RecordBatchReader
+    // can walk them. Control batches are identified by ControlMarker::isControlBatch()
+    // which reads the CONTROL attribute bit from the LE attributes field [21..22].
     {
         std::size_t pos = 0;
         const uint8_t* data = raw.data();
@@ -171,7 +171,7 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
             if (rem < static_cast<std::size_t>(
                     rune::protocol::batch::kRecordBatchOverhead)) break;
 
-            // Use RecordBatchReader for ALL batches (data + control both BE now).
+            // Use RecordBatchReader for ALL batches (data + control both little-endian now).
             rune::protocol::RecordBatchReader reader(data + pos, rem);
             int32_t totalLen   = reader.totalLength();
             int64_t baseOffset = reader.baseOffset();
@@ -249,7 +249,7 @@ std::vector<uint8_t> ReadCommittedView::read(rune::storage::Log* log,
         if (rem < static_cast<std::size_t>(
                 rune::protocol::batch::kRecordBatchOverhead)) break;
 
-        // Unified BE reader for both data and control batches (P5-4 fix).
+        // Unified little-endian reader for both data and control batches (all-LE fix).
         rune::protocol::RecordBatchReader reader(data + pos, rem);
         int32_t totalLen     = reader.totalLength();
         int64_t baseOffset   = reader.baseOffset();

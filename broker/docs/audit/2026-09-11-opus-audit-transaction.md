@@ -736,3 +736,158 @@ Date: 2026-09-11. Reviewer: Opus. Scope: read-committed isolation — `ReadCommi
 Part A: **CLEAN** for exactly-once visibility — read_committed provably never exposes an uncommitted or aborted
 record, and LSO is correct/monotone. One LOW cleanliness finding (P5-4-C1: dead first pass in rebuild(),
 lines 220-252). Part B: 8 recommended tests (top: same-PID abort-then-commit; out-of-order commit via rebuild).
+
+---
+
+# P5-4 full re-audit + endianness (commit a3ba944)
+
+## PRIORITY: control-batch endianness mismatch — VERDICT: **REAL BUG. BLOCKER. MUST FIX before P5-5.**
+
+### The mismatch is real and cross-cutting
+- `ControlMarker::build` encodes the entire control batch **little-endian** via `write_le<>`:
+  batchLength at [8..11], magic [16], CRC [17..20], attributes [21..22], producerId [43..50], etc.
+  (`libs/transaction/src/ControlMarker.cpp:152-191`). ENCODED_SIZE=75, batchLength=63.
+- The storage/protocol reader `RecordBatchReader` decodes every field **big-endian** via `detail::getBE32/getBE64`
+  (`rune-protocol/include/rune/protocol/RecordBatch.h:109-121`). `totalLength()` = `getBE32([8..11]) + 12`.
+- Data batches produced by `RecordBatchBuilder::build()` are **big-endian** (`RecordBatch.h:74-96`, `appendBE*`).
+- So data batches and control batches are in **DIFFERENT on-disk byte orders**. This diverges from Kafka KIP-98,
+  where control batches use the identical RecordBatch wire format (same endianness) with only the CONTROL attribute
+  bit set, so a single reader walks both. The header comment claiming "byte-compatible with the log format"
+  (`ControlMarker.h:15-17`) is **false**.
+
+### Why the production consumer path breaks
+The real consumer/replication read path walks batches with the BE `RecordBatchReader` ONLY — it has no CONTROL-bit
+demux:
+- `LogSegment::read` skip-loop: `RecordBatchReader r(...); total = r.totalLength()` (`libs/storage/src/LogSegment.cpp:95-98`).
+- `PartitionReplica::read` (leader committed read): `RecordBatchReader r(...)` (`libs/replication/src/PartitionReplica.cpp:327-329`).
+- `PartitionRecorder::read` (replication/recording): `RecordBatchReader reader(...)` (`libs/replication/src/PartitionRecorder.cpp:91-96`).
+- `Log::truncateTo` / `LogSegment::recover` walk with the same BE reader (`Log.cpp:113`, `LogSegment.cpp:136`).
+
+Concrete failure: a LE control batch's batchLength field [8..11] = `63` LE = bytes `3F 00 00 00`, read BE =
+`0x3F000000` = 1,056,964,608. `totalLength()` = +12 ≈ 1 GiB. In every walker the guard
+`pos + total > buf.size()` fires → the loop `break`s. In `LogSegment::read`, once the window equals the segment
+the function returns `{}`. **Net effect on a real partition that contains a control marker:**
+- If a marker is the first batch in the read window, `log->read(...)` returns EMPTY → any committed data batches
+  physically after that marker in the same window become **unreachable** → consumer hangs / never advances past LSO
+  even though LSO advanced (corruption of the fetch contract).
+- `recover()`/`truncateTo` treat the marker as a torn tail → **silently truncate the log at the marker**, destroying
+  all data after it and corrupting nextOffset/LEO.
+
+### ReadCommittedView is self-consistent but does NOT save the consumer
+`ReadCommittedView::{rebuild,read}` carry their OWN LE-aware walker that demuxes on `ControlMarker::isControlBatch`
+and uses fixed `ENCODED_SIZE` for control batches (`ReadCommittedView.cpp:74-113, 228-277, 314-377`). That is why
+every P5-4 test passes. But `ReadCommittedView` is **not wired into any production read path** at a3ba944
+(grep: no non-test caller of `ReadCommittedView`, `writeMarkers`, or `resolvePendingMarkers`). The consumer path
+today is `PartitionReplica::read`/`Log::read`, which are BE-only. Even inside `ReadCommittedView::read`, the
+underlying `log->read(fetchOffset,...)` → `LogSegment::read` BE skip-loop returns EMPTY whenever a control batch
+sits at the start of the physical read window (see below), so the LE-aware walker never even receives the bytes.
+
+### The bug is already documented in-tree and masked by test design
+`ReadCommittedViewTest.cpp:1171-1178` (Edge 6) explicitly states: "LogSegment::read() uses RecordBatchReader (BE)
+… cannot parse LE control batches. When the very first batch in a segment is a control batch, log->read(0,…)
+returns empty — the committed data at offset 1 is unreachable via read(). This is a known storage-layer limitation."
+The test deliberately **does not assert on read() output for that layout** and uses a mid-stream variant to dodge it.
+So the suite is GREEN only because it avoids the failing path — the bug is latent, not absent.
+
+### Fix direction (do before P5-5)
+Unify the control-batch format with the data RecordBatch format so ONE reader handles both (the Kafka approach):
+1. Re-encode `ControlMarker::build` **big-endian** for all batch-header + record fields (mirror `RecordBatchBuilder`:
+   `appendBE*` and BE CRC over [21..end]); keep magic=2 and set the CONTROL attribute bit. Then a data batch and a
+   control batch are byte-identical in layout/endianness and differ only by the attribute bit.
+2. Make the storage/consumer walkers CONTROL-aware OR (simpler, preferred) rely on the unified format so
+   `RecordBatchReader.totalLength()` parses control batches natively (their batchLength is already correct once BE).
+   Then `PartitionReplica::read`/`PartitionRecorder`/`recover`/`truncateTo` must **skip** (not emit) control batches
+   to the consumer but still count their bytes/offsets — add a CONTROL-bit check (attributes at [21..22] BE) to
+   filter them from consumer output while walking past them correctly.
+3. Update `ControlMarker::isControlBatch/extract` to BE and drop the LE branch in `ReadCommittedView`'s walker
+   (both formats then share the BE reader).
+4. Add a regression test that appends a data batch, then a marker, then reads back via `Log::read`/`PartitionReplica::read`
+   (NOT via ReadCommittedView) and asserts the data batch is returned and the marker is skipped — the exact case
+   Edge 6 currently refuses to assert.
+
+## Read-committed re-audit — VERDICT: **CLEAN (logic), with the endianness BLOCKER as the one cross-cutting bug**
+
+- P5-4-C1 cleanup verified via `git show a3ba944 -- …/ReadCommittedView.cpp`: the removed first pass was genuinely
+  dead — its `onProduceBatch` calls were unconditionally wiped by the following `tracker_->clear()` before the real
+  pass ran. The surviving single pass (`ReadCommittedView.cpp:228-277`) reproduces the old second pass exactly.
+  Behavior-preserving. `SamePidAbortThenCommitRebuildMatchesIncremental` (test:1338-1393) pins rebuild==incremental.
+- The 8 new edge tests (`ReadCommittedViewTest.cpp:1011-1332`) are real and correct: same-PID abort→commit offset-range
+  disambiguation, out-of-order commit LSO-pinning, empty-abort no-spurious-range, firstOffset==HW clamp, aborted-range
+  boundary via read, control-at-offset-0 rebuild robustness, maxBytes soft cap, 50-txn scale. They exercise
+  `ReadCommittedView`'s own walker and pass legitimately for that component.
+- LSO logic re-scanned: `lso()` returns `byFirstOffset_.begin()->first` (std::map ⇒ min firstOffset), clamped to
+  [0,hw] (`ReadCommittedView.cpp:155-167`) — correct and monotone. `onProduceBatch` keeps the earliest offset for a
+  PID (:127-134). `onControlMarker` for an untracked PID is a no-op returning -1, so `AbortedTxnIndex` gets no
+  spurious range (:136-153, :247-256) — matches Edge 3/6. `AbortedTxnIndex.isAborted` is per-PID + inclusive range
+  contains — correct; O(ranges) linear scan is a perf note (not correctness).
+- No regression found in the read-committed/LSO/aborted-index logic itself. No other correctness bug identified in
+  this surface beyond the endianness blocker.
+
+## Bottom line
+The read-committed component is internally sound, but the control-batch/data-batch format divergence is a genuine
+end-to-end correctness bug that WILL break P5-5 the moment markers are appended to a partition Log and read back via
+the production `LogSegment::read`/`PartitionReplica::read`/`recover` path. **Fix the format unification first.**
+
+---
+
+# LE unification review (broker e5662f7 / protocol df64c79)
+
+**Verdict: CLEAN.** The BE→LE flip of the on-disk RecordBatch format is byte-correct and complete
+across both repos; the prior BE/LE format divergence blocker identified in the earlier audit is now fixed.
+
+## 1. LE flip byte-correct & complete
+All 13 fixed header fields written AND read LE at identical offsets (RecordBatch.h:121-140 builder /
+:163-186 reader): baseOffset i64@0, length i32@8 (=size-12), partitionLeaderEpoch i32@12,
+magic@16, crc u32@17, attributes i16@21, lastOffsetDelta i32@23, baseTimestamp i64@27,
+maxTimestamp i64@35, producerId i64@43, producerEpoch i16@51, baseSequence i32@53, recordCount i32@57.
+`stampLeaderEpoch` writes LE @12 (RecordBatch.h:210-214), CRC-excluded (field @12 < kAttributesOffset 21).
+CRC computed over [21..end] and stored/read LE both sides (build :139-140, ensureValid :182-185). ✅
+
+## 2. No BE remnant anywhere
+grep of both repos for getBE/appendBE/putBE/BE-shift-read of a batch field: **zero functional hits.**
+Only matches: a test *filename* `ControlBatchBeFormatTest.cpp` + comment strings (historical "Be"),
+and unrelated LE code in consensus TermLog.cpp / ConsensusMessages.h (own formats, not batch bytes). ✅
+- Compaction producerId/epoch/baseSequence patch: LE (LogCleaner.cpp:266-294), CRC recomputed & stored LE.
+- LogCleaner baseSequence read via `detail::getLE32` (:234). ✅
+- ReadCommittedView::extractProducerId uses `RecordBatchReader::producerId()` (LE) (:44-54). ✅
+- ControlMarker build/isControlBatch/extract all LE (ControlMarker.cpp:190-234, 256-264, 288-321). ✅
+- ProducerStateManager snapshot is its own LE file format (wle/rle memcpy), unrelated to batch bytes — LE. ✅
+
+## 3. CONTROL bit + skip
+Control batch sets attrs 0x0030 (CONTROL 0x20 | TXN 0x10) (ControlMarker.cpp:195); `isControl()`
+reads LE attrs & 0x20 (RecordBatch.h:173-176); data batch attrs=0 → not control, and vice-versa
+(verified LE-7). `ControlMarker::isControlBatch` = avail≥75 + magic + CRC(LE) + CONTROL bit (LE +
+CRC-gated, correct). `ReadCommittedView::read` SKIPS control batches in BOTH modes but still parses
+totalLength to advance (ReadCommittedView.cpp:271-275) → data after marker reachable. recover /
+truncateTo / LogSegment::read treat a control batch as a normal valid batch via unified
+RecordBatchReader + ensureValid (LogSegment.cpp:135-147, Log.cpp:112-135, :94-104). ✅
+- NOTE: `PartitionReplica::read` (:306-347) is the RAW replication path — it has NO isolation level and
+  intentionally does NOT strip control batches (leader/follower logs must be byte-identical). The task's
+  "PartitionReplica read_committed/read_uncommitted skip" actually lives in ReadCommittedView, which is
+  correct. Not a defect.
+
+## 4. Regression is real
+`ControlBatchBeFormatTest.cpp` LE-12 appends data+data+COMMIT-marker+data+data to a REAL Log, asserts
+5 batches parseable from offset 0, data-after-marker reachable via read(3), exactly 1 control + 4 data
+(isControl), and recover()→LEO=5 (marker not torn tail). Under the pre-flip mismatch totalLength()
+misreads → ~1 GiB → walk stops → recover truncates → the asserts fail. Non-vacuous. LE-4/5/10/11/13
+cover Log::read, recover, ReadCommittedView both-sides, abort-indexing, LSO/abort filtering. ✅
+
+## 5. read_committed intact
+LSO = min open-txn firstOffset else HW (ReadCommittedView.cpp:95-107); aborted-range filtering by
+per-PID inclusive contains (:132-139); markers in LE parsed by extract() and drive
+onControlMarker/onAbortMarker (:188-201). LE-13 verifies aborted(0) filtered, committed(2) returned,
+in-flight(4) hidden by LSO=4, controls(1,3) never emitted. ✅
+
+## 6. No correctness/perf regression; tests converted not weakened
+- LogCleanerTest CompactionPreservesProducerIdentity: old manual BE patch `(7-i)` + BE read replaced by
+  `setProducerId/Epoch/BaseSequence` + LE read helpers; producerId/epoch/baseSequence EXPECT_EQ
+  assertions RETAINED. ✅
+- ControlMarkerTest CRC store/read flipped BE→LE; attributes read as LE int16; assertions retained. ✅
+- ReadCommittedViewTest makeDataBatch now uses builder.setProducerId() (LE). ✅
+- No test deleted or weakened to hide a regression. CRC still validates on every walk/recover.
+- Minor (non-blocking): several stale comments in ReadCommittedView.cpp (:160-174, :252) still say "BE"
+  though the code is LE — cosmetic only.
+
+**Bottom line:** on-disk LE record format is byte-correct everywhere, no BE straggler, the
+marker-in-log regression is genuinely covered, and existing tests were correctly migrated to LE.
