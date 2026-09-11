@@ -1,6 +1,9 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace rune::storage {
@@ -40,14 +44,55 @@ std::vector<uint8_t> readFile(const std::string& path) {
     return buf;
 }
 
-// Write bytes to path (overwrite).
-void writeFile(const std::string& path, const std::vector<uint8_t>& data) {
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) throw std::runtime_error("LogCleaner: cannot open " + path);
-    if (!data.empty())
-        f.write(reinterpret_cast<const char*>(data.data()),
-                static_cast<std::streamsize>(data.size()));
-    f.flush();
+// Write bytes to path (overwrite) and fsync the fd before returning.
+// Uses POSIX open/write/fsync so we can get the fd for fsync — matching
+// the idiom in libs/coordination/OffsetStore.cpp (pwrite+fsync pattern).
+void writeFileDurable(const std::string& path, const std::vector<uint8_t>& data) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::system_error(errno, std::system_category(),
+                                "LogCleaner: open " + path);
+    }
+    if (!data.empty()) {
+        const char* ptr = reinterpret_cast<const char*>(data.data());
+        size_t remaining = data.size();
+        while (remaining > 0) {
+            ssize_t n = ::write(fd, ptr, remaining);
+            if (n < 0) {
+                int saved = errno;
+                ::close(fd);
+                throw std::system_error(saved, std::system_category(),
+                                        "LogCleaner: write " + path);
+            }
+            ptr += n;
+            remaining -= static_cast<size_t>(n);
+        }
+    }
+    // Flush to disk before rename — prevents partial/zero-byte file on power loss.
+    if (::fsync(fd) != 0) {
+        int saved = errno;
+        ::close(fd);
+        throw std::system_error(saved, std::system_category(),
+                                "LogCleaner: fsync " + path);
+    }
+    ::close(fd);
+}
+
+// Fsync the directory so the rename is durable (the directory entry survives
+// a power loss).  Mirrors the Kafka/NodeStateFile pattern.
+void fsyncDir(const std::string& dir) {
+    int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        throw std::system_error(errno, std::system_category(),
+                                "LogCleaner: open dir " + dir);
+    }
+    if (::fsync(dfd) != 0) {
+        int saved = errno;
+        ::close(dfd);
+        throw std::system_error(saved, std::system_category(),
+                                "LogCleaner: fsync dir " + dir);
+    }
+    ::close(dfd);
 }
 
 // Build a sparse .index from a contiguous log byte buffer.
@@ -208,14 +253,27 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
         pos += static_cast<size_t>(total);
     }
 
-    // Write the temp file.
-    writeFile(newPath, outBuf);
-
-    // Atomically rename: newPath → logPath.
-    // If this process crashes between write and rename, we leave the .new file.
-    // On next startup, LogCleaner::compact() will clean up stale .new files
+    // Durable atomic swap: write → fsync file → rename → fsync dir.
+    //
+    // 1. Write all bytes to the .new temp file.
+    // 2. fsync the .new file (data reaches persistent storage before rename).
+    // 3. Atomically rename .new → .log (POSIX guarantees atomicity).
+    // 4. fsync the parent directory (the new directory entry survives power loss).
+    //
+    // Without step 2, a power-loss between flush and rename can leave a
+    // partially-written .new file replacing the good .log.
+    // Without step 4, the renamed directory entry may not survive a crash.
+    //
+    // If this process crashes between step 2 and step 3, we leave the fsynced
+    // .new file.  On next startup, LogCleaner::compact() will clean it up
     // (see compact() preamble).
+    writeFileDurable(newPath, outBuf);
+
+    // 3. Atomic rename: .new → .log.
     std::filesystem::rename(newPath, logPath);
+
+    // 4. fsync the parent directory so the renamed entry is durable.
+    fsyncDir(dir);
 
     // Remove the stale .index so Log::recover() (called after all segments are
     // rewritten) rebuilds a correct sparse index from the compacted bytes.

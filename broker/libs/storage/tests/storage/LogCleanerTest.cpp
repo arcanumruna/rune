@@ -7,6 +7,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -381,11 +382,12 @@ TEST(LogCleaner, LogReadableAndAppendableAfterCompaction) {
 
 // LC-12: crash recovery — stale .log.new file from interrupted compact.
 // Simulate by leaving a .log.new temp file; next compact call must clean it up
-// and still produce a correct log.
+// and still produce a correct compacted log with the EXACT expected survivors.
 TEST(LogCleaner, CrashRecoveryStaleNewFile) {
     auto dir = makeTempDir("lc_t12");
     std::filesystem::create_directories(dir);
     Log log(dir.string(), 512);
+    // k1@0=v1, k2@1=v2  (will be compacted; both are the latest for their key)
     log.append(makeBatch(0, "k1", "v1", 1000), 0);
     log.append(makeBatch(1, "k2", "v2", 1001), 1);
     for (int i = 2; i < 15; ++i)
@@ -393,6 +395,7 @@ TEST(LogCleaner, CrashRecoveryStaleNewFile) {
 
     // Manually plant a stale .log.new file (simulates crash after write, before rename).
     auto bases = log.segmentBaseOffsets();
+    ASSERT_FALSE(bases.empty());
     std::ostringstream oss;
     oss << dir.string() << "/" << std::setw(20) << std::setfill('0') << bases[0] << ".log.new";
     { std::ofstream stale(oss.str(), std::ios::binary); stale << "STALE_GARBAGE"; }
@@ -404,9 +407,86 @@ TEST(LogCleaner, CrashRecoveryStaleNewFile) {
     // Verify the .log.new is gone.
     EXPECT_FALSE(std::filesystem::exists(oss.str())) << ".log.new stale temp must be cleaned up";
 
-    // Log must be readable.
+    // Log must be readable and contain EXACTLY the expected survivors.
     auto recs = readAllRecords(log, 0);
-    EXPECT_FALSE(recs.empty());
+    ASSERT_FALSE(recs.empty()) << "Log must have records after compaction";
+
+    // k1 appears exactly once at offset 0, value "v1" (sole record, no duplicate).
+    EXPECT_EQ(countKey(recs, "k1"), 1) << "k1 must appear exactly once";
+    bool k1ok = false;
+    for (auto& r : recs)
+        if (r.key == "k1" && r.offset == 0 && r.value == "v1") k1ok = true;
+    EXPECT_TRUE(k1ok) << "k1@0=v1 must survive with correct offset and value";
+
+    // k2 appears exactly once at offset 1, value "v2".
+    EXPECT_EQ(countKey(recs, "k2"), 1) << "k2 must appear exactly once";
+    bool k2ok = false;
+    for (auto& r : recs)
+        if (r.key == "k2" && r.offset == 1 && r.value == "v2") k2ok = true;
+    EXPECT_TRUE(k2ok) << "k2@1=v2 must survive with correct offset and value";
+
+    // The stale file must not have corrupted anything — no unexpected keys.
+    for (auto& r : recs) {
+        EXPECT_TRUE(r.key == "k1" || r.key == "k2" || r.key == "pad")
+            << "Unexpected key '" << r.key << "' found — stale .new may have corrupted log";
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// LC-36: crash recovery after fsync-before-rename — complete .new file left behind.
+// Simulates crash after fsync of .new but before rename; the surviving .log should
+// remain fully readable (old state), and a fresh compact must succeed and produce
+// the correct compacted output.
+TEST(LogCleaner, CrashRecoveryCompleteNewFileLeftBehind) {
+    auto dir = makeTempDir("lc_t36");
+    std::filesystem::create_directories(dir);
+
+    // Write log: k1 duplicated twice (only @1 should survive compaction).
+    {
+        Log log(dir.string(), 512);
+        log.append(makeBatch(0, "k1", "old", 1000), 0);
+        log.append(makeBatch(1, "k1", "new", 1001), 1);
+        for (int i = 2; i < 15; ++i)
+            log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+    }
+
+    // Simulate: crash happened after fsync of .new but before rename.
+    // The old .log is intact; a complete (but stale) .new sits beside it.
+    auto bases = [&]() {
+        Log tmp(dir.string(), 512); return tmp.segmentBaseOffsets();
+    }();
+    ASSERT_FALSE(bases.empty());
+    std::ostringstream oss;
+    oss << dir.string() << "/" << std::setw(20) << std::setfill('0') << bases[0] << ".log.new";
+
+    // Write a plausible but stale .new (content doesn't matter — it's stale).
+    { std::ofstream stale(oss.str(), std::ios::binary); stale << "COMPLETE_BUT_STALE_NEW"; }
+
+    // Reopen the log — original .log files are intact (rename never happened).
+    Log log2(dir.string(), 512);
+    log2.recover();
+
+    // The original log must be consistent: both k1@0 and k1@1 survive (uncompacted).
+    {
+        auto recs = readAllRecords(log2, 0);
+        EXPECT_GE(recs.size(), 2u) << "Original log content must survive partial compaction";
+        EXPECT_EQ(countKey(recs, "k1"), 2) << "Both k1 records must be present before compact";
+    }
+
+    // Now run compact — it must remove the stale .new and produce correct output.
+    LogCleaner cleaner;
+    EXPECT_NO_THROW(cleaner.clean(log2, 0, 2, 0, 1'000'000));
+    EXPECT_FALSE(std::filesystem::exists(oss.str())) << "Stale .new must be removed by compact";
+
+    // After compaction: only k1@1=new must survive.
+    auto recs = readAllRecords(log2, 0);
+    EXPECT_EQ(countKey(recs, "k1"), 1) << "Only latest k1 must survive after compaction";
+    bool k1latest = false;
+    for (auto& r : recs)
+        if (r.key == "k1" && r.offset == 1 && r.value == "new") k1latest = true;
+    EXPECT_TRUE(k1latest) << "k1@1=new must be the sole surviving k1 record";
+
     std::filesystem::remove_all(dir);
 }
 
