@@ -287,50 +287,68 @@ bool GroupCoordinator::removeMember(const std::string& memberId)
 
 /// Compare two memberIds for deterministic leader election.
 ///
-/// Generated ids have the form "<group>-g<globalSeq>-<localSeq>".
-/// Pure lexicographic comparison is wrong when sequences cross a power-of-ten
-/// boundary ("grp-g10" < "grp-g2" lexicographically).
+/// Generated ids have the form "<group>-g<globalSeq>-<localSeq>", so an id
+/// carries MULTIPLE numeric fields (the global seq and the local seq).  Pure
+/// lexicographic comparison is wrong whenever ANY numeric field crosses a
+/// power-of-ten boundary ("grp-g10-2" < "grp-g2-3" lexicographically because
+/// "g1" < "g2", even though global seq 2 was minted before 10).  Comparing
+/// only the trailing (<local>) field numerically — the prior fix — leaves the
+/// same surprise on the <global> field one level up (audit N1-a).
 ///
-/// Strategy: compare by the numeric suffix(es).  Extract the trailing decimal
-/// run from each id and compare numerically; fall back to full string
-/// lexicographic order for hand-supplied non-generated ids (which is fine
-/// because those are typically stable names like "member-a").
-///
-/// This ensures "grp-g2" < "grp-g10" (earliest-joined wins) regardless of
-/// digit count.
+/// Strategy: NATURAL ordering.  Tokenize each id into an alternating sequence
+/// of non-digit and digit runs and compare run-by-run: digit runs compared as
+/// integers (by value, so 2 < 10 regardless of digit count), non-digit runs
+/// compared lexicographically.  This orders EVERY numeric field of the
+/// generated id — both <global> and <local> — as a numeric tuple, while still
+/// giving a well-defined total order for arbitrary hand-supplied ids (e.g.
+/// "member-a").  It is a valid strict-weak ordering (irreflexive,
+/// antisymmetric, transitive: the first differing run decides).
 static bool memberIdLess(const std::string& a, const std::string& b)
 {
-    // Try to extract leading numeric sequences after the last '-'.
-    auto trailingNum = [](const std::string& id) -> std::optional<uint64_t> {
-        if (id.empty()) return std::nullopt;
-        std::size_t i = id.size();
-        while (i > 0 && std::isdigit(static_cast<unsigned char>(id[i-1]))) --i;
-        if (i == id.size()) return std::nullopt; // no trailing digits
-        // Must be preceded by '-'.
-        if (i == 0 || id[i-1] != '-') return std::nullopt;
-        try {
-            return std::stoull(id.substr(i));
-        } catch (...) {
-            return std::nullopt;
+    auto isDigit = [](char c) { return std::isdigit(static_cast<unsigned char>(c)) != 0; };
+
+    std::size_t ia = 0, ib = 0;
+    const std::size_t na = a.size(), nb = b.size();
+
+    while (ia < na && ib < nb) {
+        const bool da = isDigit(a[ia]);
+        const bool db = isDigit(b[ib]);
+
+        if (da && db) {
+            // Both at a digit run: compare the runs numerically.  Skip leading
+            // zeros so run length reflects magnitude, then compare by length,
+            // then lexicographically (both digits → char order == value order).
+            std::size_t sa = ia, sb = ib;
+            while (sa < na && a[sa] == '0') ++sa;
+            while (sb < nb && b[sb] == '0') ++sb;
+            std::size_t ea = sa; while (ea < na && isDigit(a[ea])) ++ea;
+            std::size_t eb = sb; while (eb < nb && isDigit(b[eb])) ++eb;
+
+            const std::size_t la = ea - sa; // significant-digit count
+            const std::size_t lb = eb - sb;
+            if (la != lb) return la < lb;    // fewer significant digits → smaller
+            for (std::size_t k = 0; k < la; ++k) {
+                if (a[sa + k] != b[sb + k]) return a[sa + k] < b[sb + k];
+            }
+            // Equal magnitude: shorter raw run (fewer leading zeros) sorts first
+            // for a stable, deterministic total order.
+            const std::size_t rawA = ea - ia, rawB = eb - ib;
+            if (rawA != rawB) return rawA < rawB;
+            // Fully equal digit run: advance both past it.
+            ia = ea; ib = eb;
+        } else if (!da && !db) {
+            // Both at a non-digit char: compare lexicographically, advance one.
+            if (a[ia] != b[ib]) return a[ia] < b[ib];
+            ++ia; ++ib;
+        } else {
+            // One is a digit, the other a non-digit at this position.  Define a
+            // stable order: digit runs sort before non-digit runs.
+            return da;
         }
-    };
-
-    auto na = trailingNum(a);
-    auto nb = trailingNum(b);
-
-    // Both have numeric suffixes: compare the prefix (everything before the
-    // trailing number) first, then numeric suffix.
-    if (na.has_value() && nb.has_value()) {
-        std::size_t da = a.rfind('-');
-        std::size_t db = b.rfind('-');
-        std::string pa = a.substr(0, da);
-        std::string pb = b.substr(0, db);
-        if (pa != pb) return pa < pb;          // different group prefixes
-        return *na < *nb;                       // same prefix → numeric order
     }
 
-    // Fallback: plain lexicographic (for hand-supplied ids like "member-a").
-    return a < b;
+    // Shared prefix consumed: the shorter id sorts first.
+    return (na - ia) < (nb - ib);
 }
 
 void GroupCoordinator::electLeader()
@@ -356,7 +374,6 @@ void GroupCoordinator::triggerRebalance(int64_t nowNs)
     // Record how many members we expect to re-join.
     expectedMemberCount_ = members_.size();
     rejoinedMembers_.clear();
-    syncedMembers_.clear();
     leaderSynced_ = false;
     rebalanceStartNs_ = nowNs;
 }
@@ -474,7 +491,6 @@ std::vector<TopicPartition> GroupCoordinator::assignmentFor(const std::string& m
 void GroupCoordinator::transitionToCompletingRebalance(int64_t /*nowNs*/)
 {
     state_ = GroupState::CompletingRebalance;
-    syncedMembers_.clear();
     leaderSynced_ = false;
 }
 

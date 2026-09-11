@@ -950,6 +950,52 @@ TEST(GroupCoordinator, LeaderElection_NumericallyCorrectAcrossPowerOfTen) {
 }
 
 // ===========================================================================
+// AUDIT: N1-a residual — leader election must be numeric across ALL numeric
+// fields of the generated two-number id form "<group>-g<global>-<local>",
+// not just the trailing <local> field.  A power-of-ten flip in the GLOBAL
+// field (g2 vs g10) must NOT reorder leadership: "grp-g2-3" must win over
+// "grp-g10-2" even though "g10" < "g2" lexicographically.
+//
+// This test FAILS under a trailing-field-only comparator (which compares the
+// "<group>-g<global>" prefix lexicographically and only the <local> field
+// numerically), and passes only when the comparator orders (global, local)
+// as a numeric tuple.
+// ===========================================================================
+
+TEST(GroupCoordinator, LeaderElection_NumericAcrossGlobalFieldPowerOfTen) {
+    // Ids in the exact generated form "<group>-g<global>-<local>".
+    // Numerically the global-seq ordering is g2 < g10, so "grp-g2-3" is the
+    // earliest-minted and must be leader.  Lexicographically "grp-g10-2" would
+    // wrongly sort first ("g1" < "g2").
+    GroupCoordinator gc("grp", 0);
+
+    gc.join("grp-g10-2", kDefaultTimeoutMs, {}, 0);
+    gc.join("grp-g2-3",  kDefaultTimeoutMs, {}, 0);
+
+    EXPECT_EQ(gc.leaderId(), "grp-g2-3")
+        << "Leader must be numerically smallest across the GLOBAL field "
+           "(g2 < g10 numerically, not lexicographically)";
+
+    // Add more members spanning the boundary in the global field.
+    gc.join("grp-g9-1",  kDefaultTimeoutMs, {}, 0);
+    gc.join("grp-g11-7", kDefaultTimeoutMs, {}, 0);
+    EXPECT_EQ(gc.leaderId(), "grp-g2-3")
+        << "g2 is still the numerically smallest global seq";
+
+    // Remove the leader; next smallest global seq is g9.
+    gc.leave("grp-g2-3", gc.generationId(), 100);
+    EXPECT_EQ(gc.leaderId(), "grp-g9-1")
+        << "After removing g2, g9 must win (not g10 or g11 by lexicographic prefix)";
+
+    // Same-global tie broken by the trailing <local> field, numerically.
+    GroupCoordinator gc2("grp", 0);
+    gc2.join("grp-g5-10", kDefaultTimeoutMs, {}, 0);
+    gc2.join("grp-g5-2",  kDefaultTimeoutMs, {}, 0);
+    EXPECT_EQ(gc2.leaderId(), "grp-g5-2")
+        << "Within the same global seq, the trailing local field must order numerically (2 < 10)";
+}
+
+// ===========================================================================
 // AUDIT: C3 regression — syncGroup re-submission in Stable does not clobber assignments
 // A leader re-sending a non-empty assignment map while the group is already
 // Stable must be ignored (ack'd, but assignments must not change).

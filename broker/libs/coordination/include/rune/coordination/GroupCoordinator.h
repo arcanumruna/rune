@@ -339,11 +339,9 @@ private:
     /// expectedMemberCount_, we can transition to CompletingRebalance.
     std::size_t expectedMemberCount_{0};
 
-    /// Members that have called syncGroup (followers awaiting leader assignment).
-    /// Reset on each transition to CompletingRebalance.
-    std::unordered_set<std::string> syncedMembers_;
-
-    /// Whether the leader has submitted the full assignment map.
+    /// Whether the leader has submitted the full assignment map.  This alone
+    /// drives CompletingRebalance→Stable completion (audit N1-b: the former
+    /// `syncedMembers_` set was written but never read and has been removed).
     bool leaderSynced_{false};
 
     /// Timestamp (nowNs) when the current rebalance (PreparingRebalance) started.

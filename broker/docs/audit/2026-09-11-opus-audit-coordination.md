@@ -104,3 +104,63 @@ Fix direction: incorporate `global` into the id, or delete the atomic and the mi
 - Generation is monotonic (`++generationId_`) on every membership change including reap and Empty transition; `heartbeat` fences both lower and higher generations (`:139`).
 - TopicPartition `==`/`<`/`std::hash` are consistent and mix both fields; no cross-key leakage found. SBE codecs round-trip byte-exact (little-endian asserted).
 - RangeAssignor matches Kafka exactly on uneven splits and partial subscriptions (extras to the first `N%S` lexicographic subscribers) — verified against tests Range_1..12.
+
+---
+
+# Re-audit (commit b970401)
+
+Date: 2026-09-11. Method: read current `src/*.cpp`, `include/**`, `tests/**` at commit `b970401`; independent trace of the RoundRobin algorithm against Kafka's `CircularIterator`-based `RoundRobinAssignor` (200k-case exhaustive differential simulation); rebuilt and ran the coordination suites. **Build clean; all 195 unit + 50 integration tests PASS.**
+
+## Verdict: **CLEAN** (with one minor NEW cosmetic/design note, N1 — low severity, non-blocking)
+
+## Per-finding status
+
+### C1 — leave() fencing → **FIXED**
+`GroupCoordinator::leave(memberId, generationId, nowNs)` (`src/GroupCoordinator.cpp:105-133`) now takes a `Generation` and no-ops on `generationId != generationId_` (`:111-113`) — no rebalance, no generation bump. Unknown member is a no-op via `removeMember` returning false (`:115-117`). A current-generation leave still shrinks the group / goes Empty (`:119-132`). Header updated (`GroupCoordinator.h:200`). All 20+ call sites (tests + integration harness) pass a generation; no production caller outside the lib. Tests `StaleGenerationLeave_IsNoOp` (`GroupCoordinatorTest.cpp:850`) and `CurrentGenerationLeave_ShrinksMembership` (`:875`) assert both directions (membership/state/generation unchanged on stale; shrink+bump on current).
+
+### C2 — RoundRobin partial-subscription divergence → **FALSE-POSITIVE-CONFIRMED** (independent verdict)
+I independently traced Kafka's canonical `RoundRobinAssignor`: `CircularIterator` over sorted members; per partition `while(!subscribed(peek(),topic)) next(); assign(next())`. Net cursor position after each assignment = (assigned-member index + 1). The code (`Assignor.cpp:170-190`) scans forward from `idx` via bounded `attempt`, and on assignment sets `idx = (candidate+1) % M` — **exactly** where Kafka's iterator lands. The intermediate non-subscriber skips are transparent because the next partition re-scans from `idx` and re-skips them; the persistent cursor is only ever moved to `assigned+1`, identical to Kafka's `while`-skip + `next()`. Verified by a differential simulator on the prompt's cases (m0⊆{t0,t1},m1⊆{t1}; 3-member heterogeneous with an interleaved non-subscriber sitting between two subscribers of the skipped topic) and by **200,000 random heterogeneous configurations (1-5 members, 1-4 topics, 0-4 partitions each) — zero mismatches**. The original C2 claim ("advances the pointer only on assignment ⇒ diverges") was mistaken: advancing only on assignment *is* Kafka's behaviour, because Kafka's skip-advances are relative and get re-derived each partition. **The finding was a false positive; the fixer's decision to keep `candidate+1` is correct.**
+
+### C3 — syncGroup leader re-sync clobber → **FIXED**
+`syncGroup` (`GroupCoordinator.cpp:392-400`): the leader-assignment branch stores + transitions **only** under `state_ == CompletingRebalance && !leaderSynced_`; in Stable (or after `leaderSynced_`) it returns `kOk` without re-writing assignments. Test `SyncGroupLeaderInStable_NoClobber` (`GroupCoordinatorTest.cpp:958`) submits a real assignment, reaches Stable, then re-submits a bogus single-member map and asserts every member's stored assignment is unchanged.
+
+### C4 — follower stranded (no Stable transition) → **FIXED**
+Follower syncing before the leader now returns `SyncResult::kErrRebalanceInProgress` (=4, `GroupCoordinator.h:102`) instead of a silent empty `kOk` (`GroupCoordinator.cpp:403-407`). Dead `syncedMembers_` is now cleared but no longer relied on for completion; the leader drives `CompletingRebalance→Stable` via `transitionToStable()`. Test 8 `FollowerSyncBeforeLeader_GetsRetrySignal` (`RebalanceTest.cpp:309-345`) asserts the full ordering completes: follower→retry, leader→kOk+Stable, follower retry→kOk. Note: `syncedMembers_` remains present but effectively vestigial (see N1-b); not a correctness issue.
+
+### S3 — leader ordering across power-of-ten → **FIXED (for the tested id form)**
+`electLeader` uses `memberIdLess` (`GroupCoordinator.cpp:301-350`) which extracts the trailing decimal run after the last `-` and compares numerically, falling back to lexicographic for non-numeric-suffixed ids. `LeaderElection_NumericallyCorrectAcrossPowerOfTen` (`:923`) verifies `test-group-2 < test-group-10` and the correct successor after removing the leader. Determinism preserved; comparator is a valid strict-weak order (verified antisymmetric). See N1-a for a residual on the *generated* two-number id form.
+
+### S4 — memberId cross-instance uniqueness → **FIXED**
+`generateMemberId` (`GroupCoordinator.cpp:246-259`) now embeds the process-global `s_memberSeq.fetch_add` as `<group>-g<global>-<local>`; the global counter is monotonic across all coordinator instances, so two coordinators with the same groupId cannot collide. Tests `GeneratedMemberIds_UniqueWithinInstance` (`:894`) and `..._UniqueAcrossInstances` (`:905`) confirm. Scheme cannot collide: `global` is a unique atomically-incremented value per mint.
+
+### S1 — rejoinedMembers_ pruning → **FIXED**
+`removeMember` (`GroupCoordinator.cpp:277-286`) now erases the id from `rejoinedMembers_`, keeping it a subset of live membership; removes the phantom `size() >= expected` risk.
+
+### T1 — CRC byte-flip test → **FIXED (real)**
+`commitThenFlipBodyByte` (`OffsetStoreTest.cpp:524-573`) walks the framing, finds the last record start, and XORs a byte at `recordStart+36` (first byte of the group-id field, i.e. **past** the 36-byte header holding magic/length/CRC) — magic and length stay intact, only the CRC-covered body changes. `CrcByteFlip_CorruptedLastRecordDropped` (`:575`) asserts records 0/1 survive and the corrupted record 2 is absent; `CrcByteFlip_StoreIsWritableAfterRecovery` (`:594`) asserts the store commits + fetches after recovery. Genuinely exercises the CRC drop path.
+
+### T2 — exact partial-subscription RR test → **FIXED (distinguishing)**
+`KafkaExact_ThreeMember_HeterogeneousSubscriptions` (`AssignorTest.cpp:667`) uses m0⊆{t0,t1}, m1⊆{t1}, m2⊆{t0,t1} (m1 is an interleaved non-subscriber of t0 sitting between t0-subscribers m0 and m2) and asserts exact lists m0→t0{0,2},t1{0,3}; m1→t1{1}; m2→t0{1,3},t1{2} — matching my independent Kafka reference simulation exactly. `KafkaExact_TwoMember_SingleSubscriberTopic` (`:705`) similarly asserts exact placement. These are the cases that would distinguish a broken cursor-advance from Kafka's; not cases where the two algorithms coincide.
+
+### T4 — stale-generation leave test → **FIXED** (covered by C1's `StaleGenerationLeave_IsNoOp`).
+
+### T5 — assertNoDoubleConsume tautology → **FIXED (real)**
+The harness now models a read cursor `consumedUpTo_` set via `recordConsumed` (`ConsumerGroupHarness.h:398-407`), and `assertNoDoubleConsume` (`:420-444`) asserts both store durability (`committed <= stored`) **and** `committed >= consumedUpTo_[tp]` — i.e. a resuming consumer will not re-read already-consumed records. Both integration call sites (`ConsumerGroupIntegrationTest.cpp:304-320, 1089-1102`) call `recordConsumed` first, so the non-tautological cursor branch is actually exercised (not short-circuited by the empty-cursor early-return at `:434`).
+
+### S2 / CL1-5 / T3 — **DEFERRAL-OK**
+Not targeted by this fix commit; all were latent/style/doc-level in the original audit. CL3 was additionally addressed (both store-assignment loops now share `storeAssignments`, `Assignor`/`GroupCoordinator.cpp:416-424,454`); CL5 addressed (`applyAssignmentAndTransitionStable` renamed to `transitionToStable`, `:484-488`).
+
+## Regression checks
+- **leave() generation param:** no legitimate flow broken. Every call site passes `generationId()`; a current-gen leave still shrinks/goes-Empty. No production caller outside the lib. PASS.
+- **sync signal change:** no follower stranded. Test 8 proves the follower reaches Stable after retry; leader still transitions on submit. `kErrRebalanceInProgress` is a new distinct code, not conflated with existing ones. PASS.
+- **memberId scheme change:** exact-match lookup (`findMember`) uses string `==`, unaffected. Leader election determinism preserved (comparator antisymmetric; same set → same leader). PASS.
+
+## NEW findings
+
+### N1-a (CLEAN / low severity). Residual power-of-ten flip on the GLOBAL-seq field of generated ids
+`GroupCoordinator.cpp:323-329` — `memberIdLess` compares numerically **only the trailing decimal run** (the `<local>` field) and compares the *prefix* (`<group>-g<global>`) **lexicographically**. For generated ids `<group>-g<global>-<local>`, this means the global-seq component is still ordered lexicographically: e.g. `grp-g10-2` sorts before `grp-g2-3` (`g10` < `g2` lexically). So across a power-of-ten boundary of the *global* counter, "leader = smallest id" again stops being "earliest-minted." Determinism is fully preserved (valid strict-weak order; same set → same leader), so this is not a correctness bug — but it re-introduces exactly the S3 surprise the fix set out to remove, one level up, and the S3 regression test only covers single-suffix hand-supplied ids (`test-group-2` vs `test-group-10`), not the generated two-number form. Fix direction (optional): parse *all* `-`-separated numeric fields numerically (compare `(global, local)` as a tuple), or zero-pad, or elect by explicit join order. Low severity: leader identity is arbitrary-but-deterministic and Kafka does not require earliest-joiner leadership.
+
+### N1-b (CLEAN / trivial). `syncedMembers_` is now dead state
+`GroupCoordinator.cpp:359,477` — `syncedMembers_` is cleared in `triggerRebalance`/`transitionToCompletingRebalance` but never inserted into or read; completion is driven solely by `leaderSynced_`. Harmless, but should be removed (the original C4 note flagged it; the fix chose the `leaderSynced_` gate but left the field). Cosmetic.
+
+**Bottom line:** All eight targeted findings are resolved or confirmed false-positive; the RoundRobin false-positive claim is upheld by independent trace + exhaustive differential test. Only two low-severity cosmetic notes remain (N1-a residual leader-ordering surprise on generated global-seq; N1-b dead field). Coordination is CLEAN.
