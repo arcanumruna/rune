@@ -327,8 +327,16 @@ std::vector<uint8_t> PartitionReplica::read(Offset fetchOffset,
         rune::protocol::RecordBatchReader r(raw.data() + pos, rem);
         int32_t total = r.totalLength();
         if (total <= 0 || pos + static_cast<std::size_t>(total) > raw.size()) break;
-        int64_t batchBase = r.baseOffset();
-        if (batchBase >= hw) break; // this batch starts at or beyond HW — stop
+        int64_t batchBase    = r.baseOffset();
+        int32_t lastOffDelta = r.lastOffsetDelta();
+        // NB3 fix: a batch is only fully committed if its LAST record is strictly
+        // below HW (batchBase + lastOffsetDelta < hw).  A batch whose baseOffset
+        // is below HW but whose last record is at or above HW straddles the
+        // high-watermark — returning it would expose uncommitted records (offsets
+        // in [hw, lastOffset]).  Stop before any such straddling batch.
+        // For single-record batches lastOffsetDelta==0, so the condition reduces
+        // to batchBase < hw — identical to the old single-record behaviour.
+        if (batchBase + lastOffDelta >= hw) break; // batch straddles or is beyond HW
         committedEnd = pos + static_cast<std::size_t>(total);
         pos = committedEnd;
     }

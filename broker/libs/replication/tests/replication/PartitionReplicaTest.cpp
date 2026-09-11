@@ -2584,3 +2584,224 @@ TEST(PartBTest, PartB18_CoordinatorSignalLeaderDeadUnknownNode)
     EXPECT_EQ(leader.role(), Role::Leader)
         << "PartB18: leader must remain Leader after signalLeaderDead(unknown)";
 }
+
+// ===========================================================================
+// NB3 test: committed-read clamp uses batch LAST offset, not base offset.
+// A multi-record batch whose baseOffset < hw but lastOffset >= hw straddles
+// the high-watermark and must NOT be returned by read() (Kafka-faithful: no
+// partial-batch exposure).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// NB3_MultiRecordBatchStraddle: read() must not return a straddling batch.
+//
+// Setup (to achieve HW=5 with a straddling 4-record batch [3..6] in the log):
+//
+//   Phase A — as single-replica leader, append 3 single-record batches.
+//             HW=3 immediately (single-replica ISR majority=1).
+//
+//   Phase B — becomeFollower(epoch=2). Log stays at LEO=3 (no truncation since
+//             epoch-cache has no entry for epoch 2 yet, fall-back=committedHw=3,
+//             and truncOff==LEO → no truncation fires). followerHw_=0 reset.
+//
+//   Phase C — applyReplicated: inject a 4-record batch (offsets 3..6,
+//             lastOffsetDelta=3) via applyReplicated with highWatermark=5.
+//             The RecordBatch format is recognized; batch is appended at
+//             baseOffset=3 (== current LEO). Log LEO=7.
+//             followerHw_ = min(7, 5) = 5.
+//
+//   Phase D — becomeLeader(epoch=3, {kL, kF}): captures highWatermark()=5
+//             (the followerHw_) and uses it as the HW floor.
+//             With 2-node ISR and followerLeo[kF]=0, computeHw()=0 < floor=5.
+//             So leaderState_.highWatermark()=5. ✓
+//
+//   Phase E — read(3, bigBuf):
+//     OLD clamp: batchBase(3) >= hw(5)? No → returns the 4-record batch (WRONG).
+//     NEW clamp: batchBase+lastOffsetDelta = 3+3=6 >= hw(5)? Yes → STOP (correct).
+//
+// The test FAILS under the old clamp and PASSES under the fix.
+// ---------------------------------------------------------------------------
+TEST(NB3_CommittedReadClamp, MultiRecordBatchStradlingHwNotReturned)
+{
+    TempDir dir("nb3_straddle");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr2    = {kL, kF};
+
+    // Phase A: start as single-replica leader so HW == LEO immediately.
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             {kL}, {kL}, &log, &transport);
+    transport.setLeader(&leader);
+
+    // Append 3 single-record batches (offsets 0,1,2). Single-ISR → HW=3.
+    for (int i = 0; i < 3; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 1)));
+    ASSERT_EQ(leader.logEndOffset(), 3)  << "NB3: LEO must be 3";
+    ASSERT_EQ(leader.highWatermark(), 3) << "NB3: single-ISR HW must be 3";
+
+    // Phase B: become follower so we can inject a multi-record batch via
+    // applyReplicated (which recognises proper RecordBatch format).
+    // becomeFollower with epoch=2: epoch-cache has no entry ≥ epoch=2,
+    // fall-back truncOff = committedHw = 3; currentLeo=3 → truncOff==LEO,
+    // condition (truncOff < currentLeo) is false → no truncation. followerHw_=0.
+    leader.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/kL);
+    ASSERT_EQ(leader.role(), Role::Follower) << "NB3: must be Follower after becomeFollower";
+    ASSERT_EQ(leader.logEndOffset(), 3) << "NB3: log must still have 3 records (no truncation)";
+
+    // Phase C: build a 4-record batch at baseOffset=3 (offsets 3,4,5,6;
+    // lastOffsetDelta=3) and inject via applyReplicated with HW=5.
+    // This correctly sets followerHw_ = min(newLeo=7, HW=5) = 5.
+    {
+        rune::protocol::RecordBatchBuilder builder(/*baseOffset=*/3, /*baseTimestamp=*/0);
+        for (int i = 0; i < 4; ++i) {
+            std::string_view key{};
+            std::string_view val("rec", 3);
+            builder.append(key, val, /*timestamp=*/0);
+        }
+        auto batchBytes = builder.build();
+
+        // Verify builder output.
+        rune::protocol::RecordBatchReader r(batchBytes.data(), batchBytes.size());
+        ASSERT_EQ(r.baseOffset(), 3)       << "NB3: batch baseOffset must be 3";
+        ASSERT_EQ(r.lastOffsetDelta(), 3)  << "NB3: 4-record batch lastOffsetDelta must be 3";
+        ASSERT_EQ(r.recordCount(), 4)      << "NB3: batch must contain 4 records";
+
+        // Inject via applyReplicated: follower applies the batch at its current LEO=3.
+        FetchResponseMsg resp{};
+        resp.errorCode      = kErrNone;
+        resp.leaderEpoch    = 2;
+        resp.partition      = 0;
+        resp.highWatermark  = 5;  // HW straddles: batch lastOffset=6 > HW=5 > baseOffset=3
+        resp.logStartOffset = 0;
+        resp.records        = std::span<const uint8_t>(batchBytes.data(), batchBytes.size());
+        leader.applyReplicated(resp);
+    }
+
+    // After applying: log LEO=7 (baseOffset=3 + lastOffsetDelta=3 + 1 = 7).
+    // followerHw_ = min(7, 5) = 5.
+    ASSERT_EQ(leader.logEndOffset(), 7) << "NB3: log LEO must be 7 after 4-record batch applied";
+    ASSERT_EQ(leader.highWatermark(), 5) << "NB3: followerHw_ must be 5";
+
+    // Phase D: become leader at epoch=3 with a 2-node ISR.
+    // becomeLeader captures highWatermark()=followerHw_=5 as floor.
+    // With 2-node ISR and followerLeo[kF]=0 (not acked yet):
+    //   computeHw(): leaderLeo=7, followerLeo=0 → sorted=[7,0] → majority=2 → HW=0.
+    //   max(floor=5, compute=0) = 5. leaderState_.highWatermark() = 5. ✓
+    transport.setLeader(&leader); // re-register (becomeFollower doesn't clear it)
+    leader.becomeLeader(/*newEpoch=*/3, isr2);
+    ASSERT_EQ(leader.role(), Role::Leader) << "NB3: must be Leader";
+
+    Offset hw = leader.highWatermark();
+    ASSERT_EQ(hw, 5) << "NB3: HW must be 5 for the straddling scenario "
+                        "(batch offsets 3..6 straddle HW=5)";
+
+    // Confirm straddling: batch at baseOffset=3, lastOffsetDelta=3 → lastOffset=6.
+    // 3 < HW=5 <= 6  → straddling.
+
+    // Phase E — NB3 core assertion:
+    // read(3, bigBuf) must NOT return the straddling 4-record batch.
+    //
+    // OLD clamp (batchBase >= hw): batchBase=3 < 5 → batch included (WRONG — exposes offsets 5,6).
+    // NEW clamp (batchBase+lastOffsetDelta >= hw): 3+3=6 >= 5 → STOP before batch (correct).
+    auto readResult = leader.read(/*fetchOffset=*/3, /*maxBytes=*/1 << 20);
+
+    bool foundStraddle = false;
+    {
+        std::size_t pos = 0;
+        while (pos < readResult.size()) {
+            std::size_t rem = readResult.size() - pos;
+            if (rem < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead)) break;
+            rune::protocol::RecordBatchReader r(readResult.data() + pos, rem);
+            int32_t total = r.totalLength();
+            if (total <= 0) break;
+            int64_t batchBase = r.baseOffset();
+            int32_t lod       = r.lastOffsetDelta();
+            EXPECT_LT(batchBase + lod, hw)
+                << "NB3: read() returned a batch with lastOffset=" << (batchBase + lod)
+                << " >= HW=" << hw
+                << " (straddling/uncommitted batch must not be returned)";
+            if (batchBase == 3 && lod == 3) {
+                foundStraddle = true;
+            }
+            pos += static_cast<std::size_t>(total);
+        }
+    }
+    EXPECT_FALSE(foundStraddle)
+        << "NB3: the straddling 4-record batch (baseOffset=3, lastOffset=6) "
+        << "must NOT be returned by read() when HW=5. "
+        << "Old clamp (batchBase >= hw) would return it (exposes uncommitted offsets 5,6); "
+        << "new clamp (batchBase+lastOffsetDelta >= hw) correctly stops before it.";
+
+    // read(0, big) must still return the 3 committed single-record batches.
+    auto committed = leader.read(0, 1 << 20);
+    EXPECT_FALSE(committed.empty()) << "NB3: committed batches [0,2] must be readable";
+    int committedCount = 0;
+    {
+        std::size_t pos = 0;
+        while (pos < committed.size()) {
+            std::size_t rem = committed.size() - pos;
+            if (rem < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead)) break;
+            rune::protocol::RecordBatchReader r(committed.data() + pos, rem);
+            int32_t total = r.totalLength();
+            if (total <= 0) break;
+            EXPECT_LT(r.baseOffset() + r.lastOffsetDelta(), hw)
+                << "NB3: committed read result must not contain a batch straddling HW";
+            ++committedCount;
+            pos += static_cast<std::size_t>(total);
+        }
+    }
+    EXPECT_EQ(committedCount, 3)
+        << "NB3: read(0) must return exactly 3 committed single-record batches";
+}
+
+// ---------------------------------------------------------------------------
+// NB3_SingleRecordBehaviorUnchanged: existing single-record semantics are
+// preserved. A single-record batch at baseOffset=K < HW is returned; one at
+// baseOffset=HW is not.
+// ---------------------------------------------------------------------------
+TEST(NB3_CommittedReadClamp, SingleRecordBatchBehaviorUnchanged)
+{
+    TempDir dir("nb3_single");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1;
+    PartitionReplica leader(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                             {kL}, {kL}, &log, &transport);
+    transport.setLeader(&leader);
+
+    // Append 5 single-record batches; single-replica ISR → HW=5 immediately.
+    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 1)));
+    ASSERT_EQ(leader.logEndOffset(), 5);
+    ASSERT_EQ(leader.highWatermark(), 5);
+
+    // read(0, big) must return all 5 batches (all below HW=5).
+    auto all = leader.read(0, 1 << 20);
+    EXPECT_FALSE(all.empty()) << "NB3-single: all 5 committed batches must be readable";
+
+    // Count batches.
+    int count = 0;
+    {
+        std::size_t pos = 0;
+        while (pos < all.size()) {
+            std::size_t rem = all.size() - pos;
+            if (rem < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead)) break;
+            rune::protocol::RecordBatchReader r(all.data() + pos, rem);
+            int32_t total = r.totalLength();
+            if (total <= 0) break;
+            // NB3 clamp: batchBase + lastOffsetDelta < hw must hold.
+            EXPECT_LT(r.baseOffset() + r.lastOffsetDelta(), leader.highWatermark())
+                << "NB3-single: single-record batch lastOffset must be < HW";
+            ++count;
+            pos += static_cast<std::size_t>(total);
+        }
+    }
+    EXPECT_EQ(count, 5) << "NB3-single: must return exactly 5 single-record batches";
+
+    // read at HW returns empty.
+    EXPECT_TRUE(leader.read(5, 1 << 20).empty()) << "NB3-single: read at HW returns empty";
+}
