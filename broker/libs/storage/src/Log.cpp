@@ -113,6 +113,9 @@ void Log::truncateTo(int64_t truncateOffset) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
         if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        // A3: CRC-gate the walk — a corrupt batch terminates the scan so we
+        // don't misparse a corrupt totalLength as a valid batch boundary.
+        if (!r.ensureValid()) break;
 
         // A batch must be dropped if ANY of its records is at offset >= truncateOffset.
         // Since records in a batch are contiguous [baseOffset .. baseOffset+lastOffsetDelta],

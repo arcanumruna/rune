@@ -173,7 +173,10 @@ void LogCleaner::buildOffsetMap(Log& log, Offset fromOffset, Offset toOffset,
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
+            // A3: bounds check before CRC; a corrupt totalLength must not misparse the walk.
             if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
+            if (!r.ensureValid()) break;
 
             r.forEach([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
@@ -215,7 +218,26 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
            <= buf.size()) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
+        // A3: bounds check before CRC; a corrupt totalLength must not misparse the walk.
         if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+        // A3: CRC-gate the walk — stop on the first corrupt batch.
+        if (!r.ensureValid()) break;
+
+        // A2: Extract producer identity from the original batch so that surviving
+        // records can carry the same producerId / producerEpoch / baseSequence.
+        // Kafka's LogCleaner preserves these fields when rewriting compacted segments
+        // so idempotent/transactional dedup state remains valid after compaction.
+        // We read them directly from the raw bytes using the known v2 batch offsets.
+        const uint8_t* batchBase = buf.data() + pos;
+        int64_t origProducerId    = static_cast<int64_t>(
+            rune::protocol::detail::getBE64(batchBase + rune::protocol::batch::kProducerIdOffset));
+        // producerEpoch is int16 (2 bytes, big-endian) at kProducerEpochOffset.
+        int16_t origProducerEpoch = static_cast<int16_t>(
+            (static_cast<uint16_t>(batchBase[rune::protocol::batch::kProducerEpochOffset]) << 8) |
+             static_cast<uint16_t>(batchBase[rune::protocol::batch::kProducerEpochOffset + 1]));
+        int32_t origBaseSequence  = static_cast<int32_t>(
+            rune::protocol::detail::getBE32(batchBase + rune::protocol::batch::kBaseSequenceOffset));
+        int64_t batchBaseOffset   = r.baseOffset();
 
         // Collect records to keep from this batch.
         // We rebuild the batch only with the surviving records, preserving
@@ -225,13 +247,50 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
         // Strategy: emit each surviving record as its own 1-record batch
         // (same technique Kafka uses for compacted segments — each kept
         // record becomes a batch with baseOffset == that record's offset).
+        // A2: After building, patch in the original producer fields and
+        // recompute CRC to preserve idempotent-producer identity.
         r.forEach([&](std::string_view key, std::string_view val,
                       int64_t offset, int64_t timestamp) {
-            // Helper: emit this record as its own single-record batch.
+            // Helper: emit this record as its own single-record batch,
+            // preserving the original batch's producer identity (A2).
             auto keep = [&]() {
                 rune::protocol::RecordBatchBuilder b(offset, timestamp);
                 b.append(key, val, timestamp);
                 auto batch = b.build();
+
+                // A2: Patch producerId, producerEpoch, baseSequence into the
+                // rebuilt batch.  The record's sequence number within the
+                // original batch is: origBaseSequence + (offset - batchBaseOffset).
+                // For single-record batches origBaseSequence == offset's sequence.
+                // We always patch (even when producerId == -1) to faithfully
+                // preserve whatever producer identity the original batch carried.
+                {
+                    // producerId at offset 43 (int64 big-endian)
+                    int64_t pid = origProducerId;
+                    for (int i = 7; i >= 0; --i)
+                        batch[rune::protocol::batch::kProducerIdOffset + (7 - i)] =
+                            static_cast<uint8_t>((static_cast<uint64_t>(pid) >> (i * 8)) & 0xFF);
+                    // producerEpoch at offset 51 (int16 big-endian)
+                    int16_t ep = origProducerEpoch;
+                    batch[rune::protocol::batch::kProducerEpochOffset]     = static_cast<uint8_t>((static_cast<uint16_t>(ep) >> 8) & 0xFF);
+                    batch[rune::protocol::batch::kProducerEpochOffset + 1] = static_cast<uint8_t>(static_cast<uint16_t>(ep) & 0xFF);
+                    // baseSequence at offset 53 (int32 big-endian):
+                    // record's sequence = origBaseSequence + offsetDelta within original batch.
+                    int32_t recSeq = origBaseSequence + static_cast<int32_t>(offset - batchBaseOffset);
+                    for (int i = 3; i >= 0; --i)
+                        batch[rune::protocol::batch::kBaseSequenceOffset + (3 - i)] =
+                            static_cast<uint8_t>((static_cast<uint32_t>(recSeq) >> (i * 8)) & 0xFF);
+                    // Recompute CRC over [attributes..end] since we changed fields
+                    // in the CRC-covered region.
+                    uint32_t newCrc = rune::protocol::crc32c(
+                        batch.data() + rune::protocol::batch::kAttributesOffset,
+                        batch.size() - rune::protocol::batch::kAttributesOffset);
+                    batch[rune::protocol::batch::kCrcOffset]     = static_cast<uint8_t>(newCrc >> 24);
+                    batch[rune::protocol::batch::kCrcOffset + 1] = static_cast<uint8_t>(newCrc >> 16);
+                    batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(newCrc >> 8);
+                    batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(newCrc);
+                }
+
                 outBuf.insert(outBuf.end(), batch.begin(), batch.end());
             };
 
@@ -265,6 +324,20 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
         });
 
         pos += static_cast<size_t>(total);
+    }
+
+    // A4: If compaction removed ALL records from a non-active segment, outBuf is
+    // empty.  Writing a 0-byte .log would leave a permanent dangling file that
+    // never gets garbage-collected.  Instead, delete the segment and its index
+    // directly and fsync the directory so the deletions are durable.
+    // Log::reloadSegments() (called by compact() after all segments are
+    // rewritten) only discovers segments with on-disk .log files, so a deleted
+    // segment is simply absent — Log remains consistent and LEO is unaffected.
+    if (outBuf.empty()) {
+        std::filesystem::remove(logPath);
+        std::filesystem::remove(idxPath);
+        fsyncDir(dir);
+        return;
     }
 
     // Durable atomic swap: write → fsync file → rename → fsync dir.

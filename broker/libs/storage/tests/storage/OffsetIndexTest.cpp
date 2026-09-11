@@ -247,3 +247,52 @@ TEST(OffsetIndex, LastSearchLowWarmTailVsColdRegion) {
 
     std::filesystem::remove(p);
 }
+
+// ---------------------------------------------------------------------------
+// Part B — edge-case tests (full re-audit 2026-09-11)
+// ---------------------------------------------------------------------------
+
+// B19a: lookup for target < baseOffset returns position 0 (base of segment).
+TEST(OffsetIndex, LookupBelowBaseOffsetReturnsZero) {
+    auto p = makeTempIdx("rune_idx_b19a");
+    std::filesystem::remove(p);
+    OffsetIndex idx(p, 50 /*baseOffset*/, 8 * 1024);
+    idx.append(55, 100);
+    idx.append(60, 300);
+    // Target below baseOffset: must return the base (position 0, offset = baseOffset).
+    auto op = idx.lookup(40); // 40 < baseOffset(50)
+    EXPECT_EQ(op.position, 0) << "lookup below baseOffset must return position 0";
+    EXPECT_EQ(op.offset,  50) << "lookup below baseOffset must return baseOffset";
+    std::filesystem::remove(p);
+}
+
+// B19b: lookup for target == lastEntry.offset (largest-lower-bound inclusivity).
+// The index is a largest-lower-bound: lookup(lastEntry) must return that entry,
+// not something before it.
+TEST(OffsetIndex, LookupForLastEntryOffsetReturnsLastEntry) {
+    auto p = makeTempIdx("rune_idx_b19b");
+    std::filesystem::remove(p);
+    OffsetIndex idx(p, 0 /*baseOffset*/, 8 * 1024);
+    idx.append(10, 0);
+    idx.append(20, 400);
+    idx.append(30, 900);
+    // Lookup exactly 30 (the last entry): must return position 900.
+    auto op = idx.lookup(30);
+    EXPECT_EQ(op.position, 900) << "lookup at last entry offset must return its position";
+    EXPECT_EQ(op.offset,   30)  << "lookup at last entry offset must return that offset";
+    std::filesystem::remove(p);
+}
+
+// B19c: lookup for target just above last entry (not in index) also returns
+// the last entry (largest-lower-bound).
+TEST(OffsetIndex, LookupAboveLastEntryReturnsLastEntry) {
+    auto p = makeTempIdx("rune_idx_b19c");
+    std::filesystem::remove(p);
+    OffsetIndex idx(p, 0, 8 * 1024);
+    idx.append(10, 0);
+    idx.append(20, 400);
+    auto op = idx.lookup(25); // 25 > last entry (20) → return last entry
+    EXPECT_EQ(op.position, 400) << "lookup above last entry must return last entry position";
+    EXPECT_EQ(op.offset,   20)  << "lookup above last entry must return last entry offset";
+    std::filesystem::remove(p);
+}

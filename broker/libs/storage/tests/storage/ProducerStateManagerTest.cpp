@@ -652,3 +652,154 @@ TEST(ProducerStateManager, SnapshotCanBeOverwritten) {
 
     ::unlink(path.c_str());
 }
+
+// ===========================================================================
+// B20 / A1 — negative baseSequence must return OOS (runtime, not just assert)
+// ===========================================================================
+
+// B20a: negative baseSequence returns OutOfOrderSequence in all build modes.
+// This tests the A1 fix: the old code used assert() which is a no-op under
+// NDEBUG, so a negative baseSequence could silently collide with empty window
+// slots ({-1,-1,-1}).  The fix replaces assert with an early-return oos().
+TEST(ProducerStateManager, NegativeBaseSequenceIsOos) {
+    ProducerStateManager m;
+    // Brand-new producer: negative baseSequence must be OOS, not accepted.
+    auto r = m.validate(42, 0, 0, -1, -1);
+    EXPECT_TRUE(r.isOos()) << "Negative baseSequence must return OOS";
+}
+
+// B20b: negative baseSequence on an established producer also returns OOS
+// (not a false-dup match against empty window slot {-1,-1,-1}).
+TEST(ProducerStateManager, NegativeBaseSequenceNotFalseDup) {
+    ProducerStateManager m;
+    // Establish some state so the window has real entries.
+    produce(m, 55, 0, 0, 0, 3, 1000); // seq 0..2
+
+    // A negative baseSequence must NOT collide with empty slots or real entries.
+    auto r = m.validate(55, 0, 0, -1, -1);
+    EXPECT_TRUE(r.isOos()) << "Negative baseSequence must return OOS on known producer";
+    EXPECT_FALSE(r.isDuplicate()) << "Negative baseSequence must not match empty window slot";
+}
+
+// B20c: lastSequenceInBatch < baseSequence (malformed batch) returns OOS.
+TEST(ProducerStateManager, LastSeqBelowBaseSeqIsOos) {
+    ProducerStateManager m;
+    auto r = m.validate(99, 0, 0, 5, 3); // lastSeq(3) < baseSeq(5)
+    EXPECT_TRUE(r.isOos()) << "lastSequence < baseSequence must return OOS";
+}
+
+// ===========================================================================
+// B21 — snapshot with count field forged larger than file → safe clamp
+// ===========================================================================
+
+// B21: A snapshot whose entryCount header claims more entries than the file
+// can contain must not over-read — only the real entries are loaded.
+TEST(ProducerStateManager, SnapshotForgCountLargerThanFileLoadsOnlyReal) {
+    std::string path = tmpPath("snap_forge");
+
+    // Write a legitimate 2-producer snapshot.
+    ProducerStateManager m;
+    produce(m, 10, 0, 0, 0, 1, 100);
+    produce(m, 20, 0, 0, 0, 1, 200);
+    m.takeSnapshot(path);
+
+    // Patch the entryCount field in the file header (bytes [8..11]) to a huge value.
+    // The file contains exactly 2 entries; the count is patched to 10000.
+    {
+        int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0) << "Could not open snapshot for patching";
+        // Header layout: magic(4) version(4) count(4) pad(4) = 16 bytes.
+        // count is at byte offset 8.
+        uint32_t fakeCount = 10000;
+        uint8_t buf[4];
+        buf[0] = static_cast<uint8_t>(fakeCount >> 24);
+        buf[1] = static_cast<uint8_t>(fakeCount >> 16);
+        buf[2] = static_cast<uint8_t>(fakeCount >> 8);
+        buf[3] = static_cast<uint8_t>(fakeCount);
+        ::pwrite(fd, buf, 4, 8);
+        ::close(fd);
+    }
+
+    // Recover: must not crash or over-read; must silently load only real entries.
+    ProducerStateManager m2;
+    int loaded = m2.recover(path);
+    // The forged count fails the fileSize<needed check (or safeCount clamps it),
+    // so we expect either 0 (truncated check) or 2 (safeCount clamp).
+    // Either way, no crash and no over-read is the contract.
+    EXPECT_LE(loaded, 2) << "Recover must not load more entries than the file contains";
+    // Loaded could be 0 (fileSize < needed with huge count) or 2 (safeCount clamp).
+    // Both are acceptable; the important invariant is no crash + no over-read.
+    (void)loaded;
+
+    ::unlink(path.c_str());
+}
+
+// ===========================================================================
+// B22 — duplicate detection across a window wrap (circular index)
+// ===========================================================================
+
+// B22: After more than kRetryWindowSize batches, the window wraps.
+// A duplicate of a batch that is still within the circular window
+// must be detected even after windowHead has wrapped past 0.
+TEST(ProducerStateManager, DuplicateDetectedAcrossWindowWrap) {
+    ProducerStateManager m;
+    // Send exactly kRetryWindowSize-1 batches to fill the window to near-capacity.
+    int32_t seq = 0;
+    int64_t offset = 1000;
+    for (int i = 0; i < kRetryWindowSize - 1; ++i) {
+        produce(m, 77, 0, 0, seq, 1, offset);
+        ++seq; offset += 100;
+    }
+    // The window is now [0..kRetryWindowSize-2], windowHead = kRetryWindowSize-1.
+    // Add one more batch to push windowHead past the last slot.
+    produce(m, 77, 0, 0, seq, 1, offset);
+    int64_t wrapBatchOffset = offset;
+    int32_t wrapBatchSeq    = seq;
+    ++seq; offset += 100;
+
+    // Window is now full; windowHead has wrapped to 0 for the next write.
+    // The batch we just added (wrapBatchSeq) occupies slot kRetryWindowSize-1.
+    // Its duplicate must still be found.
+    auto r = m.validate(77, 0, 0, wrapBatchSeq, wrapBatchSeq);
+    EXPECT_TRUE(r.isDuplicate()) << "Duplicate must be found after window wrap";
+    EXPECT_EQ(r.retryBaseOffset, wrapBatchOffset);
+
+    // Add one more batch — this evicts the OLDEST (slot 0, seq 0).
+    // After eviction, seq 0 is gone; a retry of seq 0 must return OOS.
+    produce(m, 77, 0, 0, seq, 1, offset);
+    auto r2 = m.validate(77, 0, 0, 0, 0);
+    EXPECT_TRUE(r2.isOos()) << "Batch evicted from window must return OOS";
+}
+
+// ===========================================================================
+// B23 — epoch bump then pre-bump sequence replay is OOS (not stale-dup)
+// ===========================================================================
+
+// B23: After an epoch bump the retry window is cleared.  A replay of a
+// sequence that was valid in the OLD epoch must be OOS in the new epoch,
+// not a false-dup (window is cleared on bump per update(), line ~195).
+TEST(ProducerStateManager, EpochBumpThenPreBumpReplayIsOos) {
+    ProducerStateManager m;
+    // Epoch 0: seq 0..2 at offset 1000.
+    produce(m, 88, 0, 0, 0, 3, 1000);
+
+    // Bump to epoch 1: seq 0..1 at offset 2000.
+    produce(m, 88, 0, 1, 0, 2, 2000);
+
+    // Now try to replay epoch 0's batch (seq 0..2) in epoch 0.
+    // This must be fenced (epoch 0 < current epoch 1).
+    auto r_fenced = m.validate(88, 0, 0, 0, 2);
+    EXPECT_TRUE(r_fenced.isFenced()) << "Replay of pre-bump batch must be fenced";
+
+    // Try the same sequence numbers (0..1) in epoch 1 — these are in the epoch-1
+    // window and must come back as Duplicate (offset 2000), not OOS.
+    auto r_dup = m.validate(88, 0, 1, 0, 1);
+    EXPECT_TRUE(r_dup.isDuplicate()) << "Epoch-1 batch in window must be Duplicate";
+    EXPECT_EQ(r_dup.retryBaseOffset, 2000);
+
+    // Sequence 2 in epoch 1 must be OOS (window cleared; expected next is 2, lastSeq=1).
+    // Actually expected next = lastSeq+1 = 2; so seq=2 is Accept, not OOS.
+    // Verify: seq 3 (skip 2) must be OOS (gap).
+    auto r_gap = m.validate(88, 0, 1, 3, 3);
+    EXPECT_TRUE(r_gap.isOos()) << "Forward gap in epoch 1 must be OOS";
+}

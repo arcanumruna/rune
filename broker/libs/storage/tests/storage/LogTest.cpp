@@ -529,3 +529,145 @@ TEST(Log, TruncateToZeroRemovesAll) {
 
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Part B — edge-case tests (full re-audit 2026-09-11)
+// ---------------------------------------------------------------------------
+
+// B13: truncateTo into the middle of a multi-record batch.
+// A multi-record batch spans offsets [baseOffset .. baseOffset+lastOffsetDelta].
+// truncateTo(midpoint) must round down to the batch boundary and drop the
+// entire batch (no partial batch survives).
+TEST(Log, TruncateInsideMultiRecordBatchRoundsDown) {
+    auto dir = makeTempDir("rune_log_b13");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 64 * 1024 * 1024); // large segment, no roll
+    // Build a 3-record batch spanning offsets 0..2.
+    {
+        RecordBatchBuilder b(0, 1000);
+        b.append("k1", "v1", 1000);
+        b.append("k2", "v2", 1001);
+        b.append("k3", "v3", 1002);
+        log.append(b.build(), 2); // lastOffset = 2
+    }
+    EXPECT_EQ(log.logEndOffset(), 3);
+
+    // truncateTo(1): offset 1 is inside the [0..2] batch → whole batch dropped.
+    log.truncateTo(1);
+    EXPECT_EQ(log.logEndOffset(), 0)
+        << "truncateTo inside multi-record batch must drop entire batch";
+    auto bytes = log.read(0, 1 << 20);
+    EXPECT_TRUE(bytes.empty()) << "No batch must survive after truncation inside it";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B14: truncateTo exactly at a non-first segment base.
+// The segment at the boundary and all segments after it are deleted.
+// The prior segment's content is fully preserved.
+TEST(Log, TruncateAtSegmentBaseDeletesSegment) {
+    auto dir = makeTempDir("rune_log_b14");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 256); // small rollBytes to force segment creation
+
+    // Append enough records to create multiple segments.
+    int64_t off = 0;
+    for (int i = 0; i < 10; ++i) {
+        RecordBatchBuilder b(off, 1000 + i); b.append("k", "v" + std::to_string(i), 1000 + i);
+        off = log.append(b.build(), off);
+    }
+    EXPECT_GT(log.segmentBaseOffsets().size(), 1u) << "Need multiple segments";
+
+    // Find the base of the SECOND segment.
+    auto bases = log.segmentBaseOffsets();
+    int64_t secondBase = bases[1];
+    int64_t leoBeforeTrunc = log.logEndOffset();
+
+    // Truncate exactly at the second segment's base.
+    log.truncateTo(secondBase);
+
+    // LEO must equal secondBase (all records from secondBase onward are gone).
+    EXPECT_EQ(log.logEndOffset(), secondBase)
+        << "LEO must be secondBase after truncation at that boundary";
+
+    // Records in [0, secondBase) must all survive.
+    int64_t cursor = 0;
+    while (cursor < secondBase) {
+        auto bytes = log.read(cursor, 1 << 20);
+        ASSERT_FALSE(bytes.empty()) << "Record at offset " << cursor << " must survive";
+        RecordBatchReader r(bytes.data(), bytes.size());
+        ASSERT_TRUE(r.ensureValid());
+        cursor = r.baseOffset() + r.lastOffsetDelta() + 1;
+    }
+
+    (void)leoBeforeTrunc;
+    std::filesystem::remove_all(dir);
+}
+
+// B15: truncateTo(0) followed by append — contiguous offsets from 0.
+TEST(Log, TruncateToZeroThenAppendIsContiguous) {
+    auto dir = makeTempDir("rune_log_b15");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 64 * 1024 * 1024);
+    for (int i = 0; i < 5; ++i) {
+        RecordBatchBuilder b(static_cast<int64_t>(i), 1000 + i);
+        b.append("k", "v" + std::to_string(i), 1000 + i);
+        log.append(b.build(), static_cast<int64_t>(i));
+    }
+    EXPECT_EQ(log.logEndOffset(), 5);
+
+    log.truncateTo(0);
+    EXPECT_EQ(log.logEndOffset(), 0);
+
+    // Append new records starting from 0.
+    {
+        RecordBatchBuilder b(0, 9000); b.append("new", "val", 9000);
+        int64_t next = log.append(b.build(), 0);
+        EXPECT_EQ(next, 1) << "After truncateTo(0), first new offset must be 0→nextOffset=1";
+    }
+
+    // Reopen and verify.
+    log.recover();
+    auto bytes = log.read(0, 1 << 20);
+    ASSERT_FALSE(bytes.empty());
+    RecordBatchReader r(bytes.data(), bytes.size());
+    ASSERT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+
+    std::filesystem::remove_all(dir);
+}
+
+// B16: maybeRoll with a single batch larger than rollBytes.
+// The oversized batch must start its own segment and be readable.
+TEST(Log, OversizedBatchStartsOwnSegment) {
+    auto dir = makeTempDir("rune_log_b16");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    // rollBytes = 64 bytes — tiny, but the batch will be much larger.
+    Log log(dir.string(), 64);
+
+    // Build a batch with many records — guaranteed > 64 bytes.
+    RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < 10; ++i)
+        b.append("longkey_" + std::to_string(i),
+                 "longval_" + std::to_string(i) + "_payload_payload", 1000 + i);
+    auto bigBatch = b.build();
+    ASSERT_GT(bigBatch.size(), 64u) << "Batch must be larger than rollBytes";
+
+    int64_t next = log.append(bigBatch, 9); // 10 records, lastOffset=9
+    EXPECT_EQ(next, 10);
+    EXPECT_GT(log.logEndOffset(), 0u);
+
+    // The oversized batch must be readable.
+    auto bytes = log.read(0, 1 << 20);
+    ASSERT_FALSE(bytes.empty());
+    RecordBatchReader r(bytes.data(), bytes.size());
+    ASSERT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+    EXPECT_EQ(r.lastOffsetDelta(), 9); // 10 records
+
+    std::filesystem::remove_all(dir);
+}

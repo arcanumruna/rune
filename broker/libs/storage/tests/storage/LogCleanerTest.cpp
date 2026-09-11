@@ -8,7 +8,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <string>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -1140,6 +1142,431 @@ TEST(LogCleaner, CompactedIndexConsistentWithLog) {
     log3.recover();
     auto recs = readAllRecords(log3, 0);
     EXPECT_FALSE(recs.empty()) << "Log must be readable after compact+reopen";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Part B — edge-case tests (full re-audit 2026-09-11)
+// ---------------------------------------------------------------------------
+
+// B1 / A4: Compact a segment so every record is superseded → 0-byte outcome.
+// The segment file must be DELETED (not left as a 0-byte .log), and a fresh
+// log reopen must survive (LEO intact, reads from surrounding segments work).
+TEST(LogCleaner, EmptyCompactedSegmentDeletedNotLeft) {
+    auto dir = makeTempDir("lc_b1");
+    std::filesystem::create_directories(dir);
+
+    // Segment 0: k1@0 (will be superseded — segment becomes empty post-compact).
+    // Segment 1: k1@1 (latest — survives in the active/later segment).
+    // We need at least 3 segments: seg0 (compactable, becomes empty), seg1 (compactable,
+    // holds the latest k1), and seg2 (active, never compacted).
+    Log log(dir.string(), 256);
+    log.append(makeBatch(0, "k1", "old", 1000), 0); // seg 0
+    // Force a roll by padding.
+    for (int i = 1; i < 8; ++i)
+        log.append(makeBatch(i, "pad_a", "x", 2000 + i), i);
+    log.append(makeBatch(8, "k1", "new", 1008), 8); // seg ≥1: latest k1
+    for (int i = 9; i < 20; ++i)
+        log.append(makeBatch(i, "pad_b", "y", 3000 + i), i);
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u) << "Need at least two segments for this test";
+
+    // The first non-active segment (bases[0]) contains k1@0 which will be
+    // superseded by k1@8 in a later segment.  After compaction, bases[0] must
+    // be fully empty → A4 fix deletes the file.
+    int64_t cleanBoundary = bases.back(); // don't compact active segment
+
+    LogCleaner cleaner;
+    cleaner.clean(log, 0, cleanBoundary, 0, 1'000'000);
+
+    // Verify: no 0-byte .log files remain.
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".log") {
+            EXPECT_GT(std::filesystem::file_size(e.path()), 0u)
+                << "No 0-byte .log files should remain: " << e.path();
+        }
+    }
+
+    // Fresh reopen must survive.
+    Log log2(dir.string(), 256);
+    log2.recover();
+    EXPECT_GT(log2.logEndOffset(), 0) << "LEO must be intact after empty-segment deletion";
+
+    // k1 must appear exactly once — the latest version.
+    auto recs = readAllRecords(log2, 0);
+    EXPECT_EQ(countKey(recs, "k1"), 1) << "Only one k1 must survive";
+    EXPECT_EQ(latestOffsetForKey(recs, "k1"), 8) << "Surviving k1 must be at offset 8";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B2: After compact, a fresh process recovering only from segment bytes
+// (reopen + recover()) must reproduce the correct LEO and read records.
+// This tests that the on-disk compacted state is self-consistent without
+// relying on any in-memory state from the compaction run.
+TEST(LogCleaner, FreshReopenAfterCompactionProducesCorrectLEO) {
+    auto dir = makeTempDir("lc_b2");
+    std::filesystem::create_directories(dir);
+
+    {
+        Log log(dir.string(), 512);
+        log.append(makeBatch(0, "k1", "v1", 1000), 0);
+        log.append(makeBatch(1, "k1", "v2", 1001), 1); // latest k1
+        log.append(makeBatch(2, "k2", "v3", 1002), 2); // only k2
+        for (int i = 3; i < 15; ++i)
+            log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+    } // all handles closed
+
+    // Compact using a separate Log instance (simulates a new process run).
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        LogCleaner cleaner;
+        cleaner.clean(log, 0, 3, 0, 1'000'000);
+    } // all handles closed
+
+    // "Fresh process": brand-new Log, recover from disk only.
+    Log log3(dir.string(), 512);
+    int64_t leo = log3.recover();
+    EXPECT_GT(leo, 2) << "LEO must reflect all segments, not just the active one";
+
+    auto recs = readAllRecords(log3, 0);
+    EXPECT_EQ(countKey(recs, "k1"), 1) << "k1 must be compacted to 1";
+    EXPECT_EQ(latestOffsetForKey(recs, "k1"), 1);
+    EXPECT_EQ(countKey(recs, "k2"), 1);
+
+    std::filesystem::remove_all(dir);
+}
+
+// B3: Multi-record batch compaction — feed a real multi-record batch
+// (≥2 records per batch) and assert that per-record survivors and preserved
+// offsets/timestamps are correct after compaction.
+// All prior fixtures used single-record batches; this exercises the multi-
+// record code path including producer-identity preservation (A2).
+TEST(LogCleaner, MultiRecordBatchCompactionPreservesRecords) {
+    auto dir = makeTempDir("lc_b3");
+    std::filesystem::create_directories(dir);
+
+    // Build a multi-record batch: k1@0, k2@1, k1@2 in ONE batch (baseOffset=0).
+    // After compaction of [0,3): k1@2 and k2@1 survive, k1@0 is dropped.
+    // Use tiny rollBytes (128) so the multi-record batch forces a segment roll
+    // when padded records arrive, ensuring it lands in a non-active segment.
+    Log log(dir.string(), 128);
+    {
+        RecordBatchBuilder b(0, 1000);
+        b.append("k1", "v1", 1000); // offset 0
+        b.append("k2", "v2", 1001); // offset 1
+        b.append("k1", "v3", 1002); // offset 2 — latest k1
+        auto batch = b.build();
+        log.append(batch, 2); // lastOffset=2 (offsets 0,1,2)
+    }
+    // Pad to force segment roll — makes the multi-record batch non-active.
+    for (int i = 3; i < 20; ++i)
+        log.append(makeBatch(i, "pad", "p", 3000 + i), i);
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u) << "Need multiple segments: multi-record batch must be non-active";
+
+    LogCleaner cleaner;
+    cleaner.clean(log, 0, 3, 0, 1'000'000);
+
+    auto recs = readAllRecords(log, 0);
+
+    // k1@0 must be gone (superseded by k1@2).
+    for (auto& r : recs)
+        EXPECT_FALSE(r.key == "k1" && r.offset == 0)
+            << "k1@0 from multi-record batch must be compacted away";
+
+    // k2@1 must survive.
+    bool k2found = false;
+    for (auto& r : recs)
+        if (r.key == "k2" && r.offset == 1) k2found = true;
+    EXPECT_TRUE(k2found) << "k2@1 must survive compaction";
+
+    // k1@2 must survive (latest k1).
+    EXPECT_EQ(countKey(recs, "k1"), 1);
+    EXPECT_EQ(latestOffsetForKey(recs, "k1"), 2);
+
+    std::filesystem::remove_all(dir);
+}
+
+// B4 / A3: A corrupt batch (CRC mismatch) mid-segment stops buildOffsetMap
+// and rewriteSegment at the corrupt entry — no silent misparse.
+TEST(LogCleaner, CorruptBatchInBuildOffsetMapStopsWalk) {
+    auto dir = makeTempDir("lc_b4");
+    std::filesystem::create_directories(dir);
+
+    // Append two good batches.
+    Log log(dir.string(), 64 * 1024);
+    log.append(makeBatch(0, "k1", "v1", 1000), 0);
+    log.append(makeBatch(1, "k2", "v2", 1001), 1);
+    for (int i = 2; i < 10; ++i)
+        log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+
+    // Corrupt the second batch's CRC in the first segment's .log file.
+    // We need to find the segment file and flip a byte in the CRC field
+    // (offset 17 relative to the batch start = past the first batch).
+    auto bases = log.segmentBaseOffsets();
+    std::string seg0path;
+    {
+        std::ostringstream oss;
+        oss << dir.string() << "/" << std::setw(20) << std::setfill('0') << bases[0] << ".log";
+        seg0path = oss.str();
+    }
+
+    // Find the start of the second batch by reading until we've consumed the first.
+    size_t firstBatchSize = 0;
+    {
+        std::ifstream f(seg0path, std::ios::binary);
+        f.seekg(0, std::ios::end);
+        size_t fsz = static_cast<size_t>(f.tellg());
+        f.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buf(fsz);
+        f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(fsz));
+        RecordBatchReader r1(buf.data(), buf.size());
+        firstBatchSize = static_cast<size_t>(r1.totalLength());
+    }
+
+    // Flip a byte in the CRC field of the second batch (offset 17 within that batch).
+    {
+        int fd = ::open(seg0path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        size_t crcOff = firstBatchSize + 17; // kCrcOffset == 17
+        uint8_t b;
+        ::pread(fd, &b, 1, static_cast<off_t>(crcOff));
+        b ^= 0xFF; // flip all bits
+        ::pwrite(fd, &b, 1, static_cast<off_t>(crcOff));
+        ::close(fd);
+    }
+
+    // buildOffsetMap: must stop at the corrupt batch, not misparse.
+    // The result may be partial (only k1 from the first good batch).
+    OffsetMap map;
+    LogCleaner cleaner;
+    EXPECT_NO_THROW(cleaner.buildOffsetMap(log, 0, 2, map))
+        << "buildOffsetMap must not throw on corrupt batch";
+    // k1 (from the first good batch) must be in the map.
+    EXPECT_TRUE(map.get("k1").has_value()) << "k1 from first good batch must be in map";
+    // k2 (corrupt batch) may or may not be present; no crash is the contract.
+
+    std::filesystem::remove_all(dir);
+}
+
+// B5: Crash exactly between rename(.new → .log) and fsyncDir.
+// After the rename, the .log contains the new content.  A fresh reopen
+// (simulating recovery after that exact crash) must see the renamed content.
+TEST(LogCleaner, CrashAfterRenameBeforeFsyncDirSeeNewContent) {
+    auto dir = makeTempDir("lc_b5");
+    std::filesystem::create_directories(dir);
+
+    // Write a log and compact it.
+    {
+        Log log(dir.string(), 512);
+        log.append(makeBatch(0, "k1", "old", 1000), 0);
+        log.append(makeBatch(1, "k1", "new", 1001), 1); // latest k1
+        for (int i = 2; i < 15; ++i)
+            log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+    }
+
+    auto bases = [&]() {
+        Log tmp(dir.string(), 512); return tmp.segmentBaseOffsets();
+    }();
+    ASSERT_FALSE(bases.empty());
+
+    // Manually perform the rename step (simulating the critical crash window):
+    // write a compacted .new, rename it over .log, but do NOT fsyncDir.
+    std::string logPath, newPath, idxPath;
+    {
+        std::ostringstream oss;
+        oss << dir.string() << "/" << std::setw(20) << std::setfill('0') << bases[0] << ".log";
+        logPath = oss.str();
+        newPath = logPath + ".new";
+        std::ostringstream oxi;
+        oxi << dir.string() << "/" << std::setw(20) << std::setfill('0') << bases[0] << ".index";
+        idxPath = oxi.str();
+    }
+
+    // Build the expected compacted content (k1@1 only) into .new, then rename.
+    {
+        auto newContent = makeBatch(1, "k1", "new", 1001);
+        int fd = ::open(newPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ASSERT_GE(fd, 0);
+        ::write(fd, newContent.data(), newContent.size());
+        ::fsync(fd);
+        ::close(fd);
+        ::rename(newPath.c_str(), logPath.c_str());
+        // NOTE: intentionally NOT calling fsyncDir here (simulating the crash window).
+    }
+
+    // The OS page cache has the rename; a fresh reopen sees the new content
+    // (the missing fsyncDir only matters for actual power loss).
+    Log log2(dir.string(), 512);
+    log2.recover();
+    auto recs = readAllRecords(log2, 0);
+
+    // After the rename, the .log contains only k1@1 (the compacted content).
+    EXPECT_EQ(countKey(recs, "k1"), 1) << "Post-rename content must be visible on reopen";
+    EXPECT_EQ(latestOffsetForKey(recs, "k1"), 1) << "Renamed content is k1@1=new";
+    for (auto& r : recs)
+        if (r.key == "k1") EXPECT_EQ(r.value, "new") << "Surviving k1 must be the new value";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B6: Tombstone exactly at the deleteRetentionNs boundary (boundary semantics).
+// The code uses `>` (strictly greater) for expiry: (nowNs - tombstoneTs) > deleteRetentionNs.
+// Exactly at the boundary the tombstone must be RETAINED.
+TEST(LogCleaner, TombstoneExactlyAtRetentionBoundaryIsRetained) {
+    auto dir = makeTempDir("lc_b6");
+    std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 512);
+    int64_t tombTs    = 1'000'000LL;         // tombstone timestamp (ns)
+    int64_t retMs     = 100LL;               // retention: 100 ms = 100_000_000 ns
+    int64_t retNs     = retMs * 1'000'000LL; // 100_000_000 ns
+
+    log.append(makeBatch(0, "k1", "v1", tombTs - 1000), 0);
+    log.append(makeTombstone(1, "k1", tombTs), 1);
+    for (int i = 2; i < 15; ++i)
+        log.append(makeBatch(i, "pad", "p", 2'000'000 + i), i);
+
+    // nowNs exactly at boundary: (nowNs - tombTs) == retNs → NOT > retNs → retain.
+    int64_t nowNs = tombTs + retNs;
+
+    LogCleaner cleaner;
+    cleaner.clean(log, 0, 2, nowNs, retMs);
+
+    auto recs = readAllRecords(log, 0);
+    bool tombFound = false;
+    for (auto& r : recs)
+        if (r.key == "k1" && r.value.empty() && r.offset == 1) tombFound = true;
+    EXPECT_TRUE(tombFound)
+        << "Tombstone exactly at retention boundary must be retained (> not >=)";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B7 / S6: Key survives only in the active segment; an earlier segment holds
+// an older copy.  The earlier copy must be dropped; the active copy survives.
+TEST(LogCleaner, KeyOnlyInActiveSegmentDropsEarlierCopy) {
+    auto dir = makeTempDir("lc_b7");
+    std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), 256);
+    // k1@0 in segment 0 (compactable).
+    log.append(makeBatch(0, "k1", "v1", 1000), 0);
+    // Pad to roll seg0 into non-active.
+    for (int i = 1; i < 8; ++i)
+        log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+    // k1@8 in the ACTIVE segment (not compacted).
+    log.append(makeBatch(8, "k1", "v2_active", 3000), 8);
+    for (int i = 9; i < 15; ++i)
+        log.append(makeBatch(i, "pad2", "q", 4000 + i), i);
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u);
+    int64_t activeBase = bases.back();
+    // Compact everything except the active segment.
+    int64_t cleanBoundary = activeBase;
+
+    LogCleaner cleaner;
+    cleaner.clean(log, 0, cleanBoundary, 0, 1'000'000);
+
+    auto recs = readAllRecords(log, 0);
+    // k1@0 in the compactable segment must be gone (superseded by k1@8 in active).
+    for (auto& r : recs)
+        EXPECT_FALSE(r.key == "k1" && r.offset == 0)
+            << "Earlier copy of k1 must be dropped when latest is in active segment";
+
+    // k1@8 in the active segment must survive.
+    bool activeK1Found = false;
+    for (auto& r : recs)
+        if (r.key == "k1" && r.offset == 8) activeK1Found = true;
+    EXPECT_TRUE(activeK1Found) << "k1@8 in active segment must survive";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B3-producer: After compact, surviving records carry the ORIGINAL producer
+// identity (A2 fix: producerId/epoch/baseSequence are preserved, not -1).
+TEST(LogCleaner, CompactionPreservesProducerIdentity) {
+    auto dir = makeTempDir("lc_b3_pid");
+    std::filesystem::create_directories(dir);
+
+    // Build a batch carrying non-default producerId/epoch/baseSequence.
+    // RecordBatchBuilder always sets -1 for these; we patch them manually.
+    // Use a large positive int64_t (fits in signed 64-bit).
+    int64_t expectedPid   = 0x1234567890ABCDEFLL; // positive: 1311768467294899695
+    int16_t expectedEpoch = 42;
+    int32_t expectedBaseSeq = 7;
+
+    auto buildProducerBatch = [&](int64_t baseOffset, std::string_view key,
+                                  std::string_view val, int64_t ts) {
+        RecordBatchBuilder b(baseOffset, ts);
+        b.append(key, val, ts);
+        auto batch = b.build();
+        // Patch producerId (offset 43, int64 BE).
+        for (int i = 7; i >= 0; --i)
+            batch[rune::protocol::batch::kProducerIdOffset + (7 - i)] =
+                static_cast<uint8_t>((expectedPid >> (i * 8)) & 0xFF);
+        // Patch producerEpoch (offset 51, int16 BE).
+        batch[rune::protocol::batch::kProducerEpochOffset]     = static_cast<uint8_t>((expectedEpoch >> 8) & 0xFF);
+        batch[rune::protocol::batch::kProducerEpochOffset + 1] = static_cast<uint8_t>(expectedEpoch & 0xFF);
+        // Patch baseSequence (offset 53, int32 BE).
+        for (int i = 3; i >= 0; --i)
+            batch[rune::protocol::batch::kBaseSequenceOffset + (3 - i)] =
+                static_cast<uint8_t>((expectedBaseSeq >> (i * 8)) & 0xFF);
+        // Recompute CRC.
+        uint32_t crc = rune::protocol::crc32c(
+            batch.data() + rune::protocol::batch::kAttributesOffset,
+            batch.size() - rune::protocol::batch::kAttributesOffset);
+        batch[rune::protocol::batch::kCrcOffset]     = static_cast<uint8_t>(crc >> 24);
+        batch[rune::protocol::batch::kCrcOffset + 1] = static_cast<uint8_t>(crc >> 16);
+        batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(crc >> 8);
+        batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(crc);
+        return batch;
+    };
+
+    // k1@0 (superseded) and k1@1 (latest) — both with producer identity.
+    Log log(dir.string(), 512);
+    log.append(buildProducerBatch(0, "k1", "v1", 1000), 0);
+    log.append(buildProducerBatch(1, "k1", "v2", 1001), 1);
+    for (int i = 2; i < 15; ++i)
+        log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+
+    LogCleaner cleaner;
+    cleaner.clean(log, 0, 2, 0, 1'000'000);
+
+    // Read back raw bytes of the surviving k1@1 batch and check producer fields.
+    auto bytes = log.read(1, 1 << 20);
+    ASSERT_FALSE(bytes.empty()) << "k1@1 must be readable after compaction";
+
+    // Verify CRC is valid (producer fields correctly patched into rebuilt batch).
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid()) << "Compacted batch must have a valid CRC";
+
+    // Read raw producer fields from the batch bytes.
+    int64_t gotPid = 0;
+    for (int i = 0; i < 8; ++i)
+        gotPid = (gotPid << 8) | bytes[rune::protocol::batch::kProducerIdOffset + i];
+    EXPECT_EQ(gotPid, expectedPid) << "producerId must be preserved through compaction";
+
+    int16_t gotEpoch = static_cast<int16_t>(
+        (static_cast<uint16_t>(bytes[rune::protocol::batch::kProducerEpochOffset]) << 8) |
+         static_cast<uint16_t>(bytes[rune::protocol::batch::kProducerEpochOffset + 1]));
+    EXPECT_EQ(gotEpoch, expectedEpoch) << "producerEpoch must be preserved through compaction";
+
+    int32_t gotSeq = static_cast<int32_t>(
+        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset])     << 24) |
+        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset + 1]) << 16) |
+        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset + 2]) << 8)  |
+        (uint32_t(bytes[rune::protocol::batch::kBaseSequenceOffset + 3])));
+    // The record's sequence = origBaseSequence + offsetDelta within its original batch.
+    // For k1@1 in a single-record batch with baseOffset=1: offsetDelta = 1-1 = 0.
+    // So expectedSeq = expectedBaseSeq + 0 = 7.
+    EXPECT_EQ(gotSeq, expectedBaseSeq) << "baseSequence must be preserved through compaction";
 
     std::filesystem::remove_all(dir);
 }

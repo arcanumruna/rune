@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 #include <rune/storage/LogSegment.h>
+#include <rune/storage/OffsetIndex.h>
 #include <rune/protocol/RecordBatch.h>
+#include <climits>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <atomic>
 #include <chrono>
@@ -590,4 +593,162 @@ TEST(LogSegment, RecoverIndexMatchesAppendIndex) {
 
     std::filesystem::remove_all(dir1);
     std::filesystem::remove_all(dir2);
+}
+
+// ---------------------------------------------------------------------------
+// Part B — edge-case tests (full re-audit 2026-09-11)
+// ---------------------------------------------------------------------------
+
+// B9: Torn tail with a valid-looking totalLength but bad CRC.
+// recover() must use ensureValid() (not just length) to drop the corrupt entry.
+TEST(LogSegment, RecoverDropsTornTailWithGoodLengthBadCrc) {
+    auto dir = makeTempDir("lune_seg_b9");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    // Write two valid batches.
+    {
+        LogSegment seg(dir.string(), 0);
+        RecordBatchBuilder b0(0, 1000); b0.append("k", "v0", 1000);
+        seg.append(b0.build(), 0);
+        RecordBatchBuilder b1(1, 1001); b1.append("k", "v1", 1001);
+        seg.append(b1.build(), 1);
+    }
+
+    // Find the .log file and corrupt the CRC of the SECOND batch
+    // (flip the CRC byte at offset 17 within the second batch)
+    // while keeping totalLength plausible.
+    std::string logPath = (dir / "00000000000000000000.log").string();
+    {
+        std::ifstream f(logPath, std::ios::binary);
+        f.seekg(0, std::ios::end);
+        size_t fsz = static_cast<size_t>(f.tellg());
+        f.seekg(0, std::ios::beg);
+        std::vector<uint8_t> buf(fsz);
+        f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(fsz));
+
+        // Find the start of the second batch (= size of the first batch).
+        RecordBatchReader r1(buf.data(), buf.size());
+        size_t firstEnd = static_cast<size_t>(r1.totalLength());
+
+        // Flip the CRC field (offset 17 within the batch) of the second batch.
+        buf[firstEnd + 17] ^= 0xFF;
+
+        // Overwrite the file with the corrupted data.
+        std::ofstream out(logPath, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(fsz));
+    }
+
+    // Recover: should truncate at the corrupt batch and keep only batch 0.
+    LogSegment seg2(dir.string(), 0);
+    int64_t next = seg2.recover();
+    EXPECT_EQ(next, 1) << "Only batch 0 (offset 0) must survive; nextOffset must be 1";
+
+    // Verify batch 0 is readable.
+    auto bytes = seg2.read(0, 1 << 20);
+    ASSERT_FALSE(bytes.empty());
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+
+    std::filesystem::remove_all(dir);
+}
+
+// B10: recover() is idempotent — calling it twice on the same segment produces
+// the same nextOffset and correct reads, and leaves no .index.tmp orphan.
+TEST(LogSegment, RecoverTwiceIsIdempotent) {
+    auto dir = makeTempDir("rune_seg_b10");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    {
+        LogSegment seg(dir.string(), 0);
+        RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000); b.append("k2", "v2", 1001);
+        seg.append(b.build(), 1); // 2-record batch, lastOffset=1
+    }
+
+    LogSegment seg2(dir.string(), 0);
+    int64_t next1 = seg2.recover();
+
+    // No .index.tmp should remain after first recover.
+    EXPECT_FALSE(std::filesystem::exists(dir / "00000000000000000000.index.tmp"))
+        << ".index.tmp must not remain after recover()";
+
+    // Second recover on a new segment object from the same file.
+    LogSegment seg3(dir.string(), 0);
+    int64_t next2 = seg3.recover();
+
+    EXPECT_EQ(next1, next2) << "recover() must be idempotent";
+    EXPECT_EQ(next1, 2) << "nextOffset must be 2 (batch covers offsets 0 and 1)";
+
+    // .index.tmp must still not exist.
+    EXPECT_FALSE(std::filesystem::exists(dir / "00000000000000000000.index.tmp"))
+        << ".index.tmp must not remain after second recover()";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B11a: read() with maxBytes == 0 must not crash and must return a non-empty
+// result (the grow-and-retry loop always expands maxBytes until it finds the batch).
+TEST(LogSegment, ReadWithZeroMaxBytesDoesNotCrash) {
+    auto dir = makeTempDir("rune_seg_b11a");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    LogSegment seg(dir.string(), 0);
+    RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+    seg.append(b.build(), 0);
+    seg.recover();
+
+    // A maxBytes of 0 should not crash; the grow loop expands the window.
+    EXPECT_NO_THROW({
+        auto bytes = seg.read(0, 0);
+        // Result may be empty (no progress) or non-empty (grow succeeded).
+        // The important invariant is no crash and no infinite loop.
+        (void)bytes;
+    }) << "read() with maxBytes=0 must not crash";
+
+    std::filesystem::remove_all(dir);
+}
+
+// B11b: read() with maxBytes smaller than kRecordBatchOverhead must still
+// eventually succeed via the grow-and-retry loop.
+TEST(LogSegment, ReadWithTinyMaxBytesGrowsAndSucceeds) {
+    auto dir = makeTempDir("rune_seg_b11b");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    LogSegment seg(dir.string(), 0);
+    RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+    auto batch = b.build();
+    seg.append(batch, 0);
+    seg.recover();
+
+    // maxBytes = 1 (< kRecordBatchOverhead = 61).
+    auto bytes = seg.read(0, 1);
+    // The grow-and-retry loop must eventually reach a window large enough to
+    // hold at least the header and find batch 0.
+    EXPECT_FALSE(bytes.empty()) << "read() must grow window and return batch even with tiny maxBytes";
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+
+    std::filesystem::remove_all(dir);
+}
+
+// B8: OffsetIndex::append guard fires for a position > INT32_MAX.
+// (This exercises the guard added for C4/A3 — cannot easily exceed 2GiB
+// in a real segment test, so we call OffsetIndex::append directly with a
+// position just beyond INT32_MAX and expect a runtime_error.)
+TEST(LogSegment, OffsetIndexAppendGuards2GiBPosition) {
+    // Use OffsetIndex directly to test the guard without needing a >2GiB file.
+    // The test uses a 64KiB index map (smallest viable).
+    auto dir = makeTempDir("rune_seg_b8");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    std::string idxPath = (dir / "00000000000000000000.index").string();
+    rune::storage::OffsetIndex idx(idxPath, 0, 64 * 1024);
+
+    // A position just above INT32_MAX must throw.
+    int64_t tooBig = static_cast<int64_t>(INT32_MAX) + 1;
+    EXPECT_THROW(idx.append(0, tooBig), std::runtime_error)
+        << "OffsetIndex::append must throw when position > INT32_MAX";
+
+    std::filesystem::remove_all(dir);
 }

@@ -126,9 +126,11 @@ ProducerStateManager::validate(int64_t producerId,
                                int32_t baseSequence,
                                int32_t lastSequenceInBatch) const noexcept
 {
-    // Protocol invariant: sequence numbers are non-negative.
-    assert(baseSequence >= 0 && "baseSequence must be >= 0 per protocol");
-    assert(lastSequenceInBatch >= baseSequence && "lastSequence must be >= baseSequence");
+    // A1: Protocol invariant enforced at runtime (not just via assert which is a no-op
+    // under NDEBUG).  A negative baseSequence or a lastSequence below baseSequence is
+    // protocol-illegal; reject with OutOfOrderSequence in all build modes.
+    if (baseSequence < 0 || lastSequenceInBatch < baseSequence)
+        return ValidationResult::oos();
 
     const ProducerPartitionKey key{producerId, partition};
     auto it = map_.find(key);

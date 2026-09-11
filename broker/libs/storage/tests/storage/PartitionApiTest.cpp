@@ -239,3 +239,29 @@ TEST(PartitionApi, RestartMidStream) {
     }
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Part B — edge-case tests (full re-audit 2026-09-11)
+// ---------------------------------------------------------------------------
+
+// B18: consume() with fromOffset == highWatermark returns empty; fromOffset
+// beyond highWatermark also returns empty without crashing.
+TEST(PartitionApi, ConsumeAtOrPastHWMReturnsEmpty) {
+    auto dir = makeTempDir("rune_api_b18");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    PartitionApi api(dir.string());
+    api.produce("k", "v1", 1000);
+    api.produce("k", "v2", 1001);
+    EXPECT_EQ(api.highWatermark(), 2);
+
+    // consume(2) = at HWM → empty.
+    auto atHwm = api.consume(2);
+    EXPECT_TRUE(atHwm.empty()) << "consume at HWM must return empty";
+
+    // consume(100) = beyond HWM → empty.
+    auto pastHwm = api.consume(100);
+    EXPECT_TRUE(pastHwm.empty()) << "consume past HWM must return empty";
+
+    std::filesystem::remove_all(dir);
+}
