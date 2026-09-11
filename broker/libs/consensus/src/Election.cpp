@@ -7,6 +7,7 @@
 #include <rune/consensus/Election.h>
 #include <rune/consensus/ClusterMember.h>
 #include <algorithm>
+#include <cassert>
 #include <stdexcept>
 
 namespace rune::consensus {
@@ -420,7 +421,15 @@ int Election::leaderLogReplication(int64_t nowNs)
 int Election::leaderReplay(int64_t nowNs)
 {
     // Election.java:831-833: if logPosition == appendPosition → LEADER_INIT immediately
-    // (nothing to replay in Phase 2)
+    // PHASE-2-ARCHIVE-DEFERRED: Aeron Archive log replication is not wired in Phase 2.
+    // We assert the Phase-2 precondition that no log gap exists between logPosition_
+    // and appendPosition_. If this assertion fires, wire the real FollowerLogReplication
+    // path before enabling Archive integration (Phase 3).
+    // Audit finding C5: without this guard a leader with appendPosition > logPosition
+    // would publish NLT at appendPosition, over-counting quorum at a position followers
+    // don't actually hold. In Phase 2 all nodes start from position 0; this holds.
+    assert(logPosition_ == appendPosition_
+        && "PHASE-2-DEFERRED: leader has un-replayed log gap; wire Archive before enabling");
     state(ElectionState::LeaderInit, nowNs, "leader replay pass-through");
     return 1;
 }
@@ -492,7 +501,14 @@ int Election::followerReplay(int64_t nowNs)
 {
     // Election.java:967-968: if logPosition == appendPosition (nothing to replay)
     //   → if no catchup needed: FOLLOWER_LOG_INIT
-    // Phase 2: always nothing to replay.
+    // PHASE-2-ARCHIVE-DEFERRED: always nothing to replay (Archive not wired).
+    // Assert the Phase-2 precondition to prevent silent quorum over-count (audit C5):
+    // a follower with logPosition < appendPosition would need catchup replication
+    // before being counted toward quorum — but without Archive it would be counted
+    // at its local appendPosition anyway. Guard this by asserting no gap exists.
+    // In Phase 2 all nodes start from position 0; this precondition holds.
+    assert(logPosition_ == appendPosition_
+        && "PHASE-2-DEFERRED: follower has un-replayed gap; wire Archive catchup before enabling");
     state(ElectionState::FollowerLogInit, nowNs, "follower replay pass-through");
     return 1;
 }
