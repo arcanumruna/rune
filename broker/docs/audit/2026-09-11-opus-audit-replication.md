@@ -235,3 +235,142 @@ Fix: pass the buffer length into `decode` and clamp `len` to remaining bytes.
   `append` only `flush()`es, never `fsync`s (`:199`), consistent with the documented
   "async archive" trade-off (`FileRecordingStore.h:19-24`) — acceptable but worth noting
   that a crash between flush and OS write-back loses the tail (recovered as torn).
+
+---
+
+## Re-audit (commit 38e2bbe)
+
+Verdict: **FINDINGS REMAIN**. The B2 fix introduced a NEW BLOCKER (HW over-claim on
+failover → uncommitted-read). C1/S1/S3 are genuinely fixed with real tests. B1 is
+code-correct but its tests are non-distinguishing (floor masks old-vs-new). C2/C3 are
+partial. Deferrals S2/S4/S5 accepted.
+
+Build note: `cmake`/`ctest` unavailable in the audit environment; verification is by
+code + test reasoning, not by re-running the suite. Commit claims 223/223 replication
+tests pass.
+
+### Per-finding status
+
+- **B1 — PARTIAL (code FIXED, tests non-distinguishing).**
+  `HighWatermark.h:121-125` now does `followerLeo_[id] = fetchOffset` (SET not max) and
+  `recomputeHw()` recomputes from live values. The global floor `prevHw_`
+  (`:169-174`) never regresses. Code is correct: HW cannot advance past a live majority,
+  cannot regress below committed. **But the new tests do NOT fail under the old `max()`**:
+  in every case (`HighWatermarkTest.cpp:99-127` 3-node, `PartitionReplicaTest.cpp:229-345`
+  2-node) the monotonic floor already covers the differing value, so `highWatermark()`
+  returns the identical number with `max()` or `SET`. `AuditFixB1` (`:328-342`) asserts
+  HW stays 10 not 15 — but the old code's stale LEO was 10, not 15, so it also yields 10.
+  No test drives the follower's tracked LEO to a value that would inflate a FRESH
+  majority above the floor. The unit tests would be strictly better if they asserted a
+  fresh recompute after `setIsr` shrink+re-add reflects the LOWER value (the comment at
+  `HighWatermarkTest.cpp:71-77` describes this but the assertion doesn't isolate it).
+  Recommend a test where the floor has NOT yet reached the stale value.
+
+- **B2 — NOT-FIXED / regressed to a NEW BLOCKER.** See NB1 below. The floor is set to
+  `log_->logEndOffset()` (full LEO), not the committed offset. The code comment
+  (`PartitionReplica.cpp:105`) asserts "its LEO is a safe lower bound for the committed
+  HW" — this is backwards: LEO is an UPPER bound. When the elected node has an uncommitted
+  tail (localLeo > followerHw_ — reachable: followers append fetched-but-uncommitted
+  records, `applyReplicated` sets `followerHw_ = min(localLeo, resp.highWatermark)`), the
+  floor over-claims and uncommitted (possibly divergent) records become committed-readable.
+  The B2 test (`PartitionReplicaTest.cpp:163-222`) only exercises LEO == committed
+  (follower fully caught up), so it never trips the bug. Byte-equal failover test is real
+  but only for the caught-up case.
+
+- **C1 — FIXED.** `read()` (`PartitionReplica.cpp:269-302`) walks RecordBatch frames and
+  stops at the first batch with `baseOffset >= hw`. `AuditFixC1`
+  (`PartitionReplicaTest.cpp:60-149+`) commits 3, appends 2 uncommitted, asserts read
+  returns exactly 3 batches with no baseOffset >= HW — genuinely fails under the old
+  unclamped code. Boundary is exact for the current single-record-per-batch leader path
+  (`makeBatch` → lastOffsetDelta=0). NOTE (minor, NB3): the clamp is `baseOffset >= hw`,
+  not `baseOffset+lastOffsetDelta >= hw`; a multi-record batch straddling HW would be
+  returned whole and expose offsets ≥ HW. Not reachable today (leader appends 1 rec/batch;
+  followers never serve read()), but latent if batching is introduced.
+
+- **C2 — PARTIAL.** `becomeFollower` (`PartitionReplica.cpp:138-164`) now clamps
+  `truncOff >= committedHw` and documents the deferral of full OffsetsForLeaderEpoch; this
+  path never drops committed data. HOWEVER the SECOND truncation site,
+  `applyReplicated` (`:316-324`), truncates on `resp.leaderEpoch > epoch_` via the epoch
+  cache with **no committedHw floor** and `truncateLog` (`:475-486`) has no
+  commit-prefix guard. Currently latent (the coordinator always calls `becomeFollower`
+  first, bumping `epoch_`, so this branch is dead in the coordinated flow), but it is an
+  asymmetric committed-loss vector the moment a follower adopts an epoch purely via a
+  FetchResponse. See NB2.
+
+- **C3 — PARTIAL.** `electNewLeader` (`PartitionFailoverCoordinator.h:265-378`) asserts
+  every ISR candidate is registered (no silent leoOf=0) — solid — and picks highest-LEO.
+  But the `LEO >= committedHw` filter reads `committedHw` from the OLD leader's replica
+  and defaults to 0 when the old leader is unregistered (`:291-297`) — which is exactly
+  the crash-failover case. So in a real leader crash the committed-prefix filter is
+  vacuous (`LEO >= 0`) and safety again rests on the ISR invariant (which NB1 can now
+  violate). No false-negative "no eligible leader" (uses `>=`). Fix: thread the last
+  committed offset from metadata, not from the dead leader's live replica.
+
+- **S1 — FIXED.** `setLeaderLogEndOffset`/`setIsr`/`updateFollowerFetchOffset` all call
+  `recomputeHw()` (`HighWatermark.h:88-125`); header doc rewritten to match
+  (`:53-58,145-154`). `S1_SetLeaderLeoEagerlyRecomputes` / `S1_SetIsrEagerlyRecomputes`
+  (`HighWatermarkTest.cpp:134-164`) assert no dummy follower update is needed — real. No
+  stale-HW path remains. C4 selfId hack removed (`PartitionReplica.cpp:461-468`).
+
+- **S3 — FIXED.** `PartitionRecorder::onCommitted` (`PartitionRecorder.cpp:73-126`) now
+  uses a 64 MiB BYTE budget and an outer loop advancing `scanFrom` past each recorded
+  batch until `endOffset` is covered, with a no-progress break guard. Multi-record/large
+  batches are fully recorded. New large-payload test present.
+
+### Deferrals
+
+- **S2 — DEFERRAL-OK.** `becomeLeader` sets `replicas == isr` and, for a promoted
+  follower (which has no pre-existing `isrManagerOwned_`, ctor builds it only for leaders,
+  `PartitionReplica.cpp:64-77`), takes the `else` branch (`:93-96`) losing the true
+  replica set. This is a durability-breadth/liveness reduction only: HW is computed over
+  the ISR, and every ISR member holds the data, so HW is never inflated. `maybeExpandIsr`
+  iterates the shrunken `replicas_` so out-of-ISR replicas won't auto-rejoin (repair
+  leans on the coordinator). No committed-loss / HW-regression. Accept as documented.
+
+- **S4 — DEFERRAL-OK.** The `looksLikeRecordBatch` magic-byte sniff
+  (`PartitionReplica.cpp:335-370`) is a test-only artifact: in production a follower only
+  ever receives verbatim leader `log_->read()` frames whose magic byte is always
+  `kMagicValue`, so the verbatim path is always taken and no real record is misclassified.
+  The raw-bytes fallback exists solely for unit-injected payloads. No production
+  corruption path. Remains fragile — recommend a frame-type flag in FetchResponse before
+  any external producer can inject arbitrary bytes.
+
+- **S5 — DEFERRAL-OK.** `FetchResponseMsg::decode` (`ReplicationMessages.h:262-267`)
+  still forms `{vp+VAR_HEADER_SIZE, len}` with only a `len<0→0` guard. All in-process
+  callers decode a buffer they just encoded (`PartitionReplica.cpp:217,232,259`), and no
+  real Aeron transport is wired yet, so the over-read is unreachable today. MUST be fixed
+  (clamp `len` to remaining buffer) before wiring an untrusted network transport.
+
+### NEW findings
+
+- **NB1 (BLOCKER) — `becomeLeader` HW floor over-claims → uncommitted/divergent read on
+  failover.** `PartitionReplica.cpp:108`:
+  `leaderState_.setHighWatermarkFloor(log_->logEndOffset())`. LEO is an upper bound, not a
+  lower bound, for committed data. A follower promoted with an uncommitted tail
+  (`localLeo > followerHw_`) marks that tail as committed; consumers can then read
+  records that were never majority-acked (and may be divergent from the true timeline).
+  This is the same EOS violation B2 set out to prevent, re-introduced with the wrong
+  offset. Fix direction: capture the node's committed offset BEFORE flipping role
+  (`highWatermark()` still returns `followerHw_` while role==Follower — but role_ is set
+  to Leader at `:87` first), i.e. read `followerHw_`/`highWatermark()` at entry and pass
+  THAT to `setHighWatermarkFloor`, never `log_->logEndOffset()`. Add a failover test where
+  the new leader has localLeo > committed (uncommitted tail) and assert
+  `highWatermark() == committed` and `read(0,big)` excludes the tail.
+
+- **NB2 (CORRECTNESS, latent) — `applyReplicated` epoch-truncation lacks the committedHw
+  floor.** `PartitionReplica.cpp:316-324` + `truncateLog` (`:475-486`) can truncate below
+  the committed prefix if the epoch cache returns a low boundary. Dead in the coordinated
+  flow (becomeFollower runs first and bumps epoch_), so not currently reachable, but it
+  should mirror `becomeFollower`'s `max(truncOff, followerHw_)` clamp for defense in depth.
+
+- **NB3 (MINOR, latent) — read-clamp not multi-record-batch-exact.** `PartitionReplica.cpp:294`
+  uses `batchBase >= hw`; a batch straddling HW (baseOffset<HW, lastOffset>=HW) would leak
+  offsets ≥ HW. Unreachable while leader batches are single-record; fix when batching lands.
+
+### Original findings addressed?
+
+All 5 SILENT + 4 CORRECTNESS + 2 BLOCKER findings were touched. Genuinely resolved:
+C1, S1, S3 (and C4). Correct-code-but-weak-test: B1. Partial: C2, C3. Regressed: B2→NB1.
+Deferrals S2/S4/S5 accepted. Test findings T1/T4 strengthened with byte-equality but T4
+(and the B1 unit tests) still do not construct a case that distinguishes the fixed logic
+from the old `max()` (see B1 above).

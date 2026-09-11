@@ -83,6 +83,16 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
 
 void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 {
+    // NB1 fix: capture committed offset BEFORE flipping role or mutating state.
+    // highWatermark() still returns the OLD role's view here:
+    //   - Was follower: returns followerHw_ = min(localLeo, lastKnownLeaderHw)
+    //   - Was leader:   returns leaderState_.highWatermark() = exact committed HW
+    // Either is a safe committed floor (never above the true committed offset).
+    // Do NOT use log_->logEndOffset() (the LEO): a node promoted with an
+    // uncommitted tail (localLeo > committedHw) would mark that tail as committed,
+    // causing uncommitted/divergent records to be readable after failover.
+    Offset committedHw = highWatermark();
+
     epoch_ = newEpoch;
     role_  = Role::Leader;
 
@@ -97,15 +107,21 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     isrManager_ = isrManagerOwned_.get();
 
     leaderState_.setLeaderId(cfg_.selfId);
+
+    // NB1/B2 fix: set the HW floor BEFORE setting the ISR and leader LEO.
+    // setIsr() and setLeaderLogEndOffset() both call recomputeHw() eagerly,
+    // which advances prevHw_ to max(prevHw_, computeHw()).  If a 1-node ISR
+    // (or any ISR where leaderLeo >= committedHw) were set first, prevHw_
+    // would jump to leaderLeo (the LEO), making the subsequent
+    // setHighWatermarkFloor(committedHw) a no-op.  Setting the floor first
+    // ensures it is respected as a minimum even after the ISR/LEO recompute
+    // raises prevHw_ further (which is fine — recompute can only advance HW
+    // if the new compute is ABOVE committedHw, which is only legitimate when
+    // a majority of the ISR actually holds those offsets).
+    leaderState_.setHighWatermarkFloor(committedHw);
+
     leaderState_.setIsr(isr);
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
-
-    // B2 fix: restore the HW floor to the committed offset this new leader
-    // already holds.  A node elected from the ISR holds all committed data
-    // (ISR invariant), so its LEO is a safe lower bound for the committed HW.
-    // Without this, the new leader reports HW=0 until followers re-ack,
-    // making the committed prefix momentarily unreadable (EOS regression).
-    leaderState_.setHighWatermarkFloor(log_->logEndOffset());
 
     epochCache_.assign(static_cast<int32_t>(epoch_), log_->logEndOffset());
 
@@ -314,9 +330,21 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 
     // Epoch change: truncate divergent tail before applying.
     if (resp.leaderEpoch > epoch_) {
+        // NB2/C2 defense-in-depth: clamp truncation to the committed floor.
+        // In the coordinated flow becomeFollower() runs first (bumping epoch_),
+        // so this branch is currently unreachable, but it must mirror
+        // becomeFollower()'s committedHw floor in case a follower adopts a new
+        // epoch purely via a FetchResponse (e.g., in future direct-fetch paths).
+        // Never truncate below the committed prefix regardless of what the epoch
+        // cache returns.
+        Offset committedFloor = followerHw_; // follower's known committed HW
         Offset truncOff = truncationOffsetForEpochChange(epochCache_,
                                                           resp.leaderEpoch);
         if (truncOff >= 0) {
+            // Clamp: never truncate below committed.
+            if (truncOff < committedFloor) {
+                truncOff = committedFloor;
+            }
             truncateLog(truncOff);
         }
         epoch_ = resp.leaderEpoch;

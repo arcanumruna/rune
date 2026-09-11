@@ -286,13 +286,36 @@ public:
             }
         }
 
-        // Determine the committed HW from the current leader's replica (if still
-        // registered).  Used as the minimum LEO a candidate must hold.
+        // Determine the committed HW. Prefer the live old leader's replica (most
+        // accurate), but if it is unregistered or has crashed (the critical
+        // crash-failover case), compute it from SURVIVING ISR members instead.
+        // Defaulting to 0 when the old leader is absent is incorrect: it makes
+        // the LEO >= committedHw filter vacuous exactly when it matters most.
+        //
+        // C3 fix: take the max HW reported by any registered ISR candidate
+        // (they are all in-sync, so they all hold the committed prefix).
         Offset committedHw = 0;
+        bool foundOldLeader = false;
         for (const auto& e : entries_) {
             if (e.nodeId == oldLeader && e.replica != nullptr) {
                 committedHw = e.replica->highWatermark();
+                foundOldLeader = true;
                 break;
+            }
+        }
+        if (!foundOldLeader) {
+            // Old leader is unregistered (crashed). Derive committedHw from
+            // the surviving ISR members — all are in-sync so each holds the
+            // committed prefix; use max() across them (they should all agree,
+            // but max is safe).
+            for (NodeId n : candidates) {
+                for (const auto& e : entries_) {
+                    if (e.nodeId == n && e.replica != nullptr) {
+                        Offset hw = e.replica->highWatermark();
+                        if (hw > committedHw) committedHw = hw;
+                        break;
+                    }
+                }
             }
         }
 
