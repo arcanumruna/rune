@@ -480,9 +480,12 @@ int Election::leaderReady(int64_t nowNs)
     }
 
     // Election.java:890-893: hasQuorumAtPosition → appendNewLeadershipTermEvent → electionComplete
-    // C6 fix: pass logLeadershipTermId_ so quorum only counts followers on the same log branch.
+    // Aeron-faithful: check leadershipTermId + logPosition only (ref spec line ~125).
+    // logLeadershipTermId_ is intentionally NOT passed — AppendPosition wire messages
+    // do not carry that field, so followers never have it set; including it would cause
+    // permanent quorum deadlock once logLeadershipTermId_ != 0 (audit N1, 2026-09-11).
     if (ClusterMember::hasQuorumAtPosition(
-            clusterMembers_, leadershipTermId_, logLeadershipTermId_,
+            clusterMembers_, leadershipTermId_,
             logPosition_, nowNs, electionTimeoutNs_)) {
         // Election.java:891: appendNewLeadershipTermEvent (Phase 2: no-op / already in TermLog)
         electionComplete(nowNs);

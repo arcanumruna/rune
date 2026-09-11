@@ -1144,3 +1144,91 @@ TEST(ElectionLog, NLT_LeaderLogBehindFollower_IsIgnored) {
     EXPECT_EQ(e.state(), ElectionState::FollowerBallot)
         << "NLT with leader log (term=3,pos=50) behind follower (term=5,pos=200) must be ignored";
 }
+
+// ===========================================================================
+// N1 anti-regression: leader with non-zero logLeadershipTermId_ still reaches quorum.
+//
+// The C6 fix (commit 779fe5b) added logLeadershipTermId to hasQuorumAtPosition,
+// causing a liveness deadlock (audit N1, 2026-09-11): AppendPosition messages
+// do not carry logLeadershipTermId, so onAppendPosition() never sets
+// follower->logLeadershipTermId.  Once logLeadershipTermId_ != 0 on the leader,
+// no follower ever passed the predicate → quorum unreachable forever.
+//
+// This test drives a 3-member election where the leader starts with
+// logLeadershipTermId=3 (simulating a node that has appended entries in prior
+// terms).  Followers send AppendPosition (which does NOT carry logLeadershipTermId,
+// so follower->logLeadershipTermId stays at its initial value = 0 ≠ 3).
+// The election MUST close.  Under the deadlock predicate it would stall at
+// LEADER_LOG_REPLICATION and never reach Closed.
+// ===========================================================================
+TEST(ElectionLog, N1_NonZeroLogLeadershipTermId_QuorumStillReached) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // 3-member cluster; leader is node 0.
+    // logLeadershipTermId=3 to simulate a node that has appended entries in an
+    // earlier term.  Members start with logLeadershipTermId=0 (unset) to mirror
+    // what onAppendPosition() leaves them at — it never sets logLeadershipTermId.
+    std::vector<ClusterMember> ms(3);
+    for (int i = 0; i < 3; i++) {
+        ms[i].id = i;
+        ms[i].logPosition         = 0;
+        ms[i].logLeadershipTermId = 0;  // NOT set by AppendPosition wire messages
+        ms[i].leadershipTermId    = 0;
+    }
+    // Start from leadershipTermId=3, logLeadershipTermId=3 (non-zero — this is the
+    // field the deadlock predicate required followers to match but never could).
+    Election leader(/*isNodeStartup=*/true, /*gracefulClosedLeaderId=*/-1,
+                    /*leadershipTermId=*/3, /*logLeadershipTermId=*/3,
+                    /*logPosition=*/0, /*appendPosition=*/0,
+                    std::move(ms), /*self=*/0, pub, nsf, tl,
+                    kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs,
+                    /*rngSeed=*/0);
+
+    int64_t nowNs = 1'000'000LL;
+
+    // Phase 1: bring to LeaderLogReplication via canvass + votes (same as bringToLeaderLogReplication).
+    leader.doWork(nowNs); // INIT → CANVASS
+    leader.onCanvassPosition(0, 0, 0, 1);
+    leader.onCanvassPosition(0, 0, 0, 2);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    leader.doWork(nowNs); // CANVASS → NOMINATE
+
+    nowNs += kElectionTimeoutNs * 10;
+    leader.doWork(nowNs); // NOMINATE → CANDIDATE_BALLOT
+
+    nowNs += 1;
+    leader.doWork(nowNs); // sends RequestVotes
+
+    // Feed votes from followers 1 and 2 — they have logLeadershipTermId=0 (NOT 3).
+    // This is exactly what happens in real runs: followers' logLeadershipTermId is
+    // whatever was in their ClusterMember slot; onAppendPosition never updates it.
+    Term cTerm = leader.candidateTermId();
+    leader.onVote(0, 0, cTerm, 0, 1, true);
+    leader.onVote(0, 0, cTerm, 0, 2, true);
+
+    nowNs += 1;
+    leader.doWork(nowNs); // unanimous → LeaderLogReplication
+
+    ASSERT_EQ(leader.state(), ElectionState::LeaderLogReplication)
+        << "N1 setup: leader must reach LeaderLogReplication before quorum test";
+
+    // Phase 2: drive to CLOSED by feeding AppendPosition from followers.
+    // AppendPosition does NOT carry logLeadershipTermId (ref spec line ~145);
+    // onAppendPosition() sets follower->leadershipTermId and logPosition only.
+    // Therefore follower->logLeadershipTermId remains 0 (≠ leader's logLeadershipTermId_=3).
+    //
+    // With the Aeron-faithful predicate (leadershipTermId + logPosition only),
+    // quorum is reached and the election closes.
+    // With the C6 deadlock predicate (also checks logLeadershipTermId),
+    // no follower ever matches → election stalls → driveLeaderToClosed returns false.
+    bool closed = driveLeaderToClosed(leader, nowNs, pub, {1, 2});
+
+    EXPECT_TRUE(closed)
+        << "N1 anti-regression: leader with logLeadershipTermId=3 (non-zero) must reach quorum "
+           "from AppendPosition messages that do NOT carry logLeadershipTermId. "
+           "A regression to the C6 deadlock predicate would stall here (follower->logLeadershipTermId=0 != 3).";
+    EXPECT_EQ(leader.state(), ElectionState::Closed);
+}

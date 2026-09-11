@@ -307,8 +307,8 @@ TEST(ClusterMember, HasQuorumAtPosition_MajorityAtPosition_True) {
         makeActiveMember(1, ltId, 200, nowNs, timeoutNs),
         makeActiveMember(2, ltId,  50, nowNs, timeoutNs), // below pos
     };
-    // All members have logLeadershipTermId=ltId (same branch via makeActiveMember).
-    EXPECT_TRUE(ClusterMember::hasQuorumAtPosition(members, ltId, ltId, pos, nowNs, timeoutNs));
+    // Aeron-faithful: only leadershipTermId + logPosition checked (not logLeadershipTermId).
+    EXPECT_TRUE(ClusterMember::hasQuorumAtPosition(members, ltId, pos, nowNs, timeoutNs));
 }
 
 // Only one at/above position → threshold=2 → false.
@@ -322,7 +322,7 @@ TEST(ClusterMember, HasQuorumAtPosition_MinorityAtPosition_False) {
         makeActiveMember(1, ltId,  50, nowNs, timeoutNs),
         makeActiveMember(2, ltId,  30, nowNs, timeoutNs),
     };
-    EXPECT_FALSE(ClusterMember::hasQuorumAtPosition(members, ltId, ltId, pos, nowNs, timeoutNs));
+    EXPECT_FALSE(ClusterMember::hasQuorumAtPosition(members, ltId, pos, nowNs, timeoutNs));
 }
 
 // Members at position but wrong leadershipTermId → not counted.
@@ -336,7 +336,7 @@ TEST(ClusterMember, HasQuorumAtPosition_WrongTerm_NotCounted) {
         makeActiveMember(1, 99,   200, nowNs, timeoutNs),  // wrong term (ltId=99, logLtId=99)
         makeActiveMember(2, 99,   200, nowNs, timeoutNs),  // wrong term (ltId=99, logLtId=99)
     };
-    EXPECT_FALSE(ClusterMember::hasQuorumAtPosition(members, ltId, ltId, pos, nowNs, timeoutNs));
+    EXPECT_FALSE(ClusterMember::hasQuorumAtPosition(members, ltId, pos, nowNs, timeoutNs));
 }
 
 // Inactive members at position → not counted (isActive check inside hasReachedPosition).
@@ -350,7 +350,7 @@ TEST(ClusterMember, HasQuorumAtPosition_InactiveNotCounted) {
         makeInactiveMember(1, ltId, 200, nowNs, timeoutNs), // inactive
         makeInactiveMember(2, ltId, 200, nowNs, timeoutNs), // inactive
     };
-    EXPECT_FALSE(ClusterMember::hasQuorumAtPosition(members, ltId, ltId, pos, nowNs, timeoutNs));
+    EXPECT_FALSE(ClusterMember::hasQuorumAtPosition(members, ltId, pos, nowNs, timeoutNs));
 }
 
 // ---------------------------------------------------------------------------
@@ -609,38 +609,75 @@ TEST(ClusterMember, IsQuorumCandidate_Minority_False) {
 }
 
 // ===========================================================================
-// C6: hasQuorumAtPosition must NOT count a member on a different log branch.
-// Two members can share leadershipTermId yet have divergent log tails
-// (different logLeadershipTermId). Counting them together over-counts quorum.
+// N1 / C6 (corrected): hasQuorumAtPosition Aeron-faithful predicate.
+//
+// The C6 fix (commit 779fe5b) added a logLeadershipTermId match to the quorum
+// predicate, but that caused a liveness deadlock (audit N1, 2026-09-11):
+// AppendPosition wire messages do not carry logLeadershipTermId, so
+// onAppendPosition() never sets follower->logLeadershipTermId.  Once
+// logLeadershipTermId_ != 0 on the leader, no follower ever matched →
+// quorum unreachable → permanent election deadlock.
+//
+// The Aeron-faithful predicate (ClusterMember.java:907-925, ref spec line ~125)
+// checks ONLY: isActive && leadershipTermId==given && logPosition>=position.
+// Cross-branch safety is handled architecturally by the FOLLOWER_REPLAY/catch-up
+// gate (C5), not inside the quorum count.
 // ===========================================================================
 
-// C6a: member with wrong logLeadershipTermId is excluded from quorum count.
-TEST(ClusterMember, HasQuorumAtPosition_DifferentLogBranch_NotCounted) {
+// C6a (corrected): member with different logLeadershipTermId IS counted if its
+// leadershipTermId and logPosition satisfy the Aeron predicate.  The old test
+// asserted the WRONG behavior (logLeadershipTermId exclusion) which caused N1.
+// Members 0 and 1 both have leadershipTermId=5 and logPosition>=100 → quorum=2 → TRUE.
+TEST(ClusterMember, HasQuorumAtPosition_DifferentLogBranch_StillCounted) {
     // 3-member cluster: quorum threshold = 2
     std::array<ClusterMember, 3> members{};
     members[0].id = 0; members[0].leadershipTermId = 5; members[0].logLeadershipTermId = 5;
     members[0].logPosition = 100; members[0].timeOfLastAppendPositionNs = 1000;
 
-    members[1].id = 1; members[1].leadershipTermId = 5; members[1].logLeadershipTermId = 4; // WRONG branch
+    members[1].id = 1; members[1].leadershipTermId = 5; members[1].logLeadershipTermId = 4; // different logLtId
     members[1].logPosition = 100; members[1].timeOfLastAppendPositionNs = 1000;
 
     members[2].id = 2; members[2].leadershipTermId = 5; members[2].logLeadershipTermId = 5;
     members[2].logPosition = 50;  members[2].timeOfLastAppendPositionNs = 1000; // behind
 
-    // Only member 0 matches leadershipTermId=5 AND logLeadershipTermId=5 AND logPosition>=100.
-    // Member 1 has wrong logLeadershipTermId=4 (different log branch — must not count).
-    // Member 2 is behind (position 50 < 100).
-    // Quorum threshold = 2; only 1 matching → false.
+    // Aeron-faithful: members 0 and 1 both have leadershipTermId=5 and logPosition>=100.
+    // logLeadershipTermId is NOT part of the predicate — member 1 counts.
+    // Quorum threshold = 2; count = 2 → true.
     bool q = ClusterMember::hasQuorumAtPosition(
         std::span<const ClusterMember>(members.data(), members.size()),
-        /*leadershipTermId=*/5, /*logLeadershipTermId=*/5,
+        /*leadershipTermId=*/5,
         /*position=*/100,
         /*nowNs=*/2000, /*timeoutNs=*/5000);
-    EXPECT_FALSE(q) << "Member on wrong log branch (logLtId=4) must not count toward quorum";
+    EXPECT_TRUE(q)
+        << "Aeron-faithful: logLeadershipTermId is not checked by hasQuorumAtPosition; "
+           "member with different logLtId but matching leadershipTermId+logPosition must count";
 }
 
-// C6b: hasQuorumAtPosition returns true when quorum of members match both term fields.
-TEST(ClusterMember, HasQuorumAtPosition_AllMatchingBranch_True) {
+// C6b: quorum correctly requires leadershipTermId to match (not just logPosition).
+// Member 2 is behind → only 1 at position → threshold=2 → false when member 1 excluded by wrong ltId.
+TEST(ClusterMember, HasQuorumAtPosition_WrongLeadershipTermId_Excluded) {
+    std::array<ClusterMember, 3> members{};
+    members[0].id = 0; members[0].leadershipTermId = 5; members[0].logLeadershipTermId = 5;
+    members[0].logPosition = 100; members[0].timeOfLastAppendPositionNs = 1000;
+
+    // member 1 has wrong LEADERSHIP term (not the log-branch field)
+    members[1].id = 1; members[1].leadershipTermId = 4; members[1].logLeadershipTermId = 4;
+    members[1].logPosition = 100; members[1].timeOfLastAppendPositionNs = 1000;
+
+    members[2].id = 2; members[2].leadershipTermId = 5; members[2].logLeadershipTermId = 5;
+    members[2].logPosition = 50;  members[2].timeOfLastAppendPositionNs = 1000;
+
+    // Only member 0 has leadershipTermId=5 AND logPosition>=100 → count=1 < threshold=2 → false.
+    bool q = ClusterMember::hasQuorumAtPosition(
+        std::span<const ClusterMember>(members.data(), members.size()),
+        /*leadershipTermId=*/5,
+        /*position=*/100,
+        /*nowNs=*/2000, /*timeoutNs=*/5000);
+    EXPECT_FALSE(q) << "Member with wrong leadershipTermId (not logLeadershipTermId) must not count";
+}
+
+// C6c: hasQuorumAtPosition returns true when quorum of members match leadershipTermId+position.
+TEST(ClusterMember, HasQuorumAtPosition_AllMatchingTerm_True) {
     std::array<ClusterMember, 3> members{};
     for (int i = 0; i < 3; i++) {
         members[i].id = i;
@@ -649,10 +686,10 @@ TEST(ClusterMember, HasQuorumAtPosition_AllMatchingBranch_True) {
         members[i].logPosition = 100;
         members[i].timeOfLastAppendPositionNs = 1000;
     }
-    // All 3 match — quorum = 2, count = 3 → true.
+    // All 3 match leadershipTermId=5 and logPosition>=100 — quorum = 2, count = 3 → true.
     bool q = ClusterMember::hasQuorumAtPosition(
         std::span<const ClusterMember>(members.data(), members.size()),
-        /*leadershipTermId=*/5, /*logLeadershipTermId=*/5,
+        /*leadershipTermId=*/5,
         /*position=*/100,
         /*nowNs=*/2000, /*timeoutNs=*/5000);
     EXPECT_TRUE(q);

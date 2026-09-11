@@ -66,16 +66,24 @@ struct ClusterMember {
     }
 
     // ClusterMember.java:1300-1303
-    // C6 fix: also requires logLeadershipTermId match to prevent counting a member
-    // whose log tail is on a different branch toward the same position quorum.
-    // Two members can share leadershipTermId (current term) yet have divergent
-    // log tails (different logLeadershipTermId of their last appended entry).
-    // Audit finding C6: without this check, quorum can be over-counted across branches.
-    bool hasReachedPosition(Term ltId, Term logLtId, int64_t position,
+    // Aeron-faithful predicate: active AND leadershipTermId matches AND logPosition >= target.
+    // Reference: docs/specs/2026-09-10-rune-aeron-cluster-port-reference.md §Quorum (~line 125),
+    // mirroring ClusterMember.java:907-925 which checks ONLY leadershipTermId + logPosition.
+    //
+    // WHY logLeadershipTermId is intentionally NOT checked here:
+    // The AppendPosition wire message (ref spec line ~145) does NOT carry logLeadershipTermId,
+    // so onAppendPosition() never sets follower->logLeadershipTermId.  Requiring it to match
+    // would mean no follower ever passes this predicate once logLeadershipTermId_ != 0 on the
+    // leader → quorum never reached → permanent election deadlock (audit finding N1, 2026-09-11).
+    // The C6 concern (cross-branch over-count) is handled at the architectural level: a follower
+    // only publishes an AppendPosition for a position it actually holds on the leader's log branch,
+    // enforced by the FOLLOWER_REPLAY / catch-up gate (C5; asserted in followerReplay()).
+    // Do NOT add logLeadershipTermId to this predicate without also plumbing it into the wire
+    // message and onAppendPosition — otherwise you reintroduce the N1 liveness deadlock.
+    bool hasReachedPosition(Term ltId, int64_t position,
                             int64_t nowNs, int64_t timeoutNs) const noexcept {
         return isActive(nowNs, timeoutNs)
-            && ltId    == leadershipTermId
-            && logLtId == logLeadershipTermId
+            && ltId == leadershipTermId
             && logPosition >= position;
     }
 
@@ -176,22 +184,22 @@ struct ClusterMember {
         return false;
     }
 
-    // ClusterMember.java:907-925  hasQuorumAtPosition(ClusterMember[], long, long, long, long)
-    // Counts members with isActive && leadershipTermId==given && logLeadershipTermId==given
-    // && logPosition>=position. Returns true when count >= quorumThreshold.
-    // C6 fix: added logLeadershipTermId parameter — both leadershipTermId AND
-    // logLeadershipTermId must match to prevent over-counting across log branches.
+    // ClusterMember.java:907-925  hasQuorumAtPosition(ClusterMember[], long, long, long)
+    // Counts members with isActive && leadershipTermId==given && logPosition>=position.
+    // Returns true when count >= quorumThreshold.
+    // Aeron-faithful: matches ClusterMember.java:907-925 exactly — only leadershipTermId
+    // and logPosition are checked.  logLeadershipTermId is intentionally absent; see the
+    // comment on hasReachedPosition() for the full rationale (audit N1 / 2026-09-11).
     static bool hasQuorumAtPosition(
         std::span<const ClusterMember> clusterMembers,
         Term                           leadershipTermId,
-        Term                           logLeadershipTermId,
         int64_t                        position,
         int64_t                        nowNs,
         int64_t                        timeoutNs) noexcept
     {
         int votes = 0;
         for (const auto& member : clusterMembers) {
-            if (member.hasReachedPosition(leadershipTermId, logLeadershipTermId,
+            if (member.hasReachedPosition(leadershipTermId,
                                           position, nowNs, timeoutNs)) {
                 ++votes;
             }

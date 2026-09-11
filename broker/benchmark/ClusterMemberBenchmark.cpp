@@ -149,7 +149,7 @@ static void BM_ClusterMember_HasQuorumAtPosition(benchmark::State& state) {
 
         bool result = ClusterMember::hasQuorumAtPosition(
             std::span<const ClusterMember>(members.data(), static_cast<std::size_t>(sz)),
-            kLeaderTerm, kLeaderTerm, kTargetPos, kNowNs, kTimeoutNs);
+            kLeaderTerm, kTargetPos, kNowNs, kTimeoutNs);
         benchmark::DoNotOptimize(result);
     }
     state.SetItemsProcessed(state.iterations());

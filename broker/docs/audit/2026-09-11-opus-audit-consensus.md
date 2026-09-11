@@ -139,3 +139,46 @@ On `CandidateBallot` timeout without quorum the code returns to `CANVASS` (`:338
 2. **C1** — pick one authoritative vote store; the `Election`/`RaftNode` dualism is dangerous.
 3. **C5/C6** — make the Phase-2 pass-through preconditions asserted, not assumed.
 4. **T1–T4** — add the missing safety tests (they currently mask B2/C2/C5).
+
+---
+
+## Re-audit (commit 800b5e6)
+
+**Date:** 2026-09-11
+**Auditor:** Opus (read-only)
+**Fixes reviewed:** `fd1b3d2` (C1), `ede6fed` (B1/S2/S3), `89430d2` (B2), `779fe5b` (C6), `b830c4d` (C5), `800b5e6` (tests)
+
+### Verdict: **FINDINGS REMAIN** — the C6 fix introduced a NEW liveness deadlock (N1, BLOCKER-liveness).
+
+### Per-finding status
+
+- **B1 — FIXED.** `NodeStateFile.cpp:158-175` now `msync(MS_SYNC)` **and** `fsync(fd_)` on every write, default `fileSyncLevel=1` (`NodeStateFile.h:44`). Vote path is durable *before* the grant: `onRequestVote` (`Election.cpp:641-652`) and `becomeCandidate`/`nominate` (`:221-222`, `:292-293`) all call `proposeMaxCandidateTermId → updateCandidateTermId → syncFile()` synchronously before `placeVote`/state change. No path grants a vote without the term on disk. No init regression (fresh-file `syncFile()` at `:68`; single-node path `:222`). S2/S3 also fixed (fresh-init fsync; msync+fsync EIO now `throw`).
+- **B2 — FIXED.** `Election.cpp:740-763`: NLT now gated on `nextLeadershipTermId == candidateTermId_` (adopt-higher via `proposeMaxCandidateTermId` at `:742`; reject-lower at `:744-746`), **and** a leader-log-freshness gate `compareLog(logLeadershipTermId_, appendPosition_, logLeadershipTermIdArg, logPositionArg) > 0 → reject` (`:759-763`). Adopt-higher path stays safe because the compareLog gate still runs after it. Test `NLT_LeaderLogBehindFollower_IsIgnored` (`ElectionLogTest.cpp:1089`) is genuine and non-vacuous (real log term=5/pos=200 vs behind leader term=3/pos=50; would fail if gate removed). Aeron-faithful.
+- **C1 — FIXED.** `RaftNode/RaftLog/PersistentState/Messages.h` + 5 test files removed (`fd1b3d2`). Grep confirms zero live refs (only `ConsensusMessages.h`, a distinct SBE file, remains). CMake refs removed. One vote store (`NodeStateFile`) remains authoritative.
+- **C2 — FIXED.** `onRequestVote` (`Election.cpp:634-658`) is correct: stale-term deny, `compareLog>0` deny, else grant. New tests `CompareLog_SameTerm_ShorterCandidateIsBehind`, `OnRequestVote_SameTerm_CandidateShorterLog_Denies` (`ElectionBallotTest`/`ClusterMemberTest`) exercise the same-term one-behind boundary and are non-vacuous (would fail if a behind candidate could win).
+- **C5 — DEFERRAL-OK.** `assert(logPosition_ == appendPosition_)` added to `leaderReplay` (`Election.cpp:429-431`) and `followerReplay` (`:509-511`). In the no-Archive Phase-2 config all nodes start at position 0, so the precondition holds and the assert fires the moment Phase-3 introduces real divergence. Deferral is genuinely safe for the current build.
+- **C6 — NOT-FIXED (regressed).** The fix (`779fe5b`) added `logLeadershipTermId` to `hasReachedPosition`/`hasQuorumAtPosition` (`ClusterMember.h:74-80,184-197`) and the Election call site passes `logLeadershipTermId_` (`Election.cpp:484-486`). **This is not an Aeron-faithful port** — ref §Quorum (`docs/…-reference.md:125`, citing `ClusterMember.java:907-925`) states Aeron counts on `isActive && leadershipTermId==this.leadershipTermId && logPosition>=position` only; it does NOT check `logLeadershipTermId`. See **N1**.
+
+### NEW findings
+
+- **N1 (BLOCKER — liveness deadlock). C6 fix breaks quorum via a field the wire never sets.**
+  `ClusterMember.h:74-80` (`hasReachedPosition` now requires `logLtId == logLeadershipTermId`), quorum check `Election.cpp:484-486`, follower-update `Election.cpp:790-806` (`onAppendPosition`).
+  `onAppendPosition` — the *only* message a follower sends to advance its position in LEADER_LOG_REPLICATION/LEADER_READY — sets `follower->logPosition/leadershipTermId/timeOfLastAppendPositionNs` but **never** `follower->logLeadershipTermId`. The AppendPosition wire message (ref `:145`) does not even carry that field. So once `logLeadershipTermId_ != 0` (any run after the first leadership term with real log entries), the leader's `hasQuorumAtPosition` can never match a follower (`follower->logLeadershipTermId` stays stale/`kNullValue`) → quorum never reached → **election never completes / permanent leader-election deadlock**. The end-to-end tests pass only by luck: everything is term/logLtId 0 (`ElectionLogTest.cpp:135,1103`) and `makeActiveMember` sets `logLeadershipTermId=ltId` manually (`ClusterMemberTest.cpp:43`), so the field happens to match. The unit test `HasQuorumAtPosition_DifferentLogBranch_NotCounted` verifies the new predicate but not the live `onAppendPosition` feed path.
+  Fix direction: revert C6 to the Aeron-faithful predicate (drop the `logLeadershipTermId` match in `hasReachedPosition`/`hasQuorumAtPosition`). The original C6 over-counting concern is real but is solved the Aeron way — via the FOLLOWER_REPLAY/catchup gate (the very path C5 stubs in Phase 2), so a follower only reports AppendPosition on the leader's branch. Do NOT enforce branch identity in the quorum predicate. If a defensive check is wanted, either (a) plumb `logLeadershipTermId` into the AppendPosition message and set it in `onAppendPosition`, or (b) gate it behind the same Phase-2 `logPosition_==appendPosition_` precondition as C5.
+
+### Deferrals scrutinized
+
+- **C3 (re-canvass backoff) — DEFERRAL-OK (liveness only).** `Election.cpp:245-249` term-inflation-under-partition is a liveness/convergence-rate concern, not a safety violation; standalone-approximation deviation is documented. No split-brain.
+- **C4 (roster dedup) — DEFERRAL-OK (caller invariant).** `onVote`/`memberById` remain idempotent; forged/duplicate voter ids are handled (nullptr drop / idempotent For). Duplicate-member-id roster is a construction-time caller invariant; no live over-count path introduced.
+- **S1 (ConsensusAdapter silent drop) — NOT-FIXED, DEFERRAL-OK.** `ConsensusAgent.cpp:47-57` still counts unknown/mis-sized templates as "processed" with no ignored/error counter. Observability gap only — a corrupt frame is dropped, not misprocessed; no safety impact. Recommend adding an ignored counter but not blocking.
+- **T2 (fencing-test boundary) — PARTIAL.** Same-term/wrong-sender and behind-leader cases are now covered by B2/C2 tests; the "duplicate at old position" fencing case remains untested. Low risk.
+
+### Original findings not fully addressed
+- **C6/N1** — the intended fix regressed into a liveness bug (above).
+- **S1** — observability only, unaddressed (acceptable).
+- **T2** — partially addressed.
+
+### No other regressions
+B1's new `throw` on msync/fsync EIO is fail-stop during construction/vote (safe, not silent). B2's NLT gate does not reject a valid same-term leader (adopt-equal path `:748` continues; adopt-higher `:740-743` then re-checks freshness). The ONLY new bug is N1 (under-counting → deadlock), not over-counting.
+
+**Report:** this file.
