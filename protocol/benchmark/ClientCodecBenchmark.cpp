@@ -1,4 +1,4 @@
-// ClientCodecBenchmark.cpp — CP-2 + CP-3 + CP-4 codec benchmarks.
+// ClientCodecBenchmark.cpp — CP-2 + CP-3 + CP-4 + CP-6 codec benchmarks.
 //
 // Benchmarks the ConnectRequest, ConnectResponse, Keepalive, Disconnect,
 // ErrorResponse, Ping, and Pong encode + decode paths.  Inputs are pre-built
@@ -29,6 +29,7 @@
 #include <string>
 
 #include "rune/protocol/client/ControlMessages.h"
+#include "rune/protocol/client/Dispatch.h"
 #include "rune/protocol/client/PingMessages.h"
 
 namespace rpc = rune::protocol::client;
@@ -433,3 +434,49 @@ static void BM_Pong_Decode(benchmark::State& state) {
                             static_cast<int64_t>(f.pongLen));
 }
 BENCHMARK(BM_Pong_Decode)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_checkFrame_ValidKeepalive — checkFrame on a valid 24-byte Keepalive frame.
+//
+// Keepalive is the smallest (header-only) frame and represents the fast path:
+// all checks pass in order with minimal branch mis-prediction.
+// ---------------------------------------------------------------------------
+static void BM_checkFrame_ValidKeepalive(benchmark::State& state) {
+    const Frames& f = frames();
+    // kaBuf holds an encoded Keepalive frame (24 bytes, all valid).
+    for (auto _ : state) {
+        rpc::FrameCheck fc = rpc::checkFrame(f.kaBuf.data(), f.kaLen);
+        benchmark::DoNotOptimize(fc);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(f.kaLen));
+}
+BENCHMARK(BM_checkFrame_ValidKeepalive)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_peekTemplateId_ValidKeepalive — peekTemplateId (wraps checkFrame).
+// ---------------------------------------------------------------------------
+static void BM_peekTemplateId_ValidKeepalive(benchmark::State& state) {
+    const Frames& f = frames();
+    for (auto _ : state) {
+        auto tid = rpc::peekTemplateId(f.kaBuf.data(), f.kaLen);
+        benchmark::DoNotOptimize(tid);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(f.kaLen));
+}
+BENCHMARK(BM_peekTemplateId_ValidKeepalive)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_checkFrame_ValidConnectRequest — checkFrame on a larger variable-length frame.
+// ---------------------------------------------------------------------------
+static void BM_checkFrame_ValidConnectRequest(benchmark::State& state) {
+    const Frames& f = frames();
+    for (auto _ : state) {
+        rpc::FrameCheck fc = rpc::checkFrame(f.reqBuf.data(), f.reqLen);
+        benchmark::DoNotOptimize(fc);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(f.reqLen));
+}
+BENCHMARK(BM_checkFrame_ValidConnectRequest)->Unit(benchmark::kNanosecond);
