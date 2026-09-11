@@ -22,7 +22,8 @@ if(BUILD_TESTING)
             tests/protocol/Crc32cTest.cpp
             tests/protocol/VarintTest.cpp
             tests/protocol/RecordBatchTest.cpp
-            tests/protocol/client/MessageHeaderTest.cpp)
+            tests/protocol/client/MessageHeaderTest.cpp
+            tests/protocol/client/ControlMessagesConnectTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(rune_protocol_tests PRIVATE GTest::gtest_main)
     include(GoogleTest)
