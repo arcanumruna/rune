@@ -374,3 +374,111 @@ C1, S1, S3 (and C4). Correct-code-but-weak-test: B1. Partial: C2, C3. Regressed:
 Deferrals S2/S4/S5 accepted. Test findings T1/T4 strengthened with byte-equality but T4
 (and the B1 unit tests) still do not construct a case that distinguishes the fixed logic
 from the old `max()` (see B1 above).
+
+---
+
+## Re-audit 2 (commit 6cc793e)
+
+Verdict: **CLEAN** (for the committed-loss / HW-regression / uncommitted-read / bad-
+election surface audited). The NB1 blocker is genuinely fixed, and NB2/C3/B1-test are
+resolved with non-vacuous tests. No new committed-loss, HW-regression, uncommitted-read,
+or bad-election path was introduced by this fix. Remaining items are deferrals (S2/S4/S5)
+and pre-existing latent non-reachable notes (NB3), plus two minor test-coverage gaps that
+do not affect correctness. Build note: `cmake`/`ctest` unavailable in the audit env;
+verification is by code + test reasoning (commit claims 1280/1280 pass).
+
+### Per-finding status
+
+- **NB1 — RESOLVED.** `becomeLeader` (`PartitionReplica.cpp:84-130`) captures
+  `Offset committedHw = highWatermark();` at line 94 **before** the role flip
+  (`role_ = Role::Leader` at :98) and before `setIsr`/`setLeaderLogEndOffset`. At capture
+  time `highWatermark()` (`:465-470`) returns the OLD role's committed view — leaderState
+  HW for was-leader, `followerHw_` for was-follower — both ≤ true committed, never the LEO.
+  The floor is applied via `setHighWatermarkFloor(committedHw)` at :121, **before**
+  `setIsr(:123)` and `setLeaderLogEndOffset(:124)`, each of which calls `recomputeHw()`
+  eagerly. Ordering is correct: the floor is a lower bound; the subsequent recompute can
+  only advance `prevHw_` above `committedHw` when `computeHw()` — a genuine ISR majority —
+  supports it. For the NB1 case (2-node ISR {kF,kF2}, kF=LEO10, kF2=LEO0, committed=5):
+  majority(2) of {10,0}=0 < floor 5 → HW stays 5; the tail [5,10) is NOT exposed. The
+  1-node-ISR case where recompute yields leaderLeo is *correct* (leader-only quorum), and
+  the test documents this explicitly. Test `NB1_BecomeLeaderUncommittedTail.
+  HwFloorIsCommittedNotLeo` (`PartitionReplicaTest.cpp:1545-1663`) is genuinely
+  distinguishing: it asserts HW==5 (not 10) and that `read(0,big)` returns exactly 5
+  batches with no baseOffset≥5 — this FAILS under the old `log_->logEndOffset()` floor
+  (which would give HW=10). Not vacuous. All three becomeLeader entry paths
+  (was-follower / was-leader / fresh) capture a correct committed value.
+
+- **B1 (distinguishing test) — RESOLVED.** `B1_Distinguishing_StaleMaxInflatesHwAboveFloor`
+  (`HighWatermarkTest.cpp:747-793`) constructs the unique SET-vs-max() divergence: 3-node
+  ISR, leaderLeo=8 so `prevHw_` floor only reaches 8; f1 reports LEO=10 then truncates and
+  re-reports LEO=5; leader then advances to 12. SET → computeHw = median{12,5,0}=5 <8 →
+  HW=8 (correct); old max() → f1 stuck at 10 → median{12,10,0}=10 >8 → HW=10 (WRONG, f1 no
+  longer holds 10). Fails under max(). `updateFollowerFetchOffset` (`HighWatermark.h:118-125`)
+  is per-follower SET, not max — correct. Normal monotonic advance is preserved:
+  `B2_FloorPreservedAfterFollowerCatchUp` (`HighWatermarkTest.cpp:796-816`) shows floor +
+  subsequent follower re-acks advance HW normally; `recomputeHw` (`:167-173`) only advances
+  the global floor, never regresses it.
+
+- **NB2 — RESOLVED.** `applyReplicated` epoch-truncation (`PartitionReplica.cpp:326-352`)
+  now sets `Offset committedFloor = followerHw_` and clamps `truncOff = max(truncOff,
+  committedFloor)` before `truncateLog(truncOff)`, mirroring `becomeFollower`'s C2 guard.
+  When the epoch cache returns -1 no truncation fires at all (safe). Never truncates below
+  committed. Test `NB2_ApplyReplicatedTruncation.NeverTruncatesBelowCommittedHw`
+  (`PartitionReplicaTest.cpp:1669-1743`) exercises the guard via becomeFollower at epoch 2
+  and asserts follower LEO stays ≥ committedHw=5. (Note: the direct-applyReplicated epoch
+  path is still latent/unreachable in the coordinated flow, as before; the guard is
+  correct defense-in-depth.)
+
+- **C3 — RESOLVED.** `electNewLeader` (`PartitionFailoverCoordinator.h:264-378`) now, when
+  the old leader is unregistered (crash-failover, `foundOldLeader==false`, :303-317),
+  derives `committedHw = max(highWatermark())` over surviving registered ISR candidates
+  instead of defaulting to 0. Derivation safety: each surviving ISR member's
+  `highWatermark()` returns `followerHw_ = min(localLeo, lastKnownLeaderHw) ≤ true
+  committed` (B1 fix guarantees no HW inflation), so the derived value can NEVER
+  over-estimate → no false "no eligible leader" / liveness loss. It may slightly
+  under-estimate, but election picks the highest-LEO eligible candidate, and the ISR
+  invariant guarantees the highest-LEO survivor physically holds the true committed prefix
+  — so no behind node is elected. The `assert(found)` on unregistered ISR members remains
+  (hard-error, not silent leoOf=0). Tests: `ElectionC3Test.CandidateWithLEOBelowCommittedHW_
+  NotElected` (`PartitionFailoverTest.cpp:1394+`, old-leader-registered path) and
+  `C3_ElectionCommittedHw.CrashedLeaderUnregistered_CandidateWithLowLeoRejected`
+  (`PartitionReplicaTest.cpp:1745-1850+`, exercises the new surviving-ISR derivation:
+  f1 HW=10 → f2_lagging LEO=0 rejected, f1 elected; old default-0 code would allow
+  f2_lagging). Non-vacuous.
+
+### Still-holding from before (re-verified, unchanged by this commit)
+
+- **B2 goal — HELD.** Committed prefix readable immediately post-failover: the floor is
+  now committedHw (NB1), so a promoted leader reports HW ≥ committed at once (no HW=0
+  window). `read()` returns the committed prefix.
+- **C1 — HELD.** `read()` (`PartitionReplica.cpp:294-317`) still walks batches and stops at
+  `baseOffset >= hw`; unchanged by this diff. NB3 (multi-record straddling-HW batch) remains
+  latent/unreachable (leader appends 1 rec/batch).
+- **C2 (becomeFollower floor) — HELD.** `becomeFollower` (`:132-176`) retains the
+  `truncOff = max(truncOff, committedHw)` clamp; unchanged.
+- **S1 — HELD.** Eager recompute on every mutator; unchanged.
+- **S3 — HELD.** Recorder byte-budget; unchanged (not touched by this commit).
+
+### Deferrals (unchanged, accepted)
+
+- **S2 — DEFERRAL-OK.** `becomeLeader replicas == isr` (`:100`). Durability-breadth/liveness
+  reduction only; HW computed over ISR, never inflated. No committed-loss.
+- **S4 — DEFERRAL-OK.** `looksLikeRecordBatch` magic-byte sniff — test-only artifact;
+  production always takes the verbatim path.
+- **S5 — DEFERRAL-OK.** `FetchResponseMsg::decode` unbounded `len` — unreachable until an
+  untrusted Aeron transport is wired. MUST fix before then.
+
+### NEW findings from this fix
+
+- None of BLOCKER/CORRECTNESS/SILENT severity. No new committed-loss, HW-regression,
+  uncommitted-read, or bad-election path. The diff is surgical (4 regions) with no
+  collateral change to the C1/C2-becomeFollower/S1/S3 paths.
+
+- **NT1 (TEST-GAP, minor).** The `C3_ElectionCommittedHw.CrashedLeaderUnregistered` test
+  covers the surviving-ISR derivation, but the earlier `ElectionC3Test` still registers the
+  dead leader (foundOldLeader=true path). Coverage is adequate overall (NT1 is
+  informational, not a correctness issue).
+
+- **NB3 (MINOR, latent, carried) — UNCHANGED.** read-clamp uses `baseOffset >= hw`, not
+  `baseOffset+lastOffsetDelta >= hw`. Unreachable while leaders append single-record
+  batches; fix when batching lands. (`PartitionReplica.cpp:310`.)
