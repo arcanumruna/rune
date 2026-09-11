@@ -925,3 +925,140 @@ The bulk of the suite exercises REAL Phase-5 components and asserts on their rea
 
 ### Bottom line
 Atomic visibility, idempotent dedup, zombie fencing, and coordinator-failover recovery are genuinely proven against real components. NOT CLEAN because: (a) transactional-offset-commit atomicity (item 3) is simulated in the test body with no system-level binding — a weak proxy that cannot catch an offset-on-abort regression; (b) partition-leader failover (item 7) is a real, though documented, coverage hole for the marker-lost-above-HW seam. Recommend: add a PartitionReplica-backed leader-failover EOS test, and either add a real txn-offset-commit API bound to endTransaction or downgrade the item-3 test claims.
+
+---
+
+## P5-5 fix review (commit caa38a2)
+
+Date: 2026-09-11 · read-only · reviewed delta vs dbe03b7.
+Scope: `addOffsetsToTxn` + pending-offset persist/apply/discard; F3 tests;
+`LeaderFailoverEosTest`; `PartitionReplica::onLeaderLogAppended`.
+This delta directly targets the two prior NOT-CLEAN findings (item 3 weak
+offset proxy, item 7 partition-leader-failover hole).
+
+### Verdict: **CLEAN** — EOS offset-commit and leader-failover marker durability are genuinely proven. One minor documentation nit (no functional bug).
+
+1. **addOffsetsToTxn correctness (F3) ✅** — Offsets held as PENDING in the txn
+   (`TransactionCoordinator.cpp:325-327`), persisted to the log before any store
+   write (`:329-331`, `TransactionLog.cpp:113,257-269`), recovered on reopen
+   (`TransactionLog.cpp:145,364-393`). Epoch/PID fenced + Ongoing-only guard
+   (`:312-320`). Applied ONLY in the `PrepareCommit` branch of
+   `completeTransaction`, BEFORE the terminal CompleteCommit is persisted (see
+   P5-5 EOS correction below) — while still logically PrepareCommit, so the whole
+   commit-resolution is re-drivable and idempotent. Discarded in the
+   `PrepareAbort` branch. `offsetApplyCb_` has exactly ONE call site, confirmed by
+   grep — so **no path exists where an aborted txn's offsets reach the OffsetStore.**
+   Fence-abort (initProducerId→PrepareAbort), timeout-abort (doWork→PrepareAbort),
+   client-abort and recovered-PrepareAbort all converge on the same
+   `completeTransaction` PrepareAbort branch → offsets discarded by construction.
+   No committed-offset-loss on the primary path: recovered PrepareCommit carries
+   pendingOffsets and re-applies on resolve.
+
+2. **F3 tests genuine ✅** — All assert via REAL `OffsetStore::fetch`: commit →
+   `EXPECT_EQ(co->offset, exact)` (Test.cpp F3-a `:1249`, tests 11/31); abort →
+   `EXPECT_FALSE(fetch().has_value())` with an explicit "MUST FAIL if applied on
+   abort" comment (F3-b `:1275`, tests 12/32). Non-tautological: the group IS
+   written by the callback on the commit path, so the abort assertion fails if
+   the abort path ever calls the callback. Failover-recovery test (F3-c
+   `:1280-1332`) is real: `addOffsetsToTxn` → `endTransaction(commit)` →
+   `recreateCoordinator` (real destroy+reopen from disk) → asserts offset NOT in
+   store + state recovered == PrepareCommit → drives markers + completeTransaction
+   → asserts offset == 7. This closes prior **item 3** (weak proxy).
+
+3. **Leader-failover invariant (F7) genuinely asserted ✅** — Data batch is REALLY
+   synced: bounded fetch-pump loop drives until `follower.logEndOffset() >=
+   leaderLeo` AND `leader.highWatermark() >= leaderLeo` (LeaderFailoverEosTest.cpp
+   `:240-249`) via real `InMemoryTransport`, real HW/LEO through
+   `onLeaderLogAppended`. COMMIT marker is leader-only: follower severed from
+   transport before the marker append (`:292,302-303`), asserted
+   `follower LEO < leader LEO` (`:309`). Leader dies, follower promoted (real
+   `PartitionFailoverCoordinator`, epoch bumped to 2). New leader reads from the
+   follower's log where the marker is ABSENT: LSO pinned at 0 (`:350-353`),
+   read_committed EMPTY (`:360`), read_uncommitted SEES the data (`:372`) — proving
+   the data is on-log and the filter (not a parse artifact) hides it. Only after
+   the marker is re-driven on the new leader (`:408,411`) does read_committed
+   return the data (`:435-443`) with LSO==HW. The assertion WOULD FAIL if
+   visibility crossed a non-durable marker. Honest and real. Closes prior
+   **item 7** (partition-leader-failover hole). (Nit: `cfgLeader.minIsr=1` at
+   `:141` contradicts the header comment saying minIsr=2; harmless — the invariant
+   is asserted on the follower's marker-less log, not on leader HW timing.)
+
+4. **onLeaderLogAppended soundness ✅** — Leader-only (`:226`), no-op on follower.
+   Calls `leaderState_.setLeaderLogEndOffset(log_->logEndOffset())` (`:230`), which
+   **internally calls `recomputeHw()`** (HighWatermark.h:100-103; confirmed by the
+   S1 note at PartitionReplica.cpp:112 and recomputeHw at :567-573). This is the
+   SAME reconciliation `append()` performs (`:213-215`; append merely calls the
+   redundant public `recomputeHw()` after). HW is the majority-th highest ISR LEO
+   (HighWatermark.h:180-225), so it **cannot over-advance past majority**: with a
+   lagging follower, HW stays behind the externally-appended bytes until the
+   follower fetches — exactly the F7 gating. Cannot be misused to over-advance HW
+   without replication; recomputation reads only real ISR LEOs. No existing
+   invariant weakened; the co-located-writer note documents the intended use.
+
+5. **Vacuous/false-green + regressions ✅ (one doc nit)** — No vacuous green found;
+   F3 abort tests are the specific regression guards for the prior weak proxy.
+   **Minor doc nit (no bug):** the comment at `TransactionCoordinator.cpp:355-357`
+   claims a crash *after* CompleteCommit-persist but *before* the apply-loop would
+   "re-apply the offsets on recovery." Recovery only re-drives PrepareAbort/
+   PrepareCommit (`:50-52`); a recovered CompleteCommit returns kInvalidTransition
+   from completeTransaction and has no re-apply hook, so that narrow window would
+   not re-apply. In practice this is a near-zero window and the durable
+   PrepareCommit path (the one clients/failover actually recover into, and the one
+   F3-c/F7 test) is fully sound — offsets applied exactly once on resolve. Worth a
+   comment correction only; does not block the capstone. No regression to prior
+   transaction/replication findings.
+
+### Bottom line
+Both prior NOT-CLEAN findings are genuinely closed by real, non-tautological
+tests against real components. No aborted-offset-reaches-store path exists;
+no committed-offset-loss on the recover-into-PrepareCommit path; the F7
+marker-durability invariant is real and honest; `onLeaderLogAppended` reconciles
+identically to `append()` and cannot over-advance HW. EOS capstone certified
+**CLEAN** (one cosmetic comment correction recommended).
+
+---
+
+## P5-5 EOS correction (supersedes item 5's "doc nit" downgrade)
+
+Date: 2026-09-11 · Opus · durability-ordering re-review.
+
+The prior CLEAN verdict (item 5 above) correctly *spotted* the crash window
+between the CompleteCommit persist and the offset apply, but **wrongly downgraded
+it to a cosmetic "near-zero window" doc nit.** It is a REAL committed-offset-loss
+EOS violation, not cosmetic: the OLD order persisted the terminal CompleteCommit
+FIRST, then applied the pending consumer offsets to the OffsetStore. A crash in
+that window leaves a durable CompleteCommit whose offsets were never applied;
+recovery only re-drives `Prepare*` (ctor `:50-52`), so a recovered CompleteCommit
+does nothing → the committed consumer offsets are LOST → a read-process-write
+pipeline reprocesses those inputs after failover (exactly-once violation). The
+"window" is not near-zero — it spans a full OffsetStore write path and any crash
+in it is unrecoverable. This is the miss the prior CLEAN did not catch.
+
+**Fix (Kafka-faithful, idempotent re-drive):** in the `PrepareCommit` branch of
+`completeTransaction`, APPLY the pending offsets via `offsetApplyCb_` FIRST (while
+still logically `PrepareCommit` — the re-drivable resolution), THEN persist the
+terminal `CompleteCommit`, THEN clear pendingOffsets + go `Empty`. Crash-safety:
+`OffsetStore::commit` is an overwrite (idempotent) and pendingOffsets are durable
+from add-time (`addOffsetsToTxn` persists them on the Ongoing record; they ride
+the PrepareCommit record too — `TransactionLog.cpp:113,257-269`, replayed
+`:367-394`). So a crash BEFORE the CompleteCommit persist → recovery re-drives the
+still-`PrepareCommit` txn (markersPending) → re-applies offsets (idempotent
+overwrite) + re-writes markers (idempotent) → no loss, no double-effect. A crash
+AFTER the persist → offsets already applied → no loss. Abort still discards
+offsets (unchanged; single call site).
+
+**Tests (fail under old order, pass under fix):**
+`TxnCoordEosDurabilityTest.CommittedOffsetsSurviveCrashBetweenCompleteCommitPersistAndOffsetApply`
+(drives to PrepareCommit, throws in the apply callback to model a crash in the
+window, destroys the coordinator, reopens from the same durable log, re-drives →
+asserts the offset IS present post-recovery). Verified: FAILS with "committed
+consumer offset LOST across crash-in-window (EOS violation)" under the OLD order,
+PASSES under the fix. Plus `NormalCommitAppliesPendingOffsets` (exactly-once
+apply) and `AbortDiscardsPendingOffsetsEvenAcrossRecovery` (abort still discards
+across recovery). Full suite green seq (1575) and `-j4` (1575).
+
+### Revised bottom line
+The item-5 "doc nit" is upgraded to a fixed EOS durability bug. Offsets are now
+applied BEFORE the terminal CompleteCommit persist; the commit resolution is
+idempotent under re-drive; no committed-offset-loss in either crash sub-window;
+abort still discards. EOS capstone remains **CLEAN** with this correction applied.

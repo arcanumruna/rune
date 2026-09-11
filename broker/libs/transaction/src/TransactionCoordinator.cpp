@@ -345,21 +345,38 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
     }
 
     if (meta->state == TxnState::PrepareCommit) {
-        // C2: persist CompleteCommit as a distinct record BEFORE clearing to Empty.
-        // A crash between marker-write and Empty is recoverable: the recovered
-        // coordinator sees CompleteCommit and knows markers were already written.
-        meta->state = TxnState::CompleteCommit;
-        persistTransition(txnLog_, *meta, coordinatorEpoch_);
-
-        // F3: Apply pending consumer-group offsets atomically with the commit.
-        // Durable-before-visible ordering holds: CompleteCommit is already persisted
-        // above, THEN we write to the OffsetStore — so a crash between the two leaves
-        // a CompleteCommit record that re-applies the offsets on recovery.
+        // F3 / EOS durability: apply the pending consumer-group offsets to the
+        // OffsetStore FIRST, while the state is STILL PrepareCommit — i.e. as part
+        // of the RE-DRIVABLE resolution, BEFORE the terminal CompleteCommit is made
+        // durable.  This ordering is the crash-safety argument:
+        //
+        //   - Crash BEFORE the CompleteCommit persist below → the durable state
+        //     stays PrepareCommit.  Recovery marks a recovered PrepareCommit as
+        //     markersPending (see the constructor), so the re-drive re-runs THIS
+        //     path: it re-applies the offsets (OffsetStore::commit is an overwrite →
+        //     re-applying the same (group,tp,offset) is idempotent) and re-writes
+        //     the markers (resolvePendingMarkers is already idempotent — no double
+        //     marker).  → NO committed-offset loss.
+        //   - Crash AFTER the CompleteCommit persist → the offsets are already
+        //     durably in the OffsetStore, and a recovered CompleteCommit is terminal.
+        //     → NO loss.
+        //
+        // The OLD order (persist CompleteCommit, THEN apply offsets) was buggy: a
+        // crash in that window left a durable CompleteCommit whose offsets were
+        // never applied, and recovery does NOT re-drive CompleteCommit → the
+        // committed consumer offsets were lost (a read-process-write pipeline
+        // reprocesses inputs after failover — an exactly-once violation).
         if (offsetApplyCb_) {
             for (const auto& po : meta->pendingOffsets) {
                 offsetApplyCb_(po.group, po.tp, po.offset, /*timestampNs=*/0);
             }
         }
+
+        // C2: NOW persist CompleteCommit as a distinct terminal record.  The
+        // offsets are already durable in the OffsetStore, so this record makes the
+        // commit visible only AFTER the offsets are safe (durable-before-visible).
+        meta->state = TxnState::CompleteCommit;
+        persistTransition(txnLog_, *meta, coordinatorEpoch_);
 
         // Transition to Empty (ready for next txn, same epoch).
         meta->pendingOffsets.clear();

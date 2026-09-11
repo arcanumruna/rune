@@ -13,9 +13,12 @@
 
 #include <atomic>
 #include <cassert>
+#include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using namespace rune::transaction;
@@ -2441,5 +2444,223 @@ TEST(TxnCoordRound2Residual4Test, AddPartitionsRejectedInCompleteAbortAndPrepare
 
 // Residual-5 and Residual-6 are in ControlMarkerTest.cpp (non-zero offset and
 // CRC boundary). They are added there to keep marker-specific tests grouped.
+
+// ===========================================================================
+// EOS durability — committed consumer-offset loss on crash-in-window.
+//
+// Bug: completeTransaction(PrepareCommit) used to persist CompleteCommit FIRST,
+// then apply the pending offsets to the OffsetStore.  A crash BETWEEN those two
+// steps left a durable CompleteCommit record whose pendingOffsets were NEVER
+// applied — and recovery only re-drives Prepare* states, so a recovered
+// CompleteCommit did nothing → committed consumer offsets were lost (a
+// read-process-write pipeline reprocesses inputs after failover: an EOS
+// violation).
+//
+// Fix: apply the offsets to the OffsetStore FIRST (while still PrepareCommit —
+// the RE-DRIVABLE resolution), THEN persist the terminal CompleteCommit.  A
+// crash before the CompleteCommit persist leaves state == PrepareCommit, which
+// recovery marks markersPending → the re-drive re-applies the offsets
+// (OffsetStore::commit is an overwrite → idempotent) and re-writes markers
+// (already idempotent) → no loss.
+// ===========================================================================
+
+namespace {
+
+/// In-memory stand-in for OffsetStore with Kafka overwrite (idempotent) commit
+/// semantics: the same (group,tp,offset) re-applied is a no-op overwrite.
+struct FakeOffsetStore {
+    std::map<std::pair<std::string, std::pair<std::string, int32_t>>, int64_t> committed;
+
+    void commit(const std::string& group,
+                const rune::coordination::TopicPartition& tp,
+                rune::coordination::Offset offset) {
+        committed[{group, {tp.topic, tp.partition}}] = offset;   // overwrite
+    }
+    std::optional<int64_t> fetch(const std::string& group,
+                                 const std::string& topic, int32_t part) const {
+        auto it = committed.find({group, {topic, part}});
+        if (it == committed.end()) return std::nullopt;
+        return it->second;
+    }
+};
+
+} // anonymous namespace
+
+// Crash EXACTLY in the window between the CompleteCommit persist and the offset
+// apply: the injected offsetApplyCb throws on its FIRST invocation, dropping the
+// coordinator.  Reconstruct from the durable TransactionLog and drive resolution
+// → the committed offsets MUST be present in the OffsetStore (no loss).
+//
+// Under the OLD (buggy) order this FAILS: CompleteCommit is persisted, the throw
+// aborts the offset apply, and the recovered CompleteCommit re-applies nothing.
+TEST(TxnCoordEosDurabilityTest, CommittedOffsetsSurviveCrashBetweenCompleteCommitPersistAndOffsetApply)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    FakeOffsetStore store;
+    const std::string group = "rpw-group";
+    auto inputTp = tp("input-topic", 0);
+    const rune::coordination::TopicPartition cinTp{inputTp.topic, inputTp.partition};
+    const rune::coordination::Offset committedOffset = 42;
+
+    ProducerId    pid{};
+    ProducerEpoch epoch{};
+
+    // Phase 1: drive txn to PrepareCommit with a pending consumer offset, then
+    // "crash" during completeTransaction: the callback throws the first time it
+    // is called.
+    {
+        TransactionLog log(path);
+
+        // offsetApplyCb throws the FIRST time — models a crash landing in the
+        // window right after the CompleteCommit persist (old order) or right at
+        // the start of the offset apply (either order).
+        bool thrown = false;
+        auto crashingCb = [&](const std::string& g,
+                              const rune::coordination::TopicPartition& t,
+                              rune::coordination::Offset off,
+                              int64_t) {
+            if (!thrown) { thrown = true; throw std::runtime_error("crash-in-window"); }
+            store.commit(g, t, off);
+        };
+
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log,
+                                     /*coordinatorEpoch=*/0, crashingCb);
+        auto r = coord.initProducerId("rpw-txn", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        pid   = r.producerId;
+        epoch = r.producerEpoch;
+        coord.addPartitions("rpw-txn", pid, epoch, tps({tp("out", 0)}), 100LL);
+
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs;
+        offs[cinTp] = committedOffset;
+        ASSERT_TRUE(coord.addOffsetsToTxn("rpw-txn", pid, epoch, group, offs, 150LL).ok());
+
+        coord.endTransaction("rpw-txn", pid, epoch, /*commit=*/true, 200LL);
+        ASSERT_EQ(coord.state("rpw-txn"), TxnState::PrepareCommit);
+
+        // Drive completeTransaction — the callback throws, simulating a crash
+        // in the persist/apply window.  Swallow it (the process "dies").
+        try {
+            coord.completeTransaction("rpw-txn");
+        } catch (const std::exception&) { /* crashed */ }
+
+        // Offset must NOT be visible yet (the apply was interrupted).
+        EXPECT_FALSE(store.fetch(group, cinTp.topic, cinTp.partition).has_value())
+            << "offset should not be applied yet — the apply was interrupted";
+    }
+
+    // Phase 2: reconstruct the coordinator from the SAME durable log.  A
+    // non-throwing callback re-applies on the re-drive.
+    TransactionLog log2(path);
+    auto goodCb = [&](const std::string& g,
+                     const rune::coordination::TopicPartition& t,
+                     rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);
+    };
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2,
+                                  /*coordinatorEpoch=*/0, goodCb);
+
+    // Re-drive: a recovered PrepareCommit is exposed via pendingMarkerTransactions
+    // and resolved via completeTransaction (idempotent marker + offset re-apply).
+    auto pending = coord2.pendingMarkerTransactions();
+    for (const auto& p : pending) {
+        (void)p;
+        coord2.completeTransaction("rpw-txn");
+    }
+    // If recovery landed us directly in a resolvable terminal state, drive it too.
+    if (coord2.state("rpw-txn") == TxnState::PrepareCommit) {
+        coord2.completeTransaction("rpw-txn");
+    }
+
+    // THE INVARIANT: the committed consumer offset MUST be durably present.
+    auto co = store.fetch(group, cinTp.topic, cinTp.partition);
+    ASSERT_TRUE(co.has_value())
+        << "committed consumer offset LOST across crash-in-window (EOS violation)";
+    EXPECT_EQ(*co, committedOffset);
+}
+
+// Normal (no-crash) commit still applies the pending offsets exactly once.
+TEST(TxnCoordEosDurabilityTest, NormalCommitAppliesPendingOffsets)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    FakeOffsetStore store;
+    int applyCount = 0;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        ++applyCount;
+        store.commit(g, t, off);
+    };
+
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log,
+                                 /*coordinatorEpoch=*/0, cb);
+    auto r = coord.initProducerId("ok-txn", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    coord.addPartitions("ok-txn", r.producerId, r.producerEpoch, tps({tp("out", 0)}), 100LL);
+
+    rune::coordination::TopicPartition cin{"in", 0};
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs;
+    offs[cin] = 7;
+    ASSERT_TRUE(coord.addOffsetsToTxn("ok-txn", r.producerId, r.producerEpoch,
+                                      "g", offs, 150LL).ok());
+    coord.endTransaction("ok-txn", r.producerId, r.producerEpoch, /*commit=*/true, 200LL);
+    ASSERT_TRUE(coord.completeTransaction("ok-txn").ok());
+
+    EXPECT_EQ(applyCount, 1);
+    auto co = store.fetch("g", "in", 0);
+    ASSERT_TRUE(co.has_value());
+    EXPECT_EQ(*co, 7);
+    EXPECT_EQ(coord.state("ok-txn"), TxnState::Empty);
+}
+
+// Abort MUST still discard pending offsets — they are never written on abort,
+// including across a crash + recovery of the aborted transaction.
+TEST(TxnCoordEosDurabilityTest, AbortDiscardsPendingOffsetsEvenAcrossRecovery)
+{
+    auto path = coordTmpPath();
+    CoordTempFile tf{path};
+
+    FakeOffsetStore store;
+    auto cb = [&](const std::string& g,
+                 const rune::coordination::TopicPartition& t,
+                 rune::coordination::Offset off, int64_t) {
+        store.commit(g, t, off);   // must NEVER be reached for an abort
+    };
+
+    ProducerId pid{}; ProducerEpoch epoch{};
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log,
+                                     /*coordinatorEpoch=*/0, cb);
+        auto r = coord.initProducerId("ab-txn", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        pid = r.producerId; epoch = r.producerEpoch;
+        coord.addPartitions("ab-txn", pid, epoch, tps({tp("out", 0)}), 100LL);
+
+        rune::coordination::TopicPartition cin{"in", 0};
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs;
+        offs[cin] = 99;
+        ASSERT_TRUE(coord.addOffsetsToTxn("ab-txn", pid, epoch, "g", offs, 150LL).ok());
+        coord.endTransaction("ab-txn", pid, epoch, /*commit=*/false, 200LL);
+        ASSERT_EQ(coord.state("ab-txn"), TxnState::PrepareAbort);
+        // Crash before completeTransaction.
+    }
+
+    // Recover and resolve the abort — offsets must STILL be discarded.
+    TransactionLog log2(path);
+    TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2,
+                                  /*coordinatorEpoch=*/0, cb);
+    for (const auto& p : coord2.pendingMarkerTransactions()) {
+        (void)p;
+        coord2.completeTransaction("ab-txn");
+    }
+    EXPECT_FALSE(store.fetch("g", "in", 0).has_value())
+        << "aborted txn offsets must NEVER be applied to the OffsetStore";
+}
 
 } // anonymous namespace
