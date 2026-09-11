@@ -182,3 +182,27 @@ On `CandidateBallot` timeout without quorum the code returns to `CANVASS` (`:338
 B1's new `throw` on msync/fsync EIO is fail-stop during construction/vote (safe, not silent). B2's NLT gate does not reject a valid same-term leader (adopt-equal path `:748` continues; adopt-higher `:740-743` then re-checks freshness). The ONLY new bug is N1 (under-counting → deadlock), not over-counting.
 
 **Report:** this file.
+
+---
+
+## Re-audit 2 (commit 22c2244)
+
+**Date:** 2026-09-11
+**Auditor:** Opus (read-only)
+**Fix reviewed:** `22c2244` — *revert C6 logLeadershipTermId quorum match (liveness deadlock); Aeron-faithful quorum predicate + anti-regression test [audit N1]*
+
+### Verdict: **CLEAN** — N1 resolved; libs/consensus is now both safe and live.
+
+### Per-check findings
+
+- **N1 — FIXED.** `hasReachedPosition` (`ClusterMember.h:83-88`) and `hasQuorumAtPosition` (`ClusterMember.h:191-207`) now check only `isActive && ltId == leadershipTermId && logPosition >= position`. The `logLtId`/`logLeadershipTermId` parameter is gone from both the signature and the predicate — Aeron-faithful (`ClusterMember.java:907-925`). The single production call site (`Election.cpp:487-489`) passes the new 5-arg form and no longer forwards `logLeadershipTermId_`. Grep confirms zero remaining callers on the old signature (benchmark `ClusterMemberBenchmark.cpp:150` updated). Rationale is documented inline at `ClusterMember.h:73-82` with an explicit "do not re-add without plumbing the wire field" guard.
+- **No deadlock (traced).** `AppendPositionMsg` (`ConsensusMessages.h:411-452`) carries `leadershipTermId/logPosition/followerMemberId/flags` — **no** `logLeadershipTermId`. `onAppendPosition` (`Election.cpp:793-809`) sets only `logPosition/leadershipTermId/timeOfLastAppendPositionNs`, leaving `follower->logLeadershipTermId` at its initial 0. With leader `logLeadershipTermId_ = 3`, quorum is now reached (term+position match); under the old C6 predicate it never could. The two sites that *do* set `follower->logLeadershipTermId` — `onCanvassPosition` (`:614`) and `onVote` (`:684`) — read it from wire messages that legitimately carry it (`CanvassPositionMsg`/`VoteMsg`), and are unrelated to the append-position quorum path.
+- **Anti-regression test is real and non-vacuous.** `ElectionLog.N1_NonZeroLogLeadershipTermId_QuorumStillReached` (`ElectionLogTest.cpp:1160-1234`) drives a real 3-node `Election` (leader `logLeadershipTermId=3`, followers left at 0) INIT→…→**Closed** via `driveLeaderToClosed`, which feeds only `onAppendPosition` (`:212`). Under the old predicate followers stay at `logLeadershipTermId=0 ≠ 3`, quorum is never reached, the 100-iteration loop exhausts and returns false → the test would FAIL. Verified: rebuilt (CLion cmake) and ran — this test plus all `HasQuorumAtPosition_*` pass; full suite **342/342 green**.
+- **C6 tests corrected, not left asserting wrong behavior.** `HasQuorumAtPosition_DifferentLogBranch_NotCounted` → renamed `…_DifferentLogBranch_StillCounted` and now asserts a member with a different `logLeadershipTermId` (but matching `leadershipTermId`+`logPosition`) **is** counted. New `…_WrongLeadershipTermId_Excluded` pins the correct exclusion axis (`leadershipTermId`, not `logLeadershipTermId`). `…_AllMatchingTerm_True` updated. Semantics are now Aeron-correct.
+- **Revert did not re-open C6 unsafely (Phase-2).** Cross-branch over-count is prevented architecturally by the FOLLOWER_REPLAY/catch-up gate, not the quorum predicate: `followerReplay` (`Election.cpp:503-516`) and `leaderReplay` (`:425-431`) `assert(logPosition_ == appendPosition_)`. In the no-Archive Phase-2 config all nodes start at position 0, so no follower can report a position on a divergent branch; the assert fires the moment Phase-3 introduces real divergence. Acceptable for the current build; when Archive catch-up lands, branch identity must be enforced at that gate (or by plumbing `logLeadershipTermId` into AppendPosition), **not** by re-adding it to the quorum predicate.
+- **B1/B2 untouched.** `22c2244` touches only the quorum predicate, its lone call site, the benchmark, and tests (`git show --name-only`). Zero `candidateTermId`/vote/`compareLog`/NLT lines appear in the `Election.cpp` diff. The B1 durable-vote path and B2 NLT `candidateTermId`+log-freshness gates are byte-for-byte unchanged and still hold.
+
+### Residual (unchanged, non-blocking)
+- **S1** (ConsensusAgent silent-drop observability gap) and **T2** (duplicate-at-old-position fencing test) remain as noted in Re-audit 1 — observability/coverage only, no safety or liveness impact.
+
+**Overall:** no split-brain, no double-vote, no behind-leader win, and no election deadlock. libs/consensus is genuinely safe **and** live for Phase-2. **CLEAN.**
