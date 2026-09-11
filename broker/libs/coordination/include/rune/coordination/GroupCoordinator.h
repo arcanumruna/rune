@@ -54,6 +54,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/coordination/Types.h>
+#include <rune/coordination/Assignor.h>
 
 #include <cstdint>
 #include <string>
@@ -61,6 +62,8 @@
 #include <vector>
 #include <optional>
 #include <atomic>
+#include <map>
+#include <unordered_set>
 
 namespace rune::coordination {
 
@@ -73,6 +76,28 @@ enum class GroupState {
     CompletingRebalance,
     Stable,
     Dead,
+};
+
+// ---------------------------------------------------------------------------
+// AssignorType — which assignor to use for autoAssignAndSync().
+// ---------------------------------------------------------------------------
+enum class AssignorType {
+    Range,
+    RoundRobin,
+};
+
+// ---------------------------------------------------------------------------
+// SyncResult — returned by syncGroup().
+// ---------------------------------------------------------------------------
+struct SyncResult {
+    int errorCode{0};
+
+    static constexpr int kOk               = 0;
+    static constexpr int kErrStaleGeneration = 1;
+    static constexpr int kErrUnknownMember  = 2;
+    static constexpr int kErrWrongState     = 3;
+
+    [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
 
 // ---------------------------------------------------------------------------
@@ -174,13 +199,65 @@ public:
                               int64_t             nowNs);
 
     // -----------------------------------------------------------------------
+    // P4-3: SyncGroup API
+    // -----------------------------------------------------------------------
+
+    /// Sync the group assignment (JoinGroup/SyncGroup Kafka protocol step).
+    ///
+    /// The LEADER calls this with the full assignment map (memberId → partitions).
+    /// Followers call this with an empty map to receive their assignment.
+    ///
+    /// Generation-fenced: rejects if generationId != current.
+    /// Wrong-state: rejects if not in CompletingRebalance.
+    /// Unknown-member: rejects if memberId not in group.
+    ///
+    /// Stores assignments into each member's MemberInfo::assignment.
+    /// Transitions CompletingRebalance→Stable once the leader has submitted.
+    /// (Follower sync calls succeed but do not advance state by themselves.)
+    ///
+    /// \param memberId             Caller's memberId.
+    /// \param generationId         Must match current generationId.
+    /// \param assignmentsPerMember Leader: full map. Followers: empty map.
+    /// \param nowNs                Injected clock.
+    SyncResult syncGroup(const std::string& memberId,
+                         Generation         generationId,
+                         const Assignment&  assignmentsPerMember,
+                         int64_t            nowNs);
+
+    /// Convenience: run the chosen assignor internally, store result,
+    /// and transition CompletingRebalance→Stable.
+    ///
+    /// Equivalent to the leader computing and calling syncGroup + all followers
+    /// calling syncGroup with empty maps.
+    SyncResult autoAssignAndSync(const TopicPartitionCounts& partCounts,
+                                 AssignorType                assignorType,
+                                 int64_t                     nowNs);
+
+    /// Return the assigned partitions for a member (post-Stable).
+    /// Returns empty vector if member is unknown or group is not Stable.
+    [[nodiscard]] std::vector<TopicPartition> assignmentFor(const std::string& memberId) const;
+
+    // -----------------------------------------------------------------------
+    // P4-3: Join timeout (for doWork-driven rebalance expiry)
+    // -----------------------------------------------------------------------
+
+    /// Set the maximum time (ms) to wait for all members to re-join during
+    /// PreparingRebalance. After this elapses, doWork transitions to
+    /// CompletingRebalance with whoever has re-joined (others evicted).
+    /// Default: 30 000 ms (matching session timeout default).
+    void setRebalanceTimeoutMs(int32_t ms) noexcept { rebalanceTimeoutMs_ = ms; }
+
+    // -----------------------------------------------------------------------
     // doWork — single-writer periodic step (no spin, no sleep)
     // -----------------------------------------------------------------------
 
     /// Reap members whose session timeout has elapsed.
+    /// Also handles join-timeout: if in PreparingRebalance and the join timeout
+    /// has elapsed (rebalanceTimeoutMs_), members who haven't re-joined are
+    /// evicted and the state transitions to CompletingRebalance.
     ///
     /// \param nowNs  Injected clock (nanoseconds). Sampled ONCE per call.
-    /// \returns Number of members reaped (0 when no work done).
+    /// \returns Number of members reaped / state transitions (0 when no work done).
     int doWork(int64_t nowNs);
 
     // -----------------------------------------------------------------------
@@ -236,6 +313,47 @@ private:
 
     static std::atomic<uint64_t> s_memberSeq; ///< global monotonic counter for memberId generation
     uint64_t memberSeq_{0};                    ///< per-instance counter (primary)
+
+    // -----------------------------------------------------------------------
+    // P4-3 rebalance state
+    // -----------------------------------------------------------------------
+
+    /// Members that have re-joined during the current PreparingRebalance epoch.
+    /// Reset on every new rebalance (generationId bump). Used to track when
+    /// ALL expected members have re-joined → transition to CompletingRebalance.
+    std::unordered_set<std::string> rejoinedMembers_;
+
+    /// Expected member count at the START of the current rebalance epoch.
+    /// Set when triggerRebalance() is called. When rejoinedMembers_.size() ==
+    /// expectedMemberCount_, we can transition to CompletingRebalance.
+    std::size_t expectedMemberCount_{0};
+
+    /// Members that have called syncGroup (followers awaiting leader assignment).
+    /// Reset on each transition to CompletingRebalance.
+    std::unordered_set<std::string> syncedMembers_;
+
+    /// Whether the leader has submitted the full assignment map.
+    bool leaderSynced_{false};
+
+    /// Timestamp (nowNs) when the current rebalance (PreparingRebalance) started.
+    /// Used by doWork to detect join-timeout expiry.
+    int64_t rebalanceStartNs_{0};
+
+    /// Maximum ms to wait for all members to re-join. Driven by doWork.
+    int32_t rebalanceTimeoutMs_{INT32_MAX}; // effectively infinite until set
+
+    // -----------------------------------------------------------------------
+    // P4-3 private helpers
+    // -----------------------------------------------------------------------
+
+    /// Called when all expected members have re-joined OR the join timeout fired.
+    /// Transitions PreparingRebalance → CompletingRebalance.
+    /// Members who did NOT re-join (not in rejoinedMembers_) are evicted.
+    void transitionToCompletingRebalance(int64_t nowNs);
+
+    /// Distribute an Assignment map into each member's MemberInfo::assignment.
+    /// Then transitions CompletingRebalance → Stable.
+    void applyAssignmentAndTransitionStable(const Assignment& a);
 };
 
 } // namespace rune::coordination

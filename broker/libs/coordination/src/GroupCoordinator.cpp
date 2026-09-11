@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 namespace rune::coordination {
@@ -58,11 +59,15 @@ JoinResult GroupCoordinator::join(const std::string&              memberId,
         existing->sessionTimeoutMs = sessionTimeoutMs;
         existing->subscribedTopics = subscribedTopics;
         existing->lastHeartbeatNs  = nowNs;
-        // A re-join while in PreparingRebalance does NOT bump generation again —
-        // the rebalance is already in progress. Kafka: during rebalance, members
-        // re-join and coordinator waits for all expected members.
-        // We still stay in PreparingRebalance (or bump if Stable/Empty — can't be
-        // re-joining from those with a known memberId unless very unusual).
+
+        // Track that this member has re-joined during the current rebalance.
+        if (state_ == GroupState::PreparingRebalance) {
+            rejoinedMembers_.insert(effectiveMemberId);
+            // If all expected members have re-joined, advance to CompletingRebalance.
+            if (rejoinedMembers_.size() >= expectedMemberCount_) {
+                transitionToCompletingRebalance(nowNs);
+            }
+        }
     } else {
         // New member: add to the group.
         MemberInfo info;
@@ -152,39 +157,76 @@ HeartbeatResult GroupCoordinator::heartbeat(const std::string& memberId,
 // ---------------------------------------------------------------------------
 int GroupCoordinator::doWork(int64_t nowNs)
 {
-    if (members_.empty()) return 0;
     if (state_ == GroupState::Dead) return 0;
 
-    // Sample nowNs ONCE (already done by the caller passing it in).
-    int reaped = 0;
+    int work = 0;
 
-    // Collect expired members (avoid iterator invalidation).
-    std::vector<std::string> toEvict;
-    for (const auto& m : members_) {
-        int64_t timeoutNs = static_cast<int64_t>(m.sessionTimeoutMs) * 1'000'000LL;
-        if (nowNs - m.lastHeartbeatNs > timeoutNs) {
-            toEvict.push_back(m.memberId);
+    // -----------------------------------------------------------------------
+    // 1. Reap session-expired members.
+    // -----------------------------------------------------------------------
+    if (!members_.empty()) {
+        std::vector<std::string> toEvict;
+        for (const auto& m : members_) {
+            int64_t timeoutNs = static_cast<int64_t>(m.sessionTimeoutMs) * 1'000'000LL;
+            if (nowNs - m.lastHeartbeatNs > timeoutNs) {
+                toEvict.push_back(m.memberId);
+            }
         }
-    }
 
-    for (const auto& id : toEvict) {
-        if (!removeMember(id)) continue; // already gone
-        ++reaped;
+        for (const auto& id : toEvict) {
+            if (!removeMember(id)) continue;
+            ++work;
 
-        if (members_.empty()) {
-            ++generationId_;
-            state_    = GroupState::Empty;
-            leaderId_ = "";
-        } else {
-            triggerRebalance(nowNs);
-            electLeader();
-            for (auto& m : members_) {
-                m.isLeader = (m.memberId == leaderId_);
+            if (members_.empty()) {
+                ++generationId_;
+                state_    = GroupState::Empty;
+                leaderId_ = "";
+            } else {
+                triggerRebalance(nowNs);
+                electLeader();
+                for (auto& m : members_) {
+                    m.isLeader = (m.memberId == leaderId_);
+                }
             }
         }
     }
 
-    return reaped;
+    // -----------------------------------------------------------------------
+    // 2. Join-timeout: if still in PreparingRebalance and not all members
+    //    have re-joined, and the rebalance timeout has elapsed, evict
+    //    non-rejoined members and transition to CompletingRebalance.
+    // -----------------------------------------------------------------------
+    if (state_ == GroupState::PreparingRebalance && !members_.empty()) {
+        int64_t rebalanceTimeoutNs =
+            static_cast<int64_t>(rebalanceTimeoutMs_) * 1'000'000LL;
+
+        if (nowNs - rebalanceStartNs_ > rebalanceTimeoutNs) {
+            // Evict members who have not re-joined.
+            std::vector<std::string> notRejoined;
+            for (const auto& m : members_) {
+                if (!rejoinedMembers_.count(m.memberId)) {
+                    notRejoined.push_back(m.memberId);
+                }
+            }
+            for (const auto& id : notRejoined) {
+                removeMember(id);
+                ++work;
+            }
+            // Transition with whoever is left.
+            if (members_.empty()) {
+                ++generationId_;
+                state_    = GroupState::Empty;
+                leaderId_ = "";
+            } else {
+                electLeader();
+                for (auto& m : members_) m.isLeader = (m.memberId == leaderId_);
+                transitionToCompletingRebalance(nowNs);
+                ++work;
+            }
+        }
+    }
+
+    return work;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +284,137 @@ void GroupCoordinator::electLeader()
     leaderId_ = *smallest;
 }
 
-void GroupCoordinator::triggerRebalance(int64_t /*nowNs*/)
+void GroupCoordinator::triggerRebalance(int64_t nowNs)
 {
     ++generationId_;
     state_ = GroupState::PreparingRebalance;
+    // Record how many members we expect to re-join.
+    expectedMemberCount_ = members_.size();
+    rejoinedMembers_.clear();
+    syncedMembers_.clear();
+    leaderSynced_ = false;
+    rebalanceStartNs_ = nowNs;
+}
+
+// ---------------------------------------------------------------------------
+// P4-3: syncGroup
+// ---------------------------------------------------------------------------
+SyncResult GroupCoordinator::syncGroup(const std::string& memberId,
+                                        Generation         generationId,
+                                        const Assignment&  assignmentsPerMember,
+                                        int64_t            /*nowNs*/)
+{
+    // Wrong state: must be in CompletingRebalance or Stable to sync.
+    // (Stable is allowed so followers can call after leader already transitioned.)
+    if (state_ != GroupState::CompletingRebalance && state_ != GroupState::Stable) {
+        return SyncResult{ .errorCode = SyncResult::kErrWrongState };
+    }
+
+    // Generation fencing.
+    if (generationId != generationId_) {
+        return SyncResult{ .errorCode = SyncResult::kErrStaleGeneration };
+    }
+
+    // Unknown member.
+    MemberInfo* caller = findMember(memberId);
+    if (caller == nullptr) {
+        return SyncResult{ .errorCode = SyncResult::kErrUnknownMember };
+    }
+
+    // If this is the leader AND they provided a non-empty assignment map,
+    // store the assignments and mark leader as synced.
+    if (!assignmentsPerMember.empty()) {
+        // Only accept from the leader.
+        if (memberId == leaderId_) {
+            // Store each member's assignment.
+            for (auto& [mid, tps] : assignmentsPerMember) {
+                MemberInfo* m = findMember(mid);
+                if (m != nullptr) {
+                    m->assignment = tps;
+                }
+            }
+            leaderSynced_ = true;
+            // Transition to Stable now that leader has submitted the assignment.
+            applyAssignmentAndTransitionStable(assignmentsPerMember);
+        }
+    }
+
+    // Track this member as having called syncGroup.
+    syncedMembers_.insert(memberId);
+
+    return SyncResult{ .errorCode = SyncResult::kOk };
+}
+
+// ---------------------------------------------------------------------------
+// P4-3: autoAssignAndSync
+// ---------------------------------------------------------------------------
+SyncResult GroupCoordinator::autoAssignAndSync(const TopicPartitionCounts& partCounts,
+                                                AssignorType                assignorType,
+                                                int64_t                     nowNs)
+{
+    if (state_ != GroupState::CompletingRebalance) {
+        return SyncResult{ .errorCode = SyncResult::kErrWrongState };
+    }
+
+    // Build subscriptions from current members.
+    std::vector<MemberSubscription> subs;
+    subs.reserve(members_.size());
+    for (const auto& m : members_) {
+        subs.push_back({ m.memberId, m.subscribedTopics });
+    }
+
+    // Run the chosen assignor.
+    Assignment computed;
+    if (assignorType == AssignorType::Range) {
+        RangeAssignor ra;
+        computed = ra.assign(subs, partCounts);
+    } else {
+        RoundRobinAssignor rr;
+        computed = rr.assign(subs, partCounts);
+    }
+
+    // Store each member's assignment.
+    for (auto& m : members_) {
+        auto it = computed.find(m.memberId);
+        if (it != computed.end()) {
+            m.assignment = it->second;
+        }
+    }
+
+    leaderSynced_ = true;
+    state_ = GroupState::Stable;
+    (void)nowNs;
+
+    return SyncResult{ .errorCode = SyncResult::kOk };
+}
+
+// ---------------------------------------------------------------------------
+// P4-3: assignmentFor
+// ---------------------------------------------------------------------------
+std::vector<TopicPartition> GroupCoordinator::assignmentFor(const std::string& memberId) const
+{
+    const MemberInfo* m = findMember(memberId);
+    if (m == nullptr) return {};
+    return m->assignment;
+}
+
+// ---------------------------------------------------------------------------
+// P4-3: transitionToCompletingRebalance
+// ---------------------------------------------------------------------------
+void GroupCoordinator::transitionToCompletingRebalance(int64_t /*nowNs*/)
+{
+    state_ = GroupState::CompletingRebalance;
+    syncedMembers_.clear();
+    leaderSynced_ = false;
+}
+
+// ---------------------------------------------------------------------------
+// P4-3: applyAssignmentAndTransitionStable
+// ---------------------------------------------------------------------------
+void GroupCoordinator::applyAssignmentAndTransitionStable(const Assignment& /*a*/)
+{
+    // Assignments were already stored in syncGroup() before calling this.
+    state_ = GroupState::Stable;
 }
 
 } // namespace rune::coordination
