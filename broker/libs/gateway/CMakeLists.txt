@@ -54,6 +54,26 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_loopback_tests
                 PROPERTIES TIMEOUT 90)
+
+            # BR-5: session timeout reaping tests (injected clock)
+            add_executable(rune_gateway_timeout_tests
+                tests/integration/GatewayTimeoutTest.cpp)
+            target_link_libraries(rune_gateway_timeout_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_timeout_tests
+                PROPERTIES TIMEOUT 90)
+
+            # BR-5: leader-awareness REDIRECT tests
+            add_executable(rune_gateway_redirect_tests
+                tests/integration/GatewayRedirectTest.cpp)
+            target_link_libraries(rune_gateway_redirect_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_redirect_tests
+                PROPERTIES TIMEOUT 90)
         endif()
     endif()
 endif()

@@ -1,16 +1,19 @@
 #pragma once
-// ClientGateway.h — Client-facing session gateway (BR-4).
+// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5).
 //
 // Design:
 //   - Subscribes to a single Aeron ingress stream (clientChannel/clientStreamId).
 //   - FragmentAssembler reassembles multi-frame messages before dispatch.
 //   - doWork(nowNs) polls ingress and dispatches:
 //       Connect      → allocate sessionId, resolve egress ExclusivePublication,
-//                      send ConnectResponse
+//                      send ConnectResponse (or redirect if not leader)
 //       Keepalive    → touch session (update lastSeenNs)
 //       Ping         → echo Pong on session egress
 //       Disconnect   → remove session
 //       Unknown/bad  → drop (never crash)
+//   - Session timeout reaping: doWork(nowNs) reaps sessions idle beyond
+//     sessionTimeoutNs (injected clock — deterministic, no wall-clock in reap).
+//   - Leader-awareness: non-leader Connect → ErrorResponse{Redirect, leaderEndpoint}.
 //   - Single-writer: doWork() must be called from ONE thread only.
 //   - Zero-alloc on the hot path: encode scratch is a fixed member buffer.
 //   - NO busy-spin.
@@ -28,24 +31,41 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace rune::gateway {
+
+// ---------------------------------------------------------------------------
+// LeaderView — snapshot of cluster leadership from the node's perspective.
+// ---------------------------------------------------------------------------
+struct LeaderView {
+    bool        isLeader             = true;   // true if this node is the current leader
+    std::string leaderClientEndpoint;           // leader's client-facing channel; empty if unknown
+};
 
 // ---------------------------------------------------------------------------
 // ClientGateway
 // ---------------------------------------------------------------------------
 class ClientGateway {
 public:
-    // @param aeron          Shared Aeron client (connected to a media driver).
-    // @param clientChannel  Aeron channel the gateway listens on (clients publish here).
-    // @param clientStreamId Stream ID on clientChannel.
-    // @param thisNodeId     This node's id; echoed in ConnectResponse.leaderMemberId.
-    ClientGateway(std::shared_ptr<aeron::Aeron> aeron,
-                  std::string                   clientChannel,
-                  int32_t                       clientStreamId,
-                  int32_t                       thisNodeId);
+    // Default session timeout: 10 seconds.
+    static constexpr int64_t kDefaultSessionTimeoutNs = 10LL * 1'000'000'000LL;
+
+    // @param aeron             Shared Aeron client (connected to a media driver).
+    // @param clientChannel     Aeron channel the gateway listens on (clients publish here).
+    // @param clientStreamId    Stream ID on clientChannel.
+    // @param thisNodeId        This node's id; echoed in ConnectResponse.leaderMemberId.
+    // @param sessionTimeoutNs  Idle session expiry threshold (default 10 s).
+    // @param leaderView        Callable returning current LeaderView; default: always leader.
+    ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
+                  std::string                         clientChannel,
+                  int32_t                             clientStreamId,
+                  int32_t                             thisNodeId,
+                  int64_t                             sessionTimeoutNs = kDefaultSessionTimeoutNs,
+                  std::function<LeaderView()>         leaderView       = nullptr);
 
     ~ClientGateway() = default;
 
@@ -54,11 +74,18 @@ public:
     ClientGateway& operator=(const ClientGateway&) = delete;
 
     // -----------------------------------------------------------------------
-    // doWork — poll ingress (bounded fragment limit) + dispatch.
+    // doWork — poll ingress (bounded fragment limit) + dispatch + reap expired.
     // Returns number of fragments processed (work count).
     // Must be called from ONE thread only.
     // -----------------------------------------------------------------------
     int doWork(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // reapExpired — remove sessions idle beyond sessionTimeoutNs.
+    // Uses injected nowNs only (no wall-clock).  Bounded O(n) scan.
+    // Callable directly from unit tests to drive reaping without live ingress.
+    // -----------------------------------------------------------------------
+    void reapExpired(int64_t nowNs);
 
     // -----------------------------------------------------------------------
     // sessionCount — number of active sessions.
@@ -91,6 +118,12 @@ private:
     bool sendTo(Session& session, const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
+    // sendOnPub — send a frame on a raw ExclusivePublication (for redirect path
+    // where no Session is yet created).
+    // -----------------------------------------------------------------------
+    bool sendOnPub(aeron::ExclusivePublication& pub, const uint8_t* buf, std::size_t len);
+
+    // -----------------------------------------------------------------------
     // Resolve a new ExclusivePublication (bounded wait).
     // Returns nullptr if the publication cannot be resolved within the deadline.
     // -----------------------------------------------------------------------
@@ -104,11 +137,17 @@ private:
     std::string                          clientChannel_;
     int32_t                              clientStreamId_;
     int32_t                              thisNodeId_;
+    int64_t                              sessionTimeoutNs_;
+    std::function<LeaderView()>          leaderView_;
 
     std::shared_ptr<aeron::Subscription> sub_;
     aeron::FragmentAssembler             assembler_;
 
     SessionTable                         sessions_;
+
+    // Scratch buffer for reap ID collection (avoids heap allocation per frame).
+    // Populated and drained entirely within reapExpired() — single-writer, safe.
+    std::vector<int64_t>                 reapScratch_;
 
     // Reusable encode scratch — 64 KiB covers any Milestone-A frame.
     // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB)

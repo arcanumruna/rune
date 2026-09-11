@@ -1,4 +1,4 @@
-// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4).
+// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5).
 
 #include <rune/gateway/ClientGateway.h>
 
@@ -23,14 +23,18 @@ static constexpr int kResolveSliceMs = 1;
 // ---------------------------------------------------------------------------
 // ClientGateway constructor
 // ---------------------------------------------------------------------------
-ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron> aeron,
-                             std::string                   clientChannel,
-                             int32_t                       clientStreamId,
-                             int32_t                       thisNodeId)
+ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
+                             std::string                     clientChannel,
+                             int32_t                         clientStreamId,
+                             int32_t                         thisNodeId,
+                             int64_t                         sessionTimeoutNs,
+                             std::function<LeaderView()>     leaderView)
     : aeron_(std::move(aeron))
     , clientChannel_(std::move(clientChannel))
     , clientStreamId_(clientStreamId)
     , thisNodeId_(thisNodeId)
+    , sessionTimeoutNs_(sessionTimeoutNs)
+    , leaderView_(std::move(leaderView))
     , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
                         aeron::util::index_t             offset,
                         aeron::util::index_t             length,
@@ -56,12 +60,37 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron> aeron,
 }
 
 // ---------------------------------------------------------------------------
-// doWork — poll ingress; returns fragment count
+// doWork — poll ingress; reap expired sessions; returns fragment count
 // ---------------------------------------------------------------------------
 int ClientGateway::doWork(int64_t nowNs) {
     nowNs_ = nowNs;
     constexpr int kFragmentLimit = 10;
-    return sub_->poll(assembler_.handler(), kFragmentLimit);
+    int work = sub_->poll(assembler_.handler(), kFragmentLimit);
+    reapExpired(nowNs);
+    return work;
+}
+
+// ---------------------------------------------------------------------------
+// reapExpired — remove sessions idle beyond sessionTimeoutNs_.
+//
+// Uses injected nowNs ONLY (no wall-clock).  Bounded O(n) scan.
+// Two-phase: collect expired IDs into reapScratch_ (pre-allocated vector),
+// then erase them — avoids iterator invalidation.
+// ---------------------------------------------------------------------------
+void ClientGateway::reapExpired(int64_t nowNs) {
+    reapScratch_.clear();
+
+    sessions_.forEach([&](Session& s) {
+        if (nowNs - s.lastSeenNs > sessionTimeoutNs_) {
+            reapScratch_.push_back(s.sessionId);
+        }
+    });
+
+    for (int64_t sid : reapScratch_) {
+        sessions_.remove(sid);
+        // Removing from sessions_ resets the shared_ptr → Aeron releases the
+        // ExclusivePublication once no other holder exists.
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +136,12 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 
 // ---------------------------------------------------------------------------
 // handleConnect
+//
+// BR-5 leader-awareness:
+//   - Query leaderView_ (if set).
+//   - If NOT leader AND leaderClientEndpoint non-empty → send ErrorResponse
+//     {code=Redirect, message=leaderClientEndpoint} and do NOT create a session.
+//   - If leader (or hook unset/leader-unknown) → accept as BR-4.
 // ---------------------------------------------------------------------------
 void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
@@ -114,6 +149,41 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     if (!reqOpt) return; // truncated — drop
 
     const auto& req = *reqOpt;
+
+    // -----------------------------------------------------------------------
+    // BR-5: check leadership before creating a session.
+    // -----------------------------------------------------------------------
+    if (leaderView_) {
+        const LeaderView lv = leaderView_();
+        if (!lv.isLeader && !lv.leaderClientEndpoint.empty()) {
+            // REDIRECT: resolve a temporary egress to the client, send the
+            // redirect response, then drop the publication (no session stored).
+            auto pub = resolvePublication(std::string(req.egressChannel), req.egressStreamId);
+            if (!pub) return; // can't reach client — drop
+
+            pc::ErrorResponse err;
+            err.sessionId     = 0;
+            err.correlationId = req.correlationId;
+            err.code          = static_cast<int16_t>(pc::ErrorCode::Redirect);
+            err.message       = lv.leaderClientEndpoint;
+
+            // Guard: message must fit in scratch.
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2 +
+                                       lv.leaderClientEndpoint.size();
+            if (needed <= scratch_.size()) {
+                const std::size_t encoded = err.encode(scratch_.data());
+                sendOnPub(*pub, scratch_.data(), encoded);
+            }
+            // pub goes out of scope → ExclusivePublication released (no session created).
+            return;
+        }
+        // else: leader-unknown (empty endpoint) → degrade to local accept below.
+    }
+
+    // -----------------------------------------------------------------------
+    // Normal accept path (BR-4 + leader path).
+    // -----------------------------------------------------------------------
 
     // Allocate a new sessionId.
     const int64_t sessionId = sessions_.nextSessionId();
@@ -193,7 +263,16 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len)
 {
-    auto& pub = *session.egress;
+    return sendOnPub(*session.egress, buf, len);
+}
+
+// ---------------------------------------------------------------------------
+// sendOnPub — send on a raw ExclusivePublication (used by redirect path).
+// ---------------------------------------------------------------------------
+bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
+                              const uint8_t*               buf,
+                              std::size_t                  len)
+{
     if (!pub.isConnected()) return false;
 
     auto* mutableBuf = const_cast<uint8_t*>(buf);
