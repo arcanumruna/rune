@@ -594,3 +594,66 @@ Residual niche gaps still NOT covered (low severity — hardening, not correctne
   decoders) are non-blocking.
 - Part B: coverage adequate for correctness; 7 residual niche/interaction tests listed above would raise it from
   "strong" to "exhaustive" (none guards an unproven correctness property — all are belt-and-suspenders).
+
+---
+
+## Final re-audit (commit 3714879)
+
+**Scope.** Fresh whole-library pass over `libs/transaction/**` (Types, ProducerIdAllocator,
+TransactionCoordinator, TransactionLog, TransactionMessages, ControlMarker — headers, src, and all 5 test files),
+cross-referenced against `libs/storage/include/rune/storage/ProducerStateManager.h`. Verified the round-2 L1/L2
+hardening and the 7 residual tests applied on top of the round-2-CLEAN state (dcd1bb0). No code modified.
+
+### L1 — persisted state-byte validation (VERIFIED)
+`TransactionLog.cpp:329-331` computes `kMaxValidState = uint8(PrepareEpochFence) = 7` and `break`s replay when
+`stateRaw > 7`, BEFORE `applyEntry()`. `TxnState` is a `uint8_t` enum with contiguous enumerators 0..7, so every
+byte 0-7 maps to a defined enumerator and 8..255 is rejected — no out-of-range enum is reachable. The check runs
+after the partition loop, so a CRC-valid record with a bad state byte is stopped cleanly (torn-tail semantics,
+identical to a CRC failure): tail truncated, prior good records preserved, log remains writable. Test
+`InvalidStateByteRejectedEvenWithValidCrc` (flips state→0xFF, recomputes a valid CRC) confirms rejection + survival
+of the preceding record + post-truncation writability. No regression: all valid states 0..7 still replay (250-test
+suite green, including every existing replay/round-trip test).
+
+### L2 — bounds-checked Response decoders (VERIFIED)
+`InitProducerIdResponseMsg`, `AddPartitionsToTxnResponseMsg`, `EndTxnResponseMsg` each gained an `avail`-based
+`decode()` overload (`TransactionMessages.h:336-349, 450-461, 559-570`) returning `std::optional`, each guarding
+`pos + BLOCK_LENGTH > end`. All four Request decoders were already bounds-checked (A3/A4). Repo-wide grep confirms
+these Response types have NO external consumers and the unchecked 2-param overloads have NO non-test callers, so no
+public decode path (request or response) can over-read a truncated buffer. Legacy 2-param overloads are unchanged
+and behaviour-preserving (`L2LegacyTwoParamDecodeUnchanged`). Truncation sweeps `avail ∈ [0,n)` return `nullopt`
+for all three responses.
+
+### 7 residual tests (ALL REAL, ALL GREEN)
+Residual1 (INT64_MAX recovered pid → `reseedAtLeast` parks `next_` at INT64_MAX → `allocate()` returns
+`kExhausted`, never a recycled pid); Residual2 (overflow-fence + crash-injected PrepareAbort with deferred
+pendingNewProducerId + reseed: OLD pid on abort marker, deferred fresh pid adopted at Complete, next fresh alloc
+strictly `> kFreshPid`); Residual3 (resolve → reopen same log → `pendingMarkerTransactions()` empty → second resolve
+emits 0 markers = idempotent, no duplicate ABORTs); Residual4 (addPartitions → `kInvalidTransition` in BOTH
+CompleteAbort and PrepareEpochFence); Residual6 `CrcBoundaryOffByOneHandledCorrectly` (avail=SIZE-1 rejected,
+last-covered-byte flip caught by CRC, avail=SIZE+1 ok); Residual7 `TopicLenOverrunsTotalLengthRejected` (CRC-valid
+header with in-body topicLen=0xFFFF → replay per-tuple bounds `break`, no over-read, record not applied);
+Residual5 `ExtractAtNonZeroOffset` (already present, confirmed: extract at pad=37 offset round-trips). None guards
+an unproven correctness property — all are belt-and-suspenders confirmations of already-correct code.
+
+### Whole-library re-scan (A1–A7 + prior fixes still hold)
+- **EOS / PID-reuse (A1/A2):** coordinator ctor reseeds allocator past `max(producerId, pendingNewProducerId)`
+  across all recovered metadata; cross-ref confirms `ProducerStateManager` dedup/epoch is keyed by
+  `(producerId, partition)`, so reseed is the correct guard against a silent EOS break. No path recycles a live pid.
+- **Atomicity / durability (C2, endTransaction):** Prepare*/Complete* persisted+fsynced before markers and before
+  Empty; overflow (NEW-1) keeps OLD identity through PrepareAbort and adopts the deferred pid only at CompleteAbort.
+- **Overflow/exhaustion:** `allocate()` and `reseedAtLeast()` both clamp at INT64_MAX with no signed wrap to a
+  negative pid that would collide with the -1 sentinel.
+- **Unsafe decode / boundary (A3/A4/A5/S1/S2):** every public ingress decode is `avail`-bounded; all length-prefixed
+  encoders reject `>uint16` inputs rather than truncating; `isControlBatch`/`extract` are CRC-first with
+  bounds-checked varints and a required (no-default) `avail`; replay bounds use `totalLength - kChecksumSize` with
+  the `totalLength >= kFixedHeaderSize + kChecksumSize` guard preventing underflow.
+- **Concurrency:** CRC32C table init is `std::call_once` in both TransactionLog and ControlMarker (A6); single-writer
+  model intact. Suite is stable across 3 shuffled seeds (no hidden shared-state coupling).
+
+### Coverage
+Now exhaustive for correctness: the round-1 residual gaps (#3,#4,#5,#6,#7 above) are all closed by the 7 new tests;
+L1 and L2 each have dedicated pass/fail + boundary tests. No material property is left untested.
+
+### Verdict
+**CLEAN — libs/transaction section CERTIFIED DONE.** 250/250 transaction tests pass (seq and shuffled ×3; the
+commit message's "175" undercounts the current binary — zero failures either way). Zero material findings.
