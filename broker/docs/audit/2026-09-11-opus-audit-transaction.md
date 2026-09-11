@@ -657,3 +657,82 @@ L1 and L2 each have dedicated pass/fail + boundary tests. No material property i
 ### Verdict
 **CLEAN — libs/transaction section CERTIFIED DONE.** 250/250 transaction tests pass (seq and shuffled ×3; the
 commit message's "175" undercounts the current binary — zero failures either way). Zero material findings.
+
+---
+
+# P5-4 review (commit a10d765)
+
+Date: 2026-09-11. Reviewer: Opus. Scope: read-committed isolation — `ReadCommittedView.{h,cpp}`,
+`ReadCommittedViewTest.cpp`, `ControlMarker.{h,cpp}`, storage `Log`, protocol `RecordBatch`. Read-only.
+
+## Part A — bug audit: **CLEAN** (no correctness bugs; 1 cleanliness finding)
+
+### LSO correctness — CORRECT
+- `LsoTracker::lso()` returns `hw` when no open txns (ReadCommittedView.cpp:157-159) and `min(firstOffset)`
+  over open txns via `byFirstOffset_.begin()` (:162), clamped to `[0,hw]` (:164-166). LSO ≤ HW always;
+  first-open-wins; out-of-start-order commit does NOT advance past a still-open earlier txn (`byFirstOffset_`
+  is a sorted min over VALUES, not keys — verified by `LsoIsMinFirstOffsetNotMinPid`, `ThreeProducers*`).
+- Monotonicity: resolving a txn only erases entries, so `min(firstOffset)` can only rise or jump to HW.
+  A reused PID's *next* txn opens at a higher offset (later append) → LSO non-decreasing.
+- `onProduceBatch` keeps the earliest firstOffset for a multi-batch txn (:127-133). Correct.
+
+### Aborted-txn index — CORRECT
+- ABORT marker records range `[firstDataOffset, abortMarkerOffset]` (onAbortMarker :184; contains() inclusive,
+  header:89-91). `isAborted` matches on `producerId` AND offset-in-range (:192-198), so a different producer's
+  batch at the same offset is never wrongly filtered.
+- Committed txns are never inserted (rebuild only calls `onAbortMarker` when `!commit`, :283-287). Verified
+  `CommittedTxnNotInIndex`.
+- **PID reuse across sequential txns is disambiguated by offset ranges, not epoch.** Producer epoch is NOT a
+  key (openTxns_/index key on PID only). This is SAFE on a single partition: Kafka permits only one open txn
+  per PID per partition, and a reused PID's second txn opens at a strictly higher offset than the first txn's
+  abort-marker offset, so its data cannot fall inside the first (aborted) range. abort-then-commit-same-PID is
+  correct by construction (though NOT directly tested — see Part B).
+
+### read_committed / read_uncommitted filter — CORRECT
+- `limit = lso(hw)` (committed) or `hw` (uncommitted) (read :326-328); `fetchOffset >= limit` short-circuits (:330).
+- **Straddling boundary handled via `lastOff = base + lastOffsetDelta; if (lastOff >= limit) break;`**
+  (:380-381) — identical to the replication NB3 fix (PartitionReplica.cpp:339). No record ≥ LSO/HW leaks.
+- Control batches never emitted: `if (ctrl) { skip }` in BOTH modes (:384-387). Verified
+  `ControlBatchesNeverReturnedInEitherMode`.
+- Aborted data skipped only in ReadCommitted via `continue` (not break) so committed batches after an aborted
+  one are still returned (:390-395; `ThreeProducersMixedCommitAbort`).
+- Dual-endian producerId extraction is correct: BE at [43] for data (extractProducerId :51-58), LE via
+  ControlMarker::extract for control (:45-49). `isControlBatch` requires avail≥75 + magic + CRC32C, so a data
+  batch cannot be misclassified as control (CRC collision is cryptographically implausible).
+
+### Incremental vs rebuild — SAME RESULT; **FINDING P5-4-C1 (cleanliness, LOW)**
+- Incremental path (onProduceBatch/onControlMarker + onAbortMarker) and rebuild() converge — proven by
+  `IncrementalUpdatesMatchRebuild`.
+- `rebuild()` contains a **dead first pass** (ReadCommittedView.cpp:220-247): a full `walkBatches` scan whose
+  control-marker branch is a self-admitted no-op ("But we lost the pointer here", :234-239) and whose results
+  are unconditionally discarded by `clear()` at :251-252 before the real second pass (:254-309) runs.
+  Truly dead — not a correctness bug — but it DOUBLES rebuild I/O (two full log reads of the whole partition)
+  and is confusing. Recommend deleting lines 220-252's first block. Severity: LOW (perf/clean-code).
+
+### Boundaries — CORRECT
+- Empty partition (`hw<=0` early return, rebuild :211; read short-circuit), all-aborted, all-committed,
+  fetchOffset>HW, read exactly at LSO, HW=0 all covered and pass. No offset overflow (int64 throughout; the
+  only int32 cast is the maxBytes soft cap :400, bounded by maxBytes). Single-writer; no spin; no locks.
+
+### CMake — NO CYCLE
+- `rune_transaction` PUBLIC-links `rune_storage` (CMakeLists.txt:15). `rune_storage` links no internal lib;
+  `rune_replication`→`rune_storage` only. No path back to `rune_transaction`. Confirmed acyclic.
+
+## Part B — edge-case coverage: 8 niche cases NOT tested (all currently-correct by code, but unguarded)
+1. **Abort-then-commit, SAME PID, sequential txns** (the PID-reuse disambiguation guarantee) — the single most
+   valuable missing test; nothing currently pins that txn B's data escapes txn A's aborted range.
+2. **Out-of-start-order COMMIT via the log/rebuild path** (LsoTracker unit tests cover it, but no rebuild()
+   test writes marker-for-younger-txn-before-older and asserts LSO stays pinned).
+3. **ABORT marker with NO data batches** (empty aborted txn): onAbortMarker gets firstOff==markerOff; harmless
+   but untested.
+4. **Oldest open txn's firstOffset == HW** (txn opens exactly at HW boundary) — LSO clamp interaction untested.
+5. **Aborted-range boundary off-by-one at the marker offset** for a *data* batch landing exactly at last
+   (only control lands there today, but no negative test at firstOffset-1 / lastOffset via read()).
+6. **Control batch at offset 0** (partition begins with a marker for an unknown PID) — rebuild robustness.
+7. **maxBytes soft cap** — no test exercises the multi-batch byte-cap/"always return ≥1 batch" path (:399-402).
+8. **Very large aborted index** (O(ranges) linear `isAborted` scan) — no scale/perf guard.
+
+## Verdict
+Part A: **CLEAN** for exactly-once visibility — read_committed provably never exposes an uncommitted or aborted
+record, and LSO is correct/monotone. One LOW cleanliness finding (P5-4-C1: dead first pass in rebuild(),
+lines 220-252). Part B: 8 recommended tests (top: same-PID abort-then-commit; out-of-order commit via rebuild).

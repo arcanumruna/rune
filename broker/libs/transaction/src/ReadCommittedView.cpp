@@ -217,40 +217,9 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     auto raw = log->read(0, kMaxScanBytes);
     if (raw.empty()) return;
 
-    walkBatches(raw.data(), raw.size(),
-        [this, hw](const uint8_t* /*batchStart*/, std::size_t /*batchBytes*/,
-                   int64_t baseOffset, int32_t lastOffDelta,
-                   bool isControl, int64_t producerId) -> bool
-        {
-            // Stop before any batch that starts at or beyond HW.
-            if (baseOffset >= hw) return false;
-
-            if (isControl) {
-                // Decode the control marker to get COMMIT/ABORT.
-                // We need the full batch pointer — re-derive from log; instead
-                // we use a local decode via ControlMarker::extract on the span
-                // we already walked.  Trick: the walkBatches callback receives
-                // a pointer to batchStart.
-                // But we lost the pointer here.  Fix: capture via outer closure.
-                // Actually `batchStart` is a parameter — re-read below.
-                // The lambda can't re-read it here.  We restructure: see below.
-                (void)lastOffDelta;
-                (void)producerId;
-                // We'll handle this in a restructured walk — see below.
-                return true;
-            } else {
-                if (producerId >= 0) {
-                    tracker_->onProduceBatch(producerId, baseOffset);
-                }
-            }
-            return true;
-        });
-
-    // Restart with a corrected walk that passes the batchStart pointer
-    // properly into the control-marker branch.
-    tracker_->clear();
-    abortedIndex_->clear();
-
+    // Single-pass scan: walk batches, handling both data and control batches
+    // correctly.  A previous two-pass approach (dead first pass whose results
+    // were discarded by a clear()) doubled rebuild I/O and was removed (P5-4-C1).
     {
         std::size_t pos = 0;
         const uint8_t* data = raw.data();

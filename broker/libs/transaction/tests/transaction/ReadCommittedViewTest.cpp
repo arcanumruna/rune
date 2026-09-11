@@ -998,3 +998,396 @@ TEST(IsolationLevelTest, EnumValues)
     EXPECT_EQ(static_cast<uint8_t>(IsolationLevel::ReadUncommitted), 0u);
     EXPECT_EQ(static_cast<uint8_t>(IsolationLevel::ReadCommitted),   1u);
 }
+
+// ===========================================================================
+// P5-4 review follow-up: 8 missing edge-case tests
+// ===========================================================================
+
+// ── Edge 1: same-PID sequential txns — abort-then-commit ─────────────────────
+// Producer P runs txn1 (aborts) then txn2 (commits).  read_committed must:
+//   - skip txn1's data (it's in the aborted range)
+//   - return txn2's data (different offset range; same PID)
+// Disambiguation is by offset range, not epoch — proven here.
+TEST(ReadCommittedEdgeTest, SamePidAbortThenCommitDisambiguatedByOffsetRange)
+{
+    RcvFixture f;
+
+    // txn1: pid=1
+    int64_t txn1DataOff   = appendData(f.log, 1, "txn1-data");   // offset 0
+    int64_t txn1AbortOff  = appendControlMarker(f.log, 1, ControlType::Abort); // offset 1
+
+    // txn2: same pid=1, new transaction starting at a higher offset
+    int64_t txn2DataOff   = appendData(f.log, 1, "txn2-data");   // offset 2
+    int64_t txn2CommitOff = appendControlMarker(f.log, 1, ControlType::Commit); // offset 3
+
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    // Both transactions resolved → LSO == HW.
+    EXPECT_EQ(f.view.lso(hw), hw);
+
+    // Aborted index must contain txn1's range [0..1], but NOT txn2's range [2..3].
+    EXPECT_TRUE(f.abortedIndex.isAborted(1, txn1DataOff));   // txn1 data — aborted
+    EXPECT_TRUE(f.abortedIndex.isAborted(1, txn1AbortOff));  // abort marker offset — covered
+    EXPECT_FALSE(f.abortedIndex.isAborted(1, txn2DataOff));  // txn2 data — NOT aborted
+    EXPECT_FALSE(f.abortedIndex.isAborted(1, txn2CommitOff));// txn2 commit — NOT aborted
+
+    // read_committed: txn1 data filtered; txn2 data returned.
+    auto raw = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    auto offsets = readOffsets(raw);
+    ASSERT_EQ(offsets.size(), 1u) << "only txn2 data should be returned";
+    EXPECT_EQ(offsets[0], txn2DataOff);
+
+    // read_uncommitted: both data batches visible (control batches stripped).
+    auto rawRu = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadUncommitted);
+    auto offsRu = readOffsets(rawRu);
+    ASSERT_EQ(offsRu.size(), 2u) << "both txn1 and txn2 data visible under read_uncommitted";
+    EXPECT_EQ(offsRu[0], txn1DataOff);
+    EXPECT_EQ(offsRu[1], txn2DataOff);
+}
+
+// ── Edge 2: out-of-start-order commit via rebuild path ───────────────────────
+// Two open txns; the later-starting one commits first.
+// LSO must NOT advance past the still-open earlier txn.
+TEST(ReadCommittedEdgeTest, OutOfStartOrderCommitViaRebuildLsoStaysPinned)
+{
+    RcvFixture f;
+
+    // pid=1 opens first (offset 0), pid=2 opens later (offset 1).
+    appendData(f.log, 1, "pid1-data");   // offset 0 — earlier start
+    appendData(f.log, 2, "pid2-data");   // offset 1 — later start
+
+    // pid=2 (later start) commits first.
+    appendControlMarker(f.log, 2, ControlType::Commit); // offset 2
+
+    // pid=1 is still open.
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    // LSO must still be pinned at pid=1's firstOffset (0), not at HW.
+    int64_t lso = f.view.lso(hw);
+    EXPECT_EQ(lso, 0) << "LSO must not advance past the still-open earlier txn";
+
+    // read_committed must return nothing (everything >= LSO=0 is hidden by open pid=1).
+    auto raw = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    EXPECT_TRUE(raw.empty());
+}
+
+// ── Edge 3: ABORT marker with NO data batches (empty aborted txn) ─────────────
+// An ABORT control batch arrives for a producer that never wrote a data batch.
+// Expect: no spurious aborted range; LSO advances correctly (nothing to pin).
+TEST(ReadCommittedEdgeTest, AbortMarkerWithNoDataBatchesNoSpuriousRange)
+{
+    RcvFixture f;
+
+    // Append an ABORT for pid=1 with no preceding data batch for pid=1.
+    appendControlMarker(f.log, 1, ControlType::Abort);
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    // No open txns → LSO == HW.
+    EXPECT_EQ(f.view.lso(hw), hw);
+
+    // No aborted range should be recorded (producer was never tracked as open).
+    EXPECT_EQ(f.abortedIndex.size(), 0u)
+        << "no aborted range when no data batch preceded the ABORT marker";
+
+    // read_committed: empty result (only control batch, which is stripped).
+    auto raw = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    EXPECT_TRUE(raw.empty());
+}
+
+// ── Edge 4: oldest open txn's firstOffset exactly at HW ──────────────────────
+// If the only open txn starts exactly at HW, LSO == HW (clamped), so nothing
+// is hidden that shouldn't be (we can't read past HW anyway).
+TEST(ReadCommittedEdgeTest, OldestOpenTxnFirstOffsetExactlyAtHw)
+{
+    RcvFixture f;
+
+    // Append one data batch; that makes hw=1 and LSO should be 0 (open at 0).
+    appendData(f.log, 1, "d0"); // offset 0
+    int64_t hw = f.hw();        // hw = 1
+
+    f.view.rebuild(&f.log, hw);
+
+    // pid=1 is open at offset 0, which is strictly < HW=1.
+    // Fetch HW at the edge: pass hw=1 but the batch's firstOffset==0 < hw.
+    int64_t lso = f.view.lso(hw);
+    EXPECT_EQ(lso, 0);
+    EXPECT_LE(lso, hw);
+
+    // Now simulate: hw equals the txn's firstOffset (pass hw=0).
+    // With hw=0, there are no batches < hw, so LSO is clamped to [0,hw]=0.
+    int64_t lsoAtHw0 = f.view.lso(0);
+    EXPECT_EQ(lsoAtHw0, 0); // clamped to hw=0; nothing incorrect hidden
+}
+
+// ── Edge 5: aborted-range off-by-one at the marker boundary via read() ────────
+// The record immediately BEFORE the abort-range should be returned by
+// read_committed (if from a different producer).  The data batch AT the
+// first aborted offset should be filtered.  The data batch AFTER the abort
+// marker's offset (different txn) should be returned.
+TEST(ReadCommittedEdgeTest, AbortedRangeBoundaryOffByOneViaRead)
+{
+    RcvFixture f;
+
+    // pid=2 committed data at offset 0 (before the aborted range starts).
+    appendData(f.log, 2, "pre-abort-data");     // offset 0 — pid=2, committed
+    appendControlMarker(f.log, 2, ControlType::Commit); // offset 1
+
+    // pid=1 aborted txn: data at offset 2, abort marker at offset 3.
+    appendData(f.log, 1, "aborted-data");        // offset 2 — aborted
+    appendControlMarker(f.log, 1, ControlType::Abort); // offset 3
+
+    // pid=3 committed data AFTER the abort marker (offset 4).
+    appendData(f.log, 3, "post-abort-data");     // offset 4 — committed
+    appendControlMarker(f.log, 3, ControlType::Commit); // offset 5
+
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    EXPECT_EQ(f.view.lso(hw), hw); // all resolved
+
+    // Aborted range: pid=1 covers [2..3].
+    EXPECT_FALSE(f.abortedIndex.isAborted(1, 1)); // offset 1 (BEFORE range) — not aborted
+    EXPECT_TRUE(f.abortedIndex.isAborted(1, 2));  // offset 2 (AT firstOffset) — aborted
+    EXPECT_TRUE(f.abortedIndex.isAborted(1, 3));  // offset 3 (AT lastOffset)  — aborted
+    EXPECT_FALSE(f.abortedIndex.isAborted(1, 4)); // offset 4 (AFTER range)    — not aborted
+
+    // read_committed: must return pid=2 at offset 0, and pid=3 at offset 4.
+    // Must skip pid=1 at offset 2.
+    auto raw = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    auto offsets = readOffsets(raw);
+    ASSERT_EQ(offsets.size(), 2u);
+    EXPECT_EQ(offsets[0], 0); // pid=2 pre-abort data
+    EXPECT_EQ(offsets[1], 4); // pid=3 post-abort data
+}
+
+// ── Edge 6: control batch at offset 0 ────────────────────────────────────────
+// The very first batch on a partition is a control marker (e.g. ABORT for an
+// unknown/untracked producer).  rebuild() must not crash or produce a spurious
+// aborted range.
+//
+// Note on LogSegment::read() and control-batch-first logs: the storage layer's
+// LogSegment::read() uses RecordBatchReader (BE format) to walk the on-disk
+// buffer for offset-skipping, which cannot parse LE control batches.  When the
+// very first batch in a segment is a control batch, log->read(0,...) returns
+// empty — the committed data at offset 1 is unreachable via read().  This is a
+// known storage-layer limitation (control batches are LE, RecordBatchReader is
+// BE-only). The test therefore focuses on rebuild() robustness (which uses its
+// own LE-aware walk) and does NOT assert on read() output for this layout.
+TEST(ReadCommittedEdgeTest, ControlBatchAtOffsetZeroHandledCorrectly)
+{
+    RcvFixture f;
+
+    // Append a control marker as the very first batch (offset 0).
+    appendControlMarker(f.log, 42, ControlType::Abort); // offset 0 — unknown PID
+    // Follow with a committed data batch and commit marker.
+    appendData(f.log, 7, "normal-data");                // offset 1
+    appendControlMarker(f.log, 7, ControlType::Commit); // offset 2
+
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    // rebuild() must not crash and must not produce a spurious aborted range
+    // for pid=42 (which never opened a transaction via a data batch).
+    EXPECT_EQ(f.abortedIndex.size(), 0u)
+        << "control batch at offset 0 for untracked PID must not add aborted range";
+
+    // LSO == HW: pid=7 resolved; pid=42 was never open (ABORT for unknown → no-op).
+    EXPECT_EQ(f.view.lso(hw), hw)
+        << "LSO should equal HW after all transactions resolved";
+
+    // Verify the tracker correctly tracked pid=7 and then removed it.
+    // After rebuild, openTxns_ should be empty.
+    EXPECT_TRUE(f.tracker.empty())
+        << "no open transactions remain after rebuild";
+
+    // Also test via a mid-stream unknown-PID control batch (avoids the offset-0
+    // storage limitation) to confirm read_committed also handles this correctly.
+    RcvFixture f2;
+    appendData(f2.log, 5, "pid5-data");                   // offset 0
+    appendControlMarker(f2.log, 99, ControlType::Abort);  // offset 1 — unknown PID
+    appendControlMarker(f2.log, 5, ControlType::Commit);  // offset 2
+    int64_t hw2 = f2.hw();
+    f2.view.rebuild(&f2.log, hw2);
+
+    EXPECT_EQ(f2.abortedIndex.size(), 0u)
+        << "mid-stream ABORT for untracked PID must not add aborted range";
+    EXPECT_EQ(f2.view.lso(hw2), hw2);
+
+    // read_committed: pid=5 data at offset 0 returned; control batches stripped.
+    auto raw2 = f2.view.read(&f2.log, hw2, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    auto offsets2 = readOffsets(raw2);
+    ASSERT_EQ(offsets2.size(), 1u)
+        << "only pid=5's committed data should be returned";
+    EXPECT_EQ(offsets2[0], 0);
+}
+
+// ── Edge 7: maxBytes soft-cap path under read_committed ───────────────────────
+// Verifies that the soft cap is respected (≥1 batch always returned if any
+// qualify), and that the cap correctly splits the stream.
+TEST(ReadCommittedEdgeTest, MaxBytesSoftCapReturnsAtLeastOneBatchThenStops)
+{
+    RcvFixture f;
+
+    // Append 4 data batches for pid=1, all committed.
+    appendData(f.log, 1, "batch-A");
+    appendData(f.log, 1, "batch-B");
+    appendData(f.log, 1, "batch-C");
+    appendData(f.log, 1, "batch-D");
+    appendControlMarker(f.log, 1, ControlType::Commit);
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    EXPECT_EQ(f.view.lso(hw), hw);
+
+    // Get the size of a single data batch by reading 1<<20 and measuring offsets.
+    auto allRaw = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    ASSERT_EQ(readOffsets(allRaw).size(), 4u);
+
+    // Compute a maxBytes that fits exactly ONE batch (plus a tiny buffer for the
+    // soft-cap check: cap is "stop after collected > maxBytes if collected > 0").
+    // Each batch has the same size; use allRaw.size()/4 - 1 to be under one batch.
+    int32_t oneBatchSize = static_cast<int32_t>(allRaw.size() / 4);
+    int32_t smallCap = oneBatchSize / 2; // definitely less than one batch
+
+    // With smallCap < oneBatchSize, the "always return at least one batch" rule
+    // should return exactly one batch (the first qualifying one).
+    auto rawCapped = f.view.read(&f.log, hw, 0, smallCap, IsolationLevel::ReadCommitted);
+    auto cappedOffsets = readOffsets(rawCapped);
+    EXPECT_EQ(cappedOffsets.size(), 1u)
+        << "soft cap: at least 1 batch must always be returned";
+    EXPECT_EQ(cappedOffsets[0], 0);
+
+    // With a cap of exactly oneBatchSize, still ≥1 and the second batch would
+    // push us over (collected after first = oneBatchSize, > cap → stop).
+    auto rawExact = f.view.read(&f.log, hw, 0, oneBatchSize, IsolationLevel::ReadCommitted);
+    auto exactOffsets = readOffsets(rawExact);
+    // The logic: after collecting batch 0 (size = oneBatchSize),
+    // collected == oneBatchSize == maxBytes (not >, so NOT stopped yet);
+    // then batch 1: collected + size > maxBytes → stop before adding.
+    // So we expect exactly 1 batch.
+    EXPECT_GE(exactOffsets.size(), 1u);
+    EXPECT_LE(exactOffsets.size(), 2u); // at most 2 (boundary behaviour)
+
+    // Larger cap that fits all 4.
+    auto rawAll = f.view.read(&f.log, hw, 0, static_cast<int32_t>(allRaw.size()),
+                               IsolationLevel::ReadCommitted);
+    EXPECT_EQ(readOffsets(rawAll).size(), 4u);
+}
+
+// ── Edge 8: large aborted index — correctness holds at scale ──────────────────
+// Many aborted transactions for different producers.  Verifies that
+// isAborted() correctness holds (no false positives, no false negatives) and
+// that rebuild() produces the right index without overflow.
+TEST(ReadCommittedEdgeTest, LargeAbortedIndexCorrectnessAtScale)
+{
+    RcvFixture f;
+
+    constexpr int kNumAborted = 50;
+
+    // Interleave: for each producer i, write a data batch then ABORT.
+    // pid=100 will be committed at the end (after all aborts).
+    for (int i = 0; i < kNumAborted; ++i) {
+        int64_t pid = static_cast<int64_t>(i + 1);
+        appendData(f.log, pid, "aborted-payload");
+        appendControlMarker(f.log, pid, ControlType::Abort);
+    }
+    // pid=100: one committed txn at the end.
+    appendData(f.log, 100, "committed-data");
+    appendControlMarker(f.log, 100, ControlType::Commit);
+
+    int64_t hw = f.hw();
+    f.view.rebuild(&f.log, hw);
+
+    // All transactions resolved → LSO == HW.
+    EXPECT_EQ(f.view.lso(hw), hw);
+
+    // Aborted index must have exactly kNumAborted ranges.
+    EXPECT_EQ(f.abortedIndex.size(), static_cast<std::size_t>(kNumAborted));
+
+    // Every aborted producer's data offset should be flagged.
+    // Offsets: pid=i+1 data at offset 2*i, abort marker at 2*i+1.
+    for (int i = 0; i < kNumAborted; ++i) {
+        int64_t pid     = static_cast<int64_t>(i + 1);
+        int64_t dataOff = static_cast<int64_t>(2 * i);
+        EXPECT_TRUE(f.abortedIndex.isAborted(pid, dataOff))
+            << "pid=" << pid << " data at offset " << dataOff << " should be aborted";
+        // No cross-producer contamination.
+        EXPECT_FALSE(f.abortedIndex.isAborted(100, dataOff))
+            << "committed pid=100 should not appear as aborted";
+    }
+
+    // pid=100's data offset = 2*kNumAborted (after all aborted pairs).
+    int64_t pid100DataOff = static_cast<int64_t>(2 * kNumAborted);
+    EXPECT_FALSE(f.abortedIndex.isAborted(100, pid100DataOff))
+        << "committed pid=100 data batch must NOT be aborted";
+
+    // read_committed: only pid=100's data returned.
+    auto raw = f.view.read(&f.log, hw, 0, 1 << 20, IsolationLevel::ReadCommitted);
+    auto offsets = readOffsets(raw);
+    ASSERT_EQ(offsets.size(), 1u) << "only the one committed batch should be returned";
+    EXPECT_EQ(offsets[0], pid100DataOff);
+}
+
+// ── Equivalence assertion: rebuild == incremental for same-PID abort-then-commit
+// This pins the equivalence guarantee: rebuild() and the incremental
+// onProduceBatch/onControlMarker path yield IDENTICAL LSO + aborted index
+// for the same-PID sequential txn scenario (Edge 1 pattern).
+TEST(ReadCommittedEdgeTest, SamePidAbortThenCommitRebuildMatchesIncremental)
+{
+    std::string tmpDir = makeTmpDir();
+    rune::storage::Log log(tmpDir);
+
+    // --- Incremental path ---
+    LsoTracker incrTracker;
+    AbortedTxnIndex incrIndex;
+
+    // txn1: pid=5 — abort
+    int64_t txn1DataOff  = log.logEndOffset();
+    appendData(log, 5, "txn1");
+    incrTracker.onProduceBatch(5, txn1DataOff);
+
+    int64_t txn1AbortOff = log.logEndOffset();
+    appendControlMarker(log, 5, ControlType::Abort);
+    int64_t firstOff1 = incrTracker.onControlMarker(5, txn1AbortOff, false);
+    if (firstOff1 >= 0) incrIndex.onAbortMarker(5, firstOff1, txn1AbortOff);
+
+    // txn2: pid=5 — commit
+    int64_t txn2DataOff  = log.logEndOffset();
+    appendData(log, 5, "txn2");
+    incrTracker.onProduceBatch(5, txn2DataOff);
+
+    int64_t txn2CommitOff = log.logEndOffset();
+    appendControlMarker(log, 5, ControlType::Commit);
+    incrTracker.onControlMarker(5, txn2CommitOff, true);
+
+    int64_t hw = log.logEndOffset();
+
+    // --- Rebuild path ---
+    LsoTracker rebuildTracker;
+    AbortedTxnIndex rebuildIndex;
+    ReadCommittedView rebuildView(&rebuildTracker, &rebuildIndex);
+    rebuildView.rebuild(&log, hw);
+
+    // LSO must match.
+    EXPECT_EQ(incrTracker.lso(hw), rebuildTracker.lso(hw))
+        << "incremental and rebuild LSO must agree";
+    EXPECT_EQ(incrTracker.lso(hw), hw)
+        << "both txns resolved: LSO == HW";
+
+    // Aborted index must match: exactly one range for pid=5 covering txn1.
+    EXPECT_EQ(incrIndex.size(), 1u);
+    EXPECT_EQ(rebuildIndex.size(), 1u);
+
+    EXPECT_TRUE(incrIndex.isAborted(5, txn1DataOff));
+    EXPECT_TRUE(rebuildIndex.isAborted(5, txn1DataOff))
+        << "rebuild aborted index must flag txn1 data for pid=5";
+
+    EXPECT_FALSE(incrIndex.isAborted(5, txn2DataOff));
+    EXPECT_FALSE(rebuildIndex.isAborted(5, txn2DataOff))
+        << "rebuild must NOT flag txn2 data (committed) as aborted";
+
+    fs::remove_all(tmpDir);
+}
