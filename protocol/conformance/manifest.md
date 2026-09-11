@@ -1,0 +1,361 @@
+# Rune Client Protocol — Conformance Vector Manifest
+
+**Schema:** `kSchemaId = 120`, `kProtocolVersion = 1`  
+**Common IDs (all vectors):** `sessionId = 0x1122334455667788`, `correlationId = 0x0A0B0C0D0E0F1011`
+
+All multi-byte integers are **little-endian**.  
+Header layout (24 bytes): `blockLength[2] | templateId[2] | schemaId[2] | version[2] | sessionId[8] | correlationId[8]`
+
+---
+
+## 1. `connect_request.bin` — 67 bytes
+
+**Message:** `ConnectRequest` (templateId = 1)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 8                        | 0x0008                          |
+| templateId      | 1                        | 0x0001                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| egressStreamId  | 1001                     | 0x000003E9                      |
+| clientVersion   | 1                        | 0x00000001                      |
+| egressChannel   | "aeron:udp?endpoint=10.0.0.5:40456" | len=33 (0x0021), 33 bytes UTF-8 |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      08 00                                      blockLength = 8 (LE)
+02      01 00                                      templateId = 1 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      E9 03 00 00                                egressStreamId = 1001 (LE)
+28      01 00 00 00                                clientVersion = 1 (LE)
+32      21 00                                      egressChannel var-len = 33 (LE)
+34      61 65 72 6F 6E 3A 75 64 70 3F 65 6E 64 70  "aeron:udp?endp"
+        6F 69 6E 74 3D 31 30 2E 30 2E 30 2E 35 3A  "oint=10.0.0.5:"
+        34 30 34 35 36                              "40456"
+```
+
+---
+
+## 2. `connect_request_empty_channel.bin` — 34 bytes
+
+**Message:** `ConnectRequest` (templateId = 1)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 8                        | 0x0008                          |
+| templateId      | 1                        | 0x0001                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| egressStreamId  | 1001                     | 0x000003E9                      |
+| clientVersion   | 1                        | 0x00000001                      |
+| egressChannel   | ""                       | len=0 (0x0000)                  |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      08 00                                      blockLength = 8 (LE)
+02      01 00                                      templateId = 1 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      E9 03 00 00                                egressStreamId = 1001 (LE)
+28      01 00 00 00                                clientVersion = 1 (LE)
+32      00 00                                      egressChannel var-len = 0 (LE)
+```
+
+---
+
+## 3. `connect_response.bin` — 38 bytes
+
+**Message:** `ConnectResponse` (templateId = 2)
+
+| Field              | Value (decimal)          | Value (hex)           |
+|--------------------|--------------------------|-----------------------|
+| blockLength        | 14                       | 0x000E                |
+| templateId         | 2                        | 0x0002                |
+| schemaId           | 120                      | 0x0078                |
+| version            | 1                        | 0x0001                |
+| sessionId          | 1234605616436508552      | 0x1122334455667788    |
+| correlationId      | 723685415333974033       | 0x0A0B0C0D0E0F1011    |
+| code               | 0 (OK)                   | 0x0000                |
+| leaderMemberId     | 2                        | 0x00000002            |
+| assignedSessionId  | 3735928559               | 0x00000000DEADBEEF    |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      0E 00                                      blockLength = 14 (LE)
+02      02 00                                      templateId = 2 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      00 00                                      code = 0 / OK (LE)
+26      02 00 00 00                                leaderMemberId = 2 (LE)
+30      EF BE AD DE 00 00 00 00                    assignedSessionId = 0xDEADBEEF (LE)
+```
+
+---
+
+## 4. `connect_response_redirect.bin` — 38 bytes
+
+**Message:** `ConnectResponse` (templateId = 2)
+
+| Field              | Value (decimal)          | Value (hex)           |
+|--------------------|--------------------------|-----------------------|
+| blockLength        | 14                       | 0x000E                |
+| templateId         | 2                        | 0x0002                |
+| schemaId           | 120                      | 0x0078                |
+| version            | 1                        | 0x0001                |
+| sessionId          | 1234605616436508552      | 0x1122334455667788    |
+| correlationId      | 723685415333974033       | 0x0A0B0C0D0E0F1011    |
+| code               | 3 (Redirect)             | 0x0003                |
+| leaderMemberId     | 1                        | 0x00000001            |
+| assignedSessionId  | 0                        | 0x0000000000000000    |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      0E 00                                      blockLength = 14 (LE)
+02      02 00                                      templateId = 2 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      03 00                                      code = 3 / Redirect (LE)
+26      01 00 00 00                                leaderMemberId = 1 (LE)
+30      00 00 00 00 00 00 00 00                    assignedSessionId = 0 (LE)
+```
+
+---
+
+## 5. `keepalive.bin` — 24 bytes
+
+**Message:** `Keepalive` (templateId = 3, BODY_FIXED = 0 — header only)
+
+| Field           | Value (decimal)          | Value (hex)           |
+|-----------------|--------------------------|-----------------------|
+| blockLength     | 0                        | 0x0000                |
+| templateId      | 3                        | 0x0003                |
+| schemaId        | 120                      | 0x0078                |
+| version         | 1                        | 0x0001                |
+| sessionId       | 1234605616436508552      | 0x1122334455667788    |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011    |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      00 00                                      blockLength = 0 (LE)
+02      03 00                                      templateId = 3 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+```
+
+---
+
+## 6. `disconnect.bin` — 26 bytes
+
+**Message:** `Disconnect` (templateId = 4)
+
+| Field           | Value (decimal)          | Value (hex)           |
+|-----------------|--------------------------|-----------------------|
+| blockLength     | 2                        | 0x0002                |
+| templateId      | 4                        | 0x0004                |
+| schemaId        | 120                      | 0x0078                |
+| version         | 1                        | 0x0001                |
+| sessionId       | 1234605616436508552      | 0x1122334455667788    |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011    |
+| reason          | -1                       | 0xFFFF                |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      02 00                                      blockLength = 2 (LE)
+02      04 00                                      templateId = 4 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      FF FF                                      reason = -1 (LE int16)
+```
+
+---
+
+## 7. `error_response.bin` — 53 bytes
+
+**Message:** `ErrorResponse` (templateId = 5)
+
+| Field           | Value (decimal)          | Value (hex)           |
+|-----------------|--------------------------|-----------------------|
+| blockLength     | 2                        | 0x0002                |
+| templateId      | 5                        | 0x0005                |
+| schemaId        | 120                      | 0x0078                |
+| version         | 1                        | 0x0001                |
+| sessionId       | 1234605616436508552      | 0x1122334455667788    |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011    |
+| code            | 4 (SessionExpired)       | 0x0004                |
+| message         | "session 0x1122... expired" | len=25 (0x0019), 25 UTF-8 bytes |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      02 00                                      blockLength = 2 (LE)
+02      05 00                                      templateId = 5 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      04 00                                      code = 4 / SessionExpired (LE)
+26      19 00                                      message var-len = 25 (LE)
+28      73 65 73 73 69 6F 6E 20 30 78 31 31 32 32  "session 0x1122"
+        2E 2E 2E 20 65 78 70 69 72 65 64           "... expired"
+```
+
+---
+
+## 8. `error_response_empty.bin` — 28 bytes
+
+**Message:** `ErrorResponse` (templateId = 5)
+
+| Field           | Value (decimal)          | Value (hex)           |
+|-----------------|--------------------------|-----------------------|
+| blockLength     | 2                        | 0x0002                |
+| templateId      | 5                        | 0x0005                |
+| schemaId        | 120                      | 0x0078                |
+| version         | 1                        | 0x0001                |
+| sessionId       | 1234605616436508552      | 0x1122334455667788    |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011    |
+| code            | 6 (Internal)             | 0x0006                |
+| message         | ""                       | len=0 (0x0000)        |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      02 00                                      blockLength = 2 (LE)
+02      05 00                                      templateId = 5 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      06 00                                      code = 6 / Internal (LE)
+26      00 00                                      message var-len = 0 (LE)
+```
+
+---
+
+## 9. `ping.bin` — 32 bytes
+
+**Message:** `Ping` (templateId = 6, BODY_FIXED = 0)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 0                        | 0x0000                          |
+| templateId      | 6                        | 0x0006                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| echo            | binary 6 bytes           | len=6 (0x0006); bytes: 00 01 02 FF FE 00 |
+
+Note: echo contains embedded NUL bytes and 0xFF — intentionally non-UTF-8.
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      00 00                                      blockLength = 0 (LE)
+02      06 00                                      templateId = 6 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      06 00                                      echo var-len = 6 (LE)
+26      00 01 02 FF FE 00                          echo bytes (binary)
+```
+
+---
+
+## 10. `pong.bin` — 32 bytes
+
+**Message:** `Pong` (templateId = 7, BODY_FIXED = 0)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 0                        | 0x0000                          |
+| templateId      | 7                        | 0x0007                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| echo            | binary 6 bytes           | len=6 (0x0006); bytes: 00 01 02 FF FE 00 |
+
+Identical layout to `ping.bin`, only `templateId` differs (7 vs 6).
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      00 00                                      blockLength = 0 (LE)
+02      07 00                                      templateId = 7 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      06 00                                      echo var-len = 6 (LE)
+26      00 01 02 FF FE 00                          echo bytes (binary)
+```
+
+---
+
+## Session Flow
+
+The `session_flow` sequence models a real client session round-trip at the wire level.
+
+| Order | File                   | templateId | Message         |
+|-------|------------------------|------------|-----------------|
+| 1     | connect_request.bin    | 1          | ConnectRequest  |
+| 2     | connect_response.bin   | 2          | ConnectResponse |
+| 3     | keepalive.bin          | 3          | Keepalive       |
+| 4     | ping.bin               | 6          | Ping            |
+| 5     | pong.bin               | 7          | Pong            |
+| 6     | disconnect.bin         | 4          | Disconnect      |
+
+**Expected templateId sequence:** `[1, 2, 3, 6, 7, 4]`
+
+---
+
+## ErrorCode enum values
+
+| Name           | Value |
+|----------------|-------|
+| OK             | 0     |
+| ProtocolVersion| 1     |
+| NotLeader      | 2     |
+| Redirect       | 3     |
+| SessionExpired | 4     |
+| UnknownSession | 5     |
+| Internal       | 6     |
+
+---
+
+## TemplateId enum values
+
+| Name            | Value |
+|-----------------|-------|
+| Connect         | 1     |
+| ConnectResponse | 2     |
+| Keepalive       | 3     |
+| Disconnect      | 4     |
+| ErrorResponse   | 5     |
+| Ping            | 6     |
+| Pong            | 7     |

@@ -25,8 +25,11 @@ if(BUILD_TESTING)
             tests/protocol/client/MessageHeaderTest.cpp
             tests/protocol/client/ControlMessagesConnectTest.cpp
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp
-            tests/protocol/client/PingMessagesTest.cpp)
+            tests/protocol/client/PingMessagesTest.cpp
+            tests/protocol/client/ConformanceTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(rune_protocol_tests PRIVATE
+            RUNE_CONFORMANCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/conformance")
     target_link_libraries(rune_protocol_tests PRIVATE GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_protocol_tests)

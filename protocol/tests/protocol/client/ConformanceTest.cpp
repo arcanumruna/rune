@@ -1,0 +1,461 @@
+// tests/protocol/client/ConformanceTest.cpp
+//
+// CP-5 conformance harness — golden vector tests.
+//
+// For each of the 10 committed .bin vectors the harness asserts BOTH:
+//   1. Decode-golden:  read file bytes → decode → every field equals expected.
+//   2. Encode-golden:  build message from expected values → encode → bytes identical
+//                      to the committed .bin (pins the wire format).
+//   3. Header check:   templateId / schemaId / version / sessionId / correlationId.
+//
+// Plus a session-flow test that decodes each frame in order and asserts the
+// templateId sequence matches [Connect, ConnectResponse, Keepalive, Ping, Pong, Disconnect].
+//
+// RUNE_CONFORMANCE_DIR is injected as a compile-time string by CMakeLists.txt so
+// the test locates vectors regardless of the working directory ctest uses.
+
+#include <gtest/gtest.h>
+
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/PingMessages.h>
+#include <rune/protocol/client/Protocol.h>
+
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Compile-time path root (injected via -DRUNE_CONFORMANCE_DIR="...")
+// ---------------------------------------------------------------------------
+#ifndef RUNE_CONFORMANCE_DIR
+#  error "RUNE_CONFORMANCE_DIR must be defined by CMakeLists.txt"
+#endif
+
+namespace rpc = rune::protocol::client;
+
+// ---------------------------------------------------------------------------
+// Common test values — must match conformance/manifest.md exactly.
+// ---------------------------------------------------------------------------
+static constexpr int64_t kSessionId     = static_cast<int64_t>(0x1122334455667788ULL);
+static constexpr int64_t kCorrelationId = static_cast<int64_t>(0x0A0B0C0D0E0F1011ULL);
+static constexpr uint16_t kSchemaId     = rpc::kSchemaId;          // 120
+static constexpr uint16_t kVersion      = rpc::kProtocolVersion;   // 1
+
+// Ping/Pong echo payload (binary, contains embedded NUL and 0xFF).
+static constexpr uint8_t kEchoBytes[] = {0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00};
+static constexpr std::size_t kEchoLen = sizeof(kEchoBytes);
+
+// ---------------------------------------------------------------------------
+// Helper: read entire file into a vector; fatal-fail on error.
+// ---------------------------------------------------------------------------
+static std::vector<uint8_t> readVector(const char* name) {
+    std::string path = std::string(RUNE_CONFORMANCE_DIR) + "/vectors/" + name;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    EXPECT_NE(f, nullptr) << "Cannot open golden vector: " << path;
+    if (!f) return {};
+
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    EXPECT_GT(sz, 0) << "Empty vector file: " << path;
+    if (sz <= 0) { std::fclose(f); return {}; }
+
+    std::vector<uint8_t> buf(static_cast<std::size_t>(sz));
+    const std::size_t got = std::fread(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    EXPECT_EQ(got, buf.size()) << "Short read: " << path;
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: assert header fields on the decoded header from a raw buffer.
+// ---------------------------------------------------------------------------
+static void assertHeader(const std::vector<uint8_t>& buf,
+                         uint16_t expectedTemplateId,
+                         uint16_t expectedBlockLength) {
+    auto hdrOpt = rpc::MessageHeader::decode(buf.data(), buf.size());
+    ASSERT_TRUE(hdrOpt.has_value()) << "MessageHeader::decode failed";
+    EXPECT_EQ(hdrOpt->templateId,    expectedTemplateId);
+    EXPECT_EQ(hdrOpt->blockLength,   expectedBlockLength);
+    EXPECT_EQ(hdrOpt->schemaId,      kSchemaId);
+    EXPECT_EQ(hdrOpt->version,       kVersion);
+    EXPECT_EQ(hdrOpt->sessionId,     kSessionId);
+    EXPECT_EQ(hdrOpt->correlationId, kCorrelationId);
+}
+
+// ===========================================================================
+// 1. connect_request.bin
+//    ConnectRequest{ egressStreamId=1001, clientVersion=1,
+//                   egressChannel="aeron:udp?endpoint=10.0.0.5:40456" }
+//    Expected byte length: 24 + 8 + 2 + 33 = 67
+// ===========================================================================
+TEST(ConformanceGolden, ConnectRequest) {
+    const auto golden = readVector("connect_request.bin");
+    ASSERT_EQ(golden.size(), 67u);
+
+    // --- Header ---
+    assertHeader(golden, rpc::ConnectRequest::TEMPLATE_ID, rpc::ConnectRequest::BODY_FIXED);
+
+    // --- Decode-golden ---
+    auto msgOpt = rpc::ConnectRequest::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->egressStreamId, 1001);
+    EXPECT_EQ(msgOpt->clientVersion,  1);
+    EXPECT_EQ(msgOpt->egressChannel,  "aeron:udp?endpoint=10.0.0.5:40456");
+
+    // --- Encode-golden ---
+    rpc::ConnectRequest msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.egressStreamId = 1001;
+    msg.clientVersion  = 1;
+    msg.egressChannel  = "aeron:udp?endpoint=10.0.0.5:40456";
+
+    std::array<uint8_t, 128> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 67u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden connect_request.bin";
+}
+
+// ===========================================================================
+// 2. connect_request_empty_channel.bin
+//    ConnectRequest{ egressStreamId=1001, clientVersion=1, egressChannel="" }
+//    Expected byte length: 24 + 8 + 2 + 0 = 34
+// ===========================================================================
+TEST(ConformanceGolden, ConnectRequestEmptyChannel) {
+    const auto golden = readVector("connect_request_empty_channel.bin");
+    ASSERT_EQ(golden.size(), 34u);
+
+    assertHeader(golden, rpc::ConnectRequest::TEMPLATE_ID, rpc::ConnectRequest::BODY_FIXED);
+
+    auto msgOpt = rpc::ConnectRequest::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->egressStreamId, 1001);
+    EXPECT_EQ(msgOpt->clientVersion,  1);
+    EXPECT_EQ(msgOpt->egressChannel.size(), 0u);
+
+    rpc::ConnectRequest msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.egressStreamId = 1001;
+    msg.clientVersion  = 1;
+    msg.egressChannel  = "";
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 34u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden connect_request_empty_channel.bin";
+}
+
+// ===========================================================================
+// 3. connect_response.bin
+//    ConnectResponse{ code=0(OK), leaderMemberId=2,
+//                    assignedSessionId=0x00000000DEADBEEF }
+//    Expected byte length: 24 + 14 = 38
+// ===========================================================================
+TEST(ConformanceGolden, ConnectResponse) {
+    const auto golden = readVector("connect_response.bin");
+    ASSERT_EQ(golden.size(), 38u);
+
+    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ConnectResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,         kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,     kCorrelationId);
+    EXPECT_EQ(msgOpt->code,              static_cast<int16_t>(rpc::ErrorCode::OK));
+    EXPECT_EQ(msgOpt->leaderMemberId,    2);
+    EXPECT_EQ(msgOpt->assignedSessionId, static_cast<int64_t>(0x00000000DEADBEEFULL));
+
+    rpc::ConnectResponse msg;
+    msg.sessionId         = kSessionId;
+    msg.correlationId     = kCorrelationId;
+    msg.code              = static_cast<int16_t>(rpc::ErrorCode::OK);
+    msg.leaderMemberId    = 2;
+    msg.assignedSessionId = static_cast<int64_t>(0x00000000DEADBEEFULL);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 38u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden connect_response.bin";
+}
+
+// ===========================================================================
+// 4. connect_response_redirect.bin
+//    ConnectResponse{ code=3(Redirect), leaderMemberId=1, assignedSessionId=0 }
+//    Expected byte length: 38
+// ===========================================================================
+TEST(ConformanceGolden, ConnectResponseRedirect) {
+    const auto golden = readVector("connect_response_redirect.bin");
+    ASSERT_EQ(golden.size(), 38u);
+
+    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ConnectResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,         kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,     kCorrelationId);
+    EXPECT_EQ(msgOpt->code,              static_cast<int16_t>(rpc::ErrorCode::Redirect));
+    EXPECT_EQ(msgOpt->leaderMemberId,    1);
+    EXPECT_EQ(msgOpt->assignedSessionId, 0LL);
+
+    rpc::ConnectResponse msg;
+    msg.sessionId         = kSessionId;
+    msg.correlationId     = kCorrelationId;
+    msg.code              = static_cast<int16_t>(rpc::ErrorCode::Redirect);
+    msg.leaderMemberId    = 1;
+    msg.assignedSessionId = 0;
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 38u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden connect_response_redirect.bin";
+}
+
+// ===========================================================================
+// 5. keepalive.bin
+//    Keepalive{} (header only, BODY_FIXED = 0)
+//    Expected byte length: 24
+// ===========================================================================
+TEST(ConformanceGolden, Keepalive) {
+    const auto golden = readVector("keepalive.bin");
+    ASSERT_EQ(golden.size(), 24u);
+
+    assertHeader(golden, rpc::Keepalive::TEMPLATE_ID, rpc::Keepalive::BODY_FIXED);
+
+    auto msgOpt = rpc::Keepalive::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+
+    rpc::Keepalive msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+
+    std::array<uint8_t, 32> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 24u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden keepalive.bin";
+}
+
+// ===========================================================================
+// 6. disconnect.bin
+//    Disconnect{ reason=-1 }
+//    Expected byte length: 24 + 2 = 26
+// ===========================================================================
+TEST(ConformanceGolden, Disconnect) {
+    const auto golden = readVector("disconnect.bin");
+    ASSERT_EQ(golden.size(), 26u);
+
+    assertHeader(golden, rpc::Disconnect::TEMPLATE_ID, rpc::Disconnect::BODY_FIXED);
+
+    auto msgOpt = rpc::Disconnect::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    EXPECT_EQ(msgOpt->reason,        static_cast<int16_t>(-1));
+
+    rpc::Disconnect msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.reason        = -1;
+
+    std::array<uint8_t, 32> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 26u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden disconnect.bin";
+}
+
+// ===========================================================================
+// 7. error_response.bin
+//    ErrorResponse{ code=4(SessionExpired), message="session 0x1122... expired" }
+//    message length = 25 bytes
+//    Expected byte length: 24 + 2 + 2 + 25 = 53
+// ===========================================================================
+TEST(ConformanceGolden, ErrorResponse) {
+    static constexpr char kMsg[] = "session 0x1122... expired";
+    static constexpr std::size_t kMsgLen = sizeof(kMsg) - 1; // 25
+
+    const auto golden = readVector("error_response.bin");
+    ASSERT_EQ(golden.size(), 53u);
+
+    assertHeader(golden, rpc::ErrorResponse::TEMPLATE_ID, rpc::ErrorResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ErrorResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    EXPECT_EQ(msgOpt->code,          static_cast<int16_t>(rpc::ErrorCode::SessionExpired));
+    ASSERT_EQ(msgOpt->message.size(), kMsgLen);
+    EXPECT_EQ(msgOpt->message, std::string_view(kMsg, kMsgLen));
+
+    rpc::ErrorResponse msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.code          = static_cast<int16_t>(rpc::ErrorCode::SessionExpired);
+    msg.message       = std::string_view(kMsg, kMsgLen);
+
+    std::array<uint8_t, 128> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 53u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden error_response.bin";
+}
+
+// ===========================================================================
+// 8. error_response_empty.bin
+//    ErrorResponse{ code=6(Internal), message="" }
+//    Expected byte length: 24 + 2 + 2 + 0 = 28
+// ===========================================================================
+TEST(ConformanceGolden, ErrorResponseEmpty) {
+    const auto golden = readVector("error_response_empty.bin");
+    ASSERT_EQ(golden.size(), 28u);
+
+    assertHeader(golden, rpc::ErrorResponse::TEMPLATE_ID, rpc::ErrorResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ErrorResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    EXPECT_EQ(msgOpt->code,          static_cast<int16_t>(rpc::ErrorCode::Internal));
+    EXPECT_EQ(msgOpt->message.size(), 0u);
+
+    rpc::ErrorResponse msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.code          = static_cast<int16_t>(rpc::ErrorCode::Internal);
+    msg.message       = "";
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 28u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden error_response_empty.bin";
+}
+
+// ===========================================================================
+// 9. ping.bin
+//    Ping{ echo = {0x00,0x01,0x02,0xFF,0xFE,0x00} }
+//    Expected byte length: 24 + 2 + 6 = 32
+// ===========================================================================
+TEST(ConformanceGolden, Ping) {
+    const auto golden = readVector("ping.bin");
+    ASSERT_EQ(golden.size(), 32u);
+
+    assertHeader(golden, rpc::Ping::TEMPLATE_ID, rpc::Ping::BODY_FIXED);
+
+    auto msgOpt = rpc::Ping::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    ASSERT_EQ(msgOpt->echo.size(), kEchoLen);
+    EXPECT_EQ(std::memcmp(msgOpt->echo.data(), kEchoBytes, kEchoLen), 0)
+        << "Decoded echo bytes mismatch";
+
+    rpc::Ping msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.echo          = std::string_view(reinterpret_cast<const char*>(kEchoBytes), kEchoLen);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 32u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden ping.bin";
+}
+
+// ===========================================================================
+// 10. pong.bin
+//     Pong{ echo = same bytes as ping: {0x00,0x01,0x02,0xFF,0xFE,0x00} }
+//     Expected byte length: 24 + 2 + 6 = 32
+// ===========================================================================
+TEST(ConformanceGolden, Pong) {
+    const auto golden = readVector("pong.bin");
+    ASSERT_EQ(golden.size(), 32u);
+
+    assertHeader(golden, rpc::Pong::TEMPLATE_ID, rpc::Pong::BODY_FIXED);
+
+    auto msgOpt = rpc::Pong::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    ASSERT_EQ(msgOpt->echo.size(), kEchoLen);
+    EXPECT_EQ(std::memcmp(msgOpt->echo.data(), kEchoBytes, kEchoLen), 0)
+        << "Decoded echo bytes mismatch";
+
+    rpc::Pong msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.echo          = std::string_view(reinterpret_cast<const char*>(kEchoBytes), kEchoLen);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 32u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden pong.bin";
+}
+
+// ===========================================================================
+// Session-flow test
+// Sequence: connect_request, connect_response, keepalive, ping, pong, disconnect
+// Expected templateId sequence: [1, 2, 3, 6, 7, 4]
+// ===========================================================================
+TEST(ConformanceSessionFlow, TemplateIdSequence) {
+    struct Frame {
+        const char*  filename;
+        uint16_t     expectedTemplateId;
+    };
+
+    static constexpr Frame kFlow[] = {
+        { "connect_request.bin",   static_cast<uint16_t>(rpc::TemplateId::Connect)         },  // 1
+        { "connect_response.bin",  static_cast<uint16_t>(rpc::TemplateId::ConnectResponse) },  // 2
+        { "keepalive.bin",         static_cast<uint16_t>(rpc::TemplateId::Keepalive)       },  // 3
+        { "ping.bin",              static_cast<uint16_t>(rpc::TemplateId::Ping)            },  // 6
+        { "pong.bin",              static_cast<uint16_t>(rpc::TemplateId::Pong)            },  // 7
+        { "disconnect.bin",        static_cast<uint16_t>(rpc::TemplateId::Disconnect)      },  // 4
+    };
+
+    for (const auto& frame : kFlow) {
+        const auto buf = readVector(frame.filename);
+        ASSERT_FALSE(buf.empty()) << "Could not read " << frame.filename;
+
+        // Get templateId from MessageHeader::decode (CP-6 peekTemplateId not yet available)
+        auto hdrOpt = rpc::MessageHeader::decode(buf.data(), buf.size());
+        ASSERT_TRUE(hdrOpt.has_value()) << "Header decode failed for " << frame.filename;
+        EXPECT_EQ(hdrOpt->templateId, frame.expectedTemplateId)
+            << "TemplateId mismatch for " << frame.filename;
+    }
+
+    // Also verify the exact sequence as an array comparison.
+    constexpr std::size_t kFlowLen = sizeof(kFlow) / sizeof(kFlow[0]);
+    ASSERT_EQ(kFlowLen, 6u);
+
+    uint16_t observedIds[kFlowLen];
+    for (std::size_t i = 0; i < kFlowLen; ++i) {
+        const auto buf = readVector(kFlow[i].filename);
+        auto hdrOpt = rpc::MessageHeader::decode(buf.data(), buf.size());
+        ASSERT_TRUE(hdrOpt.has_value());
+        observedIds[i] = hdrOpt->templateId;
+    }
+
+    constexpr uint16_t kExpectedSequence[kFlowLen] = {1, 2, 3, 6, 7, 4};
+    for (std::size_t i = 0; i < kFlowLen; ++i) {
+        EXPECT_EQ(observedIds[i], kExpectedSequence[i])
+            << "Session-flow templateId mismatch at index " << i;
+    }
+}
