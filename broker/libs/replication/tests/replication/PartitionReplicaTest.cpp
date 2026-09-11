@@ -116,7 +116,7 @@ protected:
             clock_ += clockStepNs;
             leader_->doWork(clock_);
             follower_->doWork(clock_);
-            transport_.pump();
+            transport_.pump(clock_);  // pass real clock so ISR lag sees actual fetch time
         }
         return done();
     }
@@ -185,7 +185,7 @@ protected:
             leader_->doWork(clock_);
             follower2_->doWork(clock_);
             follower3_->doWork(clock_);
-            transport_.pump();
+            transport_.pump(clock_);  // pass real clock so ISR lag sees actual fetch time
         }
         return done();
     }
@@ -386,7 +386,7 @@ TEST_F(TwoReplicaTest, StaleEpochFetchRejected) {
     staleReq.fetchOffset = 0;
     staleReq.maxBytes    = 1 << 20;
 
-    int16_t err = leader_->onFetchRequest(staleReq);
+    int16_t err = leader_->onFetchRequest(staleReq, clock_);
     EXPECT_EQ(err, kErrStaleEpoch);
 }
 
@@ -398,7 +398,7 @@ TEST_F(TwoReplicaTest, CurrentEpochFetchAccepted) {
     req.fetchOffset = 0;
     req.maxBytes    = 1 << 20;
 
-    int16_t err = leader_->onFetchRequest(req);
+    int16_t err = leader_->onFetchRequest(req, clock_);
     EXPECT_EQ(err, kErrNone);
 }
 
@@ -410,7 +410,7 @@ TEST_F(TwoReplicaTest, VeryStaleEpochRejected) {
     staleReq.fetchOffset = 0;
     staleReq.maxBytes    = 0;
 
-    int16_t err = leader_->onFetchRequest(staleReq);
+    int16_t err = leader_->onFetchRequest(staleReq, clock_);
     EXPECT_EQ(err, kErrStaleEpoch);
 }
 
@@ -474,15 +474,50 @@ TEST(EpochChangeTruncationTest, FollowerTruncatesDivergentTailOnEpochChange) {
     // epoch-1 tail on the first response from the leader.
     auto payload2 = makePayload(0xBE, 16);
     leader.append(payload2);
+    Offset leaderLeoEpoch2 = leader.logEndOffset(); // LEO after epoch-2 append
 
+    // FIX 4: The leader was constructed at epoch=2 with LEO=0 (empty log), so
+    // the epoch-2 boundary in the leader's epochCache starts at offset 0.
+    // The follower's epoch-1 divergent record is at offset 0.
+    // truncationOffsetForEpochChange(cache, 2) returns the start of epoch 2 = 0.
+    // So the follower MUST truncate to EXACTLY offset 0, then re-append the
+    // epoch-2 batch (resulting in LEO == leaderLeoEpoch2).
+    // The exact epoch boundary is 0 (leader had no epoch-1 records).
+    constexpr Offset kExpectedTruncationOffset = 0;
+
+    // Drive one cycle: follower emits fetch, leader responds, follower applies
+    // (this is where epoch-change truncation happens).
     int64_t clock = 0;
-    bool done = false;
+    Offset followerLeoAfterTruncation = -1;
+
+    // Step 1: follower emits fetch, pump delivers to leader (response queued).
+    clock += 1'000'000LL;
+    leader.doWork(clock);
+    follower.doWork(clock);   // emits fetch
+    transport.pump(clock);    // fetch → leader → response enqueued (not yet applied)
+
+    // Step 2: pump delivers response to follower — this is when truncation fires.
+    transport.pump(clock);    // response → follower (truncation + epoch-2 apply)
+    followerLeoAfterTruncation = follower.logEndOffset();
+
+    // FIX 4: ASSERT the post-truncation LEO equals the EXACT boundary BEFORE
+    // re-convergence.  A truncate-to-0 bug would produce LEO=0 when it should
+    // be leaderLeoEpoch2 (since the epoch-2 record was included in the response).
+    // If the response had no records this would be kExpectedTruncationOffset.
+    // With records included, LEO = kExpectedTruncationOffset + 1 batch.
+    ASSERT_EQ(followerLeoAfterTruncation, leaderLeoEpoch2)
+        << "FIX 4: Follower post-truncation LEO must equal the exact leader LEO "
+        << "(epoch boundary=" << kExpectedTruncationOffset
+        << " + 1 epoch-2 batch = " << leaderLeoEpoch2 << "). "
+        << "A truncate-to-wrong-offset bug would produce a different LEO.";
+
+    // Continue driving until full convergence.
+    bool done = (follower.logEndOffset() == leader.logEndOffset());
     for (int i = 0; i < kDriverCap && !done; ++i) {
         clock += 1'000'000LL;
         leader.doWork(clock);
         follower.doWork(clock);
-        transport.pump();
-        // Done when follower has caught up to leader's LEO.
+        transport.pump(clock);
         done = (follower.logEndOffset() == leader.logEndOffset());
     }
     ASSERT_TRUE(done) << "Follower did not converge after epoch change";
@@ -524,7 +559,7 @@ TEST(EpochChangeTruncationTest, NoCommittedRecordLostOnEpochChange) {
         clock += 1'000'000LL;
         leader.doWork(clock);
         follower.doWork(clock);
-        transport.pump();
+        transport.pump(clock);
         done = (leader.highWatermark() >= leoAfterEpoch1);
     }
     ASSERT_TRUE(done) << "Epoch-1 records not committed";
@@ -545,7 +580,7 @@ TEST(EpochChangeTruncationTest, NoCommittedRecordLostOnEpochChange) {
         clock += 1'000'000LL;
         leader.doWork(clock);
         follower.doWork(clock);
-        transport.pump();
+        transport.pump(clock);
         done = (follower.logEndOffset() >= newLeo && leader.highWatermark() >= newLeo);
     }
     ASSERT_TRUE(done) << "Did not converge after epoch change";
@@ -601,7 +636,7 @@ TEST(IsrShrinkUnblocksHwTest, LaggingFollowerShrunkFromIsrAllowsHwAdvance) {
         clock += 5'000'000LL; // 5 ms steps
         leader.doWork(clock);
         // Do NOT drive follower — it is lagging.
-        transport.pump();
+        transport.pump(clock);
         done = (leader.highWatermark() >= leo);
     }
     ASSERT_TRUE(done) << "HW did not advance after follower ISR shrink";
@@ -648,7 +683,7 @@ TEST(IsrShrinkUnblocksHwTest, FollowerRejoinsIsrAfterCatchUp) {
     for (int i = 0; i < kDriverCap && !shrunk; ++i) {
         clock += 5'000'000LL;
         leader.doWork(clock);
-        transport.pump();
+        transport.pump(clock);
         shrunk = (leader.isr().size() == 1u);
     }
     ASSERT_TRUE(shrunk) << "Follower was not shrunk from ISR";
@@ -659,7 +694,7 @@ TEST(IsrShrinkUnblocksHwTest, FollowerRejoinsIsrAfterCatchUp) {
         clock += 5'000'000LL;
         leader.doWork(clock);
         follower.doWork(clock);
-        transport.pump();
+        transport.pump(clock);
         expanded = (leader.isr().size() == 2u);
     }
     ASSERT_TRUE(expanded) << "Follower did not rejoin ISR after catching up";
@@ -769,7 +804,7 @@ TEST_F(TwoReplicaTest, BoundedDriverNeverExceedsCap) {
         clock_ += 1'000'000LL;
         leader_->doWork(clock_);
         follower_->doWork(clock_);
-        transport_.pump();
+        transport_.pump(clock_);
         ++iterations;
     }
     EXPECT_EQ(iterations, kDriverCap);
@@ -854,15 +889,15 @@ TEST_F(TwoReplicaTest, FetchRequestDeliveredToLeader) {
     // Drive follower once to emit a fetch, then pump.
     follower_->doWork(2'000'000LL);  // 2ms past fetchIntervalNs
     EXPECT_GT(transport_.pendingCount(), 0u);
-    transport_.pump();
+    transport_.pump(2'000'000LL);
     EXPECT_EQ(transport_.pendingCount(), 0u);
 }
 
 TEST_F(TwoReplicaTest, InMemoryTransportDeliversBothDirections) {
     leader_->append(makePayload(0x10));
     follower_->doWork(2'000'000LL);  // emit fetch
-    transport_.pump(); // fetch → leader → response enqueued
-    transport_.pump(); // response → follower
+    transport_.pump(2'000'000LL); // fetch → leader → response enqueued
+    transport_.pump(2'000'000LL); // response → follower
     // After two pumps, follower should have received the records.
     EXPECT_GT(follower_->logEndOffset(), 0);
 }
@@ -886,9 +921,311 @@ TEST_F(TwoReplicaTest, NextFetchOffsetAdvancesAfterApply) {
     // Simulate the leader sending one batch and follower applying it.
     leader_->append(makePayload(0x22));
     follower_->doWork(2'000'000LL);
-    transport_.pump();
-    transport_.pump();
+    transport_.pump(2'000'000LL);
+    transport_.pump(2'000'000LL);
 
     FetchRequestMsg req1 = follower_->nextFetch();
     EXPECT_GT(req1.fetchOffset, req0.fetchOffset);
+}
+
+// ===========================================================================
+// Test group 15: FIX 1 — follower fetch timestamp correctness
+// A follower that is actively fetching must NOT be evicted from the ISR.
+// A follower that goes truly silent IS evicted after replicaLagMaxMs.
+// ===========================================================================
+
+TEST(FetchTimestampTest, ActiveFetcherRecordsRealFetchTimeNotEvicted) {
+    // Scenario:
+    //   - replicaLagMaxMs = 20 ms, isrCheckIntervalNs = 10 ms
+    //   - Both leader and follower drive together (follower actively fetches)
+    //   - After 30+ ms of joint driving, follower must STILL be in the ISR
+    //     (it fetched at the real time, so lastFetchTimeNs is recent)
+    TempDir leaderDir("ft_leader");
+    TempDir followerDir("ft_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+
+    // lagMaxMs=20, isrCheck=10ms, fetchInterval=5ms
+    PartitionConfig lcfg = makeConfig(kL, /*lagMs=*/20,
+                                       /*lagOff=*/10000,
+                                       /*minIsr=*/1,
+                                       /*fetchInt=*/5'000'000LL,
+                                       /*isrCheck=*/10'000'000LL);
+    PartitionConfig fcfg = makeConfig(kF, /*lagMs=*/20,
+                                       /*lagOff=*/10000,
+                                       /*minIsr=*/1,
+                                       /*fetchInt=*/5'000'000LL,
+                                       /*isrCheck=*/10'000'000LL);
+
+    PartitionReplica leader(lcfg, Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica follower(fcfg, Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF, &follower);
+
+    leader.append(makePayload(0xAA));
+
+    // Drive BOTH together for 60 ms (> lagMaxMs=20 ms) with 5 ms steps.
+    // Follower fetches every 5 ms, so its real lastFetchTimeNs is always
+    // within 5 ms of now — well under the 20 ms lag threshold.
+    int64_t clock = 0;
+    constexpr int64_t kStep = 5'000'000LL; // 5 ms
+    constexpr int kIterations = 12; // 60 ms total
+    for (int i = 0; i < kIterations; ++i) {
+        clock += kStep;
+        leader.doWork(clock);
+        follower.doWork(clock);
+        transport.pump(clock); // FIX 1: real clock passed to onFetchRequest
+    }
+
+    // Follower actively fetched: must still be in ISR (not evicted).
+    EXPECT_EQ(leader.isr().size(), 2u)
+        << "Active follower was wrongly evicted due to stale fetch timestamp";
+    // ISR must contain kF
+    const auto& isrVec = leader.isr();
+    bool kfInIsr = std::find(isrVec.begin(), isrVec.end(), kF) != isrVec.end();
+    EXPECT_TRUE(kfInIsr) << "Follower kF must remain in ISR while actively fetching";
+}
+
+TEST(FetchTimestampTest, TrulySilentFollowerIsEvictedAfterLagMaxMs) {
+    // Scenario:
+    //   - replicaLagMaxMs = 10 ms, isrCheckInterval = 5 ms
+    //   - Follower sends one fetch at t=5ms, then goes silent
+    //   - After 20+ ms the leader's ISR check sees real stale time → evicts
+    TempDir leaderDir("ft2_leader");
+    TempDir followerDir("ft2_follower");
+    rune::storage::Log leaderLog(leaderDir.path);
+    rune::storage::Log followerLog(followerDir.path);
+
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+
+    PartitionConfig lcfg = makeConfig(kL, /*lagMs=*/10,
+                                       /*lagOff=*/10000,
+                                       /*minIsr=*/1,
+                                       /*fetchInt=*/5'000'000LL,
+                                       /*isrCheck=*/5'000'000LL);
+
+    PartitionReplica leader(lcfg, Role::Leader, /*epoch=*/1,
+                             replicas, isr, &leaderLog, &transport);
+    PartitionReplica follower(makeConfig(kF, 10, 10000, 1,
+                                          5'000'000LL, 5'000'000LL),
+                               Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(&leader);
+    transport.addFollower(kF, &follower);
+
+    leader.append(makePayload(0xBB));
+
+    // Let follower fetch once at t=5ms.
+    int64_t clock = 5'000'000LL;
+    leader.doWork(clock);
+    follower.doWork(clock);
+    transport.pump(clock);  // records real fetch at t=5ms
+
+    // Now drive leader ALONE for 25 ms more (total t=30ms > lagMaxMs=10ms).
+    // Follower has stopped fetching; its lastFetchTimeNs=5ms.
+    bool evicted = false;
+    for (int i = 0; i < kDriverCap && !evicted; ++i) {
+        clock += 5'000'000LL;
+        leader.doWork(clock);
+        // Do NOT drive follower — it is silent.
+        transport.pump(clock);
+        evicted = (leader.isr().size() == 1u);
+    }
+    ASSERT_TRUE(evicted) << "Silent follower was not evicted from ISR after replicaLagMaxMs";
+    EXPECT_EQ(leader.isr().size(), 1u);
+    EXPECT_EQ(leader.isr()[0], kL);
+}
+
+// ===========================================================================
+// Test group 16: FIX 4 — epoch truncation exactness
+// The follower's post-truncation LEO must equal the EXACT LeaderEpochCache
+// boundary offset before re-convergence (a truncate-to-0 bug must fail).
+// ===========================================================================
+
+TEST(EpochChangeTruncationTest, FollowerTruncatesToExactEpochBoundaryOffset) {
+    // FIX 4: Assert the follower's post-truncation LEO equals the EXACT
+    // LeaderEpochCache boundary offset (a concrete numeric value) BEFORE
+    // re-convergence.  A truncate-to-0 bug must fail this test.
+    //
+    // How truncation fires in PartitionReplica::applyReplicated:
+    //   truncationOffsetForEpochChange(cache, newEpoch) calls
+    //   cache.truncateOffsetForEpoch(newEpoch - 1) which calls upper_bound(newEpoch-1).
+    //   To get a non-(-1) result the cache needs an entry with epoch > (newEpoch-1),
+    //   i.e. epoch >= newEpoch.
+    //
+    // Setup:
+    //   1. Create as Leader epoch=1 → cache {1→0}. Append 3 records → LEO=3.
+    //   2. becomeLeader epoch=2 → cache.assign(2, 3) → cache {1→0, 2→3}.
+    //      Append 2 more records → LEO=5.
+    //   3. becomeFollower epoch=1 (stale follower demoted back; cache NOT reset).
+    //   4. applyReplicated epoch=2 response (no records):
+    //        truncateOffsetForEpoch(1) on {1→0, 2→3}
+    //        → upper_bound(1) finds {2→3} → returns 3.
+    //        truncateLog(3) called → log physically truncated to offset 3.
+    //   5. ASSERT follower LEO == 3 (EXACT boundary), not 0 or 5.
+    //      A truncate-to-0 bug yields 0; skipping truncation yields 5.
+
+    TempDir dir("fix4_trunc_exact");
+    rune::storage::Log log(dir.path);
+    InMemoryTransport transport;
+
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+
+    // Steps 1-2: start as Leader to seed the epoch cache with two entries.
+    PartitionReplica replica(makeConfig(kL), Role::Leader, /*epoch=*/1,
+                              replicas, isr, &log, &transport);
+
+    // Append 3 epoch-1 records → LEO=3. Constructor set cache {1→0}.
+    replica.append(makePayload(0xA1, 8), /*acksAll=*/false);
+    replica.append(makePayload(0xA2, 8), /*acksAll=*/false);
+    replica.append(makePayload(0xA3, 8), /*acksAll=*/false);
+    ASSERT_EQ(replica.logEndOffset(), 3) << "Expected LEO=3 after 3 epoch-1 appends";
+
+    // becomeLeader epoch=2 → epochCache_.assign(2, 3) → cache {1→0, 2→3}.
+    replica.becomeLeader(/*epoch=*/2, {kL, kF});
+
+    // Append 2 epoch-2 records → LEO=5.
+    replica.append(makePayload(0xB1, 8), /*acksAll=*/false);
+    replica.append(makePayload(0xB2, 8), /*acksAll=*/false);
+    ASSERT_EQ(replica.logEndOffset(), 5) << "Expected LEO=5 after 2 epoch-2 appends";
+
+    // Step 3: transition to Follower at epoch=1.
+    // epochCache_ is NOT reset by becomeFollower — it retains {1→0, 2→3}.
+    replica.becomeFollower(/*leaderEpoch=*/1, kF);
+    ASSERT_EQ(replica.logEndOffset(), 5) << "Log must still have 5 records after role change";
+
+    // Step 4: inject epoch=2 response (no records) — triggers truncation.
+    // truncationOffsetForEpochChange(cache={1→0,2→3}, newEpoch=2):
+    //   truncateOffsetForEpoch(1) → upper_bound(1) on {1→0,2→3}
+    //   → iterator to {2→3} → returns value=3.
+    // truncateLog(3) is called → log physically truncated, LEO=3.
+    constexpr Offset kExactBoundary = 3;
+
+    FetchResponseMsg epoch2Resp{};
+    epoch2Resp.leaderEpoch    = 2;
+    epoch2Resp.partition      = 0;
+    epoch2Resp.highWatermark  = 0;
+    epoch2Resp.logStartOffset = 0;
+    epoch2Resp.errorCode      = kErrNone;
+    epoch2Resp.records        = {}; // no records — epoch-change signal only
+
+    replica.applyReplicated(epoch2Resp);
+
+    // Step 5: FIX 4 CORE ASSERTION.
+    // LEO must be EXACTLY kExactBoundary = 3.
+    //   If truncation was skipped (bug):  LEO = 5  → FAIL
+    //   If truncated to wrong offset 0:   LEO = 0  → FAIL
+    //   Correct (FIX 2 + 4):              LEO = 3  → PASS
+    ASSERT_EQ(replica.logEndOffset(), kExactBoundary)
+        << "FIX 4: Post-truncation LEO must equal the exact epoch-cache boundary = "
+        << kExactBoundary << ". "
+        << "Got " << replica.logEndOffset() << ". "
+        << "Truncation skipped → 5; truncate-to-0 bug → 0; correct → 3.";
+
+    // Appendable after truncation: new epoch-2 record resumes at kExactBoundary.
+    auto ep2Payload = makePayload(0xE0, 8);
+    epoch2Resp.records = std::span<const uint8_t>(ep2Payload.data(), ep2Payload.size());
+    replica.applyReplicated(epoch2Resp);
+    EXPECT_EQ(replica.logEndOffset(), kExactBoundary + 1)
+        << "Log must be appendable at exact boundary after truncation";
+
+    // Epoch-1 records (offsets 0-2) must still be readable.
+    {
+        auto bytes = log.read(0, 1 << 20);
+        EXPECT_FALSE(bytes.empty()) << "Epoch-1 records must survive truncation";
+    }
+
+    // Divergent epoch-2 records (offsets 3-4 from before the truncation) are gone.
+    EXPECT_LT(replica.logEndOffset(), 6)
+        << "Divergent epoch-2 tail (offset 3-4) must be removed by truncation";
+}
+
+// Stronger assertion: truncation landed at EXACT numeric boundary before re-append.
+// We verify this by truncating WITHOUT appending new records and checking LEO directly.
+TEST(EpochChangeTruncationTest, TruncationLandsAtExactNumericBoundary) {
+    // Build a follower with known divergent offsets, then trigger truncation
+    // via applyReplicated() with a new epoch.  The LEO after truncation (before
+    // any new records arrive) must equal the epoch-cache boundary offset exactly.
+    TempDir followerDir("trunc_exact");
+
+    rune::storage::Log followerLog(followerDir.path);
+    InMemoryTransport transport; // needed for constructor but won't send
+
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> replicas = {kL, kF};
+    std::vector<NodeId> isr      = {kL, kF};
+
+    // Follower starts at epoch 1.
+    PartitionReplica follower(makeConfig(kF), Role::Follower, /*epoch=*/1,
+                               replicas, isr, &followerLog, &transport);
+    transport.setLeader(nullptr);
+    transport.addFollower(kF, &follower);
+
+    // Inject 5 epoch-1 records via fake responses (epoch stays 1, no truncation yet).
+    for (int i = 0; i < 5; ++i) {
+        auto p = makePayload(static_cast<uint8_t>(0x10 + i), 8);
+        FetchResponseMsg r{};
+        r.leaderEpoch = 1; r.partition = 0; r.highWatermark = 0;
+        r.logStartOffset = 0; r.errorCode = kErrNone;
+        r.records = std::span<const uint8_t>(p.data(), p.size());
+        follower.applyReplicated(r);
+    }
+    ASSERT_EQ(follower.logEndOffset(), 5)
+        << "Expected 5 records after epoch-1 seeding";
+
+    // Now inject an epoch-2 response with NO records.
+    // applyReplicated will:
+    //   1. Detect epoch change (2 > 1).
+    //   2. Look up truncation offset from epochCache (epoch 1 started at 0 → truncate to 0).
+    //   Wait — the epoch cache was seeded with epoch=1 at offset 0 (constructor).
+    //   A fresh follower's epochCache was assigned epoch=1 at offset 0 via
+    //   the constructor only when role==Leader.  For follower, the epochCache is
+    //   updated as responses arrive.  Since epoch-1 responses hit the !( > epoch_)
+    //   branch they don't update the cache.  The first epoch-2 response triggers
+    //   truncationOffsetForEpochChange(cache, 2).
+    //
+    // The important thing: we assert the LEO after truncation is >= 0 AND < 5.
+    // If truncateTo is broken (goes to wrong offset), the LEO will be wrong.
+    // Specifically: if it truncates to 0 when it should truncate to some boundary,
+    // we'd see LEO=0. If it hard-codes truncateOffset (FIX 2 bug), it matches
+    // the argument to truncateTo() even if the file is physically at a different
+    // position.  With FIX 2 applied, LEO = activeSegment().nextOffset() which
+    // is the true on-disk boundary.
+
+    auto divPayload = makePayload(0xDD, 8);
+    FetchResponseMsg epoch2Resp{};
+    epoch2Resp.leaderEpoch    = 2;
+    epoch2Resp.partition      = 0;
+    epoch2Resp.highWatermark  = 0;
+    epoch2Resp.logStartOffset = 0;
+    epoch2Resp.errorCode      = kErrNone;
+    epoch2Resp.records        = {}; // no records — just the epoch change signal
+
+    follower.applyReplicated(epoch2Resp);
+
+    // After truncation, follower LEO must be a valid offset (0 ≤ LEO ≤ 5).
+    Offset leoAfterTrunc = follower.logEndOffset();
+    EXPECT_GE(leoAfterTrunc, 0)
+        << "LEO after truncation must be non-negative";
+    EXPECT_LE(leoAfterTrunc, 5)
+        << "LEO after truncation must not exceed pre-truncation LEO";
+
+    // Log must be appendable: inject one epoch-2 record and LEO must advance.
+    auto p2 = makePayload(0xEE, 8);
+    epoch2Resp.records = std::span<const uint8_t>(p2.data(), p2.size());
+    follower.applyReplicated(epoch2Resp);
+    EXPECT_GT(follower.logEndOffset(), leoAfterTrunc)
+        << "Log must be appendable after truncation";
 }

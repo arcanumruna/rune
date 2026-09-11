@@ -107,10 +107,12 @@ void Log::truncateTo(int64_t truncateOffset) {
     int64_t base = seg.baseOffset();
     segments_.erase(base);
     segments_[base] = std::make_unique<LogSegment>(dir_, base);
-    // Re-run recover to rebuild the index and set nextOffset.
+    // Re-run recover to rebuild the index and set nextOffset correctly.
+    // Use the segment's actual nextOffset_ (derived from the physically truncated
+    // file) rather than hard-coding truncateOffset, so that LEO and the segment's
+    // nextOffset_ can never diverge.
     activeSegment().recover();
-
-    logEndOffset_ = truncateOffset;
+    logEndOffset_ = activeSegment().nextOffset();
 }
 
 int Log::deleteOldSegments(int64_t retainBytes) {

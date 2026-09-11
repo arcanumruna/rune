@@ -143,7 +143,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 // Leader: onFetchRequest
 // ---------------------------------------------------------------------------
 
-int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req)
+int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t nowNs)
 {
     assert(role_ == Role::Leader && "onFetchRequest() called on follower");
 
@@ -177,8 +177,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req)
     }
 
     // Record follower fetch: update ISR manager + leader state.
-    // We pass lastIsrCheckNs_ as the "now" for the ISR manager time tracking.
-    isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, lastIsrCheckNs_);
+    // Pass the REAL nowNs so time-lag eviction uses the actual fetch time,
+    // not the stale last-ISR-check timestamp.
+    isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
 

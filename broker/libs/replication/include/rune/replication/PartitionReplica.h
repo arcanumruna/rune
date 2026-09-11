@@ -157,8 +157,13 @@ public:
     /// Recomputes HW.
     /// Sends a FetchResponse via transport_.
     ///
+    /// \param req    The fetch request from the follower.
+    /// \param nowNs  Current wall-clock time (nanoseconds) used to record the
+    ///               follower's real fetch time in IsrManager.  Callers MUST pass
+    ///               the actual current time so time-lag eviction is correct.
+    ///
     /// \returns kErrNone on success, error code otherwise.
-    int16_t onFetchRequest(const FetchRequestMsg& req);
+    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs);
 
     /// Read committed records (≤ highWatermark) starting at fetchOffset.
     ///
@@ -313,8 +318,14 @@ public:
     }
 
     /// Deliver all pending messages: FetchRequests → leader, FetchResponses → followers.
+    ///
+    /// \param nowNs  Current wall-clock time passed to onFetchRequest() so the
+    ///               leader records the follower's real fetch timestamp.  Defaults
+    ///               to 0 for backward compatibility with tests that do not care
+    ///               about time-lag eviction; real tests should supply the clock.
+    ///
     /// Returns total messages delivered.
-    int pump() {
+    int pump(int64_t nowNs = 0) {
         int count = 0;
 
         // Deliver fetch requests to the leader.
@@ -322,7 +333,7 @@ public:
         reqs.swap(pendingRequests_);
         for (auto& pr : reqs) {
             if (leader_) {
-                leader_->onFetchRequest(pr.req);
+                leader_->onFetchRequest(pr.req, nowNs);
                 ++count;
             }
         }

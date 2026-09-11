@@ -215,3 +215,228 @@ TEST(Log, SegmentBaseOffsetsSortedAndCountMatchesRolls) {
     EXPECT_EQ(bases.size(), logFileCount);
     std::filesystem::remove_all(dir);
 }
+
+// ---- FIX 3a: single-segment truncate mid-log ----
+// Offsets < boundary kept; >= boundary dropped.
+// LEO == boundary; log still readable and appendable (resuming at boundary).
+TEST(Log, TruncateSingleSegmentMidLog) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t1";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    // Large rollBytes — stays single segment.
+    Log log(dir.string(), 64LL * 1024 * 1024);
+    int64_t off = 0;
+    // Append 10 batches.
+    for (int i = 0; i < 10; ++i) {
+        RecordBatchBuilder b(off, 100 + i);
+        b.append("k", "v" + std::to_string(i), 100 + i);
+        off = log.append(b.build(), off);
+    }
+    ASSERT_EQ(log.logEndOffset(), 10);
+    ASSERT_EQ(log.segmentBaseOffsets().size(), 1u);
+
+    // Truncate to offset 5: keep batches 0-4, drop 5-9.
+    log.truncateTo(5);
+    EXPECT_EQ(log.logEndOffset(), 5) << "LEO must equal truncation boundary";
+
+    // Records below boundary must be readable.
+    {
+        auto bytes = log.read(0, 1 << 20);
+        ASSERT_FALSE(bytes.empty()) << "Records below boundary must survive truncation";
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+    // Records at/above boundary must be gone: read at offset 5 returns empty.
+    {
+        auto bytes = log.read(5, 1 << 20);
+        EXPECT_TRUE(bytes.empty()) << "Records at/above truncation boundary must be dropped";
+    }
+
+    // Log must be appendable: new batch resumes at offset 5 (contiguous).
+    // Use logEndOffset() as the base (not the stale `off` from before truncation).
+    int64_t resumeOff = log.logEndOffset(); // = 5
+    ASSERT_EQ(resumeOff, 5);
+    RecordBatchBuilder b(resumeOff, 999);
+    b.append("k", "new", 999);
+    int64_t newOff = log.append(b.build(), resumeOff);
+    EXPECT_EQ(newOff, 6) << "Append after truncate must resume at boundary (contiguous)";
+    EXPECT_EQ(log.logEndOffset(), 6);
+
+    // Read the new batch at offset 5.
+    {
+        auto bytes = log.read(5, 1 << 20);
+        ASSERT_FALSE(bytes.empty()) << "Newly appended batch at boundary must be readable";
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 5);
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---- FIX 3b: multi-segment truncate into earlier segment ----
+// Append enough to roll >= 2 segments, truncate into an earlier segment.
+// Trailing segment files removed; straddling segment truncated; LEO exact; readable.
+TEST(Log, TruncateMultiSegmentIntoEarlierSegment) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t2";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    // Tiny rollBytes to force multiple segments (~256 bytes per batch at ~100-byte batches).
+    Log log(dir.string(), 256);
+    int64_t off = 0;
+    // Append 50 batches — well enough to create several segments.
+    for (int i = 0; i < 50; ++i) {
+        RecordBatchBuilder b(off, 200 + i);
+        b.append("key", "val" + std::to_string(i), 200 + i);
+        off = log.append(b.build(), off);
+    }
+    ASSERT_EQ(log.logEndOffset(), 50);
+    auto basesBefore = log.segmentBaseOffsets();
+    ASSERT_GE(basesBefore.size(), 3u) << "Need at least 3 segments for this test";
+
+    // Truncate into the second segment: pick a base offset inside segment[1].
+    // segment[1] base is basesBefore[1]; truncate to basesBefore[1] + 1.
+    int64_t truncOff = basesBefore[1] + 1;
+    log.truncateTo(truncOff);
+
+    EXPECT_EQ(log.logEndOffset(), truncOff) << "LEO must equal truncation boundary";
+
+    // Segment count must be <= 2 (trailing segments removed).
+    auto basesAfter = log.segmentBaseOffsets();
+    EXPECT_LE(basesAfter.size(), 2u)
+        << "Trailing segment files must be removed after multi-segment truncation";
+
+    // Only .log files present at or before the straddling segment's base.
+    for (int64_t b : basesAfter) {
+        EXPECT_LE(b, basesBefore[1]) << "No segment base should exceed the straddling segment";
+    }
+
+    // Records below truncation boundary are readable.
+    {
+        auto bytes = log.read(0, 1 << 20);
+        ASSERT_FALSE(bytes.empty()) << "First record must still be readable";
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+
+    // Records at/above truncOff are gone.
+    {
+        auto bytes = log.read(truncOff, 1 << 20);
+        EXPECT_TRUE(bytes.empty()) << "Records at truncation boundary must be dropped";
+    }
+
+    // Appendable: new batch resumes at truncOff.
+    RecordBatchBuilder nb(truncOff, 777);
+    nb.append("k", "new", 777);
+    int64_t newOff = log.append(nb.build(), truncOff);
+    EXPECT_EQ(newOff, truncOff + 1) << "Append must resume at truncation boundary";
+    EXPECT_EQ(log.logEndOffset(), truncOff + 1);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---- FIX 3c: truncate exactly at a segment baseOffset boundary ----
+// No corruption; LEO exact; readable.
+TEST(Log, TruncateAtSegmentBaseOffsetBoundary) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t3";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 256);
+    int64_t off = 0;
+    for (int i = 0; i < 40; ++i) {
+        RecordBatchBuilder b(off, 300 + i);
+        b.append("k", "v" + std::to_string(i), 300 + i);
+        off = log.append(b.build(), off);
+    }
+    ASSERT_GE(log.segmentBaseOffsets().size(), 2u);
+
+    // Truncate exactly at the base of the last segment.
+    auto bases = log.segmentBaseOffsets();
+    int64_t lastBase = bases.back();
+    ASSERT_GT(lastBase, 0) << "Last segment must not start at 0 for this test";
+
+    log.truncateTo(lastBase);
+    EXPECT_EQ(log.logEndOffset(), lastBase) << "LEO must equal the segment base boundary";
+
+    // Records strictly before lastBase must be readable.
+    {
+        auto bytes = log.read(0, 1 << 20);
+        ASSERT_FALSE(bytes.empty()) << "Earlier records must survive";
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+
+    // Reading at lastBase must return empty (records at/above boundary dropped).
+    {
+        auto bytes = log.read(lastBase, 1 << 20);
+        EXPECT_TRUE(bytes.empty()) << "Records at/above base boundary must be truncated";
+    }
+
+    // Appendable at the boundary.
+    RecordBatchBuilder nb(lastBase, 888);
+    nb.append("k", "new", 888);
+    log.append(nb.build(), lastBase);
+    EXPECT_EQ(log.logEndOffset(), lastBase + 1);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---- FIX 3d: crash recovery after truncateTo — LEO + readable consistent ----
+// Close and reopen the Log after truncation; confirm LEO and readable records
+// are consistent (no stale index / torn tail).
+TEST(Log, CrashRecoveryAfterTruncate) {
+    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t4";
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    int64_t truncBoundary = -1;
+    {
+        Log log(dir.string(), 256);
+        int64_t off = 0;
+        for (int i = 0; i < 30; ++i) {
+            RecordBatchBuilder b(off, 400 + i);
+            b.append("k", "v" + std::to_string(i), 400 + i);
+            off = log.append(b.build(), off);
+        }
+        ASSERT_EQ(log.logEndOffset(), 30);
+        // Truncate mid-log.
+        truncBoundary = 15;
+        log.truncateTo(truncBoundary);
+        ASSERT_EQ(log.logEndOffset(), truncBoundary);
+        // Log goes out of scope here (files flushed).
+    }
+
+    // Reopen and recover.
+    Log log2(dir.string(), 256);
+    int64_t recovered = log2.recover();
+
+    // LEO after recovery must equal the truncation boundary.
+    EXPECT_EQ(recovered, truncBoundary)
+        << "After truncate + reopen, LEO must equal the truncation boundary";
+    EXPECT_EQ(log2.logEndOffset(), truncBoundary);
+
+    // Records below the boundary must be readable.
+    {
+        auto bytes = log2.read(0, 1 << 20);
+        ASSERT_FALSE(bytes.empty()) << "Records below boundary must survive crash recovery";
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+
+    // Records at/above boundary must not appear.
+    {
+        auto bytes = log2.read(truncBoundary, 1 << 20);
+        EXPECT_TRUE(bytes.empty())
+            << "Truncated records must not reappear after crash recovery";
+    }
+
+    // Appendable: new records resume at truncBoundary contiguously.
+    RecordBatchBuilder nb(truncBoundary, 999);
+    nb.append("k", "post_recovery", 999);
+    int64_t newOff = log2.append(nb.build(), truncBoundary);
+    EXPECT_EQ(newOff, truncBoundary + 1)
+        << "Append after crash recovery must be contiguous from truncation boundary";
+    EXPECT_EQ(log2.logEndOffset(), truncBoundary + 1);
+
+    std::filesystem::remove_all(dir);
+}
