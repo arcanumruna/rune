@@ -3,11 +3,26 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 using namespace rune::storage;
+
+// ---------------------------------------------------------------------------
+// Helper: unique temp dir path per test
+// ---------------------------------------------------------------------------
+static std::filesystem::path makeTempDir(const char* stem) {
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto uniq = std::to_string(::getpid()) + "_" +
+                std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                std::to_string(ts);
+    return std::filesystem::temp_directory_path() / (std::string(stem) + "_" + uniq);
+}
 
 // ---- Test 1 (brief's canonical test): produce/consume + restart durability ----
 TEST(PartitionApi, ProduceConsumeAndSurviveRestart) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t1";
+    auto dir = makeTempDir("rune_api_t1");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         PartitionApi api(dir.string());
@@ -33,7 +48,7 @@ TEST(PartitionApi, ProduceConsumeAndSurviveRestart) {
 
 // ---- Test 2: empty partition ----
 TEST(PartitionApi, EmptyPartition) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t2";
+    auto dir = makeTempDir("rune_api_t2");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         PartitionApi api(dir.string());
@@ -46,7 +61,7 @@ TEST(PartitionApi, EmptyPartition) {
 
 // ---- Test 3: ordering & offsets for N=20 records ----
 TEST(PartitionApi, OrderingAndOffsets) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t3";
+    auto dir = makeTempDir("rune_api_t3");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         constexpr int N = 20;
@@ -71,7 +86,7 @@ TEST(PartitionApi, OrderingAndOffsets) {
 
 // ---- Test 4: consume from arbitrary offsets ----
 TEST(PartitionApi, ConsumeFromArbitraryOffsets) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t4";
+    auto dir = makeTempDir("rune_api_t4");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         constexpr int N = 10;
@@ -101,7 +116,7 @@ TEST(PartitionApi, ConsumeFromArbitraryOffsets) {
 
 // ---- Test 5: values round-trip exactly (empty value, embedded NUL/high bytes) ----
 TEST(PartitionApi, ValuesRoundTripExactly) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t5";
+    auto dir = makeTempDir("rune_api_t5");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         PartitionApi api(dir.string());
@@ -142,7 +157,7 @@ TEST(PartitionApi, ValuesRoundTripExactly) {
 
 // ---- Test 7: consume across many small maxBytes chunks (regression for return-vs-break bug) ----
 TEST(PartitionApi, ConsumeAcrossManyReadChunks) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t7";
+    auto dir = makeTempDir("rune_api_t7");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         constexpr int N = 500;
@@ -198,7 +213,7 @@ TEST(PartitionApi, ConsumeAcrossManyReadChunks) {
 
 // ---- Test 6: restart mid-stream (proves recover() sets logEndOffset correctly) ----
 TEST(PartitionApi, RestartMidStream) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_api_t6";
+    auto dir = makeTempDir("rune_api_t6");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     {
         PartitionApi api(dir.string());

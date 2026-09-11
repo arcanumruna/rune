@@ -9,9 +9,11 @@
 #include <rune/consensus/Messages.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <set>
+#include <unistd.h>
 
 using namespace rune::consensus;
 namespace fs = std::filesystem;
@@ -23,11 +25,13 @@ namespace fs = std::filesystem;
 struct TempFile {
     fs::path path;
     explicit TempFile(std::string_view suffix = ".bin") {
+        static std::atomic<uint64_t> g_tempSeq{0};
         auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-        static int counter = 0;
+        auto uniq = std::to_string(::getpid()) + "_" +
+                    std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                    std::to_string(ts);
         path = fs::temp_directory_path() /
-               ("rune_elec_test_" + std::to_string(ts) +
-                "_" + std::to_string(++counter) + std::string(suffix));
+               ("rune_elec_test_" + uniq + std::string(suffix));
         fs::remove(path);
     }
     ~TempFile() {

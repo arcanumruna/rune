@@ -20,6 +20,9 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 
 using namespace rune::replication;
 
@@ -37,13 +40,21 @@ static std::vector<uint8_t> makePayload(uint8_t fill, std::size_t size = 16)
     return std::vector<uint8_t>(size, fill);
 }
 
+static std::string makeUniqSuffix() {
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::to_string(::getpid()) + "_" +
+           std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+           std::to_string(ts);
+}
+
 // RAII temporary directory for Log storage.
 struct TempDir {
     std::string path;
     explicit TempDir(const std::string& suffix) {
         path = std::filesystem::temp_directory_path().string()
                + "/rune_replica_test_" + suffix + "_"
-               + std::to_string(reinterpret_cast<uintptr_t>(this));
+               + makeUniqSuffix();
         std::filesystem::create_directories(path);
     }
     ~TempDir() {

@@ -3,11 +3,26 @@
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 using namespace rune::storage; using namespace rune::protocol;
+
+// ---------------------------------------------------------------------------
+// Helper: unique temp dir path per test
+// ---------------------------------------------------------------------------
+static std::filesystem::path makeTempDir(const char* stem) {
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto uniq = std::to_string(::getpid()) + "_" +
+                std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                std::to_string(ts);
+    return std::filesystem::temp_directory_path() / (std::string(stem) + "_" + uniq);
+}
 
 // ---- Test 1 (brief's canonical test): rolls + reads across segment boundary ----
 TEST(Log, RollsSegmentsAndReadsAcross) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_log_t1";
+    auto dir = makeTempDir("rune_log_t1");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*segmentRollBytes*/ 256); // tiny to force rolls
     int64_t off = 0;
@@ -26,7 +41,7 @@ TEST(Log, RollsSegmentsAndReadsAcross) {
 
 // ---- Test 2: single segment (no roll) ----
 TEST(Log, SingleSegmentNoRoll) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_log_t2";
+    auto dir = makeTempDir("rune_log_t2");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // Large rollBytes so we never roll
     Log log(dir.string(), 64LL * 1024 * 1024);
@@ -47,7 +62,7 @@ TEST(Log, SingleSegmentNoRoll) {
 
 // ---- Test 3: read boundaries ----
 TEST(Log, ReadBoundaries) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_log_t3";
+    auto dir = makeTempDir("rune_log_t3");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // Roll every ~256 bytes so we get at least 2 segments
     Log log(dir.string(), 256);
@@ -90,7 +105,7 @@ TEST(Log, ReadBoundaries) {
 
 // ---- Test 4: reopen discovers existing segments + recover ----
 TEST(Log, ReopenDiscoversSegmentsAndRecovers) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_log_t4";
+    auto dir = makeTempDir("rune_log_t4");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     int64_t savedEndOffset = 0;
     int64_t earlyOffset = -1;
@@ -136,7 +151,7 @@ TEST(Log, ReopenDiscoversSegmentsAndRecovers) {
 
 // ---- Test 5: recover() after torn tail in the ACTIVE segment ----
 TEST(Log, RecoverAfterTornTailInActiveSegment) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_log_t5";
+    auto dir = makeTempDir("rune_log_t5");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     int64_t firstSegBase = 0;
     int64_t cleanEndOffset = -1;
@@ -191,7 +206,7 @@ TEST(Log, RecoverAfterTornTailInActiveSegment) {
 
 // ---- Test 6: segmentBaseOffsets() returns sorted base offsets matching rolls ----
 TEST(Log, SegmentBaseOffsetsSortedAndCountMatchesRolls) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_log_t6";
+    auto dir = makeTempDir("rune_log_t6");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), 256);
     int64_t off = 0;
@@ -220,7 +235,7 @@ TEST(Log, SegmentBaseOffsetsSortedAndCountMatchesRolls) {
 // Offsets < boundary kept; >= boundary dropped.
 // LEO == boundary; log still readable and appendable (resuming at boundary).
 TEST(Log, TruncateSingleSegmentMidLog) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t1";
+    auto dir = makeTempDir("rune_trunc_t1");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // Large rollBytes — stays single segment.
     Log log(dir.string(), 64LL * 1024 * 1024);
@@ -278,7 +293,7 @@ TEST(Log, TruncateSingleSegmentMidLog) {
 // Append enough to roll >= 2 segments, truncate into an earlier segment.
 // Trailing segment files removed; straddling segment truncated; LEO exact; readable.
 TEST(Log, TruncateMultiSegmentIntoEarlierSegment) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t2";
+    auto dir = makeTempDir("rune_trunc_t2");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // Tiny rollBytes to force multiple segments (~256 bytes per batch at ~100-byte batches).
     Log log(dir.string(), 256);
@@ -338,7 +353,7 @@ TEST(Log, TruncateMultiSegmentIntoEarlierSegment) {
 // ---- FIX 3c: truncate exactly at a segment baseOffset boundary ----
 // No corruption; LEO exact; readable.
 TEST(Log, TruncateAtSegmentBaseOffsetBoundary) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t3";
+    auto dir = makeTempDir("rune_trunc_t3");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), 256);
     int64_t off = 0;
@@ -385,7 +400,7 @@ TEST(Log, TruncateAtSegmentBaseOffsetBoundary) {
 // Close and reopen the Log after truncation; confirm LEO and readable records
 // are consistent (no stale index / torn tail).
 TEST(Log, CrashRecoveryAfterTruncate) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_trunc_t4";
+    auto dir = makeTempDir("rune_trunc_t4");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
 
     int64_t truncBoundary = -1;

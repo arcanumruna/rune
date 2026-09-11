@@ -3,7 +3,22 @@
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
 #include <numeric>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 using namespace rune::storage; using namespace rune::protocol;
+
+// ---------------------------------------------------------------------------
+// Helper: unique temp dir path per test
+// ---------------------------------------------------------------------------
+static std::filesystem::path makeTempDir(const char* stem) {
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto uniq = std::to_string(::getpid()) + "_" +
+                std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                std::to_string(ts);
+    return std::filesystem::temp_directory_path() / (std::string(stem) + "_" + uniq);
+}
 
 // Helper: build a batch with a given number of records
 static std::vector<uint8_t> makeBatch(int64_t baseOffset, int64_t baseTs, int nRecords) {
@@ -14,7 +29,7 @@ static std::vector<uint8_t> makeBatch(int64_t baseOffset, int64_t baseTs, int nR
 }
 
 TEST(LogSegment, AppendThenReadBack) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg";
+    auto dir = makeTempDir("rune_seg");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     LogSegment seg(dir.string(), 0);
 
@@ -36,7 +51,7 @@ TEST(LogSegment, AppendThenReadBack) {
 // Edge: multiple batches with small indexIntervalBytes so multiple sparse index entries are created;
 // read() from offsets that land on different index entries returns the correct first batch.
 TEST(LogSegment, MultipleSparseIndexEntriesCorrectRead) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_sparse";
+    auto dir = makeTempDir("rune_seg_sparse");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // Use a very small indexIntervalBytes (1 byte) so every batch gets an index entry
     LogSegment seg(dir.string(), 0, 1);
@@ -80,7 +95,7 @@ TEST(LogSegment, MultipleSparseIndexEntriesCorrectRead) {
 // Edge: read(0) returns the first batch; read at an offset in the middle returns the containing batch;
 // read past the last offset returns an empty vector.
 TEST(LogSegment, ReadFromVariousOffsets) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_readoff";
+    auto dir = makeTempDir("rune_seg_readoff");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     LogSegment seg(dir.string(), 10, 4096);
 
@@ -128,7 +143,7 @@ TEST(LogSegment, ReadFromVariousOffsets) {
 
 // Edge: read() with a small maxBytes still returns a walkable prefix (at least the first matching batch).
 TEST(LogSegment, ReadSmallMaxBytesReturnsFirstBatch) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_small";
+    auto dir = makeTempDir("rune_seg_small");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     LogSegment seg(dir.string(), 0, 4096);
 
@@ -152,7 +167,7 @@ TEST(LogSegment, ReadSmallMaxBytesReturnsFirstBatch) {
 // Edge: sizeBytes() equals the sum of appended batch sizes;
 // nextOffset() tracks lastOffset+1 across multiple appends including multi-record batches.
 TEST(LogSegment, SizeBytesAndNextOffsetTracking) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_size";
+    auto dir = makeTempDir("rune_seg_size");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     LogSegment seg(dir.string(), 0, 4096);
 
@@ -182,7 +197,7 @@ TEST(LogSegment, SizeBytesAndNextOffsetTracking) {
 
 // Edge: non-zero baseOffset segment — append and read work correctly with an offset base > 0.
 TEST(LogSegment, NonZeroBaseOffsetSegment) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_nonzero";
+    auto dir = makeTempDir("rune_seg_nonzero");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     LogSegment seg(dir.string(), 500, 4096);
 
@@ -218,7 +233,7 @@ TEST(LogSegment, NonZeroBaseOffsetSegment) {
 
 #include <fstream>
 TEST(LogSegment, RecoverTruncatesTornTail) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec";
+    auto dir = makeTempDir("rune_seg_rec");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     std::string logPath;
     {
@@ -239,7 +254,7 @@ TEST(LogSegment, RecoverTruncatesTornTail) {
 
 // Recovery: clean segment (no corruption) — recover() keeps all batches, file size unchanged.
 TEST(LogSegment, RecoverCleanSegmentKeepsAllBatches) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_clean";
+    auto dir = makeTempDir("rune_seg_rec_clean");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     std::string logPath;
     int64_t sizeAfterAppend = 0;
@@ -266,7 +281,7 @@ TEST(LogSegment, RecoverCleanSegmentKeepsAllBatches) {
 
 // Recovery: empty segment file — recover() returns baseOffset, no throw.
 TEST(LogSegment, RecoverEmptySegment) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_empty";
+    auto dir = makeTempDir("rune_seg_rec_empty");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     LogSegment seg(dir.string(), 42);
     int64_t next = seg.recover();
@@ -276,7 +291,7 @@ TEST(LogSegment, RecoverEmptySegment) {
 
 // Recovery: mid-log corruption — first batch valid, second batch CRC-corrupted, third discarded.
 TEST(LogSegment, RecoverMidLogCorruptionKeepsOnlyFirstBatch) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_mid";
+    auto dir = makeTempDir("rune_seg_rec_mid");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     std::string logPath;
     size_t batch0Size = 0;
@@ -307,7 +322,7 @@ TEST(LogSegment, RecoverMidLogCorruptionKeepsOnlyFirstBatch) {
 
 // Recovery: index rebuilt — after recover() on multi-batch segment, read() at mid offset returns correct batch.
 TEST(LogSegment, RecoverRebuildsIndexForMidOffsetRead) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_rec_idx";
+    auto dir = makeTempDir("rune_seg_rec_idx");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     std::string logPath;
     {
@@ -335,7 +350,7 @@ TEST(LogSegment, RecoverRebuildsIndexForMidOffsetRead) {
 
 // Edge: many batches with small index interval; verify multiple index entries and mid-log reads.
 TEST(LogSegment, ManyBatchesSmallIntervalMidLogRead) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_many";
+    auto dir = makeTempDir("rune_seg_many");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // indexIntervalBytes=1 ensures an index entry per batch
     LogSegment seg(dir.string(), 0, 1);
@@ -379,7 +394,7 @@ TEST(LogSegment, ManyBatchesSmallIntervalMidLogRead) {
 // Regression: read() with tiny maxBytes grows its window and still finds the target batch
 // even when maxBytes < skip-distance from the sparse index entry to startOffset's batch.
 TEST(LogSegment, ReadWithTinyMaxBytesAcrossManyIndexEntries) {
-    auto dir = std::filesystem::temp_directory_path() / "rune_seg_tiny";
+    auto dir = makeTempDir("rune_seg_tiny");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     // Small indexIntervalBytes=256 creates many index entries; 200 single-record batches
     // means the skip distance from the nearest index entry can be many batch-widths.

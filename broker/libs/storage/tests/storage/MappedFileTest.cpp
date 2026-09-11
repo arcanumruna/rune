@@ -2,10 +2,25 @@
 #include <rune/storage/MappedFile.h>
 #include <filesystem>
 #include <stdexcept>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 using rune::storage::MappedFile;
 
+// ---------------------------------------------------------------------------
+// Helper: unique temp file path per test instance
+// ---------------------------------------------------------------------------
+static std::filesystem::path makeTempPath(const char* stem) {
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto uniq = std::to_string(::getpid()) + "_" +
+                std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                std::to_string(ts);
+    return std::filesystem::temp_directory_path() / (std::string(stem) + "_" + uniq + ".bin");
+}
+
 TEST(MappedFile, WriteReadPersistAcrossReopen) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf.bin";
+    auto p = makeTempPath("rune_mf");
     std::filesystem::remove(p);
     { MappedFile mf(p.string(), 4096, true); mf.data()[0] = 42; mf.data()[4095] = 7; mf.sync(); }
     { MappedFile mf(p.string(), 4096, false); EXPECT_EQ(mf.data()[0], 42); EXPECT_EQ(mf.data()[4095], 7); }
@@ -14,7 +29,7 @@ TEST(MappedFile, WriteReadPersistAcrossReopen) {
 
 // Edge: write then read within the same instance (no reopen needed)
 TEST(MappedFile, WriteReadWithinSingleInstance) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_single.bin";
+    auto p = makeTempPath("rune_mf_single");
     std::filesystem::remove(p);
     {
         MappedFile mf(p.string(), 1024, true);
@@ -30,7 +45,7 @@ TEST(MappedFile, WriteReadWithinSingleInstance) {
 
 // Edge: resize() preserves earlier bytes and exposes new zeroed space; sync() + reopen sees it
 TEST(MappedFile, ResizePreservesAndExposesZeroedSpace) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_resize.bin";
+    auto p = makeTempPath("rune_mf_resize");
     std::filesystem::remove(p);
     {
         MappedFile mf(p.string(), 4096, true);
@@ -59,7 +74,7 @@ TEST(MappedFile, ResizePreservesAndExposesZeroedSpace) {
 
 // Edge: resize to larger then write into the newly-mapped region; verify persistence after reopen
 TEST(MappedFile, ResizeWriteIntoNewRegionPersists) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_resize2.bin";
+    auto p = makeTempPath("rune_mf_resize2");
     std::filesystem::remove(p);
     {
         MappedFile mf(p.string(), 4096, true);
@@ -81,7 +96,7 @@ TEST(MappedFile, ResizeWriteIntoNewRegionPersists) {
 
 // Edge: two sequential writable instances over the same path (second sees first's data)
 TEST(MappedFile, TwoSequentialWritableInstancesSamePath) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_seq.bin";
+    auto p = makeTempPath("rune_mf_seq");
     std::filesystem::remove(p);
     {
         MappedFile mf(p.string(), 4096, true);
@@ -107,14 +122,14 @@ TEST(MappedFile, TwoSequentialWritableInstancesSamePath) {
 
 // Edge: opening a non-existent path read-only throws
 TEST(MappedFile, OpenNonExistentReadOnlyThrows) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_noexist_xyz123.bin";
+    auto p = makeTempPath("rune_mf_noexist_xyz123");
     std::filesystem::remove(p); // ensure it doesn't exist
     EXPECT_THROW(MappedFile(p.string(), 4096, false), std::runtime_error);
 }
 
 // Edge: boundary — writing the last byte of the mapping and reading it back
 TEST(MappedFile, BoundaryLastByteWriteRead) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_boundary.bin";
+    auto p = makeTempPath("rune_mf_boundary");
     std::filesystem::remove(p);
     constexpr size_t sz = 4096;
     {
@@ -131,7 +146,7 @@ TEST(MappedFile, BoundaryLastByteWriteRead) {
 
 // Edge: sync() actually persists (read-only reopen after sync sees correct data)
 TEST(MappedFile, SyncPersistsBeforeReopen) {
-    auto p = std::filesystem::temp_directory_path() / "rune_mf_sync.bin";
+    auto p = makeTempPath("rune_mf_sync");
     std::filesystem::remove(p);
     {
         MappedFile mf(p.string(), 4096, true);

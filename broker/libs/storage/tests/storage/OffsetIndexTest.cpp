@@ -2,10 +2,25 @@
 #include <rune/storage/OffsetIndex.h>
 #include <filesystem>
 #include <string>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 using namespace rune::storage;
 
+// ---------------------------------------------------------------------------
+// Helper: unique temp file path per test
+// ---------------------------------------------------------------------------
+static std::string makeTempIdx(const char* stem) {
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto uniq = std::to_string(::getpid()) + "_" +
+                std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                std::to_string(ts);
+    return (std::filesystem::temp_directory_path() / (std::string(stem) + "_" + uniq + ".index")).string();
+}
+
 TEST(OffsetIndex, AppendAndLookupLargestLowerBound) {
-    auto p = (std::filesystem::temp_directory_path() / "rune.index").string();
+    auto p = makeTempIdx("rune_idx");
     std::filesystem::remove(p);
     OffsetIndex idx(p, 100 /*baseOffset*/, 8 * 1024);
     idx.append(105, 0);
@@ -20,7 +35,7 @@ TEST(OffsetIndex, AppendAndLookupLargestLowerBound) {
 }
 
 TEST(OffsetIndex, WarmSectionBoundaryCorrectness) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_warm.index").string();
+    auto p = makeTempIdx("rune_warm");
     std::filesystem::remove(p);
     OffsetIndex idx(p, 0, 64 * 1024);
     for (int i = 0; i < 4000; ++i) idx.append(i * 10, i * 32); // 4000 entries > 1024 warm
@@ -32,7 +47,7 @@ TEST(OffsetIndex, WarmSectionBoundaryCorrectness) {
 }
 
 TEST(OffsetIndex, WarmLookupSearchesTailOnly) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_warm2.index").string();
+    auto p = makeTempIdx("rune_warm2");
     std::filesystem::remove(p);
     OffsetIndex idx(p, 0, 64 * 1024);
     for (int i = 0; i < 4000; ++i) idx.append(i * 10, i);
@@ -43,7 +58,7 @@ TEST(OffsetIndex, WarmLookupSearchesTailOnly) {
 
 // Edge: empty index — entries()==0 and lookup(anything) returns {baseOffset, 0}
 TEST(OffsetIndex, EmptyIndexLookupReturnsBase) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_idx_empty.index").string();
+    auto p = makeTempIdx("rune_idx_empty");
     std::filesystem::remove(p);
     OffsetIndex idx(p, 500, 8 * 1024);
     EXPECT_EQ(idx.entries(), 0);
@@ -61,7 +76,7 @@ TEST(OffsetIndex, EmptyIndexLookupReturnsBase) {
 
 // Edge: single entry — below base returns base, exact match, above returns the single entry
 TEST(OffsetIndex, SingleEntryLookup) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_idx_single.index").string();
+    auto p = makeTempIdx("rune_idx_single");
     std::filesystem::remove(p);
     OffsetIndex idx(p, 200, 8 * 1024);
     idx.append(205, 100);
@@ -83,7 +98,7 @@ TEST(OffsetIndex, SingleEntryLookup) {
 
 // Edge: non-zero baseOffset — verify relative-offset math produces correct absolute offsets
 TEST(OffsetIndex, NonZeroBaseOffsetMath) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_idx_nonzero.index").string();
+    auto p = makeTempIdx("rune_idx_nonzero");
     std::filesystem::remove(p);
     const int64_t base = 1000;
     OffsetIndex idx(p, base, 8 * 1024);
@@ -116,7 +131,7 @@ TEST(OffsetIndex, NonZeroBaseOffsetMath) {
 
 // Edge: strictly-increasing offsets; lookup picks the largest <= target at exact and between points
 TEST(OffsetIndex, StrictlyIncreasingOffsetsLookup) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_idx_strict.index").string();
+    auto p = makeTempIdx("rune_idx_strict");
     std::filesystem::remove(p);
     OffsetIndex idx(p, 0, 8 * 1024);
     // Append offsets 0, 5, 10, 15, 20 with positions 0,50,100,150,200
@@ -138,15 +153,10 @@ TEST(OffsetIndex, StrictlyIncreasingOffsetsLookup) {
     std::filesystem::remove(p);
 }
 
-// Helper to build a unique index path with a tag
-static std::string uniqueIdx(const char* tag) {
-    return (std::filesystem::temp_directory_path() / (std::string("rune_idx_warm_") + tag + ".index")).string();
-}
-
 // Edge: kWarmEntries boundary — indexes of sizes 1023, 1024, 1025, 2048 entries
 // For each: verify lookup in cold region, at the warm boundary, and in the warm tail.
 TEST(OffsetIndex, WarmBoundary1023Entries) {
-    auto p = uniqueIdx("1023");
+    auto p = makeTempIdx("rune_idx_warm_1023");
     std::filesystem::remove(p);
     const int N = 1023;
     OffsetIndex idx(p, 0, 64 * 1024);
@@ -162,7 +172,7 @@ TEST(OffsetIndex, WarmBoundary1023Entries) {
 }
 
 TEST(OffsetIndex, WarmBoundary1024Entries) {
-    auto p = uniqueIdx("1024");
+    auto p = makeTempIdx("rune_idx_warm_1024");
     std::filesystem::remove(p);
     const int N = 1024; // exactly kWarmEntries
     OffsetIndex idx(p, 0, 64 * 1024);
@@ -178,7 +188,7 @@ TEST(OffsetIndex, WarmBoundary1024Entries) {
 }
 
 TEST(OffsetIndex, WarmBoundary1026Entries) {
-    auto p = uniqueIdx("1026");
+    auto p = makeTempIdx("rune_idx_warm_1026");
     std::filesystem::remove(p);
     const int N = 1026; // kWarmEntries=1024; firstWarm = N-1-1024 = 1, so cold region is [0,1) and warm tail is [1, N)
     OffsetIndex idx(p, 0, 64 * 1024);
@@ -201,7 +211,7 @@ TEST(OffsetIndex, WarmBoundary1026Entries) {
 }
 
 TEST(OffsetIndex, WarmBoundary2048Entries) {
-    auto p = uniqueIdx("2048");
+    auto p = makeTempIdx("rune_idx_warm_2048");
     std::filesystem::remove(p);
     const int N = 2048;
     OffsetIndex idx(p, 0, 128 * 1024);
@@ -218,7 +228,7 @@ TEST(OffsetIndex, WarmBoundary2048Entries) {
 
 // Edge: lastSearchLow() — warm-tail lookup starts at firstWarm; cold lookup starts at 0
 TEST(OffsetIndex, LastSearchLowWarmTailVsColdRegion) {
-    auto p = (std::filesystem::temp_directory_path() / "rune_idx_lsl.index").string();
+    auto p = makeTempIdx("rune_idx_lsl");
     std::filesystem::remove(p);
     const int N = 4000;
     OffsetIndex idx(p, 0, 64 * 1024);

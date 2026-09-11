@@ -5,9 +5,12 @@
 #include <gtest/gtest.h>
 #include <rune/consensus/TermLog.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace rune::consensus;
@@ -17,7 +20,12 @@ using namespace rune::consensus;
 // ---------------------------------------------------------------------------
 
 static std::string tmpPath(const std::string& tag) {
-    return (fs::temp_directory_path() / ("term_log_test_" + tag + ".bin")).string();
+    static std::atomic<uint64_t> g_tempSeq{0};
+    auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto uniq = std::to_string(::getpid()) + "_" +
+                std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                std::to_string(ts);
+    return (fs::temp_directory_path() / ("term_log_test_" + uniq + "_" + tag + ".bin")).string();
 }
 
 struct TempFile {

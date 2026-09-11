@@ -3,16 +3,27 @@
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <unistd.h>
 using namespace rune::storage; using namespace rune::protocol;
 
 class RetentionTest : public ::testing::Test {
 protected:
+    void SetUp() override {
+        static std::atomic<uint64_t> g_tempSeq{0};
+        auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto uniq = std::to_string(::getpid()) + "_" +
+                    std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                    std::to_string(ts);
+        testDir_ = std::filesystem::temp_directory_path() / ("rune_ret_test_" + uniq);
+    }
     void TearDown() override {
         if (std::filesystem::exists(testDir_)) {
             std::filesystem::remove_all(testDir_);
         }
     }
-    std::filesystem::path testDir_ = std::filesystem::temp_directory_path() / "rune_ret_test";
+    std::filesystem::path testDir_;
 };
 
 TEST_F(RetentionTest, DeletesOldestSegmentsBySize) {

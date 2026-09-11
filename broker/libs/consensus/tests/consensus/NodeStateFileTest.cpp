@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 #include <rune/consensus/NodeStateFile.h>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 using namespace rune::consensus;
 namespace fs = std::filesystem;
@@ -14,9 +16,13 @@ namespace fs = std::filesystem;
 struct TempNsf {
     fs::path path;
     explicit TempNsf(const char* tag = "") {
-        auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        static std::atomic<uint64_t> g_tempSeq{0};
+        auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto uniq = std::to_string(::getpid()) + "_" +
+                    std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                    std::to_string(ts);
         path = fs::temp_directory_path() /
-               ("rune_nsf_" + std::to_string(ns) + std::string(tag) + ".dat");
+               ("rune_nsf_" + uniq + std::string(tag) + ".dat");
         fs::remove(path);
     }
     ~TempNsf() {

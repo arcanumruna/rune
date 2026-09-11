@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cassert>
+#include <unistd.h>
 
 using namespace rune::consensus;
 namespace fs = std::filesystem;
@@ -49,10 +50,13 @@ using namespace std::chrono_literals;
 struct TempFile {
     fs::path path;
     explicit TempFile(std::string_view suffix = ".dat") {
-        static std::atomic<int> ctr{0};
+        static std::atomic<uint64_t> g_tempSeq{0};
         auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto uniq = std::to_string(::getpid()) + "_" +
+                    std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                    std::to_string(ts);
         path = fs::temp_directory_path() /
-               ("rune_arirt_" + std::to_string(ts) + "_" + std::to_string(++ctr) + std::string(suffix));
+               ("rune_arirt_" + uniq + std::string(suffix));
         fs::remove(path);
     }
     ~TempFile() { std::error_code ec; fs::remove(path, ec); }

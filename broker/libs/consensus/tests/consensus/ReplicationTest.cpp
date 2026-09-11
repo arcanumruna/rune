@@ -13,6 +13,7 @@
 #include <chrono>
 #include <filesystem>
 #include <set>
+#include <unistd.h>
 
 using namespace rune::consensus;
 namespace fs = std::filesystem;
@@ -23,12 +24,14 @@ namespace fs = std::filesystem;
 
 struct TempFile {
     fs::path path;
-    static std::atomic<int> counter;
     explicit TempFile(std::string_view suffix = ".bin") {
+        static std::atomic<uint64_t> g_tempSeq{0};
         auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto uniq = std::to_string(::getpid()) + "_" +
+                    std::to_string(g_tempSeq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+                    std::to_string(ts);
         path = fs::temp_directory_path() /
-               ("rune_repl_test_" + std::to_string(ts) +
-                "_" + std::to_string(++counter) + std::string(suffix));
+               ("rune_repl_test_" + uniq + std::string(suffix));
         fs::remove(path);
     }
     ~TempFile() {
@@ -38,7 +41,6 @@ struct TempFile {
     }
     std::string str() const { return path.string(); }
 };
-std::atomic<int> TempFile::counter{0};
 
 static ClusterConfig makeConfig3(NodeId self = 0) {
     return ClusterConfig{ .self = self, .members = {0, 1, 2} };
