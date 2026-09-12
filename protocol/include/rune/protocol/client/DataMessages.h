@@ -1,0 +1,195 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include "Codec.h"
+#include "MessageHeader.h"
+#include "Protocol.h"
+
+namespace rune::protocol::client {
+
+// ---------------------------------------------------------------------------
+// Produce  (templateId 16)
+//
+// Frame layout (all little-endian):
+//   [0..23]   MessageHeader (24 bytes)
+//     blockLength = BODY_FIXED (9)
+//     templateId  = 16
+//   [24..27]  topicId        : int32
+//   [28..31]  partition      : int32   (used when partitionKnown==1; else ignore)
+//   [32]      partitionKnown : uint8   (1 => use partition; 0 => broker resolves from key)
+//   BODY_FIXED = 9, so var fields start at offset 33 (header 24 + 9)
+//   [33..34]  key length     : uint16  (var prefix; may be 0 when partitionKnown==1)
+//   [35..]    key bytes
+//   [35+keyLen..36+keyLen]  recordBatch length : uint16  (var prefix)
+//   [37+keyLen..]           recordBatch bytes   (opaque — never parsed by the codec)
+//
+// Note: the u16 length prefix caps a single var field at 65535 bytes.
+// Producing batches larger than 65535 bytes requires multi-frame framing,
+// which is deferred to a later milestone.
+//
+// Total = 24 + 9 + 2 + key.size() + 2 + recordBatch.size()
+//       = 37 + key.size() + recordBatch.size()
+// ---------------------------------------------------------------------------
+struct Produce {
+    int64_t  sessionId      = 0;
+    int64_t  correlationId  = 0;
+    int32_t  topicId        = 0;
+    int32_t  partition      = 0;
+    uint8_t  partitionKnown = 0;   // 1 => explicit partition; 0 => resolve from key
+    std::span<const uint8_t> key;          // zero-copy view; may be empty
+    std::span<const uint8_t> recordBatch;  // opaque blob; zero-copy view
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Produce); // 16
+    static constexpr uint16_t BODY_FIXED  = 9;  // topicId(4) + partition(4) + partitionKnown(1)
+
+    /// Total encoded size accounting for the two var fields.
+    /// key and recordBatch are each capped at 65535 bytes by the u16 prefix.
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE
+             + BODY_FIXED
+             + 2u + key.size()
+             + 2u + recordBatch.size();
+    }
+
+    /// Encode the full frame into buf.  buf must be ≥ encodedSize() bytes.
+    /// Returns total bytes written.
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE32(buf, fixedBase + 0, topicId);
+        detail::putLE32(buf, fixedBase + 4, partition);
+        buf[fixedBase + 8] = partitionKnown;
+
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
+
+        // key var field
+        pos += putVarBytes(buf + pos,
+                           key.data(),
+                           static_cast<uint16_t>(key.size()));
+
+        // recordBatch var field
+        pos += putVarBytes(buf + pos,
+                           recordBatch.data(),
+                           static_cast<uint16_t>(recordBatch.size()));
+
+        return pos;
+    }
+
+    /// Decode a full frame from buf[0..avail-1].
+    /// Returns nullopt on any truncation or header mismatch.
+    /// The returned spans are zero-copy views into buf — buf must outlive the result.
+    static std::optional<Produce> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+
+        Produce msg;
+        msg.sessionId      = hdr.sessionId;
+        msg.correlationId  = hdr.correlationId;
+        msg.topicId        = detail::getLE32(buf, static_cast<int>(fixedBase) + 0);
+        msg.partition      = detail::getLE32(buf, static_cast<int>(fixedBase) + 4);
+        msg.partitionKnown = buf[fixedBase + 8];
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+
+        // key var field
+        const uint8_t* keyData = nullptr;
+        uint16_t       keyLen  = 0;
+        if (!getVarBytes(buf, avail, pos, keyData, keyLen)) return std::nullopt;
+        msg.key = std::span<const uint8_t>(keyData, keyLen);
+
+        // recordBatch var field
+        const uint8_t* rbData = nullptr;
+        uint16_t       rbLen  = 0;
+        if (!getVarBytes(buf, avail, pos, rbData, rbLen)) return std::nullopt;
+        msg.recordBatch = std::span<const uint8_t>(rbData, rbLen);
+
+        return msg;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ProduceResponse  (templateId 17)
+//
+// Frame layout (all little-endian):
+//   [0..23]   MessageHeader (24 bytes)
+//     blockLength = BODY_FIXED (14)
+//     templateId  = 17
+//   [24..25]  errorCode  : int16   (ErrorCode value; 0 = OK)
+//   [26..29]  partition  : int32   (assigned/confirmed partition)
+//   [30..37]  baseOffset : int64   (base offset of the batch; ignore when errorCode != 0)
+//   BODY_FIXED = 14 (2 + 4 + 8)
+//
+// Total = 24 + 14 = 38 bytes (no var fields)
+// ---------------------------------------------------------------------------
+struct ProduceResponse {
+    int64_t sessionId     = 0;
+    int64_t correlationId = 0;
+    int16_t errorCode     = 0;   // rune::protocol::client::ErrorCode value
+    int32_t partition     = 0;
+    int64_t baseOffset    = 0;   // meaningful only when errorCode == 0
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ProduceResponse); // 17
+    static constexpr uint16_t BODY_FIXED  = 14;  // errorCode(2) + partition(4) + baseOffset(8)
+
+    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 38
+
+    /// Encode the full frame (38 bytes) into buf.  Returns 38.
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16s(buf, fixedBase + 0, errorCode);
+        detail::putLE32 (buf, fixedBase + 2, partition);
+        detail::putLE64 (buf, fixedBase + 6, baseOffset);
+
+        return ENCODED_SIZE;
+    }
+
+    /// Decode a full frame from buf[0..avail-1].
+    /// Returns nullopt on any truncation or header mismatch.
+    static std::optional<ProduceResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        if (avail < ENCODED_SIZE) return std::nullopt;
+
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        ProduceResponse msg;
+        msg.sessionId     = hdr.sessionId;
+        msg.correlationId = hdr.correlationId;
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        msg.errorCode  = detail::getLE16s(buf, fixedBase + 0);
+        msg.partition  = detail::getLE32 (buf, fixedBase + 2);
+        msg.baseOffset = detail::getLE64 (buf, fixedBase + 6);
+
+        return msg;
+    }
+};
+
+} // namespace rune::protocol::client

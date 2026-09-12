@@ -13,16 +13,22 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     ErrorResponse   = 5,
     Ping            = 6,
     Pong            = 7,
+    // produce/consume range (16-31)
+    Produce         = 16,
+    ProduceResponse = 17,
 };
 
 enum class ErrorCode : uint16_t {
-    OK              = 0,
-    ProtocolVersion = 1,
-    NotLeader       = 2,
-    Redirect        = 3,
-    SessionExpired  = 4,
-    UnknownSession  = 5,
-    Internal        = 6,
+    OK                   = 0,
+    ProtocolVersion      = 1,
+    NotLeader            = 2,
+    Redirect             = 3,
+    SessionExpired       = 4,
+    UnknownSession       = 5,
+    Internal             = 6,
+    UnknownTopic         = 7,
+    UnknownPartition     = 8,
+    NotPartitionLeader   = 9,
 };
 
 } // namespace rune::protocol::client

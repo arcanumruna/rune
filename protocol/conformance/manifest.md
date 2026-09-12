@@ -317,6 +317,115 @@ Offset  Hex                                        Notes
 
 ---
 
+---
+
+## 11. `produce_explicit_partition.bin` — 45 bytes
+
+**Message:** `Produce` (templateId = 16)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 9                        | 0x0009                          |
+| templateId      | 16                       | 0x0010                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| topicId         | 1001                     | 0x000003E9                      |
+| partition       | 7                        | 0x00000007                      |
+| partitionKnown  | 1                        | 0x01                            |
+| key             | (empty)                  | len=0 (0x0000)                  |
+| recordBatch     | 8 opaque bytes           | len=8 (0x0008); DE AD BE EF 00 FF 01 02 |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      09 00                                      blockLength = 9 (LE)
+02      10 00                                      templateId = 16 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      E9 03 00 00                                topicId = 1001 (LE)
+28      07 00 00 00                                partition = 7 (LE)
+32      01                                         partitionKnown = 1
+33      00 00                                      key var-len = 0 (LE)
+35      08 00                                      recordBatch var-len = 8 (LE)
+37      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
+```
+
+---
+
+## 12. `produce_key_only.bin` — 48 bytes
+
+**Message:** `Produce` (templateId = 16)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 9                        | 0x0009                          |
+| templateId      | 16                       | 0x0010                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| topicId         | 2002                     | 0x000007D2                      |
+| partition       | 0                        | 0x00000000 (ignored; partitionKnown=0) |
+| partitionKnown  | 0                        | 0x00                            |
+| key             | "ABC" (3 bytes)          | len=3 (0x0003); 41 42 43        |
+| recordBatch     | 8 opaque bytes           | len=8 (0x0008); DE AD BE EF 00 FF 01 02 |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      09 00                                      blockLength = 9 (LE)
+02      10 00                                      templateId = 16 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      D2 07 00 00                                topicId = 2002 (LE)
+28      00 00 00 00                                partition = 0 (LE, ignored)
+32      00                                         partitionKnown = 0
+33      03 00                                      key var-len = 3 (LE)
+35      41 42 43                                   key bytes = "ABC"
+38      08 00                                      recordBatch var-len = 8 (LE)
+40      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
+```
+
+---
+
+## 13. `produce_response.bin` — 38 bytes
+
+**Message:** `ProduceResponse` (templateId = 17)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 14                       | 0x000E                          |
+| templateId      | 17                       | 0x0011                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| errorCode       | 0 (OK)                   | 0x0000                          |
+| partition       | 7                        | 0x00000007                      |
+| baseOffset      | 123456                   | 0x000000000001E240              |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      0E 00                                      blockLength = 14 (LE)
+02      11 00                                      templateId = 17 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      00 00                                      errorCode = 0 / OK (LE)
+26      07 00 00 00                                partition = 7 (LE)
+30      40 E2 01 00 00 00 00 00                    baseOffset = 123456 (LE)
+```
+
+---
+
 ## Session Flow
 
 The `session_flow` sequence models a real client session round-trip at the wire level.
@@ -336,26 +445,31 @@ The `session_flow` sequence models a real client session round-trip at the wire 
 
 ## ErrorCode enum values
 
-| Name           | Value |
-|----------------|-------|
-| OK             | 0     |
-| ProtocolVersion| 1     |
-| NotLeader      | 2     |
-| Redirect       | 3     |
-| SessionExpired | 4     |
-| UnknownSession | 5     |
-| Internal       | 6     |
+| Name                | Value |
+|---------------------|-------|
+| OK                  | 0     |
+| ProtocolVersion     | 1     |
+| NotLeader           | 2     |
+| Redirect            | 3     |
+| SessionExpired      | 4     |
+| UnknownSession      | 5     |
+| Internal            | 6     |
+| UnknownTopic        | 7     |
+| UnknownPartition    | 8     |
+| NotPartitionLeader  | 9     |
 
 ---
 
 ## TemplateId enum values
 
-| Name            | Value |
-|-----------------|-------|
-| Connect         | 1     |
-| ConnectResponse | 2     |
-| Keepalive       | 3     |
-| Disconnect      | 4     |
-| ErrorResponse   | 5     |
-| Ping            | 6     |
-| Pong            | 7     |
+| Name            | Value | Range           |
+|-----------------|-------|-----------------|
+| Connect         | 1     | control (1-15)  |
+| ConnectResponse | 2     | control (1-15)  |
+| Keepalive       | 3     | control (1-15)  |
+| Disconnect      | 4     | control (1-15)  |
+| ErrorResponse   | 5     | control (1-15)  |
+| Ping            | 6     | control (1-15)  |
+| Pong            | 7     | control (1-15)  |
+| Produce         | 16    | produce/consume (16-31) |
+| ProduceResponse | 17    | produce/consume (16-31) |

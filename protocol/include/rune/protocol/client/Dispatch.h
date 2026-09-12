@@ -14,7 +14,7 @@
 //   1. TooShort          — avail < MessageHeader::ENCODED_SIZE
 //   2. WrongSchema       — header.schemaId != kSchemaId
 //   3. UnsupportedVersion— header.version  >  kProtocolVersion
-//   4. UnknownTemplate   — templateId not in the known set (1..7, Milestone A)
+//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 16..17 MB)
 //   5. Ok
 //
 // Future tickets extend isKnownTemplate() as new template ids are assigned
@@ -50,20 +50,29 @@ struct FrameCheck {
 };
 
 // ---------------------------------------------------------------------------
-// isKnownTemplate — true for templateIds handled in Milestone A (1..7).
+// isKnownTemplate — true for templateIds handled in Milestone A (1..7)
+//                   and Milestone B produce/consume range (16..17).
 //
 // Reserved ranges (from Protocol.h):
 //   control       1-15   (Connect=1 .. Pong=7 assigned so far)
-//   produce/consume 16-31
+//   produce/consume 16-31 (Produce=16, ProduceResponse=17 added in PB-1)
 //   groups/txn    32-63
 //   view          64-95
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
 [[nodiscard]] constexpr bool isKnownTemplate(uint16_t tid) noexcept {
-    return tid >= static_cast<uint16_t>(TemplateId::Connect) &&
-           tid <= static_cast<uint16_t>(TemplateId::Pong);
-    // i.e. 1 <= tid <= 7
+    // Milestone A control range: 1..7
+    if (tid >= static_cast<uint16_t>(TemplateId::Connect) &&
+        tid <= static_cast<uint16_t>(TemplateId::Pong)) {
+        return true;
+    }
+    // Milestone B produce/consume: 16..17
+    if (tid >= static_cast<uint16_t>(TemplateId::Produce) &&
+        tid <= static_cast<uint16_t>(TemplateId::ProduceResponse)) {
+        return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------

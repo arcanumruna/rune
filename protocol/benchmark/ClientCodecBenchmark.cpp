@@ -1,4 +1,4 @@
-// ClientCodecBenchmark.cpp — CP-2 + CP-3 + CP-4 + CP-6 codec benchmarks.
+// ClientCodecBenchmark.cpp — CP-2 + CP-3 + CP-4 + CP-6 + PB-1 codec benchmarks.
 //
 // Benchmarks the ConnectRequest, ConnectResponse, Keepalive, Disconnect,
 // ErrorResponse, Ping, and Pong encode + decode paths.  Inputs are pre-built
@@ -29,6 +29,7 @@
 #include <string>
 
 #include "rune/protocol/client/ControlMessages.h"
+#include "rune/protocol/client/DataMessages.h"
 #include "rune/protocol/client/Dispatch.h"
 #include "rune/protocol/client/PingMessages.h"
 
@@ -42,6 +43,32 @@ namespace {
 
 // A realistic ConnectRequest: 24-B header + 8-B fixed + 2-B var prefix + channel.
 constexpr std::string_view kChannel = "aeron:udp?endpoint=192.168.1.42:40123";
+
+// Produce/ProduceResponse: a 64-byte opaque recordBatch payload.
+static const std::vector<uint8_t> kBatchPayload(64, 0xAB);
+static const uint8_t kProduceKey[] = {0x01, 0x02, 0x03, 0x04};
+
+rpc::Produce makeProduce() {
+    rpc::Produce msg;
+    msg.sessionId      = 0x1122334455667788LL;
+    msg.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    msg.topicId        = 42;
+    msg.partition      = 3;
+    msg.partitionKnown = 0;
+    msg.key            = std::span<const uint8_t>(kProduceKey, sizeof(kProduceKey));
+    msg.recordBatch    = std::span<const uint8_t>(kBatchPayload.data(), kBatchPayload.size());
+    return msg;
+}
+
+rpc::ProduceResponse makeProduceResponse() {
+    rpc::ProduceResponse msg;
+    msg.sessionId     = 0x1122334455667788LL;
+    msg.correlationId = 0x0A0B0C0D0E0F1011LL;
+    msg.errorCode     = 0;
+    msg.partition     = 3;
+    msg.baseOffset    = 0x0000000001234567LL;
+    return msg;
+}
 
 rpc::ConnectRequest makeRequest() {
     rpc::ConnectRequest req;
@@ -142,14 +169,25 @@ struct Frames {
     std::array<uint8_t, 128> pongBuf{};
     std::size_t pongLen = 0;
 
+    // Produce encoded frame: 24 + 9 + 2 + 4 (key) + 2 + 64 (batch) = 105 bytes
+    static constexpr std::size_t kProduceBufSize = 256;
+    std::array<uint8_t, kProduceBufSize> produceBuf{};
+    std::size_t produceLen = 0;
+
+    // ProduceResponse encoded frame: 38 bytes
+    std::array<uint8_t, 64> produceRespBuf{};
+    std::size_t produceRespLen = 0;
+
     Frames() {
-        reqLen  = makeRequest().encode(reqBuf.data());
-        respLen = makeResponse().encode(respBuf.data());
-        kaLen   = makeKeepalive().encode(kaBuf.data());
-        disLen  = makeDisconnect().encode(disBuf.data());
-        errLen  = makeErrorResponse().encode(errBuf.data());
-        pingLen = makePing().encode(pingBuf.data());
-        pongLen = makePong().encode(pongBuf.data());
+        reqLen         = makeRequest().encode(reqBuf.data());
+        respLen        = makeResponse().encode(respBuf.data());
+        kaLen          = makeKeepalive().encode(kaBuf.data());
+        disLen         = makeDisconnect().encode(disBuf.data());
+        errLen         = makeErrorResponse().encode(errBuf.data());
+        pingLen        = makePing().encode(pingBuf.data());
+        pongLen        = makePong().encode(pongBuf.data());
+        produceLen     = makeProduce().encode(produceBuf.data());
+        produceRespLen = makeProduceResponse().encode(produceRespBuf.data());
     }
 };
 
@@ -480,3 +518,72 @@ static void BM_checkFrame_ValidConnectRequest(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(f.reqLen));
 }
 BENCHMARK(BM_checkFrame_ValidConnectRequest)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// PB-1: Produce / ProduceResponse encode + decode benchmarks.
+// ---------------------------------------------------------------------------
+
+// BM_Produce_Encode — encode a Produce with 4-byte key + 64-byte recordBatch.
+static void BM_Produce_Encode(benchmark::State& state) {
+    const rpc::Produce prod = makeProduce();
+    std::array<uint8_t, 256> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = prod.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(frames().produceLen));
+}
+BENCHMARK(BM_Produce_Encode)->Unit(benchmark::kNanosecond);
+
+// BM_Produce_Decode — decode a pre-encoded Produce frame.
+static void BM_Produce_Decode(benchmark::State& state) {
+    const Frames& f = frames();
+
+    for (auto _ : state) {
+        auto result = rpc::Produce::decode(f.produceBuf.data(), f.produceLen);
+        benchmark::DoNotOptimize(result);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(f.produceLen));
+}
+BENCHMARK(BM_Produce_Decode)->Unit(benchmark::kNanosecond);
+
+// BM_ProduceResponse_Encode — encode a ProduceResponse (fixed 38 bytes).
+static void BM_ProduceResponse_Encode(benchmark::State& state) {
+    const rpc::ProduceResponse resp = makeProduceResponse();
+    std::array<uint8_t, 64> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = resp.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(rpc::ProduceResponse::ENCODED_SIZE));
+}
+BENCHMARK(BM_ProduceResponse_Encode)->Unit(benchmark::kNanosecond);
+
+// BM_ProduceResponse_Decode — decode a pre-encoded ProduceResponse frame.
+static void BM_ProduceResponse_Decode(benchmark::State& state) {
+    const Frames& f = frames();
+
+    for (auto _ : state) {
+        auto result = rpc::ProduceResponse::decode(f.produceRespBuf.data(),
+                                                    f.produceRespLen);
+        benchmark::DoNotOptimize(result);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(f.produceRespLen));
+}
+BENCHMARK(BM_ProduceResponse_Decode)->Unit(benchmark::kNanosecond);

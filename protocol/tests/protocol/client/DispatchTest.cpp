@@ -3,12 +3,12 @@
 // Exhaustive tests for rune::protocol::client::checkFrame / peekTemplateId.
 //
 // Coverage:
-//   - Ok for all 7 known template ids (built with CP-1..4 encoders)
+//   - Ok for all 9 known template ids: MA control 1..7, MB produce/consume 16..17
 //   - TooShort: avail = 0, 1, 23 (no over-read); exactly 24 is NOT TooShort
 //   - WrongSchema: schemaId = 0, 111, 119, 121, 65535
 //   - UnsupportedVersion: version = 2, 3, 65535 (> 1 rejected);
 //                         version = 1 (equal) and version = 0 (older) accepted
-//   - UnknownTemplate: templateId = 0, 8, 15, 16, 32, 64, 99, 65535
+//   - UnknownTemplate: templateId = 0, 8, 15, 18, 32, 64, 99, 65535
 //   - Ordering precedence: TooShort wins over WrongSchema; WrongSchema wins over
 //                          UnsupportedVersion
 //   - peekTemplateId: returns nullopt for every non-Ok case; returns id for Ok
@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/PingMessages.h>
@@ -189,6 +190,47 @@ TEST(DispatchCheckFrame, OkPong) {
               std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Pong)));
 }
 
+// PB-1: Produce (tid 16) and ProduceResponse (tid 17) are now known.
+TEST(DispatchCheckFrame, OkProduce) {
+    static constexpr uint8_t kRb[] = {0xAA, 0xBB};
+    rpc::Produce prod;
+    prod.sessionId      = 0x1122334455667788LL;
+    prod.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    prod.topicId        = 1;
+    prod.partitionKnown = 1;
+    prod.key            = std::span<const uint8_t>{};
+    prod.recordBatch    = std::span<const uint8_t>(kRb, sizeof(kRb));
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = prod.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::Produce));  // 16
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Produce)));
+}
+
+TEST(DispatchCheckFrame, OkProduceResponse) {
+    rpc::ProduceResponse resp;
+    resp.sessionId     = 0x1122334455667788LL;
+    resp.correlationId = 0x0A0B0C0D0E0F1011LL;
+    resp.errorCode     = 0;
+    resp.partition     = 3;
+    resp.baseOffset    = 999LL;
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = resp.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::ProduceResponse));  // 17
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::ProduceResponse)));
+}
+
 // ===========================================================================
 // 2. TooShort — avail = 0, 1, 23 → TooShort; avail = 24 (exact) → NOT TooShort
 // ===========================================================================
@@ -316,8 +358,9 @@ TEST(DispatchCheckFrame, VersionZeroAccepted) {
 }
 
 // ===========================================================================
-// 5. UnknownTemplate — ids 0, 8, 15, 16, 32, 64, 99, 65535
+// 5. UnknownTemplate — ids 0, 8, 15, 18, 32, 64, 99, 65535
 //    (valid schema + version but unknown id)
+//    Note: 16 (Produce) and 17 (ProduceResponse) are now KNOWN (PB-1).
 // ===========================================================================
 
 TEST(DispatchCheckFrame, UnknownTemplateZero) {
@@ -344,11 +387,12 @@ TEST(DispatchCheckFrame, UnknownTemplateFifteen) {
     EXPECT_EQ(fc.templateId, 15u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateSixteen) {
-    // 16 = first in produce/consume range
-    auto buf = makeValidHeaderBuf(16);
+TEST(DispatchCheckFrame, UnknownTemplateEighteen) {
+    // 18 = first unassigned id in produce/consume range (16=Produce, 17=ProduceResponse are known)
+    auto buf = makeValidHeaderBuf(18);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.templateId, 18u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateThirtyTwo) {
@@ -433,8 +477,16 @@ TEST(DispatchPeekTemplateId, NulloptForUnknownTemplate) {
 }
 
 TEST(DispatchPeekTemplateId, ReturnsIdForOkFrame) {
-    // Verify peekTemplateId returns the correct id for each of the 7 known templates.
+    // Verify peekTemplateId returns the correct id for all known templates:
+    // Milestone A control (1..7) and Milestone B produce/consume (16..17).
     for (uint16_t tid = 1; tid <= 7; ++tid) {
+        auto buf = makeValidHeaderBuf(tid);
+        const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
+        ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
+        EXPECT_EQ(*opt, tid) << "templateId mismatch for " << tid;
+    }
+    // PB-1: tids 16 and 17 must also return a value.
+    for (uint16_t tid = 16; tid <= 17; ++tid) {
         auto buf = makeValidHeaderBuf(tid);
         const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
         ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
@@ -452,7 +504,10 @@ TEST(DispatchNoOverread, ExactSizeBufferAllKnownTemplates) {
     // checkFrame must not read past byte 23.  Under ASAN this catches any
     // over-read immediately; without ASAN the exact-size array acts as a
     // canary via std::array bounds in debug mode.
-    for (uint16_t tid = 1; tid <= 7; ++tid) {
+    //
+    // Milestone A control (1..7) + Milestone B produce/consume (16..17).
+    constexpr uint16_t kKnown[] = {1, 2, 3, 4, 5, 6, 7, 16, 17};
+    for (uint16_t tid : kKnown) {
         const auto buf = makeValidHeaderBuf(tid);
         static_assert(sizeof(buf) == 24);
 
@@ -476,12 +531,20 @@ TEST(DispatchNoOverread, ExactSizeBufferWrongSchema) {
 // ===========================================================================
 
 TEST(DispatchIsKnownTemplate, KnownBoundaries) {
-    // 1..7 inclusive must be known.
+    // Milestone A control range: 1..7 inclusive must be known.
     for (uint16_t tid = 1; tid <= 7; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
-    // 0 and 8 are NOT known.
+    // Milestone B produce/consume range: 16 and 17 must be known (PB-1).
+    EXPECT_TRUE(rpc::isKnownTemplate(16));
+    EXPECT_TRUE(rpc::isKnownTemplate(17));
+
+    // Not known: 0, 8..15 (unassigned control), 18..31 (unassigned produce/consume),
+    //            32+ (groups/txn, view ranges), 65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(8));
+    EXPECT_FALSE(rpc::isKnownTemplate(15));
+    EXPECT_FALSE(rpc::isKnownTemplate(18));
+    EXPECT_FALSE(rpc::isKnownTemplate(32));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

@@ -1,5 +1,5 @@
 // conformance/gen_vectors.cpp
-// One-shot generator: produces all 10 golden .bin files in conformance/vectors/.
+// One-shot generator: produces all 13 golden .bin files in conformance/vectors/.
 // Run once, commit the output, then delete (or keep) this file.
 // The harness (ConformanceTest.cpp) only READS the committed vectors.
 //
@@ -11,11 +11,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "rune/protocol/client/MessageHeader.h"
 #include "rune/protocol/client/ControlMessages.h"
+#include "rune/protocol/client/DataMessages.h"
 #include "rune/protocol/client/PingMessages.h"
 
 namespace rpc = rune::protocol::client;
@@ -174,6 +177,74 @@ int main(int argc, char** argv) {
         write_vec(dir, "pong.bin", buf, n);
     }
 
-    std::printf("Done. 10 vectors written to %s/\n", dir);
+    // -----------------------------------------------------------------------
+    // 11. produce_explicit_partition.bin
+    //
+    // Produce{ topicId=1001, partition=7, partitionKnown=1, key=empty,
+    //          recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
+    // Total = 24 + 9 + 2 + 0 + 2 + 8 = 45 bytes
+    // -----------------------------------------------------------------------
+    {
+        static constexpr uint8_t kBatch[] = {
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x01, 0x02
+        };
+        rpc::Produce msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 1001;
+        msg.partition      = 7;
+        msg.partitionKnown = 1;
+        msg.key            = std::span<const uint8_t>{};
+        msg.recordBatch    = std::span<const uint8_t>(kBatch, sizeof(kBatch));
+
+        std::vector<uint8_t> vbuf(msg.encodedSize());
+        n = msg.encode(vbuf.data());
+        write_vec(dir, "produce_explicit_partition.bin", vbuf.data(), n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. produce_key_only.bin
+    //
+    // Produce{ topicId=2002, partition=0, partitionKnown=0, key="ABC",
+    //          recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
+    // Total = 24 + 9 + 2 + 3 + 2 + 8 = 48 bytes
+    // -----------------------------------------------------------------------
+    {
+        static constexpr uint8_t kBatch[] = {
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x01, 0x02
+        };
+        static constexpr uint8_t kKey[] = {0x41, 0x42, 0x43}; // "ABC"
+        rpc::Produce msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 2002;
+        msg.partition      = 0;
+        msg.partitionKnown = 0;
+        msg.key            = std::span<const uint8_t>(kKey, sizeof(kKey));
+        msg.recordBatch    = std::span<const uint8_t>(kBatch, sizeof(kBatch));
+
+        std::vector<uint8_t> vbuf(msg.encodedSize());
+        n = msg.encode(vbuf.data());
+        write_vec(dir, "produce_key_only.bin", vbuf.data(), n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13. produce_response.bin
+    //
+    // ProduceResponse{ errorCode=0(OK), partition=7, baseOffset=123456 }
+    // Total = 24 + 14 = 38 bytes
+    // -----------------------------------------------------------------------
+    {
+        rpc::ProduceResponse msg;
+        msg.sessionId     = kSessionId;
+        msg.correlationId = kCorrelationId;
+        msg.errorCode     = 0;  // OK
+        msg.partition     = 7;
+        msg.baseOffset    = 123456LL;
+        n = msg.encode(buf);
+        write_vec(dir, "produce_response.bin", buf, n);
+    }
+
+    std::printf("Done. 13 vectors written to %s/\n", dir);
     return 0;
 }
