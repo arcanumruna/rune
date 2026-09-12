@@ -117,7 +117,16 @@ public:
     void close();
 
     // -------------------------------------------------------------------------
-    // Callback registration — MUST be called before connect()
+    // Callback registration — MUST be called before connect()  (FIX F4)
+    //
+    // These setters are SETUP-PHASE ONLY: they are single-threaded and must be
+    // called BEFORE the first connect().  The callback std::functions are read
+    // on the runner thread once connect() traffic can arrive; setting them after
+    // connect() would be an unsynchronised data race on the std::function.  The
+    // contract is now ENFORCED: each setter asserts (debug) and no-ops with a
+    // one-shot error (release) if called after connect() — see Client.cpp.  The
+    // first connect() publishes a happens-before (release) that the runner
+    // thread acquires, so callbacks set before connect() are safely visible.
     //
     // onConnected/onError fire on the runner/agent thread. onDisconnected fires
     // on the thread that calls close() (or the dtor's thread). Do NOT block
@@ -221,6 +230,14 @@ private:
     // ---- Runner thread -------------------------------------------------------
     std::atomic<bool> stopped_   {false};
     std::thread       runnerThread_;
+
+    // ---- Callback-contract guard (FIX F4) ------------------------------------
+    // Set (release) by the first connect() on the app thread.  Once true, the
+    // callback setters refuse to mutate the std::functions (which the runner
+    // thread may now read), preventing an unsynchronised data race.  The
+    // release store here + acquire load on the runner thread establish the
+    // happens-before that publishes the pre-connect() callbacks.
+    std::atomic<bool> connectCalled_ {false};
 
     // ---- Cross-thread promise maps (guarded by mtx_) -------------------------
     // pendingConnect_: at most one in-flight connect at a time.

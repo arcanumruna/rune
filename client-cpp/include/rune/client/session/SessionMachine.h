@@ -49,7 +49,11 @@ struct SessionIo {
     virtual bool sendFrame(const uint8_t* buf, std::size_t len) = 0;
 
     /// Retarget the transport at a new ingress endpoint (redirect / notleader).
-    virtual void retarget(const std::string& newIngressChannel) = 0;
+    /// FIX F8: noexcept + returns success.  A false return means the retarget
+    /// failed (e.g. resolve timeout) and the transport kept its previous
+    /// ingress endpoint; the machine still proceeds to resend the
+    /// ConnectRequest (a failed retarget does not throw and does not crash).
+    virtual bool retarget(const std::string& newIngressChannel) noexcept = 0;
 
     virtual ~SessionIo() = default;
 };
@@ -228,7 +232,10 @@ public:
 
         redirectCount_++;
         // FIX B: retarget BEFORE resending.
-        io_.retarget(std::string(newEndpoint));
+        // FIX F8: retarget is noexcept and returns success; a failed retarget
+        // keeps the previous ingress endpoint — we still resend (bounded by the
+        // redirect cap) rather than crash.
+        (void)io_.retarget(std::string(newEndpoint));
         doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
     }
 
@@ -266,8 +273,10 @@ public:
 
                 // FIX B: if the message field carries a non-empty endpoint string,
                 // this is the real broker-gateway redirect path — retarget.
+                // FIX F8: retarget is noexcept; a failed retarget keeps the old
+                // endpoint and we still resend (no throw into noexcept dispatch).
                 if (!message.empty()) {
-                    io_.retarget(std::string(message));
+                    (void)io_.retarget(std::string(message));
                 }
                 // Resend ConnectRequest (retargeted if message was an endpoint).
                 doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);

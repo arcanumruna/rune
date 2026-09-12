@@ -225,38 +225,45 @@ bool AeronTransport::egressConnected() const noexcept {
 // retarget — release current ingress pub, create new one on newIngressChannel
 // ---------------------------------------------------------------------------
 
-void AeronTransport::retarget(const std::string& newIngressChannel) {
-    if (!aeron_) {
-        throw std::runtime_error("AeronTransport::retarget called before start()");
+bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
+    // FIX F8: noexcept + non-throwing.  Any Aeron call below can throw
+    // (addExclusivePublication / findExclusivePublication on a closed client);
+    // contain it so nothing escapes into the agent's noexcept dispatch path
+    // (→ std::terminate).  On ANY failure we leave the OLD ingressPub_ intact.
+    try {
+        if (!aeron_) {
+            return false;  // not started — cannot retarget, old state untouched
+        }
+
+        // Resolve the NEW publication BEFORE releasing the old one, so a failed
+        // resolve leaves the old pub usable (offer() keeps working).
+        const int64_t pubRegId =
+            aeron_->addExclusivePublication(newIngressChannel, cfg_.ingressStreamId);
+
+        // Bounded resolution (kResolveMaxMs hard cap — no busy-spin).
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds{kResolveMaxMs};
+
+        std::shared_ptr<aeron::ExclusivePublication> newPub;
+        while (std::chrono::steady_clock::now() < deadline) {
+            newPub = aeron_->findExclusivePublication(pubRegId);
+            if (newPub) break;
+            std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
+        }
+
+        if (!newPub) {
+            // Resolve timed out — keep the old pub; report failure.
+            return false;
+        }
+
+        // Success: swap in the new pub (releasing the old one) and update config.
+        cfg_.ingressChannel = newIngressChannel;
+        ingressPub_ = std::move(newPub);
+        return true;
+    } catch (...) {
+        // Any Aeron exception → treat as a failed retarget; old pub intact.
+        return false;
     }
-
-    // Release old ingress publication.
-    ingressPub_.reset();
-
-    // Register a new ExclusivePublication on the new channel (same stream id).
-    int64_t pubRegId = aeron_->addExclusivePublication(newIngressChannel,
-                                                        cfg_.ingressStreamId);
-
-    // Resolve within kResolveMaxMs (bounded — no busy-spin).
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds{kResolveMaxMs};
-
-    std::shared_ptr<aeron::ExclusivePublication> newPub;
-    while (std::chrono::steady_clock::now() < deadline) {
-        newPub = aeron_->findExclusivePublication(pubRegId);
-        if (newPub) break;
-        std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
-    }
-
-    if (!newPub) {
-        throw std::runtime_error(
-            "AeronTransport::retarget: timed out resolving new ingress publication "
-            "(channel=" + newIngressChannel + ")");
-    }
-
-    // Update config channel and install new pub.
-    cfg_.ingressChannel = newIngressChannel;
-    ingressPub_ = std::move(newPub);
 }
 
 // ---------------------------------------------------------------------------

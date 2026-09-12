@@ -152,12 +152,32 @@ public:
     /// session-id at the end of the most recent doWork() call.
     [[nodiscard]] int64_t sessionId() const noexcept;
 
+    // -------------------------------------------------------------------------
+    // Coherent (state, sessionId) snapshot — FIX F3
+    // -------------------------------------------------------------------------
+
+    /// A coherent (state, sessionId) pair read from a SINGLE atomic load.
+    /// Neither field can be torn against the other: they are published together
+    /// (packed into one uint64_t) by the agent thread, so a caller never sees
+    /// state==Connected paired with a sessionId from a different session epoch.
+    struct StateSnapshot {
+        session::SessionState state;
+        int64_t               sessionId;
+    };
+
+    /// Return a coherent (state, sessionId) pair in ONE atomic acquire load.
+    /// This is the accessor Client::ping() MUST use so the sessionId it stamps
+    /// on the Ping always belongs to the same session epoch as the observed
+    /// Connected state.  (Two independent atomic loads could tear across a
+    /// resume — FIX F3.)
+    [[nodiscard]] StateSnapshot stateAndSessionId() const noexcept;
+
 private:
     // -------------------------------------------------------------------------
     // SessionIo implementation (called only on the agent thread)
     // -------------------------------------------------------------------------
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
-    void retarget(const std::string& newIngressChannel) override;
+    bool retarget(const std::string& newIngressChannel) noexcept override;
 
     // -------------------------------------------------------------------------
     // Command message type IDs for the ring
@@ -172,6 +192,32 @@ private:
     // -------------------------------------------------------------------------
     bool writeCommand(int32_t msgTypeId, const uint8_t* payload, std::size_t payloadLen) noexcept;
     void dispatchEgressFrame(int64_t nowNs, const uint8_t* buf, std::size_t len) noexcept;
+
+    /// Publish the current (state, sessionId) as ONE packed atomic store
+    /// (release).  Called on the agent thread (a) after each frame is fed to the
+    /// session and BEFORE the egress observer runs (FIX F1), and (b) at the end
+    /// of each doWork() as the catch-all for tick-driven transitions.
+    void publishSnapshot() noexcept;
+
+    // ---- Packed (state, sessionId) snapshot codec (FIX F1 + F3) -------------
+    // Layout: high 16 bits = SessionState (fits in 8 bits), low 48 bits =
+    // sessionId.  sessionId is monotonic from 1 (server-assigned) and 0 when no
+    // session — it comfortably fits in 48 bits.  Packing both into ONE uint64_t
+    // makes the pair readable in a single atomic load with no torn read.
+    static constexpr int      kStateShift    = 48;
+    static constexpr uint64_t kSessionIdMask = (uint64_t{1} << kStateShift) - 1;
+
+    static uint64_t packSnapshot(session::SessionState st, int64_t sid) noexcept {
+        const uint64_t usid = static_cast<uint64_t>(sid) & kSessionIdMask;
+        return (static_cast<uint64_t>(static_cast<uint8_t>(st)) << kStateShift) | usid;
+    }
+    static session::SessionState unpackState(uint64_t v) noexcept {
+        return static_cast<session::SessionState>(
+            static_cast<uint8_t>(v >> kStateShift));
+    }
+    static int64_t unpackSessionId(uint64_t v) noexcept {
+        return static_cast<int64_t>(v & kSessionIdMask);
+    }
 
     // -------------------------------------------------------------------------
     // Members
@@ -198,12 +244,16 @@ private:
     // ---- Egress observer (agent thread only; must be set before start()) ----
     EgressObserver egressObserver_;
 
-    // ---- Thread-safe observer snapshots (BrokerNode mirror pattern) ---------
-    // Written with release order at the END of each doWork() and once in
-    // start().  Read with acquire order by sessionState()/sessionId() which
-    // are the ONLY cross-thread observer accessors.
-    std::atomic<session::SessionState> stateSnapshot_   {session::SessionState::Disconnected};
-    std::atomic<int64_t>               sessionIdSnapshot_ {0};
+    // ---- Thread-safe observer snapshot (BrokerNode mirror pattern) ----------
+    // FIX F1 + F3: (state, sessionId) are packed into ONE atomic uint64_t and
+    // published together (release) so cross-thread readers get a COHERENT pair
+    // in a single acquire load — no torn read across a resume, and the snapshot
+    // is fresh at the moment the egress observer resolves the connect promise.
+    // Written on the agent thread; read by sessionState()/sessionId()/
+    // stateAndSessionId() from any thread.
+    std::atomic<uint64_t> snapshot_ {
+        packSnapshot(session::SessionState::Disconnected, 0)
+    };
 };
 
 } // namespace rune::client::agent

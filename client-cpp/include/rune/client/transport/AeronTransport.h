@@ -119,11 +119,18 @@ public:
     // retarget — single-writer, agent-thread only
     // -------------------------------------------------------------------------
 
-    /// Release the current ingress ExclusivePublication and create a new one
-    /// on newIngressChannel (same stream id as the original config).
+    /// Create a new ingress ExclusivePublication on newIngressChannel (same
+    /// stream id as the original config) and swap it in for the current one.
     /// Bounded resolution (kResolveMaxMs hard cap + no busy-spin).
     /// Called only from the agent thread (single-writer contract).
-    void retarget(const std::string& newIngressChannel);
+    ///
+    /// FIX F8: noexcept + non-throwing.  Resolves the NEW publication BEFORE
+    /// releasing the old one, so a failed retarget (resolve timeout / not
+    /// started) leaves the OLD publication intact and usable — offer() keeps
+    /// working on the previous endpoint.  Returns true on success, false on
+    /// failure (transport left consistent, no exception, no std::terminate even
+    /// when reached from the agent's noexcept dispatchEgressFrame path).
+    bool retarget(const std::string& newIngressChannel) noexcept;
 
 private:
     // ---- Configuration -------------------------------------------------------

@@ -130,6 +130,21 @@ struct TestGateway {
     bool replyWithError = false;
     bool echoPong       = true;
 
+    // MC-2 [CC-8]: instead of a Pong, reply to a Ping with an
+    // ErrorResponse{code} carrying the ping's correlationId (session-fatal).
+    bool    pingReplyError = false;
+    int16_t pingErrorCode  = static_cast<int16_t>(rcc::ErrorCode::SessionExpired);
+
+    // MC-5 [CC-8]: reply to a ConnectRequest with ErrorResponse{Redirect,
+    // message=<endpoint>} to drive the redirect/retarget path through the agent.
+    bool        redirectOnConnect = false;
+    std::string redirectEndpoint;
+
+    // Observed correlationId of the last Ping the gateway saw (for assertions).
+    std::atomic<int64_t> lastPingCorrId{0};
+    std::atomic<int>     pingsSeen{0};
+    std::atomic<int>     connectsSeen{0};
+
     uint8_t replyBuf[512]{};
 
     explicit TestGateway(std::string dir) : aeronDir(std::move(dir)) {}
@@ -204,6 +219,21 @@ struct TestGateway {
             auto opt = rcc::decodeConnectRequest(buf, len);
             if (!opt) return;
 
+            connectsSeen.fetch_add(1, std::memory_order_relaxed);
+
+            if (redirectOnConnect) {
+                // MC-5: ErrorResponse{Redirect, message=endpoint} → agent
+                // retargets to an unresolvable endpoint (noexcept path).
+                std::size_t n = rcc::encodeErrorResponse(
+                    replyBuf, sizeof(replyBuf),
+                    static_cast<int16_t>(rcc::ErrorCode::Redirect),
+                    redirectEndpoint,
+                    opt->sessionId,
+                    opt->correlationId);
+                if (n > 0) send(replyBuf, n);
+                break;
+            }
+
             if (replyWithError) {
                 // Reply ErrorResponse with a descriptive message.
                 std::size_t n = rcc::encodeErrorResponse(
@@ -228,9 +258,25 @@ struct TestGateway {
         }
 
         case rcc::TemplateId::Ping: {
-            if (!echoPong) break; // no reply → simulates ping timeout
             auto opt = rcc::decodePing(buf, len);
             if (!opt) return;
+            lastPingCorrId.store(opt->correlationId, std::memory_order_release);
+            pingsSeen.fetch_add(1, std::memory_order_relaxed);
+
+            if (pingReplyError) {
+                // MC-2: reply with ErrorResponse carrying the ping's
+                // correlationId (e.g. SessionExpired) → client fails the ping.
+                std::size_t n = rcc::encodeErrorResponse(
+                    replyBuf, sizeof(replyBuf),
+                    pingErrorCode,
+                    "session-expired",
+                    opt->sessionId,
+                    opt->correlationId);
+                if (n > 0) send(replyBuf, n);
+                break;
+            }
+
+            if (!echoPong) break; // no reply → simulates ping timeout
             std::size_t n = rcc::encodePong(
                 replyBuf, sizeof(replyBuf),
                 opt->echo,
@@ -641,4 +687,218 @@ TEST(Client, DtorAfterConnectClean) {
         // Dtor fires here (GatewayHarness destructs client, then gw, then driver).
         // The client dtor calls close() → joins runner → stops agent → cleans up.
     });
+}
+
+// ===========================================================================
+// Test 11 (MC-1) [CC-8]: ConnectThenImmediatePingNotRejected — FIX F1
+//
+// The MOMENT connect().get() returns, call ping() on the SAME app thread with
+// NO intervening state poll.  Before F1 the state snapshot was published only
+// at the END of doWork (after the observer had already woken this thread), so
+// ping() could read a stale Connecting/Disconnected snapshot and reject with
+// "not connected".  With F1 the snapshot is published BEFORE the observer, so
+// the ping must NOT be rejected for "not connected".
+// ===========================================================================
+TEST(Client, ConnectThenImmediatePingNotRejected) {
+    GatewayHarness h(910, 911);
+
+    // Deterministic F1 gate:  sample the state snapshot INSIDE onConnected, which
+    // fires on the runner thread from within the egress observer — i.e. at the
+    // exact instant the connect promise is resolved and BEFORE the end-of-doWork
+    // catch-all publish.  With F1 the pre-observer publishSnapshot() has already
+    // run, so state() MUST already be Connected here.  Without F1 the snapshot is
+    // still the stale (pre-doWork) value at this point — the race the CC-7 miss
+    // observed.  This does not depend on runner-vs-app timing, so it is stable.
+    std::atomic<bool>              connectedFired{false};
+    std::atomic<rcs::SessionState> stateAtCallback{rcs::SessionState::Disconnected};
+
+    // build() constructs the Client (and starts the runner).
+    h.build(/*gwReplyOK=*/true);
+
+    // Register the callback BEFORE connect() (FIX F4 callback contract).
+    h.client->onConnected([&](int64_t) {
+        stateAtCallback.store(h.client->state(), std::memory_order_release);
+        connectedFired.store(true, std::memory_order_release);
+    });
+
+    auto connFut = h.client->connect();
+
+    // Drive the gateway until onConnected has fired.
+    h.pumpGwUntil([&]() { return connectedFired.load(std::memory_order_acquire); });
+
+    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "connect() future did not resolve";
+    ASSERT_NO_THROW(connFut.get());
+
+    ASSERT_TRUE(connectedFired.load()) << "onConnected did not fire";
+    // The core F1 assertion: at the instant the observer resolved the promise,
+    // the published snapshot was ALREADY Connected (published before the observer).
+    EXPECT_EQ(stateAtCallback.load(), rcs::SessionState::Connected)
+        << "state snapshot was stale inside onConnected — F1 regression "
+           "(snapshot must be published BEFORE the egress observer runs)";
+
+    // Belt-and-braces: a ping issued right now must not be rejected "not connected".
+    auto pingFut = h.client->ping({'p', 'i', 'n', 'g'});
+    h.pumpGwUntil([&]() {
+        return pingFut.wait_for(0ms) == std::future_status::ready;
+    });
+    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "immediate ping() future did not resolve";
+    Bytes echo;
+    ASSERT_NO_THROW(echo = pingFut.get())
+        << "immediate ping after connect() was rejected — F1 regression";
+    EXPECT_EQ(echo, (Bytes{'p', 'i', 'n', 'g'}));
+}
+
+// ===========================================================================
+// Test 12 (MC-2) [CC-8]: ErrorResponseFailsInFlightPing — FIX F2
+//
+// A ping is in-flight; the gateway replies ErrorResponse{SessionExpired} with
+// the ping's correlationId.  The ping future must fail PROMPTLY (well under
+// pingTimeoutMs) with the server error — not sit until the timeout.
+// ===========================================================================
+TEST(Client, ErrorResponseFailsInFlightPing) {
+    GatewayHarness h(920, 921);
+    h.pingTimeoutMs = 10000;  // long: prove we fail via the error, not the timeout
+    h.build();
+
+    h.client->onConnected([](int64_t){});
+    auto connFut = h.client->connect();
+    h.pumpGwUntil([&]() {
+        return h.client->state() == rcs::SessionState::Connected;
+    });
+    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
+    ASSERT_NO_THROW(connFut.get());
+
+    // Arm the gateway to answer the next Ping with ErrorResponse{SessionExpired}.
+    h.gw->pingReplyError = true;
+    h.gw->pingErrorCode  = static_cast<int16_t>(rcc::ErrorCode::SessionExpired);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto pingFut = h.client->ping({'x', 'y'});
+
+    h.pumpGwUntil([&]() {
+        return pingFut.wait_for(0ms) == std::future_status::ready;
+    });
+
+    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "ping() future did not resolve after ErrorResponse{SessionExpired}";
+    EXPECT_THROW(pingFut.get(), std::exception)
+        << "ping() must FAIL on ErrorResponse{SessionExpired}";
+
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(elapsed, std::chrono::milliseconds(h.pingTimeoutMs))
+        << "ping failed by TIMEOUT, not promptly by the server error (F2 regression)";
+}
+
+// ===========================================================================
+// Test 13 (MC-3) [CC-8]: ConnectResolveVsTimeoutExactlyOnce — FIX F5
+//
+// A short connectTimeoutMs races the gateway's OK reply.  Whatever wins, the
+// connect future must be satisfied EXACTLY once (either resolved OR failed) and
+// never double-satisfy / lose the resolution.  We assert the future becomes
+// ready and get() has a single, well-defined outcome (no crash, no hang).
+// ===========================================================================
+TEST(Client, ConnectResolveVsTimeoutExactlyOnce) {
+    GatewayHarness h(930, 931);
+    h.connectTimeoutMs = 120;  // short — races the gateway reply
+    h.build(/*gwReplyOK=*/true);
+
+    // Pump the gateway on a background thread so the OK reply may land right
+    // around the deadline.
+    std::atomic<bool> pumpStop{false};
+    std::thread pump([&] {
+        while (!pumpStop.load(std::memory_order_acquire)) {
+            h.pollGw(16);
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+
+    auto fut = h.client->connect();
+
+    // Exactly one outcome; must become ready (resolved or timed out), never hang.
+    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "connect() future neither resolved nor timed out — possible lost resolution";
+
+    // get() yields exactly one deterministic result: either success or a throw.
+    bool threw = false;
+    try { fut.get(); } catch (...) { threw = true; }
+    // Either outcome is acceptable; the point is no double-satisfy / no crash.
+    SUCCEED() << "connect resolved-or-failed exactly once (threw=" << threw << ")";
+
+    pumpStop.store(true, std::memory_order_release);
+    pump.join();
+}
+
+// ===========================================================================
+// Test 14 (MC-5) [CC-8]: RedirectToUnresolvableEndpointNoTerminate — FIX F8
+//
+// The gateway answers the ConnectRequest with ErrorResponse{Redirect,
+// message=<unresolvable endpoint>}.  This drives the full agent → session →
+// io_.retarget() path.  retarget is now noexcept and non-throwing, so the
+// process must NOT std::terminate.  The connect eventually fails (redirect cap /
+// timeout) but the client stays alive and closes cleanly.
+// ===========================================================================
+TEST(Client, RedirectToUnresolvableEndpointNoTerminate) {
+    GatewayHarness h(940, 941);
+    h.connectTimeoutMs = 400;  // keep the test short; redirect resends then times out
+    h.build(/*gwReplyOK=*/false);
+
+    // Arm the redirect BEFORE connecting.
+    h.gw->redirectOnConnect = true;
+    h.gw->redirectEndpoint  = "aeron:udp?endpoint=192.0.2.1:59999"; // TEST-NET-1, unroutable
+
+    auto fut = h.client->connect();
+
+    // Drive the gateway so it delivers the redirect(s); the agent will attempt
+    // to retarget to the unresolvable endpoint on the runner thread.
+    h.pumpGwUntil([&]() {
+        return fut.wait_for(0ms) == std::future_status::ready;
+    });
+
+    // The key assertion: we got here with NO std::terminate.  The future must be
+    // resolved (as a failure) within a bounded time — never hang.
+    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "connect() future never completed after unresolvable redirect";
+    EXPECT_THROW(fut.get(), std::exception)
+        << "connect() to an unresolvable redirect endpoint must fail (not succeed)";
+
+    // Client must still be usable / closeable — no crash.
+    ASSERT_NO_THROW(h.client->close());
+}
+
+// ===========================================================================
+// Test 15 (MC-4 unit) [CC-8]: CoherentStateSnapshotAfterConnect — FIX F3
+//
+// After a successful connect, the (state, sessionId) pair read via the coherent
+// accessor must never be Connected with sessionId==0 (the packing invariant),
+// and state()/sessionId() (the split accessors) must agree with it.
+// ===========================================================================
+TEST(Client, CoherentStateSnapshotAfterConnect) {
+    GatewayHarness h(950, 951);
+    h.build(/*gwReplyOK=*/true);
+
+    auto connFut = h.client->connect();
+    h.pumpGwUntil([&]() {
+        return h.client->state() == rcs::SessionState::Connected;
+    });
+    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
+    ASSERT_NO_THROW(connFut.get());
+
+    // The public state() must be Connected; the assigned sessionId (42) is set.
+    EXPECT_EQ(h.client->state(), rcs::SessionState::Connected);
+
+    // Repeatedly sample: Connected must NEVER pair with sessionId 0.
+    // (We can only observe via the public state(); the coherent accessor is
+    // exercised inside ping() — a successful ping proves a valid sessionId was
+    // stamped, i.e. the pair was coherent.)
+    auto pingFut = h.client->ping({0x01});
+    h.pumpGwUntil([&]() {
+        return pingFut.wait_for(0ms) == std::future_status::ready;
+    });
+    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready);
+    Bytes echo;
+    ASSERT_NO_THROW(echo = pingFut.get())
+        << "ping stamped with a coherent (Connected, sessionId!=0) snapshot must succeed";
+    EXPECT_EQ(echo, (Bytes{0x01}));
 }

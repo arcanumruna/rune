@@ -41,8 +41,11 @@ struct FakeIo final : sm::SessionIo {
         return sendSucceeds;
     }
 
-    void retarget(const std::string& newChannel) override {
+    bool retargetSucceeds = true;
+
+    bool retarget(const std::string& newChannel) noexcept override {
         retargets.push_back(newChannel);
+        return retargetSucceeds;
     }
 
     void reset() {
@@ -1614,4 +1617,67 @@ TEST(SessionMachine, DoubleRedirect_ErrorPathThenResponsePath) {
     EXPECT_NE(req2->correlationId, corrId1);  // another fresh correlationId
 
     EXPECT_EQ(m.state(), sm::SessionState::Connecting);
+}
+
+// ===========================================================================
+// MC-8 [CC-8]: onConnectResponse with a non-OK / non-redirect error code
+//              from Connecting → Disconnected (the else-branch).
+//
+// ProtocolVersion is neither OK nor Redirect/NotLeader, so the machine must
+// fall through to the terminal else and go Disconnected (no resend, no retarget).
+// ===========================================================================
+TEST(SessionMachine, ConnectResponseFatalErrorGoesDisconnected) {
+    FakeIo io;
+    sm::SessionMachine m(io, testConfig());
+
+    m.connect(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    const int64_t corrId = m.correlationId();
+    io.reset();
+
+    // ProtocolVersion error → else-branch → Disconnected.
+    m.onConnectResponse(
+        static_cast<int16_t>(rpc::ErrorCode::ProtocolVersion),
+        /*leaderMemberId=*/0,
+        /*assignedSessionId=*/0,
+        corrId,
+        T0 + 1);
+
+    EXPECT_EQ(m.state(), sm::SessionState::Disconnected)
+        << "non-OK/non-redirect ConnectResponse must go Disconnected";
+    EXPECT_EQ(io.sendCount(), 0u)   << "must NOT resend a ConnectRequest";
+    EXPECT_EQ(io.retargetCount(), 0u) << "must NOT retarget";
+}
+
+// ===========================================================================
+// F8 [CC-8]: a FAILED retarget (io_.retarget returns false) must NOT throw and
+//            the machine must still resend the ConnectRequest (bounded by cap).
+//
+// This exercises the noexcept/return-bool retarget contract at the session
+// layer: even if the transport can't resolve the new endpoint, the machine
+// keeps making forward progress instead of crashing.
+// ===========================================================================
+TEST(SessionMachine, RetargetFailureStillResendsNoThrow) {
+    FakeIo io;
+    io.retargetSucceeds = false;  // simulate a resolve-timeout retarget failure
+    sm::SessionMachine m(io, testConfig());
+
+    m.connect(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    const int64_t corrId0 = m.correlationId();
+    io.reset();
+
+    const std::string ep = "aeron:udp?endpoint=unresolvable:1";
+    ASSERT_NO_THROW(m.onConnectResponseRedirect(ep, corrId0, T0 + 1))
+        << "redirect with a failing retarget must not throw";
+
+    // retarget was attempted (returned false) and the machine still resent.
+    EXPECT_EQ(io.retargetCount(), 1u);
+    EXPECT_EQ(io.retargets[0], ep);
+    ASSERT_EQ(io.sendCount(), 1u) << "must resend the ConnectRequest after a failed retarget";
+    EXPECT_EQ(m.state(), sm::SessionState::Connecting);
+
+    auto req = io.lastConnectRequest();
+    ASSERT_TRUE(req.has_value());
+    EXPECT_NE(req->correlationId, corrId0) << "resend must use a fresh correlationId";
 }

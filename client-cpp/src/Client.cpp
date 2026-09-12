@@ -123,15 +123,29 @@ void Client::close() {
 // Callback registration
 // ---------------------------------------------------------------------------
 
+// FIX F4: callback setters are setup-phase only.  Once connect() has been
+// called the runner thread may read the callback std::functions, so mutating
+// them here would be a data race.  Enforce the "set before connect()" contract:
+// assert in debug builds; no-op safely in release.
 void Client::onConnected(std::function<void(int64_t)> cb) {
+    assert(!connectCalled_.load(std::memory_order_acquire) &&
+           "onConnected() must be called BEFORE connect() (callback setters are "
+           "setup-phase only; setting after connect() is a data race)");
+    if (connectCalled_.load(std::memory_order_acquire)) return;
     cbConnected_ = std::move(cb);
 }
 
 void Client::onDisconnected(std::function<void()> cb) {
+    assert(!connectCalled_.load(std::memory_order_acquire) &&
+           "onDisconnected() must be called BEFORE connect()");
+    if (connectCalled_.load(std::memory_order_acquire)) return;
     cbDisconnected_ = std::move(cb);
 }
 
 void Client::onError(std::function<void(const std::string&)> cb) {
+    assert(!connectCalled_.load(std::memory_order_acquire) &&
+           "onError() must be called BEFORE connect()");
+    if (connectCalled_.load(std::memory_order_acquire)) return;
     cbError_ = std::move(cb);
 }
 
@@ -148,6 +162,10 @@ session::SessionState Client::state() const noexcept {
 // ---------------------------------------------------------------------------
 
 std::future<void> Client::connect() {
+    // FIX F4: mark the callback setup phase closed.  Release store so the runner
+    // thread's acquire load sees all callbacks registered before this point.
+    connectCalled_.store(true, std::memory_order_release);
+
     std::promise<void> prom;
     auto fut = prom.get_future();
 
@@ -196,8 +214,13 @@ std::future<Bytes> Client::ping(Bytes payload) {
     auto fut = prom.get_future();
 
     // Require an established session (Milestone-A: reject, do not queue).
-    const auto st      = agent_.sessionState();
-    const auto sessId  = agent_.sessionId();
+    // FIX F3: read (state, sessionId) as ONE coherent atomic snapshot so the
+    // sessionId we stamp on the Ping always belongs to the same session epoch
+    // as the observed Connected state (two independent loads could tear across
+    // a resume and stamp a stale sessionId).
+    const auto snap    = agent_.stateAndSessionId();
+    const auto st      = snap.state;
+    const auto sessId  = snap.sessionId;
 
     if (st != session::SessionState::Connected) {
         prom.set_exception(std::make_exception_ptr(
@@ -393,21 +416,60 @@ void Client::onEgressFrame(codec::TemplateId tid,
         auto opt = codec::decodeErrorResponse(buf, len);
         if (!opt) break;
 
-        // Fail the pending connect (if any) and fire onError.
-        std::unique_ptr<PendingConnect> pc;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            pc = std::move(pendingConnect_);
-        }
+        namespace rpc = rune::protocol::client;
+        const auto ec = static_cast<rpc::ErrorCode>(
+            static_cast<uint16_t>(opt->code));
 
         std::string msg(opt->message);
         if (msg.empty()) {
             msg = "ErrorResponse code: " + std::to_string(opt->code);
         }
 
+        // FIX F2: fail in-flight pings on this error IMMEDIATELY rather than
+        // letting them die by pingTimeoutMs (which loses the server error and
+        // adds full-timeout latency).  Two cases, both under a single lock so
+        // there is no double-resolve (extract-under-lock discipline):
+        //   (a) the error carries a correlationId matching a pending ping →
+        //       fail exactly that ping;
+        //   (b) the error is session-fatal (SessionExpired / UnknownSession) →
+        //       fail ALL pending pings for the (now dead) session.
+        const bool sessionFatal =
+            (ec == rpc::ErrorCode::SessionExpired ||
+             ec == rpc::ErrorCode::UnknownSession);
+
+        std::unique_ptr<PendingConnect>       pc;
+        std::vector<std::promise<Bytes>>      failedPings;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+
+            // Always fail a pending connect (existing behaviour).
+            pc = std::move(pendingConnect_);
+
+            if (sessionFatal) {
+                // Fail every pending ping for this session.
+                for (auto& [corrId, pp] : pendingPings_) {
+                    failedPings.push_back(std::move(pp.promise));
+                }
+                pendingPings_.clear();
+            } else {
+                // Fail only the ping whose correlationId matches (if any).
+                auto it = pendingPings_.find(opt->correlationId);
+                if (it != pendingPings_.end()) {
+                    failedPings.push_back(std::move(it->second.promise));
+                    pendingPings_.erase(it);
+                }
+            }
+        }
+
         if (pc) {
             try {
                 pc->promise.set_exception(
+                    std::make_exception_ptr(std::runtime_error(msg)));
+            } catch (...) {}
+        }
+        for (auto& prom : failedPings) {
+            try {
+                prom.set_exception(
                     std::make_exception_ptr(std::runtime_error(msg)));
             } catch (...) {}
         }

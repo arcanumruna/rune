@@ -91,8 +91,7 @@ void ClientAgent::start() {
     transport_.start();
 
     // Publish initial snapshot so observers see a consistent value immediately.
-    stateSnapshot_.store(session_.state(), std::memory_order_release);
-    sessionIdSnapshot_.store(session_.sessionId(), std::memory_order_release);
+    publishSnapshot();
 }
 
 void ClientAgent::stop() noexcept {
@@ -165,11 +164,12 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // IdleStrategy backs off on 0, which is correct for idle cycles).
     session_.tick(nowNs);
 
-    // ---- Step 4: Publish observer snapshots (release) -----------------------
-    // Written here (agent thread) with release order.  Read by sessionState()
-    // and sessionId() from any thread with acquire order — no lock needed.
-    stateSnapshot_.store(session_.state(), std::memory_order_release);
-    sessionIdSnapshot_.store(session_.sessionId(), std::memory_order_release);
+    // ---- Step 4: Publish observer snapshot (release) ------------------------
+    // Catch-all publish for tick-driven transitions (keepalive/timeout/resume).
+    // Frame-driven transitions are ALSO published inside dispatchEgressFrame
+    // BEFORE the observer runs (FIX F1), so a thread woken by the observer sees
+    // a snapshot at least as fresh as the state that woke it.
+    publishSnapshot();
 
     return totalWork;
 }
@@ -238,16 +238,32 @@ void ClientAgent::setEgressObserver(EgressObserver obs) noexcept {
     egressObserver_ = std::move(obs);
 }
 
+void ClientAgent::publishSnapshot() noexcept {
+    // Pack (state, sessionId) into ONE atomic value and publish (release).
+    // Guard the sessionId range so the packing assumption (48 bits) holds.
+    const int64_t sid = session_.sessionId();
+    assert(sid >= 0 && (static_cast<uint64_t>(sid) & ~kSessionIdMask) == 0 &&
+           "sessionId does not fit in 48 bits — packing invariant violated");
+    snapshot_.store(packSnapshot(session_.state(), sid),
+                    std::memory_order_release);
+}
+
 session::SessionState ClientAgent::sessionState() const noexcept {
-    // Reads the atomic snapshot published (release) at the end of each doWork
-    // and once in start().  Thread-safe: callable from any thread.
-    return stateSnapshot_.load(std::memory_order_acquire);
+    // Reads the packed atomic snapshot (release-published on the agent thread).
+    // Thread-safe: callable from any thread.
+    return unpackState(snapshot_.load(std::memory_order_acquire));
 }
 
 int64_t ClientAgent::sessionId() const noexcept {
-    // Reads the atomic snapshot published (release) at the end of each doWork
-    // and once in start().  Thread-safe: callable from any thread.
-    return sessionIdSnapshot_.load(std::memory_order_acquire);
+    // Reads the packed atomic snapshot (release-published on the agent thread).
+    // Thread-safe: callable from any thread.
+    return unpackSessionId(snapshot_.load(std::memory_order_acquire));
+}
+
+ClientAgent::StateSnapshot ClientAgent::stateAndSessionId() const noexcept {
+    // Single atomic load → coherent (state, sessionId) pair (FIX F3).
+    const uint64_t v = snapshot_.load(std::memory_order_acquire);
+    return StateSnapshot{unpackState(v), unpackSessionId(v)};
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +274,9 @@ bool ClientAgent::sendFrame(const uint8_t* buf, std::size_t len) {
     return transport_.offer(buf, len);
 }
 
-void ClientAgent::retarget(const std::string& newIngressChannel) {
-    transport_.retarget(newIngressChannel);
+bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
+    // FIX F8: forward to the transport's noexcept, non-throwing retarget.
+    return transport_.retarget(newIngressChannel);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +310,10 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             opt->correlationId,
             nowNs);
         session_.onActivity(nowNs);
+        // FIX F1: publish the fresh (state, sessionId) BEFORE waking any thread
+        // via the observer, so a thread returning from connect().get() and
+        // immediately calling ping() reads Connected (not the stale snapshot).
+        publishSnapshot();
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }
@@ -304,6 +325,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         if (!opt) break;
         session_.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
         session_.onActivity(nowNs);
+        publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }
@@ -312,6 +334,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
 
     case codec::TemplateId::Pong: {
         session_.onActivity(nowNs);
+        publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }
