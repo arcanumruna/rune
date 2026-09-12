@@ -48,6 +48,10 @@
 
 namespace rune::gateway {
 
+// Forward declaration — full definition in TopicRegistry.h (avoids heavy include
+// in this header; GB-2/GB-3 will include TopicRegistry.h in ClientGateway.cpp).
+class TopicRegistry;
+
 // ---------------------------------------------------------------------------
 // LeaderView — snapshot of cluster leadership from the node's perspective.
 // ---------------------------------------------------------------------------
@@ -104,6 +108,24 @@ public:
     // Callable directly from unit tests to drive reaping without live ingress.
     // -----------------------------------------------------------------------
     void reapExpired(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // setTopicRegistry — wire in the TopicRegistry (GB-1).
+    // Must be called before doWork() if produce/subscribe dispatch is desired.
+    // May be null (no topics configured). Pointer is non-owning; lifetime must
+    // exceed the ClientGateway. Single-writer: call only on the duty-cycle thread.
+    // GB-2/GB-3 will use this pointer for produce/subscribe dispatch.
+    // -----------------------------------------------------------------------
+    void setTopicRegistry(TopicRegistry* registry) noexcept {
+        topicRegistry_ = registry;
+    }
+
+    // -----------------------------------------------------------------------
+    // topicRegistry — current registry pointer (may be null).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] TopicRegistry* topicRegistry() const noexcept {
+        return topicRegistry_;
+    }
 
     // -----------------------------------------------------------------------
     // sessionCount — number of active sessions.
@@ -240,6 +262,11 @@ private:
     // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
+
+    // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
+    // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
+    // Single-writer: only accessed on the duty-cycle thread.
+    TopicRegistry*                       topicRegistry_ = nullptr;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;

@@ -383,4 +383,146 @@ TEST(NodeConfigTest, StartupCanvassTimeoutNegativeIsError) {
     EXPECT_NE(r.error.find("RUNE_STARTUP_CANVASS_TIMEOUT_MS"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// RUNE_TOPICS parse/validate tests (GB-1)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, TopicsAbsentYieldsEmpty) {
+    // No RUNE_TOPICS → cfg.topics is empty (valid — no topics configured).
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->topics.empty());
+}
+
+TEST(NodeConfigTest, TopicsEmptyStringYieldsEmpty) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->topics.empty());
+}
+
+TEST(NodeConfigTest, TopicsSingleTopic) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->topics.size(), 1u);
+    EXPECT_EQ(r.config->topics[0].name,           "chat");
+    EXPECT_EQ(r.config->topics[0].partitionCount, 1);
+    EXPECT_EQ(r.config->topics[0].topicId,        0);
+}
+
+TEST(NodeConfigTest, TopicsMultiTopic) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "inventory:8,entities:4,chat:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->topics.size(), 3u);
+
+    EXPECT_EQ(r.config->topics[0].name,           "inventory");
+    EXPECT_EQ(r.config->topics[0].partitionCount, 8);
+    EXPECT_EQ(r.config->topics[0].topicId,        0);
+
+    EXPECT_EQ(r.config->topics[1].name,           "entities");
+    EXPECT_EQ(r.config->topics[1].partitionCount, 4);
+    EXPECT_EQ(r.config->topics[1].topicId,        1);
+
+    EXPECT_EQ(r.config->topics[2].name,           "chat");
+    EXPECT_EQ(r.config->topics[2].partitionCount, 1);
+    EXPECT_EQ(r.config->topics[2].topicId,        2);
+}
+
+TEST(NodeConfigTest, TopicsTopicIdIsDeclarationIndex) {
+    // topicId must be 0-based declaration index regardless of name ordering.
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "z:2,a:4,m:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->topics.size(), 3u);
+    EXPECT_EQ(r.config->topics[0].topicId, 0);
+    EXPECT_EQ(r.config->topics[1].topicId, 1);
+    EXPECT_EQ(r.config->topics[2].topicId, 2);
+}
+
+TEST(NodeConfigTest, TopicsZeroPartitionCountIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat:0";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsNegativePartitionCountIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat:-1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsNonIntPartitionCountIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat:abc";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsDuplicateNameIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat:1,entities:4,chat:2";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_NE(r.error.find("chat"), std::string::npos);
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsMissingColonIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsEmptyNameIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = ":4";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsWhitespaceTrimmed) {
+    // Whitespace around commas and entries is trimmed.
+    auto env = base1node();
+    env["RUNE_TOPICS"] = " inventory : 8 , chat : 1 ";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->topics.size(), 2u);
+    EXPECT_EQ(r.config->topics[0].name,           "inventory");
+    EXPECT_EQ(r.config->topics[0].partitionCount, 8);
+    EXPECT_EQ(r.config->topics[1].name,           "chat");
+    EXPECT_EQ(r.config->topics[1].partitionCount, 1);
+}
+
+TEST(NodeConfigTest, TopicsDoubleCommaIsError) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "chat:1,,entities:4";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, TopicsLargePartitionCount) {
+    // Large partition count (e.g. 64) is valid.
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "big:64";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->topics.size(), 1u);
+    EXPECT_EQ(r.config->topics[0].partitionCount, 64);
+}
+
 } // namespace rune::node

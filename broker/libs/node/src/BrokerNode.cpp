@@ -57,11 +57,17 @@ void BrokerNode::start() {
                                  config_.dataDir + "': " + ec.message());
     }
 
-    // 2. Start embedded Aeron media driver.
+    // 2. Build the TopicRegistry (after dataDir creation, before the gateway).
+    //    recover() is called for each Log in the ctor so restart resumes at LEO.
+    //    Logs are single-writer: only the AgentRunner duty-cycle thread appends/reads.
+    topicRegistry_ = std::make_unique<rune::gateway::TopicRegistry>(
+        config_.topics, config_.dataDir);
+
+    // 3. Start embedded Aeron media driver.
     startEmbeddedDriver();
     const auto t1 = sclock::now();
 
-    // 3. Connect Aeron client — must point at the same dir as the driver.
+    // 4. Connect Aeron client — must point at the same dir as the driver.
     {
         const std::string aeronDir =
             (fs::path{config_.dataDir} / "aeron").string();
@@ -74,14 +80,14 @@ void BrokerNode::start() {
     }
     const auto t2 = sclock::now();
 
-    // 4. Build all consensus objects (NodeStateFile, TermLog, Election, …).
+    // 5. Build all consensus objects (NodeStateFile, TermLog, Election, …).
     buildConsensusObjects();
     const auto t3 = sclock::now();
 
-    // 5. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
+    // 6. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
 
-    // 6. Start the agent runner thread (drives NodeRuntimeAgent, which drives
+    // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
     //    consensus + gateway on the single-writer thread).
     agentRunner_->start();
 
@@ -304,6 +310,9 @@ void BrokerNode::buildGateway() {
             rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
             std::move(leaderViewFn)
         );
+        // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
+        // the gateway (both destroyed in stop() with registry after gateway).
+        gateway_->setTopicRegistry(topicRegistry_.get());
     } catch (const std::exception& ex) {
         spdlog::warn("BrokerNode[{}]: ClientGateway construction failed: {}; proceeding without gateway",
                      nodeId, ex.what());
@@ -416,6 +425,7 @@ void BrokerNode::stop() {
     //    → close aeron → stop driver.
     runtimeAgent_.reset();   // composite agent (holds refs to inner agent + gateway)
     gateway_.reset();        // ClientGateway: deregisters Subscription + ExclusivePubs
+    topicRegistry_.reset();  // TopicRegistry: Logs are files (flushed/synced by Log dtor)
 
     // 3. Release consensus objects that own Aeron publications / subscription.
     //    Must happen BEFORE closing the Aeron client and media driver so the

@@ -249,6 +249,54 @@ ConfigResult parseNodeConfig(
         if (!err.empty()) return {{}, err};
     }
 
+    // --- RUNE_TOPICS (optional) ---
+    // Format: comma-separated "name:partitionCount" entries.
+    // Empty/absent → no topics (valid — produce/subscribe returns UnknownTopic).
+    {
+        const char* rawTopics = getenv_fn("RUNE_TOPICS");
+        if (rawTopics && !std::string_view(rawTopics).empty()) {
+            std::string_view sv(rawTopics);
+            std::unordered_set<std::string> seenNames;
+            int32_t topicIdx = 0;
+            while (!sv.empty()) {
+                auto comma = sv.find(',');
+                std::string_view entry = (comma == std::string_view::npos)
+                                           ? sv
+                                           : sv.substr(0, comma);
+                sv.remove_prefix(comma == std::string_view::npos ? sv.size() : comma + 1);
+
+                entry = trim(entry);
+                if (entry.empty())
+                    return {{}, "RUNE_TOPICS contains an empty entry (leading, trailing, or double comma)"};
+
+                auto colon = entry.find(':');
+                if (colon == std::string_view::npos)
+                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + std::string(entry)};
+
+                std::string_view namePart  = trim(entry.substr(0, colon));
+                std::string_view countPart = trim(entry.substr(colon + 1));
+
+                if (namePart.empty())
+                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + std::string(entry)};
+
+                std::string name(namePart);
+                if (!seenNames.insert(name).second)
+                    return {{}, "RUNE_TOPICS has duplicate topic name: " + name};
+
+                int32_t partCount{};
+                if (!parseInt32(countPart, partCount) || partCount < 1)
+                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + std::string(countPart) + " in entry: " + std::string(entry)};
+
+                TopicSpec ts;
+                ts.name           = std::move(name);
+                ts.partitionCount = partCount;
+                ts.topicId        = topicIdx++;
+                cfg.topics.push_back(std::move(ts));
+            }
+        }
+        // Absent or empty RUNE_TOPICS → cfg.topics stays empty (valid).
+    }
+
     return {std::move(cfg), {}};
 }
 

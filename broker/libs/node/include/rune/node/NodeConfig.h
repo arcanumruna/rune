@@ -1,5 +1,5 @@
 #pragma once
-// NodeConfig.h — env-driven broker node configuration (BR-1, BR-3b)
+// NodeConfig.h — env-driven broker node configuration (BR-1, BR-3b, GB-1)
 //
 // Environment variables:
 //   RUNE_NODE_ID           — int32, this node's id. Required. Must equal some peer's id.
@@ -12,6 +12,12 @@
 //   RUNE_CLIENT_STREAM_ID  — int32, default 1.
 //   RUNE_CONSENSUS_STREAM_ID — int32, default 10.
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
+//   RUNE_TOPICS            — comma-separated name:partitionCount topic declarations (GB-1).
+//                            Optional (absent or empty → no topics; produce/subscribe
+//                            will return UnknownTopic).
+//                            Example: "inventory:8,entities:4,chat:1"
+//                            Names must be unique, non-empty; partitionCount >= 1.
+//                            topicId is the 0-based index in declaration order.
 //
 // Election timing (all optional; defaults are fast-but-safe for co-located clusters):
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
@@ -29,6 +35,16 @@
 #include <vector>
 
 namespace rune::node {
+
+// ---------------------------------------------------------------------------
+// TopicSpec — one declared topic (GB-1).
+// topicId is the 0-based declaration index assigned by parseNodeConfig.
+// ---------------------------------------------------------------------------
+struct TopicSpec {
+    std::string name;
+    int32_t     partitionCount = 1;
+    int32_t     topicId        = -1;
+};
 
 struct PeerConfig {
     int32_t  id            = -1;
@@ -50,6 +66,11 @@ struct NodeConfig {
     ClientEndpoint      clientEndpoint;
     std::string         dataDir;
     int32_t             consensusStreamId = 0;
+
+    // Topics declared via RUNE_TOPICS (GB-1).
+    // Empty when RUNE_TOPICS is absent or empty — valid state (no topics).
+    // topicId == index in this vector.
+    std::vector<TopicSpec> topics;
 
     // Election timing — configurable via env (BR-3b).
     // Defaults are fast-but-safe for co-located / test clusters.

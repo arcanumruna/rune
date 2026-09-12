@@ -25,6 +25,7 @@
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
 
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
@@ -141,6 +142,13 @@ private:
     std::unique_ptr<rune::consensus::IngressRing>    ingressRing_;
     std::unique_ptr<rune::consensus::Election>       election_;
     std::unique_ptr<rune::consensus::ConsensusAgent> agent_;
+
+    // -----------------------------------------------------------------------
+    // Topic registry (GB-1) — per-partition Logs, bootstrapped from RUNE_TOPICS.
+    // Constructed in start() after dataDir creation; outlives the gateway.
+    // Logs are single-writer: accessed only on the AgentRunner duty-cycle thread.
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::gateway::TopicRegistry> topicRegistry_;
 
     // -----------------------------------------------------------------------
     // Client gateway (BR-7a) — runs inside the duty-cycle via NodeRuntimeAgent.

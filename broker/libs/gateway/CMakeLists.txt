@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-# rune_gateway — ClientGateway + SessionTable (BR-4)
+# rune_gateway — ClientGateway + SessionTable (BR-4) + TopicRegistry (GB-1)
 add_library(rune_gateway
-    src/ClientGateway.cpp)
+    src/ClientGateway.cpp
+    src/TopicRegistry.cpp)
 
 target_include_directories(rune_gateway PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -10,6 +11,12 @@ target_include_directories(rune_gateway PUBLIC
 # rune-protocol headers (sibling repo, header-only)
 target_include_directories(rune_gateway PUBLIC
     ${RUNE_PROTOCOL_INCLUDE})
+
+# TopicRegistry depends on rune_storage (Log).
+# NodeConfig/TopicSpec headers are included via RUNE_NODE_INCLUDE (raw path) to avoid
+# a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
+target_link_libraries(rune_gateway PUBLIC rune_storage)
+target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
 
 if(aeron_FOUND)
     target_link_libraries(rune_gateway PUBLIC aeron::aeron)
@@ -33,6 +40,16 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_gateway_session_tests)
+
+    # -------------------------------------------------------------------------
+    # TopicRegistry unit tests (GB-1) — no Aeron, real filesystem + rune_storage.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_topic_registry_tests
+        tests/gateway/TopicRegistryTest.cpp)
+    target_link_libraries(rune_gateway_topic_registry_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_topic_registry_tests)
 
     # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.

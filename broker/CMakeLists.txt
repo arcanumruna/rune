@@ -6,6 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # rune-protocol is header-only; consumed via the sibling source include path in Phase 1.
 set(RUNE_PROTOCOL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include)
 
+# rune_node include path — exposed as a CMake variable so gateway (which rune_node links)
+# can include NodeConfig.h / TopicSpec without creating a circular target dependency.
+set(RUNE_NODE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/include)
+
 find_package(aeron)
 find_package(spdlog REQUIRED)
 
