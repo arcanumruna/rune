@@ -119,7 +119,11 @@ public:
     // -------------------------------------------------------------------------
     // Callback registration — MUST be called before connect()
     //
-    // All callbacks fire on the runner/agent thread.  Do NOT block inside them.
+    // onConnected/onError fire on the runner/agent thread. onDisconnected fires
+    // on the thread that calls close() (or the dtor's thread). Do NOT block
+    // inside a callback, and do NOT call close() from within a callback that runs
+    // on the runner thread (onConnected/onError) — that self-joins the runner
+    // (UB). If a callback must close, hand the close() off to another thread.
     // -------------------------------------------------------------------------
 
     void onConnected(std::function<void(int64_t sessionId)> cb);

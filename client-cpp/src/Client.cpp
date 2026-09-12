@@ -94,6 +94,11 @@ void Client::close() {
     if (alreadyStopped) return;
 
     // Join the runner thread (it checks stopped_ in its loop condition).
+    // CONTRACT: close() must NOT be called from within a Client callback
+    // (onConnected/onDisconnected/onError run on the runner thread). Doing so
+    // would self-join the runner (std::system_error) and re-enter teardown on the
+    // runner's own doWork stack. Callbacks that want to close should hand off to
+    // another thread. (Documented on the callback setters in Client.h.)
     if (runnerThread_.joinable()) {
         runnerThread_.join();
     }
