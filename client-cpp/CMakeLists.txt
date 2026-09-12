@@ -104,6 +104,27 @@ if(aeron_FOUND)
     endif()
 endif()
 
+# ── Examples ──────────────────────────────────────────────────────────────────
+option(BUILD_EXAMPLES "Build example programs" OFF)
+if(BUILD_EXAMPLES AND aeron_FOUND)
+    add_executable(rune_client_ping
+        examples/rune_client_ping.cpp
+    )
+    target_include_directories(rune_client_ping PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_client_ping PRIVATE
+        rune_client_api
+    )
+    # Linux: link libuuid (aeron embedded driver).
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_ping PRIVATE ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)

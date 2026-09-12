@@ -1,0 +1,36 @@
+# Per-Dockerfile ignore for Dockerfile.client
+# Keep build context small — exclude everything not needed to build rune_client_ping.
+
+# Build outputs (large; do NOT send to the daemon)
+build/
+cov/
+cmake-build-debug/
+cmake-build-release/
+conan-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Tests and benchmarks (not built in the client image)
+tests/
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md
