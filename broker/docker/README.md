@@ -10,8 +10,12 @@ self-elects leader on boot.
 
 | Stage   | Image                   | Notes                                      |
 |---------|-------------------------|--------------------------------------------|
-| builder | `ubuntu:24.04`          | gcc-13 + cmake + conan 2.x (via pip)       |
-| runtime | `ubuntu:24.04`          | Must match the builder glibc/libstdc++ ABI; C++ runtime + libuuid1. Final image ~30 MB |
+| builder | `gcc:13`                | Debian bookworm base; gcc-13 + Kitware cmake 3.31 + conan 2.x. Same pattern as `world-server`. |
+| runtime | `debian:bookworm-slim`  | Shares the builder's glibc (2.36); the newer gcc-13 `libstdc++.so.6` is copied in. C++ runtime + libuuid1. |
+
+Both stages sit on Debian bookworm, so the binary's glibc matches the runtime;
+only gcc-13's newer `libstdc++.so.6` is copied from the builder (via `ldconfig`),
+keeping the runtime image slim.
 
 ---
 

@@ -1,84 +1,48 @@
 # syntax=docker/dockerfile:1
 # ──────────────────────────────────────────────────────────────────────────────
-# rune-broker — multi-stage image (linux/amd64)
-# Stage 1: builder  — conan install + cmake build (rune_broker target only)
-# Stage 2: runtime  — slim debian image + binary + entrypoint
+# rune-broker — single-node image (linux/amd64), mirroring world-server's pattern.
+# Stage 1: builder  — gcc:13 (Debian bookworm) + conan; builds the rune_broker target.
+# Stage 2: runtime  — debian:bookworm-slim (SAME glibc as gcc:13) + the binary.
+# The matching Debian-bookworm glibc across both stages avoids GLIBC version skew;
+# only the newer libstdc++ (gcc-13) is copied into the slim runtime.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────────────────────
-# BUILDER
-# Base: ubuntu:24.04 with gcc-13 + cmake + conan 2.x installed via pip.
-# The profile targets: gcc/13, arch=x86_64, cppstd=gnu17, libstdc++11, Linux.
-# All deps come from public ConanCenter (aeron, spdlog) — no private remote.
-# ──────────────────────────────────────────────────────────────────────────────
-FROM ubuntu:24.04 AS builder
+# ── BUILDER ───────────────────────────────────────────────────────────────────
+FROM gcc:13 AS builder
 
-ENV DEBIAN_FRONTEND=noninteractive
+ARG CMAKE_VERSION=3.31.5
 
-# ── System packages ───────────────────────────────────────────────────────────
-# ubuntu:24.04 (Noble) ships gcc-13 in its main archive; no PPA needed.
-# cmake 3.28+ is available from the Noble toolchain.
-# build-essential+make+ninja: the build backend CMake needs to probe the compiler
-#   and build aeron/spdlog from source.
-# default-jdk-headless: aeron's C++ build runs an SBE Java codegen step.
-# uuid-dev/zlib1g-dev/libbsd-dev: aeron media-driver C dependencies.
+# gcc:13 already provides gcc-13/g++-13 + build-essential + make. Add the rest:
+#   python3-pip           — conan
+#   ninja-build/pkg-config— build backend
+#   default-jdk-headless  — aeron's C++ build runs an SBE Java codegen step
+#   uuid-dev/zlib1g-dev   — aeron media-driver C dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc-13 g++-13 \
-        build-essential make ninja-build pkg-config \
-        cmake \
-        python3 python3-pip \
-        default-jdk-headless \
-        uuid-dev zlib1g-dev libbsd-dev \
-        git \
-        ca-certificates \
-        curl \
+        python3 python3-pip python3-venv git curl ninja-build pkg-config \
+        default-jdk-headless uuid-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
-    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
-    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100
+    && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
 
 # aeron's SBE codegen locates the JDK via JAVA_HOME.
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
-# ── Conan 2.x via pip ────────────────────────────────────────────────────────
-# ubuntu:24.04 marks the system Python PEP-668 "externally managed"; the builder
-# is a throwaway stage, so install into system site-packages directly.
-RUN pip3 install --no-cache-dir --break-system-packages "conan>=2.0"
-
-# ── Create a conan profile (gcc-13 / x86_64 / gnu17 / libstdc++11) ───────────
-RUN conan profile detect --force
-RUN conan profile path default && \
-    printf '[settings]\nos=Linux\narch=x86_64\ncompiler=gcc\ncompiler.version=13\ncompiler.cppstd=gnu17\ncompiler.libcxx=libstdc++11\nbuild_type=Release\n' \
-        > "$(conan profile path default)"
-
-# ── Conan remote (public ConanCenter only) ───────────────────────────────────
-# No private remote / credentials needed: all deps are on ConanCenter.
-RUN conan remote add conancenter https://center2.conan.io --force || true
+# The project requires CMake >= 3.31; bookworm ships older. Install the pinned
+# official Kitware release into /usr/local (same approach as world-server).
+RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+    && cmake --version
 
 WORKDIR /build
+RUN conan profile detect --force
 
-# ── Conan install (resolve + download all deps; build from source if needed) ─
+# ── Conan install (public ConanCenter only — the private `common` dep was dropped)
 # Copy ONLY the conan metadata first so this expensive layer (aeron builds from
 # source) is cached independently of application source edits.
-# --build=missing: builds aeron/spdlog from source if no prebuilt Linux binary
-# exists on ConanCenter (aeron pulls a JDK build-requirement transiently).
+# --build=missing builds aeron/spdlog (+ gtest/benchmark) from source when no
+# prebuilt Linux binary matches the detected gcc-13 profile.
 COPY conanfile.py conandata.yml VERSION.txt ./
-RUN conan install . \
-        --build=missing \
-        -s os=Linux \
-        -s arch=x86_64 \
-        -s compiler=gcc \
-        -s compiler.version=13 \
-        -s compiler.cppstd=gnu17 \
-        -s compiler.libcxx=libstdc++11 \
-        -s build_type=Release
-
-# ── Upgrade CMake for the project configure ──────────────────────────────────
-# ubuntu:24.04 ships cmake 3.28; the project requires >= 3.31. Install a recent
-# cmake via pip in its own layer (AFTER conan install) so the dependency-build
-# cache above is preserved on rebuilds. This cmake shadows /usr/bin/cmake.
-RUN pip3 install --no-cache-dir --break-system-packages "cmake>=3.31"
+RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
 
 # ── rune-protocol sibling headers (Phase-1 sibling-include, not yet packaged) ─
 # libs/storage includes <rune/protocol/RecordBatch.h>. CMake resolves
@@ -90,28 +54,26 @@ COPY --from=rune-protocol include /rune-protocol/include
 # ── Application sources (copied last so edits don't bust the conan cache) ─────
 COPY . .
 
-# ── CMake configure + build (rune_broker target only; no tests, no benchmarks) ─
-RUN cmake . -B build \
+# ── Configure + build (rune_broker target only; no tests, no benchmarks) ──────
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=conan-release/build/Release/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
-        -DCMAKE_PREFIX_PATH="/build/build/Release/generators" \
         -DBUILD_TESTING=OFF \
-        -DBUILD_BENCHMARKS=OFF && \
-    cmake --build build --target rune_broker -j2
+        -DBUILD_BENCHMARKS=OFF \
+    && cmake --build build --target rune_broker
 
-# ──────────────────────────────────────────────────────────────────────────────
-# RUNTIME
-# Base MUST match the builder's glibc/libstdc++ ABI. The builder is ubuntu:24.04
-# (GLIBC 2.38 / GLIBCXX 3.4.32); an older base (e.g. debian:bookworm-slim) lacks
-# those symbol versions and the binary fails to start. Only the binary +
-# entrypoint land here — no toolchain, no conan cache.
-# ──────────────────────────────────────────────────────────────────────────────
-FROM ubuntu:24.04 AS runtime
+# gcc-13's libstdc++ is newer than bookworm-slim's; stage it for the runtime.
+RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
 
-# Runtime shared libs: C++ runtime + libuuid1 (the binary dynamically links
-# libuuid for aeron's embedded driver) + procps for the healthcheck.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# ── RUNTIME ───────────────────────────────────────────────────────────────────
+# debian:bookworm-slim shares the gcc:13 builder's glibc (2.36). Only the binary,
+# the newer libstdc++, and the entrypoint land here — no toolchain, no conan cache.
+FROM debian:bookworm-slim AS runtime
+
+# Runtime shared libs: libgcc/atomic + libuuid1 (the binary dynamically links
+# libuuid for aeron's embedded driver) + procps for the healthcheck. libstdc++6
+# provides the base symlink that ldconfig repoints to the copied 6.0.32 below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
         libstdc++6 \
         libgcc-s1 \
         libatomic1 \
@@ -119,10 +81,13 @@ RUN apt-get update && \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the broker binary.
+# The broker binary + the newer libstdc++ from the builder (ldconfig repoints
+# the libstdc++.so.6 symlink to the higher 6.0.32 version).
 COPY --from=builder /build/build/rune_broker /usr/local/bin/rune_broker
+COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
+RUN ldconfig
 
-# Copy the entrypoint.
+# Entrypoint (defaults RUNE_DATA_DIR, exec's the binary as PID 1 → clean SIGTERM).
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

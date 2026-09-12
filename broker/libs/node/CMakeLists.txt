@@ -9,6 +9,15 @@ target_include_directories(rune_node PUBLIC
 target_link_libraries(rune_node PUBLIC rune_consensus)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron)
+    # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
+    # macOS provides it in system libs and the ConanCenter aeron recipe doesn't
+    # propagate it. Link it PUBLIC so every driver-embedding consumer (rune_broker
+    # and the BrokerNode/UDP-cluster test executables) picks it up. --no-as-needed
+    # keeps libuuid regardless of link order relative to aeron's static archive.
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(rune_node PUBLIC
+            -Wl,--no-as-needed uuid -Wl,--as-needed)
+    endif()
 endif()
 target_link_libraries(rune_node PRIVATE spdlog::spdlog)
 
