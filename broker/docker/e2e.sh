@@ -91,12 +91,15 @@ await_leader_id() {
     while [ "$(date +%s)" -lt "${deadline}" ]; do
         # Scan all three services; grep returns the first "node <N> is LEADER"
         # found in any service's log. All nodes agree on <N>.
+        # NB: `|| true` — under `set -e`+`pipefail` a no-match grep (exit 1) in
+        # this poll iteration would otherwise abort the whole script, bypassing
+        # the bounded-wait loop. A miss must just retry until the deadline.
         local raw
         raw=$(docker compose -f "${COMPOSE_FILE}" logs --no-log-prefix \
                 rune-1 rune-2 rune-3 2>/dev/null \
               | grep -oE 'node [0-9]+ is LEADER' \
               | grep -oE '[0-9]+' \
-              | head -1)
+              | head -1) || true
         if [ -n "${raw}" ]; then
             leader_id="${raw}"
             break
@@ -250,10 +253,12 @@ new_leader_raw=$(docker compose -f "${COMPOSE_FILE}" run --rm \
     -e RUNE_DATA_DIR="/tmp/rune_probe_60_assert" \
     probe 2>&1) || true
 
+# `|| true` — a parse miss (no leaderMemberId= in the probe output) must fall
+# through to the graceful WARNING branch below, not abort under set -e+pipefail.
 new_leader_id=$(echo "${new_leader_raw}" \
     | grep -oE 'leaderMemberId=[0-9]+' \
     | grep -oE '[0-9]+' \
-    | tail -1)
+    | tail -1) || true
 
 if [ -z "${new_leader_id}" ]; then
     log "WARNING: could not parse new leaderMemberId from ConnectResponse (probe output below):"
