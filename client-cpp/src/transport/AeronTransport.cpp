@@ -157,31 +157,41 @@ bool AeronTransport::offer(const uint8_t* buf, std::size_t len) noexcept {
 
     const auto ilen = static_cast<aeron::util::index_t>(len);
 
-    // For messages that fit within maxPayloadLength, use tryClaim (zero-copy —
-    // avoids a memcpy in the client for small messages that fit in one term slot).
-    // For larger messages, tryClaim() would throw IllegalArgumentException, so we
-    // go directly to offer() which calls appendFragmentedMessage() internally.
-    if (len > 0 && ilen <= ingressPub_->maxPayloadLength()) {
-        aeron::concurrent::logbuffer::BufferClaim claim;
-        const int64_t claimPos = ingressPub_->tryClaim(ilen, claim);
-        if (claimPos > 0) {
-            std::memcpy(claim.buffer().buffer() + claim.offset(), buf, len);
-            claim.commit();
-            return true;
+    // This method is noexcept but the Aeron publication calls below can throw
+    // (e.g. IllegalStateException on a closed pub during a racing teardown).
+    // The single-writer lifetime contract makes that unreachable in normal use,
+    // but a throw escaping a noexcept fn would std::terminate — so we contain it
+    // and report a failed send instead. Aeron never mutates the source buffer.
+    try {
+        // For messages that fit within maxPayloadLength, use tryClaim (zero-copy —
+        // avoids a memcpy in the client for small messages that fit in one term slot).
+        // For larger messages, tryClaim() would throw IllegalArgumentException, so we
+        // go directly to offer() which calls appendFragmentedMessage() internally.
+        if (len > 0 && ilen <= ingressPub_->maxPayloadLength()) {
+            aeron::concurrent::logbuffer::BufferClaim claim;
+            const int64_t claimPos = ingressPub_->tryClaim(ilen, claim);
+            if (claimPos > 0) {
+                std::memcpy(claim.buffer().buffer() + claim.offset(), buf, len);
+                claim.commit();
+                return true;
+            }
+            // tryClaim returned NOT_CONNECTED / BACK_PRESSURED / ADMIN_ACTION / CLOSED.
+            // Fall through to offer() for a second attempt.
         }
-        // tryClaim returned NOT_CONNECTED / BACK_PRESSURED / ADMIN_ACTION / CLOSED.
-        // Fall through to offer() for a second attempt.
-    }
 
-    // offer() handles both small messages and multi-frame fragmentation
-    // (calls appendFragmentedMessage() for len > maxPayloadLength).
-    // For empty payloads (len==0) we reach here directly.
-    static uint8_t kEmptyBuf[1] = {};
-    aeron::concurrent::AtomicBuffer ab(
-        const_cast<uint8_t*>(len > 0 ? buf : kEmptyBuf),
-        ilen);
-    const int64_t pos = ingressPub_->offer(ab, 0, ilen);
-    return pos > 0;
+        // offer() handles both small messages and multi-frame fragmentation
+        // (calls appendFragmentedMessage() for len > maxPayloadLength).
+        // For empty payloads (len==0) we reach here directly — Aeron accepts a
+        // zero-length offer; kEmptyBuf guards against a null-ptr AtomicBuffer.
+        static uint8_t kEmptyBuf[1] = {};
+        aeron::concurrent::AtomicBuffer ab(
+            const_cast<uint8_t*>(len > 0 ? buf : kEmptyBuf),
+            ilen);
+        const int64_t pos = ingressPub_->offer(ab, 0, ilen);
+        return pos > 0;
+    } catch (...) {
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
