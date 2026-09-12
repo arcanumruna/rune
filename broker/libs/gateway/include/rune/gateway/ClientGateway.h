@@ -175,6 +175,8 @@ private:
     void handleKeepalive (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handlePing      (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleDisconnect(const uint8_t* buf, std::size_t len);
+    // GB-2: Produce handler — offset-assignment + leader-local append.
+    void handleProduce   (const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
     // Egress send helper — tryClaim first, fallback to offer.
@@ -258,10 +260,17 @@ private:
     // Populated and drained entirely within reapExpired() — single-writer, safe.
     std::vector<int64_t>                 reapScratch_;
 
-    // Reusable encode scratch — 68 KiB covers any Milestone-A frame.
-    // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB)
+    // Reusable encode scratch — 68 KiB covers any Milestone-A/B frame.
+    // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB;
+    //  ProduceResponse=38 B; restamp scratch = max RecordBatch = 65535 B)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
+
+    // GB-2: Reusable restamp scratch for offset-assignment (single per-produce
+    // copy of the incoming RecordBatch bytes with baseOffset rewritten in place).
+    // Sized to the same max frame — avoids per-produce heap allocation.
+    // Single-writer: only accessed on the duty-cycle thread via handleProduce().
+    std::array<uint8_t, kScratchSize>    restampScratch_{};
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.

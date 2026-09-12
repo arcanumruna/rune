@@ -122,3 +122,52 @@ On Docker Desktop (macOS), this works because:
 5. **Election timing**: The relaxed election timing (300/50/200 ms vs defaults of 150/20/100 ms) adds ~200ms to the initial election. Tighter values work in tests but may be fragile under Docker Desktop's scheduling jitter. Keeping the relaxed values for compose.
 
 6. **Probe egress stream uniqueness**: Each probe `run --rm` gets a unique egress stream ID to avoid Aeron publication/subscription conflicts across probe invocations on the same container instance/port. The e2e.sh uses incrementing stream IDs per attempt.
+
+---
+
+## Fix-Round — Opus Review BR-7b (2026-09-12)
+
+**Commit:** `7b8ccc1`  
+**Status:** All findings fixed and E2E re-run passed.
+
+### Findings addressed
+
+| # | Severity | Finding | Fix |
+|---|----------|---------|-----|
+| 1 | MAJOR | `await_leader_logs` returned the first service that has "is LEADER" in its log (all 3 nodes log the same winner id, so always returned `rune-1`). `docker compose stop "${leader}"` would stop a follower, not the real leader. | Replaced `await_leader_logs` with `await_leader_id`: scans all-nodes combined logs for `node [0-9]+ is LEADER`, extracts the numeric id, validates it is 0/1/2, maps it to service via `node_id_to_service()` (0→rune-1, 1→rune-2, 2→rune-3). Stops THAT service. After re-election, runs an additional probe and asserts `leaderMemberId` (from `ConnectResponse`) is a DIFFERENT node id than the killed leader. Fails loudly if they are equal. |
+| 2 | MINOR | `ping_probe.cpp` only asserted echo-bytes on Pong; did not check `correlationId`. | Added: if `pong->correlationId != 2002` → stderr mismatch message + return 12. |
+| 3 | MINOR | `docker/README.md` said "4 KiB term buffer" but probe sets `term_buffer_length = 64*1024`. | Corrected to "64 KiB term buffer (Aeron fragments to MTU internally)". |
+| 4 | NIT | `docker-compose.yml` `additional_contexts` path is `../../rune-protocol`; brief said `../rune-protocol`; future readers might "correct" it. | Added one-line comment: `# relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo`. Applied to both broker and probe build sections. |
+
+### E2E Run Results (post-fix)
+
+```
+[e2e] Step 3: Awaiting initial leader (up to 90s)...
+[e2e] Initial leader: node ID=1 → service=rune-2
+[e2e] Step 4: Running probe against rune-1 (pre-kill)...
+PROBE: ConnectResponse OK sessionId=1 leaderMemberId=0
+PROBE: OK node=aeron:udp?endpoint=rune-1:40200 session=1
+PROBE: Pong received correlationId=2002 echo='rune-probe-echo'
+[e2e] Step 4 PASSED: probe got Pong before leader-kill.
+[e2e] Step 5: Stopping actual leader service 'rune-2' (node ID=1)...
+[e2e] Leader 'rune-2' (node 1) stopped.
+[e2e] Survivors: rune-1 rune-3
+[e2e] Step 6+7: Probing survivor 'rune-1' to prove re-election (up to 90s)...
+[e2e]   Probe attempt 1 failed; retrying in 5s...  (re-election in progress)
+PROBE: ConnectResponse OK sessionId=3 leaderMemberId=0
+PROBE: OK node=aeron:udp?endpoint=rune-1:40200 session=3
+PROBE: Pong received correlationId=2002 echo='rune-probe-echo'
+[e2e] Step 6+7 PASSED: survivor answered Pong after leader-kill (re-election confirmed).
+[e2e] New leader after kill: node ID=0
+[e2e] Re-election confirmed: old leader ID=1, new leader ID=0 (different node).
+[e2e] BR-7b E2E PASSED
+[e2e]   Initial leader : node ID=1 (service=rune-2)
+[e2e]   New leader      : node ID=0 (different node — genuine re-election)
+```
+
+Exit code: **0**. Teardown clean.
+
+**Leader before kill:** node 1 (rune-2)  
+**Leader after kill:** node 0 (rune-1) — confirmed different, genuine re-election exercised.  
+**PROBE: OK both times:** yes.  
+**FIX 1–4:** all confirmed.

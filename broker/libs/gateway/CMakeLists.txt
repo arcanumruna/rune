@@ -101,6 +101,16 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_async_drop_tests
                 PROPERTIES TIMEOUT 120)
+
+            # GB-2: Produce handler — leader-local append + offset assignment tests
+            add_executable(rune_gateway_produce_tests
+                tests/integration/GatewayProduceTest.cpp)
+            target_link_libraries(rune_gateway_produce_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_produce_tests
+                PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()

@@ -1,13 +1,18 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
 
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <spdlog/spdlog.h>
+
+#include <cstring>
 
 #include <algorithm>
 #include <chrono>
@@ -142,9 +147,12 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
         case pc::TemplateId::Disconnect:
             handleDisconnect(buf, len);
             break;
+        case pc::TemplateId::Produce:
+            handleProduce(buf, len);
+            break;
         default:
-            // ConnectResponse, ErrorResponse, Pong — server → client only.
-            // A client publishing them is malformed; drop.
+            // ConnectResponse, ErrorResponse, Pong, ProduceResponse, SubscribeResponse,
+            // Records, Unsubscribe — server→client or other direction; drop.
             break;
     }
 }
@@ -528,6 +536,195 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
     const int64_t result = pub.offer(atomicBuf, 0,
                                      static_cast<aeron::util::index_t>(len));
     return result > 0;
+}
+
+// ---------------------------------------------------------------------------
+// handleProduce (GB-2) — leader-local append with broker-assigned offsets.
+//
+// Flow:
+//   1. Decode Produce (tid16) — drop on truncation.
+//   2. Require known session — drop (UnknownSession) if not found.
+//   3. Resolve partition: explicit when partitionKnown==1, else partitionForKey().
+//   4. Lookup Log* from registry; reply error on unknown topic / bad partition.
+//   5. Assign offsets (CRC-safe restamp):
+//        base = log->logEndOffset()
+//        copy recordBatch bytes into restampScratch_
+//        write base as LE64 at kBaseOffsetOffset (excluded from CRC region)
+//        read recordCount as LE32 at kRecordCountOffset
+//        guard recordCount >= 1 (0-record batch → drop / InvalidBatch response)
+//        lastOffset = base + recordCount - 1
+//        log->append(restampScratch_[0..batchLen], lastOffset)
+//   6. Reply ProduceResponse{OK, partition, baseOffset=base}.
+//
+// Acks semantics (M-B leader-local):
+//   Leader and None → ack after local append (only leader log exists here).
+//   All (ISR-majority HW) → same as Leader for now — replication-ack wiring
+//   is deferred.
+//   // TODO(Milestone B GB-4/replication): true acks=All waits for ISR HW.
+//   (Produce in M-B does not carry an `acks` field; always ack after append.)
+//
+// Drop-safe: never throws; all engine calls wrapped in try/catch.
+// Single-writer: called only from onFragment → doWork duty-cycle thread.
+// Zero heap allocation on hot path: restampScratch_ is a reusable member array.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
+{
+    // 1. Decode Produce.
+    auto msgOpt = pc::Produce::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: Produce decode failed (truncated?) — dropped");
+        return;
+    }
+    const pc::Produce& msg = *msgOpt;
+
+    // 2. Require known session.
+    Session* session = sessions_.find(msg.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
+        return;
+    }
+
+    // Helper: send ProduceResponse on the session egress.
+    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t baseOffset) {
+        pc::ProduceResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        resp.errorCode     = static_cast<int16_t>(ec);
+        resp.partition     = partition;
+        resp.baseOffset    = baseOffset;
+        static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                      "scratch too small for ProduceResponse");
+        const std::size_t encoded = resp.encode(scratch_.data());
+        sendTo(*session, scratch_.data(), encoded);
+    };
+
+    // 3. Resolve partition.
+    int32_t partition = msg.partition;
+    if (msg.partitionKnown == 0) {
+        // Key-based: resolve via TopicRegistry (FNV-1a 64 % partitionCount).
+        if (!topicRegistry_) {
+            spdlog::warn("ClientGateway: Produce key-partition but no TopicRegistry — UnknownTopic");
+            sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+            return;
+        }
+        partition = topicRegistry_->partitionForKey(msg.topicId, msg.key);
+        if (partition < 0) {
+            spdlog::debug("ClientGateway: Produce partitionForKey → unknown topicId={}", msg.topicId);
+            sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+            return;
+        }
+    }
+
+    // 4. Lookup Log.
+    if (!topicRegistry_) {
+        spdlog::warn("ClientGateway: Produce but no TopicRegistry — UnknownTopic");
+        sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+        return;
+    }
+
+    // topic() returns nullptr for unknown topicId.
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(msg.topicId);
+    if (!spec) {
+        spdlog::debug("ClientGateway: Produce unknown topicId={}", msg.topicId);
+        sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+        return;
+    }
+
+    rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
+    if (!log) {
+        spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
+        sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
+        return;
+    }
+
+    // 5. Assign offsets (CRC-safe restamp).
+
+    // Guard: recordBatch must be present (non-empty).
+    const std::size_t batchLen = msg.recordBatch.size();
+    if (batchLen == 0) {
+        spdlog::debug("ClientGateway: Produce empty recordBatch — dropped");
+        // Reply InvalidBatch (no valid errorCode for InvalidBatch in client::ErrorCode;
+        // use Internal as the closest sentinel for a malformed produce).
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    }
+
+    // Guard: batch must fit in the restamp scratch.
+    if (batchLen > restampScratch_.size()) {
+        spdlog::warn("ClientGateway: Produce batch too large ({} > {}); dropped",
+                     batchLen, restampScratch_.size());
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    }
+
+    // Guard: batch must be at least large enough to hold the fixed header fields
+    // we will read (kRecordCountOffset + 4 bytes).
+    constexpr std::size_t kMinBatchSize =
+        static_cast<std::size_t>(rune::protocol::batch::kRecordCountOffset) + 4u;
+    if (batchLen < kMinBatchSize) {
+        spdlog::debug("ClientGateway: Produce batch too short ({} < {}); dropped",
+                      batchLen, kMinBatchSize);
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    }
+
+    // Copy the recordBatch bytes into the reusable restamp scratch.
+    std::memcpy(restampScratch_.data(), msg.recordBatch.data(), batchLen);
+
+    // Assign base offset and rewrite the LE64 at kBaseOffsetOffset.
+    // This field sits at bytes [0..7], BEFORE the CRC region that starts at
+    // kAttributesOffset (byte 21) — rewriting it is CRC-safe (identical to Kafka).
+    const int64_t base = log->logEndOffset();
+    {
+        uint64_t u = static_cast<uint64_t>(base);
+        for (int i = 0; i < 8; ++i) {
+            restampScratch_[static_cast<std::size_t>(rune::protocol::batch::kBaseOffsetOffset) + i] =
+                static_cast<uint8_t>(u >> (i * 8));
+        }
+    }
+
+    // Read recordCount (LE32 at kRecordCountOffset).
+    int32_t recordCount = 0;
+    {
+        const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kRecordCountOffset;
+        recordCount = static_cast<int32_t>(
+            static_cast<uint32_t>(p[0]) |
+            (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) |
+            (static_cast<uint32_t>(p[3]) << 24));
+    }
+
+    if (recordCount < 1) {
+        spdlog::debug("ClientGateway: Produce recordCount={} < 1; dropped", recordCount);
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    }
+
+    const int64_t lastOffset = base + static_cast<int64_t>(recordCount) - 1;
+
+    // Build a vector for the Log::append call (Log takes const std::vector<uint8_t>&).
+    // Single-writer: this is the unavoidable copy for offset-restamp storage.
+    // We reuse restampScratch_ as the source to avoid double-copy.
+    const std::vector<uint8_t> batchVec(
+        restampScratch_.data(),
+        restampScratch_.data() + batchLen);
+
+    try {
+        log->append(batchVec, lastOffset);
+    } catch (const std::exception& ex) {
+        spdlog::error("ClientGateway: Log::append threw: {}; ProduceResponse Internal", ex.what());
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    } catch (...) {
+        spdlog::error("ClientGateway: Log::append threw unknown exception; ProduceResponse Internal");
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    }
+
+    // 6. Reply ProduceResponse{OK, partition, baseOffset=base}.
+    // TODO(Milestone B GB-4/replication): true acks=All waits for ISR HW advance.
+    // Produce in M-B does not carry an acks field; we always ack after local append.
+    sendResp(pc::ErrorCode::OK, partition, base);
 }
 
 // ---------------------------------------------------------------------------
