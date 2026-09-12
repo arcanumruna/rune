@@ -14,7 +14,7 @@
 //   1. TooShort          — avail < MessageHeader::ENCODED_SIZE
 //   2. WrongSchema       — header.schemaId != kSchemaId
 //   3. UnsupportedVersion— header.version  >  kProtocolVersion
-//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 16..17 MB)
+//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 16..21 MB)
 //   5. Ok
 //
 // Future tickets extend isKnownTemplate() as new template ids are assigned
@@ -51,13 +51,13 @@ struct FrameCheck {
 
 // ---------------------------------------------------------------------------
 // isKnownTemplate — true for templateIds handled in Milestone A (1..7)
-//                   and Milestone B produce/consume range (16..17).
+//                   and Milestone B produce/subscribe range (16..21).
 //
 // Reserved ranges (from Protocol.h):
-//   control       1-15   (Connect=1 .. Pong=7 assigned so far)
-//   produce/consume 16-31 (Produce=16, ProduceResponse=17 added in PB-1)
-//   groups/txn    32-63
-//   view          64-95
+//   control         1-15   (Connect=1 .. Pong=7 assigned; 8-15 gap → UnknownTemplate)
+//   produce/consume 16-31  (Produce=16 .. Unsubscribe=21 assigned; 22-31 gap → UnknownTemplate)
+//   groups/txn      32-63
+//   view            64-95
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
@@ -67,9 +67,9 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::Pong)) {
         return true;
     }
-    // Milestone B produce/consume: 16..17
+    // Milestone B produce/subscribe range: 16..21
     if (tid >= static_cast<uint16_t>(TemplateId::Produce) &&
-        tid <= static_cast<uint16_t>(TemplateId::ProduceResponse)) {
+        tid <= static_cast<uint16_t>(TemplateId::Unsubscribe)) {
         return true;
     }
     return false;

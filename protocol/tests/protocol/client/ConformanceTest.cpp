@@ -1,15 +1,17 @@
 // tests/protocol/client/ConformanceTest.cpp
 //
-// CP-5 conformance harness — golden vector tests.
+// CP-5 / PB-3 conformance harness — golden vector tests.
 //
-// For each of the 10 committed .bin vectors the harness asserts BOTH:
+// For each committed .bin vector the harness asserts BOTH:
 //   1. Decode-golden:  read file bytes → decode → every field equals expected.
 //   2. Encode-golden:  build message from expected values → encode → bytes identical
 //                      to the committed .bin (pins the wire format).
 //   3. Header check:   templateId / schemaId / version / sessionId / correlationId.
 //
-// Plus a session-flow test that decodes each frame in order and asserts the
-// templateId sequence matches [Connect, ConnectResponse, Keepalive, Ping, Pong, Disconnect].
+// Session-flow tests:
+//   - Control flow: [Connect, ConnectResponse, Keepalive, Ping, Pong, Disconnect]
+//   - Produce→records flow: Produce → ProduceResponse → Subscribe → Records → Unsubscribe
+//     Uses checkFrame + peekTemplateId for each step; asserts Ok + correct templateId.
 //
 // RUNE_CONFORMANCE_DIR is injected as a compile-time string by CMakeLists.txt so
 // the test locates vectors regardless of the working directory ctest uses.
@@ -18,6 +20,7 @@
 
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -412,6 +415,125 @@ TEST(ConformanceGolden, Pong) {
 }
 
 // ===========================================================================
+// PB-1 Golden conformance: Produce / ProduceResponse vectors
+// ===========================================================================
+
+// Golden record batch shared by the PB-1 produce vectors.
+static constexpr uint8_t kProduceBatch[] = {
+    0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x01, 0x02
+};
+static constexpr uint8_t kProduceKey[] = {0x41, 0x42, 0x43}; // "ABC"
+
+// ===========================================================================
+// 11. produce_explicit_partition.bin — 45 bytes
+//     Produce{ topicId=1001, partition=7, partitionKnown=1, key=empty,
+//              recordBatch={DE AD BE EF 00 FF 01 02} }
+// ===========================================================================
+TEST(ConformanceGolden, ProduceExplicitPartition) {
+    const auto golden = readVector("produce_explicit_partition.bin");
+    ASSERT_EQ(golden.size(), 45u);
+
+    assertHeader(golden, rpc::Produce::TEMPLATE_ID, rpc::Produce::BODY_FIXED);
+
+    auto msgOpt = rpc::Produce::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->topicId,        1001);
+    EXPECT_EQ(msgOpt->partition,      7);
+    EXPECT_EQ(msgOpt->partitionKnown, 1u);
+    EXPECT_EQ(msgOpt->key.size(),     0u);
+    ASSERT_EQ(msgOpt->recordBatch.size(), sizeof(kProduceBatch));
+    EXPECT_EQ(std::memcmp(msgOpt->recordBatch.data(), kProduceBatch, sizeof(kProduceBatch)), 0);
+
+    rpc::Produce msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.topicId        = 1001;
+    msg.partition      = 7;
+    msg.partitionKnown = 1;
+    msg.key            = std::span<const uint8_t>{};
+    msg.recordBatch    = std::span<const uint8_t>(kProduceBatch, sizeof(kProduceBatch));
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 45u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden produce_explicit_partition.bin";
+}
+
+// ===========================================================================
+// 12. produce_key_only.bin — 48 bytes
+//     Produce{ topicId=2002, partition=0, partitionKnown=0, key="ABC",
+//              recordBatch={DE AD BE EF 00 FF 01 02} }
+// ===========================================================================
+TEST(ConformanceGolden, ProduceKeyOnly) {
+    const auto golden = readVector("produce_key_only.bin");
+    ASSERT_EQ(golden.size(), 48u);
+
+    assertHeader(golden, rpc::Produce::TEMPLATE_ID, rpc::Produce::BODY_FIXED);
+
+    auto msgOpt = rpc::Produce::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->topicId,        2002);
+    EXPECT_EQ(msgOpt->partition,      0);
+    EXPECT_EQ(msgOpt->partitionKnown, 0u);
+    ASSERT_EQ(msgOpt->key.size(),     sizeof(kProduceKey));
+    EXPECT_EQ(std::memcmp(msgOpt->key.data(), kProduceKey, sizeof(kProduceKey)), 0);
+    ASSERT_EQ(msgOpt->recordBatch.size(), sizeof(kProduceBatch));
+    EXPECT_EQ(std::memcmp(msgOpt->recordBatch.data(), kProduceBatch, sizeof(kProduceBatch)), 0);
+
+    rpc::Produce msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.topicId        = 2002;
+    msg.partition      = 0;
+    msg.partitionKnown = 0;
+    msg.key            = std::span<const uint8_t>(kProduceKey, sizeof(kProduceKey));
+    msg.recordBatch    = std::span<const uint8_t>(kProduceBatch, sizeof(kProduceBatch));
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 48u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden produce_key_only.bin";
+}
+
+// ===========================================================================
+// 13. produce_response.bin — 38 bytes
+//     ProduceResponse{ errorCode=0(OK), partition=7, baseOffset=123456 }
+// ===========================================================================
+TEST(ConformanceGolden, ProduceResponse) {
+    const auto golden = readVector("produce_response.bin");
+    ASSERT_EQ(golden.size(), 38u);
+
+    assertHeader(golden, rpc::ProduceResponse::TEMPLATE_ID, rpc::ProduceResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ProduceResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    EXPECT_EQ(msgOpt->errorCode,     static_cast<int16_t>(rpc::ErrorCode::OK));
+    EXPECT_EQ(msgOpt->partition,     7);
+    EXPECT_EQ(msgOpt->baseOffset,    123456LL);
+
+    rpc::ProduceResponse msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.errorCode     = static_cast<int16_t>(rpc::ErrorCode::OK);
+    msg.partition     = 7;
+    msg.baseOffset    = 123456LL;
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 38u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden produce_response.bin";
+}
+
+// ===========================================================================
 // PB-2 Golden conformance: Subscribe / Records / Unsubscribe vectors
 // ===========================================================================
 
@@ -421,7 +543,7 @@ static constexpr uint8_t kGoldenBatch[] = {
 };
 
 // ===========================================================================
-// 11. subscribe_explicit.bin
+// 14. subscribe_explicit.bin
 //     Subscribe{ topicId=3001, partition=5, partitionKnown=1, fromOffset=9999,
 //                isolation=1, key=empty }
 //     Expected byte length: 24 + 18 + 2 + 0 = 44
@@ -461,7 +583,7 @@ TEST(ConformanceGolden, SubscribeExplicit) {
 }
 
 // ===========================================================================
-// 12. subscribe_key_only.bin
+// 15. subscribe_key_only.bin
 //     Subscribe{ topicId=4004, partition=0, partitionKnown=0, fromOffset=0,
 //                isolation=0, key="ABC" }
 //     Expected byte length: 24 + 18 + 2 + 3 = 47
@@ -504,7 +626,7 @@ TEST(ConformanceGolden, SubscribeKeyOnly) {
 }
 
 // ===========================================================================
-// 13. records_push.bin
+// 16. records_push.bin
 //     Records{ subscriptionId=0x0102030405060708, topicId=3001, partition=5,
 //              baseOffset=100000, recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
 //     Expected byte length: 24 + 24 + 2 + 8 = 58
@@ -544,7 +666,7 @@ TEST(ConformanceGolden, RecordsPush) {
 }
 
 // ===========================================================================
-// 14. unsubscribe.bin
+// 17. unsubscribe.bin
 //     Unsubscribe{ subscriptionId=0x0102030405060708 }
 //     Expected byte length: 24 + 8 = 32
 // ===========================================================================
@@ -619,5 +741,147 @@ TEST(ConformanceSessionFlow, TemplateIdSequence) {
     for (std::size_t i = 0; i < kFlowLen; ++i) {
         EXPECT_EQ(observedIds[i], kExpectedSequence[i])
             << "Session-flow templateId mismatch at index " << i;
+    }
+}
+
+// ===========================================================================
+// Produce→Records session-flow script (PB-3)
+//
+// Models a client produce + subscribe round-trip at the wire level:
+//   Produce (16) → ProduceResponse (17) → Subscribe (18) → Records (20)
+//   → Unsubscribe (21)
+//
+// Each frame is loaded from the golden .bin, round-tripped through
+// checkFrame + peekTemplateId (must return Ok + correct id), and the
+// encoded form is verified byte-exact against the golden file.
+// Expected templateId sequence: [16, 17, 18, 20, 21]
+// ===========================================================================
+TEST(ConformanceSessionFlow, ProduceRecordsFlow) {
+    struct Frame {
+        const char* filename;
+        uint16_t    expectedTemplateId;
+    };
+
+    static constexpr Frame kFlow[] = {
+        { "produce_explicit_partition.bin", static_cast<uint16_t>(rpc::TemplateId::Produce)         },  // 16
+        { "produce_response.bin",           static_cast<uint16_t>(rpc::TemplateId::ProduceResponse) },  // 17
+        { "subscribe_explicit.bin",         static_cast<uint16_t>(rpc::TemplateId::Subscribe)       },  // 18
+        { "records_push.bin",               static_cast<uint16_t>(rpc::TemplateId::Records)         },  // 20
+        { "unsubscribe.bin",                static_cast<uint16_t>(rpc::TemplateId::Unsubscribe)     },  // 21
+    };
+    constexpr std::size_t kFlowLen = sizeof(kFlow) / sizeof(kFlow[0]);
+
+    // Each frame must pass checkFrame (Ok) and peekTemplateId must return the correct id.
+    for (const auto& frame : kFlow) {
+        const auto buf = readVector(frame.filename);
+        ASSERT_FALSE(buf.empty()) << "Could not read " << frame.filename;
+
+        const auto fc = rpc::checkFrame(buf.data(), buf.size());
+        EXPECT_EQ(fc.status, rpc::FrameStatus::Ok)
+            << "checkFrame != Ok for " << frame.filename;
+        EXPECT_EQ(fc.templateId, frame.expectedTemplateId)
+            << "checkFrame templateId mismatch for " << frame.filename;
+
+        const auto peeked = rpc::peekTemplateId(buf.data(), buf.size());
+        ASSERT_TRUE(peeked.has_value())
+            << "peekTemplateId returned nullopt for " << frame.filename;
+        EXPECT_EQ(*peeked, frame.expectedTemplateId)
+            << "peekTemplateId mismatch for " << frame.filename;
+    }
+
+    // Verify the exact templateId sequence as an array.
+    constexpr uint16_t kExpectedSequence[kFlowLen] = {16, 17, 18, 20, 21};
+    uint16_t observedIds[kFlowLen];
+    for (std::size_t i = 0; i < kFlowLen; ++i) {
+        const auto buf = readVector(kFlow[i].filename);
+        const auto fc  = rpc::checkFrame(buf.data(), buf.size());
+        ASSERT_EQ(fc.status, rpc::FrameStatus::Ok);
+        observedIds[i] = fc.templateId;
+    }
+    for (std::size_t i = 0; i < kFlowLen; ++i) {
+        EXPECT_EQ(observedIds[i], kExpectedSequence[i])
+            << "Produce→Records session-flow templateId mismatch at index " << i;
+    }
+
+    // Encode-golden round-trip for each frame using the data codecs.
+    // step 0: Produce (explicit partition)
+    {
+        const auto golden = readVector("produce_explicit_partition.bin");
+        rpc::Produce msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 1001;
+        msg.partition      = 7;
+        msg.partitionKnown = 1;
+        msg.key            = std::span<const uint8_t>{};
+        msg.recordBatch    = std::span<const uint8_t>(kProduceBatch, sizeof(kProduceBatch));
+        std::array<uint8_t, 64> enc{};
+        const std::size_t n = msg.encode(enc.data());
+        ASSERT_EQ(n, golden.size());
+        EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+            << "Produce round-trip differs from golden";
+    }
+    // step 1: ProduceResponse (simulated broker response: baseOffset=123456)
+    {
+        const auto golden = readVector("produce_response.bin");
+        rpc::ProduceResponse msg;
+        msg.sessionId     = kSessionId;
+        msg.correlationId = kCorrelationId;
+        msg.errorCode     = static_cast<int16_t>(rpc::ErrorCode::OK);
+        msg.partition     = 7;
+        msg.baseOffset    = 123456LL;
+        std::array<uint8_t, 64> enc{};
+        const std::size_t n = msg.encode(enc.data());
+        ASSERT_EQ(n, golden.size());
+        EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+            << "ProduceResponse round-trip differs from golden";
+    }
+    // step 2: Subscribe (explicit partition, fromOffset after baseOffset)
+    {
+        const auto golden = readVector("subscribe_explicit.bin");
+        rpc::Subscribe msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 3001;
+        msg.partition      = 5;
+        msg.partitionKnown = 1;
+        msg.fromOffset     = 9999LL;
+        msg.isolation      = 1;
+        msg.key            = std::span<const uint8_t>{};
+        std::array<uint8_t, 64> enc{};
+        const std::size_t n = msg.encode(enc.data());
+        ASSERT_EQ(n, golden.size());
+        EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+            << "Subscribe round-trip differs from golden";
+    }
+    // step 3: Records push (broker pushes matching records)
+    {
+        const auto golden = readVector("records_push.bin");
+        rpc::Records msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.subscriptionId = static_cast<int64_t>(0x0102030405060708ULL);
+        msg.topicId        = 3001;
+        msg.partition      = 5;
+        msg.baseOffset     = 100000LL;
+        msg.recordBatch    = std::span<const uint8_t>(kGoldenBatch, sizeof(kGoldenBatch));
+        std::array<uint8_t, 128> enc{};
+        const std::size_t n = msg.encode(enc.data());
+        ASSERT_EQ(n, golden.size());
+        EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+            << "Records round-trip differs from golden";
+    }
+    // step 4: Unsubscribe
+    {
+        const auto golden = readVector("unsubscribe.bin");
+        rpc::Unsubscribe msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.subscriptionId = static_cast<int64_t>(0x0102030405060708ULL);
+        std::array<uint8_t, 64> enc{};
+        const std::size_t n = msg.encode(enc.data());
+        ASSERT_EQ(n, golden.size());
+        EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+            << "Unsubscribe round-trip differs from golden";
     }
 }

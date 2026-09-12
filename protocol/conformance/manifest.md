@@ -570,6 +570,8 @@ Offset  Hex                                        Notes
 
 ## Session Flow
 
+### Control session flow
+
 The `session_flow` sequence models a real client session round-trip at the wire level.
 
 | Order | File                   | templateId | Message         |
@@ -582,6 +584,25 @@ The `session_flow` sequence models a real client session round-trip at the wire 
 | 6     | disconnect.bin         | 4          | Disconnect      |
 
 **Expected templateId sequence:** `[1, 2, 3, 6, 7, 4]`
+
+### Produce→Records session flow (PB-3)
+
+Models a produce + subscribe round-trip: client produces a batch, receives a
+response with baseOffset, subscribes at that offset, receives records, then
+unsubscribes.
+
+| Order | File                          | templateId | Message         | Direction        |
+|-------|-------------------------------|------------|-----------------|------------------|
+| 1     | produce_explicit_partition.bin| 16         | Produce         | client → broker  |
+| 2     | produce_response.bin          | 17         | ProduceResponse | broker → client  |
+| 3     | subscribe_explicit.bin        | 18         | Subscribe       | client → broker  |
+| 4     | records_push.bin              | 20         | Records         | broker → client  |
+| 5     | unsubscribe.bin               | 21         | Unsubscribe     | client → broker  |
+
+**Expected templateId sequence:** `[16, 17, 18, 20, 21]`
+
+Note: SubscribeResponse (templateId=19) is a known dispatch template but does not
+have a standalone golden vector in this set; it is exercised via the dispatch harness.
 
 ---
 

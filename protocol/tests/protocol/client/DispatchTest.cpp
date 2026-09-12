@@ -3,12 +3,14 @@
 // Exhaustive tests for rune::protocol::client::checkFrame / peekTemplateId.
 //
 // Coverage:
-//   - Ok for all 9 known template ids: MA control 1..7, MB produce/consume 16..17
+//   - Ok for all 15 known template ids: MA control 1..7, MB produce/subscribe 16..21
 //   - TooShort: avail = 0, 1, 23 (no over-read); exactly 24 is NOT TooShort
 //   - WrongSchema: schemaId = 0, 111, 119, 121, 65535
 //   - UnsupportedVersion: version = 2, 3, 65535 (> 1 rejected);
-//                         version = 1 (equal) and version = 0 (older) accepted
-//   - UnknownTemplate: templateId = 0, 8, 15, 18, 32, 64, 99, 65535
+//                         version = 1 (equal) and version = 0 (older) accepted;
+//                         data template (tid=16) at bad version → UnsupportedVersion
+//   - UnknownTemplate: templateId = 0, 8, 15, 22, 32, 64, 99, 65535
+//     (8 and 15 = control-range gap; 22 = first unassigned produce/consume gap)
 //   - Ordering precedence: TooShort wins over WrongSchema; WrongSchema wins over
 //                          UnsupportedVersion
 //   - peekTemplateId: returns nullopt for every non-Ok case; returns id for Ok
@@ -59,7 +61,7 @@ static std::array<uint8_t, 24> makeValidHeaderBuf(uint16_t templateId,
 }
 
 // ===========================================================================
-// 1. Ok — all 7 known template ids
+// 1. Ok — all 15 known template ids (MA control 1..7, MB produce/subscribe 16..21)
 //
 // For each template id we build a minimal valid encoded frame (or a plain 24-byte
 // header for the header-only messages) and assert Ok + correct templateId.
@@ -231,6 +233,87 @@ TEST(DispatchCheckFrame, OkProduceResponse) {
               std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::ProduceResponse)));
 }
 
+// PB-3: Subscribe (tid 18), SubscribeResponse (tid 19), Records (tid 20), Unsubscribe (tid 21).
+TEST(DispatchCheckFrame, OkSubscribe) {
+    rpc::Subscribe sub;
+    sub.sessionId      = 0x1122334455667788LL;
+    sub.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    sub.topicId        = 3001;
+    sub.partition      = 5;
+    sub.partitionKnown = 1;
+    sub.fromOffset     = 9999LL;
+    sub.isolation      = 1;
+    sub.key            = std::span<const uint8_t>{};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = sub.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::Subscribe));  // 18
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Subscribe)));
+}
+
+TEST(DispatchCheckFrame, OkSubscribeResponse) {
+    rpc::SubscribeResponse sresp;
+    sresp.sessionId      = 0x1122334455667788LL;
+    sresp.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    sresp.errorCode      = 0;
+    sresp.partition      = 5;
+    sresp.subscriptionId = 0x0102030405060708LL;
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = sresp.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::SubscribeResponse));  // 19
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::SubscribeResponse)));
+}
+
+TEST(DispatchCheckFrame, OkRecords) {
+    static constexpr uint8_t kRb[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    rpc::Records rec;
+    rec.sessionId      = 0x1122334455667788LL;
+    rec.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    rec.subscriptionId = 0x0102030405060708LL;
+    rec.topicId        = 3001;
+    rec.partition      = 5;
+    rec.baseOffset     = 100000LL;
+    rec.recordBatch    = std::span<const uint8_t>(kRb, sizeof(kRb));
+
+    std::array<uint8_t, 128> buf{};
+    const std::size_t len = rec.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::Records));  // 20
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Records)));
+}
+
+TEST(DispatchCheckFrame, OkUnsubscribe) {
+    rpc::Unsubscribe unsub;
+    unsub.sessionId      = 0x1122334455667788LL;
+    unsub.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    unsub.subscriptionId = 0x0102030405060708LL;
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = unsub.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::Unsubscribe));  // 21
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Unsubscribe)));
+}
+
 // ===========================================================================
 // 2. TooShort — avail = 0, 1, 23 → TooShort; avail = 24 (exact) → NOT TooShort
 // ===========================================================================
@@ -357,10 +440,21 @@ TEST(DispatchCheckFrame, VersionZeroAccepted) {
     EXPECT_EQ(fc.version, 0u);
 }
 
+TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
+    // Data template (tid=16 / Produce) at version > kProtocolVersion → UnsupportedVersion.
+    // Version guard fires before template check — no mis-parse possible.
+    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Produce), 2);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status,  rpc::FrameStatus::UnsupportedVersion);
+    EXPECT_EQ(fc.version, 2u);
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
+}
+
 // ===========================================================================
-// 5. UnknownTemplate — ids 0, 8, 15, 18, 32, 64, 99, 65535
+// 5. UnknownTemplate — ids 0, 8, 15, 22, 32, 64, 99, 65535
 //    (valid schema + version but unknown id)
-//    Note: 16 (Produce) and 17 (ProduceResponse) are now KNOWN (PB-1).
+//    Note: 16-21 (Produce..Unsubscribe) are KNOWN (PB-1/PB-2/PB-3).
+//    8 and 15 = unassigned control-range gap; 22 = first unassigned produce/consume gap.
 // ===========================================================================
 
 TEST(DispatchCheckFrame, UnknownTemplateZero) {
@@ -387,12 +481,12 @@ TEST(DispatchCheckFrame, UnknownTemplateFifteen) {
     EXPECT_EQ(fc.templateId, 15u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateEighteen) {
-    // 18 = first unassigned id in produce/consume range (16=Produce, 17=ProduceResponse are known)
-    auto buf = makeValidHeaderBuf(18);
+TEST(DispatchCheckFrame, UnknownTemplateTwentyTwo) {
+    // 22 = first unassigned id in produce/consume range (16-21 are now all known in PB-3)
+    auto buf = makeValidHeaderBuf(22);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 18u);
+    EXPECT_EQ(fc.templateId, 22u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateThirtyTwo) {
@@ -478,15 +572,15 @@ TEST(DispatchPeekTemplateId, NulloptForUnknownTemplate) {
 
 TEST(DispatchPeekTemplateId, ReturnsIdForOkFrame) {
     // Verify peekTemplateId returns the correct id for all known templates:
-    // Milestone A control (1..7) and Milestone B produce/consume (16..17).
+    // Milestone A control (1..7) and Milestone B produce/subscribe (16..21).
     for (uint16_t tid = 1; tid <= 7; ++tid) {
         auto buf = makeValidHeaderBuf(tid);
         const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
         ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
         EXPECT_EQ(*opt, tid) << "templateId mismatch for " << tid;
     }
-    // PB-1: tids 16 and 17 must also return a value.
-    for (uint16_t tid = 16; tid <= 17; ++tid) {
+    // PB-1/PB-2/PB-3: tids 16..21 must all return a value.
+    for (uint16_t tid = 16; tid <= 21; ++tid) {
         auto buf = makeValidHeaderBuf(tid);
         const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
         ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
@@ -505,8 +599,8 @@ TEST(DispatchNoOverread, ExactSizeBufferAllKnownTemplates) {
     // over-read immediately; without ASAN the exact-size array acts as a
     // canary via std::array bounds in debug mode.
     //
-    // Milestone A control (1..7) + Milestone B produce/consume (16..17).
-    constexpr uint16_t kKnown[] = {1, 2, 3, 4, 5, 6, 7, 16, 17};
+    // Milestone A control (1..7) + Milestone B produce/subscribe (16..21).
+    constexpr uint16_t kKnown[] = {1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21};
     for (uint16_t tid : kKnown) {
         const auto buf = makeValidHeaderBuf(tid);
         static_assert(sizeof(buf) == 24);
@@ -535,16 +629,17 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     for (uint16_t tid = 1; tid <= 7; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
-    // Milestone B produce/consume range: 16 and 17 must be known (PB-1).
-    EXPECT_TRUE(rpc::isKnownTemplate(16));
-    EXPECT_TRUE(rpc::isKnownTemplate(17));
+    // Milestone B produce/subscribe range: 16..21 must all be known (PB-1/PB-2/PB-3).
+    for (uint16_t tid = 16; tid <= 21; ++tid) {
+        EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
+    }
 
-    // Not known: 0, 8..15 (unassigned control), 18..31 (unassigned produce/consume),
+    // Not known: 0, 8..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
     //            32+ (groups/txn, view ranges), 65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(8));
     EXPECT_FALSE(rpc::isKnownTemplate(15));
-    EXPECT_FALSE(rpc::isKnownTemplate(18));
+    EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(32));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }
