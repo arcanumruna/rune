@@ -36,6 +36,26 @@ if(aeron_FOUND)
     target_link_libraries(rune_client INTERFACE aeron::aeron)
 endif()
 
+# ── rune_client_transport — AeronTransport (compiled, links aeronmd C driver) ─
+if(aeron_FOUND)
+    add_library(rune_client_transport STATIC
+        src/transport/AeronTransport.cpp
+    )
+    target_include_directories(rune_client_transport PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog)
+
+    # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_transport PUBLIC ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -60,4 +80,17 @@ if(BUILD_TESTING)
     )
 
     gtest_discover_tests(rune_client_tests)
+
+    # ── Transport tests (CC-3) — embedded Aeron driver + ipc loopback echo ──
+    if(aeron_FOUND)
+        add_executable(rune_transport_tests
+            tests/transport/AeronTransportTest.cpp
+        )
+        target_link_libraries(rune_transport_tests PRIVATE
+            rune_client_transport
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_transport_tests)
+    endif()
 endif()
