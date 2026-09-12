@@ -115,6 +115,16 @@ public:
     /// connected).  Safe to call before start() (returns false).
     [[nodiscard]] bool egressConnected() const noexcept;
 
+    // -------------------------------------------------------------------------
+    // retarget — single-writer, agent-thread only
+    // -------------------------------------------------------------------------
+
+    /// Release the current ingress ExclusivePublication and create a new one
+    /// on newIngressChannel (same stream id as the original config).
+    /// Bounded resolution (kResolveMaxMs hard cap + no busy-spin).
+    /// Called only from the agent thread (single-writer contract).
+    void retarget(const std::string& newIngressChannel);
+
 private:
     // ---- Configuration -------------------------------------------------------
     TransportConfig cfg_;

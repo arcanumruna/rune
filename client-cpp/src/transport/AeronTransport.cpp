@@ -222,6 +222,44 @@ bool AeronTransport::egressConnected() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// retarget — release current ingress pub, create new one on newIngressChannel
+// ---------------------------------------------------------------------------
+
+void AeronTransport::retarget(const std::string& newIngressChannel) {
+    if (!aeron_) {
+        throw std::runtime_error("AeronTransport::retarget called before start()");
+    }
+
+    // Release old ingress publication.
+    ingressPub_.reset();
+
+    // Register a new ExclusivePublication on the new channel (same stream id).
+    int64_t pubRegId = aeron_->addExclusivePublication(newIngressChannel,
+                                                        cfg_.ingressStreamId);
+
+    // Resolve within kResolveMaxMs (bounded — no busy-spin).
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds{kResolveMaxMs};
+
+    std::shared_ptr<aeron::ExclusivePublication> newPub;
+    while (std::chrono::steady_clock::now() < deadline) {
+        newPub = aeron_->findExclusivePublication(pubRegId);
+        if (newPub) break;
+        std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
+    }
+
+    if (!newPub) {
+        throw std::runtime_error(
+            "AeronTransport::retarget: timed out resolving new ingress publication "
+            "(channel=" + newIngressChannel + ")");
+    }
+
+    // Update config channel and install new pub.
+    cfg_.ingressChannel = newIngressChannel;
+    ingressPub_ = std::move(newPub);
+}
+
+// ---------------------------------------------------------------------------
 // startEmbeddedDriver — mirrors ping_probe.cpp + BrokerNode::startEmbeddedDriver
 // ---------------------------------------------------------------------------
 
