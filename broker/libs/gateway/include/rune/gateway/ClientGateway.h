@@ -221,7 +221,12 @@ private:
     // conductor transitions from AWAITING_MEDIA_DRIVER to either
     // REGISTERED_MEDIA_DRIVER (shared_ptr returned → drop it, destructor
     // releases) or ERRORED_MEDIA_DRIVER (throws → conductor already cleaned up).
-    // Bounded by kMaxPendingConnects (same cap as the main pending table).
+    // Not structurally capped: a hard cap could evict an entry before it
+    // releases and re-introduce the leak this table exists to prevent. It is
+    // instead expected-bounded — an Aeron UDP/IPC ExclusivePublication always
+    // resolves within a few driver cycles (publication creation needs no
+    // subscriber), and drainPendingReleases() clears each entry the cycle it
+    // resolves, so the table stays small (≈ pending drop rate × resolve latency).
     std::vector<int64_t>                 drainingRegistrations_;
 
     // Scratch buffer for reap ID collection (avoids heap allocation per frame).
