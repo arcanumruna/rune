@@ -78,7 +78,11 @@ void BrokerNode::start() {
     buildConsensusObjects();
     const auto t3 = sclock::now();
 
-    // 5. Start the agent runner thread.
+    // 5. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
+    buildGateway();
+
+    // 6. Start the agent runner thread (drives NodeRuntimeAgent, which drives
+    //    consensus + gateway on the single-writer thread).
     agentRunner_->start();
 
     const auto t_start = sclock::now();
@@ -161,8 +165,8 @@ void BrokerNode::buildSingleNodeConsensus() {
     // ConsensusAgent (plain — no ingress polling needed for 1-node).
     agent_ = std::make_unique<ConsensusAgent>(*election_, *ingressRing_);
 
-    // AgentRunner drives the ConsensusAgent directly.
-    agentRunner_ = std::make_unique<AgentRunner>(*agent_, idleStrategy_, clock_);
+    // NOTE: AgentRunner is created in buildGateway() after the gateway is built,
+    // so that NodeRuntimeAgent (consensus + gateway) is driven as a unit.
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +252,70 @@ void BrokerNode::buildMultiNodeConsensus() {
     nodeAgent_ = std::make_unique<NodeConsensusAgent>(
         *aeronIngress_, *agent_, *election_, selfId);
 
-    // AgentRunner drives the composite agent.
-    agentRunner_ = std::make_unique<AgentRunner>(*nodeAgent_, idleStrategy_, clock_);
+    // NOTE: AgentRunner is created in buildGateway() after the gateway is built,
+    // so that NodeRuntimeAgent (nodeAgent + gateway) is driven as a unit.
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildGateway — create the ClientGateway and NodeRuntimeAgent.
+//
+// Called AFTER buildConsensusObjects() (so agent_ / nodeAgent_ are valid)
+// and AFTER the aeron_ client is connected (so addSubscription succeeds).
+//
+// The leaderView lambda is safe: it reads this->isLeader() which is an atomic
+// observer — safe to call from the gateway's duty-cycle thread (same thread
+// as the AgentRunner).
+//
+// leaderView ruling (BR-7a / Milestone A):
+//   isLeader = node.isLeader()
+//   leaderClientEndpoint = isLeader ? config_.clientEndpoint.channel : ""
+//   Effect: followers degrade to accept locally (empty endpoint path in BR-5).
+//   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildGateway() {
+    // Capture config_ by value (immutable after construction).
+    const std::string clientChannel  = config_.clientEndpoint.channel;
+    const int32_t     clientStreamId = config_.clientEndpoint.streamId;
+    const int32_t     nodeId         = config_.nodeId;
+
+    // leaderView: read atomic isLeader(); never touches raw Election state.
+    auto leaderViewFn = [this, clientChannel]() -> rune::gateway::LeaderView {
+        const bool leader = this->isLeader();
+        return rune::gateway::LeaderView{
+            /*isLeader=*/leader,
+            /*leaderClientEndpoint=*/leader ? clientChannel : std::string{}
+        };
+    };
+
+    // Build the gateway (subscribes on clientChannel).
+    try {
+        gateway_ = std::make_unique<rune::gateway::ClientGateway>(
+            aeron_,
+            clientChannel,
+            clientStreamId,
+            nodeId,
+            rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
+            std::move(leaderViewFn)
+        );
+    } catch (const std::exception& ex) {
+        spdlog::warn("BrokerNode[{}]: ClientGateway construction failed: {}; proceeding without gateway",
+                     nodeId, ex.what());
+        gateway_.reset();
+    }
+
+    // Build the composite runtime agent:
+    //   single-node: wraps agent_    (ConsensusAgent)
+    //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
+    rune::consensus::Agent& innerAgent =
+        nodeAgent_ ? static_cast<rune::consensus::Agent&>(*nodeAgent_)
+                   : static_cast<rune::consensus::Agent&>(*agent_);
+
+    runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
+        innerAgent, gateway_.get());
+
+    // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
+    agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+        *runtimeAgent_, idleStrategy_, clock_);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +401,16 @@ void BrokerNode::stop() {
         agentRunner_->stopAndJoin();
     }
 
-    // 2. Release consensus objects that own Aeron publications / subscription.
+    // 2. Release the runtime agent and gateway FIRST — in this order:
+    //      a. runtimeAgent_ (holds refs to nodeAgent_/agent_ + gateway_)
+    //      b. gateway_ (owns the client ingress Subscription + pending egress
+    //                   ExclusivePublications — must deregister before aeron_.reset())
+    //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
+    //    → close aeron → stop driver.
+    runtimeAgent_.reset();   // composite agent (holds refs to inner agent + gateway)
+    gateway_.reset();        // ClientGateway: deregisters Subscription + ExclusivePubs
+
+    // 3. Release consensus objects that own Aeron publications / subscription.
     //    Must happen BEFORE closing the Aeron client and media driver so the
     //    client shuts down cleanly (publications/subscriptions deregistered while
     //    the conductor is still running).
@@ -349,14 +424,14 @@ void BrokerNode::stop() {
     nodeStateFile_.reset();
     termLog_.reset();
 
-    // 3. Close the Aeron client (joins the C++ conductor thread).
+    // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"
     //    commands have been written into the CnC ring by the conductor's onClose().
     if (aeron_) {
         aeron_.reset();
     }
 
-    // 4. Stop the embedded media driver.
+    // 5. Stop the embedded media driver.
     //    stopEmbeddedDriver() first joins the driver thread (so we are the ONLY
     //    thread touching the driver afterwards), then drains any final CnC commands
     //    that the conductor posted during step 3 before calling aeron_driver_close().

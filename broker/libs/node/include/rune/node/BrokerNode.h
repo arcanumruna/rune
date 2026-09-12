@@ -1,25 +1,30 @@
 #pragma once
-// BrokerNode.h — Broker node consensus runtime (BR-2 + BR-3).
+// BrokerNode.h — Broker node consensus runtime (BR-2 + BR-3 + BR-7a).
 //
 // Assembles the full consensus engine from a NodeConfig:
 //   NodeStateFile + TermLog (durable, in config.dataDir)
 //   1-node: NullSink → SbeConsensusPublisher (BR-2 path, unchanged)
 //   N-node: UdpMessageSink (per-peer ExclusivePublications) + AeronIngress +
 //           NodeConsensusAgent (composite: poll ingress + doWork) (BR-3 path)
+//   ClientGateway (BR-7a): runs inside the duty-cycle via NodeRuntimeAgent.
 //   ClusterMember vector (built from config.peers)
 //   Election (startup values)
 //   IngressRing
 //   ConsensusAgent (inner duty-cycle agent)
+//   NodeRuntimeAgent (wraps inner consensus agent + gateway, drives both)
 //   MonotonicNanoClock + BackoffIdleStrategy
 //   AgentRunner (one thread, no busy-spin)
 //   Embedded Aeron media driver + Aeron client
 //
 // Single-node: self-elects via NullSink, no UDP.
 // Multi-node: real per-peer UDP publications + ingress subscription.
+// Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
 #include <rune/node/NodeConfig.h>
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/NodeConsensusAgent.h>
+#include <rune/node/NodeRuntimeAgent.h>
+#include <rune/gateway/ClientGateway.h>
 
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
@@ -104,6 +109,7 @@ private:
     void buildConsensusObjects();
     void buildSingleNodeConsensus();
     void buildMultiNodeConsensus();
+    void buildGateway();
 
     // -----------------------------------------------------------------------
     // Configuration (immutable after construction)
@@ -135,6 +141,15 @@ private:
     std::unique_ptr<rune::consensus::IngressRing>    ingressRing_;
     std::unique_ptr<rune::consensus::Election>       election_;
     std::unique_ptr<rune::consensus::ConsensusAgent> agent_;
+
+    // -----------------------------------------------------------------------
+    // Client gateway (BR-7a) — runs inside the duty-cycle via NodeRuntimeAgent.
+    // Constructed after aeron_ in start(); destroyed in stop() before aeron_.
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::gateway::ClientGateway> gateway_;
+
+    // Composite agent: wraps inner consensus agent + gateway (single-writer).
+    std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
 
     // -----------------------------------------------------------------------
     // Runtime (AgentRunner + clock + idle)

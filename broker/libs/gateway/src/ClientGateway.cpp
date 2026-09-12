@@ -1,4 +1,4 @@
-// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5).
+// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a).
 
 #include <rune/gateway/ClientGateway.h>
 
@@ -7,6 +7,9 @@
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -15,7 +18,8 @@ namespace rune::gateway {
 namespace pc = rune::protocol::client;
 
 // ---------------------------------------------------------------------------
-// Resolution timeouts
+// Redirect-path synchronous resolution timeout (only used for non-leader redirect,
+// NOT for the normal leader-accept path which is async).
 // ---------------------------------------------------------------------------
 static constexpr int kResolveMaxMs   = 5000; // 5 s
 static constexpr int kResolveSliceMs = 1;
@@ -28,12 +32,14 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                              int32_t                         clientStreamId,
                              int32_t                         thisNodeId,
                              int64_t                         sessionTimeoutNs,
-                             std::function<LeaderView()>     leaderView)
+                             std::function<LeaderView()>     leaderView,
+                             int64_t                         connectResolveTimeoutNs)
     : aeron_(std::move(aeron))
     , clientChannel_(std::move(clientChannel))
     , clientStreamId_(clientStreamId)
     , thisNodeId_(thisNodeId)
     , sessionTimeoutNs_(sessionTimeoutNs)
+    , connectResolveTimeoutNs_(connectResolveTimeoutNs)
     , leaderView_(std::move(leaderView))
     , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
                         aeron::util::index_t             offset,
@@ -42,6 +48,9 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
           onFragment(buffer, offset, length, header);
       })
 {
+    // Reserve space for the pending-connect table (bounded, pre-allocated).
+    pendingConnects_.reserve(kMaxPendingConnects);
+
     // Register the ingress subscription.
     int64_t regId = aeron_->addSubscription(clientChannel_, clientStreamId_);
 
@@ -60,12 +69,14 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
 }
 
 // ---------------------------------------------------------------------------
-// doWork — poll ingress; reap expired sessions; returns fragment count
+// doWork — poll ingress; poll pending-connects; reap expired sessions.
+// Returns fragment count + pending-connect resolves.
 // ---------------------------------------------------------------------------
 int ClientGateway::doWork(int64_t nowNs) {
     nowNs_ = nowNs;
     constexpr int kFragmentLimit = 10;
     int work = sub_->poll(assembler_.handler(), kFragmentLimit);
+    pollPendingConnects(nowNs);
     reapExpired(nowNs);
     return work;
 }
@@ -135,13 +146,17 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 }
 
 // ---------------------------------------------------------------------------
-// handleConnect
+// handleConnect (BR-7a async path)
 //
 // BR-5 leader-awareness:
 //   - Query leaderView_ (if set).
 //   - If NOT leader AND leaderClientEndpoint non-empty → send ErrorResponse
-//     {code=Redirect, message=leaderClientEndpoint} and do NOT create a session.
-//   - If leader (or hook unset/leader-unknown) → accept as BR-4.
+//     {code=Redirect, message=leaderClientEndpoint}.  The redirect path still
+//     uses the synchronous resolvePublication — it's a one-off transient pub
+//     to an already-running client endpoint, not on the hot consensus thread.
+//   - If leader (or hook unset/leader-unknown) → ASYNC: register
+//     addExclusivePublication and enqueue a PendingConnect.  The publication
+//     is polled across doWork() cycles via pollPendingConnects().
 // ---------------------------------------------------------------------------
 void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
@@ -153,11 +168,17 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // -----------------------------------------------------------------------
     // BR-5: check leadership before creating a session.
     // -----------------------------------------------------------------------
+    bool capturedIsLeader = true;
+    std::string capturedLeaderEndpoint;
     if (leaderView_) {
         const LeaderView lv = leaderView_();
+        capturedIsLeader        = lv.isLeader;
+        capturedLeaderEndpoint  = lv.leaderClientEndpoint;
+
         if (!lv.isLeader && !lv.leaderClientEndpoint.empty()) {
-            // REDIRECT: resolve a temporary egress to the client, send the
-            // redirect response, then drop the publication (no session stored).
+            // REDIRECT: resolve a temporary egress to the client synchronously
+            // (this is a non-leader redirect — only happens on follower nodes,
+            //  not on the critical leader path).
             auto pub = resolvePublication(std::string(req.egressChannel), req.egressStreamId);
             if (!pub) return; // can't reach client — drop
 
@@ -182,32 +203,106 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     }
 
     // -----------------------------------------------------------------------
-    // Normal accept path (BR-4 + leader path).
+    // Async accept path (BR-7a): never block the duty-cycle thread.
     // -----------------------------------------------------------------------
 
-    // Allocate a new sessionId.
+    // Cap: evict the oldest pending entry if we are at capacity.
+    if (pendingConnects_.size() >= kMaxPendingConnects) {
+        spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
+        pendingConnects_.erase(pendingConnects_.begin());
+    }
+
+    // Pre-allocate sessionId now so it is stable across cycles.
     const int64_t sessionId = sessions_.nextSessionId();
 
-    // Resolve an egress ExclusivePublication to the client's egress channel.
-    auto pub = resolvePublication(std::string(req.egressChannel), req.egressStreamId);
-    if (!pub) {
-        // Cannot reach the client's egress — log and drop (no session created).
+    // Kick off the egress publication registration (returns immediately).
+    int64_t regId = -1;
+    try {
+        regId = aeron_->addExclusivePublication(
+            std::string(req.egressChannel), req.egressStreamId);
+    } catch (...) {
+        // Bad channel — drop (never crash).
+        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
+                     std::string(req.egressChannel));
         return;
     }
 
-    // Register the session.
-    Session& session = sessions_.add(sessionId, std::move(pub), nowNs);
+    PendingConnect pc_entry;
+    pc_entry.registrationId        = regId;
+    pc_entry.sessionId             = sessionId;
+    pc_entry.correlationId         = req.correlationId;
+    pc_entry.requestedAtNs         = nowNs;
+    pc_entry.isLeader              = capturedIsLeader;
+    pc_entry.leaderClientEndpoint  = std::move(capturedLeaderEndpoint);
+    pendingConnects_.push_back(std::move(pc_entry));
+}
 
-    // Encode and send ConnectResponse.
-    pc::ConnectResponse resp;
-    resp.sessionId         = sessionId;
-    resp.correlationId     = req.correlationId;
-    resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
-    resp.leaderMemberId    = thisNodeId_;
-    resp.assignedSessionId = sessionId;
+// ---------------------------------------------------------------------------
+// pollPendingConnects — called from doWork() each cycle.
+//
+// For each pending-connect entry:
+//   - Try findExclusivePublication(registrationId).
+//   - If resolved → promote to SessionTable + send ConnectResponse (OK).
+//   - If timeout exceeded → drop + log.
+//   - Otherwise → leave in pending for next cycle.
+// Never blocks.
+// ---------------------------------------------------------------------------
+void ClientGateway::pollPendingConnects(int64_t nowNs)
+{
+    if (pendingConnects_.empty()) return;
 
-    const std::size_t encoded = resp.encode(scratch_.data());
-    sendTo(session, scratch_.data(), encoded);
+    namespace pc = rune::protocol::client;
+
+    // Use erase-remove idiom: iterate and collect indices to remove.
+    // We process from front; stable iteration is fine since we erase via
+    // the std::remove_if pattern.
+    auto it = pendingConnects_.begin();
+    while (it != pendingConnects_.end()) {
+        PendingConnect& pending = *it;
+
+        // Check timeout first.
+        if (nowNs - pending.requestedAtNs > connectResolveTimeoutNs_) {
+            spdlog::warn("ClientGateway: pending-connect session={} timed out after {}ms; dropped",
+                         pending.sessionId,
+                         (nowNs - pending.requestedAtNs) / 1'000'000LL);
+            it = pendingConnects_.erase(it);
+            continue;
+        }
+
+        // Try to find the publication (non-blocking).
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+        try {
+            pub = aeron_->findExclusivePublication(pending.registrationId);
+        } catch (...) {
+            // Conductor signalled an error (bad channel, etc.) — drop.
+            spdlog::warn("ClientGateway: findExclusivePublication threw for session={}; dropped",
+                         pending.sessionId);
+            it = pendingConnects_.erase(it);
+            continue;
+        }
+
+        if (!pub) {
+            // Not yet resolved — try again next cycle.
+            ++it;
+            continue;
+        }
+
+        // Resolved! Promote to the session table.
+        Session& session = sessions_.add(pending.sessionId, std::move(pub), nowNs);
+
+        // Encode and send ConnectResponse.
+        pc::ConnectResponse resp;
+        resp.sessionId         = pending.sessionId;
+        resp.correlationId     = pending.correlationId;
+        resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
+        resp.leaderMemberId    = thisNodeId_;
+        resp.assignedSessionId = pending.sessionId;
+
+        const std::size_t encoded = resp.encode(scratch_.data());
+        sendTo(session, scratch_.data(), encoded);
+
+        it = pendingConnects_.erase(it);
+    }
 }
 
 // ---------------------------------------------------------------------------

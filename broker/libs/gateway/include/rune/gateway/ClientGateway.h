@@ -1,16 +1,24 @@
 #pragma once
-// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5).
+// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a).
 //
 // Design:
 //   - Subscribes to a single Aeron ingress stream (clientChannel/clientStreamId).
 //   - FragmentAssembler reassembles multi-frame messages before dispatch.
 //   - doWork(nowNs) polls ingress and dispatches:
-//       Connect      → allocate sessionId, resolve egress ExclusivePublication,
-//                      send ConnectResponse (or redirect if not leader)
+//       Connect      → ASYNC: addExclusivePublication (non-blocking), record
+//                      pending-connect entry; resolve + promote across doWork cycles
 //       Keepalive    → touch session (update lastSeenNs)
 //       Ping         → echo Pong on session egress
 //       Disconnect   → remove session
 //       Unknown/bad  → drop (never crash)
+//   - Async Connect egress-resolve (BR-7a):
+//       On Connect: addExclusivePublication returns a registrationId immediately —
+//       no blocking. A PendingConnect is stored. Each doWork() polls
+//       findExclusivePublication; on resolve → promote to SessionTable + send
+//       ConnectResponse; on timeout (connectResolveTimeoutNs) → drop + log.
+//       Never blocks the duty-cycle thread waiting for a client's egress.
+//       Bounded in-flight cap: kMaxPendingConnects — oldest evicted beyond cap.
+//       All PendingConnect state touched only in doWork (single-writer).
 //   - Session timeout reaping: doWork(nowNs) reaps sessions idle beyond
 //     sessionTimeoutNs (injected clock — deterministic, no wall-clock in reap).
 //   - Leader-awareness: non-leader Connect → ErrorResponse{Redirect, leaderEndpoint}.
@@ -34,6 +42,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rune::gateway {
@@ -54,18 +63,26 @@ public:
     // Default session timeout: 10 seconds.
     static constexpr int64_t kDefaultSessionTimeoutNs = 10LL * 1'000'000'000LL;
 
-    // @param aeron             Shared Aeron client (connected to a media driver).
-    // @param clientChannel     Aeron channel the gateway listens on (clients publish here).
-    // @param clientStreamId    Stream ID on clientChannel.
-    // @param thisNodeId        This node's id; echoed in ConnectResponse.leaderMemberId.
-    // @param sessionTimeoutNs  Idle session expiry threshold (default 10 s).
-    // @param leaderView        Callable returning current LeaderView; default: always leader.
+    // Async Connect egress-resolve timeout: 5 seconds.
+    static constexpr int64_t kDefaultConnectResolveTimeoutNs = 5LL * 1'000'000'000LL;
+
+    // Maximum in-flight pending connects.  Beyond this cap, the oldest is evicted.
+    static constexpr std::size_t kMaxPendingConnects = 64;
+
+    // @param aeron                    Shared Aeron client (connected to a media driver).
+    // @param clientChannel            Aeron channel the gateway listens on (clients publish here).
+    // @param clientStreamId           Stream ID on clientChannel.
+    // @param thisNodeId               This node's id; echoed in ConnectResponse.leaderMemberId.
+    // @param sessionTimeoutNs         Idle session expiry threshold (default 10 s).
+    // @param leaderView               Callable returning current LeaderView; default: always leader.
+    // @param connectResolveTimeoutNs  How long before a pending-connect egress times out (default 5 s).
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
                   int32_t                             thisNodeId,
-                  int64_t                             sessionTimeoutNs = kDefaultSessionTimeoutNs,
-                  std::function<LeaderView()>         leaderView       = nullptr);
+                  int64_t                             sessionTimeoutNs         = kDefaultSessionTimeoutNs,
+                  std::function<LeaderView()>         leaderView               = nullptr,
+                  int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs);
 
     ~ClientGateway() = default;
 
@@ -96,6 +113,22 @@ public:
 
 private:
     // -----------------------------------------------------------------------
+    // PendingConnect — tracks an in-flight async egress publication resolve.
+    // Stored in pendingConnects_ until resolved or timed out.
+    // All fields captured at Connect-request time; leaderView sampled at connect.
+    // -----------------------------------------------------------------------
+    struct PendingConnect {
+        int64_t     registrationId  = 0;   // from addExclusivePublication
+        int64_t     sessionId       = 0;   // pre-allocated
+        int64_t     correlationId   = 0;
+        int64_t     requestedAtNs   = 0;   // for timeout
+        bool        isLeader        = true; // captured at Connect time
+        // leaderClientEndpoint captured at Connect time (for redirect path).
+        // If !isLeader && !empty → send Redirect instead of OK.
+        std::string leaderClientEndpoint;
+    };
+
+    // -----------------------------------------------------------------------
     // Fragment handler — called by FragmentAssembler for each reassembled frame.
     // -----------------------------------------------------------------------
     void onFragment(aeron::concurrent::AtomicBuffer& buffer,
@@ -124,8 +157,18 @@ private:
     bool sendOnPub(aeron::ExclusivePublication& pub, const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
+    // pollPendingConnects — called in doWork; for each pending connect, try
+    // findExclusivePublication. On resolve → promote to session + send
+    // ConnectResponse. On timeout → drop + log. Never blocks.
+    // -----------------------------------------------------------------------
+    void pollPendingConnects(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
     // Resolve a new ExclusivePublication (bounded wait).
     // Returns nullptr if the publication cannot be resolved within the deadline.
+    // NOTE: kept for the redirect path (non-leader with known leader endpoint),
+    // which still needs a synchronous resolve to send the ErrorResponse.
+    // The regular (leader-accept) Connect path is now async via pendingConnects_.
     // -----------------------------------------------------------------------
     std::shared_ptr<aeron::ExclusivePublication>
     resolvePublication(const std::string& channel, int32_t streamId);
@@ -138,12 +181,17 @@ private:
     int32_t                              clientStreamId_;
     int32_t                              thisNodeId_;
     int64_t                              sessionTimeoutNs_;
+    int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;
 
     std::shared_ptr<aeron::Subscription> sub_;
     aeron::FragmentAssembler             assembler_;
 
     SessionTable                         sessions_;
+
+    // Async pending-connect table (BR-7a).
+    // Bounded to kMaxPendingConnects; all touched only in doWork (single-writer).
+    std::vector<PendingConnect>          pendingConnects_;
 
     // Scratch buffer for reap ID collection (avoids heap allocation per frame).
     // Populated and drained entirely within reapExpired() — single-writer, safe.

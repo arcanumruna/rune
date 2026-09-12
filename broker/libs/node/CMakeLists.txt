@@ -5,8 +5,8 @@ add_library(rune_node
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
-# BrokerNode needs: consensus engine, Aeron (embedded driver + client), spdlog
-target_link_libraries(rune_node PUBLIC rune_consensus)
+# BrokerNode needs: consensus engine, gateway (BR-7a), Aeron (embedded driver + client), spdlog
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -77,5 +77,20 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_udp_cluster_tests
                 PROPERTIES TIMEOUT 120)
         endif()
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # BrokerNode+Gateway integration tests (BR-7a) — single-node with live gateway.
+    # Gated behind BUILD_BROKER_NODE_TESTS (reuses that gate).
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_broker_node_gateway_tests
+            tests/node/BrokerNodeGatewayTest.cpp)
+        target_link_libraries(rune_broker_node_gateway_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_broker_node_gateway_tests
+            PROPERTIES TIMEOUT 120)
     endif()
 endif()
