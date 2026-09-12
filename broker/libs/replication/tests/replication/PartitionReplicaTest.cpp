@@ -20,6 +20,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <vector>

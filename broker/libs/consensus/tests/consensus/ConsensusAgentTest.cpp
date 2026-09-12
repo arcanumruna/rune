@@ -47,6 +47,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstring>
 #include <unistd.h>
 
 using namespace rune::consensus;

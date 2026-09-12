@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <stdexcept>

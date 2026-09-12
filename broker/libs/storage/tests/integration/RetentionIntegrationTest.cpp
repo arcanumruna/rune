@@ -20,6 +20,7 @@
 #include <rune/storage/PartitionApi.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <numeric>
 #include <set>

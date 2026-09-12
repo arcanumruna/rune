@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <set>
