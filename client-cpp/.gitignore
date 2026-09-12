@@ -34,9 +34,6 @@ pip-wheel-metadata/
 *.log
 *.tmp
 
-# --- Benchmark build ---
-/bench/
-
 # --- Superpowers scratch ---
 .superpowers/
 

@@ -125,6 +125,26 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     endif()
 endif()
 
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+if(BUILD_BENCHMARKS AND aeron_FOUND)
+    add_executable(rune_client_bench
+        bench/ClientPingBench.cpp
+    )
+    target_include_directories(rune_client_bench PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_client_bench PRIVATE
+        rune_client_api
+        benchmark::benchmark
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_bench PRIVATE ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
