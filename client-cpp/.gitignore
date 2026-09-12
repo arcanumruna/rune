@@ -1,0 +1,60 @@
+# --- Conan and build artifacts ---
+/build/
+/cmake-build-*/
+.conan/
+/conan-release/
+/.buildkit-cache/
+*.cmake
+!conan_provider.cmake
+CMakeFiles/
+CMakeCache.txt
+*.ninja
+*.ninja_deps
+*.ninja_log
+compile_commands.json
+conan-graph.json
+
+# --- Python venv and scripts ---
+/resources/.venv/
+__pycache__/
+*.pyc
+
+# --- Package manager files ---
+pip-wheel-metadata/
+*.egg-info/
+
+# --- OS or editor-specific ---
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# --- Logs and temp ---
+*.log
+*.tmp
+
+# --- Benchmark build ---
+/bench/
+
+# --- Superpowers scratch ---
+.superpowers/
+
+# --- Patterns from the initial repository template ---
+node_modules/
+dist/
+*.class
+*.py[cod]
+*.jar
+target/
+TEST*.xml
+Thumbs.db
+*.app
+*.exe
+*.war
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
