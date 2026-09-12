@@ -80,6 +80,30 @@ if(aeron_FOUND)
     endif()
 endif()
 
+# ── rune_client_api — Client (CC-6, compiled, links agent) ────────────────────
+if(aeron_FOUND)
+    add_library(rune_client_api STATIC
+        src/Client.cpp
+    )
+    target_include_directories(rune_client_api PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(rune_client_api PUBLIC
+        rune_client_agent
+        aeron::aeron
+        spdlog::spdlog
+    )
+
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_api PUBLIC ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -141,5 +165,21 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_agent_tests)
+    endif()
+
+    # ── Client API tests (CC-6) — connect/ping futures + ipc gateway ──────────
+    if(aeron_FOUND)
+        add_executable(rune_client_api_tests
+            tests/client/ClientTest.cpp
+        )
+        target_include_directories(rune_client_api_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_client_api_tests PRIVATE
+            rune_client_api
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_client_api_tests)
     endif()
 endif()
