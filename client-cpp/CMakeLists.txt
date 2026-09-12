@@ -41,9 +41,23 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     include(GoogleTest)
 
-    add_executable(rune_client_tests tests/SmokeTest.cpp)
+    # Conformance vector directory — the sibling rune-protocol repo.
+    set(RUNE_CONFORMANCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/conformance")
+    if(NOT EXISTS "${RUNE_CONFORMANCE_DIR}/vectors")
+        message(FATAL_ERROR
+            "CC-2: conformance vector directory not found: ${RUNE_CONFORMANCE_DIR}/vectors\n"
+            "  The sibling rune-protocol repo must be present at ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol")
+    endif()
+
+    add_executable(rune_client_tests
+        tests/SmokeTest.cpp
+        tests/ConformanceTest.cpp
+    )
     target_link_libraries(rune_client_tests PRIVATE rune_client GTest::gtest_main)
     target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_compile_definitions(rune_client_tests PRIVATE
+        RUNE_CONFORMANCE_DIR="${RUNE_CONFORMANCE_DIR}"
+    )
 
     gtest_discover_tests(rune_client_tests)
 endif()
