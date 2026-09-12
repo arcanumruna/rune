@@ -268,4 +268,76 @@ TEST(BrokerNodeTest, Start_BadDataDir_ErrorAndCleanShutdown) {
     // Dtor runs here — also must not hang.
 }
 
+// ===========================================================================
+// TEST 9: Dtor after explicit stop — no double-free / no hang (FIX F coverage).
+//
+// start() → awaitLeader() → stop() → dtor
+// The dtor calls stop() again internally (via ~BrokerNode).  That second call
+// must be a clean no-op (idempotent stop() guard), not a double-free or hang.
+// ===========================================================================
+TEST(BrokerNodeTest, DtorAfterExplicitStop_NoCrash) {
+    TempDir tmp{"t9_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    {
+        BrokerNode node{cfg};
+        node.start();
+
+        ASSERT_TRUE(node.awaitLeader(2s))
+            << "1-node cluster should self-elect within 2 s";
+
+        // Explicit stop: agent thread joins, Aeron and driver shut down.
+        node.stop();
+
+        // Dtor runs here — calls stop() again internally.
+        // Must not double-free, hang, or crash.
+    }
+    SUCCEED(); // reaching here means dtor completed cleanly
+}
+
+// ===========================================================================
+// TEST 10: NodeConsensusAgent leader-id state-machine mapping (FIX G).
+//
+// Table-driven coverage of the updateObservedLeader() switch in
+// NodeConsensusAgent for the states reachable in a single-node run:
+//
+//   Before election starts (observedLeaderId_ seeded to -1):
+//     - leaderId() == -1   (Init state → default/no-leader arm)
+//
+//   After self-election (LeaderReady / Closed):
+//     - leaderId() == nodeId_   (Leader* arm sets nodeId_ explicitly — FIX B)
+//
+// FIX B correctness: before FIX B the Leader* arm used leaderMemberId() which
+// happened to equal nodeId_ for single-node.  After FIX B the arm explicitly
+// uses nodeId_, making it safe if a future Election refactor leaves leaderMember_
+// stale.  This test asserts the post-FIX-B observable: leaderId() == cfg.nodeId.
+// ===========================================================================
+TEST(BrokerNodeTest, NodeConsensusAgentLeaderMap_InitAndLeader) {
+    TempDir tmp{"t10_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    BrokerNode node{cfg};
+
+    // Before start: no election running, leaderId() must be -1.
+    // (BrokerNode.leaderId() reads the atomic mirror which was seeded to -1.)
+    EXPECT_EQ(node.leaderId(), -1)
+        << "Before start(): leaderId() must be -1 (Init state / no leader)";
+
+    // Start the node and wait for self-election.
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s))
+        << "1-node cluster should self-elect within 2 s";
+
+    // After LeaderReady is reached: leaderId() must equal this node's id
+    // (FIX B: Leader* arm uses nodeId_, not leaderMemberId()).
+    EXPECT_EQ(node.leaderId(), static_cast<rune::consensus::NodeId>(cfg.nodeId))
+        << "After leadership: leaderId() must equal nodeId (FIX B — explicit nodeId_ in Leader* arm)";
+
+    // Sanity: isLeader() agrees.
+    EXPECT_TRUE(node.isLeader())
+        << "isLeader() must be true when leaderId() == nodeId";
+
+    node.stop();
+}
+
 } // namespace rune::node

@@ -279,6 +279,13 @@ void BrokerNode::buildGateway() {
     const int32_t     nodeId         = config_.nodeId;
 
     // leaderView: read atomic isLeader(); never touches raw Election state.
+    //
+    // Milestone-A ruling: followers return leaderClientEndpoint="" so the gateway
+    // degrades to local-accept (BR-5 empty-endpoint path).  The redirect-with-
+    // endpoint branch in ClientGateway::handleConnect MUST NOT fire on this path —
+    // it would trigger the synchronous resolvePublication and block the consensus
+    // thread.  This is safe because the empty endpoint forces the local-accept path.
+    // TODO(Milestone B): supply per-peer client endpoints to enable exact REDIRECT.
     auto leaderViewFn = [this, clientChannel]() -> rune::gateway::LeaderView {
         const bool leader = this->isLeader();
         return rune::gateway::LeaderView{

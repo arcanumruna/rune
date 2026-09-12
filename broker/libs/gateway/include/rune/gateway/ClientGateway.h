@@ -39,6 +39,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -150,7 +151,7 @@ private:
     // -----------------------------------------------------------------------
     void handleConnect   (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleKeepalive (const uint8_t* buf, std::size_t len, int64_t nowNs);
-    void handlePing      (const uint8_t* buf, std::size_t len);
+    void handlePing      (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleDisconnect(const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
@@ -213,7 +214,9 @@ private:
 
     // Async pending-connect table (BR-7a).
     // Bounded to kMaxPendingConnects; all touched only in doWork (single-writer).
-    std::vector<PendingConnect>          pendingConnects_;
+    // std::deque gives O(1) pop_front (evict-oldest) while still supporting
+    // erase(it) for mid-sequence resolve/timeout removals.
+    std::deque<PendingConnect>           pendingConnects_;
 
     // Draining-release table (BR-7a fix): registrationIds that were logically
     // dropped (timeout / eviction / error) before their ExclusivePublication
@@ -233,7 +236,7 @@ private:
     // Populated and drained entirely within reapExpired() — single-writer, safe.
     std::vector<int64_t>                 reapScratch_;
 
-    // Reusable encode scratch — 64 KiB covers any Milestone-A frame.
+    // Reusable encode scratch — 68 KiB covers any Milestone-A frame.
     // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};

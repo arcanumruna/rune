@@ -91,9 +91,11 @@ private:
         const auto state = static_cast<rune::consensus::ElectionState>(sc);
 
         // Update when the election has a decided leader:
-        //   Leader states: node is the leader → leader is self.
-        //   Follower states (FollowerReady, Closed) → leader is leaderMemberId().
-        //   FollowerReplay/FollowerLogInit/FollowerLogAwait also have leaderMember set.
+        //   Leader* states (LeaderLogReplication/LeaderReplay/LeaderInit/LeaderReady):
+        //     this node IS the leader → newLeaderId = nodeId_ (explicit, not leaderMemberId()).
+        //   Closed: reached from leader OR follower path → use leaderMemberId().
+        //   Follower states (FollowerBallot/FollowerReady/etc.) → leaderMemberId() when set.
+        //   Init/Canvass/Nominate/CandidateBallot → no leader yet → -1.
         rune::consensus::NodeId newLeaderId = -1;
 
         switch (state) {
@@ -101,11 +103,15 @@ private:
             case rune::consensus::ElectionState::LeaderReplay:
             case rune::consensus::ElectionState::LeaderInit:
             case rune::consensus::ElectionState::LeaderReady:
+                // In Leader* states this node IS the leader by definition.
+                // Using nodeId_ directly (rather than election_.leaderMemberId())
+                // prevents a latent wrong-isLeader() if a future Election refactor
+                // leaves leaderMember_ stale during a Leader* pass-through.
+                newLeaderId = nodeId_;
+                break;
             case rune::consensus::ElectionState::Closed: {
-                // In leader states, this node IS the leader.
-                // In Closed from follower path, leaderMemberId() returns the accepted leader.
-                // Distinguish: if election_.leaderMemberId() == nodeId_ → leader.
-                // If leaderMemberId() == some other node → follower.
+                // Closed can be reached from either the leader OR the follower path.
+                // leaderMemberId() holds the accepted leader id in both cases.
                 rune::consensus::NodeId lid = election_.leaderMemberId();
                 newLeaderId = (lid >= 0) ? lid : -1;
                 break;
