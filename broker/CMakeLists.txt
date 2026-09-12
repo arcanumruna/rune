@@ -42,6 +42,23 @@ if(aeron_FOUND)
     # libs/node/CMakeLists.txt.
 endif()
 
+# ── ping_probe — standalone raw-Aeron probe for BR-7b docker E2E ─────────────
+# Enabled by -DBUILD_PING_PROBE=ON (used in Dockerfile.probe).
+# Links against aeron (embedded driver + client) and the rune-protocol headers.
+# Not built by default to avoid polluting the standard build.
+option(BUILD_PING_PROBE "Build ping_probe (BR-7b docker e2e probe)" OFF)
+if(BUILD_PING_PROBE)
+    if(NOT aeron_FOUND)
+        message(FATAL_ERROR "BUILD_PING_PROBE=ON requires aeron")
+    endif()
+    add_executable(ping_probe docker/ping-probe/ping_probe.cpp)
+    target_include_directories(ping_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(ping_probe PRIVATE aeron::aeron spdlog::spdlog)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(ping_probe PRIVATE -Wl,--no-as-needed uuid -Wl,--as-needed)
+    endif()
+endif()
+
 if(BUILD_BENCHMARKS)
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp

@@ -1,0 +1,38 @@
+# Keep build context small for the ping_probe Dockerfile.
+# Same exclusions as Dockerfile.dockerignore.
+
+# Build outputs
+build/
+cov/
+cmake-build-debug/
+cmake-build-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Test artifacts
+tests/
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md
+
+# Scripts
+build_docker.sh

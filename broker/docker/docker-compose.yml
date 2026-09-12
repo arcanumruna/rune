@@ -1,0 +1,110 @@
+# docker-compose.yml — 3-node rune-broker UDP cluster + raw-Aeron ping probe
+# BR-7b: 3 broker nodes over aeron:udp consensus (port 40111), client gateway
+# on port 40200 per node. Probe runs under the "tools" profile.
+#
+# Platform: linux/amd64 — the builder stage uses gcc:13 (x86_64 cmake binary).
+# On macOS/Apple Silicon, Docker Desktop's Rosetta emulation runs amd64 containers.
+
+name: rune-broker
+
+x-broker-build: &broker-build
+  context: ..
+  dockerfile: docker/Dockerfile
+  additional_contexts:
+    rune-protocol: ../../rune-protocol
+
+x-broker-env: &broker-env
+  RUNE_PEERS: "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"
+  RUNE_DATA_DIR: /var/lib/rune
+  # Client gateway listens on all interfaces inside the container.
+  # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".
+  RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
+  # Election timing — slightly relaxed for cross-container UDP latency.
+  RUNE_ELECTION_TIMEOUT_MS: "300"
+  RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
+  RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
+
+services:
+  # ── Node 0 ──────────────────────────────────────────────────────────────────
+  rune-1:
+    build: *broker-build
+    platform: linux/amd64
+    hostname: rune-1
+    shm_size: "256m"
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "0"
+    volumes:
+      - rune-data-1:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── Node 1 ──────────────────────────────────────────────────────────────────
+  rune-2:
+    build: *broker-build
+    platform: linux/amd64
+    hostname: rune-2
+    shm_size: "256m"
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "1"
+    volumes:
+      - rune-data-2:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── Node 2 ──────────────────────────────────────────────────────────────────
+  rune-3:
+    build: *broker-build
+    platform: linux/amd64
+    hostname: rune-3
+    shm_size: "256m"
+    environment:
+      <<: *broker-env
+      RUNE_NODE_ID: "2"
+    volumes:
+      - rune-data-3:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+  # ── Ping probe (profile: tools — NOT started by default `up`) ────────────────
+  # Built from a separate Dockerfile that compiles only the ping_probe binary.
+  # The node publishes Pong back to the probe's egress channel; the probe
+  # hostname must be resolvable inside the compose network so the node can
+  # open a UDP publication back to "probe:40300".
+  probe:
+    profiles: ["tools"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.probe
+      additional_contexts:
+        rune-protocol: ../../rune-protocol
+    platform: linux/amd64
+    hostname: probe
+    shm_size: "256m"
+    environment:
+      RUNE_PROBE_TARGET: "aeron:udp?endpoint=rune-1:40200"
+      RUNE_PROBE_TARGET_STREAM: "1"
+      RUNE_PROBE_EGRESS: "aeron:udp?endpoint=probe:40300"
+      RUNE_PROBE_EGRESS_STREAM: "2"
+      RUNE_PROBE_TIMEOUT_MS: "8000"
+      RUNE_DATA_DIR: /tmp/rune_probe
+    # No depends_on — the e2e.sh script ensures the cluster is up before running
+    # the probe. depends_on would auto-restart killed nodes during leader-kill tests.
+
+volumes:
+  rune-data-1:
+  rune-data-2:
+  rune-data-3:
