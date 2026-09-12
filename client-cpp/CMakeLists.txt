@@ -81,6 +81,15 @@ if(BUILD_TESTING)
 
     gtest_discover_tests(rune_client_tests)
 
+    # ── Session state machine tests (CC-4) — no Aeron dependency ──────────────
+    add_executable(rune_session_tests
+        tests/session/SessionMachineTest.cpp
+    )
+    target_link_libraries(rune_session_tests PRIVATE rune_client GTest::gtest_main)
+    target_include_directories(rune_session_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+
+    gtest_discover_tests(rune_session_tests)
+
     # ── Transport tests (CC-3) — embedded Aeron driver + ipc loopback echo ──
     if(aeron_FOUND)
         add_executable(rune_transport_tests
