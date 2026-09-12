@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -408,6 +409,167 @@ TEST(ConformanceGolden, Pong) {
     ASSERT_EQ(n, 32u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden pong.bin";
+}
+
+// ===========================================================================
+// PB-2 Golden conformance: Subscribe / Records / Unsubscribe vectors
+// ===========================================================================
+
+// Golden batch bytes shared by the PB-2 records_push vector.
+static constexpr uint8_t kGoldenBatch[] = {
+    0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x01, 0x02
+};
+
+// ===========================================================================
+// 11. subscribe_explicit.bin
+//     Subscribe{ topicId=3001, partition=5, partitionKnown=1, fromOffset=9999,
+//                isolation=1, key=empty }
+//     Expected byte length: 24 + 18 + 2 + 0 = 44
+// ===========================================================================
+TEST(ConformanceGolden, SubscribeExplicit) {
+    const auto golden = readVector("subscribe_explicit.bin");
+    ASSERT_EQ(golden.size(), 44u);
+
+    assertHeader(golden, rpc::Subscribe::TEMPLATE_ID, rpc::Subscribe::BODY_FIXED);
+
+    auto msgOpt = rpc::Subscribe::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->topicId,        3001);
+    EXPECT_EQ(msgOpt->partition,      5);
+    EXPECT_EQ(msgOpt->partitionKnown, 1u);
+    EXPECT_EQ(msgOpt->fromOffset,     9999LL);
+    EXPECT_EQ(msgOpt->isolation,      1u);
+    EXPECT_EQ(msgOpt->key.size(),     0u);
+
+    rpc::Subscribe msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.topicId        = 3001;
+    msg.partition      = 5;
+    msg.partitionKnown = 1;
+    msg.fromOffset     = 9999LL;
+    msg.isolation      = 1;
+    msg.key            = std::span<const uint8_t>{};
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 44u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden subscribe_explicit.bin";
+}
+
+// ===========================================================================
+// 12. subscribe_key_only.bin
+//     Subscribe{ topicId=4004, partition=0, partitionKnown=0, fromOffset=0,
+//                isolation=0, key="ABC" }
+//     Expected byte length: 24 + 18 + 2 + 3 = 47
+// ===========================================================================
+TEST(ConformanceGolden, SubscribeKeyOnly) {
+    static constexpr uint8_t kKey[] = {0x41, 0x42, 0x43}; // "ABC"
+
+    const auto golden = readVector("subscribe_key_only.bin");
+    ASSERT_EQ(golden.size(), 47u);
+
+    assertHeader(golden, rpc::Subscribe::TEMPLATE_ID, rpc::Subscribe::BODY_FIXED);
+
+    auto msgOpt = rpc::Subscribe::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->topicId,        4004);
+    EXPECT_EQ(msgOpt->partition,      0);
+    EXPECT_EQ(msgOpt->partitionKnown, 0u);
+    EXPECT_EQ(msgOpt->fromOffset,     0LL);
+    EXPECT_EQ(msgOpt->isolation,      0u);
+    ASSERT_EQ(msgOpt->key.size(),     sizeof(kKey));
+    EXPECT_EQ(std::memcmp(msgOpt->key.data(), kKey, sizeof(kKey)), 0);
+
+    rpc::Subscribe msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.topicId        = 4004;
+    msg.partition      = 0;
+    msg.partitionKnown = 0;
+    msg.fromOffset     = 0LL;
+    msg.isolation      = 0;
+    msg.key            = std::span<const uint8_t>(kKey, sizeof(kKey));
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 47u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden subscribe_key_only.bin";
+}
+
+// ===========================================================================
+// 13. records_push.bin
+//     Records{ subscriptionId=0x0102030405060708, topicId=3001, partition=5,
+//              baseOffset=100000, recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
+//     Expected byte length: 24 + 24 + 2 + 8 = 58
+// ===========================================================================
+TEST(ConformanceGolden, RecordsPush) {
+    const auto golden = readVector("records_push.bin");
+    ASSERT_EQ(golden.size(), 58u);
+
+    assertHeader(golden, rpc::Records::TEMPLATE_ID, rpc::Records::BODY_FIXED);
+
+    auto msgOpt = rpc::Records::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->subscriptionId, static_cast<int64_t>(0x0102030405060708ULL));
+    EXPECT_EQ(msgOpt->topicId,        3001);
+    EXPECT_EQ(msgOpt->partition,      5);
+    EXPECT_EQ(msgOpt->baseOffset,     100000LL);
+    ASSERT_EQ(msgOpt->recordBatch.size(), sizeof(kGoldenBatch));
+    EXPECT_EQ(std::memcmp(msgOpt->recordBatch.data(), kGoldenBatch,
+                           sizeof(kGoldenBatch)), 0);
+
+    rpc::Records msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.subscriptionId = static_cast<int64_t>(0x0102030405060708ULL);
+    msg.topicId        = 3001;
+    msg.partition      = 5;
+    msg.baseOffset     = 100000LL;
+    msg.recordBatch    = std::span<const uint8_t>(kGoldenBatch, sizeof(kGoldenBatch));
+
+    std::array<uint8_t, 128> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 58u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden records_push.bin";
+}
+
+// ===========================================================================
+// 14. unsubscribe.bin
+//     Unsubscribe{ subscriptionId=0x0102030405060708 }
+//     Expected byte length: 24 + 8 = 32
+// ===========================================================================
+TEST(ConformanceGolden, Unsubscribe) {
+    const auto golden = readVector("unsubscribe.bin");
+    ASSERT_EQ(golden.size(), 32u);
+
+    assertHeader(golden, rpc::Unsubscribe::TEMPLATE_ID, rpc::Unsubscribe::BODY_FIXED);
+
+    auto msgOpt = rpc::Unsubscribe::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->subscriptionId, static_cast<int64_t>(0x0102030405060708ULL));
+
+    rpc::Unsubscribe msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.subscriptionId = static_cast<int64_t>(0x0102030405060708ULL);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 32u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden unsubscribe.bin";
 }
 
 // ===========================================================================

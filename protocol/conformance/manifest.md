@@ -426,6 +426,148 @@ Offset  Hex                                        Notes
 
 ---
 
+## 14. `subscribe_explicit.bin` — 44 bytes
+
+**Message:** `Subscribe` (templateId = 18)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 18                       | 0x0012                          |
+| templateId      | 18                       | 0x0012                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| topicId         | 3001                     | 0x000000BB9                     |
+| partition       | 5                        | 0x00000005                      |
+| partitionKnown  | 1                        | 0x01                            |
+| fromOffset      | 9999                     | 0x000000000000270F              |
+| isolation       | 1 (read_committed)       | 0x01                            |
+| key             | (empty)                  | len=0 (0x0000)                  |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      12 00                                      blockLength = 18 (LE)
+02      12 00                                      templateId = 18 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      B9 0B 00 00                                topicId = 3001 (LE)
+28      05 00 00 00                                partition = 5 (LE)
+32      01                                         partitionKnown = 1
+33      0F 27 00 00 00 00 00 00                    fromOffset = 9999 (LE)
+41      01                                         isolation = 1 (read_committed)
+42      00 00                                      key var-len = 0 (LE)
+```
+
+---
+
+## 15. `subscribe_key_only.bin` — 47 bytes
+
+**Message:** `Subscribe` (templateId = 18)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 18                       | 0x0012                          |
+| templateId      | 18                       | 0x0012                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| topicId         | 4004                     | 0x00000FA4                      |
+| partition       | 0                        | 0x00000000 (ignored; partitionKnown=0) |
+| partitionKnown  | 0                        | 0x00                            |
+| fromOffset      | 0                        | 0x0000000000000000              |
+| isolation       | 0 (read_uncommitted)     | 0x00                            |
+| key             | "ABC" (3 bytes)          | len=3 (0x0003); 41 42 43        |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      12 00                                      blockLength = 18 (LE)
+02      12 00                                      templateId = 18 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      A4 0F 00 00                                topicId = 4004 (LE)
+28      00 00 00 00                                partition = 0 (LE, ignored)
+32      00                                         partitionKnown = 0
+33      00 00 00 00 00 00 00 00                    fromOffset = 0 (LE)
+41      00                                         isolation = 0 (read_uncommitted)
+42      03 00                                      key var-len = 3 (LE)
+44      41 42 43                                   key bytes = "ABC"
+```
+
+---
+
+## 16. `records_push.bin` — 58 bytes
+
+**Message:** `Records` (templateId = 20)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 24                       | 0x0018                          |
+| templateId      | 20                       | 0x0014                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| subscriptionId  | 72623859790382856       | 0x0102030405060708              |
+| topicId         | 3001                     | 0x00000BB9                      |
+| partition       | 5                        | 0x00000005                      |
+| baseOffset      | 100000                   | 0x00000000000186A0              |
+| recordBatch     | 8 opaque bytes           | len=8 (0x0008); DE AD BE EF 00 FF 01 02 |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      18 00                                      blockLength = 24 (LE)
+02      14 00                                      templateId = 20 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      08 07 06 05 04 03 02 01                    subscriptionId (LE)
+32      B9 0B 00 00                                topicId = 3001 (LE)
+36      05 00 00 00                                partition = 5 (LE)
+40      A0 86 01 00 00 00 00 00                    baseOffset = 100000 (LE)
+48      08 00                                      recordBatch var-len = 8 (LE)
+50      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
+```
+
+---
+
+## 17. `unsubscribe.bin` — 32 bytes
+
+**Message:** `Unsubscribe` (templateId = 21)
+
+| Field           | Value (decimal)          | Value (hex)                     |
+|-----------------|--------------------------|---------------------------------|
+| blockLength     | 8                        | 0x0008                          |
+| templateId      | 21                       | 0x0015                          |
+| schemaId        | 120                      | 0x0078                          |
+| version         | 1                        | 0x0001                          |
+| sessionId       | 1234605616436508552      | 0x1122334455667788              |
+| correlationId   | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| subscriptionId  | 72623859790382856       | 0x0102030405060708              |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      08 00                                      blockLength = 8 (LE)
+02      15 00                                      templateId = 21 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      08 07 06 05 04 03 02 01                    subscriptionId (LE)
+```
+
+---
+
 ## Session Flow
 
 The `session_flow` sequence models a real client session round-trip at the wire level.
@@ -471,5 +613,9 @@ The `session_flow` sequence models a real client session round-trip at the wire 
 | ErrorResponse   | 5     | control (1-15)  |
 | Ping            | 6     | control (1-15)  |
 | Pong            | 7     | control (1-15)  |
-| Produce         | 16    | produce/consume (16-31) |
-| ProduceResponse | 17    | produce/consume (16-31) |
+| Produce           | 16    | produce/consume (16-31) |
+| ProduceResponse   | 17    | produce/consume (16-31) |
+| Subscribe         | 18    | produce/consume (16-31) |
+| SubscribeResponse | 19    | produce/consume (16-31) |
+| Records           | 20    | produce/consume (16-31) |
+| Unsubscribe       | 21    | produce/consume (16-31) |

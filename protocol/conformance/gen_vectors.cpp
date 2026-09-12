@@ -245,6 +245,93 @@ int main(int argc, char** argv) {
         write_vec(dir, "produce_response.bin", buf, n);
     }
 
-    std::printf("Done. 13 vectors written to %s/\n", dir);
+    // -----------------------------------------------------------------------
+    // 14. subscribe_explicit.bin
+    //
+    // Subscribe{ topicId=3001, partition=5, partitionKnown=1, fromOffset=9999,
+    //            isolation=1, key=empty }
+    // Total = 24 + 18 + 2 = 44 bytes
+    // -----------------------------------------------------------------------
+    {
+        rpc::Subscribe msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 3001;
+        msg.partition      = 5;
+        msg.partitionKnown = 1;
+        msg.fromOffset     = 9999LL;
+        msg.isolation      = 1;
+        msg.key            = std::span<const uint8_t>{};
+
+        std::vector<uint8_t> vbuf(msg.encodedSize());
+        n = msg.encode(vbuf.data());
+        write_vec(dir, "subscribe_explicit.bin", vbuf.data(), n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. subscribe_key_only.bin
+    //
+    // Subscribe{ topicId=4004, partition=0, partitionKnown=0, fromOffset=0,
+    //            isolation=0, key="ABC" }
+    // Total = 24 + 18 + 2 + 3 = 47 bytes
+    // -----------------------------------------------------------------------
+    {
+        static constexpr uint8_t kKey[] = {0x41, 0x42, 0x43}; // "ABC"
+        rpc::Subscribe msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 4004;
+        msg.partition      = 0;
+        msg.partitionKnown = 0;
+        msg.fromOffset     = 0LL;
+        msg.isolation      = 0;
+        msg.key            = std::span<const uint8_t>(kKey, sizeof(kKey));
+
+        std::vector<uint8_t> vbuf(msg.encodedSize());
+        n = msg.encode(vbuf.data());
+        write_vec(dir, "subscribe_key_only.bin", vbuf.data(), n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. records_push.bin
+    //
+    // Records{ subscriptionId=0x0102030405060708, topicId=3001, partition=5,
+    //          baseOffset=100000, recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
+    // Total = 24 + 24 + 2 + 8 = 58 bytes
+    // -----------------------------------------------------------------------
+    {
+        static constexpr uint8_t kBatch[] = {
+            0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x01, 0x02
+        };
+        rpc::Records msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.subscriptionId = static_cast<int64_t>(0x0102030405060708ULL);
+        msg.topicId        = 3001;
+        msg.partition      = 5;
+        msg.baseOffset     = 100000LL;
+        msg.recordBatch    = std::span<const uint8_t>(kBatch, sizeof(kBatch));
+
+        std::vector<uint8_t> vbuf(msg.encodedSize());
+        n = msg.encode(vbuf.data());
+        write_vec(dir, "records_push.bin", vbuf.data(), n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. unsubscribe.bin
+    //
+    // Unsubscribe{ subscriptionId=0x0102030405060708 }
+    // Total = 24 + 8 = 32 bytes
+    // -----------------------------------------------------------------------
+    {
+        rpc::Unsubscribe msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.subscriptionId = static_cast<int64_t>(0x0102030405060708ULL);
+        n = msg.encode(buf);
+        write_vec(dir, "unsubscribe.bin", buf, n);
+    }
+
+    std::printf("Done. 17 vectors written to %s/\n", dir);
     return 0;
 }

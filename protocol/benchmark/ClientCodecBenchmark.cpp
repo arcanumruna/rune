@@ -587,3 +587,129 @@ static void BM_ProduceResponse_Decode(benchmark::State& state) {
                             static_cast<int64_t>(f.produceRespLen));
 }
 BENCHMARK(BM_ProduceResponse_Decode)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// PB-2: Subscribe / Records encode + decode benchmarks.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Subscribe: 4-byte key, fromOffset=1000, isolation=1, partition 5.
+static const uint8_t kSubKey[] = {0x01, 0x02, 0x03, 0x04};
+
+rpc::Subscribe makeSubscribe() {
+    rpc::Subscribe msg;
+    msg.sessionId      = 0x1122334455667788LL;
+    msg.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    msg.topicId        = 42;
+    msg.partition      = 5;
+    msg.partitionKnown = 0;
+    msg.fromOffset     = 1000LL;
+    msg.isolation      = 1;
+    msg.key            = std::span<const uint8_t>(kSubKey, sizeof(kSubKey));
+    return msg;
+}
+
+// Records: 64-byte opaque recordBatch payload.
+static const std::vector<uint8_t> kRecordsBatch(64, 0xAB);
+
+rpc::Records makeRecords() {
+    rpc::Records msg;
+    msg.sessionId      = 0x1122334455667788LL;
+    msg.correlationId  = 0x0A0B0C0D0E0F1011LL;
+    msg.subscriptionId = 0x0102030405060708LL;
+    msg.topicId        = 42;
+    msg.partition      = 5;
+    msg.baseOffset     = 1000LL;
+    msg.recordBatch    = std::span<const uint8_t>(kRecordsBatch.data(),
+                                                   kRecordsBatch.size());
+    return msg;
+}
+
+} // anonymous namespace (PB-2 helpers)
+
+// Pre-encoded Subscribe / Records frames — extend the Frames struct approach
+// by computing them lazily at benchmark start.
+static std::vector<uint8_t>& subscribeBuf() {
+    static std::vector<uint8_t> buf = []() {
+        rpc::Subscribe msg = makeSubscribe();
+        std::vector<uint8_t> v(msg.encodedSize());
+        msg.encode(v.data());
+        return v;
+    }();
+    return buf;
+}
+
+static std::vector<uint8_t>& recordsBuf() {
+    static std::vector<uint8_t> buf = []() {
+        rpc::Records msg = makeRecords();
+        std::vector<uint8_t> v(msg.encodedSize());
+        msg.encode(v.data());
+        return v;
+    }();
+    return buf;
+}
+
+// BM_Subscribe_Encode — encode a Subscribe with 4-byte key.
+static void BM_Subscribe_Encode(benchmark::State& state) {
+    const rpc::Subscribe sub = makeSubscribe();
+    std::array<uint8_t, 256> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = sub.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(subscribeBuf().size()));
+}
+BENCHMARK(BM_Subscribe_Encode)->Unit(benchmark::kNanosecond);
+
+// BM_Subscribe_Decode — decode a pre-encoded Subscribe frame.
+static void BM_Subscribe_Decode(benchmark::State& state) {
+    const auto& buf = subscribeBuf();
+
+    for (auto _ : state) {
+        auto result = rpc::Subscribe::decode(buf.data(), buf.size());
+        benchmark::DoNotOptimize(result);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(buf.size()));
+}
+BENCHMARK(BM_Subscribe_Decode)->Unit(benchmark::kNanosecond);
+
+// BM_Records_Encode — encode a Records push with 64-byte recordBatch.
+static void BM_Records_Encode(benchmark::State& state) {
+    const rpc::Records rec = makeRecords();
+    std::array<uint8_t, 256> buf{};
+
+    for (auto _ : state) {
+        std::size_t n = rec.encode(buf.data());
+        benchmark::DoNotOptimize(n);
+        benchmark::ClobberMemory();
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(recordsBuf().size()));
+}
+BENCHMARK(BM_Records_Encode)->Unit(benchmark::kNanosecond);
+
+// BM_Records_Decode — decode a pre-encoded Records frame.
+static void BM_Records_Decode(benchmark::State& state) {
+    const auto& buf = recordsBuf();
+
+    for (auto _ : state) {
+        auto result = rpc::Records::decode(buf.data(), buf.size());
+        benchmark::DoNotOptimize(result);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(state.iterations() *
+                            static_cast<int64_t>(buf.size()));
+}
+BENCHMARK(BM_Records_Decode)->Unit(benchmark::kNanosecond);
