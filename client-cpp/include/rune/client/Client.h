@@ -5,8 +5,10 @@
 //
 // Threading model:
 //   - The Client owns a background runner thread that loops agent_.doWork()
-//     under a BackoffIdleStrategy.  The app just calls connect()/ping() and
-//     awaits the returned futures.
+//     under the configured IdleStrategy (BackoffIdleStrategy by default for
+//     CPU-friendly behaviour; YieldingIdleStrategy for LowLatency mode which
+//     trades a CPU core for sub-µs reaction time).
+//     The app just calls connect()/ping() and awaits the returned futures.
 //   - connect() / ping() are called from the APP thread.  They submit via the
 //     agent's thread-safe ring and register promises in cross-thread maps.
 //   - The egress observer (set on the agent BEFORE start) runs on the RUNNER
@@ -61,6 +63,22 @@ namespace rune::client {
 using Bytes = std::vector<uint8_t>;
 
 // ---------------------------------------------------------------------------
+// IdleMode — controls the runner-thread idle strategy.
+//
+// LowLatency: YieldingIdleStrategy — on each idle cycle the runner calls
+//   std::this_thread::yield() instead of parking.  This keeps the runner
+//   hot (no OS park latency) so it reacts to a submitted command / inbound
+//   frame in ~µs.  Cost: one CPU core pegged at ~100% while the runner is
+//   alive, even when idle.  Choose for latency-sensitive paths (game clients,
+//   real-time systems).
+//
+// Balanced (default): BackoffIdleStrategy — spins a few cycles → yields →
+//   parks up to 1 ms.  CPU-friendly for idle clients that do not need
+//   sub-millisecond reaction time.
+// ---------------------------------------------------------------------------
+enum class IdleMode { Balanced, LowLatency };
+
+// ---------------------------------------------------------------------------
 // ClientConfig
 // ---------------------------------------------------------------------------
 struct ClientConfig {
@@ -76,6 +94,11 @@ struct ClientConfig {
 
     // Keepalive interval passthrough (nanoseconds, 0 = use agent default).
     int64_t keepaliveIntervalNs = 0;
+
+    // Runner-thread idle strategy.
+    // Balanced (default) parks up to 1 ms between doWork() calls — CPU-friendly.
+    // LowLatency uses a yielding idle — no park, sub-µs reaction time, 1 CPU core cost.
+    IdleMode idleMode = IdleMode::Balanced;
 };
 
 // ---------------------------------------------------------------------------
@@ -190,8 +213,9 @@ private:
     // Runner
     // -------------------------------------------------------------------------
 
-    /// Background thread body: loops doWork() under BackoffIdleStrategy until
-    /// stopped_, performing a periodic timeout sweep.
+    /// Background thread body: loops doWork() under the configured IdleStrategy
+    /// (YieldingIdleStrategy for LowLatency, BackoffIdleStrategy for Balanced)
+    /// until stopped_, performing a periodic timeout sweep.
     void runLoop();
 
     /// Check pending-connect / pending-ping timeouts.  Called from the runner.

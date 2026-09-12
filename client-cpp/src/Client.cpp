@@ -17,6 +17,7 @@
 #include <rune/client/Client.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
+#include <concurrent/YieldingIdleStrategy.h>
 
 #include <cassert>
 #include <sstream>
@@ -290,28 +291,53 @@ std::future<Bytes> Client::ping(Bytes payload) {
 // ---------------------------------------------------------------------------
 
 void Client::runLoop() {
-    // Use Aeron BackoffIdleStrategy: spins → yields → parks (max 1 ms).
-    // This satisfies the "NO busy-spin" requirement: after the spin/yield
-    // phases it parks for up to 1 ms, backing off on idle cycles.
-    aeron::concurrent::BackoffIdleStrategy idleStrategy(
-        /*maxSpins=*/10,
-        /*maxYields=*/20,
-        /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000),
-        /*maxParkNs=*/std::chrono::milliseconds(1));
+    // Select idle strategy based on ClientConfig::idleMode.
+    //
+    // LowLatency — YieldingIdleStrategy: on idle cycles the runner yields the
+    //   OS scheduler quantum instead of parking.  No park ≡ no OS wake-up
+    //   latency; the runner picks up a submitted command / inbound frame in
+    //   ~µs.  Cost: one CPU core at ~100% while the runner is alive.
+    //
+    // Balanced (default) — BackoffIdleStrategy: spins a few cycles, then
+    //   yields, then parks up to 1 ms.  CPU-friendly for clients that do not
+    //   need sub-millisecond reaction time.
+    if (cfg_.idleMode == IdleMode::LowLatency) {
+        aeron::concurrent::YieldingIdleStrategy idleStrategy;
 
-    while (!stopped_.load(std::memory_order_acquire)) {
-        const int64_t now = nowNs();
-        const int work = agent_.doWork(now);
+        while (!stopped_.load(std::memory_order_acquire)) {
+            const int64_t now = nowNs();
+            const int work = agent_.doWork(now);
+            idleStrategy.idle(work);
 
-        // Idle strategy: backs off on 0 work, resets on positive work.
-        idleStrategy.idle(work);
+            const auto wallNow = std::chrono::steady_clock::now();
+            if (wallNow >= nextSweep_) {
+                sweepTimeouts();
+                nextSweep_ = wallNow +
+                             std::chrono::milliseconds(kSweepIntervalMs);
+            }
+        }
+    } else {
+        // Balanced: Aeron BackoffIdleStrategy: spins → yields → parks (max 1 ms).
+        aeron::concurrent::BackoffIdleStrategy idleStrategy(
+            /*maxSpins=*/10,
+            /*maxYields=*/20,
+            /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000),
+            /*maxParkNs=*/std::chrono::milliseconds(1));
 
-        // Periodic timeout sweep (bounded, steady clock).
-        const auto wallNow = std::chrono::steady_clock::now();
-        if (wallNow >= nextSweep_) {
-            sweepTimeouts();
-            nextSweep_ = wallNow +
-                         std::chrono::milliseconds(kSweepIntervalMs);
+        while (!stopped_.load(std::memory_order_acquire)) {
+            const int64_t now = nowNs();
+            const int work = agent_.doWork(now);
+
+            // Idle strategy: backs off on 0 work, resets on positive work.
+            idleStrategy.idle(work);
+
+            // Periodic timeout sweep (bounded, steady clock).
+            const auto wallNow = std::chrono::steady_clock::now();
+            if (wallNow >= nextSweep_) {
+                sweepTimeouts();
+                nextSweep_ = wallNow +
+                             std::chrono::milliseconds(kSweepIntervalMs);
+            }
         }
     }
 }

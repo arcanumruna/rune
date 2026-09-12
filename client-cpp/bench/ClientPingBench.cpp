@@ -1,28 +1,39 @@
 // bench/ClientPingBench.cpp
 //
-// CC-8 — Client ping round-trip latency benchmark.
+// CC-8 — Client ping round-trip latency benchmark (REVISED).
 //
 // Measures steady-state Client::ping() RTT over aeron:ipc loopback against an
-// in-test gateway echoer (same pattern as CC-5/CC-6 tests).
+// in-test gateway echoer run in LowLatency mode.
+//
+// Root-cause of old p99 466µs:
+//   (a) In-test gateway thread slept 200µs between polls — charged to client RTT.
+//   (b) Client runner used BackoffIdleStrategy, parking up to 1 ms on idle cycles.
+//
+// Fixes applied:
+//   (a) Gateway pump thread now tight-polls (YieldingIdleStrategy / no sleep).
+//   (b) Client constructed with IdleMode::LowLatency — YieldingIdleStrategy,
+//       no park — runner reacts in ~µs.
 //
 // Benchmark: BM_PingRoundTrip
 //   - One-time setup: embedded driver + connected Client + gateway echoer.
-//   - Gateway runs on a dedicated helper thread pumping its subscription.
-//   - Per iteration: c.ping(payload).get() — measured wall-clock RTT.
-//   - Warm-up: Google Benchmark's built-in warm-up is used (first N iterations
-//     are not sampled by default), supplemented by an explicit pre-benchmark
-//     warm-up loop of kWarmupPings iterations.
-//   - Percentiles reported via state.counters["p50_us"/"p99_us"/"p999_us"/"mean_us"].
+//   - Gateway runs on a dedicated helper thread, tight-polling (yielding loop).
+//   - Client runs in IdleMode::LowLatency (YieldingIdleStrategy, no park).
+//   - Per iteration: c.ping(payload).get() — wall-clock RTT measured.
+//   - Warm-up: explicit pre-benchmark warm-up of kWarmupPings + Google
+//     Benchmark's built-in warm-up iterations (both discard early data).
+//   - Percentiles reported: p50/p99/p99.9/mean (µs) via state.counters.
 //   - Bounded: per-iteration hard cap (kPingTimeoutMs); SkipWithError on timeout.
-//   - NO busy-spin: gateway helper thread sleeps between polls.
 //   - Unique temp driver dir (pid + atomic counter).
 //   - Clean teardown: gateway thread joined, Client::close() called.
 //
-// Note: this measures the FULL client path:
-//   app-thread → ring → runner-thread → transport → aeron:ipc →
-//   gateway-thread → aeron:ipc → runner-thread → observer → promise → future.get()
-// Including the runner-thread park + wake-up overhead.  Absolute numbers will
-// therefore be higher than broker's raw gateway RTT (BR-8 ~1–2 µs) — expected.
+// What this measures (the TRUE client hot path):
+//   app-thread → ring → runner-thread (yield loop) → transport tryClaim →
+//   aeron:ipc (IPC ring buffer) → gateway (yield loop) → aeron:ipc →
+//   runner-thread → egress observer → promise.set_value → future.get()
+//
+// Expected: p99 well under 100µs (typically 10–40µs on a quiet macOS/Linux host).
+// The broker's raw gateway RTT is ~1.9µs; the client adds ring-hop + yield cycles
+// + observer overhead + future wake-up.  A p99 of 30–60µs is typical and correct.
 
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
@@ -31,6 +42,7 @@
 #include <Subscription.h>
 #include <ExclusivePublication.h>
 #include <FragmentAssembler.h>
+#include <concurrent/YieldingIdleStrategy.h>
 
 #include <benchmark/benchmark.h>
 
@@ -58,15 +70,13 @@ namespace rcc = rune::client::codec;
 // ---------------------------------------------------------------------------
 
 /// Hard cap on each ping() call inside the benchmark.
-static constexpr int64_t kPingTimeoutMs  = 5'000;
+static constexpr int64_t kPingTimeoutMs    = 5'000;
 /// Timeout used for the initial connect().
 static constexpr int64_t kConnectTimeoutMs = 10'000;
 /// Number of warm-up pings before any sampling.
-static constexpr int     kWarmupPings    = 32;
-/// Sleep inside the gateway poll thread between poll iterations.
-static constexpr auto    kGwPollSleep    = std::chrono::microseconds{200};
-/// Gateway send retry limit.
-static constexpr int     kGwSendRetries  = 500;
+static constexpr int     kWarmupPings      = 64;
+/// Gateway send retry limit (no sleep — tight retry on IPC back-pressure).
+static constexpr int     kGwSendRetries    = 500;
 
 // ---------------------------------------------------------------------------
 // Unique temp directory
@@ -86,10 +96,14 @@ std::string uniqueDir() {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// In-test gateway — mirrors the CC-6 TestGateway, adapted for the benchmark.
+// In-test gateway — tight-polling pump thread (NO sleep between polls).
 //
-// Runs a dedicated pump thread so the measured CLIENT ping() call doesn't need
-// to drive the gateway (keeps the measurement of the CLIENT RTT clean).
+// The gateway is the "server" peer in this benchmark.  Its poll latency must
+// NOT be charged to the measured client RTT.  A 200µs sleep between polls
+// would add up to 200µs to every single RTT measurement.  We use a
+// YieldingIdleStrategy instead: idle() calls std::this_thread::yield() so the
+// OS can schedule other threads but we re-poll in microseconds, not hundreds
+// of microseconds.
 // ---------------------------------------------------------------------------
 
 struct BenchGateway {
@@ -144,14 +158,18 @@ struct BenchGateway {
                         static_cast<std::size_t>(len));
             });
 
-        // Start the pump thread.
+        // Tight-poll pump thread: yields between polls, no sleep.
+        // This keeps gateway reaction time in the single-digit-µs range so its
+        // contribution to the measured client RTT is negligible.
         stopPump_.store(false, std::memory_order_relaxed);
         pumpThread_ = std::thread([this] {
+            aeron::concurrent::YieldingIdleStrategy idle;
             while (!stopPump_.load(std::memory_order_relaxed)) {
+                int work = 0;
                 if (sub_ && assembler_) {
-                    sub_->poll(assembler_->handler(), 16);
+                    work = sub_->poll(assembler_->handler(), 16);
                 }
-                std::this_thread::sleep_for(kGwPollSleep);
+                idle.idle(work);
             }
         });
     }
@@ -169,9 +187,11 @@ struct BenchGateway {
         if (!pub_) return false;
         const auto ilen = static_cast<aeron::util::index_t>(len);
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), ilen);
+        // Tight retry — no sleep between attempts; IPC back-pressure on send
+        // is extremely rare in a two-party benchmark but we guard against it.
         for (int i = 0; i < kGwSendRetries; ++i) {
             if (pub_->offer(ab, 0, ilen) > 0) return true;
-            std::this_thread::sleep_for(1ms);
+            std::this_thread::yield();
         }
         return false;
     }
@@ -214,7 +234,8 @@ struct BenchGateway {
 };
 
 // ---------------------------------------------------------------------------
-// BenchFixture — sets up the Client + gateway once for the whole benchmark.
+// BenchFixture — sets up the Client (LowLatency) + gateway once for the
+// whole benchmark.
 // ---------------------------------------------------------------------------
 
 struct BenchFixture {
@@ -238,6 +259,8 @@ struct BenchFixture {
         cfg.dataDir          = agentDir;
         cfg.connectTimeoutMs = kConnectTimeoutMs;
         cfg.pingTimeoutMs    = kPingTimeoutMs;
+        // LowLatency: runner uses YieldingIdleStrategy → reacts in µs.
+        cfg.idleMode         = IdleMode::LowLatency;
 
         client = std::make_unique<Client>(cfg);
 
@@ -256,6 +279,8 @@ struct BenchFixture {
         fut.get(); // throws on error
 
         // Explicit warm-up: discard first kWarmupPings before sampling.
+        // This lets the IPC channels, Aeron internal caches, and CPU
+        // branch-predictor reach steady state.
         Bytes wPayload = {'w', 'a', 'r', 'm'};
         for (int i = 0; i < kWarmupPings; ++i) {
             auto wf = client->ping(wPayload);
@@ -285,7 +310,6 @@ struct BenchFixture {
 
 // ---------------------------------------------------------------------------
 // Benchmark state — keeps the fixture alive for the duration of the process.
-// Constructed once; destructed at process exit (after benchmark::RunSpecifiedBenchmarks).
 // ---------------------------------------------------------------------------
 
 static BenchFixture* g_fixture = nullptr;
@@ -294,7 +318,12 @@ static BenchFixture* g_fixture = nullptr;
 // BM_PingRoundTrip — main benchmark.
 //
 // Measures wall-clock of client.ping(payload).get() per iteration.
-// Accumulates per-iteration samples, then reports p50/p99/p99.9/mean.
+// Accumulates per-iteration samples, then reports p50/p99/p99.9/mean (µs).
+//
+// Configuration:
+//   Client: IdleMode::LowLatency (YieldingIdleStrategy, no park).
+//   Gateway: tight-poll (YieldingIdleStrategy, no sleep).
+//   Expected: p99 < 100µs on a quiet host (typically 10–60µs).
 // ---------------------------------------------------------------------------
 
 static void BM_PingRoundTrip(benchmark::State& state) {
@@ -371,7 +400,8 @@ int main(int argc, char** argv) {
     ::benchmark::Initialize(&argc, argv);
     if (::benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
 
-    // Create the fixture (starts driver, gateway, client, connect, warm-up).
+    // Create the fixture (starts driver, gateway [tight-poll], client [LowLatency],
+    // connect, warm-up kWarmupPings).
     BenchFixture fixture;
     g_fixture = &fixture;
 

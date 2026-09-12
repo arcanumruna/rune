@@ -902,3 +902,95 @@ TEST(Client, CoherentStateSnapshotAfterConnect) {
         << "ping stamped with a coherent (Connected, sessionId!=0) snapshot must succeed";
     EXPECT_EQ(echo, (Bytes{0x01}));
 }
+
+// ===========================================================================
+// Test 16 [CC-8]: IdleModeBalancedAndLowLatencyBothConnectAndPing
+//
+// Verify that both IdleMode::Balanced (default) and IdleMode::LowLatency
+// produce a functional client that can connect and ping successfully.
+// This is a correctness gate for the new idle-mode knob — it does NOT measure
+// latency (that is the benchmark's job), only that neither mode breaks the
+// connect/ping path.
+// ===========================================================================
+TEST(Client, IdleModeBalancedAndLowLatencyBothConnectAndPing) {
+    // --- Part A: IdleMode::Balanced (default) ---
+    {
+        GatewayHarness h(960, 961);
+        // Default ClientConfig has idleMode = IdleMode::Balanced.
+        h.build(/*gwReplyOK=*/true);
+
+        auto connFut = h.client->connect();
+        h.pumpGwUntil([&]() {
+            return h.client->state() == rcs::SessionState::Connected;
+        });
+        ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+            << "Balanced: connect() future did not resolve";
+        ASSERT_NO_THROW(connFut.get()) << "Balanced: connect() threw";
+
+        auto pingFut = h.client->ping({'b', 'a', 'l'});
+        h.pumpGwUntil([&]() {
+            return pingFut.wait_for(0ms) == std::future_status::ready;
+        });
+        ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+            << "Balanced: ping() future did not resolve";
+        Bytes echo;
+        ASSERT_NO_THROW(echo = pingFut.get()) << "Balanced: ping() threw";
+        EXPECT_EQ(echo, (Bytes{'b', 'a', 'l'})) << "Balanced: echo mismatch";
+    }
+
+    // --- Part B: IdleMode::LowLatency ---
+    {
+        // Build the client manually with LowLatency mode set.
+        std::string agentDir = uniqueDir();
+        std::string aeronDir = agentDir + "/aeron";
+
+        ClientConfig cfg;
+        cfg.gatewayChannel   = "aeron:ipc";
+        cfg.gatewayStreamId  = 970;
+        cfg.egressChannel    = "aeron:ipc";
+        cfg.egressStreamId   = 971;
+        cfg.dataDir          = agentDir;
+        cfg.connectTimeoutMs = 5000;
+        cfg.pingTimeoutMs    = 5000;
+        cfg.idleMode         = IdleMode::LowLatency;   // <-- the key flag
+
+        auto client = std::make_unique<Client>(cfg);
+        std::this_thread::sleep_for(150ms);
+
+        // Attach a test gateway to the same driver.
+        auto gw = std::make_unique<TestGateway>(aeronDir);
+        gw->replyWithOK = true;
+        gw->echoPong    = true;
+        gw->start(/*inStream=*/970, /*egStream=*/971);
+
+        auto pumpUntil = [&](auto pred) {
+            for (int i = 0; i < kPollMax; ++i) {
+                gw->poll(16);
+                if (pred()) return true;
+                std::this_thread::sleep_for(kPollSleep);
+            }
+            return false;
+        };
+
+        auto connFut = client->connect();
+        pumpUntil([&]() { return client->state() == rcs::SessionState::Connected; });
+
+        ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+            << "LowLatency: connect() future did not resolve";
+        ASSERT_NO_THROW(connFut.get()) << "LowLatency: connect() threw";
+        ASSERT_EQ(client->state(), rcs::SessionState::Connected)
+            << "LowLatency: state() != Connected after connect()";
+
+        auto pingFut = client->ping({'l', 'l', 'p'});
+        pumpUntil([&]() { return pingFut.wait_for(0ms) == std::future_status::ready; });
+
+        ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+            << "LowLatency: ping() future did not resolve";
+        Bytes echo;
+        ASSERT_NO_THROW(echo = pingFut.get()) << "LowLatency: ping() threw";
+        EXPECT_EQ(echo, (Bytes{'l', 'l', 'p'})) << "LowLatency: echo mismatch";
+
+        client->close();
+        try { std::filesystem::remove_all(agentDir); } catch (...) {}
+    }
+}
