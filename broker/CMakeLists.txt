@@ -37,6 +37,15 @@ add_executable(rune_broker src/main.cpp)
 target_link_libraries(rune_broker PRIVATE rune_node rune_storage spdlog::spdlog)
 if(aeron_FOUND)
     target_link_libraries(rune_broker PRIVATE aeron::aeron)
+    # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
+    # macOS provides this in its system libs, so the dependency only surfaces here.
+    # The ConanCenter aeron recipe does not propagate it to the static driver link.
+    # --no-as-needed guards against the linker discarding libuuid when it is
+    # ordered before aeron's static driver archive on the link line.
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(rune_broker PRIVATE
+            -Wl,--no-as-needed uuid -Wl,--as-needed)
+    endif()
 endif()
 
 if(BUILD_BENCHMARKS)

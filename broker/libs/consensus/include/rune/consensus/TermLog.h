@@ -11,6 +11,7 @@
 
 #include <rune/consensus/Types.h>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
