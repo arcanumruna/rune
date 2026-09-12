@@ -496,38 +496,175 @@ TEST_F(GatewayTimeoutFixture, Reap_AfterReap_PingGetsNoPong) {
 }
 
 // ===========================================================================
-// BR5T-6: Reap loop is bounded — single doWork call must complete without
-//          busy-spin even with many sessions.
+// BR5T-6: Real multi-session bounded-reap test.
 //
-// Create N sessions at t0; call reapExpired at t0+timeout+1; verify all N
-// reaped and the call completed (implicitly — test finishes in finite time).
+// Establish N=4 real sessions via the loopback harness.  Drive each connect
+// with a wall-clock-sampled connectNs so lastSeenNs is deterministic relative
+// to the captured t0.  Then:
+//   (a) reapExpired(farFutureNs): all N reaped in one tick → sessionCount N→0.
+//   (b) In a second pass with two groups (tA < tB), reapExpired at a threshold
+//       between the two groups' lastSeen values reaps only the older subset.
+//
+// No busy-spin; deterministic (synthetic reap thresholds relative to real
+// connect times, guarded the same way as BR5T-4).
 // ===========================================================================
 TEST_F(GatewayTimeoutFixture, Reap_Bounded_ManySessionsAllReaped) {
-    // We'll skip this test if sessions can't be connected quickly —
-    // instead, inject sessions directly into the SessionTable via reapExpired
-    // by calling sessions_.add() — but that's private.
-    // Strategy: connect one session at t0, reap it, confirm O(1) per session.
-    // For a bounded-loop proof: call reapExpired when there are 0 sessions
-    // and confirm it terminates immediately (no busy-spin by observation).
+    // -----------------------------------------------------------------------
+    // Part (a): all-reap.  Resolve 4 clients, connect them all, then reap all.
+    // -----------------------------------------------------------------------
+    static constexpr int kN = 4;
+    // Stream IDs 407..410 (offset chosen to avoid collision with other tests).
+    std::vector<TestClient> clients;
+    clients.reserve(kN);
+    for (int i = 0; i < kN; ++i) {
+        clients.push_back(makeClient(kEgressBase + 7 + i));
+    }
 
-    // Connect one session at t0 and verify the reap completes.
-    auto client = makeClient(kEgressBase + 7);
-    const int64_t t0 = 1'000'000'000LL;
-    auto result = doConnect(client, /*corrId=*/7, t0);
-    ASSERT_EQ(gw_->sessionCount(), 1u);
+    // Sample t0 right before connecting (wall clock, same strategy as BR5T-4).
+    const int64_t t0 = wallNowNs();
 
-    // Time the reap call — must complete << 1 second for any bounded loop.
+    for (int i = 0; i < kN; ++i) {
+        auto result = doConnect(clients[i], /*corrId=*/70 + i, t0);
+        ASSERT_GE(result.resp.assignedSessionId, 1)
+            << "connect failed for client " << i;
+    }
+    ASSERT_EQ(gw_->sessionCount(), static_cast<std::size_t>(kN));
+
+    // Time the reap call — must complete well under 1 s (bounded O(N) scan).
     using clock = std::chrono::steady_clock;
     const auto before = clock::now();
-    gw_->reapExpired(t0 + kTimeoutNs + 1);
-    const auto after = clock::now();
+    gw_->reapExpired(t0 + kTimeoutNs * 100);   // far future → everything stale
+    const auto after  = clock::now();
 
-    EXPECT_EQ(gw_->sessionCount(), 0u);
+    EXPECT_EQ(gw_->sessionCount(), 0u)
+        << "All " << kN << " sessions must be reaped in one tick";
 
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         after - before).count();
-    EXPECT_LT(elapsed, 1000)
-        << "reapExpired must complete in bounded time (< 1 s for 1 session)";
+    EXPECT_LT(elapsedMs, 1000)
+        << "reapExpired must complete in bounded time (< 1 s for " << kN << " sessions)";
+
+    // -----------------------------------------------------------------------
+    // Part (b): selective reap across two groups.
+    //
+    // Connect 2 "old" sessions at tA, then 2 "new" sessions at tB > tA.
+    // A threshold between (tA + timeout) and (tB + timeout) reaps only the A
+    // group — B group survives.
+    // -----------------------------------------------------------------------
+    // Stream IDs 411..414 (non-overlapping with above).
+    std::vector<TestClient> groupA, groupB;
+    groupA.reserve(2);
+    groupB.reserve(2);
+    for (int i = 0; i < 2; ++i)
+        groupA.push_back(makeClient(kEgressBase + 11 + i));
+    for (int i = 0; i < 2; ++i)
+        groupB.push_back(makeClient(kEgressBase + 13 + i));
+
+    const int64_t tA = wallNowNs();
+    for (int i = 0; i < 2; ++i) {
+        auto r = doConnect(groupA[i], /*corrId=*/80 + i, tA);
+        ASSERT_GE(r.resp.assignedSessionId, 1) << "groupA connect " << i;
+    }
+    ASSERT_EQ(gw_->sessionCount(), 2u);
+
+    const int64_t tB = wallNowNs();
+    ASSERT_LT(tB - tA, kTimeoutNs / 2)
+        << "Sanity: A and B connects must be within timeout/2 of each other";
+
+    for (int i = 0; i < 2; ++i) {
+        auto r = doConnect(groupB[i], /*corrId=*/82 + i, tB);
+        ASSERT_GE(r.resp.assignedSessionId, 1) << "groupB connect " << i;
+    }
+    ASSERT_EQ(gw_->sessionCount(), 4u);
+
+    // Threshold: tA+timeout+1.  Group-A idle = timeout+1 > timeout → reaped.
+    // Group-B idle = tA+timeout+1-tB = timeout+1-(tB-tA) < timeout → survives.
+    const int64_t tSelectiveReap = tA + kTimeoutNs + 1;
+    gw_->reapExpired(tSelectiveReap);
+
+    EXPECT_EQ(gw_->sessionCount(), 2u)
+        << "Selective reap: only groupA (lastSeen=tA) should be gone; groupB (lastSeen=tB) survives";
+
+    // Cleanup: reap remaining B group.
+    gw_->reapExpired(tB + kTimeoutNs + 1);
+    EXPECT_EQ(gw_->sessionCount(), 0u);
+}
+
+// ===========================================================================
+// BR5T-7: Ping-only client survives past original timeout window.
+//
+// A session that sends ONLY Pings (no explicit Keepalive) must stay alive
+// as long as Ping traffic continues — because handlePing now calls touch().
+// After Ping traffic stops, the session must be reaped once it goes idle for
+// longer than sessionTimeoutNs.
+//
+// Driven entirely with injected clock via doWork(tNow) + reapExpired(tNow).
+// ===========================================================================
+TEST_F(GatewayTimeoutFixture, Reap_PingOnlyClientSurvivesWhilePinging) {
+    auto client = makeClient(kEgressBase + 15);
+
+    const int64_t t0    = 1'000'000'000LL;
+    const int64_t delta = kTimeoutNs / 4;  // 25 ms between pings
+
+    auto result = doConnect(client, /*corrId=*/90, t0);
+    ASSERT_GE(result.resp.assignedSessionId, 1);
+    const int64_t sid = result.resp.assignedSessionId;
+    ASSERT_EQ(gw_->sessionCount(), 1u);
+
+    // -----------------------------------------------------------------------
+    // Phase 1: send Pings at t0+delta, t0+2*delta, t0+3*delta, t0+4*delta.
+    // Each Ping arrives with doWork(tPing) so nowNs_ == tPing when processed.
+    // After each Ping, reapExpired(tPing+timeout-1) must NOT reap the session
+    // (session was just touched at tPing).
+    // -----------------------------------------------------------------------
+    // Helper lambda: send one Ping and drive doWork with the given nowNs so
+    // the gateway processes it at exactly that injected timestamp.
+    auto sendPingAt = [&](int64_t tNow) {
+        pc::Ping ping;
+        ping.sessionId     = sid;
+        ping.correlationId = 99;
+        ping.echo          = "keepme";
+        uint8_t pingBuf[256] = {};
+        const std::size_t pingLen = ping.encode(pingBuf);
+        offerBounded(*client.ingressPub, pingBuf, pingLen, "Ping");
+
+        // Drain with tNow so the gateway processes the Ping at that clock value.
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::seconds{5};
+        for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
+            gw_->doWork(tNow);
+            std::this_thread::sleep_for(std::chrono::microseconds{100});
+            if (i > 500) break;   // Ping is in-flight; let ingress settle
+        }
+    };
+
+    // Send 5 Pings spread over 5*delta (well beyond t0+timeout if delta<timeout).
+    static constexpr int kPings = 5;
+    for (int p = 1; p <= kPings; ++p) {
+        const int64_t tPing = t0 + static_cast<int64_t>(p) * delta;
+        sendPingAt(tPing);
+
+        // At tPing + timeout - 1, session is still alive (just touched at tPing).
+        gw_->reapExpired(tPing + kTimeoutNs - 1);
+        EXPECT_EQ(gw_->sessionCount(), 1u)
+            << "Session should be alive just before timeout after Ping #" << p;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: stop sending Pings.  Session's lastSeen == t0 + kPings*delta.
+    // At lastSeen + timeout + 1 the session must be reaped.
+    // -----------------------------------------------------------------------
+    const int64_t tLastPing = t0 + static_cast<int64_t>(kPings) * delta;
+
+    // Just before: still alive.
+    gw_->reapExpired(tLastPing + kTimeoutNs - 1);
+    EXPECT_EQ(gw_->sessionCount(), 1u)
+        << "Session should be alive just before timeout after last Ping";
+
+    // Just after: reaped.
+    gw_->reapExpired(tLastPing + kTimeoutNs + 1);
+    EXPECT_EQ(gw_->sessionCount(), 0u)
+        << "Session should be reaped once Ping traffic stops for > timeout";
 }
 
 } // namespace

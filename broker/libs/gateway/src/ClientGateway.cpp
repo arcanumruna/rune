@@ -234,6 +234,11 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len)
         return;
     }
 
+    // Refresh session liveness: every inbound message (including Ping) keeps
+    // the session alive.  Touch before sending the Pong so a Ping-only client
+    // (no explicit Keepalive) is never wrongly reaped mid-activity.
+    sessions_.touch(pingOpt->sessionId, nowNs_);
+
     // Encode Pong with verbatim echo.
     pc::Pong pong;
     pong.sessionId     = pingOpt->sessionId;
