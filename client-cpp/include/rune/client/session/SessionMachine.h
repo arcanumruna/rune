@@ -33,8 +33,8 @@ enum class SessionState : uint8_t {
     Disconnected,
     Connecting,
     Connected,
-    Resuming,
-    Closed,  // terminal; idempotent after this
+    Resuming,  // real waiting state: entered, then doResume() fires on the NEXT tick
+    Closed,    // terminal; idempotent after this
 };
 
 // ---------------------------------------------------------------------------
@@ -128,15 +128,27 @@ public:
     /// No-op from any other state.
     void connect(int64_t nowNs) noexcept {
         if (state_ != SessionState::Disconnected) return;
-        doConnect(nowNs, /*resetSessionId=*/true);
+        doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/true);
     }
 
     /// Connected → Closed: send a Disconnect frame (clean shutdown).
-    /// No-op from any state other than Connected.
+    /// Resuming → Closed: send a Disconnect frame if a session exists.
+    /// No-op from any state other than Connected or Resuming.
     void disconnect() noexcept {
-        if (state_ != SessionState::Connected) return;
-        sendDisconnect();
-        transitionTo(SessionState::Closed);
+        if (state_ == SessionState::Connected) {
+            sendDisconnect();
+            transitionTo(SessionState::Closed);
+            return;
+        }
+        if (state_ == SessionState::Resuming) {
+            // A session was established before; send a polite goodbye if possible.
+            if (sessionId_ != 0) {
+                sendDisconnect();
+            }
+            transitionTo(SessionState::Closed);
+            return;
+        }
+        // All other states: no-op.
     }
 
     /// From ANY state → Closed, idempotent.  No frame sent.
@@ -155,7 +167,7 @@ public:
                            int64_t  assignedSessionId,
                            int64_t  incomingCorrelationId,
                            int64_t  nowNs) noexcept {
-        if (state_ == SessionState::Closed) return;
+        // FIX E: remove the redundant Closed guard before the !=Connecting guard.
         if (state_ != SessionState::Connecting) return;  // ignore in wrong state
 
         // Stale / mismatched correlationId — ignore.
@@ -166,37 +178,32 @@ public:
 
         if (ec == rpc::ErrorCode::OK) {
             // Happy path — session established.
-            sessionId_          = assignedSessionId;
+            sessionId_           = assignedSessionId;
             lastKeepaliveSentNs_ = nowNs;
             lastActivityNs_      = nowNs;
             redirectCount_       = 0;
+            // FIX C: reset both retry counters on successful connect/resume.
             connectRetryCount_   = 0;
+            resumeRetryCount_    = 0;
             transitionTo(SessionState::Connected);
             return;
         }
 
         if (ec == rpc::ErrorCode::Redirect || ec == rpc::ErrorCode::NotLeader) {
-            // leaderMemberId carries the new endpoint hint for redirect/notleader.
-            // The actual channel string is conventionally embedded in the
-            // assignedSessionId field (reused as string handle) — but the brief
-            // specifies that the machine receives the endpoint as a string.
-            // Since the codec gives us leaderMemberId + assignedSessionId
-            // (no endpoint string in ConnectResponse), we interpret:
-            //   assignedSessionId == 0 → no endpoint known → fall through to Disconnected
-            //   assignedSessionId != 0 → treat as opaque channel id (real use: CC-5 agent
-            //     resolves endpoint from a cluster-member map and calls the overload below).
-            // The test-facing overload onConnectResponseRedirect() carries the string.
+            // FIX B: ConnectResponse{Redirect/NotLeader} carries only a memberId.
+            // There is NO member→endpoint map in Milestone A.
+            // Resend to the same endpoint, bounded by the cap.
+            // TODO(Milestone B): member-id→endpoint map for ConnectResponse-based redirect.
             (void)leaderMemberId;
+            (void)assignedSessionId;
 
             if (redirectCount_ >= cfg_.maxRedirects) {
                 transitionTo(SessionState::Disconnected);
                 return;
             }
-            // Stay in Connecting; caller must re-issue with an endpoint.
-            // (No-op retarget here — this overload has no channel string.)
             redirectCount_++;
-            // Resend ConnectRequest (with same sessionId/correlationId reset).
-            doConnect(nowNs, /*resetSessionId=*/false);
+            // Resend ConnectRequest to the same endpoint (no retarget — no endpoint string).
+            doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
             return;
         }
 
@@ -207,10 +214,10 @@ public:
     /// ConnectResponse with a redirect endpoint string.
     /// This is the primary overload used by tests and by CC-5 when the agent
     /// maps leaderMemberId → channel string.
+    /// FIX B: calls io_.retarget(endpoint) BEFORE resending the ConnectRequest.
     void onConnectResponseRedirect(std::string_view newEndpoint,
                                    int64_t          incomingCorrelationId,
                                    int64_t          nowNs) noexcept {
-        if (state_ == SessionState::Closed) return;
         if (state_ != SessionState::Connecting) return;
         if (incomingCorrelationId != correlationId_) return;
 
@@ -220,15 +227,17 @@ public:
         }
 
         redirectCount_++;
+        // FIX B: retarget BEFORE resending.
         io_.retarget(std::string(newEndpoint));
-        doConnect(nowNs, /*resetSessionId=*/false);
+        doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
     }
 
     /// An ErrorResponse arrived.
     /// SessionExpired / UnknownSession in Connected → Resuming.
-    /// Redirect in Connecting → handled like onConnectResponseRedirect (no endpoint variant).
+    /// Redirect/NotLeader in Connecting with an endpoint string → retarget + resend.
+    /// Redirect/NotLeader in Connecting without endpoint → resend to same endpoint.
     void onErrorResponse(int16_t          code,
-                         std::string_view /*message*/,
+                         std::string_view message,
                          int64_t          incomingCorrelationId,
                          int64_t          nowNs) noexcept {
         if (state_ == SessionState::Closed) return;
@@ -239,22 +248,29 @@ public:
         if (state_ == SessionState::Connected) {
             if (ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) {
                 transitionTo(SessionState::Resuming);
-                // Immediately try to resume.
-                doResume(nowNs);
+                // doResume fires on the next tick (FIX D: Resuming is a real waiting state).
+                resumeEntryNs_ = nowNs;
             }
             return;
         }
 
         if (state_ == SessionState::Connecting) {
             if (incomingCorrelationId != correlationId_) return;
-            // Redirect or NotLeader without endpoint → stay connecting, retry.
+
             if (ec == rpc::ErrorCode::Redirect || ec == rpc::ErrorCode::NotLeader) {
                 if (redirectCount_ >= cfg_.maxRedirects) {
                     transitionTo(SessionState::Disconnected);
                     return;
                 }
                 redirectCount_++;
-                doConnect(nowNs, /*resetSessionId=*/false);
+
+                // FIX B: if the message field carries a non-empty endpoint string,
+                // this is the real broker-gateway redirect path — retarget.
+                if (!message.empty()) {
+                    io_.retarget(std::string(message));
+                }
+                // Resend ConnectRequest (retargeted if message was an endpoint).
+                doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
             } else {
                 transitionTo(SessionState::Disconnected);
             }
@@ -269,11 +285,12 @@ public:
     }
 
     /// The egress link dropped (e.g., Aeron image went unavailable).
-    /// Connected → Resuming.
+    /// Connected → Resuming.  doResume fires on the NEXT tick (FIX D).
     void onTransportDisconnected(int64_t nowNs) noexcept {
         if (state_ != SessionState::Connected) return;
         transitionTo(SessionState::Resuming);
-        doResume(nowNs);
+        // FIX D: enter Resuming as a real state; doResume fires on next tick.
+        resumeEntryNs_ = nowNs;
     }
 
     // ------------------------------------------------------------------------
@@ -336,12 +353,22 @@ private:
     /// Encode + send a ConnectRequest using the current config.
     /// If resetSessionId, sessionId_ is set to 0 (fresh connect).
     /// Otherwise the existing sessionId_ is used as a resume hint scaffold.
-    void doConnect(int64_t nowNs, bool resetSessionId) noexcept {
+    /// If freshEpisode, reset BOTH retry counters and redirectCount_.
+    /// FIX A: redirectCount_ is NOT reset on timeout-retry paths.
+    /// FIX C: connectRetryCount_ and resumeRetryCount_ are reset only on a
+    ///         fresh external connect() (freshEpisode=true).
+    void doConnect(int64_t nowNs, bool resetSessionId, bool freshEpisode) noexcept {
         if (resetSessionId) {
             sessionId_ = 0;
         }
-        correlationId_   = nextCorrelationId();
-        connectStartNs_  = nowNs;
+        if (freshEpisode) {
+            // FIX A + FIX C: reset all counters only on a fresh external connect().
+            redirectCount_     = 0;
+            connectRetryCount_ = 0;
+            resumeRetryCount_  = 0;
+        }
+        correlationId_  = nextCorrelationId();
+        connectStartNs_ = nowNs;
 
         const std::size_t n = rune::client::codec::encodeConnectRequest(
             scratch_.data(), kScratchCap,
@@ -358,6 +385,7 @@ private:
     }
 
     /// Initiate a resume attempt from Resuming state.
+    /// FIX C: resumeRetryCount_ is reset on onConnectResponse{OK}, not here.
     void doResume(int64_t nowNs) noexcept {
         if (resumeRetryCount_ >= cfg_.maxResumeRetries) {
             transitionTo(SessionState::Disconnected);
@@ -402,8 +430,8 @@ private:
             return;
         }
         connectRetryCount_++;
-        redirectCount_ = 0;
-        // Re-send ConnectRequest with fresh correlationId, reset timer.
+        // FIX A: do NOT reset redirectCount_ here — the redirect cap must span
+        //        the whole connect episode (reset only on fresh connect() or OK response).
         correlationId_  = nextCorrelationId();
         connectStartNs_ = nowNs;
 
@@ -423,7 +451,8 @@ private:
         // Check for stale session first.
         if (nowNs - lastActivityNs_ > cfg_.responseTimeoutNs) {
             transitionTo(SessionState::Resuming);
-            doResume(nowNs);
+            // FIX D: enter Resuming as a real state; doResume fires on next tick.
+            resumeEntryNs_ = nowNs;
             return;
         }
 
@@ -441,14 +470,16 @@ private:
         }
     }
 
+    /// FIX D: tickResuming is now live code.
+    /// Resuming is a real observable waiting state — the machine enters it
+    /// (so callers can observe state()==Resuming) and doResume() fires on the
+    /// first tick after entry.  This also enables disconnect() to be handled
+    /// while in Resuming.
     void tickResuming(int64_t nowNs) noexcept {
-        // If we transitioned to Resuming and haven't yet sent a ConnectRequest
-        // (i.e. connectStartNs_ is stale), kick off a resume attempt.
-        // This covers the case where Resuming was entered without doResume()
-        // being called immediately (e.g. from a direct tick after transport-disconnect).
-        if (nowNs - connectStartNs_ > cfg_.connectTimeoutNs) {
-            doResume(nowNs);
-        }
+        // resumeEntryNs_ is set when entering Resuming.  Fire doResume()
+        // on the very first tick (nowNs >= resumeEntryNs_).
+        (void)nowNs;
+        doResume(nowNs);
     }
 
     // ------------------------------------------------------------------------
@@ -466,6 +497,7 @@ private:
     int64_t connectStartNs_      = 0;
     int64_t lastKeepaliveSentNs_ = 0;
     int64_t lastActivityNs_      = 0;
+    int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
 
     // Counters.
     int redirectCount_     = 0;
