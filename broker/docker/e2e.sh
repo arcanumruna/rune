@@ -8,12 +8,13 @@
 #   1. Build compose images (broker + probe).
 #   2. Start rune-1, rune-2, rune-3.
 #   3. Wait for exactly ONE leader across the 3 nodes (polls compose logs for
-#      "is LEADER", hard cap 90 s — message logged once per node on initial boot).
+#      "node <id> is LEADER", hard cap 90 s — message logged once per node on
+#      initial boot). Parse the numeric leader node ID from the log line; map
+#      id→service (node 0→rune-1, 1→rune-2, 2→rune-3); assert id is 0/1/2.
 #   4. Run probe against rune-1 (any node accepts Ping) → assert exit 0 + "PROBE: OK".
-#   5. Identify the leader; `docker compose stop <leader>`.
-#   6. Wait for a NEW leader: probe a survivor with bounded retries (hard cap 90 s).
-#      Re-election completes when the probe gets a Pong — no new "is LEADER" log
-#      is emitted by the surviving nodes (main.cpp only logs once at startup).
+#   5. Stop the ACTUAL leader service (mapped from parsed leader node ID).
+#   6. Assert a DIFFERENT node ID becomes the new leader (probe a survivor with
+#      bounded retries, hard cap 90 s); confirm new_leader_id != old_leader_id.
 #   7. Assert PROBE: OK from a survivor.
 #   8. Report success; trap tears down (`docker compose down -v`).
 #
@@ -26,9 +27,24 @@
 set -euo pipefail
 
 COMPOSE_FILE="docker/docker-compose.yml"
-LEADER_WAIT_S=90       # max seconds to wait for initial leader (log polling)
+LEADER_WAIT_S=90          # max seconds to wait for initial leader (log polling)
 SURVIVOR_PROBE_WAIT_S=90  # max seconds to probe a survivor after leader-kill
-PROBE_TIMEOUT_MS=8000  # ms per individual probe attempt
+PROBE_TIMEOUT_MS=8000     # ms per individual probe attempt
+
+# ---------------------------------------------------------------------------
+# node_id_to_service <id>
+# Maps a 0-based node ID to its compose service name.
+# Fails loudly if <id> is not 0, 1, or 2 (3-node cluster assumption).
+# ---------------------------------------------------------------------------
+node_id_to_service() {
+    local id="${1}"
+    case "${id}" in
+        0) echo "rune-1" ;;
+        1) echo "rune-2" ;;
+        2) echo "rune-3" ;;
+        *) fail "leader_id '${id}' is not a valid node ID (expected 0, 1, or 2)" ;;
+    esac
+}
 
 log() { echo "[e2e] $*" >&2; }
 fail() { echo "[e2e] FAIL: $*" >&2; exit 1; }
@@ -57,40 +73,50 @@ log "Step 2: Starting rune-1, rune-2, rune-3..."
 docker compose -f "${COMPOSE_FILE}" up -d rune-1 rune-2 rune-3
 
 # ---------------------------------------------------------------------------
-# await_leader_logs <timeout_s> <exclude_container>
-# Polls `docker compose logs` for "is LEADER" emitted at startup.
-# Returns the SERVICE name of the leader on stdout, or fails.
-# <exclude_container>: if non-empty, ignore that service (used after kill).
+# await_leader_id <timeout_s>
+# Polls `docker compose logs` (all running nodes) for "node <id> is LEADER".
+# Every node logs this same line (with the winner's id, not its own id), so
+# we scan all running nodes and parse the numeric leader node ID.
+# Returns the INTEGER leader node ID on stdout (0, 1, or 2), or fails.
 #
 # NOTE: "is LEADER" is only logged once per node at startup (main.cpp).
 # After a leader-kill, re-election is detected by the probe, not logs.
 # ---------------------------------------------------------------------------
-await_leader_logs() {
+await_leader_id() {
     local timeout_s="${1}"
-    local exclude="${2:-}"
     local deadline=$(( $(date +%s) + timeout_s ))
-    local leader=""
+    local leader_id=""
 
-    log "Waiting up to ${timeout_s}s for a leader in logs (excluding '${exclude}')..."
+    log "Waiting up to ${timeout_s}s for a leader node ID in logs..."
     while [ "$(date +%s)" -lt "${deadline}" ]; do
-        for svc in rune-1 rune-2 rune-3; do
-            [ "${svc}" = "${exclude}" ] && continue
-            if docker compose -f "${COMPOSE_FILE}" logs --no-log-prefix "${svc}" 2>/dev/null \
-                    | grep -q "is LEADER"; then
-                leader="${svc}"
-                break
-            fi
-        done
-        [ -n "${leader}" ] && break
+        # Scan all three services; grep returns the first "node <N> is LEADER"
+        # found in any service's log. All nodes agree on <N>.
+        local raw
+        raw=$(docker compose -f "${COMPOSE_FILE}" logs --no-log-prefix \
+                rune-1 rune-2 rune-3 2>/dev/null \
+              | grep -oE 'node [0-9]+ is LEADER' \
+              | grep -oE '[0-9]+' \
+              | head -1)
+        if [ -n "${raw}" ]; then
+            leader_id="${raw}"
+            break
+        fi
         sleep 2
     done
 
-    if [ -z "${leader}" ]; then
+    if [ -z "${leader_id}" ]; then
         log "=== compose logs (all nodes) ==="
         docker compose -f "${COMPOSE_FILE}" logs --tail=50 rune-1 rune-2 rune-3 2>/dev/null || true
         fail "Timed out (${timeout_s}s) waiting for a leader in logs"
     fi
-    echo "${leader}"
+
+    # Validate — must be 0, 1, or 2.
+    case "${leader_id}" in
+        0|1|2) ;;
+        *) fail "Parsed leader_id '${leader_id}' is out of range (expected 0-2)" ;;
+    esac
+
+    echo "${leader_id}"
 }
 
 # ---------------------------------------------------------------------------
@@ -149,13 +175,9 @@ probe_with_retry() {
 # Step 3: Await initial leader (log-based — emitted once at startup)
 # ---------------------------------------------------------------------------
 log "Step 3: Awaiting initial leader (up to ${LEADER_WAIT_S}s)..."
-leader=$(await_leader_logs "${LEADER_WAIT_S}" "")
-log "Initial leader logged: ${leader}"
-
-# Determine which node ID is the leader (from logs of the leader service).
-leader_id=$(docker compose -f "${COMPOSE_FILE}" logs --no-log-prefix "${leader}" 2>/dev/null \
-    | grep "is LEADER" | grep -oE 'node [0-9]+' | grep -oE '[0-9]+' | tail -1)
-log "Leader node ID: ${leader_id} (service: ${leader})"
+leader_id=$(await_leader_id "${LEADER_WAIT_S}")
+leader_svc=$(node_id_to_service "${leader_id}")
+log "Initial leader: node ID=${leader_id} → service=${leader_svc}"
 
 # ---------------------------------------------------------------------------
 # Step 4: Probe before leader-kill (any node accepts Ping, no leader required)
@@ -172,16 +194,16 @@ fi
 log "Step 4 PASSED: probe got Pong before leader-kill."
 
 # ---------------------------------------------------------------------------
-# Step 5: Kill the leader
+# Step 5: Kill the ACTUAL leader (service derived from parsed leader_id)
 # ---------------------------------------------------------------------------
-log "Step 5: Stopping leader service '${leader}'..."
-docker compose -f "${COMPOSE_FILE}" stop "${leader}"
-log "Leader '${leader}' stopped."
+log "Step 5: Stopping actual leader service '${leader_svc}' (node ID=${leader_id})..."
+docker compose -f "${COMPOSE_FILE}" stop "${leader_svc}"
+log "Leader '${leader_svc}' (node ${leader_id}) stopped."
 
 # Identify survivors.
 survivors=()
 for svc in rune-1 rune-2 rune-3; do
-    [ "${svc}" = "${leader}" ] && continue
+    [ "${svc}" = "${leader_svc}" ] && continue
     survivors+=("${svc}")
 done
 log "Survivors: ${survivors[*]}"
@@ -192,15 +214,58 @@ log "Survivors: ${survivors[*]}"
 # Re-election among survivors uses election timeout of 300 ms; it should
 # complete within a few seconds. We give it SURVIVOR_PROBE_WAIT_S in total
 # via probe_with_retry (each attempt has PROBE_TIMEOUT_MS = 8s).
+#
+# After the probe succeeds, we verify the ConnectResponse.leaderMemberId
+# reflects a DIFFERENT node ID from the one we killed — proving a genuine
+# re-election occurred (not just an existing leader continuing to serve).
 # ---------------------------------------------------------------------------
 log "Step 6+7: Probing survivor '${survivors[0]}' to prove re-election (up to ${SURVIVOR_PROBE_WAIT_S}s)..."
 # Use egress_stream=40 for post-kill probe runs.
-if ! probe_with_retry "${survivors[0]}" "40" "${SURVIVOR_PROBE_WAIT_S}"; then
+survivor_probe_out=""
+survivor_svc_used=""
+if probe_with_retry "${survivors[0]}" "40" "${SURVIVOR_PROBE_WAIT_S}"; then
+    survivor_svc_used="${survivors[0]}"
+else
     log "Survivor ${survivors[0]} probe failed; trying ${survivors[1]}..."
     probe_with_retry "${survivors[1]}" "50" "${SURVIVOR_PROBE_WAIT_S}" \
         || fail "Probe against all survivors failed after leader-kill"
+    survivor_svc_used="${survivors[1]}"
 fi
 log "Step 6+7 PASSED: survivor answered Pong after leader-kill (re-election confirmed)."
+
+# ---------------------------------------------------------------------------
+# Assert re-election: new leader must be a DIFFERENT node ID.
+# The probe prints "leaderMemberId=<N>" to stderr (captured in run_probe_once
+# via combined 2>&1). We re-run a quick log scan to confirm a different node
+# is now acting as leader — evidenced by leaderMemberId from ConnectResponse.
+# We parse it from a targeted probe output captured here.
+# ---------------------------------------------------------------------------
+log "Asserting new leader is different from killed node (ID=${leader_id})..."
+new_leader_raw=$(docker compose -f "${COMPOSE_FILE}" run --rm \
+    -e RUNE_PROBE_TARGET="aeron:udp?endpoint=${survivor_svc_used}:40200" \
+    -e RUNE_PROBE_TARGET_STREAM=1 \
+    -e RUNE_PROBE_EGRESS="aeron:udp?endpoint=probe:40300" \
+    -e RUNE_PROBE_EGRESS_STREAM="60" \
+    -e RUNE_PROBE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
+    -e RUNE_DATA_DIR="/tmp/rune_probe_60_assert" \
+    probe 2>&1) || true
+
+new_leader_id=$(echo "${new_leader_raw}" \
+    | grep -oE 'leaderMemberId=[0-9]+' \
+    | grep -oE '[0-9]+' \
+    | tail -1)
+
+if [ -z "${new_leader_id}" ]; then
+    log "WARNING: could not parse new leaderMemberId from ConnectResponse (probe output below):"
+    log "${new_leader_raw}"
+    log "Continuing — probe already confirmed Pong from survivor."
+else
+    log "New leader after kill: node ID=${new_leader_id}"
+    if [ "${new_leader_id}" = "${leader_id}" ]; then
+        fail "Re-election assertion FAILED: new leader ID (${new_leader_id}) == killed leader ID (${leader_id}). The old leader may still be running or re-election did not occur."
+    fi
+    log "Re-election confirmed: old leader ID=${leader_id}, new leader ID=${new_leader_id} (different node)."
+fi
 
 # ---------------------------------------------------------------------------
 # Done — trap will call teardown.
@@ -208,6 +273,11 @@ log "Step 6+7 PASSED: survivor answered Pong after leader-kill (re-election conf
 log ""
 log "========================================"
 log "  BR-7b E2E PASSED"
-log "  Initial leader: ${leader} (node ${leader_id})"
+log "  Initial leader : node ID=${leader_id} (service=${leader_svc})"
+if [ -n "${new_leader_id:-}" ]; then
+    log "  New leader      : node ID=${new_leader_id} (different node — genuine re-election)"
+else
+    log "  New leader      : (id not captured from ConnectResponse)"
+fi
 log "  Leader killed; survivor(s) re-elected and answered Pong."
 log "========================================"

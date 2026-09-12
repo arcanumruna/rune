@@ -11,6 +11,7 @@ x-broker-build: &broker-build
   context: ..
   dockerfile: docker/Dockerfile
   additional_contexts:
+    # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
     rune-protocol: ../../rune-protocol
 
 x-broker-env: &broker-env
@@ -90,6 +91,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.probe
       additional_contexts:
+        # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
         rune-protocol: ../../rune-protocol
     platform: linux/amd64
     hostname: probe

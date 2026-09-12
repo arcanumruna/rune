@@ -361,6 +361,16 @@ int main() {
             return 11;
         }
 
+        // Assert correlationId matches what we sent (mirrors GatewayLoopbackTest.cpp).
+        constexpr int64_t kExpectedCorrelationId = 2002;
+        if (pong->correlationId != kExpectedCorrelationId) {
+            std::cerr << "PROBE: Pong correlationId mismatch: got=" << pong->correlationId
+                      << " want=" << kExpectedCorrelationId << "\n";
+            aeron.reset();
+            stopDriver();
+            return 12;
+        }
+
         std::cout << "PROBE: OK node=" << target << " session=" << sessionId << "\n";
         std::cerr << "PROBE: Pong received correlationId=" << pong->correlationId
                   << " echo='" << pongEcho << "'\n";

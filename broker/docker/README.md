@@ -203,5 +203,6 @@ embedded media driver. Cross-container UDP requires:
 - Unique Aeron dir per container (ensured by `RUNE_DATA_DIR` volume isolation).
 - The probe's egress channel must be reachable by the node: `probe:40300`
   resolves via compose DNS, and the probe's media driver binds that UDP port.
-- MTU: Docker's bridge network default (1500 B) is sufficient for Aeron's
-  default 4 KiB term buffer; no extra MTU tuning is needed.
+- MTU: Docker's bridge network default (1500 B) is sufficient for the probe's
+  64 KiB term buffer (Aeron fragments to MTU internally); no extra MTU tuning
+  is needed.
