@@ -50,6 +50,7 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
 {
     // Reserve space for the pending-connect table (bounded, pre-allocated).
     pendingConnects_.reserve(kMaxPendingConnects);
+    drainingRegistrations_.reserve(kMaxPendingConnects);
 
     // Register the ingress subscription.
     int64_t regId = aeron_->addSubscription(clientChannel_, clientStreamId_);
@@ -179,6 +180,11 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
             // REDIRECT: resolve a temporary egress to the client synchronously
             // (this is a non-leader redirect — only happens on follower nodes,
             //  not on the critical leader path).
+            // TODO(Milestone B): route redirect egress through the async pending machine —
+            // this synchronous resolvePublication would block the consensus thread once
+            // per-peer client endpoints exist; unreachable in Milestone A (single-node is
+            // always leader; multi-node followers return leaderClientEndpoint="" per the
+            // ruling → degrade-to-accept, never redirect).
             auto pub = resolvePublication(std::string(req.egressChannel), req.egressStreamId);
             if (!pub) return; // can't reach client — drop
 
@@ -207,9 +213,28 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // -----------------------------------------------------------------------
 
     // Cap: evict the oldest pending entry if we are at capacity.
+    // The evicted registration must be released: attempt a final
+    // findExclusivePublication — if it resolves (shared_ptr non-null) let it
+    // drop immediately (destructor calls
+    // ClientConductor::releaseExclusivePublication, see ExclusivePublication.cpp
+    // ~ExclusivePublication()); if it throws (ERRORED), conductor already cleaned
+    // up; if still AWAITING (nullptr returned), enqueue in drainingRegistrations_
+    // and keep polling until it resolves.
     if (pendingConnects_.size() >= kMaxPendingConnects) {
         spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
+        const int64_t evictedRegId = pendingConnects_.front().registrationId;
         pendingConnects_.erase(pendingConnects_.begin());
+        try {
+            // Attempt immediate release by resolving and dropping the shared_ptr.
+            auto pub = aeron_->findExclusivePublication(evictedRegId);
+            if (!pub) {
+                // Still AWAITING_MEDIA_DRIVER — keep draining until it resolves.
+                drainingRegistrations_.push_back(evictedRegId);
+            }
+            // If pub non-null: drops here → ~ExclusivePublication() releases registration.
+        } catch (...) {
+            // ERRORED_MEDIA_DRIVER: conductor erased the entry and threw — no leak.
+        }
     }
 
     // Pre-allocate sessionId now so it is stable across cycles.
@@ -249,13 +274,15 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
 // ---------------------------------------------------------------------------
 void ClientGateway::pollPendingConnects(int64_t nowNs)
 {
+    // Drive the draining-release table first (bounded, non-blocking).
+    drainPendingReleases();
+
     if (pendingConnects_.empty()) return;
 
     namespace pc = rune::protocol::client;
 
-    // Use erase-remove idiom: iterate and collect indices to remove.
-    // We process from front; stable iteration is fine since we erase via
-    // the std::remove_if pattern.
+    // Hand-rolled forward-erase loop (not std::remove_if — we need per-element
+    // control to handle three distinct outcomes: resolve, timeout, and error).
     auto it = pendingConnects_.begin();
     while (it != pendingConnects_.end()) {
         PendingConnect& pending = *it;
@@ -265,7 +292,24 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             spdlog::warn("ClientGateway: pending-connect session={} timed out after {}ms; dropped",
                          pending.sessionId,
                          (nowNs - pending.requestedAtNs) / 1'000'000LL);
+            // Release the registration: attempt final findExclusivePublication.
+            // If resolved (non-null shared_ptr): drop it — destructor calls
+            // ClientConductor::releaseExclusivePublication(registrationId)
+            // (Aeron C++ 1.41.4: ~ExclusivePublication() → m_conductor.releaseExclusivePublication).
+            // If throws (ERRORED): conductor already cleaned up — no leak.
+            // If nullptr (still AWAITING): enqueue in drainingRegistrations_ and
+            // keep polling per-cycle until the conductor resolves it.
+            const int64_t timedOutRegId = pending.registrationId;
             it = pendingConnects_.erase(it);
+            try {
+                auto pub = aeron_->findExclusivePublication(timedOutRegId);
+                if (!pub) {
+                    drainingRegistrations_.push_back(timedOutRegId);
+                }
+                // pub non-null: drops here → destructor releases registration.
+            } catch (...) {
+                // ERRORED_MEDIA_DRIVER: conductor erased the entry — no leak.
+            }
             continue;
         }
 
@@ -274,7 +318,8 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         try {
             pub = aeron_->findExclusivePublication(pending.registrationId);
         } catch (...) {
-            // Conductor signalled an error (bad channel, etc.) — drop.
+            // ERRORED_MEDIA_DRIVER: conductor signalled an error (bad channel, etc.).
+            // The conductor erased its own entry when throwing — no registration leak.
             spdlog::warn("ClientGateway: findExclusivePublication threw for session={}; dropped",
                          pending.sessionId);
             it = pendingConnects_.erase(it);
@@ -302,6 +347,46 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         sendTo(session, scratch_.data(), encoded);
 
         it = pendingConnects_.erase(it);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drainPendingReleases — poll registrations that were logically dropped before
+// their ExclusivePublication resolved, to complete the release.
+//
+// Release mechanism (Aeron C++ 1.41.4, ExclusivePublication.cpp line 62-65):
+//   ~ExclusivePublication() { m_conductor.releaseExclusivePublication(m_registrationId); }
+// So: obtaining a shared_ptr via findExclusivePublication and letting it drop
+// is the ONLY correct release path for a registration that is still in
+// AWAITING_MEDIA_DRIVER state.  Once the conductor transitions it to
+// REGISTERED_MEDIA_DRIVER, findExclusivePublication returns a non-null
+// shared_ptr; dropping it triggers the destructor which releases the
+// registration (and driver-side log buffers).
+// ---------------------------------------------------------------------------
+void ClientGateway::drainPendingReleases()
+{
+    if (drainingRegistrations_.empty()) return;
+
+    auto it = drainingRegistrations_.begin();
+    while (it != drainingRegistrations_.end()) {
+        const int64_t regId = *it;
+        try {
+            auto pub = aeron_->findExclusivePublication(regId);
+            if (pub) {
+                // Resolved: drop the shared_ptr immediately.
+                // ~ExclusivePublication() calls
+                // m_conductor.releaseExclusivePublication(registrationId).
+                pub.reset();
+                it = drainingRegistrations_.erase(it);
+            } else {
+                // Still AWAITING — try again next doWork cycle.
+                ++it;
+            }
+        } catch (...) {
+            // ERRORED_MEDIA_DRIVER: conductor erased its internal entry and threw.
+            // The registration is already cleaned up — remove from drain list.
+            it = drainingRegistrations_.erase(it);
+        }
     }
 }
 

@@ -74,6 +74,16 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_redirect_tests
                 PROPERTIES TIMEOUT 90)
+
+            # BR-7a fix: async pending-connect drop/timeout/eviction tests
+            add_executable(rune_gateway_async_drop_tests
+                tests/integration/GatewayAsyncDropTest.cpp)
+            target_link_libraries(rune_gateway_async_drop_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_async_drop_tests
+                PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()

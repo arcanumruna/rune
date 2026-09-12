@@ -111,6 +111,15 @@ public:
         return sessions_.size();
     }
 
+    // -----------------------------------------------------------------------
+    // pendingConnectCount — number of in-flight async egress-resolve entries.
+    // Includes both the main pending table and the draining-release table.
+    // Used by tests to assert that dropped/timed-out entries drain to zero.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t pendingConnectCount() const {
+        return pendingConnects_.size() + drainingRegistrations_.size();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // PendingConnect — tracks an in-flight async egress publication resolve.
@@ -164,6 +173,19 @@ private:
     void pollPendingConnects(int64_t nowNs);
 
     // -----------------------------------------------------------------------
+    // drainPendingReleases — called in pollPendingConnects; for each
+    // registration in drainingRegistrations_, attempt findExclusivePublication.
+    // On resolve (shared_ptr non-null): let it drop immediately — destructor
+    // calls ClientConductor::releaseExclusivePublication(registrationId)
+    // (Aeron C++ 1.41.4: ExclusivePublication::~ExclusivePublication() calls
+    // m_conductor.releaseExclusivePublication(m_registrationId)).
+    // On error (throws): conductor already removed the entry — no leak.
+    // On still-AWAITING (nullptr): keep polling until it resolves.
+    // Never blocks.
+    // -----------------------------------------------------------------------
+    void drainPendingReleases();
+
+    // -----------------------------------------------------------------------
     // Resolve a new ExclusivePublication (bounded wait).
     // Returns nullptr if the publication cannot be resolved within the deadline.
     // NOTE: kept for the redirect path (non-leader with known leader endpoint),
@@ -192,6 +214,15 @@ private:
     // Async pending-connect table (BR-7a).
     // Bounded to kMaxPendingConnects; all touched only in doWork (single-writer).
     std::vector<PendingConnect>          pendingConnects_;
+
+    // Draining-release table (BR-7a fix): registrationIds that were logically
+    // dropped (timeout / eviction / error) before their ExclusivePublication
+    // resolved.  We must keep polling findExclusivePublication until the
+    // conductor transitions from AWAITING_MEDIA_DRIVER to either
+    // REGISTERED_MEDIA_DRIVER (shared_ptr returned → drop it, destructor
+    // releases) or ERRORED_MEDIA_DRIVER (throws → conductor already cleaned up).
+    // Bounded by kMaxPendingConnects (same cap as the main pending table).
+    std::vector<int64_t>                 drainingRegistrations_;
 
     // Scratch buffer for reap ID collection (avoids heap allocation per frame).
     // Populated and drained entirely within reapExpired() — single-writer, safe.
