@@ -355,33 +355,22 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         const std::size_t encoded = resp.encode(scratch_.data());
 
         if (!sendOnPub(*pub, scratch_.data(), encoded)) {
-            // Back-pressure: publication resolved but send failed (term buffer
-            // full or not yet connected to a subscriber).  Keep this pending
-            // entry; the resolved pub is stored via the move below so we don't
-            // re-call findExclusivePublication next cycle — stash it back into
-            // the entry and try again next doWork.
-            //
-            // Implementation note: we cannot store the shared_ptr in the
-            // PendingConnect struct without changing its layout.  The clean
-            // approach is to store the pub and retry.  We extend PendingConnect
-            // with an optional<shared_ptr> for the resolved-but-unsent case.
-            // Since that requires a header change, we use the minimum acceptable
-            // path here: on send failure we put the pub into the session table
-            // ONLY as a temporary holder via sessions_.add, then remove it on
-            // the next successful send.
-            //
-            // Actually: the minimum-acceptable spec says "send first, add session
-            // only on success; on failure release the egress pub and create no
-            // session (client will re-Connect)."  We follow that here.
+            // Back-pressure: the publication resolved but the ConnectResponse
+            // could not be sent (term buffer full / not yet connected). Send
+            // BEFORE adding the session so we never create a session the client
+            // was not told about: drop the pending entry and release the egress
+            // pub (its resolved shared_ptr goes out of scope here →
+            // ~ExclusivePublication releases the registration — no leak). The
+            // client re-Connects. (A retry-in-place sub-state is deferred to
+            // Milestone B; a transient re-Connect is acceptable for now.)
             spdlog::debug("ClientGateway: ConnectResponse back-pressured for session={}; "
                           "releasing pub, client will re-Connect",
                           pending.sessionId);
-            // pub goes out of scope → ~ExclusivePublication() releases registration.
             it = pendingConnects_.erase(it);
             continue;
         }
 
-        // Send succeeded — now it is safe to add the session.
+        // Send succeeded — only now is it safe to add the session.
         sessions_.add(pending.sessionId, std::move(pub), nowNs);
 
         it = pendingConnects_.erase(it);
