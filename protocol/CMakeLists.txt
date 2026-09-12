@@ -22,6 +22,7 @@ if(BUILD_TESTING)
             tests/protocol/Crc32cTest.cpp
             tests/protocol/VarintTest.cpp
             tests/protocol/RecordBatchTest.cpp
+            tests/protocol/PartitionHashTest.cpp
             tests/protocol/client/MessageHeaderTest.cpp
             tests/protocol/client/ControlMessagesConnectTest.cpp
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp
