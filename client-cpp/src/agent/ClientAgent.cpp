@@ -89,6 +89,10 @@ void ClientAgent::start() {
         return; // already started
     }
     transport_.start();
+
+    // Publish initial snapshot so observers see a consistent value immediately.
+    stateSnapshot_.store(session_.state(), std::memory_order_release);
+    sessionIdSnapshot_.store(session_.sessionId(), std::memory_order_release);
 }
 
 void ClientAgent::stop() noexcept {
@@ -155,21 +159,17 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     totalWork += fragments;
 
     // ---- Step 3: Tick the session machine -----------------------------------
-    // tick() may emit a keepalive frame via sendFrame (→ transport_.offer).
-    // We count it as work if the session is in an active state so that we
-    // don't return 0 spuriously while keepalives are being sent.
-    // We use a simple proxy: if session is Connected or Connecting, count 1
-    // when tick() would have done something — but the brief says we can just
-    // always count the tick as 1 if the state is not Disconnected/Closed.
-    // In practice: just call tick() and leave totalWork unchanged (tick()
-    // is cheap and the IdleStrategy only backs off on 0, which is fine).
+    // tick() drives keepalive cadence and timeout handling.  It may emit
+    // frames via sendFrame() → transport_.offer().  We do not count ticks as
+    // work; ring + egress fragments are the sole work-done signals (the
+    // IdleStrategy backs off on 0, which is correct for idle cycles).
     session_.tick(nowNs);
-    // NOTE: We do NOT increment totalWork for a tick that emits nothing, but
-    // if a keepalive was sent, sendFrame() called transport_.offer() which is
-    // outside our fragment counter.  To avoid "phantom work" on pure-idle
-    // cycles we only count ring + egress fragments as real work.  The session
-    // keepalive itself causes outbound traffic that will eventually produce
-    // inbound fragments on subsequent calls — the loop self-regulates.
+
+    // ---- Step 4: Publish observer snapshots (release) -----------------------
+    // Written here (agent thread) with release order.  Read by sessionState()
+    // and sessionId() from any thread with acquire order — no lock needed.
+    stateSnapshot_.store(session_.state(), std::memory_order_release);
+    sessionIdSnapshot_.store(session_.sessionId(), std::memory_order_release);
 
     return totalWork;
 }
@@ -182,6 +182,15 @@ bool ClientAgent::writeCommand(int32_t msgTypeId,
                                 const uint8_t* payload,
                                 std::size_t payloadLen) noexcept
 {
+    // Guard: ManyToOneRingBuffer::write() throws IllegalArgumentException when
+    // length > maxMsgLength() (= ringCapacity/8).  Because this function is
+    // noexcept, an unguarded throw would call std::terminate.  Return false
+    // (= backpressure / rejection) instead so the caller can retry or signal
+    // an error without crashing the process.
+    if (payloadLen > static_cast<std::size_t>(ring_.maxMsgLength())) {
+        return false;
+    }
+
     // Wrap the payload in an AtomicBuffer for ring_.write().
     // If payloadLen == 0 we still need a valid (non-null) buffer pointer for
     // AtomicBuffer; use a static dummy byte.
@@ -193,8 +202,16 @@ bool ClientAgent::writeCommand(int32_t msgTypeId,
     aeron::concurrent::AtomicBuffer ab(ptr,
                                        static_cast<aeron::util::index_t>(
                                            payloadLen > 0 ? payloadLen : 1));
-    return ring_.write(msgTypeId, ab, 0,
-                       static_cast<aeron::util::index_t>(payloadLen));
+
+    // Defense-in-depth: if the ring throws for any other reason (e.g. a future
+    // Aeron version introduces a new check), catch and return false rather than
+    // propagating through noexcept.
+    try {
+        return ring_.write(msgTypeId, ab, 0,
+                           static_cast<aeron::util::index_t>(payloadLen));
+    } catch (...) {
+        return false;
+    }
 }
 
 bool ClientAgent::submitConnect() noexcept {
@@ -222,11 +239,15 @@ void ClientAgent::setEgressObserver(EgressObserver obs) noexcept {
 }
 
 session::SessionState ClientAgent::sessionState() const noexcept {
-    return session_.state();
+    // Reads the atomic snapshot published (release) at the end of each doWork
+    // and once in start().  Thread-safe: callable from any thread.
+    return stateSnapshot_.load(std::memory_order_acquire);
 }
 
 int64_t ClientAgent::sessionId() const noexcept {
-    return session_.sessionId();
+    // Reads the atomic snapshot published (release) at the end of each doWork
+    // and once in start().  Thread-safe: callable from any thread.
+    return sessionIdSnapshot_.load(std::memory_order_acquire);
 }
 
 // ---------------------------------------------------------------------------

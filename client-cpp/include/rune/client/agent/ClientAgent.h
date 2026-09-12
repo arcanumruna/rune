@@ -13,7 +13,8 @@
 //   No locks protect session_ or transport_ — the ring is the sync primitive.
 //
 // doWork contract:
-//   Returns total work count (ring records + fragments + session tick).
+//   Returns total work count (ring records drained + egress fragments polled).
+//   Session ticks are always performed but not counted as work.
 //   Returns 0 when nothing happened (idle); the caller's IdleStrategy backs
 //   off.  No busy-spin on the agent side.
 //
@@ -133,14 +134,22 @@ public:
     // Observers
     // -------------------------------------------------------------------------
 
-    /// Set (replace) the egress observer.  Safe to call before start().
-    /// Called from the agent thread only once the agent is running.
+    /// Set (replace) the egress observer.
+    /// MUST be called before start() (single-threaded setup phase only).
+    /// The observer is read on the agent thread; changing it after start() is
+    /// a data race.  CC-6 wires the observer once before start() — that is the
+    /// only supported usage pattern.
     void setEgressObserver(EgressObserver obs) noexcept;
 
-    /// Delegate to SessionMachine::state().
+    /// Return the session state snapshot published by the agent thread.
+    /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
+    /// state at the end of the most recent doWork() call.  Safe to call from
+    /// ANY thread — this is the cross-thread observer path used by CC-6.
     [[nodiscard]] session::SessionState sessionState() const noexcept;
 
-    /// Delegate to SessionMachine::sessionId().
+    /// Return the session-id snapshot published by the agent thread.
+    /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
+    /// session-id at the end of the most recent doWork() call.
     [[nodiscard]] int64_t sessionId() const noexcept;
 
 private:
@@ -186,12 +195,15 @@ private:
     std::atomic<bool> started_ {false};
     std::atomic<bool> stopped_ {false};
 
-    // ---- Egress observer (agent thread only after construction) --------------
+    // ---- Egress observer (agent thread only; must be set before start()) ----
     EgressObserver egressObserver_;
 
-    // ---- Scratch buffer for ring write of send payloads ---------------------
-    // AtomicBuffer requires a non-const buffer pointer; we wrap a stack frame
-    // at write time using this pattern (the ring copies the bytes internally).
+    // ---- Thread-safe observer snapshots (BrokerNode mirror pattern) ---------
+    // Written with release order at the END of each doWork() and once in
+    // start().  Read with acquire order by sessionState()/sessionId() which
+    // are the ONLY cross-thread observer accessors.
+    std::atomic<session::SessionState> stateSnapshot_   {session::SessionState::Disconnected};
+    std::atomic<int64_t>               sessionIdSnapshot_ {0};
 };
 
 } // namespace rune::client::agent

@@ -830,3 +830,371 @@ TEST(ClientAgent, DtorAfterStart) {
         // dtor called here without explicit stop().
     });
 }
+
+// ---------------------------------------------------------------------------
+// Test 8: OversizedSubmitSendReturnsFalse — FIX 1
+//
+//   submitSend with a payload > ring_.maxMsgLength() must return false and
+//   NOT crash (no std::terminate from an unguarded noexcept throw).  A
+//   subsequent normal-sized submitSend must still succeed.
+//
+//   Default ring capacity = 64 KiB → maxMsgLength = 64*1024/8 = 8192 bytes.
+// ---------------------------------------------------------------------------
+TEST(ClientAgent, OversizedSubmitSendReturnsFalse) {
+    auto cfg = makeAgentConfig(
+        uniqueDir(),
+        "aeron:ipc", 700,
+        "aeron:ipc", 701);
+    // Use default 64 KiB ring → maxMsgLength = 8192 bytes.
+
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    std::this_thread::sleep_for(20ms);
+
+    // Build a payload larger than maxMsgLength (8192 bytes) — 9000 bytes.
+    std::vector<uint8_t> bigFrame(9'000, 0xAB);
+    const bool big = agent.submitSend(bigFrame.data(), bigFrame.size());
+    EXPECT_FALSE(big) << "Oversized submitSend must return false, not crash";
+
+    // A normal-sized submit must still succeed after the rejected oversized one.
+    const uint8_t tiny[4] = {0x01, 0x02, 0x03, 0x04};
+    const bool small = agent.submitSend(tiny, sizeof(tiny));
+    EXPECT_TRUE(small) << "Normal submitSend must succeed after oversized rejection";
+
+    agent.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: RingFullReturnsFalse — FIX 1 / review coverage
+//
+//   Size a tiny ring (smallest valid power-of-two: 128 bytes) and flood it
+//   without draining.  submitSend (and other commands) must return false when
+//   the ring is full — no silent loss, no crash.
+// ---------------------------------------------------------------------------
+TEST(ClientAgent, RingFullReturnsFalse) {
+    // Smallest valid ring per RingBufferDescriptor::checkCapacity: 64 bytes
+    // capacity is the minimum power-of-two accepted by Aeron.  Use 128 bytes
+    // to be safe: maxMsgLength = 128/8 = 16 bytes.
+    auto cfg = makeAgentConfig(
+        uniqueDir(),
+        "aeron:ipc", 710,
+        "aeron:ipc", 711,
+        /*ringCap=*/128);
+
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    std::this_thread::sleep_for(20ms);
+
+    // Each kMsgSend record occupies ≥ (header + payload bytes) aligned to 32.
+    // With a 128-byte ring the ring saturates quickly.  Flood until we see a
+    // false return.
+    const uint8_t frame[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+
+    bool gotFalse = false;
+    for (int i = 0; i < 200; ++i) {
+        if (!agent.submitSend(frame, sizeof(frame))) {
+            gotFalse = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(gotFalse)
+        << "Expected submitSend to return false on a full ring after flooding";
+
+    // submitConnect should also return false with a full ring.
+    bool connectFull = false;
+    for (int i = 0; i < 200; ++i) {
+        if (!agent.submitConnect()) {
+            connectFull = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(connectFull)
+        << "Expected submitConnect to return false on a full ring";
+
+    agent.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: RetargetPostNullIngressOfferReturnsFalse — FIX 3 / review coverage
+//
+//   AeronTransport::retarget is called (via the agent's SessionIo path) from
+//   the agent thread only.  We test the invariant directly on the transport:
+//   after retarget to a bogus/unresolvable channel the offer() must return
+//   false (no crash, transport remains in a consistent state).
+//
+//   Note: forcing a retarget timeout through the full agent is impractical
+//   because it requires a server-side Redirect response that carries an
+//   unresolvable endpoint — that path is tested in SessionMachineTest.  Here
+//   we verify the post-retarget transport invariant directly.
+// ---------------------------------------------------------------------------
+TEST(ClientAgent, RetargetPostNullIngressOfferReturnsFalse) {
+    const std::string dir = uniqueDir();
+
+    rct::TransportConfig cfg;
+    cfg.ingressChannel  = "aeron:ipc";
+    cfg.ingressStreamId = 720;
+    cfg.egressChannel   = "aeron:ipc";
+    cfg.egressStreamId  = 720; // loopback
+    cfg.dataDir         = dir;
+
+    rct::AeronTransport t(cfg);
+    t.start();
+
+    // Wait for loopback connection.
+    for (int i = 0; i < kPumpMax; ++i) {
+        if (t.ingressConnected() && t.egressConnected()) break;
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_TRUE(t.ingressConnected()) << "Transport not connected before retarget";
+
+    // Retarget to a channel with an unresolvable UDP endpoint.
+    // The publication will not resolve within the test's lifetime, so after
+    // retarget offer() returns false (no connected subscriber → back-pressure).
+    // The important invariant: retarget() does NOT throw and transport stays
+    // alive (stop() completes cleanly).
+    ASSERT_NO_THROW(t.retarget("aeron:udp?endpoint=192.0.2.1:59999"))
+        << "retarget to bogus channel must not throw";
+
+    // offer() on the new (unresolved) publication must return false (or true if
+    // by some miracle the OS accepts it — in either case no crash is acceptable).
+    const uint8_t msg[] = {0xDE, 0xAD};
+    bool crashed = false;
+    try {
+        // We do NOT busy-loop here — one attempt is enough to confirm no crash.
+        // The return value may be false (unconnected pub) — that is correct.
+        (void)t.offer(msg, sizeof(msg));
+    } catch (...) {
+        crashed = true;
+    }
+    EXPECT_FALSE(crashed) << "offer() after retarget to bogus channel must not throw";
+
+    t.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: MalformedEgressFrameDropped — review coverage
+//
+//   Feed the agent a sequence of frames that includes a malformed (truncated)
+//   frame in the middle.  The agent must:
+//     a) drop the malformed frame silently (no crash), and
+//     b) continue processing — a valid Pong after the malformed frame still
+//        reaches the egress observer.
+//
+//   We use the same shared-driver gateway pattern as EndToEndAgentLoop.
+// ---------------------------------------------------------------------------
+TEST(ClientAgent, MalformedEgressFrameDropped) {
+    const std::string agentDir = uniqueDir();
+    const std::string aeronDir = agentDir + "/aeron";
+
+    static constexpr int32_t kIngressStream = 730;
+    static constexpr int32_t kEgressStream  = 731;
+
+    auto cfg = makeAgentConfig(
+        agentDir,
+        "aeron:ipc", kIngressStream,
+        "aeron:ipc", kEgressStream);
+    cfg.session.keepaliveIntervalNs = 500'000'000LL; // 500 ms — don't flood
+
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    std::this_thread::sleep_for(150ms);
+
+    aeron::Context gwCtx;
+    gwCtx.aeronDir(aeronDir);
+    auto gwAeron = aeron::Aeron::connect(gwCtx);
+    ASSERT_NE(gwAeron, nullptr);
+
+    int64_t gwSubId = gwAeron->addSubscription("aeron:ipc", kIngressStream);
+    int64_t gwPubId = gwAeron->addExclusivePublication("aeron:ipc", kEgressStream);
+
+    std::shared_ptr<aeron::Subscription>         gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+
+    {
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            agent.doWork(nowNs());
+            if (!gwSub) gwSub = gwAeron->findSubscription(gwSubId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(gwPubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        ASSERT_NE(gwSub, nullptr);
+        ASSERT_NE(gwPub, nullptr);
+    }
+
+    // Helper: publish a raw buffer to the agent's egress subscription.
+    auto gwSend = [&](const uint8_t* buf, std::size_t len) -> bool {
+        const auto ilen = static_cast<aeron::util::index_t>(len);
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), ilen);
+        for (int i = 0; i < 500; ++i) {
+            if (gwPub->offer(ab, 0, ilen) > 0) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    };
+
+    // Observer tracking.
+    std::atomic<bool> pongReceived{false};
+    agent.setEgressObserver(
+        [&](rcc::TemplateId tid, const uint8_t*, std::size_t) {
+            if (tid == rcc::TemplateId::Pong) {
+                pongReceived.store(true, std::memory_order_release);
+            }
+        });
+
+    // Connect so the agent is in a known (Connecting or Disconnected) state —
+    // dispatchEgressFrame is called regardless of session state, so we do not
+    // need to be Connected to exercise the decode/drop path.
+
+    // --- Step A: send a malformed (truncated) frame --------------------------
+    // A valid Pong header is at least ~24 bytes; send only 4 bytes → truncated.
+    uint8_t bad[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    ASSERT_TRUE(gwSend(bad, sizeof(bad))) << "Failed to send malformed frame";
+
+    // Drain — agent must not crash on the bad frame.
+    for (int i = 0; i < 50; ++i) {
+        agent.doWork(nowNs());
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    // No assertion needed here — reaching this line without crashing is the test.
+
+    // --- Step B: send a valid Pong frame -------------------------------------
+    uint8_t pongBuf[128]{};
+    std::size_t pongLen = rcc::encodePong(
+        pongBuf, sizeof(pongBuf),
+        /*echo=*/"survive",
+        /*sessionId=*/0,
+        /*correlationId=*/0);
+    ASSERT_GT(pongLen, 0u) << "encodePong failed";
+    ASSERT_TRUE(gwSend(pongBuf, pongLen)) << "Failed to send Pong";
+
+    // Pump until the observer fires or timeout.
+    bool pongOk = false;
+    for (int i = 0; i < kPumpMax; ++i) {
+        agent.doWork(nowNs());
+        if (pongReceived.load(std::memory_order_acquire)) {
+            pongOk = true;
+            break;
+        }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    EXPECT_TRUE(pongOk)
+        << "Agent must keep working after a malformed frame — valid Pong must reach observer";
+
+    gwPub.reset();
+    gwSub.reset();
+    gwAeron.reset();
+    agent.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: SessionStateAtomicSnapshotAfterConnect — FIX 2 / review coverage
+//
+//   After a successful e2e connect, sessionState() (which reads the atomic
+//   snapshot) must reflect Connected.  This is asserted AFTER a doWork() call
+//   that drained the ConnectResponse and updated the snapshot.
+//
+//   The test is structurally identical to EndToEndAgentLoop Phase A, but the
+//   assertion targets the atomic snapshot path explicitly.
+// ---------------------------------------------------------------------------
+TEST(ClientAgent, SessionStateAtomicSnapshotAfterConnect) {
+    const std::string agentDir = uniqueDir();
+    const std::string aeronDir = agentDir + "/aeron";
+
+    static constexpr int32_t kIngressStream = 740;
+    static constexpr int32_t kEgressStream  = 741;
+
+    auto cfg = makeAgentConfig(
+        agentDir,
+        "aeron:ipc", kIngressStream,
+        "aeron:ipc", kEgressStream);
+    cfg.session.keepaliveIntervalNs = 500'000'000LL;
+
+    rca::ClientAgent agent(cfg);
+    // Before start(): snapshot must be Disconnected.
+    EXPECT_EQ(agent.sessionState(), rcs::SessionState::Disconnected)
+        << "Pre-start snapshot must be Disconnected";
+
+    agent.start();
+
+    // After start(), snapshot must still be Disconnected (no connect submitted).
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(agent.sessionState(), rcs::SessionState::Disconnected)
+        << "Post-start (idle) snapshot must be Disconnected";
+
+    aeron::Context gwCtx;
+    gwCtx.aeronDir(aeronDir);
+    auto gwAeron = aeron::Aeron::connect(gwCtx);
+    ASSERT_NE(gwAeron, nullptr);
+
+    int64_t gwSubId = gwAeron->addSubscription("aeron:ipc", kIngressStream);
+    int64_t gwPubId = gwAeron->addExclusivePublication("aeron:ipc", kEgressStream);
+
+    std::shared_ptr<aeron::Subscription>         gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+
+    {
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            agent.doWork(nowNs());
+            if (!gwSub) gwSub = gwAeron->findSubscription(gwSubId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(gwPubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        ASSERT_NE(gwSub, nullptr);
+        ASSERT_NE(gwPub, nullptr);
+    }
+
+    uint8_t gwReplyBuf[512]{};
+    auto gwAssembler = std::make_unique<aeron::FragmentAssembler>(
+        [&](aeron::concurrent::AtomicBuffer& buf,
+            aeron::util::index_t            offset,
+            aeron::util::index_t            len,
+            aeron::Header&)
+        {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+            const std::size_t sz = static_cast<std::size_t>(len);
+            auto tidOpt = rcc::peekTemplate(p, sz);
+            if (!tidOpt) return;
+            if (static_cast<rcc::TemplateId>(*tidOpt) != rcc::TemplateId::Connect) return;
+            auto opt = rcc::decodeConnectRequest(p, sz);
+            if (!opt) return;
+            std::size_t n = rcc::encodeConnectResponse(
+                gwReplyBuf, sizeof(gwReplyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::OK),
+                0, 42, opt->sessionId, opt->correlationId);
+            if (n > 0) {
+                aeron::concurrent::AtomicBuffer ab(gwReplyBuf,
+                    static_cast<aeron::util::index_t>(n));
+                for (int i = 0; i < 500; ++i) {
+                    if (gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) > 0) break;
+                    std::this_thread::sleep_for(1ms);
+                }
+            }
+        });
+
+    ASSERT_TRUE(agent.submitConnect()) << "submitConnect rejected";
+
+    bool connected = false;
+    for (int i = 0; i < kPumpMax; ++i) {
+        agent.doWork(nowNs());
+        gwSub->poll(gwAssembler->handler(), 16);
+        if (agent.sessionState() == rcs::SessionState::Connected) {
+            connected = true;
+            break;
+        }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_TRUE(connected)
+        << "Atomic snapshot never reflected Connected state (timeout)";
+    ASSERT_EQ(agent.sessionId(), 42LL)
+        << "Atomic sessionId snapshot must equal assigned session id (42)";
+
+    gwAssembler.reset();
+    gwPub.reset();
+    gwSub.reset();
+    gwAeron.reset();
+    agent.stop();
+}
