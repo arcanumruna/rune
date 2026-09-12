@@ -44,6 +44,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::gateway {
@@ -135,6 +136,13 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // subscriptionCount — number of active subscriptions (for tests).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t subscriptionCount() const {
+        return subscriptions_.size();
+    }
+
+    // -----------------------------------------------------------------------
     // pendingConnectCount — number of in-flight async egress-resolve entries.
     // Includes both the main pending table and the draining-release table.
     // Used by tests to assert that dropped/timed-out entries drain to zero.
@@ -144,6 +152,24 @@ public:
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // Subscription — per-session push subscription (GB-3).
+    //
+    // nextOffset tracks the exact offset to push next.  The push loop advances
+    // it ONLY after a successful tryClaim (exactly-once delivery guarantee).
+    // isolation: 0 = read_uncommitted, 1 = read_committed.
+    //   M-B: both modes use logEndOffset() as the isolation bound; the real LSO
+    //   will be used for read_committed once transactions land (Milestone C).
+    // -----------------------------------------------------------------------
+    struct Subscription {
+        int64_t subscriptionId = 0;
+        int64_t sessionId      = 0;
+        int32_t topicId        = 0;
+        int32_t partition      = 0;
+        int64_t nextOffset     = 0;
+        uint8_t isolation      = 0;   // 0=read_uncommitted, 1=read_committed
+    };
+
     // -----------------------------------------------------------------------
     // PendingConnect — tracks an in-flight async egress publication resolve.
     // Stored in pendingConnects_ until resolved or timed out.
@@ -176,7 +202,12 @@ private:
     void handlePing      (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleDisconnect(const uint8_t* buf, std::size_t len);
     // GB-2: Produce handler — offset-assignment + leader-local append.
-    void handleProduce   (const uint8_t* buf, std::size_t len);
+    void handleProduce      (const uint8_t* buf, std::size_t len);
+    // GB-3: Subscribe/Unsubscribe handlers.
+    void handleSubscribe    (const uint8_t* buf, std::size_t len);
+    void handleUnsubscribe  (const uint8_t* buf, std::size_t len);
+    // GB-3: Push delivery — called from doWork after ingress poll.
+    void pushSubscriptions  ();
 
     // -----------------------------------------------------------------------
     // Egress send helper — tryClaim first, fallback to offer.
@@ -279,6 +310,36 @@ private:
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;
+
+    // GB-3: Subscription registry — keyed by subscriptionId.
+    // Iterated each doWork() to push new Records to each subscriber's egress.
+    // Subscriptions are reaped when the owning session is removed/reaped.
+    // Single-writer: only accessed on the duty-cycle thread.
+    std::unordered_map<int64_t, Subscription> subscriptions_;
+
+    // GB-3: Monotonic subscription ID generator (starts at 1).
+    int64_t nextSubscriptionId_ = 0;
+
+    // GB-3: Pre-allocated scratch for iterating subscriptions per cycle
+    // (avoids heap allocation per doWork invocation).
+    // Populated in pushSubscriptions(); cleared at the start of each call.
+    std::vector<int64_t> deadSubScratch_;
+
+    // GB-3: Per-cycle fairness cap — max record batches pushed per subscription
+    // per doWork() cycle.  Prevents one busy subscription from starving others.
+    static constexpr int kMaxBatchesPerSubPerCycle = 8;
+
+    // GB-3: Max bytes fetched from Log::read per subscription per cycle.
+    // Bounded to avoid reading unbounded data from a fast-filling log.
+    // Each batch is at most 65535 bytes (u16 var field cap) + overhead ≈ 64 KiB.
+    static constexpr int32_t kMaxChunkBytes = static_cast<int32_t>(512 * 1024); // 512 KiB
+
+    // GB-3: Reusable push scratch — sized to hold one encoded Records frame.
+    // Records header = 50 bytes fixed + up to 65535 bytes of recordBatch.
+    // 68 KiB covers that; share kScratchSize constant.
+    // NOTE: scratch_ is already kScratchSize = 68 KiB and is reused here.
+    // We encode into scratch_ during push; this is safe because push happens
+    // AFTER the ingress poll (handlers that use scratch_ are done for this cycle).
 };
 
 } // namespace rune::gateway

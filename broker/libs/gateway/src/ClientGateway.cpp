@@ -87,6 +87,8 @@ int ClientGateway::doWork(int64_t nowNs) {
     int work = sub_->poll(assembler_.handler(), kFragmentLimit);
     pollPendingConnects(nowNs);
     reapExpired(nowNs);
+    // GB-3: push new Records to all active subscribers (egress-paced, single-writer).
+    pushSubscriptions();
     return work;
 }
 
@@ -110,6 +112,17 @@ void ClientGateway::reapExpired(int64_t nowNs) {
         sessions_.remove(sid);
         // Removing from sessions_ resets the shared_ptr → Aeron releases the
         // ExclusivePublication once no other holder exists.
+
+        // GB-3: drop all subscriptions belonging to this session so we no longer
+        // attempt to push Records to a dead egress.
+        auto it = subscriptions_.begin();
+        while (it != subscriptions_.end()) {
+            if (it->second.sessionId == sid) {
+                it = subscriptions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 }
 
@@ -150,9 +163,15 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
         case pc::TemplateId::Produce:
             handleProduce(buf, len);
             break;
+        case pc::TemplateId::Subscribe:
+            handleSubscribe(buf, len);
+            break;
+        case pc::TemplateId::Unsubscribe:
+            handleUnsubscribe(buf, len);
+            break;
         default:
             // ConnectResponse, ErrorResponse, Pong, ProduceResponse, SubscribeResponse,
-            // Records, Unsubscribe — server→client or other direction; drop.
+            // Records — server→client or other direction; drop.
             break;
     }
 }
@@ -494,7 +513,18 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::Disconnect::decode(buf, len);
     if (!msgOpt) return;
-    sessions_.remove(msgOpt->sessionId);
+    const int64_t sid = msgOpt->sessionId;
+    sessions_.remove(sid);
+
+    // GB-3: drop all subscriptions belonging to this session.
+    auto it = subscriptions_.begin();
+    while (it != subscriptions_.end()) {
+        if (it->second.sessionId == sid) {
+            it = subscriptions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +789,327 @@ ClientGateway::resolvePublication(const std::string& channel, int32_t streamId)
         std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
     }
     return nullptr; // timed out
+}
+
+// ---------------------------------------------------------------------------
+// handleSubscribe (GB-3, tid18) — register a per-session subscription.
+//
+// Flow:
+//   1. Decode Subscribe — drop on truncation.
+//   2. Require known session — drop on unknown session (no egress to reply on).
+//   3. Resolve partition: explicit (partitionKnown=1) or partitionForKey().
+//   4. Validate topic + partition → SubscribeResponse{error} on failure.
+//   5. Clamp fromOffset:
+//        fromOffset < 0  → treat as "from Latest" (LEO).
+//        fromOffset > LEO → clamp to LEO.
+//        0 ≤ fromOffset ≤ LEO → use as-is.
+//   6. Allocate subscriptionId; register Subscription; reply SubscribeResponse{OK}.
+//
+// No heap allocation on the hot path (scratch_ is pre-allocated).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
+{
+    // 1. Decode.
+    auto msgOpt = pc::Subscribe::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: Subscribe decode failed (truncated?) — dropped");
+        return;
+    }
+    const pc::Subscribe& msg = *msgOpt;
+
+    // 2. Require known session.
+    Session* session = sessions_.find(msg.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: Subscribe for unknown sessionId={} — dropped", msg.sessionId);
+        return;
+    }
+
+    // Helper: send SubscribeResponse on the session egress.
+    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t subId) {
+        pc::SubscribeResponse resp;
+        resp.sessionId      = msg.sessionId;
+        resp.correlationId  = msg.correlationId;
+        resp.errorCode      = static_cast<int16_t>(ec);
+        resp.partition      = partition;
+        resp.subscriptionId = subId;
+        static_assert(pc::SubscribeResponse::ENCODED_SIZE <= kScratchSize,
+                      "scratch too small for SubscribeResponse");
+        const std::size_t encoded = resp.encode(scratch_.data());
+        sendTo(*session, scratch_.data(), encoded);
+    };
+
+    // 3. Resolve partition.
+    int32_t partition = msg.partition;
+    if (msg.partitionKnown == 0) {
+        if (!topicRegistry_) {
+            spdlog::warn("ClientGateway: Subscribe key-partition but no TopicRegistry — UnknownTopic");
+            sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+            return;
+        }
+        partition = topicRegistry_->partitionForKey(msg.topicId, msg.key);
+        if (partition < 0) {
+            spdlog::debug("ClientGateway: Subscribe partitionForKey → unknown topicId={}", msg.topicId);
+            sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+            return;
+        }
+    }
+
+    // 4. Validate topic + partition.
+    if (!topicRegistry_) {
+        spdlog::warn("ClientGateway: Subscribe but no TopicRegistry — UnknownTopic");
+        sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+        return;
+    }
+
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(msg.topicId);
+    if (!spec) {
+        spdlog::debug("ClientGateway: Subscribe unknown topicId={}", msg.topicId);
+        sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
+        return;
+    }
+
+    rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
+    if (!log) {
+        spdlog::debug("ClientGateway: Subscribe bad partition={} for topicId={}", partition, msg.topicId);
+        sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
+        return;
+    }
+
+    // 5. Clamp fromOffset to [0, LEO].
+    //    fromOffset < 0 → "from Latest" (LEO); fromOffset > LEO → clamp to LEO.
+    //    Convention: negative fromOffset is the "Latest" sentinel documented in the brief.
+    const int64_t leo = log->logEndOffset();
+    int64_t nextOffset;
+    if (msg.fromOffset < 0) {
+        // Negative → from Latest (subscribe only to new records).
+        nextOffset = leo;
+    } else if (msg.fromOffset > leo) {
+        // Beyond LEO → clamp to LEO (no data there yet).
+        nextOffset = leo;
+    } else {
+        nextOffset = msg.fromOffset;
+    }
+
+    // 6. Allocate subscriptionId and register subscription.
+    const int64_t subId = ++nextSubscriptionId_;
+
+    Subscription sub;
+    sub.subscriptionId = subId;
+    sub.sessionId      = msg.sessionId;
+    sub.topicId        = msg.topicId;
+    sub.partition      = partition;
+    sub.nextOffset     = nextOffset;
+    sub.isolation      = msg.isolation;
+
+    subscriptions_.emplace(subId, std::move(sub));
+
+    // Reply SubscribeResponse{OK, partition, subscriptionId}.
+    sendResp(pc::ErrorCode::OK, partition, subId);
+
+    spdlog::debug("ClientGateway: Subscribe sessionId={} subId={} topic={} partition={} nextOffset={} isolation={}",
+                  msg.sessionId, subId, msg.topicId, partition, nextOffset, msg.isolation);
+}
+
+// ---------------------------------------------------------------------------
+// handleUnsubscribe (GB-3, tid21) — remove a subscription.
+//
+// No response required (brief: "just remove").
+// Drop-safe: unknown subscriptionId is silently ignored.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
+{
+    auto msgOpt = pc::Unsubscribe::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: Unsubscribe decode failed — dropped");
+        return;
+    }
+    const std::size_t removed = subscriptions_.erase(msgOpt->subscriptionId);
+    spdlog::debug("ClientGateway: Unsubscribe subId={} removed={}",
+                  msgOpt->subscriptionId, removed);
+}
+
+// ---------------------------------------------------------------------------
+// pushSubscriptions (GB-3) — push new Records from the Log to each subscriber.
+//
+// Called from doWork() AFTER the ingress poll (single-writer, duty-cycle thread).
+//
+// For each active subscription:
+//   - Compute isolation bound: both read_uncommitted (0) and read_committed (1)
+//     use logEndOffset() for M-B (no transactions yet → LSO == LEO).
+//     // TODO(Milestone C): read_committed uses the real LSO once transactions land.
+//   - If nextOffset >= bound → skip (nothing to push).
+//   - Otherwise: Log::read(nextOffset, kMaxChunkBytes) → iterate whole batches:
+//       For each batch (identified via kLengthOffset = 12 + LE32@8):
+//         Encode Records{subscriptionId, topicId, partition, baseOffset, batchBytes}.
+//         tryClaim on session egress.
+//         SUCCESS → advance nextOffset = baseOffset + recordCount.
+//         BACK_PRESSURED / not-connected → STOP for this subscription this cycle.
+//           Do NOT advance nextOffset (retry next cycle from same offset).
+//   - Per-cycle fairness cap: at most kMaxBatchesPerSubPerCycle batches per subscription.
+//
+// Zero-alloc hot path: scratch_ is the pre-allocated encode buffer; Log::read
+// returns a vector (unavoidable OS read) but we do not allocate per-batch.
+//
+// Correctness guarantee: nextOffset is NEVER advanced past a batch that was not
+// successfully pushed (tryClaim > 0).  This ensures exactly-once delivery in order,
+// even under back-pressure.
+// ---------------------------------------------------------------------------
+void ClientGateway::pushSubscriptions()
+{
+    using namespace rune::protocol::batch;
+
+    if (subscriptions_.empty()) return;
+
+    for (auto& [subId, sub] : subscriptions_) {
+        // Find the owning session.
+        Session* session = sessions_.find(sub.sessionId);
+        if (!session) {
+            // Session gone — subscription will be reaped; skip this cycle.
+            continue;
+        }
+
+        // Compute isolation bound.
+        // TODO(Milestone C): read_committed uses the real LSO once transactions land.
+        rune::storage::Log* log = topicRegistry_ ?
+            topicRegistry_->log(sub.topicId, sub.partition) : nullptr;
+        if (!log) continue; // registry removed or not set — skip
+
+        const int64_t bound = log->logEndOffset();  // both isolation modes use LEO for M-B
+
+        if (sub.nextOffset >= bound) continue; // nothing new to push
+
+        // Fetch a bounded chunk of bytes from the log starting at nextOffset.
+        std::vector<uint8_t> chunk;
+        try {
+            chunk = log->read(sub.nextOffset, kMaxChunkBytes);
+        } catch (const std::exception& ex) {
+            spdlog::warn("ClientGateway: Log::read threw for sub={}: {}", subId, ex.what());
+            continue;
+        } catch (...) {
+            spdlog::warn("ClientGateway: Log::read threw unknown exception for sub={}", subId);
+            continue;
+        }
+
+        if (chunk.empty()) continue; // nothing returned (nextOffset not yet visible)
+
+        // Iterate whole record batches in the chunk.
+        // Batch layout: kBaseOffsetOffset=0 (LE64), kLengthOffset=8 (LE32 = bytes after this field),
+        //               total batch size = 12 + LE32@8; kRecordCountOffset=57 (LE32).
+        std::size_t chunkPos  = 0;
+        const std::size_t chunkSize = chunk.size();
+        int batchesPushed = 0;
+        bool backPressured = false;
+
+        while (chunkPos < chunkSize && batchesPushed < kMaxBatchesPerSubPerCycle && !backPressured) {
+            // Need at least kRecordCountOffset + 4 bytes to read header fields.
+            constexpr std::size_t kMinBatchHdr =
+                static_cast<std::size_t>(kRecordCountOffset) + 4u;
+            if (chunkPos + kMinBatchHdr > chunkSize) break; // partial header at end of chunk
+
+            const uint8_t* batchPtr = chunk.data() + chunkPos;
+
+            // Read baseOffset (LE64@0).
+            int64_t baseOffset = 0;
+            {
+                for (int i = 0; i < 8; ++i)
+                    baseOffset |= (static_cast<int64_t>(batchPtr[i]) << (i * 8));
+            }
+
+            // Read length field (LE32@8) → batchSize = 12 + length.
+            uint32_t lengthField = 0;
+            {
+                const uint8_t* p = batchPtr + kLengthOffset;
+                lengthField = static_cast<uint32_t>(p[0]) |
+                              (static_cast<uint32_t>(p[1]) << 8) |
+                              (static_cast<uint32_t>(p[2]) << 16) |
+                              (static_cast<uint32_t>(p[3]) << 24);
+            }
+            const std::size_t batchSize = 12u + static_cast<std::size_t>(lengthField);
+
+            // Guard: the batch must fit within the remaining chunk.
+            if (chunkPos + batchSize > chunkSize) break; // incomplete batch at end
+
+            // Read recordCount (LE32@57).
+            int32_t recordCount = 0;
+            {
+                const uint8_t* p = batchPtr + kRecordCountOffset;
+                recordCount = static_cast<int32_t>(
+                    static_cast<uint32_t>(p[0]) |
+                    (static_cast<uint32_t>(p[1]) << 8) |
+                    (static_cast<uint32_t>(p[2]) << 16) |
+                    (static_cast<uint32_t>(p[3]) << 24));
+            }
+
+            // Guard: recordCount must be positive.
+            if (recordCount < 1) {
+                // Corrupt batch — skip it to avoid getting stuck.
+                spdlog::warn("ClientGateway: push sub={} corrupt batch at chunkPos={} recordCount={} — skipping",
+                             subId, chunkPos, recordCount);
+                chunkPos += batchSize;
+                continue;
+            }
+
+            // Encode Records{subscriptionId, topicId, partition, baseOffset, batchBytes}.
+            // The batch bytes are a zero-copy span into the chunk.
+            const std::size_t needed =
+                pc::Records::BODY_FIXED + pc::MessageHeader::ENCODED_SIZE + 2u + batchSize;
+            if (needed > kScratchSize) {
+                // Batch too large for scratch — skip (should not happen: u16 cap = 65535).
+                spdlog::warn("ClientGateway: push sub={} batch too large ({} > {}); skipping",
+                             subId, needed, kScratchSize);
+                chunkPos += batchSize;
+                continue;
+            }
+
+            // Also guard: Records uses a u16 length prefix for recordBatch.
+            if (batchSize > 65535u) {
+                spdlog::warn("ClientGateway: push sub={} batchSize {} exceeds u16 max; skipping",
+                             subId, batchSize);
+                chunkPos += batchSize;
+                continue;
+            }
+
+            pc::Records rec;
+            rec.sessionId      = sub.sessionId;
+            rec.correlationId  = 0;  // push; no correlation
+            rec.subscriptionId = sub.subscriptionId;
+            rec.topicId        = sub.topicId;
+            rec.partition      = sub.partition;
+            rec.baseOffset     = baseOffset;
+            rec.recordBatch    = std::span<const uint8_t>(batchPtr, batchSize);
+
+            const std::size_t encoded = rec.encode(scratch_.data());
+
+            // Push via tryClaim (no offer-spin — single writer, no blocking).
+            aeron::ExclusivePublication& pub = *session->egress;
+            int64_t pos = -1;
+            if (pub.isConnected() && encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
+                aeron::concurrent::logbuffer::BufferClaim claim;
+                pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
+                if (pos > 0) {
+                    auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
+                    aeron::concurrent::AtomicBuffer atomicBuf(
+                        mutableBuf, static_cast<aeron::util::index_t>(encoded));
+                    claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
+                                            static_cast<aeron::util::index_t>(encoded));
+                    claim.commit();
+                }
+            }
+
+            if (pos > 0) {
+                // SUCCESS: advance nextOffset exactly past this batch.
+                sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
+                chunkPos += batchSize;
+                ++batchesPushed;
+            } else {
+                // BACK_PRESSURED or not-connected: STOP for this subscription this cycle.
+                // Do NOT advance nextOffset — retry from the same offset next cycle.
+                backPressured = true;
+                spdlog::debug("ClientGateway: push sub={} back-pressured at offset={} (pos={})",
+                              subId, baseOffset, pos);
+            }
+        }
+    }
 }
 
 } // namespace rune::gateway

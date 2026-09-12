@@ -111,6 +111,16 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_produce_tests
                 PROPERTIES TIMEOUT 120)
+
+            # GB-3: Subscribe handler — egress-paced push + back-pressure exactly-once tests
+            add_executable(rune_gateway_subscribe_tests
+                tests/integration/GatewaySubscribeTest.cpp)
+            target_link_libraries(rune_gateway_subscribe_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_subscribe_tests
+                PROPERTIES TIMEOUT 180)
         endif()
     endif()
 endif()
