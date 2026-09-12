@@ -1,0 +1,102 @@
+# docker-compose.custom.yml — fully-customizable 3-node rune-broker cluster.
+#
+# Unlike docker-compose.yml (repo default: YAML anchors, named volumes, no host ports),
+# this file spells out EVERY env var per node, uses ${VAR}-substitution for all tunables,
+# bind-mounts host data dirs, and publishes each node's client UDP port so external
+# clients can connect. Edit rune-cluster.env (copy from rune-cluster.env.example).
+#
+# Run:
+#   cp docker/rune-cluster.env.example docker/rune-cluster.env   # then edit
+#   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml up -d
+#   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml logs -f
+#   docker compose --env-file docker/rune-cluster.env -f docker/docker-compose.custom.yml down
+#
+# Uses a prebuilt image (${RUNE_IMAGE}); build it first, e.g.:
+#   docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol \
+#       -f docker/Dockerfile -t rune-broker:latest .
+
+name: rune-cluster
+
+services:
+  rune-1:
+    image: ${RUNE_IMAGE:-rune-broker:latest}
+    platform: linux/amd64
+    hostname: rune-1
+    shm_size: ${SHM_SIZE:-256m}
+    environment:
+      # --- required ---
+      RUNE_NODE_ID: "0"
+      RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111},1@rune-2:${CONSENSUS_PORT:-40111},2@rune-3:${CONSENSUS_PORT:-40111}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
+      RUNE_DATA_DIR: /var/lib/rune
+      # --- optional (defaults shown) ---
+      RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
+      RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
+      RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "${RUNE_ELECTION_STATUS_INTERVAL_MS:-20}"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
+    volumes:
+      - ${DATA_DIR_1:-./rune-data/node0}:/var/lib/rune
+    ports:
+      - "${CLIENT_HOST_PORT_1:-40201}:${CLIENT_PORT:-40200}/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+
+  rune-2:
+    image: ${RUNE_IMAGE:-rune-broker:latest}
+    platform: linux/amd64
+    hostname: rune-2
+    shm_size: ${SHM_SIZE:-256m}
+    environment:
+      RUNE_NODE_ID: "1"
+      RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111},1@rune-2:${CONSENSUS_PORT:-40111},2@rune-3:${CONSENSUS_PORT:-40111}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
+      RUNE_DATA_DIR: /var/lib/rune
+      RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
+      RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
+      RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "${RUNE_ELECTION_STATUS_INTERVAL_MS:-20}"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
+    volumes:
+      - ${DATA_DIR_2:-./rune-data/node1}:/var/lib/rune
+    ports:
+      - "${CLIENT_HOST_PORT_2:-40202}:${CLIENT_PORT:-40200}/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+
+  rune-3:
+    image: ${RUNE_IMAGE:-rune-broker:latest}
+    platform: linux/amd64
+    hostname: rune-3
+    shm_size: ${SHM_SIZE:-256m}
+    environment:
+      RUNE_NODE_ID: "2"
+      RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111},1@rune-2:${CONSENSUS_PORT:-40111},2@rune-3:${CONSENSUS_PORT:-40111}"
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
+      RUNE_DATA_DIR: /var/lib/rune
+      RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
+      RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"
+      RUNE_ELECTION_TIMEOUT_MS: "${RUNE_ELECTION_TIMEOUT_MS:-150}"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "${RUNE_ELECTION_STATUS_INTERVAL_MS:-20}"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-100}"
+    volumes:
+      - ${DATA_DIR_3:-./rune-data/node2}:/var/lib/rune
+    ports:
+      - "${CLIENT_HOST_PORT_3:-40203}:${CLIENT_PORT:-40200}/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
