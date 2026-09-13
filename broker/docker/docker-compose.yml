@@ -15,7 +15,9 @@ x-broker-build: &broker-build
     rune-protocol: ../../rune-protocol
 
 x-broker-env: &broker-env
-  RUNE_PEERS: "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"
+  # GB-4: peer spec includes clientPort (id@host:consensusPort:clientPort).
+  # Followers use these to redirect Produce/Subscribe to the leader's client endpoint.
+  RUNE_PEERS: "0@rune-1:40111:40200,1@rune-2:40111:40200,2@rune-3:40111:40200"
   RUNE_DATA_DIR: /var/lib/rune
   # Client gateway listens on all interfaces inside the container.
   # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".

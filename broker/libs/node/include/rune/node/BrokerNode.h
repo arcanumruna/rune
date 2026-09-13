@@ -101,6 +101,14 @@ public:
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
 
+    /// Return the leader's client Aeron channel for data-op redirect (GB-4).
+    /// Observer-thread-safe: reads atomic leaderId() + immutable peer config.
+    /// - If this node IS the leader → returns empty string (no self-redirect).
+    /// - If leader id is known and that peer has a clientPort → returns its
+    ///   clientChannel() ("aeron:udp?endpoint=host:port").
+    /// - Otherwise (unknown leader, or leader peer has no clientPort) → empty.
+    std::string leaderClientEndpoint() const noexcept;
+
 private:
     // -----------------------------------------------------------------------
     // Helpers

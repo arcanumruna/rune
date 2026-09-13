@@ -121,6 +121,16 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_subscribe_tests
                 PROPERTIES TIMEOUT 180)
+
+            # GB-4: Data-op REDIRECT to leader (Produce/Subscribe require leader)
+            add_executable(rune_gateway_data_op_redirect_tests
+                tests/integration/GatewayDataOpRedirectTest.cpp)
+            target_link_libraries(rune_gateway_data_op_redirect_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_data_op_redirect_tests
+                PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()

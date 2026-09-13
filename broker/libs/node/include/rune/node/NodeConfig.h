@@ -1,11 +1,13 @@
 #pragma once
-// NodeConfig.h — env-driven broker node configuration (BR-1, BR-3b, GB-1)
+// NodeConfig.h — env-driven broker node configuration (BR-1, BR-3b, GB-1, GB-4)
 //
 // Environment variables:
 //   RUNE_NODE_ID           — int32, this node's id. Required. Must equal some peer's id.
-//   RUNE_PEERS             — comma-separated id@host:consensusPort entries.
+//   RUNE_PEERS             — comma-separated id@host:consensusPort[:clientPort] entries.
 //                            Required, non-empty. Ids must be unique and include RUNE_NODE_ID.
-//                            Example: "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"
+//                            Example (with client ports): "0@rune-1:40111:40200,1@rune-2:40111:40200,2@rune-3:40111:40200"
+//                            Example (without client ports): "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"
+//                            Backward-compatible: omitting :clientPort → clientPort=0 (no known client endpoint).
 //                            Whitespace around commas and entries is trimmed.
 //   RUNE_CLIENT_ENDPOINT   — host:port for the client gateway (Required).
 //                            Built into "aeron:udp?endpoint=host:port".
@@ -50,9 +52,13 @@ struct PeerConfig {
     int32_t  id            = -1;
     std::string host;
     uint16_t consensusPort = 0;
+    uint16_t clientPort    = 0;  // 0 = no known client endpoint (GB-4, backward-compatible)
 
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
+
+    /// "aeron:udp?endpoint=<host>:<clientPort>" — empty string if clientPort == 0.
+    std::string clientChannel() const;
 };
 
 struct ClientEndpoint {

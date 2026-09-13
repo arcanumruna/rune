@@ -68,8 +68,11 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
     return true;
 }
 
-/// Parse one peer entry of the form "id@host:port". Returns an error string
-/// on failure or an empty string on success.
+/// Parse one peer entry of the form "id@host:consensusPort[:clientPort]".
+/// The clientPort segment is optional (GB-4, backward-compatible):
+///   - "1@host:40111"        → consensusPort=40111, clientPort=0 (no client endpoint)
+///   - "1@host:40111:40200"  → consensusPort=40111, clientPort=40200
+/// Returns an error string on failure or an empty string on success.
 static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     auto at = entry.find('@');
     if (at == std::string_view::npos)
@@ -82,23 +85,50 @@ static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     if (!parseInt32(idPart, id))
         return std::string("peer id is not a valid integer in entry: ") + std::string(entry);
 
-    auto colon = hostPort.rfind(':');
-    if (colon == std::string_view::npos)
+    // Count colons in hostPort to distinguish two-segment (host:cPort) from
+    // three-segment (host:cPort:kPort) formats.
+    // We split on the FIRST colon for host, then look for an optional third segment.
+    auto firstColon = hostPort.find(':');
+    if (firstColon == std::string_view::npos)
         return std::string("malformed peer entry (missing ':' in host:port): ") + std::string(entry);
 
-    std::string_view host     = trim(hostPort.substr(0, colon));
-    std::string_view portPart = trim(hostPort.substr(colon + 1));
+    std::string_view host        = trim(hostPort.substr(0, firstColon));
+    std::string_view remainder   = trim(hostPort.substr(firstColon + 1));
 
     if (host.empty())
         return std::string("peer host is empty in entry: ") + std::string(entry);
 
-    uint16_t port{};
-    if (!parsePort(portPart, port))
-        return std::string("peer port is invalid or out of range in entry: ") + std::string(entry);
+    // remainder is either "consensusPort" or "consensusPort:clientPort".
+    auto secondColon = remainder.find(':');
+
+    std::string_view consensusPortPart;
+    std::string_view clientPortPart;
+    bool hasClientPort = false;
+
+    if (secondColon == std::string_view::npos) {
+        // Two-segment: no clientPort.
+        consensusPortPart = remainder;
+    } else {
+        // Three-segment: consensusPort:clientPort.
+        consensusPortPart = trim(remainder.substr(0, secondColon));
+        clientPortPart    = trim(remainder.substr(secondColon + 1));
+        hasClientPort     = true;
+    }
+
+    uint16_t consensusPort{};
+    if (!parsePort(consensusPortPart, consensusPort))
+        return std::string("peer consensusPort is invalid or out of range in entry: ") + std::string(entry);
+
+    uint16_t clientPort = 0;
+    if (hasClientPort) {
+        if (!parsePort(clientPortPart, clientPort))
+            return std::string("peer clientPort is invalid or out of range in entry: ") + std::string(entry);
+    }
 
     out.id            = id;
     out.host          = std::string(host);
-    out.consensusPort = port;
+    out.consensusPort = consensusPort;
+    out.clientPort    = clientPort;
     return {};
 }
 
@@ -110,6 +140,11 @@ static std::string parsePeer(std::string_view entry, PeerConfig& out) {
 
 std::string PeerConfig::consensusChannel() const {
     return "aeron:udp?endpoint=" + host + ":" + std::to_string(consensusPort);
+}
+
+std::string PeerConfig::clientChannel() const {
+    if (clientPort == 0) return {};  // no known client endpoint
+    return "aeron:udp?endpoint=" + host + ":" + std::to_string(clientPort);
 }
 
 // ---------------------------------------------------------------------------

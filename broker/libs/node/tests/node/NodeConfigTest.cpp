@@ -525,4 +525,111 @@ TEST(NodeConfigTest, TopicsLargePartitionCount) {
     EXPECT_EQ(r.config->topics[0].partitionCount, 64);
 }
 
+// ---------------------------------------------------------------------------
+// Per-peer client ports (GB-4)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, PeerWithClientPort_ParsesCorrectly) {
+    // Three-segment format: id@host:consensusPort:clientPort
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@rune-1:40111:40200,1@rune-2:40111:40200,2@rune-3:40111:40200";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->peers.size(), 3u);
+
+    EXPECT_EQ(r.config->peers[0].clientPort, 40200u);
+    EXPECT_EQ(r.config->peers[1].clientPort, 40200u);
+    EXPECT_EQ(r.config->peers[2].clientPort, 40200u);
+}
+
+TEST(NodeConfigTest, PeerWithClientPort_ClientChannelFormat) {
+    PeerConfig p;
+    p.host          = "rune-2";
+    p.consensusPort = 40111;
+    p.clientPort    = 40200;
+    EXPECT_EQ(p.clientChannel(), "aeron:udp?endpoint=rune-2:40200");
+}
+
+TEST(NodeConfigTest, PeerWithoutClientPort_ClientChannelEmpty) {
+    // Backward-compatible: omitting :clientPort → clientPort=0 → clientChannel()=""
+    PeerConfig p;
+    p.host          = "rune-2";
+    p.consensusPort = 40111;
+    p.clientPort    = 0;
+    EXPECT_TRUE(p.clientChannel().empty())
+        << "clientChannel() must be empty when clientPort == 0";
+}
+
+TEST(NodeConfigTest, PeerBackwardCompat_NoClientPort_ParsesOk) {
+    // Existing "id@host:port" format (no clientPort) must still parse correctly.
+    auto env = base3node();
+    // base3node already uses two-segment format — verify clientPort=0.
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    for (const auto& peer : r.config->peers) {
+        EXPECT_EQ(peer.clientPort, 0u)
+            << "Peer without clientPort must have clientPort=0";
+        EXPECT_TRUE(peer.clientChannel().empty())
+            << "Peer without clientPort must have empty clientChannel()";
+    }
+}
+
+TEST(NodeConfigTest, PeerMixedClientPorts_ParsesOk) {
+    // Mixed: some peers with clientPort, some without.
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@rune-1:40111:40200,1@rune-2:40111,2@rune-3:40111:40201";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->peers.size(), 3u);
+
+    // Sorted by id: 0, 1, 2
+    EXPECT_EQ(r.config->peers[0].clientPort, 40200u);
+    EXPECT_EQ(r.config->peers[1].clientPort, 0u);
+    EXPECT_EQ(r.config->peers[2].clientPort, 40201u);
+
+    EXPECT_EQ(r.config->peers[0].clientChannel(), "aeron:udp?endpoint=rune-1:40200");
+    EXPECT_TRUE(r.config->peers[1].clientChannel().empty());
+    EXPECT_EQ(r.config->peers[2].clientChannel(), "aeron:udp?endpoint=rune-3:40201");
+}
+
+TEST(NodeConfigTest, PeerClientPortZeroIsError) {
+    // Explicit :0 clientPort must be rejected (invalid port).
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@rune-1:40111:0,1@rune-2:40111,2@rune-3:40111";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty())
+        << "clientPort=0 must be rejected (invalid port)";
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, PeerClientPortOutOfRangeIsError) {
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@rune-1:40111:70000,1@rune-2:40111,2@rune-3:40111";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty())
+        << "clientPort > 65535 must be rejected";
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, PeerClientPortNonIntIsError) {
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@rune-1:40111:notaport,1@rune-2:40111,2@rune-3:40111";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty())
+        << "Non-integer clientPort must be rejected";
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, ConsensusChannelUnaffectedByClientPort) {
+    // Adding clientPort must not change the consensusChannel output.
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@rune-1:40111:40200,1@rune-2:40111:40200,2@rune-3:40111:40200";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+
+    EXPECT_EQ(r.config->peers[0].consensusChannel(), "aeron:udp?endpoint=rune-1:40111");
+    EXPECT_EQ(r.config->peers[1].consensusChannel(), "aeron:udp?endpoint=rune-2:40111");
+    EXPECT_EQ(r.config->peers[2].consensusChannel(), "aeron:udp?endpoint=rune-3:40111");
+}
+
 } // namespace rune::node

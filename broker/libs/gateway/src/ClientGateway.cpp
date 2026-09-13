@@ -574,6 +574,11 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // Flow:
 //   1. Decode Produce (tid16) — drop on truncation.
 //   2. Require known session — drop (UnknownSession) if not found.
+//   GB-4: Check leadership BEFORE touching the engine.
+//     - NOT leader + known leaderClientEndpoint → ErrorResponse{Redirect, endpoint},
+//       engine untouched.
+//     - NOT leader + unknown endpoint → ErrorResponse{NotLeader}, engine untouched.
+//     - Leader → serve (existing path).
 //   3. Resolve partition: explicit when partitionKnown==1, else partitionForKey().
 //   4. Lookup Log* from registry; reply error on unknown topic / bad partition.
 //   5. Assign offsets (CRC-safe restamp):
@@ -612,6 +617,37 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (!session) {
         spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
         return;
+    }
+
+    // GB-4: Leadership check — data ops MUST reach the leader (correctness).
+    // // TODO(future): optional internal proxy for single-endpoint transparency.
+    if (leaderView_) {
+        const LeaderView lv = leaderView_();
+        if (!lv.isLeader) {
+            pc::ErrorResponse errResp;
+            errResp.sessionId     = msg.sessionId;
+            errResp.correlationId = msg.correlationId;
+            if (!lv.leaderClientEndpoint.empty()) {
+                // Known leader endpoint → redirect.
+                errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+                errResp.message = lv.leaderClientEndpoint;
+                spdlog::debug("ClientGateway: Produce redirect sessionId={} → {}",
+                              msg.sessionId, lv.leaderClientEndpoint);
+            } else {
+                // Leader unknown → NotLeader (client backs off + retries).
+                errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                spdlog::debug("ClientGateway: Produce NotLeader (endpoint unknown) sessionId={}",
+                              msg.sessionId);
+            }
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2 +
+                                       errResp.message.size();
+            if (needed <= scratch_.size()) {
+                const std::size_t encoded = errResp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+            }
+            return;  // engine untouched
+        }
     }
 
     // Helper: send ProduceResponse on the session egress.
@@ -797,6 +833,11 @@ ClientGateway::resolvePublication(const std::string& channel, int32_t streamId)
 // Flow:
 //   1. Decode Subscribe — drop on truncation.
 //   2. Require known session — drop on unknown session (no egress to reply on).
+//   GB-4: Check leadership BEFORE touching the engine.
+//     - NOT leader + known leaderClientEndpoint → ErrorResponse{Redirect, endpoint},
+//       engine untouched, no subscription registered.
+//     - NOT leader + unknown endpoint → ErrorResponse{NotLeader}, engine untouched.
+//     - Leader → serve (existing path).
 //   3. Resolve partition: explicit (partitionKnown=1) or partitionForKey().
 //   4. Validate topic + partition → SubscribeResponse{error} on failure.
 //   5. Clamp fromOffset:
@@ -822,6 +863,37 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (!session) {
         spdlog::debug("ClientGateway: Subscribe for unknown sessionId={} — dropped", msg.sessionId);
         return;
+    }
+
+    // GB-4: Leadership check — data ops MUST reach the leader (correctness).
+    // // TODO(future): optional internal proxy for single-endpoint transparency.
+    if (leaderView_) {
+        const LeaderView lv = leaderView_();
+        if (!lv.isLeader) {
+            pc::ErrorResponse errResp;
+            errResp.sessionId     = msg.sessionId;
+            errResp.correlationId = msg.correlationId;
+            if (!lv.leaderClientEndpoint.empty()) {
+                // Known leader endpoint → redirect.
+                errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+                errResp.message = lv.leaderClientEndpoint;
+                spdlog::debug("ClientGateway: Subscribe redirect sessionId={} → {}",
+                              msg.sessionId, lv.leaderClientEndpoint);
+            } else {
+                // Leader unknown → NotLeader (client backs off + retries).
+                errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                spdlog::debug("ClientGateway: Subscribe NotLeader (endpoint unknown) sessionId={}",
+                              msg.sessionId);
+            }
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2 +
+                                       errResp.message.size();
+            if (needed <= scratch_.size()) {
+                const std::size_t encoded = errResp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+            }
+            return;  // engine untouched, no subscription registered
+        }
     }
 
     // Helper: send SubscribeResponse on the session egress.

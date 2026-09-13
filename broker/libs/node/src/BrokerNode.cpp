@@ -284,19 +284,19 @@ void BrokerNode::buildGateway() {
     const int32_t     clientStreamId = config_.clientEndpoint.streamId;
     const int32_t     nodeId         = config_.nodeId;
 
-    // leaderView: read atomic isLeader(); never touches raw Election state.
+    // leaderView: read atomic isLeader() + leaderClientEndpoint() (GB-4).
     //
-    // Milestone-A ruling: followers return leaderClientEndpoint="" so the gateway
-    // degrades to local-accept (BR-5 empty-endpoint path).  The redirect-with-
-    // endpoint branch in ClientGateway::handleConnect MUST NOT fire on this path —
-    // it would trigger the synchronous resolvePublication and block the consensus
-    // thread.  This is safe because the empty endpoint forces the local-accept path.
-    // TODO(Milestone B): supply per-peer client endpoints to enable exact REDIRECT.
-    auto leaderViewFn = [this, clientChannel]() -> rune::gateway::LeaderView {
+    // Milestone-B ruling: supply per-peer client endpoints for exact REDIRECT.
+    //   - leader → {isLeader=true, leaderClientEndpoint=""}  (no self-redirect)
+    //   - follower + known leader endpoint → {isLeader=false, leaderClientEndpoint=<peer channel>}
+    //   - follower + unknown endpoint → {isLeader=false, leaderClientEndpoint=""}
+    //     (gateway degrades to local-accept for Connect; data ops return NotLeader)
+    // Both isLeader() and leaderClientEndpoint() are observer-thread-safe (atomic reads).
+    auto leaderViewFn = [this]() -> rune::gateway::LeaderView {
         const bool leader = this->isLeader();
         return rune::gateway::LeaderView{
             /*isLeader=*/leader,
-            /*leaderClientEndpoint=*/leader ? clientChannel : std::string{}
+            /*leaderClientEndpoint=*/leader ? std::string{} : this->leaderClientEndpoint()
         };
     };
 
@@ -400,6 +400,26 @@ NodeId BrokerNode::leaderId() const noexcept {
     // Single-node (BR-2) path: derive from atomic stateCode.
     if (isLeader()) return static_cast<NodeId>(config_.nodeId);
     return -1; // kNullValue — no leader known yet
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::leaderClientEndpoint (GB-4)
+// ---------------------------------------------------------------------------
+std::string BrokerNode::leaderClientEndpoint() const noexcept {
+    // If this node is the leader, no redirect to self.
+    if (isLeader()) return {};
+
+    const NodeId lid = leaderId();
+    if (lid < 0) return {};  // leader unknown — no endpoint
+
+    // Find the leader peer in the immutable config and return its clientChannel.
+    // config_.peers is sorted by id, so linear scan is bounded and fast.
+    for (const auto& peer : config_.peers) {
+        if (static_cast<NodeId>(peer.id) == lid) {
+            return peer.clientChannel();  // empty if clientPort == 0
+        }
+    }
+    return {};  // leader id not found in peer list (should not happen)
 }
 
 // ---------------------------------------------------------------------------

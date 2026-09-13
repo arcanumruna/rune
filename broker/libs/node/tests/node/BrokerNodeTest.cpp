@@ -296,6 +296,45 @@ TEST(BrokerNodeTest, DtorAfterExplicitStop_NoCrash) {
 }
 
 // ===========================================================================
+// TEST 11: leaderClientEndpoint() — single-node (leader=self → empty).
+//
+// On a single-node cluster, the node self-elects: isLeader()==true.
+// leaderClientEndpoint() must return empty (no self-redirect).
+// ===========================================================================
+TEST(BrokerNodeTest, LeaderClientEndpoint_SingleNode_LeaderSelf_ReturnsEmpty) {
+    TempDir tmp{"t11_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    // Give the self-peer a clientPort so we can verify the empty-on-leader rule.
+    cfg.peers[0].clientPort = 50001;  // self has known client endpoint
+
+    BrokerNode node{cfg};
+    node.start();
+
+    ASSERT_TRUE(node.awaitLeader(2s))
+        << "1-node cluster should self-elect within 2 s";
+    ASSERT_TRUE(node.isLeader());
+
+    // Leader → no self-redirect.
+    EXPECT_TRUE(node.leaderClientEndpoint().empty())
+        << "leaderClientEndpoint() must be empty when this node IS the leader";
+
+    node.stop();
+}
+
+// ===========================================================================
+// TEST 12: leaderClientEndpoint() — before start (no leader known → empty).
+// ===========================================================================
+TEST(BrokerNodeTest, LeaderClientEndpoint_BeforeStart_ReturnsEmpty) {
+    TempDir tmp{"t12_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    BrokerNode node{cfg};
+    // Not started → no election → leaderId() == -1 → empty endpoint.
+    EXPECT_TRUE(node.leaderClientEndpoint().empty())
+        << "leaderClientEndpoint() must be empty before start()";
+}
+
+// ===========================================================================
 // TEST 10: NodeConsensusAgent leader-id state-machine mapping (FIX G).
 //
 // Table-driven coverage of the updateObservedLeader() switch in
