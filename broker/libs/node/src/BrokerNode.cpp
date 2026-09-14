@@ -376,7 +376,7 @@ void BrokerNode::buildReplication() {
             pcfg.selfId               = selfId;
             pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
             pcfg.replicaLagMaxOffset  = 10'000;
-            pcfg.minIsr               = 1;
+            pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
             pcfg.fetchIntervalNs      = 5'000'000LL;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
             pcfg.maxFetchBytes        = 1 << 20;
@@ -486,6 +486,13 @@ void BrokerNode::buildGateway() {
         // append so the leader replica's tracked LEO/HW is reconciled and followers
         // can fetch the new bytes (Mode A seam — no double-append).
         gateway_->setReplicaRegistry(replicaRegistry_.get());
+
+        // M1: Apply the cluster-majority minIsr gate for acks=All produces.
+        // gatewayMinIsr is computed from the peer count (or RUNE_MIN_ISR env override)
+        // during parseNodeConfig; single-node → 1 (leader-only ISR is sufficient).
+        gateway_->setMinIsr(config_.gatewayMinIsr);
+        spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
+                     nodeId, config_.gatewayMinIsr, config_.peers.size());
     } catch (const std::exception& ex) {
         spdlog::warn("BrokerNode[{}]: ClientGateway construction failed: {}; proceeding without gateway",
                      nodeId, ex.what());

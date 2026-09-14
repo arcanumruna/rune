@@ -26,6 +26,8 @@
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
 //   RUNE_ELECTION_STATUS_INTERVAL_MS — int64 ms, default 20. Canvass/heartbeat cadence.
 //   RUNE_STARTUP_CANVASS_TIMEOUT_MS — int64 ms, default 100. Extended canvass on first boot.
+//   RUNE_MIN_ISR                    — int32, minimum ISR size for acks=All gate. Default:
+//                                     majority = |peers|/2+1 (e.g. 2 for 3 nodes, 1 for 1 node).
 //
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
@@ -96,6 +98,13 @@ struct NodeConfig {
     // Default 10 000 ms (10 s) matches the PartitionConfig default.
     // Tests may set a lower value (e.g. 500 ms) for faster ISR shrink in kill scenarios.
     int64_t replicaLagMaxMs = 10'000;
+
+    // Minimum ISR size gate for acks=All produces — GR-5 [M1].
+    // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
+    // Set to 1 for single-node deployments (leader-only ISR is the whole cluster).
+    // Overridable at runtime via RUNE_MIN_ISR env var.
+    // Also forwarded to PartitionConfig::minIsr in buildReplication().
+    int32_t gatewayMinIsr = 1;
 
     /// Returns the peer entry whose id == nodeId.
     /// Precondition: parse succeeded (peers non-empty, nodeId in peers).

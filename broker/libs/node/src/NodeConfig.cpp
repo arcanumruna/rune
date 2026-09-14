@@ -314,6 +314,20 @@ ConfigResult parseNodeConfig(
         if (!err.empty()) return {{}, err};
     }
 
+    // --- RUNE_MIN_ISR (optional) — M1: minimum ISR size for acks=All gate ---
+    // Default: majority = |peers|/2+1 (1 for single-node, 2 for 3-node, etc.)
+    {
+        const int32_t majority = static_cast<int32_t>(cfg.peers.size()) / 2 + 1;
+        cfg.gatewayMinIsr = majority; // may be overridden below
+        const char* rawMinIsr = getenv_fn("RUNE_MIN_ISR");
+        if (rawMinIsr && !std::string_view(rawMinIsr).empty()) {
+            int32_t v{};
+            if (!parseInt32(rawMinIsr, v) || v < 1)
+                return {{}, std::string("RUNE_MIN_ISR must be a positive integer, got: ") + rawMinIsr};
+            cfg.gatewayMinIsr = v;
+        }
+    }
+
     // --- RUNE_TOPICS (optional) ---
     // Format: comma-separated "name:partitionCount" entries.
     // Empty/absent → no topics (valid — produce/subscribe returns UnknownTopic).

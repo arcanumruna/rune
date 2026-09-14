@@ -632,4 +632,50 @@ TEST(NodeConfigTest, ConsensusChannelUnaffectedByClientPort) {
     EXPECT_EQ(r.config->peers[2].consensusChannel(), "aeron:udp?endpoint=rune-3:40111");
 }
 
+// ---------------------------------------------------------------------------
+// M1: gatewayMinIsr — majority default + RUNE_MIN_ISR env override
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, GatewayMinIsr_DefaultMajority_SingleNode) {
+    // Single-node cluster: majority = 1/2+1 = 1.
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->gatewayMinIsr, 1)
+        << "single-node cluster must have gatewayMinIsr=1";
+}
+
+TEST(NodeConfigTest, GatewayMinIsr_DefaultMajority_ThreeNodes) {
+    // 3-node cluster: majority = 3/2+1 = 2.
+    auto r = parseNodeConfig(fakeEnv(base3node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->gatewayMinIsr, 2)
+        << "3-node cluster must default gatewayMinIsr to majority=2";
+}
+
+TEST(NodeConfigTest, GatewayMinIsr_EnvOverride) {
+    // RUNE_MIN_ISR=3 overrides the 3-node majority default.
+    auto env = base3node();
+    env["RUNE_MIN_ISR"] = "3";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->gatewayMinIsr, 3)
+        << "RUNE_MIN_ISR env var must override default majority";
+}
+
+TEST(NodeConfigTest, GatewayMinIsr_EnvZeroRejected) {
+    auto env = base3node();
+    env["RUNE_MIN_ISR"] = "0";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty()) << "RUNE_MIN_ISR=0 must be rejected (must be >= 1)";
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, GatewayMinIsr_EnvNonIntegerRejected) {
+    auto env = base3node();
+    env["RUNE_MIN_ISR"] = "bad";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty()) << "RUNE_MIN_ISR=bad must be rejected";
+    EXPECT_FALSE(r.config.has_value());
+}
+
 } // namespace rune::node

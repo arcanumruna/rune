@@ -1522,15 +1522,16 @@ void ClientGateway::pushSubscriptions()
 //   - An acks=All ack ONLY fires when HW >= lastOffset (majority-durable).
 //   - An acks=All ack is NEVER sent with errorCode=OK if HW < lastOffset.
 //   - Timeout path: sends Internal (error) — NEVER an erroneous OK.
-//   - Acks for a given (session, partition) respect produce order: entries are
-//     appended in produce order and drained FIFO (vector traversal is sequential).
-//     An entry at index i is always enqueued before i+1 (same duty-cycle thread),
-//     and drain checks them in order — so a stuck entry does NOT block later
-//     entries from acking (they each check HW independently).  This is safe
-//     because each batch has its own lastOffset and HW is monotonically
-//     non-decreasing: if HW >= lastOffset[i+1] then HW >= lastOffset[i] as well
-//     (batches are sequential; lastOffset is monotonically increasing).
-//     We therefore drain in vector order without a separate per-partition queue.
+//   - Produce-order is NOT relied on: swap-and-pop (erase-by-swap-back-pop) can
+//     reorder the vector on removal, so positional order is not guaranteed after
+//     the first eviction.  This is correct because each entry carries its own
+//     lastOffset and the HW check is purely per-entry (HW >= lastOffset).
+//     Every entry resolves independently; a stuck entry does NOT block later
+//     entries from acking.  This is safe because HW is monotonically
+//     non-decreasing: once HW >= lastOffset[n], the same HW automatically
+//     satisfies all earlier batches in the same partition sequence.
+//     Future maintainers: do NOT rely on positional vector order for
+//     per-session or per-partition sequencing — the swap-and-pop is intentional.
 //
 // Zero-alloc: no heap allocation on any code path.  Erase-by-swap-back-pop
 // ensures amortised O(1) removal at arbitrary positions.
@@ -1542,7 +1543,9 @@ void ClientGateway::drainPendingAcks()
     if (pendingAcks_.empty()) return;
 
     // Iterate with index (not iterator) because we swap-and-pop, which invalidates
-    // iterators.  Process from front to back (FIFO order for per-session/partition).
+    // iterators.  Traversal is front-to-back; positional order is not maintained
+    // across removals (swap-and-pop reorders entries).  Each entry resolves
+    // independently via its own HW check — no positional ordering is required.
     for (std::size_t i = 0; i < pendingAcks_.size(); ) {
         PendingAck& entry = pendingAcks_[i];
 
