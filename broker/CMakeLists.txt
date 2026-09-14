@@ -85,7 +85,8 @@ if(BUILD_BENCHMARKS)
         benchmark/CoordinationBenchmark.cpp
         benchmark/TransactionBenchmark.cpp
         benchmark/GatewayBench.cpp
-        benchmark/GatewayDataBench.cpp)
+        benchmark/GatewayDataBench.cpp
+        benchmark/ProduceMajorityAckBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway benchmark::benchmark)
     if(aeron_FOUND)
