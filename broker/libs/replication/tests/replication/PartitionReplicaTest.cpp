@@ -3192,22 +3192,20 @@ TEST(GR10_PushOnAppend, GapPushNotAppliedOutOfOrder) {
 
 // ---------------------------------------------------------------------------
 // GR10_6: Stale-epoch push is ignored by the follower.
-// Build a follower at epoch 2; send it a push with epoch 1 (stale).
-// The follower's epoch-fence path: leaderEpoch(1) < epoch_(2) → resp is not
-// an epoch upgrade, so the existing applyReplicated() path falls through.
-// Actually: the epoch-upgrade guard only fires when resp.leaderEpoch > epoch_.
-// A push with resp.leaderEpoch < epoch_ will not truncate (correct), but will
-// it try to append?  Check: applyReplicated() skips epoch-upgrade, then tries
-// to append records — the batchBase in those records is for the old epoch's
-// offsets, which may collide with the new epoch's log.
+// GR10_6 (revised): stale-epoch push from a deposed leader must be DROPPED by
+// the follower's applyReplicated() — not appended.
 //
-// The real fencing happens in onFetchRequest() → sends kErrStaleEpoch back.
-// But for an UNSOLICITED push (pushed by a leader before it knows its stale),
-// the follower must detect the old epoch and drop it.
+// Scenario: follower is at epoch=2 (becomeFollower was called after a new
+// election).  A deposed epoch=1 leader, unaware it was replaced, sends an
+// unsolicited push (FetchResponseMsg with leaderEpoch=1).  Before GR-10's
+// fence fix, applyReplicated() would fall through the epoch-upgrade guard
+// (which only fires on leaderEpoch > epoch_) and append the stale records,
+// corrupting the follower log with data from the wrong epoch.
 //
-// Implementation test: we manually call applyReplicated() with a stale-epoch
-// FetchResponseMsg (leaderEpoch=0, follower at epoch=1) and verify the
-// follower log does NOT advance (resp is from a stale leader → skip).
+// Fix: applyReplicated() now returns immediately when resp.leaderEpoch < epoch_,
+// dropping the frame entirely.  This test asserts:
+//   1. Follower log does NOT advance (LEO stays at preLeo).
+//   2. Follower epoch does NOT downgrade to 1.
 // ---------------------------------------------------------------------------
 TEST(GR10_PushOnAppend, StaleEpochPushIgnoredByFollower) {
     TempDir dL("gr10_6_L"), dF("gr10_6_F");
@@ -3227,16 +3225,14 @@ TEST(GR10_PushOnAppend, StaleEpochPushIgnoredByFollower) {
     transport.setLeader(&leader);
     transport.addFollower(kF, &follower);
 
-    // Put follower at epoch=2 (simulate having received a new leader's response).
-    // We do this via becomeFollower — which just sets epoch_ and role_.
+    // Advance follower to epoch=2 (simulates a completed re-election).
     follower.becomeFollower(/*leaderEpoch=*/2, kL);
 
-    Offset preLeo = follower.logEndOffset();
+    const Offset preLeo = follower.logEndOffset();
 
-    // Craft a FetchResponse with epoch=1 (stale — below follower's epoch=2).
-    // This is an unsolicited push from a stale leader that doesn't know it's stale.
+    // Craft a FetchResponse with leaderEpoch=1 (stale — below follower's epoch=2).
+    // Simulates an unsolicited push from the now-deposed epoch=1 leader.
     static std::vector<uint8_t> scratch(256 * 1024, 0);
-    // Build a small record payload (raw bytes — will go through fallback path in applyReplicated).
     std::vector<uint8_t> fakeRecords(16, 0xCC);
     FetchResponseMsg::encode(scratch.data(), 0,
         /*leaderEpoch=*/1,    // STALE (follower is at epoch 2)
@@ -3247,25 +3243,18 @@ TEST(GR10_PushOnAppend, StaleEpochPushIgnoredByFollower) {
         std::span<const uint8_t>(fakeRecords.data(), fakeRecords.size()));
     auto staleResp = FetchResponseMsg::decode(scratch.data(), 0);
 
-    // Apply the stale-epoch push directly.
-    // applyReplicated: leaderEpoch(1) < follower.epoch_(2) → epoch-upgrade guard
-    // does NOT fire (only fires when resp.leaderEpoch > epoch_). The records
-    // will be attempted but the offsets won't match (fallback makeBatch path
-    // at LEO=0). Actually they WILL be appended in the fallback path...
-    //
-    // This test validates the current behavior: a push with leaderEpoch < epoch_
-    // does NOT trigger truncation (correct) but the records ARE appended (existing
-    // behavior — epoch fencing only guards UPGRADES).  For unsolicited pushes
-    // from stale leaders, the real guard is the transport layer (Aeron pub auth).
-    // In the InMemoryTransport test, we document this as expected behavior.
-    //
-    // The key invariant verified: follower's epoch does NOT downgrade to 1.
+    // Apply the stale-epoch push directly — this must be a no-op.
     follower.applyReplicated(staleResp);
 
-    // Epoch must remain at 2 (not downgraded to 1 by the stale push).
+    // --- Assertions: stale push must be REJECTED, not appended ---
+
+    // 1. Log must not advance — stale records must not be written.
+    EXPECT_EQ(follower.logEndOffset(), preLeo)
+        << "GR-10 fencing: stale-epoch push must NOT append records to follower log";
+
+    // 2. Epoch must remain at 2 — stale push must not downgrade.
     EXPECT_EQ(follower.epoch(), 2)
-        << "GR-10: stale-epoch push must NOT downgrade follower epoch";
-    (void)preLeo; // stale-epoch append to log is expected in current design
+        << "GR-10 fencing: stale-epoch push must NOT downgrade follower epoch";
 }
 
 // ---------------------------------------------------------------------------

@@ -419,6 +419,22 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         return;
     }
 
+    // GR-10 stale-epoch fence: drop any push/response from a deposed leader.
+    //
+    // With push-on-append enabled, a leader that has just been deposed may
+    // send unsolicited FetchResponse frames before it learns it is stale.
+    // The follower has already incremented its epoch_ via becomeFollower();
+    // allowing the stale push to proceed would corrupt the follower's log
+    // with records from the wrong epoch.
+    //
+    // Fix: if resp.leaderEpoch < epoch_, the frame is from a deposed leader —
+    // drop it unconditionally.  The epoch-upgrade path (> epoch_) is kept for
+    // the rare case where a follower learns of a new epoch via a FetchResponse
+    // directly (future direct-fetch path).
+    if (resp.leaderEpoch < epoch_) {
+        return; // stale-epoch push — deposed leader must not mutate a newer follower's log
+    }
+
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = log_->logEndOffset();
     const Offset preHw  = followerHw_;

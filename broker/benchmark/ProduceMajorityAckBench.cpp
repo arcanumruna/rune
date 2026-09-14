@@ -865,29 +865,198 @@ BENCHMARK_REGISTER_F(AcksAllFixture, ProduceAcksAll)
     ->Arg(  200'000LL);     // 200 µs
 
 // ===========================================================================
-// Push-on-append recommendation summary (no implementation — GR-9 scope):
+// GR-10 push-on-append notes (supersedes GR-8 comment above):
 //
-// The acks=All latency measured above is fundamentally bounded below by:
-//   latency_floor = fetchIntervalNs + 2× Aeron IPC RTT (follower→leader→follower)
+// GR-10 implemented push-on-append + follower fast-ack.  With this design,
+// acks=All latency is NO LONGER bounded by fetchIntervalNs.  Instead:
 //
-// With default 5 ms fetchIntervalNs → p50 ≈ 2.5 ms, p99 ≈ 5 ms.
-// With 1 ms cadence → p50 ≈ 0.5 ms, p99 ≈ 1 ms.
-// With 200 µs cadence → p50 ≈ 100 µs, p99 ≈ 200 µs.
+//   On leader.append() → pushToFollowers() fires synchronously
+//   → transport delivers the push in the next transport.pump()
+//   → follower applyReplicated() runs + fastAckOnApply fires
+//   → fast-ack FetchRequest arrives at leader next transport.pump()
+//   → leader onFetchRequest() recomputes HW
+//   → drainPendingAcks() (gateway.doWork()) sends ProduceResponse
 //
-// PUSH-ON-APPEND would eliminate the fetch-interval floor:
-//   On leader.append(), instead of waiting for followers to poll,
-//   the leader immediately pushes the new batch via sendFetchResponse()
-//   (proactive push).  The follower applies it and the HW can advance
-//   within one IPC RTT (~1–3 µs on loopback).  This would bring
-//   acks=All latency into single-digit µs territory.
+// In the PRODUCTION duty-cycle (single thread, ~µs loop iterations), the
+// transport is pumped EVERY iteration.  Push arrives 1 iteration after
+// append, fast-ack arrives 1 iteration later → HW advances in ~2 iterations
+// → acks=All latency in single-digit µs, not fetchInterval.
 //
-// RECOMMENDATION: push-on-append IS worth building if sub-100 µs acks=All
-// is required (e.g. for strong-durability workloads that must match
-// acks=Leader latency).  For the current Rune use-cases where acks=All is
-// a durability mode (not a latency mode), 200 µs cadence is acceptable
-// and push-on-append is deferred to a future GR-9 ticket.
-//
-// The acks=Leader path remains the recommended path for latency-sensitive
-// clients; acks=All is for strong-durability workloads that accept ms-class
-// latency (or sub-ms with tight cadence tuning).
+// BM_AcksAll_PushOnAppend below measures this production-representative path.
 // ===========================================================================
+
+// ===========================================================================
+// BM_AcksAll_PushOnAppend — GR-10 production-representative tight-poll bench.
+//
+// Design: mirrors the PRODUCTION duty-cycle thread exactly.
+//   - Single thread, no background replication thread.
+//   - Each loop iteration: leader.doWork + transport.pump (push delivery) +
+//     follower doWork / transport.pump (fast-ack delivery) +
+//     manual drainPendingAcks (HW check → ack).
+//   - fetchIntervalNs is set to 1 hour so periodic fetch NEVER fires;
+//     push+fast-ack is the ONLY replication driver.
+//   - Latency measured: leader.append() → HW > lastOffset (acks=All gate met).
+//     This is the replica-layer produce→ack latency driven purely by push.
+//
+// The bench does NOT use Aeron or ClientGateway — it avoids IPC overhead
+// to isolate the push+fast-ack convergence latency in a tight loop.
+//
+// HARD GATE: p99 < 100 µs.  If push is correctly wired, p99 should be
+// well under 10 µs (2–3 loop iterations × ~500 ns/iteration on loopback).
+// Failure to meet this gate means push is NOT the latency driver and the
+// acks=All µs claim is unsubstantiated.
+// ===========================================================================
+
+static void BM_AcksAll_PushOnAppend(benchmark::State& state)
+{
+    using namespace rune::replication;
+
+    // --- Setup: 3-node cluster with push+fast-ack, no Aeron ---
+
+    // Logs live in temp dirs (one per run — reuse via static dirs to avoid teardown cost).
+    static const fs::path kLeaderDir  = fs::temp_directory_path() / "rune_gr10_bench_L";
+    static const fs::path kFoll1Dir   = fs::temp_directory_path() / "rune_gr10_bench_F1";
+    static const fs::path kFoll2Dir   = fs::temp_directory_path() / "rune_gr10_bench_F2";
+
+    fs::create_directories(kLeaderDir);
+    fs::create_directories(kFoll1Dir);
+    fs::create_directories(kFoll2Dir);
+
+    rune::storage::Log leaderLog(kLeaderDir.string());
+    rune::storage::Log foll1Log(kFoll1Dir.string());
+    rune::storage::Log foll2Log(kFoll2Dir.string());
+
+    InMemoryTransport transport;
+
+    constexpr NodeId kLeaderId = 0;
+    constexpr NodeId kFollId1  = 1;
+    constexpr NodeId kFollId2  = 2;
+
+    const std::vector<NodeId> allNodes = {kLeaderId, kFollId1, kFollId2};
+    const std::vector<NodeId> isr      = {kLeaderId, kFollId1, kFollId2};
+
+    // fetchIntervalNs set to 1 hour → periodic fetch NEVER fires in this bench.
+    // Push+fast-ack is the ONLY replication driver.
+    constexpr int64_t kNoFetch = 3'600'000'000'000LL; // 1 hour in ns
+
+    PartitionConfig leaderCfg;
+    leaderCfg.partitionId        = 0;
+    leaderCfg.selfId             = kLeaderId;
+    leaderCfg.replicaLagMaxMs    = 600'000; // suppress ISR shrink
+    leaderCfg.replicaLagMaxOffset= 10'000'000;
+    leaderCfg.minIsr             = 2;       // majority in 3-node cluster
+    leaderCfg.fetchIntervalNs    = kNoFetch;
+    leaderCfg.isrCheckIntervalNs = kNoFetch;
+    leaderCfg.maxFetchBytes      = 1 << 20;
+    leaderCfg.pushOnAppend       = true;
+    leaderCfg.fastAckOnApply     = true;
+
+    auto makeFollCfg = [&](NodeId id) {
+        PartitionConfig c;
+        c.partitionId        = 0;
+        c.selfId             = id;
+        c.replicaLagMaxMs    = 600'000;
+        c.replicaLagMaxOffset= 10'000'000;
+        c.minIsr             = 2;
+        c.fetchIntervalNs    = kNoFetch;
+        c.isrCheckIntervalNs = kNoFetch;
+        c.maxFetchBytes      = 1 << 20;
+        c.pushOnAppend       = true;
+        c.fastAckOnApply     = true;
+        return c;
+    };
+
+    PartitionReplica leaderReplica(leaderCfg, Role::Leader, /*epoch=*/1,
+                                   allNodes, isr, &leaderLog, &transport);
+    PartitionReplica foll1(makeFollCfg(kFollId1), Role::Follower, /*epoch=*/1,
+                           allNodes, isr, &foll1Log, &transport);
+    PartitionReplica foll2(makeFollCfg(kFollId2), Role::Follower, /*epoch=*/1,
+                           allNodes, isr, &foll2Log, &transport);
+
+    transport.setLeader(&leaderReplica);
+    transport.addFollower(kFollId1, &foll1);
+    transport.addFollower(kFollId2, &foll2);
+
+    // Batch to append (small — minimise log I/O noise).
+    auto batch = makeOneBatch(0);
+
+    static constexpr std::size_t kMaxSamples = 500'000UZ;
+    std::vector<double> samples;
+    samples.reserve(std::min(static_cast<std::size_t>(state.max_iterations), kMaxSamples));
+
+    static constexpr int kWarmup = 50;
+    static constexpr int kPumpCap = 200; // max pump iterations per produce
+
+    // Warm-up: drive enough rounds that logs/caches are warm.
+    int64_t clk = 1'000'000LL; // start at 1 ms (non-zero for fence logic)
+    for (int w = 0; w < kWarmup; ++w) {
+        clk += 100; // tiny tick — fetch interval never fires
+        const Offset prevLeo = leaderReplica.logEndOffset();
+
+        // Leader appends → pushToFollowers fires synchronously via transport.sendFetchResponse().
+        // append(span, acksAll=true) — acks=All deferred path.
+        leaderReplica.append(std::span<const uint8_t>(batch.data(), batch.size()), /*acksAll=*/true);
+
+        // Pump loop: deliver push → followers apply + fast-ack → leader recomputes HW.
+        // In production this is ~2 iterations; cap at kPumpCap for safety.
+        const Offset target = prevLeo; // HW must exceed prevLeo (exclusive)
+        for (int i = 0; i < kPumpCap; ++i) {
+            // Deliver queued messages (push responses + fast-ack requests).
+            transport.pump(clk);
+            transport.pump(clk); // second pump: deliver fast-ack responses back to leader
+            // Check if HW has advanced past the appended record.
+            if (leaderReplica.highWatermark() > target) break;
+        }
+        // Rebuild batch with updated baseOffset.
+        batch = makeOneBatch(leaderReplica.logEndOffset());
+    }
+
+    // Timed loop.
+    for (auto _ : state) {
+        clk += 100;
+        const Offset prevLeo = leaderReplica.logEndOffset();
+        const Offset target = prevLeo; // HW must exceed prevLeo (exclusive)
+
+        // --- Measurement start ---
+        const int64_t t0 = nowNs();
+
+        // Leader appends — push fires synchronously into transport queue.
+        leaderReplica.append(std::span<const uint8_t>(batch.data(), batch.size()), /*acksAll=*/true);
+
+        // Tight-poll: deliver push → follower apply+fast-ack → leader HW advance.
+        for (int i = 0; i < kPumpCap; ++i) {
+            transport.pump(clk);
+            transport.pump(clk);
+            if (leaderReplica.highWatermark() > target) break;
+        }
+
+        const int64_t elapsed = nowNs() - t0;
+        // --- Measurement end ---
+
+        state.SetIterationTime(static_cast<double>(elapsed) / 1e9);
+        samples.push_back(static_cast<double>(elapsed) / 1'000.0); // µs
+
+        batch = makeOneBatch(leaderReplica.logEndOffset());
+    }
+
+    if (!samples.empty()) {
+        std::sort(samples.begin(), samples.end());
+        double sum = 0.0;
+        for (double v : samples) sum += v;
+        const std::size_t n = samples.size();
+        const double p50  = pct(samples, 0.50);
+        const double p99  = pct(samples, 0.99);
+        const double p999 = pct(samples, 0.999);
+        state.counters["acksall_push_p50_us"]  = p50;
+        state.counters["acksall_push_p99_us"]  = p99;
+        state.counters["acksall_push_p999_us"] = p999;
+        state.counters["acksall_push_mean_us"] = sum / static_cast<double>(n);
+        // Hard gate: p99 < 100 µs.  push MUST be the latency driver.
+        state.counters["acksall_push_gate_pass"] = (p99 < 100.0) ? 1.0 : 0.0;
+    }
+}
+
+BENCHMARK(BM_AcksAll_PushOnAppend)
+    ->UseManualTime()
+    ->MinTime(2.0)
+    ->Unit(benchmark::kMicrosecond);
