@@ -768,15 +768,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     const int64_t lastOffset = base + static_cast<int64_t>(recordCount) - 1;
 
-    // Build a vector for the Log::append call (Log takes const std::vector<uint8_t>&).
-    // Single-writer: this is the unavoidable copy for offset-restamp storage.
-    // We reuse restampScratch_ as the source to avoid double-copy.
-    const std::vector<uint8_t> batchVec(
-        restampScratch_.data(),
-        restampScratch_.data() + batchLen);
-
+    // GB-5 Fix #2: use the zero-alloc span overload — no per-produce vector construction.
+    // restampScratch_ holds the restamp'd bytes; Log::append(ptr, len, lastOffset)
+    // writes directly from the scratch buffer → single copy into the segment, zero heap.
     try {
-        log->append(batchVec, lastOffset);
+        log->append(restampScratch_.data(), batchLen, lastOffset);
     } catch (const std::exception& ex) {
         spdlog::error("ClientGateway: Log::append threw: {}; ProduceResponse Internal", ex.what());
         sendResp(pc::ErrorCode::Internal, partition, 0);
@@ -950,6 +946,15 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // 5. Clamp fromOffset to [0, LEO].
     //    fromOffset < 0 → "from Latest" (LEO); fromOffset > LEO → clamp to LEO.
     //    Convention: negative fromOffset is the "Latest" sentinel documented in the brief.
+    //
+    // GB-5 Fix #5 — Sub-batch over-delivery (Kafka-consistent whole-batch semantics):
+    //    If fromOffset lands mid-batch (i.e., between the batch's baseOffset and its
+    //    last record offset), pushSubscriptions() will deliver the ENTIRE containing
+    //    batch starting at baseOffset — not just the records from fromOffset onward.
+    //    This is intentional (Kafka-compatible whole-batch delivery): the broker never
+    //    splits batches, so the client must filter sub-batch records client-side.
+    //    Example: batch [baseOffset=0, recordCount=5], fromOffset=3 → the whole batch
+    //    (offsets 0..4) is delivered; client drops records 0..2 and consumes 3..4.
     const int64_t leo = log->logEndOffset();
     int64_t nextOffset;
     if (msg.fromOffset < 0) {
@@ -1125,19 +1130,28 @@ void ClientGateway::pushSubscriptions()
             // The batch bytes are a zero-copy span into the chunk.
             const std::size_t needed =
                 pc::Records::BODY_FIXED + pc::MessageHeader::ENCODED_SIZE + 2u + batchSize;
+
+            // GB-5 Fix #1: on skip of a genuinely-unsendable batch, advance BOTH
+            // chunkPos AND sub.nextOffset so the subscription makes forward progress.
+            // Without this fix the subscription stalls permanently at the oversized
+            // batch, losing all subsequent records.
+            // This must NOT apply to normal (sendable) batches or back-pressured
+            // batches — only to batches that can never be encoded/sent.
             if (needed > kScratchSize) {
                 // Batch too large for scratch — skip (should not happen: u16 cap = 65535).
-                spdlog::warn("ClientGateway: push sub={} batch too large ({} > {}); skipping",
+                spdlog::warn("ClientGateway: push sub={} batch too large ({} > {}); skipping, advancing nextOffset",
                              subId, needed, kScratchSize);
                 chunkPos += batchSize;
+                sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                 continue;
             }
 
             // Also guard: Records uses a u16 length prefix for recordBatch.
             if (batchSize > 65535u) {
-                spdlog::warn("ClientGateway: push sub={} batchSize {} exceeds u16 max; skipping",
+                spdlog::warn("ClientGateway: push sub={} batchSize {} exceeds u16 max; skipping, advancing nextOffset",
                              subId, batchSize);
                 chunkPos += batchSize;
+                sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                 continue;
             }
 

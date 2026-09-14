@@ -55,23 +55,27 @@ void LogSegment::sync() {
     index_->sync();
 }
 
-int64_t LogSegment::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
-    // Guard: batch must be at least the size of record-batch overhead
-    if (batch.size() < static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead))
+int64_t LogSegment::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+    // Guard: batch must be at least the size of record-batch overhead.
+    if (len < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
         throw std::runtime_error("rune: batch smaller than record-batch overhead");
 
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
-        rune::protocol::RecordBatchReader r(batch.data(), batch.size());
+        rune::protocol::RecordBatchReader r(data, len);
         index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
     log_.seekp(0, std::ios::end);
-    log_.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(batch.size()));
-    logSize_ += static_cast<int64_t>(batch.size());
-    bytesSinceIndex_ += static_cast<int64_t>(batch.size());
+    log_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+    logSize_ += static_cast<int64_t>(len);
+    bytesSinceIndex_ += static_cast<int64_t>(len);
     nextOffset_ = lastOffset + 1;
     sync();  // B1+B2: durable-by-default — fsync .log + msync .index after every append
     return nextOffset_;
+}
+int64_t LogSegment::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
+    // Vector overload: delegate to the zero-alloc pointer overload.
+    return append(batch.data(), batch.size(), lastOffset);
 }
 
 std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {

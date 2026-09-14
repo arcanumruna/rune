@@ -749,8 +749,33 @@ TEST_F(GatewaySubscribeFixture, BackPressure_ExactlyOnce_Gate)
     }
     // Total: 60 records.
 
-    // Drive doWork + drain egress until all kBatches received.
-    // Alternate: drive a few doWork cycles, then drain egress to relieve back-pressure.
+    // GB-5 Fix #3: assert back-pressure actually occurred.
+    //
+    // Strategy: run exactly ONE doWork() without draining the egress.  Since
+    // pushSubscriptions() caps delivery at kMaxBatchesPerSubPerCycle (8) and we
+    // have kBatches (20) > 8, the first doWork can deliver at most 8 batches.
+    // Additionally, the tiny 64 KiB egress term + the ConnectResponse already
+    // sent may fill the ring and cause tryClaim to return back-pressure (pos <= 0)
+    // before the cap is hit.
+    //
+    // Either way: after exactly ONE doWork(), receivedBaseOffsets.size() MUST be
+    // < kBatches — proving that pushSubscriptions() paused and that nextOffset was
+    // preserved (no data loss).  The subsequent drain loop resumes delivery from
+    // the exact saved offset, exercising the full pause/resume path.
+    gw_->doWork(nowNs()); // one doWork — capped at kMaxBatchesPerSubPerCycle=8
+    egressSub->poll(combinedAsm.handler(), 32);
+    const std::size_t afterOneDoWork = receivedBaseOffsets.size();
+
+    // After one doWork we must have received FEWER than all kBatches:
+    // (a) the per-cycle cap (8) is smaller than kBatches (20), OR
+    // (b) the tiny egress term was full and tryClaim returned back-pressure.
+    // Either condition means the pause path ran.
+    EXPECT_LT(afterOneDoWork, static_cast<std::size_t>(kBatches))
+        << "BP gate: expected partial delivery after one doWork() cycle "
+        << "(max-per-cycle=" << 8 << ", kBatches=" << kBatches << "). "
+        << "Got " << afterOneDoWork << " — the pause/resume path was not reached.";
+
+    // Now drive to completion (drain egress between doWork bursts).
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + std::chrono::seconds{30};
     while (static_cast<int>(receivedBaseOffsets.size()) < kBatches &&
@@ -1147,6 +1172,108 @@ TEST_F(GatewaySubscribeFixture, MalformedSubscribe_ErrorCodes_NoGatewayCrash)
     ASSERT_TRUE(okResp.has_value());
     EXPECT_EQ(okResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
     EXPECT_GE(okResp->subscriptionId, 1);
+}
+
+// ===========================================================================
+// TEST 10: Reap-driven subscription drop (GB-5 Fix #4).
+//
+// Scenario: a session subscribes successfully, then times out via reapExpired()
+// (not an explicit Unsubscribe). Asserts:
+//   (a) subscriptionCount() drops to 0 after reap.
+//   (b) No crash or push attempt to the freed egress.
+//   (c) The gateway continues serving other sessions unaffected.
+//
+// Uses injected nowNs to drive reaping deterministically (no wall-clock wait).
+// ===========================================================================
+TEST_F(GatewaySubscribeFixture, ReapDriven_SubscriptionDrop_NocrashNoPush)
+{
+    // Use a very short session timeout (10 ms expressed in ns) so we can
+    // advance the clock past it without long waits.
+    // We must rebuild the gateway with a custom timeout for this test.
+    gw_.reset(); // destroy the fixture's gateway
+
+    constexpr int64_t kShortTimeoutNs = 10LL * 1'000'000LL; // 10 ms in ns
+
+    gw_ = std::make_unique<ClientGateway>(
+        aeron_,
+        "aeron:ipc",
+        kIngressStream + 100, // use a fresh stream to avoid residual traffic
+        kThisNodeId,
+        kShortTimeoutNs);
+    gw_->setTopicRegistry(registry_.get());
+
+    // Create the ingress publication on the new stream.
+    const int32_t reapEgressStream = kEgressBase + 100;
+    int64_t pubRegId = aeron_->addPublication("aeron:ipc", kIngressStream + 100);
+    int64_t subRegId = aeron_->addSubscription("aeron:ipc", reapEgressStream);
+
+    std::shared_ptr<aeron::Publication>  ingressPub;
+    std::shared_ptr<aeron::Subscription> egressSub;
+
+    pump([&]() {
+        if (!ingressPub) ingressPub = aeron_->findPublication(pubRegId);
+        if (!egressSub)  egressSub  = aeron_->findSubscription(subRegId);
+        return ingressPub && egressSub;
+    }, nullptr, nullptr, kPumpIter, "Reap resolve pub+sub");
+
+    // Connect.
+    auto connResp = doConnect(*ingressPub, *egressSub,
+                              reapEgressStream, "aeron:ipc",
+                              /*correlationId=*/100, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+    ASSERT_GE(sid, 1);
+    EXPECT_EQ(gw_->sessionCount(), 1u);
+
+    // Subscribe from 0.
+    sendSubscribe(*ingressPub, sid, /*corrId=*/1001,
+                  kTopicIdA, kPartitionA0, /*partitionKnown=*/1,
+                  /*fromOffset=*/0, /*isolation=*/0);
+
+    auto subResp = recvSubscribeResponse(*egressSub, "SubResp_Reap");
+    ASSERT_TRUE(subResp.has_value());
+    EXPECT_EQ(subResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(gw_->subscriptionCount(), 1u) << "Subscription should be registered";
+
+    // Produce some records so pushSubscriptions() has something to attempt.
+    directAppend(kTopicIdA, kPartitionA0, 3);
+
+    // Advance injected clock well past the session timeout to trigger reap.
+    // We use a large artificial nowNs: session was created at ~current wall time,
+    // so we pass nowNs = INT64_MAX / 2 to ensure nowNs - lastSeenNs > kShortTimeoutNs.
+    const int64_t reapNs = std::numeric_limits<int64_t>::max() / 2;
+    gw_->reapExpired(reapNs);
+
+    // After reap: both session and subscription must be gone.
+    EXPECT_EQ(gw_->sessionCount(),      0u) << "Session should be reaped by idle-timeout";
+    EXPECT_EQ(gw_->subscriptionCount(), 0u) << "Subscription should be dropped when session reaped";
+
+    // Run a few doWork cycles to confirm pushSubscriptions() handles the missing
+    // session gracefully (no crash, no push to the freed egress).
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_NO_THROW(gw_->doWork(reapNs))
+            << "doWork must not throw or crash after session reap at cycle " << i;
+    }
+
+    // Drain egress — expect NO Records (subscription was dropped).
+    std::vector<pc::Records> unexpectedRecords;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                      aeron::util::index_t offset,
+                                      aeron::util::index_t len,
+                                      aeron::Header&) {
+        auto dec = pc::Records::decode(
+            reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+            static_cast<std::size_t>(len));
+        if (dec) unexpectedRecords.push_back(*dec);
+    });
+    using clock = std::chrono::steady_clock;
+    const auto drainDeadline = clock::now() + std::chrono::milliseconds{300};
+    while (clock::now() < drainDeadline) {
+        gw_->doWork(reapNs);
+        egressSub->poll(asm_.handler(), 10);
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+    EXPECT_TRUE(unexpectedRecords.empty())
+        << "No Records should be pushed after reap-driven subscription drop";
 }
 
 } // namespace

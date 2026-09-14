@@ -320,11 +320,6 @@ private:
     // GB-3: Monotonic subscription ID generator (starts at 1).
     int64_t nextSubscriptionId_ = 0;
 
-    // GB-3: Pre-allocated scratch for iterating subscriptions per cycle
-    // (avoids heap allocation per doWork invocation).
-    // Populated in pushSubscriptions(); cleared at the start of each call.
-    std::vector<int64_t> deadSubScratch_;
-
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription
     // per doWork() cycle.  Prevents one busy subscription from starving others.
     static constexpr int kMaxBatchesPerSubPerCycle = 8;

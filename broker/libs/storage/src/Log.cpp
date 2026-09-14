@@ -34,10 +34,16 @@ void Log::maybeRoll() {
         segments_[base] = std::make_unique<LogSegment>(dir_, base);
     }
 }
-int64_t Log::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
+int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+    // Zero-alloc hot path: LogSegment::append(pointer) writes directly from the
+    // caller's buffer — no std::vector construction on the produce path.
     maybeRoll();
-    logEndOffset_ = activeSegment().append(batch, lastOffset);
+    logEndOffset_ = activeSegment().append(data, len, lastOffset);
     return logEndOffset_;
+}
+int64_t Log::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
+    // Vector overload: kept for API compatibility; delegates to the pointer overload.
+    return append(batch.data(), batch.size(), lastOffset);
 }
 std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
     auto it = segments_.upper_bound(startOffset);

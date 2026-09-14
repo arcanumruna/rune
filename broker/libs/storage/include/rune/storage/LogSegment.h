@@ -1,5 +1,6 @@
 #pragma once
 #include <rune/storage/OffsetIndex.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -23,6 +24,10 @@ class LogSegment {
 public:
     LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096);
     ~LogSegment();
+    /// Raw-pointer overload — avoids heap allocation on the produce hot path.
+    /// [data, data+len) must be a valid record batch.  Returns nextOffset.
+    int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset);
+    /// Vector overload (kept for API compatibility; delegates to the pointer overload).
     int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset); // returns nextOffset
 
     /// Flush libc buffer + fdatasync ".log" + msync ".index".

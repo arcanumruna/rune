@@ -1,5 +1,7 @@
 #pragma once
 #include <rune/storage/LogSegment.h>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <vector>
@@ -15,6 +17,10 @@ namespace rune::storage {
 class Log {
 public:
     Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024);
+    /// Zero-copy span overload — avoids per-call vector construction on the hot path.
+    /// Appends [data, data+len) as a batch with the given lastOffset.
+    int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset);
+    /// Vector overload (kept for compatibility; delegates to the span overload).
     int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset);
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
