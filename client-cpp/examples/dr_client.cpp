@@ -48,6 +48,10 @@
 //                            model a slow/backpressured consumer, default 0.
 //                            NB: applied OFF the agent thread (buffered) so we
 //                            never violate the "handler must not block" rule.
+//     RUNE_SUB_PARTITIONS  number of partitions to subscribe to (0..N-1),
+//                            default 1 (= partition 0 only, backward-compatible).
+//                            Set to the topic's partitionCount to cover ALL
+//                            partitions in multi-partition end-to-end tests.
 //
 // ─────────────────────────────────────────────────────────────────────────
 // Output (stdout, one field-per-token, stable across releases):
@@ -210,6 +214,11 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 // Subscribe from `from` and collect until `expect` records (or timeout).
 // Emits "DELIVERED ..." per record.  Returns #delivered.
 //
+// `subPartitions`: number of partitions to subscribe to (0..subPartitions-1).
+//   1 (default) = partition 0 only (backward-compatible single-partition mode).
+//   >1           = subscribe to ALL partitions 0..subPartitions-1 so that the
+//                  harness can assert assert_no_committed_loss across all of them.
+//
 // The agent-thread handler only COPIES the record into a queue (never blocks).
 // A separate drain thread emits the DELIVERED lines and applies the optional
 // slow-subscriber delay, so we model a slow consumer without violating the
@@ -217,7 +226,7 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 // ---------------------------------------------------------------------------
 static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
                        int windowMs, int slowMs, int expectCidMin,
-                       int expectCidExact) {
+                       int expectCidExact, int subPartitions) {
     struct Rec { int64_t offset; std::string value; };
     std::mutex mtx;
     std::deque<Rec> q;
@@ -227,11 +236,17 @@ static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
     opts.from      = from;
     opts.isolation = Isolation::ReadUncommitted;
 
-    auto sub = c.subscribe(th, /*partition=*/0, opts, [&](const Record& r) {
-        std::string v(reinterpret_cast<const char*>(r.value.data()), r.value.size());
-        std::lock_guard<std::mutex> lk(mtx);
-        q.push_back(Rec{r.offset, std::move(v)});
-    });
+    // Subscribe to each partition and keep handles alive until we're done.
+    const int nParts = (subPartitions > 0) ? subPartitions : 1;
+    std::vector<Subscription> subs;
+    subs.reserve(nParts);
+    for (int part = 0; part < nParts; ++part) {
+        subs.push_back(c.subscribe(th, part, opts, [&](const Record& r) {
+            std::string v(reinterpret_cast<const char*>(r.value.data()), r.value.size());
+            std::lock_guard<std::mutex> lk(mtx);
+            q.push_back(Rec{r.offset, std::move(v)});
+        }));
+    }
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(windowMs);
@@ -267,7 +282,7 @@ static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
     }
 
     // Drain anything still queued after the loop broke on `expect` — harmless.
-    sub.unsubscribe();
+    for (auto& sub : subs) sub.unsubscribe();
     return delivered.load();
 }
 
@@ -299,6 +314,10 @@ int main() {
     const int         expectCidMin = getEnvInt("RUNE_EXPECT_CID_MIN", -2147483647);
     // If >=0, ONLY records with this exact cid count toward `expect` (own-cid).
     const int         expectCidExact = getEnvInt("RUNE_EXPECT_CID_EXACT", -1);
+    // RUNE_SUB_PARTITIONS: number of partitions to subscribe (0..N-1).
+    // Default 1 = partition 0 only (backward-compatible).  Set to the topic's
+    // partitionCount (from RUNE_TOPICS) to cover ALL partitions end-to-end.
+    const int         subPartitions  = getEnvInt("RUNE_SUB_PARTITIONS", 1);
 
     if (target.empty() || egress.empty() || dataDir.empty()) {
         std::cerr << "CLIENT: RUNE_TARGET, RUNE_EGRESS and RUNE_DATA_DIR are required\n";
@@ -309,7 +328,7 @@ int main() {
               << " target=" << target << " records=" << records
               << " keys=" << keys << " rateHz=" << rateHz
               << " from(wire)=" << from.toWire() << " expect=" << expect
-              << " slowMs=" << slowMs << "\n";
+              << " slowMs=" << slowMs << " subPartitions=" << subPartitions << "\n";
 
     ClientConfig cfg;
     cfg.gatewayChannel   = target;
@@ -360,7 +379,7 @@ int main() {
 
         if (doS && rc == 0) {
             delivered = doSubscribe(c, th, from, expect, subWindowMs, slowMs,
-                                    expectCidMin, expectCidExact);
+                                    expectCidMin, expectCidExact, subPartitions);
             if (expect > 0 && delivered < expect) {
                 std::cerr << "CLIENT: FAIL delivered " << delivered << "/" << expect << "\n";
                 rc = 1;
