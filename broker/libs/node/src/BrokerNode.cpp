@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace rune::consensus;
@@ -84,7 +85,11 @@ void BrokerNode::start() {
     buildConsensusObjects();
     const auto t3 = sclock::now();
 
-    // 6. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
+    // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
+    //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
+    buildReplication();
+
+    // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
 
     // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
@@ -263,6 +268,167 @@ void BrokerNode::buildMultiNodeConsensus() {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::buildReplication — GR-2/GR-3.
+//
+// Constructs one PartitionReplica per owned partition (sharing the Log* from
+// TopicRegistry), one AeronPartitionTransport (per node), and the
+// ReplicationMetadataBridge that drives role transitions from consensus.
+//
+// Prerequisites:
+//   - topicRegistry_ is fully built (all Logs recovered).
+//   - aeron_ is connected.
+//   - config_.peers is populated.
+//
+// For the DR scope: the cluster leader is the leader of ALL partitions.
+// Replication channel per peer: peer.replicationChannel().  If no peer has
+// a replication port configured (all zero), we skip transport construction
+// but still build replicas with a null transport (no-op for single-node).
+//
+// Replica initial role: always starts as Follower (epoch 0, leaderId=-1) to
+// avoid stale leader assumptions at startup.  The ReplicationMetadataBridge
+// will call becomeLeader/becomeFollower on the first cycle after the
+// consensus layer resolves the initial leader.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildReplication() {
+    using namespace rune::replication;
+
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+    // Collect all NodeIds in the cluster (used as the replica set + ISR seed).
+    std::vector<NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) {
+        allNodeIds.push_back(static_cast<NodeId>(peer.id));
+    }
+
+    // -----------------------------------------------------------------------
+    // Build replTransport_ — AeronPartitionTransport (requires aeron_).
+    // Only constructed when this node has a replication port configured.
+    // Built FIRST so we have the transport pointer ready for replica construction.
+    // -----------------------------------------------------------------------
+    const auto& selfPeer = config_.self();
+    const bool hasReplPort = (selfPeer.replicationPort != 0);
+
+    if (hasReplPort && aeron_) {
+        const std::string ingressChannel = selfPeer.replicationChannel();
+        const int32_t     ingressStream  = config_.replicationStreamId;
+
+        try {
+            replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
+                aeron_, ingressChannel, ingressStream, selfId);
+
+            // Add each peer (excluding self) as an egress destination.
+            for (const auto& peer : config_.peers) {
+                if (peer.id == config_.nodeId) continue;       // skip self
+                if (peer.replicationPort == 0) continue;       // no replication endpoint
+                replTransport_->addPeer(
+                    static_cast<NodeId>(peer.id),
+                    peer.replicationChannel(),
+                    ingressStream);
+            }
+
+            spdlog::info("BrokerNode[{}]: AeronPartitionTransport built on {} (stream={}) with {} peers",
+                         config_.nodeId, ingressChannel, ingressStream,
+                         replTransport_->peerCount());
+
+        } catch (const std::exception& ex) {
+            spdlog::warn("BrokerNode[{}]: AeronPartitionTransport construction failed: {}; "
+                         "replication transport disabled",
+                         config_.nodeId, ex.what());
+            replTransport_.reset();
+        }
+    } else {
+        const int32_t topicCountForWarn = topicRegistry_->topicCount();
+        if (topicCountForWarn > 0 && config_.peers.size() > 1) {
+            spdlog::warn("BrokerNode[{}]: no replicationPort configured — "
+                         "replication transport NOT started (topics won't replicate)",
+                         config_.nodeId);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Build replicaRegistry_ — one PartitionReplica per (topicId, partition).
+    // Each replica shares the Log* from topicRegistry_ (non-owning).
+    // Initial role: Follower / epoch 0 (bridge will set correct role on first cycle).
+    // Transport pointer: use replTransport_ if available, else use a no-op
+    // InMemoryTransport owned locally (no peers = all frames dropped).
+    //
+    // We store an InMemoryTransport per-node as a fallback when no Aeron transport
+    // is available.  This avoids the PartitionReplica assert(transport != nullptr).
+    // -----------------------------------------------------------------------
+    replicaRegistry_ = std::make_unique<ReplicaRegistry>();
+
+    const int32_t topicCount = topicRegistry_->topicCount();
+    for (int32_t topicId = 0; topicId < topicCount; ++topicId) {
+        const auto* spec = topicRegistry_->topic(topicId);
+        if (!spec) continue;
+
+        for (int32_t part = 0; part < spec->partitionCount; ++part) {
+            rune::storage::Log* logPtr = topicRegistry_->log(topicId, part);
+            if (!logPtr) {
+                spdlog::warn("BrokerNode[{}]: log not found for topic {} partition {}; skipping replica",
+                             config_.nodeId, spec->name, part);
+                continue;
+            }
+
+            PartitionConfig pcfg;
+            pcfg.partitionId          = static_cast<PartitionId>(part);
+            pcfg.selfId               = selfId;
+            pcfg.replicaLagMaxMs      = 10'000;
+            pcfg.replicaLagMaxOffset  = 10'000;
+            pcfg.minIsr               = 1;
+            pcfg.fetchIntervalNs      = 5'000'000LL;
+            pcfg.isrCheckIntervalNs   = 10'000'000LL;
+            pcfg.maxFetchBytes        = 1 << 20;
+
+            // Determine the transport: real Aeron transport if available,
+            // otherwise a per-replica InMemoryTransport (no-op: no peers wired).
+            PartitionTransport* transport = replTransport_.get();
+            if (!transport) {
+                // Allocate a no-op InMemoryTransport owned by the replica registry.
+                // InMemoryTransport with no registered leader/follower drops all frames.
+                nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+                transport = nullTransports_.back().get();
+            }
+
+            auto replica = std::make_unique<PartitionReplica>(
+                pcfg,
+                Role::Follower,
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                logPtr,
+                transport
+            );
+
+            if (replTransport_) {
+                replTransport_->registerReplica(replica->partitionId(), replica.get());
+            }
+
+            replicaRegistry_->add(topicId, part, std::move(replica));
+        }
+    }
+
+    if (replTransport_) {
+        spdlog::info("BrokerNode[{}]: registered {} replicas with AeronPartitionTransport",
+                     config_.nodeId, replicaRegistry_->replicaCount());
+    }
+
+    // -----------------------------------------------------------------------
+    // Build replBridge_ — ReplicationMetadataBridge.
+    // Always built (even without transport) so role transitions happen on
+    // the duty cycle; this is a no-op on single-node (only 1 peer = self).
+    // -----------------------------------------------------------------------
+    replBridge_ = std::make_unique<ReplicationMetadataBridge>(
+        selfId, allNodeIds, *replicaRegistry_);
+
+    spdlog::info("BrokerNode[{}]: replication built ({} replicas, transport={})",
+                 config_.nodeId,
+                 replicaRegistry_->replicaCount(),
+                 replTransport_ ? "aeron:udp" : "none");
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::buildGateway — create the ClientGateway and NodeRuntimeAgent.
 //
 // Called AFTER buildConsensusObjects() (so agent_ / nodeAgent_ are valid)
@@ -327,7 +493,12 @@ void BrokerNode::buildGateway() {
                    : static_cast<rune::consensus::Agent&>(*agent_);
 
     runtimeAgent_ = std::make_unique<NodeRuntimeAgent>(
-        innerAgent, gateway_.get());
+        innerAgent,
+        election_.get(),          // GR-2: election for leaderMemberId/leadershipTermId reads
+        replBridge_.get(),        // GR-2: metadata bridge (may be null if no replicas)
+        replTransport_.get(),     // GR-3: replication transport (may be null)
+        replicaRegistry_.get(),   // GR-3: replica registry (may be null if no topics)
+        gateway_.get());
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
@@ -438,14 +609,20 @@ void BrokerNode::stop() {
     }
 
     // 2. Release the runtime agent and gateway FIRST — in this order:
-    //      a. runtimeAgent_ (holds refs to nodeAgent_/agent_ + gateway_)
+    //      a. runtimeAgent_ (holds refs to nodeAgent_/agent_ + gateway_ + replication)
     //      b. gateway_ (owns the client ingress Subscription + pending egress
     //                   ExclusivePublications — must deregister before aeron_.reset())
+    //      c. replication objects (replBridge_ → replicaRegistry_ → replTransport_)
+    //         replTransport_ owns Aeron Subscription + ExclusivePublications
     //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
     //    → close aeron → stop driver.
-    runtimeAgent_.reset();   // composite agent (holds refs to inner agent + gateway)
-    gateway_.reset();        // ClientGateway: deregisters Subscription + ExclusivePubs
-    topicRegistry_.reset();  // TopicRegistry: Logs are files (flushed/synced by Log dtor)
+    runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
+    gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
+    replBridge_.reset();      // ReplicationMetadataBridge (no Aeron resources)
+    replicaRegistry_.reset(); // PartitionReplicas (no Aeron resources, share Log* with topicRegistry_)
+    replTransport_.reset();   // AeronPartitionTransport: deregisters replication Subscription + ExclusivePubs
+    nullTransports_.clear();  // Per-replica no-op transports (no Aeron resources)
+    topicRegistry_.reset();   // TopicRegistry: Logs are files (flushed/synced by Log dtor)
 
     // 3. Release consensus objects that own Aeron publications / subscription.
     //    Must happen BEFORE closing the Aeron client and media driver so the

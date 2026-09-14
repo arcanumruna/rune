@@ -24,8 +24,11 @@
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/replication/AeronPartitionTransport.h>
 
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
@@ -109,6 +112,40 @@ public:
     /// - Otherwise (unknown leader, or leader peer has no clientPort) → empty.
     std::string leaderClientEndpoint() const noexcept;
 
+    // -----------------------------------------------------------------------
+    // Test-only accessors (GR-2/GR-3 integration tests).
+    // NOTE: these reach into duty-cycle-owned state; call only when the node
+    // is stopped OR from a synchronized test context that knows the duty cycle
+    // is between doWork calls.  NOT safe for general concurrent use.
+    // -----------------------------------------------------------------------
+
+    /// Return the PartitionReplica for (topicId, partition), or nullptr.
+    rune::replication::PartitionReplica*
+    replicaForTest(int32_t topicId, int32_t partition) const noexcept {
+        if (!replicaRegistry_) return nullptr;
+        return replicaRegistry_->lookup(topicId, partition);
+    }
+
+    /// Return the TopicRegistry (for direct Log* access in tests).
+    rune::gateway::TopicRegistry*
+    topicRegistryForTest() const noexcept {
+        return topicRegistry_.get();
+    }
+
+    /// Observer-thread-safe: true if the replication metadata bridge has
+    /// propagated this node's leadership to all its PartitionReplicas.
+    /// Uses the atomic mirror in ReplicationMetadataBridge.
+    bool replicationIsLeaderForTest() const noexcept {
+        return replBridge_ && replBridge_->isLeaderAtomic();
+    }
+
+    /// Observer-thread-safe: the last epoch applied by the replication bridge.
+    /// Uses the atomic mirror in ReplicationMetadataBridge.
+    rune::replication::Epoch replicationEpochForTest() const noexcept {
+        if (!replBridge_) return 0;
+        return replBridge_->lastEpochAtomic();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers
@@ -118,6 +155,7 @@ private:
     void buildConsensusObjects();
     void buildSingleNodeConsensus();
     void buildMultiNodeConsensus();
+    void buildReplication();   // GR-2/GR-3: replicas + transport + bridge
     void buildGateway();
 
     // -----------------------------------------------------------------------
@@ -159,12 +197,28 @@ private:
     std::unique_ptr<rune::gateway::TopicRegistry> topicRegistry_;
 
     // -----------------------------------------------------------------------
+    // Replication (GR-2/GR-3) — per-partition PartitionReplica + transport.
+    // Constructed in buildGateway() after aeron_ and topicRegistry_ are live.
+    // All replication state is single-writer (AgentRunner duty-cycle thread).
+    //
+    // Destruction order in stop() (reverse of construction):
+    //   runtimeAgent_ → gateway_ → replicaRegistry_ → replTransport_
+    //   → replBridge_ → topicRegistry_
+    // -----------------------------------------------------------------------
+    std::unique_ptr<ReplicaRegistry>                        replicaRegistry_;
+    std::unique_ptr<rune::replication::AeronPartitionTransport> replTransport_;
+    std::unique_ptr<ReplicationMetadataBridge>              replBridge_;
+    // Per-replica no-op InMemoryTransport instances used when replTransport_ is null.
+    // Prevents PartitionReplica assert(transport!=nullptr) in single-node / no-repl-port nodes.
+    std::vector<std::unique_ptr<rune::replication::InMemoryTransport>> nullTransports_;
+
+    // -----------------------------------------------------------------------
     // Client gateway (BR-7a) — runs inside the duty-cycle via NodeRuntimeAgent.
     // Constructed after aeron_ in start(); destroyed in stop() before aeron_.
     // -----------------------------------------------------------------------
     std::unique_ptr<rune::gateway::ClientGateway> gateway_;
 
-    // Composite agent: wraps inner consensus agent + gateway (single-writer).
+    // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
 
     // -----------------------------------------------------------------------

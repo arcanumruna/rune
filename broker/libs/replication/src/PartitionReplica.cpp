@@ -236,7 +236,13 @@ void PartitionReplica::onLeaderLogAppended() noexcept
 
 int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t nowNs)
 {
-    assert(role_ == Role::Leader && "onFetchRequest() called on follower");
+    // Guard: drop silently if this replica is not yet the leader.
+    // This can happen during the window between Aeron transport receiving a
+    // FetchRequest and the metadata bridge promoting us via becomeLeader().
+    // Not an error — the follower will retry on the next fetch interval.
+    if (role_ != Role::Leader) {
+        return kErrNotLeader;
+    }
 
     // Epoch fence: reject stale leader epochs.
     if (isStaleEpoch(req.leaderEpoch, epoch_)) {

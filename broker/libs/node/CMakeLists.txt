@@ -5,10 +5,10 @@ add_library(rune_node
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
-# BrokerNode needs: consensus engine, gateway (BR-7a), Aeron (embedded driver + client), spdlog
+# BrokerNode needs: consensus engine, gateway (BR-7a), replication (GR-2/GR-3), Aeron, spdlog
 target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway)
 if(aeron_FOUND)
-    target_link_libraries(rune_node PUBLIC aeron::aeron)
+    target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
     # macOS provides it in system libs and the ConanCenter aeron recipe doesn't
     # propagate it. Link it PUBLIC so every driver-embedding consumer (rune_broker
@@ -92,5 +92,21 @@ if(BUILD_TESTING)
             GTest::gtest_main)
         gtest_discover_tests(rune_broker_node_gateway_tests
             PROPERTIES TIMEOUT 120)
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # Gateway↔Replication wiring integration tests (GR-2/GR-3) — 3-node in-process
+    # over real aeron:udp with replication ports.
+    # Gated behind BUILD_NODE_UDP_TESTS (same env requirement as UDP cluster tests).
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_gateway_replication_wiring_tests
+            tests/integration/GatewayReplicationWiringTest.cpp)
+        target_link_libraries(rune_gateway_replication_wiring_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_gateway_replication_wiring_tests
+            PROPERTIES TIMEOUT 180)
     endif()
 endif()

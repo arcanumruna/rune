@@ -3,16 +3,17 @@
 //
 // Environment variables:
 //   RUNE_NODE_ID           — int32, this node's id. Required. Must equal some peer's id.
-//   RUNE_PEERS             — comma-separated id@host:consensusPort[:clientPort] entries.
+//   RUNE_PEERS             — comma-separated id@host:consensusPort[:clientPort[:replPort]] entries.
 //                            Required, non-empty. Ids must be unique and include RUNE_NODE_ID.
-//                            Example (with client ports): "0@rune-1:40111:40200,1@rune-2:40111:40200,2@rune-3:40111:40200"
-//                            Example (without client ports): "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"
-//                            Backward-compatible: omitting :clientPort → clientPort=0 (no known client endpoint).
+//                            Example (with all ports): "0@rune-1:40111:40200:40300,1@rune-2:40111:40200:40300,2@rune-3:40111:40200:40300"
+//                            Example (without client/repl ports): "0@rune-1:40111,1@rune-2:40111,2@rune-3:40111"
+//                            Backward-compatible: omitting :clientPort → clientPort=0; omitting :replPort → replPort=0.
 //                            Whitespace around commas and entries is trimmed.
 //   RUNE_CLIENT_ENDPOINT   — host:port for the client gateway (Required).
 //                            Built into "aeron:udp?endpoint=host:port".
 //   RUNE_CLIENT_STREAM_ID  — int32, default 1.
 //   RUNE_CONSENSUS_STREAM_ID — int32, default 10.
+//   RUNE_REPLICATION_STREAM_ID — int32, default 20. Stream for per-partition replication.
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
 //   RUNE_TOPICS            — comma-separated name:partitionCount topic declarations (GB-1).
 //                            Optional (absent or empty → no topics; produce/subscribe
@@ -51,14 +52,18 @@ struct TopicSpec {
 struct PeerConfig {
     int32_t  id            = -1;
     std::string host;
-    uint16_t consensusPort = 0;
-    uint16_t clientPort    = 0;  // 0 = no known client endpoint (GB-4, backward-compatible)
+    uint16_t consensusPort    = 0;
+    uint16_t clientPort       = 0;  // 0 = no known client endpoint (GB-4, backward-compatible)
+    uint16_t replicationPort  = 0;  // 0 = no replication endpoint (GR-3, backward-compatible)
 
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
 
     /// "aeron:udp?endpoint=<host>:<clientPort>" — empty string if clientPort == 0.
     std::string clientChannel() const;
+
+    /// "aeron:udp?endpoint=<host>:<replicationPort>" — empty string if replicationPort == 0.
+    std::string replicationChannel() const;
 };
 
 struct ClientEndpoint {
@@ -71,7 +76,8 @@ struct NodeConfig {
     std::vector<PeerConfig> peers;       // includes self; sorted by id
     ClientEndpoint      clientEndpoint;
     std::string         dataDir;
-    int32_t             consensusStreamId = 0;
+    int32_t             consensusStreamId    = 0;
+    int32_t             replicationStreamId  = 20;  // GR-3: stream for per-partition replication
 
     // Topics declared via RUNE_TOPICS (GB-1).
     // Empty when RUNE_TOPICS is absent or empty — valid state (no topics).
