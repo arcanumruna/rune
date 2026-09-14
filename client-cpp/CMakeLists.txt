@@ -174,6 +174,25 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             target_link_libraries(rune_client_ping PRIVATE ${UUID_LIB})
         endif()
     endif()
+
+    # CB-5 C — E2E produce/subscribe example vs 3-node cluster
+    add_executable(rune_produce_subscribe
+        examples/rune_produce_subscribe.cpp
+    )
+    target_include_directories(rune_produce_subscribe PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_produce_subscribe PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_produce_subscribe PRIVATE ${UUID_LIB})
+        endif()
+    endif()
 endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
@@ -192,6 +211,26 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)
             target_link_libraries(rune_client_bench PRIVATE ${UUID_LIB})
+        endif()
+    endif()
+
+    # CB-5 D — Produce RTT + subscribe delivery latency benchmark
+    add_executable(rune_client_produce_bench
+        bench/ClientProduceBench.cpp
+    )
+    target_include_directories(rune_client_produce_bench PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_client_produce_bench PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+        benchmark::benchmark
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_produce_bench PRIVATE ${UUID_LIB})
         endif()
     endif()
 endif()
@@ -274,6 +313,24 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_client_api_tests)
+    endif()
+
+    # ── Redirect-follow tests (CB-5 B) — data-op redirect follow ──────────────
+    if(aeron_FOUND)
+        add_executable(rune_redirect_tests
+            tests/client/RedirectTest.cpp
+        )
+        target_include_directories(rune_redirect_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_redirect_tests PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_redirect_tests)
     endif()
 
     # ── Producer tests (CB-2) — auto-batch, partitioning, acks, idempotence ──

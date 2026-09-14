@@ -97,17 +97,11 @@ std::future<int64_t> BatchBuilder::send() {
         topicId_, partition_, corrId, recordCount, std::move(batchBytes));
 
     if (!ok) {
-        // Ring full: fail the future immediately rather than hanging.
-        // (The registered future is resolved by failAllPending or timeout sweep
-        //  in the normal case; but if the ring write failed, the token never
-        //  reaches the agent and the ack would never arrive.  Proactively fail.)
-        // We can't easily call failAllPending here (it would fail ALL pending),
-        // so we set the exception on the promise directly.
-        // However, we no longer own the promise — it's in impl_->pendingAcks_.
-        // The safest path: the timeout sweep will eventually fail this ack.
-        // Return the future; the caller gets a timeout-error in produceTimeoutMs.
-        // (Ring-full on Tier-2 is an exceptional condition; the timeout provides
-        //  the safety net — no hang ever.)
+        // CB-5 A3: ring full — fail the specific promise immediately.
+        // The ring token was never written so the agent will never see this
+        // batch; the future would otherwise hang until produceTimeoutMs.
+        // Fail it now so the caller gets an error without waiting.
+        impl_->failPending(corrId, "Tier-2 batch ring full — batch dropped");
     }
 
     return std::move(fut);

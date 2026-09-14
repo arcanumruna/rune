@@ -261,6 +261,16 @@ public:
     /// Called on agent close/stop: fail all pending acks.
     void failAllPending(const std::string& reason);
 
+    /// Fail a single pending ack by correlationId (CB-5 A3: ring-full fast-fail).
+    void failPending(int64_t corrId, const std::string& reason);
+
+    /// CB-5 B: attempt to resend the wire frame for a redirected Produce.
+    /// Returns true if resent, false if corrId unknown / max redirects exceeded.
+    /// On failure the pending ack is failed immediately.
+    static constexpr int kMaxRedirects = 3;
+    bool retryRedirectedProduce(int64_t corrId,
+                                std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+
     /// Called from Client::sweepTimeouts(): fail acks older than the deadline.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
@@ -329,7 +339,12 @@ private:
     int16_t producerEpoch_ = 0;
 
     // ---- In-flight batch tracking (agent-thread only; no mutex needed) -------
-    struct BatchInfo { int32_t topicId; int32_t partition; };
+    struct BatchInfo {
+        int32_t              topicId;
+        int32_t              partition;
+        std::vector<uint8_t> wireFrame;   // CB-5 B: encoded Produce bytes for redirect resend
+        int32_t              redirectCount = 0; // bounded redirect attempts
+    };
     std::map<int64_t, BatchInfo> batchMap_;
 
     // ---- Tier-2 batch queue (mutex-guarded — app threads push, agent pops) ----

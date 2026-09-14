@@ -107,9 +107,14 @@ void SubscriberHub::sendUnsubscribe(
 // onSubscribeResponse — agent thread
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::onSubscribeResponse(const codec::SubscribeResponseView& rsp)
+void SubscriberHub::onSubscribeResponse(
+        const codec::SubscribeResponseView& rsp,
+        int64_t                             unsubCorrId,
+        int64_t                             sessionId,
+        const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
 {
     std::shared_ptr<SubscriptionImpl> impl;
+    bool needUnsubscribe = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = pendingByCorrelation_.find(rsp.correlationId);
@@ -119,17 +124,34 @@ void SubscriberHub::onSubscribeResponse(const codec::SubscribeResponseView& rsp)
         impl = std::move(it->second);
         pendingByCorrelation_.erase(it);
 
-        if (!impl->active.load(std::memory_order_acquire)) {
-            // Already unsubscribed before SubscribeResponse arrived; discard.
-            return;
-        }
-
-        // Store the broker-assigned subscriptionId (atomic store; release
-        // so that any thread reading subscriptionId() sees a consistent value).
+        // Store the broker-assigned subscriptionId regardless of active state,
+        // so that any pending unsubscribe() on the app thread that already ran
+        // (setting active=false before this response) can now find the id.
         impl->subscriptionId.store(rsp.subscriptionId, std::memory_order_release);
 
-        // Move to the active routing table.
-        activeById_.emplace(rsp.subscriptionId, impl);
+        if (!impl->active.load(std::memory_order_acquire)) {
+            // CB-5 A2 FIX: unsubscribe() ran before SubscribeResponse arrived.
+            // The earlier sendUnsubscribe() call sent subscriptionId=0 (no-op on
+            // broker side).  Now that we know the real id, send a proper Unsubscribe.
+            // Do NOT insert into activeById_ — the impl is already logically dead.
+            needUnsubscribe = true;
+        } else {
+            // Move to the active routing table.
+            activeById_.emplace(rsp.subscriptionId, impl);
+        }
+    }
+
+    if (needUnsubscribe && submitFn) {
+        // Encode + send an Unsubscribe with the now-known subscriptionId.
+        uint8_t frameBuf[64]{};
+        const std::size_t frameLen = codec::encodeUnsubscribe(
+            frameBuf, sizeof(frameBuf),
+            rsp.subscriptionId,
+            sessionId,
+            unsubCorrId);
+        if (frameLen > 0) {
+            submitFn(frameBuf, frameLen);
+        }
     }
 }
 

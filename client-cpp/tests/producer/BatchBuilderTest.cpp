@@ -229,7 +229,12 @@ struct CB3Gateway {
                (static_cast<uint32_t>(d[59]) << 16) |
                (static_cast<uint32_t>(d[60]) << 24));
 
+            // CB-5 A3: assert RecordBatch CRC and bounds are valid on the gateway
+            // side — ensures the producer encodes a well-formed batch.
             rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
+            ASSERT_TRUE(reader.ensureValid())
+                << "CB3Gateway: RecordBatch failed ensureValid() (CRC or bounds error)";
+
             reader.forEach([&](std::string_view /*key*/, std::string_view val,
                                int64_t /*off*/, int64_t /*ts*/) {
                 rec.values.emplace_back(val.data(), val.size());
@@ -745,4 +750,380 @@ TEST(BatchBuilder, IdempotentSeqContinuity) {
         EXPECT_GT(h.gw->batches[i].baseSeq, h.gw->batches[i-1].baseSeq)
             << "baseSeq must be strictly increasing";
     }
+}
+
+// ===========================================================================
+// CB-5 A1: CrossTierOrderingUnderMaxInFlight
+//
+// Submits a Tier-1 record then a Tier-2 batch to the SAME partition with
+// maxInFlight=1 and a slow-ack gateway (holds acks until we release them).
+//
+// Assertion: the gateway MUST receive the T1 batch before the T2 batch
+// (submission order preserved), even under maxInFlight backpressure.
+// The T2 batch must NOT arrive before the T1 ack is sent.
+//
+// This is the exact scenario from the CB-3 review finding: without the A1
+// fix, flushBatches() would dispatch T2 while T1 is still in-flight at
+// maxInFlight=1, jumping T2 ahead in the log.
+// ===========================================================================
+
+// Extend CB3Gateway with slow-ack capability for this test.
+struct SlowAckGateway {
+    struct BatchRecord {
+        int32_t topicId   = 0;
+        int32_t partition = 0;
+        int64_t corrId    = 0;
+        int32_t baseSeq   = -1;
+        int32_t recCount  = 0;
+    };
+
+    std::vector<BatchRecord> batches;
+    std::atomic<int>         batchCount {0};
+    int64_t                  nextOffset = 500;
+
+    // Hold all acks when false; flush on release.
+    bool holdAcks = true;
+    std::vector<std::tuple<int32_t,int32_t,int64_t,int64_t>> pendingAcks_; // (part,cnt,sess,corr)
+
+    std::shared_ptr<aeron::Aeron>                gwAeron;
+    std::shared_ptr<aeron::Subscription>         gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+    std::unique_ptr<aeron::FragmentAssembler>    gwAsm;
+
+    uint8_t replyBuf[2048]{};
+
+    explicit SlowAckGateway(const std::string& aeronDir,
+                             int32_t ingressStream,
+                             int32_t egressStream)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        gwAeron = aeron::Aeron::connect(ctx);
+        if (!gwAeron) throw std::runtime_error("SlowAckGateway: connect failed");
+
+        int64_t subId = gwAeron->addSubscription("aeron:ipc", ingressStream);
+        int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", egressStream);
+
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        if (!gwSub || !gwPub)
+            throw std::runtime_error("SlowAckGateway: sub/pub timed out");
+
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off, aeron::util::index_t len,
+                   aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                        static_cast<std::size_t>(len));
+            });
+    }
+
+    ~SlowAckGateway() {
+        gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset();
+    }
+
+    int poll(int limit = 16) {
+        if (!gwSub || !gwAsm) return 0;
+        return gwSub->poll(gwAsm->handler(), limit);
+    }
+
+    bool gwSend(const uint8_t* buf, std::size_t len) {
+        if (!gwPub) return false;
+        const auto ilen = static_cast<aeron::util::index_t>(len);
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), ilen);
+        for (int i = 0; i < 500; ++i) {
+            if (gwPub->offer(ab, 0, ilen) > 0) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    }
+
+    void sendAck(int32_t partition, int32_t recCount,
+                 int64_t sessionId, int64_t corrId) {
+        const int64_t baseOff = nextOffset;
+        nextOffset += recCount;
+        std::size_t n = rcc::encodeProduceResponse(
+            replyBuf, sizeof(replyBuf),
+            /*errorCode=*/0, partition, baseOff, sessionId, corrId);
+        if (n > 0) gwSend(replyBuf, n);
+    }
+
+    /// Release all held acks in order.
+    void releaseAcks() {
+        for (auto& [part, cnt, sess, corr] : pendingAcks_) {
+            sendAck(part, cnt, sess, corr);
+        }
+        pendingAcks_.clear();
+    }
+
+    void onFrame(const uint8_t* buf, std::size_t len) {
+        auto tidOpt = rcc::peekTemplate(buf, len);
+        if (!tidOpt) return;
+
+        const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
+
+        if (tid == rcc::TemplateId::Connect) {
+            auto opt = rcc::decodeConnectRequest(buf, len);
+            if (!opt) return;
+            std::size_t n = rcc::encodeConnectResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::OK),
+                /*leaderMemberId=*/0,
+                /*assignedSessionId=*/42,
+                opt->sessionId,
+                opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid != rcc::TemplateId::Produce) return;
+
+        auto opt = rcc::decodeProduce(buf, len);
+        if (!opt) return;
+
+        BatchRecord rec;
+        rec.topicId   = opt->topicId;
+        rec.partition = opt->partition;
+        rec.corrId    = opt->correlationId;
+
+        const auto& rb = opt->recordBatch;
+        if (rb.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            const uint8_t* d = rb.data();
+            rec.baseSeq = static_cast<int32_t>(
+                static_cast<uint32_t>(d[53])        |
+               (static_cast<uint32_t>(d[54]) <<  8) |
+               (static_cast<uint32_t>(d[55]) << 16) |
+               (static_cast<uint32_t>(d[56]) << 24));
+            rec.recCount = static_cast<int32_t>(
+                static_cast<uint32_t>(d[57])        |
+               (static_cast<uint32_t>(d[58]) <<  8) |
+               (static_cast<uint32_t>(d[59]) << 16) |
+               (static_cast<uint32_t>(d[60]) << 24));
+        }
+
+        batches.push_back(rec);
+        batchCount.fetch_add(1, std::memory_order_release);
+
+        if (opt->correlationId == 0) return; // acks=None
+
+        if (holdAcks) {
+            pendingAcks_.emplace_back(opt->partition, rec.recCount,
+                                      opt->sessionId, opt->correlationId);
+        } else {
+            sendAck(opt->partition, rec.recCount, opt->sessionId, opt->correlationId);
+        }
+    }
+};
+
+TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
+    static constexpr int32_t kInStr = 3015, kEgStr = 3016;
+
+    const std::string agentDir = uniqueDir("cb5_a1");
+    const std::string aeronDir = agentDir + "/aeron";
+
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = kInStr;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = kEgStr;
+    cfg.transport.dataDir         = agentDir;
+    cfg.session.egressChannel     = "aeron:ipc";
+    cfg.session.egressStreamId    = kEgStr;
+    cfg.session.keepaliveIntervalNs = 10'000'000'000LL;
+
+    rprod::ProducerHub    hub;
+    std::atomic<int64_t>  nextCorrId_ {1};
+
+    auto agent = std::make_unique<rca::ClientAgent>(cfg);
+    agent->setProducerDrainFn(
+        [&](int64_t nowNs, int64_t sessionId,
+               rca::ClientAgent::SendFn sendFn) -> int {
+            return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
+        });
+    agent->setProduceResponseFn(
+        [&](int64_t correlationId, int64_t baseOffset) {
+            hub.onProduceResponse(correlationId, baseOffset);
+        });
+    agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
+    agent->start();
+    std::this_thread::sleep_for(150ms);
+
+    auto gw = std::make_unique<SlowAckGateway>(aeronDir, kInStr, kEgStr);
+
+    // Connect.
+    agent->submitConnect();
+    for (int i = 0; i < kPumpMax; ++i) {
+        agent->doWork(monoNs());
+        gw->poll();
+        if (agent->sessionState() == rcs::SessionState::Connected) break;
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_EQ(agent->sessionState(), rcs::SessionState::Connected)
+        << "Failed to connect";
+
+    // Producer with maxInFlight=1 so only 1 batch can be in-flight at a time.
+    ProducerConfig pcfg;
+    pcfg.acks        = Acks::Leader;
+    pcfg.lingerUs    = 1;        // flush fast
+    pcfg.batchBytes  = 64*1024;
+    pcfg.maxInFlight = 1;        // KEY: only 1 in-flight per partition
+
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_);
+    hub.add(impl);
+    Producer p(impl);
+
+    auto topic = makeTopic(30, 1);
+    Key  key(uint64_t{0});
+
+    const std::vector<uint8_t> t1val = {0x11};
+    const std::vector<uint8_t> t2val = {0x22, 0x33};
+
+    // Hold all acks — T1 goes in-flight, T2 must wait.
+    gw->holdAcks = true;
+
+    // Submit T1 (Tier-1 auto-batch).
+    auto fut1 = p.send(topic, key, std::span<const uint8_t>(t1val), want_future);
+
+    // Submit T2 (Tier-2 explicit batch) AFTER T1.
+    auto bb = p.batch(topic, key);
+    bb.add(std::span<const uint8_t>(t2val));
+    bb.add(std::span<const uint8_t>(t2val));
+    auto fut2 = bb.send();
+
+    // Pump for a while: only T1 should be sent (maxInFlight=1, acks held).
+    for (int i = 0; i < 300; ++i) {
+        agent->doWork(monoNs());
+        gw->poll();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    // Assert: gateway received exactly 1 batch (T1); T2 must be blocked.
+    const int batchesBefore = gw->batchCount.load(std::memory_order_acquire);
+    EXPECT_EQ(batchesBefore, 1)
+        << "With maxInFlight=1 and held acks, only T1 should be sent; got "
+        << batchesBefore << " batch(es). T2 must NOT jump ahead of T1.";
+
+    // The one batch received must be T1 (1 record, recCount=1).
+    ASSERT_GE(gw->batches.size(), 1u);
+    EXPECT_EQ(gw->batches[0].recCount, 1)
+        << "First batch must be T1 (1 record); got recCount="
+        << gw->batches[0].recCount;
+
+    // Now release T1 ack → unblocks the in-flight slot → T2 can flow.
+    gw->holdAcks = false;
+    gw->releaseAcks();
+
+    // Pump until T2 arrives and both futures resolve.
+    bool done = false;
+    for (int i = 0; i < kPumpMax; ++i) {
+        agent->doWork(monoNs());
+        gw->poll();
+        if (fut1.wait_for(0s) == std::future_status::ready &&
+            fut2.wait_for(0s) == std::future_status::ready) {
+            done = true;
+            break;
+        }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    ASSERT_TRUE(done) << "Both T1 and T2 futures must resolve after ack release";
+    ASSERT_GE(gw->batches.size(), 2u) << "Expected 2 batches total";
+
+    // Submission order: T1 before T2 → T1.baseSeq < T2.baseSeq.
+    const auto& b0 = gw->batches[0];
+    const auto& b1 = gw->batches[1];
+
+    EXPECT_EQ(b0.recCount, 1) << "Batch 0 must be T1 (1 record)";
+    EXPECT_EQ(b1.recCount, 2) << "Batch 1 must be T2 (2 records)";
+    EXPECT_LT(b0.baseSeq, b1.baseSeq)
+        << "T1 baseSeq must be < T2 baseSeq (submission order preserved)";
+    EXPECT_EQ(b1.baseSeq, b0.baseSeq + b0.recCount)
+        << "T2 must immediately follow T1 (gap-free)";
+
+    // Cleanup.
+    agent->stop();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ===========================================================================
+// CB-5 A3: RingFullTier2FailsFast
+//
+// A tiny ring (4 KiB) is filled with Tier-1 records so the next Tier-2
+// ring write fails.  The Tier-2 future must resolve IMMEDIATELY with an
+// exception (not hang until produceTimeoutMs).
+// ===========================================================================
+TEST(BatchBuilder, RingFullTier2FailsFast) {
+    static constexpr int32_t kInStr = 3017, kEgStr = 3018;
+
+    const std::string agentDir = uniqueDir("cb5_a3");
+    const std::string aeronDir = agentDir + "/aeron";
+
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = kInStr;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = kEgStr;
+    cfg.transport.dataDir         = agentDir;
+    cfg.session.egressChannel     = "aeron:ipc";
+    cfg.session.egressStreamId    = kEgStr;
+    cfg.session.keepaliveIntervalNs = 10'000'000'000LL;
+    cfg.ringCapacity              = 4096; // 4 KiB ring
+
+    rprod::ProducerHub   hub;
+    std::atomic<int64_t> nextCorrId_ {1};
+
+    auto agent = std::make_unique<rca::ClientAgent>(cfg);
+    agent->setProducerDrainFn([](int64_t,int64_t,rca::ClientAgent::SendFn){return 0;});
+    agent->setProduceResponseFn([](int64_t,int64_t){});
+    agent->setEgressObserver([](rcc::TemplateId,const uint8_t*,std::size_t){});
+    agent->start();
+    std::this_thread::sleep_for(150ms);
+
+    // Use a tiny ProducerImpl ring (4 KiB) to make it easy to fill.
+    ProducerConfig pcfg;
+    pcfg.acks             = Acks::Leader;
+    pcfg.lingerUs         = 1'000'000'000LL;
+    pcfg.batchBytes       = 64 * 1024;
+    pcfg.maxInFlight      = 4;
+    pcfg.produceTimeoutMs = 30'000; // long timeout — should NOT be reached
+
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_, 4 * 1024);
+    hub.add(impl);
+    Producer p(impl);
+
+    auto topic = makeTopic(31, 1);
+    Key  key(uint64_t{0});
+
+    // Fill the ring with Tier-1 records.
+    const std::vector<uint8_t> val(32, 0xCC);
+    for (int i = 0; i < 200; ++i) {
+        impl->submitSendRecord(
+            topic.topicId, key.partition(topic.partitionCount),
+            key, std::span<const uint8_t>(val),
+            /*wantAck=*/false, /*corrId=*/0);
+    }
+
+    // Now try a Tier-2 batch — ring should be full → fail immediately.
+    auto bb = p.batch(topic, key);
+    bb.add(std::span<const uint8_t>(val));
+    auto fut2 = bb.send();
+
+    // Future must be immediately ready (ring-full fail-fast).
+    const auto status = fut2.wait_for(0ms);
+    EXPECT_EQ(status, std::future_status::ready)
+        << "Tier-2 ring-full must fail the future IMMEDIATELY (not via timeout)";
+
+    if (status == std::future_status::ready) {
+        EXPECT_THROW({ fut2.get(); }, std::runtime_error)
+            << "Ring-full Tier-2 must throw std::runtime_error";
+    }
+
+    // Cleanup.
+    agent->stop();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }

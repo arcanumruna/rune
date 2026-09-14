@@ -113,7 +113,14 @@ public:
     /// Binds the broker-assigned subscriptionId to the pending impl, and moves
     /// the entry from pendingByCorrelation_ to activeById_.
     /// Unknown correlationId → no-op (race with close/unsubscribe; safe).
-    void onSubscribeResponse(const codec::SubscribeResponseView& rsp);
+    ///
+    /// CB-5 A2 FIX: if the impl was already unsubscribed before the response
+    /// arrived, erases it from activeById_ and sends an Unsubscribe frame via
+    /// submitFn (using the newly known subscriptionId).
+    void onSubscribeResponse(const codec::SubscribeResponseView& rsp,
+                             int64_t                             unsubCorrId,
+                             int64_t                             sessionId,
+                             const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
 
     /// Called on the agent thread when a Records push arrives.
     ///

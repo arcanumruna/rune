@@ -478,6 +478,51 @@ void Client::onEgressFrame(codec::TemplateId tid,
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->code));
 
+        // CB-5 B: Redirect handling for pending data ops (Produce/Subscribe).
+        // When a follower returns ErrorResponse{Redirect, leaderClientEndpoint}
+        // for a pending Produce, we retarget the transport to the new leader
+        // endpoint, reconnect the session, and resend the affected op.
+        // Bounded by kMaxRedirects (ProducerImpl caps per-corrId retries).
+        if (ec == rpc::ErrorCode::Redirect && !opt->message.empty()) {
+            const std::string newEndpoint(opt->message);
+            // Retarget transport to the leader's client endpoint.
+            // If the endpoint is already a full Aeron channel URI (starts with
+            // "aeron:"), use it as-is (test / ipc scenarios).  Otherwise treat
+            // it as host:port and build a UDP channel.  This allows both
+            // production UDP redirects and in-process ipc test redirects.
+            const std::string newChannel =
+                (newEndpoint.rfind("aeron:", 0) == 0)
+                    ? newEndpoint
+                    : ("aeron:udp?endpoint=" + newEndpoint);
+
+            // Retarget is noexcept; if it fails the old publication is kept.
+            const bool retargeted = agent_.retarget(newChannel);
+
+            if (retargeted) {
+                // Reconnect session so a ConnectRequest goes to the new leader.
+                agent_.submitConnect();
+
+                // Resend the pending Produce (if any) that caused this redirect.
+                // Run on the agent thread (single-writer; sendFn is transport.offer).
+                if (opt->correlationId != 0) {
+                    producerHub_.retryRedirectedProduce(
+                        opt->correlationId,
+                        [this](const uint8_t* fb, std::size_t fl) -> bool {
+                            return agent_.submitSend(fb, fl);
+                        });
+                }
+            } else {
+                // Retarget failed — fail the pending op.
+                if (opt->correlationId != 0) {
+                    producerHub_.failAll("Redirect retarget failed");
+                }
+                if (cbError_) {
+                    cbError_("Redirect retarget failed for endpoint: " + newEndpoint);
+                }
+            }
+            break; // Redirect is handled; don't fall through to the error path.
+        }
+
         std::string msg(opt->message);
         if (msg.empty()) {
             msg = "ErrorResponse code: " + std::to_string(opt->code);
@@ -567,8 +612,19 @@ void Client::onEgressFrame(codec::TemplateId tid,
     case codec::TemplateId::SubscribeResponse: {
         auto opt = codec::decodeSubscribeResponse(buf, len);
         if (!opt) break;
-        // Route to the subscriber hub (agent thread).
-        subscriberHub_.onSubscribeResponse(*opt);
+        // CB-5 A2: pass a sendFn so SubscriberHub can emit a late Unsubscribe
+        // if the app called unsubscribe() before the response arrived.
+        {
+            const int64_t unsubCorrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+            const auto snap = agent_.stateAndSessionId();
+            subscriberHub_.onSubscribeResponse(
+                *opt,
+                unsubCorrId,
+                snap.sessionId,
+                [this](const uint8_t* fbuf, std::size_t flen) -> bool {
+                    return agent_.submitSend(fbuf, flen);
+                });
+        }
         break;
     }
 

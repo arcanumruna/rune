@@ -40,6 +40,18 @@ void ProducerHub::failAll(const std::string& reason) {
     }
 }
 
+bool ProducerHub::retryRedirectedProduce(
+    int64_t corrId,
+    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+{
+    for (auto& impl : impls_) {
+        if (impl->retryRedirectedProduce(corrId, sendFn)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
     for (auto& impl : impls_) {
         impl->sweepTimedOut(now);

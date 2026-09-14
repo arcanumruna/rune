@@ -64,6 +64,12 @@ public:
 
     bool empty() const noexcept { return impls_.empty(); }
 
+    /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
+    /// Returns true if one producer handled it (resent or failed).
+    bool retryRedirectedProduce(int64_t corrId,
+                                std::function<bool(const uint8_t*, std::size_t)> sendFn);
+
+
 private:
     std::vector<std::shared_ptr<ProducerImpl>> impls_;
 };

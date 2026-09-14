@@ -344,23 +344,17 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                 // Get or create the PartitionState to access idempotent seq.
                 PartitionState& ps = getOrCreatePartition(entry.topicId, entry.partition);
 
-                // Flush any pending Tier-1 records for this partition FIRST so
-                // that the Tier-2 batch follows them in log order.
-                // (ps.builder may have accumulated Tier-1 records; flush them
-                //  now before issuing the Tier-2 batch.)
-                // NOTE: sendFn_ is not available here — Tier-2 flush from drainRing
-                // would need a sendFn.  Instead, we mark flushRequested=true so
-                // flushBatches() (called immediately after drainRing() by ProducerHub)
-                // will flush the pending Tier-1 batch first.
-                // We store the Tier-2 entry in the partition state for deferred send.
+                // If there are pending Tier-1 records in the builder, mark
+                // flushRequested so flushBatches() sends them before the Tier-2
+                // entry (preserving submission order).
+                // CB-5 A1/A3: ordering is enforced by flushBatches's tier1Pending guard;
+                // the dead dual-branch is collapsed here.
                 if (ps.builder && ps.builder->recordCount() > 0) {
                     ps.flushRequested = true;
-                    // Store Tier-2 entry for processing after flushBatches drains Tier-1.
-                    ps.pendingTier2Entries.push_back(std::move(entry));
-                } else {
-                    // No pending Tier-1 records: process Tier-2 immediately via deferred list.
-                    ps.pendingTier2Entries.push_back(std::move(entry));
                 }
+
+                // Enqueue the Tier-2 entry for deferred dispatch in flushBatches.
+                ps.pendingTier2Entries.push_back(std::move(entry));
 
                 ++drained;
                 return;
@@ -480,8 +474,12 @@ bool ProducerImpl::encodeAndSend(
             // Only track ack-expecting batches; acks=None (corrId==0) are
             // fire-and-forget and must NOT consume inFlight slots.
             ++ps.inFlight;
-            // Record correlationId → (topicId, partition) for ProduceResponse routing.
-            batchMap_[correlationId] = BatchInfo{ps.topicId, ps.partition};
+            // CB-5 B: store wire frame bytes for redirect resend.
+            BatchInfo bi;
+            bi.topicId   = ps.topicId;
+            bi.partition = ps.partition;
+            bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+            batchMap_[correlationId] = std::move(bi);
         }
     }
 
@@ -577,7 +575,12 @@ bool ProducerImpl::encodeAndSendTier2(
 
     if (ok && entry.corrId != 0) {
         ++ps.inFlight;
-        batchMap_[entry.corrId] = BatchInfo{entry.topicId, entry.partition};
+        // CB-5 B: store wire frame bytes for redirect resend.
+        BatchInfo bi;
+        bi.topicId   = entry.topicId;
+        bi.partition = entry.partition;
+        bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+        batchMap_[entry.corrId] = std::move(bi);
     }
 
     return ok;
@@ -599,9 +602,17 @@ int ProducerImpl::flushBatches(
 
     for (auto& [k, ps] : partitions_) {
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
+        //
+        // CB-5 A1 FIX: Tier-2 entries must NEVER be dispatched while a
+        // Tier-1 auto-batch is blocked in the builder (i.e. there are
+        // accumulated records that haven't been sent yet).  If a Tier-1 batch
+        // is stuck behind maxInFlight, Tier-2 entries for the same partition
+        // must also wait — jumping ahead would violate submission order.
 
-        if (ps.builder && ps.builder->recordCount() > 0) {
-            // maxInFlight guard.
+        bool tier1Pending = (ps.builder && ps.builder->recordCount() > 0);
+
+        if (tier1Pending) {
+            // maxInFlight guard: only attempt flush if there's capacity.
             if (ps.inFlight < cfg_.maxInFlight) {
                 // Check flush triggers.
                 const bool lingerExpired = (nowNs - ps.batchStartNs) >= lingerNs;
@@ -623,18 +634,28 @@ int ProducerImpl::flushBatches(
                     if (encodeAndSend(ps, nowNs, sessionId, corrId, sendFn)) {
                         ++flushed;
                         ps.pendingCorrId = 0;
+                        // After a successful Tier-1 flush, tier1Pending is now false.
+                        tier1Pending = false;
                     }
+                    // If encodeAndSend returns false (transport back-pressure),
+                    // tier1Pending remains true and Tier-2 will be blocked below.
                 }
+                // else: flush not triggered yet — Tier-1 still accumulating.
+                // tier1Pending remains true; Tier-2 blocked to preserve order.
             }
+            // else: maxInFlight exceeded — Tier-1 blocked, so Tier-2 also blocked.
         } else {
             // No pending Tier-1 records; clear flush flags.
             if (ps.flushRequested) ps.flushRequested = false;
         }
 
         // ---- Tier-2: flush any pending explicit batches (FIFO order) ---------
-        // Tier-2 entries are sent after any pending Tier-1 records are flushed,
-        // maintaining submission order (Tier-1 records already in accumulator
-        // at submit time appear in log before the Tier-2 batch).
+        // Tier-2 entries are sent after any pending Tier-1 records are flushed.
+        // CB-5 A1: skip Tier-2 entirely if a Tier-1 batch is still pending
+        // (either not triggered, blocked by maxInFlight, or send failed).
+        // This enforces strict submission order: no T2 can jump ahead of T1.
+        if (tier1Pending) continue;
+
         while (!ps.pendingTier2Entries.empty()) {
             // maxInFlight guard (shared with Tier-1 for this partition).
             if (ps.inFlight >= cfg_.maxInFlight) break;
@@ -705,6 +726,47 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
             ++it;
         }
     }
+}
+
+bool ProducerImpl::retryRedirectedProduce(
+    int64_t corrId,
+    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+{
+    auto bit = batchMap_.find(corrId);
+    if (bit == batchMap_.end()) return false; // unknown corrId
+
+    BatchInfo& bi = bit->second;
+    if (bi.redirectCount >= kMaxRedirects) {
+        // Exhausted redirect budget — fail the promise.
+        failPending(corrId, "Redirect exhausted: max redirect attempts reached");
+        batchMap_.erase(bit);
+        return false;
+    }
+
+    if (bi.wireFrame.empty()) {
+        failPending(corrId, "Redirect: wire frame not available for resend");
+        batchMap_.erase(bit);
+        return false;
+    }
+
+    ++bi.redirectCount;
+    return sendFn(bi.wireFrame.data(), bi.wireFrame.size());
+}
+
+void ProducerImpl::failPending(int64_t corrId, const std::string& reason) {
+    std::lock_guard<std::mutex> lock(ackMtx_);
+    auto it = pendingAcks_.find(corrId);
+    if (it == pendingAcks_.end()) return;
+    PendingAck& pa = it->second;
+    if (pa.kind == PendingAck::Kind::Future) {
+        try {
+            pa.promise.set_exception(
+                std::make_exception_ptr(std::runtime_error(reason)));
+        } catch (...) {}
+    } else if (pa.kind == PendingAck::Kind::Callback && pa.callback) {
+        pa.callback(-1);
+    }
+    pendingAcks_.erase(it);
 }
 
 void ProducerImpl::failAllPending(const std::string& reason) {
