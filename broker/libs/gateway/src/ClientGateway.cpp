@@ -1568,23 +1568,27 @@ void ClientGateway::pushSubscriptions()
 // doWork on the duty-cycle thread in BrokerNode::doWork()).
 //
 // For each pending entry:
-//   - If replica->highWatermark() >= lastOffset → HW covers the batch → send
-//     ProduceResponse{OK, partition, baseOffset} and remove the entry.
+//   - If replica->highWatermark() > lastOffset → HW covers the WHOLE batch →
+//     send ProduceResponse{OK, partition, baseOffset} and remove the entry.
+//     (HW is EXCLUSIVE — count of committed records — so the last record at
+//     offset `lastOffset` is majority-durable only once HW > lastOffset.)
 //   - If nowNs_ - enqueuedAtNs >= kPendingAckTimeoutNs → stuck → send
 //     ProduceResponse{Internal} (followers not advancing) and remove the entry.
 //   - Otherwise → leave in queue for next cycle.
 //
 // Correctness:
-//   - An acks=All ack ONLY fires when HW >= lastOffset (majority-durable).
-//   - An acks=All ack is NEVER sent with errorCode=OK if HW < lastOffset.
+//   - An acks=All ack ONLY fires when HW > lastOffset (majority-durable).
+//     HW is EXCLUSIVE (committed-record count); the last record at lastOffset is
+//     durable IFF HW > lastOffset (== HW >= lastOffset + 1).
+//   - An acks=All ack is NEVER sent with errorCode=OK if HW <= lastOffset.
 //   - Timeout path: sends Internal (error) — NEVER an erroneous OK.
 //   - Produce-order is NOT relied on: swap-and-pop (erase-by-swap-back-pop) can
 //     reorder the vector on removal, so positional order is not guaranteed after
 //     the first eviction.  This is correct because each entry carries its own
-//     lastOffset and the HW check is purely per-entry (HW >= lastOffset).
+//     lastOffset and the HW check is purely per-entry (HW > lastOffset).
 //     Every entry resolves independently; a stuck entry does NOT block later
 //     entries from acking.  This is safe because HW is monotonically
-//     non-decreasing: once HW >= lastOffset[n], the same HW automatically
+//     non-decreasing: once HW > lastOffset[n], the same HW automatically
 //     satisfies all earlier batches in the same partition sequence.
 //     Future maintainers: do NOT rely on positional vector order for
 //     per-session or per-partition sequencing — the swap-and-pop is intentional.
@@ -1607,8 +1611,23 @@ void ClientGateway::drainPendingAcks()
 
         bool remove = false;
 
-        // HW check: has majority replicated the batch?
-        if (entry.replica && entry.replica->highWatermark() >= entry.lastOffset) {
+        // HW check: has a majority replicated the WHOLE batch?
+        //
+        // INVARIANT (GR-9): highWatermark() is EXCLUSIVE — it is the count of
+        // majority-committed records (== the next offset to be committed), i.e.
+        // HW == leos[majority-1] where each follower/leader LEO is the NEXT slot
+        // to write.  A record at offset X is majority-durable IFF HW > X
+        // (equivalently HW >= X + 1).  entry.lastOffset is the INCLUSIVE offset
+        // of the LAST record in the batch (base + lastOffsetDelta).  Therefore
+        // the batch is fully majority-durable IFF  HW > lastOffset.
+        //
+        // Do NOT use >= here: with an exclusive HW that acks a single-record
+        // batch (lastOffset=0) at HW=0 — BEFORE any follower has replicated it —
+        // silently defeating acks=All durability (records lost on leader kill).
+        // Do NOT over-correct to > lastOffset+1 either: once a majority's LEO
+        // reaches N (all N records fetched) HW=N and HW > lastOffset=N-1 is true,
+        // so the last record acks promptly (no never-ack stall).
+        if (entry.replica && entry.replica->highWatermark() > entry.lastOffset) {
             // HW advanced past this batch — ack OK.
             Session* session = sessions_.find(entry.sessionId);
             if (session) {

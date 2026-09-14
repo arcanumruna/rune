@@ -337,8 +337,10 @@ TEST(GR5_Unit, AcksAll_DeferredUntilHW) {
 
     // --- Simulate acks=All pending-ack entry (what the gateway enqueues) ---
     // The entry would be: lastOffset=kRecords-1, replica=leader.
-    // drainPendingAcks() checks leader->highWatermark() >= lastOffset.
-    const bool drainsBeforeFetch = (leader->highWatermark() >= lastOffset);
+    // drainPendingAcks() checks leader->highWatermark() > lastOffset (GR-9:
+    // HW is EXCLUSIVE, so the last record at lastOffset is durable IFF HW >
+    // lastOffset == HW >= lastOffset + 1).
+    const bool drainsBeforeFetch = (leader->highWatermark() > lastOffset);
     EXPECT_FALSE(drainsBeforeFetch)
         << "pending-ack entry must NOT drain before follower fetches";
 
@@ -360,9 +362,11 @@ TEST(GR5_Unit, AcksAll_DeferredUntilHW) {
         << "leader HW must advance to kRecords after follower replication";
 
     // --- After HW advances: pending-ack entry SHOULD drain ---
-    const bool drainsAfterFetch = (leader->highWatermark() >= lastOffset);
+    // GR-9: HW is exclusive; once a majority's LEO reaches kRecords, HW=kRecords
+    // and HW > lastOffset (== kRecords-1) is true → the entry drains.
+    const bool drainsAfterFetch = (leader->highWatermark() > lastOffset);
     EXPECT_TRUE(drainsAfterFetch)
-        << "pending-ack entry MUST drain once leader HW >= lastOffset";
+        << "pending-ack entry MUST drain once leader HW > lastOffset";
 
     EXPECT_EQ(leader->highWatermark(), static_cast<Offset>(kRecords))
         << "leader HW must equal LEO after full replication";
@@ -414,10 +418,10 @@ TEST(GR5_Unit, AcksAll_NotBeforeHW) {
     EXPECT_LT(leaderReplica.highWatermark(), static_cast<Offset>(kRecords))
         << "HW must not reach LEO with a disconnected follower in ISR";
 
-    // The pending-ack drain condition must be false.
-    const bool wouldDrain = (leaderReplica.highWatermark() >= lastOffset);
+    // The pending-ack drain condition must be false (GR-9: gate is HW > lastOffset).
+    const bool wouldDrain = (leaderReplica.highWatermark() > lastOffset);
     EXPECT_FALSE(wouldDrain)
-        << "pending-ack entry must NOT drain when HW < lastOffset (follower disconnected)";
+        << "pending-ack entry must NOT drain when HW <= lastOffset (follower disconnected)";
 }
 
 // ===========================================================================
@@ -812,11 +816,12 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     EXPECT_EQ(prodResp->correlationId, 200);
     EXPECT_EQ(prodResp->baseOffset, 0) << "first produce must have baseOffset=0";
 
-    // KEY ASSERTION: at the time ProduceResponse arrived, HW >= lastOffset.
-    // (The response only fires when HW >= lastOffset in drainPendingAcks.)
+    // KEY ASSERTION: at the time ProduceResponse arrived, HW > lastOffset.
+    // (GR-9: HW is EXCLUSIVE — the response only fires when HW > lastOffset in
+    // drainPendingAcks, i.e. HW >= lastOffset + 1 == kNumRecords.)
     const Offset lastOffset = static_cast<Offset>(kNumRecords - 1);
-    EXPECT_GE(leaderReplica->highWatermark(), lastOffset)
-        << "acks=All ProduceResponse must not fire before HW >= lastOffset; "
+    EXPECT_GT(leaderReplica->highWatermark(), lastOffset)
+        << "acks=All ProduceResponse must not fire before HW > lastOffset; "
         << "HW=" << leaderReplica->highWatermark()
         << " lastOffset=" << lastOffset;
 
@@ -1046,6 +1051,173 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     conn.ingressPub.reset();
     conn.egressSub.reset();
 
+    for (auto* ownerPtr : owners) {
+        if (*ownerPtr) (*ownerPtr)->stop();
+    }
+}
+
+// ===========================================================================
+// INTEGRATION TEST 3 (GR-9 regression): SINGLE-record acks=All must NOT be
+// acked while HW=0 — it is durable only once a follower advances HW to 1.
+//
+// This is the boundary case that the GR-9 leader-kill Docker E2E exposed and
+// that the old `HW >= lastOffset` gate got WRONG:
+//
+//   * A single-record batch has lastOffset = baseOffset = 0.
+//   * highWatermark() is EXCLUSIVE (committed-record COUNT); it starts at 0.
+//   * With the buggy `>=` gate, `HW(0) >= lastOffset(0)` is TRUE immediately —
+//     the acks=All OK fires BEFORE any follower has replicated the record.
+//     On a leader kill the record is lost → acks=All durability defeated.
+//   * The correct gate is `HW > lastOffset` (== HW >= 1 == a majority holds the
+//     record).  The OK must be deferred until a follower fetch advances HW to 1.
+//
+// Deterministic design (no timing race):
+//   3-node cluster, minIsr=2.  Produce ONE record (acks=All).  Then STOP both
+//   follower nodes so NO follower can ever advance the leader's HW past 0
+//   (leader alone cannot form the majority-of-3 required for HW>=1).  The
+//   pending-ack entry MUST therefore remain enqueued and NO OK ProduceResponse
+//   may arrive within the observation window (well under the 30 s pending-ack
+//   timeout).  Also assert leader HW is pinned at 0.
+//
+//   PRE-FIX (`>=`): drainPendingAcks() fires OK at HW=0 on the very first duty
+//   cycle → an OK ProduceResponse arrives and pendingAckCount() drops to 0 →
+//   this test FAILS.
+//   POST-FIX (`>`): no OK arrives, HW stays 0, entry stays pending → PASSES.
+// ===========================================================================
+TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
+    Gr5TempDir dir0{"gr9_sr0_"}, dir1{"gr9_sr1_"}, dir2{"gr9_sr2_"};
+    Gr5TempDir clientDir{"client_gr9sr_"};
+
+    const auto cPorts = gr5DiscoverFreePorts(3);
+    const auto kPorts = gr5DiscoverFreePorts(3);
+    const auto rPorts = gr5DiscoverFreePorts(3);
+
+    auto cfg0 = makeGr5Config(0, dir0.path, cPorts, kPorts, rPorts);
+    auto cfg1 = makeGr5Config(1, dir1.path, cPorts, kPorts, rPorts);
+    auto cfg2 = makeGr5Config(2, dir2.path, cPorts, kPorts, rPorts);
+
+    auto node0p = std::make_unique<rune::node::BrokerNode>(cfg0);
+    auto node1p = std::make_unique<rune::node::BrokerNode>(cfg1);
+    auto node2p = std::make_unique<rune::node::BrokerNode>(cfg2);
+
+    node0p->start();
+    node1p->start();
+    node2p->start();
+
+    ASSERT_TRUE(node0p->awaitLeader(8s));
+    ASSERT_TRUE(node1p->awaitLeader(8s));
+    ASSERT_TRUE(node2p->awaitLeader(8s));
+    std::this_thread::sleep_for(300ms);
+
+    const rune::consensus::NodeId lid = node0p->leaderId();
+    ASSERT_GE(lid, 0);
+    ASSERT_LE(lid, 2);
+
+    std::array<rune::node::BrokerNode*, 3> allNodes{
+        node0p.get(), node1p.get(), node2p.get()};
+    std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
+        owners{&node0p, &node1p, &node2p};
+    rune::node::BrokerNode* leaderNode = allNodes[lid];
+
+    {
+        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < roleDeadline) {
+            if (leaderNode->replicationIsLeaderForTest()) break;
+            std::this_thread::sleep_for(10ms);
+        }
+    }
+    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+
+    // minIsr=2: the single-record produce passes the ISR gate (3 in ISR) but
+    // requires a MAJORITY (2 of 3) LEO>=1 for HW to advance past 0.
+    leaderNode->setGatewayMinIsr(2);
+
+    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
+    ASSERT_NE(leaderReplica, nullptr);
+    rune::gateway::ClientGateway* leaderGw = leaderNode->gatewayForTest();
+    ASSERT_NE(leaderGw, nullptr);
+
+    // Connect a client.
+    const fs::path clientAeronDir = clientDir.path / "aeron";
+    Gr5ClientDriver clientDrv(clientAeronDir);
+    ASSERT_NE(clientDrv.aeron, nullptr);
+
+    const std::string leaderClientChannel =
+        "aeron:udp?endpoint=127.0.0.1:" +
+        std::to_string(kPorts[static_cast<std::size_t>(lid)]);
+    constexpr int32_t kClientStreamId = 50;
+
+    ClientConn conn = ClientConn::connect(clientDrv, leaderClientChannel, kClientStreamId);
+    ASSERT_GT(conn.assignedSessionId, 0);
+
+    // Kill BOTH followers so the leader can NEVER reach HW>=1 (no majority).
+    // Do this BEFORE producing so no follower fetch can advance HW.
+    for (int i = 0; i < 3; ++i) {
+        if (i != lid) owners[i]->reset(); // hard stop
+    }
+
+    // --- Produce ONE record, acks=All ---
+    auto batch = makeBatch(/*recordCount=*/1);
+    pc::Produce prod;
+    prod.sessionId      = conn.assignedSessionId;
+    prod.correlationId  = 900;
+    prod.topicId        = 0;
+    prod.partition      = 0;
+    prod.partitionKnown = 1;
+    prod.acks           = 1;  // acks=All
+    prod.key            = std::span<const uint8_t>{};
+    prod.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+
+    constexpr std::size_t kScratch = 68 * 1024;
+    std::vector<uint8_t> scratch(kScratch, 0);
+    const std::size_t prodLen = prod.encode(scratch.data());
+    ASSERT_TRUE(gr5OfferBounded(*conn.ingressPub, scratch.data(), prodLen))
+        << "single-record acks=All Produce offer failed";
+
+    // Observe for a bounded window that NO OK ProduceResponse for corrId=900
+    // arrives (the record cannot be majority-committed with both followers dead).
+    // 3 s is far under the 30 s pending-ack timeout, so a correctly-deferred
+    // entry produces NO response at all in this window.
+    std::optional<pc::ProduceResponse> anyResp;
+    {
+        aeron::FragmentAssembler prodAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t offset,
+                                             aeron::util::index_t len,
+                                             aeron::Header&) {
+            auto dec = pc::ProduceResponse::decode(
+                reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                static_cast<std::size_t>(len));
+            if (dec && dec->correlationId == 900) anyResp = *dec;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (std::chrono::steady_clock::now() < deadline && !anyResp.has_value()) {
+            conn.egressSub->poll(prodAsm.handler(), 10);
+            std::this_thread::sleep_for(1ms);
+        }
+    }
+
+    // KEY GR-9 ASSERTION: the single record must NOT be acked OK — pre-fix the
+    // `>=` gate fires OK at HW=0 (this .value() would be present with errorCode OK).
+    if (anyResp.has_value()) {
+        EXPECT_NE(anyResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+            << "GR-9 REGRESSION: single-record acks=All was acked OK while it "
+               "cannot be majority-committed (both followers dead). HW="
+            << leaderReplica->highWatermark();
+    }
+
+    // The leader's HW must be pinned at 0 (nothing majority-committed).
+    EXPECT_EQ(leaderReplica->highWatermark(), static_cast<Offset>(0))
+        << "leader HW must stay 0 with no follower replication";
+
+    // The record was appended to the leader log (LEO advanced) but the ack is
+    // still deferred: the pending-ack entry must remain enqueued.
+    EXPECT_GE(leaderGw->pendingAckCount(), static_cast<std::size_t>(1))
+        << "acks=All entry for the single record must remain deferred "
+           "(HW=0 does NOT satisfy HW > lastOffset=0)";
+
+    // Cleanup.
+    conn.ingressPub.reset();
+    conn.egressSub.reset();
     for (auto* ownerPtr : owners) {
         if (*ownerPtr) (*ownerPtr)->stop();
     }

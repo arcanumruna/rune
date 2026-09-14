@@ -153,6 +153,15 @@ public:
         if (gateway_) gateway_->setMinIsr(minIsr);
     }
 
+    /// Return this node's ClientGateway (or nullptr).  Test-only: reaches into
+    /// duty-cycle-owned state (e.g. pendingAckCount()); call only from a
+    /// synchronized test context that knows the duty cycle is between doWork
+    /// calls (or with the node stopped).  Used by GR-9 to observe the
+    /// deferred-ack queue depth for the acks=All HW-gate boundary test.
+    rune::gateway::ClientGateway* gatewayForTest() const noexcept {
+        return gateway_.get();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers

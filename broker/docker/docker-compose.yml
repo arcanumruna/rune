@@ -15,9 +15,16 @@ x-broker-build: &broker-build
     rune-protocol: ../../rune-protocol
 
 x-broker-env: &broker-env
-  # GB-4: peer spec includes clientPort (id@host:consensusPort:clientPort).
-  # Followers use these to redirect Produce/Subscribe to the leader's client endpoint.
-  RUNE_PEERS: "0@rune-1:40111:40200,1@rune-2:40111:40200,2@rune-3:40111:40200"
+  # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
+  # replication transport actually STARTS — without it the broker logs
+  # "no replicationPort configured — topics won't replicate" and acks=All can
+  # never be majority-durable (committed records are lost on leader kill).
+  # Format: id@host:consensusPort:clientPort:replicationPort.
+  #   consensus  = 40111 (Raft/consensus aeron:udp)
+  #   client     = 40200 (client gateway aeron:udp)
+  #   replication= 40222 (follower→leader fetch / leader→follower data aeron:udp)
+  # Followers use clientPort to redirect Produce/Subscribe to the leader endpoint.
+  RUNE_PEERS: "0@rune-1:40111:40200:40222,1@rune-2:40111:40200:40222,2@rune-3:40111:40200:40222"
   RUNE_DATA_DIR: /var/lib/rune
   # Client gateway listens on all interfaces inside the container.
   # RUNE_CLIENT_ENDPOINT is the raw "host:port" appended to "aeron:udp?endpoint=".
