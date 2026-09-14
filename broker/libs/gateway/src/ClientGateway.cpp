@@ -1220,8 +1220,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // 5. Clamp fromOffset to [0, LEO].
-    //    fromOffset < 0 → "from Latest" (LEO); fromOffset > LEO → clamp to LEO.
+    // 5. Clamp fromOffset to [0, HW] (GR-6) — or [0, LEO] for non-replicated topics.
+    //    fromOffset < 0 → "from Latest"; fromOffset > clamp-limit → clamped.
     //    Convention: negative fromOffset is the "Latest" sentinel documented in the brief.
     //
     // GB-5 Fix #5 — Sub-batch over-delivery (Kafka-consistent whole-batch semantics):
@@ -1234,22 +1234,41 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     //    (offsets 0..4) is delivered; client drops records 0..2 and consumes 3..4.
     // CB-5: honour the client's From sentinels distinctly (see client
     // From::toWire()):  Earliest = -2 → offset 0 (deliver the whole log);
-    // Latest = -1 → LEO (only new records).  Previously ALL negatives mapped
+    // Latest = -1 → HW (only new committed records).  Previously ALL negatives mapped
     // to LEO, which silently dropped Earliest subscriptions (0/N delivered).
+    //
+    // GR-6: "Latest" and "beyond-clamp" both use HW (not LEO) when a replica is
+    // wired.  A subscriber starting at "Latest" should NOT sit above HW — that
+    // would mean it would only receive new records AFTER HW advances past its
+    // starting point, which is correct behavior since it should only see committed
+    // data.  Clamping to HW also prevents the caller from providing a fromOffset
+    // above HW (e.g. from a stale client cache reflecting LEO of a previous leader
+    // that lost uncommitted records on failover — clamping to HW avoids a permanent
+    // "nothing to deliver" stall on a reconnecting subscriber).
     static constexpr int64_t kFromEarliest = -2;
     static constexpr int64_t kFromLatest   = -1;
     const int64_t leo = log->logEndOffset();
+    // GR-6: use HW as the clamp limit when a replica is available.
+    // For non-replicated / single-node topics, HW == LEO — no behavioral change.
+    int64_t clampLimit;
+    if (replicaRegistry_) {
+        const rune::replication::PartitionReplica* replica =
+            replicaRegistry_->lookup(msg.topicId, partition);
+        clampLimit = replica ? replica->highWatermark() : leo;
+    } else {
+        clampLimit = leo;
+    }
     int64_t nextOffset;
     if (msg.fromOffset == kFromEarliest) {
-        // Earliest → from the beginning of the log.
+        // Earliest → from the beginning of the log (offset 0).
         nextOffset = 0;
     } else if (msg.fromOffset < 0) {
-        // Latest (-1) or any other negative sentinel → subscribe to new records.
+        // Latest (-1) or any other negative sentinel → subscribe from HW (GR-6).
         (void)kFromLatest;
-        nextOffset = leo;
-    } else if (msg.fromOffset > leo) {
-        // Beyond LEO → clamp to LEO (no data there yet).
-        nextOffset = leo;
+        nextOffset = clampLimit;
+    } else if (msg.fromOffset > clampLimit) {
+        // Beyond HW → clamp to HW (GR-6: don't skip ahead of committed data).
+        nextOffset = clampLimit;
     } else {
         nextOffset = msg.fromOffset;
     }
@@ -1293,15 +1312,39 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 }
 
 // ---------------------------------------------------------------------------
-// pushSubscriptions (GB-3) — push new Records from the Log to each subscriber.
+// pushSubscriptions (GB-3 / GR-6) — push new Records from the Log to each subscriber.
 //
 // Called from doWork() AFTER the ingress poll (single-writer, duty-cycle thread).
 //
 // For each active subscription:
-//   - Compute isolation bound: both read_uncommitted (0) and read_committed (1)
-//     use logEndOffset() for M-B (no transactions yet → LSO == LEO).
-//     // TODO(Milestone C): read_committed uses the real LSO once transactions land.
-//   - If nextOffset >= bound → skip (nothing to push).
+//   - Compute isolation bound (GR-6):
+//       When replicaRegistry_ is wired, look up the PartitionReplica.  If found,
+//       use replica->highWatermark() as the delivery bound — this is the
+//       majority-committed offset; no record above HW can ever be delivered to a
+//       subscriber regardless of isolation setting.  A record above HW has been
+//       written to the leader's log (LEO advanced) but has NOT been acknowledged
+//       by a majority of replicas.  If the leader fails before majority replication,
+//       the incoming leader truncates those records; a subscriber that already
+//       received them would hold data that is no longer on any replica — a
+//       correctness violation.  HW-bounding prevents this.
+//
+//       Isolation semantics post-GR-6:
+//         isolation=0 (read_uncommitted): still bounded by HW.  The "uncommitted"
+//           in the Kafka sense refers to open TRANSACTIONS (no-op in Milestone B/C
+//           scope here) — it does NOT mean "allow delivery of truncatable records".
+//           We default ALL subscribers to HW-bounded to be safe.
+//         isolation=1 (read_committed): also bounded by HW.  Once transactions land
+//           (Milestone C), read_committed will additionally be bounded by the real
+//           LSO (log-stable-offset).  LSO ≤ HW always, so the HW gate is the outer
+//           bound and LSO will be the inner one.
+//           // TODO(Milestone C): read_committed additionally uses real LSO once
+//           // transactions land.  For now both modes use HW.
+//
+//       If no replica is found (topic not replicated, or replicaRegistry_ null),
+//       fall back to logEndOffset() — single-node / non-replicated path where HW
+//       equals LEO by definition (no followers to lag).
+//
+//   - If nextOffset >= bound → skip (nothing committed to push yet).
 //   - Otherwise: Log::read(nextOffset, kMaxChunkBytes) → iterate whole batches:
 //       For each batch (identified via kLengthOffset = 12 + LE32@8):
 //         Encode Records{subscriptionId, topicId, partition, baseOffset, batchBytes}.
@@ -1313,6 +1356,7 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 //
 // Zero-alloc hot path: scratch_ is the pre-allocated encode buffer; Log::read
 // returns a vector (unavoidable OS read) but we do not allocate per-batch.
+// Replica lookup is O(1) (unordered_map pointer; no alloc).
 //
 // Correctness guarantee: nextOffset is NEVER advanced past a batch that was not
 // successfully pushed (tryClaim > 0).  This ensures exactly-once delivery in order,
@@ -1332,15 +1376,27 @@ void ClientGateway::pushSubscriptions()
             continue;
         }
 
-        // Compute isolation bound.
-        // TODO(Milestone C): read_committed uses the real LSO once transactions land.
+        // Compute isolation bound (GR-6: HW-bounded delivery).
+        // See block comment above for the full rationale.
         rune::storage::Log* log = topicRegistry_ ?
             topicRegistry_->log(sub.topicId, sub.partition) : nullptr;
         if (!log) continue; // registry removed or not set — skip
 
-        const int64_t bound = log->logEndOffset();  // both isolation modes use LEO for M-B
+        // GR-6: Look up the PartitionReplica for this (topicId, partition).
+        // If found → bound = replica->highWatermark() (majority-committed).
+        // If not found (non-replicated / registry not wired) → bound = LEO (pass-through).
+        // O(1), no alloc, lock-free (single-writer duty-cycle thread).
+        int64_t bound;
+        if (replicaRegistry_) {
+            const rune::replication::PartitionReplica* replica =
+                replicaRegistry_->lookup(sub.topicId, sub.partition);
+            bound = replica ? replica->highWatermark() : log->logEndOffset();
+        } else {
+            // No replication wired — single-node pass-through: HW == LEO.
+            bound = log->logEndOffset();
+        }
 
-        if (sub.nextOffset >= bound) continue; // nothing new to push
+        if (sub.nextOffset >= bound) continue; // nothing committed to push yet
 
         // Fetch a bounded chunk of bytes from the log starting at nextOffset.
         std::vector<uint8_t> chunk;

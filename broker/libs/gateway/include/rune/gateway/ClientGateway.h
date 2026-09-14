@@ -250,13 +250,18 @@ private:
     };
 
     // -----------------------------------------------------------------------
-    // Subscription — per-session push subscription (GB-3).
+    // Subscription — per-session push subscription (GB-3 / GR-6).
     //
     // nextOffset tracks the exact offset to push next.  The push loop advances
     // it ONLY after a successful tryClaim (exactly-once delivery guarantee).
     // isolation: 0 = read_uncommitted, 1 = read_committed.
-    //   M-B: both modes use logEndOffset() as the isolation bound; the real LSO
-    //   will be used for read_committed once transactions land (Milestone C).
+    //   GR-6: BOTH modes are bounded by replica->highWatermark() when a replica
+    //   is wired.  This prevents delivery of truncatable (uncommitted) records
+    //   that a leader-failover would truncate.  "read_uncommitted" here means
+    //   "allow open-transaction records" (Kafka semantics), NOT "allow records
+    //   above majority-HW" — those are never safe to deliver.
+    //   TODO(Milestone C): read_committed additionally uses the real LSO (log-
+    //   stable-offset) once transactions land; LSO ≤ HW always.
     // -----------------------------------------------------------------------
     struct Subscription {
         int64_t subscriptionId = 0;
