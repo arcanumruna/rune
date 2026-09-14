@@ -158,4 +158,21 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_gateway_subscribe_hw_bound_tests
             PROPERTIES TIMEOUT 240)
     endif()
+
+    # ---------------------------------------------------------------------------
+    # GR-7: Follower catch-up / truncation / rejoin under failover (durability crux).
+    # Unit tests (InMemoryTransport, deterministic clock) + integration tests
+    # (3-node in-process, real aeron:udp).  No Docker.
+    # Gated behind BUILD_NODE_UDP_TESTS (same env requirement as GR-3..GR-6 tests).
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_gateway_failover_replication_tests
+            tests/integration/GatewayFailoverReplicationTest.cpp)
+        target_link_libraries(rune_gateway_failover_replication_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_gateway_failover_replication_tests
+            PROPERTIES TIMEOUT 300)
+    endif()
 endif()
