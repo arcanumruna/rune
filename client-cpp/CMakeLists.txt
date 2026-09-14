@@ -161,6 +161,7 @@ if(BUILD_TESTING)
     add_executable(rune_client_tests
         tests/SmokeTest.cpp
         tests/ConformanceTest.cpp
+        tests/DataConformanceTest.cpp
     )
     target_link_libraries(rune_client_tests PRIVATE rune_client GTest::gtest_main)
     target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
