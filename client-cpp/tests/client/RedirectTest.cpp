@@ -89,7 +89,19 @@ struct RedirectGateway {
     // Observed counters.
     int producesSeen  = 0;
     int connectsSeen  = 0;
+    int subscribesSeen = 0;
     int64_t lastBaseOffset = -1;
+
+    // CB-5 B: assign a DIFFERENT sessionId on the post-redirect reconnect so the
+    // test can prove the resent Produce/Subscribe carries the NEW sessionId
+    // (re-stamped) rather than the stale first-session id.
+    static constexpr int64_t kFirstSessionId  = 42;
+    static constexpr int64_t kLeaderSessionId = 99;
+    int64_t lastConnectAssignedSessionId = 0;
+
+    // sessionId observed on the LAST Produce / Subscribe the gateway received.
+    int64_t lastProduceSessionId   = -1;
+    int64_t lastSubscribeSessionId = -1;
 
     static constexpr int64_t kBaseOffset = 200;
 
@@ -170,15 +182,50 @@ struct RedirectGateway {
             if (!opt) return;
             ++connectsSeen;
 
-            // Always reply OK — handles initial connect and post-redirect reconnect.
+            // Assign the first session on the initial connect and a DIFFERENT
+            // session on the post-redirect reconnect (proves re-stamp).
+            const int64_t assigned =
+                (connectsSeen == 1) ? kFirstSessionId : kLeaderSessionId;
+            lastConnectAssignedSessionId = assigned;
+
             const std::size_t n = rcc::encodeConnectResponse(
                 replyBuf, sizeof(replyBuf),
                 static_cast<int16_t>(rcc::ErrorCode::OK),
                 /*leaderMemberId=*/0,
-                /*assignedSessionId=*/42,
+                /*assignedSessionId=*/assigned,
                 opt->sessionId,
                 opt->correlationId);
             if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid == rcc::TemplateId::Subscribe) {
+            const auto opt = rcc::decodeSubscribe(buf, len);
+            if (!opt) return;
+            ++subscribesSeen;
+            lastSubscribeSessionId = opt->sessionId;
+
+            if (subscribesSeen == 1) {
+                // First Subscribe: reply ErrorResponse{Redirect}.
+                const std::string_view endpoint = "aeron:ipc";
+                const std::size_t n = rcc::encodeErrorResponse(
+                    replyBuf, sizeof(replyBuf),
+                    static_cast<int16_t>(rcc::ErrorCode::Redirect),
+                    endpoint,
+                    opt->sessionId,
+                    opt->correlationId);
+                if (n > 0) gwSend(replyBuf, n);
+            } else {
+                // Resend (post-redirect): reply SubscribeResponse{OK}.
+                const std::size_t n = rcc::encodeSubscribeResponse(
+                    replyBuf, sizeof(replyBuf),
+                    /*errorCode=*/0,
+                    /*partition=*/opt->partition,
+                    /*subscriptionId=*/7,
+                    opt->sessionId,
+                    opt->correlationId);
+                if (n > 0) gwSend(replyBuf, n);
+            }
             return;
         }
 
@@ -188,6 +235,7 @@ struct RedirectGateway {
         if (!opt) return;
 
         ++producesSeen;
+        lastProduceSessionId = opt->sessionId;
 
         if (producesSeen == 1) {
             // First Produce: reply ErrorResponse{Redirect}.
@@ -320,6 +368,109 @@ TEST(Redirect, ProduceRedirectFollow) {
     EXPECT_EQ(gw->producesSeen, 2)
         << "Gateway must see 2 Produces (1 redirected + 1 resend)";
 
+    // CB-5 B bug-2 fix: the resent Produce must carry the LEADER's freshly
+    // assigned sessionId (re-stamped), NOT the stale first-session id.  The
+    // reconnect assigned kLeaderSessionId; the resend must use it.
+    EXPECT_EQ(gw->lastProduceSessionId, RedirectGateway::kLeaderSessionId)
+        << "Resent Produce must carry the NEW (leader) sessionId after redirect";
+
+    // CB-5 B bug-4: exactly ONE reconnect (2 connects total: initial + redirect).
+    EXPECT_EQ(gw->connectsSeen, 2)
+        << "Exactly one reconnect after redirect (no session churn)";
+
+    client->close();
+
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Test: SubscribeRedirectFollow (CB-5 B bug-1 + bug-2)
+//
+// Client sends a Subscribe.  The gateway (follower) replies Redirect.  The
+// client must retarget + reconnect + RESEND the Subscribe (bug-1: subscribe
+// redirect was previously dropped) re-stamped with the leader's new sessionId
+// (bug-2).  The gateway (leader) then answers SubscribeResponse{OK}.  We prove
+// the resend happened AND carried the new sessionId.
+// ===========================================================================
+TEST(Redirect, SubscribeRedirectFollow) {
+    static constexpr int32_t kInStr = 4100, kEgStr = 4101;
+
+    const std::string agentDir = uniqueDir("cb5b_sub");
+    const std::string aeronDir = agentDir + "/aeron";
+
+    ClientConfig cfg;
+    cfg.gatewayChannel   = "aeron:ipc";
+    cfg.gatewayStreamId  = kInStr;
+    cfg.egressChannel    = "aeron:ipc";
+    cfg.egressStreamId   = kEgStr;
+    cfg.dataDir          = agentDir;
+    cfg.connectTimeoutMs = 8000;
+    cfg.pingTimeoutMs    = 8000;
+    cfg.idleMode         = IdleMode::LowLatency;
+
+    TopicSpec ts;
+    ts.name           = "inventory";
+    ts.topicId        = 1;
+    ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+
+    auto client = std::make_unique<Client>(cfg);
+    std::this_thread::sleep_for(150ms);
+
+    auto gw = std::make_unique<RedirectGateway>(aeronDir, kInStr, kEgStr);
+
+    // Connect.
+    auto connFut = client->connect();
+    bool connected = false;
+    for (int i = 0; i < kPumpMax; ++i) {
+        gw->poll(16);
+        if (connFut.wait_for(0s) == std::future_status::ready) {
+            connected = true;
+            break;
+        }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_TRUE(connected) << "Failed to connect to redirect gateway";
+    ASSERT_NO_THROW(connFut.get());
+
+    auto th = client->topic("inventory");
+    ASSERT_TRUE(th.valid());
+
+    std::atomic<bool> bound{false};
+    SubscribeOptions opts;
+    opts.from      = From::earliest();
+    opts.isolation = Isolation::ReadUncommitted;
+
+    auto sub = client->subscribe(th, /*partition=*/0, opts,
+                                 [](const Record&) { /* no records in this test */ });
+
+    // Pump until the subscription is bound (subscriptionId != 0), which only
+    // happens after the SubscribeResponse — i.e. after the redirect+resend.
+    bool subBound = false;
+    for (int i = 0; i < kPumpMax; ++i) {
+        gw->poll(16);
+        if (sub.subscriptionId() != 0) { subBound = true; break; }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    ASSERT_TRUE(subBound)
+        << "Subscription must bind after redirect-follow (gateway saw "
+        << gw->subscribesSeen << " Subscribe(s), "
+        << gw->connectsSeen << " Connect(s))";
+
+    // bug-1: the Subscribe must have been RESENT (2 seen: redirect + resend).
+    EXPECT_EQ(gw->subscribesSeen, 2)
+        << "Gateway must see 2 Subscribes (1 redirected + 1 resend)";
+
+    // bug-2: the resent Subscribe must carry the NEW leader sessionId.
+    EXPECT_EQ(gw->lastSubscribeSessionId, RedirectGateway::kLeaderSessionId)
+        << "Resent Subscribe must carry the NEW (leader) sessionId after redirect";
+
+    // bug-4: exactly one reconnect.
+    EXPECT_EQ(gw->connectsSeen, 2)
+        << "Exactly one reconnect after subscribe redirect (no churn)";
+
+    sub.unsubscribe();
     client->close();
 
     try { std::filesystem::remove_all(agentDir); } catch (...) {}

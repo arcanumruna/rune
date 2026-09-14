@@ -443,6 +443,22 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 try { pc->promise.set_value(); } catch (...) {}
             }
 
+            // CB-5 B: if this ConnectResponse{OK} completes a redirect-triggered
+            // reconnect, flush every pending redirected data op NOW, re-stamped
+            // with the leader's freshly assigned sessionId.  This is deferred to
+            // exactly here (rather than at redirect time) so the resent frames
+            // carry the NEW session — the leader drops unknown-session ops.
+            // Runs on the agent thread (single-writer): submitSend → agent ring.
+            if (redirectPending_.exchange(false, std::memory_order_acq_rel)) {
+                const int64_t newSessionId = opt->assignedSessionId;
+                std::function<bool(const uint8_t*, std::size_t)> sendFn =
+                    [this](const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.submitSend(fb, fl);
+                    };
+                producerHub_.resendAllRedirected(newSessionId, sendFn);
+                subscriberHub_.resendPending(newSessionId, sendFn);
+            }
+
             // Fire onConnected.
             if (cbConnected_) {
                 cbConnected_(opt->assignedSessionId);
@@ -499,23 +515,44 @@ void Client::onEgressFrame(codec::TemplateId tid,
             const bool retargeted = agent_.retarget(newChannel);
 
             if (retargeted) {
-                // Reconnect session so a ConnectRequest goes to the new leader.
-                agent_.submitConnect();
-
-                // Resend the pending Produce (if any) that caused this redirect.
-                // Run on the agent thread (single-writer; sendFn is transport.offer).
-                if (opt->correlationId != 0) {
-                    producerHub_.retryRedirectedProduce(
-                        opt->correlationId,
-                        [this](const uint8_t* fb, std::size_t fl) -> bool {
-                            return agent_.submitSend(fb, fl);
-                        });
+                // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
+                // rejected by a FOLLOWER.  We must:
+                //   (1) reconnect to the leader with a FRESH session (the leader
+                //       has no session for us — submitReconnect forces a new
+                //       ConnectRequest even though we are still logically
+                //       Connected to the follower), and
+                //   (2) resend the affected op(s) — Produce AND Subscribe — but
+                //       only AFTER the new ConnectResponse{OK} arrives, so they
+                //       carry the leader's freshly assigned sessionId (re-stamped
+                //       into the frame header).  We defer the resend by setting
+                //       redirectPending_; the ConnectResponse{OK} handler flushes
+                //       it (see above).  This fixes: subscribe never resent (1),
+                //       stale sessionId (2), resend racing the reconnect (3).
+                //
+                // Stick-to-leader (4): the transport retarget persists and the
+                // new session is the leader's, so every subsequent op reads the
+                // leader session via stateAndSessionId() and lands directly on
+                // the leader without re-redirecting.
+                //
+                // If nothing is actually in flight (e.g. a duplicate/late
+                // Redirect after we already reconnected), avoid a spurious
+                // reconnect that would churn the session.
+                const bool haveWork =
+                    producerHub_.hasInFlight() || subscriberHub_.hasPending();
+                // Only initiate ONE reconnect per redirect episode: if a
+                // reconnect is already pending (multiple in-flight ops each
+                // redirected), coalesce — the single deferred resend on the next
+                // ConnectResponse{OK} flushes ALL pending ops.  This prevents
+                // session churn from a burst of redirects.
+                bool expected = false;
+                if (haveWork &&
+                    redirectPending_.compare_exchange_strong(
+                        expected, true, std::memory_order_acq_rel)) {
+                    agent_.submitReconnect();
                 }
             } else {
-                // Retarget failed — fail the pending op.
-                if (opt->correlationId != 0) {
-                    producerHub_.failAll("Redirect retarget failed");
-                }
+                // Retarget failed — fail the pending op(s).
+                producerHub_.failAll("Redirect retarget failed");
                 if (cbError_) {
                     cbError_("Redirect retarget failed for endpoint: " + newEndpoint);
                 }

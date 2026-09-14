@@ -753,6 +753,57 @@ bool ProducerImpl::retryRedirectedProduce(
     return sendFn(bi.wireFrame.data(), bi.wireFrame.size());
 }
 
+// ---------------------------------------------------------------------------
+// CB-5 B: re-stamp the sessionId (MessageHeader int64 LE at byte offset 8) in a
+// pre-encoded wire frame.  Used on redirect resend: the leader assigned a NEW
+// sessionId, but the stored frame still carries the OLD (follower) sessionId.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr std::size_t kHeaderSessionIdOff = 8; // MessageHeader.sessionId LE64
+
+inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noexcept {
+    if (frame.size() < kHeaderSessionIdOff + 8) return;
+    const uint64_t u = static_cast<uint64_t>(sessionId);
+    for (int i = 0; i < 8; ++i)
+        frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
+}
+} // anonymous namespace
+
+int ProducerImpl::resendAllRedirected(
+    int64_t newSessionId,
+    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+{
+    int resent = 0;
+    for (auto it = batchMap_.begin(); it != batchMap_.end(); ) {
+        BatchInfo& bi = it->second;
+
+        if (bi.wireFrame.empty()) {
+            const int64_t corrId = it->first;
+            it = batchMap_.erase(it);
+            failPending(corrId, "Redirect: wire frame not available for resend");
+            continue;
+        }
+
+        if (bi.redirectCount >= kMaxRedirects) {
+            const int64_t corrId = it->first;
+            it = batchMap_.erase(it);
+            failPending(corrId, "Redirect exhausted: max redirect attempts reached");
+            continue;
+        }
+
+        // Re-stamp the frame header with the leader's freshly assigned sessionId
+        // so the leader accepts the resend (unknown-session would be dropped).
+        restampSessionId(bi.wireFrame, newSessionId);
+
+        ++bi.redirectCount;
+        if (sendFn(bi.wireFrame.data(), bi.wireFrame.size())) {
+            ++resent;
+        }
+        ++it;
+    }
+    return resent;
+}
+
 void ProducerImpl::failPending(int64_t corrId, const std::string& reason) {
     std::lock_guard<std::mutex> lock(ackMtx_);
     auto it = pendingAcks_.find(corrId);

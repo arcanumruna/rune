@@ -271,6 +271,19 @@ public:
     bool retryRedirectedProduce(int64_t corrId,
                                 std::function<bool(const uint8_t*, std::size_t)>& sendFn);
 
+    /// CB-5 B: resend EVERY in-flight (still-unacked) Produce frame after a
+    /// leader redirect + reconnect.  Each stored wire frame is re-stamped with
+    /// the NEW sessionId (bytes [8..15] of the MessageHeader) so the leader —
+    /// which just assigned a fresh session — accepts it instead of dropping it
+    /// as unknown-session.  Bounded per-frame by kMaxRedirects; frames that
+    /// exceed the budget are failed.  Returns the number of frames resent.
+    int resendAllRedirected(int64_t newSessionId,
+                            std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+
+    /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
+    /// (i.e. a redirect resend would have something to flush).
+    [[nodiscard]] bool hasInFlight() const noexcept { return !batchMap_.empty(); }
+
     /// Called from Client::sweepTimeouts(): fail acks older than the deadline.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 

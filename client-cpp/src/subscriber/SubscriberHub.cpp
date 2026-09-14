@@ -49,9 +49,16 @@ void SubscriberHub::registerSubscribe(
         correlationId);
 
     // ---- Register the impl under correlationId (control-plane lock) ---------
+    // Store the encoded Subscribe frame alongside the impl so it can be
+    // re-stamped + resent on a leader redirect (CB-5 B).
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        pendingByCorrelation_.emplace(correlationId, impl);
+        PendingSub ps;
+        ps.impl = impl;
+        if (frameLen > 0) {
+            ps.subscribeFrame.assign(frameBuf, frameBuf + frameLen);
+        }
+        pendingByCorrelation_.emplace(correlationId, std::move(ps));
     }
 
     // ---- Submit to the agent ring -------------------------------------------
@@ -121,7 +128,7 @@ void SubscriberHub::onSubscribeResponse(
         if (it == pendingByCorrelation_.end()) {
             return; // unknown correlationId — race with close/unsubscribe; safe
         }
-        impl = std::move(it->second);
+        impl = std::move(it->second.impl);
         pendingByCorrelation_.erase(it);
 
         // Store the broker-assigned subscriptionId regardless of active state,
@@ -229,14 +236,54 @@ void SubscriberHub::deactivateAll()
 {
     std::lock_guard<std::mutex> lk(mtx_);
 
-    for (auto& [corrId, impl] : pendingByCorrelation_) {
-        impl->active.store(false, std::memory_order_release);
+    for (auto& [corrId, ps] : pendingByCorrelation_) {
+        if (ps.impl) ps.impl->active.store(false, std::memory_order_release);
     }
     for (auto& [subId, impl] : activeById_) {
         impl->active.store(false, std::memory_order_release);
     }
     pendingByCorrelation_.clear();
     activeById_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// resendPending — agent thread (CB-5 B leader-redirect resend)
+// ---------------------------------------------------------------------------
+
+int SubscriberHub::resendPending(
+        int64_t newSessionId,
+        const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
+{
+    // Re-stamp the MessageHeader sessionId (int64 LE at byte offset 8) of every
+    // pending Subscribe frame with the leader's freshly assigned sessionId, then
+    // resend.  Frames are kept pending (still awaiting SubscribeResponse from the
+    // leader); we only mutate the stored bytes so a later redirect re-stamps
+    // from the last-known frame.
+    constexpr std::size_t kHeaderSessionIdOff = 8;
+
+    int resent = 0;
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (auto& [corrId, ps] : pendingByCorrelation_) {
+        if (!ps.impl) continue;
+        if (!ps.impl->active.load(std::memory_order_acquire)) continue; // unsubscribed
+        auto& frame = ps.subscribeFrame;
+        if (frame.size() < kHeaderSessionIdOff + 8) continue;
+
+        const uint64_t u = static_cast<uint64_t>(newSessionId);
+        for (int i = 0; i < 8; ++i)
+            frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
+
+        if (submitFn && submitFn(frame.data(), frame.size())) {
+            ++resent;
+        }
+    }
+    return resent;
+}
+
+bool SubscriberHub::hasPending() const
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    return !pendingByCorrelation_.empty();
 }
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,24 @@ bool ProducerHub::retryRedirectedProduce(
     return false;
 }
 
+int ProducerHub::resendAllRedirected(
+    int64_t newSessionId,
+    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+{
+    int resent = 0;
+    for (auto& impl : impls_) {
+        resent += impl->resendAllRedirected(newSessionId, sendFn);
+    }
+    return resent;
+}
+
+bool ProducerHub::hasInFlight() const noexcept {
+    for (const auto& impl : impls_) {
+        if (impl->hasInFlight()) return true;
+    }
+    return false;
+}
+
 void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
     for (auto& impl : impls_) {
         impl->sweepTimedOut(now);

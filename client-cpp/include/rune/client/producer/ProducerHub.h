@@ -69,6 +69,15 @@ public:
     bool retryRedirectedProduce(int64_t corrId,
                                 std::function<bool(const uint8_t*, std::size_t)> sendFn);
 
+    /// CB-5 B: resend every in-flight Produce across all producers after a
+    /// leader redirect + reconnect, re-stamped with the new sessionId.
+    /// Returns the total number of frames resent.
+    int resendAllRedirected(int64_t newSessionId,
+                            std::function<bool(const uint8_t*, std::size_t)> sendFn);
+
+    /// CB-5 B: true if any producer has an in-flight (unacked) batch.
+    [[nodiscard]] bool hasInFlight() const noexcept;
+
 
 private:
     std::vector<std::shared_ptr<ProducerImpl>> impls_;

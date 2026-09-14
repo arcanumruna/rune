@@ -135,6 +135,26 @@ public:
         doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/true);
     }
 
+    /// CB-5 B: force a FRESH reconnect regardless of the current state.
+    ///
+    /// Used by the data-op redirect path: a Produce/Subscribe was rejected by a
+    /// FOLLOWER with ErrorResponse{Redirect,leaderEndpoint}.  The agent has
+    /// already retarget()ed the transport to the leader.  The session is still
+    /// logically Connected to the OLD (follower) sessionId, so connect() would
+    /// no-op.  forceReconnect() drops the old session and issues a brand-new
+    /// ConnectRequest (sessionId reset to 0) so the LEADER assigns a fresh
+    /// sessionId.  Pending redirected data ops are resent — re-stamped with the
+    /// new sessionId — once the ConnectResponse{OK} arrives (see Client.cpp).
+    ///
+    /// No-op only from Closed (terminal).
+    void forceReconnect(int64_t nowNs) noexcept {
+        if (state_ == SessionState::Closed) return;
+        // Force to Disconnected first so doConnect's Connecting transition is
+        // a clean fresh episode (reset sessionId + all retry/redirect counters).
+        state_ = SessionState::Disconnected;
+        doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/true);
+    }
+
     /// Connected → Closed: send a Disconnect frame (clean shutdown).
     /// Resuming → Closed: send a Disconnect frame if a session exists.
     /// No-op from any state other than Connected or Resuming.

@@ -58,8 +58,11 @@ RUNE_PRODUCE_M="${RUNE_PRODUCE_M:-10}"
 RUNE_TIMEOUT_MS="${RUNE_TIMEOUT_MS:-10000}"
 RUNE_RECOVERY_WAIT_MS="${RUNE_RECOVERY_WAIT_MS:-5000}"
 
-# Topics spec: "events:1:1" (name:id:partitionCount).
-RUNE_TOPICS="${RUNE_TOPICS:-events:1:1}"
+# Topics spec: "events:0:1" (name:id:partitionCount).
+# topicId 0 matches the broker's RUNE_TOPICS bootstrap (rune-broker
+# docker-compose.yml), which assigns topicIds sequentially from 0 in
+# declaration order → "events" = topicId 0.
+RUNE_TOPICS="${RUNE_TOPICS:-events:0:1}"
 
 LEADER_WAIT_S=90
 CLIENT_WAIT_S=180   # Phase 1 + kill + Phase 2 may take up to 3 min
@@ -111,17 +114,28 @@ docker compose -f "${BROKER_COMPOSE}" up -d rune-1 rune-2 rune-3
 # ---------------------------------------------------------------------------
 await_leader_id() {
     local timeout_s="${1}"
+    shift
+    # Remaining args = the set of services to scan for a leader announcement.
+    # After a leader kill, the killed service is EXCLUDED so its stale
+    # "node N is LEADER" line cannot re-select the dead node.  Defaults to all
+    # three nodes when no services are supplied.
+    local -a svcs=("$@")
+    if [ "${#svcs[@]}" -eq 0 ]; then
+        svcs=(rune-1 rune-2 rune-3)
+    fi
     local deadline=$(( $(date +%s) + timeout_s ))
     local leader_id=""
 
-    log "Waiting up to ${timeout_s}s for a leader node ID in logs..."
+    log "Waiting up to ${timeout_s}s for a leader node ID in logs (scan: ${svcs[*]})..."
     while [ "$(date +%s)" -lt "${deadline}" ]; do
         local raw
+        # tail -1: take the LATEST leader announcement, not the earliest — after
+        # a re-election the newest line reflects the current leader.
         raw=$(docker compose -f "${BROKER_COMPOSE}" logs --no-log-prefix \
-                rune-1 rune-2 rune-3 2>/dev/null \
+                "${svcs[@]}" 2>/dev/null \
               | grep -oE 'node [0-9]+ is LEADER' \
               | grep -oE '[0-9]+' \
-              | head -1) || true
+              | tail -1) || true
         if [ -n "${raw}" ]; then
             leader_id="${raw}"
             break
@@ -132,7 +146,7 @@ await_leader_id() {
     if [ -z "${leader_id}" ]; then
         log "=== broker logs (last 50 lines) ==="
         docker compose -f "${BROKER_COMPOSE}" logs --tail=50 \
-            rune-1 rune-2 rune-3 2>/dev/null || true
+            "${svcs[@]}" 2>/dev/null || true
         fail "Timed out (${timeout_s}s) waiting for leader"
     fi
 
@@ -215,9 +229,31 @@ docker compose -f "${BROKER_COMPOSE}" stop "${leader_svc}"
 log "Killed ${leader_svc}. Waiting ${RUNE_RECOVERY_WAIT_MS}ms for re-election..."
 sleep $(( RUNE_RECOVERY_WAIT_MS / 1000 ))
 
-# Find the new leader.
-log "Awaiting new leader after kill..."
-new_leader_id=$(await_leader_id 60) || fail "No new leader elected after killing ${leader_svc}"
+# Find the new leader.  Exclude the killed service so its stale "is LEADER"
+# line cannot be re-selected, and poll until the elected id differs from the
+# killed node (re-election may lag the kill by a few election timeouts).
+log "Awaiting new leader after kill (excluding ${leader_svc})..."
+live_svcs=()
+for s in rune-1 rune-2 rune-3; do
+    [ "${s}" != "${leader_svc}" ] && live_svcs+=("${s}")
+done
+
+new_leader_id=""
+new_leader_deadline=$(( $(date +%s) + 60 ))
+while [ "$(date +%s)" -lt "${new_leader_deadline}" ]; do
+    cand=$(await_leader_id 60 "${live_svcs[@]}") || \
+        fail "No new leader elected after killing ${leader_svc}"
+    cand_svc=$(node_id_to_service "${cand}")
+    if [ "${cand_svc}" != "${leader_svc}" ]; then
+        new_leader_id="${cand}"
+        break
+    fi
+    # Still seeing the old (killed) leader's stale announcement — wait for the
+    # surviving nodes to elect a fresh leader.
+    sleep 2
+done
+
+[ -n "${new_leader_id}" ] || fail "New leader still resolves to killed ${leader_svc}"
 new_leader_svc=$(node_id_to_service "${new_leader_id}")
 log "New leader: node ID=${new_leader_id} → service=${new_leader_svc}"
 

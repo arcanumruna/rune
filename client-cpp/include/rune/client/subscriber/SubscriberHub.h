@@ -138,6 +138,19 @@ public:
     /// is shutting down anyway).
     void deactivateAll();
 
+    /// CB-5 B: resend every PENDING Subscribe frame after a leader redirect +
+    /// reconnect.  A Subscribe rejected by a follower with ErrorResponse
+    /// {Redirect} was never bound (no SubscribeResponse), so it still lives in
+    /// pendingByCorrelation_.  Each stored Subscribe frame is re-stamped with
+    /// the NEW leader-assigned sessionId (MessageHeader int64 LE at byte 8) and
+    /// resent so the leader — which just assigned a fresh session — accepts it.
+    /// Returns the number of Subscribe frames resent.
+    int resendPending(int64_t newSessionId,
+                      const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
+
+    /// CB-5 B: true if there is at least one pending (unbound) subscription.
+    [[nodiscard]] bool hasPending() const;
+
     // -------------------------------------------------------------------------
     // Helpers (accessible so SubscriberHub is testable standalone)
     // -------------------------------------------------------------------------
@@ -153,8 +166,13 @@ private:
     mutable std::mutex mtx_;
 
     // Pending subscriptions: Subscribe sent, SubscribeResponse not yet received.
-    // Key: correlationId.
-    std::map<int64_t, std::shared_ptr<SubscriptionImpl>> pendingByCorrelation_;
+    // Key: correlationId.  Stores the impl plus the encoded Subscribe frame so
+    // the frame can be re-stamped + resent on a leader redirect (CB-5 B).
+    struct PendingSub {
+        std::shared_ptr<SubscriptionImpl> impl;
+        std::vector<uint8_t>              subscribeFrame; // encoded Subscribe (for redirect resend)
+    };
+    std::map<int64_t, PendingSub> pendingByCorrelation_;
 
     // Active subscriptions: SubscribeResponse received, subscriptionId bound.
     // Key: subscriptionId.

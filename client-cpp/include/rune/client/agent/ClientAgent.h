@@ -126,6 +126,11 @@ public:
     /// Submit a CONNECT command.  Returns false if the ring is full.
     bool submitConnect() noexcept;
 
+    /// Submit a RECONNECT command (CB-5 B data-op redirect).  Forces a fresh
+    /// ConnectRequest even when the session is currently Connected — used after
+    /// retarget()ing the transport to a new leader.  Returns false if ring full.
+    bool submitReconnect() noexcept;
+
     /// Submit a DISCONNECT command.  Returns false if the ring is full.
     bool submitDisconnect() noexcept;
 
@@ -225,6 +230,7 @@ private:
     static constexpr int32_t kMsgDisconnect = 2;
     static constexpr int32_t kMsgClose      = 3;
     static constexpr int32_t kMsgSend       = 4;
+    static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
 
     // -------------------------------------------------------------------------
     // Helpers

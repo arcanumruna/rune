@@ -358,6 +358,18 @@ private:
     // ---- CB-4: SubscriberHub -------------------------------------------------
     // Owned by Client.  subscribe() / onEgressFrame() / close() all access it.
     subscriber::SubscriberHub subscriberHub_;
+
+    // ---- CB-5 B: data-op leader-redirect state -------------------------------
+    // Set on the runner thread when a Produce/Subscribe is rejected by a
+    // FOLLOWER with ErrorResponse{Redirect,leaderEndpoint}: the transport is
+    // retarget()ed to the leader and a fresh reconnect is submitted.  The
+    // pending redirected data ops are NOT resent immediately (they would race
+    // the new ConnectResponse and carry a stale sessionId) — instead this flag
+    // is consumed on the next ConnectResponse{OK}, at which point every pending
+    // Produce + Subscribe is re-stamped with the NEW sessionId and resent.
+    // Touched only on the runner/agent thread (onEgressFrame); atomic for
+    // publication safety.
+    std::atomic<bool> redirectPending_ {false};
 };
 
 } // namespace rune::client

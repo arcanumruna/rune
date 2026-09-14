@@ -124,6 +124,14 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 session_.connect(nowNs);
                 break;
 
+            case kMsgReconnect:
+                // CB-5 B: force a fresh reconnect (data-op redirect).  The
+                // transport was already retarget()ed to the leader; drop the
+                // stale follower session and connect fresh so the leader
+                // assigns a new sessionId.
+                session_.forceReconnect(nowNs);
+                break;
+
             case kMsgDisconnect:
                 session_.disconnect();
                 break;
@@ -231,6 +239,10 @@ bool ClientAgent::writeCommand(int32_t msgTypeId,
 
 bool ClientAgent::submitConnect() noexcept {
     return writeCommand(kMsgConnect, nullptr, 0);
+}
+
+bool ClientAgent::submitReconnect() noexcept {
+    return writeCommand(kMsgReconnect, nullptr, 0);
 }
 
 bool ClientAgent::submitDisconnect() noexcept {
