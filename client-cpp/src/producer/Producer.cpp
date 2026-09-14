@@ -1,9 +1,12 @@
 // src/producer/Producer.cpp
 //
-// CB-2 — Producer public API: thin wrapper forwarding to ProducerImpl.
+// CB-2/CB-3 — Producer public API: thin wrapper forwarding to ProducerImpl.
 
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/producer/BatchBuilder.h>
+
+#include <stdexcept>
 
 namespace rune::client {
 
@@ -59,6 +62,24 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
     impl_->submitSendRecord(topic.topicId, part, key, value,
                              /*wantAck=*/true, corrId);
     return std::move(fut);
+}
+
+// ---------------------------------------------------------------------------
+// Tier-2: explicit atomic batch
+// ---------------------------------------------------------------------------
+
+BatchBuilder Producer::batch(TopicHandle topic, const Key& key) {
+    if (!impl_ || !topic.valid()) {
+        // Return a "dead" BatchBuilder; send() will throw (empty batch guard).
+        // Use a null impl so add() and send() are still safely callable.
+        // Actually: for an invalid topic, return a BatchBuilder that will throw
+        // on send().  We satisfy this by returning a builder with impl_ set and
+        // topicId=-1; the submitTier2Batch call will fail gracefully.
+        // Best: throw here so the caller knows immediately.
+        throw std::invalid_argument("Producer::batch: invalid topic handle");
+    }
+    const int32_t part = key.partition(topic.partitionCount);
+    return BatchBuilder(impl_, topic.topicId, part);
 }
 
 // ---------------------------------------------------------------------------

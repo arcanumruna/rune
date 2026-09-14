@@ -10,6 +10,8 @@
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/Crc32c.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
 #include <chrono>
@@ -187,6 +189,51 @@ void ProducerImpl::submitFlush() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// App-thread: Tier-2 explicit batch submission
+// ---------------------------------------------------------------------------
+
+bool ProducerImpl::submitTier2Batch(int32_t topicId,
+                                     int32_t partition,
+                                     int64_t corrId,
+                                     int32_t recordCount,
+                                     std::vector<uint8_t> batchBytes)
+{
+    // Push the batch bytes to the side queue BEFORE writing the ring token.
+    // The agent pops from this queue when it processes the token.  The mutex
+    // ensures correct ordering between app thread(s) and the agent thread.
+    {
+        std::lock_guard<std::mutex> lock(tier2Mtx_);
+        Tier2Entry entry;
+        entry.topicId     = topicId;
+        entry.partition   = partition;
+        entry.corrId      = corrId;
+        entry.recordCount = recordCount;
+        entry.batchBytes  = std::move(batchBytes);
+        tier2Queue_.push_back(std::move(entry));
+    }
+
+    // Build the ring token (21 bytes).
+    uint8_t tok[kT2TokenSize];
+    writeLE32(tok, kT2TopicIdOff,   topicId);
+    writeLE32(tok, kT2PartOff,      partition);
+    tok[kT2FlagsOff] = kFlagWantAck; // Tier-2 always expects an ack
+    writeLE64(tok, kT2CorrIdOff,    corrId);
+    writeLE32(tok, kT2RecCountOff,  recordCount);
+
+    const bool ok = writeToRing(kMsgTier2Batch, tok, kT2TokenSize);
+
+    if (!ok) {
+        // Ring full: remove the entry we just pushed to keep the queue/ring in sync.
+        std::lock_guard<std::mutex> lock(tier2Mtx_);
+        if (!tier2Queue_.empty()) {
+            tier2Queue_.pop_back();
+        }
+    }
+
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // App-thread: opt-in ack registration (may allocate)
 // ---------------------------------------------------------------------------
 
@@ -277,6 +324,44 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                     ps.flushRequested = true;
                 }
                 globalFlushPending_.store(false, std::memory_order_relaxed);
+                ++drained;
+                return;
+            }
+
+            if (msgTypeId == kMsgTier2Batch) {
+                // Pop the pre-built batch from tier2Queue_ (FIFO order).
+                // NOTE: drainRing is called with limit=1; this handler is
+                // invoked on the agent thread (single-writer).  The tier2Mtx_
+                // guards access from the app thread side only.
+                Tier2Entry entry;
+                {
+                    std::lock_guard<std::mutex> lock(tier2Mtx_);
+                    if (tier2Queue_.empty()) return; // queue/ring race (shouldn't happen)
+                    entry = std::move(tier2Queue_.front());
+                    tier2Queue_.pop_front();
+                }
+
+                // Get or create the PartitionState to access idempotent seq.
+                PartitionState& ps = getOrCreatePartition(entry.topicId, entry.partition);
+
+                // Flush any pending Tier-1 records for this partition FIRST so
+                // that the Tier-2 batch follows them in log order.
+                // (ps.builder may have accumulated Tier-1 records; flush them
+                //  now before issuing the Tier-2 batch.)
+                // NOTE: sendFn_ is not available here — Tier-2 flush from drainRing
+                // would need a sendFn.  Instead, we mark flushRequested=true so
+                // flushBatches() (called immediately after drainRing() by ProducerHub)
+                // will flush the pending Tier-1 batch first.
+                // We store the Tier-2 entry in the partition state for deferred send.
+                if (ps.builder && ps.builder->recordCount() > 0) {
+                    ps.flushRequested = true;
+                    // Store Tier-2 entry for processing after flushBatches drains Tier-1.
+                    ps.pendingTier2Entries.push_back(std::move(entry));
+                } else {
+                    // No pending Tier-1 records: process Tier-2 immediately via deferred list.
+                    ps.pendingTier2Entries.push_back(std::move(entry));
+                }
+
                 ++drained;
                 return;
             }
@@ -411,6 +496,94 @@ bool ProducerImpl::encodeAndSend(
 }
 
 // ---------------------------------------------------------------------------
+// Agent-thread: encode and send a Tier-2 pre-built batch
+// ---------------------------------------------------------------------------
+
+bool ProducerImpl::encodeAndSendTier2(
+    PartitionState& ps,
+    Tier2Entry& entry,
+    int64_t sessionId,
+    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+{
+    if (entry.batchBytes.empty() || entry.recordCount == 0) return false;
+
+    // Patch the baseSequence, producerId, and producerEpoch into the pre-built
+    // RecordBatch bytes.  The fields are at fixed offsets defined in RecordBatch.h:
+    //   producerId    : int64 LE at offset 43
+    //   producerEpoch : int16 LE at offset 51
+    //   baseSequence  : int32 LE at offset 53
+    // We write directly into the bytes vector (already allocated on app thread).
+    auto& b = entry.batchBytes;
+    if (b.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        return false; // truncated batch — should not happen
+    }
+
+    // Patch producerId (int64 LE at offset 43).
+    const uint64_t pid = static_cast<uint64_t>(producerId_);
+    for (int i = 0; i < 8; ++i)
+        b[43 + i] = static_cast<uint8_t>(pid >> (i * 8));
+
+    // Patch producerEpoch (int16 LE at offset 51).
+    const uint16_t ep = static_cast<uint16_t>(producerEpoch_);
+    b[51] = static_cast<uint8_t>(ep);
+    b[52] = static_cast<uint8_t>(ep >> 8);
+
+    // Patch baseSequence (int32 LE at offset 53).
+    const uint32_t seq = static_cast<uint32_t>(ps.nextBaseSequence);
+    b[53] = static_cast<uint8_t>(seq);
+    b[54] = static_cast<uint8_t>(seq >> 8);
+    b[55] = static_cast<uint8_t>(seq >> 16);
+    b[56] = static_cast<uint8_t>(seq >> 24);
+
+    // Recompute the CRC-32C over the CRC-covered region.
+    // The CRC at offset 17 (uint32 LE) covers bytes [21..end].
+    // We must recompute after patching producerId/epoch/sequence.
+    // Use the same CRC library the RecordBatchBuilder uses.
+    {
+        const std::size_t crcStart = 21; // attributes field (kAttributesOffset)
+        const uint32_t crc = rune::protocol::crc32c(
+            b.data() + crcStart, b.size() - crcStart);
+        b[17] = static_cast<uint8_t>(crc);
+        b[18] = static_cast<uint8_t>(crc >> 8);
+        b[19] = static_cast<uint8_t>(crc >> 16);
+        b[20] = static_cast<uint8_t>(crc >> 24);
+    }
+
+    // Advance baseSequence by the record count.
+    ps.nextBaseSequence += entry.recordCount;
+
+    // Encode the Produce wire frame.
+    namespace rpc = rune::protocol::client;
+    rpc::Produce msg;
+    msg.sessionId      = sessionId;
+    msg.correlationId  = entry.corrId;
+    msg.topicId        = entry.topicId;
+    msg.partition      = entry.partition;
+    msg.partitionKnown = 1;
+    msg.key            = {};
+    msg.recordBatch    = std::span<const uint8_t>(b);
+
+    const std::size_t needed = msg.encodedSize();
+    if (needed == 0) return false;
+
+    if (encodeScratch_.size() < needed) {
+        encodeScratch_.resize(needed);
+    }
+
+    const std::size_t written = msg.encode(encodeScratch_.data());
+    if (written == 0) return false;
+
+    const bool ok = sendFn(encodeScratch_.data(), written);
+
+    if (ok && entry.corrId != 0) {
+        ++ps.inFlight;
+        batchMap_[entry.corrId] = BatchInfo{entry.topicId, entry.partition};
+    }
+
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Agent-thread: flush batches
 // ---------------------------------------------------------------------------
 
@@ -425,38 +598,53 @@ int ProducerImpl::flushBatches(
     int flushed = 0;
 
     for (auto& [k, ps] : partitions_) {
-        if (!ps.builder || ps.builder->recordCount() == 0) continue;
+        // ---- Tier-1: flush pending auto-batch if triggered -------------------
 
-        // maxInFlight guard: skip if too many outstanding batches.
-        if (ps.inFlight >= cfg_.maxInFlight) continue;
+        if (ps.builder && ps.builder->recordCount() > 0) {
+            // maxInFlight guard.
+            if (ps.inFlight < cfg_.maxInFlight) {
+                // Check flush triggers.
+                const bool lingerExpired = (nowNs - ps.batchStartNs) >= lingerNs;
+                const bool sizeFull      = (ps.builderBytes >= cfg_.batchBytes);
+                const bool doFlush       = lingerExpired || sizeFull ||
+                                           ps.flushRequested || globalFlush ||
+                                           !ps.pendingTier2Entries.empty();
 
-        // Check flush triggers.
-        const bool lingerExpired = (nowNs - ps.batchStartNs) >= lingerNs;
-        const bool sizeFull      = (ps.builderBytes >= cfg_.batchBytes);
-        const bool doFlush       = lingerExpired || sizeFull ||
-                                   ps.flushRequested || globalFlush;
+                if (doFlush) {
+                    int64_t corrId = 0;
+                    if (cfg_.acks != Acks::None) {
+                        if (ps.pendingCorrId != 0) {
+                            corrId = ps.pendingCorrId;
+                        } else {
+                            corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
 
-        if (!doFlush) continue;
-
-        // Determine correlationId:
-        //   - acks=None → 0 (fire-and-forget, no ProduceResponse expected).
-        //   - acks=Leader/All + wantAck record → use ps.pendingCorrId (registered
-        //     by the app thread in registerFuture/registerCallback before the send).
-        //   - acks=Leader/All + no wantAck → allocate a fresh corrId so the broker
-        //     can route a ProduceResponse (needed to decrement inFlight).
-        int64_t corrId = 0;
-        if (cfg_.acks != Acks::None) {
-            if (ps.pendingCorrId != 0) {
-                corrId = ps.pendingCorrId;
-            } else {
-                // No app-registered ack; allocate internally to track inFlight.
-                corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+                    if (encodeAndSend(ps, nowNs, sessionId, corrId, sendFn)) {
+                        ++flushed;
+                        ps.pendingCorrId = 0;
+                    }
+                }
             }
+        } else {
+            // No pending Tier-1 records; clear flush flags.
+            if (ps.flushRequested) ps.flushRequested = false;
         }
 
-        if (encodeAndSend(ps, nowNs, sessionId, corrId, sendFn)) {
-            ++flushed;
-            ps.pendingCorrId = 0; // reset after flush
+        // ---- Tier-2: flush any pending explicit batches (FIFO order) ---------
+        // Tier-2 entries are sent after any pending Tier-1 records are flushed,
+        // maintaining submission order (Tier-1 records already in accumulator
+        // at submit time appear in log before the Tier-2 batch).
+        while (!ps.pendingTier2Entries.empty()) {
+            // maxInFlight guard (shared with Tier-1 for this partition).
+            if (ps.inFlight >= cfg_.maxInFlight) break;
+
+            Tier2Entry& entry = ps.pendingTier2Entries.front();
+
+            if (encodeAndSendTier2(ps, entry, sessionId, sendFn)) {
+                ++flushed;
+            }
+            ps.pendingTier2Entries.pop_front();
         }
     }
 

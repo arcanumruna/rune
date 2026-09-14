@@ -48,6 +48,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <future>
 #include <map>
@@ -62,8 +63,9 @@ namespace rune::client::producer {
 // ---------------------------------------------------------------------------
 // Ring message type IDs used by the Producer (distinct from ClientAgent IDs).
 // ---------------------------------------------------------------------------
-inline constexpr int32_t kMsgSendRecord = 1; // SEND_RECORD (producer-ring local ID)
-inline constexpr int32_t kMsgFlush      = 2; // flush trigger (producer-ring local ID)
+inline constexpr int32_t kMsgSendRecord  = 1; // SEND_RECORD (producer-ring local ID)
+inline constexpr int32_t kMsgFlush       = 2; // flush trigger (producer-ring local ID)
+inline constexpr int32_t kMsgTier2Batch  = 3; // Tier-2 explicit batch token
 
 // ---------------------------------------------------------------------------
 // SEND_RECORD layout constants
@@ -78,11 +80,41 @@ inline constexpr int kRecValLenOff   = 34;  // uint32 LE
 inline constexpr int kRecValBytesOff = 38;  // value bytes
 inline constexpr int kRecHeaderSize  = 38;  // bytes before value
 
+// kMsgTier2Batch token layout constants (21 bytes total)
+// ---------------------------------------------------------------------------
+// [0..3]   topicId     : int32 LE
+// [4..7]   partition   : int32 LE
+// [8]      flags       : uint8 (bit0=wantAck — always set for Tier-2)
+// [9..16]  corrId      : int64 LE
+// [17..20] recordCount : int32 LE (number of records in the pre-built batch)
+inline constexpr int kT2TopicIdOff    = 0;   // int32 LE
+inline constexpr int kT2PartOff       = 4;   // int32 LE
+inline constexpr int kT2FlagsOff      = 8;   // uint8
+inline constexpr int kT2CorrIdOff     = 9;   // int64 LE
+inline constexpr int kT2RecCountOff   = 17;  // int32 LE
+inline constexpr int kT2TokenSize     = 21;  // total bytes
+
 // Flags bits
 inline constexpr uint8_t kFlagWantAck = 0x01;
 
 // Default ring capacity for a producer (per-producer, separate from agent ring).
 inline constexpr int32_t kDefaultProducerRingCap = 256 * 1024; // 256 KiB
+
+// ---------------------------------------------------------------------------
+// Tier2Entry — pre-built RecordBatch bytes waiting for agent-thread processing.
+//
+// The app thread builds the batch bytes (without baseSequence — left 0) and
+// stores them here.  The ring carries only a small token (kMsgTier2Batch);
+// the agent pops from this queue in FIFO order when it processes the token,
+// stamps the correct baseSequence from PartitionState, then encodes+sends.
+// ---------------------------------------------------------------------------
+struct Tier2Entry {
+    int32_t topicId     = 0;
+    int32_t partition   = 0;
+    int64_t corrId      = 0;
+    int32_t recordCount = 0;
+    std::vector<uint8_t> batchBytes; // pre-built RecordBatch (baseSequence=0, patched by agent)
+};
 
 // ---------------------------------------------------------------------------
 // PartitionState — per-(topicId,partition) accumulator (agent-thread only).
@@ -112,6 +144,11 @@ struct PartitionState {
     // Populated from the SEND_RECORD's corrId field when wantAck=true.
     // Used in flushBatches so the Produce frame carries the app-registered corrId.
     int64_t pendingCorrId = 0;
+
+    // Tier-2 batches queued for this partition (agent-thread only, no mutex).
+    // Populated by drainRing() when kMsgTier2Batch token is processed.
+    // Drained by flushBatches() in FIFO order, after any pending Tier-1 batch.
+    std::deque<Tier2Entry> pendingTier2Entries;
 
     PartitionState() = default;
     PartitionState(int32_t tid, int32_t part)
@@ -174,6 +211,26 @@ public:
     /// Write a flush trigger into the ring.  Zero-alloc.
     void submitFlush() noexcept;
 
+    // ---- App-thread API (Tier-2 explicit batch) --------------------------------
+
+    /// Submit a pre-built Tier-2 batch (from BatchBuilder::send()).
+    ///
+    /// Pushes the batch bytes to tier2Queue_ (mutex-guarded) and writes a
+    /// kMsgTier2Batch token into the ring.  The agent thread processes the
+    /// token in order with Tier-1 records, stamping baseSequence at that point.
+    ///
+    /// corrId: 0 = acks::None; non-zero = pending ack already registered.
+    /// recordCount: number of records in the pre-built batch.
+    /// batchBytes: pre-built RecordBatch bytes (baseSequence field = 0; will be
+    ///             patched by the agent).
+    ///
+    /// Returns false if the ring is full (caller should handle as an error).
+    bool submitTier2Batch(int32_t topicId,
+                          int32_t partition,
+                          int64_t corrId,
+                          int32_t recordCount,
+                          std::vector<uint8_t> batchBytes);
+
     // ---- App-thread API (opt-in ack — may allocate) --------------------------
 
     /// Allocate a correlationId + register a callback.  Returns the correlationId
@@ -232,6 +289,14 @@ private:
                        int64_t correlationId,
                        std::function<bool(const uint8_t*, std::size_t)>& sendFn);
 
+    /// Encode + send a Tier-2 pre-built batch (agent thread only).
+    /// Patches baseSequence into the provided batch bytes, then encodes a
+    /// Produce wire frame and offers it to transport.
+    bool encodeAndSendTier2(PartitionState& ps,
+                             Tier2Entry& entry,
+                             int64_t sessionId,
+                             std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+
     // ---- Members -------------------------------------------------------------
 
     ProducerConfig cfg_;
@@ -266,6 +331,12 @@ private:
     // ---- In-flight batch tracking (agent-thread only; no mutex needed) -------
     struct BatchInfo { int32_t topicId; int32_t partition; };
     std::map<int64_t, BatchInfo> batchMap_;
+
+    // ---- Tier-2 batch queue (mutex-guarded — app threads push, agent pops) ----
+    // The ring carries a small kMsgTier2Batch token; the actual batch bytes live
+    // here.  Agent pops in FIFO order when it processes the ring token.
+    std::mutex               tier2Mtx_;
+    std::deque<Tier2Entry>   tier2Queue_;
 
     // ---- Pending acks (mutex-guarded — control-plane only) -------------------
     std::mutex               ackMtx_;

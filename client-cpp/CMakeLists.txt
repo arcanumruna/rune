@@ -85,6 +85,7 @@ if(aeron_FOUND)
         src/producer/ProducerImpl.cpp
         src/producer/Producer.cpp
         src/producer/ProducerHub.cpp
+        src/producer/BatchBuilder.cpp
     )
     target_include_directories(rune_client_producer PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -265,5 +266,22 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_producer_tests)
+    endif()
+
+    # ── BatchBuilder tests (CB-3) — Tier-2 explicit atomic batch ──────────────
+    if(aeron_FOUND)
+        add_executable(rune_batch_builder_tests
+            tests/producer/BatchBuilderTest.cpp
+        )
+        target_include_directories(rune_batch_builder_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_batch_builder_tests PRIVATE
+            rune_client_producer
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_batch_builder_tests)
     endif()
 endif()

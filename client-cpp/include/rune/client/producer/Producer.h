@@ -34,6 +34,7 @@
 
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/producer/BatchBuilder.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -140,6 +141,21 @@ public:
                                const Key&               key,
                                std::span<const uint8_t> value,
                                want_future_t);
+
+    // ---- Tier-2: explicit atomic batch ---------------------------------------
+
+    /// Create a BatchBuilder bound to the partition resolved from Key.
+    ///
+    /// The returned BatchBuilder accumulates records via add() and flushes them
+    /// all as ONE RecordBatch (one partition, one atomic log append) via send().
+    ///
+    /// The batch does NOT merge into the Tier-1 auto-accumulator; it is always
+    /// flushed as its own independent RecordBatch.  Ordering with Tier-1 batches
+    /// for the same partition follows submission order (both share the same ring).
+    ///
+    /// Idempotent-seq (baseSequence) is shared with Tier-1 and advances
+    /// monotonically across both tiers for the same partition.
+    BatchBuilder batch(TopicHandle topic, const Key& key);
 
     // ---- Control -------------------------------------------------------------
 
