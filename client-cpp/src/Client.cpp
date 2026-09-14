@@ -779,7 +779,10 @@ Producer Client::producer(ProducerConfig cfg) {
         cfg,
         nextCorrId_);
 
-    // Register with the hub (hub is wired into the agent before start()).
+    // Register with the hub — DR-BUG-1: producer() may legitimately be called
+    // from the app thread at any time, including after start().  ProducerHub::add()
+    // is thread-safe (cold path under addMtx_); the runner thread's hot-path
+    // snapshot load is wait-free and sees the new entry on the next acquire.
     producerHub_.add(impl);
 
     return Producer(std::move(impl));
