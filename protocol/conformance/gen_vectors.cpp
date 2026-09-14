@@ -180,9 +180,9 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     // 11. produce_explicit_partition.bin
     //
-    // Produce{ topicId=1001, partition=7, partitionKnown=1, key=empty,
+    // Produce{ topicId=1001, partition=7, partitionKnown=1, acks=0, key=empty,
     //          recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
-    // Total = 24 + 9 + 2 + 0 + 2 + 8 = 45 bytes
+    // Total = 24 + 10 + 2 + 0 + 2 + 8 = 46 bytes
     // -----------------------------------------------------------------------
     {
         static constexpr uint8_t kBatch[] = {
@@ -205,9 +205,9 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     // 12. produce_key_only.bin
     //
-    // Produce{ topicId=2002, partition=0, partitionKnown=0, key="ABC",
+    // Produce{ topicId=2002, partition=0, partitionKnown=0, acks=0, key="ABC",
     //          recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02} }
-    // Total = 24 + 9 + 2 + 3 + 2 + 8 = 48 bytes
+    // Total = 24 + 10 + 2 + 3 + 2 + 8 = 49 bytes
     // -----------------------------------------------------------------------
     {
         static constexpr uint8_t kBatch[] = {
