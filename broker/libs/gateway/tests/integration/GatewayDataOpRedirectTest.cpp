@@ -83,23 +83,13 @@ static int64_t nowNs()
 // ---------------------------------------------------------------------------
 static std::vector<uint8_t> makeBatch()
 {
-    using namespace rune::protocol::batch;
-    // Minimum batch size = kRecordCountOffset + 4 = 57 + 4 = 61 bytes.
-    // Pad to 64 to give the length field (LE32@8) = 64 - 12 = 52.
-    constexpr std::size_t kSize = 64;
-    std::vector<uint8_t> batch(kSize, 0);
-    // length field (LE32@8) = kSize - 12 = 52
-    const uint32_t lenField = static_cast<uint32_t>(kSize - 12u);
-    batch[8]  = static_cast<uint8_t>(lenField & 0xFF);
-    batch[9]  = static_cast<uint8_t>((lenField >> 8) & 0xFF);
-    batch[10] = static_cast<uint8_t>((lenField >> 16) & 0xFF);
-    batch[11] = static_cast<uint8_t>((lenField >> 24) & 0xFF);
-    // recordCount (LE32@57) = 1
-    batch[kRecordCountOffset]     = 1;
-    batch[kRecordCountOffset + 1] = 0;
-    batch[kRecordCountOffset + 2] = 0;
-    batch[kRecordCountOffset + 3] = 0;
-    return batch;
+    // Build a proper 1-record batch via RecordBatchBuilder so the CRC +
+    // lastOffsetDelta/recordCount are valid — the GB-5 M1 fix now validates both
+    // on the produce path (ensureValid + recordCount==lastOffsetDelta+1), so a
+    // hand-assembled batch with a zero CRC is (correctly) rejected as InvalidBatch.
+    rune::protocol::RecordBatchBuilder b(/*baseOffset=*/0, /*baseTimestamp=*/1000LL);
+    b.append("k", "v", 1000LL);
+    return b.build();
 }
 
 static TopicSpec makeSpec(std::string name, int32_t partCount, int32_t id)
