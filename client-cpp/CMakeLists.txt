@@ -105,6 +105,30 @@ if(aeron_FOUND)
     endif()
 endif()
 
+# ── rune_client_subscriber — Subscription + SubscriberHub (CB-4) ──────────────
+if(aeron_FOUND)
+    add_library(rune_client_subscriber STATIC
+        src/subscriber/Subscription.cpp
+        src/subscriber/SubscriberHub.cpp
+    )
+    target_include_directories(rune_client_subscriber PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(rune_client_subscriber PUBLIC
+        rune_client_agent
+        aeron::aeron
+        spdlog::spdlog
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_subscriber PUBLIC ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
 # ── rune_client_api — Client (CC-6, compiled, links agent) ────────────────────
 if(aeron_FOUND)
     add_library(rune_client_api STATIC
@@ -116,6 +140,7 @@ if(aeron_FOUND)
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_api PUBLIC
+        rune_client_subscriber
         rune_client_producer
         rune_client_agent
         aeron::aeron
@@ -283,5 +308,24 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_batch_builder_tests)
+    endif()
+
+    # ── Subscriber tests (CB-4) — push RecordHandler, offset tracking, unsub ──
+    if(aeron_FOUND)
+        add_executable(rune_subscriber_tests
+            tests/subscriber/SubscriberTest.cpp
+        )
+        target_include_directories(rune_subscriber_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_subscriber_tests PRIVATE
+            rune_client_api
+            rune_client_subscriber
+            rune_client_producer
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_subscriber_tests)
     endif()
 endif()

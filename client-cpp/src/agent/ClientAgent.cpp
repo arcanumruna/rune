@@ -380,7 +380,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     }
 
     default:
-        // Unknown template — drop silently, never crash.
+        // Forward any non-session frame to the egress observer so that higher
+        // layers (Client) can handle subscribe-related frames:
+        //   SubscribeResponse (tid 19) — routes to SubscriberHub
+        //   Records           (tid 20) — routes to SubscriberHub
+        // and any future messages added to the protocol without agent changes.
+        if (egressObserver_) {
+            egressObserver_(tid, buf, len);
+        }
         break;
     }
 }

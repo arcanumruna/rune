@@ -44,6 +44,8 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerHub.h>
+#include <rune/client/subscriber/Subscription.h>
+#include <rune/client/subscriber/SubscriberHub.h>
 
 #include <atomic>
 #include <chrono>
@@ -54,6 +56,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -203,6 +206,36 @@ public:
     /// Rejected with a timeout error if pingTimeoutMs elapses without a Pong.
     std::future<Bytes> ping(Bytes payload);
 
+    // ---- CB-4: Subscribe API -------------------------------------------------
+
+    /// Subscribe to a topic partition using a Key (partition resolved via FNV-1a).
+    ///
+    /// Returns a Subscription handle immediately.  Records begin flowing once
+    /// the broker acknowledges (SubscribeResponse) — the Subscription does NOT
+    /// block for that ack.
+    ///
+    /// Threading:
+    ///   - subscribe() is called on the APP thread.
+    ///   - The handler fires on the RUNNER (agent) thread.  Must NOT block.
+    ///   - The record spans (key, value) are zero-copy views into the Aeron
+    ///     buffer, valid ONLY during the handler call.  Copy data to retain it.
+    ///   - unsubscribe() / Subscription dtor are safe from any thread.
+    ///   - Do NOT call unsubscribe() from inside the handler.
+    ///
+    /// Demand / back-pressure: default is broker-paced push (the broker pauses
+    /// when egress back-pressure applies, per GB-3).
+    /// TODO(CB-5): request(n) demand for Reactive-Streams style flow control.
+    Subscription subscribe(TopicHandle       topic,
+                           const Key&        key,
+                           SubscribeOptions  opts,
+                           RecordHandler     handler);
+
+    /// Subscribe overload taking an explicit partition number (no key required).
+    Subscription subscribe(TopicHandle       topic,
+                           int32_t           partition,
+                           SubscribeOptions  opts,
+                           RecordHandler     handler);
+
     // ---- CB-2: Producer API --------------------------------------------------
 
     /// Look up a topic by name and return its handle (topicId + partitionCount).
@@ -265,6 +298,14 @@ private:
     /// Caller must NOT hold mtx_ (acquires it internally).
     void failAllPending(const std::string& reason);
 
+    /// Internal subscribe implementation shared by Key and partition overloads.
+    Subscription subscribeImpl(TopicHandle              topic,
+                                int32_t                  partition,
+                                uint8_t                  partitionKnown,
+                                std::span<const uint8_t> keyBytes,
+                                SubscribeOptions         opts,
+                                RecordHandler            handler);
+
     // -------------------------------------------------------------------------
     // Members
     // -------------------------------------------------------------------------
@@ -313,6 +354,10 @@ private:
     // ---- CB-2: ProducerHub + topic registry ----------------------------------
     // Hub is owned by Client and wired into the agent before start().
     producer::ProducerHub producerHub_;
+
+    // ---- CB-4: SubscriberHub -------------------------------------------------
+    // Owned by Client.  subscribe() / onEgressFrame() / close() all access it.
+    subscriber::SubscriberHub subscriberHub_;
 };
 
 } // namespace rune::client

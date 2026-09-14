@@ -16,6 +16,7 @@
 
 #include <rune/client/Client.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/codec/DataCodec.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
@@ -121,6 +122,10 @@ void Client::close() {
 
     // Stop the agent (idempotent — CC-5 contract).
     agent_.stop();
+
+    // CB-4: Deactivate all subscriptions so no more dispatch occurs.
+    // MUST be called after agent_.stop() so no agent thread is in onRecords().
+    subscriberHub_.deactivateAll();
 
     // Fail any still-pending producer acks (futures/callbacks) BEFORE returning.
     // producerHub_.failAll() calls ProducerImpl::failAllPending on every registered
@@ -558,6 +563,24 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
+    // ---- SubscribeResponse (CB-4) ----
+    case codec::TemplateId::SubscribeResponse: {
+        auto opt = codec::decodeSubscribeResponse(buf, len);
+        if (!opt) break;
+        // Route to the subscriber hub (agent thread).
+        subscriberHub_.onSubscribeResponse(*opt);
+        break;
+    }
+
+    // ---- Records push (CB-4) ----
+    case codec::TemplateId::Records: {
+        auto opt = codec::decodeRecords(buf, len);
+        if (!opt) break;
+        // Route to the subscriber hub (agent thread).
+        subscriberHub_.onRecords(*opt);
+        break;
+    }
+
     default:
         // Unknown template — ignore (never crash).
         break;
@@ -615,6 +638,86 @@ Producer Client::producer(ProducerConfig cfg) {
     producerHub_.add(impl);
 
     return Producer(std::move(impl));
+}
+
+// ---------------------------------------------------------------------------
+// CB-4: subscribe() — create a new push subscription
+// ---------------------------------------------------------------------------
+
+Subscription Client::subscribe(TopicHandle      topic,
+                                const Key&       key,
+                                SubscribeOptions opts,
+                                RecordHandler    handler)
+{
+    const int32_t partition = key.partition(topic.partitionCount);
+    return subscribeImpl(topic, partition, /*partitionKnown=*/0,
+                         key.bytes(), opts, std::move(handler));
+}
+
+Subscription Client::subscribe(TopicHandle      topic,
+                                int32_t          partition,
+                                SubscribeOptions opts,
+                                RecordHandler    handler)
+{
+    return subscribeImpl(topic, partition, /*partitionKnown=*/1,
+                         {}, opts, std::move(handler));
+}
+
+Subscription Client::subscribeImpl(TopicHandle              topic,
+                                    int32_t                  partition,
+                                    uint8_t                  partitionKnown,
+                                    std::span<const uint8_t> keyBytes,
+                                    SubscribeOptions         opts,
+                                    RecordHandler            handler)
+{
+    // Allocate a fresh correlationId (app-thread, atomic).
+    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+
+    // Snapshot the current session id (coherent pair — same as ping()).
+    const auto snap    = agent_.stateAndSessionId();
+    const int64_t sessId = snap.sessionId;
+
+    // Build the shared impl.
+    auto impl = std::make_shared<SubscriptionImpl>();
+    impl->correlationId = corrId;
+    impl->topicId       = topic.topicId;
+    impl->partition     = partition;
+    impl->handler       = std::move(handler);
+    impl->active.store(true, std::memory_order_relaxed);
+    impl->subscriptionId.store(0, std::memory_order_relaxed);
+    impl->nextOffset.store(0, std::memory_order_relaxed);
+
+    // Build the unsubscribe callback: submits Unsubscribe via the agent ring.
+    // Capture the agent_ by reference (safe: Client owns the agent and outlives
+    // any Subscription the app can hold — same lifetime guarantee as producers).
+    auto unsubFn = [this](int64_t subId) {
+        const int64_t corrId2 = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+        const auto s = agent_.stateAndSessionId();
+        subscriberHub_.sendUnsubscribe(
+            subId,
+            s.sessionId,
+            corrId2,
+            [this](const uint8_t* buf, std::size_t len) -> bool {
+                return agent_.submitSend(buf, len);
+            });
+    };
+
+    // Register + submit Subscribe (encodes and writes to the ring).
+    subscriberHub_.registerSubscribe(
+        impl,
+        sessId,
+        corrId,
+        topic.topicId,
+        partition,
+        partitionKnown,
+        opts.from.toWire(),
+        static_cast<uint8_t>(opts.isolation),
+        keyBytes,
+        [this](const uint8_t* buf, std::size_t len) -> bool {
+            return agent_.submitSend(buf, len);
+        });
+
+    return Subscription(std::move(impl), std::move(unsubFn));
 }
 
 } // namespace rune::client
