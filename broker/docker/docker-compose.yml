@@ -34,7 +34,8 @@ x-broker-env: &broker-env
   # any post-kill leader) can serve produce/subscribe.  Broker assigns topicIds
   # sequentially from 0 in declaration order → "events" = topicId 0.  The client
   # E2E (docker/e2e-data.sh, rune_produce_subscribe) uses topicId 0 to match.
-  RUNE_TOPICS: "events:1"
+  # "multi" (topicId 1, 3 partitions) is used by the DR-2 multi-partition matrix.
+  RUNE_TOPICS: "events:1,multi:3"
 
 services:
   # ── Node 0 ──────────────────────────────────────────────────────────────────

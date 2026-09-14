@@ -125,6 +125,7 @@ def _run_one_client(
         "RUNE_TIMEOUT_MS": str(cfg.get("timeout_ms", 10000)),
         "RUNE_SUBSCRIBE_MS": str(cfg.get("subscribe_ms", 30000)),
         "RUNE_SLOW_SUBSCRIBER_MS": str(cfg.get("slow_subscriber_ms", 0)),
+        "RUNE_SUB_PARTITIONS": str(cfg.get("sub_partitions", 1)),
     }
     if "expect" in cfg:
         env["RUNE_EXPECT"] = str(cfg["expect"])
@@ -136,13 +137,19 @@ def _run_one_client(
         # the other producers.
         env["RUNE_EXPECT_CID_EXACT"] = str(cid)
 
-    # Bounded retry for TRANSIENT client-startup faults that leave NO produced
-    # records: a connect() timeout (rc==2) or a SIGSEGV (exit 139) in the
-    # connect/first-produce handshake.  The current rune-client-cpp build has a
-    # race there (documented in the DR-1 report); retrying from a clean state is
-    # safe because nothing was produced yet.  We NEVER retry once any record was
-    # produced (would risk double-produce) or on a genuine workload failure.
-    connect_retries = int(cfg.get("connect_retries", 5))
+    # DR-BUG-1 (e56a527) fixed the startup SIGSEGV race — the exit-139 retry
+    # branch is removed.  A resurfaced SIGSEGV must FAIL loudly so regressions
+    # are not silently swallowed.
+    #
+    # A minimal connect-timeout retry is KEPT (default=2) because a fresh
+    # cluster's data-plane gateway may not be ready within the first connect
+    # attempt even after a leader is elected.  The retry is strictly scoped:
+    #   - only on connect() timeout (rc==2 + "connect() timed out" in output)
+    #   - only when NOTHING was produced (no double-produce risk)
+    #   - never on crash / SIGSEGV / genuine workload failure
+    # DR-2 (no faults) passes connect_retries=0 explicitly so any startup
+    # failure is loud; fault tickets may set a higher value for their scenarios.
+    connect_retries = int(cfg.get("connect_retries", 2))
     last: ClientResult | None = None
     for attempt in range(connect_retries + 1):
         run_name = f"{name}-a{attempt}"
@@ -163,12 +170,11 @@ def _run_one_client(
         res = run(args, timeout=timeout_s)
         cr = _parse_client_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
         last = cr
+        # Only retry on a connect-timeout (rc==2, no produced records) — a
+        # genuine workload failure or any crash must fail immediately.
+        connect_timeout = (cr.rc == 2 and "connect() timed out" in cr.raw)
         nothing_produced = len(cr.produced) == 0
-        startup_crash = (res.returncode == 139) or (
-            cr.rc == 2 and "connect() timed out" in cr.raw
-        )
-        transient = startup_crash and nothing_produced
-        if not transient:
+        if not (connect_timeout and nothing_produced and attempt < connect_retries):
             return cr
     return last  # exhausted retries — return the last (still-failed) result
 
