@@ -216,15 +216,20 @@ def test_dr2_multiclient(cluster, case):
     # No split-brain before the workload.
     assert_single_leader(cluster)
 
-    # The follower redirect path adds an extra round-trip (follower → redirect →
-    # leader).  Under the full 48-case sequential load (Docker shm pressure +
-    # macOS VM overhead from 200+ container runs), the last client in a concurrent
-    # set can fail to establish its Aeron UDP endpoint within the connect timeout
-    # on the FIRST attempt.  Allow one retry for follower-targeted cases so the
-    # protocol fix (DR-BUG-2) remains the correctness gate (zero retries on a
-    # healthy isolated cluster) while the infrastructure flakiness is absorbed.
-    # Leader-targeted cases keep connect_retries=0 (no redirect overhead).
-    connect_retries = 1 if target == "follower" else 0
+    # Zero connect retries for ALL targets — first-try connect is the correctness
+    # gate.  The follower path adds a redirect round-trip (follower → redirect →
+    # leader) and a fresh leader publication that must warm up; DR-BUG-2 makes
+    # that reconnect first-try-reliable:
+    #   - broker (77dea04): stash-and-retry ConnectResponse until egress warms;
+    #   - client SessionMachine (8906828): fast-retry ConnectRequest on
+    #     NOT_CONNECTED — this ALSO covers the redirect-triggered resend, which
+    #     the SessionMachine now owns end-to-end;
+    #   - client (redirect-reconnect fix): Client.onEgressFrame no longer does a
+    #     SECOND retarget at connect time (no work in flight), which previously
+    #     discarded the SessionMachine's just-offered ConnectRequest publication
+    #     and stalled the follower reconnect until the app-side connect deadline.
+    # Result: follower cases pass with connect_retries=0 and zero connect timeouts.
+    connect_retries = 0
 
     cfg = dict(
         mode="produce_subscribe",
