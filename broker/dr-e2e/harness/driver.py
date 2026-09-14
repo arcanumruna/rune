@@ -141,20 +141,23 @@ def _run_one_client(
     # branch is removed.  A resurfaced SIGSEGV must FAIL loudly so regressions
     # are not silently swallowed.
     #
-    # A minimal connect-timeout retry is KEPT (default=2) because a fresh
-    # cluster's data-plane gateway may not be ready within the first connect
-    # attempt even after a leader is elected.  The retry is strictly scoped:
-    #   - only on connect() timeout (rc==2 + "connect() timed out" in output)
-    #   - only when NOTHING was produced (no double-produce risk)
-    #   - never on crash / SIGSEGV / genuine workload failure
-    # DR-2 (no faults) passes connect_retries=0 explicitly so any startup
-    # failure is loud; fault tickets may set a higher value for their scenarios.
-    connect_retries = int(cfg.get("connect_retries", 2))
+    # DR-BUG-2 (connect-under-load stall) is fixed in both the broker
+    # (stash-and-retry ConnectResponse) and the client (fast-retry ConnectRequest
+    # when ingress pub NOT_CONNECTED).  The baseline is now expected to pass
+    # first-try with connect_retries=0.  Fault tickets may opt into retries
+    # explicitly when their failure injection legitimately causes connect timeouts.
+    connect_retries = int(cfg.get("connect_retries", 0))
     last: ClientResult | None = None
     for attempt in range(connect_retries + 1):
         run_name = f"{name}-a{attempt}"
         run_host = run_name
-        env["RUNE_EGRESS"] = f"aeron:udp?endpoint={run_host}:{egress_port}"
+        # Vary egress port per retry attempt: on retry the old container is
+        # gone (--rm) but the Aeron media driver's cnc.dat may linger briefly
+        # in /dev/shm on the Docker network.  Using a distinct port per attempt
+        # ensures the new container's egress subscription never collides with
+        # a stale endpoint from a previous attempt on the same node.
+        attempt_port = egress_port + attempt * 100
+        env["RUNE_EGRESS"] = f"aeron:udp?endpoint={run_host}:{attempt_port}"
         args = [
             "docker", "run", "--rm",
             "--name", run_name,
@@ -198,7 +201,8 @@ def run_clients(
     exactly-once stay attributable per run.
 
     cfg keys (all optional): mode, records, keys, rate_hz, from, topics,
-    timeout_ms, subscribe_ms, slow_subscriber_ms, expect.
+    timeout_ms, subscribe_ms, slow_subscriber_ms, expect, sub_partitions,
+    connect_retries (default 0 — first-try clean; fault tickets may set > 0).
     """
     results = Results()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n)) as pool:

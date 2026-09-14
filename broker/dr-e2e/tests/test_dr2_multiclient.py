@@ -41,6 +41,16 @@ partitions=3: topic "multi"  (topicId 1, 3 partitions) — added in DR-2 compose
               client RUNE_TOPICS = "multi:1:3"
               RUNE_SUB_PARTITIONS = 3 so every subscriber covers partitions 0-2.
 
+Multi-partition coverage (DR-2 fix)
+─────────────────────────────────────
+For partitions=3 cases the effective key count is max(data_state.keys, partitions).
+This guarantees at least 3 distinct keys → FNV-1a hash spreads them across all
+3 partitions deterministically (keys 0,1,2 each land on a different partition,
+verified by the broker's partitionForKey implementation).  Without this guard,
+data_state (1, 100) with partitions=3 would produce all records to a single
+partition, making assert_no_committed_loss trivially pass for only 1/3 of the
+topic and missing per-partition correctness entirely.
+
 Follower / redirect-follow (req. C)
 ────────────────────────────────────
 target=leader  → client targets the actual consensus leader (no fallback).
@@ -49,12 +59,14 @@ target=follower → client targets an ACTUAL follower; the broker returns a
                   (e56a527) fixed the SIGSEGV race; redirect-follow is now safe
                   to test directly.
 
-Driver mask removal (req. B)
-─────────────────────────────
+Driver mask removal + DR-BUG-2 fix (req. B)
+─────────────────────────────────────────────
 driver.py no longer retries exit-139 (SIGSEGV) — a resurfaced crash fails
-loudly.  connect_retries=2 allows only Aeron UDP connect-timeout retries
-under concurrent load (rc==2 + nothing produced); crashes (exit 139) still
-fail immediately.  results.ok checks exit_code==0 AND rc==0 per client.
+loudly.  connect_retries=0 (now the default) requires first-try connect success:
+DR-BUG-2 fixed the broker (stash-and-retry ConnectResponse until egress pub
+connects) and the client (fast-retry ConnectRequest when ingress pub
+NOT_CONNECTED) so concurrent-client connect is reliable without retries.
+results.ok checks exit_code==0 AND rc==0 per client.
 """
 
 from __future__ import annotations
@@ -88,6 +100,18 @@ def _next_cid_base() -> int:
 
 def _n_clients(client_state: str) -> int:
     return int(client_state.split("=")[1])
+
+
+def _effective_keys(keys: int, partitions: int) -> int:
+    """Return the effective key count for this (keys, partitions) pair.
+
+    For partitions>1 cases, ensure keys >= partitions so FNV-1a hashing
+    spreads records across ALL partitions deterministically.  With fewer
+    keys than partitions some partitions would receive zero records, making
+    assert_no_committed_loss trivially pass for those partitions and missing
+    real per-partition correctness coverage.
+    """
+    return max(keys, partitions)
 
 
 def _topic_cfg(partitions: int) -> dict:
@@ -154,25 +178,26 @@ def test_dr2_multiclient(cluster, case):
     cid_base = _next_cid_base()
     topic_cfg = _topic_cfg(partitions)
 
+    # DR-2 fix: ensure enough distinct keys to span all partitions.
+    effective_keys = _effective_keys(keys, partitions)
+
     # No split-brain before the workload.
     assert_single_leader(cluster)
 
     cfg = dict(
         mode="produce_subscribe",
         records=records,
-        keys=keys,
+        keys=effective_keys,
         **topic_cfg,
         from_="earliest",
         expect=records,
         expect_own=True,
         timeout_ms=15000,
         subscribe_ms=60000,
-        # connect_retries=2: allow Aeron UDP connect-timeout retries under load
-        # (5 concurrent clients hitting the same broker node can cause transient
-        # >15s connect delays on a loaded cluster, NOT a broker fault).  Retries
-        # are strictly scoped: only on rc==2 + "connect() timed out" with zero
-        # produced records — crashes (exit 139) still fail immediately.
-        connect_retries=2,
+        # connect_retries=0: DR-BUG-2 fix ensures first-try connect success.
+        # Fault tickets may set connect_retries>0 when their failure injection
+        # legitimately causes connect timeouts.
+        connect_retries=0,
     )
     cfg["from"] = cfg.pop("from_")
 
@@ -238,19 +263,23 @@ def test_dr2_multiclient_soak(cluster, case):
     cid_base = _next_cid_base()
     topic_cfg = _topic_cfg(partitions)
 
+    # DR-2 fix: ensure enough distinct keys to span all partitions.
+    effective_keys = _effective_keys(keys, partitions)
+
     assert_single_leader(cluster)
 
     cfg = dict(
         mode="produce_subscribe",
         records=records,
-        keys=keys,
+        keys=effective_keys,
         **topic_cfg,
         from_="earliest",
         expect=records,
         expect_own=True,
         timeout_ms=20000,
         subscribe_ms=120000,
-        connect_retries=2,
+        # connect_retries=0: DR-BUG-2 fix ensures first-try connect success.
+        connect_retries=0,
     )
     cfg["from"] = cfg.pop("from_")
 
