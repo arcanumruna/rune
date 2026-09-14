@@ -119,6 +119,10 @@ struct ProducerBenchGateway {
     // For subscribe-delivery bench: timestamp when ProduceResponse was sent.
     std::atomic<int64_t> produceAckNs_{0};
 
+    // Session id captured from the last Subscribe request.  Used to push
+    // RecordBatch frames to the active subscription on each Produce.
+    std::atomic<int64_t> lastSessionId_{0};
+
     uint8_t replyBuf[2048]{};
 
     std::thread       pumpThread_;
@@ -248,12 +252,25 @@ struct ProducerBenchGateway {
                 opt->correlationId);
 
             // Stamp ack time before sending (so delivery latency = now − ackNs).
+            // This is the gateway-side instant the ProduceResponse goes on the wire.
             produceAckNs_.store(
                 static_cast<int64_t>(
                     std::chrono::steady_clock::now().time_since_epoch().count()),
                 std::memory_order_release);
 
             if (n > 0) send(replyBuf, n);
+
+            // If a subscription is active, push a RecordBatch for this produce
+            // so BM_SubscribeDeliveryLatency can measure produce-ack → handler
+            // delivery latency.  This models the broker pushing the newly produced
+            // record to all active subscribers immediately after acking the produce.
+            if (subscribesHandled_.load(std::memory_order_relaxed) > 0) {
+                const int64_t sid = lastSessionId_.load(std::memory_order_acquire);
+                if (sid != 0) {
+                    sendRecordBatch(sid, kSubscriptionId, base);
+                }
+            }
+
             producesHandled_.fetch_add(1, std::memory_order_relaxed);
             break;
         }
@@ -261,6 +278,10 @@ struct ProducerBenchGateway {
         case rcc::TemplateId::Subscribe: {
             const auto opt = rcc::decodeSubscribe(buf, len);
             if (!opt) return;
+
+            // Remember the session id so the Produce handler can push
+            // RecordBatch frames back to this active subscription.
+            lastSessionId_.store(opt->sessionId, std::memory_order_release);
 
             // Send SubscribeResponse{OK, partition, subscriptionId}.
             const std::size_t n = rcc::encodeSubscribeResponse(
@@ -272,7 +293,8 @@ struct ProducerBenchGateway {
                 opt->correlationId);
             if (n > 0) send(replyBuf, n);
 
-            // Immediately push one RecordBatch to trigger delivery.
+            // Immediately push one RecordBatch to prime the subscription
+            // (offset 0 — delivers first record so the sub is confirmed active).
             sendRecordBatch(opt->sessionId, kSubscriptionId,
                             /*baseOffset=*/0);
             subscribesHandled_.fetch_add(1, std::memory_order_relaxed);
@@ -511,13 +533,34 @@ static void BM_SubscribeDeliveryLatency(benchmark::State& state) {
             g_deliveryReady.store(true, std::memory_order_release);
         });
 
-    // Wait for SubscribeResponse (gateway pumps fast; should be immediate).
+    // Wait until the client has processed the SubscribeResponse (subscriptionId
+    // transitions from 0 to the broker-assigned id).  The gateway is
+    // tight-polling so this should complete in microseconds; we yield rather
+    // than sleep so we don't add tens of milliseconds of OS wake-up latency.
     const auto subDl = std::chrono::steady_clock::now() +
                        std::chrono::milliseconds(kOpTimeoutMs);
     while (std::chrono::steady_clock::now() < subDl) {
-        if (g_fixture->gw->subscribesHandled_.load(std::memory_order_relaxed) > 0)
-            break;
-        std::this_thread::sleep_for(1ms);
+        if (sub.subscriptionId() != 0) break;
+        std::this_thread::yield();
+    }
+    if (sub.subscriptionId() == 0) {
+        state.SkipWithError("SubscribeDelivery: SubscribeResponse not received in time");
+        return;
+    }
+
+    // Also drain any priming RecordBatch the gateway sent on Subscribe so that
+    // the first iteration's reset is clean.  We reset g_deliveryReady here and
+    // briefly wait for it — if the priming batch already fired, great; if not,
+    // we don't block long (the first iteration will handle it).
+    {
+        const auto primeDl = std::chrono::steady_clock::now() + 50ms;
+        while (!g_deliveryReady.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < primeDl) {
+            std::this_thread::yield();
+        }
+        // Reset so iteration 1 waits for its own produce-triggered delivery.
+        g_deliveryReady.store(false, std::memory_order_release);
+        g_deliveryNs.store(0, std::memory_order_release);
     }
 
     std::vector<double> samples;
