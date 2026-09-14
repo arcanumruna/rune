@@ -212,36 +212,35 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         capturedIsLeader        = lv.isLeader;
         capturedLeaderEndpoint  = lv.leaderClientEndpoint;
 
-        if (!lv.isLeader && !lv.leaderClientEndpoint.empty()) {
-            // REDIRECT: resolve a temporary egress to the client synchronously
-            // (this is a non-leader redirect — only happens on follower nodes,
-            //  not on the critical leader path).
-            // TODO(Milestone B): route redirect egress through the async pending machine —
-            // this synchronous resolvePublication would block the consensus thread once
-            // per-peer client endpoints exist; unreachable in Milestone A (single-node is
-            // always leader; multi-node followers return leaderClientEndpoint="" per the
-            // ruling → degrade-to-accept, never redirect).
-            auto pub = resolvePublication(std::string(req.egressChannel), req.egressStreamId);
-            if (!pub) return; // can't reach client — drop
-
-            pc::ErrorResponse err;
-            err.sessionId     = 0;
-            err.correlationId = req.correlationId;
-            err.code          = static_cast<int16_t>(pc::ErrorCode::Redirect);
-            err.message       = lv.leaderClientEndpoint;
-
-            // Guard: message must fit in scratch.
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2 +
-                                       lv.leaderClientEndpoint.size();
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = err.encode(scratch_.data());
-                sendOnPub(*pub, scratch_.data(), encoded);
-            }
-            // pub goes out of scope → ExclusivePublication released (no session created).
-            return;
-        }
-        // else: leader-unknown (empty endpoint) → degrade to local accept below.
+        // NOTE: the REDIRECT case (!isLeader && !leaderClientEndpoint.empty()) is
+        // handled by the SAME async pending-connect machinery as the leader-accept
+        // path below (see DR-BUG-2 fix).  We do NOT resolve the egress publication
+        // synchronously here.
+        //
+        // DR-BUG-2 (redirect-reconnect storm) ROOT CAUSE + FIX:
+        //   Previously this path called the BLOCKING resolvePublication(), which
+        //   sleeps up to kResolveMaxMs (5 s) in 1 ms slices ON THE GATEWAY
+        //   DUTY-CYCLE THREAD.  When N clients hit a follower at once (the DR-3
+        //   reconnect storm), each ConnectRequest was dispatched serially inside a
+        //   single sub_->poll() and each blocked in resolvePublication before the
+        //   next client's addExclusivePublication was even issued.  One slow egress
+        //   warm-up (media-driver contention while N new publications warm up on
+        //   BOTH follower and leader simultaneously) head-of-line-blocked the whole
+        //   follower gateway — no ingress poll, no reaping, and the LAST client's
+        //   redirect was delayed enough that its subsequent leader connect blew the
+        //   app-side connect deadline (the intermittent 1-of-5 connect() timeout).
+        //   The synchronous resolve ALSO serialised the follower's own doWork loop.
+        //
+        //   Fix: enqueue the redirect as an async PendingConnect (non-blocking
+        //   addExclusivePublication) — pollPendingConnects() resolves ALL pending
+        //   entries fairly per cycle (no head-of-line block), stashes the resolved
+        //   pub, and retries the ErrorResponse{Redirect} until the egress link
+        //   warms up.  Bounded by kMaxPendingConnects + connectResolveTimeoutNs_,
+        //   single-writer on the gateway agent thread, no busy-spin.
+        //
+        // else (leader-unknown, empty endpoint) → degrade to local accept below,
+        // ALSO via the same async machinery (isLeader captured true / redirect
+        // endpoint empty ⇒ pollPendingConnects sends ConnectResponse{OK}).
     }
 
     // -----------------------------------------------------------------------
@@ -418,17 +417,47 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             pending.resolvedPub = pub;
         }
 
-        // Invariant (FIX A): a session must NEVER be added to the table unless
-        // the client received a ConnectResponse for it.  Only promote to a
-        // session after a successful send.
-        pc::ConnectResponse resp;
-        resp.sessionId         = pending.sessionId;
-        resp.correlationId     = pending.correlationId;
-        resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
-        resp.leaderMemberId    = thisNodeId_;
-        resp.assignedSessionId = pending.sessionId;
+        // DR-BUG-2 (redirect-reconnect storm): a follower entry (captured
+        // !isLeader with a known leader endpoint) sends ErrorResponse{Redirect}
+        // on its resolved egress and creates NO session — the client will
+        // retarget to the leader and reconnect there.  This shares the fair,
+        // non-blocking poll loop with the leader-accept path (no synchronous
+        // resolvePublication head-of-line block on the duty-cycle thread).
+        const bool isRedirect = (!pending.isLeader && !pending.leaderClientEndpoint.empty());
 
-        const std::size_t encoded = resp.encode(scratch_.data());
+        std::size_t encoded = 0;
+        if (isRedirect) {
+            pc::ErrorResponse err;
+            err.sessionId     = 0;
+            err.correlationId = pending.correlationId;
+            err.code          = static_cast<int16_t>(pc::ErrorCode::Redirect);
+            err.message       = pending.leaderClientEndpoint;
+
+            // Guard: message must fit in scratch (encode would overflow otherwise).
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2 +
+                                       pending.leaderClientEndpoint.size();
+            if (needed > scratch_.size()) {
+                // Pathological endpoint length — drop (cannot encode).  The
+                // resolvedPub shared_ptr release on erase() frees the egress reg.
+                spdlog::warn("ClientGateway: redirect endpoint too large ({}B); dropping",
+                             pending.leaderClientEndpoint.size());
+                it = pendingConnects_.erase(it);
+                continue;
+            }
+            encoded = err.encode(scratch_.data());
+        } else {
+            // Invariant (FIX A): a session must NEVER be added to the table unless
+            // the client received a ConnectResponse for it.  Only promote to a
+            // session after a successful send.
+            pc::ConnectResponse resp;
+            resp.sessionId         = pending.sessionId;
+            resp.correlationId     = pending.correlationId;
+            resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
+            resp.leaderMemberId    = thisNodeId_;
+            resp.assignedSessionId = pending.sessionId;
+            encoded = resp.encode(scratch_.data());
+        }
 
         if (!sendOnPub(*pub, scratch_.data(), encoded)) {
             // Publication not yet Aeron-connected (UDP image not yet up) or
@@ -436,15 +465,20 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // (resolvedPub is now stashed); retry next doWork() cycle.
             // The resolve-timeout still bounds this: if it expires before the
             // link warms up, we drop + the client re-Connects.
-            spdlog::debug("ClientGateway: ConnectResponse not-connected/back-pressured for "
+            spdlog::debug("ClientGateway: {} not-connected/back-pressured for "
                           "session={}; retrying next cycle (pub stashed)",
+                          isRedirect ? "Redirect" : "ConnectResponse",
                           pending.sessionId);
             ++it;
             continue;
         }
 
-        // Send succeeded — only now is it safe to add the session.
-        sessions_.add(pending.sessionId, std::move(pub), nowNs);
+        // Send succeeded.  Redirect entries create NO session (the resolvedPub
+        // shared_ptr release on erase frees the transient egress registration).
+        if (!isRedirect) {
+            // Only now is it safe to add the session (leader-accept path).
+            sessions_.add(pending.sessionId, std::move(pub), nowNs);
+        }
 
         it = pendingConnects_.erase(it);
     }

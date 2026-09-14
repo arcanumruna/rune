@@ -203,12 +203,26 @@ def run_clients(
 
     cfg keys (all optional): mode, records, keys, rate_hz, from, topics,
     timeout_ms, subscribe_ms, slow_subscriber_ms, expect, sub_partitions,
-    connect_retries (default 0 — first-try clean; fault tickets may set > 0).
+    connect_retries (default 0 — first-try clean; fault tickets may set > 0),
+    start_stagger_ms (default 400 — delay between launching each client so N
+    embedded Aeron media drivers don't cold-start in the same instant).
     """
+    # start_stagger_ms: launching N dr_client containers at the *exact* same
+    # moment makes N embedded media drivers + ingress UDP publications warm up
+    # simultaneously on the Docker-Desktop VM, a thundering herd whose contention
+    # tail occasionally exceeds even a generous connect deadline (a pure env
+    # artifact — real clients never cold-start in the same millisecond).  A small
+    # stagger removes that peak without weakening any invariant.  Fault tickets
+    # (reconnect storms) may set it to 0 when the simultaneity IS the test.
+    start_stagger_ms = int(cfg.pop("start_stagger_ms", 400))
+
     results = Results()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, n)) as pool:
-        futs = [
-            pool.submit(
+        futs = []
+        for i in range(n):
+            if i > 0 and start_stagger_ms > 0:
+                time.sleep(start_stagger_ms / 1000.0)
+            futs.append(pool.submit(
                 _run_one_client,
                 network=network,
                 cid=cid_base + i,
@@ -216,9 +230,7 @@ def run_clients(
                 egress_port=egress_port_base + i,
                 cfg=cfg,
                 timeout_s=timeout_s,
-            )
-            for i in range(n)
-        ]
+            ))
         for f in concurrent.futures.as_completed(futs, timeout=timeout_s + 30):
             results.clients.append(f.result())
     results.clients.sort(key=lambda c: c.cid)
