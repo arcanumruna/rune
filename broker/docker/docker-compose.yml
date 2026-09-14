@@ -26,6 +26,15 @@ x-broker-env: &broker-env
   RUNE_ELECTION_TIMEOUT_MS: "300"
   RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
   RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
+  # Optional log level (honoured by src/main.cpp via RUNE_LOG_LEVEL); "info"
+  # keeps the E2E output readable.  Set "debug" to surface gateway
+  # redirect/accept/subscribe decisions when diagnosing.
+  RUNE_LOG_LEVEL: "info"
+  # GB-1/CB-5: bootstrap the data-plane topics on every node so the leader (and
+  # any post-kill leader) can serve produce/subscribe.  Broker assigns topicIds
+  # sequentially from 0 in declaration order → "events" = topicId 0.  The client
+  # E2E (docker/e2e-data.sh, rune_produce_subscribe) uses topicId 0 to match.
+  RUNE_TOPICS: "events:1"
 
 services:
   # ── Node 0 ──────────────────────────────────────────────────────────────────

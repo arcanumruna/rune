@@ -35,6 +35,12 @@ int main() {
     std::signal(SIGINT,  sighandler);
     std::signal(SIGTERM, sighandler);
 
+    // TEMP DEBUG (CB-5 diagnosis): honor RUNE_LOG_LEVEL=debug/trace so the
+    // gateway's redirect/accept decisions are visible during E2E debugging.
+    if (const char* lvl = std::getenv("RUNE_LOG_LEVEL")) {
+        spdlog::set_level(spdlog::level::from_str(lvl));
+    }
+
     // Parse configuration from environment.
     auto [cfg, err] = rune::node::parseNodeConfigFromEnv();
     if (!cfg.has_value()) {

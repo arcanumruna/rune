@@ -1026,10 +1026,20 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     //    splits batches, so the client must filter sub-batch records client-side.
     //    Example: batch [baseOffset=0, recordCount=5], fromOffset=3 → the whole batch
     //    (offsets 0..4) is delivered; client drops records 0..2 and consumes 3..4.
+    // CB-5: honour the client's From sentinels distinctly (see client
+    // From::toWire()):  Earliest = -2 → offset 0 (deliver the whole log);
+    // Latest = -1 → LEO (only new records).  Previously ALL negatives mapped
+    // to LEO, which silently dropped Earliest subscriptions (0/N delivered).
+    static constexpr int64_t kFromEarliest = -2;
+    static constexpr int64_t kFromLatest   = -1;
     const int64_t leo = log->logEndOffset();
     int64_t nextOffset;
-    if (msg.fromOffset < 0) {
-        // Negative → from Latest (subscribe only to new records).
+    if (msg.fromOffset == kFromEarliest) {
+        // Earliest → from the beginning of the log.
+        nextOffset = 0;
+    } else if (msg.fromOffset < 0) {
+        // Latest (-1) or any other negative sentinel → subscribe to new records.
+        (void)kFromLatest;
         nextOffset = leo;
     } else if (msg.fromOffset > leo) {
         // Beyond LEO → clamp to LEO (no data there yet).
