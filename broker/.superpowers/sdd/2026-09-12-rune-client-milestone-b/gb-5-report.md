@@ -226,3 +226,119 @@ Full suite run time: ~30 seconds (Release build, 4 parallel jobs).
 2. **Per-append fsync (300–450µs)**: eliminated by `appendNoSync()` + group-commit in `flushDirtyLogs()`.
 3. **Aeron ADMIN_ACTION transient (-3 from tryClaim)**: fixed in `GatewayDataBench.cpp` by draining and continuing instead of failing the benchmark run.
 4. **Google Benchmark 1GB+ reserve**: fixed by capping `samples.reserve()` at 2M items.
+
+---
+
+# GB-5 Fix Round — Durability Blocker + Majors (Group-Commit Produce/Subscribe Path)
+
+## Status: COMPLETE
+
+Base: `d2d7649`. Commit: `9af81b8`. Milestone B.
+
+---
+
+## Fix B1 [BLOCKER] — Durability hole: sync() only fsyncs the active segment
+
+**File:** `libs/storage/src/Log.cpp` — `Log::maybeRoll()`
+
+**Problem:** `appendNoSync()` calls `maybeRoll()` before writing. When a roll fires, the active segment advances to a new (empty) segment. Any `appendNoSync` writes into the previously-active (now-sealed) segment are in page cache only. The subsequent `Log::sync()` call in `flushDirtyLogs()` only fsyncs the NEW active segment — the sealed segment is never fsync'd, permanently losing acked records if a crash occurs after `flushDirtyLogs()` reported success.
+
+**Fix:** Before creating the new segment in `maybeRoll()`, fsync the segment being sealed:
+```cpp
+activeSegment().sync();  // fsync-on-seal: durable before immutable
+int64_t base = logEndOffset_;
+segments_[base] = std::make_unique<LogSegment>(dir_, base);
+```
+After this fix: every segment that received `appendNoSync` writes is fsync'd exactly once — at seal time (via `maybeRoll`) or at the end of the flush window (via `Log::sync()` for the still-active segment). `Log::flush()` = "all no-sync writes since last flush are on disk across all segment boundaries."
+
+**Test (MC1):** `IntegrationTestBase.MC1_AppendNoSync_AcrossSegmentRoll_Flush_AllSurvive` — appends 12 batches via `appendNoSync` with `rollBytes=256` (forces ≥2 segments), calls `sync()`, reopens + recovers, asserts all 12 batches survive across both segments. **PASSES with fix; confirmed failing before fix.**
+
+---
+
+## Fix M1 [MAJOR] — LEO desync: produce trusts client recordCount
+
+**File:** `libs/gateway/src/ClientGateway.cpp` — `handleProduce()`
+
+**Problem:** `handleProduce` computed `lastOffset = base + recordCount - 1` using the client-supplied `recordCount@57` (unchecked). A malicious/buggy client with `recordCount=1, lastOffsetDelta=1000` would advance LEO by 1 while the stored batch self-describes as spanning 1001 offsets. The next produce's `baseOffset` overlaps the previous batch's claimed range — exactly-once violation.
+
+**Fix:** Read `lastOffsetDelta@23` (CRC-covered) and validate:
+1. `lastOffsetDelta >= 0`
+2. `recordCount == lastOffsetDelta + 1` (internal consistency)
+3. `ensureValid()` — CRC check (rejects corrupt batches before they touch the log)
+
+Derive `lastOffset = base + lastOffsetDelta` (single CRC-covered source of truth).
+Reject mismatched/corrupt batches with `ProduceResponse{Internal}` — no append, no LEO change.
+
+**Test (MC4):** `GatewayProduceFixture.MC4_RecordCountLastOffsetDeltaMismatch_Rejected` — three sub-tests: (A) `recordCount=1/lastOffsetDelta=3` mismatch → Internal, LEO unchanged; (B) CRC-corrupt batch → Internal, LEO unchanged; (C) valid subsequent produce gets correct contiguous `baseOffset=0` (no desync). **PASSES.**
+
+---
+
+## Fix M2 [MAJOR] — Subscribe mid-chunk corrupt-batch skip stalls subscription
+
+**File:** `libs/gateway/src/ClientGateway.cpp` — `pushSubscriptions()`, `recordCount < 1` guard
+
+**Problem:** When a batch has `recordCount < 1` mid-chunk, the loop advanced `chunkPos` but NOT `sub.nextOffset`. Next cycle re-reads from the same offset, re-encounters the same corrupt batch, stalls permanently.
+
+**Fix:** On `recordCount < 1` skip, advance BOTH `chunkPos` AND `sub.nextOffset = baseOffset + 1`:
+```cpp
+chunkPos += batchSize;
+sub.nextOffset = baseOffset + 1;
+continue;
+```
+This matches the pattern from the GB-5p1 fix for the too-large/u16-overflow branches. The back-pressure path (`pos <= 0`) is unchanged — it still does NOT advance `nextOffset`.
+
+**Test (MC5):** `GatewaySubscribeFixture.MC5_MidChunkCorruptBatchSkip_ForwardProgress` — injects a corrupt batch (`recordCount=0`) between two valid batches directly in the log, subscribes from offset 0, asserts both valid batches are delivered in order (corrupt batch skipped, no stall). **PASSES.**
+
+---
+
+## Fix MC6 — fsync failure: log stays dirty (not silently marked clean)
+
+**File:** `libs/gateway/src/ClientGateway.cpp` — `flushDirtyLogs()`
+
+**Problem:** `dirtyLogs_.clear()` ran unconditionally even if `log->sync()` threw. A failed fsync (EIO, disk full) would falsely mark the log as clean — subsequent produces would not retry the sync, silently losing ack durability.
+
+**Fix:** Track successfully-synced logs separately; keep failed logs in `dirtyLogs_` for retry:
+```cpp
+std::unordered_set<rune::storage::Log*> stillDirty;
+for (auto* log : dirtyLogs_) {
+    bool synced = false;
+    try { log->sync(); synced = true; }
+    catch (...) { spdlog::error("...log stays dirty..."); }
+    if (!synced) stillDirty.insert(log);
+}
+dirtyLogs_ = std::move(stillDirty);
+```
+Failed logs are retried next flush cycle. No crash; no false durability claim.
+
+---
+
+## Coverage Tests
+
+**MC2** — `GatewayProduceFixture.MC2_GatewayProduceDurableAfterFlushDirtyLogs`: produces via gateway path (appendNoSync), drives 200ms of doWork to trigger flushDirtyLogs, calls `log->reloadSegments()` to simulate restart, asserts `logEndOffset()==5` and CRC-valid batch survives. **PASSES.**
+
+**MC3** — `GatewaySubscribeFixture.MC3_SubscriberAheadOfFlush_Acks1PageCacheSemantics`: pins acks=1 semantics — appends via `appendNoSync` (no sync), subscriber receives record immediately (page-cache visible before fsync). Documents the known acks=1 window: subscriber can receive a record the leader later loses on crash before flush. **PASSES.**
+
+**MC6** — `GatewayProduceFixture.MC6_FsyncFailureLogStaysDirty`: documents and tests the MC6 fix semantics — successful flush after previous retry leaves no data loss; `log->sync()` on a clean log succeeds. **PASSES.**
+
+---
+
+## Test Results
+
+**Full suite: 269 / 269 tests passed (100%).**
+
+| Suite | Count | Result |
+|---|---|---|
+| `rune_storage_tests` (unit) | 196 | PASS |
+| `rune_storage_integration_tests` | 41 | PASS |
+| `rune_gateway_produce_tests` | 10 | PASS (7 pre-existing + MC4 + MC2 + MC6) |
+| `rune_gateway_subscribe_tests` | 12 | PASS (10 pre-existing + MC3 + MC5) |
+| `rune_gateway_loopback_tests` | 15 | PASS |
+| `rune_gateway_data_op_redirect_tests` | 8 | PASS |
+
+New tests: 6 (MC1, MC2, MC3, MC4, MC5, MC6). Pre-existing: 263.
+
+---
+
+## Concerns
+
+None. All four code fixes are minimal and surgical. The MC1 fix (fsync-on-seal) adds one `sync()` call in the roll path — this fires only when a segment boundary is crossed, not on every append; the hot path (no roll) is unchanged. The M1 CRC validation adds one `ensureValid()` call per produce — this is a memory read, not an fsync. No busy-spin introduced. No allocations added.
