@@ -1,0 +1,228 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// AeronPartitionTransport.h — PartitionTransport implementation over
+// aeron:udp.  GR-1 (replication transport wiring).
+//
+// Namespace: rune::replication
+// C++23.  Single-writer.  NO locks.  NO hot-path alloc.
+// NO synchronous blocking on the poll/duty-cycle thread.
+//
+// ## Design
+//
+//   Per-peer ExclusivePublications  (one per remote node; async resolve).
+//   One ingress Subscription + FragmentAssembler (for all inbound frames).
+//
+//   Outbound (sendFetchRequest / sendFetchResponse):
+//     1. SBE-encode into a pre-allocated scratch buffer (no per-call alloc).
+//     2. Look up the destination peer's publication.
+//     3. If not yet resolved — register addExclusivePublication on the first
+//        call and then poll findExclusivePublication inside poll(); return
+//        without blocking (frame is dropped until the pub resolves — the
+//        retry is driven by the duty-cycle's periodic doWork/nextFetch loop).
+//     4. tryClaim → copy → commit; fall back to offer() on back-pressure /
+//        NOT_CONNECTED.  Both paths return a result code (> 0 = sent).
+//
+//   Inbound (poll):
+//     Drain the ingress subscription (bounded fragment limit).
+//     Decode each frame header (peekTemplateId) and route:
+//       FetchRequest  → look up leader replica via registry → onFetchRequest.
+//       FetchResponse → look up follower replica via registry → applyReplicated.
+//     Routing registry: the caller supplies an
+//       std::function<PartitionReplica*(PartitionId)> at construction.
+//     Returns total work count (fragments + dispatches).
+//
+//   Async pub resolve:
+//     Each peer slot carries a PendingPub struct:
+//       { int64_t registrationId; std::shared_ptr<ExclusivePublication> pub; }
+//     poll() iterates pending registrations and calls findExclusivePublication.
+//     No sleep, no spin — just one non-blocking probe per poll() call.
+//
+// ## Thread model
+//   All methods (sendFetchRequest, sendFetchResponse, poll) MUST be called
+//   from the single duty-cycle thread.  ExclusivePublication is not
+//   thread-safe for offer/tryClaim; the Aeron ClientConductor IS thread-safe
+//   for addXxx/findXxx.
+//
+// ## Zero-alloc invariant
+//   encodeScratch_ (4 MiB) is pre-allocated in the constructor.
+//   The decoded FetchResponseMsg::records span is a zero-copy view into the
+//   fragment buffer (same lifetime as the FragmentAssembler callback scope);
+//   applyReplicated() must be called WITHIN that callback — the transport does
+//   this synchronously.
+// ---------------------------------------------------------------------------
+
+#include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationMessages.h>
+
+#include <Aeron.h>
+#include <ExclusivePublication.h>
+#include <Subscription.h>
+#include <FragmentAssembler.h>
+#include <concurrent/AtomicBuffer.h>
+#include <concurrent/logbuffer/BufferClaim.h>
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+namespace rune::replication {
+
+// ---------------------------------------------------------------------------
+// ReplicaRegistry — lookup callback type
+//
+// The transport needs to route inbound frames to the right PartitionReplica.
+// Callers register replicas via registerReplica() or supply a lookup function.
+// ---------------------------------------------------------------------------
+class AeronPartitionTransport final : public PartitionTransport {
+public:
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
+
+    /// \param aeron          Shared Aeron client (ClientConductor is thread-safe
+    ///                       for addXxx/findXxx; must outlive this object).
+    /// \param ingressChannel Aeron channel this node listens on for replication
+    ///                       ingress, e.g. "aeron:udp?endpoint=127.0.0.1:40300".
+    /// \param ingressStreamId Stream ID for inbound replication frames.
+    /// \param selfId          This node's NodeId (stamped on FetchRequests).
+    ///
+    /// The ingress Subscription is registered synchronously (bounded 5 s wait)
+    /// in the constructor — this is the only synchronous resolve; it runs once
+    /// at startup, never on the duty-cycle hot path.
+    AeronPartitionTransport(std::shared_ptr<aeron::Aeron> aeron,
+                            const std::string&             ingressChannel,
+                            int32_t                        ingressStreamId,
+                            NodeId                         selfId);
+
+    ~AeronPartitionTransport() override = default;
+
+    // Non-copyable, non-movable (holds shared_ptrs and a FragmentAssembler
+    // whose lambda captures `this`).
+    AeronPartitionTransport(const AeronPartitionTransport&)            = delete;
+    AeronPartitionTransport& operator=(const AeronPartitionTransport&) = delete;
+
+    // -----------------------------------------------------------------------
+    // Peer egress registration
+    //
+    // Call once per remote peer before the first send.  Registers an
+    // addExclusivePublication (non-blocking); the pub is resolved lazily
+    // inside poll().
+    // -----------------------------------------------------------------------
+
+    /// Register a peer's egress channel+streamId.  Does NOT block — just
+    /// issues addExclusivePublication and stores the registration id.
+    void addPeer(NodeId peerId,
+                 const std::string& egressChannel,
+                 int32_t            egressStreamId);
+
+    // -----------------------------------------------------------------------
+    // Replica registry
+    //
+    // Map (topicId=0, partitionId) → PartitionReplica*.  The transport
+    // doesn't own replicas; callers keep them alive.
+    // For GR-1 (single partition per test) partitionId alone is the key.
+    // -----------------------------------------------------------------------
+
+    /// Register a replica so inbound frames can be routed to it.
+    void registerReplica(PartitionId partitionId, PartitionReplica* replica);
+
+    // -----------------------------------------------------------------------
+    // PartitionTransport interface
+    // -----------------------------------------------------------------------
+
+    /// (Follower → Leader) encode and offer a FetchRequest on the leader's pub.
+    /// Non-blocking: drops if the pub is not yet resolved or back-pressured.
+    void sendFetchRequest(const FetchRequestMsg& req) override;
+
+    /// (Leader → Follower) encode and offer a FetchResponse to a follower.
+    /// Non-blocking: drops if the follower's pub is not yet resolved.
+    void sendFetchResponse(NodeId toFollower,
+                           const FetchResponseMsg& resp) override;
+
+    // -----------------------------------------------------------------------
+    // Duty-cycle step
+    // -----------------------------------------------------------------------
+
+    /// Drain the ingress subscription (≤ kFragmentLimit fragments), resolve
+    /// pending publications, and route decoded frames to registered replicas.
+    ///
+    /// \param nowNs  Current time (nanoseconds) — passed to onFetchRequest.
+    /// \returns Total work count (fragment polls + dispatches).
+    int poll(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // Accessors (for tests)
+    // -----------------------------------------------------------------------
+
+    /// Number of peers whose publication has not yet been resolved.
+    [[nodiscard]] int unresolvedPeerCount() const noexcept;
+
+    /// Number of peers registered.
+    [[nodiscard]] int peerCount() const noexcept {
+        return static_cast<int>(peers_.size());
+    }
+
+private:
+    // -----------------------------------------------------------------------
+    // Internal types
+    // -----------------------------------------------------------------------
+
+    struct PeerPub {
+        NodeId      peerId         = -1;
+        int64_t     registrationId = -1;     ///< from addExclusivePublication
+        std::shared_ptr<aeron::ExclusivePublication> pub; ///< null until resolved
+        bool        registered     = false;  ///< addExclusivePublication called
+    };
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Probe pending publications — called at the start of poll().
+    /// One non-blocking findExclusivePublication per unresolved peer.
+    void resolvePendingPubs();
+
+    /// Send a raw buffer on a peer's ExclusivePublication.
+    /// Returns true if the frame was accepted (> 0 from tryClaim/offer).
+    /// Non-blocking; caller bears the drop silently.
+    bool sendOnPub(aeron::ExclusivePublication& pub,
+                   const uint8_t* buf, std::size_t len);
+
+    /// Look up a peer's PeerPub entry (or nullptr if not found).
+    PeerPub* findPeer(NodeId id);
+
+    // -----------------------------------------------------------------------
+    // Fragment callback — called by FragmentAssembler on each reassembled frame.
+    // -----------------------------------------------------------------------
+    void onFragment(aeron::concurrent::AtomicBuffer& buffer,
+                    aeron::util::index_t             offset,
+                    aeron::util::index_t             length,
+                    aeron::Header&                   header);
+
+    // -----------------------------------------------------------------------
+    // Fields
+    // -----------------------------------------------------------------------
+
+    static constexpr int   kFragmentLimit = 10;
+    static constexpr std::size_t kScratchSize = 4 * 1024 * 1024; // 4 MiB
+
+    std::shared_ptr<aeron::Aeron>          aeron_;
+    std::shared_ptr<aeron::Subscription>   sub_;
+    aeron::FragmentAssembler               assembler_;
+
+    NodeId                                 selfId_;
+    int64_t                                nowNs_ = 0; ///< updated at top of poll()
+
+    // Per-peer egress publications (keyed by NodeId).
+    std::unordered_map<NodeId, PeerPub>    peers_;
+
+    // Replica registry: PartitionId → PartitionReplica*
+    std::unordered_map<PartitionId, PartitionReplica*> replicas_;
+
+    // Pre-allocated scratch buffer — zero per-op alloc on the send path.
+    std::vector<uint8_t> encodeScratch_;
+};
+
+} // namespace rune::replication

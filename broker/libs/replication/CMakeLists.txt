@@ -10,6 +10,22 @@ target_include_directories(rune_replication PUBLIC
 # consumers of rune_replication also get rune_storage headers transitively.
 target_link_libraries(rune_replication PUBLIC rune_storage)
 
+# ---------------------------------------------------------------------------
+# AeronPartitionTransport — compiled separately only when aeron is available.
+# Consumers that want the real transport link rune_replication_aeron.
+# The base rune_replication library remains Aeron-free (pure + InMemoryTransport).
+# ---------------------------------------------------------------------------
+if(aeron_FOUND)
+    add_library(rune_replication_aeron
+        src/AeronPartitionTransport.cpp)
+    target_include_directories(rune_replication_aeron PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    target_link_libraries(rune_replication_aeron PUBLIC
+        rune_replication
+        aeron::aeron)
+    target_link_libraries(rune_replication_aeron PRIVATE spdlog::spdlog)
+endif()
+
 option(BUILD_REPLICATION_INTEGRATION_TESTING
     "Build replication cluster disaster/recovery integration tests (P3-6)" OFF)
 if(BUILD_REPLICATION_INTEGRATION_TESTING)
@@ -39,10 +55,32 @@ if(BUILD_TESTING)
         tests/replication/PartitionReplicaTest.cpp
         tests/replication/PartitionRecorderTest.cpp
         tests/replication/PartitionReplayTest.cpp
-        tests/replication/PartitionFailoverTest.cpp)
+        tests/replication/PartitionFailoverTest.cpp
+        tests/replication/AeronPartitionTransportTest.cpp)
     target_link_libraries(rune_replication_tests PRIVATE rune_replication GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_replication_tests)
+
+    # ---------------------------------------------------------------------------
+    # AeronPartitionTransport in-process integration test (GR-1).
+    # Gated behind BUILD_AERON_REPLICATION_TESTS (default ON when aeron is found).
+    # Requires the embedded media driver (same as BUILD_BROKER_NODE_TESTS).
+    # ---------------------------------------------------------------------------
+    option(BUILD_AERON_REPLICATION_TESTS
+        "Build AeronPartitionTransport in-process Aeron integration tests (GR-1)" ON)
+    if(BUILD_AERON_REPLICATION_TESTS AND aeron_FOUND)
+        add_executable(rune_replication_aeron_tests
+            tests/integration/AeronPartitionTransportIntegrationTest.cpp)
+        target_link_libraries(rune_replication_aeron_tests PRIVATE
+            rune_replication_aeron
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_replication_aeron_tests
+            PROPERTIES TIMEOUT 60)
+    elseif(BUILD_AERON_REPLICATION_TESTS AND NOT aeron_FOUND)
+        message(WARNING
+            "BUILD_AERON_REPLICATION_TESTS=ON requires aeron; disabling rune_replication_aeron_tests")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
