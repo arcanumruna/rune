@@ -479,6 +479,13 @@ void BrokerNode::buildGateway() {
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
+
+        // Wire in the ReplicaRegistry (GR-4). Non-owning pointer; replicaRegistry_
+        // outlives the gateway (gateway_ is destroyed before replicaRegistry_ in stop()).
+        // When set, handleProduce() will call onLeaderLogAppended() after each
+        // append so the leader replica's tracked LEO/HW is reconciled and followers
+        // can fetch the new bytes (Mode A seam — no double-append).
+        gateway_->setReplicaRegistry(replicaRegistry_.get());
     } catch (const std::exception& ex) {
         spdlog::warn("BrokerNode[{}]: ClientGateway construction failed: {}; proceeding without gateway",
                      nodeId, ex.what());

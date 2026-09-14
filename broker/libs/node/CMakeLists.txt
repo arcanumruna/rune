@@ -109,4 +109,20 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_gateway_replication_wiring_tests
             PROPERTIES TIMEOUT 180)
     endif()
+
+    # ---------------------------------------------------------------------------
+    # GR-4: Gateway produce → leader PartitionReplica (Mode A onLeaderLogAppended).
+    # Unit + integration tests (3-node in-process, real aeron:udp, no Docker).
+    # Gated behind BUILD_NODE_UDP_TESTS (same env requirement as GR-3 tests).
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_gateway_produce_replication_tests
+            tests/integration/GatewayProduceReplicationTest.cpp)
+        target_link_libraries(rune_gateway_produce_replication_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_gateway_produce_replication_tests
+            PROPERTIES TIMEOUT 180)
+    endif()
 endif()

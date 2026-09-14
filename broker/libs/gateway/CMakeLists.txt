@@ -13,9 +13,11 @@ target_include_directories(rune_gateway PUBLIC
     ${RUNE_PROTOCOL_INCLUDE})
 
 # TopicRegistry depends on rune_storage (Log).
-# NodeConfig/TopicSpec headers are included via RUNE_NODE_INCLUDE (raw path) to avoid
-# a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
-target_link_libraries(rune_gateway PUBLIC rune_storage)
+# NodeConfig/TopicSpec and ReplicaRegistry headers are included via RUNE_NODE_INCLUDE
+# (raw path) to avoid a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
+# rune_replication is linked PUBLIC so ReplicaRegistry.h (which includes PartitionReplica.h)
+# compiles correctly and consumers of rune_gateway also get rune_replication headers.
+target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
 
 if(aeron_FOUND)

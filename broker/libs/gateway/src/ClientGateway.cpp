@@ -1,7 +1,9 @@
-// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a).
+// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4).
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/replication/PartitionReplica.h>
 
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -783,6 +785,51 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
 
+    // GR-4: Per-partition NotLeader defence-in-depth.
+    //
+    // If the ReplicaRegistry is wired in, look up the PartitionReplica for this
+    // (topicId, partition).  If the replica exists and is NOT in Leader role,
+    // reject the produce BEFORE touching the Log.  This is belt-and-suspenders
+    // beyond the cluster-level leaderView_ check above: the cluster check uses a
+    // coarse atomic observer that may lag a partition-level role transition
+    // (particularly during epoch changes or single-node bootstrap where
+    // replicaRegistry_ is set but the bridge has not yet called becomeLeader).
+    //
+    // We accept the produce when:
+    //   a) replicaRegistry_ is null (replication not wired in — passthrough, e.g. tests
+    //      that exercise the gateway without replication).
+    //   b) no replica found for this (topicId, partition) — replica map is sparse
+    //      (same passthrough).
+    //   c) replica.role() == Leader.
+    //
+    // We reject (NotLeader) when replica.role() == Follower.
+    //
+    // O(1) lookup (unordered_map): zero per-op alloc, lock-free (single-writer).
+    rune::replication::PartitionReplica* replica = nullptr;
+    if (replicaRegistry_) {
+        replica = replicaRegistry_->lookup(msg.topicId, partition);
+        if (replica && replica->role() != rune::replication::Role::Leader) {
+            // Per-partition NotLeader: reject without appending.
+            // Use the same errResp path as the cluster-level check above.
+            pc::ErrorResponse errResp;
+            errResp.sessionId     = msg.sessionId;
+            errResp.correlationId = msg.correlationId;
+            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            spdlog::debug("ClientGateway: Produce per-partition NotLeader "
+                          "(topicId={} partition={}) sessionId={}",
+                          msg.topicId, partition, msg.sessionId);
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2;
+            if (needed <= scratch_.size()) {
+                const std::size_t encoded = errResp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+            }
+            return;  // engine untouched — no append
+        }
+        // replica is either nullptr (no replica for this partition — passthrough)
+        // or role == Leader (allow produce through).
+    }
+
     // 5. Assign offsets (CRC-safe restamp).
 
     // Guard: recordBatch must be present (non-empty).
@@ -928,6 +975,27 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // Mark this Log dirty so flushDirtyLogs() will sync it at end of cycle.
     dirtyLogs_.insert(log);
+
+    // GR-4: Reconcile the leader replica's tracked LEO/HW (Mode A seam).
+    //
+    // The gateway appended DIRECTLY to the Log (bypassing PartitionReplica::append)
+    // so the leader replica's ReplicaLeaderState still holds the pre-append LEO.
+    // onLeaderLogAppended() reads log_->logEndOffset(), refreshes per-follower LEO,
+    // and recomputes HW — this is EXACTLY the Mode-A seam described in the spec.
+    //
+    // No double-append: the Log was written once by appendNoSync() above.
+    // onLeaderLogAppended() only reads the Log's LEO (log_->logEndOffset()) and
+    // updates in-memory replica state (ReplicaLeaderState + IsrManager).
+    //
+    // No per-op alloc: replica lookup is O(1) (pointer was captured before the
+    // restamp section); onLeaderLogAppended() is noexcept with no allocation.
+    //
+    // acks=Leader / None: we ack immediately after the append + reconciliation
+    // (same as before GR-4).  acks=All deferral is deferred to GR-5 — for now
+    // acks=All behaves identically (immediate ack, no wait for ISR HW advance).
+    if (replica) {
+        replica->onLeaderLogAppended();
+    }
 
     // 6. Reply ProduceResponse{OK, partition, baseOffset=base}.
     // acks=Leader: ack after page-cache write; fsync runs in flushDirtyLogs().

@@ -1,5 +1,5 @@
 #pragma once
-// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a).
+// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4).
 //
 // Design:
 //   - Subscribes to a single Aeron ingress stream (clientChannel/clientStreamId).
@@ -22,6 +22,11 @@
 //   - Session timeout reaping: doWork(nowNs) reaps sessions idle beyond
 //     sessionTimeoutNs (injected clock — deterministic, no wall-clock in reap).
 //   - Leader-awareness: non-leader Connect → ErrorResponse{Redirect, leaderEndpoint}.
+//   - GR-4: Produce is routed through the leader PartitionReplica (Mode A):
+//       After appendNoSync, onLeaderLogAppended() reconciles the replica's tracked
+//       LEO/HW so followers can fetch the new bytes.  Per-partition NotLeader
+//       defence: if the replica is not in Leader role, produce is rejected BEFORE
+//       any append (belt-and-suspenders beyond the cluster-level leaderView_ check).
 //   - Single-writer: doWork() must be called from ONE thread only.
 //   - Zero-alloc on the hot path: encode scratch is a fixed member buffer.
 //   - NO busy-spin.
@@ -49,6 +54,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace rune::node { class ReplicaRegistry; }
 
 namespace rune::gateway {
 
@@ -129,6 +136,28 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] TopicRegistry* topicRegistry() const noexcept {
         return topicRegistry_;
+    }
+
+    // -----------------------------------------------------------------------
+    // setReplicaRegistry — wire in the ReplicaRegistry (GR-4).
+    // Must be called before doWork() if produce replication is desired.
+    // May be null (no replication configured). Pointer is non-owning; lifetime
+    // must exceed the ClientGateway. Single-writer: call only on the duty-cycle
+    // thread (same restriction as setTopicRegistry).
+    //
+    // When set, handleProduce() will call replica->onLeaderLogAppended() after
+    // each successful append so the leader replica's tracked LEO/HW is reconciled
+    // and followers can fetch the new bytes.
+    // -----------------------------------------------------------------------
+    void setReplicaRegistry(rune::node::ReplicaRegistry* registry) noexcept {
+        replicaRegistry_ = registry;
+    }
+
+    // -----------------------------------------------------------------------
+    // replicaRegistry — current registry pointer (may be null).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] rune::node::ReplicaRegistry* replicaRegistry() const noexcept {
+        return replicaRegistry_;
     }
 
     // -----------------------------------------------------------------------
@@ -322,6 +351,13 @@ private:
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
     // Single-writer: only accessed on the duty-cycle thread.
     TopicRegistry*                       topicRegistry_ = nullptr;
+
+    // Replica registry (GR-4) — non-owning; set via setReplicaRegistry().
+    // Null until wired in; handleProduce() uses it to call onLeaderLogAppended()
+    // after each successful append so the leader PartitionReplica's tracked LEO/HW
+    // covers the new bytes (Mode A seam — no double-append).
+    // Single-writer: only accessed on the duty-cycle thread.
+    rune::node::ReplicaRegistry*         replicaRegistry_ = nullptr;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;
