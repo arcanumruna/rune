@@ -41,6 +41,24 @@ SIGKILL a node + restart it → rejoins, catches up, no data loss for committed 
 ### DR-8 — Combined chaos + soak
 Combinations while multiple clients act: leader-kill + packet loss; rolling restarts + client churn; a bounded chaos-monkey soak (random faults over N minutes) asserting invariants throughout. **Acceptance:** invariants hold under combined faults; catalogue + fix every bug surfaced.
 
+### DR-10 — Zombie / paused-leader split-brain (CRITICAL)
+`docker pause` (SIGSTOP-equivalent freeze) the leader → the majority re-elects a new leader → then `unpause` the old leader. The un-paused ex-leader MUST detect it is stale (higher term exists) and step down — it must NEVER accept produces / serve stale reads / act as a second leader. Variants: pause during produce; pause for just-under vs just-over the election timeout; pause+unpause repeatedly. Assert: at no instant are there two write-accepting leaders; no committed loss; the ex-leader rejects/redirects. (Consensus-safety review mandatory.) This is the #1 split-brain scenario.
+
+### DR-11 — Asymmetric / partial / flapping partitions
+One-way links (A→B ok, B→A dropped) via netem on specific interfaces; a leader that can reach ONE follower but not the other (partial quorum); rapid partition↔heal flapping (election-storm stress). Assert: single leader always, no election livelock/storm that never converges, no committed loss, heal converges. (Consensus-safety review on fixes.)
+
+### DR-12 — Packet reorder + duplication + MTU
+netem `reorder` + `duplicate` (not just loss/delay) on consensus + client links; large (multi-fragment) batches across a reduced-MTU link. Assert Aeron's reliability/ordering holds end-to-end (no app-level dup/reorder/loss), consensus tolerates duplicates (idempotent message handling), fragmentation works.
+
+### DR-13 — Client-side faults (crash / reconnect storm / slow subscriber / scale)
+Client crash (SIGKILL a client container) mid-produce → reconnect + resume: no committed loss, idempotent (no dup); crash mid-subscribe → resume from tracked offset (no gap/dup). Reconnect storm: kill the leader with many clients connected → all reconnect at once (session churn) — cluster stays healthy, all recover. Slow/stalled subscriber (stops draining) → broker back-pressure pauses IT without stalling other subscribers or the produce path. Scale: 50–100 concurrent clients (session/resource limits). 
+
+### DR-14 — Storage / disk / shared-memory faults
+fsync failure / disk-full on a node during produce (durability + graceful degradation, no corruption); restart a node from a CORRUPTED/TRUNCATED data dir (torn-write recovery → consistent state or clean refusal, never silent corruption); `/dev/shm` exhaustion (Aeron CnC/log-buffer alloc failure) handled without crash-loop; slow-fsync latency spike during produce (group-commit backpressure, no unbounded memory).
+
+### DR-15 — Failover data-integrity deep-dive
+Quantify the `acks=Leader` (page-cache) TAIL-LOSS window precisely: is an *acknowledged* record ever lost across leader failover, and exactly how much un-flushed/un-replicated tail can vanish (vs `acks=All` which must lose nothing — Milestone C)? Log divergence/truncation: force a follower to accept uncommitted entries from a soon-dead leader, fail the leader, assert the new leader's log + the follower truncate the uncommitted tail (no divergence, no phantom-committed record). Subscribe across a truncation (a subscriber must not see a record that gets truncated). Graceful (SIGTERM) vs ungraceful (SIGKILL) shutdown parity. Simultaneous all-3-node crash → cold restart → consistent recovery.
+
 ### DR-9 — Bug consolidation + full-area review + docs
 Consolidate + verify all fixes from DR-1..8; a full-area Opus review of the accumulated broker/client changes (esp. consensus/durability) for safety; document the DR suite (how to run, the fault matrix, the invariant set, the acks=Leader durability caveat). **Acceptance:** whole DR suite green + reviewed CLEAN; docs written.
 
@@ -48,4 +66,5 @@ Consolidate + verify all fixes from DR-1..8; a full-area Opus review of the accu
 The full DR-E2E suite passes against the live cluster (all scenarios), every surfaced bug fixed + reviewed, invariants documented. Milestone C may then begin.
 
 ## Self-review (coverage)
-- Multiple concurrent clients → DR-1/DR-2/DR-8. Leader crash → DR-3. Follower/quorum → DR-4. Network lost/partition → DR-5. Packet loss → DR-6. Node crash+restart/durability → DR-7. Combinations/chaos → DR-8. Fix-all-bugs → every ticket + DR-9. py-testinfra style → DR-1 harness. Single-leader/no-split-brain safety → DR-4/DR-5 (+ safety reviews). ✓
+- Multiple concurrent clients → DR-1/DR-2/DR-8/DR-13. Leader crash → DR-3. Follower/quorum → DR-4. Network lost/partition → DR-5; asymmetric/partial/flapping → DR-11. Packet loss/delay → DR-6; reorder/duplicate/MTU → DR-12. Node crash+restart/durability → DR-7; disk/fsync/shm faults → DR-14. Combinations/chaos → DR-8. **Zombie/paused-leader split-brain → DR-10 (the critical one).** Client crash/reconnect-storm/slow-subscriber/scale → DR-13. acks=Leader tail-loss + log-divergence/truncation + graceful-vs-ungraceful + all-node-crash → DR-15. Fix-all-bugs → every ticket + DR-9. py-testinfra style → DR-1 harness. Single-leader/no-split-brain safety → DR-4/DR-5/DR-10/DR-11 (+ mandatory consensus-safety reviews). ✓
+- Fault taxonomy covered: process (graceful/ungraceful/simultaneous/pause-freeze), network (partition/asymmetric/partial/flapping/loss/delay/reorder/duplicate/MTU), client (crash/reconnect-storm/slow/scale), storage (fsync-fail/disk-full/corrupt-dir/shm-exhaustion/slow-fsync), consensus (split-brain/zombie-leader/election-storm/log-divergence/higher-term-rejoin), data-integrity (tail-loss/truncation/exactly-once/ordering/resume).
