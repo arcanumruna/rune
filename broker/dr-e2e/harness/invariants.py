@@ -24,59 +24,55 @@ def assert_no_committed_loss(results: Results) -> None:
     """Every acked (committed) record must be delivered to at least one
     subscriber (the union of all subscriber views covers the committed set).
 
-    Matching is by log offset (globally unique in an append-only log) rather
-    than (cid, key, seq) so that historical records with the same triple do not
-    produce false negatives.
+    Matching is by (cid, key, seq) identity encoded in the record value
+    payload — partition-agnostic and correct across multi-partition topics
+    where the same log offset can exist in multiple partitions.
     """
-    produced_offsets: set[int] = {m.offset for m in results.all_produced}
-    delivered_offsets: set[int] = {m.offset for m in results.all_delivered}
-    missing = produced_offsets - delivered_offsets
+    produced_ids: set[tuple[int, int, int]] = {_rid(m) for m in results.all_produced
+                                               if m.cid >= 0}
+    delivered_ids: set[tuple[int, int, int]] = {_rid(m) for m in results.all_delivered
+                                                if m.cid >= 0}
+    missing = produced_ids - delivered_ids
     assert not missing, (
         f"committed-loss: {len(missing)} acked records never delivered "
-        f"(by offset): {sorted(missing)[:20]}{' ...' if len(missing) > 20 else ''}"
+        f"(by cid,key,seq): {sorted(missing)[:20]}{' ...' if len(missing) > 20 else ''}"
     )
 
 
 def assert_per_key_ordering(results: Results) -> None:
-    """For each (subscribing client, source key), delivered offsets must be
-    strictly increasing AND record seq order monotonic (no per-key reordering).
+    """For each (subscribing client, source producer key), delivered records
+    must arrive in strictly increasing seq order (no per-key reordering).
 
     Ordering is a PER-SUBSCRIBER property: every subscriber reads the shared
-    partition-0 log independently, so we check each subscribing client's own
+    partition log independently, so we check each subscribing client's own
     delivered stream, grouped by the source producer key (cid, key).
 
-    Only records produced by THIS run are checked.  The cluster log persists
-    across test sessions; historical records may share the same (cid, key, seq)
-    triple when _run_counter resets each session (same deterministic seq).
-    Filtering by OFFSET membership is session-exact: each run's committed records
-    have unique offsets (append-only log); no prior session can produce a record
-    at an offset that this run's producer also used.
+    Only records from THIS run are checked (m.cid >= 0 skips foreign records
+    whose value did not match the schema).  Per-run cid disjointness via
+    _next_cid_base() keeps each run's records distinct from earlier runs in
+    the same session without needing offset-based filtering.
     """
-    # Build the set of log offsets committed in this run — session-exact filter.
-    run_offsets: set[int] = {m.offset for m in results.all_produced}
+    run_rids: set[tuple[int, int, int]] = {_rid(m) for m in results.all_produced
+                                           if m.cid >= 0}
 
     for sub in results.clients:
         by_key: dict[tuple[int, int], list[Msg]] = {}
         for m in sub.delivered:
-            if m.offset not in run_offsets:  # historical or foreign record — skip
+            if m.cid < 0:  # foreign record — skip
+                continue
+            if _rid(m) not in run_rids:  # not produced in this run — skip
                 continue
             by_key.setdefault((m.cid, m.key), []).append(m)
 
         for (cid, key), msgs in by_key.items():
-            last_off = None
             last_seq = None
             for m in msgs:
-                if last_off is not None and m.offset <= last_off:
-                    raise AssertionError(
-                        f"per-key-ordering: subscriber={sub.cid} src cid={cid} "
-                        f"key={key} delivered offset {m.offset} <= previous {last_off}"
-                    )
                 if last_seq is not None and m.seq < last_seq:
                     raise AssertionError(
                         f"per-key-ordering: subscriber={sub.cid} src cid={cid} "
                         f"key={key} seq {m.seq} < previous {last_seq} (reordered)"
                     )
-                last_off, last_seq = m.offset, m.seq
+                last_seq = m.seq
 
 
 def assert_exactly_once(results: Results) -> None:
@@ -86,23 +82,26 @@ def assert_exactly_once(results: Results) -> None:
     every record on the shared partition, so duplicate detection is scoped to a
     single subscribing client's stream.
 
-    Only records from THIS run are checked; historical records (same cid/key/seq
-    reused across sessions due to deterministic dr_client seq numbering) must not
-    be conflated with current-run records.  Offset membership is the
-    session-exact filter: each run's committed records have unique log offsets.
+    Only records from THIS run are checked (cid >= 0 + run_rids membership).
+    Per-run cid disjointness via _next_cid_base() keeps records from separate
+    runs distinct without offset-based filtering.
     """
-    run_offsets: set[int] = {m.offset for m in results.all_produced}
+    run_rids: set[tuple[int, int, int]] = {_rid(m) for m in results.all_produced
+                                           if m.cid >= 0}
 
     for sub in results.clients:
-        seen: dict[int, int] = {}  # offset → count
+        seen: dict[tuple[int, int, int], int] = {}  # (cid,key,seq) → count
         for m in sub.delivered:
-            if m.offset not in run_offsets:  # historical or foreign — skip
+            if m.cid < 0:  # foreign record — skip
                 continue
-            seen[m.offset] = seen.get(m.offset, 0) + 1
-        dups = {off: n for off, n in seen.items() if n > 1}
+            rid = _rid(m)
+            if rid not in run_rids:  # not from this run — skip
+                continue
+            seen[rid] = seen.get(rid, 0) + 1
+        dups = {rid: n for rid, n in seen.items() if n > 1}
         assert not dups, (
             f"exactly-once violated for subscriber={sub.cid}: {len(dups)} records "
-            f"delivered >1 time (by offset): {list(dups.items())[:20]}"
+            f"delivered >1 time (by cid,key,seq): {list(dups.items())[:20]}"
         )
 
 

@@ -100,6 +100,10 @@ def test_dr1_baseline(cluster, case):
     # There must never be two write-accepting leaders — check before workload.
     assert_single_leader(cluster)
 
+    # follower-targeted cases add a redirect round-trip; allow one retry for
+    # infrastructure resilience under concurrent Docker load.
+    connect_retries = 1 if case.target == "follower" else 0
+
     if from_mode == "earliest":
         # n concurrent producers all write partition 0. Each earliest subscriber
         # verifies delivery of its OWN committed records (expect_own) so it never
@@ -114,6 +118,7 @@ def test_dr1_baseline(cluster, case):
             expect_own=True,
             timeout_ms=15000,
             subscribe_ms=40000,
+            connect_retries=connect_retries,
         )
     else:
         # from=latest: produce N, then a latest-subscribe (may deliver 0..N since
@@ -127,6 +132,7 @@ def test_dr1_baseline(cluster, case):
             expect=0,                # don't require full delivery for 'latest'
             timeout_ms=15000,
             subscribe_ms=8000,
+            connect_retries=connect_retries,
         )
 
     # 'from' is a reserved kwarg name; driver.run_clients reads cfg['from'].

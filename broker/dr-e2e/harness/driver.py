@@ -3,8 +3,8 @@
 The dr_client binary (rune-client-cpp/examples/dr_client.cpp, image
 `rune-dr-client:dev`) is fully env-driven and emits machine-parseable lines:
 
-    PRODUCED  cid=<c> key=<k> seq=<s> offset=<o>
-    DELIVERED cid=<c> key=<k> seq=<s> offset=<o>
+    PRODUCED  cid=<c> key=<k> seq=<s> part=<p> offset=<o>
+    DELIVERED cid=<c> key=<k> seq=<s> part=<p> offset=<o>
     SUMMARY   produced=<np> delivered=<nd> mode=<m> rc=<rc>
 
 `run_clients(n, ...)` runs n such containers concurrently against the cluster,
@@ -25,8 +25,8 @@ from .dockerutil import run
 
 DR_IMAGE = "rune-dr-client:dev"
 
-_PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) offset=(-?\d+)")
-_DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) offset=(-?\d+)")
+_PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
+_DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _SUMMARY_RE = re.compile(r"SUMMARY produced=(\d+) delivered=(\d+) mode=(\S+) rc=(\d+)")
 
 
@@ -35,6 +35,7 @@ class Msg:
     cid: int
     key: int
     seq: int
+    partition: int
     offset: int
 
 
@@ -88,9 +89,9 @@ class Results:
 def _parse_client_output(cid: int, exit_code: int, out: str) -> ClientResult:
     res = ClientResult(cid=cid, rc=1, exit_code=exit_code, raw=out)
     for m in _PRODUCED_RE.finditer(out):
-        res.produced.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4])))
+        res.produced.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5])))
     for m in _DELIVERED_RE.finditer(out):
-        res.delivered.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4])))
+        res.delivered.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5])))
     sm = _SUMMARY_RE.search(out)
     if sm:
         res.rc = int(sm[4])
@@ -164,7 +165,7 @@ def _run_one_client(
             "--platform", "linux/amd64",
             "--network", network,
             "--hostname", run_host,
-            "--shm-size=256m",
+            "--shm-size=64m",
         ]
         for k, v in env.items():
             args += ["-e", f"{k}={v}"]
