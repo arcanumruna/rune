@@ -20,6 +20,11 @@
 //     RUNE_DATA_DIR        Aeron driver dir (required)
 //     RUNE_TOPICS          "name:id:partitions,..." default "events:0:1"
 //     RUNE_TIMEOUT_MS      per-op timeout ms, default 10000
+//     RUNE_ACKS            "leader" | "all", default "leader".
+//                            "all" → ProducerConfig::acks = Acks::All so the
+//                            broker waits for majority-ISR durability before
+//                            resolving the ProduceResponse.  A "PRODUCED" line
+//                            then means majority-committed, not just leader-acked.
 //
 //   Workload:
 //     RUNE_MODE            "produce" | "subscribe" | "produce_subscribe"
@@ -157,11 +162,13 @@ static void decodePayload(const std::string& v, int& cid, int& key, int& seq) {
 // ---------------------------------------------------------------------------
 // Produce `records` records across `keys` distinct keys at up to `rateHz`.
 // Emits "PRODUCED ..." per acked record.  Returns #acked.
+// `acksPolicy`: Acks::Leader (default) or Acks::All (majority-durable).
 // ---------------------------------------------------------------------------
 static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
-                     int keys, int rateHz, int timeoutMs, int32_t partitionCount) {
+                     int keys, int rateHz, int timeoutMs, int32_t partitionCount,
+                     Acks acksPolicy) {
     ProducerConfig pcfg;
-    pcfg.acks             = Acks::Leader;
+    pcfg.acks             = acksPolicy;
     pcfg.lingerUs         = 1;
     pcfg.batchBytes       = 1;
     pcfg.maxInFlight      = 16;
@@ -322,6 +329,14 @@ int main() {
     // partitionCount (from RUNE_TOPICS) to cover ALL partitions end-to-end.
     const int         subPartitions  = getEnvInt("RUNE_SUB_PARTITIONS", 1);
 
+    // RUNE_ACKS: "leader" (default) | "all".
+    // "all" → Acks::All so the broker holds the ProduceResponse until a
+    // majority of ISR nodes have replicated the batch (majority-durable).
+    // A PRODUCED line under acks=All means majority-committed.
+    const std::string acksStr  = getEnvStr("RUNE_ACKS", "leader");
+    const Acks        acksPolicy =
+        (acksStr == "all") ? Acks::All : Acks::Leader;
+
     if (target.empty() || egress.empty() || dataDir.empty()) {
         std::cerr << "CLIENT: RUNE_TARGET, RUNE_EGRESS and RUNE_DATA_DIR are required\n";
         return 1;
@@ -331,7 +346,8 @@ int main() {
               << " target=" << target << " records=" << records
               << " keys=" << keys << " rateHz=" << rateHz
               << " from(wire)=" << from.toWire() << " expect=" << expect
-              << " slowMs=" << slowMs << " subPartitions=" << subPartitions << "\n";
+              << " slowMs=" << slowMs << " subPartitions=" << subPartitions
+              << " acks=" << acksStr << "\n";
 
     ClientConfig cfg;
     cfg.gatewayChannel   = target;
@@ -373,7 +389,7 @@ int main() {
         const bool doS = (mode == "subscribe" || mode == "produce_subscribe");
 
         if (doP) {
-            produced = doProduce(c, th, cid, records, keys, rateHz, timeoutMs, th.partitionCount);
+            produced = doProduce(c, th, cid, records, keys, rateHz, timeoutMs, th.partitionCount, acksPolicy);
             if (produced < records) {
                 std::cerr << "CLIENT: FAIL produced " << produced << "/" << records << "\n";
                 rc = 1;
