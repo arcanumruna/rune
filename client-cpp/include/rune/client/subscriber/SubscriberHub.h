@@ -36,6 +36,7 @@
 #include <rune/client/codec/DataCodec.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -82,16 +83,18 @@ public:
     ///   isolation    — isolation byte
     ///   keyBytes     — key bytes (zero-copy span; valid only during this call)
     ///   partitionKnown — 1 if partition is explicit, 0 if resolved from key
+    ///   deadline     — subscribe-request timeout (M2: sweepTimedOut fails it if no response)
     ///   submitFn     — calls agent_.submitSend(frame, len)
-    void registerSubscribe(std::shared_ptr<SubscriptionImpl> impl,
-                           int64_t                          sessionId,
-                           int64_t                          correlationId,
-                           int32_t                          topicId,
-                           int32_t                          partition,
-                           uint8_t                          partitionKnown,
-                           int64_t                          fromOffset,
-                           uint8_t                          isolation,
-                           std::span<const uint8_t>         keyBytes,
+    void registerSubscribe(std::shared_ptr<SubscriptionImpl>             impl,
+                           int64_t                                       sessionId,
+                           int64_t                                       correlationId,
+                           int32_t                                       topicId,
+                           int32_t                                       partition,
+                           uint8_t                                       partitionKnown,
+                           int64_t                                       fromOffset,
+                           uint8_t                                       isolation,
+                           std::span<const uint8_t>                      keyBytes,
+                           std::chrono::steady_clock::time_point         deadline,
                            const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
 
     /// Submit an Unsubscribe frame for a given subscriptionId.
@@ -138,6 +141,22 @@ public:
     /// is shutting down anyway).
     void deactivateAll();
 
+    /// M2 FIX [CB-5]: Fail all PENDING (unbound) subscriptions with a clear
+    /// error.  Called when a redirect reaches a dead endpoint, retarget fails,
+    /// or kMaxRedirects is exhausted — so pending subscribes are not orphaned
+    /// in pendingByCorrelation_ forever.  Also called from close() to guarantee
+    /// no subscribe future can hang.
+    ///
+    /// Each pending impl's active flag is cleared (so a late SubscribeResponse
+    /// is treated as an already-unsubscribed response and a late Unsubscribe is
+    /// emitted via the CB-5 A2 path rather than routing records to a dead impl).
+    void failPendingSubscribes(const std::string& reason);
+
+    /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
+    /// deadline has expired.  Mirrors the produce-ack timeout sweep.
+    /// Called from Client::sweepTimeouts() on the runner thread.
+    void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
+
     /// CB-5 B: resend every PENDING Subscribe frame after a leader redirect +
     /// reconnect.  A Subscribe rejected by a follower with ErrorResponse
     /// {Redirect} was never bound (no SubscribeResponse), so it still lives in
@@ -169,8 +188,9 @@ private:
     // Key: correlationId.  Stores the impl plus the encoded Subscribe frame so
     // the frame can be re-stamped + resent on a leader redirect (CB-5 B).
     struct PendingSub {
-        std::shared_ptr<SubscriptionImpl> impl;
-        std::vector<uint8_t>              subscribeFrame; // encoded Subscribe (for redirect resend)
+        std::shared_ptr<SubscriptionImpl>     impl;
+        std::vector<uint8_t>                  subscribeFrame; // encoded Subscribe (for redirect resend)
+        std::chrono::steady_clock::time_point deadline;       // M2: subscribe-request timeout
     };
     std::map<int64_t, PendingSub> pendingByCorrelation_;
 

@@ -11,8 +11,10 @@
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 namespace rune::client::subscriber {
 
@@ -21,15 +23,16 @@ namespace rune::client::subscriber {
 // ---------------------------------------------------------------------------
 
 void SubscriberHub::registerSubscribe(
-        std::shared_ptr<SubscriptionImpl> impl,
-        int64_t                          sessionId,
-        int64_t                          correlationId,
-        int32_t                          topicId,
-        int32_t                          partition,
-        uint8_t                          partitionKnown,
-        int64_t                          fromOffset,
-        uint8_t                          isolation,
-        std::span<const uint8_t>         keyBytes,
+        std::shared_ptr<SubscriptionImpl>             impl,
+        int64_t                                       sessionId,
+        int64_t                                       correlationId,
+        int32_t                                       topicId,
+        int32_t                                       partition,
+        uint8_t                                       partitionKnown,
+        int64_t                                       fromOffset,
+        uint8_t                                       isolation,
+        std::span<const uint8_t>                      keyBytes,
+        std::chrono::steady_clock::time_point         deadline,
         const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
 {
     // ---- Encode the Subscribe frame -----------------------------------------
@@ -54,7 +57,8 @@ void SubscriberHub::registerSubscribe(
     {
         std::lock_guard<std::mutex> lk(mtx_);
         PendingSub ps;
-        ps.impl = impl;
+        ps.impl     = impl;
+        ps.deadline = deadline;
         if (frameLen > 0) {
             ps.subscribeFrame.assign(frameBuf, frameBuf + frameLen);
         }
@@ -63,7 +67,7 @@ void SubscriberHub::registerSubscribe(
 
     // ---- Submit to the agent ring -------------------------------------------
     // If submission fails (ring full), we leave the impl registered; it will
-    // be cleaned up by deactivateAll() on close or by a timeout in the future.
+    // be cleaned up by deactivateAll() on close or by a timeout sweep.
     if (frameLen > 0) {
         submitFn(frameBuf, frameLen);
     }
@@ -284,6 +288,56 @@ bool SubscriberHub::hasPending() const
 {
     std::lock_guard<std::mutex> lk(mtx_);
     return !pendingByCorrelation_.empty();
+}
+
+// ---------------------------------------------------------------------------
+// M2 FIX: failPendingSubscribes — fail all unbound pending subscribes
+// ---------------------------------------------------------------------------
+
+void SubscriberHub::failPendingSubscribes(const std::string& reason)
+{
+    // Collect the impls to fail under the lock, then deactivate outside.
+    std::vector<std::shared_ptr<SubscriptionImpl>> toFail;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto& [corrId, ps] : pendingByCorrelation_) {
+            if (ps.impl) {
+                // Mark inactive so a late SubscribeResponse / Records push is
+                // treated as an already-unsubscribed response and dropped.
+                ps.impl->active.store(false, std::memory_order_release);
+                toFail.push_back(ps.impl);
+            }
+        }
+        pendingByCorrelation_.clear();
+    }
+    // Note: SubscriptionImpl does not currently hold a promise / future — the
+    // Subscription handle is the app's only reference.  Marking active=false
+    // is the error signal; the app polls subscriptionId() / active.  This
+    // mirrors the deactivateAll() semantics (no unsubscribe frame needed — the
+    // broker never bound the id).  If a future per-subscribe promise is added
+    // (Milestone-C), resolve it with an exception here.
+    (void)reason;
+}
+
+// ---------------------------------------------------------------------------
+// M2 FIX: sweepTimedOut — timeout pending subscribes that got no response
+// ---------------------------------------------------------------------------
+
+void SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now)
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (auto it = pendingByCorrelation_.begin();
+         it != pendingByCorrelation_.end(); )
+    {
+        if (now >= it->second.deadline) {
+            if (it->second.impl) {
+                it->second.impl->active.store(false, std::memory_order_release);
+            }
+            it = pendingByCorrelation_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

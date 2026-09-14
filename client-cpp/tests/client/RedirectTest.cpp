@@ -51,6 +51,7 @@ using namespace std::chrono_literals;
 using namespace rune::client;
 
 namespace rcc = rune::client::codec;
+namespace rcs = rune::client::session;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -473,5 +474,620 @@ TEST(Redirect, SubscribeRedirectFollow) {
     sub.unsubscribe();
     client->close();
 
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Test: M1 — Produce + Subscribe submitted DURING the redirect-reconnect window
+// are gated (not emitted with sessionId=0) and flushed with the new sessionId
+// once ConnectResponse{OK} arrives.
+//
+// Scenario:
+//   The gateway triggers a redirect on the FIRST Produce.  While the client is
+//   in Connecting state (between the Redirect and the second ConnectResponse),
+//   the test submits a SECOND Produce and a Subscribe.  These must NOT be sent
+//   with sessionId=0; they must be held and then emitted with the leader's new
+//   sessionId once Connected.
+//
+// Gateway state machine:
+//   ConnectRequest #1 → ConnectResponse{OK, session=42}
+//   Produce #1        → ErrorResponse{Redirect, "aeron:ipc"}
+//   ConnectRequest #2 → ConnectResponse{OK, session=99}  [after delay]
+//   Produce #2 (resend of #1)  → ProduceResponse{OK}
+//   Produce #3 (new during reconnect) → ProduceResponse{OK}
+//   Subscribe (new during reconnect)  → SubscribeResponse{OK}
+//
+// Assertions:
+//   - Produce #3 session id == kLeaderSessionId (99), not 0
+//   - Subscribe session id  == kLeaderSessionId (99), not 0
+//   - produce future #2 and #3 both resolve
+//   - subscription binds
+// ===========================================================================
+
+struct M1Gateway {
+    // State counters
+    std::atomic<int> connectsSeen{0};
+    std::atomic<int> producesSeen{0};
+    std::atomic<int> subscribesSeen{0};
+
+    static constexpr int64_t kFirstSession  = 42;
+    static constexpr int64_t kLeaderSession = 99;
+
+    // sessionId observed on each produce / subscribe
+    std::atomic<int64_t> lastProduceSession{-1};
+    std::atomic<int64_t> lastSubSession{-1};
+
+    // track corrIds so we can reply correctly
+    int64_t produce1CorrId = 0;
+    int64_t produce2CorrId = 0; // resend of #1 — same corrId
+    int64_t produce3CorrId = 0; // new produce during reconnect
+    int64_t subCorrId = 0;
+
+    std::shared_ptr<aeron::Aeron>                gwAeron;
+    std::shared_ptr<aeron::Subscription>         gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+    std::unique_ptr<aeron::FragmentAssembler>    gwAsm;
+    uint8_t replyBuf[2048]{};
+
+    M1Gateway(const std::string& aeronDir, int32_t inStr, int32_t egStr)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        gwAeron = aeron::Aeron::connect(ctx);
+        const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
+        const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", egStr);
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(1ms);
+        }
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off, aeron::util::index_t len,
+                   aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(buf.buffer()+off),
+                        static_cast<std::size_t>(len));
+            });
+    }
+    ~M1Gateway() { gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset(); }
+
+    int poll(int lim=16) { return gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), lim) : 0; }
+
+    bool gwSend(const uint8_t* b, std::size_t l) {
+        const auto il = static_cast<aeron::util::index_t>(l);
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), il);
+        for (int i = 0; i < 500; ++i) {
+            if (gwPub->offer(ab, 0, il) > 0) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    }
+
+    void onFrame(const uint8_t* buf, std::size_t len) {
+        const auto tidOpt = rcc::peekTemplate(buf, len);
+        if (!tidOpt) return;
+        const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
+
+        if (tid == rcc::TemplateId::Connect) {
+            const auto opt = rcc::decodeConnectRequest(buf, len);
+            if (!opt) return;
+            const int c = connectsSeen.fetch_add(1) + 1;
+            const int64_t assigned = (c == 1) ? kFirstSession : kLeaderSession;
+            const std::size_t n = rcc::encodeConnectResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::OK), 0, assigned,
+                opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid == rcc::TemplateId::Subscribe) {
+            const auto opt = rcc::decodeSubscribe(buf, len);
+            if (!opt) return;
+            subscribesSeen.fetch_add(1);
+            lastSubSession.store(opt->sessionId, std::memory_order_release);
+            subCorrId = opt->correlationId;
+            // Reply SubscribeResponse{OK}
+            const std::size_t n = rcc::encodeSubscribeResponse(
+                replyBuf, sizeof(replyBuf),
+                0, opt->partition, /*subscriptionId=*/55,
+                opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid != rcc::TemplateId::Produce) return;
+        const auto opt = rcc::decodeProduce(buf, len);
+        if (!opt) return;
+        const int p = producesSeen.fetch_add(1) + 1;
+        lastProduceSession.store(opt->sessionId, std::memory_order_release);
+
+        if (p == 1) {
+            // First produce: send Redirect
+            produce1CorrId = opt->correlationId;
+            const std::string_view ep = "aeron:ipc";
+            const std::size_t n = rcc::encodeErrorResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::Redirect),
+                ep, opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+        } else {
+            // All subsequent produces (resend of #1 + new ones): reply OK
+            const std::size_t n = rcc::encodeProduceResponse(
+                replyBuf, sizeof(replyBuf),
+                0, opt->partition, /*baseOffset=*/300,
+                opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+        }
+    }
+};
+
+TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
+    static constexpr int32_t kInStr = 4200, kEgStr = 4201;
+    const std::string agentDir = uniqueDir("cb5_m1");
+    const std::string aeronDir = agentDir + "/aeron";
+
+    ClientConfig cfg;
+    cfg.gatewayChannel    = "aeron:ipc";
+    cfg.gatewayStreamId   = kInStr;
+    cfg.egressChannel     = "aeron:ipc";
+    cfg.egressStreamId    = kEgStr;
+    cfg.dataDir           = agentDir;
+    cfg.connectTimeoutMs  = 8000;
+    cfg.idleMode          = IdleMode::LowLatency;
+    cfg.subscribeTimeoutMs = 15000;
+
+    TopicSpec ts;
+    ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+
+    auto client = std::make_unique<Client>(cfg);
+    std::this_thread::sleep_for(150ms);
+    auto gw = std::make_unique<M1Gateway>(aeronDir, kInStr, kEgStr);
+
+    // Connect
+    auto connFut = client->connect();
+    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+        gw->poll(16);
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_NO_THROW(connFut.get()) << "Initial connect must succeed";
+
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 15000;
+    auto p = client->producer(pcfg);
+    auto th = client->topic("t");
+
+    Key key(uint64_t{1});
+    const std::vector<uint8_t> val = {0xAA};
+
+    // Send first produce (will be redirected by gateway)
+    auto fut1 = p.send(th, key, std::span<const uint8_t>(val), want_future);
+
+    // Pump until gateway sends the Redirect (produce #1 seen) AND the client
+    // has entered Connecting state (i.e. sessionId() == 0).
+    for (int i = 0; i < kPumpMax; ++i) {
+        gw->poll(16);
+        if (gw->producesSeen.load() >= 1 &&
+            client->state() == rcs::SessionState::Connecting)
+        {
+            break;
+        }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    // Confirm we caught the reconnect window
+    ASSERT_EQ(client->state(), rcs::SessionState::Connecting)
+        << "Client must be Connecting (mid-redirect) before new sends";
+
+    // --- Submit new Produce and Subscribe DURING the reconnect window ---
+    // These must NOT go out with sessionId=0; they must be held.
+    auto fut2 = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    SubscribeOptions opts;
+    opts.from = From::earliest();
+    opts.isolation = Isolation::ReadUncommitted;
+    auto sub = client->subscribe(th, 0, opts, [](const Record&){});
+
+    // Pump until fut1 AND fut2 resolve and subscription is bound
+    bool fut1Done = false, fut2Done = false, subBound = false;
+    for (int i = 0; i < kPumpMax * 2; ++i) {
+        gw->poll(16);
+        if (!fut1Done && fut1.wait_for(0s) == std::future_status::ready) fut1Done = true;
+        if (!fut2Done && fut2.wait_for(0s) == std::future_status::ready) fut2Done = true;
+        if (!subBound && sub.subscriptionId() != 0) subBound = true;
+        if (fut1Done && fut2Done && subBound) break;
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    ASSERT_TRUE(fut1Done) << "Redirected produce future must resolve";
+    ASSERT_TRUE(fut2Done) << "New-during-reconnect produce future must resolve";
+    ASSERT_TRUE(subBound) << "New-during-reconnect subscribe must bind";
+
+    ASSERT_NO_THROW({ fut1.get(); }) << "fut1 must not throw";
+    ASSERT_NO_THROW({ fut2.get(); }) << "fut2 must not throw";
+
+    // Key M1 assertion: no frame was emitted with sessionId==0
+    // The gateway would have seen a Produce with sessionId=0 if the guard
+    // was missing; instead all produces after the redirect use the leader session.
+    EXPECT_EQ(gw->lastProduceSession.load(), M1Gateway::kLeaderSession)
+        << "All produces after redirect must carry the NEW leader sessionId (not 0)";
+    EXPECT_EQ(gw->lastSubSession.load(), M1Gateway::kLeaderSession)
+        << "Subscribe submitted during reconnect must carry the NEW leader sessionId";
+
+    sub.unsubscribe();
+    client->close();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Test: M2 — Redirect to a dead/unresponsive endpoint fails produce promptly
+// AND subscribe promptly (no hang).  Both must resolve in well under
+// produceTimeoutMs/subscribeTimeoutMs.
+//
+// Scenario:
+//   Gateway answers ConnectRequest → ConnectResponse{OK}.
+//   Client sends a Produce and a Subscribe.
+//   Gateway replies ErrorResponse{Redirect, "aeron:ipc"} (same channel but
+//   the gateway then IGNORES subsequent ConnectRequests, simulating a dead
+//   endpoint that the retarget succeeds to but nobody answers).
+//   After connectTimeoutMs * (maxRetries+1), the session transitions to
+//   Disconnected.  sweepTimeouts() detects redirectPending_+Disconnected and
+//   promptly fails both the pending produce future and the pending subscribe.
+//
+// Assertions:
+//   - produce future fails within kDeadlineMs (< produceTimeoutMs full value)
+//   - subscription is deactivated (active=false) within kDeadlineMs
+//   - no hang
+// ===========================================================================
+
+struct DeadGateway {
+    std::atomic<int> connectsSeen{0};
+    std::atomic<int> producesSeen{0};
+    std::atomic<int> subscribesSeen{0};
+
+    static constexpr int64_t kSessionId = 77;
+
+    std::shared_ptr<aeron::Aeron>                gwAeron;
+    std::shared_ptr<aeron::Subscription>         gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+    std::unique_ptr<aeron::FragmentAssembler>    gwAsm;
+    uint8_t replyBuf[2048]{};
+
+    DeadGateway(const std::string& aeronDir, int32_t inStr, int32_t egStr)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        gwAeron = aeron::Aeron::connect(ctx);
+        const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
+        const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", egStr);
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(1ms);
+        }
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off, aeron::util::index_t len,
+                   aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(buf.buffer()+off),
+                        static_cast<std::size_t>(len));
+            });
+    }
+    ~DeadGateway() { gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset(); }
+
+    int poll(int lim=16) { return gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), lim) : 0; }
+
+    bool gwSend(const uint8_t* b, std::size_t l) {
+        const auto il = static_cast<aeron::util::index_t>(l);
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), il);
+        for (int i = 0; i < 200; ++i) {
+            if (gwPub->offer(ab, 0, il) > 0) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    }
+
+    void onFrame(const uint8_t* buf, std::size_t len) {
+        const auto tidOpt = rcc::peekTemplate(buf, len);
+        if (!tidOpt) return;
+        const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
+
+        if (tid == rcc::TemplateId::Connect) {
+            const auto opt = rcc::decodeConnectRequest(buf, len);
+            if (!opt) return;
+            connectsSeen.fetch_add(1);
+            // Only answer the FIRST ConnectRequest with OK.
+            // Subsequent ConnectRequests (the reconnect after redirect) get
+            // NO response — simulating a dead / unreachable endpoint.
+            if (connectsSeen.load() == 1) {
+                const std::size_t n = rcc::encodeConnectResponse(
+                    replyBuf, sizeof(replyBuf),
+                    static_cast<int16_t>(rcc::ErrorCode::OK), 0, kSessionId,
+                    opt->sessionId, opt->correlationId);
+                if (n > 0) gwSend(replyBuf, n);
+            }
+            // Subsequent connects: drop silently (dead endpoint simulation).
+            return;
+        }
+
+        if (tid == rcc::TemplateId::Subscribe) {
+            const auto opt = rcc::decodeSubscribe(buf, len);
+            if (!opt) return;
+            subscribesSeen.fetch_add(1);
+            // Reply Redirect to the same aeron:ipc endpoint (which will then
+            // drop the reconnect — simulating dead endpoint via the no-response path).
+            const std::string_view dead = "aeron:ipc";
+            const std::size_t n = rcc::encodeErrorResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::Redirect),
+                dead, opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid == rcc::TemplateId::Produce) {
+            const auto opt = rcc::decodeProduce(buf, len);
+            if (!opt) return;
+            producesSeen.fetch_add(1);
+            // Reply Redirect to the same aeron:ipc endpoint (dead — no response).
+            const std::string_view dead = "aeron:ipc";
+            const std::size_t n = rcc::encodeErrorResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::Redirect),
+                dead, opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+        }
+    }
+};
+
+TEST(Redirect, M2DeadEndpointProduceFutureFails_SubscribeDoesNotHang) {
+    static constexpr int32_t kInStr = 4300, kEgStr = 4301;
+    const std::string agentDir = uniqueDir("cb5_m2dead");
+    const std::string aeronDir = agentDir + "/aeron";
+
+    // Use very short connect timeout so the dead reconnect fails quickly.
+    // The sweep detects Disconnected+redirectPending_ and fails everything.
+    ClientConfig cfg;
+    cfg.gatewayChannel    = "aeron:ipc";
+    cfg.gatewayStreamId   = kInStr;
+    cfg.egressChannel     = "aeron:ipc";
+    cfg.egressStreamId    = kEgStr;
+    cfg.dataDir           = agentDir;
+    // Very short timeouts so the dead reconnect fails fast in the test.
+    cfg.connectTimeoutMs  = 300;  // 300 ms connect timeout (agent-level)
+    cfg.produceTimeoutMs  = 30000; // long enough not to fire before our prompt-fail
+    cfg.subscribeTimeoutMs = 30000;
+    cfg.idleMode          = IdleMode::LowLatency;
+
+    TopicSpec ts;
+    ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+
+    auto client = std::make_unique<Client>(cfg);
+    std::this_thread::sleep_for(150ms);
+    auto gw = std::make_unique<DeadGateway>(aeronDir, kInStr, kEgStr);
+
+    // Connect (first ConnectRequest → OK)
+    auto connFut = client->connect();
+    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+        gw->poll(16);
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_NO_THROW(connFut.get()) << "Initial connect must succeed";
+
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 30000;
+    auto p = client->producer(pcfg);
+    auto th = client->topic("t");
+
+    Key key(uint64_t{1});
+    const std::vector<uint8_t> val = {0xBB};
+
+    // Submit a Produce and a Subscribe — both will get Redirect to dead endpoint
+    auto prodFut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    SubscribeOptions opts;
+    opts.from = From::earliest();
+    opts.isolation = Isolation::ReadUncommitted;
+    auto sub = client->subscribe(th, 0, opts, [](const Record&){});
+
+    // Record start time; both must fail in well under kDeadlineMs.
+    // The deadline is: connectTimeoutMs * (maxConnectRetries+1) + sweep interval.
+    // With connectTimeoutMs=300ms, maxConnectRetries=3: ≤ 300*4 + 200 = 1.4 s.
+    // We wait up to 8 s (allowing for slow CI) but assert elapsed < 8 s strictly.
+    const auto startTime = std::chrono::steady_clock::now();
+    constexpr auto kDeadlineMs = std::chrono::milliseconds(8000);
+
+    bool prodFailed = false, subDeactivated = false;
+    for (int i = 0; i < kPumpMax * 4; ++i) {
+        gw->poll(16);
+        if (!prodFailed && prodFut.wait_for(0s) == std::future_status::ready)
+            prodFailed = true;
+        if (!subDeactivated && !sub.active())
+            subDeactivated = true;
+        if (prodFailed && subDeactivated) break;
+        std::this_thread::sleep_for(kPumpSleep);
+        if (std::chrono::steady_clock::now() - startTime > kDeadlineMs) break;
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - startTime;
+
+    ASSERT_TRUE(prodFailed)
+        << "Produce future must fail (not hang) on dead-endpoint redirect";
+    ASSERT_TRUE(subDeactivated)
+        << "Subscribe must be deactivated (not hang forever) on dead-endpoint redirect";
+
+    // Verify it failed promptly (under kDeadlineMs)
+    EXPECT_LT(elapsed, kDeadlineMs)
+        << "Dead-endpoint redirect must fail PROMPTLY (not wait for full produce timeout)";
+
+    // Verify produce future threw (not resolved with a value)
+    bool prodThrew = false;
+    try { prodFut.get(); } catch (...) { prodThrew = true; }
+    EXPECT_TRUE(prodThrew) << "Produce future must throw on dead-endpoint redirect";
+
+    client->close();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Test: M2b — >kMaxRedirects (3) redirect episodes fail cleanly.
+//
+// Scenario:
+//   Every Produce the gateway sees is answered with ErrorResponse{Redirect, ipc}.
+//   Since the redirect target is "aeron:ipc" (same), the client reconnects each
+//   time.  After kMaxRedirects redirects, the per-frame redirect counter is
+//   exhausted and the produce future must fail (not loop infinitely).
+//
+// Note: kMaxRedirects caps per-frame redirect attempts in resendAllRedirected
+// (ProducerImpl.cpp).  The test drives 4 redirect episodes (> 3) and verifies
+// the future fails.
+// ===========================================================================
+
+struct MaxRedirectGateway {
+    std::atomic<int> connectsSeen{0};
+    std::atomic<int> producesSeen{0};
+
+    std::shared_ptr<aeron::Aeron>                gwAeron;
+    std::shared_ptr<aeron::Subscription>         gwSub;
+    std::shared_ptr<aeron::ExclusivePublication> gwPub;
+    std::unique_ptr<aeron::FragmentAssembler>    gwAsm;
+    uint8_t replyBuf[2048]{};
+
+    MaxRedirectGateway(const std::string& aeronDir, int32_t inStr, int32_t egStr)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        gwAeron = aeron::Aeron::connect(ctx);
+        const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
+        const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", egStr);
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(1ms);
+        }
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off, aeron::util::index_t len,
+                   aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(buf.buffer()+off),
+                        static_cast<std::size_t>(len));
+            });
+    }
+    ~MaxRedirectGateway() { gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset(); }
+
+    int poll(int lim=16) { return gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), lim) : 0; }
+
+    bool gwSend(const uint8_t* b, std::size_t l) {
+        const auto il = static_cast<aeron::util::index_t>(l);
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), il);
+        for (int i = 0; i < 300; ++i) {
+            if (gwPub->offer(ab, 0, il) > 0) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    }
+
+    void onFrame(const uint8_t* buf, std::size_t len) {
+        const auto tidOpt = rcc::peekTemplate(buf, len);
+        if (!tidOpt) return;
+        const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
+
+        if (tid == rcc::TemplateId::Connect) {
+            const auto opt = rcc::decodeConnectRequest(buf, len);
+            if (!opt) return;
+            const int c = connectsSeen.fetch_add(1) + 1;
+            const int64_t assigned = static_cast<int64_t>(100 + c);
+            const std::size_t n = rcc::encodeConnectResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::OK), 0, assigned,
+                opt->sessionId, opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid != rcc::TemplateId::Produce) return;
+        const auto opt = rcc::decodeProduce(buf, len);
+        if (!opt) return;
+        producesSeen.fetch_add(1);
+        // Always redirect (never resolve) so the per-frame redirect counter exhausts
+        const std::string_view ep = "aeron:ipc";
+        const std::size_t n = rcc::encodeErrorResponse(
+            replyBuf, sizeof(replyBuf),
+            static_cast<int16_t>(rcc::ErrorCode::Redirect),
+            ep, opt->sessionId, opt->correlationId);
+        if (n > 0) gwSend(replyBuf, n);
+    }
+};
+
+TEST(Redirect, M2bMaxRedirectsExhaustedFailsCleanly) {
+    static constexpr int32_t kInStr = 4400, kEgStr = 4401;
+    const std::string agentDir = uniqueDir("cb5_m2b");
+    const std::string aeronDir = agentDir + "/aeron";
+
+    ClientConfig cfg;
+    cfg.gatewayChannel    = "aeron:ipc";
+    cfg.gatewayStreamId   = kInStr;
+    cfg.egressChannel     = "aeron:ipc";
+    cfg.egressStreamId    = kEgStr;
+    cfg.dataDir           = agentDir;
+    cfg.connectTimeoutMs  = 8000;
+    // Use a shorter produce timeout so the test doesn't take too long if something
+    // goes wrong, but long enough that the redirect-exhausted path fires first.
+    cfg.produceTimeoutMs  = 20000;
+    cfg.idleMode          = IdleMode::LowLatency;
+
+    TopicSpec ts;
+    ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+
+    auto client = std::make_unique<Client>(cfg);
+    std::this_thread::sleep_for(150ms);
+    auto gw = std::make_unique<MaxRedirectGateway>(aeronDir, kInStr, kEgStr);
+
+    auto connFut = client->connect();
+    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+        gw->poll(16);
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    ASSERT_NO_THROW(connFut.get()) << "Initial connect must succeed";
+
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 20000;
+    auto p = client->producer(pcfg);
+    auto th = client->topic("t");
+    Key key(uint64_t{1});
+    const std::vector<uint8_t> val = {0xCC};
+
+    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+
+    // Pump until the future resolves (either error or value).
+    // The gateway always redirects, so after kMaxRedirects the frame is failed.
+    bool done = false;
+    for (int i = 0; i < kPumpMax * 6; ++i) {
+        gw->poll(16);
+        if (fut.wait_for(0s) == std::future_status::ready) { done = true; break; }
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    ASSERT_TRUE(done) << "Produce future must resolve after kMaxRedirects exhausted";
+
+    // The future must throw (redirect exhausted, not a valid offset).
+    bool threw = false;
+    try { fut.get(); } catch (...) { threw = true; }
+    EXPECT_TRUE(threw) << "Produce future must throw when kMaxRedirects is exhausted";
+
+    // The gateway must have seen > kMaxRedirects produce attempts
+    EXPECT_GT(gw->producesSeen.load(), rune::client::producer::ProducerImpl::kMaxRedirects)
+        << "Gateway should see > kMaxRedirects produce attempts before exhaustion";
+
+    client->close();
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }

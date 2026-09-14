@@ -348,6 +348,13 @@ private:
 
     // Stub producerId for M-B: local random-ish value.
     // TODO(milestone-c): real InitProducerId + zombie-fencing.
+    // NOTE: every ProducerImpl instance (and every Client instance) shares
+    // this same (producerId, epoch) pair.  On the broker, the idempotent-dedup
+    // key is (producerId, partition, baseSequence).  Two concurrent producers
+    // writing to the SAME partition with the same producerId WILL collide and
+    // deduplicate incorrectly.  M-B assumes a single producer per broker
+    // partition at a time; multi-producer safety requires per-producer unique
+    // producerIds via InitProducerId (Milestone-C TODO).
     int64_t producerId_  = 0x4352554E'4543422DULL; // "RUNECB-" magic stub
     int16_t producerEpoch_ = 0;
 

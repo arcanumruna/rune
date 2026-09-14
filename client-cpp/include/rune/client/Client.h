@@ -95,9 +95,13 @@ struct ClientConfig {
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
-    int64_t connectTimeoutMs  = 5000;
-    int64_t pingTimeoutMs     = 5000;
-    int64_t produceTimeoutMs  = 5000; // max wait for a ProduceResponse ack
+    int64_t connectTimeoutMs   = 5000;
+    int64_t pingTimeoutMs      = 5000;
+    int64_t produceTimeoutMs   = 5000; // max wait for a ProduceResponse ack
+    // M2 FIX [CB-5]: subscribe-request timeout — if a SubscribeResponse does
+    // not arrive within this window the pending subscribe is failed (active
+    // cleared) so the app is not left polling subscriptionId() forever.
+    int64_t subscribeTimeoutMs = 10000; // max wait for a SubscribeResponse
 
     // Keepalive interval passthrough (nanoseconds, 0 = use agent default).
     int64_t keepaliveIntervalNs = 0;

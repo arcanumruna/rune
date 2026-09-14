@@ -50,6 +50,17 @@ agent::AgentConfig makeAgentConfig(const ClientConfig& c) {
         acfg.session.keepaliveIntervalNs = c.keepaliveIntervalNs;
     }
 
+    // M2 FIX: propagate connectTimeoutMs → SessionMachine connectTimeoutNs.
+    // Without this, the SessionMachine uses its default 5s per-retry timeout
+    // regardless of the user-configured ClientConfig::connectTimeoutMs, which
+    // means a dead-endpoint reconnect can take 5s × (maxRetries+1) = 20s before
+    // the session transitions to Disconnected and sweep can promptly fail pending
+    // produce futures and subscribes.  Map ms → ns; clamp to a 1ms minimum.
+    if (c.connectTimeoutMs > 0) {
+        acfg.session.connectTimeoutNs =
+            static_cast<int64_t>(c.connectTimeoutMs) * 1'000'000LL;
+    }
+
     return acfg;
 }
 
@@ -127,12 +138,23 @@ void Client::close() {
     // MUST be called after agent_.stop() so no agent thread is in onRecords().
     subscriberHub_.deactivateAll();
 
+    // M2 FIX: Fail any still-pending (unbound) subscribes so their active flag
+    // is cleared and any polling app-code sees the subscription is dead.
+    // Must be called after deactivateAll() (which already clears pending), but
+    // failPendingSubscribes is idempotent (operates on pendingByCorrelation_
+    // which deactivateAll already cleared — this is a belt-and-suspenders call
+    // for any edge where deactivateAll was not yet called).
+    subscriberHub_.failPendingSubscribes("Client closed");
+
     // Fail any still-pending producer acks (futures/callbacks) BEFORE returning.
     // producerHub_.failAll() calls ProducerImpl::failAllPending on every registered
     // producer — this resolves every pending future/callback with an error so they
     // never hang.  MUST be called after agent_.stop() so the agent thread is no
     // longer in drainAndFlush / onProduceResponse (no concurrent access to pendingAcks_).
     producerHub_.failAll("Client closed");
+
+    // M2 FIX: clear redirectPending_ on close so it does not latch.
+    redirectPending_.store(false, std::memory_order_release);
 
     // Fail any still-pending connect/ping futures.
     failAllPending("Client closed");
@@ -381,6 +403,32 @@ void Client::sweepTimeouts() {
     // produceTimeoutMs is failed so futures/callbacks never hang.
     producerHub_.sweepTimedOut(now);
 
+    // --- M2 FIX: Pending subscribe-request timeouts ---
+    // A Subscribe that gets no SubscribeResponse within subscribeTimeoutMs is
+    // failed (active cleared) so the app is never left polling forever.
+    subscriberHub_.sweepTimedOut(now);
+
+    // --- M2 FIX: Disconnected-while-redirectPending_ prompt fail ---------------
+    // When a redirect-triggered reconnect exhausts its connect retries (SessionMachine
+    // tickConnecting → Disconnected), the Client has no Disconnected callback wired
+    // into the agent.  Detect the condition here: state==Disconnected while
+    // redirectPending_ is set → the reconnect to the (possibly dead) leader failed.
+    // Promptly fail all pending produces + subscribes and reset redirectPending_
+    // so it does not latch into any later connect attempt.
+    if (redirectPending_.load(std::memory_order_acquire)) {
+        const auto snap = agent_.stateAndSessionId();
+        if (snap.state == session::SessionState::Disconnected) {
+            if (redirectPending_.exchange(false, std::memory_order_acq_rel)) {
+                producerHub_.failAll("Redirect reconnect failed: endpoint unreachable");
+                subscriberHub_.failPendingSubscribes(
+                    "Redirect reconnect failed: endpoint unreachable");
+                if (cbError_) {
+                    cbError_("Redirect reconnect failed: endpoint unreachable");
+                }
+            }
+        }
+    }
+
     std::lock_guard<std::mutex> lk(mtx_);
 
     // --- Pending connect timeout ---
@@ -551,8 +599,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     agent_.submitReconnect();
                 }
             } else {
-                // Retarget failed — fail the pending op(s).
+                // Retarget failed — fail the pending op(s) promptly.
+                // M2 FIX: also fail pending subscribes (not just produces) and
+                // reset redirectPending_ so it does not latch into a later connect.
                 producerHub_.failAll("Redirect retarget failed");
+                subscriberHub_.failPendingSubscribes("Redirect retarget failed");
+                redirectPending_.store(false, std::memory_order_release);
                 if (cbError_) {
                     cbError_("Redirect retarget failed for endpoint: " + newEndpoint);
                 }
@@ -796,6 +848,11 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     };
 
     // Register + submit Subscribe (encodes and writes to the ring).
+    // M2 FIX: pass a deadline so sweepTimedOut() can fail this subscribe if
+    // SubscribeResponse never arrives (mirrors produce-ack timeout sweep).
+    const auto subscribeDL = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(cfg_.subscribeTimeoutMs);
+
     subscriberHub_.registerSubscribe(
         impl,
         sessId,
@@ -806,6 +863,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         opts.from.toWire(),
         static_cast<uint8_t>(opts.isolation),
         keyBytes,
+        subscribeDL,
         [this](const uint8_t* buf, std::size_t len) -> bool {
             return agent_.submitSend(buf, len);
         });

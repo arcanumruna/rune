@@ -506,45 +506,42 @@ bool ProducerImpl::encodeAndSendTier2(
     if (entry.batchBytes.empty() || entry.recordCount == 0) return false;
 
     // Patch the baseSequence, producerId, and producerEpoch into the pre-built
-    // RecordBatch bytes.  The fields are at fixed offsets defined in RecordBatch.h:
-    //   producerId    : int64 LE at offset 43
-    //   producerEpoch : int16 LE at offset 51
-    //   baseSequence  : int32 LE at offset 53
-    // We write directly into the bytes vector (already allocated on app thread).
+    // RecordBatch bytes.  Use the named constants from rune::protocol::batch
+    // (RecordBatch.h) so a layout change on the C++ server side causes a
+    // compile-time break rather than silent CRC/seq corruption.
+    namespace rb = rune::protocol::batch;
     auto& b = entry.batchBytes;
-    if (b.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+    if (b.size() < static_cast<std::size_t>(rb::kRecordBatchOverhead)) {
         return false; // truncated batch — should not happen
     }
 
-    // Patch producerId (int64 LE at offset 43).
+    // Patch producerId (int64 LE at kProducerIdOffset).
     const uint64_t pid = static_cast<uint64_t>(producerId_);
     for (int i = 0; i < 8; ++i)
-        b[43 + i] = static_cast<uint8_t>(pid >> (i * 8));
+        b[rb::kProducerIdOffset + i] = static_cast<uint8_t>(pid >> (i * 8));
 
-    // Patch producerEpoch (int16 LE at offset 51).
+    // Patch producerEpoch (int16 LE at kProducerEpochOffset).
     const uint16_t ep = static_cast<uint16_t>(producerEpoch_);
-    b[51] = static_cast<uint8_t>(ep);
-    b[52] = static_cast<uint8_t>(ep >> 8);
+    b[rb::kProducerEpochOffset]     = static_cast<uint8_t>(ep);
+    b[rb::kProducerEpochOffset + 1] = static_cast<uint8_t>(ep >> 8);
 
-    // Patch baseSequence (int32 LE at offset 53).
+    // Patch baseSequence (int32 LE at kBaseSequenceOffset).
     const uint32_t seq = static_cast<uint32_t>(ps.nextBaseSequence);
-    b[53] = static_cast<uint8_t>(seq);
-    b[54] = static_cast<uint8_t>(seq >> 8);
-    b[55] = static_cast<uint8_t>(seq >> 16);
-    b[56] = static_cast<uint8_t>(seq >> 24);
+    b[rb::kBaseSequenceOffset]     = static_cast<uint8_t>(seq);
+    b[rb::kBaseSequenceOffset + 1] = static_cast<uint8_t>(seq >> 8);
+    b[rb::kBaseSequenceOffset + 2] = static_cast<uint8_t>(seq >> 16);
+    b[rb::kBaseSequenceOffset + 3] = static_cast<uint8_t>(seq >> 24);
 
-    // Recompute the CRC-32C over the CRC-covered region.
-    // The CRC at offset 17 (uint32 LE) covers bytes [21..end].
-    // We must recompute after patching producerId/epoch/sequence.
-    // Use the same CRC library the RecordBatchBuilder uses.
+    // Recompute the CRC-32C over the CRC-covered region
+    // [kAttributesOffset .. end], stored as uint32 LE at kCrcOffset.
+    // Must be recomputed after patching producerId/epoch/baseSequence.
     {
-        const std::size_t crcStart = 21; // attributes field (kAttributesOffset)
         const uint32_t crc = rune::protocol::crc32c(
-            b.data() + crcStart, b.size() - crcStart);
-        b[17] = static_cast<uint8_t>(crc);
-        b[18] = static_cast<uint8_t>(crc >> 8);
-        b[19] = static_cast<uint8_t>(crc >> 16);
-        b[20] = static_cast<uint8_t>(crc >> 24);
+            b.data() + rb::kAttributesOffset, b.size() - rb::kAttributesOffset);
+        b[rb::kCrcOffset]     = static_cast<uint8_t>(crc);
+        b[rb::kCrcOffset + 1] = static_cast<uint8_t>(crc >> 8);
+        b[rb::kCrcOffset + 2] = static_cast<uint8_t>(crc >> 16);
+        b[rb::kCrcOffset + 3] = static_cast<uint8_t>(crc >> 24);
     }
 
     // Advance baseSequence by the record count.
@@ -595,6 +592,14 @@ int ProducerImpl::flushBatches(
     int64_t sessionId,
     std::function<bool(const uint8_t*, std::size_t)> sendFn)
 {
+    // M1 FIX [CB-5]: Do NOT emit any frame while the session is not established
+    // (sessionId == 0 means Connecting / post-forceReconnect window).  Records
+    // stay in the builder / Tier-2 queue and will flush naturally once
+    // ConnectResponse{OK} arrives and drainAndFlush is called with the real
+    // leader-assigned sessionId.  This prevents Produce frames from being
+    // stamped sessionId=0 and silently dropped by the broker.
+    if (sessionId == 0) return 0;
+
     const int64_t lingerNs = cfg_.lingerUs * 1000LL;
     const bool globalFlush = globalFlushPending_.load(std::memory_order_acquire);
 
