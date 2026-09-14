@@ -270,6 +270,28 @@ private:
     // We reuse electionStatusIntervalNs_ for this (same parameter in tests).
     // Election.java:81  private final long leaderHeartbeatIntervalNs;
 
+    // Follower leader-liveness tracking (mirrors ConsensusModuleAgent's
+    // timeOfLastLeaderUpdateNs + leaderHeartbeatTimeoutNs in Aeron).
+    //
+    // In Aeron, the ConsensusModuleAgent — not the Election — detects a dead
+    // leader: it records the time of the last heartbeat from the leader and, if
+    // no heartbeat arrives within leaderHeartbeatTimeoutNs, it calls
+    // election.startElection() to re-enter CANVASS.  We fold that liveness
+    // detection into the Election here (the ConsensusModuleAgent is not ported).
+    //
+    // timeOfLastLeaderUpdateNs_ is refreshed whenever a follower accepts a
+    // leader (electionComplete) or receives a heartbeat from the CURRENT leader
+    // (onNewLeadershipTerm / onCommitPosition of the matching term).  A follower
+    // in CLOSED whose last update is older than leaderHeartbeatTimeoutNs_
+    // re-enters CANVASS so the surviving nodes elect a new leader.
+    //
+    // INT64_MIN sentinel = "no leader heartbeat observed yet" — the timeout is
+    // only armed once a follower has actually accepted a leader, so a node that
+    // has never had a leader (still canvassing) is not force-re-canvassed.
+    int64_t timeOfLastLeaderUpdateNs_ = INT64_MIN;
+    // Derived in the constructor from the election timing parameters.
+    int64_t leaderHeartbeatTimeoutNs_ = 0;
+
     // Log position fields — Election.java:85-87
     int64_t logPosition_             = 0;
     int64_t appendPosition_          = 0;

@@ -1770,7 +1770,12 @@ TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Leader_MultipleHeartbeats_SameTerm
 
 // CH-4: 3-member FOLLOWER in CLOSED emits no NLT (only the leader heartbeats).
 //       Drive node 0 to CLOSED as a follower (leader = node 1).
-TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Follower_IsNoop) {
+// CB-5: a follower in CLOSED must NOT broadcast leader heartbeats (only the
+// leader does), but it MUST run leader-liveness detection: while the leader
+// keeps sending heartbeats the follower stays in CLOSED; once the leader goes
+// silent past the leader-heartbeat timeout the follower re-enters CANVASS so the
+// surviving nodes can elect a new leader (dead-leader recovery).
+TEST(ElectionLog, ClosedFollower_NoHeartbeatBroadcast_ButLivenessRearmed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
@@ -1789,23 +1794,60 @@ TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Follower_IsNoop) {
                           /*leaderMemberId=*/1, 0, true, 0);
     ASSERT_TRUE(driveToClosed(e, nowNs));
     ASSERT_EQ(e.state(), ElectionState::Closed);
-    ASSERT_EQ(e.leaderMemberId(), 1) << "CH-4 setup: leader must be node 1, not node 0";
+    ASSERT_EQ(e.leaderMemberId(), 1) << "setup: leader must be node 1, not node 0";
 
     pub.clear();
 
-    // nextDeadlineNs must be INT64_MIN for a follower in CLOSED (no heartbeat).
-    EXPECT_EQ(e.nextDeadlineNs(), INT64_MIN)
-        << "CH-4: follower in CLOSED must return INT64_MIN deadline (no heartbeat)";
+    // The follower now arms the leader-liveness deadline (it accepted leader 1).
+    EXPECT_NE(e.nextDeadlineNs(), INT64_MIN)
+        << "follower in CLOSED must arm a leader-liveness deadline";
 
-    // Advance past multiple status intervals — no NLT must be emitted.
+    // While the leader keeps sending CommitPosition heartbeats, the follower
+    // stays in CLOSED and emits NO NLT of its own.
     for (int i = 0; i < 5; ++i) {
         nowNs += kStatusIntervalNs + 1;
+        e.onCommitPosition(nowNs, /*leadershipTermId=*/1, 0, /*leaderMemberId=*/1);
         int work = e.doWork(nowNs);
         EXPECT_EQ(work, 0)
-            << "CH-4: follower CLOSED doWork must return 0 at step " << i;
+            << "live-leader follower CLOSED doWork must return 0 at step " << i;
+        EXPECT_EQ(e.state(), ElectionState::Closed)
+            << "follower must stay CLOSED while leader heartbeats arrive";
     }
     EXPECT_TRUE(pub.nltCalls.empty())
-        << "CH-4: follower in CLOSED must never emit NLT";
+        << "follower in CLOSED must never emit NLT (only the leader broadcasts)";
+}
+
+// CB-5: dead-leader detection — a follower in CLOSED whose leader goes silent
+// past the leader-heartbeat timeout re-enters CANVASS to trigger re-election.
+TEST(ElectionLog, ClosedFollower_DeadLeader_ReCanvasses) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs); // INIT → CANVASS
+    e.onRequestVote(0, 0, 1, /*candidateId=*/1, nowNs); // vote for node 1 → FOLLOWER_BALLOT
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, /*leadershipTermId=*/1, 0, 0, 0, 0,
+                          /*leaderMemberId=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.state(), ElectionState::Closed);
+    ASSERT_EQ(e.leaderMemberId(), 1);
+
+    // Leader dies: no more heartbeats.  Advance past the liveness timeout
+    // (max(electionTimeout, 3*statusInterval) = 150ms in this test config).
+    const int64_t deadline = e.nextDeadlineNs();
+    ASSERT_NE(deadline, INT64_MIN);
+    nowNs = deadline + 1;
+    int work = e.doWork(nowNs);
+
+    EXPECT_GT(work, 0) << "silent-leader timeout must produce work (re-canvass)";
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "follower must re-enter CANVASS after leader-heartbeat timeout";
+    EXPECT_EQ(e.leaderMemberId(), -1)
+        << "stale dead leader must be dropped so observers stop redirecting to it";
 }
 
 // B-8b: C5 positive path — leaderReplay pass-through also must not crash when

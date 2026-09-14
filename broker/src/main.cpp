@@ -73,9 +73,25 @@ int main() {
     }
 
     // Run until SIGINT / SIGTERM.
+    //
+    // Observability (CB-5): main.cpp previously logged "is LEADER" exactly once
+    // at startup, which masked re-election after a leader-kill.  Poll the
+    // observed leaderId and log every leadership change so failover is visible in
+    // the container logs (e.g. a survivor electing a new leader after the old
+    // leader dies).  The E2E scans these lines to confirm post-kill recovery.
     spdlog::info("rune-broker: running — send SIGINT or SIGTERM to stop");
+    rune::consensus::NodeId lastObservedLeader = node.leaderId();
     while (!g_stop.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(100ms);
+        const rune::consensus::NodeId cur = node.leaderId();
+        if (cur != lastObservedLeader) {
+            lastObservedLeader = cur;
+            if (cur >= 0) {
+                spdlog::info("rune-broker: leadership change — node {} is LEADER", cur);
+            } else {
+                spdlog::info("rune-broker: leadership change — no leader (election in progress)");
+            }
+        }
     }
 
     spdlog::info("rune-broker: shutdown signal received — stopping");

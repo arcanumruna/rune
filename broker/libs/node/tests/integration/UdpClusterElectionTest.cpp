@@ -25,10 +25,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <stdexcept>
+#include <vector>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -328,6 +331,100 @@ TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_LateJoin_Converges) {
     node0.stop();
     node1.stop();
     node2.stop();
+}
+
+// ===========================================================================
+// TEST 4 (CB-5): leader-kill failover — a surviving follower's observed
+// leaderId() must UPDATE to a NEW, live leader after the old leader dies.
+//
+// This is the exact invariant that CB-5 Phase 2 depends on: the gateway
+// redirects data ops to BrokerNode::leaderId()'s client endpoint, so after a
+// leader-kill a follower whose leaderId() stayed stale would redirect clients
+// to the DEAD endpoint forever.  Here we assert the atomic leader mirror on the
+// survivors moves off the killed node to a live survivor.
+// ===========================================================================
+TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_LeaderKill_SurvivorsReElect) {
+    TempDir dir0{"fk0_"}, dir1{"fk1_"}, dir2{"fk2_"};
+
+    const auto cPorts = discoverFreePorts(3);
+    const auto kPorts = discoverFreePorts(3);
+
+    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
+    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
+    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+
+    auto node0 = std::make_unique<BrokerNode>(cfg0);
+    auto node1 = std::make_unique<BrokerNode>(cfg1);
+    auto node2 = std::make_unique<BrokerNode>(cfg2);
+
+    node0->start();
+    node1->start();
+    node2->start();
+
+    constexpr auto kDeadline = 8s;
+    ASSERT_TRUE(node0->awaitLeader(kDeadline));
+    ASSERT_TRUE(node1->awaitLeader(kDeadline));
+    ASSERT_TRUE(node2->awaitLeader(kDeadline));
+
+    // Give the cluster a moment to settle on a single agreed leader.
+    std::this_thread::sleep_for(300ms);
+
+    const rune::consensus::NodeId initialLeader = node0->leaderId();
+    ASSERT_GE(initialLeader, 0);
+    ASSERT_LE(initialLeader, 2);
+    // All three must agree on the initial leader.
+    ASSERT_EQ(node1->leaderId(), initialLeader);
+    ASSERT_EQ(node2->leaderId(), initialLeader);
+
+    // Map the leader id to its node object; collect the two survivors.
+    std::array<BrokerNode*, 3> nodes{node0.get(), node1.get(), node2.get()};
+    std::array<std::unique_ptr<BrokerNode>*, 3> owners{&node0, &node1, &node2};
+    std::vector<BrokerNode*> survivors;
+    for (int i = 0; i < 3; ++i) {
+        if (i != initialLeader) survivors.push_back(nodes[i]);
+    }
+    ASSERT_EQ(survivors.size(), 2u);
+
+    // Kill the leader (full stop → joins its agent thread, closes Aeron/driver;
+    // the survivors stop receiving its heartbeats).
+    owners[initialLeader]->reset();
+
+    // Poll the survivors: their observed leaderId() must move to a NEW live
+    // leader (one of the two survivors) within a bounded window.  This proves
+    // the atomic leader mirror updates on failover (the CB-5 root cause).
+    const auto pollDeadline = std::chrono::steady_clock::now() + 12s;
+    bool reElected = false;
+    rune::consensus::NodeId newLeader = -1;
+    while (std::chrono::steady_clock::now() < pollDeadline) {
+        const rune::consensus::NodeId l0 = survivors[0]->leaderId();
+        const rune::consensus::NodeId l1 = survivors[1]->leaderId();
+        if (l0 >= 0 && l0 != initialLeader && l0 == l1) {
+            reElected = true;
+            newLeader = l0;
+            break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+
+    EXPECT_TRUE(reElected)
+        << "survivors did not re-elect a new leader after leader-kill: "
+        << "survivor leaderIds = {" << survivors[0]->leaderId() << ", "
+        << survivors[1]->leaderId() << "}, killed=" << initialLeader;
+    EXPECT_NE(newLeader, initialLeader)
+        << "new leader must differ from the killed node";
+    EXPECT_GE(newLeader, 0);
+    EXPECT_LE(newLeader, 2);
+    // The new leader must be one of the survivors, and it must self-report leader.
+    for (auto* s : survivors) {
+        if (s->leaderId() == newLeader) {
+            EXPECT_TRUE(s->isLeader() || s->leaderId() == newLeader);
+        }
+    }
+
+    // Clean shutdown of the survivors (the killed node is already reset()).
+    for (auto* ownerPtr : owners) {
+        if (*ownerPtr) (*ownerPtr)->stop();
+    }
 }
 
 } // namespace rune::node

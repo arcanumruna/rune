@@ -56,6 +56,16 @@ Election::Election(bool             isNodeStartup,
     initialTimeOfLastUpdateNs_ = INT64_MIN / 2;
     timeOfLastUpdateNs_        = initialTimeOfLastUpdateNs_;
 
+    // Follower leader-liveness timeout (mirrors Aeron's leaderHeartbeatTimeoutNs).
+    // A follower re-enters CANVASS if it hears no leader heartbeat within this
+    // window.  The leader broadcasts NLT+CommitPosition every
+    // electionStatusIntervalNs_; we require several missed heartbeats before
+    // declaring the leader dead, and never less than one election timeout, so a
+    // transient scheduling hiccup does not trigger a spurious re-election.
+    //   timeout = max(electionTimeoutNs, 3 * electionStatusIntervalNs)
+    leaderHeartbeatTimeoutNs_ = std::max<int64_t>(
+        electionTimeoutNs_, 3 * electionStatusIntervalNs_);
+
     // Pre-allocate rankedPositions for quorumPosition — no alloc in the hot path.
     const int threshold = ClusterMember::quorumThreshold(
         static_cast<int>(clusterMembers_.size()));
@@ -137,6 +147,15 @@ int64_t Election::nextDeadlineNs() const noexcept {
                 leaderMember_->id == thisMemberId_ &&
                 clusterMembers_.size() > 1) {
                 return timeOfLastUpdateNs_ + electionStatusIntervalNs_;
+            }
+            // Multi-node FOLLOWER in Closed: wake on the leader-liveness deadline so
+            // a dead leader is detected and re-election is triggered.  Only armed
+            // once a leader heartbeat has actually been observed (sentinel guard).
+            if (clusterMembers_.size() > 1 &&
+                leaderMember_ != nullptr &&
+                leaderMember_->id != thisMemberId_ &&
+                timeOfLastLeaderUpdateNs_ != INT64_MIN) {
+                return timeOfLastLeaderUpdateNs_ + leaderHeartbeatTimeoutNs_;
             }
             return INT64_MIN;
     }
@@ -750,6 +769,15 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
             if (commitPositionArg > notifiedCommitPosition_) {
                 notifiedCommitPosition_ = commitPositionArg;
             }
+            // An NLT heartbeat for our current term from the current leader
+            // refreshes the follower liveness clock (leader still alive).
+            if (leaderMemberIdArg == thisMemberId_) {
+                // Defensive: never arm the timeout for ourselves.
+            } else if (leaderMember_ != nullptr &&
+                       leaderMember_->id == leaderMemberIdArg &&
+                       leaderMember_->id != thisMemberId_) {
+                timeOfLastLeaderUpdateNs_ = nowNs;
+            }
         }
         return;
     }
@@ -866,6 +894,14 @@ void Election::onCommitPosition(int64_t nowNs,
     // Election.java:563-565: ignore if wrong term
     if (leadershipTermIdArg != leadershipTermId_) return;
 
+    // Leader-liveness refresh: a CommitPosition for our current term IS a leader
+    // heartbeat.  Refresh the follower liveness clock so a live leader is never
+    // spuriously timed out.  Only refresh for a follower that is actually
+    // following someone else (the leader must not arm its own timeout).
+    if (leaderMember_ != nullptr && leaderMember_->id != thisMemberId_) {
+        timeOfLastLeaderUpdateNs_ = nowNs;
+    }
+
     // Election.java:567: update notifiedCommitPosition
     if (logPositionArg > notifiedCommitPosition_) {
         notifiedCommitPosition_ = logPositionArg;
@@ -888,8 +924,37 @@ void Election::onCommitPosition(int64_t nowNs,
 // ---------------------------------------------------------------------------
 int Election::closedLeaderHeartbeat(int64_t nowNs)
 {
-    // Only the leader broadcasts; followers in Closed are silent.
+    // Only the leader broadcasts; followers in Closed are silent EXCEPT they run
+    // leader-liveness detection so a dead leader triggers a fresh election.
     if (leaderMember_ == nullptr || leaderMember_->id != thisMemberId_) {
+        // Follower path: detect a dead leader.  In Aeron this lives in the
+        // ConsensusModuleAgent (timeOfLastLeaderUpdateNs + leaderHeartbeatTimeoutNs);
+        // it is folded into the Election here because the agent is not ported.
+        //
+        // Only multi-node followers that have actually observed a leader arm the
+        // timeout (sentinel guard).  When the current leader has been silent for
+        // longer than leaderHeartbeatTimeoutNs_, re-enter CANVASS so the surviving
+        // nodes elect a new leader.  This does NOT weaken safety: the re-election
+        // runs the full canvass/ballot/quorum path with a strictly-higher term.
+        const bool haveLeader   = (leaderMember_ != nullptr);
+        const bool isFollower   = haveLeader && leaderMember_->id != thisMemberId_;
+        const bool multiNode    = clusterMembers_.size() > 1;
+        const bool timeoutArmed = timeOfLastLeaderUpdateNs_ != INT64_MIN;
+
+        if (multiNode && isFollower && timeoutArmed &&
+            nowNs >= (timeOfLastLeaderUpdateNs_ + leaderHeartbeatTimeoutNs_)) {
+            // (Observability: the leadership-change is logged by the caller —
+            //  NodeConsensusAgent::updateObservedLeader — when leaderMemberId()
+            //  transitions away from the dead node.  rune_consensus deliberately
+            //  has no spdlog dependency.)
+            // Drop the stale leader so leaderMemberId() no longer reports the dead
+            // node while we re-elect (observer mirror will fall back to -1).
+            leaderMember_ = nullptr;
+            // Disarm until we accept a new leader again.
+            timeOfLastLeaderUpdateNs_ = INT64_MIN;
+            state(ElectionState::Canvass, nowNs, "leader heartbeat timeout → re-election");
+            return 1;
+        }
         return 0;
     }
 
@@ -980,6 +1045,16 @@ void Election::electionComplete(int64_t nowNs)
 
     // Commit the term's log position (both paths).
     termLog_.commitLogPosition(leadershipTermId_, logPosition_);
+
+    // Arm the follower leader-liveness timeout: a follower that just accepted a
+    // leader must start expecting heartbeats from it.  The leader itself does
+    // NOT arm the timeout (it never times itself out).  Sentinel INT64_MIN keeps
+    // a leader (or a not-yet-following node) from being force-re-canvassed.
+    if (leaderMember_ != nullptr && leaderMember_->id != thisMemberId_) {
+        timeOfLastLeaderUpdateNs_ = nowNs;
+    } else {
+        timeOfLastLeaderUpdateNs_ = INT64_MIN;
+    }
 
     state(ElectionState::Closed, nowNs, "electionComplete");
 }
