@@ -451,6 +451,7 @@ bool ProducerImpl::encodeAndSend(
     msg.topicId        = ps.topicId;
     msg.partition      = ps.partition;
     msg.partitionKnown = 1;
+    msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
     msg.key            = {};
     msg.recordBatch    = std::span<const uint8_t>(batchScratch_);
 
@@ -555,6 +556,7 @@ bool ProducerImpl::encodeAndSendTier2(
     msg.topicId        = entry.topicId;
     msg.partition      = entry.partition;
     msg.partitionKnown = 1;
+    msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
     msg.key            = {};
     msg.recordBatch    = std::span<const uint8_t>(b);
 

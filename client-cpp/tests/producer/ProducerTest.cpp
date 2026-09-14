@@ -119,6 +119,7 @@ struct ProduceGateway {
         int64_t corrId    = 0;
         int32_t baseSeq   = -1; // from RecordBatch header offset 53
         int32_t recCount  = 0;
+        uint8_t acks      = 0xff; // captured from wire frame (0=Leader/None, 1=All)
         std::vector<std::string> values; // decoded record values
     };
 
@@ -224,6 +225,7 @@ struct ProduceGateway {
         rec.topicId   = opt->topicId;
         rec.partition = opt->partition;
         rec.corrId    = opt->correlationId;
+        rec.acks      = opt->acks;  // B2: capture wire acks field
 
         // Decode RecordBatch header: baseSequence at offset 53, recordCount at 57.
         const auto& rb = opt->recordBatch;
@@ -1423,4 +1425,67 @@ TEST(Producer, RingFullDropAndRecover) {
 
     EXPECT_TRUE(okAfter)
         << "After ring drain, sends must succeed (producer recovers from ring-full)";
+}
+
+// ===========================================================================
+// Test 19: AcksWireEncoding  [B2]
+//   Verify that the acks field is correctly set on the wire:
+//     - acks=All  producer   → Produce.acks == 1 (wire)
+//     - acks=Leader producer → Produce.acks == 0 (wire)
+// ===========================================================================
+TEST(Producer, AcksWireEncoding) {
+    // --- acks=All sends wire acks=1 ---
+    {
+        static constexpr int32_t kInStr = 2039, kEgStr = 2040;
+        AgentHarness h(kInStr, kEgStr);
+        ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+        ProducerConfig pcfg;
+        pcfg.acks      = Acks::All;
+        pcfg.lingerUs  = 1;
+        pcfg.batchBytes = 1;
+
+        auto p     = h.makeProducer(pcfg);
+        auto topic = makeTopic(20, 1);
+        Key  key(uint64_t{0});
+
+        const std::vector<uint8_t> val(4, 0xAA);
+        p.send(topic, key, std::span<const uint8_t>(val));
+        p.flush();
+
+        ASSERT_TRUE(h.pumpUntilBatches(1)) << "acks=All batch must be delivered";
+
+        // The wire acks field must be 1 (All) — not 0 (Leader).
+        ASSERT_FALSE(h.gw->batches.empty());
+        EXPECT_EQ(h.gw->batches[0].acks, uint8_t{1})
+            << "acks=All producer must encode wire acks=1; got "
+            << static_cast<int>(h.gw->batches[0].acks);
+    }
+
+    // --- acks=Leader sends wire acks=0 ---
+    {
+        static constexpr int32_t kInStr = 2041, kEgStr = 2042;
+        AgentHarness h(kInStr, kEgStr);
+        ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+        ProducerConfig pcfg;
+        pcfg.acks      = Acks::Leader;
+        pcfg.lingerUs  = 1;
+        pcfg.batchBytes = 1;
+
+        auto p     = h.makeProducer(pcfg);
+        auto topic = makeTopic(21, 1);
+        Key  key(uint64_t{0});
+
+        const std::vector<uint8_t> val(4, 0xBB);
+        p.send(topic, key, std::span<const uint8_t>(val));
+        p.flush();
+
+        ASSERT_TRUE(h.pumpUntilBatches(1)) << "acks=Leader batch must be delivered";
+
+        ASSERT_FALSE(h.gw->batches.empty());
+        EXPECT_EQ(h.gw->batches[0].acks, uint8_t{0})
+            << "acks=Leader producer must encode wire acks=0; got "
+            << static_cast<int>(h.gw->batches[0].acks);
+    }
 }

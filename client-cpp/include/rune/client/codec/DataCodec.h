@@ -42,6 +42,7 @@ struct ProduceView {
     int32_t                   topicId        = 0;
     int32_t                   partition      = 0;
     uint8_t                   partitionKnown = 0;
+    uint8_t                   acks           = 0;  // GR-5: 0=Leader/None, 1=All
     std::span<const uint8_t>  key;          // zero-copy view into the original buffer
     std::span<const uint8_t>  recordBatch;  // zero-copy view into the original buffer
 };
@@ -84,6 +85,7 @@ inline std::optional<ProduceView> decodeProduce(const uint8_t* buf,
     v.topicId        = opt->topicId;
     v.partition      = opt->partition;
     v.partitionKnown = opt->partitionKnown;
+    v.acks           = opt->acks;
     v.key            = opt->key;
     v.recordBatch    = opt->recordBatch;
     return v;
