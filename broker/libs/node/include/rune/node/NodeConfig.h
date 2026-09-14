@@ -91,6 +91,12 @@ struct NodeConfig {
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 
+    // Replication lag tolerance — GR-5.
+    // After a follower hasn't fetched for replicaLagMaxMs, it is shrunk from the ISR.
+    // Default 10 000 ms (10 s) matches the PartitionConfig default.
+    // Tests may set a lower value (e.g. 500 ms) for faster ISR shrink in kill scenarios.
+    int64_t replicaLagMaxMs = 10'000;
+
     /// Returns the peer entry whose id == nodeId.
     /// Precondition: parse succeeded (peers non-empty, nodeId in peers).
     const PeerConfig& self() const;

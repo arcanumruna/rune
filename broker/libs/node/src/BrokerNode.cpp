@@ -374,7 +374,7 @@ void BrokerNode::buildReplication() {
             PartitionConfig pcfg;
             pcfg.partitionId          = static_cast<PartitionId>(part);
             pcfg.selfId               = selfId;
-            pcfg.replicaLagMaxMs      = 10'000;
+            pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
             pcfg.replicaLagMaxOffset  = 10'000;
             pcfg.minIsr               = 1;
             pcfg.fetchIntervalNs      = 5'000'000LL;

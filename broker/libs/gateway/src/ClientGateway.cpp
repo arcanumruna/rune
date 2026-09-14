@@ -1,9 +1,10 @@
-// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4).
+// ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/IsrManager.h>
 
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -62,6 +63,11 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     // pendingConnects_ is a deque — no reserve() needed; O(1) front push/pop.
     drainingRegistrations_.reserve(kMaxPendingConnects);
 
+    // GR-5: Pre-allocate the pending-ack queue to avoid heap allocs on the hot path.
+    // The vector is used as a shrinking queue (erase-by-swap-and-pop); capacity
+    // stays at kMaxPendingAcks after the initial reserve.
+    pendingAcks_.reserve(kMaxPendingAcks);
+
     // Register the ingress subscription.
     int64_t regId = aeron_->addSubscription(clientChannel_, clientStreamId_);
 
@@ -95,6 +101,14 @@ int ClientGateway::doWork(int64_t nowNs) {
     // Must run AFTER the ingress poll; placed before pushSubscriptions so push
     // reads fsync-durable data.  No busy-spin; no-op when interval not elapsed.
     flushDirtyLogs();
+    // GR-5: drain deferred acks=All pending-ack queue.
+    // Called AFTER ingress poll (appends already done for this cycle) and AFTER
+    // the replica's HW may have advanced (replication doWork is driven by the
+    // BrokerNode agent loop BEFORE gateway.doWork in the same duty-cycle thread,
+    // so any follower FetchResponse processed this cycle already updated HW).
+    // Must run BEFORE pushSubscriptions so the client gets the ProduceResponse
+    // before any Records push (strictly ordered on the same egress publication).
+    drainPendingAcks();
     // GB-3: push new Records to all active subscribers (egress-paced, single-writer).
     pushSubscriptions();
     return work;
@@ -946,6 +960,33 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // This is the offset of the last record in the batch; LEO advances past it.
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
 
+    // GR-5: min-ISR gate for acks=All — checked BEFORE appendNoSync.
+    //
+    // If the produce carries acks=All AND the current ISR is below minIsr_, reject
+    // with MinIsrViolation before touching the log.  A rejected produce MUST NOT
+    // appear in the log at all (no partial state, no LEO advance).
+    //
+    // "NEVER falsely ack": the gate is checked here (before append) so that:
+    //   - MinIsrViolation guarantees logEndOffset did not change.
+    //   - The pending-ack queue is untouched.
+    //
+    // passthrough (replica==nullptr): no ISR check — single-node / test mode.
+    const bool acksAll = (msg.acks == 1);
+    if (acksAll && replica) {
+        // min-ISR gate: require ISR size >= minIsr_ for acks=All durability.
+        // replica->isr() returns the leader's current ISR (as of the last
+        // maybeShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
+        const int currentMinIsr = minIsr_.load(std::memory_order_relaxed);
+        const int isrSize = static_cast<int>(replica->isr().size());
+        if (isrSize < currentMinIsr) {
+            spdlog::debug("ClientGateway: acks=All produce rejected (ISR size={} < minIsr={}) "
+                          "sessionId={} topicId={} partition={}",
+                          isrSize, currentMinIsr, msg.sessionId, msg.topicId, partition);
+            sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
+            return;  // log untouched — no append, no LEO advance
+        }
+    }
+
     // GB-5p2: use appendNoSync — page-cache write only, no fsync on the hot path.
     // flushDirtyLogs() is called once per doWork() cycle (after all ingress has
     // been processed) to fsync all touched partition Logs in one pass → group-commit.
@@ -956,11 +997,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   at the end of this doWork() cycle.  A leader crash in the window between
     //   appendNoSync() and sync() may lose the most-recent un-flushed acked
     //   records.  True crash-durability requires acks=All + ISR replication
-    //   (Milestone C).  This is the standard acks=1 / Kafka-default trade-off.
-    //
-    // TODO(Milestone C): when acks=All is supported, the ProduceResponse must be
-    //   deferred until the ISR high-watermark advances past lastOffset on all
-    //   in-sync replicas.  Today we ack immediately after page-cache write.
+    //   (GR-5/Milestone C).
     try {
         log->appendNoSync(restampScratch_.data(), batchLen, lastOffset);
     } catch (const std::exception& ex) {
@@ -989,17 +1026,44 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     // No per-op alloc: replica lookup is O(1) (pointer was captured before the
     // restamp section); onLeaderLogAppended() is noexcept with no allocation.
-    //
-    // acks=Leader / None: we ack immediately after the append + reconciliation
-    // (same as before GR-4).  acks=All deferral is deferred to GR-5 — for now
-    // acks=All behaves identically (immediate ack, no wait for ISR HW advance).
     if (replica) {
         replica->onLeaderLogAppended();
     }
 
-    // 6. Reply ProduceResponse{OK, partition, baseOffset=base}.
-    // acks=Leader: ack after page-cache write; fsync runs in flushDirtyLogs().
-    sendResp(pc::ErrorCode::OK, partition, base);
+    // 6. Reply ProduceResponse or enqueue deferred ack.
+    //
+    // acks=Leader / None: ack immediately after page-cache write.
+    // acks=All:           enqueue a PendingAck; drainPendingAcks() will send the
+    //                     response once replica->highWatermark() >= lastOffset.
+    if (!acksAll || !replica) {
+        // Immediate ack: acks=Leader (or no replica wired = passthrough mode).
+        sendResp(pc::ErrorCode::OK, partition, base);
+    } else {
+        // acks=All deferred ack path.
+        // Cap check: if the queue is full, reject rather than silently overflowing.
+        if (pendingAcks_.size() >= kMaxPendingAcks) {
+            spdlog::warn("ClientGateway: pendingAcks_ full ({} entries); acks=All produce rejected "
+                         "with MinIsrViolation sessionId={} topicId={} partition={}",
+                         kMaxPendingAcks, msg.sessionId, msg.topicId, partition);
+            sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
+            return;
+        }
+
+        PendingAck entry;
+        entry.sessionId     = msg.sessionId;
+        entry.correlationId = msg.correlationId;
+        entry.partition     = partition;
+        entry.baseOffset    = base;
+        entry.lastOffset    = lastOffset;
+        entry.enqueuedAtNs  = nowNs_;
+        entry.replica       = replica;
+
+        pendingAcks_.push_back(entry);  // no heap alloc (capacity pre-reserved)
+
+        spdlog::debug("ClientGateway: acks=All produce enqueued pending-ack "
+                      "sessionId={} partition={} baseOffset={} lastOffset={}",
+                      msg.sessionId, partition, base, lastOffset);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,6 +1500,112 @@ void ClientGateway::pushSubscriptions()
                 spdlog::debug("ClientGateway: push sub={} back-pressured at offset={} (pos={})",
                               subId, baseOffset, pos);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drainPendingAcks (GR-5) — drain the deferred acks=All pending-ack queue.
+//
+// Called from doWork() each cycle, after the replica's HW has been advanced
+// by any FetchResponse processing (replication doWork is ordered BEFORE gateway
+// doWork on the duty-cycle thread in BrokerNode::doWork()).
+//
+// For each pending entry:
+//   - If replica->highWatermark() >= lastOffset → HW covers the batch → send
+//     ProduceResponse{OK, partition, baseOffset} and remove the entry.
+//   - If nowNs_ - enqueuedAtNs >= kPendingAckTimeoutNs → stuck → send
+//     ProduceResponse{Internal} (followers not advancing) and remove the entry.
+//   - Otherwise → leave in queue for next cycle.
+//
+// Correctness:
+//   - An acks=All ack ONLY fires when HW >= lastOffset (majority-durable).
+//   - An acks=All ack is NEVER sent with errorCode=OK if HW < lastOffset.
+//   - Timeout path: sends Internal (error) — NEVER an erroneous OK.
+//   - Acks for a given (session, partition) respect produce order: entries are
+//     appended in produce order and drained FIFO (vector traversal is sequential).
+//     An entry at index i is always enqueued before i+1 (same duty-cycle thread),
+//     and drain checks them in order — so a stuck entry does NOT block later
+//     entries from acking (they each check HW independently).  This is safe
+//     because each batch has its own lastOffset and HW is monotonically
+//     non-decreasing: if HW >= lastOffset[i+1] then HW >= lastOffset[i] as well
+//     (batches are sequential; lastOffset is monotonically increasing).
+//     We therefore drain in vector order without a separate per-partition queue.
+//
+// Zero-alloc: no heap allocation on any code path.  Erase-by-swap-back-pop
+// ensures amortised O(1) removal at arbitrary positions.
+//
+// Single-writer: called only on the duty-cycle thread.
+// ---------------------------------------------------------------------------
+void ClientGateway::drainPendingAcks()
+{
+    if (pendingAcks_.empty()) return;
+
+    // Iterate with index (not iterator) because we swap-and-pop, which invalidates
+    // iterators.  Process from front to back (FIFO order for per-session/partition).
+    for (std::size_t i = 0; i < pendingAcks_.size(); ) {
+        PendingAck& entry = pendingAcks_[i];
+
+        bool remove = false;
+
+        // HW check: has majority replicated the batch?
+        if (entry.replica && entry.replica->highWatermark() >= entry.lastOffset) {
+            // HW advanced past this batch — ack OK.
+            Session* session = sessions_.find(entry.sessionId);
+            if (session) {
+                pc::ProduceResponse resp;
+                resp.sessionId     = entry.sessionId;
+                resp.correlationId = entry.correlationId;
+                resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
+                resp.partition     = entry.partition;
+                resp.baseOffset    = entry.baseOffset;
+                static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                              "scratch too small for ProduceResponse");
+                const std::size_t encoded = resp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+                spdlog::debug("ClientGateway: acks=All deferred ack sent OK "
+                              "sessionId={} partition={} baseOffset={} lastOffset={} hw={}",
+                              entry.sessionId, entry.partition, entry.baseOffset,
+                              entry.lastOffset, entry.replica->highWatermark());
+            }
+            // Session gone (reaped): entry is silently discarded (no way to ack).
+            remove = true;
+        } else if (nowNs_ - entry.enqueuedAtNs >= kPendingAckTimeoutNs) {
+            // Timeout: HW never advanced to cover this batch within the timeout
+            // (follower stuck/crashed and ISR not updated yet).  Send an error
+            // response so the client can retry rather than waiting forever.
+            // NEVER send OK here — that would falsely claim majority durability.
+            Session* session = sessions_.find(entry.sessionId);
+            if (session) {
+                pc::ProduceResponse resp;
+                resp.sessionId     = entry.sessionId;
+                resp.correlationId = entry.correlationId;
+                resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::Internal);
+                resp.partition     = entry.partition;
+                resp.baseOffset    = entry.baseOffset;
+                const std::size_t encoded = resp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+                spdlog::warn("ClientGateway: acks=All deferred ack timed out "
+                             "sessionId={} partition={} baseOffset={} lastOffset={} "
+                             "hw={} elapsed_ms={}",
+                             entry.sessionId, entry.partition, entry.baseOffset,
+                             entry.lastOffset,
+                             entry.replica ? static_cast<long long>(entry.replica->highWatermark()) : -1LL,
+                             (nowNs_ - entry.enqueuedAtNs) / 1'000'000LL);
+            }
+            remove = true;
+        }
+
+        if (remove) {
+            // Swap-and-pop: move last element to position i, shrink by 1.
+            // If this IS the last element, swap is a no-op and pop reduces size by 1.
+            if (i + 1 < pendingAcks_.size()) {
+                pendingAcks_[i] = std::move(pendingAcks_.back());
+            }
+            pendingAcks_.pop_back();
+            // Do NOT increment i — the swapped-in entry at position i needs checking.
+        } else {
+            ++i;
         }
     }
 }

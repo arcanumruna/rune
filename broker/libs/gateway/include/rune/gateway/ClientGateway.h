@@ -1,5 +1,5 @@
 #pragma once
-// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4).
+// ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 //
 // Design:
 //   - Subscribes to a single Aeron ingress stream (clientChannel/clientStreamId).
@@ -27,6 +27,20 @@
 //       LEO/HW so followers can fetch the new bytes.  Per-partition NotLeader
 //       defence: if the replica is not in Leader role, produce is rejected BEFORE
 //       any append (belt-and-suspenders beyond the cluster-level leaderView_ check).
+//   - GR-5: acks=All deferred ack (non-blocking pending-ack queue):
+//       When a Produce carries acks=1 (All), the ProduceResponse is NOT sent
+//       immediately after append.  Instead a PendingAck entry is enqueued
+//       (zero-alloc: pre-sized ring buffer).  Each doWork() cycle, after the
+//       replica's HW may have advanced (replication fetch responses processed by
+//       the duty-cycle thread BEFORE gateway.doWork), drainPendingAcks() checks
+//       every entry: if replica->highWatermark() >= entry.lastOffset, the
+//       ProduceResponse is sent and the entry removed.
+//       min-ISR gate: before enqueuing, canProduce(minIsr, acksAll=true) is
+//       checked via the ISR manager; if ISR is too small, ProduceResponse
+//       MinIsrViolation is sent immediately (no append).
+//       Timeout: entries stuck beyond kPendingAckTimeoutNs receive
+//       ProduceResponse{Internal} and are evicted (follower never advancing).
+//       acks=Leader/None: unchanged — ack immediately after append.
 //   - Single-writer: doWork() must be called from ONE thread only.
 //   - Zero-alloc on the hot path: encode scratch is a fixed member buffer.
 //   - NO busy-spin.
@@ -44,6 +58,7 @@
 #include <rune/storage/Log.h>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -56,6 +71,7 @@
 #include <vector>
 
 namespace rune::node { class ReplicaRegistry; }
+namespace rune::replication { class PartitionReplica; }
 
 namespace rune::gateway {
 
@@ -161,6 +177,30 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // setMinIsr — configure the minimum ISR size gate for acks=All produces.
+    // Default: 1 (single-node safe; for 3-node clusters, set to 2).
+    // Thread-safe (atomic store): may be called from any thread.
+    // -----------------------------------------------------------------------
+    void setMinIsr(int minIsr) noexcept {
+        minIsr_.store((minIsr >= 1) ? minIsr : 1, std::memory_order_relaxed);
+    }
+
+    // -----------------------------------------------------------------------
+    // minIsr — current minIsr setting.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int minIsr() const noexcept {
+        return minIsr_.load(std::memory_order_relaxed);
+    }
+
+    // -----------------------------------------------------------------------
+    // pendingAckCount — number of deferred acks=All entries waiting for HW.
+    // For tests and monitoring.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t pendingAckCount() const noexcept {
+        return pendingAcks_.size();
+    }
+
+    // -----------------------------------------------------------------------
     // sessionCount — number of active sessions.
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t sessionCount() const {
@@ -184,6 +224,31 @@ public:
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // PendingAck — one deferred acks=All produce waiting for ISR HW to cover it.
+    //
+    // Enqueued in pendingAcks_ (pre-sized vector used as a ring — zero heap
+    // alloc on the hot path).  Drained in drainPendingAcks() each doWork()
+    // cycle after the replica's HW has advanced for this cycle.
+    //
+    // Safety invariants:
+    //   - replica pointer is non-owning; outlives the gateway (same lifetime
+    //     contract as replicaRegistry_ pointer).
+    //   - All fields set once on enqueue; read-only during drain.
+    //   - Single-writer: only touched on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    struct PendingAck {
+        int64_t      sessionId     = 0;   ///< owning session
+        int64_t      correlationId = 0;   ///< echoed back in ProduceResponse
+        int32_t      partition     = 0;   ///< partition (echoed in ProduceResponse)
+        int64_t      baseOffset    = 0;   ///< first offset of the batch
+        int64_t      lastOffset    = 0;   ///< last offset of the batch (HW must reach this)
+        int64_t      enqueuedAtNs  = 0;   ///< for timeout eviction
+        // Non-owning: null only when replicaRegistry_ is not set (passthrough mode,
+        // which does not produce acks=All entries).
+        rune::replication::PartitionReplica* replica = nullptr;
+    };
+
     // -----------------------------------------------------------------------
     // Subscription — per-session push subscription (GB-3).
     //
@@ -252,6 +317,13 @@ private:
     // Zero per-produce heap; dirtyLogs_ is a pre-allocated inline set.
     // Single-writer: called only on the duty-cycle thread.
     void flushDirtyLogs();
+
+    // GR-5: Drain deferred acks=All pending-ack queue.
+    // Called from doWork() AFTER the replica's HW may have advanced for this cycle.
+    // For each entry: if replica->highWatermark() >= lastOffset → send ProduceResponse{OK}.
+    //                 if enqueuedAtNs + kPendingAckTimeoutNs < nowNs_ → timeout → ProduceResponse{Internal}.
+    // Never blocks; never spins.
+    void drainPendingAcks();
 
     // -----------------------------------------------------------------------
     // Egress send helper — tryClaim first, fallback to offer.
@@ -412,6 +484,29 @@ private:
     // NOTE: scratch_ is already kScratchSize = 68 KiB and is reused here.
     // We encode into scratch_ during push; this is safe because push happens
     // AFTER the ingress poll (handlers that use scratch_ are done for this cycle).
+
+    // GR-5: Deferred acks=All pending-ack queue.
+    //
+    // Pre-allocated to kMaxPendingAcks entries (zero heap alloc on the hot path).
+    // Stored as a vector used in insertion order; drainPendingAcks() removes
+    // entries that either: (a) HW >= lastOffset → send OK, or (b) timed out → send Internal.
+    // std::vector with erase-by-swap-and-pop avoids per-cycle allocation; entries
+    // are individually removed as they resolve.  All state touched only on the
+    // duty-cycle thread (single-writer).
+    //
+    // Timeout: kPendingAckTimeoutNs (same order as the produce timeout seen by clients).
+    // Cap: kMaxPendingAcks (power-of-two so the check is fast); a new acks=All produce
+    // that would overflow the cap is rejected with MinIsrViolation to prevent unbounded
+    // queue growth when followers are persistently lagging.
+    static constexpr std::size_t kMaxPendingAcks     = 1024;          ///< bounded queue
+    static constexpr int64_t kPendingAckTimeoutNs     = 30LL * 1'000'000'000LL; ///< 30 s
+    std::vector<PendingAck>         pendingAcks_;
+
+    // Default minIsr for the pending-ack gate.  Overridable via setMinIsr().
+    // For a 3-node cluster: 2 (majority).  For a 1-node cluster: 1 (leader only).
+    // std::atomic so setMinIsr() can safely be called from a different thread
+    // (e.g. a test thread) without data racing the duty-cycle read in handleProduce().
+    std::atomic<int>                minIsr_{1};
 };
 
 } // namespace rune::gateway

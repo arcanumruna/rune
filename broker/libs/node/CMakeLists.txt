@@ -125,4 +125,20 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_gateway_produce_replication_tests
             PROPERTIES TIMEOUT 180)
     endif()
+
+    # ---------------------------------------------------------------------------
+    # GR-5: acks=All deferred-ack via non-blocking pending-ack queue + min-ISR gate.
+    # Unit + integration tests (3-node in-process, real aeron:udp, no Docker).
+    # Gated behind BUILD_NODE_UDP_TESTS (same env requirement as GR-3/GR-4 tests).
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_gateway_acks_all_deferred_ack_tests
+            tests/integration/GatewayAcksAllDeferredAckTest.cpp)
+        target_link_libraries(rune_gateway_acks_all_deferred_ack_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_gateway_acks_all_deferred_ack_tests
+            PROPERTIES TIMEOUT 240)
+    endif()
 endif()

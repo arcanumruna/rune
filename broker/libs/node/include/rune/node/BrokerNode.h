@@ -146,6 +146,13 @@ public:
         return replBridge_->lastEpochAtomic();
     }
 
+    /// Set the minimum ISR size required for acks=All produces on this node's gateway.
+    /// Thread-safe (gateway::ClientGateway::setMinIsr uses std::atomic<int>).
+    /// Typically called from tests to configure min-ISR before or after start().
+    void setGatewayMinIsr(int minIsr) noexcept {
+        if (gateway_) gateway_->setMinIsr(minIsr);
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers
