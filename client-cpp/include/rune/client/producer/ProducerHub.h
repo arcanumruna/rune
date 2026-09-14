@@ -18,6 +18,7 @@
 
 #include <rune/client/producer/ProducerImpl.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -57,6 +58,9 @@ public:
 
     /// Fail all pending acks on close.
     void failAll(const std::string& reason);
+
+    /// Sweep timed-out acks (called from Client::sweepTimeouts).
+    void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
     bool empty() const noexcept { return impls_.empty(); }
 

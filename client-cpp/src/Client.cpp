@@ -122,7 +122,14 @@ void Client::close() {
     // Stop the agent (idempotent — CC-5 contract).
     agent_.stop();
 
-    // Fail any still-pending futures.
+    // Fail any still-pending producer acks (futures/callbacks) BEFORE returning.
+    // producerHub_.failAll() calls ProducerImpl::failAllPending on every registered
+    // producer — this resolves every pending future/callback with an error so they
+    // never hang.  MUST be called after agent_.stop() so the agent thread is no
+    // longer in drainAndFlush / onProduceResponse (no concurrent access to pendingAcks_).
+    producerHub_.failAll("Client closed");
+
+    // Fail any still-pending connect/ping futures.
     failAllPending("Client closed");
 
     // Fire onDisconnected once.
@@ -363,6 +370,11 @@ void Client::runLoop() {
 
 void Client::sweepTimeouts() {
     const auto now = std::chrono::steady_clock::now();
+
+    // --- Pending producer ack timeouts (no mtx_ — ProducerImpl has its own ackMtx_) ---
+    // Mirror the connect/ping sweep: any pending ProduceResponse ack older than
+    // produceTimeoutMs is failed so futures/callbacks never hang.
+    producerHub_.sweepTimedOut(now);
 
     std::lock_guard<std::mutex> lk(mtx_);
 

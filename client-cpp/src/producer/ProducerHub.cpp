@@ -40,4 +40,10 @@ void ProducerHub::failAll(const std::string& reason) {
     }
 }
 
+void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
+    for (auto& impl : impls_) {
+        impl->sweepTimedOut(now);
+    }
+}
+
 } // namespace rune::client::producer

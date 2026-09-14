@@ -60,10 +60,11 @@ enum class Acks : uint8_t {
 // ProducerConfig — tuning knobs; sane defaults.
 // ---------------------------------------------------------------------------
 struct ProducerConfig {
-    Acks    acks        = Acks::Leader;
-    int64_t lingerUs    = 5'000;      // max time to accumulate a batch (µs)
-    int32_t batchBytes  = 64 * 1024;  // flush when a partition's builder reaches this
-    int32_t maxInFlight = 4;          // max outstanding un-acked batches per partition
+    Acks    acks           = Acks::Leader;
+    int64_t lingerUs       = 5'000;      // max time to accumulate a batch (µs)
+    int32_t batchBytes     = 64 * 1024;  // flush when a partition's builder reaches this
+    int32_t maxInFlight    = 4;          // max outstanding un-acked batches per partition
+    int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
 };
 
 // ---------------------------------------------------------------------------
@@ -91,12 +92,33 @@ public:
 
     ~Producer() = default;
 
+    // ---- Max value size (named constant) ------------------------------------
+
+    /// Maximum value size for a single send().
+    ///
+    /// The SEND_RECORD ring message is limited to kMaxSendValueBytes bytes of
+    /// value data.  Values larger than this are silently DROPPED on the void
+    /// send path (fire-and-forget) or will cause submitSendRecord() to return
+    /// false on the internal path.
+    ///
+    /// Rationale: the ring write uses an 8 KiB stack scratch buffer
+    /// (kMaxStackBuf = 8192) and the record header is 38 bytes, leaving
+    /// 8192 - 38 = 8154 bytes for the value.  Chunking for larger payloads
+    /// is left to the caller.
+    static constexpr std::size_t kMaxSendValueBytes = 8192 - 38; // 8154 bytes
+
     // ---- Hot path — void send (ZERO per-send heap allocation) ---------------
 
-    /// Fire-and-forget send.
+    /// Fire-and-forget send (ZERO per-send heap allocation, lock-free).
+    ///
     /// Computes the partition from Key via partitionForKey (shared FNV-1a),
-    /// then writes a compact SEND_RECORD into the agent ring.
-    /// NO heap allocation, NO lock, NO std::function/promise.
+    /// then writes a compact SEND_RECORD into the agent's lock-free ring.
+    /// NO heap allocation, NO lock, NO std::function/promise on this path.
+    ///
+    /// **Drop policy (void path):** if the ring is full OR the value exceeds
+    /// kMaxSendValueBytes, the message is SILENTLY DROPPED.  This is the
+    /// fire-and-forget contract — callers that need delivery confirmation
+    /// must use the callback or want_future overloads instead.
     void send(TopicHandle            topic,
               const Key&             key,
               std::span<const uint8_t> value) noexcept;

@@ -27,10 +27,13 @@ namespace rune::client::producer {
 
 namespace {
 
-// Unique key for the partition map: topicId * 100000 + partition.
-// Assumes partitionCount < 100000 (fine for any real topology).
+// Unique key for the partition map: collision-free bit-packing.
+// Upper 32 bits = topicId, lower 32 bits = partition.
+// This is provably collision-free for all (topicId, partition) pairs,
+// unlike the old topicId*100000+partition formula which collides for
+// partition >= 100000 or high topicIds.
 inline int64_t partKey(int32_t topicId, int32_t partition) noexcept {
-    return static_cast<int64_t>(topicId) * 100000LL + partition;
+    return (static_cast<int64_t>(topicId) << 32) | static_cast<uint32_t>(partition);
 }
 
 // Write a 4-byte LE int32 at buf[off].
@@ -129,7 +132,8 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
 {
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
-    encodeScratch_.reserve(64 * 1024);
+    batchScratch_.reserve(64 * 1024);  // RecordBatch bytes (reused by buildInto)
+    encodeScratch_.reserve(64 * 1024); // Produce wire frame (grown once)
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +196,8 @@ int64_t ProducerImpl::registerCallback(std::function<void(int64_t)> cb) {
     PendingAck pa;
     pa.kind     = PendingAck::Kind::Callback;
     pa.callback = std::move(cb);
+    pa.deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(cfg_.produceTimeoutMs);
     pendingAcks_.emplace(corrId, std::move(pa));
     return corrId;
 }
@@ -200,7 +206,9 @@ std::pair<int64_t, std::future<int64_t>> ProducerImpl::registerFuture() {
     const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(ackMtx_);
     PendingAck pa;
-    pa.kind = PendingAck::Kind::Future;
+    pa.kind    = PendingAck::Kind::Future;
+    pa.deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(cfg_.produceTimeoutMs);
     auto fut = pa.promise.get_future();
     pendingAcks_.emplace(corrId, std::move(pa));
     return {corrId, std::move(fut)};
@@ -343,8 +351,10 @@ bool ProducerImpl::encodeAndSend(
     ps.builder->setProducerEpoch(producerEpoch_);
     ps.builder->setBaseSequence(ps.nextBaseSequence);
 
-    // Build the RecordBatch bytes (std::vector — allocated/reused inside builder).
-    std::vector<uint8_t> batchBytes = ps.builder->build();
+    // Build the RecordBatch bytes into the reused member scratch buffer
+    // (batchScratch_ is cleared + refilled; capacity is retained across flushes —
+    // zero per-flush heap allocation on the agent produce hot path).
+    ps.builder->buildInto(batchScratch_);
 
     // Stamp the baseSequence advance.
     ps.nextBaseSequence += ps.builder->recordCount();
@@ -363,7 +373,7 @@ bool ProducerImpl::encodeAndSend(
     msg.partition      = ps.partition;
     msg.partitionKnown = 1;
     msg.key            = {};
-    msg.recordBatch    = std::span<const uint8_t>(batchBytes);
+    msg.recordBatch    = std::span<const uint8_t>(batchScratch_);
 
     const std::size_t needed = msg.encodedSize();
     if (needed == 0) return false;
@@ -484,6 +494,27 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
                 try { pa.promise.set_value(baseOffset); } catch (...) {}
             }
             pendingAcks_.erase(ait);
+        }
+    }
+}
+
+void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
+    std::lock_guard<std::mutex> lock(ackMtx_);
+    for (auto it = pendingAcks_.begin(); it != pendingAcks_.end(); ) {
+        if (now >= it->second.deadline) {
+            PendingAck& pa = it->second;
+            if (pa.kind == PendingAck::Kind::Future) {
+                try {
+                    pa.promise.set_exception(
+                        std::make_exception_ptr(
+                            std::runtime_error("produce ack timed out (no ProduceResponse)")));
+                } catch (...) {}
+            } else if (pa.kind == PendingAck::Kind::Callback && pa.callback) {
+                pa.callback(-1); // -1 signals error to callback
+            }
+            it = pendingAcks_.erase(it);
+        } else {
+            ++it;
         }
     }
 }

@@ -44,6 +44,7 @@
 #include <concurrent/ringbuffer/RingBufferDescriptor.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -135,6 +136,9 @@ struct PendingAck {
 
     // Future path.
     std::promise<int64_t> promise;
+
+    // Deadline for timeout sweep (steady_clock).
+    std::chrono::steady_clock::time_point deadline;
 };
 
 // ---------------------------------------------------------------------------
@@ -200,6 +204,9 @@ public:
     /// Called on agent close/stop: fail all pending acks.
     void failAllPending(const std::string& reason);
 
+    /// Called from Client::sweepTimeouts(): fail acks older than the deadline.
+    void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
+
     // ---- Accessors -----------------------------------------------------------
 
     const ProducerConfig& config() const noexcept { return cfg_; }
@@ -242,10 +249,13 @@ private:
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 
-    // Per-(topicId * 100000 + partition) → PartitionState.
+    // Per-((int64_t(topicId)<<32)|uint32_t(partition)) → PartitionState (collision-free).
     std::unordered_map<int64_t, PartitionState> partitions_;
 
-    // Encode scratch buffer (reused per batch).
+    // Encode scratch buffers (reused per batch — zero per-flush heap allocation).
+    // batchScratch_: RecordBatch bytes (cleared + refilled by buildInto()).
+    // encodeScratch_: Produce wire frame (grown once; steady-state = no alloc).
+    std::vector<uint8_t> batchScratch_;
     std::vector<uint8_t> encodeScratch_;
 
     // Stub producerId for M-B: local random-ish value.

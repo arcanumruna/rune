@@ -92,8 +92,9 @@ struct ClientConfig {
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
-    int64_t connectTimeoutMs = 5000;
-    int64_t pingTimeoutMs    = 5000;
+    int64_t connectTimeoutMs  = 5000;
+    int64_t pingTimeoutMs     = 5000;
+    int64_t produceTimeoutMs  = 5000; // max wait for a ProduceResponse ack
 
     // Keepalive interval passthrough (nanoseconds, 0 = use agent default).
     int64_t keepaliveIntervalNs = 0;

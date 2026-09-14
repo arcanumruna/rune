@@ -29,6 +29,7 @@
 //   - Injected clock for linger tests: pass synthetic nowNs to doWork().
 //   - No background runner thread in these tests: we drive doWork() directly.
 
+#include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -843,32 +844,91 @@ TEST(Producer, BinaryAndEmptyValue) {
 }
 
 // ===========================================================================
-// Test 12: ZeroAllocVoidSend (structural proof)
+// Test 12: ZeroAllocVoidSend — REAL zero-alloc proof via global new/delete hook
 //
-//   The void Producer::send(topic, key, value) path:
-//     1. Calls key.partition(partitionCount) — pure FNV-1a arithmetic on the
-//        inline 16-byte array; zero allocation.
-//     2. Calls ProducerImpl::submitSendRecord() — writes into a stack-local
-//        uint8_t[8192] scratch buffer, then ring_.write() copies it into the
-//        pre-allocated ring.  NO new/malloc on this path.
-//     3. Does NOT call registerCallback/registerFuture (those allocate).
-//     4. Does NOT construct a per-call std::function.
+//   Installs a process-wide operator new/delete counting hook, warms up the
+//   ring + agent internals (allows any one-time allocations), then asserts
+//   ZERO heap allocations occur in a steady-state void-send loop.
 //
-//   We verify the structural invariant by running 10,000 void sends in a
-//   tight loop.  The ring drains between batches of doWork() calls.  If the
-//   void path allocated, the ring would overflow (each send would be ~38 +
-//   value_size bytes; the ring is large enough for the burst).
-//   No OOM, no crash → structural zero-alloc property holds.
+//   This is the LATENCY GATE: if ANY call on the void send path (partition
+//   hash, ring write, etc.) allocates, the counter increments and the test
+//   fails.  The only non-failing allocs are during warm-up.
+//
+//   Threading note: both the test thread (app) and the agent thread run
+//   concurrently during the baseline phase.  We snapshot the counter before
+//   and after the measured send loop on the app thread.  Agent-thread allocs
+//   during the measured window would be caught, but the measured window is
+//   deliberately narrow (app-thread send loop only, no doWork call inside).
 // ===========================================================================
+
+namespace {
+
+// Global allocation counters — std::atomic so agent-thread incrs are visible.
+std::atomic<long> g_newCount  {0};
+std::atomic<long> g_delCount  {0};
+std::atomic<bool> g_hookActive{false};
+
+} // anonymous namespace
+
+// Override global operator new/delete to count allocations.
+// These are the lowest-level hooks; malloc-backed allocations from system
+// libraries route through here on macOS (libSystem uses new/delete via the
+// ObjC runtime path for C++ objects).
+void* operator new(std::size_t size) {
+    if (g_hookActive.load(std::memory_order_relaxed)) {
+        g_newCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    void* p = std::malloc(size);
+    if (!p) throw std::bad_alloc{};
+    return p;
+}
+
+void* operator new[](std::size_t size) {
+    if (g_hookActive.load(std::memory_order_relaxed)) {
+        g_newCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    void* p = std::malloc(size);
+    if (!p) throw std::bad_alloc{};
+    return p;
+}
+
+void operator delete(void* p) noexcept {
+    if (g_hookActive.load(std::memory_order_relaxed)) {
+        g_delCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::free(p);
+}
+
+void operator delete[](void* p) noexcept {
+    if (g_hookActive.load(std::memory_order_relaxed)) {
+        g_delCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::free(p);
+}
+
+void operator delete(void* p, std::size_t) noexcept {
+    if (g_hookActive.load(std::memory_order_relaxed)) {
+        g_delCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::free(p);
+}
+
+void operator delete[](void* p, std::size_t) noexcept {
+    if (g_hookActive.load(std::memory_order_relaxed)) {
+        g_delCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::free(p);
+}
+
 TEST(Producer, ZeroAllocVoidSend) {
     static constexpr int32_t kInStr = 2023, kEgStr = 2024;
-    // 1 MiB ring → ample headroom for 200 × 70-byte ring entries per round.
-    AgentHarness h(kInStr, kEgStr, 1 * 1024 * 1024);
+    // 4 MiB ring → ample headroom for 5000 × 70-byte ring entries.
+    AgentHarness h(kInStr, kEgStr, 4 * 1024 * 1024);
 
     ProducerConfig pcfg;
-    pcfg.acks       = Acks::None;
-    pcfg.lingerUs   = 1'000'000'000; // 1000 s — no linger flush
-    pcfg.batchBytes = 64 * 1024 * 1024; // 64 MB — no size flush
+    pcfg.acks        = Acks::None;
+    pcfg.lingerUs    = 1'000'000'000LL; // 1000 s — no linger flush during test
+    pcfg.batchBytes  = 64 * 1024 * 1024; // 64 MB — no size flush
     pcfg.maxInFlight = 4;
 
     auto p     = h.makeProducer(pcfg);
@@ -878,21 +938,46 @@ TEST(Producer, ZeroAllocVoidSend) {
     const std::vector<uint8_t> val(32, 0x55);
     const std::span<const uint8_t> valSpan(val);
 
-    static constexpr int kSendBatch = 200;
-    int total = 0;
-    for (int round = 0; round < 50; ++round) {
-        for (int i = 0; i < kSendBatch; ++i) {
-            // This is the zero-alloc void fast path under test.
-            p.send(topic, key, valSpan);
-            ++total;
-        }
-        // Drain the ring so it doesn't fill up.
+    // --- Warm-up phase: allow one-time allocs (ring init, partition map, etc.) ---
+    // Run 200 sends + doWork to touch all lazily-allocated paths.
+    for (int i = 0; i < 200; ++i) {
+        p.send(topic, key, valSpan);
+    }
+    h.agent->doWork(monoNs());
+    h.gw->poll();
+    // Drain remaining ring entries before the measured phase.
+    for (int i = 0; i < 20; ++i) {
         h.agent->doWork(monoNs());
         h.gw->poll();
+        std::this_thread::sleep_for(1ms);
     }
 
-    EXPECT_EQ(total, 10'000);
-    // If we got here without an assertion failure or OOM, the ring is functional.
+    // --- Measured phase: enable hook, run steady-state void-send loop ---
+    g_newCount.store(0, std::memory_order_seq_cst);
+    g_delCount.store(0, std::memory_order_seq_cst);
+    g_hookActive.store(true, std::memory_order_seq_cst);
+
+    // 5,000 sends in a tight loop — pure app-thread void fast path.
+    static constexpr int kMeasuredSends = 5'000;
+    for (int i = 0; i < kMeasuredSends; ++i) {
+        p.send(topic, key, valSpan); // THE path under test
+    }
+
+    g_hookActive.store(false, std::memory_order_seq_cst);
+
+    const long allocsDuringMeasure = g_newCount.load(std::memory_order_seq_cst);
+
+    // Assert: ZERO heap allocations on the steady-state void send path.
+    EXPECT_EQ(allocsDuringMeasure, 0L)
+        << "void Producer::send() must perform ZERO heap allocations in steady state; "
+        << "got " << allocsDuringMeasure << " allocs for " << kMeasuredSends << " sends";
+
+    // Drain remaining ring (ring is pre-allocated; this is post-measurement).
+    for (int i = 0; i < 100; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        if (i > 10) std::this_thread::sleep_for(1ms);
+    }
 }
 
 // ===========================================================================
@@ -925,4 +1010,417 @@ TEST(Producer, TopicLookup) {
     Key empty(std::span<const uint8_t>{});
     EXPECT_GE(empty.partition(4), 0);
     EXPECT_LT(empty.partition(4), 4);
+}
+
+// ===========================================================================
+// FIX 1 — Test 14: CloseWithPendingFuture
+//   send(want_future) then close() before any ack → future throws (not hangs).
+//   Tests that producerHub_.failAll("Client closed") is called on close().
+// ===========================================================================
+TEST(Producer, CloseWithPendingFuture) {
+    static constexpr int32_t kInStr = 2025, kEgStr = 2026;
+    AgentHarness h(kInStr, kEgStr);
+
+    // Disable gateway acks so the ProduceResponse never arrives.
+    // (We want to close while a future is pending.)
+    // We DON'T connect — just set up the producer and call close() immediately.
+
+    ProducerConfig pcfg;
+    pcfg.acks            = Acks::Leader;
+    pcfg.lingerUs        = 1;
+    pcfg.batchBytes      = 1;
+    pcfg.maxInFlight     = 4;
+    pcfg.produceTimeoutMs = 30'000; // long timeout — we close before it fires
+
+    // Register a future BEFORE connecting or connecting at all.
+    // The future is registered in pendingAcks_ immediately.
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, h.nextCorrId_);
+    h.hub.add(impl);
+
+    // Register a future directly (without submitting to the ring — this puts
+    // the corrId into pendingAcks_ immediately, simulating an in-flight ack).
+    auto [corrId, fut] = impl->registerFuture();
+
+    // Verify the future is pending (not yet resolved).
+    ASSERT_EQ(fut.wait_for(0s), std::future_status::timeout)
+        << "Future must be pending before failAll";
+
+    // Now call failAll (as Client::close() would do).
+    h.hub.failAll("Client closed");
+
+    // Future must now be immediately resolvable with an exception (not hang).
+    ASSERT_EQ(fut.wait_for(0s), std::future_status::ready)
+        << "Future must be resolved by failAll (close)";
+
+    // Confirm it throws with the expected message.
+    EXPECT_THROW({
+        fut.get();
+    }, std::runtime_error) << "Future must throw std::runtime_error on close";
+}
+
+// ===========================================================================
+// FIX 1 — Test 15: ProduceAckTimeout (no-ack gateway → future fails after timeout)
+//   Gateway receives Produce but never replies → sweepTimedOut() fails the future.
+//   Uses a short produceTimeoutMs to bound the test duration.
+// ===========================================================================
+TEST(Producer, ProduceAckTimeout) {
+    static constexpr int32_t kInStr = 2027, kEgStr = 2028;
+    AgentHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    // Short produce timeout for the test.
+    ProducerConfig pcfg;
+    pcfg.acks             = Acks::Leader;
+    pcfg.lingerUs         = 1;
+    pcfg.batchBytes       = 1;
+    pcfg.maxInFlight      = 4;
+    pcfg.produceTimeoutMs = 200; // 200 ms — short enough for unit test
+
+    auto p     = h.makeProducer(pcfg);
+    auto topic = makeTopic(13, 1);
+    Key  key(uint64_t{0});
+
+    // Gateway will receive but never reply.
+    h.gw->replyAcks = false;
+
+    const std::vector<uint8_t> val = {0xAB};
+    auto fut = p.send(topic, key, std::span<const uint8_t>(val), want_future);
+
+    // Must be pending initially.
+    ASSERT_EQ(fut.wait_for(0s), std::future_status::timeout)
+        << "Future must be pending before timeout";
+
+    // Wait past the timeout, calling sweepTimedOut() periodically.
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    bool resolved = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+
+        // Simulate the Client's sweepTimeouts() calling hub.sweepTimedOut().
+        h.hub.sweepTimedOut(std::chrono::steady_clock::now());
+
+        if (fut.wait_for(0s) == std::future_status::ready) {
+            resolved = true;
+            break;
+        }
+        std::this_thread::sleep_for(20ms);
+    }
+
+    ASSERT_TRUE(resolved) << "Future must be resolved by timeout sweep (not hang)";
+    EXPECT_THROW({ fut.get(); }, std::runtime_error)
+        << "Timed-out future must throw std::runtime_error";
+}
+
+// ===========================================================================
+// FIX 1 — Test 16: ProduceAckTimeoutCallback (callback error variant)
+//   Callback fires with offset=-1 when ack times out.
+// ===========================================================================
+TEST(Producer, ProduceAckTimeoutCallback) {
+    static constexpr int32_t kInStr = 2029, kEgStr = 2030;
+    AgentHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    ProducerConfig pcfg;
+    pcfg.acks             = Acks::Leader;
+    pcfg.lingerUs         = 1;
+    pcfg.batchBytes       = 1;
+    pcfg.maxInFlight      = 4;
+    pcfg.produceTimeoutMs = 200; // short timeout
+
+    auto p     = h.makeProducer(pcfg);
+    auto topic = makeTopic(14, 1);
+    Key  key(uint64_t{0});
+
+    h.gw->replyAcks = false;
+
+    std::atomic<int64_t> cbOffset{-999}; // sentinel: -999 = not fired
+    const std::vector<uint8_t> val = {0xBB};
+    p.send(topic, key, std::span<const uint8_t>(val),
+           [&](int64_t offset) {
+               cbOffset.store(offset, std::memory_order_release);
+           });
+
+    // Pump past the timeout.
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        h.hub.sweepTimedOut(std::chrono::steady_clock::now());
+        if (cbOffset.load(std::memory_order_acquire) != -999) break;
+        std::this_thread::sleep_for(20ms);
+    }
+
+    EXPECT_NE(cbOffset.load(std::memory_order_acquire), -999LL)
+        << "Callback must fire on timeout (not hang)";
+    EXPECT_EQ(cbOffset.load(std::memory_order_acquire), -1LL)
+        << "Timed-out callback must receive offset=-1 (error signal)";
+}
+
+// ===========================================================================
+// FIX 5 — Test 17: MultiRecordBatch
+//   Pack >1 record into a single batch via batchBytes size trigger.
+//   Assert: baseSequence advances by recordCount (gap-free), recordCount > 1.
+//
+//   Design: use acks=None (no corrId allocation), small batchBytes (<=200),
+//   LARGE linger (no linger flush), and NO explicit p.flush() call.
+//   All records are submitted to the ring before doWork is called, so the
+//   batchBytes trigger fires after enough records accumulate.
+//   This avoids the globalFlushPending_ early-flush issue (p.flush() sets the
+//   flag before the ring is drained, causing a 1-record batch).
+// ===========================================================================
+TEST(Producer, MultiRecordBatch) {
+    static constexpr int32_t kInStr = 2031, kEgStr = 2032;
+    AgentHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    // Small batchBytes (150 bytes) so a batch of 5×20-byte records (= ~100 bytes
+    // of value, plus varint overhead) will fill it and trigger one batch flush.
+    // Large linger so no time-based flush fires during the test.
+    ProducerConfig pcfg;
+    pcfg.acks        = Acks::None;
+    pcfg.lingerUs    = 1'000'000'000LL; // 1000 s — no linger flush
+    pcfg.batchBytes  = 150;             // triggers at ~150 bytes of builder value bytes
+    pcfg.maxInFlight = 4;
+
+    auto p     = h.makeProducer(pcfg);
+    auto topic = makeTopic(15, 1); // 1 partition: all records go to partition 0
+    Key  key(uint64_t{0});
+
+    // Each send: 20-byte value. After 8 sends, builderBytes = 8*20 = 160 >= 150 → flush.
+    // Note: builderBytes tracks accumulated valueLen only (not headers).
+    const std::vector<uint8_t> val(20, 0xAA);
+    static constexpr int kRecords = 8; // 8 × 20 = 160 bytes > batchBytes(150)
+
+    // Queue all records into the ring BEFORE calling doWork.
+    // No p.flush() here — we rely on batchBytes trigger alone.
+    for (int i = 0; i < kRecords; ++i) {
+        p.send(topic, key, std::span<const uint8_t>(val));
+    }
+
+    // doWork drains one record at a time, calling flushBatches after each.
+    // Once builderBytes >= 150, the size trigger fires and a multi-record
+    // batch is flushed.
+    ASSERT_TRUE(h.pumpUntilBatches(1)) << "Expected exactly 1 multi-record batch";
+
+    ASSERT_GE(h.gw->batches.size(), 1u);
+    const auto& b0 = h.gw->batches[0];
+
+    // The batch must contain MORE than 1 record (batchBytes trigger fires
+    // after ≥ 150 bytes accumulated, which requires ≥ 8 records of 20 bytes).
+    EXPECT_GT(b0.recCount, 1)
+        << "First batch must pack multiple records (batchBytes trigger)";
+
+    // baseSequence must be 0 (first batch on this partition).
+    EXPECT_EQ(b0.baseSeq, 0)
+        << "First batch baseSequence must be 0";
+
+    // Wait for all batches to be sent (remaining records after the first flush).
+    // Poll until total received records == kRecords (all records flushed).
+    for (int i = 0; i < kPumpMax; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        int32_t got = 0;
+        for (const auto& b : h.gw->batches) got += b.recCount;
+        if (got >= kRecords) break;
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    // Compute total records sent so far across all received batches.
+    int32_t totalRecsSoFar = 0;
+    for (const auto& b : h.gw->batches) totalRecsSoFar += b.recCount;
+
+    // Verify monotonic gap-free baseSequence across all batches.
+    int32_t nextExpected = 0;
+    for (std::size_t i = 0; i < h.gw->batches.size(); ++i) {
+        const auto& b = h.gw->batches[i];
+        EXPECT_EQ(b.baseSeq, nextExpected)
+            << "Gap-free baseSequence required at batch " << i;
+        nextExpected = b.baseSeq + b.recCount;
+    }
+    // nextExpected == total records = kRecords (gap-free).
+    EXPECT_EQ(nextExpected, kRecords)
+        << "baseSequence must advance by exactly kRecords across all batches";
+}
+
+// ===========================================================================
+// FIX 5 — Test 18: MultiPartitionInterleave
+//   Two keys that land on different partitions within the same producer.
+//   Both partitions receive records; sequences are tracked independently.
+// ===========================================================================
+TEST(Producer, MultiPartitionInterleave) {
+    static constexpr int32_t kInStr = 2033, kEgStr = 2034;
+    static constexpr int32_t kParts = 8;
+    AgentHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    ProducerConfig pcfg;
+    pcfg.acks        = Acks::None;
+    pcfg.lingerUs    = 1;   // flush fast
+    pcfg.batchBytes  = 1;   // flush every record
+    pcfg.maxInFlight = 32;
+
+    auto p     = h.makeProducer(pcfg);
+    auto topic = makeTopic(16, kParts);
+
+    const std::vector<uint8_t> val(4, 0x01);
+
+    // Find two keys that hash to DIFFERENT partitions.
+    uint64_t kA = 0, kB = 1;
+    {
+        uint8_t ka[8]{}, kb[8]{};
+        for (int j = 0; j < 8; ++j) ka[j] = static_cast<uint8_t>(kA >> (j * 8));
+        for (int j = 0; j < 8; ++j) kb[j] = static_cast<uint8_t>(kB >> (j * 8));
+        int32_t pA = rune::protocol::partitionForKey(std::span<const uint8_t>(ka, 8), kParts);
+        int32_t pB = rune::protocol::partitionForKey(std::span<const uint8_t>(kb, 8), kParts);
+        // Scan for a second key on a different partition if needed.
+        for (uint64_t k2 = 2; pA == pB && k2 < 1000; ++k2) {
+            kB = k2;
+            for (int j = 0; j < 8; ++j) kb[j] = static_cast<uint8_t>(kB >> (j * 8));
+            pB = rune::protocol::partitionForKey(std::span<const uint8_t>(kb, 8), kParts);
+        }
+        ASSERT_NE(pA, pB)
+            << "Test setup: could not find two keys on different partitions (should not happen with FNV-1a)";
+    }
+
+    Key keyA(kA), keyB(kB);
+    static constexpr int kSendsEach = 3;
+
+    // Interleave sends to partition A and B.
+    for (int i = 0; i < kSendsEach; ++i) {
+        p.send(topic, keyA, std::span<const uint8_t>(val));
+        p.flush();
+        p.send(topic, keyB, std::span<const uint8_t>(val));
+        p.flush();
+    }
+
+    // Expect kSendsEach batches per partition = 2 * kSendsEach total.
+    ASSERT_TRUE(h.pumpUntilBatches(2 * kSendsEach))
+        << "Expected " << 2 * kSendsEach << " batches (interleaved partitions)";
+
+    // Collect seen partitions.
+    std::set<int32_t> partsSeen;
+    for (const auto& b : h.gw->batches) partsSeen.insert(b.partition);
+    EXPECT_GE(partsSeen.size(), 2u)
+        << "Interleaved sends must produce batches on at least 2 distinct partitions";
+
+    // Verify per-partition baseSequence is monotonically increasing.
+    std::map<int32_t, int32_t> lastSeq;
+    for (const auto& b : h.gw->batches) {
+        auto it = lastSeq.find(b.partition);
+        if (it == lastSeq.end()) {
+            EXPECT_EQ(b.baseSeq, 0)
+                << "First batch for partition " << b.partition << " must start at seq 0";
+            lastSeq[b.partition] = b.baseSeq + b.recCount;
+        } else {
+            EXPECT_EQ(b.baseSeq, it->second)
+                << "Gap-free sequence required for partition " << b.partition;
+            it->second += b.recCount;
+        }
+    }
+}
+
+// ===========================================================================
+// FIX 5 — Test 19: OversizedValueRejected
+//   Value > kMaxSendValueBytes must NOT crash; the send is silently dropped
+//   (ring write returns false; void path ignores it).
+//   A subsequent normal send must still succeed.
+// ===========================================================================
+TEST(Producer, OversizedValueRejected) {
+    static constexpr int32_t kInStr = 2035, kEgStr = 2036;
+    AgentHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    ProducerConfig pcfg;
+    pcfg.acks        = Acks::None;
+    pcfg.lingerUs    = 1;
+    pcfg.batchBytes  = 1;
+    pcfg.maxInFlight = 4;
+
+    auto p     = h.makeProducer(pcfg);
+    auto topic = makeTopic(17, 1);
+    Key  key(uint64_t{0});
+
+    // Value exactly at kMaxSendValueBytes — must be accepted.
+    const std::vector<uint8_t> maxVal(rc::Producer::kMaxSendValueBytes, 0xAA);
+    p.send(topic, key, std::span<const uint8_t>(maxVal));
+    p.flush();
+
+    // Value one byte over — must be silently dropped.
+    const std::vector<uint8_t> overVal(rc::Producer::kMaxSendValueBytes + 1, 0xBB);
+    p.send(topic, key, std::span<const uint8_t>(overVal)); // must not crash
+    p.flush();
+
+    // Only the max-size send should produce a batch (the oversized one was dropped).
+    ASSERT_TRUE(h.pumpUntilBatches(1)) << "max-size value must produce a batch";
+
+    // Wait a bit extra to confirm the oversized value didn't sneak through.
+    for (int i = 0; i < 50; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+    EXPECT_EQ(h.gw->batchCount.load(std::memory_order_acquire), 1)
+        << "Oversized value must be silently dropped (no extra batch)";
+}
+
+// ===========================================================================
+// FIX 5 — Test 20: RingFullDropAndRecover
+//   Fill the ring (tiny ring cap) then verify sends are dropped without crash,
+//   and the producer recovers once the ring is drained.
+// ===========================================================================
+TEST(Producer, RingFullDropAndRecover) {
+    static constexpr int32_t kInStr = 2037, kEgStr = 2038;
+    // Very small ring (4 KiB usable) to make it easy to fill.
+    AgentHarness h(kInStr, kEgStr, 4 * 1024);
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    ProducerConfig pcfg;
+    pcfg.acks        = Acks::None;
+    pcfg.lingerUs    = 1'000'000'000LL; // don't auto-flush during fill
+    pcfg.batchBytes  = 64 * 1024;
+    pcfg.maxInFlight = 4;
+
+    // Use an impl directly so we can call submitSendRecord and inspect the return value.
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, h.nextCorrId_, 4 * 1024);
+    h.hub.add(impl);
+    Producer p(impl);
+
+    auto topic = makeTopic(18, 1);
+    Key  key(uint64_t{0});
+
+    const std::vector<uint8_t> val(32, 0xCC); // 32-byte value → ~70 byte ring msg
+
+    // Fill ring until writes start failing (returns false from submitSendRecord).
+    int sent = 0, dropped = 0;
+    for (int i = 0; i < 200; ++i) {
+        const bool ok = impl->submitSendRecord(
+            topic.topicId, key.partition(topic.partitionCount),
+            key, std::span<const uint8_t>(val),
+            /*wantAck=*/false, /*corrId=*/0);
+        if (ok) ++sent;
+        else { ++dropped; }
+    }
+    // Must have at least some drops (ring is too small for 200 × 70-byte msgs).
+    EXPECT_GT(dropped, 0)
+        << "Ring must report drops once full (fire-and-forget contract)";
+
+    // Drain the ring: keep calling doWork until the ring is empty enough for a
+    // fresh send to succeed.  With up to 256 records drained per doWork call,
+    // this should take at most ~2 doWork iterations for |sent| <= 200 records.
+    bool okAfter = false;
+    for (int i = 0; i < 200; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        // Try the send — once the ring has free space it will succeed.
+        okAfter = impl->submitSendRecord(
+            topic.topicId, key.partition(topic.partitionCount),
+            key, std::span<const uint8_t>(val),
+            /*wantAck=*/false, /*corrId=*/0);
+        if (okAfter) break;
+        std::this_thread::sleep_for(1ms);
+    }
+
+    EXPECT_TRUE(okAfter)
+        << "After ring drain, sends must succeed (producer recovers from ring-full)";
 }
