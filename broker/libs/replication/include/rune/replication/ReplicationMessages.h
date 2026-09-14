@@ -248,8 +248,17 @@ struct FetchResponseMsg {
     /// Decode FetchResponse from buf[offset].
     /// FetchResponseMsg::records is a zero-copy view into buf — caller must
     /// keep buf alive while using the returned msg.
+    ///
+    /// \param fragmentSize  Total bytes of the frame available starting at
+    ///                      buf[offset].  Pass SIZE_MAX (default) to skip the
+    ///                      bounds check (backward compat).  Pass the actual
+    ///                      fragment length to clamp the records span — prevents
+    ///                      an OOB span read when the records length prefix
+    ///                      claims more bytes than the fragment actually holds
+    ///                      (malformed or truncated frame).
     static FetchResponseMsg decode(const uint8_t* buf,
-                                   std::size_t offset) noexcept
+                                   std::size_t offset,
+                                   std::size_t fragmentSize = SIZE_MAX) noexcept
     {
         const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
         FetchResponseMsg m{};
@@ -261,9 +270,27 @@ struct FetchResponseMsg {
 
         const uint8_t* vp = p + BLOCK_LENGTH_FIXED;
         int32_t len = detail::read_le<int32_t>(vp);
-        m.records = std::span<const uint8_t>{
-            vp + VAR_HEADER_SIZE,
-            static_cast<std::size_t>(len < 0 ? 0 : len)};
+
+        // Bound-check: clamp the records span to the actual bytes available in
+        // the fragment.  kFixedEnd = bytes consumed before the records payload.
+        static constexpr std::size_t kFixedEnd =
+            ReplicationMessageHeader::ENCODED_SIZE +
+            BLOCK_LENGTH_FIXED +
+            VAR_HEADER_SIZE;
+        std::size_t maxAvail = (fragmentSize != SIZE_MAX && fragmentSize >= kFixedEnd)
+            ? (fragmentSize - kFixedEnd)
+            : SIZE_MAX;
+
+        std::size_t safeLen;
+        if (len < 0) {
+            safeLen = 0;
+        } else if (maxAvail != SIZE_MAX && static_cast<std::size_t>(len) > maxAvail) {
+            safeLen = maxAvail;
+        } else {
+            safeLen = static_cast<std::size_t>(len);
+        }
+
+        m.records = std::span<const uint8_t>{vp + VAR_HEADER_SIZE, safeLen};
         return m;
     }
 };

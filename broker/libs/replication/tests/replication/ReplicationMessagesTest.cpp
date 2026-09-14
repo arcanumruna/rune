@@ -384,3 +384,59 @@ TEST(ReplicationMessages, PeekDistinguishesTemplates) {
     EXPECT_EQ(tReq,  static_cast<uint16_t>(FetchRequestMsg::TEMPLATE_ID));
     EXPECT_EQ(tResp, static_cast<uint16_t>(FetchResponseMsg::TEMPLATE_ID));
 }
+
+// ============================================================================
+// FetchResponse decode bounds-check (fragmentSize parameter)
+// ============================================================================
+
+TEST(FetchResponseDecode, BoundsCheckClampsMalformedLength) {
+    // Encode a legitimate FetchResponse with 10 bytes of records.
+    std::vector<uint8_t> buf(256, 0);
+    std::vector<uint8_t> records(10, 0xAB);
+    std::size_t written = FetchResponseMsg::encode(
+        buf.data(), 0,
+        /*leaderEpoch=*/1LL, /*partition=*/0,
+        /*highWatermark=*/5LL, /*logStartOffset=*/0LL,
+        /*errorCode=*/0,
+        std::span<const uint8_t>(records.data(), records.size()));
+
+    // Artificially shorten the fragment by 5 bytes so the actual available
+    // records space is 5 bytes, not 10.  decode() with fragmentSize=written-5
+    // must clamp the span to 5 bytes.
+    FetchResponseMsg m = FetchResponseMsg::decode(buf.data(), 0, written - 5);
+    EXPECT_LE(m.records.size(), 5u)
+        << "decode must not return a span beyond the available fragment bytes";
+
+    // With no fragmentSize (SIZE_MAX), the full 10 bytes are returned.
+    FetchResponseMsg m2 = FetchResponseMsg::decode(buf.data(), 0);
+    EXPECT_EQ(m2.records.size(), 10u);
+}
+
+TEST(FetchResponseDecode, BoundsCheckNegativeLengthClampsToZero) {
+    // Encode an empty FetchResponse, then corrupt the length prefix to -1.
+    std::vector<uint8_t> buf(128, 0);
+    FetchResponseMsg::encode(buf.data(), 0, 1LL, 0, 0LL, 0LL, 0, {});
+    // Corrupt the int32 length prefix at offset 42 (8 header + 30 fixed + 4 len prefix - 4 = 38... actually at offset kFixed)
+    // Header(8) + BLOCK_LENGTH_FIXED(30) = 38; length prefix at buf[38].
+    constexpr std::size_t kLenOff =
+        ReplicationMessageHeader::ENCODED_SIZE + FetchResponseMsg::BLOCK_LENGTH_FIXED;
+    // Write -1 as little-endian int32.
+    buf[kLenOff + 0] = 0xFF; buf[kLenOff + 1] = 0xFF;
+    buf[kLenOff + 2] = 0xFF; buf[kLenOff + 3] = 0xFF;
+
+    FetchResponseMsg m = FetchResponseMsg::decode(buf.data(), 0, 42u);
+    EXPECT_EQ(m.records.size(), 0u) << "negative length prefix must decode to empty span";
+}
+
+TEST(FetchResponseDecode, BoundsCheckExactFitReturnsFullRecords) {
+    // Encode 10 bytes; pass exact fragmentSize → returns all 10.
+    std::vector<uint8_t> buf(256, 0);
+    std::vector<uint8_t> records(10, 0xCD);
+    std::size_t written = FetchResponseMsg::encode(
+        buf.data(), 0, 1LL, 0, 0LL, 0LL, 0,
+        std::span<const uint8_t>(records.data(), records.size()));
+
+    FetchResponseMsg m = FetchResponseMsg::decode(buf.data(), 0, written);
+    EXPECT_EQ(m.records.size(), 10u);
+    for (auto b : m.records) EXPECT_EQ(b, 0xCD);
+}

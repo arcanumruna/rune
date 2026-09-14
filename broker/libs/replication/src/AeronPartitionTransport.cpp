@@ -199,7 +199,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             spdlog::trace("AeronPartitionTransport: FetchRequest truncated ({} bytes)", len);
             return;
         }
-        const FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
+        FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
 
         // Route to the replica owning this partition.
         auto it = replicas_.find(req.partition);
@@ -207,6 +207,32 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             spdlog::trace("AeronPartitionTransport: FetchRequest for unknown partition={}", req.partition);
             return;
         }
+
+        // GR-1 fix: cap req.maxBytes to the deliverable ceiling for this follower.
+        //
+        // The leader reads up to req.maxBytes from the log and encodes them into
+        // a single FetchResponse.  Aeron's offer() throws IllegalArgumentException
+        // if the message exceeds pub.maxMessageLength() = termLength/8.  With the
+        // production 64 KiB term this is 8192 bytes; uncapped responses of up to
+        // 1 MiB would throw on every send and livelock the follower at LEO=0.
+        //
+        // kFetchResponseOverhead = SBE header(8) + fixed block(30) + len-prefix(4) = 42
+        // bytes of framing that are always present; the remaining budget is for records.
+        static constexpr int32_t kFetchResponseOverhead =
+            static_cast<int32_t>(ReplicationMessageHeader::ENCODED_SIZE) +
+            static_cast<int32_t>(FetchResponseMsg::BLOCK_LENGTH_FIXED) +
+            static_cast<int32_t>(FetchResponseMsg::VAR_HEADER_SIZE);
+
+        auto* followerPeer = findPeer(req.followerId);
+        if (followerPeer && followerPeer->pub) {
+            int32_t ceiling = static_cast<int32_t>(followerPeer->pub->maxMessageLength())
+                              - kFetchResponseOverhead;
+            if (ceiling < 0) ceiling = 0;
+            if (req.maxBytes > ceiling) {
+                req.maxBytes = ceiling;
+            }
+        }
+
         it->second->onFetchRequest(req, nowNs_);
 
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
@@ -223,7 +249,9 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // which lives in the Aeron term buffer for the duration of this callback.
         // We call applyReplicated() synchronously within the callback, so the
         // span is valid.  applyReplicated() copies the bytes into the local Log.
-        const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0);
+        // Pass `len` so decode() can clamp the records span against the actual
+        // fragment size (defence against malformed length prefix).
+        const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
 
         auto it = replicas_.find(resp.partition);
         if (it == replicas_.end() || it->second == nullptr) {
@@ -269,6 +297,25 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
                                          const uint8_t*               buf,
                                          std::size_t                  len)
 {
+    // Defence-in-depth: NEVER let offer() throw IllegalArgumentException on an
+    // oversized frame.  After fixes (1)+(3) this branch must never be reached in
+    // normal operation — req.maxBytes is capped to the deliverable ceiling before
+    // onFetchRequest() reads the log, and the whole-batch alignment in
+    // onFetchRequest() ensures the encoded response stays within that ceiling.
+    // If somehow it fires, DROP + warn (the follower will retry on next fetch).
+    //
+    // Note: a single very large RecordBatch (e.g. value field close to INT16_MAX)
+    // could still exceed maxMessageLength with the production 64 KiB term
+    // (maxMessageLength = 8192).  In that case the replication term must be sized
+    // to accommodate the largest possible batch.  The guard here prevents a crash
+    // regardless — the batch simply cannot be replicated until the term is resized.
+    if (len > static_cast<std::size_t>(pub.maxMessageLength())) {
+        spdlog::warn("AeronPartitionTransport::sendOnPub: drop oversized frame "
+                     "len={} maxMessageLength={} — fetch ceiling not applied correctly",
+                     len, pub.maxMessageLength());
+        return false;
+    }
+
     auto* mutableBuf = const_cast<uint8_t*>(buf);
     aeron::concurrent::AtomicBuffer atomicBuf(
         mutableBuf, static_cast<aeron::util::index_t>(len));

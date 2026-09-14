@@ -313,3 +313,170 @@ TEST(AeronPartitionTransportInteg, FetchLoop_TwoNodes) {
     EXPECT_GE(leaderReplica.highWatermark(), targetLeo)
         << "Leader HW did not advance to LEO (follower must have acknowledged)";
 }
+
+// ===========================================================================
+// TEST: large-backlog convergence — GR-1 regression test
+//
+// Leader pre-loads ≥500 batches (each 100-byte payload → ~173 bytes on-disk
+// after RecordBatch framing), totalling ~86,500 bytes — well over the
+// production 64 KiB term's maxMessageLength of 8192 bytes.
+//
+// Pre-fix: AeronPartitionTransport::sendOnPub called offer() with a
+//   FetchResponse of up to 1 MiB → offer() throws IllegalArgumentException →
+//   duty-cycle thread crash → follower LEO stays 0 forever (livelock).
+//
+// Post-fix: req.maxBytes is capped to maxMessageLength - 42 = 8150 bytes
+//   before onFetchRequest reads the log, and whole-batch alignment ensures the
+//   encoded response never exceeds 8150 bytes.  The follower drains the
+//   ~86,500-byte backlog across ~11 fetches and fully converges.
+//
+// This test uses the PRODUCTION 64 KiB term (same as BrokerNode) to prove
+// the fix works at the real production ceiling, not a padded configuration.
+// ===========================================================================
+TEST(AeronPartitionTransportInteg, FetchLoop_LargeBacklog) {
+    // -----------------------------------------------------------------------
+    // 0.  Temp dirs + embedded media driver (production 64 KiB term)
+    // -----------------------------------------------------------------------
+    TempDir driverTd("rune_repl_large_driver_");
+    std::string driverDir = (driverTd.dir / "aeron").string();
+
+    const uint16_t portLeader   = discoverFreeUdpPort();
+    const uint16_t portFollower = discoverFreeUdpPort();
+    ASSERT_NE(portLeader, portFollower) << "Port collision — retry";
+
+    const std::string chanLeader   = udpChannel(portLeader);
+    const std::string chanFollower = udpChannel(portFollower);
+    constexpr int32_t kReplStream  = 501;
+
+    // Production-identical: 64 KiB term → maxMessageLength = 8192 bytes.
+    // The fix must drain 500 batches across multiple fetches without ever
+    // attempting a send > 8192 bytes.
+    EmbeddedMediaDriver driver(driverDir);
+
+    // -----------------------------------------------------------------------
+    // 1.  Shared Aeron client
+    // -----------------------------------------------------------------------
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    aeronCtx.errorHandler([](const std::exception& e) {
+        fprintf(stderr, "[AeronPartitionTransportInteg/LargeBacklog] Aeron error: %s\n",
+                e.what());
+    });
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    // -----------------------------------------------------------------------
+    // 2.  Log storage
+    // -----------------------------------------------------------------------
+    TempDir logDirLeader("ldr_large");
+    TempDir logDirFollower("flw_large");
+    rune::storage::Log ldrLog(logDirLeader.dir.string());
+    rune::storage::Log flwLog(logDirFollower.dir.string());
+
+    // -----------------------------------------------------------------------
+    // 3.  AeronPartitionTransports
+    // -----------------------------------------------------------------------
+    constexpr NodeId kLeaderId   = 3;
+    constexpr NodeId kFollowerId = 4;
+    constexpr PartitionId kPid   = 1;
+
+    auto ldrTransport = std::make_unique<AeronPartitionTransport>(
+        aeronClient, chanLeader, kReplStream, kLeaderId);
+    ldrTransport->addPeer(kFollowerId, chanFollower, kReplStream);
+
+    auto flwTransport = std::make_unique<AeronPartitionTransport>(
+        aeronClient, chanFollower, kReplStream, kFollowerId);
+    flwTransport->addPeer(kLeaderId, chanLeader, kReplStream);
+
+    // -----------------------------------------------------------------------
+    // 4.  PartitionReplicas
+    // -----------------------------------------------------------------------
+    std::vector<NodeId> nodes = {kLeaderId, kFollowerId};
+    std::vector<NodeId> isr   = {kLeaderId, kFollowerId};
+
+    PartitionReplica leaderReplica(makeConfig(kLeaderId, kPid),
+                                   Role::Leader, 1, nodes, isr,
+                                   &ldrLog, ldrTransport.get());
+    PartitionReplica followerReplica(makeConfig(kFollowerId, kPid),
+                                     Role::Follower, 1, nodes, isr,
+                                     &flwLog, flwTransport.get());
+
+    ldrTransport->registerReplica(kPid, &leaderReplica);
+    flwTransport->registerReplica(kPid, &followerReplica);
+
+    // -----------------------------------------------------------------------
+    // 5.  Leader: append 500 batches BEFORE the drive loop.
+    //
+    //   Each payload = 100 bytes.
+    //   On-disk size per batch ≈ 61 (header) + ~12 (varint overhead) + 100 = ~173 bytes.
+    //   Total backlog ≈ 500 × 173 = ~86,500 bytes.
+    //
+    //   With production 64 KiB term (maxMessageLength = 8192):
+    //     ceiling per fetch = 8192 - 42 (FetchResponse overhead) = 8150 bytes
+    //     batches per fetch ≈ 8150 / 173 ≈ 47 batches/fetch
+    //     fetches needed to drain ≈ 500 / 47 ≈ 11 fetches (multi-fetch drain).
+    //
+    //   Pre-fix: offer() throws on first fetch (437 KB response) → livelock.
+    //   Post-fix: drains in ~11 fetches → convergence.
+    // -----------------------------------------------------------------------
+    constexpr int kNumBatches = 500;
+    Offset targetLeo = -1;
+    for (int i = 0; i < kNumBatches; ++i) {
+        std::vector<uint8_t> payload(100, static_cast<uint8_t>(i & 0xFF));
+        Offset off = leaderReplica.append(payload);
+        ASSERT_GE(off, 0) << "Leader append failed at batch " << i;
+        targetLeo = leaderReplica.logEndOffset();
+    }
+    ASSERT_GT(targetLeo, 0);
+    ASSERT_GE(targetLeo, static_cast<Offset>(kNumBatches))
+        << "Leader LEO must be ≥ " << kNumBatches << " (one offset per batch)";
+
+    // -----------------------------------------------------------------------
+    // 6.  Duty-cycle: drive until convergence (hard 30 s wall-clock deadline).
+    //
+    //   With 5 ms fetch interval and ~11 fetches needed:
+    //     minimum wall-clock time ≈ 11 × 5 ms = 55 ms.
+    //   Budget of 30 s is generous (allows for CI slow-down).
+    // -----------------------------------------------------------------------
+    using Wall = std::chrono::steady_clock;
+    const auto deadline = Wall::now() + seconds{30};
+
+    bool converged = false;
+    int64_t simNs = 0;
+    constexpr int64_t kStepNs = 5'000'000LL; // 5 ms simulated clock step
+
+    while (Wall::now() < deadline) {
+        simNs += kStepNs;
+
+        ldrTransport->poll(simNs);
+        flwTransport->poll(simNs);
+
+        leaderReplica.doWork(simNs);
+        followerReplica.doWork(simNs);
+
+        if (followerReplica.logEndOffset() >= targetLeo &&
+            leaderReplica.highWatermark() >= targetLeo) {
+            converged = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(milliseconds{1});
+    }
+
+    // -----------------------------------------------------------------------
+    // 7.  Assertions
+    // -----------------------------------------------------------------------
+    ASSERT_TRUE(converged)
+        << "Large-backlog replication did not converge within 30 s.\n"
+        << "  Follower LEO=" << followerReplica.logEndOffset()
+        << "  targetLeo="   << targetLeo
+        << "  leaderHW="    << leaderReplica.highWatermark()
+        << "\n  unresolvedPeerCount(ldr)=" << ldrTransport->unresolvedPeerCount()
+        << "  unresolvedPeerCount(flw)="   << flwTransport->unresolvedPeerCount()
+        << "\n  Pre-fix: offer() would throw on any response > 8192 bytes and"
+           " the follower LEO would stay 0 forever.";
+
+    EXPECT_GE(followerReplica.logEndOffset(), targetLeo)
+        << "Follower LEO did not reach leader LEO";
+    EXPECT_GE(leaderReplica.highWatermark(), targetLeo)
+        << "Leader HW did not advance to LEO";
+}

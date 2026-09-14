@@ -295,6 +295,36 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     std::vector<uint8_t> logBytes;
     if (req.maxBytes > 0 && req.fetchOffset < log_->logEndOffset()) {
         logBytes = log_->read(req.fetchOffset, req.maxBytes);
+
+        // GR-1 fix: whole-batch alignment.
+        //
+        // Walk the returned bytes with RecordBatchReader and truncate to the
+        // largest whole-batch prefix that does NOT exceed req.maxBytes.
+        // This ensures the encoded FetchResponse fits within the Aeron
+        // publication's maxMessageLength (callers cap req.maxBytes to
+        // pub.maxMessageLength() - kFetchResponseOverhead before calling us).
+        // Without this, a partial-batch tail could push the encoded response
+        // over the transport ceiling, causing offer() to throw.
+        if (!logBytes.empty()) {
+            const std::size_t cap = static_cast<std::size_t>(req.maxBytes);
+            std::size_t pos = 0;
+            std::size_t committedEnd = 0;
+            while (pos < logBytes.size()) {
+                std::size_t rem = logBytes.size() - pos;
+                if (rem < static_cast<std::size_t>(
+                        rune::protocol::batch::kRecordBatchOverhead)) break;
+                rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
+                int32_t total = r.totalLength();
+                if (total <= 0) break;
+                std::size_t nextEnd = pos + static_cast<std::size_t>(total);
+                if (nextEnd > logBytes.size()) break;
+                // Stop before a batch that would push the byte count over cap.
+                if (nextEnd > cap) break;
+                committedEnd = nextEnd;
+                pos = committedEnd;
+            }
+            logBytes.resize(committedEnd);
+        }
     }
 
     FetchResponseMsg::encode(

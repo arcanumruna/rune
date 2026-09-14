@@ -2806,3 +2806,93 @@ TEST(NB3_CommittedReadClamp, SingleRecordBatchBehaviorUnchanged)
     // read at HW returns empty.
     EXPECT_TRUE(leader.read(5, 1 << 20).empty()) << "NB3-single: read at HW returns empty";
 }
+
+// ---------------------------------------------------------------------------
+// GR-1 regression: onFetchRequest must clamp records to whole-batch boundary
+// within req.maxBytes.  Before the fix, it returned whatever log_->read()
+// returned (could exceed maxBytes if batches straddle the byte ceiling), meaning
+// a transport with a small maxMessageLength would drop the response every time.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaTest, OnFetchRequest_WholeBatchAlignment) {
+    // Create a leader with 10 appended batches (~87 bytes each after framing).
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_align_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    // Capture transport: records the size of the last FetchResponse records blob.
+    struct CaptureTransport : public PartitionTransport {
+        std::size_t lastResponseRecordsSize = SIZE_MAX;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+            lastResponseRecordsSize = r.records.size();
+        }
+    };
+
+    rune::storage::Log log(logDir.string());
+    CaptureTransport transport;
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 5000;
+    cfg.replicaLagMaxOffset = 100000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;
+
+    PartitionReplica leader(cfg, Role::Leader, 1,
+                            {1, 2}, {1, 2}, &log, &transport);
+
+    // Append 10 small batches (20-byte payload → ~87 bytes per batch after framing).
+    for (int i = 0; i < 10; ++i) {
+        std::vector<uint8_t> payload(20, static_cast<uint8_t>(i));
+        ASSERT_GE(leader.append(payload), 0) << "append failed at batch " << i;
+    }
+
+    // Issue a fetch with maxBytes = 200.
+    // With ~87-byte batches: 2 complete batches = ~174 bytes; 3 would be ~261 bytes.
+    // Whole-batch alignment must return exactly 2 complete batches (≤ 200 bytes).
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1;
+    req.partition   = 0;
+    req.followerId  = 2;
+    req.fetchOffset = 0;
+    req.maxBytes    = 200;
+
+    leader.onFetchRequest(req, 0);
+
+    // Response records blob must be ≤ 200 bytes (the ceiling) and > 0.
+    ASSERT_NE(transport.lastResponseRecordsSize, SIZE_MAX)
+        << "transport.sendFetchResponse was never called";
+    EXPECT_LE(transport.lastResponseRecordsSize, 200u)
+        << "records blob must not exceed maxBytes ceiling";
+    EXPECT_GT(transport.lastResponseRecordsSize, 0u)
+        << "at least one batch must fit within the 200-byte ceiling";
+
+    // Also verify the response is a whole-batch sequence: parse with RecordBatchReader
+    // and confirm the walk covers the full returned blob with no partial batch at end.
+    // (We re-issue the same request and capture raw records for inspection.)
+    // The transport captures only the size; confirm it's a multiple of the actual
+    // batch size by ensuring log_->read(0, 200) returns the same trimmed result.
+    std::vector<uint8_t> logBytes = log.read(0, 200);
+    // Walk to find how many whole batches fit in ≤ 200 bytes.
+    std::size_t pos = 0, committedEnd = 0;
+    while (pos < logBytes.size()) {
+        std::size_t rem = logBytes.size() - pos;
+        if (rem < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) break;
+        rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
+        int32_t total = r.totalLength();
+        if (total <= 0) break;
+        std::size_t nextEnd = pos + static_cast<std::size_t>(total);
+        if (nextEnd > logBytes.size()) break;
+        if (nextEnd > 200u) break;
+        committedEnd = nextEnd;
+        pos = committedEnd;
+    }
+    EXPECT_EQ(transport.lastResponseRecordsSize, committedEnd)
+        << "transport got a whole-batch-aligned slice matching " << committedEnd << " bytes";
+
+    std::filesystem::remove_all(logDir);
+}
