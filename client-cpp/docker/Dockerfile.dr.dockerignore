@@ -1,0 +1,38 @@
+# Per-Dockerfile ignore for Dockerfile.data (rune_produce_subscribe E2E example).
+# Keep build context small + exclude the host build trees (a leaked host
+# CMakeCache.txt breaks the in-image cmake configure).
+
+# Build outputs (large; a leaked host build/ CMakeCache aborts the container build)
+build/
+build_release/
+cov/
+cmake-build-debug/
+cmake-build-release/
+conan-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Tests and benchmarks (not built in the data example image)
+tests/
+benchmark/
+bench/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md
