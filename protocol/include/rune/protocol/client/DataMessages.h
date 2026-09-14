@@ -14,23 +14,27 @@ namespace rune::protocol::client {
 //
 // Frame layout (all little-endian):
 //   [0..23]   MessageHeader (24 bytes)
-//     blockLength = BODY_FIXED (9)
+//     blockLength = BODY_FIXED (10)
 //     templateId  = 16
 //   [24..27]  topicId        : int32
 //   [28..31]  partition      : int32   (used when partitionKnown==1; else ignore)
 //   [32]      partitionKnown : uint8   (1 => use partition; 0 => broker resolves from key)
-//   BODY_FIXED = 9, so var fields start at offset 33 (header 24 + 9)
-//   [33..34]  key length     : uint16  (var prefix; may be 0 when partitionKnown==1)
-//   [35..]    key bytes
-//   [35+keyLen..36+keyLen]  recordBatch length : uint16  (var prefix)
-//   [37+keyLen..]           recordBatch bytes   (opaque — never parsed by the codec)
+//   [33]      acks           : uint8   (0 = Leader/None, 1 = All — GR-5)
+//   BODY_FIXED = 10, so var fields start at offset 34 (header 24 + 10)
+//   [34..35]  key length     : uint16  (var prefix; may be 0 when partitionKnown==1)
+//   [36..]    key bytes
+//   [36+keyLen..37+keyLen]  recordBatch length : uint16  (var prefix)
+//   [38+keyLen..]           recordBatch bytes   (opaque — never parsed by the codec)
+//
+// Backward compatibility: old clients (BODY_FIXED==9) omit the acks byte.
+// The decoder accepts both: if the frame only carries 9 fixed bytes, acks defaults to 0.
 //
 // Note: the u16 length prefix caps a single var field at 65535 bytes.
 // Producing batches larger than 65535 bytes requires multi-frame framing,
 // which is deferred to a later milestone.
 //
-// Total = 24 + 9 + 2 + key.size() + 2 + recordBatch.size()
-//       = 37 + key.size() + recordBatch.size()
+// Total = 24 + 10 + 2 + key.size() + 2 + recordBatch.size()
+//       = 38 + key.size() + recordBatch.size()
 // ---------------------------------------------------------------------------
 struct Produce {
     int64_t  sessionId      = 0;
@@ -38,11 +42,13 @@ struct Produce {
     int32_t  topicId        = 0;
     int32_t  partition      = 0;
     uint8_t  partitionKnown = 0;   // 1 => explicit partition; 0 => resolve from key
+    uint8_t  acks           = 0;   // 0 = Leader/None (immediate ack), 1 = All (deferred until ISR HW)
     std::span<const uint8_t> key;          // zero-copy view; may be empty
     std::span<const uint8_t> recordBatch;  // opaque blob; zero-copy view
 
-    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Produce); // 16
-    static constexpr uint16_t BODY_FIXED  = 9;  // topicId(4) + partition(4) + partitionKnown(1)
+    static constexpr uint16_t TEMPLATE_ID   = static_cast<uint16_t>(TemplateId::Produce); // 16
+    static constexpr uint16_t BODY_FIXED    = 10; // topicId(4) + partition(4) + partitionKnown(1) + acks(1)
+    static constexpr uint16_t BODY_FIXED_V0 = 9;  // old clients without the acks byte
 
     /// Total encoded size accounting for the two var fields.
     /// key and recordBatch are each capped at 65535 bytes by the u16 prefix.
@@ -69,6 +75,7 @@ struct Produce {
         detail::putLE32(buf, fixedBase + 0, topicId);
         detail::putLE32(buf, fixedBase + 4, partition);
         buf[fixedBase + 8] = partitionKnown;
+        buf[fixedBase + 9] = acks;
 
         std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
 
@@ -88,6 +95,7 @@ struct Produce {
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
     /// The returned spans are zero-copy views into buf — buf must outlive the result.
+    /// Backward compat: accepts both BODY_FIXED==9 (old, acks=0) and BODY_FIXED==10 (new).
     static std::optional<Produce> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -95,8 +103,13 @@ struct Produce {
         if (hdr.schemaId   != kSchemaId)   return std::nullopt;
         if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
 
+        // Accept both v0 (BODY_FIXED=9, no acks byte) and v1 (BODY_FIXED=10).
+        // The blockLength in the header tells us which variant the sender used.
+        const uint16_t declaredFixed = hdr.blockLength;
+        if (declaredFixed < BODY_FIXED_V0) return std::nullopt; // too short
+        if (avail < MessageHeader::ENCODED_SIZE + declaredFixed) return std::nullopt;
+
         constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
-        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
 
         Produce msg;
         msg.sessionId      = hdr.sessionId;
@@ -104,8 +117,11 @@ struct Produce {
         msg.topicId        = detail::getLE32(buf, static_cast<int>(fixedBase) + 0);
         msg.partition      = detail::getLE32(buf, static_cast<int>(fixedBase) + 4);
         msg.partitionKnown = buf[fixedBase + 8];
+        // acks field only present in v1 (declaredFixed >= 10)
+        msg.acks = (declaredFixed >= BODY_FIXED) ? buf[fixedBase + 9] : uint8_t{0};
 
-        std::size_t pos = fixedBase + BODY_FIXED;
+        // Var fields start after the declared fixed block (forward-compat: skip unknown fields).
+        std::size_t pos = fixedBase + declaredFixed;
 
         // key var field
         const uint8_t* keyData = nullptr;

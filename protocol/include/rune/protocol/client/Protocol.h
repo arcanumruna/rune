@@ -33,6 +33,7 @@ enum class ErrorCode : uint16_t {
     UnknownTopic         = 7,
     UnknownPartition     = 8,
     NotPartitionLeader   = 9,
+    MinIsrViolation      = 10,  // acks=All rejected — ISR below minIsr
 };
 
 } // namespace rune::protocol::client
