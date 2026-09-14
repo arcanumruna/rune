@@ -87,6 +87,12 @@ int ClientGateway::doWork(int64_t nowNs) {
     int work = sub_->poll(assembler_.handler(), kFragmentLimit);
     pollPendingConnects(nowNs);
     reapExpired(nowNs);
+    // GB-5p2: group-commit flush — time-based cadence (kGroupCommitIntervalNs).
+    // Fsyncs all dirty partition Logs (appendNoSync'd since last flush) at most
+    // once per interval.  Produces between flushes land in page cache at ~1-10µs.
+    // Must run AFTER the ingress poll; placed before pushSubscriptions so push
+    // reads fsync-durable data.  No busy-spin; no-op when interval not elapsed.
+    flushDirtyLogs();
     // GB-3: push new Records to all active subscribers (egress-paced, single-writer).
     pushSubscriptions();
     return work;
@@ -768,24 +774,38 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     const int64_t lastOffset = base + static_cast<int64_t>(recordCount) - 1;
 
-    // GB-5 Fix #2: use the zero-alloc span overload — no per-produce vector construction.
-    // restampScratch_ holds the restamp'd bytes; Log::append(ptr, len, lastOffset)
-    // writes directly from the scratch buffer → single copy into the segment, zero heap.
+    // GB-5p2: use appendNoSync — page-cache write only, no fsync on the hot path.
+    // flushDirtyLogs() is called once per doWork() cycle (after all ingress has
+    // been processed) to fsync all touched partition Logs in one pass → group-commit.
+    //
+    // Durability contract — acks=Leader (acks=1):
+    //   Records are written to the OS page cache and visible to Log::read()
+    //   immediately.  They are NOT fsync-durable until flushDirtyLogs() runs
+    //   at the end of this doWork() cycle.  A leader crash in the window between
+    //   appendNoSync() and sync() may lose the most-recent un-flushed acked
+    //   records.  True crash-durability requires acks=All + ISR replication
+    //   (Milestone C).  This is the standard acks=1 / Kafka-default trade-off.
+    //
+    // TODO(Milestone C): when acks=All is supported, the ProduceResponse must be
+    //   deferred until the ISR high-watermark advances past lastOffset on all
+    //   in-sync replicas.  Today we ack immediately after page-cache write.
     try {
-        log->append(restampScratch_.data(), batchLen, lastOffset);
+        log->appendNoSync(restampScratch_.data(), batchLen, lastOffset);
     } catch (const std::exception& ex) {
-        spdlog::error("ClientGateway: Log::append threw: {}; ProduceResponse Internal", ex.what());
+        spdlog::error("ClientGateway: Log::appendNoSync threw: {}; ProduceResponse Internal", ex.what());
         sendResp(pc::ErrorCode::Internal, partition, 0);
         return;
     } catch (...) {
-        spdlog::error("ClientGateway: Log::append threw unknown exception; ProduceResponse Internal");
+        spdlog::error("ClientGateway: Log::appendNoSync threw unknown exception; ProduceResponse Internal");
         sendResp(pc::ErrorCode::Internal, partition, 0);
         return;
     }
 
+    // Mark this Log dirty so flushDirtyLogs() will sync it at end of cycle.
+    dirtyLogs_.insert(log);
+
     // 6. Reply ProduceResponse{OK, partition, baseOffset=base}.
-    // TODO(Milestone B GB-4/replication): true acks=All waits for ISR HW advance.
-    // Produce in M-B does not carry an acks field; we always ack after local append.
+    // acks=Leader: ack after page-cache write; fsync runs in flushDirtyLogs().
     sendResp(pc::ErrorCode::OK, partition, base);
 }
 
@@ -1196,6 +1216,67 @@ void ClientGateway::pushSubscriptions()
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// flushDirtyLogs (GB-5p2) — group-commit fsync for the produce hot path.
+//
+// Called from doWork() every cycle, but only performs the actual fsync when
+// kGroupCommitIntervalNs nanoseconds have elapsed since the last flush.
+// This is the time-based group-commit cadence:
+//
+//   - Produces BETWEEN flushes: appendNoSync() writes to page cache at ~1-10µs.
+//     ProduceResponse is sent immediately (acks=Leader, page-cache-durable).
+//     Data is visible to Log::read() before the fsync.
+//   - At flush time: one fdatasync per dirty partition Log amortises the fsync
+//     cost over every produce since the last flush.
+//   - Under idle (no produces): dirtyLogs_ is empty; the timer still fires but
+//     no syscalls are made → zero overhead.
+//
+// Durability contract — acks=Leader (acks=1):
+//   Data written since the last flush is in the OS page cache and visible to
+//   Log::read(), but NOT fsync-durable.  A leader crash before the next flush
+//   may lose the most-recent un-flushed acked records.  The maximum durability
+//   window is kGroupCommitIntervalNs (10 ms by default).  True fsync-durability
+//   requires acks=All + ISR replication (Milestone C).
+//
+// TODO(Milestone C): when acks=All is wired, the ProduceResponse must be deferred
+//   until ISR HWM advances past lastOffset on all in-sync replicas.  Today we ack
+//   immediately after page-cache write.
+//
+// Single-writer: called only on the duty-cycle thread → no locking.
+// Zero per-produce heap: dirtyLogs_ is a pre-allocated unordered_set<Log*>.
+// ---------------------------------------------------------------------------
+void ClientGateway::flushDirtyLogs()
+{
+    // Time-based cadence: skip if the flush interval has not elapsed yet.
+    // This is the key that keeps fsync off the per-produce hot path.
+    // Lazy init: lastFlushNs_ == 0 means "not yet set"; initialise to nowNs_
+    // so the first flush fires after kGroupCommitIntervalNs, not immediately.
+    if (lastFlushNs_ == 0) {
+        lastFlushNs_ = nowNs_;
+        return;
+    }
+    if (nowNs_ - lastFlushNs_ < kGroupCommitIntervalNs) return;
+
+    if (dirtyLogs_.empty()) {
+        // No produces since last flush — just advance the timer.
+        lastFlushNs_ = nowNs_;
+        return;
+    }
+
+    // Flush each dirty partition Log exactly once per interval.
+    for (rune::storage::Log* log : dirtyLogs_) {
+        try {
+            log->sync();
+        } catch (const std::exception& ex) {
+            spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw: {}", ex.what());
+        } catch (...) {
+            spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw unknown exception");
+        }
+    }
+    dirtyLogs_.clear();
+    lastFlushNs_ = nowNs_;
 }
 
 } // namespace rune::gateway

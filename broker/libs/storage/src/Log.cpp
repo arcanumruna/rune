@@ -45,6 +45,15 @@ int64_t Log::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
     // Vector overload: kept for API compatibility; delegates to the pointer overload.
     return append(batch.data(), batch.size(), lastOffset);
 }
+int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+    // No-sync group-commit path: write to page cache only; no fsync.
+    // maybeRoll() is still needed to start a fresh segment when the active one
+    // is full; the new segment starts empty (no prior un-flushed data to lose).
+    // The caller (gateway doWork) calls sync() once after the ingress batch.
+    maybeRoll();
+    logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
+    return logEndOffset_;
+}
 std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};

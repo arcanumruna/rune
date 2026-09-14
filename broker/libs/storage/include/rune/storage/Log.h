@@ -19,9 +19,26 @@ public:
     Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024);
     /// Zero-copy span overload — avoids per-call vector construction on the hot path.
     /// Appends [data, data+len) as a batch with the given lastOffset.
+    /// Calls sync() after writing (durable-by-default).
     int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset);
     /// Vector overload (kept for compatibility; delegates to the span overload).
     int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset);
+
+    /// No-sync append — writes to page cache only; does NOT call sync().
+    ///
+    /// Gateway group-commit path: use appendNoSync() for every per-produce
+    /// write, then call sync() once per duty-cycle to amortise the fsync over
+    /// all produces in that cycle.
+    ///
+    /// Durability contract (acks=Leader / acks=1):
+    ///   - Data immediately visible to Log::read() (page cache).
+    ///   - NOT fsync-durable: a leader crash before sync() may lose un-flushed
+    ///     acked records.  True crash-durability = acks=All + ISR replication
+    ///     (Milestone C).
+    ///
+    /// Callers MUST NOT advance the durable ISR high-watermark past an offset
+    /// before sync() has returned for that offset.
+    int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset);
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     int64_t recover();

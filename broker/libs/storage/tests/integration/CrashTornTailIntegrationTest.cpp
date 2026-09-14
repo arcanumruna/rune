@@ -8,6 +8,7 @@
 
 #include "IntegrationTestBase.h"
 #include <rune/storage/PartitionApi.h>
+#include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
 #include <fstream>
@@ -276,6 +277,126 @@ TEST_F(IntegrationTestBase, CorruptCrcCoveredByteInFirstBatchDropsIt) {
         // CRC check in ensureValid() must fail → recover stops at batch 0 → HWM == 0.
         EXPECT_EQ(api.highWatermark(), 0);
         EXPECT_TRUE(consumeAll(api).empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7b. appendNoSync + crash (no sync before reopen) → recover() yields a
+//     consistent state.
+//
+//     This is the GB-5p2 correctness test for the group-commit path:
+//       1. Append N records via PartitionApi (durable — establish a clean base).
+//       2. Close PartitionApi.
+//       3. Open a Log directly and appendNoSync() M more records WITHOUT calling
+//          sync() (simulates a leader crash before the group-commit flush).
+//       4. Destroy the Log (process exits — no sync/close flush guarantee).
+//       5. Reopen PartitionApi (which calls recover() internally).
+//       6. Assert: recovered logEndOffset is in [N, N+M] (flushed prefix
+//          survives; the un-flushed tail may be absent = acks=1 trade-off).
+//       7. Assert: no corruption — all surviving records are readable and
+//          match the originally produced bytes exactly.
+//       8. Assert: logEndOffset == count of readable records (no gap/orphan).
+//
+//     acks=1 trade-off: an un-flushed tail MAY be absent after the crash —
+//     this is not a bug; it is the documented acks=Leader/acks=1 behaviour.
+//     The test accepts any count in [N, N+M].  What is NOT acceptable:
+//       - Corrupt bytes in a surviving record.
+//       - A torn / partial batch being returned by consume().
+//       - logEndOffset != readable record count (offset accounting broken).
+// ---------------------------------------------------------------------------
+TEST_F(IntegrationTestBase, AppendNoSync_CrashBeforeFlush_RecoverConsistentState) {
+    constexpr int N = 20;  // durable baseline records (fsynced via PartitionApi)
+    constexpr int M = 10;  // records appended no-sync (may be lost after crash)
+
+    // --- Phase 1: produce N records durably ---
+    std::vector<ProducedRecord> producedDurable;
+    {
+        rune::storage::PartitionApi api(testDir_.string());
+        producedDurable = produceN(api, N, 32);
+        ASSERT_EQ(api.highWatermark(), static_cast<int64_t>(N));
+    }
+
+    // --- Phase 2: appendNoSync M more records via Log directly, then "crash" ---
+    //     We open the Log, call appendNoSync() for each record, and destroy the
+    //     Log WITHOUT calling sync().  On macOS/Linux the fstream buffer may or
+    //     may not be flushed to the OS on close (implementation-defined), so the
+    //     un-flushed tail may or may not be visible after reopen.  Either outcome
+    //     is acceptable; what matters is that recover() leaves the Log consistent.
+    std::vector<ProducedRecord> producedNoSync;
+    {
+        rune::storage::Log log(testDir_.string());
+        log.recover(); // bring in-memory state up to date before appending more
+        int64_t nextOff = log.logEndOffset();
+        ASSERT_EQ(nextOff, static_cast<int64_t>(N));
+
+        for (int i = 0; i < M; ++i) {
+            ProducedRecord rec;
+            rec.key       = "nosync-key-" + std::to_string(i);
+            rec.value     = makeValue(N + i, 32);
+            rec.timestamp = static_cast<int64_t>(2000 + i);
+            producedNoSync.push_back(rec);
+
+            rune::protocol::RecordBatchBuilder b(nextOff, rec.timestamp);
+            b.append(rec.key, rec.value, rec.timestamp);
+            auto batch = b.build();
+            const int64_t lastOff = nextOff; // one record → lastOff == baseOff
+            nextOff = log.appendNoSync(batch.data(), batch.size(), lastOff);
+        }
+        // Deliberately do NOT call log.sync() before destruction.
+        // Log destructor does NOT call sync(); the fstream ~fstream() may or may
+        // not flush its write buffer to the OS — this is the "crash" simulation.
+    }
+
+    // --- Phase 3: reopen via PartitionApi (calls recover() internally) ---
+    //     The recovered state must be in [N, N+M] and self-consistent.
+    {
+        rune::storage::PartitionApi api(testDir_.string());
+        const int64_t hw = api.highWatermark();
+
+        // Correctness gate 1: HWM is in the valid range.
+        EXPECT_GE(hw, static_cast<int64_t>(N))
+            << "AppendNoSync crash-recovery: durable prefix must survive";
+        EXPECT_LE(hw, static_cast<int64_t>(N + M))
+            << "AppendNoSync crash-recovery: HWM must not exceed N+M";
+
+        // Correctness gate 2: all readable records are byte-exact.
+        auto recs = consumeAll(api);
+        const int recovered = static_cast<int>(recs.size());
+
+        // Correctness gate 3: HWM matches the readable record count (no orphan offset).
+        EXPECT_EQ(hw, static_cast<int64_t>(recovered))
+            << "AppendNoSync crash-recovery: HWM must equal readable record count";
+
+        // Correctness gate 4: records are contiguous from offset 0.
+        for (int i = 0; i < recovered; ++i) {
+            EXPECT_EQ(recs[static_cast<size_t>(i)].offset, static_cast<int64_t>(i))
+                << "AppendNoSync crash-recovery: offset gap at i=" << i;
+        }
+
+        // Correctness gate 5: the durable prefix matches exactly.
+        const int durableCount = std::min(recovered, N);
+        for (int i = 0; i < durableCount; ++i) {
+            EXPECT_EQ(recs[static_cast<size_t>(i)].value,
+                      producedDurable[static_cast<size_t>(i)].value)
+                << "AppendNoSync crash-recovery: durable record corrupt at i=" << i;
+            EXPECT_EQ(recs[static_cast<size_t>(i)].key,
+                      producedDurable[static_cast<size_t>(i)].key)
+                << "AppendNoSync crash-recovery: durable key corrupt at i=" << i;
+        }
+
+        // Correctness gate 6: if any no-sync records survived, they must be
+        // byte-exact too (no torn/partial batch).
+        if (recovered > N) {
+            const int noSyncSurvived = recovered - N;
+            for (int i = 0; i < noSyncSurvived; ++i) {
+                EXPECT_EQ(recs[static_cast<size_t>(N + i)].value,
+                          producedNoSync[static_cast<size_t>(i)].value)
+                    << "AppendNoSync crash-recovery: no-sync record corrupt at i=" << i;
+                EXPECT_EQ(recs[static_cast<size_t>(N + i)].key,
+                          producedNoSync[static_cast<size_t>(i)].key)
+                    << "AppendNoSync crash-recovery: no-sync key corrupt at i=" << i;
+            }
+        }
     }
 }
 

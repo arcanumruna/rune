@@ -81,6 +81,50 @@ static void BM_Log_AppendWithRolling(benchmark::State& state) {
 BENCHMARK(BM_Log_AppendWithRolling)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
+// BM_Log_AppendNoSyncThenRead
+//
+// Simulates the gateway group-commit hot path: appendNoSync() one batch,
+// then immediately read() it back (as pushSubscriptions does in each cycle).
+// Measures combined latency without fsync.
+// ---------------------------------------------------------------------------
+static void BM_Log_AppendNoSyncThenRead(benchmark::State& state) {
+    namespace fs = std::filesystem;
+    static constexpr int64_t kRollBytes = 64LL * 1024 * 1024;
+
+    auto dir = fs::temp_directory_path() / "rune_bench_log_nosync_read";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    rune::storage::Log log(dir.string(), kRollBytes);
+    log.recover();
+
+    int64_t nextOff = 0;
+    std::vector<uint8_t> batch;
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        batch = makePoseBatch(nextOff, 1700000000000LL + nextOff);
+        state.ResumeTiming();
+
+        // appendNoSync (page-cache write only)
+        int64_t result = log.appendNoSync(batch.data(), batch.size(), nextOff);
+        benchmark::DoNotOptimize(result);
+
+        // Immediately read it back (as pushSubscriptions does)
+        auto data = log.read(nextOff, 512 * 1024);
+        benchmark::DoNotOptimize(data);
+        benchmark::ClobberMemory();
+
+        ++nextOff;
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(batch.size()));
+    fs::remove_all(dir);
+}
+BENCHMARK(BM_Log_AppendNoSyncThenRead)->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
 // BM_Log_ReadAcrossSegments
 //
 // Pre-build a multi-segment log (4 KiB roll, 500 batches → ~6 segments)

@@ -36,6 +36,8 @@
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
 
+#include <rune/storage/Log.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +47,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rune::gateway {
@@ -208,6 +211,12 @@ private:
     void handleUnsubscribe  (const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
+    // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
+    // handleProduce() calls have completed.  Flushes each dirty partition Log
+    // exactly once (one fsync per touched partition = group-commit under load).
+    // Zero per-produce heap; dirtyLogs_ is a pre-allocated inline set.
+    // Single-writer: called only on the duty-cycle thread.
+    void flushDirtyLogs();
 
     // -----------------------------------------------------------------------
     // Egress send helper — tryClaim first, fallback to offer.
@@ -319,6 +328,32 @@ private:
 
     // GB-3: Monotonic subscription ID generator (starts at 1).
     int64_t nextSubscriptionId_ = 0;
+
+    // GB-5p2: Dirty-log set + group-commit flush cadence.
+    //
+    // handleProduce() uses appendNoSync() (page-cache write, no fsync) and
+    // records the Log* in dirtyLogs_.  flushDirtyLogs() is called every
+    // kGroupCommitIntervalNs nanoseconds (time-based cadence) from doWork():
+    // it fsyncs each dirty Log once and clears the set.
+    //
+    // Cadence rationale:
+    //   - Per-cycle flush (every doWork()): one fsync per produce under light
+    //     load — latency still dominated by fsync (~400µs).
+    //   - Time-based flush (every kGroupCommitIntervalNs): produces between
+    //     flushes land in page cache at ~1-10µs; fsync is amortised over all
+    //     records accumulated since the last flush.  Under load many records
+    //     share one fsync.  Under idle the flush fires on a timer even with no
+    //     produces (keeps dirty data from sitting un-fsynced indefinitely).
+    //
+    // kGroupCommitIntervalNs = 10 ms: matches Kafka's default log.flush.interval.ms.
+    // Durability trade-off: data written since the last flush may be lost on a
+    // leader crash — acks=Leader (acks=1) semantics.
+    //
+    // Pointer identity: Log objects are owned by TopicRegistry (lifetime >
+    // gateway); raw pointer equality is the correct identity key.
+    static constexpr int64_t kGroupCommitIntervalNs = 10LL * 1'000'000LL; // 10 ms
+    std::unordered_set<rune::storage::Log*> dirtyLogs_;
+    int64_t                                 lastFlushNs_ = 0;
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription
     // per doWork() cycle.  Prevents one busy subscription from starving others.

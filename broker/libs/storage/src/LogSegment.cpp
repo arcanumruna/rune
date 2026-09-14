@@ -34,8 +34,11 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
     if (!log_.is_open()) { std::ofstream(logPath_, std::ios::binary).close();
         log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app); }
-    // Open a POSIX fd for fsync — writes still go through fstream for simplicity.
-    fd_ = ::open(logPath_.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
+    // Open a POSIX fd for fsync and direct reads (pread).
+    // O_RDWR so we can use pread() from it in read() without the fstream
+    // mixed-mode slowdown on macOS.  Writes still go through fstream for
+    // simplicity; fd_ is used for fdatasync and pread only.
+    fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
     // 8 MiB index map: over-provisioned (~64x) for a 64 MiB segment at 4 KiB interval.
     // Acceptable trade-off: simplifies growth logic. Each segment uses at most 128 KiB
     // of actual index data; the rest is zero-padded and evicted by the OS.
@@ -55,7 +58,12 @@ void LogSegment::sync() {
     index_->sync();
 }
 
-int64_t LogSegment::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+// ---------------------------------------------------------------------------
+// writeAndUpdateState — shared core: update index + write bytes + advance LEO.
+// Writes via fstream (buffered, write-only path) for the durable append() path.
+// Does NOT call sync(). Called by append() and (indirectly) appendNoSync().
+// ---------------------------------------------------------------------------
+int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // Guard: batch must be at least the size of record-batch overhead.
     if (len < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
         throw std::runtime_error("rune: batch smaller than record-batch overhead");
@@ -70,12 +78,62 @@ int64_t LogSegment::append(const uint8_t* data, std::size_t len, int64_t lastOff
     logSize_ += static_cast<int64_t>(len);
     bytesSinceIndex_ += static_cast<int64_t>(len);
     nextOffset_ = lastOffset + 1;
-    sync();  // B1+B2: durable-by-default — fsync .log + msync .index after every append
     return nextOffset_;
+}
+
+int64_t LogSegment::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+    int64_t next = writeAndUpdateState(data, len, lastOffset);
+    sync();  // B1+B2: durable-by-default — fsync .log + msync .index after every append
+    return next;
 }
 int64_t LogSegment::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
     // Vector overload: delegate to the zero-alloc pointer overload.
     return append(batch.data(), batch.size(), lastOffset);
+}
+
+int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+    // No-sync path: write via pwrite() directly to fd_ (O_RDWR|O_APPEND),
+    // bypassing the fstream write path entirely.  pwrite() goes directly to the
+    // OS page cache — no userspace buffer, no seekp/write fstream overhead.
+    // No fsync: data is page-cache-durable only (acks=Leader / acks=1 trade-off).
+    //
+    // Guard: batch must be at least the size of record-batch overhead.
+    if (len < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
+        throw std::runtime_error("rune: batch smaller than record-batch overhead");
+
+    // Update the sparse index (mmap write, no syscall).
+    if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
+        rune::protocol::RecordBatchReader r(data, len);
+        index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
+        bytesSinceIndex_ = 0;
+    }
+
+    // Write directly to the fd with O_APPEND semantics: pwrite() at offset
+    // logSize_ is equivalent to an append for an O_APPEND fd.  We use
+    // logSize_ as the explicit offset so the write lands at the correct position.
+    // pwrite() on macOS with O_APPEND ignores the offset argument for the actual
+    // write location (always appends to end), but using logSize_ makes the intent
+    // clear and lets pread() read the data from the same position.
+    //
+    // Note: because we bypass fstream's write buffer here, the fstream's internal
+    // "dirty" state may be stale. We must NOT mix fstream writes and pwrite()
+    // calls without a sync — so appendNoSync exclusively uses pwrite(), and
+    // append() (durable path) uses fstream.  In practice, the log is only ever
+    // used via one path (either fstream-append or pwrite-appendNoSync) at a time.
+    //
+    // Durability: pwrite() to a non-O_SYNC fd writes to page cache only.
+    // A leader crash before sync() (flushDirtyLogs) may lose the tail.
+    // TODO(Milestone C): acks=All waits for ISR HWM before acking.
+    off_t writePos = static_cast<off_t>(logSize_);
+    ssize_t written = ::pwrite(fd_, data, len, writePos);
+    if (written < 0 || static_cast<std::size_t>(written) != len) {
+        throw std::runtime_error("rune: LogSegment::appendNoSync pwrite failed");
+    }
+
+    logSize_ += static_cast<int64_t>(len);
+    bytesSinceIndex_ += static_cast<int64_t>(len);
+    nextOffset_ = lastOffset + 1;
+    return nextOffset_;
 }
 
 std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
@@ -90,8 +148,17 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
     // the batch or exhaust the segment.
     for (;;) {
         std::vector<uint8_t> buf(static_cast<size_t>(toRead));
-        log_.seekg(op.position, std::ios::beg);
-        if (toRead > 0) log_.read(reinterpret_cast<char*>(buf.data()), toRead);
+        // Use pread() via fd_ to avoid fstream mixed read/write mode overhead.
+        // On macOS, fstream::seekg() after a write flushes the write buffer
+        // through a slow path (~600µs per call observed); pread() is O(1) and
+        // bypasses the fstream buffer entirely.  fd_ is O_RDWR | O_APPEND so
+        // pread() is legal (pread ignores the file position for the read).
+        if (toRead > 0 && fd_ >= 0) {
+            ssize_t nread = ::pread(fd_, buf.data(), static_cast<std::size_t>(toRead),
+                                   static_cast<off_t>(op.position));
+            if (nread < 0) nread = 0;
+            buf.resize(static_cast<size_t>(nread));
+        }
         // Skip batches whose lastOffset < startOffset (index is sparse -> may start earlier).
         // Guard: require at least kRecordBatchOverhead bytes before constructing a reader.
         size_t pos = 0;

@@ -80,6 +80,38 @@ static void BM_LogSegment_AppendBatch(benchmark::State& state) {
 BENCHMARK(BM_LogSegment_AppendBatch)->Unit(benchmark::kMicrosecond);
 
 // ---------------------------------------------------------------------------
+// BM_LogSegment_AppendNoSync
+//
+// Same as AppendBatch but calls appendNoSync() — no fsync, page-cache only.
+// Measures the gateway group-commit hot-path append cost.
+// ---------------------------------------------------------------------------
+static void BM_LogSegment_AppendNoSync(benchmark::State& state) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "rune_bench_seg_nosync";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+
+    rune::storage::LogSegment seg(dir.string(), /*baseOffset=*/0);
+    auto batch = makePoseBatch(0, 1700000000000LL);
+
+    int64_t nextOff = 0;
+    for (auto _ : state) {
+        state.PauseTiming();
+        batch = makePoseBatch(nextOff, 1700000000000LL + nextOff);
+        state.ResumeTiming();
+
+        int64_t result = seg.appendNoSync(batch.data(), batch.size(), nextOff);
+        benchmark::DoNotOptimize(result);
+        ++nextOff;
+    }
+
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(batch.size()));
+    fs::remove_all(dir);
+}
+BENCHMARK(BM_LogSegment_AppendNoSync)->Unit(benchmark::kMicrosecond);
+
+// ---------------------------------------------------------------------------
 // BM_LogSegment_ReadAtOffset
 //
 // Pre-build a segment with 1 000 batches (outside loop), then repeatedly
