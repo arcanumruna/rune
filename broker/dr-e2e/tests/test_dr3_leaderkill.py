@@ -19,12 +19,12 @@ Variants (parametrized):
                   so it rejoins (quorum preserved), repeat N times; then verify a
                   produce+subscribe works and there is a single leader.
 
-NOTE on the acks=Leader durability caveat (Milestone B): a record is "committed"
-here = the producer received a Leader ack (page-cache durable, group-committed).
-With acks=Leader an unflushed/unreplicated TAIL can in principle be lost on a
-hard leader crash; DR-15 quantifies that window precisely.  These tests assert no
-loss of the ACKED set as reported by the producer; the DR harness produces at a
-bounded rate so the group-commit flush (10ms) keeps the acked prefix durable.
+NOTE on durability (GR-9 / Milestone C): producers now use acks=All, so a
+PRODUCED line means the batch has been durably replicated to a majority of ISR
+nodes before the ProduceResponse was sent.  This makes the no-committed-loss
+assertion iron-clad: any record that appears in `committed` MUST survive a leader
+kill because it was majority-flushed before the ack.  The prior acks=Leader
+caveat (DR-15 tail window) no longer applies to these test scenarios.
 """
 
 from __future__ import annotations
@@ -87,13 +87,18 @@ def _subscribe_all(cluster, target_svc: str, cid_base: int, keys: int,
 
 def _produce(cluster, target_svc: str, n: int, cid_base: int, records: int,
              keys: int, rate_hz: int = 0) -> Results:
-    """Run `n` producers (produce-only) against target_svc. Returns Results."""
+    """Run `n` producers (produce-only) against target_svc. Returns Results.
+
+    Uses acks=all so every PRODUCED line represents a majority-committed record.
+    This is the correct basis for no-committed-loss assertions across failover.
+    """
     cfg = dict(
         mode="produce",
         topics="multi:1:3",
         records=records,
         keys=max(keys, 18),       # ≥ partitions so records span all 3 partitions
         rate_hz=rate_hz,
+        acks="all",               # GR-9: majority-durable ack before counting as committed
         expect_own=True,
         timeout_ms=_CONNECT_MS,
         connect_retries=0,
@@ -125,7 +130,8 @@ def _assert_recovery(cluster, new_leader_svc: str, committed: Results,
     assert_exactly_once(sub)
 
     # Post-recovery usability: a fresh produce+subscribe round-trips on the new
-    # leader (cluster fully serving again).
+    # leader (cluster fully serving again).  Use acks=all so the produce side of
+    # this round-trip is also majority-durable (not just leader-page-cache).
     cid = _next_cid_base()
     post = run_clients(
         1,
@@ -139,6 +145,7 @@ def _assert_recovery(cluster, new_leader_svc: str, committed: Results,
         records=30,
         keys=max(keys, 18),
         expect=30,
+        acks="all",               # GR-9: post-recovery produce must also be majority-durable
         expect_own=True,
         from_="earliest",
         timeout_ms=_CONNECT_MS,
@@ -199,8 +206,13 @@ def test_dr3_leader_kill(fresh_cluster, n_clients, timing, rep):
         committed = holder.get("r", Results())
 
     # Re-election: a DIFFERENT node must lead.
+    # wait_for_new_leader already excludes old-leader logs; use its result
+    # directly to derive new_leader_svc — avoids identify_leader() re-scanning
+    # all logs (including the dead node's stale "is LEADER" entry) and returning
+    # the old leader again (harness-log scan artefact, not a real election bug).
+    from harness.cluster import node_id_to_service
     new_lid = cluster.wait_for_new_leader(leader_svc)
-    _, new_leader_svc = cluster.identify_leader()
+    new_leader_svc = node_id_to_service(new_lid)
     assert new_leader_svc != leader_svc, "leader did not change after kill"
 
     _assert_recovery(cluster, new_leader_svc, committed, keys)
