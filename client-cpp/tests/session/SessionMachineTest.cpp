@@ -1650,6 +1650,90 @@ TEST(SessionMachine, ConnectResponseFatalErrorGoesDisconnected) {
 }
 
 // ===========================================================================
+// DR-BUG-2 regression: ConnectRequest fast-retry when send fails (NOT_CONNECTED).
+//
+// Pre-8906828 behaviour: if io_.sendFrame returned false (NOT_CONNECTED),
+// the machine would NOT retry until the full connectTimeoutNs elapsed.
+// Post-8906828: the machine re-offers the ConnectRequest every
+// connectRetryIntervalNs (200ms) as long as connectSentOk_==false.
+//
+// This test fails against the pre-fix SessionMachine and passes now.
+// ===========================================================================
+TEST(SessionMachine, ConnectFastRetryWhenSendFails) {
+    FakeIo io;
+    auto cfg = testConfig();
+    // Use a retry interval shorter than the connect timeout so we can
+    // advance the clock in manageable increments.
+    cfg.connectTimeoutNs        = 10'000'000LL;  // 10 ms
+    cfg.connectRetryIntervalNs  =  2'000'000LL;  //  2 ms fast-retry
+    cfg.maxConnectRetries       = 3;
+    sm::SessionMachine m(io, cfg);
+
+    // Phase 1: send fails (simulates NOT_CONNECTED publication).
+    io.sendSucceeds = false;
+    m.connect(T0);
+
+    // The initial ConnectRequest is attempted but fails (sendSucceeds=false).
+    // The FakeIo still records the call, so sendCount grows.
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    const std::size_t initial_sends = io.sendCount();
+    EXPECT_GE(initial_sends, 1u) << "connect() must attempt a send even when failing";
+
+    // Phase 2: advance clock by connectRetryIntervalNs → machine must re-offer.
+    // We tick 3 times within the timeout window; each tick at a retry boundary
+    // must produce an additional ConnectRequest attempt.
+    const int64_t interval = cfg.connectRetryIntervalNs;
+    m.tick(T0 + interval);
+    const std::size_t after_retry1 = io.sendCount();
+    EXPECT_GT(after_retry1, initial_sends)
+        << "DR-BUG-2: machine must fast-retry ConnectRequest after connectRetryIntervalNs "
+           "when send has not yet succeeded (connectSentOk_==false)";
+
+    m.tick(T0 + interval * 2);
+    const std::size_t after_retry2 = io.sendCount();
+    EXPECT_GT(after_retry2, after_retry1)
+        << "DR-BUG-2: second fast-retry must fire at 2*connectRetryIntervalNs";
+
+    // All sends so far must be ConnectRequests (no keepalives / other frames).
+    for (std::size_t i = 0; i < io.sendCount(); ++i) {
+        auto tid = io.templateIdAt(i);
+        ASSERT_TRUE(tid.has_value()) << "send[" << i << "] must be parseable";
+        EXPECT_EQ(*tid, static_cast<uint16_t>(cc::TemplateId::Connect))
+            << "send[" << i << "] must be a ConnectRequest during fast-retry";
+    }
+
+    // Phase 3: sends start succeeding → machine stops re-offering (sent OK).
+    io.sendSucceeds = true;
+    const std::size_t before_success = io.sendCount();
+    m.tick(T0 + interval * 3);
+    const std::size_t after_success = io.sendCount();
+    // One more send on the next retry boundary (now succeeding).
+    EXPECT_GT(after_success, before_success)
+        << "machine must attempt one more send when sends start succeeding";
+
+    // Phase 4: once sent OK, no more fast-retries (connectSentOk_==true).
+    const std::size_t sends_after_ok = io.sendCount();
+    m.tick(T0 + interval * 4);
+    m.tick(T0 + interval * 5);
+    EXPECT_EQ(io.sendCount(), sends_after_ok)
+        << "after a successful send the machine must not fast-retry further";
+
+    // Machine is still Connecting (no ConnectResponse yet).
+    EXPECT_EQ(m.state(), sm::SessionState::Connecting);
+
+    // Phase 5: ConnectResponse arrives → Connected.
+    const int64_t corrId = m.correlationId();
+    m.onConnectResponse(
+        static_cast<int16_t>(rpc::ErrorCode::OK),
+        /*leaderMemberId=*/1,
+        /*assignedSessionId=*/0xCAFELL,
+        corrId,
+        T0 + interval * 6);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(m.sessionId(), 0xCAFELL);
+}
+
+// ===========================================================================
 // F8 [CC-8]: a FAILED retarget (io_.retarget returns false) must NOT throw and
 //            the machine must still resend the ConnectRequest (bounded by cap).
 //

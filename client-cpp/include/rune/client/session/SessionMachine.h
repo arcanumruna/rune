@@ -471,7 +471,7 @@ private:
             // The ingress UDP pub to the broker needs time to establish under
             // concurrent-client load; retrying at connectRetryIntervalNs (200ms)
             // ensures the broker receives the ConnectRequest once the UDP link
-            // is up, without waiting the full connectTimeoutNs (15s).
+            // is up, without waiting the full connectTimeoutNs (5s default).
             //
             // We do NOT generate a new correlationId on fast-retry: the broker
             // may have already created a PendingConnect for an earlier send that

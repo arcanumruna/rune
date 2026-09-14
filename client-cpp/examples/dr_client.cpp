@@ -56,8 +56,8 @@
 // ─────────────────────────────────────────────────────────────────────────
 // Output (stdout, one field-per-token, stable across releases):
 //
-//   PRODUCED cid=<c> key=<k> seq=<s> offset=<o>
-//   DELIVERED cid=<c> key=<k> seq=<s> offset=<o>
+//   PRODUCED cid=<c> key=<k> seq=<s> part=<p> offset=<o>
+//   DELIVERED cid=<c> key=<k> seq=<s> part=<p> offset=<o>
 //   SUMMARY produced=<np> delivered=<nd> mode=<m> rc=<rc>
 //
 //   For DELIVERED, cid/key/seq are decoded from the record VALUE payload,
@@ -159,7 +159,7 @@ static void decodePayload(const std::string& v, int& cid, int& key, int& seq) {
 // Emits "PRODUCED ..." per acked record.  Returns #acked.
 // ---------------------------------------------------------------------------
 static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
-                     int keys, int rateHz, int timeoutMs) {
+                     int keys, int rateHz, int timeoutMs, int32_t partitionCount) {
     ProducerConfig pcfg;
     pcfg.acks             = Acks::Leader;
     pcfg.lingerUs         = 1;
@@ -187,6 +187,7 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
         const std::vector<uint8_t> val(valStr.begin(), valStr.end());
 
         Key key(effKey);
+        const int32_t part = key.partition(partitionCount);
         auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -198,7 +199,7 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
         try {
             const int64_t offset = fut.get();
             std::cout << "PRODUCED cid=" << cid << " key=" << keyIdx
-                      << " seq=" << seq << " offset=" << offset << "\n";
+                      << " seq=" << seq << " part=" << part << " offset=" << offset << "\n";
             std::cout.flush();
             ++acked;
         } catch (const std::exception& ex) {
@@ -227,7 +228,7 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
                        int windowMs, int slowMs, int expectCidMin,
                        int expectCidExact, int subPartitions) {
-    struct Rec { int64_t offset; std::string value; };
+    struct Rec { int64_t offset; int32_t partition; std::string value; };
     std::mutex mtx;
     std::deque<Rec> q;
     std::atomic<int> delivered{0};
@@ -237,14 +238,15 @@ static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
     opts.isolation = Isolation::ReadUncommitted;
 
     // Subscribe to each partition and keep handles alive until we're done.
+    // Thread the partition index into each handler so DELIVERED lines carry part=.
     const int nParts = (subPartitions > 0) ? subPartitions : 1;
     std::vector<Subscription> subs;
     subs.reserve(nParts);
     for (int part = 0; part < nParts; ++part) {
-        subs.push_back(c.subscribe(th, part, opts, [&](const Record& r) {
+        subs.push_back(c.subscribe(th, part, opts, [&mtx, &q, part](const Record& r) {
             std::string v(reinterpret_cast<const char*>(r.value.data()), r.value.size());
             std::lock_guard<std::mutex> lk(mtx);
-            q.push_back(Rec{r.offset, std::move(v)});
+            q.push_back(Rec{r.offset, static_cast<int32_t>(part), std::move(v)});
         }));
     }
 
@@ -262,7 +264,8 @@ static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
             int cid, key, seq;
             decodePayload(rec.value, cid, key, seq);
             std::cout << "DELIVERED cid=" << cid << " key=" << key
-                      << " seq=" << seq << " offset=" << rec.offset << "\n";
+                      << " seq=" << seq << " part=" << rec.partition
+                      << " offset=" << rec.offset << "\n";
             std::cout.flush();
             // Only records from this run's cid range (>= expectCidMin), and if
             // expectCidExact >= 0 only that exact cid, count toward `expect`.
@@ -370,7 +373,7 @@ int main() {
         const bool doS = (mode == "subscribe" || mode == "produce_subscribe");
 
         if (doP) {
-            produced = doProduce(c, th, cid, records, keys, rateHz, timeoutMs);
+            produced = doProduce(c, th, cid, records, keys, rateHz, timeoutMs, th.partitionCount);
             if (produced < records) {
                 std::cerr << "CLIENT: FAIL produced " << produced << "/" << records << "\n";
                 rc = 1;
