@@ -187,6 +187,12 @@ private:
         // leaderClientEndpoint captured at Connect time (for redirect path).
         // If !isLeader && !empty → send Redirect instead of OK.
         std::string leaderClientEndpoint;
+
+        // DR-BUG-2 FIX: once the egress ExclusivePublication resolves it is
+        // stashed here so subsequent doWork() cycles can retry the
+        // ConnectResponse offer while the Aeron UDP link is still warming up.
+        // null = publication not yet resolved; non-null = resolved, retrying send.
+        std::shared_ptr<aeron::ExclusivePublication> resolvedPub;
     };
 
     // -----------------------------------------------------------------------

@@ -486,22 +486,28 @@ TEST_F(GatewayAsyncDropFixture, ResolveAfterCycles_SessionCreated_PendingClears)
 }
 
 // ===========================================================================
-// GW-DR-4: Back-pressure / send-failure → no orphaned session (FIX A).
+// GW-DR-4: No-subscriber / not-yet-connected → no orphaned session (FIX A +
+//          DR-BUG-2 stash-and-retry).
 //
 // Intent: when ConnectResponse offer fails (publication not yet connected to
-// any subscriber), the gateway MUST NOT leave a server-side session the client
+// any subscriber), the gateway MUST NOT create a server-side session the client
 // never learned about.
+//
+// DR-BUG-2 FIX changes the contract here:
+//   BEFORE: on failed send → entry erased immediately (pub released).
+//   AFTER:  on failed send → entry KEPT, pub STASHED, send retried each cycle.
+//           Entry is only removed once the send succeeds (session created) OR
+//           the connectResolveTimeoutNs elapses.
 //
 // Strategy:
 //   1. Send a Connect whose egressChannel is a valid aeron:ipc stream but for
 //      which NO egress subscriber exists yet (the gateway's ExclusivePublication
 //      resolves but isConnected() returns false → sendOnPub returns false).
-//   2. Drive doWork until the pending entry is promoted (pub resolves) and the
-//      send is attempted.  With no subscriber, sendOnPub fails immediately
-//      (isConnected() == false → returns false).
-//   3. With FIX A (minimum-acceptable path): the pub is released and no session
-//      is created → sessionCount()==0 and pendingConnectCount()==0.
-//   4. Assert no orphan: sessionCount() must be 0 throughout.
+//   2. Drive doWork at a FROZEN tBase (before timeout) until the pub resolves
+//      and send attempts begin.  Assert sessionCount() == 0 throughout.
+//   3. Advance clock past timeout (tBase + kConnectTimeoutNs + 1 ns).
+//   4. After timeout sweep: pendingConnectCount()==0 (entry dropped cleanly).
+//   5. sessionCount() must still be 0 (FIX A: no orphaned session ever created).
 //
 // The test is deterministic because the egress stream intentionally has no
 // subscriber — isConnected() reliably returns false until a subscriber joins.
@@ -510,9 +516,10 @@ TEST_F(GatewayAsyncDropFixture, BackPressure_SendFails_NoOrphanSession) {
     auto ingressPub = makeIngressPub();
 
     // Use a stream that has NO subscriber — publication resolves but
-    // isConnected() returns false → sendOnPub returns false immediately.
+    // isConnected() returns false → sendOnPub returns false on every attempt.
     constexpr int32_t kNoSubEgressStream = kEgressBase + 300;
 
+    // Frozen base timestamp: entries won't time out while we drive at tBase.
     const int64_t tBase = 4'000'000'000LL;
 
     uint8_t sc[256] = {};
@@ -523,30 +530,34 @@ TEST_F(GatewayAsyncDropFixture, BackPressure_SendFails_NoOrphanSession) {
         kNoSubEgressStream);
     offerBounded(*ingressPub, sc, reqLen, "Connect-no-subscriber");
 
-    // Drive at wall clock until the pending entry resolves and send is attempted.
-    // The resolved pub's isConnected()==false means sendOnPub returns false →
-    // FIX A: the entry is erased (pub released) with no session created.
-    // We expect pendingConnectCount to drop to 0 once the pub resolves and the
-    // send-failure path fires.
-    using clock = std::chrono::steady_clock;
-    const auto deadline = clock::now() + std::chrono::seconds{10};
-    for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
-        gw_->doWork(wallNowNs());
-        // KEY invariant: no session must ever appear.
+    // Phase 1: drive at tBase until the pending entry appears.
+    pumpNs([&]() { return gw_->pendingConnectCount() > 0; },
+           tBase, kPumpIter, "pendingCount > 0");
+    EXPECT_EQ(gw_->sessionCount(), 0u)
+        << "No session must be created while retrying ConnectResponse";
+
+    // Phase 2: drive a while longer at tBase — the pub resolves and sendOnPub
+    // is attempted repeatedly (stash-and-retry).  Session must stay 0.
+    for (int i = 0; i < 200; ++i) {
+        gw_->doWork(tBase);
         ASSERT_EQ(gw_->sessionCount(), 0u)
             << "Orphaned session detected at iteration " << i
             << " (FIX A violation: session created before ConnectResponse was sent)";
-        if (gw_->pendingConnectCount() == 0u) break;
         std::this_thread::sleep_for(std::chrono::microseconds{200});
     }
 
-    // After the send-failure path: pending table must be empty (entry erased).
+    // Phase 3: advance past timeout — entry must be dropped cleanly.
+    const int64_t tTimeout = tBase + kConnectTimeoutNs + 1;
+    pumpNs([&]() { return gw_->pendingConnectCount() == 0; },
+           tTimeout, kPumpIter, "pendingCount == 0 after timeout");
+
+    // After timeout: pending table must be empty (entry dropped + released).
     EXPECT_EQ(gw_->pendingConnectCount(), 0u)
-        << "Pending entry must be erased after send failure (pub released)";
+        << "Pending entry must be erased after connectResolveTimeoutNs (pub released)";
 
     // No orphan: session count must still be zero.
     EXPECT_EQ(gw_->sessionCount(), 0u)
-        << "No session must be created when ConnectResponse send failed (FIX A)";
+        << "No session must be created when ConnectResponse send never succeeded (FIX A)";
 }
 
 } // namespace

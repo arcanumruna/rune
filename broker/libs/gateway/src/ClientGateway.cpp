@@ -258,19 +258,31 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // and keep polling until it resolves.
     if (pendingConnects_.size() >= kMaxPendingConnects) {
         spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
-        const int64_t evictedRegId = pendingConnects_.front().registrationId;
-        pendingConnects_.pop_front(); // O(1) on deque
-        try {
-            // Attempt immediate release by resolving and dropping the shared_ptr.
-            auto pub = aeron_->findExclusivePublication(evictedRegId);
-            if (!pub) {
-                // Still AWAITING_MEDIA_DRIVER — keep draining until it resolves.
-                drainingRegistrations_.push_back(evictedRegId);
+        const int64_t evictedRegId      = pendingConnects_.front().registrationId;
+        // DR-BUG-2 FIX: if the oldest entry has a stashed resolvedPub, the
+        // shared_ptr destructor (run by pop_front()) is sufficient to release the
+        // registration.  Do NOT call findExclusivePublication again — that would
+        // touch a conductor entry that is already being released, and if it
+        // returns nullptr we would push a stale regId to drainingRegistrations_
+        // that never drains.  Only push to drain when resolvedPub==nullptr (pub
+        // not yet resolved — the conductor still holds it in AWAITING state).
+        const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr);
+        pendingConnects_.pop_front(); // O(1); drops resolvedPub shared_ptr if non-null
+        if (!evictedAlreadyResolved) {
+            try {
+                // Attempt immediate release by resolving and dropping the shared_ptr.
+                auto pub = aeron_->findExclusivePublication(evictedRegId);
+                if (!pub) {
+                    // Still AWAITING_MEDIA_DRIVER — keep draining until it resolves.
+                    drainingRegistrations_.push_back(evictedRegId);
+                }
+                // If pub non-null: drops here → ~ExclusivePublication() releases registration.
+            } catch (...) {
+                // ERRORED_MEDIA_DRIVER: conductor erased the entry and threw — no leak.
             }
-            // If pub non-null: drops here → ~ExclusivePublication() releases registration.
-        } catch (...) {
-            // ERRORED_MEDIA_DRIVER: conductor erased the entry and threw — no leak.
         }
+        // If evictedAlreadyResolved: the drop of resolvedPub in pop_front() already
+        // releases the registration — no findExclusivePublication needed, no drain entry.
     }
 
     // Pre-allocate sessionId now so it is stable across cycles.
@@ -328,23 +340,37 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             spdlog::warn("ClientGateway: pending-connect session={} timed out after {}ms; dropped",
                          pending.sessionId,
                          (nowNs - pending.requestedAtNs) / 1'000'000LL);
-            // Release the registration: attempt final findExclusivePublication.
-            // If resolved (non-null shared_ptr): drop it — destructor calls
-            // ClientConductor::releaseExclusivePublication(registrationId)
-            // (Aeron C++ 1.41.4: ~ExclusivePublication() → m_conductor.releaseExclusivePublication).
-            // If throws (ERRORED): conductor already cleaned up — no leak.
-            // If nullptr (still AWAITING): enqueue in drainingRegistrations_ and
-            // keep polling per-cycle until the conductor resolves it.
+
+            // DR-BUG-2 FIX: if the publication was already resolved and stashed
+            // in pending.resolvedPub, the shared_ptr release happens naturally
+            // when the PendingConnect entry is erased (destructor drops the
+            // shared_ptr → ~ExclusivePublication() releases the registration).
+            // We must NOT call findExclusivePublication again in that case — the
+            // conductor entry is already being released, and a redundant find
+            // would return nullptr and push a stale regId into drainingRegistrations_
+            // that can never drain (use-after-release).
+            //
+            // Only call findExclusivePublication / push to drainingRegistrations_
+            // when the publication was NOT yet resolved (resolvedPub == nullptr):
+            // in that case the conductor still holds the registration in AWAITING
+            // state and we must poll it until it resolves so we can drop it.
             const int64_t timedOutRegId = pending.registrationId;
-            it = pendingConnects_.erase(it);
-            try {
-                auto pub = aeron_->findExclusivePublication(timedOutRegId);
-                if (!pub) {
-                    drainingRegistrations_.push_back(timedOutRegId);
+            const bool alreadyResolved  = (pending.resolvedPub != nullptr);
+            it = pendingConnects_.erase(it); // drops resolvedPub shared_ptr if non-null
+            if (!alreadyResolved) {
+                // Publication not yet resolved: enqueue in drain table.
+                // If resolved (non-null shared_ptr): drop immediately.
+                // If throws (ERRORED): conductor already cleaned up.
+                // If nullptr (still AWAITING): enqueue to keep polling until resolved.
+                try {
+                    auto pub = aeron_->findExclusivePublication(timedOutRegId);
+                    if (!pub) {
+                        drainingRegistrations_.push_back(timedOutRegId);
+                    }
+                    // pub non-null: drops here → destructor releases registration.
+                } catch (...) {
+                    // ERRORED_MEDIA_DRIVER: conductor erased the entry — no leak.
                 }
-                // pub non-null: drops here → destructor releases registration.
-            } catch (...) {
-                // ERRORED_MEDIA_DRIVER: conductor erased the entry — no leak.
             }
             continue;
         }
@@ -363,21 +389,38 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         }
 
         if (!pub) {
-            // Not yet resolved — try again next cycle.
-            ++it;
-            continue;
+            // Not yet resolved — but we may already have a stashed resolved pub
+            // from a previous cycle (DR-BUG-2 fix: stash-and-retry path).
+            if (!pending.resolvedPub) {
+                // Still waiting for the conductor to register the publication.
+                ++it;
+                continue;
+            }
+            // Use the already-resolved pub from a previous cycle.
+            pub = pending.resolvedPub;
         }
 
-        // Resolved! Attempt to send ConnectResponse BEFORE adding the session.
+        // Resolved (either this cycle or previously stashed).
         //
+        // DR-BUG-2 FIX: stash the resolved pub in the PendingConnect entry so
+        // that if the ConnectResponse send fails (publication not yet Aeron-
+        // connected — the UDP image between the broker and the client egress
+        // endpoint may not be established yet when 5 clients start
+        // simultaneously), we keep retrying on subsequent doWork() cycles
+        // instead of dropping the entry.  The resolve-timeout still applies:
+        // if connectResolveTimeoutNs_ elapses before the send succeeds, the
+        // entry is dropped and the client times out and re-Connects.
+        //
+        // This fixes the ~33% failure rate for one-of-five concurrent clients
+        // under load: previously a not-yet-connected pub caused an immediate
+        // drop and the client waited the full 15 s connectTimeoutMs.
+        if (!pending.resolvedPub) {
+            pending.resolvedPub = pub;
+        }
+
         // Invariant (FIX A): a session must NEVER be added to the table unless
-        // the client received a ConnectResponse for it.  If back-pressure causes
-        // the offer to fail we keep the PendingConnect entry (with the already-
-        // resolved shared_ptr stashed) and retry the send on the next doWork
-        // cycle.  The resolve-timeout still applies: if the timeout elapses
-        // before the send succeeds we drop the pending entry and release the
-        // publication — no session is created, and the client times out and
-        // re-Connects.
+        // the client received a ConnectResponse for it.  Only promote to a
+        // session after a successful send.
         pc::ConnectResponse resp;
         resp.sessionId         = pending.sessionId;
         resp.correlationId     = pending.correlationId;
@@ -388,18 +431,15 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         const std::size_t encoded = resp.encode(scratch_.data());
 
         if (!sendOnPub(*pub, scratch_.data(), encoded)) {
-            // Back-pressure: the publication resolved but the ConnectResponse
-            // could not be sent (term buffer full / not yet connected). Send
-            // BEFORE adding the session so we never create a session the client
-            // was not told about: drop the pending entry and release the egress
-            // pub (its resolved shared_ptr goes out of scope here →
-            // ~ExclusivePublication releases the registration — no leak). The
-            // client re-Connects. (A retry-in-place sub-state is deferred to
-            // Milestone B; a transient re-Connect is acceptable for now.)
-            spdlog::debug("ClientGateway: ConnectResponse back-pressured for session={}; "
-                          "releasing pub, client will re-Connect",
+            // Publication not yet Aeron-connected (UDP image not yet up) or
+            // transient back-pressure.  Keep the PendingConnect alive
+            // (resolvedPub is now stashed); retry next doWork() cycle.
+            // The resolve-timeout still bounds this: if it expires before the
+            // link warms up, we drop + the client re-Connects.
+            spdlog::debug("ClientGateway: ConnectResponse not-connected/back-pressured for "
+                          "session={}; retrying next cycle (pub stashed)",
                           pending.sessionId);
-            it = pendingConnects_.erase(it);
+            ++it;
             continue;
         }
 
