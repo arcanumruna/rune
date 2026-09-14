@@ -401,6 +401,120 @@ TEST_F(IntegrationTestBase, AppendNoSync_CrashBeforeFlush_RecoverConsistentState
 }
 
 // ---------------------------------------------------------------------------
+// MC1 [B1 regression gate] — appendNoSync across a forced segment roll,
+//     then flush, then crash-reopen → ALL flushed records survive.
+//
+// This test is the direct regression gate for the B1 durability bug:
+//   "sync() only fsyncs the ACTIVE segment; records in the SEALED segment
+//    (created by a roll inside the flush window) are never fsync'd."
+//
+// Fix: maybeRoll() fsyncs the outgoing segment before sealing it (fsync-on-seal).
+// Then sync() fsyncs the active segment.  Together they mean every segment
+// that received appendNoSync writes is fsync'd exactly once — at seal time or
+// at the explicit sync() call — regardless of how many segment rolls occurred.
+//
+// Scenario:
+//   1. Open a Log with a very small rollBytes (256 B) to force a roll.
+//   2. appendNoSync() enough batches to trigger ≥1 roll (so some writes go
+//      into the pre-roll / sealed segment).
+//   3. Call sync() (simulates flushDirtyLogs — group-commit flush point).
+//   4. Destroy the Log without calling sync() again (simulate a process exit
+//      AFTER the flush).
+//   5. Reopen the Log + recover() (simulate restart).
+//   6. Assert ALL records from steps 2+3 survive — both the sealed-segment
+//      records AND the active-segment records at flush time.
+//
+// Acceptable loss: NONE — every record appended before sync() must survive.
+// (Records appended AFTER sync() may be lost — that is acks=1 acceptable tail.)
+// ---------------------------------------------------------------------------
+TEST_F(IntegrationTestBase, MC1_AppendNoSync_AcrossSegmentRoll_Flush_AllSurvive) {
+    // Use rollBytes=256 to force a segment roll after a handful of batches.
+    // Each RecordBatchBuilder batch with 1 record is ~100–150 bytes, so 3–4
+    // batches will exceed 256 bytes and trigger a roll.
+    constexpr int64_t kRollBytes = 256;
+    constexpr int     kBatches   = 12;  // enough to guarantee ≥1 roll
+
+    std::vector<std::string> values;
+    values.reserve(kBatches);
+
+    // --- Phase 1: appendNoSync kBatches records with forced segment roll ---
+    {
+        rune::storage::Log log(testDir_.string(), kRollBytes);
+
+        int64_t nextOff = 0;
+        for (int i = 0; i < kBatches; ++i) {
+            std::string val = makeValue(i, 64);
+            values.push_back(val);
+
+            rune::protocol::RecordBatchBuilder b(nextOff, static_cast<int64_t>(1000 + i));
+            b.append("k" + std::to_string(i), val, static_cast<int64_t>(1000 + i));
+            auto batch = b.build();
+            const int64_t lastOff = nextOff; // single record per batch → lastOff == baseOff
+            nextOff = log.appendNoSync(batch.data(), batch.size(), lastOff);
+        }
+
+        // Verify that at least one roll occurred (≥2 segments on disk).
+        const auto segs = log.segmentBaseOffsets();
+        ASSERT_GE(static_cast<int>(segs.size()), 2)
+            << "MC1: expected ≥2 segments after " << kBatches
+            << " batches with rollBytes=" << kRollBytes
+            << "; got " << segs.size() << " — test validity: roll did not fire";
+
+        // --- Phase 2: flush (simulates flushDirtyLogs group-commit point) ---
+        log.sync();
+
+        // The Log is now destroyed (goes out of scope).
+        // This simulates a clean process exit after a flush.
+        // Records before sync() MUST survive recovery.
+    }
+
+    // --- Phase 3: reopen + recover ---
+    {
+        rune::storage::Log log2(testDir_.string(), kRollBytes);
+        const int64_t leo = log2.recover();
+
+        // B1 gate: ALL kBatches records must survive (they were flushed).
+        EXPECT_EQ(leo, static_cast<int64_t>(kBatches))
+            << "MC1: expected LEO=" << kBatches
+            << " after flush+recover, got " << leo
+            << "; sealed-segment records lost (B1 regression)";
+
+        // Read and verify all records by scanning offset-by-offset.
+        // Log::read() returns data from the segment containing startOffset only;
+        // we advance offset by 1 per batch to cross segment boundaries.
+        int recovered = 0;
+        int64_t readOffset = 0;
+        while (readOffset < leo) {
+            auto chunk = log2.read(readOffset, 1024 * 1024);
+            if (chunk.empty()) break;
+
+            // Walk batches in this chunk.
+            size_t pos = 0;
+            bool advanced = false;
+            while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
+                   <= chunk.size()) {
+                rune::protocol::RecordBatchReader r(chunk.data() + pos, chunk.size() - pos);
+                int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<size_t>(total) > chunk.size()) break;
+                EXPECT_TRUE(r.ensureValid())
+                    << "MC1: recovered batch " << recovered << " failed CRC check";
+                EXPECT_EQ(r.baseOffset(), static_cast<int64_t>(recovered))
+                    << "MC1: batch " << recovered << " has wrong baseOffset";
+                ++recovered;
+                readOffset = r.baseOffset() + r.lastOffsetDelta() + 1;
+                pos += static_cast<size_t>(total);
+                advanced = true;
+            }
+            if (!advanced) break; // no progress — exit to avoid infinite loop
+        }
+
+        EXPECT_EQ(recovered, kBatches)
+            << "MC1: expected " << kBatches << " valid batches after recovery, got "
+            << recovered << " (B1: sealed-segment records lost after roll+flush+crash)";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8. After a crash-recovery that drops some records, subsequent produces
 //    continue from the recovered HWM contiguously (no gap / offset collision).
 // ---------------------------------------------------------------------------

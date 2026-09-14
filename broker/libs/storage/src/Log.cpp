@@ -30,6 +30,15 @@ void Log::maybeRoll() {
     // A single oversized batch (larger than rollBytes) always starts a new
     // segment of its own — no splitting occurs.
     if (activeSegment().sizeBytes() >= rollBytes_) {
+        // B1 fix (fsync-on-seal): fsync the segment being sealed BEFORE
+        // opening a new one.  appendNoSync() writes to page cache only; if
+        // a roll fires mid-flush-window the sealed segment would otherwise
+        // never be fsync'd (Log::sync() only fsyncs the ACTIVE segment).
+        // Fsyncing here guarantees that every segment receiving a no-sync
+        // write is fsync'd exactly once — at seal time — so Log::sync()
+        // after a roll means "all no-sync writes since last sync are on disk
+        // across all segment boundaries".
+        activeSegment().sync();
         int64_t base = logEndOffset_;
         segments_[base] = std::make_unique<LogSegment>(dir_, base);
     }

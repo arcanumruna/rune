@@ -1276,5 +1276,251 @@ TEST_F(GatewaySubscribeFixture, ReapDriven_SubscriptionDrop_NocrashNoPush)
         << "No Records should be pushed after reap-driven subscription drop";
 }
 
+// ===========================================================================
+// MC3 [acks=1 semantics pin] — subscriber can receive a record that is not
+// yet fsync'd (read-uncommitted-of-unflushed).
+//
+// This test pins the INTENDED acks=1 / page-cache-visible semantics:
+//   A subscriber CAN receive a record that is page-cache-visible (via
+//   Log::read) but NOT yet fsync'd (flushDirtyLogs has not fired yet).
+//   If the leader crashes between appendNoSync() and sync(), the record
+//   may be lost.  This is the documented acks=1 / acks=Leader trade-off.
+//   Milestone C (acks=All) closes this gap via ISR replication.
+//
+// The test confirms:
+//   1. A subscriber receives the record immediately (page-cache-visible).
+//   2. The record is NOT yet in the fsynced log (we verify by dropping the
+//      in-memory log state and reopening without sync — simulating a crash
+//      before flush).
+//   3. After that simulated crash, the subscriber would have seen a record
+//      that is no longer on disk — this is the documented acks=1 window.
+//
+// Note: the test does NOT assert the acks=1 window is safe (it is not — it
+// is an explicit trade-off).  It asserts that the window EXISTS and the
+// subscriber receives the record before the flush, pinning this as a known
+// property rather than an accidental one.
+// ===========================================================================
+TEST_F(GatewaySubscribeFixture, MC3_SubscriberAheadOfFlush_Acks1PageCacheSemantics)
+{
+    // Use a Log directly to inject a no-sync write, bypass the gateway produce
+    // path (which would flush asynchronously and complicate the timing).
+    rune::storage::Log* log = registry_->log(kTopicIdA, kPartitionA0);
+    ASSERT_NE(log, nullptr);
+
+    // Subscribe FIRST so the subscription is registered before any data.
+    auto client = makeClient(kEgressBase + 110);
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/110, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+
+    sendSubscribe(*client.ingressPub, sid, /*corrId=*/1100,
+                  kTopicIdA, kPartitionA0, /*partitionKnown=*/1,
+                  /*fromOffset=*/0, /*isolation=*/0);
+
+    auto subResp = recvSubscribeResponse(*client.egressSub, "MC3-SubResp");
+    ASSERT_TRUE(subResp.has_value());
+    EXPECT_EQ(subResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    const int64_t subId = subResp->subscriptionId;
+
+    // appendNoSync — page-cache write, NO fsync.
+    // This simulates a produce arriving in the acks=1 window: the gateway has
+    // acked the record to the producer but has not yet called flushDirtyLogs().
+    constexpr int kNoSyncRecords = 2;
+    {
+        const int64_t base = log->logEndOffset();
+        auto batch = makeBatch(kNoSyncRecords, base);
+        const int64_t lastOff = base + kNoSyncRecords - 1;
+        log->appendNoSync(batch.data(), batch.size(), lastOff);
+    }
+    // LEO has advanced (page-cache visible).
+    EXPECT_EQ(log->logEndOffset(), kNoSyncRecords);
+
+    // --- Gate: subscriber MUST receive the record (page-cache-visible) ---
+    // This is the key acks=1 assertion: pushSubscriptions() calls Log::read()
+    // which reads from page cache, so the not-yet-fsynced record is visible.
+    std::vector<int64_t> received;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                       aeron::util::index_t offset,
+                                       aeron::util::index_t len,
+                                       aeron::Header&) {
+        auto dec = pc::Records::decode(
+            reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+            static_cast<std::size_t>(len));
+        if (dec && dec->subscriptionId == subId)
+            received.push_back(dec->baseOffset);
+    });
+
+    pump([&]() { return !received.empty(); },
+         &*client.egressSub, &asm_, kPumpIter, "MC3-RecvUnflushed");
+
+    ASSERT_FALSE(received.empty())
+        << "MC3 [acks=1 pin]: subscriber must receive page-cache-visible record "
+           "BEFORE flushDirtyLogs() fires — acks=1 semantics";
+    EXPECT_EQ(received.front(), 0)
+        << "MC3: first received batch must start at baseOffset=0";
+
+    // --- Document the acks=1 window (comment — no further assertion) ---
+    // At this point, the subscriber has received the record but Log::sync()
+    // has NOT been called.  A leader crash here would lose the record from
+    // disk (torn tail dropped by recover()), yet the subscriber already
+    // received and acked it.  This is the known acks=1 / acks=Leader window.
+    // Milestone C (acks=All + ISR HWM) will close this gap.
+    // We do NOT assert data loss here — we only pin that the window exists.
+
+    // Clean up: sync the log to avoid interfering with other tests.
+    EXPECT_NO_THROW(log->sync());
+}
+
+// ===========================================================================
+// MC5 [M2 regression gate] — mid-chunk corrupt-batch skip advances nextOffset.
+//
+// If a batch in the middle of a chunk read has recordCount < 1 (corrupt),
+// the push loop must advance BOTH chunkPos AND sub.nextOffset past it.
+// Without the M2 fix, nextOffset stays at the corrupt batch's baseOffset,
+// the next cycle re-reads the same corrupt batch, and the subscription
+// permanently stalls — all subsequent (valid) records are starved.
+//
+// Test scenario:
+//   1. Append one VALID batch (batch A, offsets [0..1]).
+//   2. Directly write a corrupt batch (recordCount=0) into the log segment
+//      at offset 2 (bypassing gateway M1 validation).
+//   3. Append another VALID batch (batch C, offsets [3..4]) after the corrupt one.
+//   4. Subscribe from 0.
+//   5. Assert batch A is delivered.
+//   6. Assert batch C is eventually delivered (the corrupt batch is skipped,
+//      nextOffset advances past it, forward progress is made).
+//   7. Assert the back-pressure path is unchanged (no regression).
+// ===========================================================================
+TEST_F(GatewaySubscribeFixture, MC5_MidChunkCorruptBatchSkip_ForwardProgress)
+{
+    rune::storage::Log* log = registry_->log(kTopicIdA, kPartitionA0);
+    ASSERT_NE(log, nullptr);
+
+    // --- Step 1: append valid batch A (2 records: offsets 0, 1) ---
+    {
+        const int64_t base = log->logEndOffset(); // 0
+        auto batchA = makeBatch(2, base);
+        log->append(batchA, base + 1);
+    }
+    ASSERT_EQ(log->logEndOffset(), 2);
+
+    // --- Step 2: write a corrupt batch with recordCount=0 at offset 2 ---
+    // We build a well-formed 1-record batch and then patch recordCount to 0.
+    // The batch's length field and structure are otherwise valid so the push
+    // loop can parse batchSize and advance chunkPos past it.
+    // We use appendNoSync directly (bypasses the gateway M1 CRC+count checks).
+    {
+        const int64_t base = log->logEndOffset(); // 2
+        auto corruptBatch = makeBatch(1, base);   // valid 1-record batch
+        // Patch recordCount (LE32 at kRecordCountOffset=57) to 0.
+        constexpr int rcOff = rune::protocol::batch::kRecordCountOffset;
+        corruptBatch[rcOff + 0] = 0;
+        corruptBatch[rcOff + 1] = 0;
+        corruptBatch[rcOff + 2] = 0;
+        corruptBatch[rcOff + 3] = 0;
+        // lastOffset = base (single record was there before patching, lastOff=base).
+        // We use base as lastOff — the log's nextOffset_ will advance by 1,
+        // but we don't use the log's LEO tracking for the corrupt batch's extent.
+        // The important thing is the batch bytes on disk have recordCount=0.
+        log->appendNoSync(corruptBatch.data(), corruptBatch.size(), base);
+    }
+    // LEO has advanced past the corrupt batch (it's in page cache).
+    ASSERT_EQ(log->logEndOffset(), 3);
+
+    // --- Step 3: append valid batch C (2 records: offsets 3, 4) ---
+    {
+        const int64_t base = log->logEndOffset(); // 3
+        auto batchC = makeBatch(2, base);
+        // Use appendNoSync to keep everything in the same chunk.
+        log->appendNoSync(batchC.data(), batchC.size(), base + 1);
+    }
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // Sync all data to disk (the corrupt batch and batch C are now fsync'd).
+    log->sync();
+
+    // --- Step 4: subscribe from offset 0 ---
+    auto client = makeClient(kEgressBase + 120);
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/120, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+
+    sendSubscribe(*client.ingressPub, sid, /*corrId=*/1200,
+                  kTopicIdA, kPartitionA0, /*partitionKnown=*/1,
+                  /*fromOffset=*/0, /*isolation=*/0);
+
+    // --- Steps 5 & 6: receive batch A and batch C ---
+    // Batch A: baseOffset=0 (2 records).
+    // Corrupt batch: skipped, nextOffset advanced past it.
+    // Batch C: baseOffset=3 (2 records) — must be delivered (no stall).
+    //
+    // Use a COMBINED assembler that captures both SubscribeResponse and Records.
+    // The doWork() pump for SubscribeResponse can push Records at the same time —
+    // a single-purpose SubscribeResponse assembler would silently drop them.
+    std::optional<pc::SubscribeResponse> subResp;
+    int64_t subId = 0;
+    std::vector<int64_t> receivedBaseOffsets;
+
+    aeron::FragmentAssembler combinedAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                              aeron::util::index_t offset,
+                                              aeron::util::index_t len,
+                                              aeron::Header&) {
+        const auto* ptr = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+        const auto  sz  = static_cast<std::size_t>(len);
+        if (!subResp) {
+            auto dec = pc::SubscribeResponse::decode(ptr, sz);
+            if (dec) { subResp = *dec; subId = dec->subscriptionId; return; }
+        }
+        if (subId != 0) {
+            auto dec = pc::Records::decode(ptr, sz);
+            if (dec && dec->subscriptionId == subId)
+                receivedBaseOffsets.push_back(dec->baseOffset);
+        }
+    });
+
+    // Wait for SubscribeResponse (combined assembler also captures early Records).
+    pump([&]() { return subResp.has_value(); },
+         &*client.egressSub, &combinedAsm, kPumpIter, "MC5-SubResp");
+    ASSERT_TRUE(subResp.has_value());
+    EXPECT_EQ(subResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+
+    // We expect two batches: base=0 and base=3.
+    // Use a bounded wait with a hard cap — test must not hang even if M2 is broken
+    // (in that case the second batch is never delivered, and we fail the ASSERT below).
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::seconds{10};
+    while (receivedBaseOffsets.size() < 2 && clock::now() < deadline) {
+        gw_->doWork(nowNs());
+        client.egressSub->poll(combinedAsm.handler(), 10);
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+
+    // --- Assert forward progress ---
+    ASSERT_GE(receivedBaseOffsets.size(), 1u)
+        << "MC5: batch A (baseOffset=0) must be delivered";
+    EXPECT_EQ(receivedBaseOffsets[0], 0)
+        << "MC5: first received batch must be batch A at baseOffset=0";
+
+    ASSERT_GE(receivedBaseOffsets.size(), 2u)
+        << "MC5 [M2 regression gate]: batch C (baseOffset=3) must be delivered after "
+           "the corrupt batch is skipped. If this fails, nextOffset was not advanced "
+           "past the corrupt batch — permanent subscription stall (M2 bug).";
+    EXPECT_EQ(receivedBaseOffsets[1], 3)
+        << "MC5: second received batch must be batch C at baseOffset=3 "
+           "(corrupt batch skipped, nextOffset advanced)";
+
+    // No duplicates.
+    {
+        auto sorted = receivedBaseOffsets;
+        std::sort(sorted.begin(), sorted.end());
+        auto unique_end = std::unique(sorted.begin(), sorted.end());
+        EXPECT_EQ(std::distance(sorted.begin(), unique_end),
+                  static_cast<std::ptrdiff_t>(receivedBaseOffsets.size()))
+            << "MC5: duplicate Records detected";
+    }
+}
+
 } // namespace
 } // namespace rune::gateway

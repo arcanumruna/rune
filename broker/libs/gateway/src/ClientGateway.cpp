@@ -731,6 +731,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // Guard: batch must be at least large enough to hold the fixed header fields
     // we will read (kRecordCountOffset + 4 bytes).
+    // M1 fix: also need kLastOffsetDeltaOffset + 4 bytes (kLastOffsetDeltaOffset=23 < 57).
     constexpr std::size_t kMinBatchSize =
         static_cast<std::size_t>(rune::protocol::batch::kRecordCountOffset) + 4u;
     if (batchLen < kMinBatchSize) {
@@ -755,7 +756,34 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
     }
 
-    // Read recordCount (LE32 at kRecordCountOffset).
+    // M1 fix: derive lastOffset from the CRC-covered lastOffsetDelta field
+    // (kLastOffsetDeltaOffset=23, LE32) rather than trusting client recordCount.
+    //
+    // A buggy/malicious client can send recordCount=1 with lastOffsetDelta=1000;
+    // LEO would advance by 1 while the stored batch self-describes as spanning
+    // 1001 offsets — the next produce's baseOffset overlaps the previous batch
+    // (exactly-once violation).  lastOffsetDelta is CRC-covered: the CRC region
+    // starts at kAttributesOffset=21 which precedes kLastOffsetDeltaOffset=23.
+    //
+    // Canonical derivation:
+    //   lastOffset = base + lastOffsetDelta
+    //   count      = lastOffsetDelta + 1
+    // Validate: recordCount (client-supplied) must match lastOffsetDelta+1.
+    // A mismatch means the batch is internally inconsistent → reject (Internal).
+    // Also validate via CRC (ensureValid) to reject any corrupt batch.
+
+    // Read lastOffsetDelta (LE32 at kLastOffsetDeltaOffset=23).
+    int32_t lastOffsetDelta = 0;
+    {
+        const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kLastOffsetDeltaOffset;
+        lastOffsetDelta = static_cast<int32_t>(
+            static_cast<uint32_t>(p[0]) |
+            (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) |
+            (static_cast<uint32_t>(p[3]) << 24));
+    }
+
+    // Read recordCount (LE32 at kRecordCountOffset=57) for consistency validation only.
     int32_t recordCount = 0;
     {
         const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kRecordCountOffset;
@@ -766,13 +794,36 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             (static_cast<uint32_t>(p[3]) << 24));
     }
 
-    if (recordCount < 1) {
-        spdlog::debug("ClientGateway: Produce recordCount={} < 1; dropped", recordCount);
+    // lastOffsetDelta must be >= 0 (single-record batch: delta=0 → count=1).
+    if (lastOffsetDelta < 0) {
+        spdlog::debug("ClientGateway: Produce lastOffsetDelta={} < 0; rejected (Internal)",
+                      lastOffsetDelta);
         sendResp(pc::ErrorCode::Internal, partition, 0);
         return;
     }
 
-    const int64_t lastOffset = base + static_cast<int64_t>(recordCount) - 1;
+    // recordCount must equal lastOffsetDelta + 1.
+    if (recordCount != lastOffsetDelta + 1) {
+        spdlog::warn("ClientGateway: Produce recordCount={} != lastOffsetDelta+1={}; "
+                     "batch internally inconsistent → rejected (Internal)",
+                     recordCount, lastOffsetDelta + 1);
+        sendResp(pc::ErrorCode::Internal, partition, 0);
+        return;
+    }
+
+    // CRC validation: reject corrupt batches before they touch the log.
+    {
+        rune::protocol::RecordBatchReader reader(restampScratch_.data(), batchLen);
+        if (!reader.ensureValid()) {
+            spdlog::warn("ClientGateway: Produce CRC mismatch (corrupt batch) → rejected (Internal)");
+            sendResp(pc::ErrorCode::Internal, partition, 0);
+            return;
+        }
+    }
+
+    // Derive lastOffset from the CRC-covered lastOffsetDelta (single source of truth).
+    // This is the offset of the last record in the batch; LEO advances past it.
+    const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
 
     // GB-5p2: use appendNoSync — page-cache write only, no fsync on the hot path.
     // flushDirtyLogs() is called once per doWork() cycle (after all ingress has
@@ -1139,10 +1190,29 @@ void ClientGateway::pushSubscriptions()
 
             // Guard: recordCount must be positive.
             if (recordCount < 1) {
-                // Corrupt batch — skip it to avoid getting stuck.
-                spdlog::warn("ClientGateway: push sub={} corrupt batch at chunkPos={} recordCount={} — skipping",
-                             subId, chunkPos, recordCount);
+                // M2 fix: corrupt batch — skip it and advance BOTH chunkPos AND
+                // sub.nextOffset so the subscription makes forward progress.
+                //
+                // Without advancing nextOffset, the next pushSubscriptions() cycle
+                // re-reads from the same offset, re-encounters the same corrupt
+                // batch, and stalls permanently (the subscription can never advance
+                // past it).  This is the mid-chunk analogue of the GB-5p1 fix
+                // applied to the too-large/u16-overflow branches below.
+                //
+                // A corrupt batch in a recovered log should be unreachable
+                // (recover() drops torn tails), but if it occurs (e.g. a bug
+                // writes recordCount=0 to the log), this ensures no permanent stall.
+                //
+                // Note: this is NOT the back-pressure path.  Back-pressure (pos≤0)
+                // must NOT advance nextOffset — the back-pressured batch will be
+                // retried next cycle from the same offset (see the else-branch below).
+                spdlog::warn("ClientGateway: push sub={} corrupt batch at chunkPos={} "
+                             "recordCount={} baseOffset={} — skipping, advancing nextOffset",
+                             subId, chunkPos, recordCount, baseOffset);
                 chunkPos += batchSize;
+                // Use baseOffset+1 as the best-effort next offset when recordCount
+                // is zero/negative (we cannot compute lastOffset = base + recordCount - 1).
+                sub.nextOffset = baseOffset + 1;
                 continue;
             }
 
@@ -1266,16 +1336,29 @@ void ClientGateway::flushDirtyLogs()
     }
 
     // Flush each dirty partition Log exactly once per interval.
+    // MC6 fix: if sync() throws, keep the Log in dirtyLogs_ so the next cycle
+    // retries (don't silently mark it clean on fsync failure).  An fsync failure
+    // means the data is NOT durable; falsely clearing dirtyLogs_ would ack
+    // durability that was never achieved.  We log the error but do NOT crash —
+    // fsync failure is surfaced here and the dirty state is retained.
+    // Note: on Linux, fsync failure may be unrecoverable (EIO/fsyncgate semantics);
+    // at Milestone C this path should escalate to a leader step-down.
+    std::unordered_set<rune::storage::Log*> stillDirty;
     for (rune::storage::Log* log : dirtyLogs_) {
+        bool synced = false;
         try {
             log->sync();
+            synced = true;
         } catch (const std::exception& ex) {
-            spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw: {}", ex.what());
+            spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw: {}; "
+                          "log stays dirty (durability NOT achieved)", ex.what());
         } catch (...) {
-            spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw unknown exception");
+            spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw unknown exception; "
+                          "log stays dirty (durability NOT achieved)");
         }
+        if (!synced) stillDirty.insert(log);
     }
-    dirtyLogs_.clear();
+    dirtyLogs_ = std::move(stillDirty);
     lastFlushNs_ = nowNs_;
 }
 
