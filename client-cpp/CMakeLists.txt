@@ -369,6 +369,26 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_producer_tests)
     endif()
 
+    # ── Producer race regression tests (DR-BUG-1) ─────────────────────────────
+    # Exercises the connect → immediate first-produce path with NO settle delay.
+    # Must pass cleanly and TSan-clean after the lock-free snapshot fix.
+    if(aeron_FOUND)
+        add_executable(rune_producer_race_tests
+            tests/producer/ProducerRaceTest.cpp
+        )
+        target_include_directories(rune_producer_race_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_producer_race_tests PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_producer_race_tests)
+    endif()
+
     # ── BatchBuilder tests (CB-3) — Tier-2 explicit atomic batch ──────────────
     if(aeron_FOUND)
         add_executable(rune_batch_builder_tests

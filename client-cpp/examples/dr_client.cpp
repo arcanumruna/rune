@@ -337,16 +337,9 @@ int main() {
         c.connect().get();
         std::cerr << "CLIENT: connected\n";
 
-        // Settle window: let the client agent fully establish its session /
-        // producer-hub state before the first produce.  Without this there is a
-        // narrow startup race in the current rune-client-cpp build that can
-        // SIGSEGV on the first send (documented in the DR-1 report).  A short
-        // deterministic pause closes the window; RUNE_SETTLE_MS tunes it.
-        {
-            const int settleMs = getEnvInt("RUNE_SETTLE_MS", 250);
-            if (settleMs > 0)
-                std::this_thread::sleep_for(std::chrono::milliseconds(settleMs));
-        }
+        // No settle window needed: DR-BUG-1 is fixed. Producer registration
+        // is now safe to call at any time after Client construction via the
+        // lock-free copy-on-write snapshot in ProducerHub.
 
         const TopicHandle th = c.topic(cfg.topics[0].name);
         if (!th.valid()) {
