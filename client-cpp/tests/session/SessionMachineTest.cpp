@@ -1015,6 +1015,72 @@ TEST(SessionMachine, ErrorResponseRedirectInConnecting_WithEndpoint) {
     EXPECT_NE(req->correlationId, corrId);  // fresh correlationId after redirect
 }
 
+// DR-BUG-2 (redirect-reconnect robustness): when a follower redirects the
+// INITIAL connect via ErrorResponse{Redirect, endpoint}, the machine retargets
+// to the leader and resends the ConnectRequest.  The freshly-retargeted leader
+// publication is NOT yet Aeron-connected, so that first offer is dropped
+// (sendFrame → false).  The machine MUST fast-retry the ConnectRequest at
+// connectRetryIntervalNs within the connect window — NOT wait the full
+// connectTimeoutNs — so the reconnect completes as soon as the leader pub warms.
+// This is the same NOT_CONNECTED fast-retry discipline the initial connect uses.
+TEST(SessionMachine, RedirectReconnectFastRetriesWhenLeaderPubNotConnected) {
+    FakeIo io;
+    auto cfg = testConfig();
+    cfg.connectTimeoutNs       = 5'000'000'000LL;  // 5 s window (real-ish)
+    cfg.connectRetryIntervalNs = 200'000'000LL;    // 200 ms fast-retry
+    cfg.maxRedirects           = 5;
+    sm::SessionMachine m(io, cfg);
+
+    // Initial connect to the follower succeeds at offer time.
+    io.sendSucceeds = true;
+    m.connect(T0);
+    const int64_t corrId = m.correlationId();
+    io.reset();
+
+    // Follower redirects to the leader.  Model the not-yet-connected leader pub:
+    // the retargeted resend of the ConnectRequest is DROPPED (offer → false).
+    io.sendSucceeds = false;
+    const std::string leaderEndpoint = "aeron:udp?endpoint=leader:40200";
+    m.onErrorResponse(
+        static_cast<int16_t>(rpc::ErrorCode::Redirect),
+        leaderEndpoint,
+        corrId,
+        T0 + 1);
+
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    ASSERT_EQ(io.retargetCount(), 1u);          // retargeted to the leader
+    ASSERT_EQ(io.sendCount(), 1u);              // one (dropped) ConnectRequest offer
+    const int64_t redirectCorrId = m.correlationId();
+    EXPECT_NE(redirectCorrId, corrId);
+
+    // Tick BEFORE the fast-retry cadence elapses: no extra send yet, and we are
+    // NOWHERE NEAR the full connect timeout (proving we don't wait it out).
+    m.tick(T0 + 1 + cfg.connectRetryIntervalNs / 2);
+    EXPECT_EQ(io.sendCount(), 1u);
+
+    // Leader pub warms up; tick at the fast-retry cadence → ConnectRequest resent.
+    io.sendSucceeds = true;
+    m.tick(T0 + 1 + cfg.connectRetryIntervalNs);
+    ASSERT_EQ(io.sendCount(), 2u);              // fast-retry fired
+    EXPECT_EQ(io.retargetCount(), 1u);          // no extra retarget on fast-retry
+
+    // The fast-retry keeps the SAME (redirect-episode) correlationId so a
+    // ConnectResponse the broker already stashed still matches.
+    auto req = io.lastConnectRequest();
+    ASSERT_TRUE(req.has_value());
+    EXPECT_EQ(req->correlationId, redirectCorrId);
+
+    // Now the leader answers → Connected, well within the timeout window.
+    m.onConnectResponse(
+        static_cast<int16_t>(rpc::ErrorCode::OK),
+        /*leaderMemberId=*/0,
+        /*assignedSessionId=*/4242,
+        redirectCorrId,
+        T0 + 1 + cfg.connectRetryIntervalNs + 1);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(m.sessionId(), 4242);
+}
+
 TEST(SessionMachine, ErrorResponseRedirectCapExhausted) {
     FakeIo io;
     auto cfg = testConfig();

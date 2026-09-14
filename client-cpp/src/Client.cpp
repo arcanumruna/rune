@@ -548,6 +548,38 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // endpoint, reconnect the session, and resend the affected op.
         // Bounded by kMaxRedirects (ProducerImpl caps per-corrId retries).
         if (ec == rpc::ErrorCode::Redirect && !opt->message.empty()) {
+            // DR-BUG-2 (redirect-reconnect robustness): a Redirect only concerns
+            // THIS Client-level handler when there is an in-flight data op to
+            // follow to the leader.  Determine that FIRST — before touching the
+            // transport.
+            //
+            // Root cause of the follower connect() timeout: on the INITIAL
+            // connect to a follower, the broker replies ErrorResponse{Redirect}.
+            // That frame is dispatched to BOTH the SessionMachine (which, in
+            // Connecting, already retarget()s to the leader and resends the
+            // ConnectRequest WITH the DR-BUG-2 NOT_CONNECTED fast-retry) AND to
+            // this observer.  If this observer ALSO retarget()ed, it created a
+            // SECOND brand-new leader publication that DISCARDED the one the
+            // SessionMachine had just offered its ConnectRequest on — throwing
+            // away that offer and the pub's warm-up.  Under concurrent-client
+            // load (slow pub warm-up) the reconnect then stalled until the
+            // 15 s app-side connect deadline → "connect() timed out".
+            //
+            // Fix: at connect time (no work in flight) the SessionMachine OWNS
+            // the redirect end-to-end; this observer must NOT retarget.  Only a
+            // genuine established-session data-op redirect (haveWork) drives the
+            // Client-level retarget + submitReconnect below.  This makes the
+            // redirect-reconnect as robust as the initial connect (both now rely
+            // on the single SessionMachine fast-retry publication) and removes
+            // the pub-swap race — no busy-spin, connect/setup path only.
+            const bool haveWork =
+                producerHub_.hasInFlight() || subscriberHub_.hasPending();
+            if (!haveWork) {
+                // Connect-time (or duplicate/late) redirect: let the
+                // SessionMachine handle it; do not churn the transport.
+                break;
+            }
+
             const std::string newEndpoint(opt->message);
             // Retarget transport to the leader's client endpoint.
             // If the endpoint is already a full Aeron channel URI (starts with
@@ -582,19 +614,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // leader session via stateAndSessionId() and lands directly on
                 // the leader without re-redirecting.
                 //
-                // If nothing is actually in flight (e.g. a duplicate/late
-                // Redirect after we already reconnected), avoid a spurious
-                // reconnect that would churn the session.
-                const bool haveWork =
-                    producerHub_.hasInFlight() || subscriberHub_.hasPending();
                 // Only initiate ONE reconnect per redirect episode: if a
                 // reconnect is already pending (multiple in-flight ops each
                 // redirected), coalesce — the single deferred resend on the next
                 // ConnectResponse{OK} flushes ALL pending ops.  This prevents
                 // session churn from a burst of redirects.
                 bool expected = false;
-                if (haveWork &&
-                    redirectPending_.compare_exchange_strong(
+                if (redirectPending_.compare_exchange_strong(
                         expected, true, std::memory_order_acq_rel)) {
                     agent_.submitReconnect();
                 }
