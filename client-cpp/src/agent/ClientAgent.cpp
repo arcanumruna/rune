@@ -12,6 +12,7 @@
 // Returns total work count; returns 0 when idle (no busy-spin).
 
 #include <rune/client/agent/ClientAgent.h>
+#include <rune/client/codec/DataCodec.h>
 
 #include <cassert>
 #include <cstdlib>    // aligned_alloc / free
@@ -164,7 +165,21 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // IdleStrategy backs off on 0, which is correct for idle cycles).
     session_.tick(nowNs);
 
-    // ---- Step 4: Publish observer snapshot (release) ------------------------
+    // ---- Step 4: CB-2 — Producer duty cycle (drain ring + flush batches) -----
+    // Runs on the AGENT thread (single-writer); no lock needed.
+    // NanoClock is already sampled as nowNs above — reused here.
+    if (producerDrainFn_) {
+        const int64_t sessId = session_.sessionId();
+        const int producerWork = producerDrainFn_(
+            nowNs,
+            sessId,
+            [this](const uint8_t* buf, std::size_t len) -> bool {
+                return transport_.offer(buf, len);
+            });
+        totalWork += producerWork;
+    }
+
+    // ---- Step 5: Publish observer snapshot (release) ------------------------
     // Catch-all publish for tick-driven transitions (keepalive/timeout/resume).
     // Frame-driven transitions are ALSO published inside dispatchEgressFrame
     // BEFORE the observer runs (FIX F1), so a thread woken by the observer sees
@@ -236,6 +251,14 @@ bool ClientAgent::submitSend(const uint8_t* frame, std::size_t len) noexcept {
 
 void ClientAgent::setEgressObserver(EgressObserver obs) noexcept {
     egressObserver_ = std::move(obs);
+}
+
+void ClientAgent::setProducerDrainFn(ProducerDrainFn fn) noexcept {
+    producerDrainFn_ = std::move(fn);
+}
+
+void ClientAgent::setProduceResponseFn(ProduceResponseFn fn) noexcept {
+    produceResponseFn_ = std::move(fn);
 }
 
 void ClientAgent::publishSnapshot() noexcept {
@@ -335,6 +358,21 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     case codec::TemplateId::Pong: {
         session_.onActivity(nowNs);
         publishSnapshot();  // FIX F1: fresh snapshot before observer
+        if (egressObserver_) {
+            egressObserver_(tid, buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::ProduceResponse: {
+        // Route to the producer response hook so pending acks are resolved.
+        if (produceResponseFn_) {
+            auto opt = codec::decodeProduceResponse(buf, len);
+            if (opt) {
+                produceResponseFn_(opt->correlationId, opt->baseOffset);
+            }
+        }
+        // Also forward to egress observer so Client can chain-observe if needed.
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }

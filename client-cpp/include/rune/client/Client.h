@@ -41,6 +41,9 @@
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/session/SessionMachine.h>
 #include <rune/client/codec/Codec.h>
+#include <rune/client/TopicHandle.h>
+#include <rune/client/producer/Producer.h>
+#include <rune/client/producer/ProducerHub.h>
 
 #include <atomic>
 #include <chrono>
@@ -99,6 +102,11 @@ struct ClientConfig {
     // Balanced (default) parks up to 1 ms between doWork() calls — CPU-friendly.
     // LowLatency uses a yielding idle — no park, sub-µs reaction time, 1 CPU core cost.
     IdleMode idleMode = IdleMode::Balanced;
+
+    // CB-2: Static topic configuration for the producer.
+    // Mirrors the broker's RUNE_TOPICS environment variable.
+    // TODO(dynamic): fetch topic metadata from the broker on connect.
+    std::vector<TopicSpec> topics;
 };
 
 // ---------------------------------------------------------------------------
@@ -194,6 +202,20 @@ public:
     /// Rejected with a timeout error if pingTimeoutMs elapses without a Pong.
     std::future<Bytes> ping(Bytes payload);
 
+    // ---- CB-2: Producer API --------------------------------------------------
+
+    /// Look up a topic by name and return its handle (topicId + partitionCount).
+    /// Returns an invalid handle (topicId == -1) if the topic is not found in
+    /// the static ClientConfig::topics list.
+    /// TODO(dynamic): fetch topic metadata from the broker on connect.
+    [[nodiscard]] TopicHandle topic(const std::string& name) const noexcept;
+
+    /// Create a Producer with the given config.
+    /// The producer uses the same underlying agent ring and session as the Client.
+    /// MUST be called before connect() — producers are registered in the hub
+    /// during the setup phase.  (Calling after start() is a data race on the hub.)
+    Producer producer(ProducerConfig cfg = {});
+
 private:
     // -------------------------------------------------------------------------
     // Internal types
@@ -286,6 +308,10 @@ private:
 
     // ---- Flag: did we already fire onDisconnected on close()? ----------------
     std::atomic<bool> disconnectedFired_ {false};
+
+    // ---- CB-2: ProducerHub + topic registry ----------------------------------
+    // Hub is owned by Client and wired into the agent before start().
+    producer::ProducerHub producerHub_;
 };
 
 } // namespace rune::client

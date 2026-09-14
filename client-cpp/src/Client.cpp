@@ -15,6 +15,7 @@
 //     resolves/rejects promises while holding mtx_ for minimal scopes.
 
 #include <rune/client/Client.h>
+#include <rune/client/producer/ProducerImpl.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
@@ -69,6 +70,20 @@ Client::Client(ClientConfig cfg)
                                     std::size_t       len) {
         onEgressFrame(tid, buf, len);
     });
+
+    // CB-2: Wire the ProducerHub into the agent via function hooks so doWork
+    // drives producer drain+flush and ProduceResponse frames are routed.
+    // Using std::function keeps ClientAgent free of a header dependency on
+    // ProducerHub (the agent links to no producer symbols at all).
+    agent_.setProducerDrainFn(
+        [this](int64_t nowNs, int64_t sessionId,
+               agent::ClientAgent::SendFn sendFn) -> int {
+            return producerHub_.drainAndFlush(nowNs, sessionId, std::move(sendFn));
+        });
+    agent_.setProduceResponseFn(
+        [this](int64_t correlationId, int64_t baseOffset) {
+            producerHub_.onProduceResponse(correlationId, baseOffset);
+        });
 
     // Start the agent (transport + embedded driver).
     agent_.start();
@@ -559,6 +574,35 @@ void Client::failAllPending(const std::string& reason) {
         } catch (...) {}
     }
     pendingPings_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// CB-2: topic() — static topic handle lookup
+// ---------------------------------------------------------------------------
+
+TopicHandle Client::topic(const std::string& name) const noexcept {
+    for (const auto& spec : cfg_.topics) {
+        if (spec.name == name) {
+            return TopicHandle{spec.topicId, spec.partitionCount};
+        }
+    }
+    return TopicHandle{-1, 1}; // invalid
+}
+
+// ---------------------------------------------------------------------------
+// CB-2: producer() — create and register a Producer
+// ---------------------------------------------------------------------------
+
+Producer Client::producer(ProducerConfig cfg) {
+    // ProducerImpl owns its own ring buffer; shares the correlationId counter.
+    auto impl = std::make_shared<producer::ProducerImpl>(
+        cfg,
+        nextCorrId_);
+
+    // Register with the hub (hub is wired into the agent before start()).
+    producerHub_.add(impl);
+
+    return Producer(std::move(impl));
 }
 
 } // namespace rune::client

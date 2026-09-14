@@ -71,11 +71,35 @@ if(aeron_FOUND)
         aeron::aeron
         spdlog::spdlog
     )
-
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)
             target_link_libraries(rune_client_agent PUBLIC ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
+# ── rune_client_producer — Producer (CB-2, compiled, links agent) ─────────────
+if(aeron_FOUND)
+    add_library(rune_client_producer STATIC
+        src/producer/ProducerImpl.cpp
+        src/producer/Producer.cpp
+        src/producer/ProducerHub.cpp
+    )
+    target_include_directories(rune_client_producer PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(rune_client_producer PUBLIC
+        rune_client_agent
+        aeron::aeron
+        spdlog::spdlog
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_producer PUBLIC ${UUID_LIB})
         endif()
     endif()
 endif()
@@ -91,6 +115,7 @@ if(aeron_FOUND)
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_api PUBLIC
+        rune_client_producer
         rune_client_agent
         aeron::aeron
         spdlog::spdlog
@@ -223,5 +248,22 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_client_api_tests)
+    endif()
+
+    # ── Producer tests (CB-2) — auto-batch, partitioning, acks, idempotence ──
+    if(aeron_FOUND)
+        add_executable(rune_producer_tests
+            tests/producer/ProducerTest.cpp
+        )
+        target_include_directories(rune_producer_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_producer_tests PRIVATE
+            rune_client_producer
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_producer_tests)
     endif()
 endif()

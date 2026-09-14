@@ -23,6 +23,7 @@
 //     ConnectResponse → session_.onConnectResponse + onActivity + observer
 //     ErrorResponse   → session_.onErrorResponse   + onActivity + observer
 //     Pong            → session_.onActivity         + observer
+//     ProduceResponse → producerHub_.onProduceResponse  (CB-2)
 //     unknown/bad     → drop (never crash)
 
 #pragma once
@@ -41,6 +42,11 @@
 #include <functional>
 #include <memory>
 #include <string>
+
+// ---------------------------------------------------------------------------
+// CB-2 forward declaration — allow Client to access ring_ for ProducerImpl.
+// ---------------------------------------------------------------------------
+namespace rune::client { class Client; }
 
 namespace rune::client::agent {
 
@@ -108,6 +114,7 @@ public:
     ///  1. Drain the command ring (bounded).
     ///  2. Poll transport egress (bounded).
     ///  3. Tick the session machine.
+    ///  4. CB-2: drain producer ring + flush batches (via ProducerHub).
     /// Returns total work count (0 = nothing happened → IdleStrategy backs off).
     /// Must be called from ONE thread only (the agent thread).
     int doWork(int64_t nowNs) noexcept;
@@ -141,6 +148,28 @@ public:
     /// only supported usage pattern.
     void setEgressObserver(EgressObserver obs) noexcept;
 
+    // -------------------------------------------------------------------------
+    // CB-2: Producer duty-cycle hooks (setup-phase only; call before start())
+    // -------------------------------------------------------------------------
+
+    /// Send function type: (frame, len) -> bool.
+    using SendFn = std::function<bool(const uint8_t*, std::size_t)>;
+
+    /// Producer drain+flush callback: invoked on the agent thread every doWork
+    /// cycle.  Signature: (nowNs, sessionId, sendFn) -> workCount.
+    using ProducerDrainFn =
+        std::function<int(int64_t /*nowNs*/, int64_t /*sessionId*/, SendFn)>;
+
+    /// ProduceResponse routing callback: invoked on the agent thread when a
+    /// ProduceResponse frame arrives.  Signature: (correlationId, baseOffset).
+    using ProduceResponseFn = std::function<void(int64_t, int64_t)>;
+
+    /// Set the producer drain+flush hook.  MUST be called before start().
+    void setProducerDrainFn(ProducerDrainFn fn) noexcept;
+
+    /// Set the ProduceResponse routing hook.  MUST be called before start().
+    void setProduceResponseFn(ProduceResponseFn fn) noexcept;
+
     /// Return the session state snapshot published by the agent thread.
     /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
     /// state at the end of the most recent doWork() call.  Safe to call from
@@ -171,6 +200,16 @@ public:
     /// Connected state.  (Two independent atomic loads could tear across a
     /// resume — FIX F3.)
     [[nodiscard]] StateSnapshot stateAndSessionId() const noexcept;
+
+    // CB-2: Allow Client to access ring_ for ProducerImpl construction.
+    friend class ::rune::client::Client;
+
+    // Internal accessor for producer tests (CB-2): returns the ring buffer so
+    // ProducerImpl can be constructed directly in test harnesses.
+    // NOT part of the public API; production code must use Client::producer().
+    aeron::concurrent::ringbuffer::ManyToOneRingBuffer& ringForTesting() noexcept {
+        return ring_;
+    }
 
 private:
     // -------------------------------------------------------------------------
@@ -243,6 +282,10 @@ private:
 
     // ---- Egress observer (agent thread only; must be set before start()) ----
     EgressObserver egressObserver_;
+
+    // ---- CB-2: Producer hooks (agent thread only; set before start()) --------
+    ProducerDrainFn    producerDrainFn_;
+    ProduceResponseFn  produceResponseFn_;
 
     // ---- Thread-safe observer snapshot (BrokerNode mirror pattern) ----------
     // FIX F1 + F3: (state, sessionId) are packed into ONE atomic uint64_t and
