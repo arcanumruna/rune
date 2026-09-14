@@ -214,6 +214,12 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // Leader self-advances HW (leader always in ISR, so majority includes leader).
     recomputeHw();
 
+    // GR-10: push newly-appended bytes to ISR followers immediately (best-effort).
+    // Collapsed to ~RTT from the follower-poll floor.
+    if (cfg_.pushOnAppend) {
+        pushToFollowers(baseOffset);
+    }
+
     return baseOffset;
 }
 
@@ -224,10 +230,17 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 void PartitionReplica::onLeaderLogAppended() noexcept
 {
     if (role_ != Role::Leader) return;   // follower LEO/HW driven by applyReplicated()
+    // Capture the pre-update LEO so pushToFollowers() knows which bytes are new.
+    Offset prevLeo = lastPushedOffset_;
     // Re-read the log's LEO and recompute HW (leader always in ISR, so with the
     // ISR satisfied the HW advances to cover the newly-appended bytes exactly as
     // it would after append()).
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+
+    // GR-10: push newly-appended bytes to ISR followers immediately (best-effort).
+    if (cfg_.pushOnAppend) {
+        pushToFollowers(prevLeo);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +419,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         return;
     }
 
+    // Capture pre-apply state to detect if anything changed (for fast-ack guard).
+    const Offset preLeo = log_->logEndOffset();
+    const Offset preHw  = followerHw_;
+
     // Epoch change: truncate divergent tail before applying.
     if (resp.leaderEpoch > epoch_) {
         // NB2/C2 defense-in-depth: clamp truncation to the committed floor.
@@ -517,6 +534,24 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     Offset newHw    = std::min(localLeo, resp.highWatermark);
     if (newHw > followerHw_) {
         followerHw_ = newHw;
+    }
+
+    // GR-10: fast-ack — immediately emit a FetchRequest to the leader carrying
+    // our new LEO.  This collapses acks=All from fetchInterval+RTT to ~RTT
+    // because the leader receives the follower's updated LEO and advances HW
+    // without waiting for the next fetch interval to fire.
+    //
+    // A duplicate periodic fetch from doWork() is harmless — the leader simply
+    // re-reads from the follower's fetchOffset (idempotent, no divergence).
+    //
+    // Guard: only fast-ack if new records arrived OR HW advanced.  An empty
+    // HW-only push with no actual new data does not warrant an extra round-trip.
+    const Offset postLeo = log_->logEndOffset();
+    const Offset postHw  = followerHw_;
+    if (cfg_.fastAckOnApply && role_ == Role::Follower
+        && (postLeo > preLeo || postHw > preHw)) {
+        FetchRequestMsg ack = nextFetch();
+        transport_->sendFetchRequest(ack);
     }
 }
 
@@ -640,6 +675,87 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     if (followerHw_ > truncateOffset) {
         followerHw_ = truncateOffset;
     }
+}
+
+// ---------------------------------------------------------------------------
+// GR-10: pushToFollowers — send newly-appended bytes to ISR followers immediately.
+//
+// Called from append() and onLeaderLogAppended() on the leader duty-cycle thread.
+// Non-blocking: sendFetchResponse() is a best-effort tryClaim/offer.  A dropped
+// push is recovered by the follower's periodic fetch backstop.
+//
+// Design:
+//   1. Read log bytes from [fromOffset, LEO) using the existing log_.read() path.
+//   2. Apply the same whole-batch alignment as onFetchRequest() to ensure the
+//      encoded FetchResponse fits within transport limits.
+//   3. Encode a FetchResponse into encodeScratch_ (pre-allocated, zero per-call alloc).
+//   4. Call sendFetchResponse(followerId, resp) for each ISR follower != selfId.
+//   5. Update lastPushedOffset_ so onLeaderLogAppended() does not re-push.
+//
+// Epoch fencing: the FetchResponse carries the current leader epoch; followers
+// compare it against their local epoch and drop mismatches (existing applyReplicated
+// guard: resp.leaderEpoch > epoch_ → truncate; resp.leaderEpoch < epoch_ → silent
+// drop via errorCode path handled above).  Stale-epoch pushes are harmless but
+// wasteful; the follower's fast-ack fetch-response will carry the new epoch.
+// ---------------------------------------------------------------------------
+void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
+{
+    if (role_ != Role::Leader) return;
+    if (!isrManager_) return;
+
+    const std::vector<NodeId>& isrList = isrManager_->isr();
+    if (isrList.empty()) return;
+
+    // Nothing new to push if fromOffset is at or above current LEO.
+    Offset currentLeo = log_->logEndOffset();
+    if (fromOffset >= currentLeo) {
+        lastPushedOffset_ = currentLeo;
+        return;
+    }
+
+    // Read the bytes from the log — same path as onFetchRequest().
+    std::vector<uint8_t> logBytes = log_->read(fromOffset, cfg_.maxFetchBytes);
+
+    // Apply whole-batch alignment to avoid partial-batch tails.
+    if (!logBytes.empty()) {
+        const std::size_t cap = static_cast<std::size_t>(cfg_.maxFetchBytes);
+        std::size_t pos = 0;
+        std::size_t committedEnd = 0;
+        while (pos < logBytes.size()) {
+            std::size_t rem = logBytes.size() - pos;
+            if (rem < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead)) break;
+            rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
+            int32_t total = r.totalLength();
+            if (total <= 0) break;
+            std::size_t nextEnd = pos + static_cast<std::size_t>(total);
+            if (nextEnd > logBytes.size()) break;
+            if (nextEnd > cap) break;
+            committedEnd = nextEnd;
+            pos = committedEnd;
+        }
+        logBytes.resize(committedEnd);
+    }
+
+    // Encode once into encodeScratch_ — reuse for all followers.
+    FetchResponseMsg::encode(
+        encodeScratch_.data(), 0,
+        epoch_,
+        cfg_.partitionId,
+        leaderState_.highWatermark(),
+        /*logStartOffset=*/0,
+        kErrNone,
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
+
+    auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+
+    // Push to each ISR follower (skip self).
+    for (NodeId followerId : isrList) {
+        if (followerId == cfg_.selfId) continue;
+        transport_->sendFetchResponse(followerId, resp);
+    }
+
+    lastPushedOffset_ = currentLeo;
 }
 
 } // namespace rune::replication

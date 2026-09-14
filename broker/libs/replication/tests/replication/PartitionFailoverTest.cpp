@@ -288,14 +288,16 @@ TEST(ElectionOrderTest, HighestLEO_IsChosen) {
     }
     ASSERT_TRUE(ok);
 
-    // Give f3 one extra record by hacking via direct fake FetchResponse.
-    // (We give f3 a slightly higher "apparent" LEO by appending one more record
-    //  to its log directly — this tests the coordinator's LEO ranking.)
-    // Instead, produce one more record on the leader and only deliver to f3.
+    // Give f3 one extra record — only deliver to f3, not f2.
+    // GR-10: push-on-append would deliver to both followers; remove f2 from
+    // transport first so the push is dropped for f2, then re-add after.
+    transport.removeFollower(kF2);
     leader.append(makePayload(0x04));
-    // Force only f3 to fetch.
+    // Force only f3 to fetch (push already delivered via append → transport).
     f3.doWork(clock + kStep1ms);
     transport.pump(clock + kStep1ms);
+    // Restore f2 (does not affect f2's LEO — it missed record 4).
+    transport.addFollower(kF2, &f2);
 
     // Now f3.LEO > f2.LEO.
     ASSERT_GT(f3.logEndOffset(), f2.logEndOffset())

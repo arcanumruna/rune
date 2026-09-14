@@ -40,6 +40,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <span>
 #include <vector>
 #include <string>
@@ -77,9 +78,11 @@ struct PartitionConfig {
     int64_t     replicaLagMaxMs   = 10'000;         ///< ms before follower shrunk from ISR
     Offset      replicaLagMaxOffset = 10'000;       ///< offset lag before ISR shrink
     int         minIsr            = 1;              ///< min ISR for acksAll produce
-    int64_t     fetchIntervalNs   = 5'000'000LL;    ///< follower fetch cadence (5 ms)
+    int64_t     fetchIntervalNs   = 50'000'000LL;   ///< follower fetch cadence (50 ms backstop; push is steady-state)
     int64_t     isrCheckIntervalNs = 10'000'000LL;  ///< leader ISR check cadence (10 ms)
     int32_t     maxFetchBytes     = 1 << 20;        ///< max bytes per fetch (1 MiB)
+    bool        pushOnAppend      = true;            ///< GR-10: leader pushes to ISR followers immediately on append
+    bool        fastAckOnApply    = true;            ///< GR-10: follower fast-acks (emit FetchRequest immediately after applyReplicated)
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +161,9 @@ public:
     /// markers into the same partition log the replica owns.  Without this call the
     /// leader's ReplicaLeaderState would still hold the pre-append LEO and HW would
     /// never advance to cover the externally-written bytes.
+    ///
+    /// GR-10: when pushOnAppend is enabled, also pushes the newly-appended bytes
+    /// to each ISR follower via an unsolicited FetchResponse (non-blocking).
     ///
     /// No-op on a follower (follower LEO/HW are driven by applyReplicated()).
     void onLeaderLogAppended() noexcept;
@@ -249,6 +255,12 @@ private:
     /// offset = truncateOffset - 1).  Updates local LEO.
     void truncateLog(Offset truncateOffset);
 
+    /// (Leader) GR-10: push records starting at fromOffset to all ISR followers
+    /// via unsolicited FetchResponse.  Non-blocking (tryClaim/offer); a dropped
+    /// push is fine — the fetch backstop recovers it.  Uses encodeScratch_ (no
+    /// per-call alloc).  Only called when cfg_.pushOnAppend is true.
+    void pushToFollowers(Offset fromOffset) noexcept;
+
     // -----------------------------------------------------------------------
     // Fields
     // -----------------------------------------------------------------------
@@ -278,6 +290,10 @@ private:
 
     // Follower HW (leader uses leaderState_.highWatermark())
     Offset followerHw_ = 0;
+
+    // GR-10: push tracking — last offset that was pushed to followers.
+    // Avoids re-pushing bytes already pushed in the same append cycle.
+    Offset lastPushedOffset_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -320,7 +336,13 @@ public:
     }
 
     // PartitionTransport implementation
+    //
+    // GR-10: sendFetchRequest and sendFetchResponse are guarded by a mutex so
+    // that the leader push path (called from the produce thread) and the
+    // pump() path (called from the replication duty-cycle thread) are safe to
+    // call concurrently.  In single-threaded tests the lock is uncontended.
     void sendFetchRequest(const FetchRequestMsg& req) override {
+        std::lock_guard lk(mu_);
         pendingRequests_.push_back({req});
     }
 
@@ -333,6 +355,7 @@ public:
         pr.resp = resp;
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
+        std::lock_guard lk(mu_);
         pendingResponses_.push_back(std::move(pr));
     }
 
@@ -349,7 +372,10 @@ public:
 
         // Deliver fetch requests to the leader.
         std::vector<PendingRequest> reqs;
-        reqs.swap(pendingRequests_);
+        {
+            std::lock_guard lk(mu_);
+            reqs.swap(pendingRequests_);
+        }
         for (auto& pr : reqs) {
             if (leader_) {
                 leader_->onFetchRequest(pr.req, nowNs);
@@ -359,7 +385,10 @@ public:
 
         // Deliver fetch responses to followers.
         std::vector<PendingResponse> resps;
-        resps.swap(pendingResponses_);
+        {
+            std::lock_guard lk(mu_);
+            resps.swap(pendingResponses_);
+        }
         for (auto& pr : resps) {
             auto it = followers_.find(pr.toFollower);
             if (it != followers_.end()) {
@@ -373,6 +402,7 @@ public:
 
     /// Number of in-flight messages (for test assertions).
     [[nodiscard]] std::size_t pendingCount() const noexcept {
+        std::lock_guard lk(mu_);
         return pendingRequests_.size() + pendingResponses_.size();
     }
 
@@ -380,6 +410,7 @@ private:
     PartitionReplica* leader_ = nullptr;
     std::unordered_map<NodeId, PartitionReplica*> followers_;
 
+    mutable std::mutex           mu_;              ///< guards pendingRequests_/pendingResponses_
     std::vector<PendingRequest>  pendingRequests_;
     std::vector<PendingResponse> pendingResponses_;
 };

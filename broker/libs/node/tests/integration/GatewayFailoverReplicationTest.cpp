@@ -154,6 +154,13 @@ static PartitionConfig makeGr7PartitionCfg(NodeId selfId, int minIsr = 1) {
     cfg.fetchIntervalNs     = 1'000'000LL;    // 1 ms
     cfg.isrCheckIntervalNs  = 10'000'000LL;   // 10 ms
     cfg.maxFetchBytes       = 1 << 20;
+    // GR-7 tests verify fetch-based (pull) replication semantics and truncation
+    // of uncommitted tails on epoch change.  Push+fast-ack (GR-10) changes the
+    // semantics: data fetched by a follower immediately becomes committed via
+    // fast-ack, which invalidates the uncommitted-tail scenario these tests check.
+    // Explicitly opt out of GR-10 push to preserve GR-7 test semantics.
+    cfg.pushOnAppend     = false;
+    cfg.fastAckOnApply   = false;
     return cfg;
 }
 
@@ -419,6 +426,7 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     // B3: 1 record → L+F3 can fetch it (old epoch 1), but B3 is NOT committed
     // (F2 is gone; ISR shrinks to {L,F3} or leader alone; but we don't wait
     //  for ISR shrink here — we just check that F3 gets B3 from L).
+    // push-on-append is disabled (makeGr7PartitionCfg) so B3 stays uncommitted.
     Offset leo3 = appendN(replicaL, 1, 0x33);
     ASSERT_GT(leo3, committedHw) << "B3 must be above committedHw (uncommitted)";
 
