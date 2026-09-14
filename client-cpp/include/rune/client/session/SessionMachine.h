@@ -71,6 +71,15 @@ struct SessionConfig {
     int64_t keepaliveIntervalNs = 1'000'000'000LL;   // 1 s  — send keepalive this often
     int64_t responseTimeoutNs   = 10'000'000'000LL;  // 10 s — stale session threshold
 
+    // DR-BUG-2 FIX: fast-retry cadence for ConnectRequest when the ingress
+    // publication was not-connected or back-pressured at send time.  The
+    // SessionMachine retries the ConnectRequest at this interval (default 200 ms)
+    // without waiting the full connectTimeoutNs.  Bounded: at most
+    // connectTimeoutNs / connectRetryIntervalNs retries per connect attempt
+    // (capped by maxConnectRetries episodes).  Connect-path only — no effect on
+    // the steady-state produce/subscribe hot path.
+    int64_t connectRetryIntervalNs = 200'000'000LL;  // 200 ms fast-retry cadence
+
     // Redirect/retry caps — prevent infinite loops.
     int maxRedirects     = 5;  // per connect() call
     int maxConnectRetries = 3;  // connect-timeout retries before → Disconnected
@@ -396,8 +405,9 @@ private:
             connectRetryCount_ = 0;
             resumeRetryCount_  = 0;
         }
-        correlationId_  = nextCorrelationId();
-        connectStartNs_ = nowNs;
+        correlationId_       = nextCorrelationId();
+        connectStartNs_      = nowNs;
+        lastConnectSentNs_   = nowNs;   // DR-BUG-2: track last send time for fast-retry
 
         const std::size_t n = rune::client::codec::encodeConnectRequest(
             scratch_.data(), kScratchCap,
@@ -408,7 +418,9 @@ private:
             correlationId_);
 
         if (n > 0) {
-            io_.sendFrame(scratch_.data(), n);
+            // DR-BUG-2: record whether the initial send succeeded so tickConnecting
+            // can fast-retry when the ingress pub was not-connected at offer time.
+            connectSentOk_ = io_.sendFrame(scratch_.data(), n);
         }
         transitionTo(SessionState::Connecting);
     }
@@ -422,8 +434,9 @@ private:
         }
         resumeRetryCount_++;
         // Resend ConnectRequest with the last sessionId (resume hint scaffold).
-        correlationId_  = nextCorrelationId();
-        connectStartNs_ = nowNs;
+        correlationId_       = nextCorrelationId();
+        connectStartNs_      = nowNs;
+        lastConnectSentNs_   = nowNs;   // DR-BUG-2: track send time for fast-retry
 
         const std::size_t n = rune::client::codec::encodeConnectRequest(
             scratch_.data(), kScratchCap,
@@ -434,7 +447,7 @@ private:
             correlationId_);
 
         if (n > 0) {
-            io_.sendFrame(scratch_.data(), n);
+            connectSentOk_ = io_.sendFrame(scratch_.data(), n);
         }
         transitionTo(SessionState::Connecting);
     }
@@ -451,7 +464,42 @@ private:
     }
 
     void tickConnecting(int64_t nowNs) noexcept {
-        if (nowNs - connectStartNs_ <= cfg_.connectTimeoutNs) return;
+        // Guard: only fast-retry if the full timeout has NOT elapsed yet.
+        if (nowNs - connectStartNs_ <= cfg_.connectTimeoutNs) {
+            // DR-BUG-2 FIX: fast-retry the ConnectRequest when the ingress
+            // publication was not-connected at offer time (connectSentOk_==false).
+            // The ingress UDP pub to the broker needs time to establish under
+            // concurrent-client load; retrying at connectRetryIntervalNs (200ms)
+            // ensures the broker receives the ConnectRequest once the UDP link
+            // is up, without waiting the full connectTimeoutNs (15s).
+            //
+            // We do NOT generate a new correlationId on fast-retry: the broker
+            // may have already created a PendingConnect for an earlier send that
+            // got through partially.  Keeping the same correlationId means:
+            //   - the broker's pending entry (if it exists) sends ConnectResponse
+            //     with the matching correlationId → client accepts it;
+            //   - if the broker never received it, it creates a new PendingConnect
+            //     with the same correlationId and sends ConnectResponse.
+            // Either way, the client's onConnectResponse check passes.
+            //
+            // If the send already succeeded (connectSentOk_==true), the broker has
+            // the ConnectRequest.  Its DR-BUG-2 fix retries sending ConnectResponse
+            // until the egress link warms up — no client action needed beyond waiting.
+            if (!connectSentOk_ && (nowNs - lastConnectSentNs_ >= cfg_.connectRetryIntervalNs)) {
+                lastConnectSentNs_ = nowNs;
+                const std::size_t n = rune::client::codec::encodeConnectRequest(
+                    scratch_.data(), kScratchCap,
+                    cfg_.egressChannel,
+                    cfg_.egressStreamId,
+                    cfg_.clientVersion,
+                    sessionId_,
+                    correlationId_);
+                if (n > 0) {
+                    connectSentOk_ = io_.sendFrame(scratch_.data(), n);
+                }
+            }
+            return;
+        }
 
         // Connect timed out.
         if (connectRetryCount_ >= cfg_.maxConnectRetries) {
@@ -461,8 +509,9 @@ private:
         connectRetryCount_++;
         // FIX A: do NOT reset redirectCount_ here — the redirect cap must span
         //        the whole connect episode (reset only on fresh connect() or OK response).
-        correlationId_  = nextCorrelationId();
-        connectStartNs_ = nowNs;
+        correlationId_       = nextCorrelationId();
+        connectStartNs_      = nowNs;
+        lastConnectSentNs_   = nowNs;
 
         const std::size_t n = rune::client::codec::encodeConnectRequest(
             scratch_.data(), kScratchCap,
@@ -472,7 +521,7 @@ private:
             sessionId_,
             correlationId_);
         if (n > 0) {
-            io_.sendFrame(scratch_.data(), n);
+            connectSentOk_ = io_.sendFrame(scratch_.data(), n);
         }
     }
 
@@ -527,6 +576,9 @@ private:
     int64_t lastKeepaliveSentNs_ = 0;
     int64_t lastActivityNs_      = 0;
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
+    // DR-BUG-2: fast-retry state for the connect path.
+    int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
+    bool    connectSentOk_       = false; // true if the last offer() succeeded
 
     // Counters.
     int redirectCount_     = 0;
