@@ -92,22 +92,79 @@ public:
     void append(std::string_view key, std::string_view value, int64_t timestamp) {
         // Kafka v2 record: length(varint) attributes(int8) tsDelta(varlong)
         //   offsetDelta(varint) keyLen(varint) key valueLen(varint) value headerCount(varint=0)
-        std::vector<uint8_t> body;
-        auto put = [&](auto fn){ uint8_t tmp[10]; size_t n = fn(tmp); body.insert(body.end(), tmp, tmp+n); };
-        body.push_back(0); // attributes
-        put([&](uint8_t* o){ return writeVarlong(timestamp - baseTimestamp_, o); });
-        put([&](uint8_t* o){ return writeVarint(recordCount_, o); }); // offsetDelta
-        put([&](uint8_t* o){ return writeVarint(static_cast<int32_t>(key.size()), o); });
-        body.insert(body.end(), key.begin(), key.end());
-        put([&](uint8_t* o){ return writeVarint(static_cast<int32_t>(value.size()), o); });
-        body.insert(body.end(), value.begin(), value.end());
-        put([&](uint8_t* o){ return writeVarint(0, o); }); // header count
+        //
+        // Zero per-record heap: we write the record body directly into records_,
+        // reserving 10 bytes for the length varint (max varint32 size) at the start,
+        // then patch it once we know the body size.
+        const std::size_t lenPatchPos = records_.size();
+        records_.resize(lenPatchPos + 10); // reserve space for length varint (max 10 bytes)
+        const std::size_t bodyStart = lenPatchPos + 10;
 
-        uint8_t lenbuf[10]; size_t ln = writeVarint(static_cast<int32_t>(body.size()), lenbuf);
-        records_.insert(records_.end(), lenbuf, lenbuf+ln);
-        records_.insert(records_.end(), body.begin(), body.end());
+        auto appendVarlong = [&](int64_t v) {
+            uint8_t tmp[10]; size_t n = writeVarlong(v, tmp);
+            records_.insert(records_.end(), tmp, tmp+n);
+        };
+        auto appendVarint = [&](int32_t v) {
+            uint8_t tmp[10]; size_t n = writeVarint(v, tmp);
+            records_.insert(records_.end(), tmp, tmp+n);
+        };
+
+        records_.push_back(0); // attributes
+        appendVarlong(timestamp - baseTimestamp_);          // tsDelta
+        appendVarint(recordCount_);                         // offsetDelta
+        appendVarint(static_cast<int32_t>(key.size()));    // keyLen
+        records_.insert(records_.end(), key.begin(), key.end());
+        appendVarint(static_cast<int32_t>(value.size())); // valueLen
+        records_.insert(records_.end(), value.begin(), value.end());
+        appendVarint(0);                                    // header count
+
+        // Patch length varint: body size is (records_.size() - bodyStart).
+        const std::size_t bodySize = records_.size() - bodyStart;
+        uint8_t lenbuf[10]; size_t ln = writeVarint(static_cast<int32_t>(bodySize), lenbuf);
+        // Shift body bytes right if the actual varint is shorter than the 10-byte reserve.
+        // Typical small records: varint is 1-2 bytes, so we trim the reserve.
+        const std::size_t reserve = 10;
+        if (ln < reserve) {
+            // Move body forward to close the gap.
+            const std::size_t gap = reserve - ln;
+            std::memmove(records_.data() + lenPatchPos + ln,
+                         records_.data() + bodyStart, bodySize);
+            records_.resize(records_.size() - gap);
+        }
+        // Write the actual length varint at lenPatchPos.
+        std::memcpy(records_.data() + lenPatchPos, lenbuf, ln);
+
         maxTimestamp_ = std::max(maxTimestamp_, timestamp);
         ++recordCount_;
+    }
+
+    /// Build the batch into the caller-supplied buffer (clear + reuse capacity).
+    /// Eliminates the per-flush heap allocation on the agent produce hot path.
+    void buildInto(std::vector<uint8_t>& out) {
+        using namespace batch;
+        int16_t attrs = control_
+            ? static_cast<int16_t>(kAttrControl | kAttrTransactional)
+            : int16_t{0};
+
+        out.clear();
+        detail::appendLE64(out, baseOffset_);
+        detail::appendLE32(out, 0);                          // length (patched below)
+        detail::appendLE32(out, -1);                         // partitionLeaderEpoch
+        out.push_back(static_cast<uint8_t>(kMagicValue));   // magic = 2
+        detail::appendLE32(out, 0);                          // CRC (patched below)
+        detail::appendLE16(out, attrs);                      // attributes
+        detail::appendLE32(out, recordCount_ - 1);           // lastOffsetDelta
+        detail::appendLE64(out, baseTimestamp_);             // baseTimestamp
+        detail::appendLE64(out, maxTimestamp_);              // maxTimestamp
+        detail::appendLE64(out, producerId_);                // producerId
+        detail::appendLE16(out, producerEpoch_);             // producerEpoch
+        detail::appendLE32(out, baseSequence_);              // baseSequence
+        detail::appendLE32(out, recordCount_);               // recordCount
+        out.insert(out.end(), records_.begin(), records_.end());
+
+        detail::putLE(out, kLengthOffset, static_cast<uint32_t>(out.size() - 12));
+        uint32_t crc = crc32c(out.data() + kAttributesOffset, out.size() - kAttributesOffset);
+        detail::putLE(out, kCrcOffset, crc);
     }
 
     std::vector<uint8_t> build() {
