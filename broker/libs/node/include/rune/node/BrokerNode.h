@@ -104,6 +104,14 @@ public:
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
 
+    /// Return the current leadershipTermId from the election state.
+    /// Observer-thread-safe: reads the atomic stateCode to decide the path,
+    /// then reads the duty-cycle-written term from the Election.
+    /// Used by main.cpp to annotate leadership log messages with the term so
+    /// the DR-5 oracle can distinguish stale pre-election announcements from
+    /// current-term announcements (term-aware assert_single_leader).
+    rune::consensus::Term leadershipTermId() const noexcept;
+
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer-thread-safe: reads atomic leaderId() + immutable peer config.
     /// - If this node IS the leader → returns empty string (no self-redirect).

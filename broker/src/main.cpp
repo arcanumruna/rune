@@ -67,7 +67,8 @@ int main() {
 
     // For a 1-node cluster, await self-election.
     if (node.awaitLeader(5s)) {
-        spdlog::info("rune-broker: node {} is LEADER", node.leaderId());
+        spdlog::info("rune-broker: node {} is LEADER term {}",
+                     node.leaderId(), node.leadershipTermId());
     } else {
         spdlog::warn("rune-broker: leadership not reached within 5 s — continuing");
     }
@@ -79,6 +80,9 @@ int main() {
     // observed leaderId and log every leadership change so failover is visible in
     // the container logs (e.g. a survivor electing a new leader after the old
     // leader dies).  The E2E scans these lines to confirm post-kill recovery.
+    //
+    // DR-5 fix: include leadershipTermId() in each announcement so the oracle
+    // can filter out stale pre-election announcements from a healed ex-leader.
     spdlog::info("rune-broker: running — send SIGINT or SIGTERM to stop");
     rune::consensus::NodeId lastObservedLeader = node.leaderId();
     while (!g_stop.load(std::memory_order_acquire)) {
@@ -87,7 +91,8 @@ int main() {
         if (cur != lastObservedLeader) {
             lastObservedLeader = cur;
             if (cur >= 0) {
-                spdlog::info("rune-broker: leadership change — node {} is LEADER", cur);
+                spdlog::info("rune-broker: leadership change — node {} is LEADER term {}",
+                             cur, node.leadershipTermId());
             } else {
                 spdlog::info("rune-broker: leadership change — no leader (election in progress)");
             }

@@ -494,22 +494,41 @@ def _assert_single_leader_among(cluster, services: list[str]) -> int:
     on the isolated container (docker logs still works, but the isolated node's
     stale leadership entry would trigger assert_single_leader's cross-node check).
 
+    Term-aware (same algorithm as invariants.assert_single_leader): only
+    announcements at the highest observed term are checked.
+
     Returns the agreed leader id.
     """
-    leader_re = re.compile(r"node (\d+) is LEADER")
-    claims: dict[str, int] = {}
+    # Matches "node N is LEADER term T" (new) or "node N is LEADER" (legacy).
+    leader_re = re.compile(r"node (\d+) is LEADER(?: term (\d+))?")
+    per_svc: dict[str, list[tuple[int, int]]] = {}
     for svc in services:
         logs = cluster.compose.logs(svc, timeout=30)
-        ids = leader_re.findall(logs)
-        if ids:
-            claims[svc] = int(ids[-1])
+        matches = leader_re.findall(logs)
+        announcements = [
+            (int(t) if t else -1, int(nid))
+            for nid, t in matches
+        ]
+        if announcements:
+            per_svc[svc] = announcements
+
+    assert per_svc, (
+        f"no leader observed among majority nodes {services}"
+    )
+    t_max = max(term for anns in per_svc.values() for (term, _) in anns)
+    claims: dict[str, int] = {}
+    for svc, anns in per_svc.items():
+        tmax_anns = [(t, nid) for (t, nid) in anns if t == t_max]
+        if tmax_anns:
+            claims[svc] = tmax_anns[-1][1]
+
     distinct = set(claims.values())
     assert len(distinct) <= 1, (
-        f"split-brain among majority {services}: nodes disagree on leader: {claims} "
+        f"split-brain among majority {services} at term {t_max}: {claims} "
         f"(distinct leaders: {sorted(distinct)})"
     )
     assert distinct, (
-        f"no leader observed among majority nodes {services} "
+        f"no leader observed at term {t_max} among majority nodes {services} "
         f"(claims={claims})"
     )
     return next(iter(distinct))

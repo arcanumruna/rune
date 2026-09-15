@@ -108,28 +108,79 @@ def assert_exactly_once(results: Results) -> None:
 def assert_single_leader(cluster, timeout_s: int = 30) -> int:
     """At most one node claims leadership for the current term.
 
-    We parse each running node's logs for its LATEST 'node <id> is LEADER'
-    announcement; every node must agree on the SAME leader id.  Two distinct
-    write-accepting leaders would show divergent latest announcements.
-    Returns the agreed leader id.
+    Term-aware algorithm (DR-5 fix):
+      1. Parse each running node's logs for ALL 'node <id> is LEADER term <T>'
+         announcements.  If no term is present (legacy format without 'term'),
+         treat term as -1 (lowest priority — only used as a last resort).
+      2. Determine the highest term T_max observed across all running nodes.
+      3. Consider ONLY announcements at T_max; check that at most ONE distinct
+         node id claims leadership at that term.
+
+    Rationale: after a leader-isolation + heal cycle the ex-leader's log still
+    contains its pre-partition "node N is LEADER term T_old" startup entry.
+    The new leader logs "node M is LEADER term T_new" (T_new > T_old).  The
+    old term-unaware oracle saw two distinct node ids and raised a false
+    split-brain.  The term-aware oracle ignores T_old announcements — it checks
+    only T_max, where exactly one node should be the leader.  A REAL split-brain
+    (two nodes both logging "is LEADER" at the SAME highest term) still fails.
+
+    Returns the agreed leader id at the highest term observed.
     """
     import re
     from .cluster import SERVICES
 
-    leader_re = re.compile(r"node (\d+) is LEADER")
-    claims: dict[str, int] = {}
+    # Matches both:
+    #   "node N is LEADER term T"   (new format, term-aware)
+    #   "node N is LEADER"          (legacy format, no term — treated as term -1)
+    leader_re = re.compile(r"node (\d+) is LEADER(?: term (\d+))?")
+
+    # Per-service: collect all (term, node_id) pairs from the log.
+    # We keep ALL announcements, not just the latest, so the highest-term one wins.
+    per_svc_announcements: dict[str, list[tuple[int, int]]] = {}
     running = cluster.running_services()
     for svc in running:
         logs = cluster.compose.logs(svc, timeout=timeout_s)
-        ids = leader_re.findall(logs)
-        if ids:
-            claims[svc] = int(ids[-1])
-    distinct = set(claims.values())
-    assert len(distinct) <= 1, (
-        f"split-brain: nodes disagree on leader: {claims} "
-        f"(distinct leaders: {sorted(distinct)})"
+        matches = leader_re.findall(logs)
+        # matches is a list of (node_id_str, term_str_or_empty)
+        announcements = [
+            (int(term_s) if term_s else -1, int(nid_s))
+            for nid_s, term_s in matches
+        ]
+        if announcements:
+            per_svc_announcements[svc] = announcements
+
+    if not per_svc_announcements:
+        assert False, f"no leader observed among running nodes {running}"
+
+    # Find the highest term across all running nodes' announcements.
+    t_max = max(
+        term
+        for announcements in per_svc_announcements.values()
+        for (term, _nid) in announcements
     )
-    assert distinct, f"no leader observed among running nodes {running}"
+
+    # For each running node, take the latest announcement at t_max (if any).
+    # A node that has no announcement at t_max uses its highest-term announcement
+    # only if that's all it has (i.e., it hasn't yet received the new term).
+    # We only assert on nodes that HAVE an announcement at t_max; nodes that
+    # haven't yet seen t_max (e.g. late-rejoin) are silently ignored — their
+    # stale announcements are below t_max and thus excluded.
+    claims_at_tmax: dict[str, int] = {}
+    for svc, announcements in per_svc_announcements.items():
+        tmax_announcements = [(t, nid) for (t, nid) in announcements if t == t_max]
+        if tmax_announcements:
+            # Take the most recent announcement at t_max (last in log order).
+            claims_at_tmax[svc] = tmax_announcements[-1][1]
+
+    distinct = set(claims_at_tmax.values())
+    assert len(distinct) <= 1, (
+        f"split-brain: two distinct leaders at term {t_max}: {claims_at_tmax} "
+        f"(distinct leaders: {sorted(distinct)}; all claims: {per_svc_announcements})"
+    )
+    assert distinct, (
+        f"no leader observed at highest term {t_max} among running nodes {running}; "
+        f"all claims: {per_svc_announcements}"
+    )
     _ = SERVICES
     return next(iter(distinct))
 

@@ -588,6 +588,19 @@ NodeId BrokerNode::leaderId() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::leadershipTermId
+// ---------------------------------------------------------------------------
+Term BrokerNode::leadershipTermId() const noexcept {
+    if (!election_) return 0;
+    // election_->leadershipTermId() is written on the duty-cycle thread; reading
+    // it from an observer thread (main's polling loop) is a benign data race on
+    // a plain Term (int64_t) — same pattern used by leaderId() observers.  We
+    // accept the rare torn-read risk here because this value is used only for
+    // logging and the oracle filter, never for consensus decisions.
+    return election_->leadershipTermId();
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::leaderClientEndpoint (GB-4)
 // ---------------------------------------------------------------------------
 std::string BrokerNode::leaderClientEndpoint() const noexcept {
