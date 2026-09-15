@@ -200,6 +200,43 @@ def heal_all(cluster) -> None:
 # explicit MTU restore is needed in the test's finally block.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Client-container faults (DR-13)
+#
+# dr_client containers are named `dr-client-<cid>-<hex8>-a<attempt>` (see
+# driver._run_one_client).  kill_client_container(name_substr) finds the
+# first running container whose name contains `name_substr` and sends it
+# SIGKILL via `docker kill`.
+# ---------------------------------------------------------------------------
+
+def kill_client_container(name_substr: str, sig: str = "KILL") -> str:
+    """Find a running dr-client container matching ``name_substr`` and kill it.
+
+    Uses `docker ps --filter name=<name_substr>` to locate the container, then
+    `docker kill --signal <sig>` to send the signal.  Returns the container id
+    that was killed.  Raises RuntimeError if no matching container is found.
+
+    This is used in DR-13 fault scenarios to crash a client mid-produce so the
+    broker's behaviour under a sudden client disconnect can be observed.
+    """
+    # docker ps -q --filter name=<substr> returns container ids whose NAME
+    # contains the substring (anchored at the start by Docker's filter, so we
+    # use the full name prefix where possible).
+    res = run(
+        ["docker", "ps", "-q", "--filter", f"name={name_substr}"],
+        timeout=30,
+    )
+    ids = res.stdout.strip().splitlines()
+    if not ids:
+        raise RuntimeError(
+            f"kill_client_container: no running container matching {name_substr!r}; "
+            f"stdout={res.stdout!r} stderr={res.stderr!r}"
+        )
+    target = ids[0]
+    run(["docker", "kill", "--signal", sig, target], timeout=30, check=True)
+    return target
+
+
 def set_mtu(cluster, service: str, mtu: int, iface: str = "eth0") -> None:
     """Set the interface MTU inside the broker's network namespace.
 
