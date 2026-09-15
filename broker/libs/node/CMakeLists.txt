@@ -80,6 +80,22 @@ if(BUILD_TESTING)
     endif()
 
     # ---------------------------------------------------------------------------
+    # DR-BUG-4: UdpMessageSink peer resolution must be non-fatal + self-healing
+    # (an unresolvable peer host must never abort startup/send).  Uses one
+    # embedded Aeron media driver in-process.  Gated behind BUILD_BROKER_NODE_TESTS.
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_udp_message_sink_resolve_tests
+            tests/integration/UdpMessageSinkResolveTest.cpp)
+        target_link_libraries(rune_udp_message_sink_resolve_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_udp_message_sink_resolve_tests
+            PROPERTIES TIMEOUT 120)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # BrokerNode+Gateway integration tests (BR-7a) — single-node with live gateway.
     # Gated behind BUILD_BROKER_NODE_TESTS (reuses that gate).
     # ---------------------------------------------------------------------------
