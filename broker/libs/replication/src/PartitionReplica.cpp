@@ -151,6 +151,26 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
     lastIsrCheckNs_ = 0;
 
+    // DR-BUG-6 LEADER-COMPLETENESS GATE — arm on EVERY becomeLeader (churn-robust).
+    //
+    // Hold the served/advertised committed HW at the pre-failover committed floor
+    // (committedHw, captured above under the OLD role's view) until we have proven
+    // we hold the majority committed frontier.  survivorFrontier_ is reset so a
+    // prior term's stale reports never satisfy this term's completeness quorum;
+    // we seed our OWN frontier (our LEO) — self is always a live ISR member and
+    // always "reports in".  leaderComplete_ starts false; maybeCompleteLeadership()
+    // (called from the first doWork / first survivor report) flips it to true the
+    // moment a majority of the ISR has reported in AND our LEO covers the on-lineage
+    // majority frontier with no reconcile in flight.  For a clean failover with no
+    // ahead survivor (or a single-member ISR) that condition holds immediately, so
+    // the gate never stalls normal operation.
+    completenessFloor_ = committedHw;
+    leaderComplete_    = false;
+    survivorFrontier_.clear();
+    survivorFrontier_[cfg_.selfId] = log_->logEndOffset();
+    reconcileTarget_   = -1;   // drop any pull latched under a prior term
+    reconcileIssuedNs_ = -1;
+
     // DR-BUG-6: arm the follower-lag TIME-clock reset for the first leader
     // doWork(nowNs).  Until it fires, no ISR check runs (lastIsrCheckNs_==0 makes
     // the first doWork the ISR-check tick, and we reset the clock there BEFORE the
@@ -159,6 +179,13 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // up-to-date survivor stay in the ISR while it runs its OffsetsForLeaderEpoch
     // probe, so the reverse-reconcile engages instead of an authoritative truncate.
     leaderLagClockNeedsReset_ = true;
+
+    // DR-BUG-6 completeness gate: evaluate immediately.  For a lone-member ISR
+    // (majority == 1, self already reported) or any ISR whose only member ahead is
+    // ourselves, all completion conditions hold NOW, so leadership completes here
+    // and normal HW serving is never gated — the gate only ever HOLDS when there is
+    // a genuine live survivor we still need to hear from / reconcile.
+    maybeCompleteLeadership();
 }
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
@@ -340,6 +367,15 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // in flight, we serve nothing this round and let the follower's own epoch
     // probe (armed on becomeFollower) drive the lineage-checked decision.
     if (req.fetchOffset > log_->logEndOffset()) {
+        // DR-BUG-6 completeness gate: an ahead follower reached a plain fetch whose
+        // tail lineage we cannot validate here — clamp its frontier to our LEO so
+        // it never raises the target (the epoch-probe path does the lineage-checked
+        // recording that legitimately raises it).  We still (re-)evaluate so a
+        // divergent ahead follower does not block completion forever.
+        if (!leaderComplete_) {
+            survivorFrontier_[req.followerId] = log_->logEndOffset();
+            maybeCompleteLeadership();
+        }
         if (reconcileTarget_ == req.followerId) {
             FetchRequestMsg pull{};
             pull.leaderEpoch = epoch_;
@@ -362,6 +398,16 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
+
+    // DR-BUG-6 completeness gate: record this survivor's frontier.  A plain fetch
+    // cannot validate lineage (req carries the fetch epoch, not the tail epoch), so
+    // it can NEVER raise the frontier above our own LEO — clamp it.  Once reconcile
+    // has raised our LEO, subsequent fetches naturally record the higher value.
+    if (!leaderComplete_) {
+        survivorFrontier_[req.followerId] =
+            std::min<Offset>(req.fetchOffset, log_->logEndOffset());
+        maybeCompleteLeadership();
+    }
 
     // Read records from the log.
     std::vector<uint8_t> logBytes;
@@ -767,6 +813,20 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
     const bool sharedCont =
         followerTailIsSharedContinuation(req.requestedEpoch, req.followerLeo);
 
+    // DR-BUG-6 completeness gate: the probe is the ONLY lineage-validated report.
+    // An ISR survivor whose ahead tail is a genuine on-lineage continuation
+    // contributes its FULL LEO to the frontier (we must reconcile up to it before
+    // we may advertise/serve).  Any other case (divergent tail, non-ISR, or not
+    // ahead) is clamped to our own LEO so it can never raise the frontier.
+    if (!leaderComplete_) {
+        const Offset onLineage =
+            (followerInIsr && sharedCont)
+                ? req.followerLeo
+                : std::min<Offset>(req.followerLeo, log_->logEndOffset());
+        survivorFrontier_[req.followerId] = onLineage;
+        maybeCompleteLeadership();
+    }
+
     if (followerInIsr && sharedCont) {
         // (Re)issue the reverse pull.  We (re)send when idle (reconcileTarget_<0)
         // OR when the pending target is this same follower — the previous pull or
@@ -1079,6 +1139,15 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     // any) can trigger another pull.
     reconcileTarget_ = -1;
 
+    // DR-BUG-6 completeness gate: our LEO advanced by the pulled on-lineage tail.
+    // Refresh our own frontier entry and re-evaluate — once our LEO covers the
+    // majority frontier with no pull outstanding, leadership completes and the
+    // held HW is released to cover the recovered records.
+    if (!leaderComplete_) {
+        survivorFrontier_[cfg_.selfId] = log_->logEndOffset();
+        maybeCompleteLeadership();
+    }
+
     // GR-10: push the freshly-reconciled records to ISR followers so the whole
     // cluster converges on the recovered committed prefix.
     if (cfg_.pushOnAppend) {
@@ -1120,6 +1189,62 @@ int PartitionReplica::doWork(int64_t nowNs)
             isrManager_->maybeExpandIsr(nowNs, leaderState_.highWatermark());
             if (isrManager_->isrChanged()) {
                 syncIsrToLeaderState();
+            }
+
+            // DR-BUG-6 completeness gate: re-evaluate each ISR check.  This lets a
+            // lone-member ISR complete promptly and lets completion proceed once a
+            // genuinely lagging/dead survivor has been shrunk out of the ISR (so it
+            // no longer counts toward the quorum/frontier).  No busy-spin — bounded
+            // to the ISR-check cadence.
+            maybeCompleteLeadership();
+
+            // DR-BUG-6 CHURN-ROBUSTNESS: while still INCOMPLETE, ACTIVELY (re)drive
+            // the reverse-reconcile toward a known on-lineage-ahead survivor instead
+            // of waiting passively for that survivor's next probe round-trip.  Under
+            // 10% loss + double-election churn a single probe→reconcile→response
+            // chain is easily dropped inside the window; leader-driven, cadence-based
+            // re-issue makes catch-up self-healing.  We only pull from a survivor we
+            // have ALREADY validated as on-lineage (survivorFrontier_ holds its FULL
+            // ahead LEO — the probe path only records the full LEO for a shared
+            // continuation; a divergent tail is clamped to our LEO and so never
+            // appears ahead here).  Idempotent: applyReconcileResponse appends only
+            // the strictly-new tail.  Bounded to the ISR-check cadence; no spin.
+            if (!leaderComplete_) {
+                // Self-heal a stuck pull: if the in-flight reconcile has gone
+                // unanswered past the stuck window (request/response dropped), clear
+                // the latch so we can re-issue below.
+                if (reconcileTarget_ >= 0 && reconcileIssuedNs_ >= 0
+                    && (nowNs - reconcileIssuedNs_) >= kReconcileStuckNs) {
+                    reconcileTarget_   = -1;
+                    reconcileIssuedNs_ = -1;
+                }
+
+                if (reconcileTarget_ < 0) {
+                    const Offset myLeo = log_->logEndOffset();
+                    NodeId aheadPeer = -1;
+                    Offset aheadLeo  = myLeo;
+                    for (NodeId id : isrManager_->isr()) {
+                        if (id == cfg_.selfId) continue;
+                        auto it = survivorFrontier_.find(id);
+                        if (it != survivorFrontier_.end() && it->second > aheadLeo) {
+                            aheadLeo  = it->second;
+                            aheadPeer = id;
+                        }
+                    }
+                    if (aheadPeer >= 0) {
+                        reconcileTarget_   = aheadPeer;
+                        reconcileIssuedNs_ = nowNs;
+                        FetchRequestMsg pull{};
+                        pull.leaderEpoch = epoch_;
+                        pull.partition   = cfg_.partitionId;
+                        pull.followerId  = cfg_.selfId;          // WE are the puller
+                        pull.fetchOffset = myLeo;                // from our LEO
+                        pull.maxBytes    = cfg_.maxFetchBytes;
+                        pull.topicId     = cfg_.topicId;
+                        transport_->sendReconcileRequest(aheadPeer, pull);
+                        ++work;
+                    }
+                }
             }
         }
     } else {
@@ -1204,6 +1329,23 @@ Offset PartitionReplica::highWatermark() const noexcept
     // Raw majority-of-ISR HW from the leader state (spec §4).
     const Offset rawHw = leaderState_.highWatermark();
 
+    // DR-BUG-6 LEADER-COMPLETENESS GATE.
+    //
+    // While a newly-promoted leader has not yet reconciled up to the majority
+    // committed frontier, HOLD the served committed HW at the pre-failover floor.
+    // This is the fix for the residual DR-8 loss: a data-lagging node elected by
+    // the blind consensus must NOT advertise its own regressed frontier (which
+    // would let the acks=All drain / HW-bounded subscribers observe a view that
+    // MISSES a committed record still held on an up-to-date survivor).  The floor
+    // is exactly the last majority-committed offset captured at failover, so it
+    // never exposes uncommitted data and never regresses below what was already
+    // committed.  Once maybeCompleteLeadership() proves we hold the frontier
+    // (leaderComplete_ == true) the normal min-ISR-gated raw HW is served, which
+    // is >= the floor (monotonic).  A complete leader is the common steady state.
+    if (!leaderComplete_) {
+        return completenessFloor_;
+    }
+
     // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.
     //
     // computeHw() takes the majority-th highest LEO across the CURRENT ISR.
@@ -1247,6 +1389,82 @@ const std::vector<NodeId>& PartitionReplica::isr() const noexcept
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DR-BUG-6 LEADER-COMPLETENESS GATE
+// ---------------------------------------------------------------------------
+
+// (Leader) The highest ON-LINEAGE offset any ISR member holds — the frontier the
+// new leader must reconcile up to before it may advertise/serve.
+//
+// survivorFrontier_ already holds ON-LINEAGE-CLAMPED values (recorded at the probe
+// / fetch / reconcile sites): an on-lineage ahead survivor contributes its FULL
+// LEO (a genuine committed continuation of our still-open shared epoch we must
+// recover), a divergent / lineage-unverifiable ahead tail is clamped to our own
+// LEO (it can NEVER raise the frontier — no-divergence), and self contributes our
+// own LEO.  The target is the MAX over the ISR: the highest committed offset that
+// exists on our lineage across live survivors.  We are complete once our own LEO
+// reaches it (the reverse-reconcile pulls the gap in), at which point a MAJORITY
+// (self + the ahead survivor we pulled from) genuinely holds it.
+Offset PartitionReplica::majorityCommittedFrontier() const
+{
+    Offset target = log_->logEndOffset();   // self is always a live ISR member
+    if (!isrManager_) return target;
+    for (NodeId id : isrManager_->isr()) {
+        auto it = survivorFrontier_.find(id);
+        if (it != survivorFrontier_.end() && it->second > target) {
+            target = it->second;
+        }
+    }
+    return target;
+}
+
+// (Leader) Re-evaluate the completeness gate.
+//
+// Completion requires ALL of:
+//   (1) QUORUM — we have HEARD from a MAJORITY of the ISR (self always counts).
+//       This prevents completing before an ahead survivor has even had a chance
+//       to report its frontier (which would let us serve a regressed view).
+//   (2) FRONTIER COVERED — our own LEO has reached the on-lineage majority
+//       frontier: there is no on-lineage survivor still holding committed records
+//       we have not pulled.  (majorityCommittedFrontier() folds the reconcile
+//       target in; a divergent tail is clamped out, so it never blocks us.)
+//   (3) NO RECONCILE IN FLIGHT — reconcileTarget_ < 0, so a pull we started is not
+//       still outstanding (its records may not be applied yet).
+//
+// When all hold we release the gate: served HW resumes at the normal min-ISR-gated
+// majority HW (>= completenessFloor_, monotonic).  Bounded, single-writer, no spin
+// — this is called from the sites that change our knowledge (fetch, probe,
+// reconcile-apply, ISR check).  For a clean failover with no ahead survivor (or a
+// lone-member ISR) all three hold on the first evaluation, so the gate is a no-op
+// in the steady state.
+void PartitionReplica::maybeCompleteLeadership()
+{
+    if (leaderComplete_) return;
+    if (role_ != Role::Leader || !isrManager_) return;
+
+    const int isrSize  = static_cast<int>(isrManager_->isr().size());
+    if (isrSize <= 0) return;
+    const int majority = isrSize / 2 + 1;
+
+    // (1) Quorum of the ISR has reported in.
+    int reported = 0;
+    for (NodeId id : isrManager_->isr()) {
+        if (survivorFrontier_.find(id) != survivorFrontier_.end()) ++reported;
+    }
+    if (reported < majority) return;
+
+    // (3) No reconcile pull outstanding.
+    if (reconcileTarget_ >= 0) return;
+
+    // (2) Our LEO covers the on-lineage majority frontier.
+    if (log_->logEndOffset() < majorityCommittedFrontier()) return;
+
+    // Complete: release the served HW.  The floor was the last majority-committed
+    // offset; the raw HW is now >= it (we hold the frontier) so serving resumes
+    // without any regression.
+    leaderComplete_ = true;
+}
 
 void PartitionReplica::recomputeHw()
 {

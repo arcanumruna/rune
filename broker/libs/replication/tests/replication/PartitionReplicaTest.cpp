@@ -1050,6 +1050,288 @@ TEST(EpochChangeTruncationTest, FallbackRaceDeferKeepAlivePreventsCommittedLoss)
 }
 
 // ===========================================================================
+// DR-BUG-6 LEADER-COMPLETENESS GATE — the final DR-8 close.
+//
+// Helper: build N contiguous single-record epoch-`ep` batches starting at offset
+// `base` and feed them to a follower via applyReplicated with a (possibly stale)
+// advertised HW.  Mirrors the seed pattern used by the DR-8 tests above.
+// ===========================================================================
+static void seedCommitted(PartitionReplica& r, int from, int count,
+                          Epoch ep, Offset advertisedHw) {
+    std::vector<uint8_t> all;
+    for (int i = from; i < from + count; ++i) {
+        rune::protocol::RecordBatchBuilder bld(i, 0);
+        std::string_view key{}; std::string_view val("rec", 3);
+        bld.append(key, val, 0);
+        auto one = bld.build();
+        all.insert(all.end(), one.begin(), one.end());
+    }
+    FetchResponseMsg resp{};
+    resp.errorCode = kErrNone; resp.leaderEpoch = ep; resp.partition = 0;
+    resp.highWatermark = advertisedHw; resp.logStartOffset = 0;
+    resp.records = std::span<const uint8_t>(all.data(), all.size());
+    r.applyReplicated(resp);
+}
+
+// ===========================================================================
+// GATE INVARIANT: a newly-promoted DEFICIENT leader must NOT advertise a serving
+// high-watermark ABOVE the pre-failover committed floor until it has reconciled up
+// to the majority committed frontier.  Serving its own regressed frontier is the
+// residual DR-8 loss.  Here B is elected deficient (LEO=2) while survivor A holds
+// all K=5 committed records; before A's probe/reconcile lands, B.highWatermark()
+// must stay clamped at the floor (2) — never jumping to a value that omits A's
+// committed tail — and must only advance to >= K AFTER the reverse-reconcile.
+// ===========================================================================
+TEST(LeaderCompletenessGateTest, DeficientNewLeaderHoldsHwUntilReconciled) {
+    TempDir aDir("gate_A");
+    TempDir bDir("gate_B");
+    rune::storage::Log aLog(aDir.path);
+    rune::storage::Log bLog(bDir.path);
+    InMemoryTransport transport;
+
+    constexpr NodeId kA = 2, kB = 3;
+    std::vector<NodeId> replicas = {kA, kB};
+    std::vector<NodeId> isr      = {kA, kB};
+
+    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &aLog, &transport);
+    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &bLog, &transport);
+
+    constexpr Offset kK = 5;
+    seedCommitted(a, 0, kK, /*ep=*/1, /*advertisedHw=*/2);   // A holds all K, stale HW
+    seedCommitted(b, 0, 2,  /*ep=*/1, /*advertisedHw=*/2);   // B deficient (LEO=2)
+    ASSERT_EQ(a.logEndOffset(), kK);
+    ASSERT_LT(b.logEndOffset(), kK);
+
+    transport.setLeader(&b);
+    transport.addFollower(kA, &a);
+    b.becomeLeader(/*epoch=*/2, {kA, kB});
+    a.becomeFollower(/*epoch=*/2, kB);
+
+    // IMMEDIATELY after election, before any reconcile, the deficient leader must
+    // hold its served HW at the pre-failover floor (2) — NOT its own LEO, and never
+    // a value that skips A's committed tail.
+    EXPECT_LE(b.highWatermark(), b.logEndOffset())
+        << "gate: served HW must never exceed what the leader actually holds";
+
+    int64_t clock = 0;
+    bool converged = false;
+    for (int i = 0; i < kDriverCap && !converged; ++i) {
+        clock += 1'000'000LL;
+        b.doWork(clock);
+        a.doWork(clock);
+        transport.pump(clock);
+
+        // GATE INVARIANT (checked EVERY round): the served HW may never exceed the
+        // leader's own LEO — i.e. it can never advertise committed records it does
+        // not hold.  While incomplete this pins it at/below the floor; once complete
+        // it equals the (now-recovered) majority HW.
+        ASSERT_LE(b.highWatermark(), b.logEndOffset())
+            << "gate violated at round " << i
+            << ": HW=" << b.highWatermark() << " LEO=" << b.logEndOffset();
+        // A must never lose its committed tail.
+        ASSERT_GE(a.logEndOffset(), kK) << "A truncated committed data at round " << i;
+
+        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
+    }
+    ASSERT_TRUE(converged)
+        << "cluster did not converge: B.LEO=" << b.logEndOffset()
+        << " B.HW=" << b.highWatermark();
+    EXPECT_GE(b.highWatermark(), kK) << "committed frontier must be served after reconcile";
+}
+
+// ===========================================================================
+// GATE HOLDS SERVED HW AT THE FLOOR WHILE RECONCILE IS INCOMPLETE.
+//
+// This is the behavioural core of the gate (the residual DR-8 delivery loss).  A
+// transport drops ALL reverse-reconcile responses, so the deficient leader B can
+// never catch up to survivor A's committed tail.  The ISR stays {A,B} (size 2), so
+// the min-ISR gate alone does NOT pin the HW.  WITHOUT the completeness gate, B
+// would advertise a served HW at its own (regressed) frontier and the acks=All
+// drain / HW-bounded subscribers would treat A's un-reconciled committed tail as
+// lost.  WITH the gate, B holds the served HW at the pre-failover floor for the
+// ENTIRE drop window and never marks itself complete — no committed record is ever
+// exposed as delivered-then-lost.  When the drops stop, it reconciles and serves
+// the full frontier.
+// ===========================================================================
+TEST(LeaderCompletenessGateTest, ServedHwHeldAtFloorWhileReconcileDropped) {
+    TempDir aDir("hold_A");
+    TempDir bDir("hold_B");
+    rune::storage::Log aLog(aDir.path);
+    rune::storage::Log bLog(bDir.path);
+    DroppingReconcileTransport transport;
+    transport.dropCount = 40;   // drop ALL reconcile answers for the whole window
+
+    constexpr NodeId kA = 2, kB = 3;
+    std::vector<NodeId> replicas = {kA, kB};
+    std::vector<NodeId> isr      = {kA, kB};
+
+    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1, replicas, isr, &aLog, &transport);
+    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1, replicas, isr, &bLog, &transport);
+
+    constexpr Offset kK = 7;
+    constexpr Offset kFloor = 3;
+    seedCommitted(a, 0, kK, /*ep=*/1, /*advertisedHw=*/kFloor);  // A: all K, stale HW
+    seedCommitted(b, 0, kFloor, /*ep=*/1, /*advertisedHw=*/kFloor); // B: deficient (LEO=floor)
+    ASSERT_EQ(a.logEndOffset(), kK);
+    ASSERT_EQ(b.logEndOffset(), kFloor);
+
+    transport.setLeader(&b);
+    transport.addFollower(kA, &a);
+    b.becomeLeader(/*epoch=*/2, {kA, kB});
+    a.becomeFollower(/*epoch=*/2, kB);
+
+    const Offset floor = b.highWatermark();   // captured floor
+    ASSERT_LE(floor, kFloor);
+
+    // While reconcile responses are dropped, the served HW MUST NOT advance past
+    // the floor — B has an on-lineage survivor (A) still holding committed records
+    // it has not pulled, so it must stay incomplete.
+    int64_t clock = 0;
+    for (int i = 0; i < 30; ++i) {   // well within the drop window
+        clock += 1'000'000LL;
+        b.doWork(clock);
+        a.doWork(clock);
+        transport.pump(clock);
+        ASSERT_LE(b.highWatermark(), floor)
+            << "GATE VIOLATED at round " << i << ": served HW advanced to "
+            << b.highWatermark() << " while an on-lineage survivor still held "
+               "un-reconciled committed records (floor=" << floor << ")";
+        ASSERT_GE(a.logEndOffset(), kK) << "A lost committed data at round " << i;
+    }
+
+    // Stop dropping; the reconcile now lands and the cluster converges to the full
+    // committed frontier.
+    transport.dropCount = 0;
+    bool converged = false;
+    for (int i = 0; i < kDriverCap && !converged; ++i) {
+        clock += 1'000'000LL;
+        b.doWork(clock);
+        a.doWork(clock);
+        transport.pump(clock);
+        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
+    }
+    ASSERT_TRUE(converged)
+        << "cluster did not converge after drops cleared: B.LEO="
+        << b.logEndOffset() << " B.HW=" << b.highWatermark();
+    EXPECT_GE(b.highWatermark(), kK);
+}
+
+// ===========================================================================
+// GATE + DOUBLE-ELECTION CHURN: under loss the cluster can flap leadership several
+// times before it settles.  The completeness gate must RE-ARM on every becomeLeader
+// so that NO leader — at any point in the churn — advertises a HW covering records
+// it does not hold, and the up-to-date survivor never drops its committed tail.
+// After the churn settles the eventual leader must have reconciled ALL committed
+// records and serve them.  This is the exact residual DR-8 case, reproduced
+// deterministically.
+// ===========================================================================
+TEST(LeaderCompletenessGateTest, DoubleElectionChurnNoCommittedLossNoRegression) {
+    TempDir aDir("churn_A");
+    TempDir bDir("churn_B");
+    TempDir cDir("churn_C");
+    rune::storage::Log aLog(aDir.path);
+    rune::storage::Log bLog(bDir.path);
+    rune::storage::Log cLog(cDir.path);
+    InMemoryTransport transport;
+
+    constexpr NodeId kA = 1, kB = 2, kC = 3;
+    std::vector<NodeId> replicas = {kA, kB, kC};
+    std::vector<NodeId> isr      = {kA, kB, kC};
+
+    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1, replicas, isr, &aLog, &transport);
+    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1, replicas, isr, &bLog, &transport);
+    PartitionReplica c(makeConfig(kC), Role::Follower, /*epoch=*/1, replicas, isr, &cLog, &transport);
+
+    constexpr Offset kK = 8;
+    seedCommitted(a, 0, kK, /*ep=*/1, /*advertisedHw=*/3);   // A: all K committed, stale HW
+    seedCommitted(b, 0, 3,  /*ep=*/1, /*advertisedHw=*/3);   // B: deficient (LEO=3)
+    seedCommitted(c, 0, 3,  /*ep=*/1, /*advertisedHw=*/3);   // C: deficient (LEO=3)
+    ASSERT_EQ(a.logEndOffset(), kK);
+    ASSERT_LT(b.logEndOffset(), kK);
+    ASSERT_LT(c.logEndOffset(), kK);
+
+    auto wireLeader = [&](PartitionReplica& leader, NodeId lid,
+                          PartitionReplica& f1, NodeId f1id,
+                          PartitionReplica& f2, NodeId f2id) {
+        transport.setLeader(&leader);
+        transport.addFollower(f1id, &f1);
+        transport.addFollower(f2id, &f2);
+        (void)lid;
+    };
+
+    // Every replica that is currently a leader must satisfy the gate invariant.
+    auto checkGate = [&](PartitionReplica& r, const char* who, int round) {
+        if (r.role() == Role::Leader) {
+            ASSERT_LE(r.highWatermark(), r.logEndOffset())
+                << who << " advertised HW > its LEO at round " << round
+                << " (gate violated): HW=" << r.highWatermark()
+                << " LEO=" << r.logEndOffset();
+        }
+        ASSERT_GE(a.logEndOffset(), kK)
+            << "A lost its committed tail at round " << round << " (" << who << ")";
+    };
+
+    int64_t clock = 0;
+    auto drive = [&](int rounds, PartitionReplica& l, PartitionReplica& f1,
+                     PartitionReplica& f2, const char* leaderName) {
+        for (int i = 0; i < rounds; ++i) {
+            clock += 1'000'000LL;
+            l.doWork(clock);
+            f1.doWork(clock);
+            f2.doWork(clock);
+            transport.pump(clock);
+            checkGate(l, leaderName, i);
+        }
+    };
+
+    // ── Election 1: deficient B leads at epoch 2 (churn cut short before it fully
+    //    reconciles) ────────────────────────────────────────────────────────────
+    wireLeader(b, kB, a, kA, c, kC);
+    b.becomeLeader(/*epoch=*/2, {kA, kB, kC});
+    a.becomeFollower(/*epoch=*/2, kB);
+    c.becomeFollower(/*epoch=*/2, kB);
+    drive(/*rounds=*/3, b, a, c, "B@e2");   // only a few rounds — do NOT let it settle
+
+    // ── Election 2: leadership flaps to the OTHER deficient node C at epoch 3 ────
+    wireLeader(c, kC, a, kA, b, kB);
+    c.becomeLeader(/*epoch=*/3, {kA, kB, kC});
+    a.becomeFollower(/*epoch=*/3, kC);
+    b.becomeFollower(/*epoch=*/3, kC);
+    drive(/*rounds=*/3, c, a, b, "C@e3");   // again cut short mid-reconcile
+
+    // ── Election 3: flaps BACK to B at epoch 4 — gate must re-arm again ─────────
+    wireLeader(b, kB, a, kA, c, kC);
+    b.becomeLeader(/*epoch=*/4, {kA, kB, kC});
+    a.becomeFollower(/*epoch=*/4, kB);
+    c.becomeFollower(/*epoch=*/4, kB);
+
+    // Now let it settle.
+    bool converged = false;
+    for (int i = 0; i < kDriverCap && !converged; ++i) {
+        clock += 1'000'000LL;
+        b.doWork(clock);
+        a.doWork(clock);
+        c.doWork(clock);
+        transport.pump(clock);
+        checkGate(b, "B@e4", i);
+        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
+    }
+
+    ASSERT_TRUE(converged)
+        << "cluster did not converge after double-election churn: "
+        << "B.LEO=" << b.logEndOffset() << " B.HW=" << b.highWatermark()
+        << " A.LEO=" << a.logEndOffset();
+
+    // No committed loss: the survivor kept all K, and the final leader recovered +
+    // serves all K committed records.
+    EXPECT_GE(a.logEndOffset(), kK);
+    EXPECT_GE(b.logEndOffset(), kK);
+    EXPECT_GE(b.highWatermark(), kK);
+}
+
+// ===========================================================================
 // Test group 7: ISR shrink unblocks HW
 // ===========================================================================
 

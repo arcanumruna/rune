@@ -42,6 +42,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include <string>
 
@@ -418,6 +419,15 @@ private:
     // avoid a storm of duplicate reconcile requests); -1 means idle.
     NodeId reconcileTarget_    = -1;   ///< peer we are reverse-fetching from
 
+    // DR-BUG-6 CHURN-ROBUSTNESS: wall-clock (ns) at which the in-flight reconcile
+    // pull was issued.  If a pull goes unanswered (its request or response dropped
+    // under packet loss) reconcileTarget_ would otherwise latch forever and stall
+    // the leader-driven re-drive.  The incomplete-leader doWork clears a stuck
+    // target after kReconcileStuckNs so the pull re-arms on the next cadence — the
+    // self-healing retry that makes catch-up robust to sustained loss / churn.
+    int64_t reconcileIssuedNs_ = -1;
+    static constexpr int64_t kReconcileStuckNs = 250'000'000LL; // 250 ms
+
     // GR-10: push tracking — last offset that was pushed to followers.
     // Avoids re-pushing bytes already pushed in the same append cycle.
     Offset lastPushedOffset_ = 0;
@@ -430,6 +440,65 @@ private:
     // rationale (this eviction is what disabled the reverse-reconcile in
     // production and caused the DR-8 committed-loss).
     bool leaderLagClockNeedsReset_ = false;
+
+    // DR-BUG-6 LEADER-COMPLETENESS GATE (the final DR-8 close).
+    //
+    // A newly-promoted partition leader may have been elected by the data-BLIND
+    // consensus while it is BEHIND the true committed frontier (the double-election
+    // churn case).  Serving its own regressed committed HW immediately is the
+    // residual DR-8 loss: a committed record held on an up-to-date survivor is
+    // never delivered / gets dropped because the deficient leader advertises a HW
+    // at its own frontier and the reverse-reconcile has not (yet, or reliably under
+    // loss) caught it up.
+    //
+    // The gate enforces leader-completeness at the REPLICATION layer (not the Raft
+    // election, which stays untouched for consensus safety): on becomeLeader we
+    // enter a NOT-YET-COMPLETE state and HOLD the served/advertised high-watermark
+    // at the pre-failover committed floor (completenessFloor_).  While incomplete
+    // the leader does NOT advance the committed offset past that floor — so neither
+    // the acks=All drain nor HW-bounded subscribers (GR-6) can observe a regressed
+    // or partial view.  We LEARN each live ISR survivor's committed frontier from
+    // the probe/fetch requests they send (their LEO + epoch — the lag-clock reset
+    // keeps them in ISR so they report in), compute the highest offset a MAJORITY
+    // of the ISR holds (the true committed frontier), reverse-reconcile UP TO it
+    // from an ahead on-lineage survivor, and only THEN mark leadership COMPLETE and
+    // advertise a HW >= that frontier.  The served HW never REGRESSES below a
+    // previously-committed frontier across the failover (completenessFloor_ is a
+    // hard floor; the post-complete HW is monotonic).
+    //
+    // NO-DIVERGENCE: the frontier is computed ONLY from ON-LINEAGE survivor reports.
+    // A divergent ahead survivor (one whose tail fails the epoch-lineage gate
+    // followerTailIsSharedContinuation) contributes only min(itsLeo, ourLeo) to the
+    // majority computation — its divergent tail can NEVER raise the frontier nor be
+    // adopted (the per-batch hasEpoch gate in applyReconcileResponse rejects it).
+    // Genuine divergent tails still truncate exactly as before.
+    //
+    // BOUNDED / CHURN-ROBUST: the gate is re-armed on EVERY becomeLeader (so it
+    // survives leadership flaps under loss); completion is decided per-doWork /
+    // per-report with no busy-spin; and it degrades safely — if a majority of the
+    // ISR never reports in (genuine quorum loss), the DR-BUG-3 min-ISR gate already
+    // pins the committed offset at the floor, so the incomplete state can never
+    // expose uncommitted data.  Completion requires only that we have HEARD from a
+    // majority AND our own LEO covers the majority frontier with no reconcile in
+    // flight — an event that the reverse-reconcile machinery drives deterministically.
+    bool   leaderComplete_    = true;   ///< false while a new leader reconciles to the frontier
+    Offset completenessFloor_ = 0;      ///< pre-failover committed HW; served HW held here until complete
+
+    /// (Leader) Re-evaluate the completeness gate: if we have heard from a majority
+    /// of the ISR and our LEO covers the on-lineage majority frontier with no
+    /// reconcile pending, mark leadership complete and release the served HW.
+    void maybeCompleteLeadership();
+
+    /// (Leader) The highest offset a MAJORITY of the ISR holds, computed from
+    /// ON-LINEAGE survivor reports only (a divergent ahead survivor is clamped to
+    /// our own LEO).  == the true committed frontier we must reconcile up to.
+    [[nodiscard]] Offset majorityCommittedFrontier() const;
+
+    // DR-BUG-6: per-survivor last-reported LEO (frontier), recorded from probe and
+    // fetch requests.  Used to (a) decide when a MAJORITY of the ISR has reported
+    // in (completeness quorum) and (b) — clamped for divergent tails — compute the
+    // majority committed frontier.  Single-writer (leader thread); bounded by |ISR|.
+    std::unordered_map<NodeId, Offset> survivorFrontier_;
 
     // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
     // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
