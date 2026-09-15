@@ -294,6 +294,22 @@ private:
     // GR-10: push tracking — last offset that was pushed to followers.
     // Avoids re-pushing bytes already pushed in the same append cycle.
     Offset lastPushedOffset_ = 0;
+
+    // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
+    // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
+    // when the ISR shrinks to a single member (the leader stranded in a
+    // minority), majority-of-1 == the leader's own LEO, so the raw HW jumps to
+    // uncommitted-by-a-real-majority offsets.  That polluted HW must NOT be
+    // exposed as "committed" — neither to the acks=All drain nor to HW-bounded
+    // subscribers (GR-6) — or a minority leader's records would be acked/
+    // delivered and then truncated on failover (data-loss / phantom reads).
+    //
+    // lastHealthyHw_ is the last HW observed while the ISR was healthy
+    // (|ISR| >= minIsr).  While |ISR| < minIsr, highWatermark() clamps to this
+    // frozen floor so the effective committed offset cannot advance past the
+    // last majority-committed offset.  It is monotonic (only advances) and is
+    // refreshed on every leader HW read/recompute while the ISR is healthy.
+    mutable Offset lastHealthyHw_ = 0;
 };
 
 // ---------------------------------------------------------------------------

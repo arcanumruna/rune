@@ -1568,10 +1568,13 @@ void ClientGateway::pushSubscriptions()
 // doWork on the duty-cycle thread in BrokerNode::doWork()).
 //
 // For each pending entry:
-//   - If replica->highWatermark() > lastOffset → HW covers the WHOLE batch →
-//     send ProduceResponse{OK, partition, baseOffset} and remove the entry.
+//   - If replica->highWatermark() > lastOffset AND replica->isr().size() >=
+//     minIsr_ → HW covers the WHOLE batch AND the ISR is still healthy at
+//     DRAIN time → send ProduceResponse{OK, partition, baseOffset} and remove.
 //     (HW is EXCLUSIVE — count of committed records — so the last record at
 //     offset `lastOffset` is majority-durable only once HW > lastOffset.)
+//     (DR-BUG-3: the ISR>=minIsr check at drain closes the enqueue→drain
+//     shrink-to-minority TOCTOU; a minority leader never falsely acks OK.)
 //   - If nowNs_ - enqueuedAtNs >= kPendingAckTimeoutNs → stuck → send
 //     ProduceResponse{Internal} (followers not advancing) and remove the entry.
 //   - Otherwise → leave in queue for next cycle.
@@ -1627,8 +1630,34 @@ void ClientGateway::drainPendingAcks()
         // Do NOT over-correct to > lastOffset+1 either: once a majority's LEO
         // reaches N (all N records fetched) HW=N and HW > lastOffset=N-1 is true,
         // so the last record acks promptly (no never-ack stall).
-        if (entry.replica && entry.replica->highWatermark() > entry.lastOffset) {
-            // HW advanced past this batch — ack OK.
+        // DR-BUG-3: drain-time min-ISR COMMIT gate (Kafka min.insync.replicas).
+        //
+        // The enqueue-time gate (handleProduce) only proves the ISR was healthy
+        // at ADMISSION.  The ISR can shrink below minIsr in the window between
+        // enqueue and this drain (leader stranded in a minority after followers
+        // die).  An acks=All entry may be acked OK ONLY when BOTH:
+        //   (a) HW covers the whole batch (HW > lastOffset), AND
+        //   (b) the ISR is still >= minIsr at DRAIN time.
+        //
+        // If the ISR is below minIsr we do NOT ack (hold the entry); it stays in
+        // the queue and either (i) acks later if the ISR recovers and HW covers
+        // it, or (ii) hits the existing timeout path below → error (never OK).
+        // This closes the shrink-to-minority TOCTOU: a minority leader NEVER
+        // returns a false majority-durable ack.
+        //
+        // Defense in depth: PartitionReplica::highWatermark() also clamps the
+        // exposed HW to the last majority-committed offset while |ISR| < minIsr
+        // (so HW > lastOffset would already be false for the stranded tail); this
+        // explicit gate makes the commit contract unambiguous at the ack site and
+        // is robust to any future HW-exposure change.
+        const int drainMinIsr = minIsr_.load(std::memory_order_relaxed);
+        const bool isrHealthy =
+            entry.replica &&
+            static_cast<int>(entry.replica->isr().size()) >= drainMinIsr;
+
+        if (entry.replica && isrHealthy &&
+            entry.replica->highWatermark() > entry.lastOffset) {
+            // HW advanced past this batch AND ISR is healthy — ack OK.
             Session* session = sessions_.find(entry.sessionId);
             if (session) {
                 pc::ProduceResponse resp;

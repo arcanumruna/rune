@@ -70,6 +70,11 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
         leaderState_.setIsr(isr);
         leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
 
+        // DR-BUG-3: seed the min-ISR-gated committed floor from the initial HW
+        // (see becomeLeader for the rationale — prevents a gated HW of 0 from
+        // hiding already-committed data while the ISR is below minIsr).
+        lastHealthyHw_ = leaderState_.highWatermark();
+
         if (epoch_ >= 0) {
             epochCache_.assign(static_cast<int32_t>(epoch_),
                                log_->logEndOffset());
@@ -119,6 +124,18 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // if the new compute is ABOVE committedHw, which is only legitimate when
     // a majority of the ISR actually holds those offsets).
     leaderState_.setHighWatermarkFloor(committedHw);
+
+    // DR-BUG-3: seed the min-ISR-gated committed floor from the (majority-)
+    // committed HW captured above.  Without this, a newly-elected leader whose
+    // ISR has not yet re-expanded to minIsr would report a GATED highWatermark()
+    // of min(rawHw, lastHealthyHw_=0) == 0, hiding ALL already-committed data
+    // from HW-bounded subscribers (GR-6) during the ISR-rebuild window — even
+    // though committedHw is genuinely majority-durable.  committedHw is the last
+    // majority-committed offset (exactly the floor we are allowed to expose while
+    // the ISR is below minIsr), so it is the correct seed.
+    if (committedHw > lastHealthyHw_) {
+        lastHealthyHw_ = committedHw;
+    }
 
     leaderState_.setIsr(isr);
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
@@ -346,11 +363,21 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         }
     }
 
+    // DR-BUG-3: advertise the min-ISR-GATED committed HW to followers via the
+    // gated accessor.  followerHw_ = min(localLeo, resp.highWatermark), so a
+    // rejoining follower never treats a minority leader's uncommitted tail as
+    // committed.  Note this does NOT bound catch-up: log_->read() above is
+    // intentionally NOT HW-bounded, so the follower still fetches (and applies)
+    // the uncommitted tail and advances its own LEO — which is exactly what
+    // lets the leader's real (majority) HW advance and the ISR re-expand.  Only
+    // the follower's *committed view* (followerHw_) is held at the majority floor
+    // until the ISR heals.
+    const Offset advertiseHw = highWatermark();
     FetchResponseMsg::encode(
         encodeScratch_.data(), 0,
         epoch_,
         cfg_.partitionId,
-        leaderState_.highWatermark(),
+        advertiseHw,
         /*logStartOffset=*/0,
         kErrNone,
         std::span<const uint8_t>(logBytes.data(), logBytes.size()));
@@ -632,10 +659,42 @@ int PartitionReplica::doWork(int64_t nowNs)
 
 Offset PartitionReplica::highWatermark() const noexcept
 {
-    if (role_ == Role::Leader) {
-        return leaderState_.highWatermark();
+    if (role_ != Role::Leader) {
+        return followerHw_;
     }
-    return followerHw_;
+
+    // Raw majority-of-ISR HW from the leader state (spec §4).
+    const Offset rawHw = leaderState_.highWatermark();
+
+    // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.
+    //
+    // computeHw() takes the majority-th highest LEO across the CURRENT ISR.
+    // When the ISR shrinks to a lone minority survivor (|ISR|==1, majority-of-1
+    // == leaderLeo), rawHw jumps to the leader's own LEO — offsets that no real
+    // majority holds.  Exposing that as "committed" would let the acks=All drain
+    // ack it and HW-bounded subscribers (GR-6) read it, only for it to be
+    // truncated on failover.  So: while the ISR is BELOW minIsr, the effective
+    // committed HW must not advance past the last offset committed while the ISR
+    // was healthy.
+    //
+    // lastHealthyHw_ tracks that frozen floor.  It advances (monotonically) only
+    // while |ISR| >= minIsr; below minIsr it is held constant and clamps rawHw.
+    const int minIsr  = (cfg_.minIsr >= 1) ? cfg_.minIsr : 1;
+    const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
+
+    if (isrSize >= minIsr) {
+        // Healthy ISR: rawHw is a legitimate majority-committed offset.  Advance
+        // the frozen floor and expose the raw HW.
+        if (rawHw > lastHealthyHw_) {
+            lastHealthyHw_ = rawHw;
+        }
+        return rawHw;
+    }
+
+    // ISR below minIsr: do not advance past the last majority-committed offset.
+    // (rawHw may be at or above lastHealthyHw_ due to the monotonic prevHw_
+    // floor; clamp down to the frozen healthy value.)
+    return (rawHw < lastHealthyHw_) ? rawHw : lastHealthyHw_;
 }
 
 const std::vector<NodeId>& PartitionReplica::isr() const noexcept
@@ -754,11 +813,12 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
     }
 
     // Encode once into encodeScratch_ — reuse for all followers.
+    // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
     FetchResponseMsg::encode(
         encodeScratch_.data(), 0,
         epoch_,
         cfg_.partitionId,
-        leaderState_.highWatermark(),
+        highWatermark(),
         /*logStartOffset=*/0,
         kErrNone,
         std::span<const uint8_t>(logBytes.data(), logBytes.size()));

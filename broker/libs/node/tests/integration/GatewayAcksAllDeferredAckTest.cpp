@@ -481,6 +481,161 @@ TEST(GR5_Unit, MinIsr_Rejects) {
 }
 
 // ===========================================================================
+// DRBUG3_Unit_DrainTimeMinIsr_DoesNotAckOnShrinkToMinority
+//
+// SAFETY-CRITICAL (DR-BUG-3 — DR-4 quorum-loss).  This is the drain-time TOCTOU:
+//
+//   1. An acks=All produce is ENQUEUED while the ISR is healthy (|ISR| >= minIsr).
+//      (Enqueue-time gate passes — this is the fast-admission path.)
+//   2. A MAJORITY replicates the batch → HW advances to cover it → the entry is
+//      legitimately acked OK (ISR still healthy).  [sanity: healthy path works]
+//   3. The ISR then SHRINKS below minIsr (the leader is stranded in a minority
+//      after followers die).
+//   4. A FURTHER acks=All batch is appended to the leader (a "minority tail" that
+//      only the lone survivor holds).  Its pending-ack entry MUST NOT be acked OK
+//      — no real majority holds it, so it is NOT majority-durable.
+//
+// The bug (pre-fix): drainPendingAcks only checked `HW > lastOffset`.  When the
+// ISR shrinks to {leader}, ReplicaLeaderState::computeHw() = majority-of-1 =
+// leaderLeo, so HW jumps to the leader's own LEO and covers the minority tail →
+// the deferred ack fires OK → a FALSE majority-durable ack (data-loss on failover).
+//
+// The fix has two layers, BOTH exercised here:
+//   (a) PartitionReplica::highWatermark() clamps the exposed HW to the last
+//       majority-committed offset while |ISR| < minIsr (so HW does NOT cover the
+//       minority tail).
+//   (b) drainPendingAcks() additionally requires isr().size() >= minIsr at drain.
+//
+// This test drives the REPLICA directly (no Aeron) and asserts the EXACT boolean
+// drainPendingAcks() evaluates: (isr>=minIsr) && (HW > lastOffset).  It also
+// asserts the raw HW-clamp so the source-level fix is covered.
+//
+// PRE-FIX: after the ISR shrinks to 1, highWatermark() == leaderLeo (covers the
+//          minority tail) AND the drain gate has no ISR check → the boolean is
+//          TRUE → this test FAILS.
+// POST-FIX: HW is clamped to the majority-committed floor and the ISR check fails
+//          → the boolean is FALSE → this test PASSES.
+// ===========================================================================
+TEST(DRBUG3_Unit, DrainTimeMinIsr_DoesNotAckOnShrinkToMinority) {
+    Gr5TempDir dirL("drbug3_L_"), dirF("drbug3_F_");
+    rune::storage::Log leaderLog(dirL.path.string());
+    rune::storage::Log followerLog(dirF.path.string());
+
+    constexpr NodeId kLeader   = 1;
+    constexpr NodeId kFollower = 2;
+    const std::vector<NodeId> allNodes = {kLeader, kFollower};
+    constexpr int kMinIsr = 2;
+
+    PartitionConfig cfgL = makePartitionCfg(kLeader, kMinIsr);
+    PartitionConfig cfgF = makePartitionCfg(kFollower, kMinIsr);
+    cfgF.selfId = kFollower;
+
+    InMemoryTransport transport;
+    auto leaderReplica = std::make_unique<PartitionReplica>(
+        cfgL, Role::Follower, 0, allNodes, allNodes, &leaderLog, &transport);
+    auto followerReplica = std::make_unique<PartitionReplica>(
+        cfgF, Role::Follower, 0, allNodes, allNodes, &followerLog, &transport);
+
+    PartitionReplica* leader   = leaderReplica.get();
+    PartitionReplica* follower = followerReplica.get();
+
+    transport.setLeader(leader);
+    transport.addFollower(kFollower, follower);
+
+    leader->becomeLeader(1, allNodes);
+    follower->becomeFollower(1, kLeader);
+    ASSERT_EQ(leader->role(), Role::Leader);
+
+    // --- Step 1+2: append a MAJORITY-committed batch (the "safe" batch). ---
+    // Stamp the batch's header baseOffset to match its log position so the
+    // follower's idempotent-apply (baseOffset-keyed) accepts it (the gateway
+    // does this restamp on the produce hot path).
+    constexpr int32_t kSafeRecords = 4;
+    const int64_t safeBase       = leaderLog.logEndOffset();
+    auto safeBatch = makeBatch(kSafeRecords, safeBase);
+    const int64_t safeLastOffset = safeBase + kSafeRecords - 1;
+    leaderLog.appendNoSync(safeBatch.data(), safeBatch.size(), safeLastOffset);
+    leader->onLeaderLogAppended();
+
+    // Replicate until HW covers the safe batch (ISR is healthy: {leader,follower}).
+    int64_t clock = 100'000'000LL;
+    bool safeCommitted = false;
+    for (int i = 0; i < 200 && !safeCommitted; ++i) {
+        clock += 5'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+        if (leader->highWatermark() > safeLastOffset) safeCommitted = true;
+    }
+    ASSERT_TRUE(safeCommitted)
+        << "safe batch must become majority-committed while ISR is healthy";
+    ASSERT_EQ(static_cast<int>(leader->isr().size()), kMinIsr)
+        << "ISR must be healthy (2) after replication";
+
+    const Offset committedFloor = leader->highWatermark();
+    ASSERT_EQ(committedFloor, static_cast<Offset>(kSafeRecords))
+        << "majority-committed HW must equal the safe LEO";
+
+    // --- Step 3: shrink the ISR below minIsr (follower dies / lags out). ---
+    transport.removeFollower(kFollower);        // follower no longer fetches
+    const int64_t kFarFuture = clock + 60LL * 1'000'000'000LL; // > replicaLagMaxMs
+    for (int i = 0; i < 50; ++i) leader->doWork(kFarFuture);
+    ASSERT_EQ(static_cast<int>(leader->isr().size()), 1)
+        << "ISR must shrink to {leader} after follower lag timeout";
+
+    // --- Step 4: append a MINORITY tail (only the lone survivor holds it). ---
+    constexpr int32_t kTailRecords = 5;
+    const int64_t tailBase       = leaderLog.logEndOffset();
+    auto tailBatch = makeBatch(kTailRecords, tailBase);
+    const int64_t tailLastOffset = tailBase + kTailRecords - 1;
+    leaderLog.appendNoSync(tailBatch.data(), tailBatch.size(), tailLastOffset);
+    leader->onLeaderLogAppended();
+
+    // (a) SOURCE-LEVEL: the exposed HW must NOT advance past the majority floor
+    //     while the ISR is below minIsr.  Pre-fix it jumps to leaderLeo (== tail
+    //     LEO) because majority-of-1 == leaderLeo.
+    EXPECT_EQ(leader->highWatermark(), committedFloor)
+        << "DR-BUG-3: minority leader must NOT advance HW past the last "
+           "majority-committed offset (committedFloor=" << committedFloor
+        << ") while |ISR|=" << leader->isr().size() << " < minIsr=" << kMinIsr;
+    EXPECT_LE(leader->highWatermark(), tailLastOffset)
+        << "HW must not cover the minority tail";
+
+    // (b) DRAIN-GATE: the EXACT boolean drainPendingAcks() evaluates for the
+    //     minority-tail pending-ack entry (lastOffset=tailLastOffset).
+    const int isrSize = static_cast<int>(leader->isr().size());
+    const bool isrHealthyAtDrain = (isrSize >= kMinIsr);
+    const bool hwCoversTail      = (leader->highWatermark() > tailLastOffset);
+    const bool wouldAckOk        = isrHealthyAtDrain && hwCoversTail;
+    EXPECT_FALSE(wouldAckOk)
+        << "DR-BUG-3: acks=All minority tail must NEVER be acked OK "
+           "(isrSize=" << isrSize << " minIsr=" << kMinIsr
+        << " HW=" << leader->highWatermark()
+        << " tailLastOffset=" << tailLastOffset << ")";
+
+    // --- Recovery: follower rejoins → ISR heals → HW advances → tail commits. ---
+    // Continue the clock forward from kFarFuture (never rewind time — the
+    // IsrManager time-lag logic is monotonic in nowNs).  The rejoined follower
+    // fetches, catches up to the leader LEO, and maybeExpandIsr re-admits it once
+    // its fetch offset reaches the (clamped) committed prefix.
+    transport.addFollower(kFollower, follower);
+    int64_t rclock = kFarFuture;
+    bool tailCommitted = false;
+    for (int i = 0; i < 2000 && !tailCommitted; ++i) {
+        rclock += 5'000'000LL;
+        leader->doWork(rclock);
+        follower->doWork(rclock);
+        transport.pump(rclock);
+        const bool healthy = static_cast<int>(leader->isr().size()) >= kMinIsr;
+        if (healthy && leader->highWatermark() > tailLastOffset) tailCommitted = true;
+    }
+    EXPECT_TRUE(tailCommitted)
+        << "after the follower rejoins and the ISR heals, the tail MUST become "
+           "majority-committed and ackable (HW=" << leader->highWatermark()
+        << " isr=" << leader->isr().size() << ")";
+}
+
+// ===========================================================================
 // GR5_Unit_PendingAck_Timeout
 //
 // Verify the timeout path: an acks=All entry that has been pending longer than
