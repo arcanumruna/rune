@@ -248,8 +248,9 @@ TEST(AeronPartitionTransportInteg, FetchLoop_TwoNodes) {
                                      &flwLog, flwTransport.get());
 
     // Wire routing: each transport → its local replica.
-    ldrTransport->registerReplica(kPid, &leaderReplica);
-    flwTransport->registerReplica(kPid, &followerReplica);
+    // DR-BUG-5: pass topicId (0 here) as the first argument.
+    ldrTransport->registerReplica(0, kPid, &leaderReplica);
+    flwTransport->registerReplica(0, kPid, &followerReplica);
 
     // -----------------------------------------------------------------------
     // 5.  Leader: append 5 batches before the drive loop starts.
@@ -400,8 +401,9 @@ TEST(AeronPartitionTransportInteg, FetchLoop_LargeBacklog) {
                                      Role::Follower, 1, nodes, isr,
                                      &flwLog, flwTransport.get());
 
-    ldrTransport->registerReplica(kPid, &leaderReplica);
-    flwTransport->registerReplica(kPid, &followerReplica);
+    // DR-BUG-5: pass topicId (0 here) as the first argument.
+    ldrTransport->registerReplica(0, kPid, &leaderReplica);
+    flwTransport->registerReplica(0, kPid, &followerReplica);
 
     // -----------------------------------------------------------------------
     // 5.  Leader: append 500 batches BEFORE the drive loop.

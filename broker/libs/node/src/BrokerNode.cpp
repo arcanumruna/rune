@@ -372,6 +372,7 @@ void BrokerNode::buildReplication() {
             }
 
             PartitionConfig pcfg;
+            pcfg.topicId              = topicId;   // DR-BUG-5: multi-topic routing
             pcfg.partitionId          = static_cast<PartitionId>(part);
             pcfg.selfId               = selfId;
             pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
@@ -402,7 +403,10 @@ void BrokerNode::buildReplication() {
             );
 
             if (replTransport_) {
-                replTransport_->registerReplica(replica->partitionId(), replica.get());
+                // DR-BUG-5: register with composite (topicId, partitionId) key so
+                // replicas from different topics with the same partition index do not
+                // collide in the transport routing table.
+                replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
             }
 
             replicaRegistry_->add(topicId, part, std::move(replica));

@@ -80,12 +80,15 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
 }
 
 // ---------------------------------------------------------------------------
-// registerReplica — add a (partitionId → PartitionReplica*) entry.
+// registerReplica — add a ((topicId, partitionId) → PartitionReplica*) entry.
+// DR-BUG-5: composite key prevents collision when multiple topics share the
+// same partition index.
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::registerReplica(PartitionId       partitionId,
+void AeronPartitionTransport::registerReplica(int32_t           topicId,
+                                               PartitionId       partitionId,
                                                PartitionReplica* replica)
 {
-    replicas_[partitionId] = replica;
+    replicas_[ReplicaKey{topicId, partitionId}] = replica;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,10 +204,13 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         }
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
 
-        // Route to the replica owning this partition.
-        auto it = replicas_.find(req.partition);
+        // Route to the replica owning (topicId, partition).
+        // DR-BUG-5: composite key prevents collision across topics that share
+        // the same partition index.
+        auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
         if (it == replicas_.end() || it->second == nullptr) {
-            spdlog::trace("AeronPartitionTransport: FetchRequest for unknown partition={}", req.partition);
+            spdlog::trace("AeronPartitionTransport: FetchRequest for unknown (topicId={}, partition={})",
+                          req.topicId, req.partition);
             return;
         }
 
@@ -253,9 +259,12 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // fragment size (defence against malformed length prefix).
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
 
-        auto it = replicas_.find(resp.partition);
+        // Route to the replica owning (topicId, partition).
+        // DR-BUG-5: composite key prevents collision across topics.
+        auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
         if (it == replicas_.end() || it->second == nullptr) {
-            spdlog::trace("AeronPartitionTransport: FetchResponse for unknown partition={}", resp.partition);
+            spdlog::trace("AeronPartitionTransport: FetchResponse for unknown (topicId={}, partition={})",
+                          resp.topicId, resp.partition);
             return;
         }
         it->second->applyReplicated(resp);

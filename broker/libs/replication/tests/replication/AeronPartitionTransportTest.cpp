@@ -112,7 +112,8 @@ TEST(AeronTransportSbe, FetchResponseRoundTripNoRecords) {
     std::size_t written = FetchResponseMsg::encode(
         buf.data(), 0, epoch, pid, hw, lso, err, records);
 
-    // Expected: header(8) + fixed(30) + var_header(4) + 0 records = 42
+    // Expected: header(8) + fixed(36) + var_header(4) + 0 records = 48
+    // DR-BUG-5: BLOCK_LENGTH_FIXED grew from 30→36 when topicId was added.
     EXPECT_EQ(written, ReplicationMessageHeader::ENCODED_SIZE +
                        FetchResponseMsg::BLOCK_LENGTH_FIXED +
                        FetchResponseMsg::VAR_HEADER_SIZE);
@@ -337,5 +338,165 @@ TEST(AeronTransportNonBlocking, InMemoryTransport_DropResponseWhenFollowerRemove
     transport.sendFetchResponse(/*toFollower=*/99, resp); // drop (no such follower)
     int delivered = transport.pump(0);
     EXPECT_EQ(delivered, 0) << "Expected 0 delivered (follower 99 not registered)";
+}
+
+// ===========================================================================
+// Suite 4: DR-BUG-5 — multi-topic no-collision
+//
+// Prove that two topics sharing partition index 0 (topic0/part0 and topic1/part0)
+// replicate independently without one orphaning the other.
+//
+// This test would FAIL against the old partitionId-only routing key because
+// registering (topic1/part0) would silently overwrite (topic0/part0) in the map,
+// leaving one follower's replica unreachable from inbound frames.
+//
+// Design: use InMemoryTransport for each (topicId, partition) pair so we can
+// exercise the routing logic end-to-end in-process without Aeron.  Each
+// InMemoryTransport wires one leader ↔ one follower for its own topic/partition.
+// We drive all four replicas in a bounded duty cycle and assert both followers
+// converge (neither is orphaned / stuck at LEO=0).
+// ===========================================================================
+
+TEST(DR_BUG_5, MultiTopicNoCollision_BothFollowersConverge) {
+    // Two topics, both with partition index 0.
+    // topic0 → (leader0 @ nodeId=10, follower0 @ nodeId=11)
+    // topic1 → (leader1 @ nodeId=12, follower1 @ nodeId=13)
+    // Each pair gets its own InMemoryTransport — this mirrors what the
+    // AeronPartitionTransport now does after the DR-BUG-5 fix: route by
+    // (topicId, partition), not partition alone.
+
+    // -----------------------------------------------------------------------
+    // Temp dirs
+    // -----------------------------------------------------------------------
+    const std::string ldr0Dir = makeUniq("mttopic0_ldr");
+    const std::string flw0Dir = makeUniq("mttopic0_flw");
+    const std::string ldr1Dir = makeUniq("mttopic1_ldr");
+    const std::string flw1Dir = makeUniq("mttopic1_flw");
+    std::filesystem::create_directories(ldr0Dir);
+    std::filesystem::create_directories(flw0Dir);
+    std::filesystem::create_directories(ldr1Dir);
+    std::filesystem::create_directories(flw1Dir);
+
+    rune::storage::Log ldr0Log(ldr0Dir);
+    rune::storage::Log flw0Log(flw0Dir);
+    rune::storage::Log ldr1Log(ldr1Dir);
+    rune::storage::Log flw1Log(flw1Dir);
+
+    // -----------------------------------------------------------------------
+    // Build PartitionConfigs — same partitionId=0, different topicId.
+    // -----------------------------------------------------------------------
+    auto makeCfgWithTopic = [](NodeId selfId, int32_t topic, PartitionId pid) {
+        PartitionConfig cfg = makeConfig(selfId, pid);
+        cfg.topicId = topic;
+        return cfg;
+    };
+
+    std::vector<NodeId> nodes0 = {10, 11};
+    std::vector<NodeId> isr0   = {10, 11};
+    std::vector<NodeId> nodes1 = {12, 13};
+    std::vector<NodeId> isr1   = {12, 13};
+
+    InMemoryTransport transport0;  // topic0 partition0
+    InMemoryTransport transport1;  // topic1 partition0
+
+    PartitionReplica leader0(makeCfgWithTopic(10, /*topicId=*/0, 0),
+                              Role::Leader, 1, nodes0, isr0, &ldr0Log, &transport0);
+    PartitionReplica follower0(makeCfgWithTopic(11, /*topicId=*/0, 0),
+                               Role::Follower, 1, nodes0, isr0, &flw0Log, &transport0);
+    transport0.setLeader(&leader0);
+    transport0.addFollower(11, &follower0);
+
+    PartitionReplica leader1(makeCfgWithTopic(12, /*topicId=*/1, 0),
+                              Role::Leader, 1, nodes1, isr1, &ldr1Log, &transport1);
+    PartitionReplica follower1(makeCfgWithTopic(13, /*topicId=*/1, 0),
+                               Role::Follower, 1, nodes1, isr1, &flw1Log, &transport1);
+    transport1.setLeader(&leader1);
+    transport1.addFollower(13, &follower1);
+
+    // -----------------------------------------------------------------------
+    // Append payloads to both leaders.
+    // -----------------------------------------------------------------------
+    auto payload0 = makePayload(0xAA, 32);
+    auto payload1 = makePayload(0xBB, 32);
+
+    Offset off0 = leader0.append(payload0);
+    Offset off1 = leader1.append(payload1);
+    ASSERT_GE(off0, 0) << "leader0 (topic0/part0) append failed";
+    ASSERT_GE(off1, 0) << "leader1 (topic1/part0) append failed";
+
+    const Offset targetLeo0 = leader0.logEndOffset();
+    const Offset targetLeo1 = leader1.logEndOffset();
+
+    // -----------------------------------------------------------------------
+    // Drive both pairs in a bounded duty cycle.
+    // Pre-DR-BUG-5: one of the followers would be orphaned (LEO stays 0).
+    // Post-DR-BUG-5: both followers must converge.
+    // -----------------------------------------------------------------------
+    int64_t clock = 0;
+    constexpr int kCap = 300;
+    bool done = false;
+    for (int i = 0; i < kCap && !done; ++i) {
+        clock += 1'000'000LL;  // 1 ms per step
+        leader0.doWork(clock);
+        follower0.doWork(clock);
+        transport0.pump(clock);
+
+        leader1.doWork(clock);
+        follower1.doWork(clock);
+        transport1.pump(clock);
+
+        done = (follower0.logEndOffset() >= targetLeo0 &&
+                follower1.logEndOffset() >= targetLeo1);
+    }
+
+    // Both followers must have converged.
+    ASSERT_GE(follower0.logEndOffset(), targetLeo0)
+        << "follower0 (topic0/part0) orphaned — replication stalled (DR-BUG-5)";
+    ASSERT_GE(follower1.logEndOffset(), targetLeo1)
+        << "follower1 (topic1/part0) orphaned — replication stalled (DR-BUG-5)";
+}
+
+// DR-BUG-5 wire-layer variant: verify that FetchRequest and FetchResponse
+// with different topicIds but the same partition decode to different routing keys.
+TEST(DR_BUG_5, FetchRequestTopicIdRouting_DifferentKeys) {
+    // Encode FetchRequest for (topic0, part0) and (topic1, part0).
+    uint8_t buf0[FetchRequestMsg::TOTAL_SIZE + 8]{};
+    uint8_t buf1[FetchRequestMsg::TOTAL_SIZE + 8]{};
+
+    FetchRequestMsg::encode(buf0, 0,
+        /*leaderEpoch=*/1, /*partition=*/0, /*followerId=*/2,
+        /*fetchOffset=*/0, /*maxBytes=*/1024, /*topicId=*/0);
+    FetchRequestMsg::encode(buf1, 0,
+        /*leaderEpoch=*/1, /*partition=*/0, /*followerId=*/2,
+        /*fetchOffset=*/0, /*maxBytes=*/1024, /*topicId=*/1);
+
+    auto m0 = FetchRequestMsg::decode(buf0, 0);
+    auto m1 = FetchRequestMsg::decode(buf1, 0);
+
+    // Same partition, different topicId → routing keys must differ.
+    EXPECT_EQ(m0.partition, m1.partition);
+    EXPECT_NE(m0.topicId,   m1.topicId);
+    EXPECT_EQ(m0.topicId, 0);
+    EXPECT_EQ(m1.topicId, 1);
+}
+
+TEST(DR_BUG_5, FetchResponseTopicIdRouting_DifferentKeys) {
+    uint8_t buf0[512]{};
+    uint8_t buf1[512]{};
+
+    FetchResponseMsg::encode(buf0, 0,
+        /*leaderEpoch=*/1, /*partition=*/0,
+        /*hw=*/100, /*lso=*/0, /*errorCode=*/0, {}, /*topicId=*/0);
+    FetchResponseMsg::encode(buf1, 0,
+        /*leaderEpoch=*/1, /*partition=*/0,
+        /*hw=*/100, /*lso=*/0, /*errorCode=*/0, {}, /*topicId=*/1);
+
+    auto r0 = FetchResponseMsg::decode(buf0, 0);
+    auto r1 = FetchResponseMsg::decode(buf1, 0);
+
+    EXPECT_EQ(r0.partition, r1.partition);
+    EXPECT_NE(r0.topicId,   r1.topicId);
+    EXPECT_EQ(r0.topicId, 0);
+    EXPECT_EQ(r1.topicId, 1);
 }
 

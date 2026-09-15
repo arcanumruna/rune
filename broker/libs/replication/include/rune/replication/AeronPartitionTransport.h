@@ -120,13 +120,16 @@ public:
     // -----------------------------------------------------------------------
     // Replica registry
     //
-    // Map (topicId=0, partitionId) → PartitionReplica*.  The transport
+    // Map (topicId, partitionId) → PartitionReplica*.  The transport
     // doesn't own replicas; callers keep them alive.
-    // For GR-1 (single partition per test) partitionId alone is the key.
+    //
+    // DR-BUG-5: keying by partitionId alone caused collisions when multiple
+    // topics share the same partition index (e.g. "events"/part0 and
+    // "multi"/part0).  The composite (topicId, partitionId) key is unique.
     // -----------------------------------------------------------------------
 
     /// Register a replica so inbound frames can be routed to it.
-    void registerReplica(PartitionId partitionId, PartitionReplica* replica);
+    void registerReplica(int32_t topicId, PartitionId partitionId, PartitionReplica* replica);
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -218,8 +221,22 @@ private:
     // Per-peer egress publications (keyed by NodeId).
     std::unordered_map<NodeId, PeerPub>    peers_;
 
-    // Replica registry: PartitionId → PartitionReplica*
-    std::unordered_map<PartitionId, PartitionReplica*> replicas_;
+    // Replica registry: (topicId, partitionId) → PartitionReplica*   [DR-BUG-5]
+    struct ReplicaKey {
+        int32_t     topicId;
+        PartitionId partitionId;
+        bool operator==(const ReplicaKey& o) const noexcept {
+            return topicId == o.topicId && partitionId == o.partitionId;
+        }
+    };
+    struct ReplicaKeyHash {
+        std::size_t operator()(const ReplicaKey& k) const noexcept {
+            std::size_t h = static_cast<std::size_t>(k.topicId);
+            h ^= (static_cast<std::size_t>(k.partitionId) + 0x9e3779b9u + (h << 6) + (h >> 2));
+            return h;
+        }
+    };
+    std::unordered_map<ReplicaKey, PartitionReplica*, ReplicaKeyHash> replicas_;
 
     // Pre-allocated scratch buffer — zero per-op alloc on the send path.
     std::vector<uint8_t> encodeScratch_;

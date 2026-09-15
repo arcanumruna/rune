@@ -73,6 +73,7 @@ inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
 // PartitionConfig — constructor argument bundle
 // ---------------------------------------------------------------------------
 struct PartitionConfig {
+    int32_t     topicId           = 0;   ///< DR-BUG-5: topic identifier for multi-topic routing
     PartitionId partitionId       = 0;
     NodeId      selfId            = 0;
     int64_t     replicaLagMaxMs   = 10'000;         ///< ms before follower shrunk from ISR
@@ -231,6 +232,7 @@ public:
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return log_->logEndOffset(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
+    [[nodiscard]] int32_t     topicId()        const noexcept { return cfg_.topicId; }
     [[nodiscard]] PartitionId partitionId()    const noexcept { return cfg_.partitionId; }
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
 

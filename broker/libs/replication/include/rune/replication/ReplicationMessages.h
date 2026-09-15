@@ -37,7 +37,7 @@ namespace rune::replication {
 // Schema constants
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kSchemaId      = 112;
-inline constexpr uint16_t kSchemaVersion = 1;
+inline constexpr uint16_t kSchemaVersion = 2; // bumped: DR-BUG-5 added topicId to FetchRequest/FetchResponse
 
 // ---------------------------------------------------------------------------
 // Template IDs (assigned for the replication protocol)
@@ -124,13 +124,14 @@ inline uint16_t peekTemplateId(const uint8_t* buf,
 //   (b) Report its own logEndOffset (= fetchOffset) so the leader can
 //       compute the high-watermark.
 //
-// Wire layout (fixed block, 28 bytes):
+// Wire layout (fixed block, 32 bytes):  [schema version 2: DR-BUG-5 adds topicId]
 //   leaderEpoch   : Epoch       (int64)  @ +0   leader epoch the follower expects
 //   partition     : PartitionId (int32)  @ +8
 //   followerId    : NodeId      (int32)  @ +12
 //   fetchOffset   : Offset      (int64)  @ +16  follower logEndOffset / next wanted offset
 //   maxBytes      : int32       @ +24   max bytes of records wanted (0 = position-only)
-// Total: 8 + 4 + 4 + 8 + 4 = 28 bytes
+//   topicId       : int32       @ +28   topic identifier (DR-BUG-5: multi-topic routing)
+// Total: 8 + 4 + 4 + 8 + 4 + 4 = 32 bytes
 // ===========================================================================
 struct FetchRequestMsg {
     Epoch       leaderEpoch;
@@ -138,9 +139,10 @@ struct FetchRequestMsg {
     NodeId      followerId;
     Offset      fetchOffset;
     int32_t     maxBytes;
+    int32_t     topicId;    ///< DR-BUG-5: distinguishes replicas that share a partitionId
 
     static constexpr uint16_t TEMPLATE_ID  = 1;
-    static constexpr uint16_t BLOCK_LENGTH = 28; // 2×int64 + 3×int32 = 16 + 12 = 28
+    static constexpr uint16_t BLOCK_LENGTH = 32; // 2×int64 + 4×int32 = 16 + 16 = 32
     static constexpr std::size_t TOTAL_SIZE =
         ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
 
@@ -150,7 +152,8 @@ struct FetchRequestMsg {
                               PartitionId partition_,
                               NodeId      followerId_,
                               Offset      fetchOffset_,
-                              int32_t     maxBytes_) noexcept
+                              int32_t     maxBytes_,
+                              int32_t     topicId_ = 0) noexcept
     {
         std::size_t pos = offset;
         pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
@@ -160,6 +163,7 @@ struct FetchRequestMsg {
         detail::write_le<int32_t>(p + 12, followerId_);
         detail::write_le<int64_t>(p + 16, fetchOffset_);
         detail::write_le<int32_t>(p + 24, maxBytes_);
+        detail::write_le<int32_t>(p + 28, topicId_);
         return TOTAL_SIZE;
     }
 
@@ -174,6 +178,7 @@ struct FetchRequestMsg {
         m.followerId   = detail::read_le<int32_t>(p + 12);
         m.fetchOffset  = detail::read_le<int64_t>(p + 16);
         m.maxBytes     = detail::read_le<int32_t>(p + 24);
+        m.topicId      = detail::read_le<int32_t>(p + 28);
         return m;
     }
 };
@@ -186,19 +191,23 @@ struct FetchRequestMsg {
 // consumers), the logStartOffset (earliest offset available in this epoch),
 // an error code, and a variable-length records blob.
 //
-// Fixed block (30 bytes):
+// Fixed block (34 bytes):  [schema version 2: DR-BUG-5 adds topicId]
 //   leaderEpoch    : Epoch       (int64)  @ +0
 //   partition      : PartitionId (int32)  @ +8
 //   highWatermark  : Offset      (int64)  @ +12
 //   logStartOffset : Offset      (int64)  @ +20
 //   errorCode      : int16       @ +28
-// Total fixed: 8 + 4 + 8 + 8 + 2 = 30 bytes
+//   _pad           : int16       @ +30   (alignment padding; must be 0)
+//   topicId        : int32       @ +32   (DR-BUG-5: multi-topic routing)
+// Total fixed: 8 + 4 + 8 + 8 + 2 + 2 + 4 = 36 bytes... wait:
+//   leaderEpoch(8) + partition(4) + highWatermark(8) + logStartOffset(8) +
+//   errorCode(2) + _pad(2) + topicId(4) = 36 bytes
 //
 // Followed by variable-length records blob:
-//   recordsLength  : int32       @ +30  (can be 0 for HW-only updates)
-//   recordsData    : uint8[]     @ +34  (recordsLength bytes)
+//   recordsLength  : int32       @ +36  (can be 0 for HW-only updates)
+//   recordsData    : uint8[]     @ +40  (recordsLength bytes)
 //
-// Total on-wire = 8 (header) + 30 (fixed) + 4 (length prefix) + recordsLength
+// Total on-wire = 8 (header) + 36 (fixed) + 4 (length prefix) + recordsLength
 // ===========================================================================
 struct FetchResponseMsg {
     Epoch                    leaderEpoch;
@@ -206,10 +215,11 @@ struct FetchResponseMsg {
     Offset                   highWatermark;
     Offset                   logStartOffset;
     int16_t                  errorCode;
+    int32_t                  topicId;   ///< DR-BUG-5: distinguishes replicas that share a partitionId
     std::span<const uint8_t> records;   ///< Zero-copy view into the decode buf.
 
     static constexpr uint16_t TEMPLATE_ID        = 2;
-    static constexpr uint16_t BLOCK_LENGTH_FIXED = 30; // fixed fields only
+    static constexpr uint16_t BLOCK_LENGTH_FIXED = 36; // fixed fields only (DR-BUG-5: was 30, now 36)
     static constexpr std::size_t VAR_HEADER_SIZE  = 4;  // int32 length prefix
 
     /// Encode FetchResponse into buf[offset].
@@ -221,7 +231,8 @@ struct FetchResponseMsg {
                               Offset                   highWatermark_,
                               Offset                   logStartOffset_,
                               int16_t                  errorCode_,
-                              std::span<const uint8_t> records_) noexcept
+                              std::span<const uint8_t> records_,
+                              int32_t                  topicId_ = 0) noexcept
     {
         std::size_t pos = offset;
         pos += ReplicationMessageHeader::encode(buf, pos,
@@ -232,6 +243,8 @@ struct FetchResponseMsg {
         detail::write_le<int64_t>(p + 12, highWatermark_);
         detail::write_le<int64_t>(p + 20, logStartOffset_);
         detail::write_le<int16_t>(p + 28, errorCode_);
+        detail::write_le<int16_t>(p + 30, 0);         // alignment pad
+        detail::write_le<int32_t>(p + 32, topicId_);
         pos += BLOCK_LENGTH_FIXED;
 
         // Variable-length records blob: int32 length + raw bytes
@@ -267,6 +280,8 @@ struct FetchResponseMsg {
         m.highWatermark  = detail::read_le<int64_t>(p + 12);
         m.logStartOffset = detail::read_le<int64_t>(p + 20);
         m.errorCode      = detail::read_le<int16_t>(p + 28);
+        // p+30: alignment pad (skip)
+        m.topicId        = detail::read_le<int32_t>(p + 32);
 
         const uint8_t* vp = p + BLOCK_LENGTH_FIXED;
         int32_t len = detail::read_le<int32_t>(vp);

@@ -282,7 +282,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
             leaderState_.highWatermark(),
             /*logStartOffset=*/0,
             kErrStaleEpoch,
-            {});
+            {},
+            cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
         auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
         transport_->sendFetchResponse(req.followerId, resp);
         return kErrStaleEpoch;
@@ -314,7 +315,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
             committedHw,
             /*logStartOffset=*/0,
             kErrNotLeader,  // A-NEW-5: correct error code (follower is ahead)
-            {});
+            {},
+            cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
         auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
         transport_->sendFetchResponse(req.followerId, resp);
         return kErrNotLeader;
@@ -380,7 +382,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         advertiseHw,
         /*logStartOffset=*/0,
         kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()),
+        cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
 
     auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
     transport_->sendFetchResponse(req.followerId, resp);
@@ -610,6 +613,7 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.followerId  = cfg_.selfId;
     req.fetchOffset = log_->logEndOffset();
     req.maxBytes    = cfg_.maxFetchBytes;
+    req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     return req;
 }
 
@@ -821,7 +825,8 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
         highWatermark(),
         /*logStartOffset=*/0,
         kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()),
+        cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
 
     auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
 

@@ -38,8 +38,9 @@ TEST(ReplicationMessages, SchemaIdIs112) {
     EXPECT_EQ(kSchemaId, 112);
 }
 
-TEST(ReplicationMessages, SchemaVersionIs1) {
-    EXPECT_EQ(kSchemaVersion, 1);
+TEST(ReplicationMessages, SchemaVersionIs2) {
+    // DR-BUG-5: version bumped from 1→2 when topicId was added to FetchRequest/FetchResponse.
+    EXPECT_EQ(kSchemaVersion, 2);
 }
 
 TEST(ReplicationMessages, FetchRequestTemplateId) {
@@ -51,19 +52,20 @@ TEST(ReplicationMessages, FetchResponseTemplateId) {
 }
 
 TEST(ReplicationMessages, FetchRequestBlockLength) {
-    // 2×int64 + 3×int32 = 16 + 12 = 28
-    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 28u);
+    // DR-BUG-5: 2×int64 + 4×int32 = 16 + 16 = 32 (topicId added)
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 32u);
 }
 
 TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
-    // int64 + int32 + int64 + int64 + int16 = 8+4+8+8+2 = 30
-    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 30u);
+    // DR-BUG-5: int64+int32+int64+int64+int16+int16(pad)+int32 = 8+4+8+8+2+2+4 = 36 (topicId added)
+    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 36u);
 }
 
 TEST(ReplicationMessages, FetchRequestTotalSize) {
     EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE,
               ReplicationMessageHeader::ENCODED_SIZE + FetchRequestMsg::BLOCK_LENGTH);
-    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 36u);
+    // DR-BUG-5: 8 (header) + 32 (block) = 40 (was 36 before topicId was added)
+    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 40u);
 }
 
 TEST(ReplicationMessages, HeaderEncodedSize) {
@@ -211,8 +213,8 @@ TEST(FetchResponse, RoundTripEmptyRecords) {
 
     std::size_t written = FetchResponseMsg::encode(buf, 0,
         epoch, part, hw, logSt, err, empty);
-    // header(8) + fixed(30) + len_prefix(4) + 0 = 42
-    EXPECT_EQ(written, 42u);
+    // DR-BUG-5: header(8) + fixed(36) + len_prefix(4) + 0 = 48 (was 42 before topicId)
+    EXPECT_EQ(written, 48u);
 
     FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
     EXPECT_EQ(m.leaderEpoch,    epoch);
@@ -416,15 +418,17 @@ TEST(FetchResponseDecode, BoundsCheckNegativeLengthClampsToZero) {
     // Encode an empty FetchResponse, then corrupt the length prefix to -1.
     std::vector<uint8_t> buf(128, 0);
     FetchResponseMsg::encode(buf.data(), 0, 1LL, 0, 0LL, 0LL, 0, {});
-    // Corrupt the int32 length prefix at offset 42 (8 header + 30 fixed + 4 len prefix - 4 = 38... actually at offset kFixed)
-    // Header(8) + BLOCK_LENGTH_FIXED(30) = 38; length prefix at buf[38].
+    // Corrupt the int32 length prefix at offset kFixed = Header(8) + BLOCK_LENGTH_FIXED(36) = 44.
+    // DR-BUG-5: BLOCK_LENGTH_FIXED grew from 30→36; kLenOff is now 44 (was 38).
     constexpr std::size_t kLenOff =
         ReplicationMessageHeader::ENCODED_SIZE + FetchResponseMsg::BLOCK_LENGTH_FIXED;
     // Write -1 as little-endian int32.
     buf[kLenOff + 0] = 0xFF; buf[kLenOff + 1] = 0xFF;
     buf[kLenOff + 2] = 0xFF; buf[kLenOff + 3] = 0xFF;
 
-    FetchResponseMsg m = FetchResponseMsg::decode(buf.data(), 0, 42u);
+    // Pass fragmentSize = kLenOff + 4 = 48 (header + fixed + length prefix, no records body).
+    FetchResponseMsg m = FetchResponseMsg::decode(buf.data(), 0,
+        ReplicationMessageHeader::ENCODED_SIZE + FetchResponseMsg::BLOCK_LENGTH_FIXED + FetchResponseMsg::VAR_HEADER_SIZE);
     EXPECT_EQ(m.records.size(), 0u) << "negative length prefix must decode to empty span";
 }
 
@@ -439,4 +443,86 @@ TEST(FetchResponseDecode, BoundsCheckExactFitReturnsFullRecords) {
     FetchResponseMsg m = FetchResponseMsg::decode(buf.data(), 0, written);
     EXPECT_EQ(m.records.size(), 10u);
     for (auto b : m.records) EXPECT_EQ(b, 0xCD);
+}
+
+// ============================================================================
+// DR-BUG-5: topicId round-trip tests
+// These tests verify that the topicId field is correctly encoded and decoded
+// for both FetchRequest and FetchResponse (added in schema version 2).
+// ============================================================================
+
+TEST(FetchRequest, TopicIdRoundTrip) {
+    uint8_t buf[kBufSize]{};
+    // Encode with a non-zero topicId.
+    FetchRequestMsg::encode(buf, 0,
+        /*leaderEpoch=*/1LL, /*partition=*/0,
+        /*followerId=*/2, /*fetchOffset=*/100LL,
+        /*maxBytes=*/4096, /*topicId=*/7);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    EXPECT_EQ(m.topicId, 7);
+    // Other fields must be unaffected.
+    EXPECT_EQ(m.leaderEpoch, 1LL);
+    EXPECT_EQ(m.partition,   0);
+    EXPECT_EQ(m.followerId,  2);
+    EXPECT_EQ(m.fetchOffset, 100LL);
+    EXPECT_EQ(m.maxBytes,    4096);
+}
+
+TEST(FetchRequest, TopicIdDefaultIsZero) {
+    uint8_t buf[kBufSize]{};
+    // Call without topicId (default parameter = 0).
+    FetchRequestMsg::encode(buf, 0, 5LL, 3, 1, 50LL, 512);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    EXPECT_EQ(m.topicId, 0) << "default topicId must be 0";
+}
+
+TEST(FetchRequest, TopicIdDistinguishesTwoTopics) {
+    // Encode two different topicIds for the same partition — ensure decode gives different values.
+    uint8_t buf0[kBufSize]{};
+    uint8_t buf1[kBufSize]{};
+    FetchRequestMsg::encode(buf0, 0, 1LL, 0, 1, 0LL, 0, /*topicId=*/0);
+    FetchRequestMsg::encode(buf1, 0, 1LL, 0, 1, 0LL, 0, /*topicId=*/1);
+    auto m0 = FetchRequestMsg::decode(buf0, 0);
+    auto m1 = FetchRequestMsg::decode(buf1, 0);
+    EXPECT_EQ(m0.partition, m1.partition) << "same partition index";
+    EXPECT_NE(m0.topicId,   m1.topicId)   << "different topicId must produce different decoded value";
+    EXPECT_EQ(m0.topicId, 0);
+    EXPECT_EQ(m1.topicId, 1);
+}
+
+TEST(FetchResponse, TopicIdRoundTrip) {
+    uint8_t buf[kBufSize]{};
+    std::vector<uint8_t> payload = {0x01, 0x02};
+    FetchResponseMsg::encode(buf, 0,
+        /*leaderEpoch=*/2LL, /*partition=*/0,
+        /*highWatermark=*/500LL, /*logStartOffset=*/0LL,
+        /*errorCode=*/0,
+        std::span<const uint8_t>{payload},
+        /*topicId=*/42);
+    FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
+    EXPECT_EQ(m.topicId, 42);
+    EXPECT_EQ(m.leaderEpoch,   2LL);
+    EXPECT_EQ(m.partition,     0);
+    EXPECT_EQ(m.highWatermark, 500LL);
+    EXPECT_EQ(m.records.size(), 2u);
+}
+
+TEST(FetchResponse, TopicIdDefaultIsZero) {
+    uint8_t buf[kBufSize]{};
+    // Call without topicId (default parameter = 0).
+    FetchResponseMsg::encode(buf, 0, 1LL, 0, 0LL, 0LL, 0, {});
+    FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
+    EXPECT_EQ(m.topicId, 0) << "default topicId must be 0";
+}
+
+TEST(FetchResponse, TopicIdDistinguishesTwoTopics) {
+    uint8_t buf0[kBufSize]{};
+    uint8_t buf1[kBufSize]{};
+    FetchResponseMsg::encode(buf0, 0, 1LL, 0, 0LL, 0LL, 0, {}, /*topicId=*/0);
+    FetchResponseMsg::encode(buf1, 0, 1LL, 0, 0LL, 0LL, 0, {}, /*topicId=*/99);
+    auto m0 = FetchResponseMsg::decode(buf0, 0);
+    auto m1 = FetchResponseMsg::decode(buf1, 0);
+    EXPECT_NE(m0.topicId, m1.topicId);
+    EXPECT_EQ(m0.topicId, 0);
+    EXPECT_EQ(m1.topicId, 99);
 }
