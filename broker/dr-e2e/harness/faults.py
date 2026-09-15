@@ -258,3 +258,198 @@ def set_mtu(cluster, service: str, mtu: int, iface: str = "eth0") -> None:
             f"set_mtu({mtu}) failed on {service} ({iface}): "
             f"{res.stderr or res.stdout}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Storage / disk / log-corruption faults (DR-14)
+#
+# These helpers reach into a broker node's named Docker volume via a temporary
+# alpine container.  The container is STOPPED (exited) when these helpers run —
+# the volume persists on the Docker host and is accessible by mounting it into a
+# throwaway container with `docker run --rm -v <vol>:/data alpine ...`.
+#
+# Volume naming: docker compose uses "<project>_<volume-name>" for named volumes.
+# The compose volumes are declared as `rune-data-1`, `rune-data-2`, `rune-data-3`.
+# With project="rune-dr-fault" (fresh_cluster) the volume names are:
+#   rune-dr-fault_rune-data-1, rune-dr-fault_rune-data-2, rune-dr-fault_rune-data-3
+#
+# RUNE_DATA_DIR is /var/lib/rune (baked into x-broker-env in docker-compose.yml).
+# The helpers mount the volume at /data inside the throwaway container, so paths
+# inside the volume are /data/<topic>/<partition>/<segment>.log (or similar).
+#
+# Log file discovery: `find /data -type f \( -name "*.log" -o -name "*.seg" \)
+# | sort` locates all log/segment files.  The LAST file (sort order) is treated
+# as the active tail; the FIRST file is the oldest segment.  For small test runs
+# (few hundred records) there will typically be a single segment file per
+# partition, so tail ≡ first ≡ only.
+#
+# Docker Desktop / macOS caveat: named volume mounts via `docker run -v` work
+# on Docker Desktop (the volume lives in the LinuxKit VM).  Shell commands
+# (find, dd, truncate) work inside the alpine container.  The approach is
+# portable across platforms.
+# ---------------------------------------------------------------------------
+
+_ALPINE_IMAGE = "alpine:latest"
+
+
+def _volume_name(project: str, service_idx: int) -> str:
+    """Return the Docker volume name for a broker node.
+
+    compose naming: "<project>_rune-data-<service_idx>" where service_idx is
+    1-based (rune-1 → 1, rune-2 → 2, rune-3 → 3).
+    """
+    return f"{project}_rune-data-{service_idx}"
+
+
+def _exec_on_volume(volume: str, shell_cmd: str, timeout: int = 60):
+    """Run a shell command inside a throwaway alpine container with the broker
+    volume mounted at /data.  Returns CmdResult.
+
+    The container is removed after the command exits (--rm).  The volume must
+    exist (i.e., the broker container must have been started at least once so
+    compose has initialised the named volume).
+    """
+    return run(
+        [
+            "docker", "run", "--rm",
+            "-v", f"{volume}:/data",
+            _ALPINE_IMAGE,
+            "sh", "-c", shell_cmd,
+        ],
+        timeout=timeout,
+    )
+
+
+def _find_log_files_cmd() -> str:
+    """Shell fragment that lists all broker log/segment files under /data, sorted."""
+    return r"find /data -type f \( -name '*.log' -o -name '*.seg' \) | sort"
+
+
+def truncate_log_tail(project: str, service_idx: int, tail_bytes: int = 128) -> None:
+    """Remove the last `tail_bytes` bytes from the active log segment of the
+    broker node identified by `service_idx` (1-based).
+
+    The node's container MUST be stopped (exited) before calling this.  The
+    helper mounts the named Docker volume into a throwaway alpine container,
+    finds the last log/segment file (sorted), and uses `truncate` to remove
+    the tail, simulating a torn write or incomplete fsync before crash.
+
+    Raises RuntimeError if no log files are found (volume empty / wrong path)
+    or if the truncate command fails.
+
+    Args:
+        project:     Compose project name (e.g. "rune-dr-fault").
+        service_idx: 1-based node index matching the volume suffix (1, 2, or 3).
+        tail_bytes:  Number of bytes to remove from the end of the last segment.
+    """
+    vol = _volume_name(project, service_idx)
+
+    # Find the last (active) log segment and truncate its tail.
+    # The shell script:
+    #   1. Finds all .log/.seg files under /data.
+    #   2. Takes the LAST one (sort, tail -1) as the active tail segment.
+    #   3. Gets its current size via `wc -c`.
+    #   4. Truncates to max(0, size - tail_bytes) bytes.
+    shell_cmd = (
+        f"set -e; "
+        f"FILES=$({_find_log_files_cmd()}); "
+        f"if [ -z \"$FILES\" ]; then echo 'ERROR: no log files found in /data' >&2; exit 1; fi; "
+        f"LAST=$(echo \"$FILES\" | tail -1); "
+        f"echo \"Truncating tail of: $LAST\"; "
+        f"SIZE=$(wc -c < \"$LAST\"); "
+        f"NEW_SIZE=$(( SIZE > {tail_bytes} ? SIZE - {tail_bytes} : 0 )); "
+        f"truncate -s \"$NEW_SIZE\" \"$LAST\"; "
+        f"echo \"Truncated $LAST from $SIZE → $NEW_SIZE bytes\""
+    )
+
+    res = _exec_on_volume(vol, shell_cmd)
+    if not res.ok:
+        raise RuntimeError(
+            f"truncate_log_tail failed for volume {vol}:\n"
+            f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        )
+
+
+def corrupt_log_tail(project: str, service_idx: int,
+                     corrupt_offset: int = 0, corrupt_length: int = 16) -> None:
+    """Overwrite `corrupt_length` bytes at `corrupt_offset` from the END of the
+    last log segment with 0xFF, simulating bit-flips in the tail (torn write).
+
+    The node's container MUST be stopped before calling this.  Unlike
+    truncate_log_tail (which removes the tail), this OVERWRITES bytes, which
+    exercises the CRC-detection path without changing the file size.
+
+    Args:
+        project:        Compose project name.
+        service_idx:    1-based node index.
+        corrupt_offset: Byte offset from the END of the file to start overwriting.
+                        0 = the very last `corrupt_length` bytes.
+        corrupt_length: Number of bytes to overwrite with 0xFF.
+    """
+    vol = _volume_name(project, service_idx)
+
+    shell_cmd = (
+        f"set -e; "
+        f"FILES=$({_find_log_files_cmd()}); "
+        f"if [ -z \"$FILES\" ]; then echo 'ERROR: no log files found in /data' >&2; exit 1; fi; "
+        f"LAST=$(echo \"$FILES\" | tail -1); "
+        f"echo \"Corrupting tail of: $LAST\"; "
+        f"SIZE=$(wc -c < \"$LAST\"); "
+        f"WRITE_POS=$(( SIZE - {corrupt_offset} - {corrupt_length} )); "
+        f"if [ $WRITE_POS -lt 0 ]; then WRITE_POS=0; fi; "
+        f"dd if=/dev/zero bs=1 count={corrupt_length} 2>/dev/null | tr '\\000' '\\377' | "
+        f"dd of=\"$LAST\" bs=1 seek=$WRITE_POS count={corrupt_length} conv=notrunc 2>/dev/null; "
+        f"echo \"Overwrote {corrupt_length} bytes at offset $WRITE_POS in $LAST\""
+    )
+
+    res = _exec_on_volume(vol, shell_cmd)
+    if not res.ok:
+        raise RuntimeError(
+            f"corrupt_log_tail failed for volume {vol}:\n"
+            f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        )
+
+
+def corrupt_log_mid(project: str, service_idx: int,
+                    corrupt_offset: int = 64, corrupt_length: int = 16) -> None:
+    """Overwrite `corrupt_length` bytes at `corrupt_offset` bytes from the
+    START of the FIRST (oldest) log segment with 0xFF, simulating a mid-log
+    bit-flip or hardware error in the middle of the committed log.
+
+    The node's container MUST be stopped before calling this.  Targeting the
+    FIRST segment (oldest) means the corruption is not at the tail — the broker
+    must scan through the committed log from the beginning to detect it.
+
+    Args:
+        project:        Compose project name.
+        service_idx:    1-based node index.
+        corrupt_offset: Byte offset from the START of the first segment.
+                        Default 64: skip a typical header before overwriting.
+        corrupt_length: Number of bytes to overwrite with 0xFF.
+    """
+    vol = _volume_name(project, service_idx)
+
+    shell_cmd = (
+        f"set -e; "
+        f"FILES=$({_find_log_files_cmd()}); "
+        f"if [ -z \"$FILES\" ]; then echo 'ERROR: no log files found in /data' >&2; exit 1; fi; "
+        f"FIRST=$(echo \"$FILES\" | head -1); "
+        f"echo \"Corrupting mid-log of: $FIRST at offset {corrupt_offset}\"; "
+        f"SIZE=$(wc -c < \"$FIRST\"); "
+        f"if [ $SIZE -le {corrupt_offset} ]; then "
+        f"  echo \"WARN: file too small ($SIZE <= {corrupt_offset}), using offset 0\"; "
+        f"  WRITE_POS=0; "
+        f"else "
+        f"  WRITE_POS={corrupt_offset}; "
+        f"fi; "
+        f"dd if=/dev/zero bs=1 count={corrupt_length} 2>/dev/null | tr '\\000' '\\377' | "
+        f"dd of=\"$FIRST\" bs=1 seek=$WRITE_POS count={corrupt_length} conv=notrunc 2>/dev/null; "
+        f"echo \"Overwrote {corrupt_length} bytes at offset $WRITE_POS in $FIRST\""
+    )
+
+    res = _exec_on_volume(vol, shell_cmd)
+    if not res.ok:
+        raise RuntimeError(
+            f"corrupt_log_mid failed for volume {vol}:\n"
+            f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        )
