@@ -13,6 +13,8 @@
 //   6. rebuildFromLog reconstructs identical state from a fresh store over the
 //      same replica Log (last-write-wins including lower-offset overwrite)
 //   7. commit returns false when the replica is minIsr-gated
+//   8. rebuildFromLog spans multiple log segments (segment-roll durability)
+//   9. commit() rejects fields that would overflow uint16 encoding
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -25,8 +27,10 @@
 #include <chrono>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <unistd.h>
 #include <vector>
 
@@ -290,4 +294,133 @@ TEST_F(GatedReplicaTest, CommitReturnsFalseWhenGated) {
 
     // In-memory map must NOT be updated when gated.
     EXPECT_FALSE(store_->fetch("grp1", tp("topicA", 0)).has_value());
+}
+
+// ===========================================================================
+// 8. rebuildFromLog spans multiple log segments (durability correctness)
+//
+// A Log with a tiny segmentRollBytes forces a segment roll after a small
+// number of commits.  rebuildFromLog() must walk ALL segments and reconstruct
+// every committed offset — including those written to segments after the first.
+// This is the exact case that the old single-call read(0, INT32_MAX) missed.
+// ===========================================================================
+TEST(RebuildAcrossSegmentRoll, ReconstructsAllCommitsAcrossRoll) {
+    // Use a very small segment roll threshold (512 bytes) so a handful of
+    // commits force a segment roll.  Each commit payload is ~80-120 bytes of
+    // RecordBatch-wrapped data, so ~5 commits fill the first segment.
+    constexpr int64_t kTinyRoll = 512;
+
+    TempDir dir("ros_roll");
+    rune::storage::Log log(dir.path, kTinyRoll);
+
+    NullTransport nt;
+    PartitionReplica replica(
+        makeSingleNodeConfig(/*selfId=*/1, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1},
+        std::vector<NodeId>{1},
+        &log,
+        &nt);
+
+    ReplicatedOffsetStore store(&replica);
+    int64_t clock = 0;
+
+    auto pumpHW = [&](Offset target) {
+        for (int i = 0; i < kDriverCap && replica.highWatermark() < target; ++i) {
+            clock += 1'000'000LL;
+            replica.doWork(clock);
+        }
+        return replica.highWatermark() >= target;
+    };
+
+    // Commit enough records to guarantee a segment roll.  With a 512-byte
+    // threshold and ~100-byte payloads per commit, 10 commits ensures >= 2
+    // segments.
+    constexpr int kNumCommits = 10;
+    for (int i = 0; i < kNumCommits; ++i) {
+        std::string grp  = "grp"  + std::to_string(i % 3);    // 3 groups
+        std::string tpc  = "topic" + std::to_string(i % 2);   // 2 topics
+        int32_t     part = i % 4;                              // 4 partitions
+        int64_t     off  = static_cast<int64_t>(i * 10);
+        std::string meta = "meta_" + std::to_string(i);
+        ASSERT_TRUE(store.commit(grp, tp(tpc, part), off, meta, /*tsNs=*/i * 1000LL));
+    }
+    // Pump HW so all commits become visible.
+    ASSERT_TRUE(pumpHW(kNumCommits));
+
+    // Verify we actually have multiple segments (proves the roll happened).
+    auto segs = log.segmentBaseOffsets();
+    ASSERT_GT(segs.size(), 1u) << "Expected a segment roll with " << kNumCommits
+        << " commits into a " << kTinyRoll << "-byte segment — only 1 segment found."
+        << "  Either segmentRollBytes is too large or each commit is too small.";
+
+    // Snapshot original state for comparison.
+    // Build expected map: last-write-wins per (grp, topic, partition).
+    struct Key { std::string grp, topic; int32_t part; };
+    struct Val { int64_t off; std::string meta; };
+    std::map<std::tuple<std::string,std::string,int32_t>, Val> expected;
+    for (int i = 0; i < kNumCommits; ++i) {
+        std::string grp  = "grp"  + std::to_string(i % 3);
+        std::string tpc  = "topic" + std::to_string(i % 2);
+        int32_t     part = i % 4;
+        int64_t     off  = static_cast<int64_t>(i * 10);
+        std::string meta = "meta_" + std::to_string(i);
+        expected[{grp, tpc, part}] = {off, meta};
+    }
+
+    // Construct a FRESH store over the same replica and rebuild.
+    ReplicatedOffsetStore rebuilt(&replica);
+    rebuilt.rebuildFromLog();
+
+    // Every expected (grp, topic, partition) → offset must be present and correct.
+    for (auto& [key, val] : expected) {
+        auto& [grp, tpc, part] = key;
+        auto co = rebuilt.fetch(grp, tp(tpc, part));
+        ASSERT_TRUE(co.has_value())
+            << "rebuildFromLog() missed commit for ("
+            << grp << ", " << tpc << ", " << part << ")";
+        EXPECT_EQ(co->offset, val.off)
+            << "Wrong offset for (" << grp << ", " << tpc << ", " << part << ")";
+        EXPECT_EQ(co->metadata, val.meta)
+            << "Wrong metadata for (" << grp << ", " << tpc << ", " << part << ")";
+    }
+}
+
+// ===========================================================================
+// 9. commit() rejects fields that would overflow uint16 encoding
+// ===========================================================================
+TEST(CommitLengthGuard, RejectsOversizedFields) {
+    TempDir dir("ros_guard");
+    rune::storage::Log log(dir.path);
+
+    NullTransport nt;
+    PartitionReplica replica(
+        makeSingleNodeConfig(/*selfId=*/1, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1},
+        std::vector<NodeId>{1},
+        &log,
+        &nt);
+
+    ReplicatedOffsetStore store(&replica);
+
+    // A string just over UINT16_MAX characters.
+    const std::string bigStr(static_cast<std::size_t>(UINT16_MAX) + 1, 'x');
+
+    // Oversized group name.
+    EXPECT_FALSE(store.commit(bigStr,         tp("topic", 0), 1, "meta", 0));
+    // Oversized topic name.
+    EXPECT_FALSE(store.commit("grp",          tp(bigStr,  0), 1, "meta", 0));
+    // Oversized metadata.
+    EXPECT_FALSE(store.commit("grp",          tp("topic", 0), 1, bigStr, 0));
+
+    // None of the above should have side-effects on the in-memory map.
+    EXPECT_FALSE(store.fetch("grp", tp("topic", 0)).has_value());
+
+    // A normal commit must still succeed after the guard returns.
+    EXPECT_TRUE(store.commit("grp", tp("topic", 0), 42, "ok", 0));
+    // (We do not need to pump HW for the in-memory check.)
+    auto co = store.fetch("grp", tp("topic", 0));
+    ASSERT_TRUE(co.has_value());
+    EXPECT_EQ(co->offset, 42);
 }

@@ -125,6 +125,13 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
                                     std::string_view      metadata,
                                     int64_t               tsNs)
 {
+    // Guard: group name, topic name, and metadata must each fit in uint16_t.
+    // A size() >= 64 KiB would silently truncate the encoded length to a wrong
+    // value and mis-frame every record after this one in rebuildFromLog().
+    if (group.size()      > UINT16_MAX) return false;
+    if (tp.topic.size()   > UINT16_MAX) return false;
+    if (metadata.size()   > UINT16_MAX) return false;
+
     // 1. Encode key + value into reusable scratch buffers.
     encodeKey(group, tp);
     encodeVal(offset, tsNs, metadata);
@@ -264,6 +271,20 @@ void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
 // ---------------------------------------------------------------------------
 // rebuildFromLog
 // ---------------------------------------------------------------------------
+//
+// Log::read(fetchOffset, maxBytes) resolves only the ONE segment that contains
+// fetchOffset — it does NOT span segment boundaries (segments roll at the
+// configured segmentRollBytes, default 64 MiB).  A single call with
+// fetchOffset=0 and maxBytes=INT32_MAX therefore silently stops at the end of
+// the first segment and misses every commit written to subsequent segments.
+//
+// The fix: loop, advancing fetchOffset to (lastBatchBase + lastOffsetDelta + 1)
+// after each chunk, until we reach or exceed the committed high-watermark.
+// Each iteration issues one read() that covers one segment (or part of one),
+// and we walk the returned batches to both apply records AND compute the next
+// fetchOffset.  The loop terminates when the read returns nothing new (empty,
+// or no progress made) or when fetchOffset >= hw.
+// ---------------------------------------------------------------------------
 
 void ReplicatedOffsetStore::rebuildFromLog()
 {
@@ -272,32 +293,59 @@ void ReplicatedOffsetStore::rebuildFromLog()
     const rune::replication::Offset hw = replica_->highWatermark();
     if (hw <= 0) return; // nothing committed yet
 
-    // read() returns all committed bytes [0, hw).
-    std::vector<uint8_t> data = replica_->read(/*fetchOffset=*/0, /*maxBytes=*/INT32_MAX);
-    if (data.empty()) return;
+    // Chunk size: large enough to read an entire typical segment in one call.
+    // INT32_MAX would work but is unnecessarily large; 64 MiB matches the
+    // default segment roll size and avoids requesting more than one segment's
+    // worth of bytes per iteration.
+    static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB
 
-    // Walk RecordBatches in the returned buffer.
-    std::size_t pos = 0;
-    while (pos < data.size()) {
-        const uint8_t*    batchStart = data.data() + pos;
-        const std::size_t remaining  = data.size() - pos;
+    rune::replication::Offset fetchOffset = 0;
 
-        if (remaining < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
-            break;
+    while (fetchOffset < hw) {
+        std::vector<uint8_t> data =
+            replica_->read(fetchOffset, kChunkBytes);
+        if (data.empty()) break; // no more committed data at this offset
 
-        rune::protocol::RecordBatchReader reader(batchStart, remaining);
-        if (!reader.ensureValid()) break;
+        // Walk all RecordBatches in this chunk, applying each record and
+        // tracking the next fetchOffset (last batch's committed end + 1).
+        std::size_t pos = 0;
+        rune::replication::Offset lastBatchEnd = fetchOffset; // sentinel: no progress
 
-        int32_t tl = reader.totalLength();
-        if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+        while (pos < data.size()) {
+            const uint8_t*    batchStart = data.data() + pos;
+            const std::size_t remaining  = data.size() - pos;
 
-        // Each outer batch has exactly 1 record: key="", value=<our payload>.
-        reader.forEach([this](std::string_view key, std::string_view val,
-                              int64_t /*offset*/, int64_t /*ts*/) {
-            applyRecord(key, val);
-        });
+            if (remaining < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead))
+                break;
 
-        pos += static_cast<std::size_t>(tl);
+            rune::protocol::RecordBatchReader reader(batchStart, remaining);
+            if (!reader.ensureValid()) break;
+
+            int32_t tl = reader.totalLength();
+            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+
+            // Each outer batch has exactly 1 record: key="", value=<our payload>.
+            reader.forEach([this](std::string_view key, std::string_view val,
+                                  int64_t /*offset*/, int64_t /*ts*/) {
+                applyRecord(key, val);
+            });
+
+            // Compute the committed end of this batch: baseOffset + lastOffsetDelta + 1.
+            // This is the fetchOffset at which the NEXT batch starts in the log.
+            const rune::replication::Offset batchNextOffset =
+                reader.baseOffset() + reader.lastOffsetDelta() + 1;
+            if (batchNextOffset > lastBatchEnd)
+                lastBatchEnd = batchNextOffset;
+
+            pos += static_cast<std::size_t>(tl);
+        }
+
+        // If no progress was made (no valid batch decoded), stop to avoid an
+        // infinite loop (e.g. a corrupt leading batch at this offset).
+        if (lastBatchEnd <= fetchOffset) break;
+
+        fetchOffset = lastBatchEnd;
     }
 }
 

@@ -16,15 +16,18 @@
 //           [total: 18 + metaLen bytes]
 //
 // Allocation behavior:
-//   commit(): no per-commit heap allocation on the hot path.  The key_bytes and
-//   val_bytes are encoded into keyScratch_ and valScratch_ (member vectors
+//   commit(): CG-2's own encoding path is close-to-zero-alloc.  The key_bytes
+//   and val_bytes are encoded into keyScratch_ and valScratch_ (member vectors
 //   pre-reserved in the constructor and reused across calls).  The compact
 //   payload is assembled into batchScratch_ (also a member vector reused across
-//   calls).  PartitionReplica::append() internally wraps the payload in a
-//   RecordBatch (one heap allocation for the batch vector, amortised by the
-//   replica's own scratch — see PartitionReplica.cpp::makeBatch), which is
-//   beyond our control; this is noted as a concern for a future zero-alloc pass
-//   that could bypass the wrapping (see cg2-report.md).
+//   calls) — no per-commit heap allocation on these three buffers after the
+//   first call that causes them to reach their steady-state size.
+//   However, PartitionReplica::append() internally calls makeBatch() which
+//   returns a fresh std::vector<uint8_t> by value (one heap allocation per
+//   commit, in the replication layer, beyond our control).  A future zero-alloc
+//   pass would need a PartitionReplica::appendInto() variant (using the existing
+//   RecordBatchBuilder::buildInto seam) to write the wrapper batch into a
+//   caller-supplied buffer.  Deferred to the DR-9 M1 zero-copy card.
 //   fetch() / fetchAll(): cold path; allocations are acceptable.
 //   rebuildFromLog(): replay path (cold); allocations are acceptable.
 //
