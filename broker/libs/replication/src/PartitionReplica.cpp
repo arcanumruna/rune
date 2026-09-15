@@ -150,6 +150,15 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     epochCache_.assign(static_cast<int32_t>(epoch_), log_->logEndOffset());
 
     lastIsrCheckNs_ = 0;
+
+    // DR-BUG-6: arm the follower-lag TIME-clock reset for the first leader
+    // doWork(nowNs).  Until it fires, no ISR check runs (lastIsrCheckNs_==0 makes
+    // the first doWork the ISR-check tick, and we reset the clock there BEFORE the
+    // shrink), so followers get a full lag window to probe/fetch instead of being
+    // evicted at t=election+10ms with lastFetchTimeNs=0.  This is what lets an
+    // up-to-date survivor stay in the ISR while it runs its OffsetsForLeaderEpoch
+    // probe, so the reverse-reconcile engages instead of an authoritative truncate.
+    leaderLagClockNeedsReset_ = true;
 }
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
@@ -727,6 +736,24 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         return;
     }
 
+    // DR-BUG-6 HW-RECOVERY: an OffsetsForLeaderEpoch probe is proof of liveness and
+    // carries the follower's LEO.  A survivor DEFERS normal fetching while it
+    // probes, so without this the leader never learns the survivor's LEO and its
+    // majority-of-ISR high-watermark stays stuck at 0 after failover — the whole
+    // committed set becomes UNDELIVERABLE to HW-bounded subscribers (GR-6) even
+    // though every record is durably on disk (observed: full committed set
+    // undelivered on a post-failover subscribe).  Treat the probe like a fetch for
+    // HW/ISR bookkeeping: record the follower's LEO (clamped to our own LEO — a
+    // follower can never advance our committed HW beyond what WE hold) so the HW
+    // recomputes and the survivor stays a live ISR member.  This is pure HW/liveness
+    // bookkeeping; it does NOT change any truncation decision below.
+    {
+        const Offset trackedLeo = std::min<Offset>(req.followerLeo, log_->logEndOffset());
+        if (trackedLeo >= 0) {
+            leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
+        }
+    }
+
     // Deficient-leader detection — EPOCH-LINEAGE gated AND ISR gated (see the
     // block comment above).  (1) The ahead tail must be a genuine continuation of
     // OUR OWN still-open shared epoch (rejects divergent non-shared-epoch tails),
@@ -737,8 +764,10 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         && std::find(isrManager_->isr().begin(), isrManager_->isr().end(),
                      req.followerId) != isrManager_->isr().end();
 
-    if (followerInIsr
-        && followerTailIsSharedContinuation(req.requestedEpoch, req.followerLeo)) {
+    const bool sharedCont =
+        followerTailIsSharedContinuation(req.requestedEpoch, req.followerLeo);
+
+    if (followerInIsr && sharedCont) {
         // (Re)issue the reverse pull.  We (re)send when idle (reconcileTarget_<0)
         // OR when the pending target is this same follower — the previous pull or
         // its response may have been dropped by the transport, and the follower
@@ -1066,6 +1095,15 @@ int PartitionReplica::doWork(int64_t nowNs)
     int work = 0;
 
     if (role_ == Role::Leader) {
+        // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
+        // becoming leader (becomeLeader has no clock).  This MUST happen before
+        // the first maybeShrinkIsr so followers are not evicted with a stale
+        // lastFetchTimeNs of 0 (see becomeLeader / IsrManager::resetLagClock).
+        if (leaderLagClockNeedsReset_) {
+            isrManager_->resetLagClock(nowNs);
+            leaderLagClockNeedsReset_ = false;
+        }
+
         if (nowNs - lastIsrCheckNs_ >= cfg_.isrCheckIntervalNs) {
             lastIsrCheckNs_ = nowNs;
             ++work; // ISR check cycle itself counts as work
@@ -1095,25 +1133,36 @@ int PartitionReplica::doWork(int64_t nowNs)
             if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
                 lastFetchEmitNs_ = nowNs;
 
-                // DR-BUG-6 liveness fallback: if the probe goes unanswered for
-                // kEpochProbeMaxAttempts cycles (transport without support, or
-                // the new leader not yet promoted), fall back to the
-                // conservative committed-HW truncation and resume fetching.  This
-                // is the exact pre-DR-BUG-6 behaviour — safe (never below the
-                // committed floor), just possibly re-fetching a small committed
-                // tail — and it guarantees we never stall permanently.
+                // DR-BUG-6 liveness fallback (NON-DESTRUCTIVE).
+                //
+                // The pre-fix fallback truncated to the committed-HW floor after
+                // kEpochProbeMaxAttempts unanswered probes.  That was the residual
+                // DR-8 committed-loss: under packet loss / while the new leader is
+                // still being promoted, the probe goes unanswered, the counter
+                // climbs to the cap, and the survivor truncates to its STALE HW
+                // view — dropping committed records the (deficient) new leader has
+                // not yet reconciled (observed live: LEO 68 -> 67, floor 67).
+                //
+                // Correct behaviour: an unanswered probe is NOT evidence of
+                // divergence, so it must NEVER trigger a truncation.  On reaching
+                // the cap we (a) KEEP the full tail (no truncation — committed data
+                // is never dropped on a timeout), (b) keep the probe ARMED so the
+                // leader's eventual AUTHORITATIVE answer (kErrNone) still performs
+                // the correct, divergence-safe truncation via
+                // applyOffsetsForLeaderEpochResponse (this is the no-divergence
+                // backstop — a genuinely divergent tail is truncated then), and
+                // (c) ALSO emit a plain fetch for liveness so the follower makes
+                // progress even if the leader is slow to answer the probe.  A plain
+                // fetch from an ahead follower hits the leader's reconcile backstop
+                // (fetchOffset > leaderLEO → serves nothing, keeps our tail), so it
+                // is safe and cannot stamp divergent bytes.  We reset the attempt
+                // counter so probing continues indefinitely rather than giving up.
                 if (epochProbeAttempts_ >= kEpochProbeMaxAttempts) {
-                    Offset committedFloor = epochProbeFloor_;
-                    Offset truncOff =
-                        truncationOffsetForEpochChange(epochCache_, epoch_);
-                    if (truncOff < 0)             truncOff = committedFloor;
-                    if (truncOff < committedFloor) truncOff = committedFloor;
-                    if (truncOff < log_->logEndOffset()) truncateLog(truncOff);
-                    epochProbePending_ = false;
+                    epochProbeAttempts_ = 0;   // keep probing; never give up destructively
                     FetchRequestMsg fr = nextFetch();
                     transport_->sendFetchRequest(fr);
                     ++work;
-                    return work;
+                    // fall through to re-issue the probe this cycle too.
                 }
 
                 ++epochProbeAttempts_;

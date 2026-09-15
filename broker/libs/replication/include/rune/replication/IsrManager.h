@@ -114,6 +114,32 @@ public:
         s.lastFetchTimeNs = nowNs;
     }
 
+    /// DR-BUG-6 — reset the replica-lag TIME clock for every follower to `nowNs`.
+    ///
+    /// Kafka fidelity: a replica's `replica.lag.time.max.ms` window is measured
+    /// from the moment the leader takes over the partition, NOT from wall-clock
+    /// zero.  A newly-elected leader must give each follower one full lag window
+    /// to make contact before it may shrink that follower out of the ISR.
+    ///
+    /// Without this, every follower's `lastFetchTimeNs` is 0 at leadership start,
+    /// so the FIRST `maybeShrinkIsr` (10 ms after election) sees `nowNs - 0` far
+    /// exceeding the lag window and evicts EVERY follower immediately — collapsing
+    /// the ISR to the leader alone.  That eviction is the production DR-BUG-6
+    /// failure: an up-to-date survivor that DEFERS fetching while it runs its
+    /// OffsetsForLeaderEpoch probe never refreshes its fetch time, so it is not in
+    /// the ISR when its probe arrives → the leader answers AUTHORITATIVE(truncate)
+    /// instead of DEFER+RECONCILE → the survivor drops its committed tail.
+    ///
+    /// Resetting the time clock (only the time; lastFetchOffset is untouched so a
+    /// genuinely offset-lagging replica is still caught by the offset gate) gives
+    /// the survivor's probe/fetch the full lag window to land, so it stays in the
+    /// ISR and the reverse-reconcile engages.  Bounded, single-writer, no alloc.
+    void resetLagClock(int64_t nowNs) {
+        for (auto& [node, s] : followerState_) {
+            s.lastFetchTimeNs = nowNs;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ISR shrink / expand
     // -----------------------------------------------------------------------

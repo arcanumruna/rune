@@ -422,6 +422,15 @@ private:
     // Avoids re-pushing bytes already pushed in the same append cycle.
     Offset lastPushedOffset_ = 0;
 
+    // DR-BUG-6: on becomeLeader the follower-lag TIME clock must be reset to the
+    // election time so a newly-elected leader does not evict every follower from
+    // the ISR on its first ISR check (their lastFetchTimeNs is 0 → instantly
+    // "time-lagged").  We defer the reset to the first leader doWork(nowNs) since
+    // becomeLeader has no clock.  See IsrManager::resetLagClock() for the full
+    // rationale (this eviction is what disabled the reverse-reconcile in
+    // production and caused the DR-8 committed-loss).
+    bool leaderLagClockNeedsReset_ = false;
+
     // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
     // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
     // when the ISR shrinks to a single member (the leader stranded in a

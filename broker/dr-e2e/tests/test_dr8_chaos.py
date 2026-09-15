@@ -407,7 +407,23 @@ def test_dr8_leader_kill_netem(fresh_cluster, netem_ready, loss_pct):
     assert_per_key_ordering(sub)
     assert_exactly_once(sub)
 
-    # ── Post-recovery usability (with 2 live nodes; killed leader still down) ──
+    # ── Restart the killed ex-leader so the cluster returns to full health ─────
+    # The durability invariants above are already verified on the 2-node majority.
+    # For the post-recovery usability round-trip we need the cluster back to 3/3
+    # (the correct DR expectation: the killed node cold-restarts and rejoins,
+    # mirroring DR-7 and DR-8 scenarios 2/3).  Without this, _post_recovery_round_trip
+    # can never see 3 running nodes because this scenario SIGKILLs the leader and
+    # never brings it back.
+    cluster.compose.start(leader_svc)
+    time.sleep(8.0)  # cold-start + log-replay + ISR rejoin
+    running = cluster.running_services()
+    assert len(running) == 3, (
+        f"expected 3 running after ex-leader restart, got {running}"
+    )
+    _assert_single_leader_among(cluster, running)
+
+    # ── Post-recovery usability (full 3-node cluster after ex-leader rejoin) ───
+    _, current_leader = cluster.identify_leader()
     _post_recovery_round_trip(cluster, current_leader, keys)
 
     print(
