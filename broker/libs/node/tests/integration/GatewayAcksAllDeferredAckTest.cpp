@@ -458,9 +458,20 @@ TEST(GR5_Unit, MinIsr_Rejects) {
 
     // Drive the replica to shrink the ISR by advancing time far past replicaLagMaxMs.
     // After replicaLagMaxMs (10 s default), the follower (never fetched) is evicted.
-    constexpr int64_t kFarFuture = 60LL * 1'000'000'000LL; // 60 s in ns
+    //
+    // DR-BUG-6: becomeLeader arms leaderLagClockNeedsReset_ so the FIRST leader
+    // doWork(nowNs) resets every follower's lag clock to `nowNs` (so a newly-elected
+    // leader does not evict followers whose lastFetchTime is still 0).  A degenerate
+    // loop that calls doWork with a SINGLE fixed timestamp therefore resets the lag
+    // clock to that timestamp and then measures ZERO lag against the same timestamp
+    // — the follower is never evicted and this test would spuriously fail.  We must
+    // ADVANCE the clock across the loop: the first tick resets the lag clock at t0,
+    // and each later tick measures a growing lag until it crosses replicaLagMaxMs.
+    constexpr int64_t kStepNs = 5LL * 1'000'000'000LL;   // 5 s per tick
+    int64_t clock = 0;
     for (int i = 0; i < 50; ++i) {
-        leaderReplica.doWork(kFarFuture);
+        clock += kStepNs;                 // advance BEFORE each doWork
+        leaderReplica.doWork(clock);
     }
 
     // ISR must now be {leader only} = size 1.
