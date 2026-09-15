@@ -735,6 +735,321 @@ TEST(EpochChangeTruncationTest, DR8_DeficientLeaderNoCommittedLoss) {
 }
 
 // ===========================================================================
+// DR-BUG-6 DIVERGENCE GUARD (safety-review Blocker) — scenario (a):
+// A single ahead tail from a NON-SHARED epoch must be TRUNCATED (not committed)
+// by the new leader/survivor, EVEN THOUGH the survivor is in the (bridge-seeded
+// all-replica) ISR.
+//
+// Pre-correction (commit 3c13aa9): the reconcile keep-vs-truncate gate keyed on
+// followerInIsr && followerLeo > leaderLeo, ignoring the tail's epoch.  Because
+// the GR-2 bridge sets ISR = ALL replicas, the divergent epoch-2 tail was ADOPTED
+// (kept + reverse-reconciled) → the new leader committed divergent data.
+//
+// Post-correction: the epoch-lineage gate (followerTailIsSharedContinuation) sees
+// the survivor's tail is in epoch 2, which the new leader (epochs {1,3}) never
+// held → NOT a shared continuation → authoritative answer → survivor TRUNCATES to
+// the shared epoch-1 boundary.  No divergent data is ever committed.
+// ===========================================================================
+TEST(EpochChangeTruncationTest, DivergentAheadTailFromNonSharedEpochIsTruncated) {
+    TempDir nDir("divg_a_N");
+    TempDir sDir("divg_a_S");
+    rune::storage::Log nLog(nDir.path);
+    rune::storage::Log sLog(sDir.path);
+    InMemoryTransport transport;
+
+    constexpr NodeId kN = 1, kS = 2;
+    std::vector<NodeId> replicas = {kN, kS};
+    std::vector<NodeId> isr      = {kN, kS};   // bridge-style ISR = ALL replicas
+
+    // N (soon-to-be new leader) and S (survivor with a divergent tail) both start
+    // as epoch-1 followers.
+    PartitionReplica n(makeConfig(kN), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &nLog, &transport);
+    PartitionReplica s(makeConfig(kS), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &sLog, &transport);
+
+    auto seedEpoch = [](PartitionReplica& r, int epoch, int64_t baseOffset,
+                        int count) {
+        std::vector<uint8_t> batches;
+        for (int i = 0; i < count; ++i) {
+            rune::protocol::RecordBatchBuilder b(baseOffset + i, 0);
+            std::string_view key{}; std::string_view val("rec", 3);
+            b.append(key, val, 0);
+            auto one = b.build();
+            batches.insert(batches.end(), one.begin(), one.end());
+        }
+        FetchResponseMsg resp{};
+        resp.errorCode = kErrNone; resp.leaderEpoch = epoch; resp.partition = 0;
+        resp.highWatermark = baseOffset; // committed up to baseOffset only
+        resp.logStartOffset = 0;
+        resp.records = std::span<const uint8_t>(batches.data(), batches.size());
+        r.applyReplicated(resp);
+    };
+
+    // Both hold committed epoch-1 [0,3).
+    seedEpoch(n, 1, 0, 3);
+    seedEpoch(s, 1, 0, 3);
+    // S additionally holds a DIVERGENT epoch-2 tail [3,5) from a dead short-lived
+    // leader that N NEVER saw.  N stays at LEO=3 (committed prefix only).
+    seedEpoch(s, 2, 3, 2);
+    ASSERT_EQ(n.logEndOffset(), 3);
+    ASSERT_EQ(s.logEndOffset(), 5) << "S must hold the divergent epoch-2 tail";
+
+    // Consensus (blind) elects N at epoch 3.  ISR = ALL replicas (bridge).
+    transport.setLeader(&n);
+    transport.addFollower(kS, &s);
+    n.becomeLeader(/*epoch=*/3, {kN, kS});
+    s.becomeFollower(/*epoch=*/3, kN);
+
+    // Drive to convergence.
+    int64_t clock = 0;
+    bool done = false;
+    for (int i = 0; i < kDriverCap && !done; ++i) {
+        clock += 1'000'000LL;
+        n.doWork(clock);
+        s.doWork(clock);
+        transport.pump(clock);
+        done = (s.logEndOffset() == n.logEndOffset());
+    }
+    ASSERT_TRUE(done) << "S did not converge with N (S.LEO=" << s.logEndOffset()
+                      << " N.LEO=" << n.logEndOffset() << ")";
+
+    // CORE ASSERTION: the divergent epoch-2 tail must be GONE — S truncated it to
+    // the shared epoch-1 boundary (offset 3).  Pre-correction, N would have
+    // ADOPTED S's divergent tail (kept+reconciled) → S.LEO stays 5 → divergence.
+    EXPECT_EQ(s.logEndOffset(), 3)
+        << "Divergent epoch-2 tail must be TRUNCATED to the shared epoch-1 "
+           "boundary (3); the ISR-only gate would have wrongly kept it (5).";
+    EXPECT_EQ(n.logEndOffset(), 3)
+        << "New leader must NOT adopt the divergent tail.";
+}
+
+// ===========================================================================
+// DR-BUG-6 DIVERGENCE GUARD (safety-review Blocker) — scenario (b):
+// Two ahead ISR members with CONTRADICTORY same-offset tails must NOT produce
+// divergence: the two survivors must converge to IDENTICAL logs, never
+// contradictory.  The epoch-lineage check picks the correct single history and
+// truncates the non-lineage tails.
+//
+// Pre-correction: with ISR = ALL replicas, the new leader keeps+commits whichever
+// ahead tail it probes/reconciles FIRST → the two survivors end with different
+// (contradictory) logs at the same offsets → LOG DIVERGENCE.
+//
+// Post-correction: neither survivor's tail is on the new leader's epoch lineage
+// (the leader was elected at a higher epoch and never held either divergent
+// epoch) → both truncate to the shared committed prefix → identical logs.
+// ===========================================================================
+TEST(EpochChangeTruncationTest, TwoContradictoryAheadTailsConvergeNoDivergence) {
+    TempDir nDir("divg_b_N");
+    TempDir xDir("divg_b_X");
+    TempDir yDir("divg_b_Y");
+    rune::storage::Log nLog(nDir.path);
+    rune::storage::Log xLog(xDir.path);
+    rune::storage::Log yLog(yDir.path);
+    InMemoryTransport transport;
+
+    constexpr NodeId kN = 1, kX = 2, kY = 3;
+    std::vector<NodeId> replicas = {kN, kX, kY};
+    std::vector<NodeId> isr      = {kN, kX, kY};   // bridge-style ISR = ALL
+
+    PartitionReplica n(makeConfig(kN), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &nLog, &transport);
+    PartitionReplica x(makeConfig(kX), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &xLog, &transport);
+    PartitionReplica y(makeConfig(kY), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &yLog, &transport);
+
+    auto seedEpoch = [](PartitionReplica& r, int epoch, int64_t baseOffset,
+                        int count, uint8_t fill) {
+        std::vector<uint8_t> batches;
+        for (int i = 0; i < count; ++i) {
+            rune::protocol::RecordBatchBuilder b(baseOffset + i, 0);
+            std::string_view key{};
+            char v[3] = { (char)fill, (char)fill, (char)fill };
+            std::string_view val(v, 3);
+            b.append(key, val, 0);
+            auto one = b.build();
+            batches.insert(batches.end(), one.begin(), one.end());
+        }
+        FetchResponseMsg resp{};
+        resp.errorCode = kErrNone; resp.leaderEpoch = epoch; resp.partition = 0;
+        resp.highWatermark = baseOffset; resp.logStartOffset = 0;
+        resp.records = std::span<const uint8_t>(batches.data(), batches.size());
+        r.applyReplicated(resp);
+    };
+
+    // All three hold committed epoch-1 [0,3).
+    seedEpoch(n, 1, 0, 3, 0x11);
+    seedEpoch(x, 1, 0, 3, 0x11);
+    seedEpoch(y, 1, 0, 3, 0x11);
+
+    // X has a CONTRADICTORY epoch-2 tail at offset 3 (from short-lived leader LX).
+    // Y has a CONTRADICTORY epoch-3 tail at offset 3 (from short-lived leader LY).
+    // Both at the SAME offset (3) but different epochs / content → divergent.
+    seedEpoch(x, 2, 3, 2, 0x22);   // X: [3,5) epoch 2
+    seedEpoch(y, 3, 3, 1, 0x33);   // Y: [3,4) epoch 3
+    ASSERT_EQ(x.logEndOffset(), 5);
+    ASSERT_EQ(y.logEndOffset(), 4);
+
+    // Consensus (blind) elects N at epoch 4 (higher than both divergent epochs);
+    // N holds only the committed prefix [0,3).  ISR = ALL.
+    transport.setLeader(&n);
+    transport.addFollower(kX, &x);
+    transport.addFollower(kY, &y);
+    n.becomeLeader(/*epoch=*/4, {kN, kX, kY});
+    x.becomeFollower(/*epoch=*/4, kN);
+    y.becomeFollower(/*epoch=*/4, kN);
+
+    int64_t clock = 0;
+    bool done = false;
+    for (int i = 0; i < kDriverCap && !done; ++i) {
+        clock += 1'000'000LL;
+        n.doWork(clock);
+        x.doWork(clock);
+        y.doWork(clock);
+        transport.pump(clock);
+        done = (x.logEndOffset() == n.logEndOffset()
+                && y.logEndOffset() == n.logEndOffset());
+    }
+    ASSERT_TRUE(done) << "survivors did not converge (N=" << n.logEndOffset()
+                      << " X=" << x.logEndOffset() << " Y=" << y.logEndOffset() << ")";
+
+    // CORE ASSERTION: the two survivors converge to IDENTICAL logs — no divergence.
+    EXPECT_EQ(x.logEndOffset(), y.logEndOffset())
+        << "Survivors must converge to identical LEOs (no divergence).";
+
+    // And the identical log is the shared committed prefix; the divergent tails
+    // (X's epoch-2, Y's epoch-3) are both truncated.
+    EXPECT_EQ(x.logEndOffset(), 3)
+        << "X's divergent epoch-2 tail must be truncated to the shared prefix.";
+    EXPECT_EQ(y.logEndOffset(), 3)
+        << "Y's divergent epoch-3 tail must be truncated to the shared prefix.";
+
+    // Byte-identical over the whole log (the strongest no-divergence check).
+    auto xBytes = xLog.read(0, 1 << 20);
+    auto yBytes = yLog.read(0, 1 << 20);
+    EXPECT_EQ(xBytes, yBytes)
+        << "Survivor logs must be BYTE-IDENTICAL — never contradictory.";
+}
+
+// ===========================================================================
+// DR-BUG-6 FALLBACK RACE (the Major): a survivor must NOT fire the destructive
+// 8-probe fallback-to-committedHw truncation while a reconcile-pull addressed to
+// it is in flight / the leader is actively deferring.  The deficient leader sends
+// an explicit defer keep-alive (kErrReconcileDeferred) that RESETS the survivor's
+// probe-attempt counter, so a slow reconcile under sustained packet loss never
+// destroys committed data (which reintroduced the DR-8 loss).
+//
+// Here the reconcile is delayed well past kEpochProbeMaxAttempts (8) probe
+// intervals, but the defer keep-alive keeps flowing → the survivor keeps its
+// committed tail rather than truncating to its stale HW.
+// ===========================================================================
+// Transport that DROPS the first `dropCount` reconcile responses (simulating
+// sustained packet loss on the reverse-reconcile pull), so the deficient leader
+// cannot catch up for many rounds.  Epoch-probe / defer keep-alive messages still
+// flow.  Pre-correction (silent defer, no keep-alive), the survivor's probe
+// counter climbs to kEpochProbeMaxAttempts and fires the destructive fallback
+// truncation.  Post-correction, the defer keep-alive resets the counter → no loss.
+class DroppingReconcileTransport : public InMemoryTransport {
+public:
+    int dropCount = 0;
+    int dropped   = 0;
+    void sendReconcileResponse(NodeId toPeer,
+                               const FetchResponseMsg& resp) override {
+        if (dropped < dropCount) { ++dropped; return; } // swallow (lost)
+        InMemoryTransport::sendReconcileResponse(toPeer, resp);
+    }
+};
+
+TEST(EpochChangeTruncationTest, FallbackRaceDeferKeepAlivePreventsCommittedLoss) {
+    TempDir aDir("frace_A");
+    TempDir bDir("frace_B");
+    rune::storage::Log aLog(aDir.path);
+    rune::storage::Log bLog(bDir.path);
+    DroppingReconcileTransport transport;
+    transport.dropCount = 20;   // drop reconcile answers for well past 8 attempts
+
+    constexpr NodeId kA = 2, kB = 3;
+    std::vector<NodeId> replicas = {kA, kB};
+    std::vector<NodeId> isr      = {kA, kB};
+
+    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &aLog, &transport);
+    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &bLog, &transport);
+
+    constexpr Offset kK = 6;
+    // A holds all K committed epoch-1 records but with a STALE HW view (2).
+    {
+        std::vector<uint8_t> all;
+        for (int i = 0; i < kK; ++i) {
+            rune::protocol::RecordBatchBuilder bld(i, 0);
+            std::string_view key{}; std::string_view val("rec", 3);
+            bld.append(key, val, 0);
+            auto one = bld.build();
+            all.insert(all.end(), one.begin(), one.end());
+        }
+        FetchResponseMsg resp{};
+        resp.errorCode = kErrNone; resp.leaderEpoch = 1; resp.partition = 0;
+        resp.highWatermark = 2; resp.logStartOffset = 0;
+        resp.records = std::span<const uint8_t>(all.data(), all.size());
+        a.applyReplicated(resp);
+    }
+    ASSERT_EQ(a.logEndOffset(), kK);
+    ASSERT_LT(a.highWatermark(), kK) << "A's HW view must be stale";
+
+    // B is deficient (LEO=2).
+    {
+        std::vector<uint8_t> two;
+        for (int i = 0; i < 2; ++i) {
+            rune::protocol::RecordBatchBuilder bld(i, 0);
+            std::string_view key{}; std::string_view val("rec", 3);
+            bld.append(key, val, 0);
+            auto one = bld.build();
+            two.insert(two.end(), one.begin(), one.end());
+        }
+        FetchResponseMsg resp{};
+        resp.errorCode = kErrNone; resp.leaderEpoch = 1; resp.partition = 0;
+        resp.highWatermark = 2; resp.logStartOffset = 0;
+        resp.records = std::span<const uint8_t>(two.data(), two.size());
+        b.applyReplicated(resp);
+    }
+    ASSERT_LT(b.logEndOffset(), kK);
+
+    transport.setLeader(&b);
+    transport.addFollower(kA, &a);
+    b.becomeLeader(/*epoch=*/2, {kA, kB});
+    a.becomeFollower(/*epoch=*/2, kB);
+
+    // Reconcile answers are DROPPED for the first 20 rounds (dropCount) — far past
+    // the kEpochProbeMaxAttempts=8 fallback threshold — while the epoch-probe /
+    // defer keep-alive keeps flowing.  A must NEVER destroy its committed tail
+    // during this window (the keep-alive resets its fallback counter each round).
+    // After the drops stop, the cluster must converge with no committed loss.
+    int64_t clock = 0;
+    bool converged = false;
+    for (int i = 0; i < kDriverCap && !converged; ++i) {
+        clock += 1'000'000LL;
+        b.doWork(clock);
+        a.doWork(clock);
+        transport.pump(clock);
+        // INVARIANT (the Major): A must never truncate its committed tail while a
+        // reconcile is in flight / the leader is deferring.  Pre-correction A
+        // would fall back to its stale-HW truncation after 8 unanswered probes.
+        ASSERT_GE(a.logEndOffset(), kK)
+            << "A truncated its committed tail at round " << i
+            << " (fallback race not hardened): A.LEO=" << a.logEndOffset();
+        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
+    }
+
+    // Cluster converges once the reconcile answers get through — no committed loss.
+    ASSERT_TRUE(converged) << "cluster did not converge after the drop window";
+    EXPECT_GE(a.logEndOffset(), kK);
+    EXPECT_GE(b.logEndOffset(), kK);
+    EXPECT_GE(b.highWatermark(), kK);
+}
+
+// ===========================================================================
 // Test group 7: ISR shrink unblocks HW
 // ===========================================================================
 

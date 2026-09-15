@@ -94,6 +94,37 @@ public:
         return {responseEpoch, next->second};
     }
 
+    /// DR-BUG-6 divergence guard — the leader-epoch that OWNS a given offset.
+    ///
+    /// Returns the largest cached epoch whose startOffset <= `offset` (the epoch
+    /// under which the record at `offset` was written on THIS node's lineage), or
+    /// -1 if `offset` precedes the earliest cached epoch (or the cache is empty).
+    ///
+    /// Used by applyReconcileResponse() to reject a pulled batch whose stamped
+    /// leader-epoch does not belong to the receiving node's accepted lineage — a
+    /// same-offset batch from an UNSHARED epoch must never be adopted (divergence).
+    ///
+    /// Pure: does not mutate the cache.
+    int32_t epochForOffset(int64_t offset) const {
+        // Search by VALUE (startOffset).  epochs_ is keyed by epoch and
+        // startOffsets are monotonic in epoch (invariant A5), so a forward scan
+        // finds the largest epoch whose startOffset <= offset.
+        int32_t owner = -1;
+        for (const auto& [ep, start] : epochs_) {
+            if (start <= offset) owner = ep;
+            else break;
+        }
+        return owner;
+    }
+
+    /// DR-BUG-6 divergence guard — is `epoch` on THIS node's accepted lineage?
+    ///
+    /// True iff the cache contains an entry for exactly `epoch`.  A pulled batch
+    /// stamped with an epoch the receiver never held is off-lineage → reject.
+    bool hasEpoch(int32_t epoch) const {
+        return epochs_.find(epoch) != epochs_.end();
+    }
+
     /// A5: Prune epoch entries whose startOffset ≥ truncateOffset.
     /// Should be called whenever Log::truncateTo(truncateOffset) is called
     /// so the epoch cache stays consistent with the physical log extent.

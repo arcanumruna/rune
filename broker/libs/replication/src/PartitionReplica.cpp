@@ -318,33 +318,33 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
 
     // DR-BUG-6 — deficient-leader reverse-catch-up backstop.
     //
-    // Primary trigger is the OffsetsForLeaderEpoch probe path; this is a backstop
-    // for the case where an ISR follower reaches a normal fetch while still ahead
-    // of a deficient leader (e.g. push/fetch race).  ISR-gated: we only pull from
-    // an ISR member (whose ahead tail is committed) — never from a non-ISR
-    // follower (whose ahead tail is an uncommitted, truncatable tail).
+    // Primary trigger is the OffsetsForLeaderEpoch probe path, which carries the
+    // follower's TAIL epoch and is the ONLY place we can validate lineage.  A
+    // plain FetchRequest does NOT carry the follower's tail epoch (req.leaderEpoch
+    // is the epoch the follower fetches UNDER — our current epoch — not the epoch
+    // of its ahead tail), so we MUST NOT decide keep-vs-truncate from a plain
+    // fetch: doing so was the divergence bug (any ahead tail looked "keepable").
+    //
+    // Backstop policy: if an ahead follower reaches a plain fetch, we only CONTINUE
+    // a reconcile the probe path already established with THIS peer (idempotent
+    // retry).  We never START a lineage-blind pull here.  If no such reconcile is
+    // in flight, we serve nothing this round and let the follower's own epoch
+    // probe (armed on becomeFollower) drive the lineage-checked decision.
     if (req.fetchOffset > log_->logEndOffset()) {
-        const bool followerInIsr =
-            isrManager_ && !isrManager_->isr().empty()
-            && std::find(isrManager_->isr().begin(), isrManager_->isr().end(),
-                         req.followerId) != isrManager_->isr().end();
-        if (followerInIsr) {
-            if (reconcileTarget_ < 0) {
-                reconcileTarget_ = req.followerId;
-                FetchRequestMsg pull{};
-                pull.leaderEpoch = epoch_;
-                pull.partition   = cfg_.partitionId;
-                pull.followerId  = cfg_.selfId;               // WE are the puller
-                pull.fetchOffset = log_->logEndOffset();      // from our LEO
-                pull.maxBytes    = cfg_.maxFetchBytes;
-                pull.topicId     = cfg_.topicId;
-                transport_->sendReconcileRequest(req.followerId, pull);
-            }
-            // Serve nothing this round; the follower keeps its (committed) tail.
-            return kErrNone;
+        if (reconcileTarget_ == req.followerId) {
+            FetchRequestMsg pull{};
+            pull.leaderEpoch = epoch_;
+            pull.partition   = cfg_.partitionId;
+            pull.followerId  = cfg_.selfId;               // WE are the puller
+            pull.fetchOffset = log_->logEndOffset();      // from our LEO
+            pull.maxBytes    = cfg_.maxFetchBytes;
+            pull.topicId     = cfg_.topicId;
+            transport_->sendReconcileRequest(req.followerId, pull);
         }
-        // Non-ISR follower ahead → its tail is uncommitted; fall through and
-        // serve normally (it will truncate via its own epoch probe).
+        // Serve nothing forward to an ahead follower: forward-serving under the
+        // new epoch could stamp divergent bytes.  The follower keeps its tail
+        // until its epoch probe resolves the correct truncation point.
+        return kErrNone;
     }
 
     // Record follower fetch: update ISR manager + leader state.
@@ -657,24 +657,60 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
 // DR-BUG-6 — OffsetsForLeaderEpoch exchange (KIP-101)
 // ---------------------------------------------------------------------------
 
+// (Leader) DR-BUG-6 divergence guard — epoch-lineage gate (see header).
+bool PartitionReplica::followerTailIsSharedContinuation(
+        Epoch requestedEpoch, Offset followerLeo) const
+{
+    const Offset leaderLeo = log_->logEndOffset();
+
+    // The follower must genuinely be AHEAD for a reverse-reconcile to make sense.
+    if (followerLeo <= leaderLeo) return false;
+
+    // A follower with no epoch history (requestedEpoch < 0) cannot be validated
+    // against our lineage → not a shared continuation (truncate it).
+    if (requestedEpoch < 0) return false;
+
+    // KIP-101 lineage resolution against OUR OWN epoch cache.
+    auto r = epochCache_.endOffsetForEpoch(
+        static_cast<int32_t>(requestedEpoch), leaderLeo);
+    const int32_t responseEpoch = r.first;
+    const Offset  endOffset     = r.second;
+
+    // Shared continuation ⇔ we share the EXACT epoch the follower's tail is in
+    // (responseEpoch == requestedEpoch) AND that epoch is our own latest OPEN
+    // epoch, so its boundary is our LEO (endOffset == leaderLeo, i.e. >= leaderLeo).
+    // A follower tail in an epoch we only share at an OLDER boundary — or in an
+    // epoch we never held (responseEpoch < requestedEpoch, or -1) — is divergent.
+    return responseEpoch == static_cast<int32_t>(requestedEpoch)
+        && endOffset == leaderLeo;
+}
+
 // (Leader) Answer a follower's epoch-boundary query from the LeaderEpochCache.
 //
-// DR-BUG-6 discriminator — the deficient-leader reconcile pivots on ISR
-// membership of the probing follower:
+// DR-BUG-6 divergence guard — the deficient-leader reconcile now requires BOTH
+// conditions, and the EPOCH-LINEAGE condition is the one that closes the
+// divergence hole:
 //
-//   • If the probing follower is a CURRENT ISR MEMBER and reports a LEO ABOVE
-//     this leader's own LEO, then THIS leader is DEFICIENT: the data-blind
-//     consensus elected a lagging node, and the ISR follower still holds
-//     committed records this leader is missing.  The leader reverse-reconciles
-//     (pulls [ownLEO, followerLEO) from that follower) and DEFERS the epoch
-//     answer until it has caught up — so when it finally answers, its epoch
-//     boundary already covers the recovered committed prefix and the follower
-//     keeps all its (committed) records.  This is the DR-8 fix.
+//   (1) followerTailIsSharedContinuation(requestedEpoch, followerLeo) — the
+//       follower's ahead tail is on THIS leader's OWN epoch lineage (a genuine
+//       continuation of our still-open shared epoch, KIP-101).  A DIVERGENT tail
+//       is ALWAYS in a non-shared epoch (that is what makes it divergent), so
+//       this check alone rejects the reviewer's contradictory-tail scenario: the
+//       divergent survivor's tail epoch is one WE never held → we answer
+//       authoritatively → it TRUNCATES to the shared-epoch boundary.  This is the
+//       fix for the DIVERGENCE bug the old ISR-only gate had.
 //
-//   • If the probing follower is NOT an ISR member (e.g. a rejoining former
-//     leader with an UNCOMMITTED same-epoch tail), the leader is authoritative:
-//     it answers from its cache immediately and the follower truncates its
-//     divergent/uncommitted tail to the leader's epoch boundary (KIP-101).
+//   (2) followerInIsr — WITHIN a shared epoch, offset+epoch cannot distinguish a
+//       COMMITTED continuation (DR-8: keep+reconcile) from an UNCOMMITTED tail
+//       (old-leader tail: truncate) — both are pure same-epoch records above the
+//       survivor's HW.  ISR membership is the only remaining discriminator: the
+//       dead old leader is excluded from the new ISR by the failover coordinator,
+//       so its uncommitted same-epoch tail fails this gate and truncates, while a
+//       genuine ISR survivor's committed tail is kept and reverse-reconciled.
+//
+// Both must hold to keep+reconcile.  The epoch-lineage check (1) is the necessary
+// addition that the old ISR-only gate lacked; (2) remains for the shared-epoch
+// committed-vs-uncommitted case that epoch metadata cannot resolve.
 void PartitionReplica::onOffsetsForLeaderEpochRequest(
         const OffsetsForLeaderEpochReqMsg& req)
 {
@@ -691,15 +727,18 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         return;
     }
 
-    // Deficient-leader detection: an ISR follower ahead of us holds committed
-    // records we lack.  Trigger the reverse-reconcile pull and DEFER the answer
-    // (the follower re-probes on cadence; we answer once caught up).
+    // Deficient-leader detection — EPOCH-LINEAGE gated AND ISR gated (see the
+    // block comment above).  (1) The ahead tail must be a genuine continuation of
+    // OUR OWN still-open shared epoch (rejects divergent non-shared-epoch tails),
+    // AND (2) the follower must be in the ISR (rejects a dead old leader's
+    // uncommitted same-epoch tail).  Only then reverse-reconcile + DEFER.
     const bool followerInIsr =
-        isrManager_ && isrManager_->isr().size() > 0
+        isrManager_ && !isrManager_->isr().empty()
         && std::find(isrManager_->isr().begin(), isrManager_->isr().end(),
                      req.followerId) != isrManager_->isr().end();
 
-    if (followerInIsr && req.followerLeo > log_->logEndOffset()) {
+    if (followerInIsr
+        && followerTailIsSharedContinuation(req.requestedEpoch, req.followerLeo)) {
         // (Re)issue the reverse pull.  We (re)send when idle (reconcileTarget_<0)
         // OR when the pending target is this same follower — the previous pull or
         // its response may have been dropped by the transport, and the follower
@@ -716,7 +755,20 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
             pull.topicId     = cfg_.topicId;
             transport_->sendReconcileRequest(req.followerId, pull);
         }
-        // Defer the epoch answer — the follower keeps its tail and re-probes.
+        // Fallback-race hardening (the Major): send an EXPLICIT defer keep-alive
+        // instead of silently dropping the answer.  Silence lets the follower's
+        // fallback probe counter climb to kEpochProbeMaxAttempts under packet loss
+        // and fire the destructive fallback-to-committedHw truncation while our
+        // reconcile pull is still in flight — reintroducing the DR-8 loss.  The
+        // keep-alive tells the follower: KEEP your tail, RESET your counter.
+        OffsetsForLeaderEpochRespMsg defer{};
+        defer.leaderEpoch   = epoch_;
+        defer.partition     = cfg_.partitionId;
+        defer.responseEpoch = static_cast<Epoch>(req.requestedEpoch);
+        defer.endOffset     = req.followerLeo;   // "keep everything up to your LEO"
+        defer.errorCode     = kErrReconcileDeferred;
+        defer.topicId       = cfg_.topicId;
+        transport_->sendOffsetsForLeaderEpochResponse(req.followerId, defer);
         return;
     }
 
@@ -744,6 +796,19 @@ void PartitionReplica::applyOffsetsForLeaderEpochResponse(
     // Fence: the answer must come from our current-epoch leader.  A stale answer
     // (older leaderEpoch) is dropped — we re-probe on the next doWork().
     if (resp.leaderEpoch < epoch_) return;
+
+    if (resp.errorCode == kErrReconcileDeferred) {
+        // Fallback-race hardening (the Major): the leader is actively reverse-
+        // reconciling a genuine committed continuation from US.  This is an
+        // explicit KEEP-ALIVE, not a truncation directive.  KEEP our tail and
+        // RESET the fallback probe counter so a slow reconcile under sustained
+        // packet loss never trips the destructive fallback-to-committedHw
+        // truncation (which reintroduced the DR-8 committed-loss).  Stay pending;
+        // doWork() re-probes on cadence and the leader answers kErrNone once its
+        // LEO covers our tail (endOffset >= our LEO → no-op truncation).
+        epochProbeAttempts_ = 0;
+        return;
+    }
 
     if (resp.errorCode != kErrNone) {
         // Leader could not answer (not leader yet / transient).  Keep the probe
@@ -823,6 +888,31 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
             }
             logBytes.resize(committedEnd);
         }
+
+        // DR-BUG-6 divergence guard — stamp each served batch's partitionLeaderEpoch
+        // from OUR epoch lineage (the epoch that owns each offset).  The field is
+        // excluded from the CRC, so stamping in place needs no re-checksum.  The
+        // deficient leader validates these epochs against its OWN accepted lineage
+        // in applyReconcileResponse() and rejects any batch from an unshared epoch —
+        // so a same-offset batch from a divergent epoch can never be adopted.
+        {
+            std::size_t pos = 0;
+            while (pos < logBytes.size()) {
+                std::size_t rem = logBytes.size() - pos;
+                if (rem < static_cast<std::size_t>(
+                        rune::protocol::batch::kRecordBatchOverhead)) break;
+                rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
+                int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total)
+                                  > logBytes.size()) break;
+                int32_t ownEp = epochCache_.epochForOffset(r.baseOffset());
+                if (ownEp >= 0) {
+                    rune::protocol::RecordBatchReader::stampLeaderEpoch(
+                        logBytes.data() + pos, ownEp);
+                }
+                pos += static_cast<std::size_t>(total);
+            }
+        }
     }
 
     // Reply carrying the records and our LEO as the highWatermark hint (the
@@ -875,6 +965,25 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                 int64_t batchBase = r.baseOffset();
                 if (batchBase < currentLeo) { pos += static_cast<std::size_t>(total); continue; }
                 if (batchBase > currentLeo) break; // gap — stop
+
+                // DR-BUG-6 divergence guard — per-batch epoch-lineage validation.
+                //
+                // A survivor stamps each served batch's partitionLeaderEpoch from
+                // its own lineage (onReconcileRequest).  Before adopting a batch we
+                // require its stamped epoch to be on OUR accepted lineage — an epoch
+                // we ourselves hold in our epochCache.  This rejects a same-offset
+                // batch pulled from an UNSHARED / divergent epoch (the two-survivor
+                // contradiction): we never append it, and we stop the walk so no
+                // later (also-suspect) batch is adopted either.  A batch with an
+                // UNSET epoch (-1, e.g. legacy / raw-injected data with no lineage
+                // metadata) is accepted for backward compatibility — the primary
+                // epoch-lineage gate on the probe path already prevents pulling from
+                // a divergent source in the first place; this is defence in depth.
+                int32_t batchEp = r.partitionLeaderEpoch();
+                if (batchEp >= 0 && !epochCache_.hasEpoch(batchEp)) {
+                    break; // off-lineage batch — reject and stop.
+                }
+
                 if (newStart == resp.records.size()) newStart = pos;
                 lastOff = batchBase + r.lastOffsetDelta();
                 currentLeo = lastOff + 1;
@@ -884,6 +993,26 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                 std::vector<uint8_t> raw(
                     resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
                     resp.records.end());
+                // Byte-identity: the survivor stamped partitionLeaderEpoch on the
+                // served copy for our validation above.  Restore it to the UNSET
+                // sentinel (-1) before appending so a reconciled batch is
+                // BYTE-IDENTICAL to the same batch obtained via normal replication
+                // (which carries -1).  Otherwise a replica that reconciled a batch
+                // and one that replicated it would hold cosmetically-different bytes
+                // at the same offset — a (benign but real) log divergence.  The
+                // field is CRC-excluded, so restoring it needs no re-checksum.
+                std::size_t rp = 0;
+                while (rp < raw.size()) {
+                    std::size_t rem = raw.size() - rp;
+                    if (rem < static_cast<std::size_t>(
+                            rune::protocol::batch::kRecordBatchOverhead)) break;
+                    rune::protocol::RecordBatchReader rr(raw.data() + rp, rem);
+                    int32_t tl = rr.totalLength();
+                    if (tl <= 0 || rp + static_cast<std::size_t>(tl) > raw.size()) break;
+                    rune::protocol::RecordBatchReader::stampLeaderEpoch(
+                        raw.data() + rp, -1);
+                    rp += static_cast<std::size_t>(tl);
+                }
                 log_->append(raw, lastOff);
             }
         }

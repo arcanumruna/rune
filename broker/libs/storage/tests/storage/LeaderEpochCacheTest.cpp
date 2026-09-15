@@ -227,3 +227,44 @@ TEST(LeaderEpochCache, AssignAfterTruncateFromEnd) {
     EXPECT_EQ(c.latestEpoch(), 3);
     EXPECT_EQ(c.startOffsetFor(3), 50);
 }
+
+// ---------------------------------------------------------------------------
+// DR-BUG-6 divergence guard — epochForOffset / hasEpoch (per-batch lineage).
+// ---------------------------------------------------------------------------
+
+// epochForOffset returns the epoch that OWNS a given offset (largest epoch whose
+// startOffset <= offset), or -1 below the earliest / on an empty cache.
+TEST(LeaderEpochCache, EpochForOffset_OwnsOffsetByStartOffset) {
+    LeaderEpochCache c;
+    c.assign(1, 0);
+    c.assign(2, 100);
+    c.assign(5, 250);
+    EXPECT_EQ(c.epochForOffset(0),   1);   // start of epoch 1
+    EXPECT_EQ(c.epochForOffset(99),  1);   // last offset of epoch 1
+    EXPECT_EQ(c.epochForOffset(100), 2);   // start of epoch 2
+    EXPECT_EQ(c.epochForOffset(249), 2);
+    EXPECT_EQ(c.epochForOffset(250), 5);   // start of epoch 5
+    EXPECT_EQ(c.epochForOffset(9999), 5);  // open latest epoch owns the tail
+}
+
+TEST(LeaderEpochCache, EpochForOffset_EmptyAndBelowEarliest) {
+    LeaderEpochCache empty;
+    EXPECT_EQ(empty.epochForOffset(0), -1);
+    LeaderEpochCache c;
+    c.assign(3, 50);
+    EXPECT_EQ(c.epochForOffset(49), -1) << "offset below earliest start → -1";
+    EXPECT_EQ(c.epochForOffset(50),  3);
+}
+
+// hasEpoch: true iff the cache holds an entry for exactly that epoch — the
+// divergence-guard lineage membership test used by applyReconcileResponse().
+TEST(LeaderEpochCache, HasEpoch_MembershipOnLineage) {
+    LeaderEpochCache c;
+    c.assign(1, 0);
+    c.assign(4, 100);
+    EXPECT_TRUE(c.hasEpoch(1));
+    EXPECT_TRUE(c.hasEpoch(4));
+    EXPECT_FALSE(c.hasEpoch(2)) << "an epoch never held is off-lineage";
+    EXPECT_FALSE(c.hasEpoch(3));
+    EXPECT_FALSE(c.hasEpoch(-1));
+}

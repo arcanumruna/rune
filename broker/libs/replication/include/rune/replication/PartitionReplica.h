@@ -68,6 +68,12 @@ inline constexpr int16_t kErrStaleEpoch   = -1;   // request epoch < local epoch
 inline constexpr int16_t kErrNotLeader    = -2;   // this node is not the leader
 inline constexpr int16_t kErrMinIsr       = -3;   // ISR too small to produce
 inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
+// DR-BUG-6: leader is deferring the epoch answer while it reverse-reconciles a
+// genuine committed continuation from this (ahead, on-lineage) follower.  This
+// is a KEEP-ALIVE, NOT a truncation directive: the follower KEEPS its tail and
+// RESETS its fallback probe counter so a slow reconcile under packet loss never
+// trips the destructive fallback-to-committedHw truncation (the DR-8 loss).
+inline constexpr int16_t kErrReconcileDeferred = -5;
 
 // ---------------------------------------------------------------------------
 // PartitionConfig — constructor argument bundle
@@ -311,6 +317,27 @@ private:
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// (Leader) DR-BUG-6 divergence guard — is an ahead follower's tail a genuine
+    /// continuation of THIS leader's OWN epoch lineage (KIP-101), i.e. safe to
+    /// keep+reverse-reconcile rather than direct the follower to truncate?
+    ///
+    /// Gates on the follower's tail EPOCH, NOT on ISR membership.  Because the
+    /// GR-2 bridge seeds ISR = ALL replicas, ISR membership cannot distinguish a
+    /// committed continuation from a divergent tail — both look "in ISR".  The
+    /// only sound discriminator is epoch lineage:
+    ///
+    ///   endOffsetForEpoch(requestedEpoch, leaderLEO) → (responseEpoch, endOffset)
+    ///
+    /// The follower's ahead tail is a shared continuation ONLY when the leader
+    /// shares the EXACT epoch the follower's tail is in AND that epoch is the
+    /// leader's own latest OPEN epoch (endOffset == leaderLEO, boundary >=
+    /// leaderLEO).  Then the follower's [leaderLEO, followerLEO) tail extends the
+    /// leader's still-open shared epoch → keep + reverse-reconcile.  Otherwise the
+    /// follower's tail is from a divergent / non-shared epoch → the leader answers
+    /// authoritatively and the follower TRUNCATES to the shared-epoch end offset.
+    [[nodiscard]] bool followerTailIsSharedContinuation(
+            Epoch requestedEpoch, Offset followerLeo) const;
 
     /// (Leader) Recompute HW from ReplicaLeaderState and propagate to leader ISR.
     void recomputeHw();
