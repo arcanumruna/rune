@@ -175,12 +175,23 @@ def _run_one_client(
         res = run(args, timeout=timeout_s)
         cr = _parse_client_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
         last = cr
-        # Only retry on a connect-timeout (rc==2, no produced records) — a
-        # genuine workload failure or any crash must fail immediately.
-        connect_timeout = (cr.rc == 2 and "connect() timed out" in cr.raw)
+        # Retry on transient startup failures with no produced records:
+        #   * connect-timeout ("connect() timed out") — broker not yet ready
+        #   * DNS resolution failure ("unknown host" / "Name or service not known")
+        #     which can occur on Docker Desktop when a recently-unpaused container's
+        #     hostname hasn't propagated to the embedded DNS resolver yet.
+        # Any other failure (genuine workload error, crash) must fail immediately.
         nothing_produced = len(cr.produced) == 0
-        if not (connect_timeout and nothing_produced and attempt < connect_retries):
+        connect_timeout = (cr.rc == 2 and "connect() timed out" in cr.raw)
+        dns_failure = (cr.rc == 2 and (
+            "unknown host" in cr.raw or "Name or service not known" in cr.raw
+        ))
+        transient_startup = (connect_timeout or dns_failure) and nothing_produced
+        if not (transient_startup and attempt < connect_retries):
             return cr
+        # Brief back-off before retry: give Docker Desktop's embedded DNS proxy
+        # time to recover after Docker network operations (pause/unpause cycles).
+        time.sleep(3.0)
     return last  # exhausted retries — return the last (still-failed) result
 
 

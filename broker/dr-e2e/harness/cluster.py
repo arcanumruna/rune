@@ -176,3 +176,17 @@ class Cluster:
 
     def container_id(self, service: str) -> str | None:
         return self.compose.container_id(service)
+
+    def container_ip(self, service: str, network: str | None = None) -> str | None:
+        """Return the container's IP on the compose default network, or None."""
+        cid = self.container_id(service)
+        if not cid:
+            return None
+        net = network or self.compose.network_name()
+        res = run(
+            ["docker", "inspect", "--format",
+             f"{{{{.NetworkSettings.Networks.{net}.IPAddress}}}}", cid],
+            timeout=15,
+        )
+        ip = res.stdout.strip()
+        return ip if ip else None

@@ -96,11 +96,15 @@ def kill_node(cluster, service: str, sig=signal.SIGKILL) -> None:
 def pause(cluster, service: str) -> None:
     """Freeze the process (docker pause -> SIGSTOP-equivalent cgroup freeze)."""
     cid = cluster.container_id(service)
+    if not cid:
+        raise RuntimeError(f"pause: no container id for {service!r} (container not running?)")
     run(["docker", "pause", cid], timeout=30, check=True)
 
 
 def unpause(cluster, service: str) -> None:
     cid = cluster.container_id(service)
+    if not cid:
+        raise RuntimeError(f"unpause: no container id for {service!r} (container not running?)")
     run(["docker", "unpause", cid], timeout=30, check=True)
 
 
