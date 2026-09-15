@@ -28,6 +28,8 @@ if(BUILD_TESTING)
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp
             tests/protocol/client/PingMessagesTest.cpp
             tests/protocol/client/DataMessagesTest.cpp
+            tests/protocol/client/GroupMessagesTest.cpp
+            tests/protocol/client/OffsetMessagesTest.cpp
             tests/protocol/client/ConformanceTest.cpp
             tests/protocol/client/DispatchTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

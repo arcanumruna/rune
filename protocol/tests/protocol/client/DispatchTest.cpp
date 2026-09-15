@@ -3,14 +3,16 @@
 // Exhaustive tests for rune::protocol::client::checkFrame / peekTemplateId.
 //
 // Coverage:
-//   - Ok for all 15 known template ids: MA control 1..7, MB produce/subscribe 16..21
+//   - Ok for all 28 known template ids: MA control 1..7, MB produce/subscribe 16..21,
+//     MC consumer-groups 32..44
 //   - TooShort: avail = 0, 1, 23 (no over-read); exactly 24 is NOT TooShort
 //   - WrongSchema: schemaId = 0, 111, 119, 121, 65535
 //   - UnsupportedVersion: version = 2, 3, 65535 (> 1 rejected);
 //                         version = 1 (equal) and version = 0 (older) accepted;
 //                         data template (tid=16) at bad version → UnsupportedVersion
-//   - UnknownTemplate: templateId = 0, 8, 15, 22, 32, 64, 99, 65535
-//     (8 and 15 = control-range gap; 22 = first unassigned produce/consume gap)
+//   - UnknownTemplate: templateId = 0, 8, 15, 22, 45, 64, 99, 65535
+//     (8 and 15 = control-range gap; 22 = first unassigned produce/consume gap;
+//      45 = first unassigned groups/txn gap after Assign=44)
 //   - Ordering precedence: TooShort wins over WrongSchema; WrongSchema wins over
 //                          UnsupportedVersion
 //   - peekTemplateId: returns nullopt for every non-Ok case; returns id for Ok
@@ -21,7 +23,9 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Dispatch.h>
+#include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -314,6 +318,193 @@ TEST(DispatchCheckFrame, OkUnsubscribe) {
               std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Unsubscribe)));
 }
 
+// CG-1: Consumer-group range 32..44 — all must be known.
+// We test each by building a minimal valid header (24 bytes) with the correct
+// templateId and verifying checkFrame returns Ok (not UnknownTemplate).
+TEST(DispatchCheckFrame, OkJoinGroup) {
+    const uint8_t kGrp[] = {'g'};
+    rpc::JoinGroup msg;
+    msg.sessionId        = 0x1122334455667788LL;
+    msg.correlationId    = 0x0A0B0C0D0E0F1011LL;
+    msg.sessionTimeoutMs = 30000;
+    msg.groupId          = std::span<const uint8_t>(kGrp, 1u);
+    msg.memberId         = std::span<const uint8_t>{};
+    msg.subscribedTopicIds = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::JoinGroup));  // 32
+}
+
+TEST(DispatchCheckFrame, OkJoinGroupResponse) {
+    rpc::JoinGroupResponse msg;
+    msg.generationId = 1;
+    msg.isLeader     = 0;
+    msg.errorCode    = 0;
+    msg.memberId     = std::span<const uint8_t>{};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::JoinGroupResponse));  // 33
+}
+
+TEST(DispatchCheckFrame, OkSyncGroup) {
+    const uint8_t kGrp[] = {'g'};
+    rpc::SyncGroup msg;
+    msg.groupId      = std::span<const uint8_t>(kGrp, 1u);
+    msg.memberId     = std::span<const uint8_t>{};
+    msg.generationId = 1;
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::SyncGroup));  // 34
+}
+
+TEST(DispatchCheckFrame, OkSyncGroupResponse) {
+    rpc::SyncGroupResponse msg;
+    msg.errorCode  = 0;
+    msg.assignment = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::SyncGroupResponse));  // 35
+}
+
+TEST(DispatchCheckFrame, OkHeartbeat) {
+    const uint8_t kGrp[] = {'g'};
+    rpc::Heartbeat msg;
+    msg.groupId      = std::span<const uint8_t>(kGrp, 1u);
+    msg.memberId     = std::span<const uint8_t>{};
+    msg.generationId = 1;
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::Heartbeat));  // 36
+}
+
+TEST(DispatchCheckFrame, OkHeartbeatResponse) {
+    rpc::HeartbeatResponse msg;
+    msg.errorCode = 0;
+
+    std::array<uint8_t, 32> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::HeartbeatResponse));  // 37
+}
+
+TEST(DispatchCheckFrame, OkLeaveGroup) {
+    const uint8_t kGrp[] = {'g'};
+    rpc::LeaveGroup msg;
+    msg.groupId  = std::span<const uint8_t>(kGrp, 1u);
+    msg.memberId = std::span<const uint8_t>{};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::LeaveGroup));  // 38
+}
+
+TEST(DispatchCheckFrame, OkLeaveGroupResponse) {
+    rpc::LeaveGroupResponse msg;
+    msg.errorCode = 0;
+
+    std::array<uint8_t, 32> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::LeaveGroupResponse));  // 39
+}
+
+TEST(DispatchCheckFrame, OkOffsetCommit) {
+    const uint8_t kGrp[] = {'g'};
+    rpc::OffsetCommit msg;
+    msg.generationId = 1;
+    msg.groupId      = std::span<const uint8_t>(kGrp, 1u);
+    msg.memberId     = std::span<const uint8_t>{};
+    msg.entries      = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::OffsetCommit));  // 40
+}
+
+TEST(DispatchCheckFrame, OkOffsetCommitResponse) {
+    rpc::OffsetCommitResponse msg;
+    msg.results = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::OffsetCommitResponse));  // 41
+}
+
+TEST(DispatchCheckFrame, OkOffsetFetch) {
+    const uint8_t kGrp[] = {'g'};
+    rpc::OffsetFetch msg;
+    msg.groupId = std::span<const uint8_t>(kGrp, 1u);
+    msg.entries = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::OffsetFetch));  // 42
+}
+
+TEST(DispatchCheckFrame, OkOffsetFetchResponse) {
+    rpc::OffsetFetchResponse msg;
+    msg.results = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::OffsetFetchResponse));  // 43
+}
+
+TEST(DispatchCheckFrame, OkAssign) {
+    rpc::Assign msg;
+    msg.generationId = 1;
+    msg.assignment   = {};
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t len = msg.encode(buf.data());
+
+    const auto fc = rpc::checkFrame(buf.data(), len);
+    EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::Assign));  // 44
+
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), len),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Assign)));
+}
+
 // ===========================================================================
 // 2. TooShort — avail = 0, 1, 23 → TooShort; avail = 24 (exact) → NOT TooShort
 // ===========================================================================
@@ -451,10 +642,12 @@ TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
 }
 
 // ===========================================================================
-// 5. UnknownTemplate — ids 0, 8, 15, 22, 32, 64, 99, 65535
+// 5. UnknownTemplate — ids 0, 8, 15, 22, 45, 64, 99, 65535
 //    (valid schema + version but unknown id)
 //    Note: 16-21 (Produce..Unsubscribe) are KNOWN (PB-1/PB-2/PB-3).
-//    8 and 15 = unassigned control-range gap; 22 = first unassigned produce/consume gap.
+//          32-44 (JoinGroup..Assign) are KNOWN (CG-1).
+//    8 and 15 = unassigned control-range gap; 22 = first unassigned produce/consume gap;
+//    45 = first unassigned groups/txn gap (Assign=44 is last assigned).
 // ===========================================================================
 
 TEST(DispatchCheckFrame, UnknownTemplateZero) {
@@ -489,15 +682,16 @@ TEST(DispatchCheckFrame, UnknownTemplateTwentyTwo) {
     EXPECT_EQ(fc.templateId, 22u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateThirtyTwo) {
-    // 32 = first in groups/txn range
-    auto buf = makeValidHeaderBuf(32);
+TEST(DispatchCheckFrame, UnknownTemplateFortyFive) {
+    // 45 = first unassigned id in groups/txn range (32-44 are now all known in CG-1)
+    auto buf = makeValidHeaderBuf(45);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.templateId, 45u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateSixtyFour) {
-    // 64 = first in view range
+    // 64 = first in view range (unassigned)
     auto buf = makeValidHeaderBuf(64);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
@@ -572,7 +766,8 @@ TEST(DispatchPeekTemplateId, NulloptForUnknownTemplate) {
 
 TEST(DispatchPeekTemplateId, ReturnsIdForOkFrame) {
     // Verify peekTemplateId returns the correct id for all known templates:
-    // Milestone A control (1..7) and Milestone B produce/subscribe (16..21).
+    // Milestone A control (1..7), Milestone B produce/subscribe (16..21),
+    // Milestone C consumer-groups (32..44).
     for (uint16_t tid = 1; tid <= 7; ++tid) {
         auto buf = makeValidHeaderBuf(tid);
         const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
@@ -581,6 +776,13 @@ TEST(DispatchPeekTemplateId, ReturnsIdForOkFrame) {
     }
     // PB-1/PB-2/PB-3: tids 16..21 must all return a value.
     for (uint16_t tid = 16; tid <= 21; ++tid) {
+        auto buf = makeValidHeaderBuf(tid);
+        const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
+        ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
+        EXPECT_EQ(*opt, tid) << "templateId mismatch for " << tid;
+    }
+    // CG-1: tids 32..44 must all return a value.
+    for (uint16_t tid = 32; tid <= 44; ++tid) {
         auto buf = makeValidHeaderBuf(tid);
         const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
         ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
@@ -599,8 +801,13 @@ TEST(DispatchNoOverread, ExactSizeBufferAllKnownTemplates) {
     // over-read immediately; without ASAN the exact-size array acts as a
     // canary via std::array bounds in debug mode.
     //
-    // Milestone A control (1..7) + Milestone B produce/subscribe (16..21).
-    constexpr uint16_t kKnown[] = {1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21};
+    // Milestone A control (1..7) + Milestone B produce/subscribe (16..21)
+    // + Milestone C consumer-groups (32..44).
+    constexpr uint16_t kKnown[] = {
+        1, 2, 3, 4, 5, 6, 7,
+        16, 17, 18, 19, 20, 21,
+        32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
+    };
     for (uint16_t tid : kKnown) {
         const auto buf = makeValidHeaderBuf(tid);
         static_assert(sizeof(buf) == 24);
@@ -633,13 +840,19 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     for (uint16_t tid = 16; tid <= 21; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
+    // Milestone C consumer-group range: 32..44 must all be known (CG-1).
+    for (uint16_t tid = 32; tid <= 44; ++tid) {
+        EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
+    }
 
     // Not known: 0, 8..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
-    //            32+ (groups/txn, view ranges), 65535.
+    //            45..63 (unassigned groups/txn gap), 64+ (view range), 65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(8));
     EXPECT_FALSE(rpc::isKnownTemplate(15));
     EXPECT_FALSE(rpc::isKnownTemplate(22));
-    EXPECT_FALSE(rpc::isKnownTemplate(32));
+    EXPECT_FALSE(rpc::isKnownTemplate(31));
+    EXPECT_FALSE(rpc::isKnownTemplate(45));
+    EXPECT_FALSE(rpc::isKnownTemplate(64));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }
