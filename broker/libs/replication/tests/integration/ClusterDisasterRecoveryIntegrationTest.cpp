@@ -322,18 +322,41 @@ TEST(OldLeaderFencing, OldLeaderTruncatesUncommittedTail) {
     Offset committed = h.appendAndCommit(3);
     ASSERT_EQ(committed, 3);
 
-    // Leader appends 2 more uncommitted records.
+    // Partition off BOTH followers so the next appends stay LOCAL to the leader
+    // (genuinely uncommitted — never replicated to any other node).  Without
+    // this, push-on-append would replicate the "uncommitted" tail to all nodes
+    // during the failover drive, and there would be nothing divergent to
+    // truncate (all replicas would simply agree on the tail).
+    h.partitionOff(1);
+    h.partitionOff(2);
+
+    // Leader appends 2 more uncommitted records (local only).
     PartitionReplica* oldLdr = h.leaderReplica();
     oldLdr->append(makePayload(0xE1));  // uncommitted
     oldLdr->append(makePayload(0xE2));  // uncommitted
     Offset staleLeo = oldLdr->logEndOffset();  // > committed
 
-    // Failover: old leader becomes follower.
-    h.killLeader();
+    // Failover: kill the leader and elect a new one from the (caught-up) ISR.
+    int oldIdx = h.killLeader();
     ASSERT_TRUE(h.electNewLeader());
-
-    // Old leader (now follower) must have truncated its uncommitted tail.
     EXPECT_EQ(oldLdr->role(), Role::Follower);
+
+    // Heal the surviving followers so the new leader is reachable.
+    h.healPartition();
+
+    // DR-BUG-6: truncation is DEFERRED to the OffsetsForLeaderEpoch exchange.
+    // A killed node truncates when it REVIVES and rejoins (it cannot run the
+    // exchange while dead).  Revive the old leader as a follower and drive the
+    // exchange: it is NOT in the new ISR, so its ahead same-epoch tail is an
+    // uncommitted, truncatable tail — the new authoritative leader answers the
+    // epoch probe and the old leader truncates to the committed boundary.
+    h.reviveNode(oldIdx);
+    bool truncated = h.driveUntil([&]{
+        return oldLdr->logEndOffset() == committed;
+    });
+
+    EXPECT_TRUE(truncated)
+        << "revived old leader must truncate its uncommitted tail via the epoch exchange";
     EXPECT_EQ(oldLdr->logEndOffset(), committed)
         << "Old leader must truncate uncommitted tail to committed=" << committed
         << " (not staleLeo=" << staleLeo << ")";

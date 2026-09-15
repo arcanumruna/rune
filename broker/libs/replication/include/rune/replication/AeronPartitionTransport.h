@@ -144,6 +144,16 @@ public:
     void sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override;
 
+    // DR-BUG-6: OffsetsForLeaderEpoch exchange + deficient-leader reconcile.
+    void sendOffsetsForLeaderEpochRequest(
+            NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override;
+    void sendOffsetsForLeaderEpochResponse(
+            NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override;
+    void sendReconcileRequest(
+            NodeId toPeer, const FetchRequestMsg& req) override;
+    void sendReconcileResponse(
+            NodeId toPeer, const FetchResponseMsg& resp) override;
+
     // -----------------------------------------------------------------------
     // Duty-cycle step
     // -----------------------------------------------------------------------

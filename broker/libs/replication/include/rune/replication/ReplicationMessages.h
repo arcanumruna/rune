@@ -43,9 +43,20 @@ inline constexpr uint16_t kSchemaVersion = 2; // bumped: DR-BUG-5 added topicId 
 // Template IDs (assigned for the replication protocol)
 // ---------------------------------------------------------------------------
 enum class ReplicationTemplateId : uint16_t {
-    FetchRequest  = 1,
-    FetchResponse = 2,
+    FetchRequest             = 1,
+    FetchResponse            = 2,
+    OffsetsForLeaderEpochReq = 3,   // DR-BUG-6: KIP-101 epoch-boundary query
+    OffsetsForLeaderEpochResp= 4,   // DR-BUG-6: KIP-101 epoch-boundary answer
+    ReconcileFetchReq        = 5,   // DR-BUG-6: deficient-leader reverse pull (req)
+    ReconcileFetchResp       = 6,   // DR-BUG-6: deficient-leader reverse pull (resp)
 };
+
+// DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
+// the FetchRequest/FetchResponse WIRE LAYOUT but carry a DISTINCT templateId so
+// the transport routes them to onReconcileRequest()/applyReconcileResponse()
+// instead of the normal onFetchRequest()/applyReplicated() path.
+inline constexpr uint16_t kReconcileFetchReqTemplateId  = 5;
+inline constexpr uint16_t kReconcileFetchRespTemplateId = 6;
 
 // ---------------------------------------------------------------------------
 // Internal little-endian helpers (UB-free via memcpy; optimises to mov)
@@ -114,6 +125,15 @@ inline uint16_t peekTemplateId(const uint8_t* buf,
                                 std::size_t offset = 0) noexcept
 {
     return detail::read_le<uint16_t>(buf + offset + 2);
+}
+
+/// DR-BUG-6: overwrite the templateId of an already-encoded frame (SBE header
+/// byte +2).  Used to re-stamp a Fetch frame as a Reconcile frame so it routes
+/// to the reconcile handlers, reusing the Fetch codec without duplication.
+inline void stampTemplateId(uint8_t* buf, std::size_t offset,
+                            uint16_t tid) noexcept
+{
+    detail::write_le<uint16_t>(buf + offset + 2, tid);
 }
 
 // ===========================================================================
@@ -306,6 +326,140 @@ struct FetchResponseMsg {
         }
 
         m.records = std::span<const uint8_t>{vp + VAR_HEADER_SIZE, safeLen};
+        return m;
+    }
+};
+
+// ===========================================================================
+// 3. OffsetsForLeaderEpochRequest  (templateId = 3)   [DR-BUG-6, KIP-101]
+//
+// A follower that has just learned of a new leader/epoch sends this to the NEW
+// leader to discover the true divergence point BEFORE truncating.  It carries
+// the follower's LATEST leader-epoch (the largest epoch it has records for) and
+// its own log-end-offset.  The leader answers from its LeaderEpochCache.
+//
+// Wire layout (fixed block, 24 bytes):
+//   currentEpoch   : Epoch       (int64)  @ +0   epoch this fence request is issued under
+//   partition      : PartitionId (int32)  @ +8
+//   followerId     : NodeId      (int32)  @ +12
+//   requestedEpoch : Epoch       (int64)  @ +16  follower's latest leader-epoch
+//   followerLeo    : Offset      (int64)  @ +24  follower's log-end-offset
+//   topicId        : int32       @ +32
+// Total block: 8+4+4+8+8+4 = 36 bytes
+// ===========================================================================
+struct OffsetsForLeaderEpochReqMsg {
+    Epoch       currentEpoch;
+    PartitionId partition;
+    NodeId      followerId;
+    Epoch       requestedEpoch;
+    Offset      followerLeo;
+    int32_t     topicId;
+
+    static constexpr uint16_t TEMPLATE_ID  = 3;
+    static constexpr uint16_t BLOCK_LENGTH = 36;
+    static constexpr std::size_t TOTAL_SIZE =
+        ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset,
+                              Epoch       currentEpoch_,
+                              PartitionId partition_,
+                              NodeId      followerId_,
+                              Epoch       requestedEpoch_,
+                              Offset      followerLeo_,
+                              int32_t     topicId_ = 0) noexcept
+    {
+        std::size_t pos = offset;
+        pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, currentEpoch_);
+        detail::write_le<int32_t>(p +  8, partition_);
+        detail::write_le<int32_t>(p + 12, followerId_);
+        detail::write_le<int64_t>(p + 16, requestedEpoch_);
+        detail::write_le<int64_t>(p + 24, followerLeo_);
+        detail::write_le<int32_t>(p + 32, topicId_);
+        return TOTAL_SIZE;
+    }
+
+    static OffsetsForLeaderEpochReqMsg decode(const uint8_t* buf,
+                                              std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
+        OffsetsForLeaderEpochReqMsg m{};
+        m.currentEpoch   = detail::read_le<int64_t>(p +  0);
+        m.partition      = detail::read_le<int32_t>(p +  8);
+        m.followerId     = detail::read_le<int32_t>(p + 12);
+        m.requestedEpoch = detail::read_le<int64_t>(p + 16);
+        m.followerLeo    = detail::read_le<int64_t>(p + 24);
+        m.topicId        = detail::read_le<int32_t>(p + 32);
+        return m;
+    }
+};
+
+// ===========================================================================
+// 4. OffsetsForLeaderEpochResponse  (templateId = 4)   [DR-BUG-6, KIP-101]
+//
+// The NEW leader's answer: for the requested epoch, the leader reports the
+// epoch it and the follower actually share (responseEpoch, the largest cached
+// epoch <= requestedEpoch, or -1 if none) and the end offset of that shared
+// epoch on the leader's log (the start of the next epoch, or the leader's LEO
+// if the shared epoch is still open).
+//
+// Wire layout (fixed block, 28 bytes):
+//   leaderEpoch    : Epoch       (int64)  @ +0   leader's current epoch (for fencing)
+//   partition      : PartitionId (int32)  @ +8
+//   responseEpoch  : Epoch       (int64)  @ +12  shared epoch, or -1
+//   endOffset      : Offset      (int64)  @ +20  end offset of the shared epoch
+//   errorCode      : int16       @ +28
+//   _pad           : int16       @ +30
+//   topicId        : int32       @ +32
+// Total block: 8+4+8+8+2+2+4 = 36 bytes
+// ===========================================================================
+struct OffsetsForLeaderEpochRespMsg {
+    Epoch       leaderEpoch;
+    PartitionId partition;
+    Epoch       responseEpoch;
+    Offset      endOffset;
+    int16_t     errorCode;
+    int32_t     topicId;
+
+    static constexpr uint16_t TEMPLATE_ID  = 4;
+    static constexpr uint16_t BLOCK_LENGTH = 36;
+    static constexpr std::size_t TOTAL_SIZE =
+        ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset,
+                              Epoch       leaderEpoch_,
+                              PartitionId partition_,
+                              Epoch       responseEpoch_,
+                              Offset      endOffset_,
+                              int16_t     errorCode_,
+                              int32_t     topicId_ = 0) noexcept
+    {
+        std::size_t pos = offset;
+        pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, leaderEpoch_);
+        detail::write_le<int32_t>(p +  8, partition_);
+        detail::write_le<int64_t>(p + 12, responseEpoch_);
+        detail::write_le<int64_t>(p + 20, endOffset_);
+        detail::write_le<int16_t>(p + 28, errorCode_);
+        detail::write_le<int16_t>(p + 30, 0);     // alignment pad
+        detail::write_le<int32_t>(p + 32, topicId_);
+        return TOTAL_SIZE;
+    }
+
+    static OffsetsForLeaderEpochRespMsg decode(const uint8_t* buf,
+                                               std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
+        OffsetsForLeaderEpochRespMsg m{};
+        m.leaderEpoch   = detail::read_le<int64_t>(p +  0);
+        m.partition     = detail::read_le<int32_t>(p +  8);
+        m.responseEpoch = detail::read_le<int64_t>(p + 12);
+        m.endOffset     = detail::read_le<int64_t>(p + 20);
+        m.errorCode     = detail::read_le<int16_t>(p + 28);
+        // p+30: alignment pad (skip)
+        m.topicId       = detail::read_le<int32_t>(p + 32);
         return m;
     }
 };

@@ -464,13 +464,28 @@ TEST_F(FailoverTest3, OldLeader_BecomeFollower_TruncatesUncommittedTail) {
     // Old leader is now follower with new epoch.
     ASSERT_EQ(leader_->role(), Role::Follower);
 
-    // FIX 2: becomeFollower MUST truncate the uncommitted tail immediately at
-    // transition time.  The old leader's LEO must equal exactly the committed
-    // boundary — NOT leoBeforeFailover.  A no-truncation bug would leave LEO at
-    // leoBeforeFailover (> committed) and this assertion would fail.
+    // DR-BUG-6: becomeFollower now DEFERS truncation until the OffsetsForLeaderEpoch
+    // exchange with the new leader resolves the TRUE divergence point (KIP-101).
+    // The old leader (kL) is NOT an ISR member of the new epoch (it was the dead
+    // leader, excluded from the new ISR), so its ahead tail is treated as an
+    // uncommitted, truncatable tail — the new leader answers authoritatively and
+    // kL truncates to the leader's epoch boundary (== committed).
+    NodeId nl = coord_->currentLeader();
+    PartitionReplica* newLeaderReplica = (nl == kF2) ? follower2_.get() : follower3_.get();
+    transport_.setLeader(newLeaderReplica);
+    transport_.addFollower(kL, leader_.get());
+
+    bool truncated = driveUntil(
+        {newLeaderReplica, leader_.get()}, transport_, clock_,
+        [&]{ return leader_->logEndOffset() == committed; });
+
+    // Intent preserved: the uncommitted tail is truncated (now via the deferred
+    // epoch exchange), landing exactly at the committed boundary.
+    EXPECT_TRUE(truncated)
+        << "old leader must truncate its uncommitted tail via the epoch exchange";
     EXPECT_EQ(leader_->logEndOffset(), committed)
-        << "becomeFollower must truncate uncommitted tail: LEO must equal committed="
-        << committed << " not staleLeo=" << leoBeforeFailover;
+        << "post-exchange LEO must equal committed=" << committed
+        << " not staleLeo=" << leoBeforeFailover;
 
     // Committed data must survive (we never truncate below HW).
     auto bytes = leader_->log()->read(0, 1 << 20);
@@ -532,34 +547,32 @@ TEST_F(FailoverTest3, OldLeader_TailTruncation_ExactOffset) {
     // Old leader is now follower at newEpoch.
     ASSERT_EQ(leader_->role(), Role::Follower);
     ASSERT_EQ(leader_->epoch(), newEpoch);
+    (void)newEpoch;
 
-    // Inject a FetchResponse from the new leader with newEpoch and no records
-    // to trigger truncation on the old leader.
-    FetchResponseMsg resp{};
-    resp.leaderEpoch    = newEpoch;
-    resp.partition      = 0;
-    resp.highWatermark  = committed;
-    resp.logStartOffset = 0;
-    resp.errorCode      = kErrNone;
-    resp.records        = {};  // no records — epoch-change signal
-
-    // FIX 2: becomeFollower already truncated the tail at transition time.
-    // LEO must already equal `committed` before applyReplicated fires.
+    // DR-BUG-6: truncation is DEFERRED to the OffsetsForLeaderEpoch exchange.
+    // Right after becomeFollower the uncommitted tail is still present (the
+    // follower keeps its log until it learns the TRUE divergence point) — this
+    // is the deliberate change that prevents the DR-8 committed-loss.
     Offset leoAfterBecomeFollower = leader_->logEndOffset();
-    EXPECT_EQ(leoAfterBecomeFollower, committed)
-        << "becomeFollower must truncate tail immediately: LEO must equal committed="
-        << committed << " before any applyReplicated call";
+    EXPECT_EQ(leoAfterBecomeFollower, staleLeo)
+        << "deferred truncation: tail is retained until the epoch exchange";
 
-    // applyReplicated with same-epoch response (leaderEpoch == epoch_ now)
-    // must leave LEO at the committed boundary (no secondary truncation needed,
-    // tail is already gone).
-    leader_->applyReplicated(resp);
+    // Drive the epoch exchange with the authoritative new leader.  kL is NOT in
+    // the new ISR → its ahead tail is uncommitted → it truncates to the leader's
+    // epoch boundary, which is EXACTLY the committed offset.
+    NodeId nl = coord_->currentLeader();
+    PartitionReplica* newLeaderReplica = (nl == kF2) ? follower2_.get() : follower3_.get();
+    transport_.setLeader(newLeaderReplica);
+    transport_.addFollower(kL, leader_.get());
+
+    bool truncated = driveUntil(
+        {newLeaderReplica, leader_.get()}, transport_, clock_,
+        [&]{ return leader_->logEndOffset() == committed; });
+
     Offset leoAfterTrunc = leader_->logEndOffset();
-
-    // FIX 2: exact equality — must equal committed, not merely <= staleLeo.
-    // A no-truncation bug would leave leoAfterTrunc == staleLeo (> committed).
+    EXPECT_TRUE(truncated) << "old leader must truncate its uncommitted tail";
     EXPECT_EQ(leoAfterTrunc, committed)
-        << "After truncation LEO must be EXACTLY committed=" << committed
+        << "After the epoch exchange LEO must be EXACTLY committed=" << committed
         << "; staleLeo was=" << staleLeo;
     (void)staleLeo;
 }
@@ -1570,23 +1583,20 @@ TEST_F(FailoverTest3, B1_T4_OldLeaderTruncatesAndRefetchesLower_HWNotStale) {
     EXPECT_GE(follower2_->highWatermark(), hw)
         << "B2: new leader kF2 HW must be >= committed hw immediately";
 
-    // kL (old leader, now follower) truncated to HW=5 on becomeFollower.
-    EXPECT_LE(leader_->logEndOffset(), hw)
-        << "Old leader must truncate uncommitted tail to <= committedHw";
-
-    // Old leader sends a FetchRequest from LEO=5 (post-truncation) to new leader kF2.
+    // DR-BUG-6: kL's uncommitted tail truncation is DEFERRED to the epoch
+    // exchange.  Re-wire kL to the new leader and drive the exchange.  kL is NOT
+    // in the new ISR ({kF2,kF3}) → its ahead tail is uncommitted → it truncates
+    // to the leader's epoch boundary (== committed hw).
     transport_.setLeader(follower2_.get());
     transport_.addFollower(kL, leader_.get());
 
-    FetchRequestMsg lowerReq{};
-    lowerReq.leaderEpoch = static_cast<Epoch>(coord_->currentEpoch());
-    lowerReq.partition   = 0;
-    lowerReq.followerId  = kL;
-    lowerReq.fetchOffset = leader_->logEndOffset(); // should be 5
-    lowerReq.maxBytes    = 1 << 20;
-
-    int16_t err = follower2_->onFetchRequest(lowerReq, clock_);
-    ASSERT_EQ(err, kErrNone) << "Fetch at post-truncation LEO must be accepted";
+    bool truncated = driveUntil(
+        {follower2_.get(), leader_.get()}, transport_, clock_,
+        [&]{ return leader_->logEndOffset() <= hw; });
+    EXPECT_TRUE(truncated)
+        << "Old leader must truncate uncommitted tail to <= committedHw via epoch exchange";
+    EXPECT_LE(leader_->logEndOffset(), hw)
+        << "Old leader must truncate uncommitted tail to <= committedHw";
 
     // B1 fix: new leader kF2's HW must still be >= committedHw=5.
     EXPECT_GE(follower2_->highWatermark(), hw)

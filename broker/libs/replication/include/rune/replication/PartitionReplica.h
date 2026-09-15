@@ -103,6 +103,38 @@ public:
     /// (Leader → Follower) send a FetchResponse.
     virtual void sendFetchResponse(NodeId toFollower,
                                    const FetchResponseMsg& resp) = 0;
+
+    // -----------------------------------------------------------------------
+    // DR-BUG-6 — OffsetsForLeaderEpoch exchange + deficient-leader reconcile.
+    //
+    // These are peer-routed (addressed to a specific NodeId).  They have SAFE
+    // DEFAULT NO-OP bodies so a transport that has not implemented them yet
+    // still compiles AND the replica degrades to the conservative
+    // truncate-to-committed-HW fallback (never loses committed data, but may
+    // re-fetch a small committed tail).  InMemoryTransport (tests),
+    // FilteringTransport (integration harness) and AeronPartitionTransport
+    // (production) implement them fully.
+    // -----------------------------------------------------------------------
+
+    /// (New follower → New leader) ask for the leader's end offset for the last
+    /// epoch they share (KIP-101), BEFORE the follower truncates on epoch change.
+    virtual void sendOffsetsForLeaderEpochRequest(
+            NodeId /*toLeader*/, const OffsetsForLeaderEpochReqMsg& /*req*/) {}
+
+    /// (Leader → New follower) the epoch-boundary answer.
+    virtual void sendOffsetsForLeaderEpochResponse(
+            NodeId /*toFollower*/, const OffsetsForLeaderEpochRespMsg& /*resp*/) {}
+
+    /// (Deficient leader → ahead survivor) pull missing committed records
+    /// [fromOffset, survivorLEO) — a REVERSE fetch (leader fetches from a
+    /// follower).  Reuses the FetchRequest shape.
+    virtual void sendReconcileRequest(
+            NodeId /*toPeer*/, const FetchRequestMsg& /*req*/) {}
+
+    /// (Ahead survivor → deficient leader) serve the requested records.
+    /// Reuses the FetchResponse shape.
+    virtual void sendReconcileResponse(
+            NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -211,6 +243,39 @@ public:
     FetchRequestMsg nextFetch() const noexcept;
 
     // -----------------------------------------------------------------------
+    // DR-BUG-6 — OffsetsForLeaderEpoch exchange (KIP-101) + deficient-leader
+    // reverse-catch-up reconcile.
+    // -----------------------------------------------------------------------
+
+    /// (Leader) Handle an OffsetsForLeaderEpochRequest from a follower that is
+    /// deciding whether/where to truncate on an epoch change.  Answers from the
+    /// LeaderEpochCache: (responseEpoch, endOffset) — see LeaderEpochCache::
+    /// endOffsetForEpoch.  Sends the response via
+    /// transport_->sendOffsetsForLeaderEpochResponse().
+    void onOffsetsForLeaderEpochRequest(const OffsetsForLeaderEpochReqMsg& req);
+
+    /// (Follower) Apply the leader's OffsetsForLeaderEpoch answer: perform the
+    /// DEFERRED, correct truncation.
+    ///   • responseEpoch == our latest epoch  → SHARED (possibly open) epoch:
+    ///     no divergence.  We keep our tail (the leader reconciles anything it
+    ///     lacks).  Truncate only to min(ourLEO, endOffset) which, for a shared
+    ///     open epoch (endOffset == leaderLEO), can be BELOW our LEO — but those
+    ///     are committed records the leader is missing, so we KEEP them.
+    ///   • responseEpoch  < our latest epoch  → GENUINE divergence at the epoch
+    ///     boundary: truncate to min(ourLEO, endOffset).
+    /// Never truncates below our committed HW floor (defence in depth).
+    void applyOffsetsForLeaderEpochResponse(const OffsetsForLeaderEpochRespMsg& resp);
+
+    /// (Any role) Serve a reconcile pull: read raw log bytes [fromOffset, LEO)
+    /// and reply via transport_->sendReconcileResponse().  Used by an ahead
+    /// survivor to feed committed records to a deficient new leader.
+    void onReconcileRequest(const FetchRequestMsg& req);
+
+    /// (Leader) Apply reconcile records pulled from an ahead survivor: append
+    /// the strictly-new committed tail and advance LEO/HW.
+    void applyReconcileResponse(const FetchResponseMsg& resp);
+
+    // -----------------------------------------------------------------------
     // doWork — single-writer periodic step (no spin, no sleep)
     // -----------------------------------------------------------------------
 
@@ -293,6 +358,39 @@ private:
     // Follower HW (leader uses leaderState_.highWatermark())
     Offset followerHw_ = 0;
 
+    // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
+    //
+    // On becomeFollower(newEpoch) we do NOT truncate eagerly.  Instead we set
+    // epochProbePending_ and remember the epoch we are probing under and the
+    // committed floor captured at transition time.  The follower issues an
+    // OffsetsForLeaderEpochRequest to the new leader and defers all fetching
+    // until the answer arrives (applyOffsetsForLeaderEpochResponse), which does
+    // the correct truncation.  This prevents an up-to-date survivor from
+    // dropping its committed tail before the (possibly deficient) new leader can
+    // pull it (the DR-8 loss).
+    bool   epochProbePending_ = false;
+    Epoch  epochProbeEpoch_    = -1;   ///< epoch we transitioned into
+    Offset epochProbeFloor_    = 0;    ///< committed HW floor at transition
+    int    epochProbeAttempts_ = 0;    ///< probes issued without an answer
+
+    // DR-BUG-6: after this many unanswered probes, fall back to the conservative
+    // committed-HW truncation and resume fetching.  Keeps the replica live even
+    // when the transport does not implement OffsetsForLeaderEpoch or the new
+    // leader is not promoted yet — it degrades EXACTLY to the pre-DR-BUG-6
+    // behaviour (never loses committed data; may re-fetch a small committed
+    // tail), never a permanent stall.
+    static constexpr int kEpochProbeMaxAttempts = 8;
+
+    // DR-BUG-6: deficient-leader reconcile state.
+    //
+    // A newly-elected leader may be BEHIND the committed frontier (a deficient
+    // node elected by the data-blind consensus).  When it sees a follower whose
+    // LEO exceeds its own, it pulls the missing committed records from that
+    // ahead survivor via sendReconcileRequest() before advertising a HW that
+    // covers them.  reconcileTarget_ tracks which peer we are pulling from (to
+    // avoid a storm of duplicate reconcile requests); -1 means idle.
+    NodeId reconcileTarget_    = -1;   ///< peer we are reverse-fetching from
+
     // GR-10: push tracking — last offset that was pushed to followers.
     // Avoids re-pushing bytes already pushed in the same append cycle.
     Offset lastPushedOffset_ = 0;
@@ -344,13 +442,20 @@ public:
     };
 
     // Register leader and followers after construction.
-    void setLeader(PartitionReplica* leader) { leader_ = leader; }
+    void setLeader(PartitionReplica* leader) {
+        leader_ = leader;
+        // DR-BUG-6: also index the leader by NodeId so peer-routed messages
+        // (OffsetsForLeaderEpoch responses, reconcile requests) can reach it.
+        if (leader) byId_[leader->selfId()] = leader;
+    }
     void addFollower(NodeId id, PartitionReplica* follower) {
         followers_[id] = follower;
+        byId_[id] = follower;   // DR-BUG-6: index for peer-routed messages
     }
     /// Remove a follower from the transport (simulates network partition/crash).
     void removeFollower(NodeId id) {
         followers_.erase(id);
+        byId_.erase(id);
     }
 
     // PartitionTransport implementation
@@ -375,6 +480,34 @@ public:
                                                     pr.recordsBuf.size());
         std::lock_guard lk(mu_);
         pendingResponses_.push_back(std::move(pr));
+    }
+
+    // DR-BUG-6: OffsetsForLeaderEpoch + reconcile peer-routed messages.
+    void sendOffsetsForLeaderEpochRequest(
+            NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override {
+        std::lock_guard lk(mu_);
+        pendingEpochReqs_.push_back({toLeader, req});
+    }
+    void sendOffsetsForLeaderEpochResponse(
+            NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override {
+        std::lock_guard lk(mu_);
+        pendingEpochResps_.push_back({toFollower, resp});
+    }
+    void sendReconcileRequest(
+            NodeId toPeer, const FetchRequestMsg& req) override {
+        std::lock_guard lk(mu_);
+        pendingReconcileReqs_.push_back({toPeer, req});
+    }
+    void sendReconcileResponse(
+            NodeId toPeer, const FetchResponseMsg& resp) override {
+        PendingResponse pr;
+        pr.toFollower = toPeer;
+        pr.recordsBuf.assign(resp.records.begin(), resp.records.end());
+        pr.resp = resp;
+        pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
+                                                    pr.recordsBuf.size());
+        std::lock_guard lk(mu_);
+        pendingReconcileResps_.push_back(std::move(pr));
     }
 
     /// Deliver all pending messages: FetchRequests → leader, FetchResponses → followers.
@@ -415,22 +548,89 @@ public:
             }
         }
 
+        // DR-BUG-6: OffsetsForLeaderEpoch requests → target (the new leader).
+        std::vector<PendingEpochReq> ereqs;
+        {
+            std::lock_guard lk(mu_);
+            ereqs.swap(pendingEpochReqs_);
+        }
+        for (auto& e : ereqs) {
+            auto it = byId_.find(e.to);
+            if (it != byId_.end()) {
+                it->second->onOffsetsForLeaderEpochRequest(e.req);
+                ++count;
+            }
+        }
+
+        // DR-BUG-6: OffsetsForLeaderEpoch responses → target (the follower).
+        std::vector<PendingEpochResp> eresps;
+        {
+            std::lock_guard lk(mu_);
+            eresps.swap(pendingEpochResps_);
+        }
+        for (auto& e : eresps) {
+            auto it = byId_.find(e.to);
+            if (it != byId_.end()) {
+                it->second->applyOffsetsForLeaderEpochResponse(e.resp);
+                ++count;
+            }
+        }
+
+        // DR-BUG-6: reconcile requests → target (the ahead survivor).
+        std::vector<PendingReconcileReq> rreqs;
+        {
+            std::lock_guard lk(mu_);
+            rreqs.swap(pendingReconcileReqs_);
+        }
+        for (auto& r : rreqs) {
+            auto it = byId_.find(r.to);
+            if (it != byId_.end()) {
+                it->second->onReconcileRequest(r.req);
+                ++count;
+            }
+        }
+
+        // DR-BUG-6: reconcile responses → target (the deficient leader).
+        std::vector<PendingResponse> rresps;
+        {
+            std::lock_guard lk(mu_);
+            rresps.swap(pendingReconcileResps_);
+        }
+        for (auto& pr : rresps) {
+            auto it = byId_.find(pr.toFollower);
+            if (it != byId_.end()) {
+                it->second->applyReconcileResponse(pr.resp);
+                ++count;
+            }
+        }
+
         return count;
     }
 
     /// Number of in-flight messages (for test assertions).
     [[nodiscard]] std::size_t pendingCount() const noexcept {
         std::lock_guard lk(mu_);
-        return pendingRequests_.size() + pendingResponses_.size();
+        return pendingRequests_.size() + pendingResponses_.size()
+             + pendingEpochReqs_.size() + pendingEpochResps_.size()
+             + pendingReconcileReqs_.size() + pendingReconcileResps_.size();
     }
 
 private:
+    struct PendingEpochReq  { NodeId to; OffsetsForLeaderEpochReqMsg  req; };
+    struct PendingEpochResp { NodeId to; OffsetsForLeaderEpochRespMsg resp; };
+    struct PendingReconcileReq { NodeId to; FetchRequestMsg req; };
+
     PartitionReplica* leader_ = nullptr;
     std::unordered_map<NodeId, PartitionReplica*> followers_;
+    std::unordered_map<NodeId, PartitionReplica*> byId_;   ///< DR-BUG-6: all replicas by id
 
-    mutable std::mutex           mu_;              ///< guards pendingRequests_/pendingResponses_
+    mutable std::mutex           mu_;              ///< guards all pending queues
     std::vector<PendingRequest>  pendingRequests_;
     std::vector<PendingResponse> pendingResponses_;
+    std::vector<PendingEpochReq>  pendingEpochReqs_;   ///< DR-BUG-6
+    std::vector<PendingEpochResp> pendingEpochResps_;  ///< DR-BUG-6
+    std::vector<PendingReconcileReq> pendingReconcileReqs_;  ///< DR-BUG-6
+    std::vector<PendingResponse>  pendingReconcileResps_;    ///< DR-BUG-6
 };
 
 } // namespace rune::replication

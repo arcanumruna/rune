@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <map>
+#include <utility>
 namespace rune::storage {
 
 /// In-memory cache of (leaderEpoch → startOffset) pairs.
@@ -42,6 +43,55 @@ public:
     int64_t truncateOffsetForEpoch(int32_t leaderEpoch) const {
         auto it = epochs_.upper_bound(leaderEpoch);
         return it == epochs_.end() ? -1 : it->second;
+    }
+
+    /// DR-BUG-6 — the leader-side OffsetsForLeaderEpoch answer (KIP-101).
+    ///
+    /// A follower asks "for epoch `requestedEpoch` (the follower's latest
+    /// epoch), what is your end offset for the last epoch we share?".
+    ///
+    /// Returns a pair (responseEpoch, endOffset):
+    ///   • responseEpoch — the largest cached epoch <= requestedEpoch (the
+    ///     epoch the leader and follower actually share at/below the request),
+    ///     or -1 if the leader has NO epoch <= requestedEpoch (the follower's
+    ///     entire requested-epoch history predates the leader's → divergent).
+    ///   • endOffset — the offset at which responseEpoch ENDED on the leader:
+    ///       - the start offset of the first cached epoch strictly greater than
+    ///         responseEpoch (the boundary where the next epoch began), OR
+    ///       - the leader's `logEndOffset` when responseEpoch is the leader's
+    ///         LATEST cached epoch (the epoch is still open → its end is the
+    ///         current LEO).  This is the crucial KIP-101 case: an open shared
+    ///         epoch reports the leader LEO, and the follower interprets a
+    ///         shared open epoch as "no divergence → keep my tail" (the leader
+    ///         reconciles the tail it is missing).
+    ///     When responseEpoch == -1, endOffset is the start of the leader's
+    ///     earliest cached epoch (or `logEndOffset` if the cache is empty),
+    ///     i.e. the offset up to which the two histories can be trusted.
+    ///
+    /// Pure: does not mutate the cache.
+    std::pair<int32_t, int64_t>
+    endOffsetForEpoch(int32_t requestedEpoch, int64_t logEndOffset) const {
+        if (epochs_.empty()) {
+            return {-1, 0};
+        }
+        // Largest cached epoch <= requestedEpoch.
+        // upper_bound(requestedEpoch) → first epoch > requestedEpoch.
+        auto next = epochs_.upper_bound(requestedEpoch);
+        if (next == epochs_.begin()) {
+            // No cached epoch <= requestedEpoch: the follower's requested-epoch
+            // history predates everything the leader knows → divergent.  The
+            // shared history ends at the leader's earliest start offset.
+            return {-1, epochs_.begin()->second};
+        }
+        auto shared = std::prev(next);               // largest epoch <= requested
+        const int32_t responseEpoch = shared->first;
+        if (next == epochs_.end()) {
+            // responseEpoch is the leader's latest cached epoch → still open →
+            // its end offset is the current log-end-offset.
+            return {responseEpoch, logEndOffset};
+        }
+        // responseEpoch ended where the next cached epoch began.
+        return {responseEpoch, next->second};
     }
 
     /// A5: Prune epoch entries whose startOffset ≥ truncateOffset.

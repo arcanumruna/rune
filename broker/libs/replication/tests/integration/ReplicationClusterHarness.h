@@ -141,6 +141,34 @@ public:
         pendingResponses_.push_back(std::move(pr));
     }
 
+    // DR-BUG-6: OffsetsForLeaderEpoch + reconcile peer-routed messages.
+    void sendOffsetsForLeaderEpochRequest(
+            NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override {
+        if (isolated_.count(req.followerId) || isolated_.count(toLeader)) return;
+        pendingEpochReqs_.push_back({toLeader, req});
+    }
+    void sendOffsetsForLeaderEpochResponse(
+            NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override {
+        if (isolated_.count(toFollower)) return;
+        pendingEpochResps_.push_back({toFollower, resp});
+    }
+    void sendReconcileRequest(
+            NodeId toPeer, const FetchRequestMsg& req) override {
+        if (isolated_.count(toPeer) || isolated_.count(req.followerId)) return;
+        pendingReconcileReqs_.push_back({toPeer, req});
+    }
+    void sendReconcileResponse(
+            NodeId toPeer, const FetchResponseMsg& resp) override {
+        if (isolated_.count(toPeer)) return;
+        PendingResponse pr;
+        pr.toFollower = toPeer;
+        pr.recordsBuf.assign(resp.records.begin(), resp.records.end());
+        pr.resp = resp;
+        pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
+                                                    pr.recordsBuf.size());
+        pendingReconcileResps_.push_back(std::move(pr));
+    }
+
     // Deliver all pending messages.
     int pump(int64_t nowNs) {
         int count = 0;
@@ -170,11 +198,57 @@ public:
             }
         }
 
+        // DR-BUG-6: OffsetsForLeaderEpoch requests → target replica (by NodeId).
+        std::vector<PendingEpochReq> ereqs;
+        ereqs.swap(pendingEpochReqs_);
+        for (auto& e : ereqs) {
+            auto it = replicas_.find(e.to);
+            if (it != replicas_.end() && it->second != nullptr) {
+                it->second->onOffsetsForLeaderEpochRequest(e.req);
+                ++count;
+            }
+        }
+
+        // DR-BUG-6: OffsetsForLeaderEpoch responses → target follower.
+        std::vector<PendingEpochResp> eresps;
+        eresps.swap(pendingEpochResps_);
+        for (auto& e : eresps) {
+            auto it = replicas_.find(e.to);
+            if (it != replicas_.end() && it->second != nullptr) {
+                it->second->applyOffsetsForLeaderEpochResponse(e.resp);
+                ++count;
+            }
+        }
+
+        // DR-BUG-6: reconcile requests → target (ahead survivor).
+        std::vector<PendingReconcileReq> rreqs;
+        rreqs.swap(pendingReconcileReqs_);
+        for (auto& r : rreqs) {
+            auto it = replicas_.find(r.to);
+            if (it != replicas_.end() && it->second != nullptr) {
+                it->second->onReconcileRequest(r.req);
+                ++count;
+            }
+        }
+
+        // DR-BUG-6: reconcile responses → target (deficient leader).
+        std::vector<PendingResponse> rresps;
+        rresps.swap(pendingReconcileResps_);
+        for (auto& pr : rresps) {
+            auto it = replicas_.find(pr.toFollower);
+            if (it != replicas_.end() && it->second != nullptr) {
+                it->second->applyReconcileResponse(pr.resp);
+                ++count;
+            }
+        }
+
         return count;
     }
 
     [[nodiscard]] std::size_t pendingCount() const noexcept {
-        return pendingRequests_.size() + pendingResponses_.size();
+        return pendingRequests_.size() + pendingResponses_.size()
+             + pendingEpochReqs_.size() + pendingEpochResps_.size()
+             + pendingReconcileReqs_.size() + pendingReconcileResps_.size();
     }
 
     [[nodiscard]] NodeId currentLeaderId() const noexcept {
@@ -190,6 +264,9 @@ private:
         FetchResponseMsg  resp;
         std::vector<uint8_t> recordsBuf;
     };
+    struct PendingEpochReq  { NodeId to; OffsetsForLeaderEpochReqMsg  req; };
+    struct PendingEpochResp { NodeId to; OffsetsForLeaderEpochRespMsg resp; };
+    struct PendingReconcileReq { NodeId to; FetchRequestMsg req; };
 
     NodeId currentLeaderId_ = -1;
     std::unordered_map<NodeId, PartitionReplica*> replicas_;
@@ -197,6 +274,10 @@ private:
 
     std::vector<PendingRequest>  pendingRequests_;
     std::vector<PendingResponse> pendingResponses_;
+    std::vector<PendingEpochReq>  pendingEpochReqs_;    ///< DR-BUG-6
+    std::vector<PendingEpochResp> pendingEpochResps_;   ///< DR-BUG-6
+    std::vector<PendingReconcileReq> pendingReconcileReqs_;  ///< DR-BUG-6
+    std::vector<PendingResponse>  pendingReconcileResps_;    ///< DR-BUG-6
 };
 
 // ---------------------------------------------------------------------------

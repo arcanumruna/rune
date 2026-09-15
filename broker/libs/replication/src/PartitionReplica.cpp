@@ -79,6 +79,13 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
             epochCache_.assign(static_cast<int32_t>(epoch_),
                                log_->logEndOffset());
         }
+    } else {
+        // DR-BUG-6: seed the follower's epoch cache so it knows its latest
+        // leader-epoch (needed to build the OffsetsForLeaderEpoch request).
+        // The initial epoch's records (if any pre-seeded) begin at offset 0.
+        if (epoch_ >= 0) {
+            epochCache_.assign(static_cast<int32_t>(epoch_), /*startOffset=*/0);
+        }
     }
 }
 
@@ -147,57 +154,43 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 {
-    // Truncate uncommitted tail BEFORE adopting the new epoch so that
-    // applyReplicated()'s ">" check still fires on the first fetch (and as a
-    // belt-and-suspenders path). Compute the boundary using the PRE-transition
-    // epoch so the cache lookup is correct.
+    // DR-BUG-6 — DEFERRED, epoch-correct truncation (KIP-101).
+    //
+    // We do NOT truncate eagerly to the committed HW here.  Eagerly truncating a
+    // follower's tail to its OWN (possibly stale) committed-HW view is the DR-8
+    // data-loss bug: an up-to-date survivor that never received the dead leader's
+    // final HW-advance would destroy committed records it alone still holds
+    // before the (possibly deficient) new leader can pull them.
+    //
+    // Instead, on epoch change we DEFER: we arm an OffsetsForLeaderEpoch probe.
+    // The follower asks the NEW leader for the end offset of the last epoch they
+    // share, and only then truncates to the TRUE divergence point
+    // (applyOffsetsForLeaderEpochResponse).  While the probe is pending the
+    // follower does not fetch and does not truncate — it keeps its full log so
+    // the new leader can reconcile any committed tail it is missing.
+    //
+    // C2 floor: capture the committed HW NOW (while the old role's view is still
+    // valid) as a hard lower bound the deferred truncation may never cross.
     if (leaderEpoch > epoch_) {
-        // C2: Capture the committed HW NOW (while the old role is still valid)
-        // as the safety floor for truncation.
-        //
-        // For a node that WAS leader:   highWatermark() returns leaderState_.highWatermark()
-        //                                which is the exact committed offset (accurate).
-        // For a node that WAS follower: highWatermark() returns followerHw_ =
-        //                                min(localLeo, lastKnownLeaderHw) — conservative;
-        //                                may be below the true committed offset if the
-        //                                follower missed a HW-only update, but is never
-        //                                above it, so truncating here never drops committed
-        //                                data and at worst causes a re-fetch of a small
-        //                                committed tail (safe).
-        //
-        // A full OffsetsForLeaderEpoch exchange with the new leader (Kafka P3)
-        // would give a precise boundary, but is out of scope for this phase.
-        // Truncating to committedHw is the documented safe fallback.
         Offset committedHw = highWatermark();
 
-        // Try epoch-cache boundary first (Kafka OffsetsForLeaderEpoch-style).
-        Offset truncOff = truncationOffsetForEpochChange(epochCache_, leaderEpoch);
-
-        // If the cache returns -1 (no epoch >= leaderEpoch in our cache, which
-        // is the common case when all records share the same old epoch), fall
-        // back to the committed boundary: everything above HW is uncommitted
-        // and potentially divergent from the new leader's timeline.
-        if (truncOff < 0) {
-            truncOff = committedHw;
-        }
-
-        // Safety clamp: never truncate below the committed prefix.
-        // This ensures C2: we never drop committed data regardless of what the
-        // epoch-cache returns.
-        if (truncOff < committedHw) {
-            truncOff = committedHw;
-        }
-
-        // Only truncate if there is actually an uncommitted tail to drop.
-        Offset currentLeo = log_->logEndOffset();
-        if (truncOff < currentLeo) {
-            // A10: prune epoch cache in step with log truncation so that a
-            // subsequent epochCache_.assign() after truncation is not silently
-            // dropped by the monotonic-startOffset guard.
-            epochCache_.truncateFromEnd(truncOff);
-            log_->truncateTo(truncOff);
-            // followerHw_ will be reset below; no need to cap it here.
-        }
+        epochProbePending_  = true;
+        epochProbeEpoch_    = leaderEpoch;   // epoch we are transitioning INTO
+        epochProbeFloor_    = committedHw;    // never truncate below this
+        epochProbeAttempts_ = 0;
+    } else if (leaderEpoch == epoch_ && epochProbePending_
+               && epochProbeEpoch_ == leaderEpoch) {
+        // Re-assertion of the SAME epoch we are already probing (e.g. a node
+        // demoted at the new epoch while dead, then revived under that same
+        // epoch): PRESERVE the pending probe so the deferred truncation still
+        // fires once the exchange completes.  Reset the attempt counter and
+        // re-capture the committed floor so the probe restarts cleanly.
+        epochProbeFloor_    = highWatermark();
+        epochProbeAttempts_ = 0;
+    } else {
+        // No epoch advance and no in-flight probe for this epoch: no probe, no
+        // truncation (normal same-epoch re-assert / initial seed).
+        epochProbePending_ = false;
     }
 
     epoch_    = leaderEpoch;
@@ -205,6 +198,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     leaderId_ = leaderId;
     followerHw_ = 0;
     lastFetchEmitNs_ = 0;
+    reconcileTarget_ = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +314,37 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
         transport_->sendFetchResponse(req.followerId, resp);
         return kErrNotLeader;
+    }
+
+    // DR-BUG-6 — deficient-leader reverse-catch-up backstop.
+    //
+    // Primary trigger is the OffsetsForLeaderEpoch probe path; this is a backstop
+    // for the case where an ISR follower reaches a normal fetch while still ahead
+    // of a deficient leader (e.g. push/fetch race).  ISR-gated: we only pull from
+    // an ISR member (whose ahead tail is committed) — never from a non-ISR
+    // follower (whose ahead tail is an uncommitted, truncatable tail).
+    if (req.fetchOffset > log_->logEndOffset()) {
+        const bool followerInIsr =
+            isrManager_ && !isrManager_->isr().empty()
+            && std::find(isrManager_->isr().begin(), isrManager_->isr().end(),
+                         req.followerId) != isrManager_->isr().end();
+        if (followerInIsr) {
+            if (reconcileTarget_ < 0) {
+                reconcileTarget_ = req.followerId;
+                FetchRequestMsg pull{};
+                pull.leaderEpoch = epoch_;
+                pull.partition   = cfg_.partitionId;
+                pull.followerId  = cfg_.selfId;               // WE are the puller
+                pull.fetchOffset = log_->logEndOffset();      // from our LEO
+                pull.maxBytes    = cfg_.maxFetchBytes;
+                pull.topicId     = cfg_.topicId;
+                transport_->sendReconcileRequest(req.followerId, pull);
+            }
+            // Serve nothing this round; the follower keeps its (committed) tail.
+            return kErrNone;
+        }
+        // Non-ISR follower ahead → its tail is uncommitted; fall through and
+        // serve normally (it will truncate via its own epoch probe).
     }
 
     // Record follower fetch: update ISR manager + leader state.
@@ -575,6 +600,17 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         }
     }
 
+    // DR-BUG-6: maintain the leader-epoch cache on the follower.  If this
+    // response's epoch is newer than anything we have recorded, record its
+    // start offset as the offset where this epoch's first applied records began
+    // (preLeo).  assign() is monotonic + idempotent, so a repeated same-epoch
+    // call is a harmless no-op.  This keeps latestEpoch() accurate so the
+    // OffsetsForLeaderEpoch request carries the correct requestedEpoch.
+    if (resp.leaderEpoch >= 0
+        && static_cast<int32_t>(resp.leaderEpoch) > epochCache_.latestEpoch()) {
+        epochCache_.assign(static_cast<int32_t>(resp.leaderEpoch), preLeo);
+    }
+
     // Advance local HW = min(localLeo, leader's HW).
     Offset localLeo = log_->logEndOffset();
     Offset newHw    = std::min(localLeo, resp.highWatermark);
@@ -618,6 +654,281 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
 }
 
 // ---------------------------------------------------------------------------
+// DR-BUG-6 — OffsetsForLeaderEpoch exchange (KIP-101)
+// ---------------------------------------------------------------------------
+
+// (Leader) Answer a follower's epoch-boundary query from the LeaderEpochCache.
+//
+// DR-BUG-6 discriminator — the deficient-leader reconcile pivots on ISR
+// membership of the probing follower:
+//
+//   • If the probing follower is a CURRENT ISR MEMBER and reports a LEO ABOVE
+//     this leader's own LEO, then THIS leader is DEFICIENT: the data-blind
+//     consensus elected a lagging node, and the ISR follower still holds
+//     committed records this leader is missing.  The leader reverse-reconciles
+//     (pulls [ownLEO, followerLEO) from that follower) and DEFERS the epoch
+//     answer until it has caught up — so when it finally answers, its epoch
+//     boundary already covers the recovered committed prefix and the follower
+//     keeps all its (committed) records.  This is the DR-8 fix.
+//
+//   • If the probing follower is NOT an ISR member (e.g. a rejoining former
+//     leader with an UNCOMMITTED same-epoch tail), the leader is authoritative:
+//     it answers from its cache immediately and the follower truncates its
+//     divergent/uncommitted tail to the leader's epoch boundary (KIP-101).
+void PartitionReplica::onOffsetsForLeaderEpochRequest(
+        const OffsetsForLeaderEpochReqMsg& req)
+{
+    // Only a current leader can answer.
+    if (role_ != Role::Leader) {
+        OffsetsForLeaderEpochRespMsg resp{};
+        resp.leaderEpoch   = epoch_;
+        resp.partition     = cfg_.partitionId;
+        resp.responseEpoch = -1;
+        resp.endOffset     = 0;
+        resp.errorCode     = kErrNotLeader;
+        resp.topicId       = cfg_.topicId;
+        transport_->sendOffsetsForLeaderEpochResponse(req.followerId, resp);
+        return;
+    }
+
+    // Deficient-leader detection: an ISR follower ahead of us holds committed
+    // records we lack.  Trigger the reverse-reconcile pull and DEFER the answer
+    // (the follower re-probes on cadence; we answer once caught up).
+    const bool followerInIsr =
+        isrManager_ && isrManager_->isr().size() > 0
+        && std::find(isrManager_->isr().begin(), isrManager_->isr().end(),
+                     req.followerId) != isrManager_->isr().end();
+
+    if (followerInIsr && req.followerLeo > log_->logEndOffset()) {
+        // (Re)issue the reverse pull.  We (re)send when idle (reconcileTarget_<0)
+        // OR when the pending target is this same follower — the previous pull or
+        // its response may have been dropped by the transport, and the follower
+        // re-probes on cadence, so re-issuing here is the natural retry (it is
+        // idempotent: applyReconcileResponse only appends the strictly-new tail).
+        if (reconcileTarget_ < 0 || reconcileTarget_ == req.followerId) {
+            reconcileTarget_ = req.followerId;
+            FetchRequestMsg pull{};
+            pull.leaderEpoch = epoch_;
+            pull.partition   = cfg_.partitionId;
+            pull.followerId  = cfg_.selfId;               // WE are the puller
+            pull.fetchOffset = log_->logEndOffset();      // from our LEO
+            pull.maxBytes    = cfg_.maxFetchBytes;
+            pull.topicId     = cfg_.topicId;
+            transport_->sendReconcileRequest(req.followerId, pull);
+        }
+        // Defer the epoch answer — the follower keeps its tail and re-probes.
+        return;
+    }
+
+    // Authoritative answer from our cache.
+    auto r = epochCache_.endOffsetForEpoch(
+        static_cast<int32_t>(req.requestedEpoch), log_->logEndOffset());
+
+    OffsetsForLeaderEpochRespMsg resp{};
+    resp.leaderEpoch   = epoch_;
+    resp.partition     = cfg_.partitionId;
+    resp.responseEpoch = r.first;
+    resp.endOffset     = r.second;
+    resp.errorCode     = kErrNone;
+    resp.topicId       = cfg_.topicId;
+    transport_->sendOffsetsForLeaderEpochResponse(req.followerId, resp);
+}
+
+// (Follower) Apply the leader's answer: the DEFERRED, epoch-correct truncation.
+void PartitionReplica::applyOffsetsForLeaderEpochResponse(
+        const OffsetsForLeaderEpochRespMsg& resp)
+{
+    // Only meaningful while a probe is pending for this epoch.
+    if (!epochProbePending_) return;
+
+    // Fence: the answer must come from our current-epoch leader.  A stale answer
+    // (older leaderEpoch) is dropped — we re-probe on the next doWork().
+    if (resp.leaderEpoch < epoch_) return;
+
+    if (resp.errorCode != kErrNone) {
+        // Leader could not answer (not leader yet / transient).  Keep the probe
+        // pending; doWork() re-issues it.  Do NOT truncate — deferring is safe.
+        return;
+    }
+
+    const Offset currentLeo     = log_->logEndOffset();
+    const Offset committedFloor  = epochProbeFloor_;
+
+    // KIP-101 truncation: drop everything at/beyond the leader's end offset for
+    // the last epoch we share — the TRUE divergence point.  endOffset is:
+    //   • the start of the leader's next epoch (if the shared epoch has CLOSED
+    //     on the leader) → our records beyond it diverge from the leader's newer
+    //     epoch (uncommitted/stale tail) → truncate;
+    //   • the leader's LEO (if the shared epoch is still OPEN on the leader) →
+    //     we truncate to the leader's LEO, dropping only what the leader does
+    //     not have.
+    //
+    // The DR-8 "ISR-member ahead within a shared open epoch" case never reaches
+    // here with a data-losing endOffset: the leader detects that case on the
+    // probe, reverse-reconciles the missing committed records from us FIRST, and
+    // only answers once its own LEO covers our tail — so endOffset >= our LEO
+    // and this truncation is a no-op.  For a NON-ISR ahead tail (uncommitted),
+    // the leader answers immediately with endOffset at its boundary and we
+    // correctly truncate the uncommitted tail.
+    Offset truncOff = std::min<Offset>(currentLeo, resp.endOffset);
+
+    // C2 defence-in-depth: never truncate below the committed floor captured at
+    // transition — committed data is never dropped regardless of the answer.
+    if (truncOff < committedFloor) {
+        truncOff = committedFloor;
+    }
+
+    if (truncOff < currentLeo) {
+        truncateLog(truncOff);   // prunes epoch cache in step (A10)
+    }
+
+    // Probe resolved — resume normal fetching under the new epoch.
+    epochProbePending_ = false;
+    lastFetchEmitNs_   = 0;   // fetch immediately on next doWork()
+
+    // Kick a fetch right now so convergence does not wait a full interval.
+    FetchRequestMsg req = nextFetch();
+    transport_->sendFetchRequest(req);
+}
+
+// (Any role) Serve a reconcile pull from an ahead survivor's log.
+void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
+{
+    // Read raw bytes [req.fetchOffset, LEO).  A survivor serves everything it
+    // holds up to its own LEO — these are committed-or-better records the
+    // deficient new leader needs.  (Not HW-bounded: the survivor may itself have
+    // a stale HW view, which is exactly the DR-8 case — but every byte it holds
+    // up to LEO was part of the committed prefix on the old leader.)
+    std::vector<uint8_t> logBytes;
+    Offset leo = log_->logEndOffset();
+    if (req.maxBytes > 0 && req.fetchOffset < leo) {
+        logBytes = log_->read(req.fetchOffset, req.maxBytes);
+
+        // Whole-batch alignment (same as onFetchRequest) so the encoded frame
+        // fits transport limits.
+        if (!logBytes.empty()) {
+            const std::size_t cap = static_cast<std::size_t>(req.maxBytes);
+            std::size_t pos = 0, committedEnd = 0;
+            while (pos < logBytes.size()) {
+                std::size_t rem = logBytes.size() - pos;
+                if (rem < static_cast<std::size_t>(
+                        rune::protocol::batch::kRecordBatchOverhead)) break;
+                rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
+                int32_t total = r.totalLength();
+                if (total <= 0) break;
+                std::size_t nextEnd = pos + static_cast<std::size_t>(total);
+                if (nextEnd > logBytes.size() || nextEnd > cap) break;
+                committedEnd = nextEnd;
+                pos = committedEnd;
+            }
+            logBytes.resize(committedEnd);
+        }
+    }
+
+    // Reply carrying the records and our LEO as the highWatermark hint (the
+    // deficient leader uses byte content, not this HW, to advance its own).
+    FetchResponseMsg::encode(
+        encodeScratch_.data(), 0,
+        epoch_,                          // our epoch (>= leader's; fences stale)
+        cfg_.partitionId,
+        leo,                             // survivor LEO
+        /*logStartOffset=*/0,
+        kErrNone,
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()),
+        cfg_.topicId);
+    auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+    transport_->sendReconcileResponse(req.followerId, resp);
+}
+
+// (Leader) Apply reconcile records pulled from an ahead survivor.
+void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
+{
+    if (resp.errorCode != kErrNone) { reconcileTarget_ = -1; return; }
+    if (role_ != Role::Leader)      { reconcileTarget_ = -1; return; }
+
+    // Stale-epoch fence: ignore a reconcile answer from an older epoch.
+    if (resp.leaderEpoch < epoch_) { reconcileTarget_ = -1; return; }
+
+    if (!resp.records.empty()) {
+        const std::size_t kMagicOff = static_cast<std::size_t>(
+            rune::protocol::batch::kMagicOffset);
+        const uint8_t kMagic = static_cast<uint8_t>(
+            rune::protocol::batch::kMagicValue);
+        bool looksLikeRecordBatch =
+            resp.records.size() > kMagicOff && resp.records[kMagicOff] == kMagic;
+
+        if (looksLikeRecordBatch) {
+            // Append only the strictly-new tail (baseOffset >= current LEO),
+            // preserving contiguity — identical idempotent walk to applyReplicated.
+            Offset currentLeo = log_->logEndOffset();
+            std::size_t newStart = resp.records.size();
+            int64_t lastOff = -1;
+            std::size_t pos = 0;
+            while (pos < resp.records.size()) {
+                std::size_t rem = resp.records.size() - pos;
+                if (rem < static_cast<std::size_t>(
+                        rune::protocol::batch::kRecordBatchOverhead)) break;
+                rune::protocol::RecordBatchReader r(resp.records.data() + pos, rem);
+                int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total)
+                                  > resp.records.size()) break;
+                int64_t batchBase = r.baseOffset();
+                if (batchBase < currentLeo) { pos += static_cast<std::size_t>(total); continue; }
+                if (batchBase > currentLeo) break; // gap — stop
+                if (newStart == resp.records.size()) newStart = pos;
+                lastOff = batchBase + r.lastOffsetDelta();
+                currentLeo = lastOff + 1;
+                pos += static_cast<std::size_t>(total);
+            }
+            if (newStart < resp.records.size() && lastOff >= log_->logEndOffset()) {
+                std::vector<uint8_t> raw(
+                    resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
+                    resp.records.end());
+                log_->append(raw, lastOff);
+            }
+        }
+    }
+
+    // DR-BUG-6: re-stamp our leader-epoch boundary at the reconciled frontier.
+    //
+    // becomeLeader() optimistically stamped epoch_ → oldLEO (our stale LEO at
+    // election).  The records we just pulled are OLD-epoch committed records that
+    // belong BELOW our new-epoch boundary, so that boundary must move up to our
+    // new LEO — otherwise our LeaderEpochCache would claim the new epoch began
+    // in the MIDDLE of recovered old-epoch data, and a subsequent
+    // OffsetsForLeaderEpoch answer would tell an ISR survivor to truncate
+    // committed records (re-introducing the DR-8 loss).
+    //
+    // We only wrote the new epoch's boundary; we have not appended any records
+    // under it yet (LEO advanced solely from the pulled old-epoch records), so
+    // moving the boundary up is safe and correct.
+    {
+        const Offset newLeo = log_->logEndOffset();
+        const int32_t curEp = static_cast<int32_t>(epoch_);
+        const int64_t curEpStart = epochCache_.startOffsetFor(curEp);
+        if (curEpStart >= 0 && curEpStart < newLeo) {
+            // Drop the premature boundary and re-assign at the true frontier.
+            epochCache_.truncateFromEnd(curEpStart);
+            epochCache_.assign(curEp, newLeo);
+        }
+    }
+
+    // Reflect the pulled records into the leader's own LEO/HW machinery.
+    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    recomputeHw();
+
+    // Reconcile round complete; clear the in-flight marker so a further gap (if
+    // any) can trigger another pull.
+    reconcileTarget_ = -1;
+
+    // GR-10: push the freshly-reconciled records to ISR followers so the whole
+    // cluster converges on the recovered committed prefix.
+    if (cfg_.pushOnAppend) {
+        pushToFollowers(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // doWork
 // ---------------------------------------------------------------------------
 
@@ -645,12 +956,57 @@ int PartitionReplica::doWork(int64_t nowNs)
             }
         }
     } else {
-        // Follower: emit a fetch on cadence.
-        if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
-            lastFetchEmitNs_ = nowNs;
-            FetchRequestMsg req = nextFetch();
-            transport_->sendFetchRequest(req);
-            ++work;
+        // DR-BUG-6: while an OffsetsForLeaderEpoch probe is pending we DEFER
+        // normal fetching and (re)issue the epoch probe on cadence instead.  We
+        // must not fetch under the new epoch until we have decided the correct
+        // truncation point — otherwise the leader could push us data before we
+        // reconcile our own tail.  The probe is idempotent; re-issuing it until
+        // the answer arrives is safe (the leader may not have been promoted yet).
+        if (epochProbePending_) {
+            if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
+                lastFetchEmitNs_ = nowNs;
+
+                // DR-BUG-6 liveness fallback: if the probe goes unanswered for
+                // kEpochProbeMaxAttempts cycles (transport without support, or
+                // the new leader not yet promoted), fall back to the
+                // conservative committed-HW truncation and resume fetching.  This
+                // is the exact pre-DR-BUG-6 behaviour — safe (never below the
+                // committed floor), just possibly re-fetching a small committed
+                // tail — and it guarantees we never stall permanently.
+                if (epochProbeAttempts_ >= kEpochProbeMaxAttempts) {
+                    Offset committedFloor = epochProbeFloor_;
+                    Offset truncOff =
+                        truncationOffsetForEpochChange(epochCache_, epoch_);
+                    if (truncOff < 0)             truncOff = committedFloor;
+                    if (truncOff < committedFloor) truncOff = committedFloor;
+                    if (truncOff < log_->logEndOffset()) truncateLog(truncOff);
+                    epochProbePending_ = false;
+                    FetchRequestMsg fr = nextFetch();
+                    transport_->sendFetchRequest(fr);
+                    ++work;
+                    return work;
+                }
+
+                ++epochProbeAttempts_;
+                OffsetsForLeaderEpochReqMsg req{};
+                req.currentEpoch   = epoch_;
+                req.partition      = cfg_.partitionId;
+                req.followerId     = cfg_.selfId;
+                // Our latest leader-epoch (largest epoch we have records for).
+                req.requestedEpoch = epochCache_.latestEpoch();
+                req.followerLeo    = log_->logEndOffset();
+                req.topicId        = cfg_.topicId;
+                transport_->sendOffsetsForLeaderEpochRequest(leaderId_, req);
+                ++work;
+            }
+        } else {
+            // Follower: emit a fetch on cadence.
+            if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
+                lastFetchEmitNs_ = nowNs;
+                FetchRequestMsg req = nextFetch();
+                transport_->sendFetchRequest(req);
+                ++work;
+            }
         }
     }
 

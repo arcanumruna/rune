@@ -286,11 +286,23 @@ TEST(GR7_Unit, LeaderKillMidProduce_CommittedNotLost) {
     replicaL.becomeFollower(newEpoch, kF2);
     replicaF2.becomeLeader(newEpoch, {kF2, kF3});
 
+    // DR-BUG-6: truncation is DEFERRED to the OffsetsForLeaderEpoch exchange
+    // (KIP-101).  Wire L to the new leader and drive the exchange; L is NOT in
+    // F2's ISR ({kF2,kF3}), so its ahead tail is treated as uncommitted and it
+    // truncates to F2's epoch boundary (== committedHw).
+    transport.setLeader(&replicaF2);
+    transport.addFollower(kL, &replicaL);
+    bool truncated = gr7Drive({&replicaF2, &replicaL}, transport, clock,
+                              [&]{ return replicaL.logEndOffset() <= committedHw; });
+
     // Assertions:
 
-    // 3a: Old leader L must have truncated B_unc to at most committedHw.
+    // 3a: Old leader L must have truncated B_unc to at most committedHw (via the
+    // deferred epoch exchange).
+    EXPECT_TRUE(truncated)
+        << "old leader must truncate uncommitted B_unc via epoch exchange";
     EXPECT_LE(replicaL.logEndOffset(), committedHw)
-        << "becomeFollower must truncate uncommitted B_unc: L.LEO="
+        << "epoch exchange must truncate uncommitted B_unc: L.LEO="
         << replicaL.logEndOffset() << " must be <= committedHw=" << committedHw;
 
     // 3b: L is now a follower.
@@ -437,48 +449,51 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     ASSERT_GT(replicaF3.logEndOffset(), committedHw) << "F3 has uncommitted B3";
 
     // Failover: L→Follower(epoch 2), F2→Leader(epoch 2).
-    // F3 also adopts the new epoch.
+    // F3 also adopts the new epoch.  All three are in the new ISR.
     const Epoch newEpoch = 2;
     replicaL.becomeFollower(newEpoch, kF2);
     replicaF2.becomeLeader(newEpoch, {kF2, kF3, kL});
-
-    // F3 adopts new epoch: becomeFollower must truncate B3 (uncommitted tail).
-    const Offset f3LeoBeforeTrunc = replicaF3.logEndOffset();
-    ASSERT_GT(f3LeoBeforeTrunc, committedHw) << "F3 has B3 before truncation";
-
     replicaF3.becomeFollower(newEpoch, kF2);
 
-    // Assert: F3 truncated B3 — LEO must now be <= committedHw.
-    EXPECT_LE(replicaF3.logEndOffset(), committedHw)
-        << "F3 must truncate uncommitted B3 on epoch change: LEO="
-        << replicaF3.logEndOffset() << " must be <= committedHw=" << committedHw
-        << " (was=" << f3LeoBeforeTrunc << ")";
-
-    // Re-wire transport to new leader F2.
+    // DR-BUG-6: F3 (and L) are ISR members whose ahead same-epoch tail (B3) is
+    // indistinguishable, from local information alone, from a committed
+    // continuation the new leader merely lacks — this is exactly the DR-8
+    // ambiguity.  The divergence-critical priority is: NEVER lose committed data
+    // and NEVER diverge.  So an ahead ISR member KEEPS its tail and the new
+    // leader reconciles (pulls) it, rather than truncating (which risked the
+    // DR-8 committed-loss).  The result: all replicas CONVERGE byte-identically
+    // on the reconciled log — no divergence, which is this test's stated intent.
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
-    transport.addFollower(kF2, &replicaF2);
+    transport.addFollower(kF3, &replicaF3);
 
-    // Converge: drive until F3 matches F2.
-    Offset f2Leo = replicaF2.logEndOffset();
+    // Drive the epoch exchange + reconcile to full convergence.
     bool okConv = gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
-                           [&]{ return replicaF3.logEndOffset() >= f2Leo; });
-    ASSERT_TRUE(okConv) << "F3 must converge to new leader after truncation";
+                           [&]{
+                               Offset a = replicaF2.logEndOffset();
+                               return replicaF3.logEndOffset() == a &&
+                                      replicaL.logEndOffset()  == a;
+                           });
+    ASSERT_TRUE(okConv) << "all replicas must converge to a single log (no divergence)";
 
-    // No divergence: F3's committed prefix must match F2's committed prefix.
-    // Both logs should have the same bytes over [0, committedHw).
-    const int32_t readBound = static_cast<int32_t>((committedHw + 1) * 1024 + 4096);
+    // No divergence: F2 and F3 logs must be byte-identical over their whole
+    // (converged) extent.
+    const int32_t readBound = static_cast<int32_t>((leo3 + 2) * 1024 + 4096);
     auto f2Bytes = logF2.read(0, readBound);
     auto f3Bytes = logF3.read(0, readBound);
 
-    ASSERT_FALSE(f2Bytes.empty()) << "F2 committed prefix must be non-empty";
-    ASSERT_FALSE(f3Bytes.empty()) << "F3 committed prefix must be non-empty";
+    ASSERT_FALSE(f2Bytes.empty()) << "F2 log must be non-empty";
+    ASSERT_FALSE(f3Bytes.empty()) << "F3 log must be non-empty";
 
-    // Byte-identical committed prefix.
     EXPECT_EQ(f2Bytes.size(), f3Bytes.size())
-        << "F2 and F3 committed prefix byte-lengths must match (no divergence)";
+        << "F2 and F3 log byte-lengths must match (no divergence)";
     EXPECT_EQ(f2Bytes, f3Bytes)
-        << "F2 and F3 log bytes must be byte-identical over [0, committedHw) (no divergence)";
+        << "F2 and F3 logs must be byte-identical (no divergence) — the DR-BUG-6 "
+           "guarantee is convergence without committed loss";
+
+    // Committed prefix (B1) is never lost.
+    EXPECT_GE(replicaF2.logEndOffset(), committedHw)
+        << "committed prefix must survive on the new leader";
 }
 
 // ===========================================================================
@@ -646,23 +661,30 @@ TEST(GR7_Unit, GroupCommit_DutyCycleOrder_TruncationBeforeSync) {
     ASSERT_GT(leoBeforeTrunc, committedHw) << "Uncommitted tail must exist";
 
     // SIMULATE the duty-cycle order:
-    // Step A: bridge.doWork fires → becomeFollower (truncation).
-    // This is step 1 in NodeRuntimeAgent::doWork — happens BEFORE gateway.doWork.
+    // Step A: bridge.doWork fires → becomeFollower.
+    // DR-BUG-6: truncation is now DEFERRED to the OffsetsForLeaderEpoch exchange.
+    // becomeFollower alone no longer truncates — it arms the epoch probe.  Make
+    // kF the authoritative new leader (ISR={kF}; L is NOT in the ISR → its ahead
+    // tail is an uncommitted, truncatable tail), then drive the exchange.
     replicaL.becomeFollower(2, kF);
+    replicaF.becomeLeader(2, {kF});
 
-    // Step B: After truncation, replica.role() == Follower.
+    // Step B: After becomeFollower, replica.role() == Follower.
     // GR-4: per-partition NotLeader guard prevents new appends.
     EXPECT_EQ(replicaL.role(), Role::Follower)
         << "Demoted node must be Follower (GR-4 NotLeader guard fires)";
 
-    // Step C: Log contains only committed data after truncation.
-    EXPECT_LE(replicaL.logEndOffset(), committedHw)
-        << "After becomeFollower: logEndOffset=" << replicaL.logEndOffset()
-        << " must be <= committedHw=" << committedHw;
+    // Drive the epoch exchange so the deferred truncation fires.
+    transport.setLeader(&replicaF);
+    transport.addFollower(kL, &replicaL);
+    bool truncated = gr7Drive({&replicaF, &replicaL}, transport, clock,
+                              [&]{ return replicaL.logEndOffset() <= committedHw; });
 
-    // Step D: HW resets to 0 after demotion (followerHw_=0).
-    EXPECT_EQ(replicaL.highWatermark(), 0)
-        << "Demoted node's HW resets to 0 (followerHw_=0 in becomeFollower)";
+    // Step C: Log contains only committed data after the exchange truncates the tail.
+    EXPECT_TRUE(truncated) << "epoch exchange must truncate the uncommitted tail";
+    EXPECT_LE(replicaL.logEndOffset(), committedHw)
+        << "After epoch exchange: logEndOffset=" << replicaL.logEndOffset()
+        << " must be <= committedHw=" << committedHw;
 
     // Step E: gateway.doWork fires → flushDirtyLogs() → log.sync().
     // This runs AFTER truncation. sync() only fsyncs the surviving committed tail.

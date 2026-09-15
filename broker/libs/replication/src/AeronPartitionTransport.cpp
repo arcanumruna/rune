@@ -156,6 +156,70 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
 }
 
 // ---------------------------------------------------------------------------
+// DR-BUG-6: OffsetsForLeaderEpoch request  (Follower → new Leader)
+// ---------------------------------------------------------------------------
+void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
+        NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req)
+{
+    PeerPub* peer = findPeer(toLeader);
+    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    const std::size_t len = OffsetsForLeaderEpochReqMsg::encode(
+        encodeScratch_.data(), 0,
+        req.currentEpoch, req.partition, req.followerId,
+        req.requestedEpoch, req.followerLeo, req.topicId);
+    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+}
+
+// ---------------------------------------------------------------------------
+// DR-BUG-6: OffsetsForLeaderEpoch response  (Leader → Follower)
+// ---------------------------------------------------------------------------
+void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
+        NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp)
+{
+    PeerPub* peer = findPeer(toFollower);
+    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    const std::size_t len = OffsetsForLeaderEpochRespMsg::encode(
+        encodeScratch_.data(), 0,
+        resp.leaderEpoch, resp.partition, resp.responseEpoch,
+        resp.endOffset, resp.errorCode, resp.topicId);
+    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+}
+
+// ---------------------------------------------------------------------------
+// DR-BUG-6: reconcile request  (deficient Leader → ahead survivor)
+// Reuses the FetchRequest layout, re-stamped with the reconcile templateId.
+// ---------------------------------------------------------------------------
+void AeronPartitionTransport::sendReconcileRequest(
+        NodeId toPeer, const FetchRequestMsg& req)
+{
+    PeerPub* peer = findPeer(toPeer);
+    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    const std::size_t len = FetchRequestMsg::encode(
+        encodeScratch_.data(), 0,
+        req.leaderEpoch, req.partition, req.followerId,
+        req.fetchOffset, req.maxBytes, req.topicId);
+    stampTemplateId(encodeScratch_.data(), 0, kReconcileFetchReqTemplateId);
+    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+}
+
+// ---------------------------------------------------------------------------
+// DR-BUG-6: reconcile response  (ahead survivor → deficient Leader)
+// Reuses the FetchResponse layout, re-stamped with the reconcile templateId.
+// ---------------------------------------------------------------------------
+void AeronPartitionTransport::sendReconcileResponse(
+        NodeId toPeer, const FetchResponseMsg& resp)
+{
+    PeerPub* peer = findPeer(toPeer);
+    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    const std::size_t len = FetchResponseMsg::encode(
+        encodeScratch_.data(), 0,
+        resp.leaderEpoch, resp.partition, resp.highWatermark,
+        resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
+    stampTemplateId(encodeScratch_.data(), 0, kReconcileFetchRespTemplateId);
+    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+}
+
+// ---------------------------------------------------------------------------
 // poll — duty-cycle step: resolve pubs + drain ingress subscription.
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::poll(int64_t nowNs)
@@ -268,6 +332,55 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             return;
         }
         it->second->applyReplicated(resp);
+
+    } else if (tid == OffsetsForLeaderEpochReqMsg::TEMPLATE_ID) {
+        // DR-BUG-6: KIP-101 epoch-boundary query → leader answers.
+        if (len < OffsetsForLeaderEpochReqMsg::TOTAL_SIZE) return;
+        auto req = OffsetsForLeaderEpochReqMsg::decode(buf, 0);
+        auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
+        if (it == replicas_.end() || it->second == nullptr) return;
+        it->second->onOffsetsForLeaderEpochRequest(req);
+
+    } else if (tid == OffsetsForLeaderEpochRespMsg::TEMPLATE_ID) {
+        // DR-BUG-6: KIP-101 epoch-boundary answer → follower truncates.
+        if (len < OffsetsForLeaderEpochRespMsg::TOTAL_SIZE) return;
+        auto resp = OffsetsForLeaderEpochRespMsg::decode(buf, 0);
+        auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
+        if (it == replicas_.end() || it->second == nullptr) return;
+        it->second->applyOffsetsForLeaderEpochResponse(resp);
+
+    } else if (tid == kReconcileFetchReqTemplateId) {
+        // DR-BUG-6: reverse pull request (deficient leader → survivor).  Reuses
+        // the FetchRequest layout.  Cap maxBytes to the requesting peer's
+        // deliverable ceiling (same rationale as the normal FetchRequest path).
+        if (len < FetchRequestMsg::TOTAL_SIZE) return;
+        FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
+        auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
+        if (it == replicas_.end() || it->second == nullptr) return;
+        static constexpr int32_t kOverhead =
+            static_cast<int32_t>(ReplicationMessageHeader::ENCODED_SIZE) +
+            static_cast<int32_t>(FetchResponseMsg::BLOCK_LENGTH_FIXED) +
+            static_cast<int32_t>(FetchResponseMsg::VAR_HEADER_SIZE);
+        auto* peer = findPeer(req.followerId);
+        if (peer && peer->pub) {
+            int32_t ceiling = static_cast<int32_t>(peer->pub->maxMessageLength()) - kOverhead;
+            if (ceiling < 0) ceiling = 0;
+            if (req.maxBytes > ceiling) req.maxBytes = ceiling;
+        }
+        it->second->onReconcileRequest(req);
+
+    } else if (tid == kReconcileFetchRespTemplateId) {
+        // DR-BUG-6: reverse pull response (survivor → deficient leader).  Reuses
+        // the FetchResponse layout.
+        static constexpr std::size_t kMinResp =
+            ReplicationMessageHeader::ENCODED_SIZE +
+            FetchResponseMsg::BLOCK_LENGTH_FIXED +
+            FetchResponseMsg::VAR_HEADER_SIZE;
+        if (len < kMinResp) return;
+        const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
+        auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
+        if (it == replicas_.end() || it->second == nullptr) return;
+        it->second->applyReconcileResponse(resp);
 
     } else {
         spdlog::trace("AeronPartitionTransport: unknown templateId={} dropped", tid);

@@ -606,6 +606,135 @@ TEST(EpochChangeTruncationTest, NoCommittedRecordLostOnEpochChange) {
 }
 
 // ===========================================================================
+// DR-BUG-6 — Unit A: the DR-8 mechanism.
+//
+// 3 replicas: L (dead leader), A (up-to-date survivor with a STALE HW view),
+// B (lagging → deficient new leader).
+//
+// All K records were committed on {L, A} under epoch 1.  A holds ALL K records
+// in its LOG, but A's committed-HW VIEW is stale (< K) because it never
+// received L's final HW-advance (L died first).  B is lagging: B.LEO < K.
+//
+// Consensus (blind to partition data) elects B — the deficient node — as the
+// new epoch-2 leader (we force this directly, mimicking the GR-2 bridge).
+//
+// Pre-fix: on becomeFollower(epoch 2), A truncates its OWN committed tail down
+// to its stale HW view → the K records A alone still holds are DESTROYED before
+// B can pull them.  Net: committed data lost.
+//
+// Post-fix (KIP-101 OffsetsForLeaderEpoch): A asks B for the end offset of the
+// last epoch they share.  Both share epoch 1 (still open on B) → B answers its
+// LEO for epoch 1 → A sees a SHARED OPEN epoch → A does NOT truncate its
+// committed tail.  B, being deficient, reverse-catches-up: it pulls the missing
+// committed records [B.LEO, A.LEO) from A.  Both end holding all K records.
+// ===========================================================================
+TEST(EpochChangeTruncationTest, DR8_DeficientLeaderNoCommittedLoss) {
+    TempDir aDir("dr8_A");
+    TempDir bDir("dr8_B");
+    rune::storage::Log aLog(aDir.path);
+    rune::storage::Log bLog(bDir.path);
+
+    InMemoryTransport transport;
+
+    constexpr NodeId kL = 1, kA = 2, kB = 3;
+    std::vector<NodeId> replicas = {kL, kA, kB};
+    std::vector<NodeId> isr      = {kL, kA, kB};
+
+    // A and B start as followers at epoch 1 (L, the leader, has died — we model
+    // only the survivors A and B here; L is gone from the cluster).
+    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &aLog, &transport);
+    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1,
+                       replicas, isr, &bLog, &transport);
+
+    // --- Seed committed epoch-1 data ---
+    // A received all K=5 records under epoch 1 but with a STALE advertised HW
+    // (L died before advancing A's HW to 5).  We model L's last response to A
+    // as carrying all 5 records but highWatermark = 2 (stale view).
+    constexpr Offset kK = 5;
+    {
+        // Build 5 single-record epoch-1 batches contiguously.
+        std::vector<uint8_t> allBatches;
+        for (int i = 0; i < kK; ++i) {
+            rune::protocol::RecordBatchBuilder builder(/*baseOffset=*/i, 0);
+            std::string_view key{};
+            std::string_view val("rec", 3);
+            builder.append(key, val, 0);
+            auto b1 = builder.build();
+            allBatches.insert(allBatches.end(), b1.begin(), b1.end());
+        }
+        FetchResponseMsg resp{};
+        resp.errorCode      = kErrNone;
+        resp.leaderEpoch    = 1;
+        resp.partition      = 0;
+        resp.highWatermark  = 2;  // STALE HW VIEW — A never learned true HW=5.
+        resp.logStartOffset = 0;
+        resp.records        = std::span<const uint8_t>(allBatches.data(), allBatches.size());
+        a.applyReplicated(resp);
+    }
+    ASSERT_EQ(a.logEndOffset(), kK)  << "A must hold all K records in its LOG";
+    ASSERT_LT(a.highWatermark(), kK) << "A's committed-HW VIEW must be STALE (< K)";
+
+    // B is lagging: it received only the first 2 records under epoch 1.
+    {
+        std::vector<uint8_t> twoBatches;
+        for (int i = 0; i < 2; ++i) {
+            rune::protocol::RecordBatchBuilder builder(/*baseOffset=*/i, 0);
+            std::string_view key{};
+            std::string_view val("rec", 3);
+            builder.append(key, val, 0);
+            auto b1 = builder.build();
+            twoBatches.insert(twoBatches.end(), b1.begin(), b1.end());
+        }
+        FetchResponseMsg resp{};
+        resp.errorCode      = kErrNone;
+        resp.leaderEpoch    = 1;
+        resp.partition      = 0;
+        resp.highWatermark  = 2;
+        resp.logStartOffset = 0;
+        resp.records        = std::span<const uint8_t>(twoBatches.data(), twoBatches.size());
+        b.applyReplicated(resp);
+    }
+    ASSERT_LT(b.logEndOffset(), kK) << "B must be LAGGING (LEO < K) — deficient";
+
+    // --- Consensus elects the DEFICIENT node B as the new epoch-2 leader ---
+    // (Directly forcing the role transitions, mimicking the GR-2 bridge which is
+    // blind to partition data.)
+    transport.setLeader(&b);
+    transport.addFollower(kA, &a);
+
+    b.becomeLeader(/*epoch=*/2, {kA, kB});   // B leads, deficient (LEO < K)
+    a.becomeFollower(/*epoch=*/2, kB);       // A must NOT truncate its committed tail
+
+    // --- Drive convergence ---
+    int64_t clock = 0;
+    bool done = false;
+    for (int i = 0; i < kDriverCap && !done; ++i) {
+        clock += 1'000'000LL;
+        b.doWork(clock);
+        a.doWork(clock);
+        transport.pump(clock);
+        // Converged when both hold all K records AND B has committed all K.
+        done = (a.logEndOffset() >= kK && b.logEndOffset() >= kK
+                && b.highWatermark() >= kK);
+    }
+
+    // --- Assertions: NO committed record lost ---
+    EXPECT_GE(a.logEndOffset(), kK)
+        << "DR-8: A (up-to-date survivor) must NOT truncate its committed tail — "
+           "it must still hold all " << kK << " committed records";
+    EXPECT_GE(b.logEndOffset(), kK)
+        << "DR-8: B (deficient new leader) must reverse-catch-up the missing "
+           "committed records from A";
+    EXPECT_GE(b.highWatermark(), kK)
+        << "DR-8: B must commit all " << kK << " records after reconcile";
+    ASSERT_TRUE(done)
+        << "DR-8: cluster must converge with all " << kK
+        << " committed records preserved (A.LEO=" << a.logEndOffset()
+        << " B.LEO=" << b.logEndOffset() << " B.HW=" << b.highWatermark() << ")";
+}
+
+// ===========================================================================
 // Test group 7: ISR shrink unblocks HW
 // ===========================================================================
 

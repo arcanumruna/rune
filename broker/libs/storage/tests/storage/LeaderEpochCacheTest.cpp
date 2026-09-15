@@ -65,6 +65,88 @@ TEST(LeaderEpochCache, NonContiguousEpochs) {
     EXPECT_EQ(c.truncateOffsetForEpoch(7), -1);   // no epoch after 7
 }
 
+// ---------------------------------------------------------------------------
+// DR-BUG-6 — endOffsetForEpoch: the leader-side OffsetsForLeaderEpoch answer
+// (KIP-101).  Given a requested epoch and the leader's current logEndOffset,
+// return (responseEpoch, endOffset) where:
+//   • responseEpoch = the largest cached epoch <= requestedEpoch (the shared
+//     epoch), or -1 if the cache has no epoch <= requestedEpoch;
+//   • endOffset = the start offset of the first cached epoch STRICTLY GREATER
+//     than responseEpoch (the offset where the shared epoch ended), OR the
+//     leader's logEndOffset if responseEpoch is the leader's latest cached
+//     epoch (the epoch has not ended yet).
+// ---------------------------------------------------------------------------
+
+// DR-BUG-6a: requested epoch == leader's latest cached epoch → LEO returned,
+// responseEpoch == requestedEpoch (the shared epoch is still open).
+TEST(LeaderEpochCache, EndOffsetForEpoch_RequestedIsLatest_ReturnsLeo) {
+    LeaderEpochCache c;
+    c.assign(0, 0);
+    c.assign(5, 100);
+    auto r = c.endOffsetForEpoch(/*requestedEpoch=*/5, /*logEndOffset=*/250);
+    EXPECT_EQ(r.first,  5)   << "responseEpoch is the shared (latest) epoch";
+    EXPECT_EQ(r.second, 250) << "epoch 5 is still open → its end offset is the leader LEO";
+}
+
+// DR-BUG-6b: requested epoch is older than latest → return the start of the
+// next epoch (where the requested epoch ended on the leader).
+TEST(LeaderEpochCache, EndOffsetForEpoch_RequestedIsOlder_ReturnsNextStart) {
+    LeaderEpochCache c;
+    c.assign(0, 0);
+    c.assign(3, 100);
+    c.assign(7, 250);
+    auto r = c.endOffsetForEpoch(/*requestedEpoch=*/3, /*logEndOffset=*/400);
+    EXPECT_EQ(r.first,  3)   << "responseEpoch == requested (leader has epoch 3)";
+    EXPECT_EQ(r.second, 250) << "epoch 3 ended where epoch 7 began (250)";
+}
+
+// DR-BUG-6c: requested epoch is BETWEEN two cached epochs (leader never had it)
+// → responseEpoch is the largest cached epoch <= requested; endOffset is the
+// start of the next cached epoch after responseEpoch.
+TEST(LeaderEpochCache, EndOffsetForEpoch_RequestedBetween_ReturnsSharedBoundary) {
+    LeaderEpochCache c;
+    c.assign(0, 0);
+    c.assign(3, 100);
+    c.assign(7, 250);
+    // Requested epoch 5: leader has no epoch 5, largest <= 5 is epoch 3.
+    auto r = c.endOffsetForEpoch(/*requestedEpoch=*/5, /*logEndOffset=*/400);
+    EXPECT_EQ(r.first,  3)   << "largest cached epoch <= 5 is epoch 3";
+    EXPECT_EQ(r.second, 250) << "epoch 3 ended at 250 (start of epoch 7)";
+}
+
+// DR-BUG-6d: requested epoch is HIGHER than the leader's latest cached epoch
+// → responseEpoch == leader's latest, endOffset == leader LEO (shared epoch
+// is the leader's latest, still open).
+TEST(LeaderEpochCache, EndOffsetForEpoch_RequestedHigherThanLatest_ReturnsLeo) {
+    LeaderEpochCache c;
+    c.assign(0, 0);
+    c.assign(4, 100);
+    auto r = c.endOffsetForEpoch(/*requestedEpoch=*/9, /*logEndOffset=*/180);
+    EXPECT_EQ(r.first,  4)   << "leader's latest epoch is 4";
+    EXPECT_EQ(r.second, 180) << "epoch 4 is still open → leader LEO";
+}
+
+// DR-BUG-6e: leader has NO epoch <= requested (requested predates the cache)
+// → responseEpoch = -1, endOffset = start of the earliest cached epoch
+// (everything the follower has for requested epoch is divergent).
+TEST(LeaderEpochCache, EndOffsetForEpoch_NoSharedEpoch_ReturnsEarliestStart) {
+    LeaderEpochCache c;
+    c.assign(5, 0);
+    c.assign(6, 100);
+    // Follower asks about epoch 2; leader's earliest epoch is 5.
+    auto r = c.endOffsetForEpoch(/*requestedEpoch=*/2, /*logEndOffset=*/200);
+    EXPECT_EQ(r.first,  -1) << "leader has no epoch <= 2";
+    EXPECT_EQ(r.second, 0)  << "shared history ends at the leader's earliest start (0)";
+}
+
+// DR-BUG-6f: empty cache → responseEpoch = -1, endOffset = 0.
+TEST(LeaderEpochCache, EndOffsetForEpoch_EmptyCache) {
+    LeaderEpochCache c;
+    auto r = c.endOffsetForEpoch(/*requestedEpoch=*/3, /*logEndOffset=*/50);
+    EXPECT_EQ(r.first,  -1);
+    EXPECT_EQ(r.second, 0);
+}
+
 // A5: Re-assigning the same epoch is a no-op (monotonic enforcement).
 // In Kafka, epoch numbers are strictly increasing; re-using an epoch
 // number with a different startOffset is ignored to preserve monotonicity.

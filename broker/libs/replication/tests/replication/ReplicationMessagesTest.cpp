@@ -526,3 +526,107 @@ TEST(FetchResponse, TopicIdDistinguishesTwoTopics) {
     EXPECT_EQ(m0.topicId, 0);
     EXPECT_EQ(m1.topicId, 99);
 }
+
+// ============================================================================
+// DR-BUG-6: OffsetsForLeaderEpoch request/response round-trip tests (KIP-101).
+// ============================================================================
+
+TEST(OffsetsForLeaderEpoch, RequestTemplateId) {
+    EXPECT_EQ(OffsetsForLeaderEpochReqMsg::TEMPLATE_ID, 3);
+}
+
+TEST(OffsetsForLeaderEpoch, ResponseTemplateId) {
+    EXPECT_EQ(OffsetsForLeaderEpochRespMsg::TEMPLATE_ID, 4);
+}
+
+TEST(OffsetsForLeaderEpoch, RequestRoundTrip) {
+    uint8_t buf[kBufSize]{};
+    std::size_t written = OffsetsForLeaderEpochReqMsg::encode(
+        buf, 0,
+        /*currentEpoch=*/9LL, /*partition=*/4,
+        /*followerId=*/2, /*requestedEpoch=*/7LL,
+        /*followerLeo=*/12345LL, /*topicId=*/11);
+    EXPECT_EQ(written, OffsetsForLeaderEpochReqMsg::TOTAL_SIZE);
+
+    auto m = OffsetsForLeaderEpochReqMsg::decode(buf, 0);
+    EXPECT_EQ(m.currentEpoch,   9LL);
+    EXPECT_EQ(m.partition,      4);
+    EXPECT_EQ(m.followerId,     2);
+    EXPECT_EQ(m.requestedEpoch, 7LL);
+    EXPECT_EQ(m.followerLeo,    12345LL);
+    EXPECT_EQ(m.topicId,        11);
+}
+
+TEST(OffsetsForLeaderEpoch, RequestDistinctSentinels) {
+    uint8_t buf[kBufSize]{};
+    OffsetsForLeaderEpochReqMsg::encode(buf, 0,
+        0x0102030405060708LL, 0x0A0B0C0D, 0x1E1F2021,
+        0x2122232425262728LL, 0x3132333435363738LL, 0x41424344);
+    auto m = OffsetsForLeaderEpochReqMsg::decode(buf, 0);
+    EXPECT_EQ(m.currentEpoch,   0x0102030405060708LL);
+    EXPECT_EQ(m.partition,      0x0A0B0C0D);
+    EXPECT_EQ(m.followerId,     0x1E1F2021);
+    EXPECT_EQ(m.requestedEpoch, 0x2122232425262728LL);
+    EXPECT_EQ(m.followerLeo,    0x3132333435363738LL);
+    EXPECT_EQ(m.topicId,        0x41424344);
+}
+
+TEST(OffsetsForLeaderEpoch, ResponseRoundTrip) {
+    uint8_t buf[kBufSize]{};
+    std::size_t written = OffsetsForLeaderEpochRespMsg::encode(
+        buf, 0,
+        /*leaderEpoch=*/9LL, /*partition=*/4,
+        /*responseEpoch=*/7LL, /*endOffset=*/250LL,
+        /*errorCode=*/0, /*topicId=*/11);
+    EXPECT_EQ(written, OffsetsForLeaderEpochRespMsg::TOTAL_SIZE);
+
+    auto m = OffsetsForLeaderEpochRespMsg::decode(buf, 0);
+    EXPECT_EQ(m.leaderEpoch,   9LL);
+    EXPECT_EQ(m.partition,     4);
+    EXPECT_EQ(m.responseEpoch, 7LL);
+    EXPECT_EQ(m.endOffset,     250LL);
+    EXPECT_EQ(m.errorCode,     0);
+    EXPECT_EQ(m.topicId,       11);
+}
+
+TEST(OffsetsForLeaderEpoch, ResponseNegativeResponseEpoch) {
+    // responseEpoch = -1 means "no shared epoch" (divergent).
+    uint8_t buf[kBufSize]{};
+    OffsetsForLeaderEpochRespMsg::encode(buf, 0, 3LL, 0, -1LL, 0LL, 0, 0);
+    auto m = OffsetsForLeaderEpochRespMsg::decode(buf, 0);
+    EXPECT_EQ(m.responseEpoch, -1LL);
+    EXPECT_EQ(m.endOffset,     0LL);
+}
+
+TEST(OffsetsForLeaderEpoch, ResponseErrorCode) {
+    uint8_t buf[kBufSize]{};
+    OffsetsForLeaderEpochRespMsg::encode(buf, 0, 3LL, 0, 2LL, 100LL, -2, 0);
+    auto m = OffsetsForLeaderEpochRespMsg::decode(buf, 0);
+    EXPECT_EQ(m.errorCode, -2);
+}
+
+TEST(OffsetsForLeaderEpoch, PeekDistinguishesFromFetch) {
+    uint8_t bufReq[kBufSize]{};
+    uint8_t bufResp[kBufSize]{};
+    uint8_t bufFetch[kBufSize]{};
+    OffsetsForLeaderEpochReqMsg::encode(bufReq, 0, 1LL, 0, 0, 0LL, 0LL, 0);
+    OffsetsForLeaderEpochRespMsg::encode(bufResp, 0, 1LL, 0, 0LL, 0LL, 0, 0);
+    FetchRequestMsg::encode(bufFetch, 0, 1LL, 0, 0, 0LL, 0);
+    uint16_t tReq   = peekTemplateId(bufReq, 0);
+    uint16_t tResp  = peekTemplateId(bufResp, 0);
+    uint16_t tFetch = peekTemplateId(bufFetch, 0);
+    EXPECT_EQ(tReq,  3u);
+    EXPECT_EQ(tResp, 4u);
+    EXPECT_NE(tReq,  tFetch);
+    EXPECT_NE(tResp, tFetch);
+}
+
+TEST(OffsetsForLeaderEpoch, RequestEncodeAtNonZeroOffset) {
+    uint8_t buf[kBufSize]{};
+    const std::size_t OFF = 24;
+    OffsetsForLeaderEpochReqMsg::encode(buf, OFF, 2LL, 1, 3, 2LL, 99LL, 5);
+    auto m = OffsetsForLeaderEpochReqMsg::decode(buf, OFF);
+    EXPECT_EQ(m.requestedEpoch, 2LL);
+    EXPECT_EQ(m.followerLeo,    99LL);
+    EXPECT_EQ(m.topicId,        5);
+}
