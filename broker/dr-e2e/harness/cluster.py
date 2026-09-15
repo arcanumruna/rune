@@ -125,6 +125,65 @@ class Cluster:
 
     # ---- data-plane readiness --------------------------------------------
 
+    def wait_data_plane_ready(self, max_attempts: int = 5, timeout_s: int = 60) -> str:
+        """Block until the data plane (Aeron media driver + broker ingress) is
+        fully warm on the current leader and return the leader service name.
+
+        Leader-elected (consensus) does not guarantee the Aeron data path is
+        ready: the media driver and broker ingress publication need a few
+        additional seconds to complete their start-up handshake.  Without this
+        gate the FIRST workload produce of a test can connect before the data
+        plane is ready, causing a spurious "pre-fault produce failed" (DR-BUG-8).
+
+        Strategy: attempt a tiny acks=All warm-up produce (5 records) against the
+        current leader up to ``max_attempts`` times, with short back-off between
+        attempts, within ``timeout_s`` seconds total.  On success the leader
+        service is cached as the known-serving node so ``serving_node()`` need not
+        re-probe.  Uses cid_base=995000 — disjoint from test cids and from the
+        990000 window used by ``serving_node()``.
+
+        Raises RuntimeError if no warm-up succeeds within the budget.
+        """
+        # Imported lazily to avoid a cycle (driver imports nothing from cluster).
+        from .driver import run_clients
+
+        deadline = time.time() + timeout_s
+        last_err = ""
+        attempt = 0
+        while attempt < max_attempts and time.time() < deadline:
+            attempt += 1
+            try:
+                leader_id = self.wait_for_leader(timeout_s=30)
+                leader_svc = node_id_to_service(leader_id)
+            except TimeoutError as exc:
+                last_err = str(exc)
+                time.sleep(2.0)
+                continue
+
+            res = run_clients(
+                1,
+                network=self.compose.network_name(),
+                target_service=leader_svc,
+                mode="produce",
+                records=5,
+                keys=3,
+                acks="all",
+                timeout_ms=12000,
+                cid_base=995000,  # warm-up cid window; disjoint from test cids
+                timeout_s=45,
+            )
+            if res.ok and len(res.all_produced) == 5:
+                # Cache so serving_node() does not re-probe for this Cluster.
+                self._serving_cache = leader_svc
+                return leader_svc
+            last_err = (res.clients[0].raw[-500:] if res.clients else "no result")
+            time.sleep(3.0)
+
+        raise RuntimeError(
+            f"data-plane not ready after {attempt} attempts / {timeout_s}s; "
+            f"last output:\n{last_err}"
+        )
+
     def serving_node(self, timeout_s: int = 60) -> str:
         """Return a node that actually SERVES produce (data-plane ready).
 

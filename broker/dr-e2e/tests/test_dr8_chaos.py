@@ -275,16 +275,6 @@ def _assert_isolated_cannot_serve(cluster, isolated_svc: str) -> None:
 @pytest.mark.fault
 @pytest.mark.netem
 @pytest.mark.timeout(600)
-@pytest.mark.xfail(
-    reason="Blocked on DR-BUG-6 (leader-completeness): combined leader-kill + "
-    "packet-loss can elect a partition-data-lagging node whose committed-tail "
-    "reconcile doesn't engage in the production consensus/bridge path, so an "
-    "acks=All-committed record can be lost across this specific failover. This is "
-    "a REAL durability Blocker (tracked as DR-BUG-6), deferred by owner decision "
-    "for a focused fix — NOT a passing scenario. leader-kill-alone (DR-3) and "
-    "loss-alone (DR-6) both pass with zero loss; only the combination triggers it.",
-    strict=False,
-)
 @pytest.mark.parametrize("loss_pct", [10])
 def test_dr8_leader_kill_netem(fresh_cluster, netem_ready, loss_pct):
     """COMBINED FAULT: apply netem loss (~10%) to one follower, then SIGKILL the

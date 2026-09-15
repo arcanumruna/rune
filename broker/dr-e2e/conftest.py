@@ -34,6 +34,7 @@ def cluster():
     c = Cluster(project="rune-dr")
     try:
         c.up(build=_build_flag(), leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
         yield c
     finally:
         faults.heal_all(c)
@@ -45,6 +46,7 @@ def fresh_cluster():
     c = Cluster(project="rune-dr-fault")
     try:
         c.up(build=_build_flag(), leader_timeout=120)
+        c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
         yield c
     finally:
         faults.heal_all(c)
