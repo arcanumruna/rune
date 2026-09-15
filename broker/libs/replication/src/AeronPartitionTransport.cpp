@@ -97,13 +97,18 @@ void AeronPartitionTransport::registerReplica(int32_t           topicId,
 void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 {
     // Encode into scratch buffer (zero alloc).
+    // DR-BUG-5: pass req.topicId so the leader can route to the correct
+    // replica.  The default topicId=0 caused multi-topic FetchRequests to be
+    // misrouted to topic-0 replicas, starving multi-topic ISRs and blocking
+    // all acks=All produces to any topic with id != 0.
     const std::size_t len = FetchRequestMsg::encode(
         encodeScratch_.data(), 0,
         req.leaderEpoch,
         req.partition,
         req.followerId,
         req.fetchOffset,
-        req.maxBytes);
+        req.maxBytes,
+        req.topicId);
 
     // The leader is identified by the replica's leaderId field; the follower
     // knows the leader's NodeId from its PartitionConfig (set via becomeFollower).
@@ -143,6 +148,10 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
     }
 
     // Encode FetchResponse + records into scratch buffer.
+    // DR-BUG-5: pass resp.topicId so the follower can route to the correct
+    // replica.  The default topicId=0 caused multi-topic FetchResponses to be
+    // misrouted to topic-0 replicas on the follower side, so multi-topic
+    // replicas never applied replicated data.
     const std::size_t len = FetchResponseMsg::encode(
         encodeScratch_.data(), 0,
         resp.leaderEpoch,
@@ -150,7 +159,8 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
         resp.highWatermark,
         resp.logStartOffset,
         resp.errorCode,
-        resp.records);
+        resp.records,
+        resp.topicId);
 
     sendOnPub(*peer->pub, encodeScratch_.data(), len);
 }
