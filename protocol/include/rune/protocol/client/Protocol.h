@@ -20,6 +20,20 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     SubscribeResponse   = 19,
     Records             = 20,
     Unsubscribe         = 21,
+    // groups/txn range (32-63)
+    JoinGroup            = 32,
+    JoinGroupResponse    = 33,
+    SyncGroup            = 34,
+    SyncGroupResponse    = 35,
+    Heartbeat            = 36,
+    HeartbeatResponse    = 37,
+    LeaveGroup           = 38,
+    LeaveGroupResponse   = 39,
+    OffsetCommit         = 40,
+    OffsetCommitResponse = 41,
+    OffsetFetch          = 42,
+    OffsetFetchResponse  = 43,
+    Assign               = 44,
 };
 
 enum class ErrorCode : uint16_t {
@@ -34,6 +48,13 @@ enum class ErrorCode : uint16_t {
     UnknownPartition     = 8,
     NotPartitionLeader   = 9,
     MinIsrViolation      = 10,  // acks=All rejected — ISR below minIsr
+    // consumer-group error codes (CG-1)
+    StaleGeneration      = 11,
+    UnknownMember        = 12,
+    RebalanceInProgress  = 13,
+    NotCoordinator       = 14,
+    IllegalGeneration    = 15,
+    GroupDead            = 16,
 };
 
 } // namespace rune::protocol::client
