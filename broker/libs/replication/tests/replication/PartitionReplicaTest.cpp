@@ -4113,3 +4113,47 @@ TEST(GR10_PushOnAppend, FailoverDurabilityPreserved) {
     auto data = f2.read(0, 1 << 20);
     EXPECT_FALSE(data.empty()) << "GR-10: committed data must survive leader kill";
 }
+
+// ---------------------------------------------------------------------------
+// DR-9 m3: lock the byte-identity invariant that DR-BUG-6 reconcile depends on.
+//
+// PartitionReplica::onReconcileRequest / applyReconcileResponse stamp each
+// served batch's partitionLeaderEpoch IN PLACE (RecordBatchReader::stampLeaderEpoch)
+// without recomputing the CRC, and rely on the byte-identity of reconciled
+// batches for the no-divergence guarantee.  This is only sound if
+// partitionLeaderEpoch is EXCLUDED from the CRC-32C coverage.  That property
+// lives in the external rune-protocol package; assert it here so an upstream
+// layout drift (moving the field into the CRC region) fails loudly in this repo
+// rather than silently corrupting reconciliation.
+TEST(DR9_ReconcileInvariant, StampLeaderEpochDoesNotChangeCrc) {
+    rune::protocol::RecordBatchBuilder builder(/*baseOffset=*/42, 0);
+    builder.append("key-a", "value-a", 0);
+    builder.append("key-b", "value-b", 0);
+    auto batch = builder.build();
+
+    rune::protocol::RecordBatchReader before(batch.data(), batch.size());
+    ASSERT_TRUE(before.ensureValid()) << "freshly built batch must have a valid CRC";
+    ASSERT_EQ(before.partitionLeaderEpoch(), -1) << "unset epoch sentinel";
+
+    // Capture the 4 stored CRC bytes.
+    const uint8_t crc0 = batch[rune::protocol::batch::kCrcOffset + 0];
+    const uint8_t crc1 = batch[rune::protocol::batch::kCrcOffset + 1];
+    const uint8_t crc2 = batch[rune::protocol::batch::kCrcOffset + 2];
+    const uint8_t crc3 = batch[rune::protocol::batch::kCrcOffset + 3];
+
+    // Stamp an epoch in place (exactly what reconcile does on the hot path).
+    rune::protocol::RecordBatchReader::stampLeaderEpoch(batch.data(), /*epoch=*/7);
+
+    rune::protocol::RecordBatchReader after(batch.data(), batch.size());
+    EXPECT_EQ(after.partitionLeaderEpoch(), 7) << "epoch must be stamped";
+    // ensureValid() recomputes CRC over [attributes..end] and compares to the
+    // stored CRC — if stampLeaderEpoch had touched a CRC-covered byte this fails.
+    EXPECT_TRUE(after.ensureValid())
+        << "stamping partitionLeaderEpoch must NOT invalidate the CRC "
+           "(field must remain excluded from CRC coverage)";
+    // The stored CRC bytes themselves must be byte-identical.
+    EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 0], crc0);
+    EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 1], crc1);
+    EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 2], crc2);
+    EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 3], crc3);
+}

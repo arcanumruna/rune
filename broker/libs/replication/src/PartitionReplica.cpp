@@ -339,6 +339,17 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         followerHw_ = committedHw;
         lastFetchEmitNs_ = 0;
 
+        // DR-9 m1: arm the KIP-101 epoch probe exactly as becomeFollower() does
+        // (lines 213-216).  Self-demotion bumps epoch_ directly, so applyReplicated's
+        // epoch-upgrade truncation never fires; without arming the probe here, any
+        // uncommitted tail this stale leader appended above committedHw lingers
+        // unpruned.  The floor (committedHw) guarantees the probe never truncates
+        // committed data — it only reconciles/prunes the divergent uncommitted tail.
+        epochProbePending_  = true;
+        epochProbeEpoch_    = req.leaderEpoch; // epoch we are transitioning INTO
+        epochProbeFloor_    = committedHw;      // never truncate below this
+        epochProbeAttempts_ = 0;
+
         FetchResponseMsg::encode(
             encodeScratch_.data(), 0,
             epoch_, cfg_.partitionId,
