@@ -20,8 +20,10 @@ updated** as it works. Three habits, always:
   kinds: `plan` (intent) · `thought` (reasoning) · `status` (progress).
 
 ## 3. Tests & benchmarks — push results as they run
-- After running tests/benchmarks, push the result with a **stable `id` per suite**
-  so re-runs conflate (the dashboard dedups by id, latest wins):
+- After running tests/benchmarks, push the result. The **first argument is the stable
+  test name (the suite)** — the dashboard conflates by it, so re-runs fold into one row
+  with a run count. Use a stable name (e.g. `rune-broker/storage`, `dr-e2e`); do NOT pass
+  a per-run or ticket id there:
   ```
   scripts/rune-live.sh test "rune-broker/storage" passed \
     passed=65 failed=0 total=65 commit=$(git rev-parse --short HEAD)

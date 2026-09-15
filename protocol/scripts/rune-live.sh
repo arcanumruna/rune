@@ -4,9 +4,12 @@
 #
 #   scripts/rune-live.sh chat <kind> <text...>
 #       kind: plan | thought | status
-#   scripts/rune-live.sh test <id> <status> [k=v ...]
-#       status: passed | failed | running ; id is a STABLE per-suite key (re-runs conflate)
-#       common k=v: suite=.. passed=.. failed=.. total=.. p99Us=.. durationMs=.. commit=.. kind=test|benchmark
+#   scripts/rune-live.sh test <suite> <status> [k=v ...]
+#       <suite> = the STABLE test name (e.g. rune-broker/storage, dr-e2e). The dashboard
+#                 CONFLATES by suite: re-runs of the same name fold into one row with a run
+#                 count. Do NOT pass a per-run or ticket id here — use the stable test name.
+#       status:   passed | failed | running
+#       common k=v: passed=.. failed=.. total=.. p99Us=.. durationMs=.. commit=.. kind=test|benchmark
 #   scripts/rune-live.sh raw-test '<json>'
 #
 # Config: RUNE_LIVE_URL (default https://live.regressorspath.com),
@@ -25,10 +28,11 @@ case "$sub" in
     body=$(python3 -c 'import json,sys;print(json.dumps({"kind":sys.argv[1],"text":sys.argv[2]}))' "$kind" "$text")
     post chat "$body" ;;
   test)
-    id="${1:?id required}"; status="${2:?status required}"; shift 2 || true
-    body=$(python3 - "$id" "$status" "$@" <<'PY'
+    # first arg is the STABLE test/suite name — the dashboard conflates by it
+    suite="${1:?suite (stable test name) required}"; status="${2:?status required}"; shift 2 || true
+    body=$(python3 - "$suite" "$status" "$@" <<'PY'
 import json, sys
-d = {"id": sys.argv[1], "suite": sys.argv[1], "status": sys.argv[2], "kind": "test"}
+d = {"suite": sys.argv[1], "status": sys.argv[2], "kind": "test"}
 for kv in sys.argv[3:]:
     if "=" in kv:
         k, v = kv.split("=", 1)
@@ -40,5 +44,5 @@ PY
 )
     post tests "$body" ;;
   raw-test) post tests "${1:?json body required}" ;;
-  *) echo "usage: rune-live.sh {chat <kind> <text...>|test <id> <status> [k=v...]|raw-test <json>}" >&2; exit 1 ;;
+  *) echo "usage: rune-live.sh {chat <kind> <text...>|test <suite> <status> [k=v...]|raw-test <json>}" >&2; exit 1 ;;
 esac
