@@ -218,6 +218,9 @@ public:
     RecordBatchReader(const uint8_t* data, size_t len) : d_(data), len_(len) {}
 
     int64_t baseOffset()      const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kBaseOffsetOffset)); }
+    // partitionLeaderEpoch: the leader-epoch under which this batch was written.
+    // Excluded from the CRC; -1 (unset) until a broker stamps it (stampLeaderEpoch).
+    int32_t partitionLeaderEpoch() const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kPartitionLeaderEpochOffset)); }
     int32_t lastOffsetDelta() const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kLastOffsetDeltaOffset)); }
     int32_t recordCount()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kRecordCountOffset)); }
     int32_t totalLength()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kLengthOffset)) + 12; }
