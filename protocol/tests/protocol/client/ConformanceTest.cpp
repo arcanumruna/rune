@@ -21,7 +21,9 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Dispatch.h>
+#include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -884,4 +886,231 @@ TEST(ConformanceSessionFlow, ProduceRecordsFlow) {
         EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
             << "Unsubscribe round-trip differs from golden";
     }
+}
+
+// ===========================================================================
+// CG-1 Golden conformance tests (file-backed, non-self-referential)
+//
+// All vectors committed in conformance/vectors/ by gen_cg1_vectors.cpp.
+// Each test:
+//   1. Reads the committed .bin file.
+//   2. Asserts header fields (templateId, schemaId, version, session, corr).
+//   3. Decode-golden: decodes + asserts every field.
+//   4. Encode-golden: re-encodes from expected values, asserts byte-identical.
+//
+// Golden field values shared across all CG-1 vectors.
+// ===========================================================================
+
+static const uint8_t kCG1GroupId[]  = {'g', 'r', 'p', '2'};
+static const uint8_t kCG1MemberId[] = {'m', 'b', 'r', 'X'};
+static const uint8_t kCG1Meta[]     = {0xDE, 0xAD, 0xBE, 0xEF};
+
+// ===========================================================================
+// CG-1-1. cg1_join_group.bin  (templateId 32, 50 bytes)
+//
+// JoinGroup{ sessionTimeoutMs=30000, groupId="grp2", memberId="mbrX",
+//            subscribedTopicIds=[10, 20] }
+//
+// Frame layout:
+//   [0..23]  header: blockLen=4, tid=32, schema=120, ver=1
+//   [24..27] sessionTimeoutMs = 30000
+//   [28..29] groupId len = 4;  [30..33] "grp2"
+//   [34..35] memberId len = 4; [36..39] "mbrX"
+//   [40..41] topicIds count = 2
+//   [42..45] topicId[0] = 10 (LE32)
+//   [46..49] topicId[1] = 20 (LE32)
+// ===========================================================================
+TEST(GroupConformance, JoinGroupFileGolden) {
+    const auto golden = readVector("cg1_join_group.bin");
+    ASSERT_EQ(golden.size(), 50u);
+
+    assertHeader(golden, rpc::JoinGroup::TEMPLATE_ID, rpc::JoinGroup::BODY_FIXED);
+
+    // Decode-golden
+    auto msgOpt = rpc::JoinGroup::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,        kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,    kCorrelationId);
+    EXPECT_EQ(msgOpt->sessionTimeoutMs, 30000);
+    ASSERT_EQ(msgOpt->groupId.size(),   sizeof(kCG1GroupId));
+    EXPECT_EQ(std::memcmp(msgOpt->groupId.data(), kCG1GroupId, sizeof(kCG1GroupId)), 0);
+    ASSERT_EQ(msgOpt->memberId.size(),  sizeof(kCG1MemberId));
+    EXPECT_EQ(std::memcmp(msgOpt->memberId.data(), kCG1MemberId, sizeof(kCG1MemberId)), 0);
+    ASSERT_EQ(msgOpt->subscribedTopicIds.size(), 2u);
+    EXPECT_EQ(msgOpt->subscribedTopicIds[0], 10);
+    EXPECT_EQ(msgOpt->subscribedTopicIds[1], 20);
+
+    // Encode-golden
+    const std::span<const uint8_t> grp(kCG1GroupId, sizeof(kCG1GroupId));
+    const std::span<const uint8_t> mbr(kCG1MemberId, sizeof(kCG1MemberId));
+    const int32_t topicIds[] = {10, 20};
+    const std::span<const int32_t> topicSpan(topicIds, 2);
+
+    rpc::JoinGroup enc;
+    enc.sessionId        = kSessionId;
+    enc.correlationId    = kCorrelationId;
+    enc.sessionTimeoutMs = 30000;
+    enc.groupId          = grp;
+    enc.memberId         = mbr;
+
+    std::array<uint8_t, 64> encBuf{};
+    const std::size_t n = enc.encode(encBuf.data(), topicSpan);
+    ASSERT_EQ(n, 50u);
+    EXPECT_EQ(std::memcmp(encBuf.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden cg1_join_group.bin";
+}
+
+// ===========================================================================
+// CG-1-2. cg1_sync_group_response.bin  (templateId 35, 44 bytes)
+//
+// SyncGroupResponse{ errorCode=0,
+//                    assignment=[(topicId=10,partition=0),(topicId=20,partition=3)] }
+//
+// Frame layout:
+//   [0..23]  header: blockLen=2, tid=35, schema=120, ver=1
+//   [24..25] errorCode = 0
+//   [26..27] assignment count = 2
+//   [28..31] topicId[0]=10  [32..35] partition[0]=0
+//   [36..39] topicId[1]=20  [40..43] partition[1]=3
+// ===========================================================================
+TEST(GroupConformance, SyncGroupResponseFileGolden) {
+    const auto golden = readVector("cg1_sync_group_response.bin");
+    ASSERT_EQ(golden.size(), 44u);
+
+    assertHeader(golden, rpc::SyncGroupResponse::TEMPLATE_ID, rpc::SyncGroupResponse::BODY_FIXED);
+
+    // Decode-golden
+    auto msgOpt = rpc::SyncGroupResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    EXPECT_EQ(msgOpt->errorCode,     0);
+    ASSERT_EQ(msgOpt->assignment.size(), 2u);
+    EXPECT_EQ(msgOpt->assignment[0].topicId,   10);
+    EXPECT_EQ(msgOpt->assignment[0].partition, 0);
+    EXPECT_EQ(msgOpt->assignment[1].topicId,   20);
+    EXPECT_EQ(msgOpt->assignment[1].partition, 3);
+
+    // Encode-golden
+    const rpc::TopicPartition32 asgn[] = { {10, 0}, {20, 3} };
+    const std::span<const rpc::TopicPartition32> asgnSpan(asgn, 2);
+
+    rpc::SyncGroupResponse enc;
+    enc.sessionId     = kSessionId;
+    enc.correlationId = kCorrelationId;
+    enc.errorCode     = 0;
+
+    std::array<uint8_t, 64> encBuf{};
+    const std::size_t n = enc.encode(encBuf.data(), asgnSpan);
+    ASSERT_EQ(n, 44u);
+    EXPECT_EQ(std::memcmp(encBuf.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden cg1_sync_group_response.bin";
+}
+
+// ===========================================================================
+// CG-1-3. cg1_offset_commit.bin  (templateId 40, 64 bytes)
+//
+// OffsetCommit{ generationId=5, groupId="grp2", memberId="mbrX",
+//               entries=[(topicId=10,partition=0,offset=1000,meta={DE,AD,BE,EF})] }
+//
+// Frame layout:
+//   [0..23]  header: blockLen=4, tid=40, schema=120, ver=1
+//   [24..27] generationId = 5
+//   [28..29] groupId len = 4;  [30..33] "grp2"
+//   [34..35] memberId len = 4; [36..39] "mbrX"
+//   [40..41] entries count = 1
+//   [42..45] topicId = 10  [46..49] partition = 0
+//   [50..57] offset = 1000
+//   [58..59] meta len = 4; [60..63] DE AD BE EF
+// ===========================================================================
+TEST(OffsetConformance, OffsetCommitFileGolden) {
+    const auto golden = readVector("cg1_offset_commit.bin");
+    ASSERT_EQ(golden.size(), 64u);
+
+    assertHeader(golden, rpc::OffsetCommit::TEMPLATE_ID, rpc::OffsetCommit::BODY_FIXED);
+
+    // Decode-golden
+    auto msgOpt = rpc::OffsetCommit::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,       kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,   kCorrelationId);
+    EXPECT_EQ(msgOpt->generationId,    5);
+    ASSERT_EQ(msgOpt->groupId.size(),  sizeof(kCG1GroupId));
+    EXPECT_EQ(std::memcmp(msgOpt->groupId.data(), kCG1GroupId, sizeof(kCG1GroupId)), 0);
+    ASSERT_EQ(msgOpt->memberId.size(), sizeof(kCG1MemberId));
+    EXPECT_EQ(std::memcmp(msgOpt->memberId.data(), kCG1MemberId, sizeof(kCG1MemberId)), 0);
+    ASSERT_EQ(msgOpt->entries.size(),  1u);
+
+    const auto ref0 = msgOpt->entries[0];
+    EXPECT_EQ(ref0.topicId,   10);
+    EXPECT_EQ(ref0.partition, 0);
+    EXPECT_EQ(ref0.offset,    1000LL);
+    ASSERT_EQ(ref0.metadata.size(), sizeof(kCG1Meta));
+    EXPECT_EQ(std::memcmp(ref0.metadata.data(), kCG1Meta, sizeof(kCG1Meta)), 0);
+
+    // Encode-golden
+    const std::span<const uint8_t> grp(kCG1GroupId, sizeof(kCG1GroupId));
+    const std::span<const uint8_t> mbr(kCG1MemberId, sizeof(kCG1MemberId));
+
+    rpc::OffsetCommitEntry e;
+    e.topicId   = 10;
+    e.partition = 0;
+    e.offset    = 1000LL;
+    e.metadata  = std::span<const uint8_t>(kCG1Meta, sizeof(kCG1Meta));
+
+    const rpc::OffsetCommitEntry entries[] = {e};
+    const std::span<const rpc::OffsetCommitEntry> entrySpan(entries, 1);
+
+    rpc::OffsetCommit enc;
+    enc.sessionId     = kSessionId;
+    enc.correlationId = kCorrelationId;
+    enc.generationId  = 5;
+    enc.groupId       = grp;
+    enc.memberId      = mbr;
+
+    std::array<uint8_t, 128> encBuf{};
+    const std::size_t n = enc.encode(encBuf.data(), entrySpan);
+    ASSERT_EQ(n, 64u);
+    EXPECT_EQ(std::memcmp(encBuf.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden cg1_offset_commit.bin";
+}
+
+// ===========================================================================
+// CG-1-4. cg1_assign_revoke.bin  (templateId 44, 30 bytes)
+//
+// Assign{ generationId=7, assignment=[] (empty = revoke all) }
+//
+// Frame layout:
+//   [0..23]  header: blockLen=4, tid=44, schema=120, ver=1
+//   [24..27] generationId = 7
+//   [28..29] assignment count = 0
+// ===========================================================================
+TEST(GroupConformance, AssignRevokeFileGolden) {
+    const auto golden = readVector("cg1_assign_revoke.bin");
+    ASSERT_EQ(golden.size(), 30u);
+
+    assertHeader(golden, rpc::Assign::TEMPLATE_ID, rpc::Assign::BODY_FIXED);
+
+    // Decode-golden
+    auto msgOpt = rpc::Assign::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,         kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,     kCorrelationId);
+    EXPECT_EQ(msgOpt->generationId,      7);
+    EXPECT_EQ(msgOpt->assignment.size(), 0u);  // empty = revoke all
+    EXPECT_TRUE(msgOpt->assignment.empty());
+
+    // Encode-golden
+    const std::span<const rpc::TopicPartition32> empty{};
+
+    rpc::Assign enc;
+    enc.sessionId     = kSessionId;
+    enc.correlationId = kCorrelationId;
+    enc.generationId  = 7;
+
+    std::array<uint8_t, 64> encBuf{};
+    const std::size_t n = enc.encode(encBuf.data(), empty);
+    ASSERT_EQ(n, 30u);
+    EXPECT_EQ(std::memcmp(encBuf.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden cg1_assign_revoke.bin";
 }

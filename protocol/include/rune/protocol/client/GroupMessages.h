@@ -9,15 +9,17 @@
 //   [24+BODY_FIXED..]       var fields: groupId, memberId, etc. (uint16 length prefix)
 //                           array fields: uint16 count prefix + fixed-stride elements
 //
-// All spans are zero-copy views into the caller-supplied buffer — buf must outlive
-// the decoded result.  Array fields (subscribedTopicIds, assignment) are decoded
-// into caller-owned vectors.
+// Lifetime contract:
+//   - Span fields (groupId, memberId) and array-view fields (subscribedTopicIds,
+//     assignment) are zero-copy views into the caller-supplied buffer.
+//   - buf MUST outlive every decoded result.  No heap allocation on decode.
+//   - Encode accepts span/range inputs and writes into a caller-provided buffer.
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
-#include <vector>
+#include "ArrayView.h"
 #include "Codec.h"
 #include "MessageHeader.h"
 #include "Protocol.h"
@@ -25,8 +27,9 @@
 namespace rune::protocol::client {
 
 // ---------------------------------------------------------------------------
-// TopicPartition32 — shared helper for assignment/entry arrays.
-// 8 bytes: topicId(int32) + partition(int32), little-endian.
+// TopicPartition32 — shared helper for encoding assignment/entry arrays.
+// 8 bytes on the wire: topicId(int32) + partition(int32), little-endian.
+// Used only in encode() path; decoded results expose TopicPartition32Decoded.
 // ---------------------------------------------------------------------------
 struct TopicPartition32 {
     int32_t topicId   = 0;
@@ -55,25 +58,30 @@ struct JoinGroup {
     int64_t  sessionId        = 0;
     int64_t  correlationId    = 0;
     int32_t  sessionTimeoutMs = 0;
-    std::span<const uint8_t> groupId;   // zero-copy view; must not be empty
-    std::span<const uint8_t> memberId;  // zero-copy view; empty = new member
-    std::vector<int32_t>     subscribedTopicIds;
+    std::span<const uint8_t> groupId;          // zero-copy view; must not be empty
+    std::span<const uint8_t> memberId;         // zero-copy view; empty = new member
+
+    // Decoded: zero-copy view — buf must outlive this.  Not usable on encode path.
+    Int32ArrayView subscribedTopicIds;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::JoinGroup); // 32
     static constexpr uint16_t BODY_FIXED  = 4;  // sessionTimeoutMs(4)
 
-    /// Total encoded size.
-    std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE
-             + BODY_FIXED
-             + 2u + groupId.size()
-             + 2u + memberId.size()
-             + 2u + 4u * subscribedTopicIds.size();
+    /// Total encoded size (use when encoding from a vector/span input).
+    static std::size_t encodedSizeFor(std::span<const uint8_t> grp,
+                                      std::span<const uint8_t> mbr,
+                                      std::size_t topicCount) noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED
+             + 2u + grp.size()
+             + 2u + mbr.size()
+             + 2u + 4u * topicCount;
     }
 
-    /// Encode the full frame into buf.  buf must be >= encodedSize() bytes.
+    /// Encode the full frame into buf.  topicIds is an iterable of int32_t.
+    /// buf must be >= encodedSizeFor(groupId, memberId, topicIds.size()) bytes.
     /// Returns total bytes written.
-    std::size_t encode(uint8_t* buf) const noexcept {
+    std::size_t encode(uint8_t* buf,
+                       std::span<const int32_t> topicIds) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -99,9 +107,9 @@ struct JoinGroup {
                            static_cast<uint16_t>(memberId.size()));
 
         // subscribedTopicIds: uint16 count + int32 entries
-        detail::putLE16(buf + pos, 0, static_cast<uint16_t>(subscribedTopicIds.size()));
+        detail::putLE16(buf + pos, 0, static_cast<uint16_t>(topicIds.size()));
         pos += 2;
-        for (int32_t tid : subscribedTopicIds) {
+        for (int32_t tid : topicIds) {
             detail::putLE32(buf, static_cast<int>(pos), tid);
             pos += 4;
         }
@@ -111,7 +119,8 @@ struct JoinGroup {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
-    /// Spans are zero-copy views into buf — buf must outlive the result.
+    /// ALL views (groupId, memberId, subscribedTopicIds) are zero-copy into buf —
+    /// buf must outlive the decoded result.  No heap allocation.
     static std::optional<JoinGroup> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -141,16 +150,12 @@ struct JoinGroup {
         if (!getVarBytes(buf, avail, pos, memberIdData, memberIdLen)) return std::nullopt;
         msg.memberId = std::span<const uint8_t>(memberIdData, memberIdLen);
 
-        // subscribedTopicIds: uint16 count + int32 entries
+        // subscribedTopicIds: uint16 count + int32 entries (zero-copy view)
         if (pos + 2 > avail) return std::nullopt;
         const uint16_t count = detail::getLE16(buf, static_cast<int>(pos));
         pos += 2;
         if (pos + static_cast<std::size_t>(count) * 4u > avail) return std::nullopt;
-        msg.subscribedTopicIds.resize(count);
-        for (uint16_t i = 0; i < count; ++i) {
-            msg.subscribedTopicIds[i] = detail::getLE32(buf, static_cast<int>(pos));
-            pos += 4;
-        }
+        msg.subscribedTopicIds = Int32ArrayView(buf + pos, count);
 
         return msg;
     }
@@ -161,7 +166,7 @@ struct JoinGroup {
 //
 // Frame layout (all little-endian):
 //   [0..23]   MessageHeader (24 bytes)
-//     blockLength = BODY_FIXED (6)
+//     blockLength = BODY_FIXED (7)
 //     templateId  = 33
 //   [24..27]  generationId : int32
 //   [28]      isLeader     : uint8   (1 = this member is the group leader)
@@ -218,6 +223,7 @@ struct JoinGroupResponse {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
+    /// memberId is a zero-copy span into buf — buf must outlive the result.
     static std::optional<JoinGroupResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -306,6 +312,7 @@ struct SyncGroup {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
+    /// groupId and memberId are zero-copy spans into buf — buf must outlive the result.
     static std::optional<SyncGroup> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -355,21 +362,25 @@ struct SyncGroupResponse {
     int64_t  sessionId     = 0;
     int64_t  correlationId = 0;
     int16_t  errorCode     = 0;         // ErrorCode value; 0 = OK
-    std::vector<TopicPartition32> assignment;
+
+    // Decoded: zero-copy view — buf must outlive this.
+    // Use assignment[i].topicId / assignment[i].partition or range-for.
+    TopicPartition32View assignment;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::SyncGroupResponse); // 35
     static constexpr uint16_t BODY_FIXED  = 2;  // errorCode(2)
 
-    /// Total encoded size.
-    std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE
-             + BODY_FIXED
-             + 2u + 8u * assignment.size();
+    /// Encoded size when encoding from a span of TopicPartition32 structs.
+    static std::size_t encodedSizeFor(std::size_t count) noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + 8u * count;
     }
 
-    /// Encode the full frame into buf.  buf must be >= encodedSize() bytes.
+    /// Encode the full frame into buf.
+    /// assignment is a span of TopicPartition32 structs for the encode path.
+    /// buf must be >= encodedSizeFor(assignment.size()) bytes.
     /// Returns total bytes written.
-    std::size_t encode(uint8_t* buf) const noexcept {
+    std::size_t encode(uint8_t* buf,
+                       std::span<const TopicPartition32> asgn) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -385,9 +396,9 @@ struct SyncGroupResponse {
         std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
 
         // assignment array: uint16 count + 8-byte entries
-        detail::putLE16(buf + pos, 0, static_cast<uint16_t>(assignment.size()));
+        detail::putLE16(buf + pos, 0, static_cast<uint16_t>(asgn.size()));
         pos += 2;
-        for (const auto& tp : assignment) {
+        for (const auto& tp : asgn) {
             detail::putLE32(buf, static_cast<int>(pos),     tp.topicId);
             detail::putLE32(buf, static_cast<int>(pos) + 4, tp.partition);
             pos += 8;
@@ -398,6 +409,7 @@ struct SyncGroupResponse {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
+    /// assignment is a zero-copy view into buf — buf must outlive the result.
     static std::optional<SyncGroupResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -415,17 +427,12 @@ struct SyncGroupResponse {
 
         std::size_t pos = fixedBase + BODY_FIXED;
 
-        // assignment array
+        // assignment array (zero-copy view)
         if (pos + 2 > avail) return std::nullopt;
         const uint16_t count = detail::getLE16(buf, static_cast<int>(pos));
         pos += 2;
         if (pos + static_cast<std::size_t>(count) * 8u > avail) return std::nullopt;
-        msg.assignment.resize(count);
-        for (uint16_t i = 0; i < count; ++i) {
-            msg.assignment[i].topicId   = detail::getLE32(buf, static_cast<int>(pos));
-            msg.assignment[i].partition = detail::getLE32(buf, static_cast<int>(pos) + 4);
-            pos += 8;
-        }
+        msg.assignment = TopicPartition32View(buf + pos, count);
 
         return msg;
     }
@@ -490,6 +497,7 @@ struct Heartbeat {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
+    /// groupId and memberId are zero-copy spans into buf — buf must outlive the result.
     static std::optional<Heartbeat> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -636,6 +644,7 @@ struct LeaveGroup {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
+    /// groupId and memberId are zero-copy spans into buf — buf must outlive the result.
     static std::optional<LeaveGroup> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -744,21 +753,26 @@ struct Assign {
     int64_t  sessionId     = 0;
     int64_t  correlationId = 0;
     int32_t  generationId  = 0;
-    std::vector<TopicPartition32> assignment;  // empty = revoke
+
+    // Decoded: zero-copy view — buf must outlive this.
+    // Use assignment[i].topicId / assignment[i].partition or range-for.
+    // Empty (size()==0) means revoke all.
+    TopicPartition32View assignment;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Assign); // 44
     static constexpr uint16_t BODY_FIXED  = 4;  // generationId(4)
 
-    /// Total encoded size.
-    std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE
-             + BODY_FIXED
-             + 2u + 8u * assignment.size();
+    /// Encoded size when encoding from a span of TopicPartition32 structs.
+    static std::size_t encodedSizeFor(std::size_t count) noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + 8u * count;
     }
 
-    /// Encode the full frame into buf.  buf must be >= encodedSize() bytes.
-    /// Returns total bytes written.
-    std::size_t encode(uint8_t* buf) const noexcept {
+    /// Encode the full frame into buf.
+    /// asgn is a span of TopicPartition32 structs for the encode path.
+    /// buf must be >= encodedSizeFor(asgn.size()) bytes.
+    /// An empty asgn signals a full revoke.  Returns total bytes written.
+    std::size_t encode(uint8_t* buf,
+                       std::span<const TopicPartition32> asgn) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
@@ -774,9 +788,9 @@ struct Assign {
         std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
 
         // assignment array: uint16 count + 8-byte entries
-        detail::putLE16(buf + pos, 0, static_cast<uint16_t>(assignment.size()));
+        detail::putLE16(buf + pos, 0, static_cast<uint16_t>(asgn.size()));
         pos += 2;
-        for (const auto& tp : assignment) {
+        for (const auto& tp : asgn) {
             detail::putLE32(buf, static_cast<int>(pos),     tp.topicId);
             detail::putLE32(buf, static_cast<int>(pos) + 4, tp.partition);
             pos += 8;
@@ -787,7 +801,8 @@ struct Assign {
 
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
-    /// An empty assignment (count=0) means revoke all.
+    /// assignment is a zero-copy view into buf — buf must outlive the result.
+    /// An empty assignment (size()==0) means revoke all.
     static std::optional<Assign> decode(const uint8_t* buf, std::size_t avail) noexcept {
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -805,17 +820,12 @@ struct Assign {
 
         std::size_t pos = fixedBase + BODY_FIXED;
 
-        // assignment array
+        // assignment array (zero-copy view)
         if (pos + 2 > avail) return std::nullopt;
         const uint16_t count = detail::getLE16(buf, static_cast<int>(pos));
         pos += 2;
         if (pos + static_cast<std::size_t>(count) * 8u > avail) return std::nullopt;
-        msg.assignment.resize(count);
-        for (uint16_t i = 0; i < count; ++i) {
-            msg.assignment[i].topicId   = detail::getLE32(buf, static_cast<int>(pos));
-            msg.assignment[i].partition = detail::getLE32(buf, static_cast<int>(pos) + 4);
-            pos += 8;
-        }
+        msg.assignment = TopicPartition32View(buf + pos, count);
 
         return msg;
     }

@@ -3,10 +3,13 @@
 // Coverage per message:
 //   (1) encode→decode round-trip asserting all fields (incl. arrays, var fields
 //       with/without content, empty memberId, multi-element arrays)
-//   (2) truncation: decode(buf, buf.size()-1) → nullopt
-//   (3) wrong-template/schema: decode → nullopt
-// Plus: conformance vectors (fixed byte array + expected decode) for JoinGroup,
-//       SyncGroupResponse (with assignment), and Assign (empty = revoke).
+//   (2) truncation: decode(buf, total-1) → nullopt
+//   (3) wrong-template/schema: ASSERT_TRUE(decode(good_buf,total)) baseline first,
+//       then assert !has_value() for the mutated buffer.
+//
+// NOTE: After CG-1 fix round, JoinGroup/SyncGroupResponse/Assign encode() takes
+// the array as a second argument (std::span<const T>) — the struct fields for
+// array data are zero-copy views on the decode side only.
 
 #include <gtest/gtest.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -58,21 +61,24 @@ static const uint8_t kMemberId[] = {'m', 'b', 'r', 'A', 'B', 'C'};
 // JG-1. Round-trip: non-empty groupId, non-empty memberId, two subscribed topics.
 // ---------------------------------------------------------------------------
 TEST(JoinGroupCodec, RoundTripFull) {
+    const std::span<const uint8_t> grp(kGroupId, sizeof(kGroupId));
+    const std::span<const uint8_t> mbr(kMemberId, sizeof(kMemberId));
+    const int32_t topics[] = {10, 20};
+    const std::span<const int32_t> topicSpan(topics, 2);
+
     rpc::JoinGroup msg;
     msg.sessionId        = kSession;
     msg.correlationId    = kCorrelation;
     msg.sessionTimeoutMs = 30000;
-    msg.groupId          = std::span<const uint8_t>(kGroupId, sizeof(kGroupId));
-    msg.memberId         = std::span<const uint8_t>(kMemberId, sizeof(kMemberId));
-    msg.subscribedTopicIds = {10, 20};
+    msg.groupId          = grp;
+    msg.memberId         = mbr;
 
-    // Total = 24+4 + 2+4 + 2+6 + 2+4+4 = 24+4+6+8+10 = 52
-    const std::size_t expected = 24u + 4u + 2u + sizeof(kGroupId) + 2u + sizeof(kMemberId)
-                               + 2u + 4u * 2u;
-    ASSERT_EQ(msg.encodedSize(), expected);
+    // Total = 24+4 + 2+4 + 2+6 + 2+4+4 = 52
+    const std::size_t expected = rpc::JoinGroup::encodedSizeFor(grp, mbr, 2u);
+    ASSERT_EQ(expected, 24u + 4u + 2u + sizeof(kGroupId) + 2u + sizeof(kMemberId) + 2u + 8u);
 
     std::vector<uint8_t> buf(expected, 0u);
-    const std::size_t written = msg.encode(buf.data());
+    const std::size_t written = msg.encode(buf.data(), topicSpan);
     ASSERT_EQ(written, expected);
 
     // Header checks
@@ -120,40 +126,47 @@ TEST(JoinGroupCodec, RoundTripFull) {
 // JG-2. Round-trip: empty memberId (new member), single topic.
 // ---------------------------------------------------------------------------
 TEST(JoinGroupCodec, EmptyMemberId) {
+    const std::span<const uint8_t> grp(kGroupId, sizeof(kGroupId));
+    const std::span<const uint8_t> mbr{};
+    const int32_t topics[] = {99};
+    const std::span<const int32_t> topicSpan(topics, 1);
+
     rpc::JoinGroup msg;
     msg.sessionId        = kSession;
     msg.correlationId    = kCorrelation;
     msg.sessionTimeoutMs = 5000;
-    msg.groupId          = std::span<const uint8_t>(kGroupId, sizeof(kGroupId));
-    msg.memberId         = std::span<const uint8_t>{};  // empty = new member
-    msg.subscribedTopicIds = {99};
+    msg.groupId          = grp;
+    msg.memberId         = mbr;
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::JoinGroup::encodedSizeFor(grp, mbr, 1u);
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t written = msg.encode(buf.data());
+    const std::size_t written = msg.encode(buf.data(), topicSpan);
     ASSERT_EQ(written, total);
 
     auto decoded = rpc::JoinGroup::decode(buf.data(), written);
     ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->sessionTimeoutMs,             5000);
-    EXPECT_EQ(decoded->memberId.size(),              0u);
-    ASSERT_EQ(decoded->subscribedTopicIds.size(),    1u);
-    EXPECT_EQ(decoded->subscribedTopicIds[0],        99);
+    EXPECT_EQ(decoded->sessionTimeoutMs,              5000);
+    EXPECT_EQ(decoded->memberId.size(),               0u);
+    ASSERT_EQ(decoded->subscribedTopicIds.size(),     1u);
+    EXPECT_EQ(decoded->subscribedTopicIds[0],         99);
 }
 
 // ---------------------------------------------------------------------------
 // JG-3. Round-trip: empty subscribedTopicIds list.
 // ---------------------------------------------------------------------------
 TEST(JoinGroupCodec, EmptyTopics) {
+    const std::span<const uint8_t> grp(kGroupId, sizeof(kGroupId));
+    const std::span<const uint8_t> mbr{};
+    const std::span<const int32_t> emptyTopics{};
+
     rpc::JoinGroup msg;
     msg.sessionTimeoutMs = 1000;
-    msg.groupId          = std::span<const uint8_t>(kGroupId, sizeof(kGroupId));
-    msg.memberId         = std::span<const uint8_t>{};
-    msg.subscribedTopicIds = {};
+    msg.groupId          = grp;
+    msg.memberId         = mbr;
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::JoinGroup::encodedSizeFor(grp, mbr, 0u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), emptyTopics);
 
     auto decoded = rpc::JoinGroup::decode(buf.data(), total);
     ASSERT_TRUE(decoded.has_value());
@@ -164,33 +177,43 @@ TEST(JoinGroupCodec, EmptyTopics) {
 // JG-4. Truncation: decode(buf, total-1) → nullopt.
 // ---------------------------------------------------------------------------
 TEST(JoinGroupCodec, Truncation) {
+    const std::span<const uint8_t> grp(kGroupId, sizeof(kGroupId));
+    const std::span<const uint8_t> mbr(kMemberId, sizeof(kMemberId));
+    const int32_t topics[] = {1, 2, 3};
+    const std::span<const int32_t> topicSpan(topics, 3);
+
     rpc::JoinGroup msg;
     msg.sessionTimeoutMs = 1000;
-    msg.groupId          = std::span<const uint8_t>(kGroupId, sizeof(kGroupId));
-    msg.memberId         = std::span<const uint8_t>(kMemberId, sizeof(kMemberId));
-    msg.subscribedTopicIds = {1, 2, 3};
+    msg.groupId          = grp;
+    msg.memberId         = mbr;
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::JoinGroup::encodedSizeFor(grp, mbr, 3u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), topicSpan);
 
+    ASSERT_TRUE(rpc::JoinGroup::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::JoinGroup::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::JoinGroup::decode(buf.data(), total).has_value());
 }
 
 // ---------------------------------------------------------------------------
 // JG-5. Wrong template → nullopt; wrong schema → nullopt.
 // ---------------------------------------------------------------------------
 TEST(JoinGroupCodec, WrongTemplateAndSchema) {
+    const std::span<const uint8_t> grp(kGroupId, sizeof(kGroupId));
+    const std::span<const uint8_t> mbr{};
+    const std::span<const int32_t> emptyTopics{};
+
     rpc::JoinGroup msg;
     msg.sessionTimeoutMs = 1000;
-    msg.groupId = std::span<const uint8_t>(kGroupId, sizeof(kGroupId));
-    msg.memberId = std::span<const uint8_t>{};
-    msg.subscribedTopicIds = {};
+    msg.groupId = grp;
+    msg.memberId = mbr;
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::JoinGroup::encodedSizeFor(grp, mbr, 0u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), emptyTopics);
+
+    // Baseline: valid decode must succeed before we mutate
+    ASSERT_TRUE(rpc::JoinGroup::decode(buf.data(), total).has_value());
 
     // Wrong templateId
     std::vector<uint8_t> buf2 = buf;
@@ -261,8 +284,8 @@ TEST(JoinGroupResponseCodec, Truncation) {
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
 
+    ASSERT_TRUE(rpc::JoinGroupResponse::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::JoinGroupResponse::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::JoinGroupResponse::decode(buf.data(), total).has_value());
 }
 
 TEST(JoinGroupResponseCodec, WrongTemplate) {
@@ -275,9 +298,11 @@ TEST(JoinGroupResponseCodec, WrongTemplate) {
     const std::size_t total = msg.encodedSize();
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
+    // Baseline
+    ASSERT_TRUE(rpc::JoinGroupResponse::decode(buf.data(), total).has_value());
+
     buf[2] = 32;  // JoinGroup
     buf[3] = 0;
-
     EXPECT_FALSE(rpc::JoinGroupResponse::decode(buf.data(), total).has_value());
 }
 
@@ -319,8 +344,8 @@ TEST(SyncGroupCodec, Truncation) {
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
 
+    ASSERT_TRUE(rpc::SyncGroup::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::SyncGroup::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::SyncGroup::decode(buf.data(), total).has_value());
 }
 
 TEST(SyncGroupCodec, WrongTemplate) {
@@ -332,9 +357,10 @@ TEST(SyncGroupCodec, WrongTemplate) {
     const std::size_t total = msg.encodedSize();
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
+    ASSERT_TRUE(rpc::SyncGroup::decode(buf.data(), total).has_value());
+
     buf[2] = 35;  // SyncGroupResponse
     buf[3] = 0;
-
     EXPECT_FALSE(rpc::SyncGroup::decode(buf.data(), total).has_value());
 }
 
@@ -343,18 +369,20 @@ TEST(SyncGroupCodec, WrongTemplate) {
 // ===========================================================================
 
 TEST(SyncGroupResponseCodec, RoundTripWithAssignment) {
+    const rpc::TopicPartition32 asgn[] = { {10, 0}, {10, 1}, {20, 3} };
+    const std::span<const rpc::TopicPartition32> asgnSpan(asgn, 3);
+
     rpc::SyncGroupResponse msg;
     msg.sessionId     = kSession;
     msg.correlationId = kCorrelation;
     msg.errorCode     = 0;
-    msg.assignment    = { {10, 0}, {10, 1}, {20, 3} };
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::SyncGroupResponse::encodedSizeFor(3u);
     // 24 + 2 + 2 + 3*8 = 52
-    EXPECT_EQ(total, 24u + 2u + 2u + 3u * 8u);
+    EXPECT_EQ(total, 52u);
 
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t written = msg.encode(buf.data());
+    const std::size_t written = msg.encode(buf.data(), asgnSpan);
     ASSERT_EQ(written, total);
 
     auto decoded = rpc::SyncGroupResponse::decode(buf.data(), written);
@@ -372,13 +400,14 @@ TEST(SyncGroupResponseCodec, RoundTripWithAssignment) {
 }
 
 TEST(SyncGroupResponseCodec, EmptyAssignment) {
-    rpc::SyncGroupResponse msg;
-    msg.errorCode  = static_cast<int16_t>(rpc::ErrorCode::NotCoordinator);
-    msg.assignment = {};
+    const std::span<const rpc::TopicPartition32> empty{};
 
-    const std::size_t total = msg.encodedSize();
+    rpc::SyncGroupResponse msg;
+    msg.errorCode = static_cast<int16_t>(rpc::ErrorCode::NotCoordinator);
+
+    const std::size_t total = rpc::SyncGroupResponse::encodedSizeFor(0u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), empty);
 
     auto decoded = rpc::SyncGroupResponse::decode(buf.data(), total);
     ASSERT_TRUE(decoded.has_value());
@@ -387,29 +416,33 @@ TEST(SyncGroupResponseCodec, EmptyAssignment) {
 }
 
 TEST(SyncGroupResponseCodec, Truncation) {
+    const rpc::TopicPartition32 asgn[] = { {1, 0}, {2, 1} };
+    const std::span<const rpc::TopicPartition32> asgnSpan(asgn, 2);
+
     rpc::SyncGroupResponse msg;
     msg.errorCode  = 0;
-    msg.assignment = { {1, 0}, {2, 1} };
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::SyncGroupResponse::encodedSizeFor(2u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), asgnSpan);
 
+    ASSERT_TRUE(rpc::SyncGroupResponse::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::SyncGroupResponse::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::SyncGroupResponse::decode(buf.data(), total).has_value());
 }
 
 TEST(SyncGroupResponseCodec, WrongTemplate) {
+    const std::span<const rpc::TopicPartition32> empty{};
+
     rpc::SyncGroupResponse msg;
     msg.errorCode  = 0;
-    msg.assignment = {};
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::SyncGroupResponse::encodedSizeFor(0u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), empty);
+    ASSERT_TRUE(rpc::SyncGroupResponse::decode(buf.data(), total).has_value());
+
     buf[2] = 34;  // SyncGroup
     buf[3] = 0;
-
     EXPECT_FALSE(rpc::SyncGroupResponse::decode(buf.data(), total).has_value());
 }
 
@@ -451,8 +484,8 @@ TEST(HeartbeatCodec, Truncation) {
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
 
+    ASSERT_TRUE(rpc::Heartbeat::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::Heartbeat::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::Heartbeat::decode(buf.data(), total).has_value());
 }
 
 TEST(HeartbeatCodec, WrongTemplate) {
@@ -464,9 +497,10 @@ TEST(HeartbeatCodec, WrongTemplate) {
     const std::size_t total = msg.encodedSize();
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
+    ASSERT_TRUE(rpc::Heartbeat::decode(buf.data(), total).has_value());
+
     buf[2] = 37;  // HeartbeatResponse
     buf[3] = 0;
-
     EXPECT_FALSE(rpc::Heartbeat::decode(buf.data(), total).has_value());
 }
 
@@ -528,6 +562,8 @@ TEST(HeartbeatResponseCodec, WrongTemplate) {
     msg.errorCode = 0;
     std::array<uint8_t, 32> buf{};
     msg.encode(buf.data());
+    ASSERT_TRUE(rpc::HeartbeatResponse::decode(buf.data(), rpc::HeartbeatResponse::ENCODED_SIZE).has_value());
+
     buf[2] = 36;  // Heartbeat
     buf[3] = 0;
     EXPECT_FALSE(rpc::HeartbeatResponse::decode(buf.data(), rpc::HeartbeatResponse::ENCODED_SIZE).has_value());
@@ -568,8 +604,8 @@ TEST(LeaveGroupCodec, Truncation) {
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
 
+    ASSERT_TRUE(rpc::LeaveGroup::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::LeaveGroup::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::LeaveGroup::decode(buf.data(), total).has_value());
 }
 
 TEST(LeaveGroupCodec, WrongTemplate) {
@@ -580,9 +616,10 @@ TEST(LeaveGroupCodec, WrongTemplate) {
     const std::size_t total = msg.encodedSize();
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
+    ASSERT_TRUE(rpc::LeaveGroup::decode(buf.data(), total).has_value());
+
     buf[2] = 39;  // LeaveGroupResponse
     buf[3] = 0;
-
     EXPECT_FALSE(rpc::LeaveGroup::decode(buf.data(), total).has_value());
 }
 
@@ -614,8 +651,8 @@ TEST(LeaveGroupResponseCodec, Truncation) {
     std::array<uint8_t, 32> buf{};
     msg.encode(buf.data());
 
+    ASSERT_TRUE(rpc::LeaveGroupResponse::decode(buf.data(), rpc::LeaveGroupResponse::ENCODED_SIZE).has_value());
     EXPECT_FALSE(rpc::LeaveGroupResponse::decode(buf.data(), rpc::LeaveGroupResponse::ENCODED_SIZE - 1u).has_value());
-    EXPECT_TRUE (rpc::LeaveGroupResponse::decode(buf.data(), rpc::LeaveGroupResponse::ENCODED_SIZE).has_value());
 }
 
 TEST(LeaveGroupResponseCodec, WrongTemplate) {
@@ -623,6 +660,8 @@ TEST(LeaveGroupResponseCodec, WrongTemplate) {
     msg.errorCode = 0;
     std::array<uint8_t, 32> buf{};
     msg.encode(buf.data());
+    ASSERT_TRUE(rpc::LeaveGroupResponse::decode(buf.data(), rpc::LeaveGroupResponse::ENCODED_SIZE).has_value());
+
     buf[2] = 38;  // LeaveGroup
     buf[3] = 0;
     EXPECT_FALSE(rpc::LeaveGroupResponse::decode(buf.data(), rpc::LeaveGroupResponse::ENCODED_SIZE).has_value());
@@ -633,18 +672,20 @@ TEST(LeaveGroupResponseCodec, WrongTemplate) {
 // ===========================================================================
 
 TEST(AssignCodec, RoundTripWithAssignment) {
+    const rpc::TopicPartition32 asgn[] = { {10, 0}, {10, 1} };
+    const std::span<const rpc::TopicPartition32> asgnSpan(asgn, 2);
+
     rpc::Assign msg;
     msg.sessionId     = kSession;
     msg.correlationId = kCorrelation;
     msg.generationId  = 3;
-    msg.assignment    = { {10, 0}, {10, 1} };
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::Assign::encodedSizeFor(2u);
     // 24 + 4 + 2 + 2*8 = 46
-    EXPECT_EQ(total, 24u + 4u + 2u + 2u * 8u);
+    EXPECT_EQ(total, 46u);
 
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t written = msg.encode(buf.data());
+    const std::size_t written = msg.encode(buf.data(), asgnSpan);
     ASSERT_EQ(written, total);
 
     auto decoded = rpc::Assign::decode(buf.data(), written);
@@ -660,18 +701,19 @@ TEST(AssignCodec, RoundTripWithAssignment) {
 }
 
 TEST(AssignCodec, EmptyAssignmentIsRevoke) {
+    const std::span<const rpc::TopicPartition32> empty{};
+
     rpc::Assign msg;
     msg.sessionId     = kSession;
     msg.correlationId = kCorrelation;
     msg.generationId  = 7;
-    msg.assignment    = {};  // empty = revoke all
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::Assign::encodedSizeFor(0u);
     // 24 + 4 + 2 + 0 = 30
     EXPECT_EQ(total, 30u);
 
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t written = msg.encode(buf.data());
+    const std::size_t written = msg.encode(buf.data(), empty);
     ASSERT_EQ(written, total);
 
     auto decoded = rpc::Assign::decode(buf.data(), written);
@@ -681,48 +723,56 @@ TEST(AssignCodec, EmptyAssignmentIsRevoke) {
 }
 
 TEST(AssignCodec, Truncation) {
+    const rpc::TopicPartition32 asgn[] = { {5, 2}, {6, 3} };
+    const std::span<const rpc::TopicPartition32> asgnSpan(asgn, 2);
+
     rpc::Assign msg;
     msg.generationId = 1;
-    msg.assignment   = { {5, 2}, {6, 3} };
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::Assign::encodedSizeFor(2u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), asgnSpan);
 
+    ASSERT_TRUE(rpc::Assign::decode(buf.data(), total).has_value());
     EXPECT_FALSE(rpc::Assign::decode(buf.data(), total - 1u).has_value());
-    EXPECT_TRUE (rpc::Assign::decode(buf.data(), total).has_value());
 }
 
 TEST(AssignCodec, WrongTemplate) {
+    const std::span<const rpc::TopicPartition32> empty{};
+
     rpc::Assign msg;
     msg.generationId = 1;
-    msg.assignment   = {};
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::Assign::encodedSizeFor(0u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), empty);
+    ASSERT_TRUE(rpc::Assign::decode(buf.data(), total).has_value());
+
     buf[2] = 35;  // SyncGroupResponse
     buf[3] = 0;
-
     EXPECT_FALSE(rpc::Assign::decode(buf.data(), total).has_value());
 }
 
 TEST(AssignCodec, WrongSchema) {
+    const std::span<const rpc::TopicPartition32> empty{};
+
     rpc::Assign msg;
     msg.generationId = 1;
-    msg.assignment   = {};
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::Assign::encodedSizeFor(0u);
     std::vector<uint8_t> buf(total, 0u);
-    msg.encode(buf.data());
+    msg.encode(buf.data(), empty);
+    ASSERT_TRUE(rpc::Assign::decode(buf.data(), total).has_value());
+
     buf[4] = 0;
     buf[5] = 0;  // schemaId = 0
-
     EXPECT_FALSE(rpc::Assign::decode(buf.data(), total).has_value());
 }
 
 // ===========================================================================
 // CG-1 Conformance vectors for group messages
+// (Self-referential but field-pinning tests; real file-backed golden tests
+//  are in ConformanceTest.cpp via cg1_join_group.bin etc.)
 // ===========================================================================
 
 // Canonical golden values
@@ -732,33 +782,28 @@ static const uint8_t kGoldGroupId[]  = {'r', 'u', 'n', 'e', '-', 'g', 'r', 'p'};
 static const uint8_t kGoldMemberId[] = {'m', '-', '0', '0', '1'};
 
 // ---------------------------------------------------------------------------
-// CV-GRP-1: JoinGroup golden
+// CV-GRP-1: JoinGroup golden (field-pinning only)
 //   sessionTimeoutMs=30000, groupId="rune-grp", memberId="" (new), topics=[100,200]
-//   Frame layout:
-//     [0..23]  header: blockLen=4, tid=32, schema=120, ver=1, session, correlation
-//     [24..27] sessionTimeoutMs = 30000 = 0x00007530 → 30 75 00 00 (LE)
-//     [28..29] groupId len = 8 → 08 00
-//     [30..37] "rune-grp"
-//     [38..39] memberId len = 0 → 00 00
-//     [40..41] topicCount = 2 → 02 00
-//     [42..45] 100 = 0x64 → 64 00 00 00
-//     [46..49] 200 = 0xC8 → C8 00 00 00
 //   Total = 50 bytes
 // ---------------------------------------------------------------------------
 TEST(GroupConformance, JoinGroupGolden) {
+    const std::span<const uint8_t> grp(kGoldGroupId, sizeof(kGoldGroupId));
+    const std::span<const uint8_t> mbr{};
+    const int32_t topics[] = {100, 200};
+    const std::span<const int32_t> topicSpan(topics, 2);
+
     rpc::JoinGroup msg;
     msg.sessionId        = kGoldSession;
     msg.correlationId    = kGoldCorrelation;
     msg.sessionTimeoutMs = 30000;
-    msg.groupId          = std::span<const uint8_t>(kGoldGroupId, sizeof(kGoldGroupId));
-    msg.memberId         = std::span<const uint8_t>{};  // new member
-    msg.subscribedTopicIds = {100, 200};
+    msg.groupId          = grp;
+    msg.memberId         = mbr;
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::JoinGroup::encodedSizeFor(grp, mbr, 2u);
     ASSERT_EQ(total, 50u);
 
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t n = msg.encode(buf.data());
+    const std::size_t n = msg.encode(buf.data(), topicSpan);
     ASSERT_EQ(n, 50u);
 
     // Header
@@ -801,20 +846,22 @@ TEST(GroupConformance, JoinGroupGolden) {
 // ---------------------------------------------------------------------------
 // CV-GRP-2: SyncGroupResponse golden with assignment
 //   errorCode=0, assignment=[ (10,0), (10,1), (20,3) ]
-//   Total = 24 + 2 + 2 + 3*8 = 52 bytes
+//   Total = 52 bytes
 // ---------------------------------------------------------------------------
 TEST(GroupConformance, SyncGroupResponseGolden) {
+    const rpc::TopicPartition32 asgn[] = { {10, 0}, {10, 1}, {20, 3} };
+    const std::span<const rpc::TopicPartition32> asgnSpan(asgn, 3);
+
     rpc::SyncGroupResponse msg;
     msg.sessionId     = kGoldSession;
     msg.correlationId = kGoldCorrelation;
     msg.errorCode     = 0;
-    msg.assignment    = { {10, 0}, {10, 1}, {20, 3} };
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::SyncGroupResponse::encodedSizeFor(3u);
     ASSERT_EQ(total, 52u);
 
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t n = msg.encode(buf.data());
+    const std::size_t n = msg.encode(buf.data(), asgnSpan);
     ASSERT_EQ(n, 52u);
 
     // Header
@@ -846,20 +893,21 @@ TEST(GroupConformance, SyncGroupResponseGolden) {
 // ---------------------------------------------------------------------------
 // CV-GRP-3: Assign empty = revoke golden
 //   generationId=7, assignment=[] (revoke)
-//   Total = 24 + 4 + 2 = 30 bytes
+//   Total = 30 bytes
 // ---------------------------------------------------------------------------
 TEST(GroupConformance, AssignEmptyRevokeGolden) {
+    const std::span<const rpc::TopicPartition32> empty{};
+
     rpc::Assign msg;
     msg.sessionId     = kGoldSession;
     msg.correlationId = kGoldCorrelation;
     msg.generationId  = 7;
-    msg.assignment    = {};
 
-    const std::size_t total = msg.encodedSize();
+    const std::size_t total = rpc::Assign::encodedSizeFor(0u);
     ASSERT_EQ(total, 30u);
 
     std::vector<uint8_t> buf(total, 0u);
-    const std::size_t n = msg.encode(buf.data());
+    const std::size_t n = msg.encode(buf.data(), empty);
     ASSERT_EQ(n, 30u);
 
     // Header

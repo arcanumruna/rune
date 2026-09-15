@@ -640,3 +640,172 @@ have a standalone golden vector in this set; it is exercised via the dispatch ha
 | SubscribeResponse | 19    | produce/consume (16-31) |
 | Records           | 20    | produce/consume (16-31) |
 | Unsubscribe       | 21    | produce/consume (16-31) |
+| JoinGroup         | 32    | groups/txn (32-63) |
+| JoinGroupResponse | 33    | groups/txn (32-63) |
+| SyncGroup         | 34    | groups/txn (32-63) |
+| SyncGroupResponse | 35    | groups/txn (32-63) |
+| Heartbeat         | 36    | groups/txn (32-63) |
+| HeartbeatResponse | 37    | groups/txn (32-63) |
+| LeaveGroup        | 38    | groups/txn (32-63) |
+| LeaveGroupResponse| 39    | groups/txn (32-63) |
+| OffsetCommit      | 40    | groups/txn (32-63) |
+| OffsetCommitResponse | 41 | groups/txn (32-63) |
+| OffsetFetch       | 42    | groups/txn (32-63) |
+| OffsetFetchResponse | 43 | groups/txn (32-63) |
+| Assign            | 44    | groups/txn (32-63) |
+
+---
+
+## CG-1 Golden vectors (consumer-group protocol, templateIds 32–44)
+
+All vectors use the same session/correlation IDs as the rest of the manifest.
+`groupId = "grp2"` (4 bytes), `memberId = "mbrX"` (4 bytes).
+
+### 18. `cg1_join_group.bin` — 50 bytes
+
+**Message:** `JoinGroup` (templateId = 32)
+
+| Field               | Value             | Hex             |
+|---------------------|-------------------|-----------------|
+| blockLength         | 4                 | 0x0004          |
+| templateId          | 32                | 0x0020          |
+| schemaId            | 120               | 0x0078          |
+| version             | 1                 | 0x0001          |
+| sessionId           | 0x1122334455667788 | see header     |
+| correlationId       | 0x0A0B0C0D0E0F1011 | see header     |
+| sessionTimeoutMs    | 30000             | 0x00007530      |
+| groupId             | "grp2"            | len=4; 67 72 70 32 |
+| memberId            | "mbrX"            | len=4; 6D 62 72 58 |
+| subscribedTopicIds  | [10, 20]          | count=2; 0A000000 14000000 |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      04 00                                      blockLength = 4 (LE)
+02      20 00                                      templateId = 32 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      30 75 00 00                                sessionTimeoutMs = 30000 (LE)
+28      04 00                                      groupId var-len = 4 (LE)
+30      67 72 70 32                                "grp2"
+34      04 00                                      memberId var-len = 4 (LE)
+36      6D 62 72 58                                "mbrX"
+40      02 00                                      topicIds count = 2 (LE)
+42      0A 00 00 00                                topicId[0] = 10 (LE)
+46      14 00 00 00                                topicId[1] = 20 (LE)
+```
+
+---
+
+### 19. `cg1_sync_group_response.bin` — 44 bytes
+
+**Message:** `SyncGroupResponse` (templateId = 35)
+
+| Field         | Value               | Hex             |
+|---------------|---------------------|-----------------|
+| blockLength   | 2                   | 0x0002          |
+| templateId    | 35                  | 0x0023          |
+| schemaId      | 120                 | 0x0078          |
+| version       | 1                   | 0x0001          |
+| sessionId     | 0x1122334455667788  | see header      |
+| correlationId | 0x0A0B0C0D0E0F1011  | see header      |
+| errorCode     | 0 (OK)              | 0x0000          |
+| assignment    | [(10,0), (20,3)]    | count=2; stride 8 bytes each |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      02 00                                      blockLength = 2 (LE)
+02      23 00                                      templateId = 35 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      00 00                                      errorCode = 0 / OK (LE)
+26      02 00                                      assignment count = 2 (LE)
+28      0A 00 00 00                                assignment[0].topicId = 10 (LE)
+32      00 00 00 00                                assignment[0].partition = 0 (LE)
+36      14 00 00 00                                assignment[1].topicId = 20 (LE)
+40      03 00 00 00                                assignment[1].partition = 3 (LE)
+```
+
+---
+
+### 20. `cg1_offset_commit.bin` — 64 bytes
+
+**Message:** `OffsetCommit` (templateId = 40)
+
+Encodes 1 entry with 4-byte metadata `{DE AD BE EF}`.
+
+| Field         | Value               | Hex             |
+|---------------|---------------------|-----------------|
+| blockLength   | 4                   | 0x0004          |
+| templateId    | 40                  | 0x0028          |
+| schemaId      | 120                 | 0x0078          |
+| version       | 1                   | 0x0001          |
+| sessionId     | 0x1122334455667788  | see header      |
+| correlationId | 0x0A0B0C0D0E0F1011  | see header      |
+| generationId  | 5                   | 0x00000005      |
+| groupId       | "grp2"              | len=4           |
+| memberId      | "mbrX"              | len=4           |
+| entries count | 1                   | 0x0001          |
+| entry.topicId | 10                  | 0x0000000A      |
+| entry.partition | 0                 | 0x00000000      |
+| entry.offset  | 1000                | 0x00000000000003E8 |
+| entry.metadata| {DE,AD,BE,EF}       | len=4           |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      04 00                                      blockLength = 4 (LE)
+02      28 00                                      templateId = 40 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      05 00 00 00                                generationId = 5 (LE)
+28      04 00                                      groupId var-len = 4 (LE)
+30      67 72 70 32                                "grp2"
+34      04 00                                      memberId var-len = 4 (LE)
+36      6D 62 72 58                                "mbrX"
+40      01 00                                      entries count = 1 (LE)
+42      0A 00 00 00                                entry.topicId = 10 (LE)
+46      00 00 00 00                                entry.partition = 0 (LE)
+50      E8 03 00 00 00 00 00 00                    entry.offset = 1000 (LE)
+58      04 00                                      entry.meta var-len = 4 (LE)
+60      DE AD BE EF                                entry.metadata bytes
+```
+
+---
+
+### 21. `cg1_assign_revoke.bin` — 30 bytes
+
+**Message:** `Assign` (templateId = 44)
+
+Empty assignment array signals a full revoke (consumer loses all partitions).
+
+| Field         | Value               | Hex             |
+|---------------|---------------------|-----------------|
+| blockLength   | 4                   | 0x0004          |
+| templateId    | 44                  | 0x002C          |
+| schemaId      | 120                 | 0x0078          |
+| version       | 1                   | 0x0001          |
+| sessionId     | 0x1122334455667788  | see header      |
+| correlationId | 0x0A0B0C0D0E0F1011  | see header      |
+| generationId  | 7                   | 0x00000007      |
+| assignment    | [] (empty = revoke) | count=0         |
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      04 00                                      blockLength = 4 (LE)
+02      2C 00                                      templateId = 44 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      01 00                                      version = 1 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      07 00 00 00                                generationId = 7 (LE)
+28      00 00                                      assignment count = 0 (empty = revoke)
+```

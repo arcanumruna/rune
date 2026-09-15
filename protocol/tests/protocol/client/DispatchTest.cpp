@@ -329,10 +329,10 @@ TEST(DispatchCheckFrame, OkJoinGroup) {
     msg.sessionTimeoutMs = 30000;
     msg.groupId          = std::span<const uint8_t>(kGrp, 1u);
     msg.memberId         = std::span<const uint8_t>{};
-    msg.subscribedTopicIds = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const int32_t> noTopics{};
+    const std::size_t len = msg.encode(buf.data(), noTopics);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
@@ -372,10 +372,10 @@ TEST(DispatchCheckFrame, OkSyncGroup) {
 TEST(DispatchCheckFrame, OkSyncGroupResponse) {
     rpc::SyncGroupResponse msg;
     msg.errorCode  = 0;
-    msg.assignment = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const rpc::TopicPartition32> noAsgn{};
+    const std::size_t len = msg.encode(buf.data(), noAsgn);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
@@ -441,10 +441,10 @@ TEST(DispatchCheckFrame, OkOffsetCommit) {
     msg.generationId = 1;
     msg.groupId      = std::span<const uint8_t>(kGrp, 1u);
     msg.memberId     = std::span<const uint8_t>{};
-    msg.entries      = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const rpc::OffsetCommitEntry> noEntries{};
+    const std::size_t len = msg.encode(buf.data(), noEntries);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
@@ -453,10 +453,10 @@ TEST(DispatchCheckFrame, OkOffsetCommit) {
 
 TEST(DispatchCheckFrame, OkOffsetCommitResponse) {
     rpc::OffsetCommitResponse msg;
-    msg.results = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const rpc::OffsetCommitResult> noResults{};
+    const std::size_t len = msg.encode(buf.data(), noResults);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
@@ -467,10 +467,10 @@ TEST(DispatchCheckFrame, OkOffsetFetch) {
     const uint8_t kGrp[] = {'g'};
     rpc::OffsetFetch msg;
     msg.groupId = std::span<const uint8_t>(kGrp, 1u);
-    msg.entries = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const rpc::OffsetFetchEntry> noEntries{};
+    const std::size_t len = msg.encode(buf.data(), noEntries);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
@@ -479,10 +479,10 @@ TEST(DispatchCheckFrame, OkOffsetFetch) {
 
 TEST(DispatchCheckFrame, OkOffsetFetchResponse) {
     rpc::OffsetFetchResponse msg;
-    msg.results = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const rpc::OffsetFetchResult> noResults{};
+    const std::size_t len = msg.encode(buf.data(), noResults);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
@@ -492,10 +492,10 @@ TEST(DispatchCheckFrame, OkOffsetFetchResponse) {
 TEST(DispatchCheckFrame, OkAssign) {
     rpc::Assign msg;
     msg.generationId = 1;
-    msg.assignment   = {};
 
     std::array<uint8_t, 64> buf{};
-    const std::size_t len = msg.encode(buf.data());
+    const std::span<const rpc::TopicPartition32> noAsgn{};
+    const std::size_t len = msg.encode(buf.data(), noAsgn);
 
     const auto fc = rpc::checkFrame(buf.data(), len);
     EXPECT_EQ(fc.status,     rpc::FrameStatus::Ok);
