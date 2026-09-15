@@ -185,3 +185,39 @@ def heal_all(cluster) -> None:
             clear_netem(cluster, s)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# MTU control (sidecar ip link set — NET_ADMIN)
+#
+# Reduces (or restores) the interface MTU inside the broker's network namespace.
+# Mirrors _netns_exec with `ip link set dev <iface> mtu <mtu>`.
+#
+# Docker Desktop caveat: MTU changes on veth pairs inside the LinuxKit VM may
+# be silently ignored or cause Aeron media driver stalls.  Use on Linux CI only.
+# The container restart performed by fresh_cluster teardown (c.down()) destroys
+# and recreates the container, which resets the veth MTU automatically — no
+# explicit MTU restore is needed in the test's finally block.
+# ---------------------------------------------------------------------------
+
+def set_mtu(cluster, service: str, mtu: int, iface: str = "eth0") -> None:
+    """Set the interface MTU inside the broker's network namespace.
+
+    Uses the netem sidecar with NET_ADMIN (mirrors _netns_exec).  On Linux CI
+    this forces IP-level fragmentation when combined with large Aeron frames,
+    exercising the two-level fragmentation path (Aeron + IP).
+
+    On Docker Desktop (macOS LinuxKit VM) this may have no effect or cause
+    media driver stalls — use only on Linux CI where veth MTU changes are
+    reliable.  The MTU is automatically restored when the container is
+    recreated by the fresh_cluster teardown (c.down()).
+    """
+    cid = cluster.container_id(service)
+    if not cid:
+        raise RuntimeError(f"no container for {service}")
+    res = _netns_exec(cid, ["ip", "link", "set", "dev", iface, "mtu", str(mtu)])
+    if not res.ok:
+        raise RuntimeError(
+            f"set_mtu({mtu}) failed on {service} ({iface}): "
+            f"{res.stderr or res.stdout}"
+        )
