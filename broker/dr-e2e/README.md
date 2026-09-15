@@ -1,5 +1,9 @@
 # Rune disaster-recovery E2E harness (`dr-e2e`)
 
+> **Full suite reference:** [`DR_SUITE.md`](DR_SUITE.md) — comprehensive coverage of all 14
+> DR tickets, 6 invariants, the durability contract, Docker Desktop caveats, and the
+> DR-BUG-1..6 catalogue (generated from source; authoritative for DR-9).
+
 A py-testinfra-style **pytest + Docker** harness that drives the REAL 3-node
 `aeron:udp` Rune cluster (`rune-broker/docker/docker-compose.yml`) plus multiple
 `rune-client-cpp` client containers, injects faults, and asserts durability /
