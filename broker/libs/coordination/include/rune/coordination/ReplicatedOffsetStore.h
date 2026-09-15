@@ -1,0 +1,133 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// ReplicatedOffsetStore.h — Consumer committed-offset store whose commits
+// are durable via the replicated `__consumer_offsets` partition Log.
+//
+// Design (CG-2):
+//   Each offset commit = one single-record RecordBatch appended to the
+//   replica Log with acksAll=true (majority-durable).  On coordinator
+//   failover the new leader calls rebuildFromLog() to replay the replicated
+//   Log and reconstruct the in-memory committed-offset map — zero data loss.
+//
+// Key/value encoding (compact little-endian, no padding):
+//   key   = groupLen(uint16) + group(bytes) + topicLen(uint16) + topic(bytes)
+//           + partition(int32)                                  [total: variable]
+//   value = offset(int64) + tsNs(int64) + metaLen(uint16) + meta(bytes)
+//           [total: 18 + metaLen bytes]
+//
+// Allocation behavior:
+//   commit(): no per-commit heap allocation on the hot path.  The key_bytes and
+//   val_bytes are encoded into keyScratch_ and valScratch_ (member vectors
+//   pre-reserved in the constructor and reused across calls).  The compact
+//   payload is assembled into batchScratch_ (also a member vector reused across
+//   calls).  PartitionReplica::append() internally wraps the payload in a
+//   RecordBatch (one heap allocation for the batch vector, amortised by the
+//   replica's own scratch — see PartitionReplica.cpp::makeBatch), which is
+//   beyond our control; this is noted as a concern for a future zero-alloc pass
+//   that could bypass the wrapping (see cg2-report.md).
+//   fetch() / fetchAll(): cold path; allocations are acceptable.
+//   rebuildFromLog(): replay path (cold); allocations are acceptable.
+//
+// Single-writer: no locks; no hot-path allocation beyond the above.
+// Namespace: rune::coordination
+// C++23
+// ---------------------------------------------------------------------------
+
+#include <rune/coordination/OffsetStore.h>   // CommittedOffset, GroupId, TopicPartition, Offset, Types.h
+#include <rune/replication/PartitionReplica.h>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace rune::coordination {
+
+// ---------------------------------------------------------------------------
+// ReplicatedOffsetStore
+// ---------------------------------------------------------------------------
+class ReplicatedOffsetStore {
+public:
+    /// Construct over an existing PartitionReplica (non-owning).
+    /// The replica must outlive the store.
+    explicit ReplicatedOffsetStore(rune::replication::PartitionReplica* replica);
+
+    // -----------------------------------------------------------------------
+    // Write path (hot — called on every OffsetCommit RPC).
+    // -----------------------------------------------------------------------
+
+    /// Commit/overwrite the offset for (group, tp).
+    ///
+    /// Builds a single-record RecordBatch and appends it to the replica Log
+    /// with acksAll=true (majority-durable).  Updates the in-memory map ONLY
+    /// if the append succeeds (returned base offset >= 0).
+    ///
+    /// \returns true  on success (appended + in-memory map updated).
+    /// \returns false if the replica is minIsr-gated (append returned -1).
+    ///
+    /// Kafka semantics: a later commit with a LOWER offset is allowed and
+    /// replaces the previous entry.
+    bool commit(const GroupId&        group,
+                const TopicPartition& tp,
+                Offset                offset,
+                std::string_view      metadata,
+                int64_t               tsNs);
+
+    // -----------------------------------------------------------------------
+    // Read path (cold — O(1) or O(n) over the group's partitions).
+    // -----------------------------------------------------------------------
+
+    /// Fetch the committed offset for (group, tp).
+    /// Returns nullopt if no commit has been recorded for this pair.
+    [[nodiscard]]
+    std::optional<CommittedOffset> fetch(const GroupId&        group,
+                                         const TopicPartition& tp) const;
+
+    /// Return all committed offsets for @p group (ordering unspecified).
+    [[nodiscard]]
+    std::vector<std::pair<TopicPartition, CommittedOffset>>
+    fetchAll(const GroupId& group) const;
+
+    // -----------------------------------------------------------------------
+    // Rebuild (called after leader election, before serving any commits).
+    // -----------------------------------------------------------------------
+
+    /// Replay the replica Log [0, highWatermark()) and reconstruct the
+    /// in-memory committed-offset map.  Last-write-wins per (group, tp) key,
+    /// including a lower-offset overwrite.
+    ///
+    /// Typical use: new coordinator leader calls this once after becoming
+    /// leader before accepting any new OffsetCommit requests.
+    void rebuildFromLog();
+
+private:
+    // -----------------------------------------------------------------------
+    // Key/value encode helpers (write into caller-supplied vectors).
+    // -----------------------------------------------------------------------
+
+    /// Encode (group, tp) → keyScratch_.
+    void encodeKey(const GroupId& group, const TopicPartition& tp);
+
+    /// Encode (offset, tsNs, metadata) → valScratch_.
+    void encodeVal(Offset offset, int64_t tsNs, std::string_view metadata);
+
+    /// Apply one decoded record to the in-memory map (last-write-wins).
+    void applyRecord(std::string_view key, std::string_view val);
+
+    // -----------------------------------------------------------------------
+    // In-memory index: group → { tp → CommittedOffset }
+    // -----------------------------------------------------------------------
+    using TpMap = std::unordered_map<TopicPartition, CommittedOffset>;
+    std::unordered_map<std::string, TpMap> index_;
+
+    rune::replication::PartitionReplica* replica_;  ///< non-owning
+
+    // Per-store reusable scratch buffers (avoids per-commit heap allocation).
+    std::vector<uint8_t> keyScratch_;   ///< encoded key_bytes section
+    std::vector<uint8_t> valScratch_;   ///< encoded val_bytes section
+    std::vector<uint8_t> batchScratch_; ///< compact payload (keyLen+key+valLen+val) passed to append()
+};
+
+} // namespace rune::coordination

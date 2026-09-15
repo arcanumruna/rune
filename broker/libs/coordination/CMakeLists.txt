@@ -1,13 +1,16 @@
 add_library(rune_coordination
     src/OffsetStore.cpp
     src/GroupCoordinator.cpp
-    src/Assignor.cpp)
+    src/Assignor.cpp
+    src/ReplicatedOffsetStore.cpp)
 target_include_directories(rune_coordination PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${RUNE_PROTOCOL_INCLUDE})
 # rune_coordination uses OffsetStore (filesystem) and GroupCoordinator which
 # depend on rune_storage types (Log, LogCleaner, OffsetMap) used in integration
 # tests.  Link rune_storage so the integration target gets its headers too.
-target_link_libraries(rune_coordination PUBLIC rune_storage)
+# CG-2: ReplicatedOffsetStore depends on rune_replication (PartitionReplica).
+target_link_libraries(rune_coordination PUBLIC rune_storage rune_replication)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -16,7 +19,8 @@ if(BUILD_TESTING)
         tests/coordination/OffsetMessagesTest.cpp
         tests/coordination/GroupCoordinatorTest.cpp
         tests/coordination/AssignorTest.cpp
-        tests/coordination/RebalanceTest.cpp)
+        tests/coordination/RebalanceTest.cpp
+        tests/coordination/ReplicatedOffsetStoreTest.cpp)
     target_link_libraries(rune_coordination_tests PRIVATE
         rune_coordination
         GTest::gtest_main)

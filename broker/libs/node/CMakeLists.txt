@@ -34,6 +34,20 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_node_tests)
 
     # ---------------------------------------------------------------------------
+    # CG-2: ReplicatedOffsetStore integration tests — 3-in-process-node cluster
+    # using InMemoryTransport (no Aeron required).  Tests offset durability across
+    # a leader kill + Log replay (offset-survives-leader-kill scenario).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_offset_replication_tests
+        tests/integration/OffsetReplicationTest.cpp)
+    target_link_libraries(rune_offset_replication_tests PRIVATE
+        rune_coordination
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_offset_replication_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # BrokerNode integration tests — embed the Aeron media driver.
     # Gated behind BUILD_BROKER_NODE_TESTS (default ON when BUILD_TESTING=ON)
     # so CI can disable if the embedded driver cannot start in the environment.
