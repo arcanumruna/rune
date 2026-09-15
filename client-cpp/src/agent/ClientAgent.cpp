@@ -378,10 +378,21 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
 
     case codec::TemplateId::ProduceResponse: {
         // Route to the producer response hook so pending acks are resolved.
+        //
+        // DR-BUG-5 client fix: always check errorCode before resolving.  A
+        // non-zero errorCode (e.g. MinIsrViolation=10) means the broker
+        // rejected the produce — the record was NOT written.  Pass a
+        // negative sentinel (-errorCode) so ProducerImpl::onProduceResponse
+        // can distinguish an error response from a genuine baseOffset=0.
+        // Valid committed baseOffsets are always >= 0, so negative is unambiguous.
         if (produceResponseFn_) {
             auto opt = codec::decodeProduceResponse(buf, len);
             if (opt) {
-                produceResponseFn_(opt->correlationId, opt->baseOffset);
+                const int64_t sentinel =
+                    (opt->errorCode != 0)
+                        ? -static_cast<int64_t>(static_cast<uint16_t>(opt->errorCode))
+                        : opt->baseOffset;
+                produceResponseFn_(opt->correlationId, sentinel);
             }
         }
         // Also forward to egress observer so Client can chain-observe if needed.

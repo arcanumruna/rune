@@ -700,14 +700,35 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
         }
 
         // Fire user callback / resolve future (under mutex).
+        //
+        // DR-BUG-5 client fix: a negative baseOffset is a sentinel from
+        // ClientAgent indicating that the broker returned a non-OK errorCode
+        // (e.g. MinIsrViolation).  Reject the future as an exception rather
+        // than silently resolving with a garbage offset — callers expect
+        // fut.get() to throw on broker-side errors.
         std::lock_guard<std::mutex> lock(ackMtx_);
         auto ait = pendingAcks_.find(correlationId);
         if (ait != pendingAcks_.end()) {
             PendingAck& pa = ait->second;
-            if (pa.kind == PendingAck::Kind::Callback) {
-                if (pa.callback) pa.callback(baseOffset);
+            if (baseOffset < 0) {
+                // Broker error: reject rather than resolve with a negative offset.
+                const int64_t errorCode = -baseOffset;
+                const std::string msg =
+                    "produce rejected by broker (errorCode=" + std::to_string(errorCode) + ")";
+                if (pa.kind == PendingAck::Kind::Callback) {
+                    if (pa.callback) pa.callback(-1); // -1 signals error to callback
+                } else {
+                    try {
+                        pa.promise.set_exception(
+                            std::make_exception_ptr(std::runtime_error(msg)));
+                    } catch (...) {}
+                }
             } else {
-                try { pa.promise.set_value(baseOffset); } catch (...) {}
+                if (pa.kind == PendingAck::Kind::Callback) {
+                    if (pa.callback) pa.callback(baseOffset);
+                } else {
+                    try { pa.promise.set_value(baseOffset); } catch (...) {}
+                }
             }
             pendingAcks_.erase(ait);
         }
