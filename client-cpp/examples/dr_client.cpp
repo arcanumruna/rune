@@ -27,7 +27,7 @@
 //                            then means majority-committed, not just leader-acked.
 //
 //   Workload:
-//     RUNE_MODE            "produce" | "subscribe" | "produce_subscribe"
+//     RUNE_MODE            "produce" | "subscribe" | "produce_subscribe" | "group"
 //                            default "produce_subscribe"
 //     RUNE_RECORDS         records to produce (produce modes), default 20
 //     RUNE_KEYS            number of distinct keys to spread records across,
@@ -58,6 +58,11 @@
 //                            Set to the topic's partitionCount to cover ALL
 //                            partitions in multi-partition end-to-end tests.
 //
+//   Group consumer (RUNE_MODE=group):
+//     RUNE_GROUP_ID        consumer-group id (required for group mode)
+//     RUNE_AUTOCOMMIT_MS   auto-commit interval ms, default 1000
+//     RUNE_MEMBER_ID       optional member id hint (informational only)
+//
 // ─────────────────────────────────────────────────────────────────────────
 // Output (stdout, one field-per-token, stable across releases):
 //
@@ -70,6 +75,12 @@
 //   value does not match that schema (e.g. produced by another driver run) is
 //   still emitted with cid=-1 key=-1 seq=-1 but counted.
 //
+//   Group mode (RUNE_MODE=group) emits:
+//   ASSIGN cid=<c> parts=<p0,p1,...>
+//   REVOKE cid=<c> parts=<p0,p1,...>
+//   GROUPREC cid=<c> topic=<t> partition=<p> offset=<o> rec_cid=<rc> rec_key=<rk> rec_seq=<rs>
+//   GROUPSUMMARY cid=<c> consumed=<n> rc=<rc>
+//
 // Exit code: 0 on success, 1 on workload assertion failure, 2 on exception.
 
 #include <rune/client/Client.h>
@@ -77,6 +88,8 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/client/group/GroupConsumer.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +101,7 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -297,6 +311,133 @@ static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
 }
 
 // ---------------------------------------------------------------------------
+// Group consumer mode (RUNE_MODE=group).
+//
+// Joins a consumer group using Client::subscribeGroup().  Records arrive via
+// the broker's server-side partition assignment.  The handler decodes each
+// record payload and emits GROUPREC lines parseable by the harness.
+//
+// Output lines:
+//   ASSIGN  cid=<c> parts=<p0,p1,...>
+//   REVOKE  cid=<c> parts=<p0,p1,...>
+//   GROUPREC cid=<c> topic=<t> partition=<p> offset=<o> rec_cid=<rc> rec_key=<rk> rec_seq=<rs>
+//   GROUPSUMMARY cid=<c> consumed=<n> rc=<rc>
+//
+// Returns the total number of records consumed (all partitions).
+// ---------------------------------------------------------------------------
+static int doGroup(Client& client,
+                   const std::string& groupId,
+                   const std::vector<std::string>& topicNames,
+                   int cid,
+                   int windowMs,
+                   int autoCommitMs) {
+    // Thread-safe record queue: the GroupConsumer runner thread pushes here
+    // and the drain loop below pulls.
+    struct GRec {
+        std::string topicName;
+        int32_t     partition;
+        int64_t     offset;
+        int         rec_cid, rec_key, rec_seq;
+    };
+    std::mutex        qMtx;
+    std::deque<GRec>  q;
+    std::atomic<int>  consumed{0};
+
+    GroupConfig gcfg;
+    gcfg.autoCommit           = true;
+    gcfg.autoCommitIntervalMs = autoCommitMs;
+    gcfg.sessionTimeoutMs     = 30000;
+    gcfg.autoOffsetReset      = OffsetReset::Earliest;
+
+    // We need the topic name map (topicId → name) for output.
+    // The Client::topic() call resolves by name; GroupConsumer only gets topicId
+    // in the RecordSet.  Build a reverse map from the cfg.topics list.
+    // Because we only have one topic in group mode (enforced by the harness),
+    // we emit the first topic name for all records.
+    const std::string& primaryTopic = topicNames.empty() ? "unknown" : topicNames[0];
+
+    GroupConsumer gc = client.subscribeGroup(groupId, topicNames, gcfg);
+
+    gc.onAssigned([cid, primaryTopic](std::vector<TopicPartition> parts) {
+        std::ostringstream oss;
+        oss << "ASSIGN cid=" << cid << " parts=";
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << parts[i].partition;
+        }
+        std::cout << oss.str() << "\n";
+        std::cout.flush();
+        (void)primaryTopic;
+    });
+
+    gc.onRevoked([cid, primaryTopic](std::vector<TopicPartition> parts) {
+        std::ostringstream oss;
+        oss << "REVOKE cid=" << cid << " parts=";
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << parts[i].partition;
+        }
+        std::cout << oss.str() << "\n";
+        std::cout.flush();
+        (void)primaryTopic;
+    });
+
+    gc.onRecords([&qMtx, &q, primaryTopic, cid](const RecordSet& rs) {
+        // rs is a RecordsView (RecordSet alias) with .recordBatch span.
+        // Iterate each record in the batch using RecordBatchReader.
+        if (rs.recordBatch.size() < static_cast<std::size_t>(
+                rune::protocol::batch::kRecordBatchOverhead)) {
+            // Empty/stub batch — nothing to drain.
+            return;
+        }
+        rune::protocol::RecordBatchReader reader(rs.recordBatch.data(),
+                                                  rs.recordBatch.size());
+        reader.forEach([&](std::string_view /*key*/, std::string_view val,
+                           int64_t off, int64_t /*ts*/) {
+            int rc = -1, rk = -1, rs_seq = -1;
+            const std::string valStr(val);
+            decodePayload(valStr, rc, rk, rs_seq);
+            std::lock_guard<std::mutex> lk(qMtx);
+            q.push_back({primaryTopic, rs.partition, off, rc, rk, rs_seq});
+        });
+        (void)cid;
+    });
+
+    // All callbacks registered before connect() — setup-phase contract satisfied.
+    std::cerr << "CLIENT: group connecting...\n";
+    client.connect().get();
+    std::cerr << "CLIENT: group connected\n";
+
+    // Drain the queue until windowMs expires.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(windowMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        GRec rec;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(qMtx);
+            if (!q.empty()) { rec = std::move(q.front()); q.pop_front(); have = true; }
+        }
+        if (have) {
+            std::cout << "GROUPREC cid=" << cid
+                      << " topic=" << rec.topicName
+                      << " partition=" << rec.partition
+                      << " offset=" << rec.offset
+                      << " rec_cid=" << rec.rec_cid
+                      << " rec_key=" << rec.rec_key
+                      << " rec_seq=" << rec.rec_seq << "\n";
+            std::cout.flush();
+            consumed.fetch_add(1);
+        } else {
+            std::this_thread::sleep_for(2ms);
+        }
+    }
+
+    gc.close();
+    return consumed.load();
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -337,8 +478,17 @@ int main() {
     const Acks        acksPolicy =
         (acksStr == "all") ? Acks::All : Acks::Leader;
 
+    // Group mode env vars.
+    const std::string groupId        = getEnvStr("RUNE_GROUP_ID");
+    const int         autoCommitMs   = getEnvInt("RUNE_AUTOCOMMIT_MS", 1000);
+
     if (target.empty() || egress.empty() || dataDir.empty()) {
         std::cerr << "CLIENT: RUNE_TARGET, RUNE_EGRESS and RUNE_DATA_DIR are required\n";
+        return 1;
+    }
+
+    if (mode == "group" && groupId.empty()) {
+        std::cerr << "CLIENT: RUNE_GROUP_ID is required for mode=group\n";
         return 1;
     }
 
@@ -370,6 +520,33 @@ int main() {
     try {
         Client c(cfg);
         c.onError([](const std::string& msg) { std::cerr << "CLIENT: onError: " << msg << "\n"; });
+
+        if (mode == "group") {
+            // Group mode: register callbacks BEFORE connect() (setup-phase contract).
+            // Build the list of topic names from cfg.topics.
+            std::vector<std::string> topicNames;
+            topicNames.reserve(cfg.topics.size());
+            for (const auto& ts : cfg.topics) topicNames.push_back(ts.name);
+
+            std::cerr << "CLIENT: group mode groupId=" << groupId
+                      << " topics=" << topicsStr
+                      << " windowMs=" << subWindowMs
+                      << " autoCommitMs=" << autoCommitMs << "\n";
+
+            // subscribeGroup + callback registration must happen before connect()
+            // so the runner sees the callbacks under the happens-before that
+            // connect() publishes.  doGroup returns after the windowMs drain.
+            const int consumed = doGroup(c, groupId, topicNames, cid, subWindowMs, autoCommitMs);
+            std::cout << "GROUPSUMMARY cid=" << cid
+                      << " consumed=" << consumed
+                      << " rc=0\n";
+            std::cout.flush();
+            std::cout << "SUMMARY produced=0 delivered=" << consumed
+                      << " mode=group rc=0\n";
+            std::cout.flush();
+            c.close();
+            return 0;
+        }
 
         std::cerr << "CLIENT: connecting...\n";
         c.connect().get();
