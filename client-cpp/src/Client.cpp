@@ -17,6 +17,8 @@
 #include <rune/client/Client.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/OffsetMessages.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
@@ -97,6 +99,10 @@ Client::Client(ClientConfig cfg)
             producerHub_.onProduceResponse(correlationId, baseOffset);
         });
 
+    // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence;
+    // fine for heartbeat ~10 s and auto-commit ~5 s timescales).
+    // Egress frame routing is wired in onEgressFrame below.
+
     // Start the agent (transport + embedded driver).
     agent_.start();
 
@@ -137,6 +143,17 @@ void Client::close() {
     // CB-4: Deactivate all subscriptions so no more dispatch occurs.
     // MUST be called after agent_.stop() so no agent thread is in onRecords().
     subscriberHub_.deactivateAll();
+
+    // CG-5: Deactivate all group consumers (fire onRevoked, send LeaveGroup).
+    // MUST be called after agent_.stop() so no agent thread is in onRecords().
+    // sendFn here is a best-effort last send (transport may be stopping).
+    {
+        const auto snap = agent_.stateAndSessionId();
+        const group::SendFn gcSendFn = [this](const uint8_t* fb, std::size_t fl) -> bool {
+            return agent_.submitSend(fb, fl);
+        };
+        groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
+    }
 
     // M2 FIX: Fail any still-pending (unbound) subscribes so their active flag
     // is cleared and any polling app-code sees the subscription is dead.
@@ -408,6 +425,21 @@ void Client::sweepTimeouts() {
     // failed (active cleared) so the app is never left polling forever.
     subscriberHub_.sweepTimedOut(now);
 
+    // --- CG-5: GroupConsumerHub duty cycle (heartbeat / auto-commit / rejoin) ---
+    // The hub's doWork checks its own internal timers so calling it every
+    // kSweepIntervalMs (100 ms) is sufficient for heartbeat (~10 s) and
+    // auto-commit (~5 s) cadences.  Rejoining consumers send JoinGroup on the
+    // very first doWork call after a state transition (no extra latency).
+    if (!groupConsumerHub_.empty()) {
+        const auto snap = agent_.stateAndSessionId();
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+        const group::SendFn sendFn = [this](const uint8_t* fb, std::size_t fl) -> bool {
+            return agent_.submitSend(fb, fl);
+        };
+        groupConsumerHub_.doWork(nowNs, snap.sessionId, sendFn);
+    }
+
     // --- M2 FIX: Disconnected-while-redirectPending_ prompt fail ---------------
     // When a redirect-triggered reconnect exhausts its connect retries (SessionMachine
     // tickConnecting → Disconnected), the Client has no Disconnected callback wired
@@ -505,6 +537,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     };
                 producerHub_.resendAllRedirected(newSessionId, sendFn);
                 subscriberHub_.resendPending(newSessionId, sendFn);
+            }
+
+            // CG-5: Trigger group consumers to send JoinGroup on connect.
+            if (!groupConsumerHub_.empty()) {
+                const group::SendFn gcSendFn =
+                    [this](const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.submitSend(fb, fl);
+                    };
+                groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
             }
 
             // Fire onConnected.
@@ -743,12 +784,78 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
-    // ---- Records push (CB-4) ----
+    // ---- Records push (CB-4 + CG-5) ----
     case codec::TemplateId::Records: {
         auto opt = codec::decodeRecords(buf, len);
         if (!opt) break;
-        // Route to the subscriber hub (agent thread).
+        // Route to the subscriber hub first (direct subscriptions).
         subscriberHub_.onRecords(*opt);
+        // Also route to group consumer hub (assigned partitions).
+        groupConsumerHub_.onRecords(*opt);
+        break;
+    }
+
+    // ---- CG-5: Consumer-group response frames --------------------------------
+
+    case codec::TemplateId::JoinGroupResponse: {
+        if (!groupConsumerHub_.empty()) {
+            const auto snap = agent_.stateAndSessionId();
+            const group::SendFn gcSendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            groupConsumerHub_.onJoinGroupResponse(buf, len, snap.sessionId, gcSendFn);
+        }
+        break;
+    }
+
+    case codec::TemplateId::SyncGroupResponse: {
+        if (!groupConsumerHub_.empty()) {
+            const auto snap = agent_.stateAndSessionId();
+            const group::SendFn gcSendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            groupConsumerHub_.onSyncGroupResponse(buf, len, snap.sessionId, gcSendFn);
+        }
+        break;
+    }
+
+    case codec::TemplateId::HeartbeatResponse: {
+        if (!groupConsumerHub_.empty()) {
+            const auto snap = agent_.stateAndSessionId();
+            const group::SendFn gcSendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            groupConsumerHub_.onHeartbeatResponse(buf, len, snap.sessionId, gcSendFn);
+        }
+        break;
+    }
+
+    case codec::TemplateId::OffsetCommitResponse: {
+        if (!groupConsumerHub_.empty()) {
+            groupConsumerHub_.onOffsetCommitResponse(buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::OffsetFetchResponse: {
+        if (!groupConsumerHub_.empty()) {
+            groupConsumerHub_.onOffsetFetchResponse(buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::Assign: {
+        if (!groupConsumerHub_.empty()) {
+            const auto snap = agent_.stateAndSessionId();
+            const group::SendFn gcSendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            groupConsumerHub_.onAssign(buf, len, snap.sessionId, gcSendFn);
+        }
         break;
     }
 
@@ -898,6 +1005,37 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         });
 
     return Subscription(std::move(impl), std::move(unsubFn));
+}
+
+// ---------------------------------------------------------------------------
+// CG-5: subscribeGroup() — create and register a GroupConsumer
+// ---------------------------------------------------------------------------
+
+GroupConsumer Client::subscribeGroup(std::string              groupId,
+                                      std::vector<std::string> topicNames,
+                                      GroupConfig              cfg)
+{
+    auto impl = std::make_shared<GroupConsumerImpl>();
+    impl->groupId = std::move(groupId);
+    impl->cfg     = cfg;
+
+    // Resolve topicNames → topicIds using ClientConfig::topics.
+    for (const auto& name : topicNames) {
+        for (const auto& spec : cfg_.topics) {
+            if (spec.name == name) {
+                impl->topicIds.push_back(spec.topicId);
+                break;
+            }
+        }
+    }
+
+    impl->state  = GroupConsumerState::Unjoined;
+    impl->active.store(true, std::memory_order_relaxed);
+
+    // Register with the hub — thread-safe cold path (under addMtx_).
+    groupConsumerHub_.add(impl);
+
+    return GroupConsumer(std::move(impl));
 }
 
 } // namespace rune::client

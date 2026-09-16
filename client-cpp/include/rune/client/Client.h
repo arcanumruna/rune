@@ -46,6 +46,8 @@
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/client/subscriber/SubscriberHub.h>
+#include <rune/client/group/GroupConsumer.h>
+#include <rune/client/group/GroupConsumerHub.h>
 
 #include <atomic>
 #include <chrono>
@@ -254,6 +256,29 @@ public:
     /// during the setup phase.  (Calling after start() is a data race on the hub.)
     Producer producer(ProducerConfig cfg = {});
 
+    // ---- CG-5: Consumer-group API -------------------------------------------
+
+    /// Join a consumer group and begin receiving pushed Records for assigned
+    /// partitions.
+    ///
+    /// Returns a GroupConsumer handle.  The handle fires onAssigned/onRevoked
+    /// callbacks on the runner thread as the group coordinator assigns or
+    /// revokes partitions.  Records for assigned partitions are pushed via the
+    /// broker's server-side subscription and routed through onRecords.
+    ///
+    /// Threading:
+    ///   - subscribeGroup() is called on the APP thread (setup phase, before
+    ///     connect() or right after — same contract as producer()).
+    ///   - onAssigned / onRevoked / onRecords callbacks fire on the RUNNER thread.
+    ///   - commit() / commitSync() are wait-free from the APP thread.
+    ///   - close() on the handle is safe from any thread.
+    ///
+    /// topicNames are resolved against ClientConfig::topics.  Topics not found
+    /// in the static list are silently skipped (topicId lookup fails).
+    GroupConsumer subscribeGroup(std::string                groupId,
+                                 std::vector<std::string>   topicNames,
+                                 GroupConfig                cfg = {});
+
 private:
     // -------------------------------------------------------------------------
     // Internal types
@@ -362,6 +387,10 @@ private:
     // ---- CB-4: SubscriberHub -------------------------------------------------
     // Owned by Client.  subscribe() / onEgressFrame() / close() all access it.
     subscriber::SubscriberHub subscriberHub_;
+
+    // ---- CG-5: GroupConsumerHub ---------------------------------------------
+    // Owned by Client.  subscribeGroup() / onEgressFrame() / close() access it.
+    group::GroupConsumerHub groupConsumerHub_;
 
     // ---- CB-5 B: data-op leader-redirect state -------------------------------
     // Set on the runner thread when a Produce/Subscribe is rejected by a
