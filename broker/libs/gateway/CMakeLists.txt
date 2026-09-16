@@ -24,7 +24,7 @@ if(aeron_FOUND)
     target_link_libraries(rune_gateway PUBLIC aeron::aeron)
 endif()
 
-target_link_libraries(rune_gateway PRIVATE spdlog::spdlog)
+target_link_libraries(rune_gateway PRIVATE spdlog::spdlog rune_coordination)
 
 # ---------------------------------------------------------------------------
 # Tests

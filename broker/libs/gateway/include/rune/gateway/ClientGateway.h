@@ -71,6 +71,7 @@
 #include <vector>
 
 namespace rune::node { class ReplicaRegistry; }
+namespace rune::node { class GroupCoordinationService; }
 namespace rune::replication { class PartitionReplica; }
 
 namespace rune::gateway {
@@ -174,6 +175,23 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] rune::node::ReplicaRegistry* replicaRegistry() const noexcept {
         return replicaRegistry_;
+    }
+
+    // -----------------------------------------------------------------------
+    // setGroupService — wire in the GroupCoordinationService (CG-3).
+    // Must be called before doWork() if group-coordination dispatch is desired.
+    // May be null (group messages are dropped). Pointer is non-owning; lifetime
+    // must exceed the ClientGateway. Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setGroupService(rune::node::GroupCoordinationService* service) noexcept {
+        groupService_ = service;
+    }
+
+    // -----------------------------------------------------------------------
+    // groupService — current service pointer (may be null).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] rune::node::GroupCoordinationService* groupService() const noexcept {
+        return groupService_;
     }
 
     // -----------------------------------------------------------------------
@@ -314,6 +332,9 @@ private:
     // GB-3: Subscribe/Unsubscribe handlers.
     void handleSubscribe    (const uint8_t* buf, std::size_t len);
     void handleUnsubscribe  (const uint8_t* buf, std::size_t len);
+    // CG-3: Group coordination handler — routes templateIds 32–43 to GroupCoordinationService.
+    // tid is the raw uint16_t template id (avoids including Protocol.h in this header).
+    void handleGroupMessage (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
@@ -435,6 +456,11 @@ private:
     // covers the new bytes (Mode A seam — no double-append).
     // Single-writer: only accessed on the duty-cycle thread.
     rune::node::ReplicaRegistry*         replicaRegistry_ = nullptr;
+
+    // Group coordination service (CG-3) — non-owning; set via setGroupService().
+    // Null until wired in; group messages (templateIds 32–43) are dispatched here.
+    // Single-writer: only accessed on the duty-cycle thread.
+    rune::node::GroupCoordinationService* groupService_ = nullptr;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;

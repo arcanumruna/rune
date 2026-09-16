@@ -3,6 +3,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/GroupCoordinationService.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/IsrManager.h>
 
@@ -10,6 +11,8 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
+#include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -191,9 +194,18 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
         case pc::TemplateId::Unsubscribe:
             handleUnsubscribe(buf, len);
             break;
+        // CG-3: consumer-group range (32–43); Assign (44) is broker→client, drop.
+        case pc::TemplateId::JoinGroup:
+        case pc::TemplateId::SyncGroup:
+        case pc::TemplateId::Heartbeat:
+        case pc::TemplateId::LeaveGroup:
+        case pc::TemplateId::OffsetCommit:
+        case pc::TemplateId::OffsetFetch:
+            handleGroupMessage(buf, len, nowNs_, fc.templateId);
+            break;
         default:
             // ConnectResponse, ErrorResponse, Pong, ProduceResponse, SubscribeResponse,
-            // Records — server→client or other direction; drop.
+            // Records, Assign — server→client or other direction; drop.
             break;
     }
 }
@@ -1789,6 +1801,86 @@ void ClientGateway::flushDirtyLogs()
     }
     dirtyLogs_ = std::move(stillDirty);
     lastFlushNs_ = nowNs_;
+}
+
+// ---------------------------------------------------------------------------
+// handleGroupMessage (CG-3) — route consumer-group frames to the
+// GroupCoordinationService.
+//
+// Flow:
+//   1. Require a known session (drop on unknown session — no egress).
+//   2. Delegate decode + act + encode to groupService_ (null-safe: drop if
+//      service not wired in).
+//   3. Send the encoded response on the session egress (same send path as all
+//      other handlers — sendTo / scratch_).
+//
+// Reused response buffer: responses are encoded into scratch_ which is already
+// 68 KiB — sufficient for any group response (max SyncGroupResponse with 64
+// partitions ≈ 24 + 2 + 2 + 64*8 = 540 B; OffsetFetchResponse with 1024
+// entries ≈ 24 + 2 + 1024*18 = 18458 B).  Well within kScratchSize.
+//
+// Single-writer: called only on the duty-cycle thread.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
+                                       int64_t nowNs, uint16_t tid)
+{
+    if (!groupService_) {
+        // Group service not wired in — drop silently (configuration choice).
+        spdlog::debug("ClientGateway: group message tid={} received but groupService_ not set — dropped", tid);
+        return;
+    }
+
+    // Decode just the session/correlationId from the MessageHeader to find the
+    // session egress.  Every group request carries sessionId in the MessageHeader
+    // (positions [8..15] LE64).  We don't need the full decode here — just the
+    // session lookup.
+    auto hdrOpt = pc::MessageHeader::decode(buf, len);
+    if (!hdrOpt) {
+        spdlog::debug("ClientGateway: group message tid={} header decode failed — dropped", tid);
+        return;
+    }
+
+    Session* session = sessions_.find(hdrOpt->sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: group message tid={} for unknown sessionId={} — dropped",
+                      tid, hdrOpt->sessionId);
+        return;
+    }
+
+    // Dispatch to the service.  The service encodes the response into scratch_.
+    std::size_t encoded = 0;
+    const auto templateId = static_cast<pc::TemplateId>(tid);
+    switch (templateId) {
+        case pc::TemplateId::JoinGroup:
+            encoded = groupService_->handleJoinGroup(buf, len, nowNs, scratch_.data());
+            break;
+        case pc::TemplateId::SyncGroup:
+            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data());
+            break;
+        case pc::TemplateId::Heartbeat:
+            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data());
+            break;
+        case pc::TemplateId::LeaveGroup:
+            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data());
+            break;
+        case pc::TemplateId::OffsetCommit:
+            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data());
+            break;
+        case pc::TemplateId::OffsetFetch:
+            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data());
+            break;
+        default:
+            return; // unknown group template — drop
+    }
+
+    if (encoded == 0) return; // handler signalled an error (e.g. decode failure)
+    if (encoded > scratch_.size()) {
+        spdlog::warn("ClientGateway: group response tid={} encoded size {} > scratch {}; dropped",
+                     tid, encoded, scratch_.size());
+        return;
+    }
+
+    sendTo(*session, scratch_.data(), encoded);
 }
 
 } // namespace rune::gateway
