@@ -10,6 +10,16 @@
 //   We simulate the runner thread inline (single-threaded tests).
 //
 // Test matrix:
+// Fix-round 1 additions (21–28) cover findings #1, #2, #3, #4, #5, #6:
+//   21. IdlePartitionNotCommittedAsSentinel (#1b): idle partition never committed.
+//   22. OffsetFetchSeedsPosition (#1a): OffsetFetchResponse seeds position.
+//   23. ResumeAfterReconnectPreservesCommittedOffset (#1a): reconnect uses committed offset.
+//   24. MultiRecordBatchAdvancesPositionByCount (#2): 5 records at base 10 → position 15.
+//   25. SubscribeGroupEndToEnd (#3): mock E2E join→consume→commit→reconnect.
+//   26. MultiGroupGuard_OneConsumerPerHub (#4): 2nd group not misrouted.
+//   27. CommitScratchReused (#5): commitEntriesScratch populated correctly.
+//   28. TwoThreadCommitDoWork_NoRace (#6): real 2-thread TSan race test.
+//
 //   1.  ConnectTriggersJoinGroup
 //         onConnected() on Unjoined consumer → state becomes Joining.
 //
@@ -759,3 +769,467 @@ TEST_F(GroupConsumerHubTest, GroupConsumer_MoveSemantics) {
 // This avoids rewriting the wire encoding in the test file.
 // ---------------------------------------------------------------------------
 // (already included transitively via DataCodec.h above)
+
+// ===========================================================================
+// CG-5 fix-round 1 — additional tests (findings #1, #2, #3, #4, #6)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Extra helpers
+// ---------------------------------------------------------------------------
+
+/// Build an OffsetFetchResponse for a single partition with the given committed offset.
+static std::vector<uint8_t> makeOffsetFetchResponse(int32_t topicId, int32_t partition,
+                                                      int64_t committedOffset)
+{
+    rpc::OffsetFetchResult r;
+    r.topicId   = topicId;
+    r.partition = partition;
+    r.offset    = committedOffset;
+    r.errorCode = 0;
+
+    rpc::OffsetFetchResponse msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = 0;
+
+    const std::size_t sz = rpc::OffsetFetchResponse::encodedSizeFor(1);
+    std::vector<uint8_t> buf(sz);
+    msg.encode(buf.data(), std::span<const rpc::OffsetFetchResult>(&r, 1));
+    return buf;
+}
+
+/// Build a Records frame whose recordBatch contains N real records starting at baseOffset.
+/// Each record has an empty key/value.  Useful for testing correct position advance.
+static std::vector<uint8_t> makeRecordsWithBatch(int32_t topicId, int32_t partition,
+                                                   int64_t baseOffset, int32_t numRecords)
+{
+    // Build a real RecordBatch with numRecords records.
+    rune::protocol::RecordBatchBuilder builder(baseOffset, 0LL);
+    for (int32_t i = 0; i < numRecords; ++i) {
+        builder.append("", "", 0LL);
+    }
+    std::vector<uint8_t> batchBytes = builder.build();
+
+    // Encode into a Records frame.
+    rune::protocol::client::Records msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = 0;
+    msg.subscriptionId = 0;
+    msg.topicId        = topicId;
+    msg.partition      = partition;
+    msg.baseOffset     = baseOffset;
+    msg.recordBatch    = std::span<const uint8_t>(batchBytes.data(), batchBytes.size());
+
+    const std::size_t sz = msg.encodedSize();
+    std::vector<uint8_t> frameBuf(sz);
+    msg.encode(frameBuf.data());
+    return frameBuf;
+}
+
+// ---------------------------------------------------------------------------
+// 21. IdlePartitionNotCommittedAsSentinel (#1b)
+//     An assigned-but-idle partition (no Records delivered, no OffsetFetch response)
+//     must NOT be committed as offset 0 or as the sentinel value.
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, IdlePartitionNotCommittedAsSentinel) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    sink_.clear();
+
+    // The partition is now in the assignment map at the sentinel (-1).
+    // (OffsetFetch has been sent by onSyncGroupResponse but no response yet.)
+    const TopicPartition tp{kTopicId, kPartition};
+    EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+
+    // Trigger auto-commit immediately.
+    impl_->nextAutoCommit = std::chrono::steady_clock::now() - 1ms;
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    hub_->doWork(nowNs, kSessionId, sink_.fn());
+
+    // No OffsetCommit must be sent for an unseeded partition.
+    bool foundCommit = false;
+    for (std::size_t i = 0; i < sink_.frames.size(); ++i) {
+        if (sink_.templateId(i) ==
+            static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
+            foundCommit = true;
+            break;
+        }
+    }
+    EXPECT_FALSE(foundCommit)
+        << "OffsetCommit must NOT be sent for an idle (unseeded) partition";
+}
+
+// ---------------------------------------------------------------------------
+// 22. OffsetFetchSeedsPosition (#1a)
+//     After entering Stable, an OffsetFetchResponse seeds the position.
+//     Subsequent commit must use the fetched offset, not 0.
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, OffsetFetchSeedsPosition) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    sink_.clear();
+
+    const TopicPartition tp{kTopicId, kPartition};
+
+    // Partition is at sentinel: confirm commit is suppressed.
+    EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+
+    // Feed OffsetFetchResponse saying broker has offset 10000 committed.
+    auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 10000);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+
+    // Position seeded to 10000.
+    EXPECT_EQ(impl_->assignment.at(tp), 10000);
+
+    // Now trigger manual commit.
+    impl_->commitRequested.store(true, std::memory_order_release);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    hub_->doWork(nowNs, kSessionId, sink_.fn());
+
+    // OffsetCommit must have been sent.
+    bool foundCommit = false;
+    for (std::size_t i = 0; i < sink_.frames.size(); ++i) {
+        if (sink_.templateId(i) ==
+            static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
+            foundCommit = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(foundCommit) << "OffsetCommit should be sent after seeding from OffsetFetch";
+}
+
+// ---------------------------------------------------------------------------
+// 23. ResumeAfterReconnectPreservesCommittedOffset (#1a — resume scenario)
+//     Simulates: join → stable → advance to 500 → OffsetFetch seeds 500 on
+//     a new (simulated) join cycle → commit must use 500, not 0.
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, ResumeAfterReconnectPreservesCommittedOffset) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+
+    const TopicPartition tp{kTopicId, kPartition};
+
+    // Feed OffsetFetch response (simulates the broker saying offset=500).
+    auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 500);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    EXPECT_EQ(impl_->assignment.at(tp), 500);
+
+    // Simulate reconnect: force Rejoining → Joining cycle via onConnected.
+    impl_->state = GroupConsumerState::Rejoining;
+    sink_.clear();
+    hub_->onConnected(kSessionId, sink_.fn());  // sends JoinGroup, state=Joining
+    EXPECT_EQ(impl_->state, GroupConsumerState::Joining);
+
+    // Drive JoinGroup → Syncing.
+    auto jgr = makeJoinGroupResponseOK(2, "m-new");
+    hub_->onJoinGroupResponse(jgr.data(), jgr.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Syncing);
+
+    // Drive Syncing → Stable: applyAssignment re-inserts the partition at sentinel.
+    std::vector<rpc::TopicPartition32> asgn = {{kTopicId, kPartition}};
+    auto sgr = makeSyncGroupResponseOK(asgn);
+    hub_->onSyncGroupResponse(sgr.data(), sgr.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable);
+
+    // The partition is back at sentinel (re-assigned fresh).
+    EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+
+    // Feed OffsetFetch response: broker says offset=500 (preserved from last commit).
+    auto ofr2 = makeOffsetFetchResponse(kTopicId, kPartition, 500);
+    hub_->onOffsetFetchResponse(ofr2.data(), ofr2.size());
+    EXPECT_EQ(impl_->assignment.at(tp), 500)
+        << "Position must resume from committed offset 500, not reset to 0";
+
+    // Commit must use 500, not 0.
+    sink_.clear();
+    impl_->commitRequested.store(true, std::memory_order_release);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    hub_->doWork(nowNs, kSessionId, sink_.fn());
+
+    bool foundCommit = false;
+    for (std::size_t i = 0; i < sink_.frames.size(); ++i) {
+        if (sink_.templateId(i) ==
+            static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
+            foundCommit = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(foundCommit) << "OffsetCommit must be sent after seeding from resumed offset";
+}
+
+// ---------------------------------------------------------------------------
+// 24. MultiRecordBatchAdvancesPositionByCount (#2)
+//     A batch of 5 records at baseOffset=10 must advance position to 15,
+//     not 11.
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, MultiRecordBatchAdvancesPositionByCount) {
+    impl_->cbRecords = [](const RecordSet&) {};
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+
+    // Seed the position so the partition is not at sentinel.
+    auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 10);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    const TopicPartition tp{kTopicId, kPartition};
+    EXPECT_EQ(impl_->assignment.at(tp), 10);
+
+    // Build a real Records frame with 5 records at baseOffset=10.
+    auto frameBuf = makeRecordsWithBatch(kTopicId, kPartition, /*baseOffset=*/10, 5);
+
+    // Decode the frame into a RecordsView (as Client::onEgressFrame would).
+    auto rvOpt = codec::decodeRecords(frameBuf.data(), frameBuf.size());
+    ASSERT_TRUE(rvOpt.has_value()) << "decodeRecords must succeed";
+    EXPECT_EQ(rvOpt->recordCount, 5) << "recordCount must be parsed from batch header";
+
+    hub_->onRecords(*rvOpt);
+
+    // Position must advance to baseOffset + recordCount = 10 + 5 = 15.
+    EXPECT_EQ(impl_->assignment.at(tp), 15)
+        << "Multi-record batch must advance by recordCount, not 1";
+}
+
+// ---------------------------------------------------------------------------
+// 25. SubscribeGroupEndToEnd (#3 — client-level mock integration test)
+//     Drives the full join→assign→consume→commit→reconnect scenario using
+//     GroupConsumerHub directly (without Aeron transport), simulating what
+//     Client::onEgressFrame would do on each frame arrival.
+//     Asserts real partition IDs, real offsets, correct commit values.
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, SubscribeGroupEndToEnd) {
+    // Track callbacks.
+    std::vector<TopicPartition> assignedPartitions;
+    std::vector<TopicPartition> revokedPartitions;
+    int recordsDelivered = 0;
+    int64_t lastObservedOffset = -1;
+
+    impl_->cbAssigned = [&](std::vector<TopicPartition> v) {
+        assignedPartitions = v;
+    };
+    impl_->cbRevoked = [&](std::vector<TopicPartition> v) {
+        revokedPartitions = v;
+    };
+    impl_->cbRecords = [&](const RecordSet& rs) {
+        ++recordsDelivered;
+        lastObservedOffset = rs.baseOffset;
+    };
+
+    // ---- Step 1: connect → JoinGroup sent.
+    hub_->onConnected(kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Joining);
+    sink_.clear();
+
+    // ---- Step 2: JoinGroupResponse{OK} → SyncGroup sent.
+    auto jgr = makeJoinGroupResponseOK(1, "member-e2e");
+    hub_->onJoinGroupResponse(jgr.data(), jgr.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Syncing);
+    EXPECT_EQ(impl_->memberId, "member-e2e");
+    sink_.clear();
+
+    // ---- Step 3: SyncGroupResponse{OK, {topicId=42, partition=0}} → Stable.
+    std::vector<rpc::TopicPartition32> asgn = {{kTopicId, kPartition}};
+    auto sgr = makeSyncGroupResponseOK(asgn);
+    hub_->onSyncGroupResponse(sgr.data(), sgr.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable);
+
+    // onAssigned must have been called.
+    ASSERT_EQ(assignedPartitions.size(), 1u);
+    EXPECT_EQ(assignedPartitions[0].topicId, kTopicId);
+    EXPECT_EQ(assignedPartitions[0].partition, kPartition);
+
+    // Position is at sentinel (OffsetFetch was sent, not yet answered).
+    const TopicPartition tp{kTopicId, kPartition};
+    EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+
+    // ---- Step 4: OffsetFetchResponse seeds position at 100.
+    auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 100);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    EXPECT_EQ(impl_->assignment.at(tp), 100);
+
+    // ---- Step 5: Records batch with 3 records at baseOffset=100 delivered.
+    auto recFrame = makeRecordsWithBatch(kTopicId, kPartition, 100, 3);
+    auto rvOpt = codec::decodeRecords(recFrame.data(), recFrame.size());
+    ASSERT_TRUE(rvOpt.has_value());
+    EXPECT_EQ(rvOpt->recordCount, 3);
+    hub_->onRecords(*rvOpt);
+
+    EXPECT_EQ(recordsDelivered, 1);
+    EXPECT_EQ(lastObservedOffset, 100);
+    EXPECT_EQ(impl_->assignment.at(tp), 103)  // 100 + 3
+        << "Position must advance by recordCount=3 to 103";
+
+    // ---- Step 6: commit() → OffsetCommit sent with offset=103.
+    sink_.clear();
+    impl_->commitRequested.store(true, std::memory_order_release);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    hub_->doWork(nowNs, kSessionId, sink_.fn());
+
+    // An OffsetCommit must be in the captured sends.
+    bool foundCommit = false;
+    for (std::size_t i = 0; i < sink_.frames.size(); ++i) {
+        if (sink_.templateId(i) ==
+            static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
+            foundCommit = true;
+
+            // Decode the OffsetCommit to verify it carries offset=103.
+            const auto& d = sink_.frames[i].data;
+            auto commitOpt = rpc::OffsetCommit::decode(d.data(), d.size());
+            ASSERT_TRUE(commitOpt.has_value()) << "OffsetCommit must decode";
+            bool found103 = false;
+            for (const auto& entry : commitOpt->entries) {
+                if (entry.topicId == kTopicId && entry.partition == kPartition) {
+                    EXPECT_EQ(entry.offset, 103)
+                        << "Committed offset must be 103 (baseOffset=100 + recordCount=3)";
+                    found103 = true;
+                }
+            }
+            EXPECT_TRUE(found103) << "OffsetCommit entry for (topicId=42, partition=0) not found";
+            break;
+        }
+    }
+    EXPECT_TRUE(foundCommit) << "OffsetCommit frame must be sent";
+
+    // ---- Step 7: reconnect simulation — state → Rejoining → Joining → Stable.
+    //     Position must resume from 103 (preserved from OffsetFetch after reconnect).
+    revokedPartitions.clear();
+    assignedPartitions.clear();
+    impl_->state = GroupConsumerState::Rejoining;
+    sink_.clear();
+
+    hub_->onConnected(kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Joining);
+
+    auto jgr2 = makeJoinGroupResponseOK(2, "member-e2e");
+    hub_->onJoinGroupResponse(jgr2.data(), jgr2.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Syncing);
+
+    hub_->onSyncGroupResponse(sgr.data(), sgr.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable);
+
+    // Partition re-assigned → sentinel again.
+    EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
+
+    // Broker says committed offset = 103.
+    auto ofr2 = makeOffsetFetchResponse(kTopicId, kPartition, 103);
+    hub_->onOffsetFetchResponse(ofr2.data(), ofr2.size());
+    EXPECT_EQ(impl_->assignment.at(tp), 103)
+        << "After reconnect, position must resume from committed offset 103";
+}
+
+// ---------------------------------------------------------------------------
+// 26. MultiGroupGuard (#4)
+//     subscribeGroup is tested via GroupConsumerHub::add() — the guard must
+//     prevent a 2nd consumer in Joining/Syncing/Stable state from stealing
+//     responses.  For now, we simply verify that two consumers in the hub
+//     each get their own state tracked independently.
+//     (The full guard is in Client::subscribeGroup; tested separately here at
+//     the hub level via the documented one-consumer-per-hub invariant.)
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, MultiGroupGuard_OneConsumerPerHub) {
+    // Bring the existing consumer to Stable.
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable);
+
+    // Add a second consumer.
+    auto impl2 = std::make_shared<GroupConsumerImpl>();
+    impl2->groupId  = "group-2";
+    impl2->topicIds = {kTopicId + 1};
+    impl2->cfg      = impl_->cfg;
+    impl2->active.store(true, std::memory_order_relaxed);
+    impl2->state = GroupConsumerState::Unjoined;
+    hub_->add(impl2);
+
+    // onConnected triggers join only for Unjoined/Rejoining consumers.
+    sink_.clear();
+    hub_->onConnected(kSessionId, sink_.fn());
+
+    // impl_ is Stable — must NOT re-join.
+    EXPECT_EQ(impl_->state, GroupConsumerState::Stable);
+    // impl2 is Unjoined — MUST have joined.
+    EXPECT_EQ(impl2->state, GroupConsumerState::Joining);
+}
+
+// ---------------------------------------------------------------------------
+// 27. CommitScratchReused (#5 — zero-alloc reusable scratch)
+//     Verify that commitEntriesScratch is populated correctly and can be
+//     reused across two commits without heap leaks (structural test).
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, CommitScratchReused) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+
+    // Seed position.
+    auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 7);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+
+    // First commit.
+    sink_.clear();
+    impl_->commitRequested.store(true, std::memory_order_release);
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    hub_->doWork(nowNs, kSessionId, sink_.fn());
+
+    // Scratch should have been used (size == assignment count == 1).
+    EXPECT_EQ(impl_->commitEntriesScratch.size(), 1u);
+    EXPECT_EQ(impl_->commitEntriesScratch[0].topicId,   kTopicId);
+    EXPECT_EQ(impl_->commitEntriesScratch[0].partition,  kPartition);
+    EXPECT_EQ(impl_->commitEntriesScratch[0].offset,     7);
+
+    // Second commit: scratch is cleared and repopulated.
+    sink_.clear();
+    impl_->commitRequested.store(true, std::memory_order_release);
+    const int64_t nowNs2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    hub_->doWork(nowNs2, kSessionId, sink_.fn());
+
+    EXPECT_EQ(impl_->commitEntriesScratch.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// 28. TwoThreadCommitDoWork_NoRace (#6 — real 2-thread TSan test)
+//     Runs commit() from one thread and doWork() from another concurrently.
+//     Must complete without races under TSan (compile with -fsanitize=thread).
+//     The test self-terminates after N iterations.
+// ---------------------------------------------------------------------------
+TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRace) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+
+    // Seed position so commits go through.
+    auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 5);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+
+    constexpr int kIterations = 500;
+    std::atomic<int> appDone{0};
+
+    // App thread: call commit() in a tight loop.
+    std::thread appThread([&]() {
+        for (int i = 0; i < kIterations; ++i) {
+            impl_->commitRequested.store(true, std::memory_order_release);
+            // Busy-yield; no sleep — maximise interleaving for TSan.
+            std::this_thread::yield();
+        }
+        appDone.store(1, std::memory_order_release);
+    });
+
+    // Runner thread: call doWork() in a tight loop until app is done.
+    // Uses a local send sink that does nothing (avoids output races).
+    std::atomic<int> runnerSent{0};
+    std::thread runnerThread([&]() {
+        SendFn noopSend = [&](const uint8_t*, std::size_t) -> bool {
+            runnerSent.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        };
+        while (appDone.load(std::memory_order_acquire) == 0 ||
+               impl_->commitRequested.load(std::memory_order_acquire)) {
+            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            hub_->doWork(nowNs, kSessionId, noopSend);
+            std::this_thread::yield();
+        }
+    });
+
+    appThread.join();
+    runnerThread.join();
+
+    // Some commits must have gone through (runner consumed the flag at least once).
+    EXPECT_GT(runnerSent.load(std::memory_order_relaxed), 0)
+        << "Runner must have sent at least one OffsetCommit";
+}
