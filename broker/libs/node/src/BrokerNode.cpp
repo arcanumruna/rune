@@ -11,6 +11,10 @@
 #include <unordered_map>
 #include <vector>
 
+// CG-6 wiring: storage + replication headers for __consumer_offsets.
+#include <rune/replication/PartitionReplica.h>
+#include <rune/storage/Log.h>
+
 namespace fs = std::filesystem;
 using namespace rune::consensus;
 
@@ -503,6 +507,132 @@ void BrokerNode::buildGateway() {
         gateway_.reset();
     }
 
+    // -----------------------------------------------------------------------
+    // CG-6 wiring: GroupCoordinationService → ClientGateway.
+    //
+    // Build a durable __consumer_offsets Log + single-partition PartitionReplica
+    // (InMemoryTransport — role transitions handled by the bridge like other
+    // replicas; no Aeron transport needed for the offset log in CG-6).
+    // Then create ReplicatedOffsetStore + GroupCoordinationService and wire
+    // both directions: gateway → service (setGroupService) and
+    // service → gateway (setGateway).
+    //
+    // This must happen AFTER gateway_ is set (we wire into it), and the
+    // GroupCoordinationService is passed to NodeRuntimeAgent so doWork
+    // drives the group coordinator duty cycle on the single-writer thread.
+    // -----------------------------------------------------------------------
+    if (gateway_) {
+        try {
+            const fs::path offsetDir = fs::path{config_.dataDir} / "__consumer_offsets";
+            fs::create_directories(offsetDir);
+
+            // One partition Log for all committed offsets (compact key/value encoding).
+            offsetLog_ = std::make_unique<rune::storage::Log>(offsetDir.string());
+            offsetLog_->recover();
+
+            // Wrap in a PartitionReplica for the __consumer_offsets topic.
+            // topicId=-1 is the sentinel for the offset log (not a user topic).
+            // When replTransport_ is available (multi-node cluster), use it so
+            // committed offsets are replicated to all peers and survive leader
+            // failover.  On single-node (no transport), fall back to InMemoryTransport.
+            // The replica is added to replicaRegistry_ so the metadata bridge drives
+            // its role transitions (Follower → Leader on election, Leader → Follower
+            // on dethronement) exactly like user-topic replicas.
+            // Role starts Follower / epoch 0; the bridge corrects on first doWork.
+            const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+            // Rebuild allNodeIds (same as in buildReplication).
+            std::vector<NodeId> allNodeIds;
+            allNodeIds.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                allNodeIds.push_back(static_cast<NodeId>(peer.id));
+            }
+
+            rune::replication::PartitionConfig ocfg;
+            ocfg.topicId              = -1;   // sentinel: not a user topic
+            ocfg.partitionId          = 0;
+            ocfg.selfId               = selfId;
+            // minIsr=1: offset commits are leader-local (no ISR majority wait).
+            // The replica still replicates to followers via Aeron so that a new
+            // leader can rebuild committed offsets after failover.  Leader-local
+            // (minIsr=1) avoids ISR-establishment delays on the new leader before
+            // the first offset commit succeeds.
+            ocfg.minIsr               = 1;
+            ocfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            ocfg.replicaLagMaxOffset  = 10'000;
+            ocfg.fetchIntervalNs      = 5'000'000LL;
+            ocfg.isrCheckIntervalNs   = 10'000'000LL;
+            ocfg.maxFetchBytes        = 1 << 20;
+
+            // Transport: real Aeron transport if available, else no-op InMemoryTransport.
+            rune::replication::PartitionTransport* offsetTransport = replTransport_.get();
+            if (!offsetTransport) {
+                nullTransports_.push_back(std::make_unique<rune::replication::InMemoryTransport>());
+                offsetTransport = nullTransports_.back().get();
+            }
+
+            offsetReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                ocfg,
+                rune::replication::Role::Follower, // bridge promotes to Leader on first doWork
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                offsetLog_.get(),
+                offsetTransport);
+
+            // Register with the Aeron transport (topicId=-1, partitionId=0) so
+            // FetchRequest / FetchResponse frames for the offset log are routed here.
+            if (replTransport_) {
+                replTransport_->registerReplica(-1, 0, offsetReplica_.get());
+            }
+
+            // Add to replicaRegistry_ so the metadata bridge drives role transitions
+            // and NodeRuntimeAgent::doWork calls replica->doWork() each cycle.
+            if (replicaRegistry_) {
+                replicaRegistry_->add(-1, 0, std::move(offsetReplica_));
+                // After move, recover the raw pointer for offsetStore_ construction.
+                offsetReplica_.reset(); // unique_ptr now owned by replicaRegistry_
+            }
+            // Re-acquire raw pointer from registry for offsetStore_ construction.
+            rune::replication::PartitionReplica* offsetReplicaRaw =
+                replicaRegistry_ ? replicaRegistry_->lookup(-1, 0) : nullptr;
+
+            // ReplicatedOffsetStore: commits append to offsetReplicaRaw + in-memory map.
+            // offsetReplicaRaw is now owned by replicaRegistry_; offsetReplica_ is null.
+            offsetStore_ = std::make_unique<rune::coordination::ReplicatedOffsetStore>(
+                offsetReplicaRaw);
+            // Replay any previously committed offsets from the local Log.
+            // On a fresh node this is a no-op; on restart it restores durable state.
+            // On failover, GroupCoordinationService::doWork() will rebuild on
+            // becoming leader so the in-memory index reflects replicated commits.
+            offsetStore_->rebuildFromLog();
+
+            // GroupCoordinationService: handles JoinGroup / SyncGroup / Heartbeat /
+            // LeaveGroup / OffsetCommit / OffsetFetch for all consumer groups.
+            groupCoordService_ = std::make_unique<GroupCoordinationService>(
+                offsetStore_.get(),
+                topicRegistry_.get(),
+                [this]() -> bool { return this->isLeader(); },
+                [this]() -> NodeId { return static_cast<NodeId>(this->leaderId()); });
+
+            // Wire both directions.
+            gateway_->setGroupService(groupCoordService_.get());
+            groupCoordService_->setGateway(gateway_.get());
+
+            spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
+                         nodeId, offsetDir.string());
+        } catch (const std::exception& ex) {
+            spdlog::error("BrokerNode[{}]: GroupCoordinationService setup failed: {}; "
+                          "group consumers will not work", nodeId, ex.what());
+            groupCoordService_.reset();
+            offsetStore_.reset();
+            // offsetReplica_ may have been moved into replicaRegistry_ already;
+            // reset() is safe either way (no-op if already null).
+            offsetReplica_.reset();
+            offsetLog_.reset();
+        }
+    }
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
@@ -516,7 +646,8 @@ void BrokerNode::buildGateway() {
         replBridge_.get(),        // GR-2: metadata bridge (may be null if no replicas)
         replTransport_.get(),     // GR-3: replication transport (may be null)
         replicaRegistry_.get(),   // GR-3: replica registry (may be null if no topics)
-        gateway_.get());
+        gateway_.get(),
+        groupCoordService_.get()); // CG-6: group coordinator (null-safe if setup failed)
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
@@ -648,9 +779,16 @@ void BrokerNode::stop() {
     //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
     //    → close aeron → stop driver.
     runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
+    // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
+    groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
+    // CG-6: destroy offset store before replicaRegistry_ (offsetStore_ holds raw ptr
+    //       to the offsetReplica which replicaRegistry_ owns after CG-6 refactor).
+    offsetStore_.reset();     // ReplicatedOffsetStore (holds raw ptr to offset replica in registry)
+    offsetReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildGateway
+    offsetLog_.reset();       // Log for __consumer_offsets (file flush on dtor)
     replBridge_.reset();      // ReplicationMetadataBridge (no Aeron resources)
-    replicaRegistry_.reset(); // PartitionReplicas (no Aeron resources, share Log* with topicRegistry_)
+    replicaRegistry_.reset(); // PartitionReplicas + offsetReplica (destroyed before transport)
     replTransport_.reset();   // AeronPartitionTransport: deregisters replication Subscription + ExclusivePubs
     nullTransports_.clear();  // Per-replica no-op transports (no Aeron resources)
     topicRegistry_.reset();   // TopicRegistry: Logs are files (flushed/synced by Log dtor)

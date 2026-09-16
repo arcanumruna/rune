@@ -26,9 +26,12 @@
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
+#include <rune/node/GroupCoordinationService.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/coordination/ReplicatedOffsetStore.h>
+#include <rune/storage/Log.h>
 
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
@@ -241,6 +244,23 @@ private:
     // Constructed after aeron_ in start(); destroyed in stop() before aeron_.
     // -----------------------------------------------------------------------
     std::unique_ptr<rune::gateway::ClientGateway> gateway_;
+
+    // -----------------------------------------------------------------------
+    // Consumer-group coordination (CG-5 wiring — created in buildGateway()).
+    // offsetLog_     — durable Log for __consumer_offsets (one partition).
+    // offsetReplica_ — PartitionReplica wrapping the offset Log (single-node
+    //                  with InMemoryTransport; role transitions handled by bridge).
+    // offsetStore_   — ReplicatedOffsetStore for committed-offset persistence.
+    // groupCoordService_ — GroupCoordinationService (dispatches JoinGroup etc.).
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   runtimeAgent_ → groupCoordService_ → offsetStore_ → offsetReplica_
+    //   → offsetLog_ → gateway_ → …
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::storage::Log>                        offsetLog_;
+    std::unique_ptr<rune::replication::PartitionReplica>       offsetReplica_;
+    std::unique_ptr<rune::coordination::ReplicatedOffsetStore> offsetStore_;
+    std::unique_ptr<GroupCoordinationService>                  groupCoordService_;
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
