@@ -250,32 +250,6 @@ private:
     /// Short topic names benefit from SSO; the vector itself is amortized.
     std::vector<std::string> joinTopicsScratch_;
 
-    // CG-6: group-position cache for cross-generation re-delivery prevention.
-    //
-    // When onEnterPreparingRebalance revokes a member's subscriptions, we capture
-    // the subscription's nextOffset (= the first offset NOT YET pushed to the
-    // client) for each (topicId, partition).  On the next generation's SyncGroup
-    // we seed new subscriptions at max(committedOffset, capturedNextOffset) so
-    // that a reassigned partition starts where the previous owner left off,
-    // not from the (potentially stale) committed offset.
-    //
-    // Key: (groupId, topicId, partition) encoded as a struct for readability.
-    // Value: captured nextOffset.
-    //
-    // Lifetime: entries are written at rebalance start and consumed (used + erased
-    // lazily) in handleSyncGroup.  Old entries for a group are overwritten on the
-    // next rebalance, so the map stays small (O(groups × partitions)).
-    struct GroupTpKey {
-        std::string groupId;
-        int32_t     topicId;
-        int32_t     partition;
-        bool operator<(const GroupTpKey& o) const noexcept {
-            if (groupId != o.groupId) return groupId < o.groupId;
-            if (topicId != o.topicId) return topicId < o.topicId;
-            return partition < o.partition;
-        }
-    };
-    std::map<GroupTpKey, int64_t> groupPositionCache_;
 };
 
 } // namespace rune::node

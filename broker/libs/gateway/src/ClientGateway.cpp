@@ -2029,32 +2029,6 @@ void ClientGateway::revokeGroupSubscriptions(int64_t memberSessionId)
 }
 
 // ---------------------------------------------------------------------------
-// CG-6: captureGroupPositions — snapshot nextOffset for each group subscription
-// belonging to memberSessionId.  Called BEFORE revokeGroupSubscriptions so the
-// GroupCoordinationService can seed the next generation's subscriptions at the
-// maximum of (committedOffset, capturedNextOffset).
-//
-// Returns empty vector if session has no group subs (no-op caller path).
-// Single-writer: must be called on the duty-cycle thread.
-// ---------------------------------------------------------------------------
-std::vector<ClientGateway::TopicPartitionPosition>
-ClientGateway::captureGroupPositions(int64_t memberSessionId) const
-{
-    std::vector<TopicPartitionPosition> out;
-    const auto it = groupMemberSubs_.find(memberSessionId);
-    if (it == groupMemberSubs_.end()) return out;
-
-    out.reserve(it->second.size());
-    for (int64_t subId : it->second) {
-        const auto sit = subscriptions_.find(subId);
-        if (sit == subscriptions_.end()) continue;
-        const Subscription& sub = sit->second;
-        out.push_back({ sub.topicId, sub.partition, sub.nextOffset });
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
 // CG-4: sendControlFrame — send an already-encoded frame (e.g. Assign) on
 // a session's egress.  Reuses the same sendTo path as all other responses.
 //

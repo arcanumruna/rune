@@ -434,9 +434,24 @@ size_t GroupCoordinationService::handleSyncGroup(
     // because the subscription always starts from the committed offset, which
     // is what the client will OffsetFetch next anyway.
     //
-    // Two-step: (1) revoke existing group subs for this session (idempotent if
-    // none exist); (2) re-create from committed offset.
+    // Fix #4: skip the revoke+recreate cycle when this member session already
+    // has the correct group subscriptions active (idempotent SyncGroup for an
+    // unchanged assignment — Stable→Stable re-sync).  Revoking a live sub and
+    // re-creating it from the committed offset would move the push frontier
+    // backwards (re-delivery), which is unnecessary bounded duplication when
+    // the assignment did not change.  Guard: only recreate when the session has
+    // NO live group subs (first SyncGroup in this generation) or the count
+    // differs from the assignment (partition set did change).
     if (gateway_) {
+        const std::size_t existingSubs = gateway_->groupMemberSubCount(msg.sessionId);
+        const bool needRecreate = (existingSubs != assignment.size());
+        if (!needRecreate) {
+            // Assignment matches existing live subs — skip revoke+recreate.
+            spdlog::debug("GroupCoordinationService::handleSyncGroup: "
+                          "skipping sub recreate for member='{}' sessionId={} "
+                          "(already have {} subs = assignment size)",
+                          memberIdStr, msg.sessionId, existingSubs);
+        } else {
         gateway_->revokeGroupSubscriptions(msg.sessionId);
         for (const auto& tp : assignment) {
             int32_t topicId = -1;
@@ -450,25 +465,19 @@ size_t GroupCoordinationService::handleSyncGroup(
                              tp.topic, memberIdStr);
                 continue;
             }
+            // Seed at the committed offset only.  Cross-generation re-delivery
+            // of [committed, delivered) is legitimate bounded duplication (the
+            // group tolerates it via assert_group_bounded_duplicates).  We do NOT
+            // import the previous generation's wire-send position: that position is
+            // the broker's PUSH frontier (nextOffset in Subscription), which may be
+            // ahead of any records actually consumed+committed by the client.
+            // Seeding at max(committed, wirePosition) would silently skip records
+            // that were pushed to the old member but never consumed — an at-least-
+            // once violation (silent loss).
             int64_t fromOffset = 0;
             {
                 const auto committed = offsets_->fetch(groupIdStr, tp);
                 if (committed.has_value()) fromOffset = committed->offset;
-            }
-            // CG-6: check the group-position cache.  If the previous generation
-            // had a subscription for this partition that advanced beyond the
-            // committed offset, start from there to avoid re-delivering records
-            // already consumed by another member in an earlier generation.
-            {
-                const GroupTpKey key{ groupIdStr, topicId, tp.partition };
-                const auto cit = groupPositionCache_.find(key);
-                if (cit != groupPositionCache_.end() && cit->second > fromOffset) {
-                    spdlog::debug("GroupCoordinationService::handleSyncGroup: "
-                                  "position cache hit group='{}' topic={} partition={} "
-                                  "committed={} cached={} → using cached",
-                                  groupIdStr, topicId, tp.partition, fromOffset, cit->second);
-                    fromOffset = cit->second;
-                }
             }
             const int64_t subId = gateway_->addGroupSubscription(
                 msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/0);
@@ -482,7 +491,8 @@ size_t GroupCoordinationService::handleSyncGroup(
                               memberIdStr, msg.sessionId, topicId, tp.partition, fromOffset);
             }
         }
-    }
+        } // end else (needRecreate)
+    } // end if (gateway_)
 
     // Build TopicPartition32 array for the response.
     // assignScratch_ is pre-reserved; may grow if needed (rare, cold).
@@ -883,24 +893,6 @@ void GroupCoordinationService::onEnterPreparingRebalance(
         if (it == memberSessionMap_.end()) continue;  // no session tracked yet (early join)
 
         const int64_t sessionId = it->second;
-
-        // CG-6: capture consumed nextOffset BEFORE revoking so that the next
-        // generation's SyncGroup can seed subscriptions at max(committed, captured)
-        // rather than just the committed offset.  This prevents cross-generation
-        // re-delivery when partitions are reassigned to a different member.
-        {
-            const auto positions = gateway_->captureGroupPositions(sessionId);
-            for (const auto& pos : positions) {
-                GroupTpKey key{ groupId, pos.topicId, pos.partition };
-                const auto [entry, inserted] = groupPositionCache_.try_emplace(key, pos.nextOffset);
-                if (!inserted && pos.nextOffset > entry->second) {
-                    entry->second = pos.nextOffset;
-                }
-                spdlog::debug("GroupCoordinationService::onEnterPreparingRebalance: "
-                              "captured position group='{}' topic={} partition={} nextOffset={}",
-                              groupId, pos.topicId, pos.partition, pos.nextOffset);
-            }
-        }
 
         // 1. Eagerly revoke all group push subscriptions for this member.
         gateway_->revokeGroupSubscriptions(sessionId);

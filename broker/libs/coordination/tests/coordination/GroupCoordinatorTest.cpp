@@ -1050,12 +1050,19 @@ TEST(GroupCoordinator, SyncGroupLeaderInStable_NoClobber) {
 //
 // The state table (GroupCoordinator.h:24) says:
 //   "Stable + join/leave → PreparingRebalance (generation bumped)"
-// An existing member re-joining while Stable must trigger a rebalance,
-// NOT be silently absorbed. This is the standard Kafka subscription-change
-// flow (consumer calls rejoin to change subscriptions or request reassignment).
+// A join that CHANGES the member's subscription (or a genuinely new member)
+// must trigger a rebalance — see SubscriptionChangeOnRejoin_* below.
+//
+// CG-6 idempotency guard (commit ec53265): an existing member re-joining while
+// Stable with an UNCHANGED subscription is a stale in-flight duplicate (a
+// buffered JoinGroup from a prior Rejoining cadence that arrived after the
+// group already stabilised). It must be silently absorbed — heartbeat refresh
+// + current-generation OK, NO rebalance and NO generation bump. Without this,
+// late JoinGroup frames re-trigger Stable→PreparingRebalance immediately after
+// auto-assign, causing an infinite-rebalance loop.
 // ===========================================================================
 
-TEST(GroupCoordinator, ExistingMemberRejoinWhileStable_TriggersRebalance) {
+TEST(GroupCoordinator, ExistingMemberRejoinWhileStable_SameSubscription_IsIdempotent) {
     GroupCoordinator gc("test-group", 0);
 
     // Reach Stable: single member, auto-assign.
@@ -1076,13 +1083,15 @@ TEST(GroupCoordinator, ExistingMemberRejoinWhileStable_TriggersRebalance) {
 
     Generation genStable = gc.generationId();
 
-    // Existing member re-joins while Stable — must trigger rebalance.
+    // Existing member re-joins while Stable with the SAME subscription — this is
+    // a stale duplicate join and must be absorbed idempotently (no rebalance).
     gc.join("member-a", kDefaultTimeoutMs, {"t"}, 300);
 
-    EXPECT_EQ(gc.state(), GroupState::PreparingRebalance)
-        << "Existing-member re-join while Stable must transition to PreparingRebalance";
-    EXPECT_GT(gc.generationId(), genStable)
-        << "Existing-member re-join while Stable must bump generation";
+    EXPECT_EQ(gc.state(), GroupState::Stable)
+        << "Same-subscription re-join while Stable must NOT trigger a rebalance "
+           "(CG-6 idempotency guard prevents the infinite-rebalance loop)";
+    EXPECT_EQ(gc.generationId(), genStable)
+        << "Same-subscription re-join while Stable must NOT bump generation";
 }
 
 // ===========================================================================
