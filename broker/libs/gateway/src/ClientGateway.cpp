@@ -640,6 +640,9 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len)
 {
+    // Guard against null egress (test sessions injected via injectTestSession
+    // have no real ExclusivePublication — only the onControlFrame_ callback path).
+    if (!session.egress) return false;
     return sendOnPub(*session.egress, buf, len);
 }
 
@@ -1885,6 +1888,135 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     }
 
     sendTo(*session, scratch_.data(), encoded);
+}
+
+// ---------------------------------------------------------------------------
+// CG-4: addGroupSubscription — create an internal push subscription for a
+// group member.  Seeds nextOffset from fromOffset (the committed offset from
+// the ReplicatedOffsetStore, or log-start/HW for auto.offset.reset).
+//
+// Reuses the SAME Subscription struct and pushSubscriptions() machinery;
+// marks isGroup=true so revokeGroupSubscriptions() can identify it.
+// Tracks the subscriptionId in groupMemberSubs_[memberSessionId].
+//
+// Returns subscriptionId > 0 on success, -1 if session is unknown or topic
+// is unreachable (topicRegistry_ null / bad topicId / bad partition).
+//
+// Single-writer: must be called on the duty-cycle thread.
+// Rebalance-time cold path: not on the per-cycle push hot path.
+// ---------------------------------------------------------------------------
+int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
+                                            int32_t topicId,
+                                            int32_t partition,
+                                            int64_t fromOffset,
+                                            uint8_t isolation)
+{
+    // Require a known session.
+    Session* session = sessions_.find(memberSessionId);
+    if (!session) {
+        spdlog::warn("ClientGateway::addGroupSubscription: unknown session={}", memberSessionId);
+        return -1;
+    }
+
+    // Validate the topic and partition via the registry.
+    if (!topicRegistry_) {
+        spdlog::warn("ClientGateway::addGroupSubscription: topicRegistry_ not set");
+        return -1;
+    }
+
+    rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+    if (!log) {
+        spdlog::warn("ClientGateway::addGroupSubscription: unknown topicId={} partition={}",
+                     topicId, partition);
+        return -1;
+    }
+
+    // Clamp fromOffset to [0, bound] where bound is HW when a replica is
+    // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start).
+    const int64_t leo = log->logEndOffset();
+    int64_t bound;
+    if (replicaRegistry_) {
+        const rune::replication::PartitionReplica* replica =
+            replicaRegistry_->lookup(topicId, partition);
+        bound = replica ? replica->highWatermark() : leo;
+    } else {
+        bound = leo;
+    }
+    const int64_t nextOffset = (fromOffset < 0)  ? int64_t{0}
+                             : (fromOffset > bound) ? bound
+                             : fromOffset;
+
+    // Allocate subscriptionId and register the group subscription.
+    const int64_t subId = ++nextSubscriptionId_;
+
+    Subscription sub;
+    sub.subscriptionId = subId;
+    sub.sessionId      = memberSessionId;
+    sub.topicId        = topicId;
+    sub.partition      = partition;
+    sub.nextOffset     = nextOffset;
+    sub.isolation      = isolation;
+    sub.isGroup        = true;
+
+    subscriptions_.emplace(subId, std::move(sub));
+
+    // Track the subscriptionId under this member session for eager revoke.
+    groupMemberSubs_[memberSessionId].push_back(subId);
+
+    spdlog::debug("ClientGateway::addGroupSubscription: sessionId={} subId={} "
+                  "topic={} partition={} nextOffset={}",
+                  memberSessionId, subId, topicId, partition, nextOffset);
+    return subId;
+}
+
+// ---------------------------------------------------------------------------
+// CG-4: revokeGroupSubscriptions — eagerly remove all push subscriptions
+// that were created via addGroupSubscription() for the given member session.
+//
+// Normal client-initiated subscriptions (isGroup==false) are NOT touched.
+// O(n_group_subs) where n_group_subs is the number of partitions assigned
+// to this member — typically very small.
+//
+// Single-writer: must be called on the duty-cycle thread.
+// ---------------------------------------------------------------------------
+void ClientGateway::revokeGroupSubscriptions(int64_t memberSessionId)
+{
+    auto it = groupMemberSubs_.find(memberSessionId);
+    if (it == groupMemberSubs_.end()) return;  // no group subs for this session
+
+    for (int64_t subId : it->second) {
+        const std::size_t removed = subscriptions_.erase(subId);
+        spdlog::debug("ClientGateway::revokeGroupSubscriptions: sessionId={} subId={} removed={}",
+                      memberSessionId, subId, removed);
+    }
+    groupMemberSubs_.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// CG-4: sendControlFrame — send an already-encoded frame (e.g. Assign) on
+// a session's egress.  Reuses the same sendTo path as all other responses.
+//
+// Returns true if the frame was accepted by the egress publication.
+// Does NOT modify scratch_ (the caller encodes the frame into its own buffer).
+//
+// Single-writer: must be called on the duty-cycle thread.
+// ---------------------------------------------------------------------------
+bool ClientGateway::sendControlFrame(int64_t sessionId,
+                                     const uint8_t* buf,
+                                     std::size_t len)
+{
+    // Invoke the optional test capture callback BEFORE the egress send.
+    // This allows test code to capture Assign frames without a live Aeron publication.
+    if (onControlFrame_) {
+        onControlFrame_(sessionId, buf, len);
+    }
+
+    Session* session = sessions_.find(sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway::sendControlFrame: unknown sessionId={} — dropped", sessionId);
+        return false;
+    }
+    return sendTo(*session, buf, len);
 }
 
 } // namespace rune::gateway

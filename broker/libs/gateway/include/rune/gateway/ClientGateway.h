@@ -219,6 +219,71 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // CG-4: Group-push API — called by GroupCoordinationService on rebalance.
+    // These are rebalance-time (cold-ish) operations; NOT on the hot push path.
+    // All three must be called from the single duty-cycle thread (single-writer).
+    // -----------------------------------------------------------------------
+
+    // addGroupSubscription — create an internal push subscription for a group
+    // member, seeded from fromOffset.  Reuses the SAME Subscription struct and
+    // pushSubscriptions() machinery.  Marks the subscription as a group sub so
+    // revokeGroupSubscriptions() removes it without touching client subs.
+    // Returns subscriptionId (> 0) on success, or -1 if sessionId is unknown.
+    int64_t addGroupSubscription(int64_t memberSessionId,
+                                 int32_t topicId,
+                                 int32_t partition,
+                                 int64_t fromOffset,
+                                 uint8_t isolation);
+
+    // revokeGroupSubscriptions — remove ALL push subscriptions that were created
+    // via addGroupSubscription for a member session.  Normal client subscriptions
+    // are unaffected.  No-op if the session has no group subscriptions.
+    void revokeGroupSubscriptions(int64_t memberSessionId);
+
+    // sendControlFrame — send an already-encoded frame (e.g. Assign) on a
+    // session's egress.  Reuses the same sendTo path as all other responses.
+    // Returns true if the frame was accepted by the egress publication.
+    bool sendControlFrame(int64_t sessionId, const uint8_t* buf, std::size_t len);
+
+    // -----------------------------------------------------------------------
+    // CG-4 test / introspection hooks — not used in production code paths.
+    // -----------------------------------------------------------------------
+
+    // setOnControlFrame — optional callback invoked by sendControlFrame BEFORE
+    // the actual egress send (regardless of whether the send succeeds).  Useful
+    // in tests to capture Assign frames without a live Aeron egress publication.
+    // Pass nullptr to clear.  Single-writer: call only on the duty-cycle thread.
+    using ControlFrameCallback = std::function<void(int64_t sessionId,
+                                                    const uint8_t* buf,
+                                                    std::size_t len)>;
+    void setOnControlFrame(ControlFrameCallback cb) noexcept {
+        onControlFrame_ = std::move(cb);
+    }
+
+    // groupMemberSubCount — number of group push subscriptions tracked for a
+    // given member session.  Returns 0 if the session has no group subs.
+    // For tests to assert that addGroupSubscription added the right entries.
+    [[nodiscard]] std::size_t groupMemberSubCount(int64_t memberSessionId) const noexcept {
+        const auto it = groupMemberSubs_.find(memberSessionId);
+        return (it != groupMemberSubs_.end()) ? it->second.size() : 0u;
+    }
+
+    // injectTestSession — install a fake session with no real egress publication.
+    // The ExclusivePublication shared_ptr is null; sendTo will call pub.isConnected()
+    // which will crash unless sendControlFrame uses the onControlFrame_ callback
+    // only path (or the session has a real pub).  Tests must install onControlFrame_
+    // if they want to capture frames, and set topicRegistry_ before calling
+    // addGroupSubscription.
+    //
+    // Returns the allocated sessionId.
+    // Single-writer: call only on the duty-cycle thread or before doWork() starts.
+    int64_t injectTestSession(int64_t nowNs = 0) {
+        const int64_t sid = sessions_.nextSessionId();
+        sessions_.add(sid, /*egress=*/nullptr, nowNs);
+        return sid;
+    }
+
+    // -----------------------------------------------------------------------
     // sessionCount — number of active sessions.
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t sessionCount() const {
@@ -280,6 +345,9 @@ private:
     //   above majority-HW" — those are never safe to deliver.
     //   TODO(Milestone C): read_committed additionally uses the real LSO (log-
     //   stable-offset) once transactions land; LSO ≤ HW always.
+    // CG-4: isGroup marks subscriptions created via addGroupSubscription so
+    // that revokeGroupSubscriptions() can remove exactly those and leave
+    // normal client-initiated subscriptions untouched.
     // -----------------------------------------------------------------------
     struct Subscription {
         int64_t subscriptionId = 0;
@@ -288,6 +356,7 @@ private:
         int32_t partition      = 0;
         int64_t nextOffset     = 0;
         uint8_t isolation      = 0;   // 0=read_uncommitted, 1=read_committed
+        bool    isGroup        = false; // CG-4: true = created by addGroupSubscription
     };
 
     // -----------------------------------------------------------------------
@@ -473,6 +542,17 @@ private:
 
     // GB-3: Monotonic subscription ID generator (starts at 1).
     int64_t nextSubscriptionId_ = 0;
+
+    // CG-4: Group-member push subscription tracking.
+    // Maps memberSessionId → set of subscriptionIds that were created via
+    // addGroupSubscription() for that member.  Enables O(n_subs) eager revoke
+    // that removes ONLY group subs, leaving normal client subs untouched.
+    // Single-writer (duty-cycle thread only).
+    std::unordered_map<int64_t, std::vector<int64_t>> groupMemberSubs_;
+
+    // CG-4: Optional control-frame capture callback (for tests without live Aeron egress).
+    // Invoked by sendControlFrame BEFORE the actual egress send.  Null in production.
+    ControlFrameCallback onControlFrame_;
 
     // GB-5p2: Dirty-log set + group-commit flush cadence.
     //
