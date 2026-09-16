@@ -200,8 +200,9 @@ private:
     rune::gateway::ClientGateway*              gateway_ = nullptr;
 
     /// Per-group coordinators.  Inserted lazily on first Join.
-    /// std::map for deterministic ordering (not hot path).
-    std::map<GroupId, rune::coordination::GroupCoordinator> coordinators_;
+    /// std::map with std::less<> (transparent comparator) so hot-path find()
+    /// can be called with std::string_view without constructing a std::string.
+    std::map<GroupId, rune::coordination::GroupCoordinator, std::less<>> coordinators_;
 
     // CG-4: member → sessionId tracking.
     // Keyed by (groupId + ":" + memberId) for global uniqueness.
@@ -209,7 +210,16 @@ private:
     // Used by doWork to know which egress session to send Assign frames to and
     // which session to create push subscriptions for.
     // Single-writer (duty-cycle thread); no locks needed.
-    std::unordered_map<std::string, int64_t> memberSessionMap_;
+    // std::map with std::less<> enables transparent find() with string_view.
+    std::map<std::string, int64_t, std::less<>> memberSessionMap_;
+
+    // CG-7 zero-alloc: per-handler scratch strings.
+    // Assigned via assign(data, size) each call — no heap alloc when
+    // capacity >= size (capacity grows on first long-string call, then stable).
+    // Never holds state across call boundaries — purely per-handler scratch.
+    std::string groupIdScratch_;    ///< groupId span → reusable std::string
+    std::string memberIdScratch_;   ///< memberId span → reusable std::string
+    std::string memberKeyScratch_;  ///< "groupId:memberId" composite lookup key
 
     // CG-4: scratch buffer for Assign frame encoding.
     // 68 KiB bound: header 24 + generationId 4 + count 2 = 30 B fixed; each

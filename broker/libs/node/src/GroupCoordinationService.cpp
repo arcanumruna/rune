@@ -77,6 +77,13 @@ GroupCoordinationService::GroupCoordinationService(
     topicIdToNameScratch_.reserve(32);
     joinTopicsScratch_.reserve(32);
     assignFrameTpScratch_.reserve(64);  // CG-4: Assign frame TopicPartition32 scratch
+
+    // CG-7 zero-alloc: pre-reserve per-handler string scratch buffers.
+    // 128 bytes covers groupId + memberId + composite key for any realistic name.
+    // After the first long-string call the capacity stabilises — no per-call alloc.
+    groupIdScratch_.reserve(64);
+    memberIdScratch_.reserve(64);
+    memberKeyScratch_.reserve(128);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,10 +243,14 @@ size_t GroupCoordinationService::handleJoinGroup(
     }
     const pc::JoinGroup& msg = *msgOpt;
 
-    const std::string groupIdStr(
+    // CG-7 zero-alloc: assign() into pre-reserved scratch strings; no heap alloc
+    // when capacity >= size (capacity grows on first long-string call, then stable).
+    groupIdScratch_.assign(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
-    const std::string memberIdStr(
+    memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+    const std::string& groupIdStr  = groupIdScratch_;
+    const std::string& memberIdStr = memberIdScratch_;
 
     // NotCoordinator fence.
     if (!isLocalCoordinator()) {
@@ -299,10 +310,14 @@ size_t GroupCoordinationService::handleJoinGroup(
     // Store/overwrite on every JoinGroup (covers re-join with the same memberId
     // but from a new TCP session with a different sessionId).
     if (!jr.memberId.empty() && jr.errorCode != coord::JoinResult::kErrDead) {
-        const std::string memberKey = groupIdStr + ":" + jr.memberId;
-        memberSessionMap_[memberKey] = msg.sessionId;
+        // CG-7 zero-alloc: build composite key into pre-reserved scratch.
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupIdStr);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(jr.memberId);
+        memberSessionMap_[memberKeyScratch_] = msg.sessionId;
         spdlog::debug("GroupCoordinationService: JoinGroup tracking member '{}' sessionId={}",
-                      memberKey, msg.sessionId);
+                      memberKeyScratch_, msg.sessionId);
     }
 
     // CG-6 fix: if the group just reached CompletingRebalance (all expected
@@ -364,10 +379,13 @@ size_t GroupCoordinationService::handleSyncGroup(
     }
     const pc::SyncGroup& msg = *msgOpt;
 
-    const std::string groupIdStr(
+    // CG-7 zero-alloc: assign() into pre-reserved scratch strings.
+    groupIdScratch_.assign(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
-    const std::string memberIdStr(
+    memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+    const std::string& groupIdStr  = groupIdScratch_;
+    const std::string& memberIdStr = memberIdScratch_;
 
     // NotCoordinator fence.
     if (!isLocalCoordinator()) {
@@ -531,10 +549,14 @@ size_t GroupCoordinationService::handleHeartbeat(
     }
     const pc::Heartbeat& msg = *msgOpt;
 
-    const std::string groupIdStr(
+    // CG-7 zero-alloc: assign() into pre-reserved scratch strings; no heap alloc
+    // once capacity >= size.  Heartbeat is the hottest handler path.
+    groupIdScratch_.assign(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
-    const std::string memberIdStr(
+    memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+    const std::string& groupIdStr  = groupIdScratch_;
+    const std::string& memberIdStr = memberIdScratch_;
 
     // NotCoordinator fence.
     if (!isLocalCoordinator()) {
@@ -577,10 +599,13 @@ size_t GroupCoordinationService::handleLeaveGroup(
     }
     const pc::LeaveGroup& msg = *msgOpt;
 
-    const std::string groupIdStr(
+    // CG-7 zero-alloc: assign() into pre-reserved scratch strings.
+    groupIdScratch_.assign(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
-    const std::string memberIdStr(
+    memberIdScratch_.assign(
         reinterpret_cast<const char*>(msg.memberId.data()), msg.memberId.size());
+    const std::string& groupIdStr  = groupIdScratch_;
+    const std::string& memberIdStr = memberIdScratch_;
 
     // NotCoordinator fence.
     if (!isLocalCoordinator()) {
@@ -598,8 +623,11 @@ size_t GroupCoordinationService::handleLeaveGroup(
     // records for its old partitions until session reap, which can overlap with
     // the reassigned owner (dup delivery, single-owner violation).
     if (gateway_ && !memberIdStr.empty()) {
-        const std::string memberKey = groupIdStr + ":" + memberIdStr;
-        const auto sessIt = memberSessionMap_.find(memberKey);
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupIdStr);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(memberIdStr);
+        const auto sessIt = memberSessionMap_.find(memberKeyScratch_);
         if (sessIt != memberSessionMap_.end()) {
             const int64_t leavingSid = sessIt->second;
             gateway_->revokeGroupSubscriptions(leavingSid);
@@ -621,8 +649,13 @@ size_t GroupCoordinationService::handleLeaveGroup(
 
     // CG-4: drop member → session mapping on Leave.
     if (!memberIdStr.empty()) {
-        const std::string memberKey = groupIdStr + ":" + memberIdStr;
-        memberSessionMap_.erase(memberKey);
+        // memberKeyScratch_ was already built above; rebuild in case the
+        // gateway block was skipped (empty gateway_).
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupIdStr);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(memberIdStr);
+        memberSessionMap_.erase(memberKeyScratch_);
     }
 
     pc::LeaveGroupResponse resp;
@@ -645,8 +678,10 @@ size_t GroupCoordinationService::handleOffsetCommit(
     }
     const pc::OffsetCommit& msg = *msgOpt;
 
-    const std::string groupIdStr(
+    // CG-7 zero-alloc: assign() into pre-reserved scratch; no heap alloc once stable.
+    groupIdScratch_.assign(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    const std::string& groupIdStr = groupIdScratch_;
 
     // NotCoordinator fence — fires for both empty and non-empty entry lists.
     // For empty entries: encode a sentinel single result with NotCoordinator so
@@ -754,8 +789,10 @@ size_t GroupCoordinationService::handleOffsetFetch(
     }
     const pc::OffsetFetch& msg = *msgOpt;
 
-    const std::string groupIdStr(
+    // CG-7 zero-alloc: assign() into pre-reserved scratch; no heap alloc once stable.
+    groupIdScratch_.assign(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
+    const std::string& groupIdStr = groupIdScratch_;
 
     // NotCoordinator fence — fires for both empty and non-empty entry lists.
     // For empty entries: encode a sentinel result so the caller can detect the
@@ -888,8 +925,12 @@ void GroupCoordinationService::onEnterPreparingRebalance(
     const int32_t gen = coord.generationId();
 
     for (const auto& member : coord.members()) {
-        const std::string memberKey = groupId + ":" + member.memberId;
-        const auto it = memberSessionMap_.find(memberKey);
+        // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupId);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(member.memberId);
+        const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) continue;  // no session tracked yet (early join)
 
         const int64_t sessionId = it->second;
@@ -952,8 +993,12 @@ void GroupCoordinationService::onReachedStable(
     const int32_t gen = coord.generationId();
 
     for (const auto& member : coord.members()) {
-        const std::string memberKey = groupId + ":" + member.memberId;
-        const auto it = memberSessionMap_.find(memberKey);
+        // CG-7 zero-alloc: build memberKey into pre-reserved scratch string.
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupId);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(member.memberId);
+        const auto it = memberSessionMap_.find(memberKeyScratch_);
         if (it == memberSessionMap_.end()) {
             spdlog::warn("GroupCoordinationService::onReachedStable: "
                          "no sessionId for member '{}' in group '{}' — skipping",
