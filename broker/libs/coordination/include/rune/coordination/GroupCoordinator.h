@@ -280,6 +280,12 @@ public:
     [[nodiscard]] Generation            generationId() const noexcept { return generationId_; }
     [[nodiscard]] const std::string&    leaderId()     const noexcept { return leaderId_; }
 
+    /// True when the group leader has submitted sync assignments in this rebalance
+    /// epoch.  Used by GroupCoordinationService::doWork to detect
+    /// CompletingRebalance groups that still need autoAssignAndSync (regardless
+    /// of whether the state was reached via join-timeout or via all-members-rejoined).
+    [[nodiscard]] bool leaderSynced() const noexcept { return leaderSynced_; }
+
     /// All current members (snapshot — no alloc guarantee for the vector itself,
     /// but elements are stable while no join/leave/expire occurs).
     [[nodiscard]] const std::vector<MemberInfo>& members() const noexcept { return members_; }
