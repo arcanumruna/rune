@@ -7,6 +7,8 @@
 
 #include <rune/node/GroupCoordinationService.h>
 
+#include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
+
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -74,6 +76,7 @@ GroupCoordinationService::GroupCoordinationService(
     fetchResultScratch_.reserve(64);
     topicIdToNameScratch_.reserve(32);
     joinTopicsScratch_.reserve(32);
+    assignFrameTpScratch_.reserve(64);  // CG-4: Assign frame TopicPartition32 scratch
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +141,21 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         const int w = coord.doWork(nowNs);
         work += w;
 
+        // CG-4: detect PreparingRebalance entry (membership change) and eagerly
+        // revoke all group push subscriptions + send empty Assign to each member.
+        // This fires when:
+        //   (a) stateBefore == Stable and stateAfter == PreparingRebalance
+        //       (member join/leave triggered a new rebalance)
+        //   (b) stateBefore == CompletingRebalance and a member joined causing
+        //       another rebalance — but typically handled by the join logic.
+        // Guard: only trigger once per entry by checking stateBefore != PreparingRebalance
+        // and stateAfter == PreparingRebalance (avoid repeated revoke calls).
+        const coord::GroupState stateAfter = coord.state();
+        if (stateAfter == coord::GroupState::PreparingRebalance &&
+            stateBefore != coord::GroupState::PreparingRebalance) {
+            onEnterPreparingRebalance(groupId, coord);
+        }
+
         // Check for CompletingRebalance → autoAssignAndSync.
         //
         // The group can reach CompletingRebalance via two paths:
@@ -152,9 +170,6 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         // In both cases we need to call autoAssignAndSync to compute assignments
         // and drive the group into Stable.  We use !leaderSynced() as the guard
         // so we don't call it twice if doWork is already past it.
-        //
-        // CG-4 will hook here to send Assign egress frames.
-        const coord::GroupState stateAfter = coord.state();
         if (stateAfter == coord::GroupState::CompletingRebalance && !coord.leaderSynced()) {
             // Auto-assign with RangeAssignor; transitions to Stable.
             const coord::TopicPartitionCounts partCounts = buildTopicPartitionCounts();
@@ -163,6 +178,10 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
             if (sr.ok()) {
                 spdlog::debug("GroupCoordinationService: group='{}' auto-assigned, Stable",
                               groupId);
+                // CG-4: on reaching Stable, create push subscriptions and send Assign frames.
+                if (coord.state() == coord::GroupState::Stable) {
+                    onReachedStable(groupId, coord, nowNs);
+                }
             } else {
                 spdlog::warn("GroupCoordinationService: group='{}' autoAssignAndSync failed: {}",
                              groupId, sr.errorCode);
@@ -241,6 +260,18 @@ size_t GroupCoordinationService::handleJoinGroup(
                                    msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000,
                                    joinTopicsScratch_,
                                    nowNs);
+
+    // CG-4: track member → sessionId so doWork can send Assign frames and create
+    // push subscriptions without carrying session context through the coordinator.
+    // Key format: "<groupId>:<memberId>" (both non-empty in steady state).
+    // Store/overwrite on every JoinGroup (covers re-join with the same memberId
+    // but from a new TCP session with a different sessionId).
+    if (!jr.memberId.empty() && jr.errorCode != coord::JoinResult::kErrDead) {
+        const std::string memberKey = groupIdStr + ":" + jr.memberId;
+        memberSessionMap_[memberKey] = msg.sessionId;
+        spdlog::debug("GroupCoordinationService: JoinGroup tracking member '{}' sessionId={}",
+                      memberKey, msg.sessionId);
+    }
 
     // Build response.
     const std::string& assignedMemberId = jr.memberId;
@@ -427,6 +458,12 @@ size_t GroupCoordinationService::handleLeaveGroup(
         it->second.leave(memberIdStr, it->second.generationId(), nowNs);
     }
     // If group doesn't exist: no-op (treat as already left).
+
+    // CG-4: drop member → session mapping on Leave.
+    if (!memberIdStr.empty()) {
+        const std::string memberKey = groupIdStr + ":" + memberIdStr;
+        memberSessionMap_.erase(memberKey);
+    }
 
     pc::LeaveGroupResponse resp;
     resp.sessionId     = msg.sessionId;
@@ -663,6 +700,183 @@ size_t GroupCoordinationService::handleOffsetFetch(
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
     return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+}
+
+// ===========================================================================
+// CG-4 helpers
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// onEnterPreparingRebalance — called from doWork when a group transitions into
+// PreparingRebalance (e.g. a new member joined while Stable, or a member left).
+//
+// For every current member:
+//   1. revokeGroupSubscriptions(memberSession) — stop all group push deliveries.
+//   2. sendControlFrame with an Assign{gen, {}} (empty = revoke all).
+//
+// This is the "eager stop-the-world" revoke: no member receives records for
+// partitions from the previous generation once rebalance begins.
+//
+// No-op when gateway_ is null (tests without a real gateway).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::onEnterPreparingRebalance(
+    const GroupId& groupId,
+    rune::coordination::GroupCoordinator& coord)
+{
+    if (!gateway_) return;  // no push path wired
+
+    const int32_t gen = coord.generationId();
+
+    for (const auto& member : coord.members()) {
+        const std::string memberKey = groupId + ":" + member.memberId;
+        const auto it = memberSessionMap_.find(memberKey);
+        if (it == memberSessionMap_.end()) continue;  // no session tracked yet (early join)
+
+        const int64_t sessionId = it->second;
+
+        // 1. Eagerly revoke all group push subscriptions for this member.
+        gateway_->revokeGroupSubscriptions(sessionId);
+
+        // 2. Send empty Assign{gen, {}} (revoke).
+        // Encode into assignFrameScratch_ (pre-allocated, no heap alloc).
+        const std::size_t needed = pc::Assign::encodedSizeFor(0);
+        if (needed > kAssignFrameScratchSize) {
+            spdlog::error("GroupCoordinationService::onEnterPreparingRebalance: "
+                          "Assign frame size {} > scratch {}; skipping member '{}'",
+                          needed, kAssignFrameScratchSize, member.memberId);
+            continue;
+        }
+
+        pc::Assign revokeFrame;
+        revokeFrame.sessionId     = sessionId;
+        revokeFrame.correlationId = 0;
+        revokeFrame.generationId  = gen;
+        const std::size_t encoded = revokeFrame.encode(
+            assignFrameScratch_.data(), std::span<const pc::TopicPartition32>{});
+
+        const bool sent = gateway_->sendControlFrame(
+            sessionId, assignFrameScratch_.data(), encoded);
+        spdlog::debug("GroupCoordinationService: revoke Assign(gen={}) sent={} "
+                      "to member='{}' sessionId={}",
+                      gen, sent, member.memberId, sessionId);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// onReachedStable — called from doWork after autoAssignAndSync succeeds and
+// the group transitions to Stable.
+//
+// For every member:
+//   1. For each assigned (topicId, partition):
+//      - fromOffset = offsets_->fetch(group, tp) → committed, or 0 (earliest)
+//        if not found.  (Milestone-D will support auto.offset.reset=latest via
+//        replicaRegistry lookup — for now, "no commit" → earliest = 0.)
+//      - addGroupSubscription(memberSession, topicId, partition, fromOffset, 0)
+//   2. Build Assign{gen, assignments} and send via sendControlFrame.
+//      Bounded by assignFrameScratch_ capacity (outCap-bounded encode).
+//
+// Resolves the CG-3 carried item: Assign frame encoding is outCap-bounded
+// (entries that exceed the scratch capacity are silently capped, not written).
+//
+// No-op when gateway_ is null (tests without a real gateway).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::onReachedStable(
+    const GroupId& groupId,
+    rune::coordination::GroupCoordinator& coord,
+    int64_t nowNs)
+{
+    (void)nowNs;
+    if (!gateway_) return;  // no push path wired
+
+    const int32_t gen = coord.generationId();
+
+    for (const auto& member : coord.members()) {
+        const std::string memberKey = groupId + ":" + member.memberId;
+        const auto it = memberSessionMap_.find(memberKey);
+        if (it == memberSessionMap_.end()) {
+            spdlog::warn("GroupCoordinationService::onReachedStable: "
+                         "no sessionId for member '{}' in group '{}' — skipping",
+                         member.memberId, groupId);
+            continue;
+        }
+        const int64_t sessionId = it->second;
+
+        // Build assignment and create push subscriptions.
+        assignFrameTpScratch_.clear();
+
+        for (const auto& tp : member.assignment) {
+            // Resolve topic name → topicId via TopicRegistry.
+            int32_t topicId = -1;
+            if (topics_) {
+                const auto opt = topics_->topicIdForName(tp.topic);
+                if (opt) topicId = *opt;
+            }
+            if (topicId < 0) {
+                spdlog::warn("GroupCoordinationService::onReachedStable: "
+                             "unknown topic '{}' for member '{}' — skipping partition",
+                             tp.topic, member.memberId);
+                continue;
+            }
+
+            // fromOffset: use committed offset if available; else 0 (earliest).
+            int64_t fromOffset = 0;
+            {
+                const auto committed = offsets_->fetch(groupId, tp);
+                if (committed.has_value()) {
+                    fromOffset = committed->offset;
+                }
+                // auto.offset.reset=latest would use replica->highWatermark() here;
+                // deferred to Milestone-D.  For now: no commit → earliest (0).
+            }
+
+            // Create the push subscription (resumed from fromOffset).
+            const int64_t subId = gateway_->addGroupSubscription(
+                sessionId, topicId, tp.partition, fromOffset, /*isolation=*/0);
+            if (subId < 0) {
+                spdlog::warn("GroupCoordinationService::onReachedStable: "
+                             "addGroupSubscription failed for member '{}' topic={} partition={}",
+                             member.memberId, topicId, tp.partition);
+                continue;
+            }
+
+            // Accumulate for the Assign frame (outCap-bounded below).
+            // Check if this entry would overflow the scratch before pushing.
+            const std::size_t nextCount = assignFrameTpScratch_.size() + 1;
+            const std::size_t neededForNext = pc::Assign::encodedSizeFor(nextCount);
+            if (neededForNext > kAssignFrameScratchSize) {
+                spdlog::warn("GroupCoordinationService::onReachedStable: "
+                             "Assign frame capacity reached at {} entries (scratch={}B); "
+                             "remaining partitions pushed but not in Assign frame",
+                             assignFrameTpScratch_.size(), kAssignFrameScratchSize);
+                break;  // push subscriptions already created above; frame is capped
+            }
+            assignFrameTpScratch_.push_back(pc::TopicPartition32{topicId, tp.partition});
+        }
+
+        // Encode and send Assign{gen, assignment}.
+        const std::size_t needed = pc::Assign::encodedSizeFor(assignFrameTpScratch_.size());
+        if (needed > kAssignFrameScratchSize) {
+            // Defensive — should never happen given the outCap-bounded loop above.
+            spdlog::error("GroupCoordinationService::onReachedStable: "
+                          "Assign frame {} > scratch {} — BUG; skipping send",
+                          needed, kAssignFrameScratchSize);
+            continue;
+        }
+
+        pc::Assign assignFrame;
+        assignFrame.sessionId     = sessionId;
+        assignFrame.correlationId = 0;
+        assignFrame.generationId  = gen;
+        const std::size_t encoded = assignFrame.encode(
+            assignFrameScratch_.data(),
+            std::span<const pc::TopicPartition32>(assignFrameTpScratch_));
+
+        const bool sent = gateway_->sendControlFrame(
+            sessionId, assignFrameScratch_.data(), encoded);
+        spdlog::debug("GroupCoordinationService::onReachedStable: Assign(gen={}, {} partitions) "
+                      "sent={} to member='{}' sessionId={}",
+                      gen, assignFrameTpScratch_.size(), sent, member.memberId, sessionId);
+    }
 }
 
 } // namespace rune::node

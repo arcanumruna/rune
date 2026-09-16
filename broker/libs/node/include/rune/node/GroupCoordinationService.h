@@ -1,7 +1,8 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// GroupCoordinationService.h — CG-3: wires GroupCoordinator + ReplicatedOffsetStore
-// into the broker duty cycle.
+// GroupCoordinationService.h — CG-3/CG-4: wires GroupCoordinator +
+// ReplicatedOffsetStore into the broker duty cycle; translates group
+// assignments into HW-bounded push subscriptions (CG-4).
 //
 // Namespace: rune::node
 // C++23. Single-writer (doWork driven). No locks. No hot-path allocation.
@@ -11,6 +12,10 @@
 //   - Per-group GroupCoordinator lifecycle: lazy get-or-create on first Join.
 //   - doWork(nowNs): drives every GroupCoordinator::doWork; on
 //     CompletingRebalance-transition → autoAssignAndSync; returns work count.
+//   - CG-4: on Stable: for each member, seed push subscriptions (one per
+//     assigned partition, resumed from committed offset or auto.offset.reset)
+//     and send Assign control frames.  On PreparingRebalance: eagerly revoke
+//     all group push subscriptions and send empty Assign (revoke) frames.
 //   - Six request handlers (JoinGroup / SyncGroup / Heartbeat / LeaveGroup /
 //     OffsetCommit / OffsetFetch): decode, act, encode response into a reused
 //     caller-supplied buffer; return bytes written.
@@ -36,14 +41,8 @@
 //   offset results) are members of GroupCoordinationService and pre-reserved
 //   so steady-state is allocation-free.  New-group creation (coordinator map
 //   insert + GroupCoordinator ctor) allocates once — cold path only.
-//
-// ## CG-4 seam
-//
-//   After doWork calls autoAssignAndSync, CG-4 will additionally push Assign
-//   frames to all member sessions and create/revoke push subscriptions.
-//   The service returns the work count; CG-4 can extend doWork or hook a
-//   callback.  The interface here is exactly what the brief specifies so CG-4
-//   can consume coordinator(groupId) without API changes.
+//   CG-4: Assign encoding uses assignFrameScratch_ (pre-allocated 68 KiB
+//   member buffer); no per-rebalance heap allocation.
 // ---------------------------------------------------------------------------
 
 #include <rune/coordination/GroupCoordinator.h>
@@ -54,12 +53,18 @@
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+// Forward declaration — avoid including ClientGateway.h in this header
+// (would create a circular dependency: gateway includes node, node includes gateway).
+namespace rune::gateway { class ClientGateway; }
 
 namespace rune::node {
 
@@ -95,6 +100,19 @@ public:
     // No per-cycle allocation in steady state.
     // -----------------------------------------------------------------------
     int doWork(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // setGateway — wire in the ClientGateway for CG-4 push-subscription
+    // translation.  Must be called before doWork() for group push delivery.
+    // May be null (doWork still drives rebalance but sends no Assign frames
+    // and creates no push subscriptions — useful for tests that exercise
+    // coordinator state without a real gateway).
+    // Non-owning; lifetime must exceed the service.
+    // Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setGateway(rune::gateway::ClientGateway* gateway) noexcept {
+        gateway_ = gateway;
+    }
 
     // -----------------------------------------------------------------------
     // isLocalCoordinator — true when this node is the cluster leader.
@@ -147,6 +165,19 @@ private:
     /// Cold path — called only on join-timeout transition.
     rune::coordination::TopicPartitionCounts buildTopicPartitionCounts() const;
 
+    // CG-4: called from doWork on the PreparingRebalance entry for a group.
+    // Revokes all group push subscriptions and sends empty Assign (revoke) to
+    // every member session.
+    void onEnterPreparingRebalance(const GroupId& groupId,
+                                   rune::coordination::GroupCoordinator& coord);
+
+    // CG-4: called from doWork after autoAssignAndSync succeeds (Stable).
+    // Creates push subscriptions (resumed from committed offset) and sends
+    // Assign frames with each member's new partition set.
+    void onReachedStable(const GroupId& groupId,
+                         rune::coordination::GroupCoordinator& coord,
+                         int64_t nowNs);
+
     // -----------------------------------------------------------------------
     // Members
     // -----------------------------------------------------------------------
@@ -155,9 +186,32 @@ private:
     std::function<bool()>                      isLeaderFn_;
     std::function<NodeId()>                    leaderIdFn_;
 
+    // CG-4: ClientGateway — non-owning; may be null (tests without push subs).
+    rune::gateway::ClientGateway*              gateway_ = nullptr;
+
     /// Per-group coordinators.  Inserted lazily on first Join.
     /// std::map for deterministic ordering (not hot path).
     std::map<GroupId, rune::coordination::GroupCoordinator> coordinators_;
+
+    // CG-4: member → sessionId tracking.
+    // Keyed by (groupId + ":" + memberId) for global uniqueness.
+    // Populated on JoinGroup; cleared on Leave/expiry revoke.
+    // Used by doWork to know which egress session to send Assign frames to and
+    // which session to create push subscriptions for.
+    // Single-writer (duty-cycle thread); no locks needed.
+    std::unordered_map<std::string, int64_t> memberSessionMap_;
+
+    // CG-4: scratch buffer for Assign frame encoding.
+    // 68 KiB covers any Assign frame (header 24 + gen 4 + count 2 + 64K partitions * 8B
+    // = ~512 KiB for 65535 partitions, but real clusters << 1K partitions per member).
+    // Sized to match kScratchSize in ClientGateway (68 KiB — covers any realistic frame).
+    // Pre-allocated; no per-rebalance heap allocation.
+    static constexpr std::size_t kAssignFrameScratchSize = 68 * 1024;
+    std::array<uint8_t, kAssignFrameScratchSize> assignFrameScratch_{};
+
+    // CG-4: assignment TopicPartition32 encode scratch (for Assign frame encoding).
+    // Pre-reserved; stays at steady-state capacity after first rebalance.
+    std::vector<rune::protocol::client::TopicPartition32> assignFrameTpScratch_;
 
     // -----------------------------------------------------------------------
     // Pre-reserved scratch vectors — avoid per-handler allocation on hot path.
