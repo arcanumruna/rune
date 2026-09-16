@@ -7,10 +7,20 @@ The dr_client binary (rune-client-cpp/examples/dr_client.cpp, image
     DELIVERED cid=<c> key=<k> seq=<s> part=<p> offset=<o>
     SUMMARY   produced=<np> delivered=<nd> mode=<m> rc=<rc>
 
+Group mode (RUNE_MODE=group) additionally emits:
+    ASSIGN       cid=<c> parts=<p0,p1,...>
+    REVOKE       cid=<c> parts=<p0,p1,...>
+    GROUPREC     cid=<c> topic=<t> partition=<p> offset=<o> rec_cid=<rc> rec_key=<rk> rec_seq=<rs>
+    GROUPSUMMARY cid=<c> consumed=<n> rc=<rc>
+
 `run_clients(n, ...)` runs n such containers concurrently against the cluster,
 collects every line, and returns a `Results` object the invariant assertions
 consume.  Each client gets a disjoint client id (0..n-1) and its own egress
 port so their Aeron UDP endpoints never collide.
+
+`run_group(members, producer_n, ...)` launches producer_n produce-mode clients
+plus `members` group-mode consumers in the same group, collects all parsed
+output, and returns a `GroupResults` the group-invariant assertions consume.
 """
 
 from __future__ import annotations
@@ -20,6 +30,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Optional
 
 from .dockerutil import run
 
@@ -28,6 +39,15 @@ DR_IMAGE = "rune-dr-client:dev"
 _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _SUMMARY_RE = re.compile(r"SUMMARY produced=(\d+) delivered=(\d+) mode=(\S+) rc=(\d+)")
+
+# Group-mode regexes
+_ASSIGN_RE = re.compile(r"ASSIGN cid=(-?\d+) parts=([\d,]*)")
+_REVOKE_RE = re.compile(r"REVOKE cid=(-?\d+) parts=([\d,]*)")
+_GROUPREC_RE = re.compile(
+    r"GROUPREC cid=(-?\d+) topic=(\S+) partition=(-?\d+) offset=(-?\d+)"
+    r" rec_cid=(-?\d+) rec_key=(-?\d+) rec_seq=(-?\d+)"
+)
+_GROUPSUMMARY_RE = re.compile(r"GROUPSUMMARY cid=(-?\d+) consumed=(\d+) rc=(\d+)")
 
 
 @dataclass
@@ -84,6 +104,242 @@ class Results:
             if c.cid == cid:
                 return c
         raise KeyError(cid)
+
+
+# ---------------------------------------------------------------------------
+# Group-consumer data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GroupRec:
+    """A single record received by a group-consumer member."""
+    member_cid: int    # the consumer-group member's client id
+    topic: str
+    partition: int
+    offset: int
+    rec_cid: int       # cid encoded in the record value payload
+    rec_key: int       # key encoded in the payload
+    rec_seq: int       # seq encoded in the payload
+
+
+@dataclass
+class GroupMemberResult:
+    """Parsed output of one group-consumer member container."""
+    cid: int
+    exit_code: int
+    rc: int            # from GROUPSUMMARY rc= field (0=success)
+    consumed: int      # total records consumed (all assigned partitions)
+    records: list[GroupRec] = field(default_factory=list)
+    assigned_partitions: list[list[int]] = field(default_factory=list)  # list of assignment events
+    revoked_partitions: list[list[int]] = field(default_factory=list)
+    raw: str = ""
+
+
+@dataclass
+class GroupResults:
+    """Collected output from a run_group() call.
+
+    ``produce_results`` is the Results from the producer containers.
+    ``member_results`` is a list of GroupMemberResult, one per consumer member.
+    """
+    produce_results: Results
+    member_results: list[GroupMemberResult] = field(default_factory=list)
+
+    @property
+    def all_produced(self) -> list[Msg]:
+        return self.produce_results.all_produced
+
+    @property
+    def all_group_records(self) -> list[GroupRec]:
+        out: list[GroupRec] = []
+        for m in self.member_results:
+            out.extend(m.records)
+        return out
+
+    @property
+    def ok(self) -> bool:
+        prod_ok = self.produce_results.ok
+        members_ok = all(
+            m.exit_code == 0 and m.rc == 0 for m in self.member_results
+        )
+        return prod_ok and members_ok
+
+
+def _parse_group_member_output(cid: int, exit_code: int, out: str) -> GroupMemberResult:
+    """Parse a group-consumer member's stdout+stderr into a GroupMemberResult."""
+    res = GroupMemberResult(cid=cid, exit_code=exit_code, rc=1, consumed=0, raw=out)
+    for m in _ASSIGN_RE.finditer(out):
+        parts_str = m[2].strip()
+        parts = [int(p) for p in parts_str.split(",") if p] if parts_str else []
+        res.assigned_partitions.append(parts)
+    for m in _REVOKE_RE.finditer(out):
+        parts_str = m[2].strip()
+        parts = [int(p) for p in parts_str.split(",") if p] if parts_str else []
+        res.revoked_partitions.append(parts)
+    for m in _GROUPREC_RE.finditer(out):
+        res.records.append(GroupRec(
+            member_cid=int(m[1]),
+            topic=m[2],
+            partition=int(m[3]),
+            offset=int(m[4]),
+            rec_cid=int(m[5]),
+            rec_key=int(m[6]),
+            rec_seq=int(m[7]),
+        ))
+    sm = _GROUPSUMMARY_RE.search(out)
+    if sm:
+        res.consumed = int(sm[2])
+        res.rc = int(sm[3])
+    # Fallback to SUMMARY rc if GROUPSUMMARY not found (shouldn't happen).
+    elif _SUMMARY_RE.search(out):
+        sm2 = _SUMMARY_RE.search(out)
+        res.rc = int(sm2[4])  # type: ignore[index]
+    return res
+
+
+def _run_one_group_member(
+    *,
+    network: str,
+    cid: int,
+    target_service: str,
+    egress_port: int,
+    cfg: dict,
+    timeout_s: int,
+) -> GroupMemberResult:
+    """Run a single group-consumer container and parse its output."""
+    name = f"dr-group-member-{cid}-{uuid.uuid4().hex[:8]}"
+    group_id = cfg.get("group_id", "test-group")
+    topics = cfg.get("topics", "events:0:1")
+    subscribe_ms = cfg.get("subscribe_ms", 30000)
+    autocommit_ms = cfg.get("autocommit_ms", 1000)
+    timeout_ms = cfg.get("timeout_ms", 15000)
+
+    env = {
+        "RUNE_TARGET": f"aeron:udp?endpoint={target_service}:40200",
+        "RUNE_TARGET_STREAM": "1",
+        "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
+        "RUNE_EGRESS_STREAM": "2",
+        "RUNE_DATA_DIR": "/var/lib/rune-client",
+        "RUNE_TOPICS": topics,
+        "RUNE_CLIENT_ID": str(cid),
+        "RUNE_MODE": "group",
+        "RUNE_GROUP_ID": group_id,
+        "RUNE_SUBSCRIBE_MS": str(subscribe_ms),
+        "RUNE_AUTOCOMMIT_MS": str(autocommit_ms),
+        "RUNE_TIMEOUT_MS": str(timeout_ms),
+    }
+
+    args = [
+        "docker", "run", "--rm",
+        "--name", name,
+        "--platform", "linux/amd64",
+        "--network", network,
+        "--hostname", name,
+        "--shm-size=64m",
+    ]
+    for k, v in env.items():
+        args += ["-e", f"{k}={v}"]
+    args.append(DR_IMAGE)
+
+    res = run(args, timeout=timeout_s)
+    return _parse_group_member_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
+
+
+def run_group(
+    members: int,
+    *,
+    network: str,
+    target_service: str,
+    group_id: str,
+    topics: str = "events:0:1",
+    records: int = 50,
+    keys: int = 1,
+    partitions: int = 2,
+    cid_base: int = 0,
+    subscribe_ms: int = 30000,
+    autocommit_ms: int = 1000,
+    timeout_ms: int = 15000,
+    timeout_s: int = 240,
+    start_stagger_ms: int = 400,
+    acks: str = "all",
+    producer_cid_base: Optional[int] = None,
+) -> GroupResults:
+    """Run a producer then M group-consumer members and return GroupResults.
+
+    Launches one produce-only container (cid_base) then `members` group-consumer
+    containers (cids: cid_base+1 .. cid_base+members).  The producer uses
+    cid_base+0 by default but can be overridden via producer_cid_base.
+
+    Args:
+        members:           Number of consumer-group members to launch.
+        network:           Docker network name (from cluster.compose.network_name()).
+        target_service:    Broker service name to connect to.
+        group_id:          Consumer group id string.
+        topics:            Topic spec "name:id:partitions,...".
+        records:           Records for the producer to produce (acks=all).
+        keys:              Distinct keys the producer uses.
+        partitions:        Number of topic partitions (for sub_partitions).
+        cid_base:          Base client-id; producer gets cid_base, members get
+                           cid_base+1..cid_base+members.
+        subscribe_ms:      How long each member consumes (window).
+        autocommit_ms:     Auto-commit interval for group consumers.
+        timeout_ms:        Connection timeout for both producers and consumers.
+        timeout_s:         Wall-clock budget per container.
+        start_stagger_ms:  Delay between launching member containers.
+        acks:              Producer acks policy ("all" default — majority-durable).
+        producer_cid_base: Override producer cid (defaults to cid_base).
+    """
+    if producer_cid_base is None:
+        producer_cid_base = cid_base
+    member_cid_base = cid_base + 1
+
+    # Phase 1: produce records with acks=all so every PRODUCED = majority-committed.
+    prod_results = run_clients(
+        1,
+        network=network,
+        target_service=target_service,
+        cid_base=producer_cid_base,
+        timeout_s=timeout_s,
+        mode="produce",
+        topics=topics,
+        records=records,
+        keys=max(keys, partitions),   # spread across partitions
+        acks=acks,
+        timeout_ms=timeout_ms,
+        connect_retries=0,
+        start_stagger_ms=0,
+    )
+
+    # Phase 2: run members consumer-group members concurrently.
+    member_results: list[GroupMemberResult] = []
+    member_cfg = {
+        "group_id": group_id,
+        "topics": topics,
+        "subscribe_ms": subscribe_ms,
+        "autocommit_ms": autocommit_ms,
+        "timeout_ms": timeout_ms,
+    }
+    egress_port_base = 40700  # disjoint from run_clients base (40500)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, members)) as pool:
+        futs = []
+        for i in range(members):
+            if i > 0 and start_stagger_ms > 0:
+                time.sleep(start_stagger_ms / 1000.0)
+            futs.append(pool.submit(
+                _run_one_group_member,
+                network=network,
+                cid=member_cid_base + i,
+                target_service=target_service,
+                egress_port=egress_port_base + i,
+                cfg=member_cfg,
+                timeout_s=timeout_s,
+            ))
+        for f in concurrent.futures.as_completed(futs, timeout=timeout_s + 30):
+            member_results.append(f.result())
+
+    member_results.sort(key=lambda m: m.cid)
+    return GroupResults(produce_results=prod_results, member_results=member_results)
 
 
 def _parse_client_output(cid: int, exit_code: int, out: str) -> ClientResult:

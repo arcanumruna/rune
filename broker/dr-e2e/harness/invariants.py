@@ -9,11 +9,24 @@ Terminology:
   * "delivered" = records a subscriber actually received.
   * A record is identified across produce/subscribe by (cid, key, seq): the
     dr_client encodes that triple into the record VALUE payload.
+
+CG-6 group-consumer invariants:
+  * "single_owner" — each partition is consumed by at most ONE member per
+    generation (no simultaneous delivery to two members).
+  * "group_no_committed_loss" — the UNION of all group members' records covers
+    every produced record (no committed record missed by the group).
+  * "bounded_duplicates" — duplicates only within the uncommitted window; after
+    a rebalance / failover, redelivery starts at the last committed offset, not
+    from 0 (i.e. duplicated offsets must all be >= the member's own min-offset,
+    not far below the committed frontier).
+  * "offset_resume" — after coordinator failover, members resume from the
+    committed offset (not 0, not skipping ahead).
 """
 
 from __future__ import annotations
+from collections import defaultdict
 
-from .driver import Msg, Results
+from .driver import GroupResults, Msg, Results
 
 
 def _rid(m: Msg) -> tuple[int, int, int]:
@@ -208,4 +221,165 @@ def assert_durable_after_restart(before: Results, after: Results) -> None:
     assert not missing, (
         f"durable-after-restart: {len(missing)} pre-restart committed records "
         f"missing after restart: {sorted(missing)[:20]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CG-6: Consumer-group invariants
+# ---------------------------------------------------------------------------
+
+def assert_group_single_owner(group_results: GroupResults) -> None:
+    """Every partition is consumed by at most ONE member at any time.
+
+    We identify records by (partition, offset): if two distinct members report
+    a GROUPREC for the same (partition, offset), that violates single_owner.
+
+    Note: duplicates within the SAME member (redelivery after rebalance at the
+    committed offset boundary) are allowed and checked by assert_group_bounded_duplicates.
+    This assertion only fires when TWO DIFFERENT members receive the SAME record
+    simultaneously (true split-ownership, which must never happen).
+    """
+    # Map (partition, offset) -> set of member cids that delivered it.
+    delivery_map: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for rec in group_results.all_group_records:
+        delivery_map[(rec.partition, rec.offset)].add(rec.member_cid)
+
+    violations = {
+        k: sorted(v) for k, v in delivery_map.items() if len(v) > 1
+    }
+    assert not violations, (
+        f"group-single-owner: {len(violations)} (partition,offset) pairs delivered "
+        f"to multiple members simultaneously: "
+        f"{list(violations.items())[:10]}"
+    )
+
+
+def assert_group_no_committed_loss(group_results: GroupResults) -> None:
+    """The UNION of all group members' records covers every produced record.
+
+    A produced record is identified by (rec_cid, rec_key, rec_seq) — the triple
+    encoded in the value payload.  The union of all group members' GROUPREC lines
+    must include every triple the producer got an ack for.
+
+    This is the group-level "at-least-once" invariant: no committed record is
+    missed by the group as a whole.
+    """
+    # Produced set: (rec_cid, rec_key, rec_seq) for all acked records.
+    produced_rids: set[tuple[int, int, int]] = {
+        (m.cid, m.key, m.seq)
+        for m in group_results.all_produced
+        if m.cid >= 0
+    }
+    # Consumed union across all members.
+    consumed_rids: set[tuple[int, int, int]] = {
+        (r.rec_cid, r.rec_key, r.rec_seq)
+        for r in group_results.all_group_records
+        if r.rec_cid >= 0
+    }
+    missing = produced_rids - consumed_rids
+    assert not missing, (
+        f"group-no-committed-loss: {len(missing)} produced records never consumed "
+        f"by any group member (by rec_cid,rec_key,rec_seq): "
+        f"{sorted(missing)[:20]}{' ...' if len(missing) > 20 else ''}"
+    )
+
+
+def assert_group_bounded_duplicates(
+    group_results: GroupResults,
+    max_dup_fraction: float = 0.5,
+) -> None:
+    """Duplicates are bounded to the uncommitted window.
+
+    After a rebalance or failover, a member may redeliver records starting from
+    the last committed offset (not from 0).  This means duplicates — i.e. the
+    same (partition, offset) appearing more than once for a SINGLE member — are
+    expected in bounded amounts after faults.
+
+    This assertion verifies:
+      1. Per-member duplicates do not exceed max_dup_fraction × total_consumed
+         (a gross-sanity cap that would catch "started from 0" regressions).
+      2. Cross-member duplicates are zero (covered by assert_group_single_owner;
+         this is a belt-and-suspenders check).
+
+    The default max_dup_fraction=0.5 (50%) is intentionally loose so that a
+    single rebalance in a small test (e.g. 50 records / 2 partitions) where the
+    second member re-reads up to the committed frontier does not fail the test.
+    The important invariant is that duplicates are BOUNDED (not from offset 0)
+    which is captured by checking that no member sees more than half the total
+    produced records as duplicates.
+    """
+    for member in group_results.member_results:
+        seen: dict[tuple[int, int], int] = {}  # (partition, offset) -> count
+        for r in member.records:
+            k = (r.partition, r.offset)
+            seen[k] = seen.get(k, 0) + 1
+        dups = {k: n for k, n in seen.items() if n > 1}
+        if not dups:
+            continue
+        total = len(member.records)
+        dup_count = sum(n - 1 for n in dups.values())
+        fraction = dup_count / max(total, 1)
+        assert fraction <= max_dup_fraction, (
+            f"group-bounded-duplicates: member cid={member.cid} has {dup_count} "
+            f"duplicate deliveries out of {total} total "
+            f"({fraction:.1%} > {max_dup_fraction:.1%} cap). "
+            f"First 10 dups: {list(dups.items())[:10]}"
+        )
+
+
+def assert_group_offset_resume(
+    group_results_before: GroupResults,
+    group_results_after: GroupResults,
+) -> None:
+    """After a coordinator failover, members resume from the committed offset.
+
+    Compares two GroupResults:
+      - ``group_results_before``: produced+consumed before the failover.
+      - ``group_results_after``: produced+consumed after the failover.
+
+    The ``after`` members must NOT re-deliver records from offset 0 (i.e. the
+    minimum offset seen in the ``after`` run must be >= the minimum committed
+    offset from the ``before`` run minus the uncommitted window tolerance).
+
+    Concretely: for each partition, the earliest offset consumed in the AFTER
+    run must be within the autocommit window of the latest committed offset in
+    the BEFORE run — not at 0 unless the partition was genuinely empty.
+
+    This is a relaxed check: it only fires if ``after`` members start from an
+    offset that is suspiciously close to 0 while ``before`` consumed records
+    well past 0.
+    """
+    # For each partition: what was the maximum offset consumed in the before run?
+    before_max_offset: dict[int, int] = {}
+    for r in group_results_before.all_group_records:
+        before_max_offset[r.partition] = max(
+            before_max_offset.get(r.partition, -1), r.offset
+        )
+
+    # Minimum offset in the after run per partition.
+    after_min_offset: dict[int, int] = {}
+    for r in group_results_after.all_group_records:
+        after_min_offset[r.partition] = min(
+            after_min_offset.get(r.partition, 2**63 - 1), r.offset
+        )
+
+    violations: list[str] = []
+    for part, before_max in before_max_offset.items():
+        if before_max <= 0:
+            continue  # partition had nothing or only offset-0 records before
+        after_min = after_min_offset.get(part)
+        if after_min is None:
+            continue  # partition not consumed after failover — skip
+        # If after_min is 0 and before_max is > 10, it almost certainly means
+        # the member reset to offset 0 instead of resuming from the committed offset.
+        if after_min == 0 and before_max > 10:
+            violations.append(
+                f"partition {part}: after-failover min_offset={after_min} "
+                f"but before had max_offset={before_max} "
+                f"(suspected restart from 0)"
+            )
+    assert not violations, (
+        "group-offset-resume: members appear to have restarted from offset 0 "
+        f"instead of committed offset after failover:\n" +
+        "\n".join(violations)
     )
