@@ -129,6 +129,29 @@ if(aeron_FOUND)
     endif()
 endif()
 
+# ── rune_client_group — GroupConsumer + GroupConsumerHub (CG-5) ───────────────
+add_library(rune_client_group STATIC
+    src/group/GroupConsumer.cpp
+    src/group/GroupConsumerHub.cpp
+)
+target_include_directories(rune_client_group PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>
+    $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(rune_client_group PUBLIC
+    spdlog::spdlog
+)
+if(aeron_FOUND)
+    target_link_libraries(rune_client_group PUBLIC aeron::aeron)
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_client_group PUBLIC ${UUID_LIB})
+        endif()
+    endif()
+endif()
+
 # ── rune_client_api — Client (CC-6, compiled, links agent) ────────────────────
 if(aeron_FOUND)
     add_library(rune_client_api STATIC
@@ -140,6 +163,7 @@ if(aeron_FOUND)
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_api PUBLIC
+        rune_client_group
         rune_client_subscriber
         rune_client_producer
         rune_client_agent
@@ -423,5 +447,42 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_subscriber_tests)
+    endif()
+
+    # ── Group consumer tests (CG-5) — state machine, records routing, commit ──
+    # No Aeron dependency: GroupConsumerHub is self-contained (no transport).
+    add_executable(rune_group_tests
+        tests/group/GroupConsumerTest.cpp
+    )
+    target_include_directories(rune_group_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_group_tests PRIVATE
+        rune_client_group
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(rune_group_tests)
+
+    # ── Group consumer TSan tests (CG-5) ─────────────────────────────────────
+    # Targets: commit() wait-free path vs runner doWork (hot path).
+    # Build with -fsanitize=thread if a TSan build dir is configured.
+    # This target is only added when ENABLE_TSAN is explicitly set.
+    option(ENABLE_TSAN "Enable ThreadSanitizer for group consumer tests" OFF)
+    if(ENABLE_TSAN)
+        add_executable(rune_group_tsan_tests
+            tests/group/GroupConsumerTest.cpp
+        )
+        target_include_directories(rune_group_tsan_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_group_tsan_tests PRIVATE
+            rune_client_group
+            GTest::gtest_main
+        )
+        target_compile_options(rune_group_tsan_tests PRIVATE -fsanitize=thread -g -O1)
+        target_link_options(rune_group_tsan_tests PRIVATE -fsanitize=thread)
+
+        gtest_discover_tests(rune_group_tsan_tests)
     endif()
 endif()
