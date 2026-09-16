@@ -27,6 +27,7 @@
 
 #include <rune/consensus/ConsensusAgent.h>  // defines rune::consensus::Agent
 #include <rune/gateway/ClientGateway.h>
+#include <rune/node/GroupCoordinationService.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -52,7 +53,9 @@ public:
     // @param registry        ReplicaRegistry (may be nullptr). Non-owning.
     // @param gateway         ClientGateway pointer (may be null; non-owning).
     //                        Must outlive this object.
-    // Full constructor (GR-2/GR-3 wiring).
+    // @param groupService    GroupCoordinationService pointer (may be null). Non-owning.
+    //                        Must outlive this object.
+    // Full constructor (GR-2/GR-3/CG-3 wiring).
     // @param consensusAgent  Inner agent (ConsensusAgent or NodeConsensusAgent).
     //                        Must outlive this object.
     // @param election        Consensus Election — read leaderMemberId() + leadershipTermId()
@@ -61,29 +64,34 @@ public:
     // @param transport       AeronPartitionTransport (may be nullptr). Non-owning.
     // @param registry        ReplicaRegistry (may be nullptr). Non-owning.
     // @param gateway         ClientGateway pointer (may be null). Non-owning.
+    // @param groupService    GroupCoordinationService pointer (may be null). Non-owning.
     NodeRuntimeAgent(rune::consensus::Agent&            consensusAgent,
                      rune::consensus::Election*          election,
                      ReplicationMetadataBridge*          bridge,
                      rune::replication::AeronPartitionTransport* transport,
                      ReplicaRegistry*                    registry,
-                     rune::gateway::ClientGateway*       gateway) noexcept
+                     rune::gateway::ClientGateway*       gateway,
+                     GroupCoordinationService*           groupService = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(election)
         , bridge_(bridge)
         , transport_(transport)
         , registry_(registry)
         , gateway_(gateway)
+        , groupService_(groupService)
     {}
 
     // Backward-compatible constructor for single-node / tests without replication.
     NodeRuntimeAgent(rune::consensus::Agent&       consensusAgent,
-                     rune::gateway::ClientGateway* gateway) noexcept
+                     rune::gateway::ClientGateway* gateway,
+                     GroupCoordinationService*     groupService = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(nullptr)
         , bridge_(nullptr)
         , transport_(nullptr)
         , registry_(nullptr)
         , gateway_(gateway)
+        , groupService_(groupService)
     {}
 
     NodeRuntimeAgent(const NodeRuntimeAgent&)            = delete;
@@ -106,12 +114,19 @@ public:
             work += bridge_->doWork(lid, epoch);
         }
 
-        // 3. Transport poll — drain inbound Aeron frames, resolve pending pubs.
+        // 3. Group coordination service — drive after bridge (sees current leadership).
+        //    Called BEFORE transport/gateway so membership state is current before
+        //    any ingress group messages are processed by gateway.doWork.
+        if (groupService_) {
+            work += groupService_->doWork(nowNs);
+        }
+
+        // 4. Transport poll — drain inbound Aeron frames, resolve pending pubs.
         if (transport_) {
             work += transport_->poll(nowNs);
         }
 
-        // 4. Per-replica duty cycle — ISR checks (leader) / fetch emission (follower).
+        // 5. Per-replica duty cycle — ISR checks (leader) / fetch emission (follower).
         if (registry_) {
             for (auto* replica : registry_->allReplicas()) {
                 if (replica) {
@@ -120,7 +135,7 @@ public:
             }
         }
 
-        // 5. Gateway.
+        // 6. Gateway.
         if (gateway_) {
             work += gateway_->doWork(nowNs);
         }
@@ -135,6 +150,7 @@ private:
     rune::replication::AeronPartitionTransport*        transport_;  // non-owning; null-safe
     ReplicaRegistry*                                   registry_;   // non-owning; null-safe
     rune::gateway::ClientGateway*                      gateway_;    // non-owning; null-safe
+    GroupCoordinationService*                          groupService_; // non-owning; null-safe (CG-3)
 };
 
 } // namespace rune::node

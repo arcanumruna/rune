@@ -1,12 +1,14 @@
 add_library(rune_node
     src/NodeConfig.cpp
-    src/BrokerNode.cpp)
+    src/BrokerNode.cpp
+    src/GroupCoordinationService.cpp)
 
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
 # BrokerNode needs: consensus engine, gateway (BR-7a), replication (GR-2/GR-3), Aeron, spdlog
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway)
+# rune_coordination: GroupCoordinator + ReplicatedOffsetStore (CG-3)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -32,6 +34,34 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
+
+    # ---------------------------------------------------------------------------
+    # CG-3: GroupCoordinationService unit tests — injected clock, fake leader toggle.
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_group_coordination_service_tests
+        tests/node/GroupCoordinationServiceTest.cpp)
+    target_link_libraries(rune_group_coordination_service_tests PRIVATE
+        rune_node
+        rune_coordination
+        GTest::gtest_main)
+    gtest_discover_tests(rune_group_coordination_service_tests)
+
+    # ---------------------------------------------------------------------------
+    # CG-3: GroupCoordinationService integration tests — drive real Join→doWork→
+    # Sync→OffsetCommit→OffsetFetch through GroupCoordinationService against real
+    # GroupCoordinator + ReplicatedOffsetStore.
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_group_coordination_integration_tests
+        tests/integration/GroupHandlerIntegrationTest.cpp)
+    target_link_libraries(rune_group_coordination_integration_tests PRIVATE
+        rune_node
+        rune_coordination
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_group_coordination_integration_tests
+        PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
     # CG-2: ReplicatedOffsetStore integration tests — 3-in-process-node cluster
