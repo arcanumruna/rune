@@ -124,15 +124,19 @@ public:
     // errorCode = NotCoordinator and return that size (no coordinator action).
     //
     // buf and out MUST not overlap.
-    // out must be large enough for the response (caller guarantees scratch size).
+    // outCap is the capacity of out[] in bytes; handlers bound-check BEFORE
+    // writing each variable-length element so out[] is never overrun.
+    // Fixed-size responses (JoinGroup, Heartbeat, LeaveGroup) fit in any
+    // reasonable scratch; variable-size ones (OffsetCommit, OffsetFetch)
+    // cap the entry count to what fits.
     // Never throws.  Never allocates from heap in steady state.
     // -----------------------------------------------------------------------
-    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out);
-    size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out);
-    size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out);
-    size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out);
-    size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out);
-    size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out);
+    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
 
 private:
     // -----------------------------------------------------------------------
@@ -174,6 +178,11 @@ private:
     /// We build the reverse map from TopicRegistry on the first lookup per handler.
     /// Re-used scratch; cleared per-call (no allocation if capacity >= nTopics).
     std::vector<std::pair<int32_t, std::string>> topicIdToNameScratch_;
+
+    /// JoinGroup subscribedTopics scratch — reused across calls to avoid per-call
+    /// vector allocation on the hot path.  Cleared + refilled on each JoinGroup.
+    /// Short topic names benefit from SSO; the vector itself is amortized.
+    std::vector<std::string> joinTopicsScratch_;
 };
 
 } // namespace rune::node

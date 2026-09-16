@@ -67,12 +67,13 @@ GroupCoordinationService::GroupCoordinationService(
     , leaderIdFn_(std::move(leaderId))
 {
     // Pre-reserve scratch vectors to avoid alloc in steady state.
-    // 64 partitions per group covers common real-world scenarios;
-    // vectors will grow if needed (cold path).
+    // 64 partitions / entries covers common real-world scenarios;
+    // vectors will grow if needed (cold path, amortised).
     assignScratch_.reserve(64);
     commitResultScratch_.reserve(64);
     fetchResultScratch_.reserve(64);
     topicIdToNameScratch_.reserve(32);
+    joinTopicsScratch_.reserve(32);
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +192,7 @@ static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t 
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleJoinGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
 {
     auto msgOpt = pc::JoinGroup::decode(buf, len);
     if (!msgOpt) {
@@ -218,13 +219,14 @@ size_t GroupCoordinationService::handleJoinGroup(
     }
 
     // Collect subscribedTopicIds → topic names.
-    // Pre-cleared scratch; grows only on first encounters (cold path).
-    std::vector<std::string> subscribedTopics;
-    subscribedTopics.reserve(msg.subscribedTopicIds.size());
+    // joinTopicsScratch_ is a reused member; clear + refill to avoid per-call
+    // vector allocation.  Short topic names benefit from SSO; the vector itself
+    // is amortized (only grows on first large-subscribe, cold path).
+    joinTopicsScratch_.clear();
     for (const int32_t tid : msg.subscribedTopicIds) {
         std::string name = topicNameForId(topics_, tid);
         if (!name.empty()) {
-            subscribedTopics.push_back(std::move(name));
+            joinTopicsScratch_.push_back(std::move(name));
         }
         // Unknown topicId silently ignored (Assignor ignores topics not in partCounts).
     }
@@ -237,7 +239,7 @@ size_t GroupCoordinationService::handleJoinGroup(
 
     coord::JoinResult jr = gc.join(memberIdStr,
                                    msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000,
-                                   subscribedTopics,
+                                   joinTopicsScratch_,
                                    nowNs);
 
     // Build response.
@@ -259,7 +261,7 @@ size_t GroupCoordinationService::handleJoinGroup(
 // handleSyncGroup (templateId 34)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleSyncGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
 {
     auto msgOpt = pc::SyncGroup::decode(buf, len);
     if (!msgOpt) {
@@ -346,7 +348,7 @@ size_t GroupCoordinationService::handleSyncGroup(
 // handleHeartbeat (templateId 36)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleHeartbeat(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
 {
     auto msgOpt = pc::Heartbeat::decode(buf, len);
     if (!msgOpt) {
@@ -392,7 +394,7 @@ size_t GroupCoordinationService::handleHeartbeat(
 // handleLeaveGroup (templateId 38)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleLeaveGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
 {
     auto msgOpt = pc::LeaveGroup::decode(buf, len);
     if (!msgOpt) {
@@ -437,7 +439,7 @@ size_t GroupCoordinationService::handleLeaveGroup(
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::OffsetCommit::decode(buf, len);
     if (!msgOpt) {
@@ -449,35 +451,33 @@ size_t GroupCoordinationService::handleOffsetCommit(
     const std::string groupIdStr(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
 
-    // NotCoordinator fence.
+    // NotCoordinator fence — fires for both empty and non-empty entry lists.
+    // For empty entries: encode a sentinel single result with NotCoordinator so
+    // the client receives an unambiguous error signal (not a silent empty-OK frame).
     if (!isLocalCoordinator()) {
-        // Return a single-entry response with NotCoordinator for each entry.
-        // The response doesn't carry per-entry semantics for this error; use
-        // a 0-result response and encode NotCoordinator at the frame level via
-        // a standard error code in the first (and only) result, or return 0
-        // results with an implicit error.  Per the protocol spec (CG-1),
-        // OffsetCommitResponse contains per-result errorCodes; we return an
-        // empty result list with no NotCoordinator result — clients check the
-        // errorCode per result.  For simplicity in the non-coordinator case,
-        // return a single result entry with NotCoordinator.
-        // Actually the best approach: return 0 results (empty) and let the
-        // caller handle missing results as errors.  But per-brief:
-        // "encode the response with errorCode=NotCoordinator".
-        // We'll encode the response with 0 entries; the session layer wraps
-        // this correctly as a coordinator error at the gateway level.
-        // Per brief: "If !isLocalCoordinator(): encode the response with
-        // errorCode=NotCoordinator." This means we encode it using the response
-        // message's per-result errorCode field — since OffsetCommitResponse
-        // doesn't have a top-level errorCode, we build one synthetic result
-        // per entry (or a single synthetic result).  The cleanest approach:
-        // build one result per requested entry with NotCoordinator.
         commitResultScratch_.clear();
         for (const auto& e : msg.entries) {
+            // Bound-check: stop if adding this result would overrun outCap.
+            const std::size_t needed =
+                pc::OffsetCommitResponse::encodedSizeFor(commitResultScratch_.size() + 1);
+            if (needed > outCap) break;
             pc::OffsetCommitResult r;
             r.topicId   = e.topicId;
             r.partition = e.partition;
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
             commitResultScratch_.push_back(r);
+        }
+        // If entries were empty, add a single sentinel so the caller can detect
+        // NotCoordinator even without per-entry results.
+        if (commitResultScratch_.empty()) {
+            const std::size_t needed = pc::OffsetCommitResponse::encodedSizeFor(1);
+            if (needed <= outCap) {
+                pc::OffsetCommitResult sentinel;
+                sentinel.topicId   = -1;
+                sentinel.partition = -1;
+                sentinel.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+                commitResultScratch_.push_back(sentinel);
+            }
         }
         pc::OffsetCommitResponse resp;
         resp.sessionId     = msg.sessionId;
@@ -494,7 +494,17 @@ size_t GroupCoordinationService::handleOffsetCommit(
 
     // Iterate entries defensively (CG-1 note: count can overstate; stop when
     // the view iterator ends, which happens when the frame bytes run out).
+    // Also bound-check BEFORE each push so the final encode never overruns outCap.
     for (const auto& e : msg.entries) {
+        // Stop if adding this result would overrun the output buffer.
+        const std::size_t needed =
+            pc::OffsetCommitResponse::encodedSizeFor(commitResultScratch_.size() + 1);
+        if (needed > outCap) {
+            spdlog::warn("GroupCoordinationService: OffsetCommit response capped at {} entries "
+                         "(outCap={} would be exceeded)", commitResultScratch_.size(), outCap);
+            break;
+        }
+
         pc::OffsetCommitResult r;
         r.topicId   = e.topicId;
         r.partition = e.partition;
@@ -510,7 +520,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
         // Resolve topicId → topic name.
         const std::string topicName = topicNameForId(topics_, e.topicId);
         if (topicName.empty()) {
-            // Unknown topic — skip (no commit, no error; or use UnknownTopic).
+            // Unknown topic — no commit; report UnknownTopic per entry.
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::UnknownTopic);
             commitResultScratch_.push_back(r);
             continue;
@@ -536,7 +546,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
 // handleOffsetFetch (templateId 42)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetFetch(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     (void)nowNs;
 
@@ -550,16 +560,35 @@ size_t GroupCoordinationService::handleOffsetFetch(
     const std::string groupIdStr(
         reinterpret_cast<const char*>(msg.groupId.data()), msg.groupId.size());
 
-    // NotCoordinator fence.
+    // NotCoordinator fence — fires for both empty and non-empty entry lists.
+    // For empty entries: encode a sentinel result so the caller can detect the
+    // error; a purely empty OK frame would be indistinguishable from "committed
+    // nothing".
     if (!isLocalCoordinator()) {
         fetchResultScratch_.clear();
         for (const auto& e : msg.entries) {
+            // Bound-check before each push.
+            const std::size_t needed =
+                pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1);
+            if (needed > outCap) break;
             pc::OffsetFetchResult r;
             r.topicId   = e.topicId;
             r.partition = e.partition;
             r.offset    = -1;
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
             fetchResultScratch_.push_back(r);
+        }
+        // Sentinel for empty-entries case.
+        if (fetchResultScratch_.empty()) {
+            const std::size_t needed = pc::OffsetFetchResponse::encodedSizeFor(1);
+            if (needed <= outCap) {
+                pc::OffsetFetchResult sentinel;
+                sentinel.topicId   = -1;
+                sentinel.partition = -1;
+                sentinel.offset    = -1;
+                sentinel.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+                fetchResultScratch_.push_back(sentinel);
+            }
         }
         pc::OffsetFetchResponse resp;
         resp.sessionId     = msg.sessionId;
@@ -571,9 +600,20 @@ size_t GroupCoordinationService::handleOffsetFetch(
 
     if (msg.entries.empty()) {
         // Fetch all committed offsets for the group.
+        // Bound-check BEFORE writing each result so a large fetch-all never
+        // overruns a fixed scratch buffer.  Results that would exceed outCap
+        // are silently dropped (the response is capped but never overruns).
         const auto all = offsets_->fetchAll(groupIdStr);
-        fetchResultScratch_.reserve(all.size());
         for (const auto& [tp, co] : all) {
+            // Bound-check before each push.
+            const std::size_t needed =
+                pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1);
+            if (needed > outCap) {
+                spdlog::warn("GroupCoordinationService: OffsetFetch fetch-all capped at {} entries "
+                             "(outCap={} would be exceeded)", fetchResultScratch_.size(), outCap);
+                break;
+            }
+
             // Resolve topic name → topicId.
             int32_t topicId = -1;
             if (topics_) {
@@ -591,8 +631,16 @@ size_t GroupCoordinationService::handleOffsetFetch(
         }
     } else {
         // Fetch specific (topicId, partition) entries.
-        fetchResultScratch_.reserve(msg.entries.size());
+        // Bound-check before each push.
         for (const auto& e : msg.entries) {
+            const std::size_t needed =
+                pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1);
+            if (needed > outCap) {
+                spdlog::warn("GroupCoordinationService: OffsetFetch capped at {} entries "
+                             "(outCap={} would be exceeded)", fetchResultScratch_.size(), outCap);
+                break;
+            }
+
             const std::string topicName = topicNameForId(topics_, e.topicId);
 
             pc::OffsetFetchResult r;
