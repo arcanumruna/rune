@@ -66,17 +66,23 @@ if(BUILD_TESTING)
     # ---------------------------------------------------------------------------
     # CG-4: GroupPushDelivery integration tests — assignment→push-subscription
     # translation, resume-from-committed offset, eager revoke on rebalance, and
-    # Assign egress control frame encode/decode.  No Aeron required.
+    # Assign egress control frame encode/decode.
+    # Uses an embedded Aeron IPC driver (no network ports) to drive the real
+    # ClientGateway push path (onEgressFrame capture, no live Aeron subscribers).
+    # Gated behind aeron_FOUND (same gate as the broker-node tests that embed a driver).
     # ---------------------------------------------------------------------------
-    add_executable(rune_group_push_delivery_tests
-        tests/integration/GroupPushDeliveryTest.cpp)
-    target_link_libraries(rune_group_push_delivery_tests PRIVATE
-        rune_node
-        rune_coordination
-        rune_replication
-        GTest::gtest_main)
-    gtest_discover_tests(rune_group_push_delivery_tests
-        PROPERTIES TIMEOUT 60)
+    if(aeron_FOUND)
+        add_executable(rune_group_push_delivery_tests
+            tests/integration/GroupPushDeliveryTest.cpp)
+        target_link_libraries(rune_group_push_delivery_tests PRIVATE
+            rune_node
+            rune_coordination
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_group_push_delivery_tests
+            PROPERTIES TIMEOUT 120)
+    endif()
 
     # ---------------------------------------------------------------------------
     # CG-2: ReplicatedOffsetStore integration tests — 3-in-process-node cluster

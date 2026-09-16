@@ -653,8 +653,17 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len)
 {
     // Guard against null egress (test sessions injected via injectTestSession
-    // have no real ExclusivePublication — only the onControlFrame_ callback path).
-    if (!session.egress) return false;
+    // have no real ExclusivePublication).
+    if (!session.egress) {
+        // CG-4 test hook: when a null-egress callback is installed, fire it and
+        // return true so callers (pushSubscriptions) advance nextOffset — this lets
+        // tests drive the real push path and capture Records without a live Aeron driver.
+        if (onEgressFrame_) {
+            onEgressFrame_(session.sessionId, buf, len);
+            return true;
+        }
+        return false;
+    }
     return sendOnPub(*session.egress, buf, len);
 }
 
@@ -1556,18 +1565,33 @@ void ClientGateway::pushSubscriptions()
             const std::size_t encoded = rec.encode(scratch_.data());
 
             // Push via tryClaim (no offer-spin — single writer, no blocking).
-            aeron::ExclusivePublication& pub = *session->egress;
+            //
+            // Guard: test sessions (injectTestSession) have a null egress shared_ptr.
+            // Dereferencing a null shared_ptr is UB/crash.  Mirror the sendTo() pattern:
+            // fire onEgressFrame_ and treat as a successful send (pos=1) so nextOffset
+            // advances.  Without this guard the fixture crashes at the *session->egress
+            // dereference for every group push subscription on a test session.
             int64_t pos = -1;
-            if (pub.isConnected() && encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
-                aeron::concurrent::logbuffer::BufferClaim claim;
-                pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
-                if (pos > 0) {
-                    auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
-                    aeron::concurrent::AtomicBuffer atomicBuf(
-                        mutableBuf, static_cast<aeron::util::index_t>(encoded));
-                    claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
-                                            static_cast<aeron::util::index_t>(encoded));
-                    claim.commit();
+            if (!session->egress) {
+                // Null-egress path: invoke the test capture hook (if installed).
+                if (onEgressFrame_) {
+                    onEgressFrame_(session->sessionId, scratch_.data(), encoded);
+                    pos = 1; // treat as sent — advance nextOffset
+                }
+                // No hook: leave pos=-1 → back-pressured (subscription retries next cycle).
+            } else {
+                aeron::ExclusivePublication& pub = *session->egress;
+                if (pub.isConnected() && encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
+                    aeron::concurrent::logbuffer::BufferClaim claim;
+                    pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
+                    if (pos > 0) {
+                        auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
+                        aeron::concurrent::AtomicBuffer atomicBuf(
+                            mutableBuf, static_cast<aeron::util::index_t>(encoded));
+                        claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
+                                                static_cast<aeron::util::index_t>(encoded));
+                        claim.commit();
+                    }
                 }
             }
 

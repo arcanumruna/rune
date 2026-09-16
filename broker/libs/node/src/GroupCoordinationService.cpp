@@ -256,10 +256,26 @@ size_t GroupCoordinationService::handleJoinGroup(
     gc.setRebalanceTimeoutMs(
         (msg.sessionTimeoutMs > 0) ? msg.sessionTimeoutMs : 30'000);
 
+    // CG-4: capture state BEFORE join so we can detect a Stable→PreparingRebalance
+    // transition triggered directly by gc.join() (new member arriving while Stable).
+    // The doWork() transition detector only fires when the transition happens inside
+    // coord.doWork(); for join-triggered rebalances the state is already
+    // PreparingRebalance by the time doWork() next runs — so we must fire here.
+    const coord::GroupState stateBefore = gc.state();
+
     coord::JoinResult jr = gc.join(memberIdStr,
                                    msg.sessionTimeoutMs > 0 ? msg.sessionTimeoutMs : 30'000,
                                    joinTopicsScratch_,
                                    nowNs);
+
+    // CG-4: if the join triggered a Stable→PreparingRebalance transition, eagerly
+    // revoke all group push subscriptions and send empty Assign (revoke) frames.
+    // This mirrors the doWork() detection path for timer-triggered rebalances.
+    if (gateway_ &&
+        gc.state() == coord::GroupState::PreparingRebalance &&
+        stateBefore != coord::GroupState::PreparingRebalance) {
+        onEnterPreparingRebalance(groupIdStr, gc);
+    }
 
     // CG-4: track member → sessionId so doWork can send Assign frames and create
     // push subscriptions without carrying session context through the coordinator.

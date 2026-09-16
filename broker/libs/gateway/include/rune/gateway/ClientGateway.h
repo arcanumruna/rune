@@ -261,6 +261,21 @@ public:
         onControlFrame_ = std::move(cb);
     }
 
+    // setOnEgressFrame — optional callback invoked by sendTo() when the session
+    // egress publication is null (i.e. an injected test session).  The callback
+    // receives (sessionId, encoded frame bytes, length) BEFORE the null-egress
+    // early-return fires, so tests can capture Records pushes and Assign frames
+    // that would otherwise be silently dropped because there is no real Aeron
+    // publication.  Pass nullptr to clear.  Single-writer: call only on the
+    // duty-cycle thread.  The callback fires and sendTo returns true (as if
+    // successfully sent) — callers (pushSubscriptions) advance nextOffset.
+    using EgressFrameCallback = std::function<void(int64_t sessionId,
+                                                   const uint8_t* buf,
+                                                   std::size_t len)>;
+    void setOnEgressFrame(EgressFrameCallback cb) noexcept {
+        onEgressFrame_ = std::move(cb);
+    }
+
     // groupMemberSubCount — number of group push subscriptions tracked for a
     // given member session.  Returns 0 if the session has no group subs.
     // For tests to assert that addGroupSubscription added the right entries.
@@ -556,6 +571,12 @@ private:
     // CG-4: Optional control-frame capture callback (for tests without live Aeron egress).
     // Invoked by sendControlFrame BEFORE the actual egress send.  Null in production.
     ControlFrameCallback onControlFrame_;
+
+    // CG-4: Optional egress-frame capture callback (for tests with null-egress sessions).
+    // Invoked by sendTo() when session.egress is null; fires instead of the
+    // null-egress early-return.  Returns true so callers (pushSubscriptions) advance
+    // nextOffset.  Null in production.
+    EgressFrameCallback onEgressFrame_;
 
     // GB-5p2: Dirty-log set + group-commit flush cadence.
     //

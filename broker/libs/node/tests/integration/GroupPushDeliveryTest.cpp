@@ -1,47 +1,79 @@
 // ---------------------------------------------------------------------------
-// GroupPushDeliveryTest.cpp — CG-4 integration tests.
+// GroupPushDeliveryTest.cpp — CG-4 fix: rewritten integration tests.
+//
+// Tests drive the REAL orchestration path:
+//   - Real ClientGateway (embedded IPC Aeron driver) + setOnEgressFrame for
+//     capture without a full network stack.
+//   - Real TopicRegistry + ReplicaRegistry wired into the gateway.
+//   - Real GroupCoordinationService wired via setGateway / setGroupService.
+//   - service_->doWork() drives rebalance to Stable; the SERVICE (not the test)
+//     calls addGroupSubscription + sendControlFrame.
+//   - gateway_->pushSubscriptions() (driven via doWork) delivers Records;
+//     captured by the onEgressFrame callback.
 //
 // Tests:
-//   CG4_EachPartitionToExactlyOneMember — 2 members, 2 partitions → Stable.
-//     Assert each member owns exactly 1 partition; union = {0,1}; no overlap.
+//   CG4_Delivery.EachPartitionToExactlyOneMember
+//     2 members join a 2-partition topic → Stable → pushSubscriptions pumped.
+//     Assert each member receives records for exactly ONE partition; every
+//     partition owned by exactly one member; union of delivered = all produced.
 //
-//   CG4_ResumeFromCommittedOffset — commit offset 5 for (g, T:p0) before join.
-//     After Stable, the owning member's stub subscription has nextOffset=5.
+//   CG4_Delivery.ResumeFromCommittedOffset
+//     Commit offset 5 for (g, T:p0) BEFORE join → owning member's egress
+//     delivers offsets 5..N-1 only (actual delivered baseOffsets verified).
 //
-//   CG4_EagerRevokeOnRebalance — Stable with 2 members, 3rd joins → revoke fired.
-//     subscriptionCount drops to 0 at PreparingRebalance; new Stable reassigns.
+//   CG4_Delivery.EagerRevokeAndReassign
+//     3rd member joins after Stable → service sends empty Assign (revoke) then
+//     reassigns; after second Stable still single-owner per partition.
 //
-//   CG4_AssignFrameEncodeDecode — Assign frame encode→decode for full and empty (revoke).
+//   CG4_Delivery.AssignFramesDelivered
+//     Assert each member's egress receives an Assign frame with its partition
+//     set on Stable (decoded from captured egress); and an empty Assign on revoke.
 //
-//   CG4_AssignFrameCaptureCallback — sendControlFrame callback captures frame bytes;
-//     decoded Assign has correct generationId and partition set.
+//   CG4_AssignFrameEncodeDecode.FullAssign  — pure encode/decode unit test (kept)
+//   CG4_AssignFrameEncodeDecode.EmptyAssignIsRevoke — pure encode/decode (kept)
 //
-//   CG4_ServiceStable_SingleMember — coordinator drives to Stable for 1 member,
-//     assignmentFor returns the partition.
-//
-// No Aeron.  No busy-spin.  All waits bounded by kCap iterations.
+// Embedded Aeron IPC driver — no network ports, no Docker.
+// All waits bounded by kCap + ASSERT.  No busy-spin.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
 
-#include <rune/node/GroupCoordinationService.h>
+// Gateway
+#include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+
+// Node / coordination
+#include <rune/node/GroupCoordinationService.h>
+#include <rune/node/NodeConfig.h>
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/coordination/GroupCoordinator.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+
+// Protocol
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
-#include <rune/protocol/client/ArrayView.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/ArrayView.h>
+
+// Aeron
+#include <Aeron.h>
+extern "C" {
+#include <aeronmd/aeronmd.h>
+}
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -50,13 +82,23 @@ using namespace rune::coordination;
 using namespace rune::replication;
 namespace pc = rune::protocol::client;
 namespace fs = std::filesystem;
+using namespace std::chrono_literals;
 
 // ===========================================================================
-// Shared constants / helpers
+// Constants
 // ===========================================================================
 
-static constexpr int     kCap    = 800;
-static constexpr int64_t kStepNs = 1'000'000LL;  // 1 ms in ns
+static constexpr int     kCap          = 1000;
+static constexpr int64_t kStepNs       = 1'000'000LL;   // 1 ms
+static constexpr int64_t kT0Ns         = 1'000'000'000LL;
+static constexpr int32_t kTopicId      = 0;
+static constexpr int32_t kNumParts     = 2;
+static constexpr int32_t kNumRecords   = 10;  // records per partition
+static constexpr std::size_t kBufSz    = 4096;
+
+// ===========================================================================
+// Helpers
+// ===========================================================================
 
 static std::string makeSuffix() {
     static std::atomic<uint64_t> g{0};
@@ -68,22 +110,24 @@ struct TempDir {
     std::string path;
     explicit TempDir(std::string_view tag) {
         path = fs::temp_directory_path().string()
-             + "/rune_cg4_" + std::string(tag) + "_" + makeSuffix();
+             + "/rune_cg4d_" + std::string(tag) + "_" + makeSuffix();
         fs::create_directories(path);
     }
     ~TempDir() { std::error_code ec; fs::remove_all(path, ec); }
 };
 
-class NullTransportCG4 : public PartitionTransport {
-public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
-};
+static TopicSpec makeTopicSpec(std::string name, int32_t partCount, int32_t id) {
+    TopicSpec ts;
+    ts.name           = std::move(name);
+    ts.partitionCount = partCount;
+    ts.topicId        = id;
+    return ts;
+}
 
-static PartitionConfig makePartCfg() {
+static PartitionConfig makePartCfg(int32_t selfId = 1) {
     PartitionConfig cfg;
     cfg.partitionId         = 0;
-    cfg.selfId              = 1;
+    cfg.selfId              = selfId;
     cfg.replicaLagMaxMs     = 10'000;
     cfg.replicaLagMaxOffset = 10'000;
     cfg.minIsr              = 1;
@@ -94,135 +138,260 @@ static PartitionConfig makePartCfg() {
     return cfg;
 }
 
-static TopicSpec makeTopicSpec(std::string name, int32_t partCount, int32_t id) {
-    TopicSpec ts;
-    ts.name           = std::move(name);
-    ts.partitionCount = partCount;
-    ts.topicId        = id;
-    return ts;
+class NullTransport : public PartitionTransport {
+public:
+    void sendFetchRequest(const FetchRequestMsg&) override {}
+    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+};
+
+// Build kN individual record batches (one per record) and write them to the log.
+// Each record is its own batch so that log->read(offset, ...) returns the batch
+// starting exactly at that offset, enabling precise resume-from-committed testing.
+static void appendRecords(rune::storage::Log& log, int32_t kN, int64_t baseTs = 2000LL) {
+    for (int32_t i = 0; i < kN; ++i) {
+        const int64_t base = log.logEndOffset();
+        rune::protocol::RecordBatchBuilder b(base, baseTs + i);
+        b.append("k", "v", baseTs + i);
+        auto bytes = b.build();
+        log.appendNoSync(bytes.data(), bytes.size(), base);
+        log.sync();
+    }
+}
+
+// Decode a Records frame from raw bytes; return baseOffset or -1 on failure.
+static int64_t decodeRecordsBaseOffset(const uint8_t* buf, std::size_t len) {
+    auto dec = pc::Records::decode(buf, len);
+    if (!dec) return -1;
+    return dec->baseOffset;
+}
+
+// Decode an Assign frame from raw bytes; return the decoded Assign or empty.
+static std::optional<pc::Assign> decodeAssign(const uint8_t* buf, std::size_t len) {
+    return pc::Assign::decode(buf, len);
+}
+
+// Decode the templateId from a frame header.
+static uint16_t frameTemplateId(const uint8_t* buf, std::size_t len) {
+    auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) return 0;
+    return hdr->templateId;
 }
 
 // ===========================================================================
-// StubGateway — minimal in-process implementation of the CG-4 gateway API.
-//
-// NOT a subclass of ClientGateway — used directly to verify that the
-// orchestration logic in GroupCoordinationService produces correct calls.
-// Tests that need to verify assignments or Assign frames call the stub methods
-// manually (mirroring what onReachedStable / onEnterPreparingRebalance do),
-// then assert on the stub's internal state.
+// Embedded Aeron IPC driver — creates a shared single driver for the fixture.
+// Uses IPC so no network ports are needed.
 // ===========================================================================
+struct EmbeddedAeronDriver {
+    aeron_driver_context_t* driverCtx = nullptr;
+    aeron_driver_t*         driver    = nullptr;
+    std::atomic<bool>       running{false};
+    std::thread             thread;
+    std::shared_ptr<aeron::Aeron> aeron;
+    bool                    ok = false;
 
-struct StubGateway {
-    struct Sub {
-        int64_t sessionId  = 0;
-        int32_t topicId    = 0;
-        int32_t partition  = 0;
-        int64_t nextOffset = 0;
-        bool    isGroup    = false;
-    };
+    // Returns false on failure (call site checks ok flag).
+    bool start(const std::string& aeronDir) {
+        fs::create_directories(aeronDir);
+        aeron_driver_context_init(&driverCtx);
+        aeron_driver_context_set_dir(driverCtx, aeronDir.c_str());
+        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
+        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
+        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
+        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
+        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
+        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
 
-    std::map<int64_t, Sub>                     subs;            // subId -> Sub
-    std::map<int64_t, std::vector<int64_t>>    groupMemberSubs; // sessionId -> [subId]
-    std::set<int64_t>                          sessions;
-    int64_t                                    nextSubId  = 0;
-    int64_t                                    nextSessId = 0;
+        if (aeron_driver_init(&driver, driverCtx) != 0) return false;
+        if (aeron_driver_start(driver, /*manual_main_loop=*/true) != 0) return false;
 
-    // Captured Assign frame bytes per sessionId.
-    std::map<int64_t, std::vector<std::vector<uint8_t>>> frames;
+        running.store(true, std::memory_order_release);
+        thread = std::thread([this]() {
+            while (running.load(std::memory_order_acquire)) {
+                aeron_driver_main_idle_strategy(
+                    driver, aeron_driver_main_do_work(driver));
+            }
+        });
 
-    int64_t addSession() {
-        const int64_t sid = ++nextSessId;
-        sessions.insert(sid);
-        return sid;
-    }
+        // Spin until cnc.dat appears (driver ready).
+        const std::string cncPath = aeronDir + "/cnc.dat";
+        for (int i = 0; i < 500; ++i) {
+            aeron_driver_main_do_work(driver);
+            if (fs::exists(cncPath)) break;
+            std::this_thread::sleep_for(1ms);
+        }
+        if (!fs::exists(cncPath)) return false;
 
-    int64_t addGroupSubscription(int64_t memberSessionId,
-                                 int32_t topicId,
-                                 int32_t partition,
-                                 int64_t fromOffset,
-                                 uint8_t /*isolation*/) {
-        if (!sessions.count(memberSessionId)) return -1;
-        const int64_t subId = ++nextSubId;
-        Sub s;
-        s.sessionId  = memberSessionId;
-        s.topicId    = topicId;
-        s.partition  = partition;
-        s.nextOffset = fromOffset;
-        s.isGroup    = true;
-        subs[subId]  = s;
-        groupMemberSubs[memberSessionId].push_back(subId);
-        return subId;
-    }
-
-    void revokeGroupSubscriptions(int64_t memberSessionId) {
-        auto it = groupMemberSubs.find(memberSessionId);
-        if (it == groupMemberSubs.end()) return;
-        for (int64_t sid : it->second) subs.erase(sid);
-        groupMemberSubs.erase(it);
-    }
-
-    bool sendControlFrame(int64_t sessionId, const uint8_t* buf, std::size_t len) {
-        frames[sessionId].emplace_back(buf, buf + len);
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        aeron = aeron::Aeron::connect(ctx);
+        if (!aeron) return false;
+        ok = true;
         return true;
     }
 
-    std::size_t subscriptionCount()              const { return subs.size(); }
-    std::size_t groupMemberSubCount(int64_t sid)  const {
-        auto it = groupMemberSubs.find(sid);
-        return it != groupMemberSubs.end() ? it->second.size() : 0;
+    ~EmbeddedAeronDriver() {
+        aeron.reset();
+        if (running.exchange(false, std::memory_order_acq_rel)) {
+            if (thread.joinable()) thread.join();
+        }
+        if (driver) {
+            const auto dl = std::chrono::steady_clock::now() + 50ms;
+            while (std::chrono::steady_clock::now() < dl) {
+                if (aeron_driver_main_do_work(driver) == 0) {
+                    aeron_driver_main_do_work(driver); break;
+                }
+                std::this_thread::sleep_for(200us);
+            }
+            aeron_driver_close(driver);   driver    = nullptr;
+        }
+        if (driverCtx) {
+            aeron_driver_context_close(driverCtx); driverCtx = nullptr;
+        }
     }
 };
 
 // ===========================================================================
-// Fixture — shared infrastructure across tests
+// Captured egress frame — records both raw bytes and the template id
+// so tests can distinguish Records pushes from Assign control frames.
 // ===========================================================================
+struct EgressFrame {
+    int64_t sessionId = 0;
+    std::vector<uint8_t> bytes;
+};
 
-class CG4Test : public ::testing::Test {
+// ===========================================================================
+// CG4DeliveryFixture
+//
+// Single fixture for all real-delivery tests.
+//
+// Setup:
+//   - Embedded Aeron IPC driver.
+//   - TopicRegistry with kNumParts=2 partitions of "test-topic".
+//   - kNumRecords records pre-appended to EACH partition log.
+//   - PartitionReplica (Leader role, minIsr=1) per partition → LEO == HW.
+//   - ReplicaRegistry wired into the gateway.
+//   - GroupCoordinationService wired into the gateway (both directions).
+//   - injectTestSession for each member: null egress, setOnEgressFrame captures.
+// ===========================================================================
+class CG4DeliveryFixture : public ::testing::Test {
 protected:
     static constexpr std::string_view kTopicName = "test-topic";
-    static constexpr int32_t kTopicId  = 0;
-    static constexpr int32_t kNumParts = 2;
-    static constexpr std::size_t kBufSz = 4096;
+    static constexpr int32_t kIngressStream = 9901;
 
-    CG4Test()
-        : offsetDir_("offset")
+    CG4DeliveryFixture()
+        : aeronDir_("aeron")
         , topicDir_("topics")
+        , offsetDir_("offset")
         , offsetLog_(offsetDir_.path)
     {}
 
     void SetUp() override {
-        transport_ = std::make_unique<NullTransportCG4>();
-        replica_ = std::make_unique<PartitionReplica>(
-            makePartCfg(), Role::Leader, /*generation=*/1,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1},
-            &offsetLog_, transport_.get());
-        store_   = std::make_unique<ReplicatedOffsetStore>(replica_.get());
-        registry_ = std::make_unique<rune::gateway::TopicRegistry>(
-            std::vector<TopicSpec>{
-                makeTopicSpec(std::string(kTopicName), kNumParts, kTopicId)
-            },
-            topicDir_.path);
-        service_ = std::make_unique<GroupCoordinationService>(
-            store_.get(), registry_.get(),
-            [] { return true; },
-            [] { return NodeId{1}; });
-        // Note: service_->setGateway() is NOT called here.  Tests exercise the
-        // coordinator state machine directly and verify assignments via
-        // coordinator().  Gateway-side logic is verified via the StubGateway.
-    }
+        // 1. Embedded Aeron IPC driver.
+        aeron_drv_ = std::make_unique<EmbeddedAeronDriver>();
+        ASSERT_TRUE(aeron_drv_->start(aeronDir_.path))
+            << "Embedded Aeron driver failed to start";
+        ASSERT_NE(aeron_drv_->aeron, nullptr);
 
-    // Drive doWork until predicate is true or cap iterations.
-    bool driveUntil(std::function<bool()> pred, int cap = kCap) {
-        for (int i = 0; i < cap && !pred(); ++i) {
-            clock_ += kStepNs;
-            service_->doWork(clock_);
+        // 2. TopicRegistry: 2 partitions.
+        std::vector<TopicSpec> specs = {
+            makeTopicSpec(std::string(kTopicName), kNumParts, kTopicId)
+        };
+        topicReg_ = std::make_unique<rune::gateway::TopicRegistry>(specs, topicDir_.path);
+
+        // 3. Append kNumRecords records to each partition log.
+        for (int32_t p = 0; p < kNumParts; ++p) {
+            rune::storage::Log* log = topicReg_->log(kTopicId, p);
+            ASSERT_NE(log, nullptr);
+            appendRecords(*log, kNumRecords);
+            ASSERT_EQ(log->logEndOffset(), kNumRecords);
         }
-        return pred();
+
+        // 4. PartitionReplicas (one per partition) — Leader, minIsr=1 → HW == LEO.
+        // ReplicaRegistry takes unique_ptr ownership; keep raw pointers for HW advance.
+        nullTransport_ = std::make_unique<NullTransport>();
+        replicaReg_ = std::make_unique<rune::node::ReplicaRegistry>();
+        for (int32_t p = 0; p < kNumParts; ++p) {
+            rune::storage::Log* log = topicReg_->log(kTopicId, p);
+            auto cfg = makePartCfg(1);
+            cfg.partitionId = p;
+            auto r = std::make_unique<PartitionReplica>(
+                cfg, Role::Leader, /*generation=*/1,
+                std::vector<NodeId>{1}, std::vector<NodeId>{1},
+                log, nullTransport_.get());
+            r->onLeaderLogAppended();  // advance HW to LEO
+            replicaRawPtrs_.push_back(r.get());
+            replicaReg_->add(kTopicId, p, std::move(r));
+        }
+
+        // 5. ReplicatedOffsetStore (for committed-offset tests).
+        offsetReplica_ = std::make_unique<PartitionReplica>(
+            makePartCfg(1), Role::Leader, 1,
+            std::vector<NodeId>{1}, std::vector<NodeId>{1},
+            &offsetLog_, nullTransport_.get());
+        offsetStore_ = std::make_unique<ReplicatedOffsetStore>(offsetReplica_.get());
+
+        // 6. ClientGateway — ingress on IPC, IPC-only (no real clients connect).
+        const std::string ingressCh = "aeron:ipc";
+        gw_ = std::make_unique<rune::gateway::ClientGateway>(
+            aeron_drv_->aeron, ingressCh, kIngressStream,
+            /*thisNodeId=*/1,
+            /*sessionTimeoutNs=*/rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
+            /*leaderView=*/nullptr);
+
+        gw_->setTopicRegistry(topicReg_.get());
+        gw_->setReplicaRegistry(replicaReg_.get());
+
+        // 7. Install egress capture callback.
+        //    All sends through sendTo (push Records + Assign) land here.
+        gw_->setOnEgressFrame([this](int64_t sid, const uint8_t* buf, std::size_t len) {
+            std::vector<uint8_t> bytes(buf, buf + len);
+            std::lock_guard lk(frameMx_);
+            captured_[sid].push_back({sid, std::move(bytes)});
+        });
+        // Also capture control frames (sendControlFrame fires this BEFORE sendTo).
+        gw_->setOnControlFrame([this](int64_t sid, const uint8_t* buf, std::size_t len) {
+            std::vector<uint8_t> bytes(buf, buf + len);
+            std::lock_guard lk(frameMx_);
+            controlFrames_[sid].push_back({sid, std::move(bytes)});
+        });
+
+        // 8. GroupCoordinationService.
+        service_ = std::make_unique<GroupCoordinationService>(
+            offsetStore_.get(), topicReg_.get(),
+            [] { return true; }, [] { return NodeId{1}; });
+
+        // 9. Wire both directions:
+        //    gateway → service (for group message dispatch).
+        gw_->setGroupService(service_.get());
+        //    service → gateway (for addGroupSubscription / revokeGroupSubscriptions / sendControlFrame).
+        service_->setGateway(gw_.get());
+
+        clock_ = kT0Ns;
     }
 
-    // Do a JoinGroup round-trip; returns the assigned memberId.
+    void TearDown() override {
+        service_.reset();
+        gw_.reset();
+        offsetStore_.reset();
+        offsetReplica_.reset();
+        replicaReg_.reset();   // destroys owned PartitionReplica instances
+        replicaRawPtrs_.clear();
+        topicReg_.reset();
+        aeron_drv_.reset();
+    }
+
+    // -----------------------------------------------------------------------
+    // Inject a test session (null egress — captured via onEgressFrame).
+    // -----------------------------------------------------------------------
+    int64_t injectSession() {
+        return gw_->injectTestSession(clock_);
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode + call handleJoinGroup; return assigned memberId.
+    // -----------------------------------------------------------------------
     std::string doJoin(int64_t sessionId, int64_t correlationId,
-                        std::string_view groupId, std::string_view memberId = "") {
+                       std::string_view groupId, std::string_view memberId = "") {
         pc::JoinGroup msg;
         msg.sessionId        = sessionId;
         msg.correlationId    = correlationId;
@@ -232,43 +401,107 @@ protected:
         msg.memberId = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
         std::array<int32_t, 1> topics{kTopicId};
-        const auto reqLen = msg.encode(req_, std::span<const int32_t>(topics));
-        const auto outLen = service_->handleJoinGroup(req_, reqLen, clock_, out_, kBufSz);
+        uint8_t req[kBufSz]{}, out[kBufSz]{};
+        const auto reqLen = msg.encode(req, std::span<const int32_t>(topics));
+        const auto outLen = service_->handleJoinGroup(req, reqLen, clock_, out, kBufSz);
         if (outLen == 0) return {};
-        const auto resp = pc::JoinGroupResponse::decode(out_, outLen);
+        const auto resp = pc::JoinGroupResponse::decode(out, outLen);
         if (!resp) return {};
         return std::string(reinterpret_cast<const char*>(resp->memberId.data()),
                            resp->memberId.size());
     }
 
-    TempDir                                        offsetDir_;
-    TempDir                                        topicDir_;
-    rune::storage::Log                             offsetLog_;
-    std::unique_ptr<NullTransportCG4>              transport_;
-    std::unique_ptr<PartitionReplica>              replica_;
-    std::unique_ptr<ReplicatedOffsetStore>         store_;
-    std::unique_ptr<rune::gateway::TopicRegistry>  registry_;
-    std::unique_ptr<GroupCoordinationService>      service_;
+    // -----------------------------------------------------------------------
+    // Drive service_->doWork until predicate or cap.
+    // -----------------------------------------------------------------------
+    bool driveUntil(std::function<bool()> pred, int cap = kCap) {
+        for (int i = 0; i < cap && !pred(); ++i) {
+            clock_ += kStepNs;
+            service_->doWork(clock_);
+            gw_->doWork(clock_);
+        }
+        return pred();
+    }
 
-    StubGateway gw_;
-    int64_t     clock_ = 1'000'000LL;
+    // -----------------------------------------------------------------------
+    // Drive pushSubscriptions alone (via gw_->doWork) N times.
+    // -----------------------------------------------------------------------
+    void pumpPush(int n = 30) {
+        for (int i = 0; i < n; ++i) {
+            clock_ += kStepNs;
+            gw_->doWork(clock_);
+        }
+    }
 
-    uint8_t req_[kBufSz]{};
-    uint8_t out_[kBufSz]{};
+    // -----------------------------------------------------------------------
+    // Get all captured Records frames for a session.
+    // -----------------------------------------------------------------------
+    std::vector<EgressFrame> capturedFrames(int64_t sid) {
+        std::lock_guard lk(frameMx_);
+        auto it = captured_.find(sid);
+        if (it == captured_.end()) return {};
+        return it->second;
+    }
+
+    // -----------------------------------------------------------------------
+    // Get all captured control frames (Assign) for a session.
+    // -----------------------------------------------------------------------
+    std::vector<EgressFrame> controlFrames(int64_t sid) {
+        std::lock_guard lk(frameMx_);
+        auto it = controlFrames_.find(sid);
+        if (it == controlFrames_.end()) return {};
+        return it->second;
+    }
+
+    // -----------------------------------------------------------------------
+    // Clear captured frames for a session.
+    // -----------------------------------------------------------------------
+    void clearFrames(int64_t sid) {
+        std::lock_guard lk(frameMx_);
+        captured_.erase(sid);
+        controlFrames_.erase(sid);
+    }
+
+    // Members
+    TempDir aeronDir_;
+    TempDir topicDir_;
+    TempDir offsetDir_;
+    rune::storage::Log offsetLog_;
+
+    std::unique_ptr<EmbeddedAeronDriver>             aeron_drv_;
+    std::unique_ptr<rune::gateway::TopicRegistry>    topicReg_;
+    std::unique_ptr<NullTransport>                   nullTransport_;
+    std::unique_ptr<rune::node::ReplicaRegistry>     replicaReg_;
+    std::vector<PartitionReplica*>                   replicaRawPtrs_; // non-owning (registry owns)
+    std::unique_ptr<PartitionReplica>                offsetReplica_;
+    std::unique_ptr<ReplicatedOffsetStore>           offsetStore_;
+    std::unique_ptr<rune::gateway::ClientGateway>    gw_;
+    std::unique_ptr<GroupCoordinationService>        service_;
+
+    int64_t clock_ = kT0Ns;
+
+    std::mutex frameMx_;
+    std::map<int64_t, std::vector<EgressFrame>> captured_;       // Records frames
+    std::map<int64_t, std::vector<EgressFrame>> controlFrames_;  // Assign frames
 };
 
 // ===========================================================================
 // Test: EachPartitionToExactlyOneMember
 //
-// 2 members join a 2-partition topic, both re-join -> Stable.
-// After Stable: each member assignment is size 1; union = {0,1}; no overlap.
+// 2 members join a 2-partition topic → SERVICE drives to Stable → pushSubscriptions
+// pumped.  Assert:
+//   - Each member receives Records for exactly ONE partition.
+//   - No partition is owned by >1 member (single-owner).
+//   - Union of delivered partitions = {0, 1} (all produced).
 // ===========================================================================
-TEST_F(CG4Test, EachPartitionToExactlyOneMember) {
-    const std::string group = "g-cg4-exact-owner";
-    const int64_t sess1 = gw_.addSession();
-    const int64_t sess2 = gw_.addSession();
+TEST_F(CG4DeliveryFixture, EachPartitionToExactlyOneMember) {
+    const std::string group = "g-cg4d-exact-owner";
 
-    // Initial joins -- both get new memberIds.
+    // Inject test sessions (null egress → captured via onEgressFrame).
+    const int64_t sess1 = injectSession();
+    const int64_t sess2 = injectSession();
+
+    // Phase 1: initial joins → both members get assigned IDs.
     const std::string m1 = doJoin(sess1, 1, group);
     ASSERT_FALSE(m1.empty());
     const std::string m2 = doJoin(sess2, 2, group);
@@ -276,88 +509,87 @@ TEST_F(CG4Test, EachPartitionToExactlyOneMember) {
 
     EXPECT_EQ(service_->coordinator(group).state(), GroupState::PreparingRebalance);
 
-    // Re-join with assigned memberIds.
+    // Phase 2: re-joins with assigned memberIds.
     doJoin(sess1, 3, group, m1);
     doJoin(sess2, 4, group, m2);
 
-    // Drive to Stable.
+    // Drive to Stable.  The SERVICE (not the test) calls addGroupSubscription +
+    // sends Assign frames when it reaches Stable.
     const bool stable = driveUntil([&] {
         return service_->coordinator(group).state() == GroupState::Stable;
     });
     ASSERT_TRUE(stable) << "Must reach Stable after both members re-join";
 
-    const auto& coord = service_->coordinator(group);
-    EXPECT_EQ(coord.memberCount(), 2u);
+    // Service should have called addGroupSubscription for each member×partition.
+    EXPECT_EQ(gw_->groupMemberSubCount(sess1), 1u) << "m1 must own 1 group sub";
+    EXPECT_EQ(gw_->groupMemberSubCount(sess2), 1u) << "m2 must own 1 group sub";
+    EXPECT_EQ(gw_->subscriptionCount(), 2u);
 
-    const auto a1 = coord.assignmentFor(m1);
-    const auto a2 = coord.assignmentFor(m2);
+    // Pump pushSubscriptions to deliver Records.
+    pumpPush(50);
 
-    // Each member gets exactly 1 partition (Range assignor, 2 members, 2 partitions).
-    EXPECT_EQ(a1.size(), 1u) << "m1 must own exactly 1 partition";
-    EXPECT_EQ(a2.size(), 1u) << "m2 must own exactly 1 partition";
+    // Collect delivered partitions per member.
+    const auto frames1 = capturedFrames(sess1);
+    const auto frames2 = capturedFrames(sess2);
 
-    std::set<int32_t> owned1, owned2;
-    for (const auto& tp : a1) owned1.insert(tp.partition);
-    for (const auto& tp : a2) owned2.insert(tp.partition);
+    // Records frames have templateId = Records.
+    std::set<int32_t> partitions1, partitions2;
+    for (const auto& f : frames1) {
+        auto dec = pc::Records::decode(f.bytes.data(), f.bytes.size());
+        if (dec) partitions1.insert(dec->partition);
+    }
+    for (const auto& f : frames2) {
+        auto dec = pc::Records::decode(f.bytes.data(), f.bytes.size());
+        if (dec) partitions2.insert(dec->partition);
+    }
 
-    // No overlap.
+    EXPECT_FALSE(partitions1.empty()) << "m1 must receive Records";
+    EXPECT_FALSE(partitions2.empty()) << "m2 must receive Records";
+
+    // Each member received exactly one partition.
+    EXPECT_EQ(partitions1.size(), 1u) << "m1 must receive records for exactly 1 partition";
+    EXPECT_EQ(partitions2.size(), 1u) << "m2 must receive records for exactly 1 partition";
+
+    // No overlap (single-owner).
     std::set<int32_t> overlap;
-    std::set_intersection(owned1.begin(), owned1.end(),
-                          owned2.begin(), owned2.end(),
+    std::set_intersection(partitions1.begin(), partitions1.end(),
+                          partitions2.begin(), partitions2.end(),
                           std::inserter(overlap, overlap.begin()));
-    EXPECT_TRUE(overlap.empty()) << "No partition may be owned by >1 member";
+    EXPECT_TRUE(overlap.empty()) << "No partition may be owned by >1 member (dual-owner violation)";
 
-    // Union = {0, 1}.
+    // Union = {0, 1} (all partitions covered).
     std::set<int32_t> allOwned;
-    allOwned.insert(owned1.begin(), owned1.end());
-    allOwned.insert(owned2.begin(), owned2.end());
+    allOwned.insert(partitions1.begin(), partitions1.end());
+    allOwned.insert(partitions2.begin(), partitions2.end());
     EXPECT_EQ(allOwned.size(), 2u) << "Both partitions must be assigned";
     EXPECT_TRUE(allOwned.count(0) && allOwned.count(1))
-        << "Partitions 0 and 1 must both appear in the union";
-
-    // Stub: simulate what onReachedStable does -- add group subs for each member.
-    for (const auto& tp : a1) {
-        const int64_t subId = gw_.addGroupSubscription(sess1, kTopicId, tp.partition, 0, 0);
-        EXPECT_GT(subId, 0);
-    }
-    for (const auto& tp : a2) {
-        const int64_t subId = gw_.addGroupSubscription(sess2, kTopicId, tp.partition, 0, 0);
-        EXPECT_GT(subId, 0);
-    }
-
-    // Each member has exactly 1 group subscription.
-    EXPECT_EQ(gw_.groupMemberSubCount(sess1), 1u);
-    EXPECT_EQ(gw_.groupMemberSubCount(sess2), 1u);
-    EXPECT_EQ(gw_.subscriptionCount(), 2u);
+        << "Partitions 0 and 1 must both appear in the delivery union";
 }
 
 // ===========================================================================
 // Test: ResumeFromCommittedOffset
 //
-// Commit offset 5 for (g, T:p0) before join.
-// 2 members join -> Stable.
-// Find who owns p0; simulate onReachedStable with fromOffset=committed.
-// Assert nextOffset == 5 for that member; == 0 for non-committed partition.
+// Commit offset 5 for (g, T:p0) BEFORE any member joins.
+// 2 members join → Stable → pushSubscriptions pumped.
+// Assert: the member who owns p0 receives Records with baseOffset >= 5 only
+// (actual delivered baseOffsets verified from egress capture).
 // ===========================================================================
-TEST_F(CG4Test, ResumeFromCommittedOffset) {
-    const std::string group = "g-cg4-resume";
-    const TopicPartition tp{std::string(kTopicName), 0};
+TEST_F(CG4DeliveryFixture, ResumeFromCommittedOffset) {
+    const std::string group = "g-cg4d-resume";
+    const TopicPartition tp0{std::string(kTopicName), 0};
 
-    // Commit offset 5 BEFORE any member joins.
-    store_->commit(group, tp, /*offset=*/5, /*meta=*/"", clock_);
-    const auto committed = store_->fetch(group, tp);
-    ASSERT_TRUE(committed.has_value());
-    ASSERT_EQ(committed->offset, int64_t{5});
+    // Commit offset 5 for p0 BEFORE join.
+    offsetStore_->commit(group, tp0, /*offset=*/5, /*meta=*/"", clock_);
+    ASSERT_TRUE(offsetStore_->fetch(group, tp0).has_value());
+    ASSERT_EQ(offsetStore_->fetch(group, tp0)->offset, int64_t{5});
 
-    const int64_t sess1 = gw_.addSession();
-    const int64_t sess2 = gw_.addSession();
+    const int64_t sess1 = injectSession();
+    const int64_t sess2 = injectSession();
 
-    // Join and drive to Stable.
     const std::string m1 = doJoin(sess1, 10, group);
     ASSERT_FALSE(m1.empty());
     const std::string m2 = doJoin(sess2, 11, group);
     ASSERT_FALSE(m2.empty());
-
     doJoin(sess1, 12, group, m1);
     doJoin(sess2, 13, group, m2);
 
@@ -366,61 +598,74 @@ TEST_F(CG4Test, ResumeFromCommittedOffset) {
     });
     ASSERT_TRUE(stable);
 
+    // Determine which member owns p0 (via coordinator assignment).
     const auto& coord = service_->coordinator(group);
-
-    // Find which member owns partition 0.
-    std::string ownerP0;
     int64_t ownerSess = -1;
+    int64_t otherSess = -1;
     for (const auto& member : coord.members()) {
         for (const auto& mtp : member.assignment) {
             if (mtp.partition == 0) {
-                ownerP0   = member.memberId;
                 ownerSess = (member.memberId == m1) ? sess1 : sess2;
+                otherSess = (ownerSess == sess1)   ? sess2 : sess1;
             }
         }
     }
-    ASSERT_FALSE(ownerP0.empty()) << "Partition 0 must be assigned to some member";
+    ASSERT_GE(ownerSess, 0) << "Partition 0 must be assigned to some member";
 
-    // Simulate onReachedStable for p0 owner: fromOffset = committed offset = 5.
-    const auto co = store_->fetch(group, tp);
-    const int64_t fromOffset = co ? co->offset : 0;
-    EXPECT_EQ(fromOffset, int64_t{5});
+    // Pump push delivery.
+    pumpPush(50);
 
-    const int64_t subId0 = gw_.addGroupSubscription(ownerSess, kTopicId, 0, fromOffset, 0);
-    ASSERT_GT(subId0, 0) << "addGroupSubscription must succeed";
-    EXPECT_EQ(gw_.subs.at(subId0).nextOffset, int64_t{5})
-        << "Owner of p0 must start at committed offset 5";
+    // Collect baseOffsets delivered to the p0 owner.
+    const auto frames = capturedFrames(ownerSess);
+    std::vector<int64_t> baseOffsets;
+    for (const auto& f : frames) {
+        auto dec = pc::Records::decode(f.bytes.data(), f.bytes.size());
+        if (dec && dec->partition == 0) {
+            baseOffsets.push_back(dec->baseOffset);
+        }
+    }
 
-    // Non-owner of p0 gets p1 with fromOffset=0 (no commit for p1).
-    const int64_t nonOwnerSess = (ownerSess == sess1) ? sess2 : sess1;
-    const auto co1 = store_->fetch(group, TopicPartition{std::string(kTopicName), 1});
-    const int64_t fromOffset1 = co1 ? co1->offset : 0;
-    const int64_t subId1 = gw_.addGroupSubscription(nonOwnerSess, kTopicId, 1, fromOffset1, 0);
-    ASSERT_GT(subId1, 0);
-    EXPECT_EQ(gw_.subs.at(subId1).nextOffset, int64_t{0})
-        << "Non-committed partition must start at offset 0";
+    ASSERT_FALSE(baseOffsets.empty())
+        << "Owner of p0 must receive Records after committed-offset resume";
+
+    // All delivered baseOffsets must be >= 5 (resumed from committed offset).
+    for (int64_t bo : baseOffsets) {
+        EXPECT_GE(bo, int64_t{5})
+            << "Owner of p0: delivered baseOffset=" << bo
+            << " must be >= committed offset 5 (resume-from-committed violated)";
+    }
+
+    // The other member (p1, no commit) must have received Records starting from 0.
+    const auto framesOther = capturedFrames(otherSess);
+    bool gotP1From0 = false;
+    for (const auto& f : framesOther) {
+        auto dec = pc::Records::decode(f.bytes.data(), f.bytes.size());
+        if (dec && dec->partition == 1 && dec->baseOffset == 0) {
+            gotP1From0 = true;
+        }
+    }
+    EXPECT_TRUE(gotP1From0)
+        << "Non-committed partition p1 must start delivery from baseOffset=0";
 }
 
 // ===========================================================================
-// Test: EagerRevokeOnRebalance
+// Test: EagerRevokeAndReassign
 //
-// Stable with 2 members (subs manually added).
-// 3rd member joins -> PreparingRebalance.
-// Simulate eager revoke: revokeGroupSubscriptions for both members.
-// Assert subscriptionCount drops to 0.
-// Drive to new Stable -> partition set is coherent (no overlap).
+// 2 members reach Stable → SERVICE adds group subs + sends Assign frames.
+// 3rd member joins → SERVICE sends empty Assign (revoke) to existing members
+// and drops their group subs.  After second Stable, still single-owner.
 // ===========================================================================
-TEST_F(CG4Test, EagerRevokeOnRebalance) {
-    const std::string group = "g-cg4-eager-revoke";
-    const int64_t sess1 = gw_.addSession();
-    const int64_t sess2 = gw_.addSession();
+TEST_F(CG4DeliveryFixture, EagerRevokeAndReassign) {
+    const std::string group = "g-cg4d-eager-revoke";
 
-    // Phase 1: 2 members -> Stable.
+    const int64_t sess1 = injectSession();
+    const int64_t sess2 = injectSession();
+
+    // Phase 1: 2 members → Stable.
     const std::string m1 = doJoin(sess1, 20, group);
     ASSERT_FALSE(m1.empty());
     const std::string m2 = doJoin(sess2, 21, group);
     ASSERT_FALSE(m2.empty());
-
     doJoin(sess1, 22, group, m1);
     doJoin(sess2, 23, group, m2);
 
@@ -429,32 +674,24 @@ TEST_F(CG4Test, EagerRevokeOnRebalance) {
     });
     ASSERT_TRUE(stable) << "Phase 1 must reach Stable";
 
-    // Manually mirror what onReachedStable does: add group subs.
-    {
-        const auto& coord = service_->coordinator(group);
-        for (const auto& member : coord.members()) {
-            const int64_t mSess = (member.memberId == m1) ? sess1 : sess2;
-            for (const auto& mtp : member.assignment) {
-                gw_.addGroupSubscription(mSess, kTopicId, mtp.partition, 0, 0);
-            }
-        }
-    }
-    EXPECT_EQ(gw_.subscriptionCount(), 2u)
-        << "Phase 1: 2 members, 2 partitions -> 2 group subs";
+    // Service must have added group subs for the 2 members.
+    EXPECT_EQ(gw_->subscriptionCount(), 2u)
+        << "Phase 1: 2 members, 2 partitions → 2 group subs";
 
-    // Phase 2: 3rd member joins -> triggers rebalance.
-    const int64_t sess3 = gw_.addSession();
+    // Phase 2: 3rd member joins → triggers rebalance.
+    const int64_t sess3 = injectSession();
     const std::string m3 = doJoin(sess3, 24, group);
     ASSERT_FALSE(m3.empty());
-    EXPECT_EQ(service_->coordinator(group).state(), GroupState::PreparingRebalance);
 
-    // Simulate onEnterPreparingRebalance: revoke all existing group subs.
-    gw_.revokeGroupSubscriptions(sess1);
-    gw_.revokeGroupSubscriptions(sess2);
-    EXPECT_EQ(gw_.subscriptionCount(), 0u)
-        << "After eager revoke, subscription count must be 0";
+    // After 3rd join, coordinator moves to PreparingRebalance.
+    // The service (in doWork) fires onEnterPreparingRebalance → revokes subs.
+    const bool revoked = driveUntil([&] {
+        return gw_->subscriptionCount() == 0;
+    }, 50);
+    EXPECT_TRUE(revoked)
+        << "After 3rd member joins, eager revoke must drop all group subs to 0";
 
-    // All three members re-join.
+    // All 3 members re-join for Phase 2.
     doJoin(sess1, 25, group, m1);
     doJoin(sess2, 26, group, m2);
     doJoin(sess3, 27, group, m3);
@@ -464,30 +701,125 @@ TEST_F(CG4Test, EagerRevokeOnRebalance) {
     });
     ASSERT_TRUE(stable) << "Phase 2 must reach Stable after 3rd member joins";
 
-    // Verify new assignments: all partitions assigned exactly once.
+    // All partitions must be assigned exactly once.
     const auto& coord2 = service_->coordinator(group);
     EXPECT_EQ(coord2.memberCount(), 3u);
     std::set<int32_t> allAssigned;
     for (const auto& member : coord2.members()) {
         for (const auto& mtp : member.assignment) {
             EXPECT_EQ(allAssigned.count(mtp.partition), 0u)
-                << "Partition " << mtp.partition << " assigned to >1 member";
+                << "Partition " << mtp.partition << " assigned to >1 member (dual-owner)";
             allAssigned.insert(mtp.partition);
         }
     }
-    // With 3 members and 2 partitions, 2 partitions should be assigned total.
     EXPECT_EQ(allAssigned.size(), 2u)
         << "Both partitions must be assigned after phase-2 Stable";
 }
 
 // ===========================================================================
-// Test: AssignFrameEncodeDecode (full assign)
+// Test: AssignFramesDelivered
 //
-// Encode an Assign frame with 2 partitions; decode; verify correctness.
+// Assert that:
+//  (a) On reaching Stable, each member's egress receives an Assign frame with
+//      its partition set (decoded from captured control frames).
+//  (b) On entering PreparingRebalance (3rd member joins), each existing member
+//      receives an empty Assign frame (revoke).
 // ===========================================================================
+TEST_F(CG4DeliveryFixture, AssignFramesDelivered) {
+    const std::string group = "g-cg4d-assign-frames";
+
+    const int64_t sess1 = injectSession();
+    const int64_t sess2 = injectSession();
+
+    // Phase 1: 2 members → Stable.
+    const std::string m1 = doJoin(sess1, 30, group);
+    ASSERT_FALSE(m1.empty());
+    const std::string m2 = doJoin(sess2, 31, group);
+    ASSERT_FALSE(m2.empty());
+    doJoin(sess1, 32, group, m1);
+    doJoin(sess2, 33, group, m2);
+
+    const bool stable = driveUntil([&] {
+        return service_->coordinator(group).state() == GroupState::Stable;
+    });
+    ASSERT_TRUE(stable) << "Must reach Stable";
+
+    // Each member must have received at least one Assign frame (Stable assign).
+    const auto cf1 = controlFrames(sess1);
+    const auto cf2 = controlFrames(sess2);
+
+    ASSERT_FALSE(cf1.empty()) << "m1 must receive an Assign control frame on Stable";
+    ASSERT_FALSE(cf2.empty()) << "m2 must receive an Assign control frame on Stable";
+
+    // Find the Assign frame with a non-empty assignment (the Stable assign).
+    bool m1GotAssign = false;
+    bool m2GotAssign = false;
+    for (const auto& f : cf1) {
+        auto dec = decodeAssign(f.bytes.data(), f.bytes.size());
+        if (dec && dec->assignment.size() == 1u) { m1GotAssign = true; }
+    }
+    for (const auto& f : cf2) {
+        auto dec = decodeAssign(f.bytes.data(), f.bytes.size());
+        if (dec && dec->assignment.size() == 1u) { m2GotAssign = true; }
+    }
+    EXPECT_TRUE(m1GotAssign) << "m1 must receive a non-empty Assign (partition set) on Stable";
+    EXPECT_TRUE(m2GotAssign) << "m2 must receive a non-empty Assign (partition set) on Stable";
+
+    // Verify single-owner: extract partitions from Assign frames.
+    std::set<int32_t> assignedToM1, assignedToM2;
+    for (const auto& f : cf1) {
+        auto dec = decodeAssign(f.bytes.data(), f.bytes.size());
+        if (dec) for (std::size_t i = 0; i < dec->assignment.size(); ++i)
+            assignedToM1.insert(dec->assignment[i].partition);
+    }
+    for (const auto& f : cf2) {
+        auto dec = decodeAssign(f.bytes.data(), f.bytes.size());
+        if (dec) for (std::size_t i = 0; i < dec->assignment.size(); ++i)
+            assignedToM2.insert(dec->assignment[i].partition);
+    }
+    // No overlap between final assignments.
+    std::set<int32_t> overlap;
+    std::set_intersection(assignedToM1.begin(), assignedToM1.end(),
+                          assignedToM2.begin(), assignedToM2.end(),
+                          std::inserter(overlap, overlap.begin()));
+    EXPECT_TRUE(overlap.empty())
+        << "No partition may be assigned to >1 member in the Assign frames";
+
+    // Phase 2: 3rd member joins → each existing member must get an empty Assign (revoke).
+    clearFrames(sess1);
+    clearFrames(sess2);
+
+    const int64_t sess3 = injectSession();
+    const std::string m3 = doJoin(sess3, 34, group);
+    ASSERT_FALSE(m3.empty());
+
+    // Drive until revoke fires (subscriptionCount drops to 0 and control frames appear).
+    driveUntil([&] {
+        return !controlFrames(sess1).empty() || !controlFrames(sess2).empty();
+    }, 100);
+
+    // Each member (m1, m2) must have received an empty Assign frame (revoke).
+    bool m1GotRevoke = false;
+    bool m2GotRevoke = false;
+    for (const auto& f : controlFrames(sess1)) {
+        auto dec = decodeAssign(f.bytes.data(), f.bytes.size());
+        if (dec && dec->assignment.size() == 0u) m1GotRevoke = true;
+    }
+    for (const auto& f : controlFrames(sess2)) {
+        auto dec = decodeAssign(f.bytes.data(), f.bytes.size());
+        if (dec && dec->assignment.size() == 0u) m2GotRevoke = true;
+    }
+    EXPECT_TRUE(m1GotRevoke) << "m1 must receive an empty Assign (revoke) when 3rd member joins";
+    EXPECT_TRUE(m2GotRevoke) << "m2 must receive an empty Assign (revoke) when 3rd member joins";
+}
+
+// ===========================================================================
+// Pure encode/decode unit tests — kept from original (no orchestration).
+// ===========================================================================
+
 TEST(CG4_AssignFrameEncodeDecode, FullAssign) {
-    static constexpr std::size_t kBufSz = 512;
-    uint8_t buf[kBufSz]{};
+    static constexpr std::size_t kBufSz2 = 512;
+    uint8_t buf[kBufSz2]{};
 
     pc::Assign frame;
     frame.sessionId     = 77;
@@ -500,7 +832,7 @@ TEST(CG4_AssignFrameEncodeDecode, FullAssign) {
     }};
     const std::size_t encoded = frame.encode(buf, std::span<const pc::TopicPartition32>(asgn));
     ASSERT_GT(encoded, 0u);
-    ASSERT_LE(encoded, kBufSz);
+    ASSERT_LE(encoded, kBufSz2);
 
     const auto decoded = pc::Assign::decode(buf, encoded);
     ASSERT_TRUE(decoded.has_value());
@@ -515,12 +847,9 @@ TEST(CG4_AssignFrameEncodeDecode, FullAssign) {
     EXPECT_TRUE(partitions.count(1));
 }
 
-// ===========================================================================
-// Test: AssignFrameEncodeDecode (empty = revoke)
-// ===========================================================================
 TEST(CG4_AssignFrameEncodeDecode, EmptyAssignIsRevoke) {
-    static constexpr std::size_t kBufSz = 64;
-    uint8_t buf[kBufSz]{};
+    static constexpr std::size_t kBufSz2 = 64;
+    uint8_t buf[kBufSz2]{};
 
     pc::Assign frame;
     frame.sessionId     = 99;
@@ -529,7 +858,7 @@ TEST(CG4_AssignFrameEncodeDecode, EmptyAssignIsRevoke) {
 
     const std::size_t encoded = frame.encode(buf, std::span<const pc::TopicPartition32>{});
     ASSERT_GT(encoded, 0u);
-    ASSERT_LE(encoded, kBufSz);
+    ASSERT_LE(encoded, kBufSz2);
 
     const auto decoded = pc::Assign::decode(buf, encoded);
     ASSERT_TRUE(decoded.has_value());
@@ -537,141 +866,4 @@ TEST(CG4_AssignFrameEncodeDecode, EmptyAssignIsRevoke) {
     EXPECT_EQ(decoded->generationId, int32_t{7});
     EXPECT_EQ(decoded->assignment.size(), std::size_t{0})
         << "Empty assignment = revoke all";
-}
-
-// ===========================================================================
-// Test: AssignFrameCaptureCallback
-//
-// Simulate onReachedStable + onEnterPreparingRebalance frame dispatch:
-//   - Encode Assign with partition via StubGateway::sendControlFrame.
-//   - Encode empty Assign (revoke) via StubGateway::sendControlFrame.
-// Assert: frames captured in the right order; each decodes correctly.
-// ===========================================================================
-TEST(CG4_AssignFrameCapture, FullThenRevoke) {
-    StubGateway gw;
-    const int64_t sid = gw.addSession();
-
-    static constexpr std::size_t kBufSz = 512;
-    uint8_t buf[kBufSz]{};
-
-    // Assign frame: generation=2, partition=0.
-    {
-        pc::Assign frame;
-        frame.sessionId     = sid;
-        frame.correlationId = 0;
-        frame.generationId  = 2;
-        std::array<pc::TopicPartition32, 1> asgn{{{0, 0}}};
-        const std::size_t n = frame.encode(buf, std::span<const pc::TopicPartition32>(asgn));
-        gw.sendControlFrame(sid, buf, n);
-    }
-
-    // Revoke Assign frame: generation=3, empty.
-    {
-        pc::Assign frame;
-        frame.sessionId     = sid;
-        frame.correlationId = 0;
-        frame.generationId  = 3;
-        const std::size_t n = frame.encode(buf, std::span<const pc::TopicPartition32>{});
-        gw.sendControlFrame(sid, buf, n);
-    }
-
-    ASSERT_EQ(gw.frames.count(sid), 1u);
-    ASSERT_EQ(gw.frames.at(sid).size(), 2u);
-
-    // First frame: Assign with p0.
-    {
-        const auto& bytes = gw.frames.at(sid)[0];
-        const auto d = pc::Assign::decode(bytes.data(), bytes.size());
-        ASSERT_TRUE(d.has_value());
-        EXPECT_EQ(d->generationId, int32_t{2});
-        ASSERT_EQ(d->assignment.size(), std::size_t{1});
-        EXPECT_EQ(d->assignment[0].partition, int32_t{0});
-    }
-
-    // Second frame: revoke (empty, gen=3).
-    {
-        const auto& bytes = gw.frames.at(sid)[1];
-        const auto d = pc::Assign::decode(bytes.data(), bytes.size());
-        ASSERT_TRUE(d.has_value());
-        EXPECT_EQ(d->generationId, int32_t{3});
-        EXPECT_EQ(d->assignment.size(), std::size_t{0});
-    }
-}
-
-// ===========================================================================
-// Test: ServiceStable_SingleMember
-//
-// 1 member joins a 1-partition topic -> coordinator drives to Stable.
-// assignmentFor(m1) returns 1 entry with partition=0.
-// ===========================================================================
-TEST(CG4_ServiceStable, SingleMemberOnePartitionTopic) {
-    const std::string suffix = makeSuffix();
-    TempDir offsetDir("svc_offset_" + suffix);
-    TempDir topicDir2("svc_topic_" + suffix);
-    rune::storage::Log offsetLog(offsetDir.path);
-    NullTransportCG4 transport;
-    auto replica = std::make_unique<PartitionReplica>(
-        makePartCfg(), Role::Leader, /*generation=*/1,
-        std::vector<NodeId>{1}, std::vector<NodeId>{1},
-        &offsetLog, &transport);
-    auto store = std::make_unique<ReplicatedOffsetStore>(replica.get());
-
-    auto reg = std::make_unique<rune::gateway::TopicRegistry>(
-        std::vector<TopicSpec>{
-            makeTopicSpec("t1", /*partitions=*/1, /*id=*/0)
-        },
-        topicDir2.path);
-
-    GroupCoordinationService svc(store.get(), reg.get(),
-                                 [] { return true; }, [] { return NodeId{1}; });
-
-    const std::string group = "g-single";
-    static constexpr std::size_t kBufSz = 4096;
-    uint8_t req[kBufSz]{};
-    uint8_t out[kBufSz]{};
-    int64_t clock = 1'000'000LL;
-
-    // Encode a JoinGroup request for topic id=0.
-    auto encodeJoin = [&](std::string_view memberId) -> std::size_t {
-        pc::JoinGroup msg;
-        msg.sessionId        = 1;
-        msg.correlationId    = 1;
-        msg.sessionTimeoutMs = 5000;
-        msg.groupId  = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(group.data()), group.size());
-        msg.memberId = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
-        std::array<int32_t, 1> tids{0};
-        return msg.encode(req, std::span<const int32_t>(tids));
-    };
-
-    // Initial join (empty memberId -> server assigns one).
-    const auto r0Len = encodeJoin({});
-    const auto o0Len = svc.handleJoinGroup(req, r0Len, clock, out, kBufSz);
-    ASSERT_GT(o0Len, 0u);
-    const auto r0 = pc::JoinGroupResponse::decode(out, o0Len);
-    ASSERT_TRUE(r0.has_value());
-    const std::string m1(reinterpret_cast<const char*>(r0->memberId.data()),
-                         r0->memberId.size());
-    ASSERT_FALSE(m1.empty());
-
-    // Re-join with assigned memberId.
-    const auto r1Len = encodeJoin(m1);
-    svc.handleJoinGroup(req, r1Len, clock + kStepNs, out, kBufSz);
-
-    // Drive to Stable.
-    for (int i = 0; i < kCap; ++i) {
-        clock += kStepNs;
-        svc.doWork(clock);
-        if (svc.coordinator(group).state() == GroupState::Stable) break;
-    }
-
-    EXPECT_EQ(svc.coordinator(group).state(), GroupState::Stable);
-
-    const auto asgn = svc.coordinator(group).assignmentFor(m1);
-    ASSERT_FALSE(asgn.empty()) << "m1 must receive an assignment";
-    EXPECT_EQ(asgn.size(), 1u);
-    EXPECT_EQ(asgn[0].partition, int32_t{0})
-        << "Single-member, single-partition: m1 gets partition 0";
-    EXPECT_EQ(asgn[0].topic, std::string{"t1"});
 }
