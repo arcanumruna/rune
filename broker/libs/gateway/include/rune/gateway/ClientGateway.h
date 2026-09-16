@@ -241,6 +241,20 @@ public:
     // are unaffected.  No-op if the session has no group subscriptions.
     void revokeGroupSubscriptions(int64_t memberSessionId);
 
+    // captureGroupPositions — return a snapshot of the nextOffset for each group
+    // subscription belonging to memberSessionId BEFORE revoking.
+    //
+    // Called from GroupCoordinationService::onEnterPreparingRebalance so the
+    // service can cache (topicId, partition) → nextOffset for each partition that
+    // was live when the rebalance started.  The cache is later used in
+    // handleSyncGroup to seed new subscriptions at the maximum of:
+    //   max(committedOffset, capturedNextOffset)
+    // This prevents cross-generation re-delivery when partitions are reassigned.
+    //
+    // Returns an empty vector if the session has no group subscriptions.
+    struct TopicPartitionPosition { int32_t topicId; int32_t partition; int64_t nextOffset; };
+    std::vector<TopicPartitionPosition> captureGroupPositions(int64_t memberSessionId) const;
+
     // sendControlFrame — send an already-encoded frame (e.g. Assign) on a
     // session's egress.  Reuses the same sendTo path as all other responses.
     // Returns true if the frame was accepted by the egress publication.

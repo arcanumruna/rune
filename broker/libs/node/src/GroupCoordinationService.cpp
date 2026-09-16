@@ -132,6 +132,22 @@ coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts(
 // Returns total work count (0 in steady state when all groups are Stable/Empty).
 // ---------------------------------------------------------------------------
 int GroupCoordinationService::doWork(int64_t nowNs) {
+    // CG-6 failover: rebuild the in-memory offset index on the first duty cycle
+    // after becoming coordinator (Follower → Leader transition).  This ensures
+    // committed offsets that were replicated to this node while it was a follower
+    // are visible before serving any JoinGroup / SyncGroup requests.
+    const bool amLeader = isLocalCoordinator();
+    if (amLeader && !wasLeader_) {
+        spdlog::info("GroupCoordinationService::doWork: became coordinator — rebuilding offset index");
+        if (offsets_) {
+            offsets_->rebuildFromLog();
+        }
+        wasLeader_ = true;
+    } else if (!amLeader && wasLeader_) {
+        // Lost leadership — mark so the next election triggers another rebuild.
+        wasLeader_ = false;
+    }
+
     if (coordinators_.empty()) return 0;
 
     int work = 0;
@@ -289,6 +305,37 @@ size_t GroupCoordinationService::handleJoinGroup(
                       memberKey, msg.sessionId);
     }
 
+    // CG-6 fix: if the group just reached CompletingRebalance (all expected
+    // members joined), auto-assign NOW instead of waiting for the next doWork()
+    // cycle.  Without this, the client receives JoinGroupResponse-OK and
+    // immediately sends SyncGroup — but leaderSynced_ is still false so
+    // syncGroup() returns RebalanceInProgress, the client enters Rejoining state,
+    // and the next JoinGroup re-triggers a rebalance → infinite revoke/assign loop.
+    //
+    // By calling autoAssignAndSync() synchronously here (before returning the
+    // JoinGroupResponse), the assignment is committed + subscriptions are wired
+    // + the Assign frame is sent — all before the client even sees
+    // JoinGroupResponse.  When the client's SyncGroup arrives, leaderSynced_=true
+    // and state=Stable → syncGroup() returns OK with the assignment in-hand.
+    //
+    // Mirrors the doWork() detection path for timer-triggered completions; the
+    // guard (!gc.leaderSynced()) ensures this fires at most once per generation.
+    if (gc.state() == coord::GroupState::CompletingRebalance && !gc.leaderSynced()) {
+        const coord::TopicPartitionCounts partCounts = buildTopicPartitionCounts();
+        const coord::SyncResult sr =
+            gc.autoAssignAndSync(partCounts, coord::AssignorType::Range, nowNs);
+        if (sr.ok()) {
+            spdlog::debug("GroupCoordinationService: group='{}' early auto-assign (join-triggered)",
+                          groupIdStr);
+            if (gc.state() == coord::GroupState::Stable) {
+                onReachedStable(groupIdStr, gc, nowNs);
+            }
+        } else {
+            spdlog::warn("GroupCoordinationService: group='{}' early autoAssignAndSync failed: {}",
+                         groupIdStr, sr.errorCode);
+        }
+    }
+
     // Build response.
     const std::string& assignedMemberId = jr.memberId;
     pc::JoinGroupResponse resp;
@@ -366,6 +413,76 @@ size_t GroupCoordinationService::handleSyncGroup(
 
     // Stable: return the member's assignment.
     const std::vector<coord::TopicPartition> assignment = gc.assignmentFor(memberIdStr);
+
+    // CG-6 push-subscription seam: create (or reset) the member's group push
+    // subscriptions here — at the moment the client confirms it is ready to
+    // receive records — rather than eagerly in onReachedStable.
+    //
+    // Rationale: onReachedStable fires while the client is still in Joining or
+    // Syncing state (it just sent JoinGroup and is waiting for the SyncGroup
+    // round-trip).  If subscriptions are created there, pushSubscriptions() may
+    // deliver records BEFORE the client reaches Stable, causing them to be
+    // silently dropped by GroupConsumerHub::onRecords (state != Stable guard).
+    // By the time the client enters Stable the subscription's nextOffset has
+    // already advanced past all pre-existing records → 0 records consumed.
+    //
+    // Creating subscriptions HERE (on the SyncGroup OK path) guarantees the
+    // push starts at the committed offset EXACTLY when the client is about to
+    // transition to Stable (the SyncGroupResponse triggers the transition).
+    // Any records pushed between now and the SyncGroupResponse arriving at the
+    // client are at most one network-RTT worth — a negligible window and safe
+    // because the subscription always starts from the committed offset, which
+    // is what the client will OffsetFetch next anyway.
+    //
+    // Two-step: (1) revoke existing group subs for this session (idempotent if
+    // none exist); (2) re-create from committed offset.
+    if (gateway_) {
+        gateway_->revokeGroupSubscriptions(msg.sessionId);
+        for (const auto& tp : assignment) {
+            int32_t topicId = -1;
+            if (topics_) {
+                const auto opt = topics_->topicIdForName(tp.topic);
+                if (opt) topicId = *opt;
+            }
+            if (topicId < 0) {
+                spdlog::warn("GroupCoordinationService::handleSyncGroup: "
+                             "unknown topic '{}' for member '{}' — skipping partition",
+                             tp.topic, memberIdStr);
+                continue;
+            }
+            int64_t fromOffset = 0;
+            {
+                const auto committed = offsets_->fetch(groupIdStr, tp);
+                if (committed.has_value()) fromOffset = committed->offset;
+            }
+            // CG-6: check the group-position cache.  If the previous generation
+            // had a subscription for this partition that advanced beyond the
+            // committed offset, start from there to avoid re-delivering records
+            // already consumed by another member in an earlier generation.
+            {
+                const GroupTpKey key{ groupIdStr, topicId, tp.partition };
+                const auto cit = groupPositionCache_.find(key);
+                if (cit != groupPositionCache_.end() && cit->second > fromOffset) {
+                    spdlog::debug("GroupCoordinationService::handleSyncGroup: "
+                                  "position cache hit group='{}' topic={} partition={} "
+                                  "committed={} cached={} → using cached",
+                                  groupIdStr, topicId, tp.partition, fromOffset, cit->second);
+                    fromOffset = cit->second;
+                }
+            }
+            const int64_t subId = gateway_->addGroupSubscription(
+                msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/0);
+            if (subId < 0) {
+                spdlog::warn("GroupCoordinationService::handleSyncGroup: "
+                             "addGroupSubscription failed for member '{}' topic={} partition={}",
+                             memberIdStr, topicId, tp.partition);
+            } else {
+                spdlog::debug("GroupCoordinationService::handleSyncGroup: "
+                              "group sub for member='{}' sessionId={} topic={} partition={} fromOffset={}",
+                              memberIdStr, msg.sessionId, topicId, tp.partition, fromOffset);
+            }
+        }
+    }
 
     // Build TopicPartition32 array for the response.
     // assignScratch_ is pre-reserved; may grow if needed (rare, cold).
@@ -767,6 +884,24 @@ void GroupCoordinationService::onEnterPreparingRebalance(
 
         const int64_t sessionId = it->second;
 
+        // CG-6: capture consumed nextOffset BEFORE revoking so that the next
+        // generation's SyncGroup can seed subscriptions at max(committed, captured)
+        // rather than just the committed offset.  This prevents cross-generation
+        // re-delivery when partitions are reassigned to a different member.
+        {
+            const auto positions = gateway_->captureGroupPositions(sessionId);
+            for (const auto& pos : positions) {
+                GroupTpKey key{ groupId, pos.topicId, pos.partition };
+                const auto [entry, inserted] = groupPositionCache_.try_emplace(key, pos.nextOffset);
+                if (!inserted && pos.nextOffset > entry->second) {
+                    entry->second = pos.nextOffset;
+                }
+                spdlog::debug("GroupCoordinationService::onEnterPreparingRebalance: "
+                              "captured position group='{}' topic={} partition={} nextOffset={}",
+                              groupId, pos.topicId, pos.partition, pos.nextOffset);
+            }
+        }
+
         // 1. Eagerly revoke all group push subscriptions for this member.
         gateway_->revokeGroupSubscriptions(sessionId);
 
@@ -796,20 +931,21 @@ void GroupCoordinationService::onEnterPreparingRebalance(
 }
 
 // ---------------------------------------------------------------------------
-// onReachedStable — called from doWork after autoAssignAndSync succeeds and
-// the group transitions to Stable.
+// onReachedStable — called from doWork/handleJoinGroup after autoAssignAndSync
+// succeeds and the group transitions to Stable.
 //
-// For every member:
-//   1. For each assigned (topicId, partition):
-//      - fromOffset = offsets_->fetch(group, tp) → committed, or 0 (earliest)
-//        if not found.  (Milestone-D will support auto.offset.reset=latest via
-//        replicaRegistry lookup — for now, "no commit" → earliest = 0.)
-//      - addGroupSubscription(memberSession, topicId, partition, fromOffset, 0)
-//   2. Build Assign{gen, assignments} and send via sendControlFrame.
-//      Bounded by assignFrameScratch_ capacity (outCap-bounded encode).
+// Sends an Assign{gen, assignment} control frame to each member so they can
+// update their local assignment maps.  Group push subscriptions are NOT created
+// here; they are created in handleSyncGroup when the member's SyncGroup arrives
+// with the correct generation (the moment the client is about to enter Stable).
 //
-// Resolves the CG-3 carried item: Assign frame encoding is outCap-bounded
-// (entries that exceed the scratch capacity are silently capped, not written).
+// Separation of concerns:
+//   - onReachedStable  → Assign frame only (best-effort delivery; may be
+//                        silently dropped if the client is in Joining/Syncing
+//                        state, which is fine — SyncGroupResponse carries the
+//                        assignment authoritatively).
+//   - handleSyncGroup  → push subscriptions created here (correct committed
+//                        offset seed; see comment block there for full rationale).
 //
 // No-op when gateway_ is null (tests without a real gateway).
 // ---------------------------------------------------------------------------
@@ -834,7 +970,7 @@ void GroupCoordinationService::onReachedStable(
         }
         const int64_t sessionId = it->second;
 
-        // Build assignment and create push subscriptions.
+        // Build assignment for the Assign frame only (no subscription creation).
         assignFrameTpScratch_.clear();
 
         for (const auto& tp : member.assignment) {
@@ -851,37 +987,15 @@ void GroupCoordinationService::onReachedStable(
                 continue;
             }
 
-            // fromOffset: use committed offset if available; else 0 (earliest).
-            int64_t fromOffset = 0;
-            {
-                const auto committed = offsets_->fetch(groupId, tp);
-                if (committed.has_value()) {
-                    fromOffset = committed->offset;
-                }
-                // auto.offset.reset=latest would use replica->highWatermark() here;
-                // deferred to Milestone-D.  For now: no commit → earliest (0).
-            }
-
-            // Create the push subscription (resumed from fromOffset).
-            const int64_t subId = gateway_->addGroupSubscription(
-                sessionId, topicId, tp.partition, fromOffset, /*isolation=*/0);
-            if (subId < 0) {
-                spdlog::warn("GroupCoordinationService::onReachedStable: "
-                             "addGroupSubscription failed for member '{}' topic={} partition={}",
-                             member.memberId, topicId, tp.partition);
-                continue;
-            }
-
             // Accumulate for the Assign frame (outCap-bounded below).
-            // Check if this entry would overflow the scratch before pushing.
             const std::size_t nextCount = assignFrameTpScratch_.size() + 1;
             const std::size_t neededForNext = pc::Assign::encodedSizeFor(nextCount);
             if (neededForNext > kAssignFrameScratchSize) {
                 spdlog::warn("GroupCoordinationService::onReachedStable: "
                              "Assign frame capacity reached at {} entries (scratch={}B); "
-                             "remaining partitions pushed but not in Assign frame",
+                             "remaining partitions not in Assign frame",
                              assignFrameTpScratch_.size(), kAssignFrameScratchSize);
-                break;  // push subscriptions already created above; frame is capped
+                break;
             }
             assignFrameTpScratch_.push_back(pc::TopicPartition32{topicId, tp.partition});
         }
