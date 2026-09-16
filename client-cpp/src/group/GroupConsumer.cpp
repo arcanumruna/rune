@@ -131,4 +131,12 @@ bool GroupConsumer::active() const noexcept {
     return impl_ && impl_->active.load(std::memory_order_acquire);
 }
 
+// ---------------------------------------------------------------------------
+// generation() — runner-thread read (see header threading note)
+// ---------------------------------------------------------------------------
+
+int32_t GroupConsumer::generation() const noexcept {
+    return impl_ ? impl_->generationId : 0;
+}
+
 } // namespace rune::client

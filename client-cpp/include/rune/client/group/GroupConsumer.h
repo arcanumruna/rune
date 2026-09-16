@@ -215,6 +215,17 @@ public:
     /// True if the consumer is still active.
     [[nodiscard]] bool active() const noexcept;
 
+    /// Current assignment generation as last set by the broker
+    /// (JoinGroupResponse / Assign).  Increments on every rebalance.
+    ///
+    /// THREADING: generationId is written on the runner thread (during
+    /// JoinGroupResponse / Assign handling) and MUST only be read from the
+    /// runner thread — i.e. from inside an onAssigned / onRevoked / onRecords
+    /// callback, which is exactly where the generation of the current
+    /// assignment/record is meaningful.  Reading it from the app thread is a
+    /// data race and is not supported.
+    [[nodiscard]] int32_t generation() const noexcept;
+
     /// Access the raw impl (for hub wiring — not part of user API).
     [[nodiscard]] std::shared_ptr<GroupConsumerImpl> impl() const noexcept {
         return impl_;

@@ -338,6 +338,7 @@ static int doGroup(Client& client,
         int32_t     partition;
         int64_t     offset;
         int         rec_cid, rec_key, rec_seq;
+        int32_t     generation;
     };
     std::mutex        qMtx;
     std::deque<GRec>  q;
@@ -358,9 +359,15 @@ static int doGroup(Client& client,
 
     GroupConsumer gc = client.subscribeGroup(groupId, topicNames, gcfg);
 
-    gc.onAssigned([cid, primaryTopic](std::vector<TopicPartition> parts) {
+    // NOTE: the callbacks below fire on the GroupConsumer runner thread, which is
+    // the same thread that updates gc.generation().  Capturing &gc lets each
+    // callback stamp the CURRENT assignment generation onto its output — the
+    // harness single-owner invariant is generation-aware, so a (partition,offset)
+    // legitimately re-read by a NEW owner after a rebalance (different generation)
+    // is not flagged, while a true same-generation split still fails the test.
+    gc.onAssigned([cid, primaryTopic, &gc](std::vector<TopicPartition> parts) {
         std::ostringstream oss;
-        oss << "ASSIGN cid=" << cid << " parts=";
+        oss << "ASSIGN cid=" << cid << " gen=" << gc.generation() << " parts=";
         for (std::size_t i = 0; i < parts.size(); ++i) {
             if (i > 0) oss << ",";
             oss << parts[i].partition;
@@ -370,9 +377,9 @@ static int doGroup(Client& client,
         (void)primaryTopic;
     });
 
-    gc.onRevoked([cid, primaryTopic](std::vector<TopicPartition> parts) {
+    gc.onRevoked([cid, primaryTopic, &gc](std::vector<TopicPartition> parts) {
         std::ostringstream oss;
-        oss << "REVOKE cid=" << cid << " parts=";
+        oss << "REVOKE cid=" << cid << " gen=" << gc.generation() << " parts=";
         for (std::size_t i = 0; i < parts.size(); ++i) {
             if (i > 0) oss << ",";
             oss << parts[i].partition;
@@ -382,7 +389,7 @@ static int doGroup(Client& client,
         (void)primaryTopic;
     });
 
-    gc.onRecords([&qMtx, &q, primaryTopic, cid](const RecordSet& rs) {
+    gc.onRecords([&qMtx, &q, &gc, primaryTopic, cid](const RecordSet& rs) {
         // rs is a RecordsView (RecordSet alias) with .recordBatch span.
         // Iterate each record in the batch using RecordBatchReader.
         if (rs.recordBatch.size() < static_cast<std::size_t>(
@@ -397,8 +404,9 @@ static int doGroup(Client& client,
             int rc = -1, rk = -1, rs_seq = -1;
             const std::string valStr(val);
             decodePayload(valStr, rc, rk, rs_seq);
+            const int32_t gen = gc.generation();
             std::lock_guard<std::mutex> lk(qMtx);
-            q.push_back({primaryTopic, rs.partition, off, rc, rk, rs_seq});
+            q.push_back({primaryTopic, rs.partition, off, rc, rk, rs_seq, gen});
         });
         (void)cid;
     });
@@ -420,6 +428,7 @@ static int doGroup(Client& client,
         }
         if (have) {
             std::cout << "GROUPREC cid=" << cid
+                      << " gen=" << rec.generation
                       << " topic=" << rec.topicName
                       << " partition=" << rec.partition
                       << " offset=" << rec.offset
