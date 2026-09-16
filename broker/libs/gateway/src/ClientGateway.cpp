@@ -3,7 +3,9 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/ReplicaRegistry.h>
-#include <rune/node/GroupCoordinationService.h>
+// GroupCoordinationService.h is NOT included here (CG-4 fix: break rune_gateway→rune_node
+// symbol cycle).  ClientGateway dispatches group messages through IGroupRequestHandler
+// (defined in this lib); the concrete type lives in rune_node.
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/IsrManager.h>
 
@@ -148,6 +150,12 @@ void ClientGateway::reapExpired(int64_t nowNs) {
                 ++it;
             }
         }
+
+        // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
+        // does not grow unboundedly under connect/disconnect churn (session ids are
+        // monotonic, so stale entries are harmless for delivery but constitute a
+        // steady-state memory leak — violates the zero-leak directive).
+        groupMemberSubs_.erase(sid);
     }
 }
 
@@ -633,6 +641,10 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
             ++it;
         }
     }
+
+    // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
+    // does not grow unboundedly under connect/disconnect churn.
+    groupMemberSubs_.erase(sid);
 }
 
 // ---------------------------------------------------------------------------

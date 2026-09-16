@@ -1,0 +1,58 @@
+#pragma once
+// IGroupRequestHandler.h — CG-4 fix: abstract interface for consumer-group request
+// handling, owned by the gateway lib so ClientGateway depends only on this interface
+// rather than on rune_node symbols.
+//
+// GroupCoordinationService (in rune_node) implements this interface.
+// ClientGateway holds an IGroupRequestHandler* (set via setGroupService) and
+// dispatches group messages through it.  rune_gateway therefore has NO direct
+// dependency on rune_node symbols at link time.
+//
+// Direction of dependencies (after this fix):
+//   rune_gateway  → (no rune_node symbols)
+//   rune_node     → rune_gateway    (GroupCoordinationService uses ClientGateway API)
+//
+// Namespace: rune::gateway
+// C++23.
+
+#include <cstddef>
+#include <cstdint>
+
+namespace rune::gateway {
+
+struct IGroupRequestHandler {
+    virtual ~IGroupRequestHandler() = default;
+
+    // Each method decodes the request from buf[0..len-1], acts, encodes the
+    // response into out[0..outCap-1], and returns the number of bytes written
+    // (0 on decode error or unrecoverable failure).
+    //
+    // buf and out MUST NOT overlap.
+    // outCap is the capacity of out[] in bytes.
+    // Never throws.  Never allocates from heap in steady state.
+    virtual size_t handleJoinGroup   (const uint8_t* buf, size_t len,
+                                      int64_t nowNs,
+                                      uint8_t* out, size_t outCap) = 0;
+
+    virtual size_t handleSyncGroup   (const uint8_t* buf, size_t len,
+                                      int64_t nowNs,
+                                      uint8_t* out, size_t outCap) = 0;
+
+    virtual size_t handleHeartbeat   (const uint8_t* buf, size_t len,
+                                      int64_t nowNs,
+                                      uint8_t* out, size_t outCap) = 0;
+
+    virtual size_t handleLeaveGroup  (const uint8_t* buf, size_t len,
+                                      int64_t nowNs,
+                                      uint8_t* out, size_t outCap) = 0;
+
+    virtual size_t handleOffsetCommit(const uint8_t* buf, size_t len,
+                                      int64_t nowNs,
+                                      uint8_t* out, size_t outCap) = 0;
+
+    virtual size_t handleOffsetFetch (const uint8_t* buf, size_t len,
+                                      int64_t nowNs,
+                                      uint8_t* out, size_t outCap) = 0;
+};
+
+} // namespace rune::gateway

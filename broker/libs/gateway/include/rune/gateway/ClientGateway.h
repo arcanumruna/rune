@@ -46,6 +46,7 @@
 //   - NO busy-spin.
 
 #include <rune/gateway/SessionTable.h>
+#include <rune/gateway/IGroupRequestHandler.h>
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -71,7 +72,6 @@
 #include <vector>
 
 namespace rune::node { class ReplicaRegistry; }
-namespace rune::node { class GroupCoordinationService; }
 namespace rune::replication { class PartitionReplica; }
 
 namespace rune::gateway {
@@ -178,19 +178,20 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // setGroupService — wire in the GroupCoordinationService (CG-3).
+    // setGroupService — wire in the group-request handler (CG-3 / CG-4 fix).
+    // Accepts any IGroupRequestHandler implementation (e.g. GroupCoordinationService).
     // Must be called before doWork() if group-coordination dispatch is desired.
     // May be null (group messages are dropped). Pointer is non-owning; lifetime
     // must exceed the ClientGateway. Single-writer: call only on the duty-cycle thread.
     // -----------------------------------------------------------------------
-    void setGroupService(rune::node::GroupCoordinationService* service) noexcept {
+    void setGroupService(rune::gateway::IGroupRequestHandler* service) noexcept {
         groupService_ = service;
     }
 
     // -----------------------------------------------------------------------
-    // groupService — current service pointer (may be null).
+    // groupService — current handler pointer (may be null).
     // -----------------------------------------------------------------------
-    [[nodiscard]] rune::node::GroupCoordinationService* groupService() const noexcept {
+    [[nodiscard]] rune::gateway::IGroupRequestHandler* groupService() const noexcept {
         return groupService_;
     }
 
@@ -526,10 +527,12 @@ private:
     // Single-writer: only accessed on the duty-cycle thread.
     rune::node::ReplicaRegistry*         replicaRegistry_ = nullptr;
 
-    // Group coordination service (CG-3) — non-owning; set via setGroupService().
+    // Group request handler (CG-3/CG-4 fix) — non-owning; set via setGroupService().
     // Null until wired in; group messages (templateIds 32–43) are dispatched here.
+    // IGroupRequestHandler is defined in this lib (gateway); the concrete impl
+    // (GroupCoordinationService) lives in rune_node — no circular dependency.
     // Single-writer: only accessed on the duty-cycle thread.
-    rune::node::GroupCoordinationService* groupService_ = nullptr;
+    rune::gateway::IGroupRequestHandler* groupService_ = nullptr;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;

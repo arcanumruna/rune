@@ -48,6 +48,7 @@
 #include <rune/coordination/GroupCoordinator.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/gateway/IGroupRequestHandler.h>
 
 // Protocol codecs for response encoding scratch types.
 #include <rune/protocol/client/GroupMessages.h>
@@ -62,8 +63,7 @@
 #include <unordered_map>
 #include <vector>
 
-// Forward declaration — avoid including ClientGateway.h in this header
-// (would create a circular dependency: gateway includes node, node includes gateway).
+// Forward declaration — ClientGateway lives in rune_gateway; node→gateway direction is fine.
 namespace rune::gateway { class ClientGateway; }
 
 namespace rune::node {
@@ -71,7 +71,10 @@ namespace rune::node {
 using NodeId = int32_t;   // mirrors rune::replication::NodeId
 using GroupId = rune::coordination::GroupId;
 
-class GroupCoordinationService {
+// CG-4 fix: GroupCoordinationService implements IGroupRequestHandler so that
+// ClientGateway can dispatch group messages through the interface without
+// introducing a rune_gateway→rune_node symbol dependency.
+class GroupCoordinationService : public rune::gateway::IGroupRequestHandler {
 public:
     // -----------------------------------------------------------------------
     // Construction
@@ -149,12 +152,12 @@ public:
     // cap the entry count to what fits.
     // Never throws.  Never allocates from heap in steady state.
     // -----------------------------------------------------------------------
-    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
-    size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap);
+    size_t handleJoinGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleSyncGroup   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleHeartbeat   (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
 
 private:
     // -----------------------------------------------------------------------
@@ -202,9 +205,11 @@ private:
     std::unordered_map<std::string, int64_t> memberSessionMap_;
 
     // CG-4: scratch buffer for Assign frame encoding.
-    // 68 KiB covers any Assign frame (header 24 + gen 4 + count 2 + 64K partitions * 8B
-    // = ~512 KiB for 65535 partitions, but real clusters << 1K partitions per member).
-    // Sized to match kScratchSize in ClientGateway (68 KiB — covers any realistic frame).
+    // 68 KiB bound: header 24 + generationId 4 + count 2 = 30 B fixed; each
+    // TopicPartition32 entry is 8 B (topicId 4 + partition 4).
+    // Max entries = (68*1024 - 30) / 8 = 8704 partitions per member in one frame.
+    // This matches the encodedSizeFor() guard in onReachedStable; real clusters
+    // have far fewer partitions per member.  Frame is capped, not overrun.
     // Pre-allocated; no per-rebalance heap allocation.
     static constexpr std::size_t kAssignFrameScratchSize = 68 * 1024;
     std::array<uint8_t, kAssignFrameScratchSize> assignFrameScratch_{};
