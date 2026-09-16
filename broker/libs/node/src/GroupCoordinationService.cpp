@@ -448,6 +448,23 @@ size_t GroupCoordinationService::handleLeaveGroup(
         return resp.encode(out);
     }
 
+    // CG-4 fix (#3): revoke the leaving member's group push subscriptions BEFORE
+    // erasing the session mapping.  This prevents dual-owner: the next
+    // PreparingRebalance iterates coord.members() which no longer contains the
+    // departed member — so without this explicit revoke the member keeps receiving
+    // records for its old partitions until session reap, which can overlap with
+    // the reassigned owner (dup delivery, single-owner violation).
+    if (gateway_ && !memberIdStr.empty()) {
+        const std::string memberKey = groupIdStr + ":" + memberIdStr;
+        const auto sessIt = memberSessionMap_.find(memberKey);
+        if (sessIt != memberSessionMap_.end()) {
+            const int64_t leavingSid = sessIt->second;
+            gateway_->revokeGroupSubscriptions(leavingSid);
+            spdlog::debug("GroupCoordinationService: LeaveGroup revoking subs for "
+                          "member='{}' sessionId={}", memberIdStr, leavingSid);
+        }
+    }
+
     auto it = coordinators_.find(groupIdStr);
     if (it != coordinators_.end()) {
         // Leave is generation-fenced inside GroupCoordinator::leave.
