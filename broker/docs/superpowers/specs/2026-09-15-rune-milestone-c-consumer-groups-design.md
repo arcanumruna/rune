@@ -93,9 +93,16 @@ kErrUnknownMember, kErrRebalanceInProgress, kErrDead) + a `kErrNotCoordinator`
 - Today `OffsetStore` is a standalone flat-file log (replay-on-construction),
   **not replicated** → would lose offsets on coordinator failover.
 - Re-back it onto a **replicated internal-topic partition Log** (`__consumer_offsets`),
-  so each `OffsetCommit` appends via `PartitionReplica` at **acks=All** (majority
-  durable). Kafka semantics preserved: commit overwrites `(group, topic,
+  so each `OffsetCommit` appends via `PartitionReplica` and is replicated to the
+  followers over Aeron. Kafka semantics preserved: commit overwrites `(group, topic,
   partition)`; a later lower offset is allowed.
+  - **AS-BUILT (correction, 2026-09-16):** the offsets log runs at **`minIsr=1`
+    (acks=Leader + async replication)**, NOT majority-durable acks=All. Rationale:
+    avoids ISR-establishment latency on every autocommit and on a new leader. Trade:
+    a hard leader-kill within the replication window rebuilds from a slightly stale
+    committed offset → **bounded re-delivery (duplicate), never loss** — at-least-once
+    holds (DR failover matrix 10/10). Making offset commits majority-durable (acks=All)
+    is a future option if stronger "every acked commit is majority-durable" is wanted.
 - On coordinator failover, the new leader **replays `__consumer_offsets`** to
   rebuild the committed-offset map (membership is rebuilt via rejoin).
 - Compaction (keep latest per `(group, tp)`) deferred to sub-project C; simple
