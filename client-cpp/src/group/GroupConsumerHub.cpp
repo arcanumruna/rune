@@ -27,6 +27,7 @@
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/RecordBatch.h>  // RecordBatchReader (recordCount)
 
 #include <algorithm>
 #include <chrono>
@@ -189,22 +190,29 @@ void GroupConsumerHub::sendOffsetCommit(GroupConsumerImpl& impl,
 {
     if (impl.assignment.empty()) return;
 
-    // Build entry list from current positions.
-    std::vector<rpc::OffsetCommitEntry> entries;
-    entries.reserve(impl.assignment.size());
+    // Reuse the scratch vector to avoid per-commit heap allocation (#5).
+    // Skip any partition whose position is still the unseeded sentinel (-1):
+    // committing a sentinel would overwrite the broker's committed offset
+    // with 0 (or a garbage value), breaking at-least-once guarantees (#1b).
+    impl.commitEntriesScratch.clear();
     for (const auto& [tp, pos] : impl.assignment) {
+        if (pos == GroupConsumerImpl::kUnseededSentinel) {
+            continue;  // not yet seeded from OffsetFetch — never commit
+        }
         rpc::OffsetCommitEntry e;
         e.topicId   = tp.topicId;
         e.partition = tp.partition;
         e.offset    = pos;  // next offset to consume = committed position
-        // metadata: empty
-        entries.push_back(e);
+        // metadata: empty (zero-copy empty span — default constructed)
+        impl.commitEntriesScratch.push_back(e);
     }
+
+    if (impl.commitEntriesScratch.empty()) return;  // all partitions still unseeded
 
     const auto grpSpan = strSpan(impl.groupId);
     const auto mbrSpan = strSpan(impl.memberId);
     const std::size_t needed = rpc::OffsetCommit::encodedSizeFor(
-        grpSpan, mbrSpan, entries);
+        grpSpan, mbrSpan, impl.commitEntriesScratch);
     ensureBuf(impl, needed);
 
     rpc::OffsetCommit msg;
@@ -213,6 +221,45 @@ void GroupConsumerHub::sendOffsetCommit(GroupConsumerImpl& impl,
     msg.generationId  = impl.generationId;
     msg.groupId       = grpSpan;
     msg.memberId      = mbrSpan;
+
+    const std::size_t len = msg.encode(impl.sendBuf.data(), impl.commitEntriesScratch);
+    if (len == 0) return;
+
+    sendFn(impl.sendBuf.data(), len);
+}
+
+// ---------------------------------------------------------------------------
+// sendOffsetFetch — runner thread
+// Send OffsetFetch for all assigned partitions to seed positions from the
+// broker's committed offsets.  Called after entering Stable (onSyncGroupResponse)
+// and after applyAssignment adds new partitions.
+// ---------------------------------------------------------------------------
+
+/*static*/
+void GroupConsumerHub::sendOffsetFetch(GroupConsumerImpl& impl,
+                                        int64_t sessionId,
+                                        const SendFn& sendFn)
+{
+    if (impl.assignment.empty()) return;
+
+    // Build entry list from current assignment.
+    std::vector<rpc::OffsetFetchEntry> entries;
+    entries.reserve(impl.assignment.size());
+    for (const auto& [tp, _] : impl.assignment) {
+        rpc::OffsetFetchEntry e;
+        e.topicId   = tp.topicId;
+        e.partition = tp.partition;
+        entries.push_back(e);
+    }
+
+    const auto grpSpan = strSpan(impl.groupId);
+    const std::size_t needed = rpc::OffsetFetch::encodedSizeFor(grpSpan, entries.size());
+    ensureBuf(impl, needed);
+
+    rpc::OffsetFetch msg;
+    msg.sessionId     = sessionId;
+    msg.correlationId = 0;
+    msg.groupId       = grpSpan;
 
     const std::size_t len = msg.encode(impl.sendBuf.data(), entries);
     if (len == 0) return;
@@ -256,10 +303,11 @@ void GroupConsumerHub::applyAssignment(GroupConsumerImpl& impl,
         impl.assignment.erase(tp);
     }
 
-    // Add new partitions with initial offset 0 (broker resumes from committed;
-    // position will be updated by incoming Records).
+    // Add new partitions with sentinel -1 (position unknown until OffsetFetch
+    // response seeds it).  We must NOT commit sentinel positions (#1b).
+    // Caller (onSyncGroupResponse / onAssign) sends OffsetFetch after this.
     for (const auto& tp : added) {
-        impl.assignment[tp] = 0;
+        impl.assignment[tp] = GroupConsumerImpl::kUnseededSentinel;
     }
 
     // Fire assigned.
@@ -368,14 +416,17 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
             impl->cbRecords(rv);
         }
 
-        // Advance position: baseOffset + number of records in batch.
-        // The broker's baseOffset is the first record's offset; the next
-        // expected offset = baseOffset + batchSize. We use baseOffset + 1
-        // as a conservative advance (the SubscriberHub uses the same approach
-        // with nextOffset = lastDelivered + 1 from the RecordBatch).
-        // For group consumers, advance to max(current, rv.baseOffset + 1).
-        const int64_t newPos = rv.baseOffset + 1;
-        if (newPos > it->second) {
+        // (#2) Advance position by the actual batch record count:
+        //   newPos = baseOffset + recordCount  (== baseOffset + lastOffsetDelta + 1)
+        // Using +1 was wrong for multi-record batches and caused re-delivery of
+        // records B+1..B+N-1 after any rebalance or reconnect.
+        // rv.recordCount is parsed from the RecordBatch header in decodeRecords();
+        // falls back to 1 for empty/stub batches (test helpers, no real batch bytes).
+        // Also handles seeding: if the partition was at the sentinel, the first
+        // Records delivery itself acts as a position seed — safe because the broker
+        // sent us a real record, so we can safely advance from there.
+        const int64_t newPos = rv.baseOffset + static_cast<int64_t>(rv.recordCount);
+        if (newPos > it->second || it->second == GroupConsumerImpl::kUnseededSentinel) {
             it->second = newPos;
         }
 
@@ -453,6 +504,15 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
 
             applyAssignment(*impl, std::move(newAsgn));
 
+            // (#1a) On every Syncing→Stable transition (fresh join or rejoin),
+            // reset ALL assigned partitions to the unseeded sentinel.
+            // This ensures that even kept partitions (same partition re-assigned
+            // after a rejoin) are re-seeded from the broker's committed offset,
+            // which is the authoritative source after any gap in connectivity.
+            for (auto& [tp, pos] : impl->assignment) {
+                pos = GroupConsumerImpl::kUnseededSentinel;
+            }
+
             // Arm heartbeat and auto-commit timers.
             const auto now  = tpNow();
             const int32_t hbMs = impl->cfg.sessionTimeoutMs / 3;
@@ -461,13 +521,15 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
                 now + std::chrono::milliseconds(impl->cfg.autoCommitIntervalMs);
 
             impl->state = GroupConsumerState::Stable;
+
+            // (#1a) Seed positions from broker-committed offsets immediately.
+            // All assigned partitions have sentinel -1 until this response arrives.
+            sendOffsetFetch(*impl, sessionId, sendFn);
         } else {
             impl->state = GroupConsumerState::Rejoining;
         }
         break;
     }
-
-    (void)sendFn;  // unused in Stable transition (sendFn used if we send something)
 }
 
 // ---------------------------------------------------------------------------
@@ -547,13 +609,21 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         if (!impl->active.load(std::memory_order_acquire)) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
-        // Seed positions from committed offsets.
+        // (#1a) Seed positions from committed offsets.
+        // We seed unconditionally for partitions that are still at the sentinel
+        // (-1 = never seeded) OR that haven't received any Records yet (still
+        // at the committed value from a prior OffsetFetch). We do NOT seed
+        // partitions that already have a position advanced past the committed
+        // offset by delivered Records — that would regress the position.
         for (const auto& r : opt->results) {
             if (r.errorCode != 0) continue;  // skip errored entries
             const TP tp{r.topicId, r.partition};
             auto it = impl->assignment.find(tp);
-            if (it != impl->assignment.end() && it->second == 0) {
-                // Only seed if we haven't received any Records yet.
+            if (it == impl->assignment.end()) continue;
+            if (it->second == GroupConsumerImpl::kUnseededSentinel ||
+                it->second < r.offset) {
+                // Seed: either never seeded, or the committed offset is ahead
+                // of our current position (reconnect resume scenario).
                 it->second = r.offset;
             }
         }
@@ -587,10 +657,11 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
         }
 
         applyAssignment(*impl, std::move(newAsgn));
+
+        // (#1a) Seed positions for any newly added partitions from broker offsets.
+        sendOffsetFetch(*impl, sessionId, sendFn);
         break;
     }
-
-    (void)sessionId; (void)sendFn;
 }
 
 // ---------------------------------------------------------------------------

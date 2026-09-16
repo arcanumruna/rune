@@ -1015,6 +1015,18 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
                                       std::vector<std::string> topicNames,
                                       GroupConfig              cfg)
 {
+    // (#4) Guard: one group per Client.  Registering a second GroupConsumer
+    // on the same Client would cause JoinGroup/SyncGroup/OffsetCommit
+    // responses to be misrouted (all share correlationId=0 and are matched
+    // by state to the first consumer in the matching state).
+    // For multi-group support, add per-consumer correlationId tracking (CG-6).
+    if (!groupConsumerHub_.empty()) {
+        throw std::logic_error(
+            "subscribeGroup: only one GroupConsumer per Client is supported. "
+            "Use a separate Client instance for each consumer group. "
+            "(Multi-group per connection is deferred to CG-6.)");
+    }
+
     auto impl = std::make_shared<GroupConsumerImpl>();
     impl->groupId = std::move(groupId);
     impl->cfg     = cfg;

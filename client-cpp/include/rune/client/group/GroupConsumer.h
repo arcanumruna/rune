@@ -27,6 +27,8 @@
 #include <rune/client/subscriber/Subscription.h>  // TopicPartition, Record types
 #include <rune/client/codec/DataCodec.h>
 
+#include <rune/protocol/client/OffsetMessages.h>  // OffsetCommitEntry (for commitEntriesScratch)
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -115,7 +117,10 @@ struct GroupConsumerImpl {
 
     // Current assignment: partition → nextOffset to commit.
     // Written only on the runner thread.
-    std::map<TopicPartition, int64_t>   assignment;   // topicPartition → nextOffset
+    // Sentinel value -1 means "position not yet seeded from OffsetFetch".
+    // sendOffsetCommit MUST skip any entry whose value is kUnseededSentinel.
+    static constexpr int64_t kUnseededSentinel = -1;
+    std::map<TopicPartition, int64_t>   assignment;   // topicPartition → nextOffset (or sentinel)
 
     // ---- Timers (runner thread) ----------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;
@@ -125,6 +130,9 @@ struct GroupConsumerImpl {
     // ---- Send scratch buffers (runner thread, zero-alloc hot path) -----------
     // Reused on every heartbeat / join / sync / commit send.
     std::vector<uint8_t> sendBuf;
+    // Reusable OffsetCommit entries scratch — avoids per-commit heap allocation.
+    // Only accessed on the runner thread; no locking needed.
+    std::vector<rune::protocol::client::OffsetCommitEntry> commitEntriesScratch;
 
     // ---- Wait-free commit request from app thread ---------------------------
     // commitRequested_ is set (release) by the app thread's commit().

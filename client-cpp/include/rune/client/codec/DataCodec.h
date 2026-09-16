@@ -28,6 +28,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/RecordBatch.h>  // RecordBatchReader (for recordCount in RecordsView)
 
 namespace rune::client::codec {
 
@@ -252,6 +253,11 @@ struct RecordsView {
     int32_t                  partition      = 0;
     int64_t                  baseOffset     = 0;
     std::span<const uint8_t> recordBatch;  // zero-copy view into the original buffer
+
+    // Number of records in this batch: parsed from recordBatch header using
+    // RecordBatchReader.  Correct advance = baseOffset + recordCount.
+    // Defaults to 1 for backward compatibility when recordBatch is empty/missing.
+    int32_t                  recordCount    = 1;
 };
 
 /// Encode a Records frame into buf[0..cap-1].
@@ -282,6 +288,8 @@ inline std::size_t encodeRecords(uint8_t*                  buf,
 /// Decode a Records frame from buf[0..len-1].
 /// Returns nullopt on truncation, schema mismatch, or templateId mismatch.
 /// Returned span is a zero-copy view into buf — buf must outlive the result.
+/// recordCount is parsed from the recordBatch header (RecordBatchReader.recordCount());
+/// if the batch is too short to read (e.g. empty/stub batch in tests), defaults to 1.
 inline std::optional<RecordsView> decodeRecords(const uint8_t* buf,
                                                   std::size_t    len) noexcept {
     auto opt = rpc::Records::decode(buf, len);
@@ -294,6 +302,16 @@ inline std::optional<RecordsView> decodeRecords(const uint8_t* buf,
     v.partition      = opt->partition;
     v.baseOffset     = opt->baseOffset;
     v.recordBatch    = opt->recordBatch;
+    // Parse record count from RecordBatch header (little-endian at offset 57).
+    // RecordBatchReader requires at least kRecordBatchOverhead (61) bytes.
+    if (v.recordBatch.size() >= static_cast<std::size_t>(
+            rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader reader(v.recordBatch.data(),
+                                                  v.recordBatch.size());
+        const int32_t cnt = reader.recordCount();
+        v.recordCount = (cnt > 0) ? cnt : 1;
+    }
+    // else: recordCount stays 1 (default — empty/stub batch in tests)
     return v;
 }
 

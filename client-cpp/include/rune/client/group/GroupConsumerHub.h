@@ -150,10 +150,16 @@ private:
                               int64_t sessionId,
                               const SendFn& sendFn);
 
-    /// Send OffsetCommit for impl's current positions.
+    /// Send OffsetCommit for impl's current positions (skips unseeded sentinel entries).
     static void sendOffsetCommit(GroupConsumerImpl& impl,
                                  int64_t sessionId,
                                  const SendFn& sendFn);
+
+    /// Send OffsetFetch for all currently-assigned partitions to seed positions
+    /// from the broker's committed offsets.  Called after entering Stable.
+    static void sendOffsetFetch(GroupConsumerImpl& impl,
+                                int64_t sessionId,
+                                const SendFn& sendFn);
 
     /// Apply a new assignment to impl: fire revoked+assigned callbacks.
     static void applyAssignment(GroupConsumerImpl& impl,
