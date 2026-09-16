@@ -216,7 +216,15 @@ def test_cg_rebalance_member_leave(fresh_cluster, members):
         member_results=p2_members,
     )
 
+    # no_committed_loss: union of BOTH phases must cover the produced set.
+    # Phase-1 members consume and commit; phase-2 picks up from committed offsets.
+    # Together they must cover every produced record.
+    gr_combined = GroupResults(
+        produce_results=gr1.produce_results,
+        member_results=gr1.member_results + p2_members,
+    )
+
     assert_group_single_owner(gr2)
-    assert_group_no_committed_loss(gr2)
+    assert_group_no_committed_loss(gr_combined)
     assert_group_bounded_duplicates(gr2)
     assert_single_leader(cluster)

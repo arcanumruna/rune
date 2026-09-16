@@ -187,7 +187,15 @@ def test_cg_failover_leader_kill(fresh_cluster):
     assert_single_leader(cluster)
     assert_group_single_owner(gr_before)
     assert_group_single_owner(gr_after)
-    assert_group_no_committed_loss(gr_after)   # after-run must cover all produced
+
+    # no_committed_loss: union of BOTH phases must cover all produced records.
+    # Phase-1 members consume and commit; after failover phase-2 resumes from
+    # committed offsets.  Together they cover the full produced set.
+    gr_combined = GroupResults(
+        produce_results=prod,
+        member_results=gr_before.member_results + members_after,
+    )
+    assert_group_no_committed_loss(gr_combined)
     assert_group_bounded_duplicates(gr_after)
     assert_group_offset_resume(gr_before, gr_after)
 
@@ -266,8 +274,13 @@ def test_cg_failover_leader_kill_netem(fresh_cluster, netem_ready):
     # Soft invariant — may fail on DR-BUG-6 (combined kill+loss can lose
     # committed tail on the base replication path).  Mark xfail consistent
     # with the existing test_dr8_leader_kill_netem xfail.
+    # Union of both phases must cover all produced records.
+    gr_combined_netem = GroupResults(
+        produce_results=prod,
+        member_results=gr_before.member_results + members_after,
+    )
     try:
-        assert_group_no_committed_loss(gr_after)
+        assert_group_no_committed_loss(gr_combined_netem)
     except AssertionError as exc:
         pytest.xfail(
             f"group-no-committed-loss under combined kill+netem (DR-BUG-6): {exc}"
