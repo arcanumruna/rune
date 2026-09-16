@@ -57,6 +57,9 @@ JoinResult GroupCoordinator::join(const std::string&              memberId,
     MemberInfo* existing = findMember(effectiveMemberId);
 
     if (existing != nullptr) {
+        // Capture old subscription BEFORE overwriting (needed for idempotency check below).
+        const bool subscriptionChanged = (existing->subscribedTopics != subscribedTopics);
+
         // Re-join: update session timeout and topics; refresh heartbeat.
         existing->sessionTimeoutMs = sessionTimeoutMs;
         existing->subscribedTopics = subscribedTopics;
@@ -77,10 +80,25 @@ JoinResult GroupCoordinator::join(const std::string&              memberId,
             // in the state table ("Stable + join/leave → PreparingRebalance").
             // Without this, a subscription change is silently ignored and the
             // group stays Stable with a stale assignment (audit A1).
-            triggerRebalance(nowNs);
-            // Count this member as already re-joined in the new rebalance.
-            rejoinedMembers_.insert(effectiveMemberId);
-            electLeader();
+            //
+            // CG-6 idempotency guard: if the group is Stable AND this member's
+            // subscription is UNCHANGED, the join is a stale in-flight duplicate
+            // (e.g. buffered from a prior Rejoining cadence that arrived after
+            // the group already stabilised).  Silently ack it — no rebalance.
+            // This prevents the infinite-rebalance loop caused by late JoinGroup
+            // frames triggering Stable→PreparingRebalance immediately after
+            // auto-assign.  Subscription changes always trigger a rebalance.
+            if (state_ == GroupState::Stable && !subscriptionChanged) {
+                // Idempotent re-join: member already has a valid assignment.
+                // Update heartbeat (already done above) and return OK with the
+                // current generation without touching group state.
+                // (Fall through to the JoinResult return below.)
+            } else {
+                triggerRebalance(nowNs);
+                // Count this member as already re-joined in the new rebalance.
+                rejoinedMembers_.insert(effectiveMemberId);
+                electLeader();
+            }
         }
         // (Empty / Dead states: no special handling needed for re-joins.)
     } else {
