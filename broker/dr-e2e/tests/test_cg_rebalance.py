@@ -107,8 +107,18 @@ def test_cg_rebalance_stable(fresh_cluster, members):
       2. Launches `members` group-consumer containers sharing the same group-id.
       3. Waits _SUBSCRIBE_MS for records to flow.
 
+    Determinism: this is the STABLE case, so we assert a STRICT single-owner
+    guarantee within ONE generation.  To get there deterministically we launch
+    all members FIRST, let the group converge to its FINAL stable membership
+    (``produce_after_members_ms``), and only THEN produce.  Every record is thus
+    delivered inside a single assignment generation; the ramp-up rebalances
+    happen while the log is empty, so there is no legitimate cross-generation
+    re-delivery to reason about.  A REAL same-generation split would still be
+    caught by the (now generation-aware) single_owner invariant.
+
     Asserts:
-      - single_owner: no (partition, offset) delivered to two members.
+      - single_owner: no (partition, offset) delivered to two members in the
+        same generation.
       - group_no_committed_loss: union of consumed == produced.
       - bounded_duplicates: no runaway re-delivery.
     """
@@ -118,6 +128,11 @@ def test_cg_rebalance_stable(fresh_cluster, members):
     _, leader_svc = cluster.identify_leader()
     cid_base = _next_cid_base()
     group_id = f"cg-stable-{members}m"
+
+    # Stabilization budget before producing: cover the member-join stagger
+    # (start_stagger_ms per extra member) plus join/sync round-trips so the group
+    # is at its FINAL membership before any record exists.
+    stabilize_ms = 8000
 
     gr = run_group(
         members,
@@ -133,6 +148,7 @@ def test_cg_rebalance_stable(fresh_cluster, members):
         autocommit_ms=1000,
         timeout_ms=_TIMEOUT_MS,
         timeout_s=300,
+        produce_after_members_ms=stabilize_ms,
     )
 
     assert gr.produce_results.ok, (

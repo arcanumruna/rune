@@ -40,11 +40,14 @@ _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _SUMMARY_RE = re.compile(r"SUMMARY produced=(\d+) delivered=(\d+) mode=(\S+) rc=(\d+)")
 
-# Group-mode regexes
-_ASSIGN_RE = re.compile(r"ASSIGN cid=(-?\d+) parts=([\d,]*)")
-_REVOKE_RE = re.compile(r"REVOKE cid=(-?\d+) parts=([\d,]*)")
+# Group-mode regexes.
+# gen=<g> is emitted by dr_client (CG-6 fix2) so single_owner can be
+# generation-aware.  It is optional in the regex for backward compatibility with
+# older client images that predate the gen= field (parsed as generation -1).
+_ASSIGN_RE = re.compile(r"ASSIGN cid=(-?\d+)(?: gen=(-?\d+))? parts=([\d,]*)")
+_REVOKE_RE = re.compile(r"REVOKE cid=(-?\d+)(?: gen=(-?\d+))? parts=([\d,]*)")
 _GROUPREC_RE = re.compile(
-    r"GROUPREC cid=(-?\d+) topic=(\S+) partition=(-?\d+) offset=(-?\d+)"
+    r"GROUPREC cid=(-?\d+)(?: gen=(-?\d+))? topic=(\S+) partition=(-?\d+) offset=(-?\d+)"
     r" rec_cid=(-?\d+) rec_key=(-?\d+) rec_seq=(-?\d+)"
 )
 _GROUPSUMMARY_RE = re.compile(r"GROUPSUMMARY cid=(-?\d+) consumed=(\d+) rc=(\d+)")
@@ -120,6 +123,7 @@ class GroupRec:
     rec_cid: int       # cid encoded in the record value payload
     rec_key: int       # key encoded in the payload
     rec_seq: int       # seq encoded in the payload
+    generation: int = -1  # assignment generation at delivery (-1 = pre-gen client)
 
 
 @dataclass
@@ -169,22 +173,23 @@ def _parse_group_member_output(cid: int, exit_code: int, out: str) -> GroupMembe
     """Parse a group-consumer member's stdout+stderr into a GroupMemberResult."""
     res = GroupMemberResult(cid=cid, exit_code=exit_code, rc=1, consumed=0, raw=out)
     for m in _ASSIGN_RE.finditer(out):
-        parts_str = m[2].strip()
+        parts_str = m[3].strip()
         parts = [int(p) for p in parts_str.split(",") if p] if parts_str else []
         res.assigned_partitions.append(parts)
     for m in _REVOKE_RE.finditer(out):
-        parts_str = m[2].strip()
+        parts_str = m[3].strip()
         parts = [int(p) for p in parts_str.split(",") if p] if parts_str else []
         res.revoked_partitions.append(parts)
     for m in _GROUPREC_RE.finditer(out):
         res.records.append(GroupRec(
             member_cid=int(m[1]),
-            topic=m[2],
-            partition=int(m[3]),
-            offset=int(m[4]),
-            rec_cid=int(m[5]),
-            rec_key=int(m[6]),
-            rec_seq=int(m[7]),
+            generation=int(m[2]) if m[2] is not None else -1,
+            topic=m[3],
+            partition=int(m[4]),
+            offset=int(m[5]),
+            rec_cid=int(m[6]),
+            rec_key=int(m[7]),
+            rec_seq=int(m[8]),
         ))
     sm = _GROUPSUMMARY_RE.search(out)
     if sm:
@@ -263,12 +268,25 @@ def run_group(
     start_stagger_ms: int = 400,
     acks: str = "all",
     producer_cid_base: Optional[int] = None,
+    produce_after_members_ms: int = 0,
 ) -> GroupResults:
-    """Run a producer then M group-consumer members and return GroupResults.
+    """Run a producer and M group-consumer members and return GroupResults.
 
-    Launches one produce-only container (cid_base) then `members` group-consumer
+    Launches one produce-only container (cid_base) and `members` group-consumer
     containers (cids: cid_base+1 .. cid_base+members).  The producer uses
     cid_base+0 by default but can be overridden via producer_cid_base.
+
+    Ordering:
+      * ``produce_after_members_ms == 0`` (default): produce FIRST, then launch
+        members.  Members join sequentially against an already-populated log; the
+        ramp-up rebalances can cross-generation-re-deliver low offsets.  Used by
+        the failover / at-least-once tests, which explicitly tolerate that.
+      * ``produce_after_members_ms > 0``: launch all members FIRST, wait this many
+        ms for every member to join AND the group to converge to its FINAL stable
+        membership (no more joins are coming), THEN produce.  All records are then
+        delivered within a SINGLE assignment generation, making the stable test
+        deterministic and single_owner strict.  The ramp-up rebalances happen
+        while the log is empty, so no real record is re-read across generations.
 
     Args:
         members:           Number of consumer-group members to launch.
@@ -288,29 +306,37 @@ def run_group(
         start_stagger_ms:  Delay between launching member containers.
         acks:              Producer acks policy ("all" default — majority-durable).
         producer_cid_base: Override producer cid (defaults to cid_base).
+        produce_after_members_ms: If > 0, produce only after members are up and
+                           the group has converged (see Ordering above).
     """
     if producer_cid_base is None:
         producer_cid_base = cid_base
     member_cid_base = cid_base + 1
 
-    # Phase 1: produce records with acks=all so every PRODUCED = majority-committed.
-    prod_results = run_clients(
-        1,
-        network=network,
-        target_service=target_service,
-        cid_base=producer_cid_base,
-        timeout_s=timeout_s,
-        mode="produce",
-        topics=topics,
-        records=records,
-        keys=max(keys, partitions),   # spread across partitions
-        acks=acks,
-        timeout_ms=timeout_ms,
-        connect_retries=0,
-        start_stagger_ms=0,
-    )
+    def _produce() -> Results:
+        # Produce records with acks=all so every PRODUCED = majority-committed.
+        return run_clients(
+            1,
+            network=network,
+            target_service=target_service,
+            cid_base=producer_cid_base,
+            timeout_s=timeout_s,
+            mode="produce",
+            topics=topics,
+            records=records,
+            keys=max(keys, partitions),   # spread across partitions
+            acks=acks,
+            timeout_ms=timeout_ms,
+            connect_retries=0,
+            start_stagger_ms=0,
+        )
 
-    # Phase 2: run members consumer-group members concurrently.
+    prod_results: Optional[Results] = None
+    if produce_after_members_ms <= 0:
+        # Default ordering: produce first, then consume.
+        prod_results = _produce()
+
+    # Run the consumer-group members concurrently.
     member_results: list[GroupMemberResult] = []
     member_cfg = {
         "group_id": group_id,
@@ -320,6 +346,20 @@ def run_group(
         "timeout_ms": timeout_ms,
     }
     egress_port_base = 40700  # disjoint from run_clients base (40500)
+
+    # When producing after members, kick off a deferred producer on a side thread:
+    # it sleeps until all members have joined + the group has reached its FINAL
+    # stable membership, then produces into the single stable generation.
+    deferred_producer: Optional[concurrent.futures.Future] = None
+    producer_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    if produce_after_members_ms > 0:
+        producer_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        def _deferred_produce() -> Results:
+            time.sleep(produce_after_members_ms / 1000.0)
+            return _produce()
+
+        deferred_producer = producer_pool.submit(_deferred_produce)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, members)) as pool:
         futs = []
@@ -338,6 +378,12 @@ def run_group(
         for f in concurrent.futures.as_completed(futs, timeout=timeout_s + 30):
             member_results.append(f.result())
 
+    if deferred_producer is not None:
+        prod_results = deferred_producer.result(timeout=timeout_s + 30)
+    if producer_pool is not None:
+        producer_pool.shutdown(wait=True)
+
+    assert prod_results is not None
     member_results.sort(key=lambda m: m.cid)
     return GroupResults(produce_results=prod_results, member_results=member_results)
 

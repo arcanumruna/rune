@@ -229,28 +229,41 @@ def assert_durable_after_restart(before: Results, after: Results) -> None:
 # ---------------------------------------------------------------------------
 
 def assert_group_single_owner(group_results: GroupResults) -> None:
-    """Every partition is consumed by at most ONE member at any time.
+    """Every partition is owned by at most ONE member PER GENERATION.
 
-    We identify records by (partition, offset): if two distinct members report
-    a GROUPREC for the same (partition, offset), that violates single_owner.
+    single_owner is a *same-generation* property: at any instant (i.e. within one
+    assignment generation) a partition may be delivered to at most one member.
+    We therefore key deliveries by (generation, partition, offset): if two
+    distinct members report a GROUPREC for the same (partition, offset) IN THE
+    SAME generation, that is a true simultaneous split-ownership and MUST fail.
 
-    Note: duplicates within the SAME member (redelivery after rebalance at the
-    committed offset boundary) are allowed and checked by assert_group_bounded_duplicates.
-    This assertion only fires when TWO DIFFERENT members receive the SAME record
-    simultaneously (true split-ownership, which must never happen).
+    Cross-generation re-delivery is legitimate and NOT flagged:
+      * During a rebalance a partition is reassigned from an old owner (gen N) to
+        a new owner (gen N+1).  The new owner seeds at the committed offset and
+        may re-read records the old owner already delivered.  Because the two
+        deliveries carry DIFFERENT generations, they are not a split — they are
+        bounded cross-generation duplication (the seam is checked by
+        assert_group_bounded_duplicates / no_committed_loss instead).
+
+    Duplicates within the SAME member are also allowed (redelivery after rebalance
+    at the committed-offset boundary) and checked by bounded_duplicates.
+
+    Backward compatibility: records from a pre-gen client image carry
+    generation=-1; with a single sentinel bucket the check degrades to the old
+    partition,offset-across-all behaviour, so it is never weaker for old images.
     """
-    # Map (partition, offset) -> set of member cids that delivered it.
-    delivery_map: dict[tuple[int, int], set[int]] = defaultdict(set)
+    # Map (generation, partition, offset) -> set of member cids that delivered it.
+    delivery_map: dict[tuple[int, int, int], set[int]] = defaultdict(set)
     for rec in group_results.all_group_records:
-        delivery_map[(rec.partition, rec.offset)].add(rec.member_cid)
+        delivery_map[(rec.generation, rec.partition, rec.offset)].add(rec.member_cid)
 
     violations = {
         k: sorted(v) for k, v in delivery_map.items() if len(v) > 1
     }
     assert not violations, (
-        f"group-single-owner: {len(violations)} (partition,offset) pairs delivered "
-        f"to multiple members simultaneously: "
-        f"{list(violations.items())[:10]}"
+        f"group-single-owner: {len(violations)} (generation,partition,offset) tuples "
+        f"delivered to multiple members IN THE SAME GENERATION "
+        f"(true split-ownership): {list(violations.items())[:10]}"
     )
 
 
