@@ -1848,26 +1848,29 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     }
 
     // Dispatch to the service.  The service encodes the response into scratch_.
+    // Capacity is passed so handlers bound-check BEFORE writing each element;
+    // the post-write guard below is a final safety net only.
     std::size_t encoded = 0;
+    const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
         case pc::TemplateId::JoinGroup:
-            encoded = groupService_->handleJoinGroup(buf, len, nowNs, scratch_.data());
+            encoded = groupService_->handleJoinGroup(buf, len, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::SyncGroup:
-            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data());
+            encoded = groupService_->handleSyncGroup(buf, len, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::Heartbeat:
-            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data());
+            encoded = groupService_->handleHeartbeat(buf, len, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::LeaveGroup:
-            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data());
+            encoded = groupService_->handleLeaveGroup(buf, len, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::OffsetCommit:
-            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data());
+            encoded = groupService_->handleOffsetCommit(buf, len, nowNs, scratch_.data(), cap);
             break;
         case pc::TemplateId::OffsetFetch:
-            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data());
+            encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap);
             break;
         default:
             return; // unknown group template — drop
@@ -1875,8 +1878,9 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
 
     if (encoded == 0) return; // handler signalled an error (e.g. decode failure)
     if (encoded > scratch_.size()) {
-        spdlog::warn("ClientGateway: group response tid={} encoded size {} > scratch {}; dropped",
-                     tid, encoded, scratch_.size());
+        // Should never happen: handlers bound-check before writing.
+        spdlog::error("ClientGateway: group response tid={} encoded size {} > scratch {} — BUG; dropped",
+                      tid, encoded, scratch_.size());
         return;
     }
 
