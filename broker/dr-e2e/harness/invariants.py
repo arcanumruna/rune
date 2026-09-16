@@ -301,12 +301,18 @@ def assert_group_bounded_duplicates(
       2. Cross-member duplicates are zero (covered by assert_group_single_owner;
          this is a belt-and-suspenders check).
 
-    The default max_dup_fraction=0.5 (50%) is intentionally loose so that a
-    single rebalance in a small test (e.g. 50 records / 2 partitions) where the
-    second member re-reads up to the committed frontier does not fail the test.
-    The important invariant is that duplicates are BOUNDED (not from offset 0)
-    which is captured by checking that no member sees more than half the total
-    produced records as duplicates.
+    The default max_dup_fraction=0.5 (50%) is a smoke gate, not a tight bound.
+    It is intentionally loose for two reasons:
+      1. Small tests (e.g. 80 records / 4 partitions, 2 members) where the
+         uncommitted window before a rebalance can be up to ~autocommit_ms worth
+         of records — with a 1 s autocommit interval and fast producers this can
+         be a significant fraction of the total.
+      2. The important correctness property is that re-delivery starts at the
+         committed offset (not from 0).  A 50% cap is generous enough that it
+         would catch a "restarted from 0" regression (which would yield ~100%
+         duplicates for the pre-existing records) without requiring us to derive a
+         tight per-test bound from the autocommit interval and produce rate.
+    If you need a tighter bound, pass an explicit max_dup_fraction argument.
     """
     for member in group_results.member_results:
         seen: dict[tuple[int, int], int] = {}  # (partition, offset) -> count
