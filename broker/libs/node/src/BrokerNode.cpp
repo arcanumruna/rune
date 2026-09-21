@@ -119,6 +119,14 @@ void BrokerNode::start() {
     //    consensus + gateway on the single-writer thread).
     agentRunner_->start();
 
+    // 8. Start the LogCleanerAgent on its own thread (CP-6).
+    //    Must start AFTER agentRunner_ so the duty cycle begins draining swaps
+    //    before the cleaner can enqueue any (avoids a window where a swap is
+    //    enqueued but never drained if agentRunner_ hasn't started yet).
+    if (cleanerRunner_) {
+        cleanerRunner_->start();
+    }
+
     const auto t_start = sclock::now();
     spdlog::info(
         "BrokerNode: node {} started (dataDir={}) "
@@ -786,6 +794,24 @@ void BrokerNode::buildGateway() {
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
         *runtimeAgent_, idleStrategy_, clock_);
+
+    // -----------------------------------------------------------------------
+    // CP-6: Wire the LogCleanerAgent on its own AgentRunner thread.
+    //
+    // Prerequisite: replicaRegistry_ must be built (done above in buildReplication).
+    // The cleaner never accesses segments_ directly; it uses the sealed-segment
+    // snapshot (atomic published by the append thread) — so starting it here
+    // (before any appends begin) is safe.
+    //
+    // cycleBudgetBytes default (128 MiB) matches Kafka's default dedupe buffer.
+    // -----------------------------------------------------------------------
+    if (replicaRegistry_) {
+        cleanerAgent_  = std::make_unique<LogCleanerAgent>(replicaRegistry_.get());
+        cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+            *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
+        spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas)",
+                     nodeId, replicaRegistry_->replicaCount());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +972,16 @@ void BrokerNode::stop() {
         return; // idempotent
     }
 
-    // 1. Stop the agent runner (signal + join the duty-cycle thread first).
+    // 1a. Stop the LogCleanerAgent BEFORE the main agent runner.
+    //     This ensures the cleaner thread stops enqueuing swaps before the
+    //     duty cycle stops draining them (avoids a lost-swap scenario where
+    //     a swap is enqueued after the last drain).
+    if (cleanerRunner_) {
+        cleanerRunner_->stopAndJoin();
+    }
+    cleanerAgent_.reset();
+
+    // 1b. Stop the main agent runner (signal + join the duty-cycle thread).
     if (agentRunner_) {
         agentRunner_->stopAndJoin();
     }

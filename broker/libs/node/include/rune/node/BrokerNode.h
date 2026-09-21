@@ -24,6 +24,7 @@
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/LogCleanerAgent.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
@@ -291,6 +292,20 @@ private:
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
+
+    // -----------------------------------------------------------------------
+    // CP-6: LogCleanerAgent — runs on its own AgentRunner thread (off the
+    // duty-cycle / append hot path).  Wired after replicaRegistry_ is built
+    // in buildGateway().  Stopped BEFORE runtimeAgent_ in stop() to avoid a
+    // race where the cleaner enqueues a swap while the duty cycle has stopped
+    // draining.  The cleaner's AgentRunner uses a BackoffIdleStrategy (same
+    // as the main runner) but on a separate thread so compaction I/O (fsync)
+    // never delays appends.
+    // -----------------------------------------------------------------------
+    std::unique_ptr<LogCleanerAgent>              cleanerAgent_;
+    rune::consensus::BackoffIdleStrategy          cleanerIdleStrategy_;
+    rune::consensus::MonotonicNanoClock           cleanerClock_;
+    std::unique_ptr<rune::consensus::AgentRunner> cleanerRunner_;
 
     // -----------------------------------------------------------------------
     // Runtime (AgentRunner + clock + idle)
