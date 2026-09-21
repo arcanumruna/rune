@@ -361,6 +361,8 @@ int TransactionalProducerImpl::doWork(
                 ib.partition    = sr.partition;
                 ib.baseSequence = baseSeq;
                 ib.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+                ib.deadline     = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(cfg_.produceTimeoutMs);
                 pendingProduceBatches_.emplace(prodCorrId, std::move(ib));
             }
             ++work;
@@ -380,13 +382,15 @@ int TransactionalProducerImpl::doWork(
 void TransactionalProducerImpl::sweepTimedOut()
 {
     const auto now = std::chrono::steady_clock::now();
-    std::vector<int64_t> expired;
+
+    // Sweep expired control-plane ops (InitProducerId, EndTxn, SendOffsets).
+    std::vector<int64_t> expiredOps;
     for (const auto& [corrId, op] : pendingOps_) {
         if (now >= op.deadline) {
-            expired.push_back(corrId);
+            expiredOps.push_back(corrId);
         }
     }
-    for (const int64_t corrId : expired) {
+    for (const int64_t corrId : expiredOps) {
         auto it = pendingOps_.find(corrId);
         if (it == pendingOps_.end()) continue;
         try {
@@ -396,6 +400,19 @@ void TransactionalProducerImpl::sweepTimedOut()
                         "TransactionalProducer: operation timed out (no response)")));
         } catch (...) {}
         pendingOps_.erase(it);
+    }
+
+    // Sweep expired in-flight produce batches.  These have no caller future to
+    // fail (the produce path is fire-and-ack); silently drop them so they don't
+    // accumulate indefinitely when a ProduceResponse is lost or never delivered.
+    std::vector<int64_t> expiredBatches;
+    for (const auto& [corrId, ib] : pendingProduceBatches_) {
+        if (now >= ib.deadline) {
+            expiredBatches.push_back(corrId);
+        }
+    }
+    for (const int64_t corrId : expiredBatches) {
+        pendingProduceBatches_.erase(corrId);
     }
 }
 

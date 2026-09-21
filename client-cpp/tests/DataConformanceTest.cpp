@@ -81,13 +81,14 @@ static std::vector<uint8_t> readVector(const char* name) {
 }
 
 // ===========================================================================
-// 1. produce_explicit_partition.bin  (46 bytes)
+// 1. produce_explicit_partition.bin  (60 bytes)
 //    Produce{ topicId=1001, partition=7, partitionKnown=1, acks=0,
+//             producerId=-1, producerEpoch=0, baseSequence=-1 (sentinels),
 //             key=<empty>, recordBatch={DE AD BE EF 00 FF 01 02} }
 // ===========================================================================
 TEST(DataCodecConformance, ProduceExplicitPartition) {
     const auto golden = readVector("produce_explicit_partition.bin");
-    ASSERT_EQ(golden.size(), 46u);
+    ASSERT_EQ(golden.size(), 60u);
 
     // --- Decode-golden ---
     auto view = cc::decodeProduce(golden.data(), golden.size());
@@ -110,19 +111,20 @@ TEST(DataCodecConformance, ProduceExplicitPartition) {
         std::span<const uint8_t>{},
         std::span<const uint8_t>(kBatchBytes, kBatchLen),
         kSessionId, kCorrelationId);
-    ASSERT_EQ(n, 46u);
+    ASSERT_EQ(n, 60u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_explicit_partition.bin";
 }
 
 // ===========================================================================
-// 2. produce_key_only.bin  (49 bytes)
+// 2. produce_key_only.bin  (63 bytes)
 //    Produce{ topicId=2002, partition=0, partitionKnown=0, acks=0,
+//             producerId=-1, producerEpoch=0, baseSequence=-1 (sentinels),
 //             key="ABC", recordBatch={DE AD BE EF 00 FF 01 02} }
 // ===========================================================================
 TEST(DataCodecConformance, ProduceKeyOnly) {
     const auto golden = readVector("produce_key_only.bin");
-    ASSERT_EQ(golden.size(), 49u);
+    ASSERT_EQ(golden.size(), 63u);
 
     // --- Decode-golden ---
     auto view = cc::decodeProduce(golden.data(), golden.size());
@@ -147,7 +149,7 @@ TEST(DataCodecConformance, ProduceKeyOnly) {
         std::span<const uint8_t>(kKeyBytes, kKeyLen),
         std::span<const uint8_t>(kBatchBytes, kBatchLen),
         kSessionId, kCorrelationId);
-    ASSERT_EQ(n, 49u);
+    ASSERT_EQ(n, 63u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_key_only.bin";
 }

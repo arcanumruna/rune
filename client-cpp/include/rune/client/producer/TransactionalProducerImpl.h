@@ -23,9 +23,11 @@
 //   ProducerFenced error.  The caller MUST call initTransactions() again.
 //
 // Timeout sweep:
-//   doWork() sweeps pendingOps_ for expired deadlines and fails those futures
-//   with a timeout error.  In-flight produce batches whose corrId is no longer
-//   in pendingProduceBatches_ are already resolved.
+//   doWork() sweeps both pendingOps_ and pendingProduceBatches_ for expired
+//   deadlines.  Expired ops fail their futures with a timeout error.  Expired
+//   in-flight produce batches are silently dropped (no caller future to fail —
+//   the batch will not be retried and a subsequent EndTxn or abort is expected
+//   to clean up the transaction).
 
 #pragma once
 
@@ -258,6 +260,7 @@ private:
         std::vector<uint8_t> wireFrame;    // encoded Produce frame bytes for re-send
         int32_t              retryCount = 0;
         static constexpr int kMaxRetries = 5;
+        std::chrono::steady_clock::time_point deadline; // set at send time; swept by sweepTimedOut()
     };
     std::map<int64_t, InFlightBatch> pendingProduceBatches_; // corrId → in-flight batch
 
