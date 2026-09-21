@@ -79,13 +79,15 @@ if(aeron_FOUND)
     endif()
 endif()
 
-# ── rune_client_producer — Producer (CB-2, compiled, links agent) ─────────────
+# ── rune_client_producer — Producer (CB-2 + TX-5, compiled, links agent) ──────
 if(aeron_FOUND)
     add_library(rune_client_producer STATIC
         src/producer/ProducerImpl.cpp
         src/producer/Producer.cpp
         src/producer/ProducerHub.cpp
         src/producer/BatchBuilder.cpp
+        src/producer/TransactionalProducerImpl.cpp
+        src/producer/TransactionalProducer.cpp
     )
     target_include_directories(rune_client_producer PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -429,6 +431,24 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_producer_race_tests)
+    endif()
+
+    # ── TX-5 Transactional producer + read_committed consumer tests ─────────────
+    if(aeron_FOUND)
+        add_executable(rune_txn_producer_tests
+            tests/producer/TransactionalProducerTest.cpp
+        )
+        target_include_directories(rune_txn_producer_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_txn_producer_tests PRIVATE
+            rune_client_producer
+            rune_client_group
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_txn_producer_tests)
     endif()
 
     # ── BatchBuilder tests (CB-3) — Tier-2 explicit atomic batch ──────────────
