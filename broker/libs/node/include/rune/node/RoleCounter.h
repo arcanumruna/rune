@@ -1,0 +1,104 @@
+// ---------------------------------------------------------------------------
+// RoleCounter.h — Aeron-counter-based cluster node-role publication.
+//
+// Aeron Cluster publishes leadership through Aeron COUNTERS in the driver's CnC
+// (command-and-control) file — a "Cluster Node Role" counter
+// (AERON_COUNTER_CLUSTER_NODE_ROLE_TYPE_ID = 201; value codes FOLLOWER=0,
+// CANDIDATE=1, LEADER=2) and a separate leadership-term / commit-position
+// counter.  Observers read them out-of-band via CountersReader over the mmapped
+// cnc.dat — never by scraping logs.
+//
+// Rune mirrors that discipline with TWO counters per node, both keyed by the
+// static nodeId (the key never has to change after allocation — Aeron counter
+// keys are immutable once registered):
+//
+//   * ROLE counter  (type kRoleCounterTypeId):  VALUE = RoleCode
+//       mirroring Aeron's role codes, plus a NONE=-1 sentinel for
+//       "no leader observed / pre-election".
+//   * TERM counter  (type kTermCounterTypeId):  VALUE = leadershipTerm
+//       the term this node currently observes (-1 if none).  Lets the oracle
+//       discard stale pre-election announcements exactly like the old
+//       term-aware log parser (DR-5): pick the LEADER at the highest term.
+//
+// Both counters carry the same key: the 4-byte LE nodeId, so a reader can
+// attribute each counter to its node.
+//
+// This header is PURE (no Aeron dependency): the type ids, the role codes, and
+// the key encode/decode.  That keeps the wire layout unit-testable without a
+// media driver.  BrokerNode owns the live Aeron Counters; rune_role (the
+// reader) decodes the key with decodeRoleKey().
+// ---------------------------------------------------------------------------
+#ifndef RUNE_NODE_ROLE_COUNTER_H
+#define RUNE_NODE_ROLE_COUNTER_H
+
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+namespace rune::node {
+
+// Rune's counter type ids.  Deliberately in Rune's own application range
+// (1'000'000+) rather than reusing Aeron's 200-221, so they never collide with
+// counters Aeron itself registers in the same CnC file.  The trailing digits
+// echo Aeron's ids for readability (201 = node role, 203 = commit/term).
+inline constexpr std::int32_t kRoleCounterTypeId = 1'000'201;
+inline constexpr std::int32_t kTermCounterTypeId = 1'000'203;
+
+// Role codes — mirror Aeron Cluster's Cluster.Role exactly, with an extra
+// NONE sentinel for "this node observes no leader yet" (pre-election / gap).
+enum class RoleCode : std::int64_t {
+    None      = -1,  // no leader observed (election in progress / not ready)
+    Follower  = 0,   // == Aeron Cluster.Role.FOLLOWER
+    Candidate = 1,   // == Aeron Cluster.Role.CANDIDATE
+    Leader    = 2,   // == Aeron Cluster.Role.LEADER
+};
+
+// Fixed key-buffer size (bytes): just the 4-byte LE nodeId.
+inline constexpr std::size_t kRoleKeyLength = 4;
+
+inline const char* roleCodeName(RoleCode r) noexcept {
+    switch (r) {
+        case RoleCode::Leader:    return "LEADER";
+        case RoleCode::Follower:  return "FOLLOWER";
+        case RoleCode::Candidate: return "CANDIDATE";
+        case RoleCode::None:      return "NONE";
+    }
+    return "NONE";
+}
+
+// Map a RoleCode int64 (as read from the counter value) to its enum, defaulting
+// unknown values to None.
+inline RoleCode roleCodeFromValue(std::int64_t v) noexcept {
+    switch (v) {
+        case 0:  return RoleCode::Follower;
+        case 1:  return RoleCode::Candidate;
+        case 2:  return RoleCode::Leader;
+        default: return RoleCode::None;
+    }
+}
+
+// Encode nodeId into the fixed LE key buffer.
+// `out` must have room for kRoleKeyLength bytes.
+inline void encodeRoleKey(std::uint8_t* out, std::int32_t nodeId) noexcept {
+    std::memcpy(out, &nodeId, sizeof(std::int32_t));
+}
+
+// Decode a key buffer back into nodeId.  Returns false if `len` is too small.
+inline bool decodeRoleKey(const std::uint8_t* buf, std::size_t len,
+                          std::int32_t& nodeId) noexcept {
+    if (buf == nullptr || len < kRoleKeyLength) return false;
+    std::memcpy(&nodeId, buf, sizeof(std::int32_t));
+    return true;
+}
+
+// Human-readable counter labels (also useful when browsing counters).
+inline std::string roleCounterLabel(std::int32_t nodeId) {
+    return "rune-cluster-node-role node=" + std::to_string(nodeId);
+}
+inline std::string termCounterLabel(std::int32_t nodeId) {
+    return "rune-cluster-leadership-term node=" + std::to_string(nodeId);
+}
+
+} // namespace rune::node
+
+#endif // RUNE_NODE_ROLE_COUNTER_H

@@ -46,6 +46,20 @@ if(aeron_FOUND)
     # libs/node/CMakeLists.txt.
 endif()
 
+# ── rune_role — standalone Aeron node-role counter reader ────────────────────
+# Reads the machine-readable leadership signal (RoleCounter.h) out of a broker's
+# CnC file and prints one line.  The dr-e2e harness runs this via `docker exec`
+# to detect the leader WITHOUT scraping "is LEADER" log lines (log-level
+# independent).  Header-only dep on rune/node/RoleCounter.h; links aeron only.
+if(aeron_FOUND)
+    add_executable(rune_role src/rune_role.cpp)
+    target_include_directories(rune_role PRIVATE ${RUNE_NODE_INCLUDE})
+    target_link_libraries(rune_role PRIVATE aeron::aeron)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(rune_role PRIVATE -Wl,--no-as-needed uuid -Wl,--as-needed)
+    endif()
+endif()
+
 # ── ping_probe — standalone raw-Aeron probe for BR-7b docker E2E ─────────────
 # Enabled by -DBUILD_PING_PROBE=ON (used in Dockerfile.probe).
 # Links against aeron (embedded driver + client) and the rune-protocol headers.

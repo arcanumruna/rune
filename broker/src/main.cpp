@@ -87,6 +87,11 @@ int main() {
     rune::consensus::NodeId lastObservedLeader = node.leaderId();
     while (!g_stop.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(100ms);
+        // Publish the machine-readable leadership signal (Aeron node-role +
+        // leadership-term counters).  The dr-e2e harness reads these via
+        // rune_role instead of scraping the "is LEADER" log lines below — the
+        // counters are authoritative and log-level independent.
+        node.publishRole();
         const rune::consensus::NodeId cur = node.leaderId();
         if (cur != lastObservedLeader) {
             lastObservedLeader = cur;

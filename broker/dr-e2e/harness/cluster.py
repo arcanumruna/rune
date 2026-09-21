@@ -25,7 +25,13 @@ COMPOSE_FILE = os.path.join(BROKER_REPO, "docker", "docker-compose.yml")
 SERVICES = ["rune-1", "rune-2", "rune-3"]
 CLIENT_PORT = 40200
 
+# Legacy log-scrape pattern — kept ONLY as a fallback for images that predate
+# the Aeron role counter (see _read_role below).  Primary detection is
+# counter-based and does NOT depend on RUNE_LOG_LEVEL.
 _LEADER_RE = re.compile(r"node (\d+) is LEADER")
+
+# rune_role prints:  ROLE nodeId=<n> role=<LEADER|FOLLOWER|CANDIDATE|NONE> term=<t>
+_ROLE_RE = re.compile(r"ROLE nodeId=(-?\d+) role=(\w+) term=(-?\d+)")
 
 
 def node_id_to_service(node_id: int) -> str:
@@ -67,20 +73,75 @@ class Cluster:
 
     # ---- leadership -------------------------------------------------------
 
+    def _read_role(self, service: str) -> tuple[str, int, int] | None:
+        """Read (role, nodeId, term) from a service's Aeron role counter.
+
+        Runs `rune_role` inside the container (docker compose exec), which reads
+        the machine-readable node-role + leadership-term counters out of the
+        driver's CnC file — the Aeron-faithful leadership signal, independent of
+        RUNE_LOG_LEVEL and of any log line.
+
+        Returns None if the container is not running, rune_role isn't present, or
+        the counter isn't allocated yet (rune_role exits non-zero) — callers poll.
+
+        A tight exec timeout (5 s) keeps the detection poll responsive: an exec
+        against a just-killed/unreachable node returns quickly as "no reading"
+        rather than stalling the loop.  rune_role itself is a fast point read.
+        """
+        try:
+            res = self.compose.exec(service, "rune_role", timeout=5)
+        except Exception:
+            return None
+        m = _ROLE_RE.search(res.stdout or "")
+        if not m:
+            return None
+        role = m.group(2)
+        node_id = int(m.group(1))
+        term = int(m.group(3))
+        return role, node_id, term
+
     def _scan_leader(self, services: list[str]) -> int | None:
-        """Return the most-recently-announced leader id across `services`, or None."""
+        """Return the current leader node id across `services`, or None.
+
+        Counter-based: query each running service's role counter via rune_role
+        and pick the node reporting role=LEADER at the HIGHEST term (the term tie-
+        break discards a stale ex-leader that hasn't yet stepped down, exactly
+        like the old term-aware log oracle — DR-5).  Falls back to log scraping
+        only if NO service produced a usable counter reading (pre-counter image).
+        """
+        best_leader: int | None = None
+        best_term = -1
+        any_reading = False
+        for svc in services:
+            reading = self._read_role(svc)
+            if reading is None:
+                continue
+            any_reading = True
+            role, node_id, term = reading
+            if role == "LEADER" and term >= best_term:
+                best_term = term
+                best_leader = node_id
+        if any_reading:
+            return best_leader
+        # Fallback: legacy log scrape (only reached on pre-counter images).
         logs = self.compose.logs(*services, timeout=30)
         ids = _LEADER_RE.findall(logs)
         if not ids:
             return None
-        # tail: the newest announcement reflects the current term after re-election.
         return int(ids[-1])
 
+    # Poll interval for leadership detection.  The broker republishes its role
+    # counter every 100 ms (main loop tick) and _read_role is a cheap point read
+    # (docker exec rune_role), so a 200 ms poll observes a role change within ~1
+    # tick without hammering the counter.  (Election SPEED is unchanged — this is
+    # only how fast the harness OBSERVES the outcome.)
+    _LEADER_POLL_S = 0.2
+
     def wait_for_leader(self, timeout_s: int = 90, exclude: list[str] | None = None) -> int:
-        """Poll node logs until a leader id appears. Returns the leader node id.
+        """Poll the role counters until a leader appears. Returns the leader node id.
 
         `exclude` drops services (e.g. a just-killed node) from the scan so a
-        stale "is LEADER" line cannot re-select a dead node.
+        stale reading cannot re-select a dead node.
         """
         services = [s for s in SERVICES if not exclude or s not in exclude]
         deadline = time.time() + timeout_s
@@ -88,24 +149,26 @@ class Cluster:
             leader = self._scan_leader(services)
             if leader is not None and (not exclude or node_id_to_service(leader) not in exclude):
                 return leader
-            time.sleep(1.0)
+            time.sleep(self._LEADER_POLL_S)
         raise TimeoutError(
             f"no leader within {timeout_s}s (scanned {services}); "
             f"last logs:\n{self.compose.logs(*services, tail=40)}"
         )
 
     def wait_for_new_leader(self, old_leader_svc: str, timeout_s: int = 90) -> int:
-        """After killing `old_leader_svc`, wait for a DIFFERENT node to lead."""
+        """After killing `old_leader_svc`, wait for a DIFFERENT node to lead.
+
+        Polls the role counters of the surviving nodes directly (no nested
+        wait_for_leader) so detection reacts within ~one broker publish tick.
+        """
         exclude = [old_leader_svc]
+        services = [s for s in SERVICES if s not in exclude]
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            try:
-                leader = self.wait_for_leader(timeout_s=10, exclude=exclude)
-            except TimeoutError:
-                leader = None
+            leader = self._scan_leader(services)
             if leader is not None and node_id_to_service(leader) != old_leader_svc:
                 return leader
-            time.sleep(1.0)
+            time.sleep(self._LEADER_POLL_S)
         raise TimeoutError(
             f"no new leader (!= {old_leader_svc}) within {timeout_s}s"
         )

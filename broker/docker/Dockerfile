@@ -60,7 +60,7 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
-    && cmake --build build --target rune_broker
+    && cmake --build build --target rune_broker rune_role
 
 # gcc-13's libstdc++ is newer than bookworm-slim's; stage it for the runtime.
 RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6
@@ -84,6 +84,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The broker binary + the newer libstdc++ from the builder (ldconfig repoints
 # the libstdc++.so.6 symlink to the higher 6.0.32 version).
 COPY --from=builder /build/build/rune_broker /usr/local/bin/rune_broker
+# rune_role: standalone Aeron role-counter reader — the dr-e2e harness runs it
+# via `docker exec` to detect leadership from counters (not log scraping).
+COPY --from=builder /build/build/rune_role /usr/local/bin/rune_role
 COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
 RUN ldconfig
 

@@ -37,6 +37,14 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
 
+    # RoleCounter wire-encoding unit tests (pure header — no Aeron driver).
+    add_executable(rune_role_counter_tests
+        tests/node/RoleCounterTest.cpp)
+    target_link_libraries(rune_role_counter_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_role_counter_tests)
+
     # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService unit tests — injected clock, fake leader toggle.
     # No Aeron required.
@@ -175,6 +183,18 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_broker_node_tests
+                PROPERTIES TIMEOUT 60)
+
+            # RoleCounter publish→read integration test: BrokerNode publishes the
+            # Aeron node-role/term counters; CncFileReader reads them back (the
+            # rune_role path).  Embeds the media driver → gated with the others.
+            add_executable(rune_role_counter_publish_tests
+                tests/integration/RoleCounterPublishTest.cpp)
+            target_link_libraries(rune_role_counter_publish_tests PRIVATE
+                rune_node
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_role_counter_publish_tests
                 PROPERTIES TIMEOUT 60)
         endif()
     endif()

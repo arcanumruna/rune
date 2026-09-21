@@ -83,6 +83,17 @@ class Compose:
     def restart(self, service: str, timeout: int = 90) -> CmdResult:
         return run(self._base() + ["restart", service], timeout=timeout, check=True)
 
+    def exec(self, service: str, *cmd: str, timeout: int = 30) -> CmdResult:
+        """Run `cmd` inside a running service container (docker compose exec -T).
+
+        -T disables TTY allocation so the call is non-interactive and safe to
+        capture.  Returns the CmdResult (returncode + stdout + stderr); the
+        caller decides how to interpret a non-zero rc (e.g. rune_role exits 1/2
+        when the CnC counter isn't ready yet).
+        """
+        args = self._base() + ["exec", "-T", service, *cmd]
+        return run(args, timeout=timeout)
+
     def logs(self, *services: str, tail: int | None = None, timeout: int = 30) -> str:
         args = self._base() + ["logs", "--no-log-prefix"]
         if tail is not None:
