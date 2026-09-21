@@ -56,6 +56,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -1090,4 +1091,99 @@ TEST_F(TransactionalProducerTest, EndTxnDeferredUntilAllProduceBatchesAcked)
         << "commitTransaction() future must resolve after EndTxnResponse";
     EXPECT_NO_THROW(commitFut.get());
     EXPECT_FALSE(tp.transactionActive());
+}
+
+// ===========================================================================
+// Test 13: TX-6b CommitFailsWhenProduceBatchTimesOut
+//
+//   Follow-up to Test 12 (flush-before-commit).  Test 12 proves EndTxn is
+//   deferred while a batch is in-flight.  This test proves the ESCAPE path is
+//   safe: if an in-flight Produce batch is never acked and its produceTimeout
+//   expires, sweepTimedOut() drops it — but the deferred EndTxnCommit must then
+//   FAIL with an exception, NOT be sent.  Otherwise a commit control marker
+//   would be written over data that never became durable (the exact bug TX-6b
+//   set out to prevent, just triggered by timeout instead of a race).
+//
+//   RED (without poison flag): the dropped batch unblocks the deferral and
+//   EndTxn(commit=1) is emitted; commitFut resolves successfully.
+//   GREEN (with txnFailed_):   no EndTxn is emitted; commitFut throws.
+// ===========================================================================
+TEST_F(TransactionalProducerTest, CommitFailsWhenProduceBatchTimesOut)
+{
+    CaptureSink sink;
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;  // expire in-flight batches quickly
+    auto impl = makeImpl("timeout-txn-id", cfg);
+    TransactionalProducer tp(impl);
+
+    // ---- Acquire producer identity ------------------------------------------
+    {
+        auto fut = tp.initTransactions();
+        impl->doWork(kSessionId, sink.fn());
+        ASSERT_GE(sink.frames.size(), 1u);
+        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
+        ASSERT_TRUE(opt.has_value());
+        auto resp = makeInitProducerIdResponse(opt->correlationId, /*pid=*/42, /*epoch=*/0);
+        impl->onInitProducerIdResponse(resp.data(), resp.size());
+        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
+        sink.clear();
+    }
+
+    tp.beginTransaction();
+
+    TopicHandle topic{5, 1};
+    Key key(uint64_t{0});
+    const std::vector<uint8_t> val = {0xDE, 0xAD};
+
+    // One send + commit, all enqueued before any doWork.
+    tp.send(topic, key, std::span<const uint8_t>(val));
+    auto commitFut = tp.commitTransaction();
+
+    // First doWork: drains the send into a Produce frame (in-flight), defers EndTxn.
+    impl->doWork(kSessionId, sink.fn());
+    {
+        int produceCount = 0;
+        bool endTxnEarly = false;
+        for (const auto& f : sink.frames) {
+            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) ++produceCount;
+            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) endTxnEarly = true;
+        }
+        ASSERT_EQ(produceCount, 1) << "the send must produce one in-flight batch";
+        ASSERT_FALSE(endTxnEarly) << "EndTxn must be deferred while the batch is in-flight";
+    }
+    sink.clear();
+
+    // ---- Never ack the batch.  Wait past produceTimeoutMs, then tick doWork. --
+    // sweepTimedOut() runs at the END of doWork, so the first post-timeout tick
+    // drops the batch and sets txnFailed_ (the EndTxn is still deferred this
+    // cycle because the batch is dropped after the command queue is processed).
+    // The next tick observes txnFailed_ and fails the commit.
+    std::this_thread::sleep_for(40ms);
+    impl->doWork(kSessionId, sink.fn());  // sweeps + poisons
+    sink.clear();
+    impl->doWork(kSessionId, sink.fn());  // observes poison, fails commit
+
+    // ---- CRITICAL: EndTxn must NOT be sent (would commit over lost data) ------
+    {
+        bool endTxnSent = false;
+        for (const auto& f : sink.frames) {
+            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
+                endTxnSent = true;
+                break;
+            }
+        }
+        EXPECT_FALSE(endTxnSent)
+            << "TX-6b BUG: EndTxn(commit) was sent after an in-flight Produce batch "
+               "timed out without a durable ACK — the commit marker would be written "
+               "over data that never landed (flush-before-commit invariant broken).";
+    }
+
+    // ---- The commit future must resolve with an EXCEPTION --------------------
+    ASSERT_EQ(commitFut.wait_for(0s), std::future_status::ready)
+        << "commitTransaction() future must resolve (with an exception) once the "
+           "txn is poisoned by a timed-out batch";
+    EXPECT_THROW(commitFut.get(), std::runtime_error)
+        << "commitTransaction() must throw when a data batch was not durably acked";
+    EXPECT_FALSE(tp.transactionActive())
+        << "the poisoned txn must no longer be active";
 }

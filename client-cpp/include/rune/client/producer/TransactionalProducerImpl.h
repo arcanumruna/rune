@@ -231,6 +231,14 @@ private:
     // Transaction state (agent-thread only; atomic for app-thread read).
     std::atomic<bool>    txnActive_      {false};
 
+    // TX-6b: set when an in-flight Produce batch of the current transaction is
+    // dropped without a durable ACK (produceTimeout expiry or retry exhaustion).
+    // A pending EndTxnCommit MUST NOT be sent once this is true — the
+    // flush-before-commit invariant is violated, so the commit is failed with an
+    // exception instead (matching Kafka: a failed send poisons commitTransaction()).
+    // Agent-thread only; cleared when a new transaction begins.
+    bool                 txnFailed_      {false};
+
     // Partitions added to the current transaction (agent-thread only).
     std::set<rune::client::TopicPartitionKey> addedPartitions_;
 

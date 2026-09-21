@@ -288,6 +288,25 @@ int TransactionalProducerImpl::doWork(
             // read_committed consumer sees only the records that landed before the
             // marker.  Kafka semantics: commitTransaction() flushes first.
             //
+            // TX-6b: if a data batch of this txn was dropped without a durable
+            // ACK (timeout / retry exhaustion), the flush-before-commit invariant
+            // is broken.  Fail a COMMIT with an exception rather than writing a
+            // commit marker over incomplete data.  An ABORT is still allowed to
+            // proceed (aborting a poisoned txn is the correct outcome).
+            if (txnFailed_ && cmd.kind == CmdKind::EndTxnCommit) {
+                try {
+                    cmd.promise.set_exception(
+                        std::make_exception_ptr(
+                            std::runtime_error(
+                                "EndTxn: commit aborted — a data batch was not "
+                                "durably acknowledged (flush-before-commit)")));
+                } catch (...) {}
+                txnActive_.store(false, std::memory_order_release);
+                addedPartitions_.clear();
+                txnFailed_ = false;
+                break;
+            }
+
             // Defer the EndTxn until pendingSends_ is drained AND every in-flight
             // Produce has been acked (pendingProduceBatches_ empty).  Re-queue the
             // command unchanged and retry on the next doWork tick.
@@ -320,6 +339,10 @@ int TransactionalProducerImpl::doWork(
                 txnActive_.store(false, std::memory_order_release);
                 // Clear the addedPartitions set for the next transaction.
                 addedPartitions_.clear();
+                // TX-6b: reset the poison flag for the next transaction.  (Commit
+                // here is only reached when txnFailed_ was false; an abort of a
+                // poisoned txn resolves it cleanly.)
+                txnFailed_ = false;
                 ++work;
             } else {
                 try {
@@ -496,6 +519,12 @@ void TransactionalProducerImpl::sweepTimedOut()
     }
     for (const int64_t corrId : expiredBatches) {
         pendingProduceBatches_.erase(corrId);
+        // TX-6b: a data batch never became durable.  If a txn is active, poison
+        // it so the pending EndTxnCommit fails instead of writing a commit marker
+        // over incomplete data (flush-before-commit invariant).
+        if (txnActive_.load(std::memory_order_acquire)) {
+            txnFailed_ = true;
+        }
     }
 }
 
@@ -536,8 +565,13 @@ void TransactionalProducerImpl::onProduceResponse(
     // deduplicate if it already accepted this batch.
     InFlightBatch& ib = it->second;
     if (ib.retryCount >= InFlightBatch::kMaxRetries) {
-        // Exhausted retries — drop (EndTxn will fail or caller can retry the txn).
+        // Exhausted retries — drop the batch.  TX-6b: this data never became
+        // durable, so poison an active txn — the pending EndTxnCommit must fail
+        // rather than write a commit marker over incomplete data.
         pendingProduceBatches_.erase(it);
+        if (txnActive_.load(std::memory_order_acquire)) {
+            txnFailed_ = true;
+        }
         return;
     }
 
