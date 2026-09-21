@@ -94,16 +94,24 @@ namespace rune::node {
 
 class LogCleanerAgent final : public rune::consensus::Agent {
 public:
-    /// @param registry         Non-owning pointer to the replica registry.
-    ///                         Must outlive this agent.
-    /// @param cycleBudgetBytes Maximum bytes of compaction work per doWork() call.
-    ///                         Default 128 MiB matches Kafka's default dedupe buffer.
-    ///                         Also used as the dedupe map byte budget (SkimpyOffsetMap).
+    /// @param registry          Non-owning pointer to the replica registry.
+    ///                          Must outlive this agent.
+    /// @param cycleBudgetBytes  Maximum bytes of compaction work per doWork() call.
+    ///                          Default 128 MiB matches Kafka's default.
+    ///                          0 = unlimited per-cycle budget.
+    /// @param dedupeBufferBytes Memory budget for the SkimpyOffsetMap dedupe pass.
+    ///                          Default -1 = use cycleBudgetBytes (or 128 MiB if
+    ///                          cycleBudgetBytes is 0).  The map is sized to
+    ///                          floor(dedupeBufferBytes / kEntryBytes × loadFactor).
     explicit LogCleanerAgent(ReplicaRegistry* registry,
-                             int64_t cycleBudgetBytes = 128LL * 1024 * 1024) noexcept
+                             int64_t cycleBudgetBytes  = 128LL * 1024 * 1024,
+                             int64_t dedupeBufferBytes = -1) noexcept
         : registry_(registry)
         , cycleBudgetBytes_(cycleBudgetBytes)
-        , dedupeBufferBytes_(cycleBudgetBytes > 0 ? cycleBudgetBytes : 128LL * 1024 * 1024)
+        , dedupeBufferBytes_(dedupeBufferBytes >= 0
+                             ? dedupeBufferBytes
+                             : (cycleBudgetBytes > 0 ? cycleBudgetBytes
+                                                     : 128LL * 1024 * 1024))
     {}
 
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
@@ -178,11 +186,27 @@ public:
             const int64_t firstUncleanable = hw;  // min(active_base, hw); conservative
 
             // Compute byte-based dirty ratio (Kafka-exact formula §3.2).
+            //
+            // CP-7 bounded-range-per-pass amendment: after a partial pass,
+            // firstDirtyOffset may land INSIDE a segment (base < firstDirty < segEnd).
+            // That segment is still partially dirty and must be counted as cleanable,
+            // not clean — otherwise dirtyRatio falls to 0 and the log is never
+            // re-selected.  We compute each segment's logical end from the snapshot
+            // and classify a segment as cleanable whenever its range overlaps
+            // [firstDirtyOffset, firstUncleanable), i.e. segEnd > firstDirtyOffset.
             int64_t cleanBytes     = 0;
             int64_t cleanableBytes = 0;
-            for (const auto& si : *snap) {
+            for (std::size_t ii = 0; ii < snap->size(); ++ii) {
+                const auto& si = (*snap)[ii];
                 if (si.baseOffset >= firstUncleanable) break;
-                if (si.baseOffset < firstDirtyOffset) {
+                // Compute logical end of this segment.
+                int64_t siEnd = (ii + 1 < snap->size())
+                                ? (*snap)[ii + 1].baseOffset
+                                : firstUncleanable;
+                // A segment overlaps the dirty range if siEnd > firstDirtyOffset.
+                // A segment is entirely clean if its range is completely before
+                // firstDirtyOffset (siEnd <= firstDirtyOffset).
+                if (siEnd <= firstDirtyOffset) {
                     cleanBytes += si.sizeBytes;
                 } else {
                     cleanableBytes += si.sizeBytes;
@@ -197,23 +221,34 @@ public:
 
             if (dirtyRatio <= replica->minCleanableDirtyRatio()) continue;
 
-            // Find the first sealed segment to compact: base >= firstDirtyOffset
-            // and base < firstUncleanable.
+            // Find the sealed segment that CONTAINS or starts at firstDirtyOffset.
+            //
+            // CP-7 bounded-range-per-pass: after a partial pass, lastCleanOffset
+            // (= firstDirtyOffset) may be in the MIDDLE of a segment (e.g.
+            // firstDirtyOffset=3 while the only sealed segment has base=0).  We
+            // must select that segment — not skip it because base < firstDirtyOffset.
+            //
+            // Selection rule: pick the FIRST sealed segment s such that:
+            //   s.segEnd > firstDirtyOffset  AND  s.base < firstUncleanable
+            // where segEnd = next segment's base (or firstUncleanable for the last).
+            // This selects the segment whose byte range overlaps [firstDirtyOffset, ∞).
             int64_t segBase  = -1;
             int64_t segEnd   = -1;
             int64_t segBytes = 0;
             for (std::size_t i = 0; i < snap->size(); ++i) {
                 const auto& si = (*snap)[i];
-                if (si.baseOffset < firstDirtyOffset) continue;
                 if (si.baseOffset >= firstUncleanable) break;
+                // Compute this segment's logical end.
+                int64_t sEnd = (i + 1 < snap->size())
+                               ? (*snap)[i + 1].baseOffset
+                               : firstUncleanable;
+                // The segment is cleanable if its range overlaps [firstDirtyOffset, ∞):
+                //   sEnd > firstDirtyOffset  (segment ends AFTER the dirty start)
+                // AND  si.baseOffset < firstUncleanable  (segment starts before HW)
+                if (sEnd <= firstDirtyOffset) continue; // entirely before dirty range
                 segBase  = si.baseOffset;
+                segEnd   = sEnd;
                 segBytes = si.sizeBytes;
-                // segEnd: next segment's base, or use hw as upper bound.
-                if (i + 1 < snap->size()) {
-                    segEnd = (*snap)[i + 1].baseOffset;
-                } else {
-                    segEnd = firstUncleanable;
-                }
                 break;
             }
             if (segBase < 0) {
@@ -268,20 +303,35 @@ public:
         // Phase 4: compact the segment OFF-THREAD — PURE FILE WORK.
         //
         // CP-6 race-fix (the load-bearing invariant): the cleaner thread MUST
-        // NOT touch Log::segments_.  We call produceCleanedFile() which reads
-        // segment bytes ONLY from disk using the immutable snapshot base offsets
-        // (best.snap) + the race-free dir (best.dir), writes the compacted .log,
-        // and returns.  It never calls segmentBaseOffsets(), segmentSize() or
-        // reloadSegment().  The in-memory reload is deferred to the append thread
-        // via enqueueCleanedSegment() → drainCleanerSwaps() → reloadSegment().
+        // NOT touch Log::segments_.  We call produceCleanedFileBounded() which
+        // reads segment bytes ONLY from disk using the immutable snapshot base
+        // offsets (best.snap) + the race-free dir (best.dir), writes the
+        // compacted .log, and returns.  It never calls segmentBaseOffsets(),
+        // segmentSize() or reloadSegment().  The in-memory reload is deferred
+        // to the append thread via enqueueCleanedSegment() → drainCleanerSwaps()
+        // → reloadSegment().
         //
         // Uses the global dirty range for latest-per-key correctness (CP-2).
         //
-        // CP-7: uses SkimpyOffsetMap (bounded open-addressing table, wyhash64)
-        // instead of the unbounded OffsetMap.  The map size is bounded by
-        // dedupeBufferBytes_.  buildOffsetMapFromBases stops when the map is
-        // full and returns the highest offset scanned (bounded-range-per-pass).
+        // CP-7: produceCleanedFileBounded builds a SkimpyOffsetMap bounded by
+        // dedupeBufferBytes_.  When the map fills before covering the whole dirty
+        // range, it returns passEnd < activeBase so the watermark advances only
+        // to passEnd (bounded-range-per-pass).  The next cycle resumes from
+        // passEnd.  The segment is rewritten with cleanBoundaryOffset = passEnd
+        // so records beyond passEnd survive to be revisited.
         // ---------------------------------------------------------------
+
+        // CP-7 lazy checkpoint init: open (or create) the per-log checkpoint
+        // file on first use, seeding lastCleanOffset from the persisted value.
+        // MUST be called BEFORE reading globalDirtyStart (= lastCleanOffset())
+        // so the compaction starts from the persisted watermark, not 0.
+        // Pure file I/O — never touches Log::segments_.
+        // TSan fix: uses best.firstUncleanable (race-free, from Phase-1 snapshot)
+        // as the truncation-clamp bound instead of log->logEndOffset().
+        ensureCheckpoint(best.log, best.dir, best.replica, best.firstUncleanable);
+
+        // Re-read globalDirtyStart AFTER ensureCheckpoint so it reflects any
+        // value loaded from the persisted checkpoint file.
         const int64_t globalDirtyStart = best.replica->lastCleanOffset();
 
         // Snapshot-derived sealed base list (no segments_ access).
@@ -290,65 +340,73 @@ public:
         for (const auto& si : *best.snap) sealedBases.push_back(si.baseOffset);
 
         rune::storage::LogCleaner cleaner;
-        const bool compacted = cleaner.produceCleanedFile(
+        const auto passResult = cleaner.produceCleanedFileBounded(
             best.dir,
             sealedBases,
-            /*segBase=*/     best.segBase,
-            /*activeBase=*/  best.firstUncleanable,
-            /*globalDirtyStart=*/ globalDirtyStart,
+            /*segBase=*/         best.segBase,
+            /*activeBase=*/      best.firstUncleanable,
+            /*globalDirtyStart=*/globalDirtyStart,
             nowNs,
-            best.replica->deleteRetentionMs());
+            best.replica->deleteRetentionMs(),
+            /*dedupeBufferBytes=*/dedupeBufferBytes_);
 
-        // CP-7 lazy checkpoint init: open (or create) the per-log checkpoint
-        // file on first use.  The checkpoint seeds lastCleanOffset_ so passes
-        // resume correctly after a broker restart.  This is pure file I/O;
-        // it does NOT touch Log::segments_.
-        ensureCheckpoint(best.log, best.dir, best.replica);
+        // CP-7: passEnd is the next-pass boundary.  When the map covered the
+        // entire dirty range, passEnd == activeBase.  When the map was bounded
+        // and filled before the end, passEnd < activeBase — the watermark
+        // advances only to passEnd.
+        const int64_t passEnd = passResult.passEnd;
 
-        if (!compacted) return 0;
+        if (!passResult.compacted) {
+            // No segment was rewritten.  This can happen when:
+            //   (a) latestMapped < 0: map got no records in dirty range → advance
+            //       to passEnd=activeBase so we don't stall (nothing to clean).
+            //   (b) segBase >= passEnd: segment is beyond the bounded pass boundary.
+            //       Advance to passEnd so next cycle resumes from the right place.
+            // In both cases we only advance if there's no enqueue outstanding.
+            // No enqueue is needed since no file was produced; just move the watermark.
+            // NOTE: do NOT advance if passEnd == globalDirtyStart (no progress).
+            if (passEnd > globalDirtyStart) {
+                if (best.replica->role() == rune::replication::Role::Leader) {
+                    best.replica->setLastCleanOffset(passEnd);
+                    if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
+                        it->second->store(passEnd);
+                    }
+                }
+            }
+            return 0;
+        }
 
         // ---------------------------------------------------------------
         // Phase 5: enqueue the swap; advance the clean watermark ONLY on
         //          a successful enqueue.
         //
-        // We always ATTEMPT the enqueue (even if we raced a role change after
-        // the pre-clean guard) — the append thread's drainCleanerSwaps →
-        // reloadSegment handles both cases safely:
-        //   • still leader: picks up the compacted file.
-        //   • demoted to follower: reloadSegment updates the in-memory
-        //     segment to point at the (valid, below-HW) compacted file.
-        //     Subsequent truncation acts on the tail ABOVE HW — disjoint.
+        // Watermark advances to passEnd (not segEnd as before).  When the
+        // SkimpyOffsetMap was bounded (map filled mid-segment), passEnd <
+        // activeBase — this is the bounded-range-per-pass semantics: the
+        // next cycle resumes from passEnd and recompacts the same segment
+        // (now partially clean, with records up to passEnd removed).
         //
-        // SPSC-OVERFLOW FIX (blocking finding #5): enqueueCleanedSegment()
-        // returns false when the swap ring is momentarily full.  If we advanced
-        // lastCleanOffset in that case, the segment would be compacted-on-disk
-        // but NEVER installed into segments_ AND never re-selected — silent data
-        // loss / divergence.  Instead we DO NOT advance the watermark on enqueue
-        // failure: the segment stays dirty and is re-selected + re-enqueued next
-        // cycle (idempotent retry — produceCleanedFile and reloadSegment are both
-        // idempotent).  We also do NOT count budget bytes for a dropped swap, so
-        // the retry is not throttled away.
+        // SPSC-OVERFLOW FIX: enqueueCleanedSegment() returns false when the
+        // swap ring is full.  We DO NOT advance the watermark on failure.
         // ---------------------------------------------------------------
         const bool enqueued = best.log->enqueueCleanedSegment(best.segBase);
         if (!enqueued) {
-            // Ring full — leave the segment dirty (watermark unadvanced) so it is
-            // re-selected next cycle.  No budget charge, no watermark skip.
+            // Ring full — leave the segment dirty so it is re-selected next cycle.
             return 0;
         }
 
-        // Accumulate bytes consumed by this compaction toward the budget only
-        // once the swap is durably enqueued for install.
+        // Accumulate bytes consumed by this compaction toward the budget.
         bytesUsed_ += best.segBytes;
 
-        // Only advance lastCleanOffset when still leader (avoid corrupting the
-        // cleaned-watermark on a demoted replica) AND only after a successful
-        // enqueue (avoid skipping a lost swap).
+        // Advance lastCleanOffset to passEnd (the bounded-range boundary).
+        // When not bounded, passEnd == best.firstUncleanable (== activeBase),
+        // which naturally marks the whole dirty range as clean.
         if (best.replica->role() == rune::replication::Role::Leader) {
-            best.replica->setLastCleanOffset(best.segEnd);
-            // CP-7: persist the checkpoint (pure file I/O — no segments_ access).
-            // Written on the cleaner thread (safe: mmap write only, not shared state).
+            best.replica->setLastCleanOffset(passEnd);
+            // CP-7: persist the checkpoint to passEnd (not segEnd).
+            // Pure file I/O (mmap write + msync); cleaner-thread-safe.
             if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
-                it->second->store(best.segEnd);
+                it->second->store(passEnd);
             }
         }
 
@@ -360,14 +418,23 @@ private:
     // If the checkpoint file already exists, seeds replica->lastCleanOffset()
     // with the persisted value (truncation-aware).  Called on the CLEANER THREAD;
     // pure file I/O — no Log::segments_ access.
+    //
+    // TSan fix (CP-7): takes `highWatermark` (from the Phase-1 snapshot, already
+    // available and race-free) as the truncation-clamp bound instead of reading
+    // log->logEndOffset() directly (logEndOffset_ is non-atomic, written by the
+    // append thread → data race confirmed by TSan).  Compaction is bounded below
+    // HW anyway, so HW is a safe and conservative clamp.
     void ensureCheckpoint(rune::storage::Log* log,
                           const std::string& dir,
-                          rune::replication::PartitionReplica* replica) {
+                          rune::replication::PartitionReplica* replica,
+                          int64_t highWatermark) {
         if (checkpoints_.count(log)) return; // already opened
         std::string ckptPath = dir + "/cleaner-offset-checkpoint";
-        const int64_t logEnd = log->logEndOffset();
+        // Use highWatermark as the truncation-clamp bound (race-free; from the
+        // immutable Phase-1 snapshot) instead of log->logEndOffset() which is
+        // non-atomic and races with the append thread.
         auto ckpt = std::make_unique<rune::storage::CleanerOffsetCheckpoint>(
-            ckptPath, logEnd);
+            ckptPath, highWatermark);
         // Seed the in-memory watermark from the persisted checkpoint.
         // Only advance (don't regress) the existing watermark.
         const int64_t persisted = ckpt->value();
@@ -379,7 +446,7 @@ private:
 
     ReplicaRegistry* registry_;         // non-owning
     int64_t          cycleBudgetBytes_; // 0 = unlimited; >0 = soft bytes-per-window cap
-    int64_t          dedupeBufferBytes_;// dedupe map byte budget (SkimpyOffsetMap)
+    int64_t          dedupeBufferBytes_;// dedupe map byte budget (SkimpyOffsetMap, > 0 always)
     int64_t          bytesUsed_ = 0;    // bytes consumed so far in the current budget window
 
     // CP-7: per-log cleaner-offset-checkpoint (lazy init on first compaction).
