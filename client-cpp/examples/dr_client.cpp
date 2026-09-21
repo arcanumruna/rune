@@ -28,7 +28,16 @@
 //
 //   Workload:
 //     RUNE_MODE            "produce" | "subscribe" | "produce_subscribe" | "group"
+//                          | "txn_produce" | "txn_consume"
 //                            default "produce_subscribe"
+//
+//   Transactional produce (RUNE_MODE=txn_produce):
+//     RUNE_TXN_ID          transactional producer id (required for txn_produce)
+//     RUNE_TXN_COMMIT      1=commit (default), 0=abort
+//
+//   Transactional consume (RUNE_MODE=txn_consume):
+//     RUNE_ISOLATION       "read_committed" | "read_uncommitted" (default)
+//                            read_committed → GroupConsumer with IsolationLevel::ReadCommitted
 //     RUNE_RECORDS         records to produce (produce modes), default 20
 //     RUNE_KEYS            number of distinct keys to spread records across,
 //                            default 1.  Record i uses key (i % RUNE_KEYS).
@@ -81,12 +90,22 @@
 //   GROUPREC cid=<c> topic=<t> partition=<p> offset=<o> rec_cid=<rc> rec_key=<rk> rec_seq=<rs>
 //   GROUPSUMMARY cid=<c> consumed=<n> rc=<rc>
 //
+//   Txn produce mode (RUNE_MODE=txn_produce) emits:
+//   TXNPRODUCE cid=<c> key=<k> seq=<s> part=<p>
+//   TXNRESULT txn_id=<id> cid=<c> outcome=committed|aborted
+//   SUMMARY produced=<np> delivered=0 mode=txn_produce rc=<rc>
+//
+//   Txn consume mode (RUNE_MODE=txn_consume) emits the same DELIVERED / SUMMARY
+//   lines as subscribe mode plus:
+//   TXNCONSUME_SUMMARY cid=<c> consumed=<n> isolation=<iso>
+//
 // Exit code: 0 on success, 1 on workload assertion failure, 2 on exception.
 
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/client/group/GroupConsumer.h>
 #include <rune/protocol/RecordBatch.h>
@@ -447,6 +466,205 @@ static int doGroup(Client& client,
 }
 
 // ---------------------------------------------------------------------------
+// TX-5: Transactional produce mode (RUNE_MODE=txn_produce).
+//
+// Runs init→begin→produce(records)→commit/abort using the TransactionalProducer.
+// Emits:
+//   TXNPRODUCE cid=<c> key=<k> seq=<s> part=<p>   (per record sent)
+//   TXNRESULT txn_id=<id> cid=<c> outcome=committed|aborted
+//   SUMMARY produced=<n> delivered=0 mode=txn_produce rc=<rc>
+//
+// Returns 0 on success (commit or intentional abort), 1 on unexpected error.
+// ---------------------------------------------------------------------------
+static int doTxnProduce(Client& c, const TopicHandle& th,
+                        const std::string& txnId, int cid, int records, int keys,
+                        bool doCommit, int timeoutMs) {
+    ProducerConfig pcfg;
+    pcfg.acks             = Acks::All;
+    pcfg.lingerUs         = 1;
+    pcfg.batchBytes       = 1;
+    pcfg.maxInFlight      = 16;
+    pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
+
+    auto tp = c.transactionalProducer(txnId, pcfg);
+
+    // initTransactions
+    auto initFut = tp.initTransactions();
+    if (initFut.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready) {
+        std::cerr << "CLIENT: FAIL txn initTransactions TIMEOUT\n";
+        return 1;
+    }
+    try { initFut.get(); } catch (const std::exception& ex) {
+        std::cerr << "CLIENT: FAIL txn initTransactions: " << ex.what() << "\n";
+        return 1;
+    }
+
+    tp.beginTransaction();
+
+    // Send records
+    int sent = 0;
+    for (int seq = 0; seq < records; ++seq) {
+        const int keyIdx = keys > 0 ? (seq % keys) : 0;
+        const uint64_t effKey = static_cast<uint64_t>(cid) * 1'000'000ULL +
+                                static_cast<uint64_t>(keyIdx);
+        const std::string valStr = encodePayload(cid, keyIdx, seq);
+        const std::vector<uint8_t> val(valStr.begin(), valStr.end());
+        Key key(effKey);
+        const int32_t part = key.partition(th.partitionCount);
+        tp.send(th, key, std::span<const uint8_t>(val));
+        std::cout << "TXNPRODUCE cid=" << cid << " key=" << keyIdx
+                  << " seq=" << seq << " part=" << part << "\n";
+        std::cout.flush();
+        ++sent;
+    }
+
+    // commit or abort
+    const std::string outcome = doCommit ? "committed" : "aborted";
+    if (doCommit) {
+        auto fut = tp.commitTransaction();
+        if (fut.wait_for(std::chrono::milliseconds(timeoutMs * 2)) != std::future_status::ready) {
+            std::cerr << "CLIENT: FAIL txn commitTransaction TIMEOUT\n";
+            return 1;
+        }
+        try { fut.get(); } catch (const std::exception& ex) {
+            std::cerr << "CLIENT: FAIL txn commitTransaction: " << ex.what() << "\n";
+            return 1;
+        }
+    } else {
+        auto fut = tp.abortTransaction();
+        if (fut.wait_for(std::chrono::milliseconds(timeoutMs * 2)) != std::future_status::ready) {
+            std::cerr << "CLIENT: FAIL txn abortTransaction TIMEOUT\n";
+            return 1;
+        }
+        try { fut.get(); } catch (const std::exception& ex) {
+            std::cerr << "CLIENT: FAIL txn abortTransaction: " << ex.what() << "\n";
+            return 1;
+        }
+    }
+
+    std::cout << "TXNRESULT txn_id=" << txnId << " cid=" << cid
+              << " outcome=" << outcome << "\n";
+    std::cout.flush();
+    std::cout << "SUMMARY produced=" << sent << " delivered=0"
+              << " mode=txn_produce rc=0\n";
+    std::cout.flush();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// TX-5: Transactional consume mode (RUNE_MODE=txn_consume).
+//
+// Subscribes as a group consumer with the configured isolation level.
+// Emits DELIVERED lines (same as subscribe mode) plus:
+//   TXNCONSUME_SUMMARY cid=<c> consumed=<n> isolation=<iso>
+// ---------------------------------------------------------------------------
+static int doTxnConsume(Client& c,
+                        const std::vector<std::string>& topicNames,
+                        int cid, int windowMs, int autoCommitMs,
+                        const std::string& groupId,
+                        IsolationLevel isolation) {
+    struct GRec {
+        std::string topicName;
+        int32_t     partition;
+        int64_t     offset;
+        int         rec_cid, rec_key, rec_seq;
+        int32_t     generation;
+    };
+    std::mutex        qMtx;
+    std::deque<GRec>  q;
+    std::atomic<int>  consumed{0};
+
+    GroupConfig gcfg;
+    gcfg.autoCommit           = true;
+    gcfg.autoCommitIntervalMs = autoCommitMs;
+    gcfg.sessionTimeoutMs     = 30000;
+    gcfg.autoOffsetReset      = OffsetReset::Earliest;
+    gcfg.isolation            = isolation;
+
+    const std::string& primaryTopic = topicNames.empty() ? "unknown" : topicNames[0];
+
+    GroupConsumer gc = c.subscribeGroup(groupId, topicNames, gcfg);
+
+    gc.onAssigned([cid, &gc](std::vector<TopicPartition> parts) {
+        std::ostringstream oss;
+        oss << "ASSIGN cid=" << cid << " gen=" << gc.generation() << " parts=";
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << parts[i].partition;
+        }
+        std::cout << oss.str() << "\n";
+        std::cout.flush();
+    });
+
+    gc.onRevoked([cid, &gc](std::vector<TopicPartition> parts) {
+        std::ostringstream oss;
+        oss << "REVOKE cid=" << cid << " gen=" << gc.generation() << " parts=";
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << parts[i].partition;
+        }
+        std::cout << oss.str() << "\n";
+        std::cout.flush();
+    });
+
+    gc.onRecords([&qMtx, &q, &gc, primaryTopic, cid](const RecordSet& rs) {
+        if (rs.recordBatch.size() < static_cast<std::size_t>(
+                rune::protocol::batch::kRecordBatchOverhead)) {
+            return;
+        }
+        rune::protocol::RecordBatchReader reader(rs.recordBatch.data(),
+                                                  rs.recordBatch.size());
+        reader.forEach([&](std::string_view /*key*/, std::string_view val,
+                           int64_t off, int64_t /*ts*/) {
+            int rc = -1, rk = -1, rs_seq = -1;
+            const std::string valStr(val);
+            decodePayload(valStr, rc, rk, rs_seq);
+            const int32_t gen = gc.generation();
+            std::lock_guard<std::mutex> lk(qMtx);
+            q.push_back({primaryTopic, rs.partition, off, rc, rk, rs_seq, gen});
+        });
+        (void)cid;
+    });
+
+    std::cerr << "CLIENT: txn_consume group connecting...\n";
+    c.connect().get();
+    std::cerr << "CLIENT: txn_consume group connected\n";
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(windowMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        GRec rec;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lk(qMtx);
+            if (!q.empty()) { rec = std::move(q.front()); q.pop_front(); have = true; }
+        }
+        if (have) {
+            // Emit as DELIVERED for parser compatibility
+            std::cout << "DELIVERED cid=" << rec.rec_cid << " key=" << rec.rec_key
+                      << " seq=" << rec.rec_seq << " part=" << rec.partition
+                      << " offset=" << rec.offset << "\n";
+            std::cout.flush();
+            consumed.fetch_add(1);
+        } else {
+            std::this_thread::sleep_for(2ms);
+        }
+    }
+
+    gc.close();
+    const int n = consumed.load();
+    const std::string isoStr = (isolation == IsolationLevel::ReadCommitted)
+        ? "read_committed" : "read_uncommitted";
+    std::cout << "TXNCONSUME_SUMMARY cid=" << cid << " consumed=" << n
+              << " isolation=" << isoStr << "\n";
+    std::cout.flush();
+    std::cout << "SUMMARY produced=0 delivered=" << n
+              << " mode=txn_consume rc=0\n";
+    std::cout.flush();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -491,6 +709,17 @@ int main() {
     const std::string groupId        = getEnvStr("RUNE_GROUP_ID");
     const int         autoCommitMs   = getEnvInt("RUNE_AUTOCOMMIT_MS", 1000);
 
+    // TX-5: transactional produce env vars.
+    const std::string txnId          = getEnvStr("RUNE_TXN_ID");
+    const bool        txnCommit      = (getEnvInt("RUNE_TXN_COMMIT", 1) != 0);
+
+    // TX-5: transactional consume isolation.
+    const std::string isolationStr   = getEnvStr("RUNE_ISOLATION", "read_uncommitted");
+    const IsolationLevel txnIsolation =
+        (isolationStr == "read_committed")
+            ? IsolationLevel::ReadCommitted
+            : IsolationLevel::ReadUncommitted;
+
     if (target.empty() || egress.empty() || dataDir.empty()) {
         std::cerr << "CLIENT: RUNE_TARGET, RUNE_EGRESS and RUNE_DATA_DIR are required\n";
         return 1;
@@ -498,6 +727,16 @@ int main() {
 
     if (mode == "group" && groupId.empty()) {
         std::cerr << "CLIENT: RUNE_GROUP_ID is required for mode=group\n";
+        return 1;
+    }
+
+    if (mode == "txn_produce" && txnId.empty()) {
+        std::cerr << "CLIENT: RUNE_TXN_ID is required for mode=txn_produce\n";
+        return 1;
+    }
+
+    if (mode == "txn_consume" && groupId.empty()) {
+        std::cerr << "CLIENT: RUNE_GROUP_ID is required for mode=txn_consume\n";
         return 1;
     }
 
@@ -529,6 +768,43 @@ int main() {
     try {
         Client c(cfg);
         c.onError([](const std::string& msg) { std::cerr << "CLIENT: onError: " << msg << "\n"; });
+
+        if (mode == "txn_produce") {
+            // TX-5: txn_produce — init→begin→send→commit/abort.
+            // transactionalProducer() MUST be called before connect() (setup phase).
+            // We call connect() inside doTxnProduce via the c.connect() path —
+            // but actually transactionalProducer is setup-phase; connect is called
+            // here before dispatching, matching the regular producer pattern.
+            std::cerr << "CLIENT: txn_produce mode txnId=" << txnId
+                      << " commit=" << txnCommit << " records=" << records << "\n";
+            std::cerr << "CLIENT: connecting...\n";
+            c.connect().get();
+            std::cerr << "CLIENT: connected\n";
+            const TopicHandle thTxn = c.topic(cfg.topics[0].name);
+            if (!thTxn.valid()) {
+                std::cerr << "CLIENT: topic '" << cfg.topics[0].name << "' not valid\n";
+                return 1;
+            }
+            rc = doTxnProduce(c, thTxn, txnId, cid, records, keys,
+                              txnCommit, timeoutMs);
+            c.close();
+            return rc;
+        }
+
+        if (mode == "txn_consume") {
+            // TX-5: txn_consume — GroupConsumer with configured isolation level.
+            // subscribeGroup MUST be called before connect() — doTxnConsume handles that.
+            std::vector<std::string> topicNames;
+            topicNames.reserve(cfg.topics.size());
+            for (const auto& ts : cfg.topics) topicNames.push_back(ts.name);
+            std::cerr << "CLIENT: txn_consume mode groupId=" << groupId
+                      << " isolation=" << isolationStr
+                      << " windowMs=" << subWindowMs << "\n";
+            rc = doTxnConsume(c, topicNames, cid, subWindowMs, autoCommitMs,
+                              groupId, txnIsolation);
+            c.close();
+            return rc;
+        }
 
         if (mode == "group") {
             // Group mode: register callbacks BEFORE connect() (setup-phase contract).
