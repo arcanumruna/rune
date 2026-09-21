@@ -412,6 +412,32 @@ protected:
     }
 
     // -----------------------------------------------------------------------
+    // Encode + call handleSyncGroup for one member.
+    // Must be called AFTER the coordinator has reached Stable so that the
+    // SyncGroup triggers addGroupSubscription for this member.
+    // Returns the SyncGroupResponse error code (0 = OK), or -1 on decode failure.
+    // -----------------------------------------------------------------------
+    int doSync(int64_t sessionId, int64_t correlationId,
+               std::string_view groupId, std::string_view memberId) {
+        const int32_t gen = service_->coordinator(std::string(groupId)).generationId();
+        pc::SyncGroup msg;
+        msg.sessionId     = sessionId;
+        msg.correlationId = correlationId;
+        msg.generationId  = gen;
+        msg.groupId  = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(groupId.data()), groupId.size());
+        msg.memberId = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
+        uint8_t req[kBufSz]{}, out[kBufSz]{};
+        const auto reqLen = msg.encode(req);
+        const auto outLen = service_->handleSyncGroup(req, reqLen, clock_, out, kBufSz);
+        if (outLen == 0) return -1;
+        const auto resp = pc::SyncGroupResponse::decode(out, outLen);
+        if (!resp) return -1;
+        return resp->errorCode;
+    }
+
+    // -----------------------------------------------------------------------
     // Drive service_->doWork until predicate or cap.
     // -----------------------------------------------------------------------
     bool driveUntil(std::function<bool()> pred, int cap = kCap) {
@@ -520,6 +546,11 @@ TEST_F(CG4DeliveryFixture, EachPartitionToExactlyOneMember) {
     });
     ASSERT_TRUE(stable) << "Must reach Stable after both members re-join";
 
+    // SyncGroup for each member — this triggers addGroupSubscription inside
+    // handleSyncGroup (subscriptions are created on SyncGroup OK, not on Stable).
+    EXPECT_EQ(doSync(sess1, 5, group, m1), 0) << "m1 SyncGroup must succeed";
+    EXPECT_EQ(doSync(sess2, 6, group, m2), 0) << "m2 SyncGroup must succeed";
+
     // Service should have called addGroupSubscription for each member×partition.
     EXPECT_EQ(gw_->groupMemberSubCount(sess1), 1u) << "m1 must own 1 group sub";
     EXPECT_EQ(gw_->groupMemberSubCount(sess2), 1u) << "m2 must own 1 group sub";
@@ -598,6 +629,11 @@ TEST_F(CG4DeliveryFixture, ResumeFromCommittedOffset) {
     });
     ASSERT_TRUE(stable);
 
+    // SyncGroup for each member — triggers addGroupSubscription (reads committed
+    // offset at this point, so the subscription starts from the committed offset).
+    EXPECT_EQ(doSync(sess1, 14, group, m1), 0) << "m1 SyncGroup must succeed";
+    EXPECT_EQ(doSync(sess2, 15, group, m2), 0) << "m2 SyncGroup must succeed";
+
     // Determine which member owns p0 (via coordinator assignment).
     const auto& coord = service_->coordinator(group);
     int64_t ownerSess = -1;
@@ -674,6 +710,10 @@ TEST_F(CG4DeliveryFixture, EagerRevokeAndReassign) {
     });
     ASSERT_TRUE(stable) << "Phase 1 must reach Stable";
 
+    // SyncGroup for each member — triggers addGroupSubscription.
+    EXPECT_EQ(doSync(sess1, 28, group, m1), 0) << "m1 Phase1 SyncGroup must succeed";
+    EXPECT_EQ(doSync(sess2, 29, group, m2), 0) << "m2 Phase1 SyncGroup must succeed";
+
     // Service must have added group subs for the 2 members.
     EXPECT_EQ(gw_->subscriptionCount(), 2u)
         << "Phase 1: 2 members, 2 partitions → 2 group subs";
@@ -700,6 +740,11 @@ TEST_F(CG4DeliveryFixture, EagerRevokeAndReassign) {
         return service_->coordinator(group).state() == GroupState::Stable;
     });
     ASSERT_TRUE(stable) << "Phase 2 must reach Stable after 3rd member joins";
+
+    // SyncGroup for all 3 members in Phase 2.
+    EXPECT_EQ(doSync(sess1, 30, group, m1), 0) << "m1 Phase2 SyncGroup must succeed";
+    EXPECT_EQ(doSync(sess2, 31, group, m2), 0) << "m2 Phase2 SyncGroup must succeed";
+    EXPECT_EQ(doSync(sess3, 32, group, m3), 0) << "m3 Phase2 SyncGroup must succeed";
 
     // All partitions must be assigned exactly once.
     const auto& coord2 = service_->coordinator(group);
