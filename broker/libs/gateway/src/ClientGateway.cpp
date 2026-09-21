@@ -996,6 +996,56 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // This is the offset of the last record in the batch; LEO advances past it.
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
 
+    // TX-2: Idempotent-producer dedup gate.
+    //
+    // If the produce carries a valid producerId (>= 0), validate the sequence
+    // against the per-gateway ProducerStateManager before touching the log:
+    //
+    //   Accept         → fall through to append; call update() after append.
+    //   Duplicate      → reply with the previously-assigned base offset; NO append.
+    //   OutOfOrder     → reject with OutOfOrderSequence; NO append.
+    //   InvalidEpoch   → reject with InvalidProducerEpoch (zombie fenced); NO append.
+    //
+    // Legacy path (producerId == -1): skip validation entirely (backward compat).
+    //
+    // recordCount == lastOffsetDelta + 1 (validated above); safe to use.
+    // lastSequence = baseSequence + recordCount - 1 — matches ProducerStateManager spec.
+    //
+    // No per-op heap allocation: validate() is noexcept, allocation-free.
+    // update() is called AFTER a successful append (immediately below).
+    if (msg.producerId >= 0) {
+        const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
+        const auto vr = producerStateManager_.validate(
+            msg.producerId, partition,
+            msg.producerEpoch, msg.baseSequence, lastSeqInBatch);
+
+        if (vr.isDuplicate()) {
+            // Do NOT re-append.  Return the original base offset so the client
+            // can confirm its prior produce was durable.
+            spdlog::debug("ClientGateway: Produce duplicate (pid={} epoch={} baseSeq={} "
+                          "partition={}) → prior baseOffset={} (no re-append)",
+                          msg.producerId, msg.producerEpoch, msg.baseSequence,
+                          partition, vr.retryBaseOffset);
+            sendResp(pc::ErrorCode::OK, partition, vr.retryBaseOffset);
+            return;
+        }
+        if (vr.isOos()) {
+            spdlog::debug("ClientGateway: Produce OutOfOrderSequence "
+                          "(pid={} epoch={} baseSeq={} partition={})",
+                          msg.producerId, msg.producerEpoch, msg.baseSequence, partition);
+            sendResp(pc::ErrorCode::OutOfOrderSequence, partition, 0);
+            return;
+        }
+        if (vr.isFenced()) {
+            spdlog::debug("ClientGateway: Produce InvalidProducerEpoch "
+                          "(pid={} fenced epoch={} tracked partition={})",
+                          msg.producerId, msg.producerEpoch, partition);
+            sendResp(pc::ErrorCode::InvalidProducerEpoch, partition, 0);
+            return;
+        }
+        // Status::Accept — fall through to append below.
+    }
+
     // GR-5: min-ISR gate for acks=All — checked BEFORE appendNoSync.
     //
     // If the produce carries acks=All AND the current ISR is below minIsr_, reject
@@ -1044,6 +1094,20 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         spdlog::error("ClientGateway: Log::appendNoSync threw unknown exception; ProduceResponse Internal");
         sendResp(pc::ErrorCode::Internal, partition, 0);
         return;
+    }
+
+    // TX-2: Update idempotent producer state AFTER successful append.
+    //
+    // Called only on the Accept path (msg.producerId >= 0).  Records the batch
+    // in the retry window so a duplicate retry returns the original base offset.
+    // base was captured from log->logEndOffset() before the append — it is the
+    // assigned baseOffset of the batch that was just appended.
+    if (msg.producerId >= 0) {
+        const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
+        producerStateManager_.update(
+            msg.producerId, partition,
+            msg.producerEpoch, msg.baseSequence, lastSeqInBatch,
+            base);
     }
 
     // Mark this Log dirty so flushDirtyLogs() will sync it at end of cycle.

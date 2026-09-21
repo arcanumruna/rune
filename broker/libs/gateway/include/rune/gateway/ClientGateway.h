@@ -57,6 +57,7 @@
 #include <util/Index.h>
 
 #include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
 
 #include <array>
 #include <atomic>
@@ -642,6 +643,27 @@ private:
     // std::atomic so setMinIsr() can safely be called from a different thread
     // (e.g. a test thread) without data racing the duty-cycle read in handleProduce().
     std::atomic<int>                minIsr_{1};
+
+    // TX-2: Idempotent-producer dedup state.
+    //
+    // Owned by the gateway (one per gateway instance).  Keyed by
+    // (producerId, partition).  Consulted in handleProduce() when msg.producerId != -1.
+    //
+    // Ownership rationale: Log and PartitionReplica do NOT own a
+    // ProducerStateManager in the current codebase; the ExactlyOnceHarness
+    // (integration tests) also keeps PSM separate from the Log.  The gateway is
+    // the correct single-writer home: handleProduce() is the only call-site and
+    // is always on the duty-cycle thread (no locks needed).
+    //
+    // On leader failover the new leader's gateway starts with a fresh PSM.
+    // Crash-recovery (takeSnapshot/recover) is Phase-5 — deferred per brief.
+    // Phase-1 partition log does not persist producer state; the gateway PSM
+    // is the sole tracker.  This is correct for the current milestone.
+    //
+    // No per-op heap allocation: ProducerStateManager::validate() is noexcept,
+    // allocation-free; update() inserts into the internal unordered_map only on
+    // the first Accept for a new (producerId, partition) pair.
+    rune::storage::ProducerStateManager producerStateManager_;
 };
 
 } // namespace rune::gateway

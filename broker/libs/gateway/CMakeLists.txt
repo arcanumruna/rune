@@ -133,6 +133,16 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_data_op_redirect_tests
                 PROPERTIES TIMEOUT 120)
+
+            # TX-2: Idempotent-producer dedup integration tests.
+            add_executable(rune_gateway_idempotent_tests
+                tests/integration/ProduceIdempotentTest.cpp)
+            target_link_libraries(rune_gateway_idempotent_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_idempotent_tests
+                PROPERTIES TIMEOUT 120)
         endif()
     endif()
 endif()
