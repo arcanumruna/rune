@@ -7,9 +7,14 @@
 //
 // Each doWork() cycle:
 //   1. Scan all eligible leader logs in the ReplicaRegistry.
-//   2. Compute byte-based dirty ratio for each log (Kafka-exact formula).
+//   2. Compute byte-based dirty ratio for each log using the SEALED SEGMENT SNAPSHOT
+//      (atomic shared_ptr published by the append thread — no direct access to
+//       Log::segments_ which would be a data race).
 //   3. Select the SINGLE filthiest log above minCleanableDirtyRatio (global max).
-//   4. Compact one sealed segment (bounded by cycleBudgetBytes_).
+//   4. Compact one sealed segment.  The cycle budget (cycleBudgetBytes_) is
+//      accumulated across segments: if the chosen segment's bytes exceed the
+//      remaining budget, the cycle stops (soft cap; a single oversized segment
+//      is always processed once to avoid starvation, matching Kafka semantics).
 //   5. Enqueue the rewritten segment base via Log::enqueueCleanedSegment().
 //      The actual in-memory reload is deferred to the append thread via
 //      NodeRuntimeAgent::doWork → Log::drainCleanerSwaps().
@@ -20,15 +25,16 @@
 //   firstUncleanable = min(activeSegmentBase, highWatermark)
 //   dirtyRatio     = cleanableBytes / (cleanBytes + cleanableBytes)
 //
-// Lock-free swap safety (§3.1):
+// Off-hot-path mutex-synchronized swap safety (§3.1):
 //   - Cleaner calls LogCleaner::cleanSegment() which atomically renames
 //     <base>.log.new → <base>.log on disk.
 //   - After the rename, cleaner calls Log::enqueueCleanedSegment(base).
 //   - NodeRuntimeAgent::doWork drains these enqueues via drainCleanerSwaps()
 //     on the single-writer append thread — the only thread that mutates the
-//     in-memory segment map.  This is the release-store / acquire-load barrier:
-//     the mutex in enqueue/drain ensures happens-before between the cleaner's
-//     file write and the append thread's map update.
+//     in-memory segment map.  The mutex in enqueue/drain ensures
+//     happens-before between the cleaner's file write and the append thread's
+//     map update.  The mutex is off the append hot path: enqueue is called
+//     only by the cleaner; drain is called once per duty cycle.
 //   - Superseded LogSegment objects are freed on the append thread in
 //     reloadSegment() — no reader can hold a reference after that point
 //     because all reads are also on the append thread (single-writer invariant).
@@ -85,9 +91,13 @@ public:
     // -----------------------------------------------------------------------
     // Agent::doWork — one cleaner cycle.
     //
-    // Selects the filthiest eligible leader log (global max byte-dirty-ratio),
-    // compacts one sealed segment from it (bounded by cycleBudgetBytes_), and
-    // enqueues the rewritten base for the append thread to reload.
+    // Selects the filthiest eligible leader log (global max byte-dirty-ratio)
+    // using the IMMUTABLE SEALED SEGMENT SNAPSHOT (atomic shared_ptr, no data
+    // race with the append thread that mutates segments_).
+    // Compacts one sealed segment per cycle. The cycle byte budget is checked
+    // BEFORE processing: once bytesUsed_ >= cycleBudgetBytes_ (across cycles
+    // within a single budget window), additional segments are skipped until
+    // reset. A budget of 0 means unlimited.
     //
     // Returns 1 if a compaction segment was processed, 0 when idle.
     // -----------------------------------------------------------------------
@@ -96,14 +106,17 @@ public:
 
         // ---------------------------------------------------------------
         // Phase 1: scan all eligible leader logs; compute byte-dirty ratio
-        //          and select the filthiest.
+        //          via the SEALED SEGMENT SNAPSHOT (cleaner must NEVER call
+        //          log->segmentBaseOffsets() or log->segmentSize() directly —
+        //          those iterate segments_ which is writer-thread-owned).
         // ---------------------------------------------------------------
         struct Candidate {
-            rune::replication::PartitionReplica* replica = nullptr;
-            rune::storage::Log*                  log     = nullptr;
-            double                               ratio   = 0.0;
-            int64_t                              segBase = -1;
-            int64_t                              segEnd  = -1;
+            rune::replication::PartitionReplica* replica  = nullptr;
+            rune::storage::Log*                  log      = nullptr;
+            double                               ratio    = 0.0;
+            int64_t                              segBase  = -1;
+            int64_t                              segEnd   = -1;
+            int64_t                              segBytes = 0;
         };
         Candidate best;
 
@@ -117,28 +130,34 @@ public:
             rune::storage::Log* log = replica->log();
             if (!log) continue;
 
-            const auto bases = log->segmentBaseOffsets();
-            if (bases.size() < 2) continue;  // need at least one sealed segment
+            // Load the immutable snapshot (atomic acquire — no race with append thread).
+            auto snap = log->sealedSegmentSnapshot();
+            if (!snap || snap->size() < 1) continue;  // need at least one sealed segment
 
-            const int64_t activeBase        = bases.back();
-            const int64_t firstDirtyOffset  = replica->lastCleanOffset();
-            const int64_t hw                = replica->highWatermark();
+            const int64_t firstDirtyOffset = replica->lastCleanOffset();
+            const int64_t hw               = replica->highWatermark();
 
-            // firstUncleanable: exclude the active segment AND anything above HW.
-            // Segments whose base >= firstUncleanable are not cleanable.
-            const int64_t firstUncleanable  = std::min(activeBase, hw);
+            // The active segment base is just beyond the last sealed segment.
+            // We approximate it from the snapshot: any segment whose base is
+            // not in the snapshot is either active or not yet published.
+            // For the firstUncleanable calculation we use hw (conservative):
+            // if hw == 0 (no writes yet), nothing is cleanable.
+            // The active segment base is also needed; since the snapshot only
+            // contains SEALED segments, we infer it as the high watermark
+            // (conservative — no active-base pollution in the dirty scan).
+            // Note: hw == logEndOffset() when the active segment is small, but
+            // that's fine: we just include slightly less in the dirty window.
+            const int64_t firstUncleanable = hw;  // min(active_base, hw); conservative
 
             // Compute byte-based dirty ratio (Kafka-exact formula §3.2).
             int64_t cleanBytes     = 0;
             int64_t cleanableBytes = 0;
-            for (std::size_t i = 0; i + 1 < bases.size(); ++i) {
-                const int64_t base = bases[i];
-                if (base >= firstUncleanable) break;  // above HW or active — stop
-                const int64_t sz = log->segmentSize(base);
-                if (base < firstDirtyOffset) {
-                    cleanBytes += sz;
+            for (const auto& si : *snap) {
+                if (si.baseOffset >= firstUncleanable) break;
+                if (si.baseOffset < firstDirtyOffset) {
+                    cleanBytes += si.sizeBytes;
                 } else {
-                    cleanableBytes += sz;
+                    cleanableBytes += si.sizeBytes;
                 }
             }
 
@@ -152,13 +171,21 @@ public:
 
             // Find the first sealed segment to compact: base >= firstDirtyOffset
             // and base < firstUncleanable.
-            int64_t segBase = -1;
-            int64_t segEnd  = -1;
-            for (std::size_t i = 0; i + 1 < bases.size(); ++i) {
-                if (bases[i] < firstDirtyOffset) continue;
-                if (bases[i] >= firstUncleanable) break;
-                segBase = bases[i];
-                segEnd  = bases[i + 1];
+            int64_t segBase  = -1;
+            int64_t segEnd   = -1;
+            int64_t segBytes = 0;
+            for (std::size_t i = 0; i < snap->size(); ++i) {
+                const auto& si = (*snap)[i];
+                if (si.baseOffset < firstDirtyOffset) continue;
+                if (si.baseOffset >= firstUncleanable) break;
+                segBase  = si.baseOffset;
+                segBytes = si.sizeBytes;
+                // segEnd: next segment's base, or use hw as upper bound.
+                if (i + 1 < snap->size()) {
+                    segEnd = (*snap)[i + 1].baseOffset;
+                } else {
+                    segEnd = firstUncleanable;
+                }
                 break;
             }
             if (segBase < 0) {
@@ -170,11 +197,12 @@ public:
 
             // Filthiest-first: keep the candidate with the highest ratio.
             if (dirtyRatio > best.ratio) {
-                best.ratio   = dirtyRatio;
-                best.replica = replica;
-                best.log     = log;
-                best.segBase = segBase;
-                best.segEnd  = segEnd;
+                best.ratio    = dirtyRatio;
+                best.replica  = replica;
+                best.log      = log;
+                best.segBase  = segBase;
+                best.segEnd   = segEnd;
+                best.segBytes = segBytes;
             }
         }
 
@@ -182,12 +210,20 @@ public:
 
         // ---------------------------------------------------------------
         // Phase 2: enforce per-cycle byte budget.
+        //
+        // bytesUsed_ accumulates across doWork() calls within a budget
+        // window.  Reset it when a new window starts (i.e. when it was 0
+        // at the top of this call — the previous cycle exhausted or idled).
+        //
+        // If cycleBudgetBytes_ > 0 AND bytesUsed_ is already >= budget,
+        // skip this cycle.  Exception: if bytesUsed_ is 0 (first segment
+        // of the window), always proceed — prevents starvation when a single
+        // segment exceeds the budget (Kafka semantics).
         // ---------------------------------------------------------------
-        const int64_t segBytes = best.log->segmentSize(best.segBase);
-        if (segBytes > cycleBudgetBytes_) {
-            // A single oversized segment exceeds the budget.  Process it
-            // anyway (Kafka does too — the budget is a soft cap on bursts,
-            // not a hard limit that stalls progress on large segments).
+        if (cycleBudgetBytes_ > 0 && bytesUsed_ >= cycleBudgetBytes_) {
+            // Budget exhausted for this window — idle this cycle, reset for next.
+            bytesUsed_ = 0;
+            return 0;
         }
 
         // ---------------------------------------------------------------
@@ -211,6 +247,9 @@ public:
             best.replica->deleteRetentionMs());
 
         if (!compacted) return 0;
+
+        // Accumulate bytes consumed by this compaction toward the budget.
+        bytesUsed_ += best.segBytes;
 
         // ---------------------------------------------------------------
         // Phase 5: enqueue the swap and advance the clean watermark.
@@ -236,8 +275,9 @@ public:
     }
 
 private:
-    ReplicaRegistry* registry_;        // non-owning
-    int64_t          cycleBudgetBytes_;
+    ReplicaRegistry* registry_;         // non-owning
+    int64_t          cycleBudgetBytes_; // 0 = unlimited; >0 = soft bytes-per-window cap
+    int64_t          bytesUsed_ = 0;    // bytes consumed so far in the current budget window
 };
 
 } // namespace rune::node
