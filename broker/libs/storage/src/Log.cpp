@@ -50,13 +50,57 @@ void Log::publishSealedSnapshot() {
     // Build a fresh immutable snapshot of all sealed segments (all except the
     // last/active).  Called on the single-writer append thread only.
     // The active segment is excluded: its sizeBytes is mutated on appends.
+    //
+    // CP-8: also carry largestTimestamp per sealed segment so the cleaner thread
+    // can gate on minCompactionLagMs without touching segments_.  We derive it
+    // from the existing snapshot if available (avoid re-scanning unchanged segs).
+    auto prevSnap = std::atomic_load(&sealedSnapshot_);
+
     auto snap = std::make_shared<SealedSegmentSnapshot>();
     if (segments_.size() > 1) {
         snap->reserve(segments_.size() - 1);
         auto it  = segments_.begin();
         auto end = std::prev(segments_.end()); // stop before active
         for (; it != end; ++it) {
-            snap->push_back({it->first, it->second->sizeBytes()});
+            int64_t base  = it->first;
+            int64_t bytes = it->second->sizeBytes();
+            // Try to reuse largestTimestamp from the previous snapshot for this
+            // segment (sealed segments are immutable after they are created).
+            int64_t largestTs = 0;
+            if (prevSnap) {
+                for (const auto& si : *prevSnap) {
+                    if (si.baseOffset == base) { largestTs = si.largestTimestamp; break; }
+                }
+            }
+            // If not found in previous snapshot (newly sealed), scan the file.
+            if (largestTs == 0) {
+                std::string logPath = it->second->logPath();
+                std::ifstream f(logPath, std::ios::binary);
+                if (f.is_open()) {
+                    f.seekg(0, std::ios::end);
+                    auto sz = static_cast<std::size_t>(f.tellg());
+                    if (sz > 0) {
+                        std::vector<uint8_t> buf(sz);
+                        f.seekg(0);
+                        f.read(reinterpret_cast<char*>(buf.data()),
+                               static_cast<std::streamsize>(sz));
+                        std::size_t pos = 0;
+                        while (pos + static_cast<std::size_t>(
+                                   rune::protocol::batch::kRecordBatchOverhead) <= sz) {
+                            rune::protocol::RecordBatchReader r(buf.data() + pos, sz - pos);
+                            int32_t total = r.totalLength();
+                            if (total <= 0 ||
+                                pos + static_cast<std::size_t>(total) > sz) break;
+                            // Use maxTimestamp (the actual record timestamps,
+                            // not the horizon-overloaded baseTimestamp).
+                            int64_t batchMax = r.maxTimestamp();
+                            if (batchMax > largestTs) largestTs = batchMax;
+                            pos += static_cast<std::size_t>(total);
+                        }
+                    }
+                }
+            }
+            snap->push_back({base, bytes, largestTs});
         }
     }
     std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap)));

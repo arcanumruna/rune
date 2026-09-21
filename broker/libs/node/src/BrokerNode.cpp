@@ -424,6 +424,9 @@ void BrokerNode::buildReplication() {
             // CP-3: size/time retention — thread from TopicSpec (-1 = unbounded).
             pcfg.retentionBytes         = spec->retentionBytes;
             pcfg.retentionMs            = spec->retentionMs;
+            // CP-8: compaction lag gates — thread from TopicSpec.
+            pcfg.minCompactionLagMs     = spec->minCompactionLagMs;
+            pcfg.maxCompactionLagMs     = spec->maxCompactionLagMs;
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).

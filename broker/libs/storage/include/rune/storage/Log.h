@@ -13,8 +13,14 @@ namespace rune::storage {
 /// snapshot so the cleaner thread can read segment sizes without touching the
 /// writer-owned segments_ map.
 struct SegInfo {
-    int64_t baseOffset = 0;
-    int64_t sizeBytes  = 0;
+    int64_t baseOffset      = 0;
+    int64_t sizeBytes       = 0;
+    /// CP-8: largest record timestamp seen in this segment (epoch-ms or ns,
+    /// matching the units used by the producer).  Scanned at seal time from
+    /// the batch headers (maxTimestamp field).  Used by minCompactionLagMs
+    /// gating on the cleaner thread — no segments_ access required.
+    /// 0 = unknown / not yet scanned (treats segment as very old = cleanable).
+    int64_t largestTimestamp = 0;
 };
 using SealedSegmentSnapshot = std::vector<SegInfo>;
 

@@ -59,6 +59,20 @@ struct TopicSpec {
     // segment.bytes.  Tests may set a small value to form multiple sealed
     // segments quickly (e.g. to exercise compaction end-to-end).
     int64_t       segmentRollBytes        = 64LL * 1024 * 1024;
+
+    // CP-8: compaction lag gates.
+    // minCompactionLagMs: a dirty segment is not eligible while
+    //   segment.largestTimestamp > nowMs - minCompactionLagMs.
+    //   Default 0 (no minimum lag) — same as Kafka.
+    int64_t       minCompactionLagMs      = 0;
+    // maxCompactionLagMs: when the oldest dirty segment's age exceeds this,
+    //   force needCompactionNow (eligible even below minCleanableDirtyRatio).
+    //   Default -1 = disabled — same as Kafka's Long.MAX_VALUE.
+    int64_t       maxCompactionLagMs      = -1;
+
+    // CP-8: shared I/O throttler budget (bytes/sec across all cleaner threads).
+    //   Default -1 = unlimited — same as Kafka.
+    int64_t       ioMaxBytesPerSecond     = -1;
 };
 
 struct PeerConfig {

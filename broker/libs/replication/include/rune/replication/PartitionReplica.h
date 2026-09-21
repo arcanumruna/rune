@@ -98,6 +98,9 @@ struct PartitionConfig {
     // CP-3: size/time retention (used by Delete + CompactDelete policies).
     int64_t     retentionBytes         = -1;          ///< CP-3: keep this many bytes; -1 = unbounded (no size deletion)
     int64_t     retentionMs            = -1;          ///< CP-3: keep segments younger than this ms; -1 = unbounded
+    // CP-8: compaction lag gates.
+    int64_t     minCompactionLagMs     = 0;           ///< CP-8: dirty segment uncleanable if largestTs within lag. Default 0.
+    int64_t     maxCompactionLagMs     = -1;          ///< CP-8: force compaction if oldest dirty seg exceeds this age. Default -1=disabled.
 };
 
 // ---------------------------------------------------------------------------
@@ -341,6 +344,11 @@ public:
     [[nodiscard]] int64_t     retentionBytes()         const noexcept { return cfg_.retentionBytes; }
     /// Max age (ms) to retain; -1 = unbounded.
     [[nodiscard]] int64_t     retentionMs()            const noexcept { return cfg_.retentionMs; }
+    // CP-8: compaction lag accessors.
+    /// A dirty segment is uncleanable while largestTs > nowMs - minCompactionLagMs. 0 = none.
+    [[nodiscard]] int64_t     minCompactionLagMs()     const noexcept { return cfg_.minCompactionLagMs; }
+    /// Force compaction when oldest dirty seg exceeds this age (ms). -1 = disabled.
+    [[nodiscard]] int64_t     maxCompactionLagMs()     const noexcept { return cfg_.maxCompactionLagMs; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     [[nodiscard]] Offset lastCleanOffset() const noexcept { return lastCleanOffset_; }
