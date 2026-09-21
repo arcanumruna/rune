@@ -269,11 +269,11 @@ TEST(CompactionDutyCycle, CompactsSealedSegmentsLeaderOnlyLatestPerKey) {
         &registry,
         /*gateway=*/nullptr);
 
-    // runBoundedCompaction is called from doWork step 6.5.
-    // Drive 50 duty cycles (leader is pre-established; compaction fires on
-    // any cycle where dirty ratio >= threshold and sealed segments exist).
+    // CP-6: compaction runs via runBoundedCompaction (off duty-cycle thread).
+    // Drive 50 compaction passes directly (doWork no longer calls it).
     for (int i = 0; i < 50; ++i) {
         fullAgent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        fullAgent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
 
     // Reload to pick up rewritten segment files.
@@ -355,9 +355,10 @@ TEST(CompactionDutyCycle, NonLeaderRunBoundedCompactionIsNoOp) {
         &registry,
         /*gateway=*/nullptr);
 
-    // Drive 50 cycles. Follower should NEVER compact.
+    // Drive 50 cycles including explicit compaction calls. Follower should NEVER compact.
     for (int i = 0; i < 50; ++i) {
         agent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
 
     log.reloadSegments();
@@ -623,6 +624,7 @@ TEST(CompactionDutyCycle, AboveDirtyRatioThresholdIsCompacted) {
     // Drive enough cycles to compact all sealed segments.
     for (int i = 0; i < 500; ++i) {
         agent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
 
     log.reloadSegments();

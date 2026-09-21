@@ -255,6 +255,7 @@ TEST(CompactionPolicy, CompactTopicNeverSizeDeletesLiveKey) {
     // cycles then snapshot the compacted segment layout.
     for (int i = 0; i < 100; ++i) {
         agent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
     log.reloadSegments();
 
@@ -517,6 +518,7 @@ TEST(CompactionPolicy, CompactDeleteBothCompactsAndAgesOut) {
     // Drive enough cycles for both compaction and retention to run.
     for (int i = 0; i < 500; ++i) {
         agent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
 
     log.reloadSegments();
@@ -724,6 +726,7 @@ TEST(CompactionPolicy, ProducerStateSurvivesCompactDelete) {
     // Drive CompactDelete cycles.
     for (int i = 0; i < 300; ++i) {
         agent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
 
     log.reloadSegments();
@@ -832,6 +835,7 @@ TEST(CompactionPolicy, DeleteTopicRetentionAgesOutSegments) {
     // Drive cycles — Delete retention should age out old segments each cycle.
     for (int i = 0; i < 100; ++i) {
         agent.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
     }
 
     log.reloadSegments();
