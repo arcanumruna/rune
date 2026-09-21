@@ -1501,6 +1501,44 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         nextOffset = msg.fromOffset;
     }
 
+    // 5b. Group-consumer isolation carrier (TX-5/TX-6):
+    //     A group member conveys its isolation level via a Subscribe frame AFTER
+    //     the SyncGroup assignment has already created the internal group
+    //     subscription (isGroup=true) through addGroupSubscription().  Treat this
+    //     Subscribe as an UPDATE of that existing group subscription's isolation
+    //     rather than a second, independent push subscription.
+    //
+    //     Without this, the same (session, topicId, partition) would carry TWO
+    //     subscriptions — the group one (created read_uncommitted by
+    //     GroupCoordinationService::handleSyncGroup) and this per-session one —
+    //     both driven by pushSubscriptions().  That produced (a) 2× delivery of
+    //     every record and (b) an isolation leak: the group subscription stayed
+    //     read_uncommitted and delivered aborted/open transactional records even
+    //     when the client asked for read_committed.  We must NOT reset the group
+    //     subscription's nextOffset (seeded from the committed group offset) — we
+    //     only carry the isolation across.
+    {
+        const auto memIt = groupMemberSubs_.find(msg.sessionId);
+        if (memIt != groupMemberSubs_.end()) {
+            for (const int64_t existingSubId : memIt->second) {
+                auto subIt = subscriptions_.find(existingSubId);
+                if (subIt == subscriptions_.end()) continue;
+                Subscription& gsub = subIt->second;
+                if (gsub.isGroup && gsub.topicId == msg.topicId &&
+                    gsub.partition == partition) {
+                    gsub.isolation = msg.isolation;
+                    spdlog::debug("ClientGateway: Subscribe carries isolation={} to group "
+                                  "sub sessionId={} subId={} topic={} partition={} "
+                                  "(no duplicate subscription)",
+                                  msg.isolation, msg.sessionId, existingSubId,
+                                  msg.topicId, partition);
+                    sendResp(pc::ErrorCode::OK, partition, existingSubId);
+                    return;
+                }
+            }
+        }
+    }
+
     // 6. Allocate subscriptionId and register subscription.
     const int64_t subId = ++nextSubscriptionId_;
 

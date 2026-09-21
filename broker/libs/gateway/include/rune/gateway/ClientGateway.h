@@ -386,6 +386,32 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // applySubscribeForTest — feed a raw Subscribe frame through the real
+    // handleSubscribe() path (test seam).  Lets integration tests exercise the
+    // group-consumer isolation-carrier merge without a live Aeron client.
+    // Single-writer: call only on the duty-cycle thread or before doWork().
+    // -----------------------------------------------------------------------
+    void applySubscribeForTest(const uint8_t* buf, std::size_t len) {
+        handleSubscribe(buf, len);
+    }
+
+    // -----------------------------------------------------------------------
+    // subscriptionIsolationForTest — return the isolation level (0/1) of the
+    // subscription matching (sessionId, topicId, partition), or -1 if none.
+    // For tests to assert the carrier merge updated the group sub in place.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int subscriptionIsolationForTest(int64_t sessionId, int32_t topicId,
+                                                   int32_t partition) const {
+        for (const auto& [subId, sub] : subscriptions_) {
+            if (sub.sessionId == sessionId && sub.topicId == topicId &&
+                sub.partition == partition) {
+                return static_cast<int>(sub.isolation);
+            }
+        }
+        return -1;
+    }
+
+    // -----------------------------------------------------------------------
     // pendingConnectCount — number of in-flight async egress-resolve entries.
     // Includes both the main pending table and the draining-release table.
     // Used by tests to assert that dropped/timed-out entries drain to zero.

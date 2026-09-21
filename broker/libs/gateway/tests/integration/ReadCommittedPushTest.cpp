@@ -54,6 +54,7 @@ extern "C" {
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -245,6 +246,42 @@ static std::vector<int64_t> extractBaseOffsets(
         offsets.push_back(recOpt->baseOffset);
     }
     return offsets;
+}
+
+// ---------------------------------------------------------------------------
+// Build an encoded Subscribe frame (the isolation carrier a group member sends
+// after entering Stable — TX-5 sendSubscribeForPartitions).
+// ---------------------------------------------------------------------------
+static std::vector<uint8_t> buildSubscribeFrame(int64_t sid, int32_t topicId,
+                                                int32_t partition, uint8_t isolation)
+{
+    pc::Subscribe s;
+    s.sessionId      = sid;
+    s.correlationId  = 4242;
+    s.topicId        = topicId;
+    s.partition      = partition;
+    s.partitionKnown = 1;
+    s.fromOffset     = 0;
+    s.isolation      = isolation;
+    std::vector<uint8_t> buf(s.encodedSize());
+    const std::size_t n = s.encode(buf.data());
+    buf.resize(n);
+    return buf;
+}
+
+// Count how many times each baseOffset was delivered to a session (dup detector).
+static std::map<int64_t,int> deliveryCounts(
+    int64_t filterSid,
+    const std::vector<std::pair<int64_t,std::vector<uint8_t>>>& frames)
+{
+    std::map<int64_t,int> counts;
+    for (const auto& [sid, frame] : frames) {
+        if (sid != filterSid) continue;
+        auto recOpt = pc::Records::decode(frame.data(), frame.size());
+        if (!recOpt) continue;  // non-Records frame (e.g. SubscribeResponse) — skip
+        counts[recOpt->baseOffset]++;
+    }
+    return counts;
 }
 
 } // namespace (anonymous — helper functions only)
@@ -630,6 +667,146 @@ TEST_F(ReadCommittedPushFixture, GroupReadCommitted)
         << "[TX-4 Step6] Group read_committed should deliver 5 batches (0..4)";
     EXPECT_TRUE(std::find(offs.begin(), offs.end(), int64_t{5}) == offs.end())
         << "[TX-4 Step6] Group read_committed must NOT deliver open-txn batch at offset 5";
+}
+
+// ===========================================================================
+// Test 4 (TX-6 regression): GroupSubscribeCarrierNoDuplicate
+//
+// Replicates the DR-E2E double-delivery bug at integration speed.
+//
+// A group member's partition is first registered by the coordinator via
+// addGroupSubscription() (isGroup=true).  The member THEN sends a Subscribe
+// carrier frame to convey its isolation level (TX-5 sendSubscribeForPartitions).
+//
+// Before the fix, handleSubscribe() always created a SECOND, independent
+// subscription for the same (session, topic, partition) — so pushSubscriptions()
+// delivered every record TWICE (the E2E "eos-no-dup: N records delivered 2×").
+//
+// After the fix, the carrier merges into the existing group subscription:
+//   - subscriptionCount() stays 1 (no duplicate),
+//   - the group sub's isolation is updated in place,
+//   - each record is delivered exactly once.
+// ===========================================================================
+TEST_F(ReadCommittedPushFixture, GroupSubscribeCarrierNoDuplicate)
+{
+    // Append 5 non-txn committed batches (offsets 0..4).
+    for (int i = 0; i < 5; ++i) {
+        appendToLog(makeNonTxnBatch(i));
+    }
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // Coordinator registers the group subscription with the conservative default
+    // isolation=read_committed (matches GroupCoordinationService::handleSyncGroup).
+    const int64_t sid   = injectSession();
+    const int64_t subId = gw_->addGroupSubscription(
+        sid, kTopicId, kPartition, /*fromOffset=*/0, /*isolation=*/1);
+    ASSERT_GT(subId, 0);
+    ASSERT_EQ(gw_->subscriptionCount(), 1u);
+    ASSERT_EQ(gw_->groupMemberSubCount(sid), 1u);
+
+    // Member sends its isolation carrier (read_uncommitted).  This MUST update
+    // the existing group sub in place, NOT create a second subscription.
+    const auto frame = buildSubscribeFrame(sid, kTopicId, kPartition, /*isolation=*/0);
+    gw_->applySubscribeForTest(frame.data(), frame.size());
+
+    EXPECT_EQ(gw_->subscriptionCount(), 1u)
+        << "[TX-6] Subscribe carrier must NOT create a duplicate subscription "
+           "(root cause of E2E 2× delivery)";
+    EXPECT_EQ(gw_->groupMemberSubCount(sid), 1u)
+        << "[TX-6] group sub tracking must remain single-entry after carrier";
+    EXPECT_EQ(gw_->subscriptionIsolationForTest(sid, kTopicId, kPartition), 0)
+        << "[TX-6] carrier must downgrade the group sub to read_uncommitted";
+
+    // Pump and assert exactly-once delivery of every batch.
+    pump([&]() {
+        return extractBaseOffsets(sid, allFrames_).size() >= 5;
+    });
+
+    const auto counts = deliveryCounts(sid, allFrames_);
+    EXPECT_EQ(counts.size(), 5u) << "[TX-6] all 5 batches (0..4) must be delivered";
+    for (const auto& [off, n] : counts) {
+        EXPECT_EQ(n, 1) << "[TX-6] batch at offset " << off
+                        << " delivered " << n << "× (duplicate delivery bug)";
+    }
+}
+
+// ===========================================================================
+// Test 5 (TX-6 regression): GroupSubscribeCarrierReadCommittedNoLeak
+//
+// Replicates the DR-E2E read_committed isolation leak.
+//
+// Before the fix, the group subscription created by the coordinator was
+// hardcoded isolation=read_uncommitted, so it delivered ABORTED transactional
+// records even to a member that asked for read_committed (the E2E
+// "read-committed-isolation: N aborted/open records leaked").
+//
+// After the fix, the group sub defaults to read_committed and the carrier keeps
+// it there; aborted/open/control batches are filtered, with no duplicates.
+// ===========================================================================
+TEST_F(ReadCommittedPushFixture, GroupSubscribeCarrierReadCommittedNoLeak)
+{
+    // Offsets 0..4: non-txn committed.
+    for (int i = 0; i < 5; ++i) appendToLog(makeNonTxnBatch(i));
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // Offsets 5..7: txn pid=9 (will be aborted).
+    for (int i = 5; i <= 7; ++i) {
+        appendToLog(makeTxnDataBatch(/*pid=*/9, /*epoch=*/0, i));
+        gw_->notifyTransactionalBatch(kTopicId, kPartition, /*pid=*/9, i);
+    }
+    // ABORT control marker at offset 8.
+    auto abortMarker = tx::ControlMarker::build(/*pid=*/9, /*epoch=*/0,
+                                                tx::ControlType::Abort, /*coordEpoch=*/0);
+    {
+        uint64_t u = 8ULL;
+        for (int i = 0; i < 8; ++i) abortMarker[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    int32_t lod = 0;
+    if (abortMarker.size() >= 27u) {
+        const uint8_t* p = abortMarker.data() + 23;
+        lod = static_cast<int32_t>(
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+    }
+    log->append(abortMarker.data(), abortMarker.size(), /*lastOffset=*/8 + lod);
+    gw_->notifyControlMarker(kTopicId, kPartition, /*pid=*/9, /*markerOffset=*/8, /*commit=*/false);
+
+    // Offset 9: non-txn committed.
+    appendToLog(makeNonTxnBatch(9));
+    ASSERT_EQ(log->logEndOffset(), 10);
+
+    // Coordinator registers group sub (conservative default isolation=1).
+    const int64_t sid   = injectSession();
+    const int64_t subId = gw_->addGroupSubscription(
+        sid, kTopicId, kPartition, /*fromOffset=*/0, /*isolation=*/1);
+    ASSERT_GT(subId, 0);
+
+    // Member's carrier confirms read_committed.  Still a single subscription.
+    const auto frame = buildSubscribeFrame(sid, kTopicId, kPartition, /*isolation=*/1);
+    gw_->applySubscribeForTest(frame.data(), frame.size());
+    ASSERT_EQ(gw_->subscriptionCount(), 1u)
+        << "[TX-6] read_committed carrier must not duplicate the group sub";
+    EXPECT_EQ(gw_->subscriptionIsolationForTest(sid, kTopicId, kPartition), 1);
+
+    // read_committed: deliver 0..4 and 9 (6 batches) exactly once; never 5..8.
+    pump([&]() {
+        return extractBaseOffsets(sid, allFrames_).size() >= 6;
+    });
+
+    const auto counts = deliveryCounts(sid, allFrames_);
+    EXPECT_EQ(counts.size(), 6u)
+        << "[TX-6] read_committed group consumer should see 6 batches (0..4, 9)";
+    for (int64_t i = 5; i <= 8; ++i) {
+        EXPECT_EQ(counts.count(i), 0u)
+            << "[TX-6] aborted/control batch at offset " << i
+            << " leaked into read_committed group consumer";
+    }
+    for (const auto& [off, n] : counts) {
+        EXPECT_EQ(n, 1) << "[TX-6] batch at offset " << off
+                        << " delivered " << n << "× (duplicate delivery bug)";
+    }
 }
 
 } // namespace rune::gateway

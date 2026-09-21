@@ -10,6 +10,10 @@
 //  GW-4: Bad egressChannel (malformed/unsupported) never crashes the node (BR-4 regression).
 //  GW-5: leaderView degrade-to-accept — single-node is leader; Connect accepted + isLeader=true.
 //  GW-6: Duty-cycle still elects — awaitLeader() succeeds with gateway composed in.
+//  GW-7 (TX-6a regression): TxnService wired — InitProducerId dispatched and returns a
+//        response through the REAL BrokerNode gateway path.  Without the
+//        buildGateway setTxnService() fix (Bug 1), gateway_ drops the message silently
+//        (txnService_==null) and this test times out: RED without fix, GREEN after.
 //
 // All waits are bounded (hard cap + ASSERT).  No busy-spin.
 // Unique temp dirs: getpid() + atomic counter.
@@ -18,9 +22,12 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
+#include <rune/protocol/client/TxnMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <Aeron.h>
 #include <Publication.h>
@@ -724,6 +731,372 @@ TEST(BrokerNodeGatewayElectionTest, GatewayComposed_NodeStillElects) {
     EXPECT_TRUE(node.isLeader());
     EXPECT_EQ(node.leaderId(), static_cast<rune::consensus::NodeId>(0));
 
+    node.stop();
+}
+
+// ===========================================================================
+// GW-7 (TX-6a Bug 1 regression): TxnService wired — InitProducerId dispatched
+//
+// Root cause: BrokerNode::buildGateway() never called gateway_->setTxnService(...),
+// so ClientGateway::handleTxnMessage() checked txnService_ == null and DROPPED
+// every transaction request silently.  The TX-3 unit tests wired txnService
+// manually and never exercised the real BrokerNode path.
+//
+// Test strategy (RED→GREEN):
+//   RED  (without fix): InitProducerId is dropped; test times out with no response.
+//   GREEN (with fix):   InitProducerId reaches TransactionCoordinationService,
+//                       which allocates a producerId and returns InitProducerIdResponse
+//                       with error==OK and producerId >= 0.
+//
+// This test builds a real BrokerNode (embedded Aeron, single-node), connects
+// as a client over aeron:ipc, and drives the full:
+//   Connect → InitProducerId → assert InitProducerIdResponse{OK, pid>=0}
+// path through the REAL gateway dispatch.
+// ===========================================================================
+TEST_F(NodeGatewayFixture, TxnService_Wired_InitProducerId_Dispatched) {
+    const int32_t egressStreamId = 380;
+    auto client = makeClient(egressStreamId);
+
+    // Connect and get a sessionId.
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/7001);
+    ASSERT_EQ(connResp.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    const int64_t sid = connResp.assignedSessionId;
+    ASSERT_GE(sid, 1);
+
+    // Encode an InitProducerId request.
+    pc::InitProducerId req;
+    req.sessionId            = sid;
+    req.correlationId        = 7002;
+    req.transactionTimeoutMs = 60'000;
+    const std::string_view txnId = "test-txn-gw7";
+    req.transactionalId = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size());
+
+    const std::size_t reqLen = req.encode(scratch_);
+    ASSERT_GT(reqLen, 0u);
+    offerBounded(*client.ingressPub, scratch_, reqLen, "InitProducerId");
+
+    // Wait for InitProducerIdResponse.
+    std::optional<pc::InitProducerIdResponse> resp;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                      aeron::util::index_t             offset,
+                                      aeron::util::index_t             len,
+                                      aeron::Header&) {
+        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+        auto dec = pc::InitProducerIdResponse::decode(p, static_cast<std::size_t>(len));
+        if (dec && dec->correlationId == 7002) resp = *dec;
+    });
+
+    pumpWithEgress([&]() { return resp.has_value(); },
+                   *client.egressSub, asm_, kPumpIter,
+                   "InitProducerIdResponse (Bug1: txnService not wired → timeout without fix)");
+
+    ASSERT_TRUE(resp.has_value())
+        << "[TX-6a Bug1] No InitProducerIdResponse — txnService not wired in buildGateway? "
+           "This test TIMES OUT without the setTxnService fix.";
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+        << "[TX-6a Bug1] InitProducerId returned non-OK error; "
+           "txnService wired but coordination failed unexpectedly";
+    EXPECT_GE(resp->producerId, 0)
+        << "[TX-6a Bug1] InitProducerId returned negative producerId";
+}
+
+// ===========================================================================
+// TX-6a Smoke: End-to-end transactional produce→commit→read_committed
+//
+// Full in-process integration smoke through a REAL BrokerNode + ClientGateway:
+//   Connect
+//   → InitProducerId                   (allocate pid)
+//   → AddPartitionsToTxn               (enlist topic-0 partition-0)
+//   → Produce (txn, acks=0)            (write 1 transactional record batch)
+//   → EndTxn (commit)                  (write COMMIT marker + advance LSO)
+//   → Subscribe (read_committed, iso=1)
+//   → assert Records delivered         (LSO must advance past the committed batch)
+//
+// Multi-partition: repeats with partition 1 of a 2-partition topic.
+//
+// This smoke was not feasible before the TX-6a fix set because:
+//   - Without Bug 1 fix: InitProducerId is dropped → no pid → test hangs.
+//   - Without Bug 3 LSO fix: EndTxn writes marker but LSO stays below; Records
+//     never delivered under read_committed → test hangs.
+// ===========================================================================
+TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
+    // -----------------------------------------------------------------------
+    // Build a single-node config with a 2-partition topic.
+    // -----------------------------------------------------------------------
+    const uint16_t clientPort = discoverFreeUdpPort();
+    TempDir tmp{"tx6a_smoke_"};
+
+    NodeConfig cfg;
+    cfg.nodeId            = 0;
+    cfg.dataDir           = tmp.path.string();
+    cfg.consensusStreamId = 10;
+
+    PeerConfig self;
+    self.id            = 0;
+    self.host          = "127.0.0.1";
+    self.consensusPort = discoverFreeUdpPort();
+    cfg.peers          = {self};
+
+    cfg.clientEndpoint.channel  =
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    cfg.clientEndpoint.streamId = 1;
+
+    TopicSpec topic;
+    topic.name           = "smoke-topic";
+    topic.partitionCount = 2;
+    topic.topicId        = 0;
+    cfg.topics.push_back(topic);
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s)) << "Smoke node must elect within 5 s";
+
+    const std::string aeronDir = (tmp.path / "aeron").string();
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(aeronDir);
+    auto testAeron = aeron::Aeron::connect(aeronCtx);
+    ASSERT_NE(testAeron, nullptr);
+
+    const std::string clientChannel  = cfg.clientEndpoint.channel;
+    const int32_t     clientStreamId = cfg.clientEndpoint.streamId;
+    constexpr int     kPumpMax       = 200'000;
+    constexpr std::size_t kSz        = 128 * 1024;
+    std::vector<uint8_t> scratch(kSz, 0);
+
+    // Helper: bounded offer.
+    auto offerB = [&](aeron::Publication& pub, const uint8_t* buf, std::size_t len,
+                      std::string_view label) {
+        aeron::concurrent::AtomicBuffer ab(
+            const_cast<uint8_t*>(buf), static_cast<aeron::util::index_t>(len));
+        bool sent = false;
+        for (int i = 0; i < kPumpMax && !sent; ++i) {
+            if (pub.offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) sent = true;
+            else std::this_thread::sleep_for(std::chrono::microseconds{200});
+        }
+        ASSERT_TRUE(sent) << "offerBounded timed out: " << label;
+    };
+
+    // Helper: pump until done() or deadline.
+    auto pump = [&](auto&& done, aeron::Subscription& sub,
+                    aeron::FragmentAssembler& asm_, std::string_view label) {
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::seconds{20};
+        for (int i = 0; i < kPumpMax && clock::now() < deadline; ++i) {
+            sub.poll(asm_.handler(), 10);
+            if (done()) return;
+            std::this_thread::sleep_for(std::chrono::microseconds{200});
+        }
+        ASSERT_TRUE(done()) << "pump timed out: " << label;
+    };
+
+    // Run the smoke for both partitions.
+    for (int32_t partition : {0, 1}) {
+        const int32_t egressStream = 600 + partition;
+        const std::string egressCh = "aeron:ipc";
+
+        int64_t pubReg = testAeron->addPublication(clientChannel, clientStreamId);
+        int64_t subReg = testAeron->addSubscription(egressCh, egressStream);
+
+        std::shared_ptr<aeron::Publication>  ingPub;
+        std::shared_ptr<aeron::Subscription> egrSub;
+
+        {
+            using clock = std::chrono::steady_clock;
+            const auto dl = clock::now() + std::chrono::seconds{10};
+            while ((!ingPub || !egrSub) && clock::now() < dl) {
+                if (!ingPub) ingPub = testAeron->findPublication(pubReg);
+                if (!egrSub) egrSub = testAeron->findSubscription(subReg);
+                std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            }
+        }
+        ASSERT_NE(ingPub, nullptr) << "smoke: ingress pub not resolved (partition=" << partition << ")";
+        ASSERT_NE(egrSub, nullptr) << "smoke: egress sub not resolved (partition=" << partition << ")";
+        {
+            using clock = std::chrono::steady_clock;
+            const auto dl = clock::now() + std::chrono::seconds{10};
+            while (!ingPub->isConnected() && clock::now() < dl)
+                std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            ASSERT_TRUE(ingPub->isConnected()) << "smoke: ingress pub did not connect (partition=" << partition << ")";
+        }
+
+        // 1. Connect → assignedSessionId.
+        pc::ConnectRequest connReq;
+        connReq.sessionId       = 0;
+        connReq.correlationId   = 8000 + partition;
+        connReq.egressStreamId  = egressStream;
+        connReq.clientVersion   = 1;
+        connReq.egressChannel   = egressCh;
+        const std::size_t connLen = connReq.encode(scratch.data());
+        offerB(*ingPub, scratch.data(), connLen, "ConnectRequest smoke");
+
+        std::optional<pc::ConnectResponse> connResp;
+        aeron::FragmentAssembler connAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t off,
+                                             aeron::util::index_t len, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            auto dec = pc::ConnectResponse::decode(p, static_cast<std::size_t>(len));
+            if (dec && dec->correlationId == 8000 + partition) connResp = *dec;
+        });
+        pump([&]{ return connResp.has_value(); }, *egrSub, connAsm, "ConnectResponse smoke");
+        ASSERT_TRUE(connResp.has_value()) << "smoke: no ConnectResponse (partition=" << partition << ")";
+        ASSERT_EQ(connResp->code, static_cast<int16_t>(pc::ErrorCode::OK));
+        const int64_t sid = connResp->assignedSessionId;
+        ASSERT_GE(sid, 1);
+
+        // 2. InitProducerId.
+        const std::string txnIdStr = "smoke-txn-p" + std::to_string(partition);
+        pc::InitProducerId initReq;
+        initReq.sessionId            = sid;
+        initReq.correlationId        = 8100 + partition;
+        initReq.transactionTimeoutMs = 60'000;
+        initReq.transactionalId = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(txnIdStr.data()), txnIdStr.size());
+        offerB(*ingPub, scratch.data(), initReq.encode(scratch.data()), "InitProducerId smoke");
+
+        std::optional<pc::InitProducerIdResponse> initResp;
+        aeron::FragmentAssembler initAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t off,
+                                             aeron::util::index_t len, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            auto dec = pc::InitProducerIdResponse::decode(p, static_cast<std::size_t>(len));
+            if (dec && dec->correlationId == 8100 + partition) initResp = *dec;
+        });
+        pump([&]{ return initResp.has_value(); }, *egrSub, initAsm, "InitProducerIdResponse smoke");
+        ASSERT_TRUE(initResp.has_value());
+        ASSERT_EQ(initResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+            << "[TX-6a Smoke] InitProducerId failed (partition=" << partition << ")";
+        const int64_t pid   = initResp->producerId;
+        const int16_t epoch = initResp->producerEpoch;
+        ASSERT_GE(pid, 0);
+
+        // 3. AddPartitionsToTxn (enlist topic-0, this partition).
+        pc::AddPartitionsToTxn apReq;
+        apReq.sessionId      = sid;
+        apReq.correlationId  = 8200 + partition;
+        apReq.producerId     = pid;
+        apReq.producerEpoch  = epoch;
+        apReq.transactionalId = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(txnIdStr.data()), txnIdStr.size());
+
+        const pc::TxnTopicPartition tpEntry{/*topicId=*/0, /*partition=*/partition};
+        const std::span<const pc::TxnTopicPartition> tpSpan{&tpEntry, 1};
+        const std::size_t apLen = apReq.encode(scratch.data(), tpSpan);
+        offerB(*ingPub, scratch.data(), apLen, "AddPartitionsToTxn smoke");
+
+        std::optional<pc::AddPartitionsToTxnResponse> apResp;
+        aeron::FragmentAssembler apAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                           aeron::util::index_t off,
+                                           aeron::util::index_t len, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            auto dec = pc::AddPartitionsToTxnResponse::decode(p, static_cast<std::size_t>(len));
+            if (dec && dec->correlationId == 8200 + partition) apResp = *dec;
+        });
+        pump([&]{ return apResp.has_value(); }, *egrSub, apAsm, "AddPartitionsToTxnResponse smoke");
+        ASSERT_TRUE(apResp.has_value())
+            << "[TX-6a Smoke] No AddPartitionsToTxnResponse (partition=" << partition << ")";
+
+        // 4. Produce (transactional, acks=0 = immediate).
+        rune::protocol::RecordBatchBuilder batchBuilder(/*baseOffset=*/0, /*baseTimestamp=*/1000LL);
+        batchBuilder.append("key", "smoke-value", 1000LL);
+        batchBuilder.setTransactional(true);
+        batchBuilder.setProducerId(pid);
+        batchBuilder.setProducerEpoch(epoch);
+        auto batchBytes = batchBuilder.build();
+
+        pc::Produce prodReq;
+        prodReq.sessionId      = sid;
+        prodReq.correlationId  = 8300 + partition;
+        prodReq.topicId        = 0;
+        prodReq.partition      = partition;
+        prodReq.partitionKnown = 1;
+        prodReq.acks           = 0;  // leader ack, non-blocking
+        prodReq.producerId     = pid;
+        prodReq.producerEpoch  = epoch;
+        prodReq.baseSequence   = 0;
+        prodReq.recordBatch    = std::span<const uint8_t>(batchBytes.data(), batchBytes.size());
+        const std::size_t prodLen = prodReq.encode(scratch.data());
+        offerB(*ingPub, scratch.data(), prodLen, "Produce smoke");
+
+        std::optional<pc::ProduceResponse> prodResp;
+        aeron::FragmentAssembler prodAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t off,
+                                             aeron::util::index_t len, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            auto dec = pc::ProduceResponse::decode(p, static_cast<std::size_t>(len));
+            if (dec && dec->correlationId == 8300 + partition) prodResp = *dec;
+        });
+        pump([&]{ return prodResp.has_value(); }, *egrSub, prodAsm, "ProduceResponse smoke");
+        ASSERT_TRUE(prodResp.has_value())
+            << "[TX-6a Smoke] No ProduceResponse (partition=" << partition << ")";
+        ASSERT_EQ(prodResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+            << "[TX-6a Smoke] Produce failed (partition=" << partition << ")";
+        const int64_t batchOffset = prodResp->baseOffset;
+
+        // 5. EndTxn (commit).
+        const std::string coordTxnId = txnIdStr;
+        pc::EndTxn etReq;
+        etReq.sessionId      = sid;
+        etReq.correlationId  = 8400 + partition;
+        etReq.producerId     = pid;
+        etReq.producerEpoch  = epoch;
+        etReq.commit         = 1;
+        etReq.transactionalId = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(coordTxnId.data()), coordTxnId.size());
+        const std::size_t etLen = etReq.encode(scratch.data());
+        offerB(*ingPub, scratch.data(), etLen, "EndTxn smoke");
+
+        std::optional<pc::EndTxnResponse> etResp;
+        aeron::FragmentAssembler etAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                           aeron::util::index_t off,
+                                           aeron::util::index_t len, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            auto dec = pc::EndTxnResponse::decode(p, static_cast<std::size_t>(len));
+            if (dec && dec->correlationId == 8400 + partition) etResp = *dec;
+        });
+        pump([&]{ return etResp.has_value(); }, *egrSub, etAsm, "EndTxnResponse smoke");
+        ASSERT_TRUE(etResp.has_value())
+            << "[TX-6a Smoke] No EndTxnResponse (partition=" << partition << ")";
+        ASSERT_EQ(etResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+            << "[TX-6a Smoke] EndTxn commit failed (partition=" << partition << ")";
+
+        // 6. Subscribe (read_committed).
+        pc::Subscribe subReq;
+        subReq.sessionId      = sid;
+        subReq.correlationId  = 8500 + partition;
+        subReq.topicId        = 0;
+        subReq.partition      = partition;
+        subReq.partitionKnown = 1;
+        subReq.fromOffset     = 0;
+        subReq.isolation      = 1;  // read_committed
+        const std::size_t subLen = subReq.encodedSize();
+        subReq.encode(scratch.data());
+        offerB(*ingPub, scratch.data(), subLen, "Subscribe smoke");
+
+        // 7. Wait for Records with the committed batch offset.
+        bool gotRecord = false;
+        aeron::FragmentAssembler recAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                            aeron::util::index_t off,
+                                            aeron::util::index_t len, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            auto dec = pc::Records::decode(p, static_cast<std::size_t>(len));
+            if (dec && dec->topicId == 0 && dec->partition == partition &&
+                dec->baseOffset == batchOffset) {
+                gotRecord = true;
+            }
+        });
+        pump([&]{ return gotRecord; }, *egrSub, recAsm,
+             "[TX-6a Smoke] Records not delivered under read_committed after commit"
+             " — LSO not advancing? (Bug 3 without fix)");
+
+        EXPECT_TRUE(gotRecord)
+            << "[TX-6a Smoke] Committed transactional batch not delivered by read_committed "
+               "subscriber (partition=" << partition << ") — LSO bug not fixed";
+    }
+
+    testAeron.reset();
     node.stop();
 }
 

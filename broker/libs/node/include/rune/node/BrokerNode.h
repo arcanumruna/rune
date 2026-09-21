@@ -27,10 +27,12 @@
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
+#include <rune/node/TransactionCoordinationService.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
+#include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/storage/Log.h>
 
 #include <rune/consensus/NodeStateFile.h>
@@ -114,6 +116,15 @@ public:
     /// the DR-5 oracle can distinguish stale pre-election announcements from
     /// current-term announcements (term-aware assert_single_leader).
     rune::consensus::Term leadershipTermId() const noexcept;
+
+    /// Publish this node's current role/term/leaderId into the Aeron node-role
+    /// counter (RoleCounter.h) in the driver's CnC file.  Idempotent + cheap:
+    /// call it from the main poll loop on every tick.  No-op until the driver
+    /// has acked the counter allocation (findCounter returns the live Counter).
+    /// Observer-thread-safe: reads the same atomic leaderId()/term accessors the
+    /// leadership log uses; the counter is the machine-readable signal the
+    /// dr-e2e harness reads (via rune_role) instead of scraping logs.
+    void publishRole() noexcept;
 
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer-thread-safe: reads atomic leaderId() + immutable peer config.
@@ -262,6 +273,22 @@ private:
     std::unique_ptr<rune::coordination::ReplicatedOffsetStore> offsetStore_;
     std::unique_ptr<GroupCoordinationService>                  groupCoordService_;
 
+    // -----------------------------------------------------------------------
+    // Transaction coordination (TX-3 wiring — created in buildGateway()).
+    // txnLog_          — durable Log for __transaction_state (one partition).
+    // txnReplica_      — PartitionReplica wrapping the txn Log (majority-durable).
+    // txnState_        — ReplicatedTxnStateStore for transaction metadata.
+    // txnCoordService_ — TransactionCoordinationService (dispatches InitProducerId etc.).
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   runtimeAgent_ → txnCoordService_ → txnState_ → txnReplica_ (in registry)
+    //   → txnLog_ → …
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::storage::Log>                             txnLog_;
+    std::unique_ptr<rune::replication::PartitionReplica>            txnReplica_;
+    std::unique_ptr<rune::transaction::ReplicatedTxnStateStore>     txnState_;
+    std::unique_ptr<TransactionCoordinationService>                 txnCoordService_;
+
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
 
@@ -281,6 +308,17 @@ private:
     std::thread             driverThread_;
 
     std::shared_ptr<aeron::Aeron> aeron_;
+
+    // -----------------------------------------------------------------------
+    // Aeron node-role counter (RoleCounter.h) — machine-readable leadership.
+    // Allocated in start() after aeron_ connects; updated by publishRole().
+    // roleCounterRegId_ is the pending registration id until the driver acks
+    // (findCounter returns the live Counter, cached in roleCounter_).
+    // -----------------------------------------------------------------------
+    std::int64_t                     roleCounterRegId_ = -1;
+    std::int64_t                     termCounterRegId_ = -1;
+    std::shared_ptr<aeron::Counter>  roleCounter_;
+    std::shared_ptr<aeron::Counter>  termCounter_;
 
     // -----------------------------------------------------------------------
     // State flags

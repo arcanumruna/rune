@@ -497,8 +497,18 @@ size_t GroupCoordinationService::handleSyncGroup(
                 const auto committed = offsets_->fetch(groupIdStr, tp);
                 if (committed.has_value()) fromOffset = committed->offset;
             }
+            // Conservative default isolation = read_committed (1).  The member
+            // conveys its true isolation via a Subscribe carrier frame AFTER it
+            // enters Stable (TX-5 sendSubscribeForPartitions), which the gateway
+            // applies to THIS same group subscription.  Defaulting to
+            // read_committed closes the race window between this sub becoming
+            // push-eligible and the carrier arriving: during that window we must
+            // never leak aborted/open transactional records to a read_committed
+            // consumer.  A read_uncommitted member is simply capped at the LSO
+            // for the few ms until its carrier downgrades this sub to isolation=0
+            // — a harmless, self-correcting delay, never a correctness violation.
             const int64_t subId = gateway_->addGroupSubscription(
-                msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/0);
+                msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/1);
             if (subId < 0) {
                 spdlog::warn("GroupCoordinationService::handleSyncGroup: "
                              "addGroupSubscription failed for member '{}' topic={} partition={}",

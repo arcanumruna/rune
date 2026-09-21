@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/node/RoleCounter.h>
 
 #include <spdlog/spdlog.h>
 
@@ -14,6 +15,9 @@
 // CG-6 wiring: storage + replication headers for __consumer_offsets.
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+// TX-3 wiring: transaction coordination service + replicated state store.
+#include <rune/node/TransactionCoordinationService.h>
+#include <rune/transaction/ReplicatedTxnStateStore.h>
 
 namespace fs = std::filesystem;
 using namespace rune::consensus;
@@ -82,6 +86,21 @@ void BrokerNode::start() {
         if (!aeron_) {
             throw std::runtime_error("BrokerNode: failed to connect Aeron client");
         }
+
+        // Allocate the Aeron node-role counter (RoleCounter.h) in the driver's
+        // CnC file.  This is the machine-readable leadership signal (mirrors
+        // Aeron Cluster's node-role counter); the dr-e2e harness reads it via
+        // rune_role instead of scraping logs.  addCounter returns a pending
+        // registration id; the driver acks asynchronously, after which
+        // publishRole() resolves it to the live Counter via findCounter().
+        std::uint8_t roleKey[kRoleKeyLength];
+        encodeRoleKey(roleKey, config_.nodeId);
+        roleCounterRegId_ = aeron_->addCounter(
+            kRoleCounterTypeId, roleKey, kRoleKeyLength,
+            roleCounterLabel(config_.nodeId));
+        termCounterRegId_ = aeron_->addCounter(
+            kTermCounterTypeId, roleKey, kRoleKeyLength,
+            termCounterLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -633,6 +652,98 @@ void BrokerNode::buildGateway() {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // TX-3: Build TransactionCoordinationService + replicated txn state store.
+    // Mirrors the GroupCoordinationService wiring above (CG-5/CG-6).
+    //
+    // __transaction_state: topicId=-2, partitionId=0 (sentinels, not user topics).
+    // minIsr=2 (majority): txn state transitions are majority-durable (unlike
+    // offsets which use minIsr=1 leader-local for lower latency).
+    // -----------------------------------------------------------------------
+    if (gateway_) {
+        try {
+            const fs::path txnDir = fs::path{config_.dataDir} / "__transaction_state";
+            fs::create_directories(txnDir);
+
+            txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string());
+            txnLog_->recover();
+
+            const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+            std::vector<NodeId> allNodeIds;
+            allNodeIds.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                allNodeIds.push_back(static_cast<NodeId>(peer.id));
+            }
+
+            rune::replication::PartitionConfig tcfg;
+            tcfg.topicId              = -2;  // sentinel: __transaction_state
+            tcfg.partitionId          = 0;
+            tcfg.selfId               = selfId;
+            tcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
+            tcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            tcfg.replicaLagMaxOffset  = 10'000;
+            tcfg.fetchIntervalNs      = 5'000'000LL;
+            tcfg.isrCheckIntervalNs   = 10'000'000LL;
+            tcfg.maxFetchBytes        = 1 << 20;
+
+            rune::replication::PartitionTransport* txnTransport = replTransport_.get();
+            if (!txnTransport) {
+                nullTransports_.push_back(
+                    std::make_unique<rune::replication::InMemoryTransport>());
+                txnTransport = nullTransports_.back().get();
+            }
+
+            txnReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                tcfg,
+                rune::replication::Role::Follower,
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                txnLog_.get(),
+                txnTransport);
+
+            if (replTransport_) {
+                replTransport_->registerReplica(-2, 0, txnReplica_.get());
+            }
+
+            if (replicaRegistry_) {
+                replicaRegistry_->add(-2, 0, std::move(txnReplica_));
+                txnReplica_.reset();
+            }
+
+            rune::replication::PartitionReplica* txnReplicaRaw =
+                replicaRegistry_ ? replicaRegistry_->lookup(-2, 0) : nullptr;
+            if (!txnReplicaRaw && txnReplica_) {
+                txnReplicaRaw = txnReplica_.get(); // single-node path (no registry)
+            }
+
+            txnState_ = std::make_unique<rune::transaction::ReplicatedTxnStateStore>(
+                txnReplicaRaw);
+            txnState_->rebuildFromLog();
+
+            txnCoordService_ = std::make_unique<TransactionCoordinationService>(
+                txnState_.get(),
+                topicRegistry_.get(),
+                [this]() -> bool { return this->isLeader(); },
+                [this]() -> NodeId { return static_cast<NodeId>(this->leaderId()); });
+
+            txnCoordService_->setGateway(gateway_.get());
+
+            gateway_->setTxnService(txnCoordService_.get());
+
+            spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
+                         nodeId, txnDir.string());
+        } catch (const std::exception& ex) {
+            spdlog::error("BrokerNode[{}]: TransactionCoordinationService setup failed: {}; "
+                          "transactions will not work", nodeId, ex.what());
+            txnCoordService_.reset();
+            txnState_.reset();
+            txnReplica_.reset();
+            txnLog_.reset();
+        }
+    }
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
@@ -647,7 +758,8 @@ void BrokerNode::buildGateway() {
         replTransport_.get(),     // GR-3: replication transport (may be null)
         replicaRegistry_.get(),   // GR-3: replica registry (may be null if no topics)
         gateway_.get(),
-        groupCoordService_.get()); // CG-6: group coordinator (null-safe if setup failed)
+        groupCoordService_.get(), // CG-6: group coordinator (null-safe if setup failed)
+        txnCoordService_.get());  // TX-3: txn coordinator (null-safe if setup failed)
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
@@ -736,6 +848,53 @@ Term BrokerNode::leadershipTermId() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::publishRole — update the Aeron node-role + leadership-term
+// counters (RoleCounter.h) with this node's current view.
+//
+// Machine-readable leadership signal: the dr-e2e harness reads these counters
+// out of the CnC file via rune_role instead of scraping "is LEADER" log lines
+// (which are log-level dependent and fragile).  Mirrors Aeron Cluster, which
+// publishes node role + leadership term as counters.
+//
+// Resolves the pending addCounter registrations lazily: the embedded driver
+// acks counter allocation asynchronously, so findCounter() may return nullptr
+// for the first few calls — we simply retry on the next poll tick.  Once
+// resolved, the Counter is cached and set() is a single relaxed store.
+//
+// Observer-thread-safe: reads the same atomic isLeader()/leaderId()/term
+// accessors the leadership log uses.  Called from main's 100 ms poll loop.
+// ---------------------------------------------------------------------------
+void BrokerNode::publishRole() noexcept {
+    if (!aeron_) return;
+
+    // Resolve pending counter registrations once the driver has acked them.
+    if (!roleCounter_ && roleCounterRegId_ >= 0) {
+        try { roleCounter_ = aeron_->findCounter(roleCounterRegId_); }
+        catch (...) { roleCounter_.reset(); }  // driver error — retry next tick
+    }
+    if (!termCounter_ && termCounterRegId_ >= 0) {
+        try { termCounter_ = aeron_->findCounter(termCounterRegId_); }
+        catch (...) { termCounter_.reset(); }
+    }
+
+    // Determine this node's current role.  We expose Leader vs Follower vs None;
+    // Candidate is not separately observable via the BrokerNode accessors, so a
+    // node that observes no leader yet is reported as None (pre-election gap).
+    const bool leader = isLeader();
+    const NodeId lid  = leaderId();
+    const RoleCode role = leader ? RoleCode::Leader
+                        : (lid >= 0 ? RoleCode::Follower : RoleCode::None);
+
+    if (roleCounter_) {
+        roleCounter_->set(static_cast<std::int64_t>(role));
+    }
+    if (termCounter_) {
+        // Publish the term this node observes (its own leadership term id).
+        termCounter_->set(static_cast<std::int64_t>(leadershipTermId()));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::leaderClientEndpoint (GB-4)
 // ---------------------------------------------------------------------------
 std::string BrokerNode::leaderClientEndpoint() const noexcept {
@@ -779,9 +938,15 @@ void BrokerNode::stop() {
     //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
     //    → close aeron → stop driver.
     runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
+    // TX-3: destroy txn coordination service before gateway (holds gateway* + txnState*).
+    txnCoordService_.reset(); // TransactionCoordinationService (no Aeron resources, holds gateway*)
     // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
     groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
+    // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
+    txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
+    txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway
+    txnLog_.reset();          // Log for __transaction_state (file flush on dtor)
     // CG-6: destroy offset store before replicaRegistry_ (offsetStore_ holds raw ptr
     //       to the offsetReplica which replicaRegistry_ owns after CG-6 refactor).
     offsetStore_.reset();     // ReplicatedOffsetStore (holds raw ptr to offset replica in registry)
@@ -806,6 +971,14 @@ void BrokerNode::stop() {
     ingressRing_.reset();
     nodeStateFile_.reset();
     termLog_.reset();
+
+    // 3b. Release the Aeron node-role/term counters BEFORE closing the client.
+    //     ~Counter deregisters from the conductor, so it must run while the
+    //     conductor thread is still alive — otherwise the Counter dtor locks a
+    //     destroyed conductor mutex (recursive_mutex lock failed) at process
+    //     teardown.  Reset these here (not in ~BrokerNode) to fix that ordering.
+    roleCounter_.reset();
+    termCounter_.reset();
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"
