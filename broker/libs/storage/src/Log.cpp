@@ -1,7 +1,7 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
-#include <filesystem>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 namespace rune::storage {
 
@@ -41,7 +41,25 @@ void Log::maybeRoll() {
         activeSegment().sync();
         int64_t base = logEndOffset_;
         segments_[base] = std::make_unique<LogSegment>(dir_, base);
+        // Publish snapshot: a new sealed segment just appeared.
+        publishSealedSnapshot();
     }
+}
+
+void Log::publishSealedSnapshot() {
+    // Build a fresh immutable snapshot of all sealed segments (all except the
+    // last/active).  Called on the single-writer append thread only.
+    // The active segment is excluded: its sizeBytes is mutated on appends.
+    auto snap = std::make_shared<SealedSegmentSnapshot>();
+    if (segments_.size() > 1) {
+        snap->reserve(segments_.size() - 1);
+        auto it  = segments_.begin();
+        auto end = std::prev(segments_.end()); // stop before active
+        for (; it != end; ++it) {
+            snap->push_back({it->first, it->second->sizeBytes()});
+        }
+    }
+    std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap)));
 }
 int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // Zero-alloc hot path: LogSegment::append(pointer) writes directly from the
@@ -240,23 +258,51 @@ int Log::deleteOldSegments(int64_t retainBytes) {
     return deleted;
 }
 
-void Log::enqueueCleanedSegment(int64_t base) {
-    std::lock_guard<std::mutex> lk(pendingSwapsMu_);
-    pendingSwaps_.push_back(base);
+bool Log::enqueueCleanedSegment(int64_t base) noexcept {
+    // LOCK-FREE SPSC producer (single cleaner thread).  No mutex on any path.
+    // Uses FREE-RUNNING (unmasked) monotonic counters: head_/tail_ only ever
+    // increase; the index into swapRing_ is (counter & kSwapRingMask).  Comparing
+    // the raw counters gives an unambiguous occupancy (tail - head) and lets the
+    // ring use its full capacity (no wasted slot).
+    //
+    // tail_ is producer-owned: a relaxed load reads our own last position.
+    // head_ is consumer-owned: an acquire-load observes slots freed by the append
+    // thread's release-store of head_ in drainCleanerSwaps().
+    const std::size_t tail = swapTail_.load(std::memory_order_relaxed);
+    const std::size_t head = swapHead_.load(std::memory_order_acquire);
+    if (tail - head >= kSwapRingCapacity) {
+        // Ring full — drop (return false).  The cleaner re-enqueues the same base
+        // next cycle; reloadSegment is idempotent so a delayed reload is safe.
+        return false;
+    }
+    swapRing_[tail & kSwapRingMask] = base;
+    // Release-store publishes the slot AND the cleaner's prior on-disk rename to
+    // the consumer's acquire-load of tail_ in drainCleanerSwaps() — the barrier
+    // between the cleaner's file rename and the append thread's reloadSegment().
+    swapTail_.store(tail + 1, std::memory_order_release);
+    return true;
 }
 
 int Log::drainCleanerSwaps() {
-    // Grab pending bases under lock, then process outside the lock on the
-    // single-writer append thread (reloadSegment modifies segments_).
-    std::vector<int64_t> toProcess;
-    {
-        std::lock_guard<std::mutex> lk(pendingSwapsMu_);
-        toProcess.swap(pendingSwaps_);
+    // LOCK-FREE SPSC consumer (single append/duty-cycle thread).  No mutex.
+    // head_ is consumer-owned: relaxed load of our own position.
+    // tail_ acquire-load pairs with the producer's release-store — the acquire
+    // half of the happens-before between the cleaner's file rename and the
+    // reloadSegment() calls below.
+    const std::size_t head = swapHead_.load(std::memory_order_relaxed);
+    const std::size_t tail = swapTail_.load(std::memory_order_acquire);
+    for (std::size_t i = head; i != tail; ++i) {
+        reloadSegment(swapRing_[i & kSwapRingMask]);
     }
-    for (int64_t base : toProcess) {
-        reloadSegment(base);
+    const int count = static_cast<int>(tail - head);
+    if (count > 0) {
+        // Release new head so the cleaner can reuse those ring slots.
+        swapHead_.store(tail, std::memory_order_release);
+        // segments_ changed (segment reloaded or dropped); refresh the snapshot
+        // so the cleaner thread sees correct sizes on the next scan.
+        publishSealedSnapshot();
     }
-    return static_cast<int>(toProcess.size());
+    return count;
 }
 
 } // namespace rune::storage

@@ -1,12 +1,22 @@
 #pragma once
 #include <rune/storage/LogSegment.h>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <vector>
 namespace rune::storage {
+
+/// Immutable descriptor for a single sealed segment — published via atomic
+/// snapshot so the cleaner thread can read segment sizes without touching the
+/// writer-owned segments_ map.
+struct SegInfo {
+    int64_t baseOffset = 0;
+    int64_t sizeBytes  = 0;
+};
+using SealedSegmentSnapshot = std::vector<SegInfo>;
 
 /// On-disk append-only log: a sequence of LogSegment files in a directory.
 ///
@@ -72,22 +82,38 @@ public:
     /// segment rewrites never move the LEO).
     void reloadSegment(int64_t baseOffset);
 
-    /// CP-6: Size in bytes of the segment with the given base offset.
-    /// Returns 0 if the segment is not found.  Thread-safe: reads only immutable
-    /// metadata (sizeBytes is updated on the append thread; sealed segments are
-    /// immutable).
-    int64_t segmentSize(int64_t base) const noexcept {
-        auto it = segments_.find(base);
-        return (it != segments_.end()) ? it->second->sizeBytes() : 0;
+    /// CP-6/race-fix: Load the latest immutable snapshot of sealed segments.
+    ///
+    /// The snapshot is a std::shared_ptr<const SealedSegmentSnapshot> published
+    /// via std::atomic on the single-writer append thread whenever segments_ changes
+    /// (in maybeRoll or after drainCleanerSwaps).  Sealed-segment sizes are fixed
+    /// once sealed so the snapshot is stable.
+    ///
+    /// The cleaner thread MUST use this accessor instead of calling segmentSize()
+    /// or segmentBaseOffsets() directly, which would race with the append thread's
+    /// mutations to segments_ (UB confirmed by TSan).
+    ///
+    /// Thread-safe: std::atomic_load provides seq_cst barrier between the
+    /// append-thread store (publishSealedSnapshot) and the cleaner-thread load.
+    std::shared_ptr<const SealedSegmentSnapshot> sealedSegmentSnapshot() const noexcept {
+        return std::atomic_load(&sealedSnapshot_);
     }
 
     /// CP-6: Enqueue a cleaner-rewritten segment base for atomic swap on the
-    /// append/duty-cycle thread.  Called by LogCleanerAgent (cleaner thread)
-    /// after atomically renaming <base>.log.new → <base>.log on disk.
-    /// The actual in-memory reload is deferred to drainCleanerSwaps() which
-    /// runs on the single-writer append thread — so no lock is needed on the
-    /// segment map.  Thread-safe: enqueue is protected by pendingSwapsMu_.
-    void enqueueCleanedSegment(int64_t base);
+    /// append/duty-cycle thread.  Called by LogCleanerAgent (the single cleaner
+    /// thread) after atomically renaming <base>.log.new → <base>.log on disk.
+    /// The actual in-memory reload is deferred to drainCleanerSwaps() which runs
+    /// on the single-writer append thread — so no lock is needed on the segment
+    /// map.
+    ///
+    /// Lock-free SPSC: this is the SINGLE-PRODUCER half of a wait-free ring.
+    /// The release-store of tail_ publishes the base AND establishes
+    /// happens-before with the append thread's acquire-load in drainCleanerSwaps
+    /// — this is the release/acquire barrier between the cleaner's file rename
+    /// and the append thread's reloadSegment().
+    /// Returns false (drops) only if the ring is momentarily full; the cleaner
+    /// re-enqueues the same base next cycle (idempotent — reloadSegment is too).
+    bool enqueueCleanedSegment(int64_t base) noexcept;
 
     /// CP-6: Drain pending cleaner swaps on the single-writer append/duty-cycle
     /// thread.  Called once per duty cycle from NodeRuntimeAgent::doWork.
@@ -95,19 +121,56 @@ public:
     /// in-memory segment map.  The superseded LogSegment is freed here (the map
     /// slot is on the append thread; no reader can hold it after this call since
     /// all reads also happen on the append thread — single-writer invariant).
+    ///
+    /// Lock-free SPSC: this is the SINGLE-CONSUMER half.  The acquire-load of
+    /// tail_ pairs with enqueueCleanedSegment's release-store.
     /// Returns number of swaps processed (>0 = work done).
     int drainCleanerSwaps();
 
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();
+
+    /// Rebuild and atomically publish a new sealed-segment snapshot.
+    /// MUST be called on the single-writer append thread whenever segments_ changes:
+    ///   - after maybeRoll() (when a segment seals)
+    ///   - after drainCleanerSwaps() (after a segment swap)
+    /// Only sealed segments (all except the last/active) are included; the active
+    /// segment's size is mutable so it is excluded.
+    void publishSealedSnapshot();
+
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     std::map<int64_t, std::unique_ptr<LogSegment>> segments_;
 
-    // CP-6: pending cleaner swaps.  Enqueued by the cleaner thread; drained on
-    // the append/duty-cycle thread.  The mutex guards only the vector; the actual
-    // reloadSegment() call happens OUTSIDE the lock on the single-writer thread.
-    mutable std::mutex   pendingSwapsMu_;
-    std::vector<int64_t> pendingSwaps_;
+    // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
+    // Written exclusively on the append thread; read safely on the cleaner thread
+    // via std::atomic_store / std::atomic_load (deprecated C++20 free-function
+    // API, but the only portable form available on Apple clang/libc++ 17 where
+    // std::atomic<shared_ptr<T>> is not yet fully supported).
+    //
+    // Correctness: atomic_store/load use an internal spinlock in libc++, providing
+    // a full happens-before between the store on the writer and the load on the
+    // cleaner — equivalent in strength to a mutex-protected assignment.  The
+    // spinlock is per-pointer-address (not global), so the append hot path is
+    // only affected when a roll occurs (infrequent).
+    mutable std::shared_ptr<const SealedSegmentSnapshot> sealedSnapshot_{
+        std::make_shared<SealedSegmentSnapshot>()};
+
+    // CP-6: pending cleaner swaps — LOCK-FREE single-producer/single-consumer
+    // ring.  Producer = the single cleaner thread (enqueueCleanedSegment);
+    // consumer = the single append/duty-cycle thread (drainCleanerSwaps).
+    // No mutex on any path.
+    //
+    //   head_ : consumer-owned index (only the append thread advances it).
+    //   tail_ : producer-owned index (only the cleaner thread advances it).
+    // A release-store to tail_ publishes a slot; an acquire-load of tail_ on the
+    // consumer establishes happens-before with the cleaner's file rename.
+    // Symmetrically head_ (release on consumer / acquire on producer) frees slots.
+    // Capacity is a power of two so index masking is a bitwise AND.
+    static constexpr std::size_t kSwapRingCapacity = 1024; // power of two
+    static constexpr std::size_t kSwapRingMask     = kSwapRingCapacity - 1;
+    std::array<int64_t, kSwapRingCapacity> swapRing_{};
+    alignas(64) std::atomic<std::size_t>   swapHead_{0}; // consumer index
+    alignas(64) std::atomic<std::size_t>   swapTail_{0}; // producer index
 };
 } // namespace rune::storage
