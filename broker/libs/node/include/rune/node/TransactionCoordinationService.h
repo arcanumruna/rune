@@ -40,11 +40,12 @@
 #include <rune/transaction/Types.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/protocol/client/TxnMessages.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -158,15 +159,17 @@ private:
     // Pre-reserved scratch for partition vectors (addPartitions, endTxn).
     std::vector<rune::transaction::TopicPartition> partitionScratch_;
 
-    // Pre-reserved scratch for partition results (addPartitions response).
-    // Each result: (topicId, partition, errorCode).
-    struct PartResult { int32_t topicId; int32_t partition; int16_t errorCode; };
-    std::vector<PartResult> partResultScratch_;
+    // Pre-reserved scratch for partition results (addPartitions / txnOffsetCommit
+    // response path).  Cleared+refilled each call — no per-call vector alloc.
+    std::vector<rune::protocol::client::TxnPartitionResult> partResultScratch_;
 
-    // Static scratch buffer for encoding responses (Task 7).
-    // 68 KiB covers any txn response frame.
-    static constexpr std::size_t kRespScratchSize = 68 * 1024;
-    std::array<uint8_t, kRespScratchSize> respScratch_{};
+    // Member scratch for the offsets map passed to addOffsetsToTxn
+    // (handleTxnOffsetCommit).  Cleared+refilled each call — no per-call map alloc.
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offsetsScratch_;
+
+    // Scratch string for topic-name fallback ("topic_<id>") — avoids the
+    // per-partition temporary "topic_" + std::to_string(topicId) alloc.
+    std::string topicNameScratch_;
 };
 
 } // namespace rune::node

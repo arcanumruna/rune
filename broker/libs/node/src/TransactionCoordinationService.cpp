@@ -27,8 +27,8 @@
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
+#include <cstdio>
 #include <cstring>
-#include <map>
 #include <string_view>
 
 namespace pc = rune::protocol::client;
@@ -72,9 +72,10 @@ TransactionCoordinationService::TransactionCoordinationService(
     , leaderIdFn_(std::move(leaderId))
     , coordinator_()
 {
-    // Pre-reserve scratch vectors to avoid steady-state allocation.
+    // Pre-reserve scratch containers to avoid steady-state allocation.
     partitionScratch_.reserve(32);
     partResultScratch_.reserve(32);
+    topicNameScratch_.reserve(32);  // "topic_<N>" stays well within 32 chars
 }
 
 // ---------------------------------------------------------------------------
@@ -95,13 +96,20 @@ NodeId TransactionCoordinationService::coordinatorFor(const TransactionalId& /*t
 // doWork — drive coordinator timeout aborts.
 // ---------------------------------------------------------------------------
 int TransactionCoordinationService::doWork(int64_t nowNs) {
-    // CG-6 pattern: detect Follower→Leader transition to rebuild index.
+    // CG-6 pattern: detect Follower→Leader TRANSITION (not every doWork while
+    // already leader) to rebuild the in-memory txn index from the replicated log.
+    // Guard mirrors GroupCoordinationService::doWork exactly:
+    //   - rebuild fires once on the first duty cycle after becoming leader.
+    //   - losing leadership resets wasLeader_ so the next election triggers again.
+    // Without this guard, rebuildFromLog() would clear index_ every cycle,
+    // wiping freshly-put in-memory state before TX-4 marker resolution completes.
     const bool leader = isLocalCoordinator();
-    if (leader && !wasLeader_ && txnState_) {
-        // Rebuild in-memory index from replicated log.
-        txnState_->rebuildFromLog();
+    if (leader && !wasLeader_) {
+        // Follower→Leader: rebuild index from replicated log.
+        if (txnState_) txnState_->rebuildFromLog();
         wasLeader_ = true;
-    } else if (!leader) {
+    } else if (!leader && wasLeader_) {
+        // Leader→Follower: reset so the next election triggers another rebuild.
         wasLeader_ = false;
     }
 
@@ -161,7 +169,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
             // Ignore persist failure here: the coordinator already updated
             // in-memory state; a log failure is a degraded-durability condition
             // not a protocol error (minIsr-gate on startup would have prevented this).
-            txnState_->put(*meta, /*coordEpoch=*/0);
+            txnState_->put(*meta, meta->coordinatorEpoch);
         }
     }
 
@@ -185,8 +193,8 @@ size_t TransactionCoordinationService::handleAddPartitions(
 
     // NotCoordinator fence — build minimal response.
     if (!isLocalCoordinator()) {
-        // Response: count=1, single error entry echoing first partition (or 0 entries ok).
-        // Encode an empty results array with all partitions NotCoordinator.
+        // Encode all partitions with NotCoordinator using partResultScratch_ directly
+        // (no per-call vector alloc — member scratch cleared+refilled).
         const size_t partCount = msg.partitions.size();
         const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
         if (outCap < needed) return 0;
@@ -204,11 +212,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
         pc::AddPartitionsToTxnResponse resp;
         resp.sessionId     = msg.sessionId;
         resp.correlationId = msg.correlationId;
-        std::vector<pc::TxnPartitionResult> res;
-        res.reserve(partResultScratch_.size());
-        for (const auto& r : partResultScratch_)
-            res.push_back({r.topicId, r.partition, r.errorCode});
-        return resp.encode(out, res);
+        return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
     }
 
     // Decode txnId.
@@ -219,6 +223,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
     // Build partition vector.  Protocol sends topicId (int32) + partition (int32).
     // TransactionCoordinator needs topic name strings. Resolve via TopicRegistry
     // if available; otherwise use numeric placeholder (e.g. "topic_<id>").
+    // topicNameScratch_ reused for fallback — avoids per-partition temp string alloc.
     partitionScratch_.clear();
     const size_t partCount = msg.partitions.size();
     for (size_t i = 0; i < partCount; ++i) {
@@ -230,11 +235,17 @@ size_t TransactionCoordinationService::handleAddPartitions(
             if (spec) {
                 txtp.topic = spec->name;
             } else {
-                // Unknown topic: use numeric placeholder.
-                txtp.topic = "topic_" + std::to_string(tp.topicId);
+                // Unknown topic: numeric placeholder via scratch (no temp alloc).
+                char numBuf[32];
+                const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", tp.topicId);
+                topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
+                txtp.topic = topicNameScratch_;
             }
         } else {
-            txtp.topic = "topic_" + std::to_string(tp.topicId);
+            char numBuf[32];
+            const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", tp.topicId);
+            topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
+            txtp.topic = topicNameScratch_;
         }
         partitionScratch_.push_back(std::move(txtp));
     }
@@ -243,37 +254,37 @@ size_t TransactionCoordinationService::handleAddPartitions(
         txnIdScratch_, msg.producerId, msg.producerEpoch,
         partitionScratch_, nowNs);
 
-    // Persist before responding.
+    // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, /*coordEpoch=*/0);
+            txnState_->put(*meta, meta->coordinatorEpoch);
         }
     }
 
     // Encode response: one result entry per partition with the same error code.
+    // Reuse partResultScratch_ (pre-reserved member) — no per-call alloc.
     const int16_t errCode = txnErrorToProtocol(result.errorCode);
     const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
     if (outCap < needed) return 0;
 
-    std::vector<pc::TxnPartitionResult> res;
-    res.reserve(partCount);
+    partResultScratch_.clear();
     for (size_t i = 0; i < partCount; ++i) {
         auto tp = msg.partitions[i];
-        res.push_back({tp.topicId, tp.partition, errCode});
+        partResultScratch_.push_back({tp.topicId, tp.partition, errCode});
     }
 
     pc::AddPartitionsToTxnResponse resp;
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
-    return resp.encode(out, res);
+    return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
 }
 
 // ---------------------------------------------------------------------------
 // handleAddOffsets (templateId 49)
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleAddOffsets(
-    const uint8_t* buf, size_t len, int64_t /*nowNs*/,
+    const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::AddOffsetsToTxn::decode(buf, len);
@@ -301,18 +312,18 @@ size_t TransactionCoordinationService::handleAddOffsets(
     // addOffsetsToTxn registers the group so it's included in the commit.
     // The actual offset values are sent via TxnOffsetCommit (templateId 51).
     // We pass an empty offsets map here — the group binding is what matters.
-    // TODO(Task 7 full implementation): if the brief requires a real offset map,
-    // we need a TxnOffsetCommit step. AddOffsetsToTxn is a "register intent" call.
-    const std::map<rune::coordination::TopicPartition, rune::coordination::Offset> emptyOffsets;
+    // AddOffsetsToTxn is a "register intent" call; offsets arrive in TxnOffsetCommit.
+    // Reuse offsetsScratch_ cleared as the empty map — no per-call map alloc.
+    offsetsScratch_.clear();
     const auto result = coordinator_.addOffsetsToTxn(
         txnIdScratch_, msg.producerId, msg.producerEpoch,
-        groupIdScratch_, emptyOffsets, /*nowNs=*/0);
+        groupIdScratch_, offsetsScratch_, nowNs);
 
-    // Persist before responding.
+    // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, /*coordEpoch=*/0);
+            txnState_->put(*meta, meta->coordinatorEpoch);
         }
     }
 
@@ -332,22 +343,22 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     if (!msgOpt) return 0;
     const auto& msg = *msgOpt;
 
-    // NotCoordinator fence — empty results array.
+    // NotCoordinator fence — encode all entries with NotCoordinator using
+    // partResultScratch_ directly (no per-call vector alloc).
     if (!isLocalCoordinator()) {
         const size_t entryCount = msg.entries.size();
         const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(entryCount);
         if (outCap < needed) return 0;
 
-        std::vector<pc::TxnPartitionResult> res;
-        res.reserve(entryCount);
+        partResultScratch_.clear();
         for (const auto& e : msg.entries) {
-            res.push_back({e.topicId, e.partition,
+            partResultScratch_.push_back({e.topicId, e.partition,
                            static_cast<int16_t>(pc::ErrorCode::NotCoordinator)});
         }
         pc::TxnOffsetCommitResponse resp;
         resp.sessionId     = msg.sessionId;
         resp.correlationId = msg.correlationId;
-        return resp.encode(out, res);
+        return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
     }
 
     // Decode txnId and groupId.
@@ -358,48 +369,60 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
         reinterpret_cast<const char*>(msg.groupId.data()),
         msg.groupId.size());
 
-    // Build an offset map from the entries.
-    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offsets;
+    // Build an offset map from the entries, reusing offsetsScratch_ (member map
+    // cleared+refilled each call — no per-call map construction alloc).
+    // topicNameScratch_ used for "topic_<id>" fallback (no per-entry temp string).
+    offsetsScratch_.clear();
     for (const auto& e : msg.entries) {
         rune::coordination::TopicPartition tp;
         if (topics_) {
             const auto* spec = topics_->topic(e.topicId);
-            tp.topic = spec ? spec->name : ("topic_" + std::to_string(e.topicId));
+            if (spec) {
+                tp.topic = spec->name;
+            } else {
+                char numBuf[32];
+                const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", e.topicId);
+                topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
+                tp.topic = topicNameScratch_;
+            }
         } else {
-            tp.topic = "topic_" + std::to_string(e.topicId);
+            char numBuf[32];
+            const int n = std::snprintf(numBuf, sizeof(numBuf), "topic_%d", e.topicId);
+            topicNameScratch_.assign(numBuf, static_cast<size_t>(n > 0 ? n : 0));
+            tp.topic = topicNameScratch_;
         }
         tp.partition = e.partition;
-        offsets[tp] = e.offset;
+        offsetsScratch_[tp] = e.offset;
     }
 
     const auto result = coordinator_.addOffsetsToTxn(
         txnIdScratch_, msg.producerId, msg.producerEpoch,
-        groupIdScratch_, offsets, nowNs);
+        groupIdScratch_, offsetsScratch_, nowNs);
 
-    // Persist before responding.
+    // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, /*coordEpoch=*/0);
+            txnState_->put(*meta, meta->coordinatorEpoch);
         }
     }
 
     // Build result entries — all same error code.
+    // Reuse partResultScratch_ (pre-reserved member) — no per-call vector alloc.
     const int16_t errCode = txnErrorToProtocol(result.errorCode);
     const size_t entryCount = msg.entries.size();
     const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(entryCount);
     if (outCap < needed) return 0;
 
-    std::vector<pc::TxnPartitionResult> res;
-    res.reserve(entryCount);
+    partResultScratch_.clear();
     for (const auto& e : msg.entries) {
-        res.push_back({e.topicId, e.partition, errCode});
+        partResultScratch_.push_back({e.topicId, e.partition, errCode});
     }
 
     pc::TxnOffsetCommitResponse resp;
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
-    return resp.encode(out, res);
+    return resp.encode(out, std::span<const pc::TxnPartitionResult>(partResultScratch_));
 }
 
 // ---------------------------------------------------------------------------
@@ -433,10 +456,11 @@ size_t TransactionCoordinationService::handleEndTxn(
         txnIdScratch_, msg.producerId, msg.producerEpoch, commit, nowNs);
 
     // Persist before responding (endTxn sets PREPARE state — durable).
+    // Pass the real coordinatorEpoch from metadata (not literal 0).
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, /*coordEpoch=*/0);
+            txnState_->put(*meta, meta->coordinatorEpoch);
         }
     }
 
