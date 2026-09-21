@@ -60,42 +60,19 @@ using rune::node::TopicSpec;
 // ---------------------------------------------------------------------------
 // Allocation counter shim
 // ---------------------------------------------------------------------------
-// We intercept global operator new to count heap allocations on the hot path.
-// Two atomics: g_allocCount tracks total allocs, g_allocEnabled gates the shim
-// so setup paths don't pollute the measurement.
+// Global operator new/delete and the shared counters live in BenchmarkMain.cpp
+// (single definition, no ODR violation).  Declared extern here so all
+// benchmark translation units share one set of counters.
 //
-// IMPORTANT: This shim is declared OUTSIDE the anonymous namespace so it has
-// external linkage and overrides the global operator new (which is a replaceable
-// function). Declaring it inside an anonymous namespace makes it internal and
-// does NOT replace the global operator new.
+// Usage:
+//   g_allocCount.store(0);
+//   g_allocEnabled.store(true, std::memory_order_release);
+//   /* ... hot loop ... */
+//   g_allocEnabled.store(false, std::memory_order_release);
+//   int64_t allocs = g_allocCount.load(std::memory_order_acquire);
 
-static std::atomic<int64_t>  g_allocCount{0};
-static std::atomic<bool>     g_allocEnabled{false};
-
-void* operator new(std::size_t sz)
-{
-    if (g_allocEnabled.load(std::memory_order_relaxed)) {
-        g_allocCount.fetch_add(1, std::memory_order_relaxed);
-    }
-    void* p = std::malloc(sz);
-    if (!p) throw std::bad_alloc{};
-    return p;
-}
-
-void* operator new[](std::size_t sz)
-{
-    if (g_allocEnabled.load(std::memory_order_relaxed)) {
-        g_allocCount.fetch_add(1, std::memory_order_relaxed);
-    }
-    void* p = std::malloc(sz);
-    if (!p) throw std::bad_alloc{};
-    return p;
-}
-
-void operator delete(void* p) noexcept  { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept  { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+extern std::atomic<int64_t> g_allocCount;
+extern std::atomic<bool>    g_allocEnabled;
 
 namespace {
 
