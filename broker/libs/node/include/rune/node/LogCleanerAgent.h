@@ -76,15 +76,18 @@
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
+#include <rune/storage/CleanerOffsetCheckpoint.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
+#include <rune/storage/SkimpyOffsetMap.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::node {
@@ -95,10 +98,12 @@ public:
     ///                         Must outlive this agent.
     /// @param cycleBudgetBytes Maximum bytes of compaction work per doWork() call.
     ///                         Default 128 MiB matches Kafka's default dedupe buffer.
+    ///                         Also used as the dedupe map byte budget (SkimpyOffsetMap).
     explicit LogCleanerAgent(ReplicaRegistry* registry,
                              int64_t cycleBudgetBytes = 128LL * 1024 * 1024) noexcept
         : registry_(registry)
         , cycleBudgetBytes_(cycleBudgetBytes)
+        , dedupeBufferBytes_(cycleBudgetBytes > 0 ? cycleBudgetBytes : 128LL * 1024 * 1024)
     {}
 
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
@@ -271,6 +276,11 @@ public:
         // via enqueueCleanedSegment() → drainCleanerSwaps() → reloadSegment().
         //
         // Uses the global dirty range for latest-per-key correctness (CP-2).
+        //
+        // CP-7: uses SkimpyOffsetMap (bounded open-addressing table, wyhash64)
+        // instead of the unbounded OffsetMap.  The map size is bounded by
+        // dedupeBufferBytes_.  buildOffsetMapFromBases stops when the map is
+        // full and returns the highest offset scanned (bounded-range-per-pass).
         // ---------------------------------------------------------------
         const int64_t globalDirtyStart = best.replica->lastCleanOffset();
 
@@ -288,6 +298,12 @@ public:
             /*globalDirtyStart=*/ globalDirtyStart,
             nowNs,
             best.replica->deleteRetentionMs());
+
+        // CP-7 lazy checkpoint init: open (or create) the per-log checkpoint
+        // file on first use.  The checkpoint seeds lastCleanOffset_ so passes
+        // resume correctly after a broker restart.  This is pure file I/O;
+        // it does NOT touch Log::segments_.
+        ensureCheckpoint(best.log, best.dir, best.replica);
 
         if (!compacted) return 0;
 
@@ -329,15 +345,49 @@ public:
         // enqueue (avoid skipping a lost swap).
         if (best.replica->role() == rune::replication::Role::Leader) {
             best.replica->setLastCleanOffset(best.segEnd);
+            // CP-7: persist the checkpoint (pure file I/O — no segments_ access).
+            // Written on the cleaner thread (safe: mmap write only, not shared state).
+            if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
+                it->second->store(best.segEnd);
+            }
         }
 
         return 1;
     }
 
 private:
+    // CP-7: Lazy-init the cleaner-offset-checkpoint for `log`.
+    // If the checkpoint file already exists, seeds replica->lastCleanOffset()
+    // with the persisted value (truncation-aware).  Called on the CLEANER THREAD;
+    // pure file I/O — no Log::segments_ access.
+    void ensureCheckpoint(rune::storage::Log* log,
+                          const std::string& dir,
+                          rune::replication::PartitionReplica* replica) {
+        if (checkpoints_.count(log)) return; // already opened
+        std::string ckptPath = dir + "/cleaner-offset-checkpoint";
+        const int64_t logEnd = log->logEndOffset();
+        auto ckpt = std::make_unique<rune::storage::CleanerOffsetCheckpoint>(
+            ckptPath, logEnd);
+        // Seed the in-memory watermark from the persisted checkpoint.
+        // Only advance (don't regress) the existing watermark.
+        const int64_t persisted = ckpt->value();
+        if (persisted > replica->lastCleanOffset()) {
+            replica->setLastCleanOffset(persisted);
+        }
+        checkpoints_.emplace(log, std::move(ckpt));
+    }
+
     ReplicaRegistry* registry_;         // non-owning
     int64_t          cycleBudgetBytes_; // 0 = unlimited; >0 = soft bytes-per-window cap
+    int64_t          dedupeBufferBytes_;// dedupe map byte budget (SkimpyOffsetMap)
     int64_t          bytesUsed_ = 0;    // bytes consumed so far in the current budget window
+
+    // CP-7: per-log cleaner-offset-checkpoint (lazy init on first compaction).
+    // Key = Log* (non-owning, lives as long as the replica registry).
+    // Pure file I/O; never touches Log::segments_.
+    std::unordered_map<rune::storage::Log*,
+                       std::unique_ptr<rune::storage::CleanerOffsetCheckpoint>>
+        checkpoints_;
 };
 
 } // namespace rune::node
