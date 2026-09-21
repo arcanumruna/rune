@@ -1690,11 +1690,6 @@ void ClientGateway::pushSubscriptions()
             // If no txn state exists yet, no transactional batches written → bound = hw.
         }
 
-        if (sub.isolation == 0 && sub.nextOffset < log->logEndOffset()) {
-            spdlog::warn("DBGRU sub={} t={} p={} iso={} hw={} leo={} bound={} next={}",
-                         subId, sub.topicId, sub.partition, sub.isolation, hw,
-                         log->logEndOffset(), bound, sub.nextOffset);
-        }
         if (sub.nextOffset >= bound) continue; // nothing committed to push yet
 
         // Fetch a bounded chunk of bytes from the log starting at nextOffset.
