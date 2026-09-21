@@ -46,10 +46,10 @@ static void BM_ProducerState_ValidateContiguous(benchmark::State& state) {
         }
 
         int32_t last = seq; // single-record batch: lastSeq == baseSeq
-        auto result = psm.validate(kProducerId, kPartition, kEpoch, seq, last);
+        auto result = psm.validate(/*topicId=*/0, kProducerId, kPartition, kEpoch, seq, last);
         benchmark::DoNotOptimize(result);
         if (result.isAccept()) {
-            psm.update(kProducerId, kPartition, kEpoch, seq, last, logOffset);
+            psm.update(/*topicId=*/0, kProducerId, kPartition, kEpoch, seq, last, logOffset);
             ++logOffset;
         }
         ++seq;
@@ -92,10 +92,10 @@ static void BM_ProducerState_ManyProducers(benchmark::State& state) {
         int32_t seq  = seqs   [static_cast<std::size_t>(idx)];
         int64_t off  = offsets[static_cast<std::size_t>(idx)];
 
-        auto result = psm.validate(producerId, kPartition, kEpoch, seq, seq);
+        auto result = psm.validate(/*topicId=*/0, producerId, kPartition, kEpoch, seq, seq);
         benchmark::DoNotOptimize(result);
         if (result.isAccept()) {
-            psm.update(producerId, kPartition, kEpoch, seq, seq, off);
+            psm.update(/*topicId=*/0, producerId, kPartition, kEpoch, seq, seq, off);
             ++offsets[static_cast<std::size_t>(idx)];
         }
         ++seqs[static_cast<std::size_t>(idx)];

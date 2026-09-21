@@ -199,11 +199,11 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
     // -----------------------------------------------------------------------
     {
         ProducerStateManager psmHw;
-        psmHw.rebuildFromLog(log, hwOffset, kPartition);
+        psmHw.rebuildFromLog(/*topicId=*/0, log, hwOffset, kPartition);
 
         // COMMITTED seqs must be Duplicate (dedup window fully intact).
         for (int seq = 0; seq < kN; ++seq) {
-            const auto vr = psmHw.validate(kPid, kPartition, kEpoch, seq, seq);
+            const auto vr = psmHw.validate(/*topicId=*/0, kPid, kPartition, kEpoch, seq, seq);
             EXPECT_TRUE(vr.isDuplicate())
                 << "committed seq=" << seq
                 << " must be Duplicate with HW-bound scan (dedup preserved)";
@@ -214,7 +214,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
         // UNCOMMITTED seq MUST be Accept.
         // This is the key assertion for the TX-2b CRITICAL fix.
         // Pre-fix LEO-bound code returns Duplicate here (see Scenario C below).
-        const auto vrUnc = psmHw.validate(kPid, kPartition, kEpoch, kUncSeq, kUncSeq);
+        const auto vrUnc = psmHw.validate(/*topicId=*/0, kPid, kPartition, kEpoch, kUncSeq, kUncSeq);
         EXPECT_TRUE(vrUnc.isAccept())
             << "CRITICAL TX-2b fix: uncommitted seq=" << kUncSeq
             << " (above HW=" << hwOffset << ", below LEO=" << leoOffset << ")"
@@ -224,7 +224,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
             << " Got status=" << static_cast<int>(vrUnc.status);
 
         // A new producer is also Accept.
-        const auto vrNew = psmHw.validate(0, kPartition, kEpoch, 0, 0);
+        const auto vrNew = psmHw.validate(/*topicId=*/0, 0, kPartition, kEpoch, 0, 0);
         EXPECT_TRUE(vrNew.isAccept())
             << "A new producer (pid=0) must be Accept after HW-bounded rebuild";
     }
@@ -236,11 +236,11 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
     // -----------------------------------------------------------------------
     {
         ProducerStateManager psmLeo;
-        psmLeo.rebuildFromLog(log, leoOffset, kPartition);
+        psmLeo.rebuildFromLog(/*topicId=*/0, log, leoOffset, kPartition);
 
         // Pre-fix behavior: LEO-bound seeds PSM from the uncommitted batch →
         // producer retry of kUncSeq is incorrectly marked Duplicate.
-        const auto vrUnc = psmLeo.validate(kPid, kPartition, kEpoch, kUncSeq, kUncSeq);
+        const auto vrUnc = psmLeo.validate(/*topicId=*/0, kPid, kPartition, kEpoch, kUncSeq, kUncSeq);
         EXPECT_TRUE(vrUnc.isDuplicate())
             << "PRE-FIX REGRESSION CHECK: LEO-bound rebuildFromLog MUST produce"
             << " false-Duplicate for uncommitted seq=" << kUncSeq << "."
@@ -250,7 +250,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
 
         // Committed seqs are still Duplicate in LEO-bound mode (correct in both cases).
         for (int seq = 0; seq < kN; ++seq) {
-            const auto vr = psmLeo.validate(kPid, kPartition, kEpoch, seq, seq);
+            const auto vr = psmLeo.validate(/*topicId=*/0, kPid, kPartition, kEpoch, seq, seq);
             EXPECT_TRUE(vr.isDuplicate())
                 << "seq=" << seq << " must be Duplicate in LEO-bound scan too";
         }

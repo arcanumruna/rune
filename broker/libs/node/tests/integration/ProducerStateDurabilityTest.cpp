@@ -195,7 +195,7 @@ TEST_F(ProducerStateDurabilityTest, RebuildFromLogRestoresDedup) {
     {
         ProducerStateManager freshPsm;
         // Seq 0 → the fresh PSM has no state; it will Accept (this is the bug).
-        auto vr = freshPsm.validate(kPid, kPartition, kEpoch, /*baseSeq=*/0, /*lastSeq=*/0);
+        auto vr = freshPsm.validate(/*topicId=*/0, kPid, kPartition, kEpoch, /*baseSeq=*/0, /*lastSeq=*/0);
         // Without the fix this would be Accept — demonstrating the hole.
         // We intentionally don't ASSERT here because this is the pre-fix baseline.
         (void)vr;
@@ -205,14 +205,14 @@ TEST_F(ProducerStateDurabilityTest, RebuildFromLogRestoresDedup) {
     // PHASE 2 (GREEN): PSM rebuilt from the log correctly detects duplicates.
     // -----------------------------------------------------------------------
     ProducerStateManager rebuiltPsm;
-    // rebuildFromLog must scan log1 and reconstruct per-(pid,partition) state.
-    // We pass partition=kPartition (the partition these batches were produced to).
-    rebuiltPsm.rebuildFromLog(log1, log1.logEndOffset(), kPartition);
+    // rebuildFromLog must scan log1 and reconstruct per-(topicId,pid,partition) state.
+    // We pass topicId=0 and partition=kPartition (the partition these batches were produced to).
+    rebuiltPsm.rebuildFromLog(/*topicId=*/0, log1, log1.logEndOffset(), kPartition);
 
     // After rebuild: seq=0..N-1 are all in the retry window (kRetryWindowSize=5
     // and we appended exactly 5 batches, so all fit).
     for (int seq = 0; seq < kN; ++seq) {
-        auto vr = rebuiltPsm.validate(kPid, kPartition, kEpoch, seq, seq);
+        auto vr = rebuiltPsm.validate(/*topicId=*/0, kPid, kPartition, kEpoch, seq, seq);
         ASSERT_TRUE(vr.isDuplicate())
             << "seq=" << seq << " must be Duplicate after rebuild; got status="
             << static_cast<int>(vr.status);
@@ -222,7 +222,7 @@ TEST_F(ProducerStateDurabilityTest, RebuildFromLogRestoresDedup) {
 
     // A genuinely new sequence should still be accepted.
     {
-        auto vr = rebuiltPsm.validate(kPid, kPartition, kEpoch, kN, kN);
+        auto vr = rebuiltPsm.validate(/*topicId=*/0, kPid, kPartition, kEpoch, kN, kN);
         ASSERT_TRUE(vr.isAccept())
             << "seq=" << kN << " (new) must be Accept after rebuild";
     }
@@ -265,12 +265,12 @@ TEST_F(ProducerStateDurabilityTest, FailoverLeaderRebuildsDedup) {
 
     // New leader node2 builds a fresh PSM and rebuilds from its log.
     ProducerStateManager newLeaderPsm;
-    newLeaderPsm.rebuildFromLog(log2, node2_->highWatermark(), kPartition2);
+    newLeaderPsm.rebuildFromLog(/*topicId=*/0, log2, node2_->highWatermark(), kPartition2);
 
     // Re-send the last committed batch (seq = kN-1) — must be Duplicate.
     {
         int32_t lastSeq = kN - 1;
-        auto vr = newLeaderPsm.validate(kPid, kPartition2, kEpoch, lastSeq, lastSeq);
+        auto vr = newLeaderPsm.validate(/*topicId=*/0, kPid, kPartition2, kEpoch, lastSeq, lastSeq);
         ASSERT_TRUE(vr.isDuplicate())
             << "Re-sending seq=" << lastSeq << " after failover must be Duplicate; "
             << "got status=" << static_cast<int>(vr.status)
@@ -285,7 +285,7 @@ TEST_F(ProducerStateDurabilityTest, FailoverLeaderRebuildsDedup) {
 
     // Re-send seq=0 — also Duplicate.
     {
-        auto vr = newLeaderPsm.validate(kPid, kPartition2, kEpoch, 0, 0);
+        auto vr = newLeaderPsm.validate(/*topicId=*/0, kPid, kPartition2, kEpoch, 0, 0);
         ASSERT_TRUE(vr.isDuplicate())
             << "Re-sending seq=0 after failover must be Duplicate";
         EXPECT_EQ(vr.retryBaseOffset, baseOffsets[0]);
@@ -293,7 +293,7 @@ TEST_F(ProducerStateDurabilityTest, FailoverLeaderRebuildsDedup) {
 
     // A genuinely new sequence (seq=kN) must be accepted.
     {
-        auto vr = newLeaderPsm.validate(kPid, kPartition2, kEpoch, kN, kN);
+        auto vr = newLeaderPsm.validate(/*topicId=*/0, kPid, kPartition2, kEpoch, kN, kN);
         ASSERT_TRUE(vr.isAccept())
             << "New seq=" << kN << " must be Accept on new leader";
     }
@@ -318,24 +318,24 @@ TEST_F(ProducerStateDurabilityTest, RebuildIsIdempotent) {
     }
 
     ProducerStateManager psm;
-    psm.rebuildFromLog(log1, log1.logEndOffset(), kPart);
+    psm.rebuildFromLog(/*topicId=*/0, log1, log1.logEndOffset(), kPart);
 
     // First rebuild: duplicate detected.
     {
-        auto vr = psm.validate(kPid, kPart, kEpoch, 0, 0);
+        auto vr = psm.validate(/*topicId=*/0, kPid, kPart, kEpoch, 0, 0);
         ASSERT_TRUE(vr.isDuplicate()) << "First rebuild must detect dup seq=0";
     }
 
     // Second rebuild: idempotent — state cleared and replayed from log.
-    psm.rebuildFromLog(log1, log1.logEndOffset(), kPart);
+    psm.rebuildFromLog(/*topicId=*/0, log1, log1.logEndOffset(), kPart);
     {
-        auto vr = psm.validate(kPid, kPart, kEpoch, 0, 0);
+        auto vr = psm.validate(/*topicId=*/0, kPid, kPart, kEpoch, 0, 0);
         ASSERT_TRUE(vr.isDuplicate()) << "Second rebuild must still detect dup seq=0";
     }
 
     // Accept for new seq is also correct after double rebuild.
     {
-        auto vr = psm.validate(kPid, kPart, kEpoch, kN, kN);
+        auto vr = psm.validate(/*topicId=*/0, kPid, kPart, kEpoch, kN, kN);
         ASSERT_TRUE(vr.isAccept()) << "New seq after double rebuild must be Accept";
     }
 }
@@ -367,11 +367,11 @@ TEST_F(ProducerStateDurabilityTest, NonIdempotentBatchesSkippedInRebuild) {
     }
 
     ProducerStateManager psm;
-    psm.rebuildFromLog(log1, log1.logEndOffset(), kPart);
+    psm.rebuildFromLog(/*topicId=*/0, log1, log1.logEndOffset(), kPart);
 
     // The idempotent batch's seq=0 must be deduped.
     {
-        auto vr = psm.validate(kPid, kPart, kEpoch, 0, 0);
+        auto vr = psm.validate(/*topicId=*/0, kPid, kPart, kEpoch, 0, 0);
         ASSERT_TRUE(vr.isDuplicate())
             << "seq=0 of idempotent batch must be Duplicate after rebuild";
         EXPECT_EQ(vr.retryBaseOffset, idempotentBase);

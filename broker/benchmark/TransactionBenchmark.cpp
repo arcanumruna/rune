@@ -90,10 +90,10 @@ static void BM_Dedup_ValidateUpdate(benchmark::State& state) {
             state.ResumeTiming();
         }
 
-        auto result = psm.validate(kProducerId, kPartition, kEpoch, seq, seq);
+        auto result = psm.validate(/*topicId=*/0, kProducerId, kPartition, kEpoch, seq, seq);
         benchmark::DoNotOptimize(result);
         if (result.isAccept()) {
-            psm.update(kProducerId, kPartition, kEpoch, seq, seq, logOffset);
+            psm.update(/*topicId=*/0, kProducerId, kPartition, kEpoch, seq, seq, logOffset);
             ++logOffset;
         }
         ++seq;

@@ -44,7 +44,8 @@ static std::string tmpPath(const char* tag = "psm") {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers to call validate+update together
+// Helpers to call validate+update together.
+// Default topicId=0 for backward-compatible single-topic tests.
 // ---------------------------------------------------------------------------
 static ValidationResult produce(ProducerStateManager& m,
                                 int64_t pid,
@@ -52,12 +53,13 @@ static ValidationResult produce(ProducerStateManager& m,
                                 int16_t epoch,
                                 int32_t baseSeq,
                                 int32_t recordCount,
-                                int64_t baseOffset)
+                                int64_t baseOffset,
+                                int32_t topicId = 0)
 {
     int32_t lastSeq = baseSeq + recordCount - 1;
-    auto r = m.validate(pid, partition, epoch, baseSeq, lastSeq);
+    auto r = m.validate(topicId, pid, partition, epoch, baseSeq, lastSeq);
     if (r.isAccept()) {
-        m.update(pid, partition, epoch, baseSeq, lastSeq, baseOffset);
+        m.update(topicId, pid, partition, epoch, baseSeq, lastSeq, baseOffset);
     }
     return r;
 }
@@ -68,19 +70,19 @@ static ValidationResult produce(ProducerStateManager& m,
 
 TEST(ProducerStateManager, BrandNewProducerBaseSequenceZeroAccepted) {
     ProducerStateManager m;
-    auto r = m.validate(42, 0, 0, 0, 0); // one record
+    auto r = m.validate(0, 42, 0, 0, 0, 0); // topicId=0, one record
     EXPECT_TRUE(r.isAccept());
 }
 
 TEST(ProducerStateManager, BrandNewProducerNonZeroBaseSequenceRejected) {
     ProducerStateManager m;
-    auto r = m.validate(42, 0, 0, 1, 2);
+    auto r = m.validate(0, 42, 0, 0, 1, 2);
     EXPECT_TRUE(r.isOos());
 }
 
 TEST(ProducerStateManager, BrandNewProducerLargeBaseSequenceRejected) {
     ProducerStateManager m;
-    auto r = m.validate(99, 0, 0, 100, 109);
+    auto r = m.validate(0, 99, 0, 0, 100, 109);
     EXPECT_TRUE(r.isOos());
 }
 
@@ -97,7 +99,7 @@ TEST(ProducerStateManager, InOrderBatchesAccepted) {
     // batch 2: seq 10..10
     EXPECT_TRUE(produce(m, 1, 0, 0, 10, 1, 3000).isAccept());
 
-    const auto* e = m.entry(1, 0);
+    const auto* e = m.entry(0, 1, 0);
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->lastSequence, 10);
 }
@@ -108,7 +110,7 @@ TEST(ProducerStateManager, SingleRecordBatchesSequentiallyAccepted) {
         EXPECT_TRUE(produce(m, 7, 0, 0, seq, 1, seq * 100LL).isAccept())
             << "seq=" << seq;
     }
-    EXPECT_EQ(m.entry(7, 0)->lastSequence, 9);
+    EXPECT_EQ(m.entry(0, 7, 0)->lastSequence, 9);
 }
 
 // ===========================================================================
@@ -121,7 +123,7 @@ TEST(ProducerStateManager, DuplicateBatchReturnsPriorOffset) {
     EXPECT_TRUE(produce(m, 10, 0, 0, 0, 3, 5000).isAccept());
 
     // Retry: same epoch+baseSequence+lastSequence
-    auto r = m.validate(10, 0, 0, 0, 2);
+    auto r = m.validate(0, 10, 0, 0, 0, 2);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 5000);
 }
@@ -131,10 +133,10 @@ TEST(ProducerStateManager, DuplicateDoesNotAdvanceState) {
     produce(m, 10, 0, 0, 0, 3, 5000);
 
     // Duplicate — should not advance lastSequence
-    auto dup_r = m.validate(10, 0, 0, 0, 2); // must not call update
+    auto dup_r = m.validate(0, 10, 0, 0, 0, 2); // must not call update
     EXPECT_TRUE(dup_r.isDuplicate());
 
-    const auto* e = m.entry(10, 0);
+    const auto* e = m.entry(0, 10, 0);
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->lastSequence, 2); // still 2, not advanced
 }
@@ -145,7 +147,7 @@ TEST(ProducerStateManager, DuplicateOfSecondBatchReturnsPriorOffset) {
     produce(m, 11, 0, 0, 3, 4, 2000); // seq 3..6 → offset 2000
 
     // Retry of second batch
-    auto r = m.validate(11, 0, 0, 3, 6);
+    auto r = m.validate(0, 11, 0, 0, 3, 6);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 2000);
 }
@@ -157,7 +159,7 @@ TEST(ProducerStateManager, DuplicateOfFirstBatchAfterSeveralBatches) {
     produce(m, 12, 0, 0, 4, 2, 300); // seq 4..5
 
     // Retry of first batch (still within window of 5)
-    auto r = m.validate(12, 0, 0, 0, 1);
+    auto r = m.validate(0, 12, 0, 0, 0, 1);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 100);
 }
@@ -170,14 +172,14 @@ TEST(ProducerStateManager, ForwardGapRejected) {
     ProducerStateManager m;
     produce(m, 20, 0, 0, 0, 3, 1000); // seq 0..2
     // Expected next: 3; send 5 → gap
-    auto r = m.validate(20, 0, 0, 5, 6);
+    auto r = m.validate(0, 20, 0, 0, 5, 6);
     EXPECT_TRUE(r.isOos());
 }
 
 TEST(ProducerStateManager, LargeForwardGapRejected) {
     ProducerStateManager m;
     produce(m, 21, 0, 0, 0, 1, 1000);
-    auto r = m.validate(21, 0, 0, 1000, 1000);
+    auto r = m.validate(0, 21, 0, 0, 1000, 1000);
     EXPECT_TRUE(r.isOos());
 }
 
@@ -192,7 +194,7 @@ TEST(ProducerStateManager, ReplayBeyondRetryWindowIsOos) {
         baseOffset += 100;
     }
     // The very first batch (seq 0..0) has been evicted from the window.
-    auto r = m.validate(30, 0, 0, 0, 0);
+    auto r = m.validate(0, 30, 0, 0, 0, 0);
     // It's below the expected next sequence but NOT in the window → OOS
     EXPECT_TRUE(r.isOos());
 }
@@ -204,14 +206,14 @@ TEST(ProducerStateManager, ReplayBeyondRetryWindowIsOos) {
 TEST(ProducerStateManager, LowerEpochFenced) {
     ProducerStateManager m;
     produce(m, 50, 0, 2, 0, 1, 1000); // epoch 2 established
-    auto r = m.validate(50, 0, 1, 1, 1); // epoch 1 < 2
+    auto r = m.validate(0, 50, 0, 1, 1, 1); // epoch 1 < 2
     EXPECT_TRUE(r.isFenced());
 }
 
 TEST(ProducerStateManager, SameEpochNotFenced) {
     ProducerStateManager m;
     produce(m, 50, 0, 2, 0, 1, 1000);
-    auto r = m.validate(50, 0, 2, 1, 1);
+    auto r = m.validate(0, 50, 0, 2, 1, 1);
     EXPECT_TRUE(r.isAccept());
 }
 
@@ -219,7 +221,7 @@ TEST(ProducerStateManager, HigherEpochAcceptsAndResetsSequence) {
     ProducerStateManager m;
     produce(m, 60, 0, 1, 0, 5, 1000); // epoch 1, seq 0..4
     // Epoch 2: new session, must start at seq 0
-    auto r = m.validate(60, 0, 2, 0, 2);
+    auto r = m.validate(0, 60, 0, 2, 0, 2);
     EXPECT_TRUE(r.isAccept());
 }
 
@@ -227,7 +229,7 @@ TEST(ProducerStateManager, HigherEpochNonZeroBaseSequenceRejected) {
     ProducerStateManager m;
     produce(m, 60, 0, 1, 0, 5, 1000);
     // Epoch 2 but baseSequence != 0
-    auto r = m.validate(60, 0, 2, 3, 5);
+    auto r = m.validate(0, 60, 0, 2, 3, 5);
     EXPECT_TRUE(r.isOos());
 }
 
@@ -241,12 +243,12 @@ TEST(ProducerStateManager, HigherEpochClearsRetryWindow) {
     // Old epoch's batches should NOT appear as duplicates in the new session.
     // seq 0..2 in epoch 0 was at offset 1000, but in epoch 1 seq 0..1 @ 2000.
     // Validate epoch 1 seq 0..1 → should be Duplicate (still in window).
-    auto r = m.validate(70, 0, 1, 0, 1);
+    auto r = m.validate(0, 70, 0, 1, 0, 1);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 2000);
 
     // Epoch 0 batch in epoch 1 → fenced
-    auto r2 = m.validate(70, 0, 0, 0, 2);
+    auto r2 = m.validate(0, 70, 0, 0, 0, 2);
     EXPECT_TRUE(r2.isFenced());
 }
 
@@ -268,12 +270,12 @@ TEST(ProducerStateManager, TwoProducersIndependent) {
     produce(m, 101, 0, 0, 0, 5, 2000); // pid 101 seq 0..4
 
     // pid 100 next: 3
-    EXPECT_TRUE(m.validate(100, 0, 0, 3, 3).isAccept());
+    EXPECT_TRUE(m.validate(0, 100, 0, 0, 3, 3).isAccept());
     // pid 101 next: 5
-    EXPECT_TRUE(m.validate(101, 0, 0, 5, 5).isAccept());
+    EXPECT_TRUE(m.validate(0, 101, 0, 0, 5, 5).isAccept());
 
     // pid 100 retry seq 0..2 → Duplicate @ 1000
-    auto r = m.validate(100, 0, 0, 0, 2);
+    auto r = m.validate(0, 100, 0, 0, 0, 2);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 1000);
 }
@@ -284,11 +286,11 @@ TEST(ProducerStateManager, SameProducerDifferentPartitionsIndependent) {
     produce(m, 200, 1, 0, 0, 5, 2000); // partition 1
 
     // Partition 0: next = 3; partition 1: next = 5
-    EXPECT_TRUE(m.validate(200, 0, 0, 3, 3).isAccept());
-    EXPECT_TRUE(m.validate(200, 1, 0, 5, 5).isAccept());
+    EXPECT_TRUE(m.validate(0, 200, 0, 0, 3, 3).isAccept());
+    EXPECT_TRUE(m.validate(0, 200, 1, 0, 5, 5).isAccept());
 
     // Partition 1 duplicate
-    auto r = m.validate(200, 1, 0, 0, 4);
+    auto r = m.validate(0, 200, 1, 0, 0, 4);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 2000);
 }
@@ -306,7 +308,7 @@ TEST(ProducerStateManager, ManyProducersManyPartitions) {
     // Each cell should expect seq 2 next
     for (int64_t pid = 1; pid <= 4; ++pid) {
         for (int32_t part = 0; part < 4; ++part) {
-            EXPECT_TRUE(m.validate(pid, part, 0, 2, 3).isAccept())
+            EXPECT_TRUE(m.validate(0, pid, part, 0, 2, 3).isAccept())
                 << "pid=" << pid << " part=" << part;
         }
     }
@@ -324,7 +326,7 @@ TEST(ProducerStateManager, RetryWindowHoldsLastNBatches) {
     }
     // All should still be in window.
     for (int i = 0; i < kRetryWindowSize; ++i) {
-        auto r = m.validate(300, 0, 0, i, i);
+        auto r = m.validate(0, 300, 0, 0, i, i);
         EXPECT_TRUE(r.isDuplicate()) << "i=" << i;
         EXPECT_EQ(r.retryBaseOffset, 5000 + i * 100LL) << "i=" << i;
     }
@@ -337,11 +339,11 @@ TEST(ProducerStateManager, RetryWindowEvictsOldestBatch) {
         produce(m, 301, 0, 0, i, 1, 7000 + i * 50LL);
     }
     // Batch 0 (seq 0..0) should be evicted → OOS (below expected, not in window).
-    auto r0 = m.validate(301, 0, 0, 0, 0);
+    auto r0 = m.validate(0, 301, 0, 0, 0, 0);
     EXPECT_TRUE(r0.isOos());
 
     // Batch 1 (seq 1..1) is the new oldest → still a Duplicate.
-    auto r1 = m.validate(301, 0, 0, 1, 1);
+    auto r1 = m.validate(0, 301, 0, 0, 1, 1);
     EXPECT_TRUE(r1.isDuplicate());
     EXPECT_EQ(r1.retryBaseOffset, 7000 + 1 * 50LL);
 }
@@ -354,14 +356,14 @@ TEST(ProducerStateManager, RetryWindowCorrectAfterManyBatches) {
     }
     // The last kRetryWindowSize batches should still be in window.
     for (int i = total - kRetryWindowSize; i < total; ++i) {
-        auto r = m.validate(302, 0, 0, i, i);
+        auto r = m.validate(0, 302, 0, 0, i, i);
         EXPECT_TRUE(r.isDuplicate()) << "i=" << i;
         EXPECT_EQ(r.retryBaseOffset, 9000 + i * 10LL) << "i=" << i;
     }
     // Batch before the window → OOS
     int evicted = total - kRetryWindowSize - 1;
     if (evicted >= 0) {
-        auto r = m.validate(302, 0, 0, evicted, evicted);
+        auto r = m.validate(0, 302, 0, 0, evicted, evicted);
         EXPECT_TRUE(r.isOos()) << "evicted=" << evicted;
     }
 }
@@ -384,12 +386,12 @@ TEST(ProducerStateManager, SnapshotAndRecoverRestoresState) {
     EXPECT_EQ(loaded, 1); // 1 producer-partition entry
 
     // Duplicate of batch 1 should still be recognized.
-    auto r = m2.validate(400, 0, 0, 3, 4);
+    auto r = m2.validate(0, 400, 0, 0, 3, 4);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 2000);
 
     // Next expected: seq 5
-    EXPECT_TRUE(m2.validate(400, 0, 0, 5, 5).isAccept());
+    EXPECT_TRUE(m2.validate(0, 400, 0, 0, 5, 5).isAccept());
 
     ::unlink(path.c_str());
 }
@@ -410,11 +412,11 @@ TEST(ProducerStateManager, SnapshotAndRecoverMultipleEntries) {
     EXPECT_EQ(loaded, 4);
 
     // pid=1, partition=0: dup of seq 0
-    EXPECT_TRUE(m2.validate(1, 0, 0, 0, 0).isDuplicate());
+    EXPECT_TRUE(m2.validate(0, 1, 0, 0, 0, 0).isDuplicate());
     // pid=2, partition=0: next = 1
-    EXPECT_TRUE(m2.validate(2, 0, 0, 1, 1).isAccept());
+    EXPECT_TRUE(m2.validate(0, 2, 0, 0, 1, 1).isAccept());
     // pid=3, partition=5: epoch 1 is fenced
-    EXPECT_TRUE(m2.validate(3, 5, 1, 0, 0).isFenced());
+    EXPECT_TRUE(m2.validate(0, 3, 5, 1, 0, 0).isFenced());
 
     ::unlink(path.c_str());
 }
@@ -470,7 +472,7 @@ TEST(ProducerStateManager, CorruptWindowCountClamped) {
 // S3: baseSequence=0 for a new producer is valid (regression for the assert).
 TEST(ProducerStateManager, ValidBaseSequenceAccepted) {
     ProducerStateManager psm;
-    auto r = psm.validate(999, 0, 0, 0, 0);
+    auto r = psm.validate(0, 999, 0, 0, 0, 0);
     EXPECT_TRUE(r.isAccept()) << "baseSequence=0 for new producer must be Accept";
 }
 
@@ -542,7 +544,7 @@ TEST(ProducerStateManager, SnapshotDedupSurvivesRestartRetryWindow) {
 
     // All kRetryWindowSize batches should still be in window.
     for (int i = 0; i < kRetryWindowSize; ++i) {
-        auto r = m.validate(500, 0, 0, i, i);
+        auto r = m.validate(0, 500, 0, 0, i, i);
         EXPECT_TRUE(r.isDuplicate()) << "i=" << i;
         EXPECT_EQ(r.retryBaseOffset, 8000 + i * 10LL) << "i=" << i;
     }
@@ -561,9 +563,9 @@ TEST(ProducerStateManager, SnapshotPreservesEpoch) {
     m2.recover(path);
 
     // Epoch 2 should be fenced after recovery
-    EXPECT_TRUE(m2.validate(600, 0, 2, 1, 1).isFenced());
+    EXPECT_TRUE(m2.validate(0, 600, 0, 2, 1, 1).isFenced());
     // Epoch 4 should be accepted (new session)
-    EXPECT_TRUE(m2.validate(600, 0, 4, 0, 0).isAccept());
+    EXPECT_TRUE(m2.validate(0, 600, 0, 4, 0, 0).isAccept());
 
     ::unlink(path.c_str());
 }
@@ -580,21 +582,21 @@ TEST(ProducerStateManager, LargeInt32SequencesHandled) {
     produce(m, 700, 0, 0, base, 10, 2000);      // seq base .. base+9
 
     // Dup of second batch
-    auto r = m.validate(700, 0, 0, base, base + 9);
+    auto r = m.validate(0, 700, 0, 0, base, base + 9);
     EXPECT_TRUE(r.isDuplicate());
     EXPECT_EQ(r.retryBaseOffset, 2000);
 
     // Next: base+10
-    EXPECT_TRUE(m.validate(700, 0, 0, base + 10, base + 10).isAccept());
+    EXPECT_TRUE(m.validate(0, 700, 0, 0, base + 10, base + 10).isAccept());
 }
 
 TEST(ProducerStateManager, VeryFirstBatchOneRecord) {
     ProducerStateManager m;
-    auto r = m.validate(800, 0, 0, 0, 0); // 1 record, lastSeq=0
+    auto r = m.validate(0, 800, 0, 0, 0, 0); // topicId=0, 1 record, lastSeq=0
     EXPECT_TRUE(r.isAccept());
-    m.update(800, 0, 0, 0, 0, 5000);
+    m.update(0, 800, 0, 0, 0, 0, 5000);
     // Next expected: 1
-    EXPECT_TRUE(m.validate(800, 0, 0, 1, 1).isAccept());
+    EXPECT_TRUE(m.validate(0, 800, 0, 0, 1, 1).isAccept());
 }
 
 // ===========================================================================
@@ -603,13 +605,13 @@ TEST(ProducerStateManager, VeryFirstBatchOneRecord) {
 
 TEST(ProducerStateManager, EntryNullForUnknownProducer) {
     ProducerStateManager m;
-    EXPECT_EQ(m.entry(9999, 0), nullptr);
+    EXPECT_EQ(m.entry(0, 9999, 0), nullptr);
 }
 
 TEST(ProducerStateManager, EntryReflectsLastSequence) {
     ProducerStateManager m;
     produce(m, 900, 0, 0, 0, 7, 1000);
-    const auto* e = m.entry(900, 0);
+    const auto* e = m.entry(0, 900, 0);
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->lastSequence, 6); // 0+7-1
     EXPECT_EQ(e->producerEpoch, 0);
@@ -621,13 +623,13 @@ TEST(ProducerStateManager, EntryReflectsLastSequence) {
 
 TEST(ProducerStateManager, BrandNewProducerEpoch2AcceptsSeq0) {
     ProducerStateManager m;
-    auto r = m.validate(1000, 0, 2, 0, 0);
+    auto r = m.validate(0, 1000, 0, 2, 0, 0);
     EXPECT_TRUE(r.isAccept());
 }
 
 TEST(ProducerStateManager, BrandNewProducerEpoch2RejectsSeq1) {
     ProducerStateManager m;
-    auto r = m.validate(1000, 0, 2, 1, 1);
+    auto r = m.validate(0, 1000, 0, 2, 1, 1);
     EXPECT_TRUE(r.isOos());
 }
 
@@ -647,8 +649,8 @@ TEST(ProducerStateManager, SnapshotCanBeOverwritten) {
 
     ProducerStateManager m2;
     m2.recover(path);
-    EXPECT_TRUE(m2.validate(1100, 0, 0, 0, 0).isDuplicate()); // still in window
-    EXPECT_TRUE(m2.validate(1100, 0, 0, 1, 1).isDuplicate()); // also in window
+    EXPECT_TRUE(m2.validate(0, 1100, 0, 0, 0, 0).isDuplicate()); // still in window
+    EXPECT_TRUE(m2.validate(0, 1100, 0, 0, 1, 1).isDuplicate()); // also in window
 
     ::unlink(path.c_str());
 }
@@ -664,7 +666,7 @@ TEST(ProducerStateManager, SnapshotCanBeOverwritten) {
 TEST(ProducerStateManager, NegativeBaseSequenceIsOos) {
     ProducerStateManager m;
     // Brand-new producer: negative baseSequence must be OOS, not accepted.
-    auto r = m.validate(42, 0, 0, -1, -1);
+    auto r = m.validate(0, 42, 0, 0, -1, -1);
     EXPECT_TRUE(r.isOos()) << "Negative baseSequence must return OOS";
 }
 
@@ -676,7 +678,7 @@ TEST(ProducerStateManager, NegativeBaseSequenceNotFalseDup) {
     produce(m, 55, 0, 0, 0, 3, 1000); // seq 0..2
 
     // A negative baseSequence must NOT collide with empty slots or real entries.
-    auto r = m.validate(55, 0, 0, -1, -1);
+    auto r = m.validate(0, 55, 0, 0, -1, -1);
     EXPECT_TRUE(r.isOos()) << "Negative baseSequence must return OOS on known producer";
     EXPECT_FALSE(r.isDuplicate()) << "Negative baseSequence must not match empty window slot";
 }
@@ -684,7 +686,7 @@ TEST(ProducerStateManager, NegativeBaseSequenceNotFalseDup) {
 // B20c: lastSequenceInBatch < baseSequence (malformed batch) returns OOS.
 TEST(ProducerStateManager, LastSeqBelowBaseSeqIsOos) {
     ProducerStateManager m;
-    auto r = m.validate(99, 0, 0, 5, 3); // lastSeq(3) < baseSeq(5)
+    auto r = m.validate(0, 99, 0, 0, 5, 3); // lastSeq(3) < baseSeq(5)
     EXPECT_TRUE(r.isOos()) << "lastSequence < baseSequence must return OOS";
 }
 
@@ -760,14 +762,14 @@ TEST(ProducerStateManager, DuplicateDetectedAcrossWindowWrap) {
     // Window is now full; windowHead has wrapped to 0 for the next write.
     // The batch we just added (wrapBatchSeq) occupies slot kRetryWindowSize-1.
     // Its duplicate must still be found.
-    auto r = m.validate(77, 0, 0, wrapBatchSeq, wrapBatchSeq);
+    auto r = m.validate(0, 77, 0, 0, wrapBatchSeq, wrapBatchSeq);
     EXPECT_TRUE(r.isDuplicate()) << "Duplicate must be found after window wrap";
     EXPECT_EQ(r.retryBaseOffset, wrapBatchOffset);
 
     // Add one more batch — this evicts the OLDEST (slot 0, seq 0).
     // After eviction, seq 0 is gone; a retry of seq 0 must return OOS.
     produce(m, 77, 0, 0, seq, 1, offset);
-    auto r2 = m.validate(77, 0, 0, 0, 0);
+    auto r2 = m.validate(0, 77, 0, 0, 0, 0);
     EXPECT_TRUE(r2.isOos()) << "Batch evicted from window must return OOS";
 }
 
@@ -788,18 +790,124 @@ TEST(ProducerStateManager, EpochBumpThenPreBumpReplayIsOos) {
 
     // Now try to replay epoch 0's batch (seq 0..2) in epoch 0.
     // This must be fenced (epoch 0 < current epoch 1).
-    auto r_fenced = m.validate(88, 0, 0, 0, 2);
+    auto r_fenced = m.validate(0, 88, 0, 0, 0, 2);
     EXPECT_TRUE(r_fenced.isFenced()) << "Replay of pre-bump batch must be fenced";
 
     // Try the same sequence numbers (0..1) in epoch 1 — these are in the epoch-1
     // window and must come back as Duplicate (offset 2000), not OOS.
-    auto r_dup = m.validate(88, 0, 1, 0, 1);
+    auto r_dup = m.validate(0, 88, 0, 1, 0, 1);
     EXPECT_TRUE(r_dup.isDuplicate()) << "Epoch-1 batch in window must be Duplicate";
     EXPECT_EQ(r_dup.retryBaseOffset, 2000);
 
     // Sequence 2 in epoch 1 must be OOS (window cleared; expected next is 2, lastSeq=1).
     // Actually expected next = lastSeq+1 = 2; so seq=2 is Accept, not OOS.
     // Verify: seq 3 (skip 2) must be OOS (gap).
-    auto r_gap = m.validate(88, 0, 1, 3, 3);
+    auto r_gap = m.validate(0, 88, 0, 1, 3, 3);
     EXPECT_TRUE(r_gap.isOos()) << "Forward gap in epoch 1 must be OOS";
+}
+
+// ===========================================================================
+// TX-2c — Cross-topic dedup isolation
+// ===========================================================================
+
+// TX-2c: The SAME producerId (+ epoch) producing independent sequences to
+// topicA:p0 (topicId=1) and topicB:p0 (topicId=2) MUST have completely
+// INDEPENDENT dedup state.
+//
+// Concretely:
+//   - topicA: seq 0, 1, 2  (all Accept)
+//   - topicB: seq 0, 1, 2  (all Accept — NOT cross-topic false Duplicate)
+//   - Real duplicate within topicA (seq=0 retry) → Duplicate
+//   - topicB still accepts its own seq 0 retry → Duplicate @ topicB's offset
+//
+// Without the TX-2c fix (topicId-less key) topicB:seq=0 would collide with
+// topicA's entry and return OutOfOrderSequence or Duplicate depending on the
+// ordering of produces.
+//
+// This test documents the RED→GREEN fix: it PASSES only with topicId in the key.
+// (To verify RED behavior: remove topicId from ProducerPartitionKey — topicB's
+// seq=0 will collide with topicA's state and fail the isAccept() assertion.)
+TEST(ProducerStateManager, CrossTopicDedupIsolation) {
+    ProducerStateManager m;
+
+    const int64_t kPid   = 77777;
+    const int16_t kEpoch = 3;
+    const int32_t kPart  = 0;       // same partition index in both topics
+    const int32_t topicA = 1;       // topicId = 1
+    const int32_t topicB = 2;       // topicId = 2
+
+    // -----------------------------------------------------------------------
+    // Phase 1: topicA gets seq 0, 1, 2 — all accepted.
+    // -----------------------------------------------------------------------
+    const int64_t offA0 = 1000, offA1 = 1001, offA2 = 1002;
+
+    EXPECT_TRUE(produce(m, kPid, kPart, kEpoch, 0, 1, offA0, topicA).isAccept())
+        << "topicA seq=0 must be Accept";
+    EXPECT_TRUE(produce(m, kPid, kPart, kEpoch, 1, 1, offA1, topicA).isAccept())
+        << "topicA seq=1 must be Accept";
+    EXPECT_TRUE(produce(m, kPid, kPart, kEpoch, 2, 1, offA2, topicA).isAccept())
+        << "topicA seq=2 must be Accept";
+
+    // -----------------------------------------------------------------------
+    // Phase 2: topicB gets seq 0, 1, 2 — INDEPENDENTLY accepted.
+    // Without TX-2c (topicId in key), topicB:seq=0 would collide with
+    // topicA's entry and return OOS or Dup.
+    // -----------------------------------------------------------------------
+    const int64_t offB0 = 2000, offB1 = 2001, offB2 = 2002;
+
+    EXPECT_TRUE(produce(m, kPid, kPart, kEpoch, 0, 1, offB0, topicB).isAccept())
+        << "TX-2c: topicB seq=0 must be Accept (independent from topicA). "
+           "A failure here means the key still lacks topicId (cross-topic collision).";
+    EXPECT_TRUE(produce(m, kPid, kPart, kEpoch, 1, 1, offB1, topicB).isAccept())
+        << "topicB seq=1 must be Accept";
+    EXPECT_TRUE(produce(m, kPid, kPart, kEpoch, 2, 1, offB2, topicB).isAccept())
+        << "topicB seq=2 must be Accept";
+
+    // -----------------------------------------------------------------------
+    // Phase 3: verify independent dedup windows.
+    // -----------------------------------------------------------------------
+
+    // Duplicate within topicA: seq=0 → Duplicate @ offA0.
+    {
+        auto vr = m.validate(topicA, kPid, kPart, kEpoch, 0, 0);
+        EXPECT_TRUE(vr.isDuplicate())
+            << "topicA seq=0 retry must be Duplicate (not cross-contaminated by topicB)";
+        EXPECT_EQ(vr.retryBaseOffset, offA0)
+            << "topicA dup must return topicA's original offset";
+    }
+
+    // Duplicate within topicB: seq=0 → Duplicate @ offB0 (NOT offA0).
+    {
+        auto vr = m.validate(topicB, kPid, kPart, kEpoch, 0, 0);
+        EXPECT_TRUE(vr.isDuplicate())
+            << "topicB seq=0 retry must be Duplicate (independent from topicA)";
+        EXPECT_EQ(vr.retryBaseOffset, offB0)
+            << "topicB dup must return topicB's own offset (not topicA's offset="
+            << offA0 << ")";
+    }
+
+    // topicA and topicB have independent next-sequence expectations:
+    // topicA: lastSeq=2 → next=3; topicB: lastSeq=2 → next=3.
+    EXPECT_TRUE(m.validate(topicA, kPid, kPart, kEpoch, 3, 3).isAccept())
+        << "topicA: seq=3 must be Accept";
+    EXPECT_TRUE(m.validate(topicB, kPid, kPart, kEpoch, 3, 3).isAccept())
+        << "topicB: seq=3 must be Accept";
+
+    // Verify PSM has separate entries for the two topics (size = 2).
+    EXPECT_EQ(m.size(), 2u)
+        << "PSM must hold SEPARATE entries for topicA and topicB (2 total, not 1)";
+
+    // Cross-check: topicA entry has epoch=kEpoch, lastSeq=2.
+    {
+        const auto* ea = m.entry(topicA, kPid, kPart);
+        ASSERT_NE(ea, nullptr) << "topicA entry must exist";
+        EXPECT_EQ(ea->lastSequence, 2) << "topicA lastSeq must be 2";
+    }
+
+    // Cross-check: topicB entry has epoch=kEpoch, lastSeq=2.
+    {
+        const auto* eb = m.entry(topicB, kPid, kPart);
+        ASSERT_NE(eb, nullptr) << "topicB entry must exist";
+        EXPECT_EQ(eb->lastSequence, 2) << "topicB lastSeq must be 2";
+    }
 }

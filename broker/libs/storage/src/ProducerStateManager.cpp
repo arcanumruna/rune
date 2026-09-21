@@ -88,12 +88,16 @@ static T rle(const uint8_t* p) noexcept { T v{}; std::memcpy(&v, p, sizeof(T)); 
 // Layout constants
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kFileMagic   = 0x50534D47u; // "PSMG"
-static constexpr uint32_t kFileVersion = 1u;
+// TX-2c: bumped to version 2 to include topicId in the per-entry header.
+// Version 1 snapshots (no topicId) are rejected cleanly in recover().
+static constexpr uint32_t kFileVersion = 2u;
 static constexpr uint32_t kFileHdrSize = 16u;         // magic+version+count+pad
 
 static constexpr uint32_t kBatchDescSize = 16u;       // int32+int32+int64
-// Per-entry fixed header: producerId(8) + partition(4) + epoch(2) + pad(2)
-//   + lastSequence(4) + windowHead(4) + windowCount(4) + pad(4) = 32
+// Per-entry fixed header (TX-2c, version 2):
+//   producerId(8) + partition(4) + epoch(2) + pad(2)
+//   + lastSequence(4) + windowHead(4) + windowCount(4) + topicId(4) = 32
+// topicId replaces the former trailing pad(4) at [28..31].
 static constexpr uint32_t kEntryFixedSize = 32u;
 static constexpr uint32_t kWindowBytes    = kRetryWindowSize * kBatchDescSize; // 80
 static constexpr uint32_t kChecksumSize   = 4u;
@@ -122,7 +126,8 @@ static BatchDescriptor decodeBatch(const uint8_t* p) noexcept {
 // validate — pure, no allocation, no locks
 // ---------------------------------------------------------------------------
 ValidationResult
-ProducerStateManager::validate(int64_t producerId,
+ProducerStateManager::validate(int32_t topicId,
+                               int64_t producerId,
                                int32_t partition,
                                int16_t producerEpoch,
                                int32_t baseSequence,
@@ -134,7 +139,7 @@ ProducerStateManager::validate(int64_t producerId,
     if (baseSequence < 0 || lastSequenceInBatch < baseSequence)
         return ValidationResult::oos();
 
-    const ProducerPartitionKey key{producerId, partition};
+    const ProducerPartitionKey key{topicId, producerId, partition};
     auto it = map_.find(key);
 
     if (it == map_.end()) {
@@ -187,14 +192,15 @@ ProducerStateManager::validate(int64_t producerId,
 // ---------------------------------------------------------------------------
 // update — called after a successful append
 // ---------------------------------------------------------------------------
-void ProducerStateManager::update(int64_t producerId,
+void ProducerStateManager::update(int32_t topicId,
+                                  int64_t producerId,
                                   int32_t partition,
                                   int16_t producerEpoch,
                                   int32_t baseSequence,
                                   int32_t lastSequence,
                                   int64_t baseOffset)
 {
-    ProducerStateEntry& e = getOrCreate(producerId, partition);
+    ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
 
     if (producerEpoch > e.producerEpoch) {
         // New epoch: clear retry window + reset sequence state.
@@ -218,18 +224,18 @@ void ProducerStateManager::update(int64_t producerId,
 // getOrCreate
 // ---------------------------------------------------------------------------
 ProducerStateEntry&
-ProducerStateManager::getOrCreate(int64_t producerId, int32_t partition)
+ProducerStateManager::getOrCreate(int32_t topicId, int64_t producerId, int32_t partition)
 {
-    return map_[ProducerPartitionKey{producerId, partition}];
+    return map_[ProducerPartitionKey{topicId, producerId, partition}];
 }
 
 // ---------------------------------------------------------------------------
 // entry (read-only accessor)
 // ---------------------------------------------------------------------------
 const ProducerStateEntry*
-ProducerStateManager::entry(int64_t producerId, int32_t partition) const noexcept
+ProducerStateManager::entry(int32_t topicId, int64_t producerId, int32_t partition) const noexcept
 {
-    auto it = map_.find(ProducerPartitionKey{producerId, partition});
+    auto it = map_.find(ProducerPartitionKey{topicId, producerId, partition});
     if (it == map_.end()) return nullptr;
     return &it->second;
 }
@@ -269,7 +275,7 @@ void ProducerStateManager::takeSnapshot(const std::string& path) const
         wle<int32_t>(ep + 16, e.lastSequence);
         wle<int32_t>(ep + 20, e.windowHead);
         wle<int32_t>(ep + 24, e.windowCount);
-        wle<int32_t>(ep + 28, 0); // pad
+        wle<int32_t>(ep + 28, key.topicId); // TX-2c: topicId (replaces former pad)
 
         uint8_t* wp = ep + kEntryFixedSize;
         for (int i = 0; i < kRetryWindowSize; ++i) {
@@ -389,7 +395,7 @@ int ProducerStateManager::recover(const std::string& path)
         e.lastSequence  = rle<int32_t>(ep + 16);
         e.windowHead    = rle<int32_t>(ep + 20);
         e.windowCount   = rle<int32_t>(ep + 24);
-        // [28..31] pad
+        key.topicId     = rle<int32_t>(ep + 28); // TX-2c: topicId (was former pad)
 
         // S5: clamp windowHead/windowCount to valid ranges (defense against corrupt snapshots).
         if (e.windowCount < 0 || e.windowCount > kRetryWindowSize)
@@ -440,7 +446,8 @@ int ProducerStateManager::recover(const std::string& path)
 //
 // Cold path: called once on leader election / restart.  Allocations acceptable.
 // ---------------------------------------------------------------------------
-void ProducerStateManager::rebuildFromLog(Log&     log,
+void ProducerStateManager::rebuildFromLog(int32_t topicId,
+                                           Log&     log,
                                            int64_t highWatermark,
                                            int32_t partition)
 {
@@ -511,7 +518,7 @@ void ProducerStateManager::rebuildFromLog(Log&     log,
                 // (for a multi-record batch, lastOffsetDelta == recordCount - 1,
                 //  matching how handleProduce computes lastSeqInBatch).
                 const int32_t lastSeq = baseSeq + lastDelta;
-                update(pid, partition, epoch, baseSeq, lastSeq, batchBase);
+                update(topicId, pid, partition, epoch, baseSeq, lastSeq, batchBase);
             }
 
             if (batchEnd > lastBatchEnd) lastBatchEnd = batchEnd;

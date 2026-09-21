@@ -728,7 +728,9 @@ private:
     // TX-2: Idempotent-producer dedup state.
     //
     // Owned by the gateway (one per gateway instance).  Keyed by
-    // (producerId, partition).  Consulted in handleProduce() when msg.producerId != -1.
+    // (topicId, producerId, partition).  Consulted in handleProduce() when msg.producerId != -1.
+    // TX-2c: topicId added to the key to prevent cross-topic state collision for the
+    // same producerId+partition across different topics.
     //
     // Ownership rationale: Log and PartitionReplica do NOT own a
     // ProducerStateManager in the current codebase; the ExactlyOnceHarness

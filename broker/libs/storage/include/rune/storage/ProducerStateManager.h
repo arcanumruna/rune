@@ -107,14 +107,23 @@ struct ValidationResult {
 };
 
 // ---------------------------------------------------------------------------
-// Key: (producerId, partition)
+// Key: (topicId, producerId, partition)
+//
+// TX-2c: topicId is included so that the same producerId producing to
+// topicA:partition0 and topicB:partition0 maintains INDEPENDENT dedup state.
+// Without topicId the map_ keyed only on (producerId, partition) caused
+// cross-topic false OutOfOrderSequence / Duplicate for any producer that
+// writes to more than one topic.
 // ---------------------------------------------------------------------------
 struct ProducerPartitionKey {
+    int32_t topicId;
     int64_t producerId;
     int32_t partition;
 
     bool operator==(const ProducerPartitionKey& o) const noexcept {
-        return producerId == o.producerId && partition == o.partition;
+        return topicId == o.topicId &&
+               producerId == o.producerId &&
+               partition == o.partition;
     }
 };
 
@@ -125,7 +134,7 @@ namespace std {
 template<>
 struct hash<rune::storage::ProducerPartitionKey> {
     std::size_t operator()(const rune::storage::ProducerPartitionKey& k) const noexcept {
-        // Combine the two halves with a mix that mirrors Kafka's hashCode idiom.
+        // Combine the three fields with a mix that mirrors Kafka's hashCode idiom.
         std::size_t h = static_cast<std::size_t>(k.producerId);
         h ^= (h >> 30);
         h *= 0xbf58476d1ce4e5b9ULL;
@@ -133,6 +142,8 @@ struct hash<rune::storage::ProducerPartitionKey> {
         h *= 0x94d049bb133111ebULL;
         h ^= (h >> 31);
         h ^= static_cast<std::size_t>(k.partition) * 0x9e3779b97f4a7c15ULL;
+        // TX-2c: mix in topicId so different topics hash differently.
+        h ^= static_cast<std::size_t>(static_cast<uint32_t>(k.topicId)) * 0x517cc1b727220a95ULL;
         return h;
     }
 };
@@ -156,6 +167,7 @@ public:
     // -----------------------------------------------------------------------
     // validate — hot path, no allocation, no locks.
     //
+    // @param topicId          — topic id (TX-2c: required for isolation across topics)
     // @param producerId       — 64-bit producer id (allocated by coordinator)
     // @param partition        — partition number
     // @param producerEpoch    — epoch of this producer session (int16)
@@ -166,7 +178,8 @@ public:
     // successful append if and only if the result is Accept.
     // -----------------------------------------------------------------------
     [[nodiscard]]
-    ValidationResult validate(int64_t producerId,
+    ValidationResult validate(int32_t topicId,
+                              int64_t producerId,
                               int32_t partition,
                               int16_t producerEpoch,
                               int32_t baseSequence,
@@ -177,7 +190,8 @@ public:
     //
     // Advances lastSequence and records the batch in the retry window.
     // -----------------------------------------------------------------------
-    void update(int64_t producerId,
+    void update(int32_t topicId,
+                int64_t producerId,
                 int32_t partition,
                 int16_t producerEpoch,
                 int32_t baseSequence,
@@ -212,6 +226,8 @@ public:
     // the in-flight sequence), so scanning forward from offset 0 naturally
     // reconstructs the correct window state as of the log end.
     //
+    // @param topicId        The topic id to use as part of the key (TX-2c: ensures
+    //                       cross-topic isolation for the same producerId+partition).
     // @param log            The partition Log to scan (non-const: Log::read is
     //                       non-const in the current implementation).
     // @param highWatermark  Scan up to (exclusive) this log offset.
@@ -224,22 +240,22 @@ public:
     //                       Pass log.logEndOffset() ONLY when HW == LEO (e.g.
     //                       single-node passthrough with no uncommitted tail).
     // @param partition      The partition id to use as the key (producer state
-    //                       is keyed by (producerId, partition)).
+    //                       is keyed by (topicId, producerId, partition)).
     //
     // Cold path — allocations are acceptable here.
     // Single-writer: call only on the duty-cycle thread.
     // -----------------------------------------------------------------------
-    void rebuildFromLog(Log& log, int64_t highWatermark, int32_t partition);
+    void rebuildFromLog(int32_t topicId, Log& log, int64_t highWatermark, int32_t partition);
 
     // -----------------------------------------------------------------------
     // Accessors (for tests / Phase-5 coordinator)
     // -----------------------------------------------------------------------
-    const ProducerStateEntry* entry(int64_t producerId, int32_t partition) const noexcept;
+    const ProducerStateEntry* entry(int32_t topicId, int64_t producerId, int32_t partition) const noexcept;
     std::size_t size() const noexcept { return map_.size(); }
 
 private:
     // Look up or create an entry.  Called from update() only (not validate).
-    ProducerStateEntry& getOrCreate(int64_t producerId, int32_t partition);
+    ProducerStateEntry& getOrCreate(int32_t topicId, int64_t producerId, int32_t partition);
 
     std::unordered_map<ProducerPartitionKey, ProducerStateEntry> map_;
 };

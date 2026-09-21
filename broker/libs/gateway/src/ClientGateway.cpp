@@ -206,7 +206,7 @@ void ClientGateway::rebuildProducerStateFromLogs()
                 }
             }
 
-            producerStateManager_.rebuildFromLog(*log, scanTo, partition);
+            producerStateManager_.rebuildFromLog(topicId, *log, scanTo, partition);
         }
     }
 
@@ -1122,7 +1122,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (msg.producerId >= 0) {
         const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
         const auto vr = producerStateManager_.validate(
-            msg.producerId, partition,
+            msg.topicId, msg.producerId, partition,
             msg.producerEpoch, msg.baseSequence, lastSeqInBatch);
 
         if (vr.isDuplicate()) {
@@ -1211,7 +1211,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (msg.producerId >= 0) {
         const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
         producerStateManager_.update(
-            msg.producerId, partition,
+            msg.topicId, msg.producerId, partition,
             msg.producerEpoch, msg.baseSequence, lastSeqInBatch,
             base);
 
