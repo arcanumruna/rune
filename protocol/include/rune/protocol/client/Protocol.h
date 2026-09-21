@@ -34,6 +34,17 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     OffsetFetch          = 42,
     OffsetFetchResponse  = 43,
     Assign               = 44,
+    // txn range (45-54, inside groups/txn 32-63)
+    InitProducerId              = 45,
+    InitProducerIdResponse      = 46,
+    AddPartitionsToTxn          = 47,
+    AddPartitionsToTxnResponse  = 48,
+    AddOffsetsToTxn             = 49,
+    AddOffsetsToTxnResponse     = 50,
+    TxnOffsetCommit             = 51,
+    TxnOffsetCommitResponse     = 52,
+    EndTxn                      = 53,
+    EndTxnResponse              = 54,
 };
 
 enum class ErrorCode : uint16_t {
@@ -55,6 +66,12 @@ enum class ErrorCode : uint16_t {
     NotCoordinator       = 14,
     IllegalGeneration    = 15,
     GroupDead            = 16,
+    // txn error codes (TX-1)
+    InvalidProducerEpoch = 17,
+    ProducerFenced       = 18,
+    InvalidTxnState      = 19,
+    OutOfOrderSequence   = 20,
+    DuplicateSequence    = 21,
 };
 
 } // namespace rune::protocol::client
