@@ -1,14 +1,16 @@
 add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
-    src/GroupCoordinationService.cpp)
+    src/GroupCoordinationService.cpp
+    src/TransactionCoordinationService.cpp)
 
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
 # BrokerNode needs: consensus engine, gateway (BR-7a), replication (GR-2/GR-3), Aeron, spdlog
 # rune_coordination: GroupCoordinator + ReplicatedOffsetStore (CG-3)
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination)
+# rune_transaction: TransactionCoordinator + ReplicatedTxnStateStore (TX-3)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -46,6 +48,19 @@ if(BUILD_TESTING)
         rune_coordination
         GTest::gtest_main)
     gtest_discover_tests(rune_group_coordination_service_tests)
+
+    # ---------------------------------------------------------------------------
+    # TX-3: TransactionCoordinationService unit tests — injected leader toggle,
+    # single-node PartitionReplica (minIsr=1), no Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_txn_coordination_service_tests
+        tests/node/TransactionCoordinationServiceTest.cpp)
+    target_link_libraries(rune_txn_coordination_service_tests PRIVATE
+        rune_node
+        rune_transaction
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_txn_coordination_service_tests)
 
     # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService integration tests — drive real Join→doWork→

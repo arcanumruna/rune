@@ -211,9 +211,19 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
         case pc::TemplateId::OffsetFetch:
             handleGroupMessage(buf, len, nowNs_, fc.templateId);
             break;
+        // TX-3: txn request range (45,47,49,51,53); responses (46,48,50,52,54) are broker→client.
+        case pc::TemplateId::InitProducerId:
+        case pc::TemplateId::AddPartitionsToTxn:
+        case pc::TemplateId::AddOffsetsToTxn:
+        case pc::TemplateId::TxnOffsetCommit:
+        case pc::TemplateId::EndTxn:
+            handleTxnMessage(buf, len, nowNs_, fc.templateId);
+            break;
         default:
             // ConnectResponse, ErrorResponse, Pong, ProduceResponse, SubscribeResponse,
-            // Records, Assign — server→client or other direction; drop.
+            // Records, Assign, InitProducerIdResponse, AddPartitionsToTxnResponse,
+            // AddOffsetsToTxnResponse, TxnOffsetCommitResponse, EndTxnResponse
+            // — server→client or other direction; drop.
             break;
     }
 }
@@ -1983,6 +1993,69 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     if (encoded > scratch_.size()) {
         // Should never happen: handlers bound-check before writing.
         spdlog::error("ClientGateway: group response tid={} encoded size {} > scratch {} — BUG; dropped",
+                      tid, encoded, scratch_.size());
+        return;
+    }
+
+    sendTo(*session, scratch_.data(), encoded);
+}
+
+// ---------------------------------------------------------------------------
+// handleTxnMessage (TX-3) — route transaction frames to the
+// TransactionCoordinationService.
+//
+// Mirrors handleGroupMessage exactly: decode session from MessageHeader,
+// dispatch to txnService_, send the encoded response on the session egress.
+//
+// Single-writer: called only on the duty-cycle thread.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
+                                     int64_t nowNs, uint16_t tid)
+{
+    if (!txnService_) {
+        spdlog::debug("ClientGateway: txn message tid={} received but txnService_ not set — dropped", tid);
+        return;
+    }
+
+    auto hdrOpt = pc::MessageHeader::decode(buf, len);
+    if (!hdrOpt) {
+        spdlog::debug("ClientGateway: txn message tid={} header decode failed — dropped", tid);
+        return;
+    }
+
+    Session* session = sessions_.find(hdrOpt->sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: txn message tid={} for unknown sessionId={} — dropped",
+                      tid, hdrOpt->sessionId);
+        return;
+    }
+
+    std::size_t encoded = 0;
+    const std::size_t cap = scratch_.size();
+    const auto templateId = static_cast<pc::TemplateId>(tid);
+    switch (templateId) {
+        case pc::TemplateId::InitProducerId:
+            encoded = txnService_->handleInitProducerId(buf, len, nowNs, scratch_.data(), cap);
+            break;
+        case pc::TemplateId::AddPartitionsToTxn:
+            encoded = txnService_->handleAddPartitions(buf, len, nowNs, scratch_.data(), cap);
+            break;
+        case pc::TemplateId::AddOffsetsToTxn:
+            encoded = txnService_->handleAddOffsets(buf, len, nowNs, scratch_.data(), cap);
+            break;
+        case pc::TemplateId::TxnOffsetCommit:
+            encoded = txnService_->handleTxnOffsetCommit(buf, len, nowNs, scratch_.data(), cap);
+            break;
+        case pc::TemplateId::EndTxn:
+            encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap);
+            break;
+        default:
+            return; // unknown txn template — drop
+    }
+
+    if (encoded == 0) return;
+    if (encoded > scratch_.size()) {
+        spdlog::error("ClientGateway: txn response tid={} encoded size {} > scratch {} — BUG; dropped",
                       tid, encoded, scratch_.size());
         return;
     }

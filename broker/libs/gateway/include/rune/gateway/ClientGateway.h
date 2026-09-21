@@ -47,6 +47,7 @@
 
 #include <rune/gateway/SessionTable.h>
 #include <rune/gateway/IGroupRequestHandler.h>
+#include <rune/gateway/ITxnRequestHandler.h>
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -194,6 +195,26 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] rune::gateway::IGroupRequestHandler* groupService() const noexcept {
         return groupService_;
+    }
+
+    // -----------------------------------------------------------------------
+    // setTxnService — wire in the txn-request handler (TX-3).
+    // Accepts any ITxnRequestHandler implementation (e.g. TransactionCoordinationService).
+    // Must be called before doWork() if txn-coordination dispatch is desired.
+    // May be null (txn messages are dropped). Pointer is non-owning; lifetime
+    // must exceed the ClientGateway. Single-writer: call only on the duty-cycle thread.
+    // Dispatches templateIds 45 (InitProducerId), 47 (AddPartitionsToTxn),
+    // 49 (AddOffsetsToTxn), 51 (TxnOffsetCommit), 53 (EndTxn).
+    // -----------------------------------------------------------------------
+    void setTxnService(rune::gateway::ITxnRequestHandler* service) noexcept {
+        txnService_ = service;
+    }
+
+    // -----------------------------------------------------------------------
+    // txnService — current txn handler pointer (may be null).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] rune::gateway::ITxnRequestHandler* txnService() const noexcept {
+        return txnService_;
     }
 
     // -----------------------------------------------------------------------
@@ -421,6 +442,9 @@ private:
     // CG-3: Group coordination handler — routes templateIds 32–43 to GroupCoordinationService.
     // tid is the raw uint16_t template id (avoids including Protocol.h in this header).
     void handleGroupMessage (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
+    // TX-3: Transaction coordination handler — routes templateIds 45,47,49,51,53
+    // to TransactionCoordinationService.
+    void handleTxnMessage   (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
@@ -549,6 +573,13 @@ private:
     // (GroupCoordinationService) lives in rune_node — no circular dependency.
     // Single-writer: only accessed on the duty-cycle thread.
     rune::gateway::IGroupRequestHandler* groupService_ = nullptr;
+
+    // Transaction request handler (TX-3) — non-owning; set via setTxnService().
+    // Null until wired in; txn messages (templateIds 45,47,49,51,53) dispatched here.
+    // ITxnRequestHandler is defined in this lib (gateway); the concrete impl
+    // (TransactionCoordinationService) lives in rune_node — no circular dependency.
+    // Single-writer: only accessed on the duty-cycle thread.
+    rune::gateway::ITxnRequestHandler* txnService_ = nullptr;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;

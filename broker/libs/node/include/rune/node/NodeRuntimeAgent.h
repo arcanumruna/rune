@@ -28,6 +28,7 @@
 #include <rune/consensus/ConsensusAgent.h>  // defines rune::consensus::Agent
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/GroupCoordinationService.h>
+#include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -65,13 +66,15 @@ public:
     // @param registry        ReplicaRegistry (may be nullptr). Non-owning.
     // @param gateway         ClientGateway pointer (may be null). Non-owning.
     // @param groupService    GroupCoordinationService pointer (may be null). Non-owning.
+    // @param txnService      TransactionCoordinationService pointer (may be null). Non-owning.
     NodeRuntimeAgent(rune::consensus::Agent&            consensusAgent,
                      rune::consensus::Election*          election,
                      ReplicationMetadataBridge*          bridge,
                      rune::replication::AeronPartitionTransport* transport,
                      ReplicaRegistry*                    registry,
                      rune::gateway::ClientGateway*       gateway,
-                     GroupCoordinationService*           groupService = nullptr) noexcept
+                     GroupCoordinationService*           groupService = nullptr,
+                     TransactionCoordinationService*     txnService   = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(election)
         , bridge_(bridge)
@@ -79,12 +82,14 @@ public:
         , registry_(registry)
         , gateway_(gateway)
         , groupService_(groupService)
+        , txnService_(txnService)
     {}
 
     // Backward-compatible constructor for single-node / tests without replication.
-    NodeRuntimeAgent(rune::consensus::Agent&       consensusAgent,
-                     rune::gateway::ClientGateway* gateway,
-                     GroupCoordinationService*     groupService = nullptr) noexcept
+    NodeRuntimeAgent(rune::consensus::Agent&        consensusAgent,
+                     rune::gateway::ClientGateway*  gateway,
+                     GroupCoordinationService*      groupService = nullptr,
+                     TransactionCoordinationService* txnService  = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(nullptr)
         , bridge_(nullptr)
@@ -92,6 +97,7 @@ public:
         , registry_(nullptr)
         , gateway_(gateway)
         , groupService_(groupService)
+        , txnService_(txnService)
     {}
 
     NodeRuntimeAgent(const NodeRuntimeAgent&)            = delete;
@@ -119,6 +125,12 @@ public:
         //    any ingress group messages are processed by gateway.doWork.
         if (groupService_) {
             work += groupService_->doWork(nowNs);
+        }
+
+        // 3b. Transaction coordination service — drive alongside group service.
+        //     TX-3: drives timeout aborts; pending marker resolution (Task 8).
+        if (txnService_) {
+            work += txnService_->doWork(nowNs);
         }
 
         // 4. Transport poll — drain inbound Aeron frames, resolve pending pubs.
@@ -151,6 +163,7 @@ private:
     ReplicaRegistry*                                   registry_;   // non-owning; null-safe
     rune::gateway::ClientGateway*                      gateway_;    // non-owning; null-safe
     GroupCoordinationService*                          groupService_; // non-owning; null-safe (CG-3)
+    TransactionCoordinationService*                    txnService_;   // non-owning; null-safe (TX-3)
 };
 
 } // namespace rune::node
