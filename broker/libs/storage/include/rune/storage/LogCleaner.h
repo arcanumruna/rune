@@ -63,16 +63,24 @@ public:
     /// CP-2: bounded, single-segment compaction (the duty-cycle unit of work).
     ///
     /// Compacts EXACTLY the one sealed segment whose base offset == `segBase`,
-    /// keeping latest-per-key within that segment's own offset range
-    /// [segBase, segEnd).  Unlike clean(), this does NOT call the O(n) full-log
+    /// but computes latest-per-key GLOBALLY over the whole dirty range
+    /// [globalDirtyStart, activeSegmentBase) so cross-segment supersession is
+    /// honoured.  Unlike clean(), this does NOT call the O(n) full-log
     /// reloadSegments(): it reloads ONLY the rewritten segment in place via
     /// Log::reloadSegment(segBase), so a per-segment duty-cycle loop is O(n) total
     /// rather than O(n^2).  The active segment is never `segBase` (the caller passes
     /// a sealed segment) and records at/past segEnd are left untouched.
     ///
+    /// @param globalDirtyStart  Start of the WHOLE dirty range (the cleaned
+    ///        watermark).  The key->latest-offset map is built over
+    ///        [globalDirtyStart, activeSegmentBase) — the ENTIRE dirty region,
+    ///        NOT just this segment — so latest-per-key is GLOBAL: a record in
+    ///        this segment that is superseded by a later sealed segment is
+    ///        correctly dropped.  Only the ONE segment at segBase is rewritten.
     /// @returns true if a compaction rewrite ran (segment existed and was
     ///          processed); false if the segment was absent / already gone.
     bool cleanSegment(Log& log, Offset segBase, Offset segEnd,
+                      Offset globalDirtyStart,
                       int64_t nowNs, int64_t deleteRetentionMs);
 
 private:

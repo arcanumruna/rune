@@ -423,6 +423,7 @@ void LogCleaner::clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOf
 // cleanSegment  (CP-2: bounded single-segment compaction — O(1) reload)
 // ---------------------------------------------------------------------------
 bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
+                              Offset globalDirtyStart,
                               int64_t nowNs, int64_t deleteRetentionMs) {
     // Guard: the target segment must exist and must NOT be the active segment
     // (the active segment is always the highest-base segment and owns the LEO).
@@ -433,6 +434,7 @@ bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
     bool found = false;
     for (int64_t b : bases) { if (b == segBase) { found = true; break; } }
     if (!found) return false;
+    (void)segEnd; // retained for API symmetry / future byte-budgeted variants
 
     // Clean up any stale .log.new temp files left by a previous crashed run.
     for (auto& e : std::filesystem::directory_iterator(log.dir())) {
@@ -441,19 +443,29 @@ bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
         }
     }
 
-    // Build the offset map scoped to THIS segment's own range only.
+    // Build the offset map GLOBALLY over the whole dirty range
+    // [globalDirtyStart, activeBase).  This is the correctness fix: a record in
+    // THIS segment that is superseded by a newer record in a LATER sealed segment
+    // must be dropped, so latest-per-key has to be computed across ALL dirty
+    // segments, not just this one.  (Scanning the whole dirty prefix each cycle is
+    // O(dirty bytes); the expensive part that was O(n^2) — reopening every segment
+    // via reloadSegments() — is avoided by reloadSegment() below.)
+    if (globalDirtyStart < 0) globalDirtyStart = 0;
     OffsetMap map;
-    buildOffsetMap(log, segBase, segEnd, map);
+    buildOffsetMap(log, globalDirtyStart, activeBase, map);
 
-    // Rewrite exactly this one segment.  firstDirtyOffset == segBase;
-    // cleanBoundaryOffset == segEnd (records at/past it are untouched).
-    rewriteSegment(log, segBase, map, segBase, segEnd, nowNs, deleteRetentionMs);
+    // Rewrite exactly the ONE segment at segBase.  We pass the GLOBAL bounds
+    // (fromOffset = globalDirtyStart, cleanBoundaryOffset = activeBase) so the
+    // per-record filter inside rewriteSegment consults the global map and drops
+    // globally-superseded records.  rewriteSegment only ever reads+writes the
+    // single segBase .log file, so passing global bounds does not touch any other
+    // segment.
+    rewriteSegment(log, segBase, map, globalDirtyStart, activeBase, nowNs, deleteRetentionMs);
 
     // Reload ONLY this segment in place — O(1) in the number of segments.  This
-    // is the crux of the CP-2 perf fix: the previous path funnelled through
-    // clean()->compact()->Log::reloadSegments() which re-recover()s EVERY segment,
-    // making a per-segment duty-cycle loop O(n^2) (~22s for 100 segments; ~128ms
-    // after this change).
+    // avoids the O(n) full-log reloadSegments() (re-recover() of EVERY segment)
+    // that made a per-segment duty-cycle loop O(n^2) (~22s for 100 segments;
+    // ~128ms after this change).
     log.reloadSegment(segBase);
     return true;
 }

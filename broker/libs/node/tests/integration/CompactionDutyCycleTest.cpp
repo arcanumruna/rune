@@ -73,82 +73,9 @@ public:
     void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
 };
 
-// ---------------------------------------------------------------------------
-// TestFixture — creates a PartitionReplica with Compact policy, wired into a
-// ReplicaRegistry, and a NodeRuntimeAgent that drives runBoundedCompaction.
-// ---------------------------------------------------------------------------
-struct CompactionHarness {
-    fs::path           dir;
-    std::unique_ptr<Log>                         log;
-    std::unique_ptr<NullTransport>               transport;
-    std::unique_ptr<PartitionReplica>            replica;
-    std::unique_ptr<rune::node::ReplicaRegistry> registry;
-    MinimalConsensusAgent                        dummyAgent;
-    std::unique_ptr<rune::node::NodeRuntimeAgent> agent;
-
-    bool isLeader = true; // injected into NodeRuntimeAgent step 6.5
-
-    explicit CompactionHarness(bool leaderRole = true,
-                               CleanupPolicy policy = CleanupPolicy::Compact,
-                               double dirtyRatioThreshold = 0.0 /* 0 = always compact */)
-        : isLeader(leaderRole)
-    {
-        dir = makeTempDir("cp2_duty");
-        // Small roll byte limit so we get multiple segments quickly.
-        log = std::make_unique<Log>(dir.string(), /*segmentRollBytes=*/256);
-
-        PartitionConfig cfg;
-        cfg.topicId              = 42;
-        cfg.partitionId          = 0;
-        cfg.selfId               = 1;
-        cfg.minIsr               = 1;
-        cfg.replicaLagMaxMs      = 10'000;
-        cfg.replicaLagMaxOffset  = 10'000;
-        cfg.fetchIntervalNs      = 1'000'000LL;
-        cfg.isrCheckIntervalNs   = 1'000'000LL;
-        cfg.maxFetchBytes        = 1 << 20;
-        cfg.pushOnAppend         = false;
-        cfg.cleanupPolicy        = policy;
-
-        transport = std::make_unique<NullTransport>();
-        replica = std::make_unique<PartitionReplica>(
-            cfg,
-            leaderRole ? Role::Leader : Role::Follower,
-            /*epoch=*/1,
-            std::vector<NodeId>{1},
-            std::vector<NodeId>{1},
-            log.get(),
-            transport.get());
-
-        if (leaderRole) {
-            replica->becomeLeader(/*epoch=*/1, {1});
-        }
-
-        registry = std::make_unique<rune::node::ReplicaRegistry>();
-        registry->add(42, 0, std::move(replica));
-
-        // NodeRuntimeAgent in the backward-compat no-gateway constructor.
-        // We need to reach runBoundedCompaction via doWork.
-        agent = std::make_unique<rune::node::NodeRuntimeAgent>(
-            dummyAgent,
-            /*gateway=*/nullptr);
-    }
-
-    ~CompactionHarness() {
-        agent.reset();
-        registry.reset();
-        // replica is moved into registry; log lives independently.
-        log.reset();
-        std::error_code ec;
-        fs::remove_all(dir, ec);
-    }
-
-    PartitionReplica* getReplicaRaw() {
-        return registry->lookup(42, 0);
-    }
-
-    Log* getLog() { return getReplicaRaw() ? getReplicaRaw()->log() : nullptr; }
-};
+// Each test below builds its PartitionReplica + ReplicaRegistry + NodeRuntimeAgent
+// inline (they need per-test config: policy, dirty-ratio threshold, retention),
+// so there is no shared fixture struct.
 
 // ---------------------------------------------------------------------------
 // Count live records from all segments of a log.
@@ -171,6 +98,36 @@ static int countLiveRecords(Log& log) {
             bool advanced = false;
             r.forEach([&](std::string_view, std::string_view, int64_t off, int64_t) {
                 ++count;
+                cursor = off + 1;
+                advanced = true;
+            });
+            if (!advanced) break;
+        }
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// Count live records for a SPECIFIC key across all segments of a log.
+// ---------------------------------------------------------------------------
+static int countLiveRecordsForKey(Log& log, std::string_view wantKey) {
+    int count = 0;
+    auto bases = log.segmentBaseOffsets();
+    if (bases.empty()) return 0;
+    int64_t cursor = 0;
+    for (size_t si = 0; si < bases.size(); ++si) {
+        int64_t segEnd = (si + 1 < bases.size()) ? bases[si + 1]
+                                                  : std::numeric_limits<int64_t>::max();
+        if (cursor >= segEnd) continue;
+        if (cursor < bases[si]) cursor = bases[si];
+        for (;;) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool advanced = false;
+            r.forEach([&](std::string_view k, std::string_view, int64_t off, int64_t) {
+                if (k == wantKey) ++count;
                 cursor = off + 1;
                 advanced = true;
             });
@@ -910,31 +867,14 @@ TEST(CompactionDutyCycle, DeleteRetentionMsFromConfigUsed) {
 
         log.reloadSegments();
 
-        // Tombstone must be GONE (expired).
-        // latestValueForKey returns "" if tombstone still present, or std::nullopt-like
-        // empty if key doesn't exist. Use countLiveRecords to verify tombstone dropped.
-        // We verify no record for k_tomb survives in the sealed segments.
-        const std::string latestTomb = latestValueForKey(log, "k_tomb");
-        // latestValueForKey returns "" for tombstones too. The key should be entirely
-        // absent — all records (both v1 and the tombstone) should be dropped once the
-        // tombstone expires. Since the sealed segment holds both, after compaction
-        // neither survives.
-        // NOTE: the active segment is NEVER compacted; if both records ended up in
-        // the active segment this sub-test is a no-op. We placed filler to force a roll.
-        // With rollBytes=128, 50 records will definitely roll multiple segments.
-        // The first 2 records (v1 + tombstone) must be in a sealed segment.
-        EXPECT_EQ(latestTomb, "")
-            << "Tombstone past retention window must be dropped (latest value is empty "
-               "because all earlier values were also superseded; key fully removed)";
-        // But more robustly: after tombstone expiry the key has no surviving record.
-        // countLiveRecords would count 0 for k_tomb. We check the total count is less
-        // than 50 (the 48 filler records minus superseded + any active records).
-        const int totalAfter = countLiveRecords(log);
-        // The tombstone expired → it + the v1 original are both removed.
-        // Filler records for kfill: each overwrites the same key, so after compaction
-        // only the latest survives. Total should be much less than 50.
-        EXPECT_LT(totalAfter, 50)
-            << "Short retention: compaction should have removed expired tombstone + prior values";
+        // Tombstone must be GONE (expired past the 1 ms retention window).
+        // Assert on record PRESENCE (not value): countLiveRecordsForKey distinguishes
+        // "key fully removed" (count 0) from "tombstone still present" (count 1) —
+        // latestValueForKey cannot, since it returns "" for both.
+        const int tombCount = countLiveRecordsForKey(log, "k_tomb");
+        EXPECT_EQ(tombCount, 0)
+            << "Short retention (1 ms): expired tombstone + its superseded value must be "
+               "FULLY removed — 0 records for k_tomb should survive, got " << tombCount;
 
         fs::remove_all(dir);
     }
@@ -999,11 +939,122 @@ TEST(CompactionDutyCycle, DeleteRetentionMsFromConfigUsed) {
 
         log.reloadSegments();
 
-        // Tombstone must still be present (within retention window).
-        const std::string latestTomb2 = latestValueForKey(log, "k_tomb");
-        EXPECT_EQ(latestTomb2, "")
-            << "Tombstone within retention window must be KEPT (empty string = tombstone present)";
+        // Tombstone must still be present (within the 1-day retention window).
+        // Assert PRESENCE: exactly one surviving record for k_tomb (the tombstone;
+        // the earlier "v1" value is superseded by the tombstone and dropped).
+        // This is the discriminating assertion that makes the retention config
+        // actually TESTED: with a hardcoded retention the two parts would not
+        // diverge (part A count 0, part B count 1).
+        const int tombCount2 = countLiveRecordsForKey(log, "k_tomb");
+        EXPECT_EQ(tombCount2, 1)
+            << "Long retention (1 day): tombstone within window must be KEPT — exactly "
+               "1 record for k_tomb should survive, got " << tombCount2;
+        // And that surviving record is the tombstone (empty value).
+        EXPECT_EQ(latestValueForKey(log, "k_tomb"), "")
+            << "The surviving k_tomb record must be the tombstone (empty value)";
 
         fs::remove_all(dir);
     }
+}
+
+
+// ===========================================================================
+// TEST 10: CrossSegmentLatestPerKeyConverges — a key updated repeatedly ACROSS
+// many sealed segments must converge to EXACTLY ONE surviving record after full
+// compaction (global latest-per-key), not one-survivor-per-segment.
+//
+// This is the regression guard for the per-segment-scoped offset-map bug: if
+// buildOffsetMap is scoped to a single segment's range, each sealed segment
+// keeps its own local "latest", leaving N stale survivors for a hot key.
+// ===========================================================================
+TEST(CompactionDutyCycle, CrossSegmentLatestPerKeyConverges) {
+    auto dir = makeTempDir("cp2_xseg");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    NullTransport transport;
+    PartitionConfig cfg;
+    cfg.topicId              = 30;
+    cfg.partitionId          = 0;
+    cfg.selfId               = 1;
+    cfg.minIsr               = 1;
+    cfg.replicaLagMaxMs      = 10'000;
+    cfg.replicaLagMaxOffset  = 10'000;
+    cfg.fetchIntervalNs      = 1'000'000LL;
+    cfg.isrCheckIntervalNs   = 1'000'000LL;
+    cfg.maxFetchBytes        = 1 << 20;
+    cfg.pushOnAppend         = false;
+    cfg.cleanupPolicy        = CleanupPolicy::Compact;
+    cfg.minCleanableDirtyRatio = 0.0;  // always compact when above 0%
+
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+
+    // ONE hot key updated 300 times → spans many sealed segments.
+    for (int v = 0; v < 300; ++v) {
+        auto batch = makeBatch(v, "hot", "v" + std::to_string(v));
+        log.append(batch, v);
+    }
+    replica->onLeaderLogAppended();
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u) << "Need multiple sealed segments to exercise the cross-segment path";
+    const size_t sealedCount = bases.size() - 1;
+    const int64_t activeBase = bases.back();
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(30, 0, std::move(replica));
+
+    MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent agent(
+        dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // Drive enough cycles to compact every sealed segment.
+    for (size_t i = 0; i < sealedCount + 10; ++i) {
+        agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+
+    log.reloadSegments();
+
+    // Count "hot" records that live BELOW the active-segment boundary (the sealed,
+    // compactable zone).  Globally, only the single latest sealed occurrence may
+    // survive there — everything earlier is superseded.  (Records at/after
+    // activeBase are in the untouched active segment and are excluded here.)
+    int sealedHot = 0;
+    {
+        auto b = log.segmentBaseOffsets();
+        int64_t cursor = 0;
+        for (size_t si = 0; si + 0 < b.size(); ++si) {
+            int64_t segStart = b[si];
+            if (segStart >= activeBase) break;  // active segment — skip
+            int64_t segEnd = (si + 1 < b.size()) ? b[si + 1] : activeBase;
+            cursor = segStart;
+            for (;;) {
+                auto bytes = log.read(cursor, 1 << 20);
+                if (bytes.empty()) break;
+                RecordBatchReader r(bytes.data(), bytes.size());
+                if (!r.ensureValid()) break;
+                bool advanced = false;
+                r.forEach([&](std::string_view k, std::string_view, int64_t off, int64_t) {
+                    if (off < activeBase && k == "hot") ++sealedHot;
+                    cursor = off + 1;
+                    advanced = true;
+                });
+                if (!advanced || cursor >= segEnd) break;
+            }
+        }
+    }
+
+    EXPECT_LE(sealedHot, 1)
+        << "Hot key must converge to at most ONE surviving record in the sealed zone "
+           "(global latest-per-key); got " << sealedHot
+        << " — a per-segment-scoped offset map leaves one survivor PER segment";
+
+    // The newest value is still readable (in the active segment or as the lone survivor).
+    EXPECT_EQ(latestValueForKey(log, "hot"), "v299")
+        << "Newest value must survive compaction";
+
+    fs::remove_all(dir);
 }

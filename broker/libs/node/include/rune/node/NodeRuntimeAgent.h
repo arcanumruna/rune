@@ -252,6 +252,7 @@ public:
             cleaner.cleanSegment(*log,
                                  /*segBase=*/segToCompact,
                                  /*segEnd=*/segEnd,
+                                 /*globalDirtyStart=*/firstDirty,
                                  nowNs,
                                  replica->deleteRetentionMs());
 
