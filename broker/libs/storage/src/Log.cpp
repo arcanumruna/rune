@@ -199,6 +199,33 @@ void Log::reloadSegments() {
     logEndOffset_ = next;
 }
 
+void Log::reloadSegment(int64_t baseOffset) {
+    // CP-2: in-place single-segment reload after a cleaner rewrite.
+    //
+    // The cleaner atomically renamed <base>.log.new -> <base>.log (or, when the
+    // segment was fully emptied, deleted <base>.log entirely).  We must refresh
+    // ONLY that segment's in-memory LogSegment so its open fd points at the new
+    // inode — without re-recover()-ing every other segment (the O(n) cost that
+    // makes a per-segment compaction loop O(n^2)).
+    //
+    // logEndOffset_ is NOT touched: sealed-segment compaction never changes the
+    // LEO (the active segment, which owns the LEO, is never compacted).
+    auto it = segments_.find(baseOffset);
+    if (it == segments_.end()) return; // unknown segment — nothing to do
+
+    const std::string logPath = it->second->logPath();
+    if (!std::filesystem::exists(logPath)) {
+        // Cleaner emptied + deleted this segment; drop it from the map.
+        segments_.erase(it);
+        return;
+    }
+
+    // Reconstruct just this segment (closes the old fd via unique_ptr reset) and
+    // recover() it so its in-memory index reflects the rewritten bytes.
+    it->second = std::make_unique<LogSegment>(dir_, baseOffset);
+    it->second->recover();
+}
+
 int Log::deleteOldSegments(int64_t retainBytes) {
     int deleted = 0;
     while (segments_.size() > 1 && totalBytes() > retainBytes) {

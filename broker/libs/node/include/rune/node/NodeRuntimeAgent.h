@@ -244,16 +244,16 @@ public:
                 continue;
             }
 
-            // 7. Compact exactly this ONE sealed segment.
-            //    Pass the segment's own range [segToCompact, segEnd) to both
-            //    buildOffsetMap and compact so only this segment's dirty records are
-            //    considered.  cleanBoundaryOffset == segEnd (never touches active seg).
+            // 7. Compact exactly this ONE sealed segment via the bounded cleaner.
+            //    cleanSegment() reloads ONLY the rewritten segment in place
+            //    (Log::reloadSegment) instead of the O(n) full-log reloadSegments(),
+            //    so a per-segment duty-cycle loop is O(n) total, not O(n^2).
             rune::storage::LogCleaner cleaner;
-            cleaner.clean(*log,
-                          /*firstDirtyOffset=*/segToCompact,
-                          /*cleanBoundaryOffset=*/segEnd,
-                          nowNs,
-                          replica->deleteRetentionMs());
+            cleaner.cleanSegment(*log,
+                                 /*segBase=*/segToCompact,
+                                 /*segEnd=*/segEnd,
+                                 nowNs,
+                                 replica->deleteRetentionMs());
 
             // 8. Advance the cleaned watermark to segEnd so the next cycle starts
             //    from the following sealed segment (forward progress).

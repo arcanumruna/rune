@@ -61,6 +61,15 @@ public:
     /// Used by LogCleaner after atomically rewriting segment files on disk,
     /// so that in-memory file handles reflect the new file contents.
     void reloadSegments();
+    /// CP-2: reload a SINGLE sealed segment in place (close + reopen just that
+    /// LogSegment) after its .log file was atomically rewritten by the cleaner.
+    /// O(1) in the number of segments — avoids the O(n) full-log reloadSegments()
+    /// that re-recover()s every segment (which makes per-segment compaction O(n^2)).
+    /// If the segment's .log file no longer exists on disk (the cleaner emptied and
+    /// deleted it), the segment is dropped from the in-memory map.  MUST NOT be
+    /// called for the active segment and does NOT change logEndOffset_ (sealed-
+    /// segment rewrites never move the LEO).
+    void reloadSegment(int64_t baseOffset);
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();

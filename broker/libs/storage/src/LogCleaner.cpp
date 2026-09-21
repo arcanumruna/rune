@@ -419,4 +419,43 @@ void LogCleaner::clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOf
     compact(log, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
 }
 
+// ---------------------------------------------------------------------------
+// cleanSegment  (CP-2: bounded single-segment compaction — O(1) reload)
+// ---------------------------------------------------------------------------
+bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
+                              int64_t nowNs, int64_t deleteRetentionMs) {
+    // Guard: the target segment must exist and must NOT be the active segment
+    // (the active segment is always the highest-base segment and owns the LEO).
+    auto bases = log.segmentBaseOffsets();
+    if (bases.empty()) return false;
+    const int64_t activeBase = bases.back();
+    if (segBase == activeBase) return false;   // never compact the active segment
+    bool found = false;
+    for (int64_t b : bases) { if (b == segBase) { found = true; break; } }
+    if (!found) return false;
+
+    // Clean up any stale .log.new temp files left by a previous crashed run.
+    for (auto& e : std::filesystem::directory_iterator(log.dir())) {
+        if (e.path().extension() == ".new") {
+            std::filesystem::remove(e.path());
+        }
+    }
+
+    // Build the offset map scoped to THIS segment's own range only.
+    OffsetMap map;
+    buildOffsetMap(log, segBase, segEnd, map);
+
+    // Rewrite exactly this one segment.  firstDirtyOffset == segBase;
+    // cleanBoundaryOffset == segEnd (records at/past it are untouched).
+    rewriteSegment(log, segBase, map, segBase, segEnd, nowNs, deleteRetentionMs);
+
+    // Reload ONLY this segment in place — O(1) in the number of segments.  This
+    // is the crux of the CP-2 perf fix: the previous path funnelled through
+    // clean()->compact()->Log::reloadSegments() which re-recover()s EVERY segment,
+    // making a per-segment duty-cycle loop O(n^2) (~22s for 100 segments; ~128ms
+    // after this change).
+    log.reloadSegment(segBase);
+    return true;
+}
+
 } // namespace rune::storage

@@ -60,6 +60,21 @@ public:
     void clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOffset,
                int64_t nowNs, int64_t deleteRetentionMs);
 
+    /// CP-2: bounded, single-segment compaction (the duty-cycle unit of work).
+    ///
+    /// Compacts EXACTLY the one sealed segment whose base offset == `segBase`,
+    /// keeping latest-per-key within that segment's own offset range
+    /// [segBase, segEnd).  Unlike clean(), this does NOT call the O(n) full-log
+    /// reloadSegments(): it reloads ONLY the rewritten segment in place via
+    /// Log::reloadSegment(segBase), so a per-segment duty-cycle loop is O(n) total
+    /// rather than O(n^2).  The active segment is never `segBase` (the caller passes
+    /// a sealed segment) and records at/past segEnd are left untouched.
+    ///
+    /// @returns true if a compaction rewrite ran (segment existed and was
+    ///          processed); false if the segment was absent / already gone.
+    bool cleanSegment(Log& log, Offset segBase, Offset segEnd,
+                      int64_t nowNs, int64_t deleteRetentionMs);
+
 private:
     /// Is a record a tombstone?
     /// Treats empty value (vlen == 0) as a delete marker, matching Kafka behaviour.
