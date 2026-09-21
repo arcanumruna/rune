@@ -81,7 +81,7 @@ TEST(ProduceCodec, ExplicitPartitionRoundTrip) {
     msg.key            = std::span<const uint8_t>{};   // empty
     msg.recordBatch    = std::span<const uint8_t>(kBatchBytes, kBatchLen);
 
-    const std::size_t expected = 24u + 10u + 2u + 0u + 2u + kBatchLen; // 48
+    const std::size_t expected = 24u + 24u + 2u + 0u + 2u + kBatchLen; // 62
     ASSERT_EQ(msg.encodedSize(), expected);
 
     std::vector<uint8_t> buf(expected, 0u);
@@ -89,7 +89,7 @@ TEST(ProduceCodec, ExplicitPartitionRoundTrip) {
     ASSERT_EQ(written, expected);
 
     // Header
-    EXPECT_EQ(leU16(buf.data(), 0), rpc::Produce::BODY_FIXED);   // blockLength = 10
+    EXPECT_EQ(leU16(buf.data(), 0), rpc::Produce::BODY_FIXED);   // blockLength = 24
     EXPECT_EQ(leU16(buf.data(), 2), rpc::Produce::TEMPLATE_ID);  // templateId = 16
     EXPECT_EQ(leU16(buf.data(), 4), rpc::kSchemaId);             // 120
     EXPECT_EQ(leU16(buf.data(), 6), rpc::kProtocolVersion);      // 1
@@ -101,13 +101,14 @@ TEST(ProduceCodec, ExplicitPartitionRoundTrip) {
     EXPECT_EQ(leS32(buf.data(), 28), 3);   // partition
     EXPECT_EQ(leU8 (buf.data(), 32), 1u);  // partitionKnown
     // buf[33] = acks (0 = Leader/None, default)
+    // buf[34..47] = producerId(-1) + producerEpoch(0) + baseSequence(-1) — idempotent sentinels
 
-    // key var field: prefix = 0
-    EXPECT_EQ(leU16(buf.data(), 34), 0u);
+    // key var field: prefix = 0 (at offset 48 now)
+    EXPECT_EQ(leU16(buf.data(), 48), 0u);
 
-    // recordBatch var field: prefix = kBatchLen
-    EXPECT_EQ(leU16(buf.data(), 36), static_cast<uint16_t>(kBatchLen));
-    EXPECT_EQ(std::memcmp(buf.data() + 38, kBatchBytes, kBatchLen), 0);
+    // recordBatch var field: prefix = kBatchLen (at offset 50)
+    EXPECT_EQ(leU16(buf.data(), 50), static_cast<uint16_t>(kBatchLen));
+    EXPECT_EQ(std::memcmp(buf.data() + 52, kBatchBytes, kBatchLen), 0);
 
     // Round-trip decode
     auto decoded = rpc::Produce::decode(buf.data(), written);
@@ -137,7 +138,7 @@ TEST(ProduceCodec, KeyOnlyRoundTrip) {
     msg.key            = std::span<const uint8_t>(kKeyBytes, kKeyLen);
     msg.recordBatch    = std::span<const uint8_t>(kBatchBytes, kBatchLen);
 
-    const std::size_t expected = 24u + 10u + 2u + kKeyLen + 2u + kBatchLen; // 54
+    const std::size_t expected = 24u + 24u + 2u + kKeyLen + 2u + kBatchLen; // 68
     ASSERT_EQ(msg.encodedSize(), expected);
 
     std::vector<uint8_t> buf(expected, 0u);
@@ -148,13 +149,14 @@ TEST(ProduceCodec, KeyOnlyRoundTrip) {
     EXPECT_EQ(leS32(buf.data(), 24), 42);  // topicId
     EXPECT_EQ(leU8 (buf.data(), 32), 0u);  // partitionKnown
     // buf[33] = acks (0 = Leader/None, default)
+    // buf[34..47] = producerId(-1) + producerEpoch(0) + baseSequence(-1)
 
-    // key var field
-    EXPECT_EQ(leU16(buf.data(), 34), static_cast<uint16_t>(kKeyLen));
-    EXPECT_EQ(std::memcmp(buf.data() + 36, kKeyBytes, kKeyLen), 0);
+    // key var field (at offset 48 now)
+    EXPECT_EQ(leU16(buf.data(), 48), static_cast<uint16_t>(kKeyLen));
+    EXPECT_EQ(std::memcmp(buf.data() + 50, kKeyBytes, kKeyLen), 0);
 
     // recordBatch var field
-    const std::size_t rbOff = 36u + kKeyLen;
+    const std::size_t rbOff = 50u + kKeyLen;
     EXPECT_EQ(leU16(buf.data(), static_cast<int>(rbOff)),
               static_cast<uint16_t>(kBatchLen));
     EXPECT_EQ(std::memcmp(buf.data() + rbOff + 2, kBatchBytes, kBatchLen), 0);
@@ -204,13 +206,15 @@ TEST(ProduceCodec, ByteExactness) {
     msg.key            = std::span<const uint8_t>{};
     msg.recordBatch    = std::span<const uint8_t>(kRb, sizeof(kRb));
 
-    std::array<uint8_t, 64> buf{};
+    std::array<uint8_t, 128> buf{};
     const std::size_t n = msg.encode(buf.data());
-    ASSERT_EQ(n, 40u);
+    ASSERT_EQ(n, 54u);
 
     // clang-format off
-    static constexpr uint8_t kExpected[40] = {
-        0x0A, 0x00,                              // blockLength = 10
+    // New layout: 24(hdr) + 24(fixed: topicId4+partition4+partitionKnown1+acks1+producerId8+producerEpoch2+baseSequence4)
+    //           + 2(key len=0) + 2(rb len=2) + 2(rb bytes) = 54
+    static constexpr uint8_t kExpected[54] = {
+        0x18, 0x00,                              // blockLength = 24
         0x10, 0x00,                              // templateId = 16
         0x78, 0x00,                              // schemaId = 120
         0x01, 0x00,                              // version = 1
@@ -220,6 +224,9 @@ TEST(ProduceCodec, ByteExactness) {
         0x02, 0x00, 0x00, 0x00,                  // partition = 2
         0x01,                                    // partitionKnown = 1
         0x00,                                    // acks = 0 (Leader/None)
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // producerId = -1 (sentinel)
+        0x00, 0x00,                              // producerEpoch = 0
+        0xFF, 0xFF, 0xFF, 0xFF,                  // baseSequence = -1 (sentinel)
         0x00, 0x00,                              // key var-len = 0
         0x02, 0x00,                              // recordBatch var-len = 2
         0xAA, 0xBB,                              // recordBatch bytes
@@ -253,8 +260,8 @@ TEST(ProduceCodec, TruncationAtEveryBoundary) {
     msg.key            = std::span<const uint8_t>{};
     msg.recordBatch    = std::span<const uint8_t>(kRb5, sizeof(kRb5));
 
-    const std::size_t total = msg.encodedSize(); // 43
-    ASSERT_EQ(total, 43u);
+    const std::size_t total = msg.encodedSize(); // 57 (24+24+2+0+2+5)
+    ASSERT_EQ(total, 57u);
 
     std::vector<uint8_t> buf(total, 0u);
     const std::size_t written = msg.encode(buf.data());
@@ -264,22 +271,22 @@ TEST(ProduceCodec, TruncationAtEveryBoundary) {
     EXPECT_FALSE(rpc::Produce::decode(buf.data(), 0).has_value());
     EXPECT_FALSE(rpc::Produce::decode(buf.data(), 23).has_value());
 
-    // Fixed body incomplete: need all 10 bytes at [24..33]
-    for (std::size_t a = 24u; a < 34u; ++a) {
+    // Fixed body incomplete: need all 24 bytes at [24..47]
+    for (std::size_t a = 24u; a < 48u; ++a) {
         EXPECT_FALSE(rpc::Produce::decode(buf.data(), a).has_value())
             << "avail=" << a << " should be nullopt (fixed body incomplete)";
     }
 
-    // key prefix: need 2 bytes starting at off 34
-    EXPECT_FALSE(rpc::Produce::decode(buf.data(), 35).has_value());  // 1 byte of prefix
+    // key prefix: need 2 bytes starting at off 48
+    EXPECT_FALSE(rpc::Produce::decode(buf.data(), 49).has_value());  // 1 byte of prefix
 
-    // key is 0 bytes; rb prefix at off 36, needs 2 bytes
-    EXPECT_FALSE(rpc::Produce::decode(buf.data(), 36).has_value());
-    EXPECT_FALSE(rpc::Produce::decode(buf.data(), 37).has_value());
+    // key is 0 bytes; rb prefix at off 50, needs 2 bytes
+    EXPECT_FALSE(rpc::Produce::decode(buf.data(), 50).has_value());
+    EXPECT_FALSE(rpc::Produce::decode(buf.data(), 51).has_value());
 
     // rb says 5 bytes; partial bytes
     for (std::size_t k = 0; k < 5u; ++k) {
-        EXPECT_FALSE(rpc::Produce::decode(buf.data(), 38u + k).has_value())
+        EXPECT_FALSE(rpc::Produce::decode(buf.data(), 52u + k).has_value())
             << "k=" << k;
     }
 
@@ -303,8 +310,8 @@ TEST(ProduceCodec, KeyPrefixClaimsMoreThanAvail) {
     msg.encode(buf.data());
 
     // Corrupt the key prefix to claim 100 bytes; avail = total (key field exhausted)
-    buf[34] = 100;
-    buf[35] = 0;
+    buf[48] = 100;
+    buf[49] = 0;
 
     EXPECT_FALSE(rpc::Produce::decode(buf.data(), total).has_value());
 }
@@ -320,13 +327,13 @@ TEST(ProduceCodec, RecordBatchPrefixClaimsMoreThanAvail) {
     msg.key            = std::span<const uint8_t>{};
     msg.recordBatch    = std::span<const uint8_t>(kRb, sizeof(kRb));
 
-    const std::size_t total = msg.encodedSize(); // 24+10+2+0+2+3 = 41
+    const std::size_t total = msg.encodedSize(); // 24+24+2+0+2+3 = 55
     std::vector<uint8_t> buf(total, 0u);
     msg.encode(buf.data());
 
-    // Corrupt the rb prefix at offset 36 to claim 0xFFFF bytes
-    buf[36] = 0xFF;
-    buf[37] = 0xFF;
+    // Corrupt the rb prefix at offset 50 to claim 0xFFFF bytes
+    buf[50] = 0xFF;
+    buf[51] = 0xFF;
 
     EXPECT_FALSE(rpc::Produce::decode(buf.data(), total).has_value());
 }
@@ -344,7 +351,7 @@ TEST(ProduceCodec, EmptyRecordBatch) {
     msg.key            = std::span<const uint8_t>{};
     msg.recordBatch    = std::span<const uint8_t>{};
 
-    const std::size_t expected = 24u + 10u + 2u + 0u + 2u + 0u; // 38
+    const std::size_t expected = 24u + 24u + 2u + 0u + 2u + 0u; // 52
     ASSERT_EQ(msg.encodedSize(), expected);
 
     std::array<uint8_t, 64> buf{};
@@ -372,7 +379,7 @@ TEST(ProduceCodec, MaxU16RecordBatchExactFit) {
     msg.key            = std::span<const uint8_t>{};
     msg.recordBatch    = std::span<const uint8_t>(bigBatch.data(), kMaxLen);
 
-    const std::size_t total = msg.encodedSize(); // 24+10+2+0+2+65535 = 65573
+    const std::size_t total = msg.encodedSize(); // 24+24+2+0+2+65535 = 65587
     std::vector<uint8_t> bigBuf(total, 0u);
     const std::size_t written = msg.encode(bigBuf.data());
     ASSERT_EQ(written, total);
@@ -737,7 +744,7 @@ static constexpr uint8_t kGoldenKey[] = {0x41, 0x42, 0x43}; // "ABC"
 // GV-1. produce_explicit_partition: encode matches expected bytes.
 //   topicId=1001, partition=7, partitionKnown=1, acks=0, key=empty,
 //   recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02}
-//   Total = 24 + 10 + 2 + 0 + 2 + 8 = 46 bytes
+//   Total = 24 + 24 + 2 + 0 + 2 + 8 = 60 bytes
 // ---------------------------------------------------------------------------
 TEST(ProduceConformance, ExplicitPartitionGolden) {
     rpc::Produce msg;
@@ -750,7 +757,7 @@ TEST(ProduceConformance, ExplicitPartitionGolden) {
     msg.recordBatch    = std::span<const uint8_t>(kGoldenBatch, sizeof(kGoldenBatch));
 
     const std::size_t total = msg.encodedSize();
-    ASSERT_EQ(total, 46u);
+    ASSERT_EQ(total, 60u);
 
     std::vector<uint8_t> buf(total, 0u);
     const std::size_t n = msg.encode(buf.data());
@@ -778,7 +785,7 @@ TEST(ProduceConformance, ExplicitPartitionGolden) {
 // GV-2. produce_key_only: encode matches expected bytes.
 //   topicId=2002, partition=0 (ignored), partitionKnown=0, acks=0, key="ABC",
 //   recordBatch={0xDE,0xAD,0xBE,0xEF,0x00,0xFF,0x01,0x02}
-//   Total = 24 + 10 + 2 + 3 + 2 + 8 = 49 bytes
+//   Total = 24 + 24 + 2 + 3 + 2 + 8 = 63 bytes
 // ---------------------------------------------------------------------------
 TEST(ProduceConformance, KeyOnlyGolden) {
     rpc::Produce msg;
@@ -791,7 +798,7 @@ TEST(ProduceConformance, KeyOnlyGolden) {
     msg.recordBatch    = std::span<const uint8_t>(kGoldenBatch, sizeof(kGoldenBatch));
 
     const std::size_t total = msg.encodedSize();
-    ASSERT_EQ(total, 49u);
+    ASSERT_EQ(total, 63u);
 
     std::vector<uint8_t> buf(total, 0u);
     const std::size_t n = msg.encode(buf.data());

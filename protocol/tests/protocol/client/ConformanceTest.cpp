@@ -427,13 +427,14 @@ static constexpr uint8_t kProduceBatch[] = {
 static constexpr uint8_t kProduceKey[] = {0x41, 0x42, 0x43}; // "ABC"
 
 // ===========================================================================
-// 11. produce_explicit_partition.bin — 46 bytes
+// 11. produce_explicit_partition.bin — 60 bytes (TX-1: BODY_FIXED expanded to 24)
 //     Produce{ topicId=1001, partition=7, partitionKnown=1, acks=0, key=empty,
-//              recordBatch={DE AD BE EF 00 FF 01 02} }
+//              recordBatch={DE AD BE EF 00 FF 01 02},
+//              producerId=-1 (sentinel), producerEpoch=0, baseSequence=-1 }
 // ===========================================================================
 TEST(ConformanceGolden, ProduceExplicitPartition) {
     const auto golden = readVector("produce_explicit_partition.bin");
-    ASSERT_EQ(golden.size(), 46u);
+    ASSERT_EQ(golden.size(), 60u);
 
     assertHeader(golden, rpc::Produce::TEMPLATE_ID, rpc::Produce::BODY_FIXED);
 
@@ -457,21 +458,22 @@ TEST(ConformanceGolden, ProduceExplicitPartition) {
     msg.key            = std::span<const uint8_t>{};
     msg.recordBatch    = std::span<const uint8_t>(kProduceBatch, sizeof(kProduceBatch));
 
-    std::array<uint8_t, 64> enc{};
+    std::array<uint8_t, 128> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 46u);
+    ASSERT_EQ(n, 60u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_explicit_partition.bin";
 }
 
 // ===========================================================================
-// 12. produce_key_only.bin — 49 bytes
+// 12. produce_key_only.bin — 63 bytes (TX-1: BODY_FIXED expanded to 24)
 //     Produce{ topicId=2002, partition=0, partitionKnown=0, acks=0, key="ABC",
-//              recordBatch={DE AD BE EF 00 FF 01 02} }
+//              recordBatch={DE AD BE EF 00 FF 01 02},
+//              producerId=-1 (sentinel), producerEpoch=0, baseSequence=-1 }
 // ===========================================================================
 TEST(ConformanceGolden, ProduceKeyOnly) {
     const auto golden = readVector("produce_key_only.bin");
-    ASSERT_EQ(golden.size(), 49u);
+    ASSERT_EQ(golden.size(), 63u);
 
     assertHeader(golden, rpc::Produce::TEMPLATE_ID, rpc::Produce::BODY_FIXED);
 
@@ -496,9 +498,9 @@ TEST(ConformanceGolden, ProduceKeyOnly) {
     msg.key            = std::span<const uint8_t>(kProduceKey, sizeof(kProduceKey));
     msg.recordBatch    = std::span<const uint8_t>(kProduceBatch, sizeof(kProduceBatch));
 
-    std::array<uint8_t, 64> enc{};
+    std::array<uint8_t, 128> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 49u);
+    ASSERT_EQ(n, 63u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_key_only.bin";
 }
@@ -817,7 +819,7 @@ TEST(ConformanceSessionFlow, ProduceRecordsFlow) {
         msg.partitionKnown = 1;
         msg.key            = std::span<const uint8_t>{};
         msg.recordBatch    = std::span<const uint8_t>(kProduceBatch, sizeof(kProduceBatch));
-        std::array<uint8_t, 64> enc{};
+        std::array<uint8_t, 128> enc{};
         const std::size_t n = msg.encode(enc.data());
         ASSERT_EQ(n, golden.size());
         EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
