@@ -518,7 +518,6 @@ TEST(TxnConformance, AddPartitionsToTxnGolden) {
         {kTxnId1, sizeof(kTxnId1)}, 1));
     const std::size_t n = msg.encode(enc.data(), ps);
 
-    // 24(hdr) + 14(fixed: producerId8+epoch2+pad?... see impl) + 2+4(txnId) + 2 + 8(1 entry)
     // BODY_FIXED = 10 (producerId8 + producerEpoch2), var: txnId(2+4), count(2), 1*8
     EXPECT_GT(n, 0u); // sanity
 
@@ -593,4 +592,316 @@ TEST(TxnConformance, EndTxnGolden) {
     EXPECT_EQ(leU16c(enc.data(), 2), rpc::EndTxn::TEMPLATE_ID); // 53
     EXPECT_EQ(leS64c(enc.data(), 8),  kSessId);
     EXPECT_EQ(leS64c(enc.data(), 16), kCorrId);
+}
+
+// ===========================================================================
+// TX-7: Fixed golden conformance vectors for txn messages (templateIds 45–54).
+//
+// The tests above (TxnConformance.*Golden) are self-referential — they encode()
+// then decode() the same bytes and check field round-trips.  These new tests are
+// INDEPENDENT: the expected wire layout is hand-derived byte-by-byte from the
+// documented field layout in TxnMessages.h and are compared via memcmp.
+//
+// Common wire values for all TX-7 golden tests:
+//   sessionId     = 0x1122334455667788  LE64 → 88 77 66 55 44 33 22 11
+//   correlationId = 0x0A0B0C0D0E0F1011  LE64 → 11 10 0F 0E 0D 0C 0B 0A
+//   schemaId      = 120 (0x0078)        LE16 → 78 00
+//   version       = 1                   LE16 → 01 00
+//
+// The MessageHeader (24 bytes) uses these offsets:
+//   [0..1]  blockLength  LE16
+//   [2..3]  templateId   LE16
+//   [4..5]  schemaId     LE16  = 78 00
+//   [6..7]  version      LE16  = 01 00
+//   [8..15] sessionId    LE64
+//   [16..23] correlationId LE64
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// TX-7-1: InitProducerId byte-exact golden
+//
+// Fields: transactionalId="txn1"(4), transactionTimeoutMs=60000
+// Layout:
+//   [0..1]  blockLength=4         → 04 00
+//   [2..3]  templateId=45         → 2D 00
+//   [4..5]  schemaId=120          → 78 00
+//   [6..7]  version=1             → 01 00
+//   [8..15] sessionId             → 88 77 66 55 44 33 22 11
+//   [16..23] correlationId        → 11 10 0F 0E 0D 0C 0B 0A
+//   [24..27] transactionTimeoutMs=60000 (0xEA60) LE32 → 60 EA 00 00
+//   [28..29] txnId len=4          → 04 00
+//   [30..33] "txn1"               → 74 78 6E 31
+// Total = 34 bytes
+// ---------------------------------------------------------------------------
+TEST(TxnConformance, ByteExactInitProducerId) {
+    // Hand-derived independent golden vector.
+    static constexpr uint8_t kExpected[34] = {
+        // MessageHeader (24 bytes)
+        0x04, 0x00,                          // blockLength = 4
+        0x2D, 0x00,                          // templateId  = 45
+        0x78, 0x00,                          // schemaId    = 120
+        0x01, 0x00,                          // version     = 1
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+        0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+        // Fixed body (4 bytes): transactionTimeoutMs = 60000 = 0x0000EA60
+        0x60, 0xEA, 0x00, 0x00,
+        // Var: txnId len=4, "txn1"
+        0x04, 0x00,
+        0x74, 0x78, 0x6E, 0x31,
+    };
+
+    // 1. encode() output must match the golden exactly.
+    rpc::InitProducerId msg;
+    msg.sessionId            = kSessId;
+    msg.correlationId        = kCorrId;
+    msg.transactionalId      = {kTxnId1, sizeof(kTxnId1)};
+    msg.transactionTimeoutMs = kTxnTimeoutMs;
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, sizeof(kExpected));
+    EXPECT_EQ(std::memcmp(enc.data(), kExpected, sizeof(kExpected)), 0)
+        << "InitProducerId encode() differs from hand-derived golden";
+
+    // 2. decode(golden) must yield the expected fields.
+    auto out = rpc::InitProducerId::decode(kExpected, sizeof(kExpected));
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->sessionId,            kSessId);
+    EXPECT_EQ(out->correlationId,        kCorrId);
+    EXPECT_EQ(out->transactionTimeoutMs, kTxnTimeoutMs);
+    ASSERT_EQ(out->transactionalId.size(), sizeof(kTxnId1));
+    EXPECT_EQ(std::memcmp(out->transactionalId.data(), kTxnId1, sizeof(kTxnId1)), 0);
+}
+
+// ---------------------------------------------------------------------------
+// TX-7-2: AddPartitionsToTxn byte-exact golden
+//
+// Fields: producerId=9999, producerEpoch=2, transactionalId="txn1"(4),
+//         partitions=[(topicId=100, partition=1)]
+// Layout:
+//   [0..1]  blockLength=10        → 0A 00
+//   [2..3]  templateId=47         → 2F 00
+//   [4..5]  schemaId=120          → 78 00
+//   [6..7]  version=1             → 01 00
+//   [8..15] sessionId             → 88 77 66 55 44 33 22 11
+//   [16..23] correlationId        → 11 10 0F 0E 0D 0C 0B 0A
+//   [24..31] producerId=9999 LE64 → 0F 27 00 00 00 00 00 00
+//   [32..33] producerEpoch=2 LE16 → 02 00
+//   [34..35] txnId len=4          → 04 00
+//   [36..39] "txn1"               → 74 78 6E 31
+//   [40..41] partitions count=1   → 01 00
+//   [42..45] topicId=100 LE32     → 64 00 00 00
+//   [46..49] partition=1 LE32     → 01 00 00 00
+// Total = 50 bytes
+// ---------------------------------------------------------------------------
+TEST(TxnConformance, ByteExactAddPartitionsToTxn) {
+    static constexpr uint8_t kExpected[50] = {
+        // MessageHeader (24 bytes)
+        0x0A, 0x00,                          // blockLength = 10
+        0x2F, 0x00,                          // templateId  = 47
+        0x78, 0x00,                          // schemaId    = 120
+        0x01, 0x00,                          // version     = 1
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+        0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+        // Fixed body (10 bytes): producerId(8) + producerEpoch(2)
+        0x0F, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // producerId = 9999
+        0x02, 0x00,                                        // producerEpoch = 2
+        // Var: txnId len=4, "txn1"
+        0x04, 0x00,
+        0x74, 0x78, 0x6E, 0x31,
+        // Array: count=1, entry (topicId=100, partition=1) each LE32
+        0x01, 0x00,
+        0x64, 0x00, 0x00, 0x00,  // topicId = 100
+        0x01, 0x00, 0x00, 0x00,  // partition = 1
+    };
+
+    static constexpr rpc::TxnTopicPartition kParts[] = {{100, 1}};
+
+    // 1. encode() output must match the golden exactly.
+    rpc::AddPartitionsToTxn msg;
+    msg.sessionId       = kSessId;
+    msg.correlationId   = kCorrId;
+    msg.transactionalId = {kTxnId1, sizeof(kTxnId1)};
+    msg.producerId      = 9999LL;
+    msg.producerEpoch   = 2;
+
+    const std::span<const rpc::TxnTopicPartition> ps(kParts, 1);
+    std::array<uint8_t, 128> enc{};
+    const std::size_t n = msg.encode(enc.data(), ps);
+    ASSERT_EQ(n, sizeof(kExpected));
+    EXPECT_EQ(std::memcmp(enc.data(), kExpected, sizeof(kExpected)), 0)
+        << "AddPartitionsToTxn encode() differs from hand-derived golden";
+
+    // 2. decode(golden) must yield the expected fields.
+    auto out = rpc::AddPartitionsToTxn::decode(kExpected, sizeof(kExpected));
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->sessionId,     kSessId);
+    EXPECT_EQ(out->correlationId, kCorrId);
+    EXPECT_EQ(out->producerId,    9999LL);
+    EXPECT_EQ(out->producerEpoch, 2);
+    ASSERT_EQ(out->transactionalId.size(), sizeof(kTxnId1));
+    EXPECT_EQ(std::memcmp(out->transactionalId.data(), kTxnId1, sizeof(kTxnId1)), 0);
+    ASSERT_EQ(out->partitions.size(), 1u);
+    EXPECT_EQ(out->partitions[0].topicId,   100);
+    EXPECT_EQ(out->partitions[0].partition, 1);
+}
+
+// ---------------------------------------------------------------------------
+// TX-7-3: TxnOffsetCommit byte-exact golden
+//
+// Fields: producerId=9999, producerEpoch=2, transactionalId="txn1"(4),
+//         groupId="grp1"(4),
+//         entries=[(topicId=5, partition=0, offset=200, metadata={0xAB})]
+// Layout:
+//   [0..1]  blockLength=10        → 0A 00
+//   [2..3]  templateId=51         → 33 00
+//   [4..5]  schemaId=120          → 78 00
+//   [6..7]  version=1             → 01 00
+//   [8..15] sessionId             → 88 77 66 55 44 33 22 11
+//   [16..23] correlationId        → 11 10 0F 0E 0D 0C 0B 0A
+//   [24..31] producerId=9999 LE64 → 0F 27 00 00 00 00 00 00
+//   [32..33] producerEpoch=2 LE16 → 02 00
+//   [34..35] txnId len=4          → 04 00
+//   [36..39] "txn1"               → 74 78 6E 31
+//   [40..41] groupId len=4        → 04 00
+//   [42..45] "grp1"               → 67 72 70 31
+//   [46..47] entries count=1      → 01 00
+//   Entry 0:
+//   [48..51] topicId=5 LE32       → 05 00 00 00
+//   [52..55] partition=0 LE32     → 00 00 00 00
+//   [56..63] offset=200 LE64      → C8 00 00 00 00 00 00 00
+//   [64..65] meta len=1           → 01 00
+//   [66]     0xAB
+// Total = 67 bytes
+// ---------------------------------------------------------------------------
+TEST(TxnConformance, ByteExactTxnOffsetCommit) {
+    static constexpr uint8_t kGrpId[] = {'g', 'r', 'p', '1'};
+    static constexpr uint8_t kMeta[]  = {0xAB};
+
+    static constexpr uint8_t kExpected[67] = {
+        // MessageHeader (24 bytes)
+        0x0A, 0x00,                          // blockLength = 10
+        0x33, 0x00,                          // templateId  = 51
+        0x78, 0x00,                          // schemaId    = 120
+        0x01, 0x00,                          // version     = 1
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+        0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+        // Fixed body (10 bytes): producerId(8) + producerEpoch(2)
+        0x0F, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // producerId = 9999
+        0x02, 0x00,                                        // producerEpoch = 2
+        // Var: txnId len=4, "txn1"
+        0x04, 0x00,
+        0x74, 0x78, 0x6E, 0x31,
+        // Var: groupId len=4, "grp1"
+        0x04, 0x00,
+        0x67, 0x72, 0x70, 0x31,
+        // entries count=1
+        0x01, 0x00,
+        // Entry 0: topicId=5(LE32), partition=0(LE32), offset=200(LE64), metaLen=1, 0xAB
+        0x05, 0x00, 0x00, 0x00,              // topicId = 5
+        0x00, 0x00, 0x00, 0x00,              // partition = 0
+        0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // offset = 200
+        0x01, 0x00,                          // meta len = 1
+        0xAB,                                // metadata byte
+    };
+
+    // 1. encode() output must match the golden exactly.
+    rpc::TxnOffsetCommit msg;
+    msg.sessionId       = kSessId;
+    msg.correlationId   = kCorrId;
+    msg.transactionalId = {kTxnId1, sizeof(kTxnId1)};
+    msg.producerId      = 9999LL;
+    msg.producerEpoch   = 2;
+    msg.groupId         = {kGrpId, sizeof(kGrpId)};
+
+    const rpc::TxnOffsetCommitEntry entries[] = {{5, 0, 200LL, {kMeta, sizeof(kMeta)}}};
+    const std::span<const rpc::TxnOffsetCommitEntry> es(entries, 1);
+
+    std::array<uint8_t, 128> enc{};
+    const std::size_t n = msg.encode(enc.data(), es);
+    ASSERT_EQ(n, sizeof(kExpected));
+    EXPECT_EQ(std::memcmp(enc.data(), kExpected, sizeof(kExpected)), 0)
+        << "TxnOffsetCommit encode() differs from hand-derived golden";
+
+    // 2. decode(golden) must yield the expected fields.
+    auto out = rpc::TxnOffsetCommit::decode(kExpected, sizeof(kExpected));
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->sessionId,     kSessId);
+    EXPECT_EQ(out->correlationId, kCorrId);
+    EXPECT_EQ(out->producerId,    9999LL);
+    EXPECT_EQ(out->producerEpoch, 2);
+    ASSERT_EQ(out->transactionalId.size(), sizeof(kTxnId1));
+    EXPECT_EQ(std::memcmp(out->transactionalId.data(), kTxnId1, sizeof(kTxnId1)), 0);
+    ASSERT_EQ(out->groupId.size(), sizeof(kGrpId));
+    EXPECT_EQ(std::memcmp(out->groupId.data(), kGrpId, sizeof(kGrpId)), 0);
+    ASSERT_EQ(out->entries.size(), 1u);
+    auto e0 = out->entries[0];
+    EXPECT_EQ(e0.topicId,   5);
+    EXPECT_EQ(e0.partition, 0);
+    EXPECT_EQ(e0.offset,    200LL);
+    ASSERT_EQ(e0.metadata.size(), sizeof(kMeta));
+    EXPECT_EQ(e0.metadata[0], 0xABu);
+}
+
+// ---------------------------------------------------------------------------
+// TX-7-4: EndTxn byte-exact golden
+//
+// Fields: producerId=9999, producerEpoch=2, commit=1, transactionalId="txn1"(4)
+// Layout:
+//   [0..1]  blockLength=11        → 0B 00
+//   [2..3]  templateId=53         → 35 00
+//   [4..5]  schemaId=120          → 78 00
+//   [6..7]  version=1             → 01 00
+//   [8..15] sessionId             → 88 77 66 55 44 33 22 11
+//   [16..23] correlationId        → 11 10 0F 0E 0D 0C 0B 0A
+//   [24..31] producerId=9999 LE64 → 0F 27 00 00 00 00 00 00
+//   [32..33] producerEpoch=2 LE16 → 02 00
+//   [34]     commit=1             → 01
+//   [35..36] txnId len=4          → 04 00
+//   [37..40] "txn1"               → 74 78 6E 31
+// Total = 41 bytes
+// ---------------------------------------------------------------------------
+TEST(TxnConformance, ByteExactEndTxn) {
+    static constexpr uint8_t kExpected[41] = {
+        // MessageHeader (24 bytes)
+        0x0B, 0x00,                          // blockLength = 11
+        0x35, 0x00,                          // templateId  = 53
+        0x78, 0x00,                          // schemaId    = 120
+        0x01, 0x00,                          // version     = 1
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+        0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+        // Fixed body (11 bytes): producerId(8) + producerEpoch(2) + commit(1)
+        0x0F, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // producerId = 9999
+        0x02, 0x00,                                        // producerEpoch = 2
+        0x01,                                              // commit = 1
+        // Var: txnId len=4, "txn1"
+        0x04, 0x00,
+        0x74, 0x78, 0x6E, 0x31,
+    };
+
+    // 1. encode() output must match the golden exactly.
+    rpc::EndTxn msg;
+    msg.sessionId       = kSessId;
+    msg.correlationId   = kCorrId;
+    msg.transactionalId = {kTxnId1, sizeof(kTxnId1)};
+    msg.producerId      = 9999LL;
+    msg.producerEpoch   = 2;
+    msg.commit          = 1;
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, sizeof(kExpected));
+    EXPECT_EQ(std::memcmp(enc.data(), kExpected, sizeof(kExpected)), 0)
+        << "EndTxn encode() differs from hand-derived golden";
+
+    // 2. decode(golden) must yield the expected fields.
+    auto out = rpc::EndTxn::decode(kExpected, sizeof(kExpected));
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->sessionId,     kSessId);
+    EXPECT_EQ(out->correlationId, kCorrId);
+    EXPECT_EQ(out->producerId,    9999LL);
+    EXPECT_EQ(out->producerEpoch, 2);
+    EXPECT_EQ(out->commit,        1u);
+    ASSERT_EQ(out->transactionalId.size(), sizeof(kTxnId1));
+    EXPECT_EQ(std::memcmp(out->transactionalId.data(), kTxnId1, sizeof(kTxnId1)), 0);
 }
