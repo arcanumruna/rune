@@ -314,4 +314,49 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_gateway_failover_replication_tests
             PROPERTIES TIMEOUT 300)
     endif()
+
+    # ---------------------------------------------------------------------------
+    # TX-2b fix round 1 (A): HW-bound unit test — no Aeron required.
+    #
+    # DivergentTail_HWBoundRebuild_NoFalseDuplicate:
+    #   Directly proves the CRITICAL fix: HW-bounded rebuildFromLog() must NOT
+    #   seed PSM from uncommitted (above-HW) batches.  A producer retry of a
+    #   never-committed sequence must be Accepted (not false-Duplicate).
+    #   Fails against the pre-fix LEO-bound code.
+    #
+    # Links only rune_storage (no rune_node/rune_consensus that require Aeron).
+    # TX2B_UNIT_ONLY suppresses the integration-only sections of the shared
+    # source file (Aeron headers, BrokerNode, integration test function).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_psm_hw_bound_tests
+        tests/integration/GatewayPsmFailoverTest.cpp)
+    target_compile_definitions(rune_psm_hw_bound_tests PRIVATE
+        TX2B_UNIT_ONLY=1)
+    target_link_libraries(rune_psm_hw_bound_tests PRIVATE
+        rune_storage
+        GTest::gtest_main)
+    gtest_discover_tests(rune_psm_hw_bound_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # TX-2b fix round 1 (B): gateway-driven integration test — requires Aeron.
+    #
+    # FailoverDedup_HandleProducePath:
+    #   3 BrokerNodes, real aeron:udp.  Produces idempotent batches via the real
+    #   handleProduce path; kills the leader; verifies the new leader's PSM rebuild
+    #   (doWork() wasLeader_ transition) deduplicates re-sends and accepts new seqs.
+    # Gated behind BUILD_NODE_UDP_TESTS + aeron_FOUND (same as GR-7).
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_gateway_psm_failover_tests
+            tests/integration/GatewayPsmFailoverTest.cpp)
+        target_link_libraries(rune_gateway_psm_failover_tests PRIVATE
+            rune_node
+            rune_storage
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_gateway_psm_failover_tests
+            PROPERTIES TIMEOUT 300)
+    endif()
 endif()

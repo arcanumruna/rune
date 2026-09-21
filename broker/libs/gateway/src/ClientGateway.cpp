@@ -152,6 +152,26 @@ int ClientGateway::doWork(int64_t nowNs) {
 // and calls ProducerStateManager::rebuildFromLog() to reconstruct the per-
 // (producerId, partition) dedup window from the durable log.
 //
+// CRITICAL (TX-2b fix): the scan upper bound is the committed high-watermark
+// (replica->highWatermark()), NOT the log-end-offset (LEO).
+//
+// Rationale: becomeLeader() defers KIP-101 divergence truncation until the
+// OffsetsForLeaderEpoch exchange completes.  A newly-elected leader may therefore
+// carry an ahead tail (local LEO > HW) of uncommitted batches from the previous
+// term.  Those batches are later truncated when divergence is resolved.  If we
+// seeded PSM state from them, a producer retry of a NEVER-COMMITTED (>HW, later
+// truncated) sequence would match the stale window entry and be returned as
+// Duplicate with the truncated-away base offset — a real distinct produce would
+// be silently rejected and acknowledged at an offset that no longer exists:
+// acknowledged data loss.
+//
+// Only committed records (offset < HW) may seed dedup state.  This directly
+// aligns the implementation with the rebuildFromLog docstring ("scans [0, HW)").
+//
+// Fallback to LEO when replicaRegistry_ is null (single-node passthrough / tests
+// that don't wire replication): in that mode there is no uncommitted tail to
+// worry about (leader is always complete), so LEO == HW is a safe assumption.
+//
 // No-op when topicRegistry_ is null (gateway not yet wired).
 // Cold path: allocations acceptable.  Single-writer: duty-cycle thread only.
 // ---------------------------------------------------------------------------
@@ -168,13 +188,24 @@ void ClientGateway::rebuildProducerStateFromLogs()
             rune::storage::Log* log = topicRegistry_->log(topicId, partition);
             if (!log) continue;
 
-            // Use logEndOffset() as the scan upper bound — we want to recover
-            // state for all durably-written batches on this replica, not just
-            // up to the last advertised HW (which lags on a freshly-elected leader
-            // before completeness is established).  PSM dedup is conservative:
-            // recovering extra batches above HW only adds more duplicates to the
-            // retry window, never causes correctness problems.
-            const int64_t scanTo = log->logEndOffset();
+            // TX-2b fix: use the committed high-watermark as the scan bound.
+            // Only committed records (≤ HW) may seed dedup state; the uncommitted
+            // tail (HW < LEO) may be truncated by KIP-101 divergence resolution
+            // and must NOT be treated as durable for dedup purposes.
+            //
+            // When replicaRegistry_ is wired, look up the PartitionReplica for
+            // this (topicId, partition) and use its highWatermark().
+            // Fallback to LEO only when replicaRegistry_ is null (passthrough
+            // mode: no replication, leader is always complete, HW == LEO).
+            int64_t scanTo = log->logEndOffset(); // fallback: passthrough/test mode
+            if (replicaRegistry_) {
+                rune::replication::PartitionReplica* replica =
+                    replicaRegistry_->lookup(topicId, partition);
+                if (replica) {
+                    scanTo = replica->highWatermark();
+                }
+            }
+
             producerStateManager_.rebuildFromLog(*log, scanTo, partition);
         }
     }

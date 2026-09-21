@@ -215,7 +215,14 @@ public:
     // @param log            The partition Log to scan (non-const: Log::read is
     //                       non-const in the current implementation).
     // @param highWatermark  Scan up to (exclusive) this log offset.
-    //                       Pass log.logEndOffset() to scan the full log.
+    //                       MUST be the committed high-watermark (HW), NOT the
+    //                       log-end-offset (LEO).  Scanning beyond HW seeds the
+    //                       PSM dedup window from uncommitted batches that may be
+    //                       truncated by KIP-101 divergence resolution, causing a
+    //                       false-Duplicate for a genuinely new producer retry →
+    //                       acknowledged data loss at a truncated-away offset.
+    //                       Pass log.logEndOffset() ONLY when HW == LEO (e.g.
+    //                       single-node passthrough with no uncommitted tail).
     // @param partition      The partition id to use as the key (producer state
     //                       is keyed by (producerId, partition)).
     //

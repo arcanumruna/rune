@@ -427,6 +427,17 @@ int ProducerStateManager::recover(const std::string& path)
 // Control batches are also skipped (their producerId is set but baseSequence
 // is typically -1 — the PSM only tracks data batches).
 //
+// TX-2b: highWatermark MUST be the committed HW (replica->highWatermark()),
+// not the log-end-offset (LEO).  Batches above HW may be truncated by KIP-101
+// divergence resolution; seeding PSM state from them would produce a false-
+// Duplicate for a producer retry of a never-committed sequence, with the
+// duplicate-reported offset pointing at a truncated-away (non-existent) log
+// position — acknowledged data loss.
+//
+// takeSnapshot / recover: still available but not called anywhere in the
+// current codebase.  They are a future Phase-5 optimisation for fast restart
+// on large logs (skip the full scan with a pre-built PSM image).
+//
 // Cold path: called once on leader election / restart.  Allocations acceptable.
 // ---------------------------------------------------------------------------
 void ProducerStateManager::rebuildFromLog(Log&     log,
@@ -477,6 +488,15 @@ void ProducerStateManager::rebuildFromLog(Log&     log,
             // ControlMarker::build which doesn't stamp a sequence).
             const bool isControl =
                 (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
+
+            // TX-2b: stop processing batches once we reach or exceed the HW bound.
+            // The outer while(fetchOffset < highWatermark) controls which LOG
+            // SEGMENTS are fetched, but within a single read() chunk the segment
+            // may contain batches beyond HW (e.g. the uncommitted tail in the same
+            // segment as the last committed batch).  We must stop here — otherwise
+            // we would seed PSM state from uncommitted batches that may later be
+            // truncated by KIP-101, producing a false-Duplicate for a real produce.
+            if (batchBase >= highWatermark) break;
 
             const int64_t pid   = reader.producerId();
             const int16_t epoch = reader.producerEpoch();
