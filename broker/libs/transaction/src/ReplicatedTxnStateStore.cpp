@@ -162,8 +162,16 @@ bool ReplicatedTxnStateStore::put(const TransactionMetadata& meta,
 {
     encodeRecord(meta, coordinatorEpoch);
 
+    // CP-1: use appendKeyed() so the on-disk record carries the transactionalId
+    // as the record key, enabling LogCleaner to compact __transaction_state by key.
+    // The VALUE remains the full TransactionLog-encoded blob so applyRecord() /
+    // rebuildFromLog() continue to work unchanged.
+    const std::span<const uint8_t> keySpan{
+        reinterpret_cast<const uint8_t*>(meta.txnId.data()),
+        meta.txnId.size()};
     const rune::replication::Offset base =
-        replica_->append(
+        replica_->appendKeyed(
+            keySpan,
             std::span<const uint8_t>(recordScratch_.data(), recordScratch_.size()),
             /*acksAll=*/true);
 

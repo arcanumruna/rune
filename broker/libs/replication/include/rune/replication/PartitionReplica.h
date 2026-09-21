@@ -193,6 +193,20 @@ public:
     /// to pump follower fetches which advance the HW.
     Offset append(std::span<const uint8_t> records, bool acksAll = true);
 
+    /// CP-1: append a single record with an explicit (non-empty) key.
+    ///
+    /// Builds a one-record RecordBatch with the supplied key and value bytes,
+    /// so the on-disk record carries a real compaction key.  All other semantics
+    /// (ISR gate, HW advance, push-on-append) are identical to append().
+    ///
+    /// \param key      Record key bytes (e.g. compaction identity for __consumer_offsets).
+    /// \param value    Record value bytes (the payload).
+    /// \param acksAll  true → require |ISR| >= minIsr (majority-durable produce).
+    /// \returns base offset of the appended batch, or -1 if gated (minIsr).
+    Offset appendKeyed(std::span<const uint8_t> key,
+                       std::span<const uint8_t> value,
+                       bool acksAll = true);
+
     /// Reconcile the leader's tracked LEO with the underlying Log and recompute HW.
     ///
     /// Called after a batch is appended DIRECTLY to the leader's partition Log by

@@ -271,6 +271,42 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 }
 
 // ---------------------------------------------------------------------------
+// Leader: append with an explicit record key (CP-1 compaction support)
+// ---------------------------------------------------------------------------
+
+Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
+                                      std::span<const uint8_t> value,
+                                      bool acksAll)
+{
+    assert(role_ == Role::Leader && "appendKeyed() called on follower");
+
+    if (!isrManager_->canProduce(cfg_.minIsr, acksAll)) {
+        return -1; // gated by min-ISR
+    }
+
+    Offset baseOffset = log_->logEndOffset();
+
+    // Build a one-record batch with the real key and value.
+    rune::protocol::RecordBatchBuilder builder(baseOffset, /*baseTimestamp=*/0);
+    builder.append(
+        std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
+        std::string_view(reinterpret_cast<const char*>(value.data()), value.size()),
+        /*timestamp=*/0);
+    auto batch = builder.build();
+
+    log_->append(batch, baseOffset);
+
+    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    recomputeHw();
+
+    if (cfg_.pushOnAppend) {
+        pushToFollowers(baseOffset);
+    }
+
+    return baseOffset;
+}
+
+// ---------------------------------------------------------------------------
 // Leader: reconcile after an external direct-to-Log append
 // ---------------------------------------------------------------------------
 

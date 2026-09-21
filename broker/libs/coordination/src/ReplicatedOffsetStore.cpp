@@ -21,10 +21,13 @@
 //
 // On rebuildFromLog() we iterate the outer RecordBatches from the replica Log
 // and in the forEach callback receive:
-//   record.key   = ""           (empty — the wrapper fills key with nothing)
+//   record.key   = keyScratch_  (CP-1: the compaction identity bytes)
+//                  or ""        (pre-CP-1 records: empty — backward-compat)
 //   record.value = <payload>    (our compact key+val encoding)
 //
-// We decode the payload from record.value.
+// We always decode the payload from record.value (works for both old and new
+// records, since the value layout is unchanged).  The record.key is used by
+// the LogCleaner for compaction routing and is ignored during replay.
 // ---------------------------------------------------------------------------
 
 #include <rune/coordination/ReplicatedOffsetStore.h>
@@ -156,8 +159,16 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
     batchScratch_.insert(batchScratch_.end(), valScratch_.begin(), valScratch_.end());
 
     // 3. Append to the replica Log (acksAll=true → majority-durable).
+    //
+    // CP-1: use appendKeyed() so the on-disk RecordBatch carries a real key
+    // equal to keyScratch_ (the compact identity: groupLen|group|topicLen|topic|
+    // partition).  This enables the LogCleaner to compact __consumer_offsets by
+    // key equality.  The VALUE remains batchScratch_ (the full keyLen+keyBytes+
+    // valLen+valBytes payload) so rebuildFromLog() continues to decode correctly
+    // from the value field for both old (empty-key) and new (keyed) records.
     const rune::replication::Offset base =
-        replica_->append(
+        replica_->appendKeyed(
+            std::span<const uint8_t>(keyScratch_.data(), keyScratch_.size()),
             std::span<const uint8_t>(batchScratch_.data(), batchScratch_.size()),
             /*acksAll=*/true);
 

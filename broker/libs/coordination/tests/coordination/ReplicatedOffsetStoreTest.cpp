@@ -22,9 +22,11 @@
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -423,4 +425,251 @@ TEST(CommitLengthGuard, RejectsOversizedFields) {
     auto co = store.fetch("grp", tp("topic", 0));
     ASSERT_TRUE(co.has_value());
     EXPECT_EQ(co->offset, 42);
+}
+
+// ===========================================================================
+// CP-1: re-keyed __consumer_offsets records
+//
+// After CP-1, each commit() must write a RecordBatch whose record.key carries
+// the compaction identity = groupLen(uint16)|group|topicLen(uint16)|topic|
+// partition(int32).  The record.value continues to hold the full compact
+// payload for backward-compat rebuild.
+// ===========================================================================
+
+namespace {
+
+// LE decode helpers local to this TU.
+inline uint16_t cp1_getLE16(const uint8_t* p) {
+    return static_cast<uint16_t>(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+}
+inline int32_t cp1_getLE32(const uint8_t* p) {
+    return static_cast<int32_t>(
+        uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+        (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24));
+}
+
+// OffsetKey — decoded compaction identity from a record key.
+struct OffsetKey {
+    std::string group;
+    std::string topic;
+    int32_t     partition = -1;
+    bool operator==(const OffsetKey& o) const {
+        return group == o.group && topic == o.topic && partition == o.partition;
+    }
+};
+
+// lastRecordKey — read all committed batches from [0, HW) and return the key
+// of the very last record encountered.
+static std::vector<uint8_t> lastRecordKey(const rune::replication::PartitionReplica& replica) {
+    const rune::replication::Offset hw = replica.highWatermark();
+    if (hw <= 0) return {};
+
+    std::vector<uint8_t> result;
+    rune::replication::Offset fetchOffset = 0;
+
+    while (fetchOffset < hw) {
+        std::vector<uint8_t> data = replica.read(fetchOffset, 64 * 1024 * 1024);
+        if (data.empty()) break;
+
+        std::size_t pos = 0;
+        rune::replication::Offset lastBatchEnd = fetchOffset;
+
+        while (pos < data.size()) {
+            const uint8_t*    batchStart = data.data() + pos;
+            const std::size_t remaining  = data.size() - pos;
+
+            if (remaining < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead))
+                break;
+
+            rune::protocol::RecordBatchReader reader(batchStart, remaining);
+            if (!reader.ensureValid()) break;
+
+            int32_t tl = reader.totalLength();
+            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+
+            reader.forEach([&result](std::string_view key, std::string_view /*val*/,
+                                     int64_t /*off*/, int64_t /*ts*/) {
+                result.assign(key.begin(), key.end());
+            });
+
+            const rune::replication::Offset batchNextOffset =
+                reader.baseOffset() + reader.lastOffsetDelta() + 1;
+            if (batchNextOffset > lastBatchEnd)
+                lastBatchEnd = batchNextOffset;
+
+            pos += static_cast<std::size_t>(tl);
+        }
+
+        if (lastBatchEnd <= fetchOffset) break;
+        fetchOffset = lastBatchEnd;
+    }
+
+    return result;
+}
+
+// decodeOffsetKey — decode compaction key bytes to OffsetKey.
+// Format: groupLen(uint16)|group|topicLen(uint16)|topic|partition(int32)
+static OffsetKey decodeOffsetKey(const std::vector<uint8_t>& b) {
+    OffsetKey k;
+    const uint8_t* p = b.data();
+    std::size_t rem = b.size();
+
+    if (rem < 2u) return k;
+    uint16_t groupLen = cp1_getLE16(p); p += 2; rem -= 2;
+    if (rem < groupLen) return k;
+    k.group.assign(reinterpret_cast<const char*>(p), groupLen); p += groupLen; rem -= groupLen;
+
+    if (rem < 2u) return k;
+    uint16_t topicLen = cp1_getLE16(p); p += 2; rem -= 2;
+    if (rem < topicLen) return k;
+    k.topic.assign(reinterpret_cast<const char*>(p), topicLen); p += topicLen; rem -= topicLen;
+
+    if (rem < 4u) return k;
+    k.partition = cp1_getLE32(p);
+    return k;
+}
+
+// makeSingleNodeReplica — convenience factory returning Log + Replica together.
+// Returns a struct that keeps both alive.
+struct SingleNodeReplica {
+    TempDir   dir;
+    rune::storage::Log log;
+    NullTransport transport;
+    std::unique_ptr<rune::replication::PartitionReplica> replica;
+
+    SingleNodeReplica(int topicId, int partId)
+        : dir("cp1_ros")
+        , log(dir.path)
+    {
+        rune::replication::PartitionConfig cfg = makeSingleNodeConfig(/*selfId=*/1, /*minIsr=*/1);
+        cfg.topicId    = topicId;
+        cfg.partitionId = partId;
+        replica = std::make_unique<rune::replication::PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            &log, &transport);
+    }
+};
+
+} // anonymous namespace
+
+// Free function: drives the replica's HW forward.
+static void driveHwAdvance(rune::replication::PartitionReplica& replica,
+                            rune::replication::Offset target = 1)
+{
+    int64_t localClock = 0;
+    for (int i = 0; i < kDriverCap && replica.highWatermark() < target; ++i) {
+        localClock += 1'000'000LL;
+        replica.doWork(localClock);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: each commit writes a non-empty record key matching the identity
+// ---------------------------------------------------------------------------
+TEST(ReplicatedOffsetStore, CP1_RecordCarriesCompactionKey) {
+    SingleNodeReplica R(/*topicId=*/0, /*partId=*/0);
+    rune::coordination::ReplicatedOffsetStore store(R.replica.get());
+
+    ASSERT_TRUE(store.commit("g", tp("t1", 0), 42, "", 1));
+    driveHwAdvance(*R.replica, /*target=*/1);
+
+    auto keyBytes = lastRecordKey(*R.replica);
+    EXPECT_FALSE(keyBytes.empty()) << "record key must be non-empty (CP-1 compaction key)";
+
+    OffsetKey decoded = decodeOffsetKey(keyBytes);
+    OffsetKey expected{"g", "t1", 0};
+    EXPECT_EQ(decoded, expected) << "decoded key must match (group='g', topic='t1', partition=0)";
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: rebuild still last-write-wins with real key
+// ---------------------------------------------------------------------------
+TEST(ReplicatedOffsetStore, CP1_RebuildStillLastWriteWinsWithRealKey) {
+    SingleNodeReplica R(/*topicId=*/0, /*partId=*/0);
+    {
+        rune::coordination::ReplicatedOffsetStore s(R.replica.get());
+        s.commit("g", tp("t1", 0), 42, "", 1);
+        s.commit("g", tp("t1", 0), 99, "", 2);
+        driveHwAdvance(*R.replica, /*target=*/2);
+    }
+    rune::coordination::ReplicatedOffsetStore s2(R.replica.get());
+    s2.rebuildFromLog();
+    ASSERT_TRUE(s2.fetch("g", tp("t1", 0)).has_value());
+    EXPECT_EQ(s2.fetch("g", tp("t1", 0))->offset, 99);
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: old empty-key records still rebuild via value decode (backward compat)
+//
+// We simulate a pre-CP-1 record by directly appending a batch with an empty
+// key (the old PartitionReplica::append path) and then rebuilding.
+// ---------------------------------------------------------------------------
+TEST(ReplicatedOffsetStore, CP1_OldEmptyKeyRecordStillRebuildViaValueDecode) {
+    TempDir dir("cp1_compat");
+    rune::storage::Log log(dir.path);
+    NullTransport nt;
+    rune::replication::PartitionReplica replica(
+        makeSingleNodeConfig(/*selfId=*/1, /*minIsr=*/1),
+        rune::replication::Role::Leader, /*epoch=*/1,
+        std::vector<rune::replication::NodeId>{1},
+        std::vector<rune::replication::NodeId>{1},
+        &log, &nt);
+
+    // Write one pre-CP-1 record (empty key) by using the old append() path
+    // with a hand-built payload matching the compact encoding.
+    //
+    // payload = keyLen(uint16) + key_bytes + valLen(uint16) + val_bytes
+    // key_bytes = groupLen(uint16) + "legacy" + topicLen(uint16) + "topicX" + partition(int32)=7
+    // val_bytes = offset(int64)=55 + tsNs(int64)=0 + metaLen(uint16)=0
+    auto pushLE16 = [](std::vector<uint8_t>& v, uint16_t x) {
+        v.push_back(static_cast<uint8_t>(x));
+        v.push_back(static_cast<uint8_t>(x >> 8));
+    };
+    auto pushLE32 = [](std::vector<uint8_t>& v, int32_t x) {
+        uint32_t u = static_cast<uint32_t>(x);
+        for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>(u >> (i * 8)));
+    };
+    auto pushLE64 = [](std::vector<uint8_t>& v, int64_t x) {
+        uint64_t u = static_cast<uint64_t>(x);
+        for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>(u >> (i * 8)));
+    };
+
+    const std::string group = "legacy";
+    const std::string topic = "topicX";
+    const int32_t     part  = 7;
+    const int64_t     off   = 55;
+
+    std::vector<uint8_t> keyBytes;
+    pushLE16(keyBytes, static_cast<uint16_t>(group.size()));
+    keyBytes.insert(keyBytes.end(), group.begin(), group.end());
+    pushLE16(keyBytes, static_cast<uint16_t>(topic.size()));
+    keyBytes.insert(keyBytes.end(), topic.begin(), topic.end());
+    pushLE32(keyBytes, part);
+
+    std::vector<uint8_t> valBytes;
+    pushLE64(valBytes, off);
+    pushLE64(valBytes, 0LL);     // tsNs
+    pushLE16(valBytes, 0u);      // metaLen
+
+    std::vector<uint8_t> payload;
+    pushLE16(payload, static_cast<uint16_t>(keyBytes.size()));
+    payload.insert(payload.end(), keyBytes.begin(), keyBytes.end());
+    pushLE16(payload, static_cast<uint16_t>(valBytes.size()));
+    payload.insert(payload.end(), valBytes.begin(), valBytes.end());
+
+    // Use old append() — produces a record with empty key.
+    replica.append(std::span<const uint8_t>(payload.data(), payload.size()), true);
+    driveHwAdvance(replica, 1);
+
+    // Rebuild and verify the legacy record is decoded via the value path.
+    rune::coordination::ReplicatedOffsetStore store(&replica);
+    store.rebuildFromLog();
+
+    auto co = store.fetch("legacy", tp("topicX", 7));
+    ASSERT_TRUE(co.has_value()) << "pre-CP-1 empty-key record must rebuild via value decode";
+    EXPECT_EQ(co->offset, 55);
 }
