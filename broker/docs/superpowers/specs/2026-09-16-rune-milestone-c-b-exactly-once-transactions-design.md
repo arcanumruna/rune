@@ -158,16 +158,64 @@ component encodes "leader owns all."
 - read_committed with an open txn at offset K → deliver only < K (LSO), even if HW > K.
 
 ## 9. Testing & benchmarks
-- **Unit:** dedup validation cases (accept/dup/oos/fenced); coordinator state machine
-  (already covered) + the handlers; ReplicatedTxnStateStore commit→replicate→replay;
-  LSO/aborted-index maintenance + read_committed filtering.
-- **Integration:** atomic multi-partition commit visible only after commit; abort hides
-  records from read_committed; zombie fencing; txn-offset-commit atomicity; coordinator-
-  failover in-flight-txn resolution.
-- **DR-E2E:** atomicity across leader-kill, read_committed differential, fencing,
-  consume-transform-produce EOS across failover.
-- **Benchmarks (100µs gate on hot paths):** dedup per-batch overhead + zero-alloc; txn
-  begin/commit p50/p99; read_committed filter cost.
+
+**Coverage bar: FULL — every edge case, no matter how small.** Match the exhaustive
+regime used for DR-E2E and MC-A: **hundreds of unit tests**, comprehensive integration
+tests, and the **full docker-based E2E harness** (disaster recovery + latency gating +
+smoke tests) plus a **complete benchmark matrix**. Nothing is "obvious enough to skip."
+
+### 9.1 Unit tests (target: hundreds of cases across the suites below)
+- **Idempotent dedup (`ProducerStateManager`):** accept in-order; exact duplicate (same
+  pid/epoch/seq) → prior offset; partial-overlap batch; out-of-order (gap) → reject;
+  seq wraparound at 2^31; epoch bump fences old epoch; unknown pid; pid with no prior
+  seq; concurrent multi-partition seq spaces; first-sequence-not-zero; empty batch;
+  max-batch-size boundary; state eviction/expiry boundaries.
+- **Coordinator state machine (`TransactionCoordinator`):** every legal transition
+  (Empty→Ongoing→PrepareCommit/PrepareAbort→CompleteCommit/CompleteAbort→Empty) AND
+  every illegal transition → `InvalidTxnState`; EndTxn on Empty/unknown; double-commit;
+  commit-after-abort; add-partitions after prepare; timeout-fires-mid-prepare;
+  epoch-fence during each state.
+- **`ReplicatedTxnStateStore`:** commit→replicate→replay round-trip; replay across
+  multiple segments (multi-segment durability — the MC-A CG-2 bug class); acks=All
+  majority wait; replay reconstructs in-flight scope exactly; empty log; corrupt/partial
+  tail record tolerated.
+- **LSO / aborted-index / read_committed filter:** LSO = HW when no open txn; LSO pinned
+  by earliest open txn; LSO advance on commit marker; aborted-range add/remove; filter
+  drops aborted records; filter drops control markers; open-txn record hidden even when
+  HW past it; interleaved committed+aborted from different pids; boundary at exactly LSO.
+- **Protocol codecs:** encode/decode round-trip + golden `.bin` conformance vectors for
+  every new message (InitProducerId/AddPartitionsToTxn/AddOffsetsToTxn/TxnOffsetCommit/
+  EndTxn + Produce pid/epoch/seq fields); empty arrays; max-cardinality arrays; every new
+  error code; truncated-buffer rejection; `outCap` overrun guard (the MC-A CG-3 class).
+
+### 9.2 Integration tests (broker in-process, real logs)
+- Atomic multi-partition commit visible only after commit marker; abort hides all
+  records from read_committed while read_uncommitted still sees them (differential).
+- TxnOffsetCommit atomicity: staged offsets become visible on commit marker only, in
+  lockstep with the data records (interaction with MC-A `ReplicatedOffsetStore`).
+- Zombie fencing end-to-end (old-epoch produce/commit rejected after re-init).
+- Coordinator-failover in-flight-txn resolution (PrepareCommit re-drives markers;
+  unprepared txn abortable); producer-state recovery after restart (dedup survives).
+- Txn timeout → auto-abort → late commit from fenced producer rejected.
+
+### 9.3 Docker E2E (full harness — reuse `dr-e2e/`, matrix over 1/3/5-node)
+- **Disaster recovery:** atomicity across leader-kill (commit marker survives ⇒ all
+  visible; abort/none ⇒ none) and follower-kill/quorum-loss/recover; consume-transform-
+  produce **exactly-once** across failover (no dup, no loss) validated by generation-
+  aware single-owner + no-loss/no-dup invariants (the MC-A harness).
+- **read_committed differential** under churn; zombie fencing under load.
+- **Latency gating:** every E2E scenario asserts hot-path p99 under the **100µs gate**;
+  a regression FAILS the run (same gate the DR/MC-A suites enforce).
+- **Smoke tests:** single-node + 3-node bring-up, init→begin→produce→commit→consume
+  happy path, clean shutdown — fast pre-flight before the full matrix.
+
+### 9.4 Benchmarks (ALL of them — 100µs gate on hot paths, zero-alloc asserted)
+- Idempotent dedup per-batch overhead (ns-class, zero-alloc) — the produce hot path.
+- Txn `begin`/`addPartitions`/`commit`/`abort` p50/p99/p999 (control-marker acks=All).
+- `read_committed` filter cost vs `read_uncommitted` baseline (per-record + per-batch).
+- InitProducerId / epoch-bump throughput; coordinator replay time vs `__transaction_state`
+  size. Contention/scaling sweeps (producers × partitions × nodes). Any hot-path p99
+  >100µs = STOP-and-fix before the milestone closes.
 
 ## 10. Ticket breakdown (proposed)
 - **TX-1** — protocol codecs (InitProducerId/AddPartitionsToTxn/AddOffsetsToTxn/
@@ -180,8 +228,12 @@ component encodes "leader owns all."
   txn index + read_committed filtering on subscribe & GroupConsumer.
 - **TX-5** — client Tier-3 transactional producer API + idempotent-by-default + read_
   committed GroupConsumer.
-- **TX-6** — DR-E2E EOS scenarios.
-- **TX-7** — benchmarks + full-area Opus review to CLEAN.
+  (Each TX-1..TX-5 lands its own §9.1 unit + §9.2 integration coverage — hundreds of
+  cases total, every edge case — before its ticket is Done.)
+- **TX-6** — full docker E2E (§9.3): DR/failover EOS scenarios + read_committed
+  differential + fencing + latency gating + smoke, matrix over 1/3/5-node.
+- **TX-7** — full benchmark matrix (§9.4) + address any hot-path p99 >100µs +
+  full-area Opus review to CLEAN.
 
 ## 11. Open questions (resolve during planning)
 - `__transaction_state` as its own store vs reusing `TransactionLog` (Phase-5) over a

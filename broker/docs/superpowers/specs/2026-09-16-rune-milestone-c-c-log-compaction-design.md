@@ -153,18 +153,59 @@ materialized-views / DB-face changelog topics need — this milestone lays that 
   hot-updated key isn't compacted every cycle.
 
 ## 9. Testing & benchmarks
-- **Unit:** `OffsetMap` (key → highest offset, collisions, capacity); `LogCleaner`
-  segment rewrite (latest-per-key, tombstone drop after window, offset preservation,
-  producer-state batch preserved); `append(key,value)` encode/decode round-trip;
-  `cleanup.policy` parsing.
-- **Integration:** re-keyed `__consumer_offsets` compacts to latest-per-`(group,tp)` and
-  rebuild matches; `__transaction_state` compacts to latest-per-`txnId`; tombstone
-  delete visible after a pass; idempotent dedup survives a compaction pass.
-- **DR-E2E:** latest-per-key + tombstone + offset-preserved correctness across
-  restart/leader-kill; producer-state-through-compaction EOS; internal-topic recovery.
-- **Benchmarks (100µs gate on the append hot path):** compaction throughput (MB/s,
-  rec/s), OffsetMap build cost, per-cycle bounded-work budget honored, append p99
-  unperturbed while a compaction pass runs.
+
+**Coverage bar: FULL — every edge case, no matter how small.** Same exhaustive regime as
+DR-E2E / MC-A / MC-B: **hundreds of unit tests**, comprehensive integration tests, the
+**full docker-based E2E harness** (disaster recovery + latency gating + smoke tests), and
+a **complete benchmark matrix**. Compaction is subtle (offset gaps, tombstone windows,
+producer-state preservation) — no case is too small to test.
+
+### 9.1 Unit tests (target: hundreds of cases across the suites below)
+- **`OffsetMap`:** key→highest-offset build; hash collisions; capacity/eviction; empty
+  range; single-key-many-updates; all-unique-keys; null-key rejection; large-key sizing;
+  multi-pass over a log larger than the map (bounded-capacity correctness).
+- **`LogCleaner` segment rewrite:** latest-per-key kept, superseded dropped; **original
+  offsets preserved (gaps ok, no renumber/reorder)**; tombstone drop only AFTER
+  delete-retention window (kept before); key-that-only-had-tombstone disappears; empty
+  segment; segment that compacts to nothing; interleaved keys; min-cleanable-dirty-ratio
+  + min-compaction-lag thrash guards; atomic-swap crash-safety (old OR new set survives).
+- **Producer-state preservation:** last batch per `producerId` retained even when its key
+  is superseded (so MC-B dedup survives); multiple producers; expired vs live producer
+  state; interaction with `compact,delete` ordering.
+- **`append(key, value)`:** RecordBatch key encode/decode round-trip; empty key
+  (backward-compat with pre-MC-C records); max-key-size; null value (tombstone framing);
+  golden `.bin` conformance vectors; truncated-buffer rejection.
+- **`cleanup.policy` parsing:** `delete`/`compact`/`compact,delete`/invalid → error;
+  default = `delete`; TopicRegistry round-trip.
+
+### 9.2 Integration tests (broker in-process, real logs)
+- Re-keyed `__consumer_offsets` compacts to latest-per-`(group,tp)`; rebuild-from-log
+  after compaction matches the pre-compaction committed offsets exactly.
+- `__transaction_state` compacts to latest-per-`txnId`; coordinator replay from the
+  compacted log reconstructs the same in-flight/complete state.
+- Tombstone delete visible after a pass; delete-retention window honored.
+- Idempotent dedup (MC-B) still rejects a duplicate after its partition was compacted.
+- `compact,delete`: compaction-then-retention ordering doesn't drop a producer-state
+  batch that must survive.
+- Dirty-ratio trigger fires only past threshold; active segment never touched.
+
+### 9.3 Docker E2E (full harness — reuse `dr-e2e/`, matrix over 1/3/5-node)
+- **Disaster recovery:** latest-per-key + tombstone + offset-preserved correctness across
+  **restart AND leader-kill/follower-kill failover**; replicas stay byte-consistent on
+  retained records (deterministic compaction); internal-topic recovery (offsets/txn-state
+  rebuilt from compacted logs) after failover; producer-state-through-compaction EOS.
+- **Latency gating:** append hot-path p99 stays under the **100µs gate** *while a
+  compaction pass is running* — a regression FAILS the run (compaction must not perturb
+  the tail).
+- **Smoke tests:** single-node + 3-node bring-up with a compact-policy topic,
+  produce→compact→consume-latest happy path, clean shutdown — fast pre-flight.
+
+### 9.4 Benchmarks (ALL of them — 100µs gate on the append hot path)
+- Compaction throughput (MB/s, records/s) across dirty-ratio and key-cardinality sweeps.
+- `OffsetMap` build cost vs segment size / key count; multi-pass overhead.
+- Per-cycle bounded-work budget honored (compaction never stalls the duty cycle).
+- **Append p99/p999 unperturbed while a compaction pass runs** (the key gate) — zero-alloc
+  on the append path asserted. Any hot-path p99 >100µs = STOP-and-fix before close.
 
 ## 10. Ticket breakdown (proposed)
 - **CP-1** — `append(key, value)` replica/protocol change + RecordBatch key encoding +
@@ -174,8 +215,11 @@ materialized-views / DB-face changelog topics need — this milestone lays that 
 - **CP-3** — per-topic `cleanup.policy` in TopicRegistry + tombstones + delete-retention.
 - **CP-4** — correctness interactions: producer-state preservation through compaction;
   replication/HW/LEO non-perturbation; internal-topic recovery from compacted logs.
-- **CP-5** — DR-E2E scenarios + compaction throughput benchmarks + full-area Opus review
-  to CLEAN.
+  (Each CP-1..CP-4 lands its own §9.1 unit + §9.2 integration coverage — hundreds of
+  cases total, every edge case — before its ticket is Done.)
+- **CP-5** — full docker E2E (§9.3): DR/failover + latency gating + smoke, matrix over
+  1/3/5-node + full benchmark matrix (§9.4) + address any hot-path p99 >100µs +
+  full-area Opus review to CLEAN.
 
 ## 11. Open questions (resolve during planning)
 - `OffsetMap` sizing/eviction: fixed-capacity hash with a per-pass segment budget vs
