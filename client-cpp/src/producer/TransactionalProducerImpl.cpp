@@ -277,6 +277,34 @@ int TransactionalProducerImpl::doWork(
                 } catch (...) {}
                 break;
             }
+            // TX-6 FIX (flush-before-commit): EndTxn must NOT be sent until every
+            // data batch of this transaction is durably ACKED by the broker.
+            // Draining the send *frames* first is not enough: Produce is acks=all
+            // and asynchronous, and send() enqueues across doWork cycles, so a
+            // commit queued right after send() can be processed while later
+            // batches are still in flight — the coordinator then writes the commit
+            // marker BETWEEN data batches (marker at offset N, more data at N+1..),
+            // re-opening the txn in the LsoTracker so the LSO never advances and a
+            // read_committed consumer sees only the records that landed before the
+            // marker.  Kafka semantics: commitTransaction() flushes first.
+            //
+            // Defer the EndTxn until pendingSends_ is drained AND every in-flight
+            // Produce has been acked (pendingProduceBatches_ empty).  Re-queue the
+            // command unchanged and retry on the next doWork tick.
+            {
+                bool sendsPending;
+                {
+                    std::lock_guard<std::mutex> lk(pendingSendsMtx_);
+                    sendsPending = !pendingSends_.empty();
+                }
+                if (sendsPending || !pendingProduceBatches_.empty()) {
+                    std::lock_guard<std::mutex> lk(cmdMtx_);
+                    cmdQueue_.push_back(std::move(cmd));
+                    ++work;  // made progress draining sends; keep the runner active
+                    break;
+                }
+            }
+
             const bool commit = (cmd.kind == CmdKind::EndTxnCommit);
             const int64_t corrId =
                 nextCorrId_.fetch_add(1, std::memory_order_relaxed);

@@ -920,3 +920,174 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
         break;
     }
 }
+
+// ===========================================================================
+// Test 12: TX-6b EndTxnDeferredUntilAllProduceBatchesAcked
+//
+//   The bug (pre-fix): commitTransaction() / EndTxn could be sent to the broker
+//   while Produce batches were still in-flight (pendingProduceBatches_ non-empty).
+//   The broker would write the commit control marker BETWEEN data batches — at
+//   offset N, with more data at N+1 — re-opening the txn in LsoTracker so the
+//   LSO never advanced and a read_committed consumer would see only records that
+//   landed before the marker.
+//
+//   The fix (TX-6b): doWork() defers EndTxn processing while pendingSends_ OR
+//   pendingProduceBatches_ is non-empty, re-queuing the command for the next tick.
+//
+//   Wire-order assertion:
+//     Given: 2 sends in-flight (pendingProduceBatches_ has 2 entries).
+//     When:  commitTransaction() is enqueued.
+//     Then:  doWork() must NOT emit EndTxn (deferred).
+//     When:  both ProduceResponses are fed (batches acked).
+//     Then:  doWork() MUST emit EndTxn (all batches clear).
+//
+//   RED (without fix): EndTxn is emitted immediately while batches are in-flight.
+//   GREEN (with fix):  EndTxn is emitted only after all batches are acked.
+// ===========================================================================
+TEST_F(TransactionalProducerTest, EndTxnDeferredUntilAllProduceBatchesAcked)
+{
+    CaptureSink sink;
+    auto impl = makeImpl();
+    TransactionalProducer tp(impl);
+
+    // ---- Acquire producer identity ------------------------------------------
+    {
+        auto fut = tp.initTransactions();
+        impl->doWork(kSessionId, sink.fn());
+        ASSERT_GE(sink.frames.size(), 1u);
+        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
+        ASSERT_TRUE(opt.has_value());
+        auto resp = makeInitProducerIdResponse(opt->correlationId, /*pid=*/42, /*epoch=*/0);
+        impl->onInitProducerIdResponse(resp.data(), resp.size());
+        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
+        sink.clear();
+    }
+
+    tp.beginTransaction();
+
+    TopicHandle topic{5, 1};
+    Key key(uint64_t{0});
+    const std::vector<uint8_t> val = {0xDE, 0xAD};
+
+    // ---- Enqueue 2 sends + commit BEFORE any doWork so they're all pending ----
+    tp.send(topic, key, std::span<const uint8_t>(val)); // send #1
+    tp.send(topic, key, std::span<const uint8_t>(val)); // send #2
+    auto commitFut = tp.commitTransaction();             // EndTxn enqueued
+
+    // ---- First doWork: drains sends, queues produce batches in-flight ---------
+    // The sends are drained into Produce frames and stored in pendingProduceBatches_.
+    // The EndTxn command should be re-queued (deferred) because batches are in-flight.
+    impl->doWork(kSessionId, sink.fn());
+
+    // Collect all Produce corrIds from this cycle.
+    std::vector<int64_t> produceCorrIds;
+    for (const auto& f : sink.frames) {
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
+            auto opt = rpc::Produce::decode(f.data(), f.size());
+            ASSERT_TRUE(opt.has_value());
+            produceCorrIds.push_back(opt->correlationId);
+        }
+    }
+    ASSERT_EQ(produceCorrIds.size(), 2u)
+        << "Both Produce frames must be sent in the first doWork cycle";
+
+    // ---- CRITICAL assertion: EndTxn must NOT be in the first doWork output ----
+    // With the bug (pre-fix): EndTxn would appear here (before batches acked).
+    // With the fix:           EndTxn is deferred; not present.
+    {
+        bool endTxnSentEarly = false;
+        for (const auto& f : sink.frames) {
+            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
+                endTxnSentEarly = true;
+                break;
+            }
+        }
+        EXPECT_FALSE(endTxnSentEarly)
+            << "TX-6b BUG: EndTxn was sent BEFORE all in-flight Produce batches were "
+               "acked (pendingProduceBatches_ non-empty).  commitTransaction() must "
+               "flush all batches first (Kafka semantics).";
+    }
+
+    // Commit future must NOT be ready yet (EndTxn not sent, response not received).
+    EXPECT_NE(commitFut.wait_for(0s), std::future_status::ready)
+        << "commitTransaction() future must not resolve while Produce batches "
+           "are still in-flight";
+
+    sink.clear();
+
+    // ---- Second doWork: still deferred (no acks yet) -------------------------
+    // Simulate another tick without acks — EndTxn must still not be sent.
+    impl->doWork(kSessionId, sink.fn());
+    {
+        bool endTxnStillDeferred = true;
+        for (const auto& f : sink.frames) {
+            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
+                endTxnStillDeferred = false;
+                break;
+            }
+        }
+        EXPECT_TRUE(endTxnStillDeferred)
+            << "EndTxn must remain deferred after a second doWork tick with no acks";
+    }
+    sink.clear();
+
+    // ---- Ack the first Produce batch -----------------------------------------
+    {
+        auto ack = makeProduceResponse(produceCorrIds[0], /*errorCode=*/0, /*baseOffset=*/0);
+        impl->onProduceResponse(ack.data(), ack.size(), sink.fn());
+    }
+    // Still one batch in-flight — EndTxn must remain deferred.
+    impl->doWork(kSessionId, sink.fn());
+    {
+        bool endTxnAfterFirstAck = false;
+        for (const auto& f : sink.frames) {
+            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
+                endTxnAfterFirstAck = true;
+                break;
+            }
+        }
+        EXPECT_FALSE(endTxnAfterFirstAck)
+            << "EndTxn must NOT be sent after only the first of two Produce batches "
+               "is acked (second batch still in-flight)";
+    }
+    sink.clear();
+
+    // ---- Ack the second Produce batch ----------------------------------------
+    {
+        auto ack = makeProduceResponse(produceCorrIds[1], /*errorCode=*/0, /*baseOffset=*/1);
+        impl->onProduceResponse(ack.data(), ack.size(), sink.fn());
+    }
+
+    // ---- Third doWork: all batches acked → EndTxn MUST be sent ---------------
+    impl->doWork(kSessionId, sink.fn());
+
+    bool endTxnSent = false;
+    int64_t endTxnCorrId = 0;
+    for (const auto& f : sink.frames) {
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
+            endTxnSent = true;
+            auto opt = rpc::EndTxn::decode(f.data(), f.size());
+            ASSERT_TRUE(opt.has_value());
+            endTxnCorrId = opt->correlationId;
+            EXPECT_EQ(opt->commit, uint8_t{1})
+                << "EndTxn must be a COMMIT (commit=1)";
+            EXPECT_EQ(opt->producerId, 42)
+                << "EndTxn must carry the correct producerId";
+            break;
+        }
+    }
+    ASSERT_TRUE(endTxnSent)
+        << "TX-6b FIX NOT EFFECTIVE: EndTxn was never sent even after all "
+           "Produce batches were acked.";
+
+    // ---- Feed EndTxnResponse → commitTransaction() future must resolve --------
+    {
+        auto resp = makeEndTxnResponse(endTxnCorrId, /*errorCode=*/0);
+        impl->onEndTxnResponse(resp.data(), resp.size());
+    }
+
+    ASSERT_EQ(commitFut.wait_for(0s), std::future_status::ready)
+        << "commitTransaction() future must resolve after EndTxnResponse";
+    EXPECT_NO_THROW(commitFut.get());
+    EXPECT_FALSE(tp.transactionActive());
+}
