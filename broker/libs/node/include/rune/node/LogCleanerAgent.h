@@ -81,8 +81,10 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/storage/SkimpyOffsetMap.h>
+#include <rune/storage/Throttler.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -103,15 +105,18 @@ public:
     ///                          Default -1 = use cycleBudgetBytes (or 128 MiB if
     ///                          cycleBudgetBytes is 0).  The map is sized to
     ///                          floor(dedupeBufferBytes / kEntryBytes × loadFactor).
+    /// @param ioMaxBytesPerSec  Shared I/O throttle (bytes/sec). -1 = unlimited.
     explicit LogCleanerAgent(ReplicaRegistry* registry,
                              int64_t cycleBudgetBytes  = 128LL * 1024 * 1024,
-                             int64_t dedupeBufferBytes = -1) noexcept
+                             int64_t dedupeBufferBytes = -1,
+                             int64_t ioMaxBytesPerSec  = -1) noexcept
         : registry_(registry)
         , cycleBudgetBytes_(cycleBudgetBytes)
         , dedupeBufferBytes_(dedupeBufferBytes >= 0
                              ? dedupeBufferBytes
                              : (cycleBudgetBytes > 0 ? cycleBudgetBytes
                                                      : 128LL * 1024 * 1024))
+        , throttler_(ioMaxBytesPerSec)
     {}
 
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
@@ -133,6 +138,10 @@ public:
     int doWork(int64_t nowNs) override {
         if (!registry_) return 0;
 
+        // CP-8: sample wall-clock epoch-ms ONCE per cycle (deterministic horizon).
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
         // ---------------------------------------------------------------
         // Phase 1: scan all eligible leader logs; compute byte-dirty ratio
         //          via the SEALED SEGMENT SNAPSHOT (cleaner must NEVER call
@@ -143,6 +152,7 @@ public:
             rune::replication::PartitionReplica* replica  = nullptr;
             rune::storage::Log*                  log      = nullptr;
             double                               ratio    = 0.0;
+            bool                                 forced   = false; // maxCompactionLag forced
             int64_t                              segBase  = -1;
             int64_t                              segEnd   = -1;
             int64_t                              segBytes = 0;
@@ -183,7 +193,35 @@ public:
             // (conservative — no active-base pollution in the dirty scan).
             // Note: hw == logEndOffset() when the active segment is small, but
             // that's fine: we just include slightly less in the dirty window.
-            const int64_t firstUncleanable = hw;  // min(active_base, hw); conservative
+            int64_t firstUncleanable = hw;  // min(active_base, hw); conservative
+
+            // CP-8: minCompactionLagMs — shrink firstUncleanable so segments
+            // whose largestTimestamp is within the lag window are excluded from
+            // the cleanable range.  This prevents compaction of very recent data.
+            //
+            // "A dirty non-active segment is UNCLEANABLE while:
+            //   segment.largestTimestamp > nowMs - minCompactionLagMs"
+            //
+            // We find the FIRST segment from the front (lowest base) whose
+            // largestTimestamp is within the lag; all segments from that point
+            // onward are excluded (firstUncleanable shrinks to that base).
+            //
+            // largestTimestamp = 0 means unknown → treat as very old → cleanable.
+            const int64_t minLagMs = replica->minCompactionLagMs();
+            if (minLagMs > 0) {
+                for (std::size_t ii = 0; ii < snap->size(); ++ii) {
+                    const auto& si = (*snap)[ii];
+                    if (si.baseOffset >= firstUncleanable) break;
+                    const int64_t largestTs = si.largestTimestamp;
+                    if (largestTs > 0 && largestTs > nowMs - minLagMs) {
+                        // This segment and all after it are within the lag window
+                        // — shrink firstUncleanable to exclude them.
+                        if (si.baseOffset < firstUncleanable)
+                            firstUncleanable = si.baseOffset;
+                        break;
+                    }
+                }
+            }
 
             // Compute byte-based dirty ratio (Kafka-exact formula §3.2).
             //
@@ -196,6 +234,7 @@ public:
             // [firstDirtyOffset, firstUncleanable), i.e. segEnd > firstDirtyOffset.
             int64_t cleanBytes     = 0;
             int64_t cleanableBytes = 0;
+            int64_t oldestDirtyTs  = std::numeric_limits<int64_t>::max(); // CP-8: for maxLag
             for (std::size_t ii = 0; ii < snap->size(); ++ii) {
                 const auto& si = (*snap)[ii];
                 if (si.baseOffset >= firstUncleanable) break;
@@ -210,6 +249,10 @@ public:
                     cleanBytes += si.sizeBytes;
                 } else {
                     cleanableBytes += si.sizeBytes;
+                    // CP-8: track oldest dirty segment's largestTimestamp for maxLag.
+                    if (si.largestTimestamp > 0 &&
+                        si.largestTimestamp < oldestDirtyTs)
+                        oldestDirtyTs = si.largestTimestamp;
                 }
             }
 
@@ -219,7 +262,20 @@ public:
             const double dirtyRatio =
                 static_cast<double>(cleanableBytes) / static_cast<double>(total);
 
-            if (dirtyRatio <= replica->minCleanableDirtyRatio()) continue;
+            // CP-8: maxCompactionLagMs — force compaction (needCompactionNow) if
+            // the oldest dirty segment has aged past maxCompactionLagMs.
+            // "The oldest dirty segment's age = nowMs - largestTimestamp".
+            // When forced, the log is eligible even if dirtyRatio <=
+            // minCleanableDirtyRatio.
+            bool needCompactionNow = false;
+            const int64_t maxLagMs = replica->maxCompactionLagMs();
+            if (maxLagMs > 0 && oldestDirtyTs < std::numeric_limits<int64_t>::max()) {
+                const int64_t ageMs = nowMs - oldestDirtyTs;
+                if (ageMs > maxLagMs) needCompactionNow = true;
+            }
+
+            if (!needCompactionNow &&
+                dirtyRatio <= replica->minCleanableDirtyRatio()) continue;
 
             // Find the sealed segment that CONTAINS or starts at firstDirtyOffset.
             //
@@ -259,8 +315,20 @@ public:
             }
 
             // Filthiest-first: keep the candidate with the highest ratio.
-            if (dirtyRatio > best.ratio) {
+            // Forced logs (maxCompactionLag) win over any non-forced log.
+            bool dominates = false;
+            if (!best.replica) {
+                dominates = true;
+            } else if (needCompactionNow && !best.forced) {
+                dominates = true; // forced always beats non-forced
+            } else if (!needCompactionNow && best.forced) {
+                dominates = false; // already have a forced candidate
+            } else {
+                dominates = (dirtyRatio > best.ratio); // both same forced status
+            }
+            if (dominates) {
                 best.ratio            = dirtyRatio;
+                best.forced           = needCompactionNow;
                 best.replica          = replica;
                 best.log              = log;
                 best.segBase          = segBase;
@@ -348,7 +416,9 @@ public:
             /*globalDirtyStart=*/globalDirtyStart,
             nowNs,
             best.replica->deleteRetentionMs(),
-            /*dedupeBufferBytes=*/dedupeBufferBytes_);
+            /*dedupeBufferBytes=*/dedupeBufferBytes_,
+            /*throttler=*/       &throttler_,
+            /*nowMs=*/           nowMs);
 
         // CP-7: passEnd is the next-pass boundary.  When the map covered the
         // entire dirty range, passEnd == activeBase.  When the map was bounded
@@ -444,10 +514,11 @@ private:
         checkpoints_.emplace(log, std::move(ckpt));
     }
 
-    ReplicaRegistry* registry_;         // non-owning
-    int64_t          cycleBudgetBytes_; // 0 = unlimited; >0 = soft bytes-per-window cap
-    int64_t          dedupeBufferBytes_;// dedupe map byte budget (SkimpyOffsetMap, > 0 always)
-    int64_t          bytesUsed_ = 0;    // bytes consumed so far in the current budget window
+    ReplicaRegistry*        registry_;         // non-owning
+    int64_t                 cycleBudgetBytes_; // 0 = unlimited; >0 = soft bytes-per-window cap
+    int64_t                 dedupeBufferBytes_;// dedupe map byte budget (SkimpyOffsetMap, > 0 always)
+    int64_t                 bytesUsed_ = 0;    // bytes consumed so far in the current budget window
+    rune::storage::Throttler throttler_;       // CP-8: shared I/O throttler (cleaner-thread only)
 
     // CP-7: per-log cleaner-offset-checkpoint (lazy init on first compaction).
     // Key = Log* (non-owning, lives as long as the replica registry).
