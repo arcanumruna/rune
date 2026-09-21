@@ -319,13 +319,13 @@ Offset  Hex                                        Notes
 
 ---
 
-## 11. `produce_explicit_partition.bin` — 45 bytes
+## 11. `produce_explicit_partition.bin` — 60 bytes
 
 **Message:** `Produce` (templateId = 16)
 
 | Field           | Value (decimal)          | Value (hex)                     |
 |-----------------|--------------------------|---------------------------------|
-| blockLength     | 9                        | 0x0009                          |
+| blockLength     | 24                       | 0x0018                          |
 | templateId      | 16                       | 0x0010                          |
 | schemaId        | 120                      | 0x0078                          |
 | version         | 1                        | 0x0001                          |
@@ -334,13 +334,17 @@ Offset  Hex                                        Notes
 | topicId         | 1001                     | 0x000003E9                      |
 | partition       | 7                        | 0x00000007                      |
 | partitionKnown  | 1                        | 0x01                            |
+| acks            | 0                        | 0x00                            |
+| producerId      | -1                       | 0xFFFFFFFFFFFFFFFF (sentinel)   |
+| producerEpoch   | 0                        | 0x0000                          |
+| baseSequence    | -1                       | 0xFFFFFFFF (sentinel)           |
 | key             | (empty)                  | len=0 (0x0000)                  |
 | recordBatch     | 8 opaque bytes           | len=8 (0x0008); DE AD BE EF 00 FF 01 02 |
 
 **Byte layout:**
 ```
 Offset  Hex                                        Notes
-00      09 00                                      blockLength = 9 (LE)
+00      18 00                                      blockLength = 24 (LE)
 02      10 00                                      templateId = 16 (LE)
 04      78 00                                      schemaId = 120 (LE)
 06      01 00                                      version = 1 (LE)
@@ -349,20 +353,24 @@ Offset  Hex                                        Notes
 24      E9 03 00 00                                topicId = 1001 (LE)
 28      07 00 00 00                                partition = 7 (LE)
 32      01                                         partitionKnown = 1
-33      00 00                                      key var-len = 0 (LE)
-35      08 00                                      recordBatch var-len = 8 (LE)
-37      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
+33      00                                         acks = 0
+34      FF FF FF FF FF FF FF FF                    producerId = -1 (sentinel, LE)
+42      00 00                                      producerEpoch = 0 (LE)
+44      FF FF FF FF                                baseSequence = -1 (sentinel, LE)
+48      00 00                                      key var-len = 0 (LE)
+50      08 00                                      recordBatch var-len = 8 (LE)
+52      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
 ```
 
 ---
 
-## 12. `produce_key_only.bin` — 48 bytes
+## 12. `produce_key_only.bin` — 63 bytes
 
 **Message:** `Produce` (templateId = 16)
 
 | Field           | Value (decimal)          | Value (hex)                     |
 |-----------------|--------------------------|---------------------------------|
-| blockLength     | 9                        | 0x0009                          |
+| blockLength     | 24                       | 0x0018                          |
 | templateId      | 16                       | 0x0010                          |
 | schemaId        | 120                      | 0x0078                          |
 | version         | 1                        | 0x0001                          |
@@ -371,13 +379,17 @@ Offset  Hex                                        Notes
 | topicId         | 2002                     | 0x000007D2                      |
 | partition       | 0                        | 0x00000000 (ignored; partitionKnown=0) |
 | partitionKnown  | 0                        | 0x00                            |
+| acks            | 0                        | 0x00                            |
+| producerId      | -1                       | 0xFFFFFFFFFFFFFFFF (sentinel)   |
+| producerEpoch   | 0                        | 0x0000                          |
+| baseSequence    | -1                       | 0xFFFFFFFF (sentinel)           |
 | key             | "ABC" (3 bytes)          | len=3 (0x0003); 41 42 43        |
 | recordBatch     | 8 opaque bytes           | len=8 (0x0008); DE AD BE EF 00 FF 01 02 |
 
 **Byte layout:**
 ```
 Offset  Hex                                        Notes
-00      09 00                                      blockLength = 9 (LE)
+00      18 00                                      blockLength = 24 (LE)
 02      10 00                                      templateId = 16 (LE)
 04      78 00                                      schemaId = 120 (LE)
 06      01 00                                      version = 1 (LE)
@@ -386,10 +398,14 @@ Offset  Hex                                        Notes
 24      D2 07 00 00                                topicId = 2002 (LE)
 28      00 00 00 00                                partition = 0 (LE, ignored)
 32      00                                         partitionKnown = 0
-33      03 00                                      key var-len = 3 (LE)
-35      41 42 43                                   key bytes = "ABC"
-38      08 00                                      recordBatch var-len = 8 (LE)
-40      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
+33      00                                         acks = 0
+34      FF FF FF FF FF FF FF FF                    producerId = -1 (sentinel, LE)
+42      00 00                                      producerEpoch = 0 (LE)
+44      FF FF FF FF                                baseSequence = -1 (sentinel, LE)
+48      03 00                                      key var-len = 3 (LE)
+50      41 42 43                                   key bytes = "ABC"
+53      08 00                                      recordBatch var-len = 8 (LE)
+55      DE AD BE EF 00 FF 01 02                    recordBatch bytes (opaque)
 ```
 
 ---
