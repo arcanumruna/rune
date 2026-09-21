@@ -1,6 +1,7 @@
 #pragma once
 #include <rune/storage/Log.h>
 #include <rune/storage/OffsetMap.h>
+#include <rune/storage/SkimpyOffsetMap.h>
 #include <cstdint>
 
 namespace rune::storage {
@@ -57,6 +58,23 @@ public:
                                  const std::vector<int64_t>& bases,
                                  Offset fromOffset, Offset toOffset,
                                  OffsetMap& map);
+
+    /// CP-7: BOUNDED overload — uses a SkimpyOffsetMap with a hard slot limit.
+    ///
+    /// Identical to the OffsetMap overload BUT stops scanning as soon as
+    /// `map.isFull()` returns true (bounded-range-per-pass).  The caller MUST
+    /// check `map.latestOffset()` after this call to determine the pass boundary:
+    ///   passEnd = map.latestOffset() + 1;
+    /// then compact only segments with base < passEnd, and advance the
+    /// cleaner checkpoint to passEnd for the next cycle.
+    ///
+    /// Returns the highest offset that was successfully entered into the map,
+    /// or -1 if no records were scanned.  This is identical to
+    /// map.latestOffset() after the call.
+    Offset buildOffsetMapFromBases(const std::string& dir,
+                                   const std::vector<int64_t>& bases,
+                                   Offset fromOffset, Offset toOffset,
+                                   SkimpyOffsetMap& map);
 
     /// Compact the log up to `cleanBoundaryOffset` using a previously-built
     /// OffsetMap.

@@ -150,6 +150,53 @@ void LogCleaner::buildOffsetMap(Log& log, Offset fromOffset, Offset toOffset,
 }
 
 // ---------------------------------------------------------------------------
+// buildOffsetMapFromBases  (CP-7 BOUNDED overload — SkimpyOffsetMap)
+// ---------------------------------------------------------------------------
+Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
+                                           const std::vector<int64_t>& bases,
+                                           Offset fromOffset, Offset toOffset,
+                                           SkimpyOffsetMap& map) {
+    if (fromOffset >= toOffset) return -1;
+
+    for (size_t i = 0; i < bases.size(); ++i) {
+        int64_t segBase = bases[i];
+        int64_t segEnd  = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
+
+        if (segEnd <= fromOffset) continue;
+        if (segBase >= toOffset)  break;
+
+        auto buf = readFile(segmentLogPath(dir, segBase));
+        if (buf.empty()) continue;
+
+        size_t pos = 0;
+        while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
+               <= buf.size()) {
+            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+            int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            if (!r.ensureValid()) break;
+
+            bool full = false;
+            r.forEach([&](std::string_view key, std::string_view /*val*/,
+                          int64_t offset, int64_t /*ts*/) {
+                if (full) return;
+                if (offset < fromOffset || offset >= toOffset) return;
+                if (key.empty()) return; // null-key: not compactable
+                if (!map.put(key, offset)) {
+                    // Map is full — stop the pass.  latestOffset() holds the
+                    // highest offset that made it into the map.
+                    full = true;
+                }
+            });
+
+            if (full) return map.latestOffset();
+            pos += static_cast<size_t>(total);
+        }
+    }
+    return map.latestOffset();
+}
+
+// ---------------------------------------------------------------------------
 // buildOffsetMapFromBases  (CLEANER-SAFE — pure file work, no segments_)
 // ---------------------------------------------------------------------------
 void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
