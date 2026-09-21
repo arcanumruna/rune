@@ -51,13 +51,14 @@ struct FrameCheck {
 
 // ---------------------------------------------------------------------------
 // isKnownTemplate — true for templateIds handled in Milestone A (1..7),
-//                   Milestone B produce/subscribe range (16..21), and
-//                   Milestone C consumer-group range (32..44).
+//                   Milestone B produce/subscribe range (16..21),
+//                   Milestone C consumer-group range (32..44), and
+//                   Milestone C-B txn range (45..54).
 //
 // Reserved ranges (from Protocol.h):
 //   control         1-15   (Connect=1 .. Pong=7 assigned; 8-15 gap → UnknownTemplate)
 //   produce/consume 16-31  (Produce=16 .. Unsubscribe=21 assigned; 22-31 gap → UnknownTemplate)
-//   groups/txn      32-63  (JoinGroup=32 .. Assign=44 assigned; 45-63 gap → UnknownTemplate)
+//   groups/txn      32-63  (JoinGroup=32 .. Assign=44; InitProducerId=45..EndTxnResponse=54)
 //   view            64-95
 //
 // Extend this function when future tickets add template ids.
@@ -76,6 +77,11 @@ struct FrameCheck {
     // Milestone C consumer-group range: 32..44
     if (tid >= static_cast<uint16_t>(TemplateId::JoinGroup) &&
         tid <= static_cast<uint16_t>(TemplateId::Assign)) {
+        return true;
+    }
+    // Milestone C-B txn range: 45..54
+    if (tid >= static_cast<uint16_t>(TemplateId::InitProducerId) &&
+        tid <= static_cast<uint16_t>(TemplateId::EndTxnResponse)) {
         return true;
     }
     return false;

@@ -682,12 +682,13 @@ TEST(DispatchCheckFrame, UnknownTemplateTwentyTwo) {
     EXPECT_EQ(fc.templateId, 22u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateFortyFive) {
-    // 45 = first unassigned id in groups/txn range (32-44 are now all known in CG-1)
-    auto buf = makeValidHeaderBuf(45);
+TEST(DispatchCheckFrame, UnknownTemplateFiftyFive) {
+    // 55 = first unassigned id in groups/txn range after EndTxnResponse=54 (TX-1)
+    // 45-54 are now all assigned to txn messages.
+    auto buf = makeValidHeaderBuf(55);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 45u);
+    EXPECT_EQ(fc.templateId, 55u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateSixtyFour) {
@@ -844,15 +845,19 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     for (uint16_t tid = 32; tid <= 44; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
+    // Milestone C-B txn range: 45..54 must all be known (TX-1).
+    for (uint16_t tid = 45; tid <= 54; ++tid) {
+        EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
+    }
 
     // Not known: 0, 8..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
-    //            45..63 (unassigned groups/txn gap), 64+ (view range), 65535.
+    //            55..63 (unassigned groups/txn gap after TX-1), 64+ (view range), 65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(8));
     EXPECT_FALSE(rpc::isKnownTemplate(15));
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));
-    EXPECT_FALSE(rpc::isKnownTemplate(45));
+    EXPECT_FALSE(rpc::isKnownTemplate(55));
     EXPECT_FALSE(rpc::isKnownTemplate(64));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }
