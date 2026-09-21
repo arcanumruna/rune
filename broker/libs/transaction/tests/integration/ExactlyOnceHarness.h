@@ -337,9 +337,7 @@ public:
         PartitionState& ps = *parts_[static_cast<std::size_t>(partIdx)];
 
         int32_t lastSeq = baseSequence; // single record per batch
-        // TX-2c: use partIdx as topicId proxy (harness uses one topic per partition;
-        // the partIdx here is also the partition number — topicId=0 is the single
-        // test topic used throughout ExactlyOnceHarness).
+        // TX-2c: topicId=0 is the single test topic used throughout ExactlyOnceHarness.
         auto vr = ps.psm.validate(/*topicId=*/0, producerId, partIdx,
                                    producerEpoch, baseSequence, lastSeq);
         if (vr.isDuplicate()) return vr.retryBaseOffset; // idempotent: return orig offset

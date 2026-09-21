@@ -380,3 +380,166 @@ TEST_F(ProducerStateDurabilityTest, NonIdempotentBatchesSkippedInRebuild) {
     // PSM size = 1 (only the idempotent producer).
     EXPECT_EQ(psm.size(), 1u);
 }
+
+// ===========================================================================
+// Test 5: [TX-2c REGRESSION] Multi-partition / multi-topic rebuild into ONE
+// shared ProducerStateManager mirrors the ClientGateway gateway loop.
+//
+// ClientGateway::rebuildProducerStateFromLogs loops over every (topicId,
+// partition) calling producerStateManager_.rebuildFromLog(...) on ONE shared
+// PSM.  With the old map_.clear(), each call wiped all prior partitions'
+// state, leaving only the LAST partition's dedup window intact.  This test
+// MUST FAIL against the map_.clear() code and pass after the erase_if fix.
+//
+// Scenario:
+//   - Two separate logs (log1 = partition 0 data, log2 = partition 1 data).
+//   - Same topicId=0, same producer (pid, epoch), but different partitions.
+//   - Rebuild both logs into ONE shared PSM via successive rebuildFromLog
+//     calls (exactly as the gateway loop does).
+//   - Assert BOTH partitions independently detect their own duplicates.
+// ===========================================================================
+TEST_F(ProducerStateDurabilityTest, MultiPartitionRebuildRetainsBothPartitions) {
+    // Two separate partition logs — log1 for partition 0, log2 for partition 1.
+    const int32_t kPart0 = 0;
+    const int32_t kPart1 = 1;
+    const int32_t kTopicId = 0;
+    const int64_t kPid   = 123456789LL;
+    const int16_t kEpoch = 1;
+
+    // Append 2 batches to partition 0 (log1): seq=0, seq=1.
+    int64_t off0_seq0 = -1, off0_seq1 = -1;
+    {
+        off0_seq0 = log1.logEndOffset();
+        auto b0 = makeIdempotentBatch(off0_seq0, kPid, kEpoch, 0);
+        log1.append(b0, off0_seq0);
+
+        off0_seq1 = log1.logEndOffset();
+        auto b1 = makeIdempotentBatch(off0_seq1, kPid, kEpoch, 1);
+        log1.append(b1, off0_seq1);
+    }
+
+    // Append 2 batches to partition 1 (log2): seq=0, seq=1.
+    int64_t off1_seq0 = -1, off1_seq1 = -1;
+    {
+        off1_seq0 = log2.logEndOffset();
+        auto b0 = makeIdempotentBatch(off1_seq0, kPid, kEpoch, 0);
+        log2.append(b0, off1_seq0);
+
+        off1_seq1 = log2.logEndOffset();
+        auto b1 = makeIdempotentBatch(off1_seq1, kPid, kEpoch, 1);
+        log2.append(b1, off1_seq1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // ONE shared PSM — rebuild both partitions in succession,
+    // exactly as ClientGateway::rebuildProducerStateFromLogs does.
+    // ---------------------------------------------------------------------------
+    ProducerStateManager sharedPsm;
+
+    // First call: partition 0
+    sharedPsm.rebuildFromLog(kTopicId, log1, log1.logEndOffset(), kPart0);
+
+    // Second call: partition 1.
+    // With map_.clear() (pre-fix), this call erases partition 0's state.
+    // With erase_if (post-fix), only partition 1's prior keys are cleared;
+    // partition 0 survives.
+    sharedPsm.rebuildFromLog(kTopicId, log2, log2.logEndOffset(), kPart1);
+
+    // ---------------------------------------------------------------------------
+    // Partition 0: seq=0 and seq=1 must BOTH be Duplicate with their original offsets.
+    // Pre-fix: partition 0's state was wiped by the second rebuildFromLog call →
+    // seq=0 on partition 0 would return Accept (stale PSM = empty for that key).
+    // ---------------------------------------------------------------------------
+    {
+        auto vr0 = sharedPsm.validate(kTopicId, kPid, kPart0, kEpoch, 0, 0);
+        ASSERT_TRUE(vr0.isDuplicate())
+            << "[TX-2c REGRESSION] partition 0 seq=0 must be Duplicate after "
+            "multi-partition rebuild; got Accept — the second rebuildFromLog call wiped "
+            "partition 0's state (map_.clear() bug). Fix: use erase_if per (topicId,partition).";
+        EXPECT_EQ(vr0.retryBaseOffset, off0_seq0)
+            << "partition 0 seq=0 retryBaseOffset must be the original offset";
+
+        auto vr1 = sharedPsm.validate(kTopicId, kPid, kPart0, kEpoch, 1, 1);
+        ASSERT_TRUE(vr1.isDuplicate())
+            << "[TX-2c REGRESSION] partition 0 seq=1 must be Duplicate";
+        EXPECT_EQ(vr1.retryBaseOffset, off0_seq1);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Partition 1: seq=0 and seq=1 must BOTH be Duplicate with their original offsets.
+    // (This was always passing — the last partition always survived the clear.)
+    // ---------------------------------------------------------------------------
+    {
+        auto vr0 = sharedPsm.validate(kTopicId, kPid, kPart1, kEpoch, 0, 0);
+        ASSERT_TRUE(vr0.isDuplicate())
+            << "partition 1 seq=0 must be Duplicate";
+        EXPECT_EQ(vr0.retryBaseOffset, off1_seq0);
+
+        auto vr1 = sharedPsm.validate(kTopicId, kPid, kPart1, kEpoch, 1, 1);
+        ASSERT_TRUE(vr1.isDuplicate())
+            << "partition 1 seq=1 must be Duplicate";
+        EXPECT_EQ(vr1.retryBaseOffset, off1_seq1);
+    }
+
+    // Shared PSM must hold exactly 2 entries: one per (topicId, pid, partition).
+    EXPECT_EQ(sharedPsm.size(), 2u)
+        << "Shared PSM must have 2 entries (one per partition), not 1";
+
+    // A new (genuinely next) sequence on each partition is still accepted.
+    EXPECT_TRUE(sharedPsm.validate(kTopicId, kPid, kPart0, kEpoch, 2, 2).isAccept())
+        << "partition 0: seq=2 (new) must be Accept";
+    EXPECT_TRUE(sharedPsm.validate(kTopicId, kPid, kPart1, kEpoch, 2, 2).isAccept())
+        << "partition 1: seq=2 (new) must be Accept";
+}
+
+// ===========================================================================
+// Test 6: [TX-2c REGRESSION — multi-topic] Two distinct topicIds rebuilt into
+// ONE shared PSM must each retain their dedup state.
+// ===========================================================================
+TEST_F(ProducerStateDurabilityTest, MultiTopicRebuildRetainsBothTopics) {
+    const int32_t kPartition = 0;
+    const int64_t kPid   = 987654321LL;
+    const int16_t kEpoch = 2;
+    const int32_t kTopicA = 1;
+    const int32_t kTopicB = 2;
+
+    // Append 1 batch for topicA to log1.
+    int64_t offA = -1;
+    {
+        offA = log1.logEndOffset();
+        auto b = makeIdempotentBatch(offA, kPid, kEpoch, 0);
+        log1.append(b, offA);
+    }
+
+    // Append 1 batch for topicB to log2.
+    int64_t offB = -1;
+    {
+        offB = log2.logEndOffset();
+        auto b = makeIdempotentBatch(offB, kPid, kEpoch, 0);
+        log2.append(b, offB);
+    }
+
+    ProducerStateManager sharedPsm;
+    sharedPsm.rebuildFromLog(kTopicA, log1, log1.logEndOffset(), kPartition);
+    sharedPsm.rebuildFromLog(kTopicB, log2, log2.logEndOffset(), kPartition);
+
+    // topicA: seq=0 must be Duplicate (not wiped by topicB's rebuild).
+    {
+        auto vr = sharedPsm.validate(kTopicA, kPid, kPartition, kEpoch, 0, 0);
+        ASSERT_TRUE(vr.isDuplicate())
+            << "[TX-2c REGRESSION] topicA seq=0 must be Duplicate after multi-topic rebuild; "
+            "map_.clear() in rebuildFromLog wipes topicA state when topicB is rebuilt.";
+        EXPECT_EQ(vr.retryBaseOffset, offA);
+    }
+
+    // topicB: seq=0 must be Duplicate.
+    {
+        auto vr = sharedPsm.validate(kTopicB, kPid, kPartition, kEpoch, 0, 0);
+        ASSERT_TRUE(vr.isDuplicate())
+            << "topicB seq=0 must be Duplicate";
+        EXPECT_EQ(vr.retryBaseOffset, offB);
+    }
+
+    EXPECT_EQ(sharedPsm.size(), 2u)
+        << "Shared PSM must hold 2 entries (one per topic)";
+}

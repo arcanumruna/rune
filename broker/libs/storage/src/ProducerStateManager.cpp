@@ -451,7 +451,17 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
                                            int64_t highWatermark,
                                            int32_t partition)
 {
-    map_.clear();
+    // TX-2c multi-partition fix: clear ONLY the keys for this (topicId, partition)
+    // instead of the whole map.  ClientGateway::rebuildProducerStateFromLogs calls
+    // this method in a loop over every (topicId, partition) on ONE shared PSM.
+    // The old map_.clear() wiped every prior partition's state on each iteration —
+    // only the LAST partition iterated survived, making dedup silently broken for
+    // any topic with >1 partition or any node hosting >1 (topicId, partition).
+    // With erase_if, each call is still idempotent for its own (topicId, partition)
+    // (RebuildIsIdempotent passes), but state from other partitions is preserved.
+    std::erase_if(map_, [&](const auto& kv) noexcept {
+        return kv.first.topicId == topicId && kv.first.partition == partition;
+    });
 
     if (highWatermark <= 0) return;
 

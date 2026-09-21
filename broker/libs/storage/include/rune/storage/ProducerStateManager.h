@@ -211,8 +211,10 @@ public:
     // rebuildFromLog — reconstruct producer state by scanning a partition Log.
     //
     // Scans all RecordBatches in [0, highWatermark) and calls update() for
-    // every batch whose producerId >= 0 (idempotent producer).  Clears the
-    // existing map first so the rebuild is idempotent.
+    // every batch whose producerId >= 0 (idempotent producer).  Clears existing
+    // (topicId, partition) entries first (via erase_if, NOT the whole map) so the
+    // rebuild is idempotent for this partition while accumulating other partitions'
+    // state into a shared PSM across successive calls (TX-2c multi-partition fix).
     //
     // Each batch contributes:
     //   producerId    from header (LE int64 at kProducerIdOffset=43)
@@ -221,7 +223,7 @@ public:
     //   lastSequence  = baseSequence + lastOffsetDelta (one record per batch→delta=0)
     //   baseOffset    from header (LE int64 at kBaseOffsetOffset=0)
     //
-    // The scan is last-write-wins per (pid, partition): each update() call
+    // The scan is last-write-wins per (topicId, pid, partition): each update() call
     // overwrites the retry window slot (oldest evicted when full, matching
     // the in-flight sequence), so scanning forward from offset 0 naturally
     // reconstructs the correct window state as of the log end.
