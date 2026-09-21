@@ -26,6 +26,13 @@ using Epoch = int64_t;
 /// Node identifier — identifies a broker node within the cluster.
 using NodeId = int32_t;
 
+/// CP-1: per-partition log cleanup policy.  Mirrors the values of
+/// rune::node::TopicSpec::CleanupPolicy exactly (kept as a separate,
+/// self-contained enum here so the replication layer does not depend on
+/// the higher-level node layer).  A future LogCleaner scheduler consults
+/// this via PartitionReplica::cleanupPolicy().
+enum class CleanupPolicy : uint8_t { Delete = 0, Compact = 1, CompactDelete = 2 };
+
 /// A lightweight reference to a record batch's base offset.
 /// The actual byte payload is managed separately (e.g. in-memory ring buffer
 /// or Aeron term buffer); this struct is used by the replication layer to

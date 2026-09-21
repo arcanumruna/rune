@@ -21,6 +21,7 @@
 #include <rune/transaction/Types.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <atomic>
 #include <chrono>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -267,4 +269,68 @@ TEST_F(ReplicatedTxnStateStoreTest, MultiTxnRebuild) {
     ASSERT_TRUE(rebuilt.get("txC"));
     EXPECT_EQ(rebuilt.get("txC")->state, TxnState::CompleteAbort);
     EXPECT_EQ(rebuilt.get("txD"), nullptr);
+}
+
+// ===========================================================================
+// CP-1: the __transaction_state record must carry the transactionalId as the
+// record key (compaction key).  This guards the appendKeyed() re-keying so a
+// future refactor back to append() (empty key) regresses loudly.
+// ===========================================================================
+
+// lastRecordKey — read [0, HW) and return the key bytes of the last record.
+static std::vector<uint8_t> lastRecordKey(const PartitionReplica& replica) {
+    const Offset hw = replica.highWatermark();
+    if (hw <= 0) return {};
+
+    std::vector<uint8_t> result;
+    Offset fetchOffset = 0;
+
+    while (fetchOffset < hw) {
+        std::vector<uint8_t> data = replica.read(fetchOffset, 64 * 1024 * 1024);
+        if (data.empty()) break;
+
+        std::size_t pos = 0;
+        Offset lastBatchEnd = fetchOffset;
+
+        while (pos < data.size()) {
+            const uint8_t*    batchStart = data.data() + pos;
+            const std::size_t remaining  = data.size() - pos;
+            if (remaining < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead))
+                break;
+
+            rune::protocol::RecordBatchReader reader(batchStart, remaining);
+            if (!reader.ensureValid()) break;
+
+            const int32_t tl = reader.totalLength();
+            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+
+            reader.forEach([&result](std::string_view key, std::string_view /*val*/,
+                                     int64_t /*off*/, int64_t /*ts*/) {
+                result.assign(key.begin(), key.end());
+            });
+
+            const Offset batchNextOffset =
+                reader.baseOffset() + reader.lastOffsetDelta() + 1;
+            if (batchNextOffset > lastBatchEnd) lastBatchEnd = batchNextOffset;
+
+            pos += static_cast<std::size_t>(tl);
+        }
+
+        if (lastBatchEnd <= fetchOffset) break;
+        fetchOffset = lastBatchEnd;
+    }
+    return result;
+}
+
+TEST_F(ReplicatedTxnStateStoreTest, CP1_RecordCarriesTxnIdKey) {
+    auto m = makeMeta("my-txn-id", /*pid=*/7, /*epoch=*/0, TxnState::Ongoing);
+    ASSERT_TRUE(store_->put(m, /*coordEpoch=*/1));
+    ASSERT_TRUE(driveHwAdvance(1));
+
+    auto keyBytes = lastRecordKey(*replica_);
+    ASSERT_FALSE(keyBytes.empty()) << "txn record key must be non-empty (CP-1 compaction key)";
+
+    std::string keyStr(keyBytes.begin(), keyBytes.end());
+    EXPECT_EQ(keyStr, "my-txn-id") << "record key must equal the transactionalId";
 }

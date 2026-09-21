@@ -91,6 +91,7 @@ struct PartitionConfig {
     int32_t     maxFetchBytes     = 1 << 20;        ///< max bytes per fetch (1 MiB)
     bool        pushOnAppend      = true;            ///< GR-10: leader pushes to ISR followers immediately on append
     bool        fastAckOnApply    = true;            ///< GR-10: follower fast-acks (emit FetchRequest immediately after applyReplicated)
+    CleanupPolicy cleanupPolicy   = CleanupPolicy::Delete;  ///< CP-1: log cleanup policy for this partition
 };
 
 // ---------------------------------------------------------------------------
@@ -321,6 +322,8 @@ public:
     [[nodiscard]] int32_t     topicId()        const noexcept { return cfg_.topicId; }
     [[nodiscard]] PartitionId partitionId()    const noexcept { return cfg_.partitionId; }
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
+    /// CP-1: the log cleanup policy for this partition (consulted by the LogCleaner).
+    [[nodiscard]] CleanupPolicy cleanupPolicy() const noexcept { return cfg_.cleanupPolicy; }
 
     /// Non-owning pointer to the underlying Log (for test inspection and replay seeding).
     [[nodiscard]] rune::storage::Log* log() const noexcept { return log_; }

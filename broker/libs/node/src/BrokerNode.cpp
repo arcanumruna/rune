@@ -582,6 +582,8 @@ void BrokerNode::buildGateway() {
             ocfg.fetchIntervalNs      = 5'000'000LL;
             ocfg.isrCheckIntervalNs   = 10'000'000LL;
             ocfg.maxFetchBytes        = 1 << 20;
+            // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
+            ocfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
 
             // Transport: real Aeron transport if available, else no-op InMemoryTransport.
             rune::replication::PartitionTransport* offsetTransport = replTransport_.get();
@@ -686,6 +688,8 @@ void BrokerNode::buildGateway() {
             tcfg.fetchIntervalNs      = 5'000'000LL;
             tcfg.isrCheckIntervalNs   = 10'000'000LL;
             tcfg.maxFetchBytes        = 1 << 20;
+            // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
+            tcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
 
             rune::replication::PartitionTransport* txnTransport = replTransport_.get();
             if (!txnTransport) {
