@@ -46,7 +46,10 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 // Forward declaration — ClientGateway lives in rune_gateway; node→gateway direction is fine.
@@ -99,6 +102,20 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // setAppendFnOverride — TEST SEAM ONLY.
+    // When gateway_ is null, doWork uses this function to resolve pending
+    // markers.  The fn maps (TopicPartition, markerBytes) to a log append.
+    // Allows testing the doWork→resolvePendingMarkers path without Aeron.
+    // Set to nullptr to clear (production: never call this).
+    // Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setAppendFnOverride(
+        std::function<int64_t(std::string_view topic, int32_t partition,
+                              std::span<const uint8_t> bytes)> fn) noexcept {
+        appendFnOverride_ = std::move(fn);
+    }
+
+    // -----------------------------------------------------------------------
     // isLocalCoordinator — true when this node is the cluster leader.
     // v1 seam: all transactions are coordinated by the cluster leader.
     // -----------------------------------------------------------------------
@@ -145,6 +162,26 @@ private:
 
     // ClientGateway — non-owning; may be null (Task 8 marker append).
     rune::gateway::ClientGateway*               gateway_ = nullptr;
+
+    // TEST SEAM: override appendFn used by doWork when gateway_ is null.
+    // Signature: (topic, partition, markerBytes) → baseOffset or -1.
+    std::function<int64_t(std::string_view, int32_t, std::span<const uint8_t>)>
+                                                appendFnOverride_;
+
+    // Zero-alloc scratch containers for doWork marker-drive path.
+    // Cleared+refilled each invocation — pre-reserved to avoid steady-state alloc.
+    // PendingInfo: commit flag keyed by producerId.
+    struct PendingInfo { bool commit; };
+    std::unordered_map<rune::transaction::ProducerId, PendingInfo> pendingByPidScratch_;
+    // MarkerNotify: per-marker data for notifyControlMarker post-processing.
+    struct MarkerNotify {
+        int32_t topicId;
+        int32_t partition;
+        int64_t producerId;
+        int64_t markerOffset;
+        bool    commit;
+    };
+    std::vector<MarkerNotify>                   toNotifyScratch_;
 
     // Per-transactionalId coordinator (single global coordinator, v1 seam).
     // One coordinator manages all transactions on this node.

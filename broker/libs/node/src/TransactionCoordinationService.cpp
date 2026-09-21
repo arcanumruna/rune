@@ -82,6 +82,8 @@ TransactionCoordinationService::TransactionCoordinationService(
     partitionScratch_.reserve(32);
     partResultScratch_.reserve(32);
     topicNameScratch_.reserve(32);  // "topic_<N>" stays well within 32 chars
+    pendingByPidScratch_.reserve(16);
+    toNotifyScratch_.reserve(32);
 }
 
 // ---------------------------------------------------------------------------
@@ -140,62 +142,62 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     //        a. Looks up topicId from the topic name via topics_->topicIdForName.
     //        b. Calls gateway_->appendControlRecord(topicId, partition, bytes).
     //        c. Records the (topicId, partition, producerId, markerOffset, commit)
-    //           in a post-process vector for notifyControlMarker() calls.
+    //           in toNotifyScratch_ for notifyControlMarker() calls.
     //   3. Call resolvePendingMarkers() (which also calls completeTransaction()).
     //   4. Feed notifyControlMarker() for all successfully-appended markers.
     //
     // Design note: we do NOT call notifyControlMarker() inside appendFn because
     // completeTransaction() is called AFTER all appendFn calls for a txn — we
     // want both appendFn and completeTransaction to succeed before feeding LSO.
-    // Using the post-process vector is cleaner and avoids partial state.
+    //
+    // Zero-alloc: pendingByPidScratch_ and toNotifyScratch_ are pre-reserved
+    // member containers (clear+refill each cycle, no heap alloc in steady state).
     //
     // Single-writer (duty-cycle thread): no locks needed.
-    if (gateway_ && topics_) {
-        // Snapshot pending txns to map (producerId → {commit, partitions}) for
-        // commit/abort disambiguation inside appendFn.
-        // Structure: producerId → {commit, partitions}.
-        // (We use producerId as the key because appendFn only receives tp, not txnId.)
-        struct PendingInfo {
-            bool   commit;
-        };
-        std::unordered_map<tx::ProducerId, PendingInfo> pendingByPid;
+    const bool haveGateway = (gateway_ != nullptr) && (topics_ != nullptr);
+    const bool haveOverride = static_cast<bool>(appendFnOverride_);
+    if (haveGateway || haveOverride) {
+        // Snapshot pending txns → producerId → {commit} map (member scratch).
+        pendingByPidScratch_.clear();
         {
             const auto pending = coordinator_.pendingMarkerTransactions();
             for (const auto& p : pending) {
-                pendingByPid[p.producerId] = PendingInfo{p.commit};
+                pendingByPidScratch_[p.producerId] = PendingInfo{p.commit};
             }
         }
 
-        // Post-process vector: (topicId, partition, producerId, markerOffset, commit).
-        struct MarkerNotify {
-            int32_t topicId;
-            int32_t partition;
-            int64_t producerId;
-            int64_t markerOffset;
-            bool    commit;
-        };
-        std::vector<MarkerNotify> toNotify;
+        // Clear post-process scratch (member — no alloc in steady state).
+        toNotifyScratch_.clear();
 
         auto appendFn = [&](const tx::TopicPartition& tp,
                              const std::vector<uint8_t>& batch)
         {
-            // Map topic name → topicId.
-            const auto topicIdOpt = topics_->topicIdForName(tp.topic);
-            if (!topicIdOpt.has_value()) {
-                spdlog::warn("TCS::doWork resolvePendingMarkers: unknown topic '{}' partition={} — skipped",
-                             tp.topic, tp.partition);
-                return;
-            }
-            const int32_t topicId = *topicIdOpt;
+            int64_t markerOffset = -1;
+            int32_t topicId      = -1;
 
-            // Append the control marker (acks=All via PartitionReplica).
-            const int64_t markerOffset = gateway_->appendControlRecord(
-                topicId, tp.partition,
-                std::span<const uint8_t>(batch.data(), batch.size()));
-            if (markerOffset < 0) {
-                spdlog::warn("TCS::doWork resolvePendingMarkers: appendControlRecord failed "
-                             "topicId={} partition={}", topicId, tp.partition);
-                return;
+            if (haveGateway) {
+                // Production path: resolve topic name → id, append via gateway.
+                const auto topicIdOpt = topics_->topicIdForName(tp.topic);
+                if (!topicIdOpt.has_value()) {
+                    spdlog::warn("TCS::doWork resolvePendingMarkers: unknown topic '{}' partition={} — skipped",
+                                 tp.topic, tp.partition);
+                    return;
+                }
+                topicId = *topicIdOpt;
+                markerOffset = gateway_->appendControlRecord(
+                    topicId, tp.partition,
+                    std::span<const uint8_t>(batch.data(), batch.size()));
+                if (markerOffset < 0) {
+                    spdlog::warn("TCS::doWork resolvePendingMarkers: appendControlRecord failed "
+                                 "topicId={} partition={}", topicId, tp.partition);
+                    return;
+                }
+            } else {
+                // Test-seam path: use override appendFn (no gateway needed).
+                markerOffset = appendFnOverride_(tp.topic, tp.partition,
+                    std::span<const uint8_t>(batch.data(), batch.size()));
+                if (markerOffset < 0) return;
+                // topicId remains -1; notifyControlMarker skipped (test path).
             }
 
             // Extract producerId from the batch (LE64@kProducerIdOffset=43).
@@ -208,21 +210,24 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
             // Determine commit/abort from the snapshot.
             bool commit = false;
             if (pid >= 0) {
-                auto it = pendingByPid.find(pid);
-                if (it != pendingByPid.end()) commit = it->second.commit;
+                auto it = pendingByPidScratch_.find(pid);
+                if (it != pendingByPidScratch_.end()) commit = it->second.commit;
             }
 
-            toNotify.push_back({topicId, tp.partition, pid, markerOffset, commit});
+            toNotifyScratch_.push_back({topicId, tp.partition, pid, markerOffset, commit});
         };
 
         const int resolved = tx::ControlMarker::resolvePendingMarkers(coordinator_, appendFn);
         if (resolved > 0) {
             work += resolved;
-            // Feed LsoTracker + AbortedTxnIndex for each resolved marker.
-            for (const auto& n : toNotify) {
-                if (n.producerId >= 0) {
-                    gateway_->notifyControlMarker(
-                        n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
+            // Feed LsoTracker + AbortedTxnIndex for each resolved marker
+            // (production path only — test-seam path skips LSO notify).
+            if (haveGateway) {
+                for (const auto& n : toNotifyScratch_) {
+                    if (n.producerId >= 0) {
+                        gateway_->notifyControlMarker(
+                            n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
+                    }
                 }
             }
         }
@@ -584,15 +589,8 @@ size_t TransactionCoordinationService::handleEndTxn(
     //
     // Single-writer: called on the duty-cycle thread.
     if (result.ok() && gateway_ && topics_) {
-        // Post-process vector for notifyControlMarker after all appends.
-        struct MarkerNotify {
-            int32_t topicId;
-            int32_t partition;
-            int64_t producerId;
-            int64_t markerOffset;
-            bool    commit;
-        };
-        std::vector<MarkerNotify> toNotify;
+        // Reuse member scratch (pre-reserved, no steady-state alloc).
+        toNotifyScratch_.clear();
 
         const int32_t coordEpoch = [&]() -> int32_t {
             const auto* m = coordinator_.metadata(txnIdScratch_);
@@ -611,8 +609,8 @@ size_t TransactionCoordinationService::handleEndTxn(
                 std::span<const uint8_t>(batch.data(), batch.size()));
             if (markerOffset < 0) return;
 
-            toNotify.push_back({topicId, tp.partition, msg.producerId,
-                                 markerOffset, commit});
+            toNotifyScratch_.push_back({topicId, tp.partition, msg.producerId,
+                                        markerOffset, commit});
         };
 
         tx::ControlMarker::writeMarkers(
@@ -620,7 +618,7 @@ size_t TransactionCoordinationService::handleEndTxn(
             msg.producerId, msg.producerEpoch,
             commit, coordEpoch, nowNs, appendFn);
 
-        for (const auto& n : toNotify) {
+        for (const auto& n : toNotifyScratch_) {
             gateway_->notifyControlMarker(
                 n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
         }

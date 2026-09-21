@@ -65,7 +65,9 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -483,51 +485,67 @@ TEST_F(TxnMarkerDirectTest, ResolvePendingMarkersResolvesPrepareAbort) {
 }
 
 // ===========================================================================
-// Test 4: doWork with a gateway wired resolves timeout-aborted txns to Empty.
-// This tests the full doWork loop: coordinator timeout → PrepareAbort →
-// doWork drives resolvePendingMarkers → markers written → CompleteAbort → Empty.
+// Test 4: doWork with the appendFnOverride test seam resolves a timeout-aborted
+// txn end-to-end: coordinator timeout → PrepareAbort (markersPending=true) →
+// doWork drives resolvePendingMarkers via the override → ABORT control batches
+// land on both participant partition logs → txn transitions to Empty.
+//
+// This is a REAL integration test of the doWork→resolvePendingMarkers path.
+// The appendFnOverride seam is used instead of a real ClientGateway to avoid
+// requiring Aeron in this test harness (ClientGateway ctor requires Aeron;
+// appendControlRecord itself does not — but ctor cannot be bypassed).
 // ===========================================================================
 TEST_F(TxnMarkerDirectTest, DoWorkWithGatewayResolvesTimeoutAbort) {
-    // Init + addPartitions with 100ms timeout.
+    // Step 1: Init producer + addPartitions with 100ms timeout.
     std::array<uint8_t, 2048> req{}, out{};
     auto reqLen = encodeInitProducerId(req.data(), req.size(), 1, 1, /*timeout=*/100, "tx_dogw");
     auto outLen = svc_->handleInitProducerId(req.data(), reqLen, 0, out.data(), out.size());
     auto initResp = pc::InitProducerIdResponse::decode(out.data(), outLen);
-    ASSERT_TRUE(initResp && initResp->errorCode == 0);
+    ASSERT_TRUE(initResp) << "[TX-4] InitProducerId must succeed";
+    ASSERT_EQ(initResp->errorCode, 0) << "[TX-4] InitProducerId errorCode must be 0";
     const int64_t pid   = initResp->producerId;
     const int16_t epoch = initResp->producerEpoch;
 
+    // AddPartitions: topic_1 partitions 0 and 1 (topicId=1).
     const std::vector<pc::TxnTopicPartition> parts = {{1, 0}, {1, 1}};
     reqLen = encodeAddPartitions(req.data(), req.size(), 1, 2, pid, epoch, "tx_dogw", parts);
-    svc_->handleAddPartitions(req.data(), reqLen, 0, out.data(), out.size());
+    outLen = svc_->handleAddPartitions(req.data(), reqLen, 0, out.data(), out.size());
+    ASSERT_GT(outLen, 0u) << "[TX-4] AddPartitions must produce a response";
 
-    // The txn is Ongoing. Now drive doWork at 200ms (timeout=100ms, txnStartNs=0).
-    // Without a gateway, markers can't be written so doWork returns early.
-    svc_->doWork(/*nowNs=*/200'000'000LL);
+    // Step 2: Install the appendFnOverride test seam.
+    // The seam routes (topic, partition, bytes) to our DirectAppendFn which
+    // appends to real Log+Replica pairs — the same as tests 1-3.
+    svc_->setAppendFnOverride(
+        [this](std::string_view topic, int32_t partition,
+               std::span<const uint8_t> bytes) -> int64_t
+        {
+            // Wrap the span in a vector and delegate to DirectAppendFn.
+            const tx::TopicPartition tp{std::string(topic), partition};
+            const std::vector<uint8_t> batchVec(bytes.begin(), bytes.end());
+            appendFn_(tp, batchVec);
+            // Return the new LEO of the log (after append) minus 1 as the base.
+            const std::string key = std::string(topic) + ":" + std::to_string(partition);
+            auto it = appendFn_.routes.find(key);
+            if (it == appendFn_.routes.end()) return -1;
+            // The offset is the pre-append LEO (base) — stored in log after append.
+            return it->second.first->logEndOffset() - 1;
+        });
 
-    // Note: txnStore_->get reads the PERSISTED (replicated) state, which was last
-    // written by handleAddPartitions. The in-memory coordinator has already transitioned
-    // to PrepareAbort (the timeout fires in coordinator.doWork), but the txnStore is
-    // NOT updated by doWork (that would require a txnState_->put() call in doWork,
-    // which is future work). The coordinator holds the authoritative state in-memory.
-    //
-    // To verify doWork correctly called coordinator.doWork, we use ControlMarker::
-    // resolvePendingMarkers on a fresh coordinator that mirrors the timeout scenario,
-    // which already passes in ResolvePendingMarkersResolvesPrepareAbort.
-    //
-    // This test is a placeholder that verifies: after doWork (with no gateway),
-    // subsequent doWork calls don't crash and the service is stable.
-    int work2 = svc_->doWork(/*nowNs=*/300'000'000LL);
-    // Should return some work (the coordinator has pending markers from the timeout).
-    // The exact count depends on the coordinator internal state.
-    // This just validates no crash and the service is operational.
-    (void)work2;
+    // Step 3: Drive doWork at 200ms — past the 100ms timeout.
+    // coordinator_.doWork fires the timeout, sets markersPending=true on "tx_dogw"
+    // (PrepareAbort state). The override appendFn then resolves the markers.
+    const int work = svc_->doWork(/*nowNs=*/200'000'000LL);
+    EXPECT_GT(work, 0) << "[TX-4] doWork should report resolved work after timeout abort";
 
-    // Confirm: the persisted metadata (txnStore) is at the Ongoing state (last persisted
-    // by handleAddPartitions). The in-memory coordinator is in PrepareAbort.
-    // We can't directly read the in-memory coordinator state from this test.
-    // The key invariant is that a subsequent doWork with a gateway wired would resolve the txn.
-    SUCCEED() << "[TX-4] doWork drives coordinator timeout correctly (no crash, service stable)";
+    // Step 4: Assert that a CONTROL (ABORT) batch landed on each participant log.
+    EXPECT_TRUE(lastBatchIsControl(&log0_))
+        << "[TX-4] Partition 0 log must end with an ABORT control batch after doWork timeout";
+    EXPECT_TRUE(lastBatchIsControl(&log1_))
+        << "[TX-4] Partition 1 log must end with an ABORT control batch after doWork timeout";
+
+    // Step 5: A second doWork at 300ms should find no more pending markers.
+    const int work2 = svc_->doWork(/*nowNs=*/300'000'000LL);
+    EXPECT_EQ(work2, 0) << "[TX-4] Second doWork should be idle (txn already resolved)";
 }
 
 // ===========================================================================

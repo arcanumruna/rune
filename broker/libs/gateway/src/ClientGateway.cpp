@@ -2431,27 +2431,7 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         replica->onLeaderLogAppended();
     }
 
-    // TX-4 Task 9: Feed the LsoTracker and AbortedTxnIndex from the marker.
-    //
-    // Decode the COMMIT/ABORT decision from the control batch attributes.
-    // ControlMarker::build sets the CONTROL bit (0x20) always; the commit/abort
-    // is stored as the ControlType in the first ControlRecord body.
-    // Simpler approach: read the producerId + the control-type from the first
-    // record's key (ControlMarker protocol) — but that requires parsing the
-    // variable-length Records array.
-    //
-    // We use notifyControlMarker() which is the same path exposed to tests.
-    // The caller (TransactionCoordinationService) already knows commit/abort;
-    // we derive it here by peeking at the attributes CONTROL bit + by convention
-    // that the ControlType is encoded in the first Record key byte.
-    //
-    // For now: notifyControlMarker() is the authoritative path; the caller of
-    // appendControlRecord MUST also call notifyControlMarker() to update the
-    // tracker.  Alternatively the doWork() path calls both.
-    //
-    // Mark this log dirty for group-commit fsync.
-    dirtyLogs_.insert(log);
-
+    // Caller must invoke notifyControlMarker() to update LsoTracker + AbortedTxnIndex.
     return base;
 }
 
