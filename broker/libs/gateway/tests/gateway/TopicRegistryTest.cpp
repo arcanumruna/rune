@@ -340,3 +340,80 @@ TEST(TopicRegistry, RecoverAcrossRestartMultiPartition) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// CP-1: cleanupPolicyOf / dirtyRatioThresholdOf / deleteRetentionMsOf
+// ---------------------------------------------------------------------------
+
+// Helper: build a TopicSpec with full retention fields.
+static TopicSpec makeCompactSpec(std::string name, int32_t pc, int32_t id) {
+    TopicSpec ts;
+    ts.name                   = std::move(name);
+    ts.partitionCount         = pc;
+    ts.topicId                = id;
+    ts.cleanupPolicy          = TopicSpec::CleanupPolicy::Compact;
+    ts.retentionMs            = 3'600'000LL;
+    ts.retentionBytes         = -1LL;
+    ts.deleteRetentionMs      = 43'200'000LL;
+    ts.minCleanableDirtyRatio = 0.3;
+    return ts;
+}
+
+TEST(TopicRegistry, CP1_DefaultPolicyIsDelete) {
+    // A topic registered with the default TopicSpec must report Delete policy.
+    auto dir = makeTempDir("cp1_default");
+    std::filesystem::create_directories(dir);
+
+    std::vector<TopicSpec> specs = {makeSpec("chat", 1, 0)};
+    TopicRegistry reg(specs, dir.string());
+
+    EXPECT_EQ(reg.cleanupPolicyOf(0), TopicSpec::CleanupPolicy::Delete);
+    EXPECT_DOUBLE_EQ(reg.dirtyRatioThresholdOf(0), 0.5);
+    EXPECT_EQ(reg.deleteRetentionMsOf(0), 86'400'000LL);
+}
+
+TEST(TopicRegistry, CP1_CompactPolicyRoundTrips) {
+    // A topic registered with Compact policy must return Compact from cleanupPolicyOf.
+    auto dir = makeTempDir("cp1_compact");
+    std::filesystem::create_directories(dir);
+
+    std::vector<TopicSpec> specs = {makeCompactSpec("events", 4, 0)};
+    TopicRegistry reg(specs, dir.string());
+
+    EXPECT_EQ(reg.cleanupPolicyOf(0), TopicSpec::CleanupPolicy::Compact);
+    EXPECT_DOUBLE_EQ(reg.dirtyRatioThresholdOf(0), 0.3);
+    EXPECT_EQ(reg.deleteRetentionMsOf(0), 43'200'000LL);
+}
+
+TEST(TopicRegistry, CP1_MultiTopicIndependentPolicies) {
+    // Two topics: one Delete, one Compact — policies must be independent.
+    auto dir = makeTempDir("cp1_multi");
+    std::filesystem::create_directories(dir);
+
+    std::vector<TopicSpec> specs = {
+        makeSpec("chat", 1, 0),           // Delete (default)
+        makeCompactSpec("events", 4, 1),  // Compact
+    };
+    TopicRegistry reg(specs, dir.string());
+
+    EXPECT_EQ(reg.cleanupPolicyOf(0), TopicSpec::CleanupPolicy::Delete);
+    EXPECT_EQ(reg.cleanupPolicyOf(1), TopicSpec::CleanupPolicy::Compact);
+    EXPECT_DOUBLE_EQ(reg.dirtyRatioThresholdOf(0), 0.5);
+    EXPECT_DOUBLE_EQ(reg.dirtyRatioThresholdOf(1), 0.3);
+    EXPECT_EQ(reg.deleteRetentionMsOf(0), 86'400'000LL);
+    EXPECT_EQ(reg.deleteRetentionMsOf(1), 43'200'000LL);
+}
+
+TEST(TopicRegistry, CP1_OutOfRangeTopicIdReturnsSafeDefaults) {
+    // Out-of-range topicId must return safe defaults, not crash.
+    auto dir = makeTempDir("cp1_oor");
+    std::filesystem::create_directories(dir);
+
+    TopicRegistry reg({}, dir.string()); // empty registry
+
+    EXPECT_EQ(reg.cleanupPolicyOf(0),   TopicSpec::CleanupPolicy::Delete);
+    EXPECT_EQ(reg.cleanupPolicyOf(-1),  TopicSpec::CleanupPolicy::Delete);
+    EXPECT_EQ(reg.cleanupPolicyOf(99),  TopicSpec::CleanupPolicy::Delete);
+    EXPECT_DOUBLE_EQ(reg.dirtyRatioThresholdOf(0),  0.5);
+    EXPECT_EQ(reg.deleteRetentionMsOf(0), 86'400'000LL);
+}

@@ -678,4 +678,51 @@ TEST(NodeConfigTest, GatewayMinIsr_EnvNonIntegerRejected) {
     EXPECT_FALSE(r.config.has_value());
 }
 
+// ---------------------------------------------------------------------------
+// CP-1: TopicSpec cleanup policy + retention fields
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, CP1_TopicSpecDefaultsToDeletePolicy) {
+    // A TopicSpec constructed with just name+partitionCount must default to
+    // CleanupPolicy::Delete and unbounded retention.
+    TopicSpec ts;
+    ts.name           = "test";
+    ts.partitionCount = 1;
+    ts.topicId        = 0;
+
+    EXPECT_EQ(ts.cleanupPolicy,          TopicSpec::CleanupPolicy::Delete);
+    EXPECT_EQ(ts.retentionMs,            -1LL);
+    EXPECT_EQ(ts.retentionBytes,         -1LL);
+    EXPECT_EQ(ts.deleteRetentionMs,      86'400'000LL);
+    EXPECT_DOUBLE_EQ(ts.minCleanableDirtyRatio, 0.5);
+}
+
+TEST(NodeConfigTest, CP1_TopicSpecCompactPolicyRoundTripViaParseNodeConfig) {
+    // TopicSpec with Compact policy parsed from RUNE_TOPICS must preserve all fields.
+    // (For now RUNE_TOPICS only carries name:partitionCount — cleanup policy is set
+    //  programmatically.  This test verifies the struct fields themselves.)
+    TopicSpec ts;
+    ts.name                   = "events";
+    ts.partitionCount         = 4;
+    ts.topicId                = 0;
+    ts.cleanupPolicy          = TopicSpec::CleanupPolicy::Compact;
+    ts.retentionMs            = 3'600'000LL;   // 1 hour
+    ts.retentionBytes         = 1'073'741'824LL; // 1 GiB
+    ts.deleteRetentionMs      = 43'200'000LL;  // 12 hours
+    ts.minCleanableDirtyRatio = 0.3;
+
+    EXPECT_EQ(ts.cleanupPolicy,              TopicSpec::CleanupPolicy::Compact);
+    EXPECT_EQ(ts.retentionMs,                3'600'000LL);
+    EXPECT_EQ(ts.retentionBytes,             1'073'741'824LL);
+    EXPECT_EQ(ts.deleteRetentionMs,          43'200'000LL);
+    EXPECT_DOUBLE_EQ(ts.minCleanableDirtyRatio, 0.3);
+}
+
+TEST(NodeConfigTest, CP1_CleanupPolicyEnumValues) {
+    // Enum values must be stable (used in serialization).
+    EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::Delete),        0u);
+    EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::Compact),       1u);
+    EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::CompactDelete), 2u);
+}
+
 } // namespace rune::node

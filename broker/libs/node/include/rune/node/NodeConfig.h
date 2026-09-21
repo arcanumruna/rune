@@ -49,6 +49,12 @@ struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
+    enum class CleanupPolicy : uint8_t { Delete = 0, Compact = 1, CompactDelete = 2 };
+    CleanupPolicy cleanupPolicy           = CleanupPolicy::Delete;
+    int64_t       retentionMs             = -1;             // -1 = unbounded
+    int64_t       retentionBytes          = -1;             // -1 = unbounded
+    int64_t       deleteRetentionMs       = 86'400'000;     // tombstone retention (1 day)
+    double        minCleanableDirtyRatio  = 0.5;            // dirty-ratio compaction trigger
 };
 
 struct PeerConfig {

@@ -107,4 +107,37 @@ TopicRegistry::partitionForKey(int32_t topicId,
     return rune::protocol::partitionForKey(key, pc);
 }
 
+// ---------------------------------------------------------------------------
+// TopicRegistry::cleanupPolicyOf (CP-1)
+// ---------------------------------------------------------------------------
+rune::node::TopicSpec::CleanupPolicy
+TopicRegistry::cleanupPolicyOf(int32_t topicId) const noexcept
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
+        return rune::node::TopicSpec::CleanupPolicy::Delete;
+    return topics_[static_cast<std::size_t>(topicId)].spec.cleanupPolicy;
+}
+
+// ---------------------------------------------------------------------------
+// TopicRegistry::dirtyRatioThresholdOf (CP-1)
+// ---------------------------------------------------------------------------
+double
+TopicRegistry::dirtyRatioThresholdOf(int32_t topicId) const noexcept
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
+        return 0.5;
+    return topics_[static_cast<std::size_t>(topicId)].spec.minCleanableDirtyRatio;
+}
+
+// ---------------------------------------------------------------------------
+// TopicRegistry::deleteRetentionMsOf (CP-1)
+// ---------------------------------------------------------------------------
+int64_t
+TopicRegistry::deleteRetentionMsOf(int32_t topicId) const noexcept
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
+        return 86'400'000LL;
+    return topics_[static_cast<std::size_t>(topicId)].spec.deleteRetentionMs;
+}
+
 } // namespace rune::gateway

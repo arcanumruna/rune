@@ -87,6 +87,26 @@ public:
     [[nodiscard]] int32_t
     partitionForKey(int32_t topicId, std::span<const uint8_t> key) const noexcept;
 
+    // -----------------------------------------------------------------------
+    // CP-1: per-topic retention + compaction config accessors.
+    // All return a default/safe value when topicId is out of range.
+    // -----------------------------------------------------------------------
+
+    /// Return the cleanup policy for topicId.
+    /// Returns CleanupPolicy::Delete if topicId is out of range.
+    [[nodiscard]] rune::node::TopicSpec::CleanupPolicy
+    cleanupPolicyOf(int32_t topicId) const noexcept;
+
+    /// Return the minCleanableDirtyRatio threshold for topicId.
+    /// Returns 0.5 (default) if topicId is out of range.
+    [[nodiscard]] double
+    dirtyRatioThresholdOf(int32_t topicId) const noexcept;
+
+    /// Return the deleteRetentionMs (tombstone retention) for topicId.
+    /// Returns 86_400_000 (1 day default) if topicId is out of range.
+    [[nodiscard]] int64_t
+    deleteRetentionMsOf(int32_t topicId) const noexcept;
+
 private:
     // Per-partition entry: the Log and its directory path.
     struct PartitionEntry {
