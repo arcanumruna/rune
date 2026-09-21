@@ -45,6 +45,12 @@
 #include <unordered_map>
 #include <utility>
 
+// Forward-declare Log so the header does not pull in Log.h (and transitively
+// the whole segment/filesystem machinery) everywhere ProducerStateManager.h
+// is included.  The out-of-line rebuildFromLog() implementation in
+// ProducerStateManager.cpp includes the full Log.h.
+namespace rune::storage { class Log; }
+
 namespace rune::storage {
 
 // ---------------------------------------------------------------------------
@@ -186,6 +192,37 @@ public:
     /// Recover state from a previous snapshot.  Returns the number of entries
     /// loaded.  Any torn tail is silently skipped.
     int  recover(const std::string& path);
+
+    // -----------------------------------------------------------------------
+    // rebuildFromLog — reconstruct producer state by scanning a partition Log.
+    //
+    // Scans all RecordBatches in [0, highWatermark) and calls update() for
+    // every batch whose producerId >= 0 (idempotent producer).  Clears the
+    // existing map first so the rebuild is idempotent.
+    //
+    // Each batch contributes:
+    //   producerId    from header (LE int64 at kProducerIdOffset=43)
+    //   producerEpoch from header (LE int16 at kProducerEpochOffset=51)
+    //   baseSequence  from header (LE int32 at kBaseSequenceOffset=53)
+    //   lastSequence  = baseSequence + lastOffsetDelta (one record per batch→delta=0)
+    //   baseOffset    from header (LE int64 at kBaseOffsetOffset=0)
+    //
+    // The scan is last-write-wins per (pid, partition): each update() call
+    // overwrites the retry window slot (oldest evicted when full, matching
+    // the in-flight sequence), so scanning forward from offset 0 naturally
+    // reconstructs the correct window state as of the log end.
+    //
+    // @param log            The partition Log to scan (non-const: Log::read is
+    //                       non-const in the current implementation).
+    // @param highWatermark  Scan up to (exclusive) this log offset.
+    //                       Pass log.logEndOffset() to scan the full log.
+    // @param partition      The partition id to use as the key (producer state
+    //                       is keyed by (producerId, partition)).
+    //
+    // Cold path — allocations are acceptable here.
+    // Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void rebuildFromLog(Log& log, int64_t highWatermark, int32_t partition);
 
     // -----------------------------------------------------------------------
     // Accessors (for tests / Phase-5 coordinator)

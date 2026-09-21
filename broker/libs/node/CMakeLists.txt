@@ -128,6 +128,21 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # TX-2b: ProducerStateManager durability across restart and leader failover.
+    # Uses InMemoryTransport (3-in-process nodes, no Aeron required).
+    # Verifies that PSM is rebuilt from the partition Log so a duplicate produce
+    # after failover is still detected as Duplicate (no re-append).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_producer_state_durability_tests
+        tests/integration/ProducerStateDurabilityTest.cpp)
+    target_link_libraries(rune_producer_state_durability_tests PRIVATE
+        rune_storage
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_producer_state_durability_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # TX-4 Task 8: TxnMarkerTest — control marker writes (ControlMarker::writeMarkers)
     # + coordinator state machine integration.  No Aeron required.
     # ---------------------------------------------------------------------------

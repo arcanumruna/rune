@@ -32,6 +32,8 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -405,6 +407,100 @@ int ProducerStateManager::recover(const std::string& path)
     }
 
     return loaded;
+}
+
+// ---------------------------------------------------------------------------
+// rebuildFromLog — reconstruct producer dedup state by scanning a partition Log.
+//
+// Mirrors ReplicatedTxnStateStore::rebuildFromLog() (and
+// ReplicatedOffsetStore::rebuildFromLog()):
+//   - Clear the existing map first (idempotent rebuild).
+//   - Scan [0, highWatermark) batch by batch using the multi-segment loop that
+//     advances fetchOffset so Log::read() is called once per segment boundary.
+//   - For each RecordBatch whose producerId >= 0 (idempotent producer), call
+//     update() to record the batch in the retry window.
+//   - Scanning forward from offset 0 naturally reproduces the correct window
+//     state at the log end: the circular window evicts oldest-first, matching
+//     the real produce sequence.
+//
+// Non-idempotent batches (producerId == -1) are silently skipped.
+// Control batches are also skipped (their producerId is set but baseSequence
+// is typically -1 — the PSM only tracks data batches).
+//
+// Cold path: called once on leader election / restart.  Allocations acceptable.
+// ---------------------------------------------------------------------------
+void ProducerStateManager::rebuildFromLog(Log&     log,
+                                           int64_t highWatermark,
+                                           int32_t partition)
+{
+    map_.clear();
+
+    if (highWatermark <= 0) return;
+
+    static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB per read
+
+    int64_t fetchOffset = 0;
+
+    while (fetchOffset < highWatermark) {
+        // Log::read() resolves only ONE segment per call (the segment that
+        // contains fetchOffset).  Loop until we reach highWatermark.
+        std::vector<uint8_t> data =
+            log.read(fetchOffset, kChunkBytes);
+        if (data.empty()) break;
+
+        std::size_t pos = 0;
+        int64_t     lastBatchEnd = fetchOffset; // progress sentinel
+
+        while (pos < data.size()) {
+            const uint8_t*    batchStart = data.data() + pos;
+            const std::size_t remaining  = data.size() - pos;
+
+            if (remaining < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead))
+                break;
+
+            rune::protocol::RecordBatchReader reader(batchStart, remaining);
+
+            const int32_t tl = reader.totalLength();
+            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+
+            // Only CRC-valid batches are accepted.
+            if (!reader.ensureValid()) break;
+
+            const int64_t batchBase = reader.baseOffset();
+            const int32_t lastDelta = reader.lastOffsetDelta();
+            const int64_t batchEnd  = batchBase + lastDelta + 1;
+
+            // Skip control batches (COMMIT/ABORT markers) — they are tagged
+            // with the CONTROL attribute bit; their baseSequence is meaningless
+            // for idempotent-producer dedup (and is typically -1 when built by
+            // ControlMarker::build which doesn't stamp a sequence).
+            const bool isControl =
+                (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
+
+            const int64_t pid   = reader.producerId();
+            const int16_t epoch = reader.producerEpoch();
+            const int32_t baseSeq = reader.baseSequence();
+
+            // Record idempotent data batches only:
+            //   producerId >= 0 — idempotent producer
+            //   baseSequence >= 0 — valid sequence (non-idempotent default is -1)
+            //   not a control batch
+            if (!isControl && pid >= 0 && baseSeq >= 0) {
+                // lastSequence = baseSequence + lastOffsetDelta
+                // (for a multi-record batch, lastOffsetDelta == recordCount - 1,
+                //  matching how handleProduce computes lastSeqInBatch).
+                const int32_t lastSeq = baseSeq + lastDelta;
+                update(pid, partition, epoch, baseSeq, lastSeq, batchBase);
+            }
+
+            if (batchEnd > lastBatchEnd) lastBatchEnd = batchEnd;
+            pos += static_cast<std::size_t>(tl);
+        }
+
+        if (lastBatchEnd <= fetchOffset) break; // no progress — stop
+        fetchOffset = lastBatchEnd;
+    }
 }
 
 } // namespace rune::storage

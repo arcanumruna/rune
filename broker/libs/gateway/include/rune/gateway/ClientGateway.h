@@ -736,15 +736,34 @@ private:
     // the correct single-writer home: handleProduce() is the only call-site and
     // is always on the duty-cycle thread (no locks needed).
     //
-    // On leader failover the new leader's gateway starts with a fresh PSM.
-    // Crash-recovery (takeSnapshot/recover) is Phase-5 — deferred per brief.
-    // Phase-1 partition log does not persist producer state; the gateway PSM
-    // is the sole tracker.  This is correct for the current milestone.
+    // TX-2b: On leader transition (Follower→Leader) or on startup as leader, the
+    // PSM is rebuilt from each partition Log via rebuildProducerStateFromLogs().
+    // This mirrors the TransactionCoordinationService::doWork pattern: wasLeader_
+    // tracks the previous cycle's leadership so the rebuild fires exactly once on
+    // the first duty cycle after becoming leader.  Without this rebuild, a
+    // producer that retries an already-durable batch after failover would be
+    // incorrectly accepted (re-appended), violating exactly-once semantics.
     //
     // No per-op heap allocation: ProducerStateManager::validate() is noexcept,
     // allocation-free; update() inserts into the internal unordered_map only on
     // the first Accept for a new (producerId, partition) pair.
     rune::storage::ProducerStateManager producerStateManager_;
+
+    // TX-2b: Tracks previous-cycle leadership to detect Follower→Leader transitions.
+    // Same pattern as TransactionCoordinationService::wasLeader_.
+    // true  = was the leader on the previous doWork() call.
+    // false = was a follower (or leadership unknown).
+    // Initialized to false so the very first doWork() as leader fires the rebuild.
+    bool wasLeader_ = false;
+
+    // TX-2b: Rebuild the PSM from all partition Logs in the TopicRegistry.
+    //
+    // Called from doWork() exactly once on Follower→Leader transition.  For each
+    // (topicId, partition) in topicRegistry_, reads the partition Log and calls
+    // ProducerStateManager::rebuildFromLog() to reconstruct the dedup window.
+    //
+    // Cold path: allocations acceptable.  Single-writer: duty-cycle thread only.
+    void rebuildProducerStateFromLogs();
 
     // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index.
     //

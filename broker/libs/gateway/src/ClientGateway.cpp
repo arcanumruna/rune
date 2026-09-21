@@ -97,6 +97,30 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
 // ---------------------------------------------------------------------------
 int ClientGateway::doWork(int64_t nowNs) {
     nowNs_ = nowNs;
+
+    // TX-2b: Detect Follower→Leader transition and rebuild the PSM from the
+    // partition Logs.  Mirrors TransactionCoordinationService::doWork().
+    //
+    // leaderView_ is set only when replication is configured; when null (single-
+    // node passthrough) we are always "leader" — the gateway was never a follower,
+    // so no rebuild is needed on the very first doWork() call (wasLeader_ starts
+    // true in the no-leaderView path to suppress the unnecessary cold rebuild).
+    //
+    // With leaderView_: rebuild fires exactly once on the first duty cycle after
+    // the node becomes leader (wasLeader_ flips false→true). Losing leadership
+    // resets wasLeader_ so the next election fires another rebuild.
+    if (leaderView_) {
+        const bool leader = leaderView_().isLeader;
+        if (leader && !wasLeader_) {
+            // Follower→Leader: rebuild PSM from all partition Logs.
+            rebuildProducerStateFromLogs();
+            wasLeader_ = true;
+        } else if (!leader && wasLeader_) {
+            // Leader→Follower: reset so the next election triggers another rebuild.
+            wasLeader_ = false;
+        }
+    }
+
     constexpr int kFragmentLimit = 10;
     int work = sub_->poll(assembler_.handler(), kFragmentLimit);
     pollPendingConnects(nowNs);
@@ -119,6 +143,46 @@ int ClientGateway::doWork(int64_t nowNs) {
     pushSubscriptions();
     return work;
 }
+
+// ---------------------------------------------------------------------------
+// rebuildProducerStateFromLogs — TX-2b: rebuild PSM from all partition Logs.
+//
+// Called exactly once on the first doWork() cycle after becoming leader.
+// For each (topicId, partition) in the TopicRegistry, reads the partition Log
+// and calls ProducerStateManager::rebuildFromLog() to reconstruct the per-
+// (producerId, partition) dedup window from the durable log.
+//
+// No-op when topicRegistry_ is null (gateway not yet wired).
+// Cold path: allocations acceptable.  Single-writer: duty-cycle thread only.
+// ---------------------------------------------------------------------------
+void ClientGateway::rebuildProducerStateFromLogs()
+{
+    if (!topicRegistry_) return;
+
+    const int32_t topicCount = topicRegistry_->topicCount();
+    for (int32_t topicId = 0; topicId < topicCount; ++topicId) {
+        const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+        if (!spec) continue;
+
+        for (int32_t partition = 0; partition < spec->partitionCount; ++partition) {
+            rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+            if (!log) continue;
+
+            // Use logEndOffset() as the scan upper bound — we want to recover
+            // state for all durably-written batches on this replica, not just
+            // up to the last advertised HW (which lags on a freshly-elected leader
+            // before completeness is established).  PSM dedup is conservative:
+            // recovering extra batches above HW only adds more duplicates to the
+            // retry window, never causes correctness problems.
+            const int64_t scanTo = log->logEndOffset();
+            producerStateManager_.rebuildFromLog(*log, scanTo, partition);
+        }
+    }
+
+    spdlog::info("ClientGateway: PSM rebuilt from {} topic(s) on leader transition",
+                 topicCount);
+}
+
 
 // ---------------------------------------------------------------------------
 // reapExpired — remove sessions idle beyond sessionTimeoutNs_.
