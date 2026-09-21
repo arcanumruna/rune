@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -174,6 +175,27 @@ int TransactionalProducerImpl::doWork(
 
     int work = 0;
 
+    // TX-6 FIX (ordering): drain pending SENDS *before* the command queue.
+    //
+    // The command queue carries EndTxn(commit/abort).  On a single doWork cycle
+    // where the app has both enqueued N transactional sends (into pendingSends_)
+    // AND requested commit (into cmdQueue_) — the exact pattern the harness'
+    // txn_produce mode uses: send×N then commitTransaction() — the EndTxn frame
+    // MUST NOT be written to the ordered channel before the N Produce frames.
+    // Aeron preserves publication order, so wire-order == broker-processing
+    // order: if EndTxn is sent first the broker writes the commit control marker
+    // and advances the LSO *before* the data batches arrive, so the data batches
+    // land AFTER the marker and are never covered by the committed range — a
+    // read_committed consumer then sees only the records that happened to drain
+    // in an earlier cycle (typically just the first).  Draining sends first
+    // guarantees every data batch precedes the EndTxn on the wire.
+    //
+    // InitProducerId ordering is unaffected: the API contract requires
+    // initTransactions().get() to complete before any send(), so init is never
+    // co-queued with sends in a way that could be reordered here (by the time a
+    // send is enqueued the producerId is already set from a prior cycle).
+    drainPendingSends(sessionId, sendFn, work);
+
     // Drain command queue (brief lock to swap).
     std::vector<Command> cmds;
     {
@@ -258,6 +280,11 @@ int TransactionalProducerImpl::doWork(
             const bool commit = (cmd.kind == CmdKind::EndTxnCommit);
             const int64_t corrId =
                 nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(pendingSendsMtx_);
+                fprintf(stderr, "CLIENTDBG EndTxn about-to-send commit=%d pendingSendsRemaining=%zu inFlightProduce=%zu\n",
+                        commit ? 1 : 0, pendingSends_.size(), pendingProduceBatches_.size());
+            }
 
             if (sendEndTxn(sessionId, corrId, (cmd.kind == CmdKind::EndTxnCommit), sendFn)) {
                 PendingTxnOp op;
@@ -283,6 +310,25 @@ int TransactionalProducerImpl::doWork(
         } // switch
     }
 
+    // Sweep expired pending ops (timeouts).
+    sweepTimedOut();
+
+    return work;
+}
+
+// ---------------------------------------------------------------------------
+// Agent-thread: drain pending transactional sends (Produce frames)
+//
+// Extracted from doWork() (TX-6 ordering fix) so it can run BEFORE the command
+// queue is processed, guaranteeing every data batch precedes an EndTxn on the
+// ordered publication.  Accumulates work into `work`.
+// ---------------------------------------------------------------------------
+
+void TransactionalProducerImpl::drainPendingSends(
+    int64_t sessionId,
+    const std::function<bool(const uint8_t*, std::size_t)>& sendFn,
+    int& work)
+{
     // Process pending sends (auto-AddPartitionsToTxn + Produce).
     std::vector<SendRecord> sends;
     {
@@ -325,6 +371,14 @@ int TransactionalProducerImpl::doWork(
         builder.setProducerId(pid);
         builder.setProducerEpoch(epoch);
 
+        // TX-6 FIX: mark the DATA batch transactional (attributes bit 0x10).
+        // Without this the broker treats it as a plain idempotent batch: its
+        // LsoTracker never records the open transaction and its read_committed
+        // abort filter (which gates on the TRANSACTIONAL bit) is skipped, so
+        // aborted records leak to read_committed consumers and read_committed
+        // is indistinguishable from read_uncommitted.
+        builder.setTransactional(true);
+
         // Snapshot baseSequence BEFORE advancing — this is what we stamp and retain.
         const int32_t baseSeq = ps.nextBaseSequence;
         builder.setBaseSequence(baseSeq);
@@ -348,6 +402,17 @@ int TransactionalProducerImpl::doWork(
         msg.partitionKnown = 1;
         msg.acks           = (cfg_.acks != Acks::None) ? uint8_t{1} : uint8_t{0};
         msg.key            = {};
+        // TX-6 FIX: stamp the idempotent/transactional identity onto the Produce
+        // FRAME (not just the record batch).  The broker's handleProduce gates
+        // ALL transactional tracking — ProducerStateManager dedup, LsoTracker
+        // onProduceBatch (open-txn set), read_committed abort filtering — on
+        // `msg.producerId >= 0`.  Left at the -1 default the batch is treated as
+        // a legacy non-idempotent produce: LSO never tracks the open txn, so on
+        // abort onControlMarker returns firstOffset=-1 and the aborted range is
+        // never recorded → aborted records leak to read_committed consumers.
+        msg.producerId     = pid;
+        msg.producerEpoch  = epoch;
+        msg.baseSequence   = baseSeq;
         msg.recordBatch    = std::span<const uint8_t>(batchScratch_);
 
         const std::size_t needed = msg.encodedSize();
@@ -368,11 +433,6 @@ int TransactionalProducerImpl::doWork(
             ++work;
         }
     }
-
-    // Sweep expired pending ops (timeouts).
-    sweepTimedOut();
-
-    return work;
 }
 
 // ---------------------------------------------------------------------------

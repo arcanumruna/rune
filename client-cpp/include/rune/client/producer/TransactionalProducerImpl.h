@@ -183,6 +183,13 @@ private:
 
     TxnPartitionState& getOrCreatePartition(int32_t topicId, int32_t partition);
 
+    // TX-6 ordering fix: drain pending transactional sends (Produce frames).
+    // Called from doWork() BEFORE the command queue so data batches always
+    // precede an EndTxn on the ordered publication.  Accumulates into `work`.
+    void drainPendingSends(int64_t sessionId,
+                           const std::function<bool(const uint8_t*, std::size_t)>& sendFn,
+                           int& work);
+
     bool sendInitProducerId(int64_t sessionId, int64_t corrId,
                             const std::function<bool(const uint8_t*, std::size_t)>& sendFn);
 

@@ -92,7 +92,18 @@ Client::Client(ClientConfig cfg)
     agent_.setProducerDrainFn(
         [this](int64_t nowNs, int64_t sessionId,
                agent::ClientAgent::SendFn sendFn) -> int {
-            return producerHub_.drainAndFlush(nowNs, sessionId, std::move(sendFn));
+            int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
+            // TX-5: drain all transactional producers (rarely >1; mutex is fine).
+            std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+            {
+                std::lock_guard<std::mutex> lk(txnHubMtx_);
+                txnSnap = txnProducers_;
+            }
+            for (auto& tp : txnSnap) {
+                work += tp->doWork(sessionId, sendFn);
+            }
+            (void)nowNs;
+            return work;
         });
     agent_.setProduceResponseFn(
         [this](int64_t correlationId, int64_t baseOffset) {
@@ -169,6 +180,14 @@ void Client::close() {
     // never hang.  MUST be called after agent_.stop() so the agent thread is no
     // longer in drainAndFlush / onProduceResponse (no concurrent access to pendingAcks_).
     producerHub_.failAll("Client closed");
+
+    // TX-5: fail all pending txn producer ops.
+    {
+        std::lock_guard<std::mutex> lk(txnHubMtx_);
+        for (auto& tp : txnProducers_) {
+            tp->failAll("Client closed");
+        }
+    }
 
     // M2 FIX: clear redirectPending_ on close so it does not latch.
     redirectPending_.store(false, std::memory_order_release);
@@ -859,6 +878,96 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
+    // ---- TX-5: Transactional producer responses --------------------------------
+    // ProduceResponse (tid 17) also lands here via the agent's egressObserver;
+    // the producerHub_ regular path is driven via setProduceResponseFn (above).
+    // Txn producers need the full buf+len+sendFn for their retry logic.
+
+    case codec::TemplateId::ProduceResponse: {
+        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+        {
+            std::lock_guard<std::mutex> lk(txnHubMtx_);
+            txnSnap = txnProducers_;
+        }
+        if (!txnSnap.empty()) {
+            std::function<bool(const uint8_t*, std::size_t)> sendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            for (auto& tp : txnSnap) {
+                tp->onProduceResponse(buf, len, sendFn);
+            }
+        }
+        break;
+    }
+
+    case codec::TemplateId::InitProducerIdResponse: {
+        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+        {
+            std::lock_guard<std::mutex> lk(txnHubMtx_);
+            txnSnap = txnProducers_;
+        }
+        for (auto& tp : txnSnap) {
+            tp->onInitProducerIdResponse(buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::AddPartitionsToTxnResponse: {
+        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+        {
+            std::lock_guard<std::mutex> lk(txnHubMtx_);
+            txnSnap = txnProducers_;
+        }
+        for (auto& tp : txnSnap) {
+            tp->onAddPartitionsToTxnResponse(buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::AddOffsetsToTxnResponse: {
+        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+        {
+            std::lock_guard<std::mutex> lk(txnHubMtx_);
+            txnSnap = txnProducers_;
+        }
+        if (!txnSnap.empty()) {
+            const auto snap = agent_.stateAndSessionId();
+            std::function<bool(const uint8_t*, std::size_t)> sendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            for (auto& tp : txnSnap) {
+                tp->onAddOffsetsToTxnResponse(buf, len, snap.sessionId, sendFn);
+            }
+        }
+        break;
+    }
+
+    case codec::TemplateId::TxnOffsetCommitResponse: {
+        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+        {
+            std::lock_guard<std::mutex> lk(txnHubMtx_);
+            txnSnap = txnProducers_;
+        }
+        for (auto& tp : txnSnap) {
+            tp->onTxnOffsetCommitResponse(buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::EndTxnResponse: {
+        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
+        {
+            std::lock_guard<std::mutex> lk(txnHubMtx_);
+            txnSnap = txnProducers_;
+        }
+        for (auto& tp : txnSnap) {
+            tp->onEndTxnResponse(buf, len);
+        }
+        break;
+    }
+
     default:
         // Unknown template — ignore (never crash).
         break;
@@ -1048,6 +1157,23 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
     groupConsumerHub_.add(impl);
 
     return GroupConsumer(std::move(impl));
+}
+
+// ---------------------------------------------------------------------------
+// TX-5: transactionalProducer() — create and register a TransactionalProducer
+// ---------------------------------------------------------------------------
+
+TransactionalProducer Client::transactionalProducer(const std::string& transactionalId,
+                                                     ProducerConfig cfg)
+{
+    auto impl = std::make_shared<producer::TransactionalProducerImpl>(
+        transactionalId,
+        cfg,
+        nextCorrId_);
+
+    std::lock_guard<std::mutex> lk(txnHubMtx_);
+    txnProducers_.push_back(impl);
+    return TransactionalProducer(std::move(impl));
 }
 
 } // namespace rune::client

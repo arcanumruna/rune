@@ -44,6 +44,8 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerHub.h>
+#include <rune/client/producer/TransactionalProducer.h>
+#include <rune/client/producer/TransactionalProducerImpl.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/client/group/GroupConsumer.h>
@@ -256,6 +258,16 @@ public:
     /// during the setup phase.  (Calling after start() is a data race on the hub.)
     Producer producer(ProducerConfig cfg = {});
 
+    // ---- TX-5: Transactional Producer API -----------------------------------
+
+    /// Create a TransactionalProducer with the given transactional id.
+    /// MUST be called before connect() (setup phase).
+    /// The returned handle's initTransactions() / beginTransaction() / send() /
+    /// commitTransaction() / abortTransaction() lifecycle is fully thread-safe
+    /// via the agent duty cycle.
+    TransactionalProducer transactionalProducer(const std::string& transactionalId,
+                                                ProducerConfig cfg = {});
+
     // ---- CG-5: Consumer-group API -------------------------------------------
 
     /// Join a consumer group and begin receiving pushed Records for assigned
@@ -383,6 +395,12 @@ private:
     // ---- CB-2: ProducerHub + topic registry ----------------------------------
     // Hub is owned by Client and wired into the agent before start().
     producer::ProducerHub producerHub_;
+
+    // ---- TX-5: Transactional producers ---------------------------------------
+    // Mutex guards the list; drain lambda loads a copy under the lock.
+    // Created at setup time (before connect()); rarely more than one per client.
+    std::mutex txnHubMtx_;
+    std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnProducers_;
 
     // ---- CB-4: SubscriberHub -------------------------------------------------
     // Owned by Client.  subscribe() / onEgressFrame() / close() all access it.
