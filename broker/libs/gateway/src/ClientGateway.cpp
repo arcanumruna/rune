@@ -207,11 +207,43 @@ void ClientGateway::rebuildProducerStateFromLogs()
             }
 
             producerStateManager_.rebuildFromLog(topicId, *log, scanTo, partition);
+
+            // TX-7: Rebuild per-partition read_committed state (LsoTracker +
+            // AbortedTxnIndex) from the same committed log range [0, scanTo).
+            //
+            // On a Follower→Leader transition the partitionTxnStates_ map is
+            // EMPTY: it is only populated incrementally via onProduceBatch /
+            // onControlMarker during normal produce handling.  An empty tracker
+            // returns lso(hw) == hw, which would allow a read_committed consumer
+            // to see records belonging to OPEN transactions (violating KIP-98 §8:
+            // LSO must pin at the first open-txn offset).  Similarly, an empty
+            // abortedIndex would deliver ABORTED data batches that are already
+            // below HW in the log (spec §8: aborted batches must be filtered).
+            //
+            // ReadCommittedView::rebuild scans [0, hw) from the log and
+            // populates both LsoTracker and AbortedTxnIndex — exactly the same
+            // structures that pushSubscriptions() reads via getTxnStateRO().
+            //
+            // We must CLEAR any stale state first (a partition that briefly had
+            // incremental state before the node lost leadership could carry
+            // stale entries; a clean rebuild from the committed log is the
+            // canonical source of truth).
+            //
+            // scanTo == hw (same bound used for PSM rebuild above) — bounded to
+            // committed records, never seeding from the uncommitted ahead-tail.
+            {
+                PartitionTxnState& ts = getTxnState(topicId, partition);
+                ts.lsoTracker.clear();
+                ts.abortedIndex.clear();
+                rune::transaction::ReadCommittedView view(
+                    &ts.lsoTracker, &ts.abortedIndex);
+                view.rebuild(log, scanTo);
+            }
         }
     }
 
-    spdlog::info("ClientGateway: PSM rebuilt from {} topic(s) on leader transition",
-                 topicCount);
+    spdlog::info("ClientGateway: PSM + read_committed state rebuilt from {} topic(s) "
+                 "on leader transition", topicCount);
 }
 
 

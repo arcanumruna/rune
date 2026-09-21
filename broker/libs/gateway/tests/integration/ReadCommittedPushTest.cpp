@@ -387,9 +387,8 @@ protected:
     std::atomic<bool>                driverRunning_{false};
     std::thread                      driverThread_;
 
-private:
     // -----------------------------------------------------------------------
-    // Aeron driver lifecycle.
+    // Aeron driver lifecycle (protected so derived fixtures can call them).
     // -----------------------------------------------------------------------
     void startDriver()
     {
@@ -924,6 +923,255 @@ TEST_F(ReadCommittedPushFixture, GroupReadUncommittedSeesAbortedAfterCarrier)
     // Non-txn post-abort batch (offset 9) MUST be present.
     EXPECT_TRUE(std::find(allOffsets.begin(), allOffsets.end(), int64_t{9}) != allOffsets.end())
         << "[TX-6b] non-txn batch at offset 9 must be delivered";
+}
+
+// ===========================================================================
+// TX-7: ReadCommittedRebuildOnFailoverFixture
+//
+// Tests that rebuildProducerStateFromLogs() ALSO rebuilds per-partition
+// read_committed state (LsoTracker + AbortedTxnIndex) on Follower→Leader
+// transition.
+//
+// Before TX-7 fix: partitionTxnStates_ is EMPTY after failover →
+//   lso(hw) returns hw (no open txns tracked) → open-txn records leak through
+//   read_committed; abortedIndex is empty → aborted records also leak.
+//
+// After TX-7 fix: ReadCommittedView::rebuild seeds LsoTracker + AbortedTxnIndex
+//   from the committed log → LSO pins correctly; aborted records are filtered.
+//
+// TEST 1 — AbortedRecordFilteredAfterFailover:
+//   Verifies the AbortedTxnIndex is rebuilt correctly after failover.
+//   Scenario:
+//     offset 0..2 — non-txn committed (always visible).
+//     offset 3..4 — txn pid=13 data batches (ABORTED).
+//     offset 5    — ABORT control marker for pid=13.
+//     offset 6    — non-txn committed (visible: LSO=HW since txn resolved).
+//   After failover rebuild:
+//     - offsets 0,1,2,6 delivered (committed, no open txns blocking LSO).
+//     - offsets 3,4 NOT delivered (aborted — AbortedTxnIndex rebuilt from log).
+//     - offset 5 NOT delivered (control marker, never delivered in any mode).
+//
+// TEST 2 — OpenTxnPinsLsoAfterFailover:
+//   Verifies the LsoTracker is rebuilt correctly after failover.
+//   Scenario:
+//     offset 0..2 — non-txn committed.
+//     offset 3    — txn pid=11 data batch (OPEN — no marker).
+//   After failover rebuild:
+//     - LSO = 3 (open txn at offset 3 pins it).
+//     - offsets 0,1,2 delivered (< LSO=3).
+//     - offset 3 NOT delivered (open txn, above LSO=3).
+// ===========================================================================
+
+class ReadCommittedRebuildOnFailoverFixture : public ReadCommittedPushFixture {
+public:
+    // Current leadership state exposed to the gateway.
+    bool isLeader_ = false;
+
+    void SetUp() override {
+        // Build dirs first (parent SetUp also does this; we replicate it so we
+        // can create the gateway with leaderView_ wired in).
+        tmpDir_  = std::make_unique<TempDir>("tx7fix");
+        dataDir_ = std::make_unique<TempDir>("tx7data");
+        fs::create_directories(dataDir_->path);
+
+        startDriver();
+        connectAeron();
+
+        std::vector<TopicSpec> specs = { makeSpec("events", /*partitions=*/1, /*topicId=*/0) };
+        registry_ = std::make_unique<TopicRegistry>(specs, dataDir_->path.string());
+
+        gw_ = std::make_unique<ClientGateway>(
+            aeron_, "aeron:ipc", kIngressStream, /*thisNodeId=*/1,
+            ClientGateway::kDefaultSessionTimeoutNs,
+            /*leaderView=*/[this]() -> LeaderView {
+                return LeaderView{isLeader_, ""};
+            });
+        gw_->setTopicRegistry(registry_.get());
+
+        gw_->setOnEgressFrame([this](int64_t sid, const uint8_t* buf, std::size_t len) {
+            allFrames_.push_back({sid, std::vector<uint8_t>(buf, buf + len)});
+        });
+    }
+
+};
+
+// ---------------------------------------------------------------------------
+// TX7 Test 1: AbortedRecordFilteredAfterFailover
+//
+// Pre-fix: empty AbortedTxnIndex → aborted records 3,4 leak into read_committed.
+// Post-fix: rebuild from log seeds aborted range → records filtered (BUG FIXED).
+// ---------------------------------------------------------------------------
+TEST_F(ReadCommittedRebuildOnFailoverFixture, AbortedRecordFilteredAfterFailover)
+{
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_NE(log, nullptr);
+
+    // Step 1. Run one doWork() as follower so wasLeader_=false is recorded.
+    isLeader_ = false;
+    gw_->doWork(nowNs());
+
+    // Step 2. Populate the log (simulates data replicated from L1).
+    //
+    //   offsets 0,1,2  — non-txn committed.
+    //   offsets 3,4    — txn pid=13 data batches (ABORTED).
+    //   offset  5      — ABORT control marker for pid=13.
+    //   offset  6      — non-txn committed (LSO=HW after marker, so visible).
+    for (int i = 0; i < 3; ++i) appendToLog(makeNonTxnBatch(i));
+    ASSERT_EQ(log->logEndOffset(), 3);
+
+    appendToLog(makeTxnDataBatch(/*pid=*/13, /*epoch=*/0, /*baseOffset=*/3));
+    appendToLog(makeTxnDataBatch(/*pid=*/13, /*epoch=*/0, /*baseOffset=*/4));
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // ABORT control marker for pid=13 at offset 5.
+    auto abortMarker = tx::ControlMarker::build(/*pid=*/13, /*epoch=*/0,
+                                                tx::ControlType::Abort, /*coordEpoch=*/0);
+    {
+        uint64_t u = 5ULL;
+        for (int i = 0; i < 8; ++i)
+            abortMarker[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    {
+        int32_t lod = 0;
+        if (abortMarker.size() >= 27u) {
+            const uint8_t* p = abortMarker.data() + 23;
+            lod = static_cast<int32_t>(
+                static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+        }
+        log->append(abortMarker.data(), abortMarker.size(), /*lastOffset=*/5 + lod);
+    }
+    ASSERT_EQ(log->logEndOffset(), 6);
+
+    // Non-txn committed batch at offset 6.
+    appendToLog(makeNonTxnBatch(6));
+    ASSERT_EQ(log->logEndOffset(), 7);
+
+    // partitionTxnStates_ is intentionally EMPTY (never populated as follower).
+    // This is the pre-fix bug state: after failover, partitionTxnStates_ is empty
+    // → AbortedTxnIndex has no entries → aborted records 3,4 would LEAK.
+    // The TX-7 fix rebuilds it from the log in rebuildProducerStateFromLogs().
+
+    // Step 3. Flip to leader → doWork() fires Follower→Leader rebuild.
+    isLeader_ = true;
+    gw_->doWork(nowNs());
+
+    // Step 4. Inject a read_committed subscriber.
+    const int64_t sid   = injectSession();
+    const int64_t subId = gw_->addGroupSubscription(
+        sid, kTopicId, kPartition, /*fromOffset=*/0, /*isolation=*/1);
+    ASSERT_GT(subId, 0);
+
+    // Pump until committed batches 0,1,2,6 are delivered.
+    // (After the fix, LSO=HW=7 since the abort marker resolved the txn;
+    //  aborted records 3,4 should be filtered by the rebuilt AbortedTxnIndex.)
+    pump([&]() {
+        const auto offs = extractBaseOffsets(sid, allFrames_);
+        bool has0=false, has1=false, has2=false, has6=false;
+        for (int64_t o : offs) {
+            if (o == 0) has0 = true;
+            if (o == 1) has1 = true;
+            if (o == 2) has2 = true;
+            if (o == 6) has6 = true;
+        }
+        return has0 && has1 && has2 && has6;
+    });
+
+    const auto delivered = extractBaseOffsets(sid, allFrames_);
+
+    // Committed non-txn records (0,1,2,6) MUST be delivered.
+    for (int64_t expected : {int64_t{0}, int64_t{1}, int64_t{2}, int64_t{6}}) {
+        EXPECT_TRUE(std::find(delivered.begin(), delivered.end(), expected) != delivered.end())
+            << "[TX-7] committed batch at offset " << expected
+            << " must be visible under read_committed after failover rebuild";
+    }
+
+    // ABORTED records (3, 4) must NOT be delivered.
+    // Pre-fix: empty AbortedTxnIndex → isAborted() always false → LEAKED (BUG).
+    // Post-fix: rebuild seeds aborted range [3..5] → records filtered.
+    EXPECT_TRUE(std::find(delivered.begin(), delivered.end(), int64_t{3}) == delivered.end())
+        << "[TX-7] CRITICAL: aborted batch at offset 3 MUST NOT be delivered "
+           "under read_committed after failover rebuild. "
+           "Pre-fix: empty AbortedTxnIndex after failover → record leaks (BUG).";
+    EXPECT_TRUE(std::find(delivered.begin(), delivered.end(), int64_t{4}) == delivered.end())
+        << "[TX-7] CRITICAL: aborted batch at offset 4 MUST NOT be delivered "
+           "under read_committed after failover rebuild. "
+           "Pre-fix: empty AbortedTxnIndex after failover → record leaks (BUG).";
+
+    // Control marker (offset 5) must never be delivered.
+    EXPECT_TRUE(std::find(delivered.begin(), delivered.end(), int64_t{5}) == delivered.end())
+        << "[TX-7] control batch at offset 5 must never be delivered in any mode";
+}
+
+// ---------------------------------------------------------------------------
+// TX7 Test 2: OpenTxnPinsLsoAfterFailover
+//
+// Pre-fix: empty LsoTracker → lso(hw)==hw → open-txn record (offset 3) LEAKED.
+// Post-fix: rebuild seeds open-txn at offset 3 → lso=3 → batch hidden.
+// ---------------------------------------------------------------------------
+TEST_F(ReadCommittedRebuildOnFailoverFixture, OpenTxnPinsLsoAfterFailover)
+{
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_NE(log, nullptr);
+
+    // Step 1. Run one doWork() as follower so wasLeader_=false is recorded.
+    isLeader_ = false;
+    gw_->doWork(nowNs());
+
+    // Step 2. Populate the log.
+    //   offsets 0,1,2 — non-txn committed.
+    //   offset  3     — txn pid=11 data batch (OPEN — no marker).
+    for (int i = 0; i < 3; ++i) appendToLog(makeNonTxnBatch(i));
+    ASSERT_EQ(log->logEndOffset(), 3);
+
+    appendToLog(makeTxnDataBatch(/*pid=*/11, /*epoch=*/0, /*baseOffset=*/3));
+    ASSERT_EQ(log->logEndOffset(), 4);
+
+    // partitionTxnStates_ is intentionally EMPTY (pre-fix bug state).
+
+    // Step 3. Flip to leader → doWork() fires Follower→Leader rebuild.
+    isLeader_ = true;
+    gw_->doWork(nowNs());
+
+    // Step 4. Inject a read_committed subscriber.
+    const int64_t sid   = injectSession();
+    const int64_t subId = gw_->addGroupSubscription(
+        sid, kTopicId, kPartition, /*fromOffset=*/0, /*isolation=*/1);
+    ASSERT_GT(subId, 0);
+
+    // Pump until committed batches 0,1,2 are delivered.
+    // After the fix: LSO=3 (open txn at offset 3 pins LSO); offsets 0,1,2 visible.
+    // Pre-fix: LSO=HW=4 → offset 3 also delivered (BUG).
+    pump([&]() {
+        const auto offs = extractBaseOffsets(sid, allFrames_);
+        bool has0=false, has1=false, has2=false;
+        for (int64_t o : offs) {
+            if (o == 0) has0 = true;
+            if (o == 1) has1 = true;
+            if (o == 2) has2 = true;
+        }
+        return has0 && has1 && has2;
+    });
+
+    // Run a few more cycles to confirm offset 3 does NOT leak.
+    pump([&]() { return false; }, 500);
+
+    const auto delivered = extractBaseOffsets(sid, allFrames_);
+
+    // Committed non-txn records (0,1,2) MUST be delivered (< LSO=3).
+    for (int64_t expected : {int64_t{0}, int64_t{1}, int64_t{2}}) {
+        EXPECT_TRUE(std::find(delivered.begin(), delivered.end(), expected) != delivered.end())
+            << "[TX-7] committed batch at offset " << expected
+            << " must be visible under read_committed (< LSO=3) after failover rebuild";
+    }
+
+    // OPEN-TXN record (offset 3) must NOT be delivered.
+    // Pre-fix: empty LsoTracker → lso(hw)=4=hw → offset 3 < bound=4 → LEAKED (BUG).
+    // Post-fix: rebuild seeds open-txn at offset 3 → lso=3 → offset 3 >= bound=3 → hidden.
+    EXPECT_TRUE(std::find(delivered.begin(), delivered.end(), int64_t{3}) == delivered.end())
+        << "[TX-7] CRITICAL: open-txn batch at offset 3 MUST NOT be delivered "
+           "under read_committed (LSO must pin at 3 after failover rebuild). "
+           "Pre-fix: empty LsoTracker → lso(hw)=hw → record leaks (BUG).";
 }
 
 } // namespace rune::gateway
