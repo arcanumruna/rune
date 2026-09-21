@@ -170,16 +170,19 @@ public:
     // Iterates all replicas in the registry.  For each replica:
     //   1. Skip if the replica's role is not Leader.
     //   2. Skip if the cleanup policy is not Compact (or CompactDelete).
-    //   3. Compute dirty ratio = (LEO - firstDirty) / LEO; skip if below threshold.
-    //      (Conservative: treat firstDirty == 0 for now — always compact if dirty.)
-    //   4. Determine the sealed range: [0, activeSegmentBase).  If there are no
-    //      sealed segments (only one segment), skip.
-    //   5. Call LogCleaner::clean([0, activeBase), nowNs, deleteRetentionMs=1 day).
+    //   3. Need at least 2 segments (one sealed, one active).
+    //   4. Dirty-ratio gate: skip if (activeBase - lastCleanOffset) / max(1, activeBase)
+    //      <= minCleanableDirtyRatio.  This prevents re-scanning already-clean logs.
+    //   5. Find the NEXT sealed segment to compact starting from lastCleanOffset.
+    //      Compact exactly ONE sealed segment per cycle (one-segment-per-cycle bound).
+    //   6. After a successful clean, advance the cleaned-watermark (lastCleanOffset)
+    //      to the end of the compacted segment so the next cycle starts fresh.
     //
-    // Returns number of compaction passes run (>0 if any work done).
+    // Returns number of compaction passes run (>0 if any work done, 0 when idle).
     //
     // Single-writer invariant: called on the AgentRunner duty-cycle thread only.
-    // NEVER touches the active segment (cleanBoundaryOffset == activeBase).
+    // NEVER touches the active segment (cleanBoundaryOffset == next-segment-base
+    // or activeBase for the last sealed segment).
     // -----------------------------------------------------------------------
     int runBoundedCompaction(int64_t nowNs) {
         if (!registry_) return 0;
@@ -206,16 +209,55 @@ public:
             // The active segment is the LAST one (highest base offset).
             const int64_t activeBase = bases.back();
 
-            // 5. Run LogCleaner::clean over the sealed range [0, activeBase).
-            //    cleanBoundaryOffset == activeBase ensures the active segment
-            //    is NEVER touched (records at offset >= activeBase are left intact).
+            // 5. Dirty-ratio gate.
             //
-            // deleteRetentionMs: use 1 day default (86_400_000 ms).
-            // Bounded: one clean() call per partition per cycle.
+            // Dirty range = [lastCleanOffset, activeBase).
+            // Dirty ratio = (activeBase - firstDirty) / max(1, activeBase).
+            // (Offset-span is the available dirty measure; no byte-level dirty
+            // count is tracked by Log — documented as acceptable approximation.)
+            const int64_t firstDirty = replica->lastCleanOffset();
+            const double dirtyRatio =
+                static_cast<double>(activeBase - firstDirty) /
+                static_cast<double>(activeBase > 0 ? activeBase : 1);
+
+            if (dirtyRatio <= replica->minCleanableDirtyRatio()) continue;
+
+            // 6. Find the next sealed segment to compact: the first sealed segment
+            //    whose base offset >= firstDirty.  We compact exactly ONE segment
+            //    per cycle (one-segment-per-cycle bound).
+            int64_t segToCompact = -1;
+            int64_t segEnd       = -1;  // start offset of the segment after segToCompact
+
+            for (std::size_t i = 0; i + 1 < bases.size(); ++i) {
+                // bases[i] is a sealed segment (not the active).
+                if (bases[i] < firstDirty) continue;  // already clean — skip
+                segToCompact = bases[i];
+                segEnd       = bases[i + 1];  // next segment base = exclusive end
+                break;
+            }
+
+            if (segToCompact < 0) {
+                // All sealed segments are already clean (watermark advanced past them).
+                // Advance watermark to activeBase so the dirty-ratio gate fires on
+                // the next produce-batch (new data arrives in the active seg then rolls).
+                replica->setLastCleanOffset(activeBase);
+                continue;
+            }
+
+            // 7. Compact exactly this ONE sealed segment.
+            //    Pass the segment's own range [segToCompact, segEnd) to both
+            //    buildOffsetMap and compact so only this segment's dirty records are
+            //    considered.  cleanBoundaryOffset == segEnd (never touches active seg).
             rune::storage::LogCleaner cleaner;
-            cleaner.clean(*log, /*firstDirtyOffset=*/0, /*cleanBoundaryOffset=*/activeBase,
-                          nowNs, /*deleteRetentionMs=*/86'400'000LL);
-            log->reloadSegments();
+            cleaner.clean(*log,
+                          /*firstDirtyOffset=*/segToCompact,
+                          /*cleanBoundaryOffset=*/segEnd,
+                          nowNs,
+                          replica->deleteRetentionMs());
+
+            // 8. Advance the cleaned watermark to segEnd so the next cycle starts
+            //    from the following sealed segment (forward progress).
+            replica->setLastCleanOffset(segEnd);
 
             ++work;
         }

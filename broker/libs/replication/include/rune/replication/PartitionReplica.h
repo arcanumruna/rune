@@ -92,6 +92,9 @@ struct PartitionConfig {
     bool        pushOnAppend      = true;            ///< GR-10: leader pushes to ISR followers immediately on append
     bool        fastAckOnApply    = true;            ///< GR-10: follower fast-acks (emit FetchRequest immediately after applyReplicated)
     CleanupPolicy cleanupPolicy   = CleanupPolicy::Delete;  ///< CP-1: log cleanup policy for this partition
+    // CP-2: compaction tuning fields.
+    double      minCleanableDirtyRatio = 0.5;        ///< CP-2: min dirty-offset fraction before compaction fires [0.0, 1.0]
+    int64_t     deleteRetentionMs      = 86'400'000LL; ///< CP-2: how long (ms) to retain tombstones before removing them
 };
 
 // ---------------------------------------------------------------------------
@@ -325,6 +328,17 @@ public:
     /// CP-1: the log cleanup policy for this partition (consulted by the LogCleaner).
     [[nodiscard]] CleanupPolicy cleanupPolicy() const noexcept { return cfg_.cleanupPolicy; }
 
+    // CP-2: compaction config accessors.
+    /// Minimum dirty-offset fraction that must be exceeded before compaction fires.
+    [[nodiscard]] double      minCleanableDirtyRatio() const noexcept { return cfg_.minCleanableDirtyRatio; }
+    /// How long (ms) tombstones are retained before being fully removed.
+    [[nodiscard]] int64_t     deleteRetentionMs()      const noexcept { return cfg_.deleteRetentionMs; }
+    /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
+    /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
+    [[nodiscard]] Offset lastCleanOffset() const noexcept { return lastCleanOffset_; }
+    /// CP-2: advance the cleaned watermark (called by NodeRuntimeAgent after each segment).
+    void setLastCleanOffset(Offset o) noexcept { lastCleanOffset_ = o; }
+
     /// Non-owning pointer to the underlying Log (for test inspection and replay seeding).
     [[nodiscard]] rune::storage::Log* log() const noexcept { return log_; }
 
@@ -444,6 +458,12 @@ private:
     // self-healing retry that makes catch-up robust to sustained loss / churn.
     int64_t reconcileIssuedNs_ = -1;
     static constexpr int64_t kReconcileStuckNs = 250'000'000LL; // 250 ms
+
+    // CP-2: cleaned watermark — the log offset up to which compaction has already
+    // been applied.  Starts at 0 (nothing compacted).  NodeRuntimeAgent advances
+    // this after each successful segment compaction so already-clean prefixes are
+    // never re-scanned or re-rewritten on the next duty-cycle call.
+    Offset lastCleanOffset_ = 0;
 
     // GR-10: push tracking — last offset that was pushed to followers.
     // Avoids re-pushing bytes already pushed in the same append cycle.

@@ -410,6 +410,10 @@ void BrokerNode::buildReplication() {
             // the same underlying values (both uint8_t, 0=Delete/1=Compact/2=CompactDelete).
             pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
                 static_cast<uint8_t>(spec->cleanupPolicy));
+            // CP-2: compaction tuning — use PartitionConfig defaults (0.5 ratio,
+            // 1-day deleteRetentionMs).  These may be overridden from TopicSpec
+            // in a future release when per-topic tuning is exposed via the API.
+            // (default values are already set in the PartitionConfig struct definition)
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).
@@ -590,6 +594,9 @@ void BrokerNode::buildGateway() {
             ocfg.maxFetchBytes        = 1 << 20;
             // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
             ocfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            // CP-2: compaction tuning for __consumer_offsets sentinel topic.
+            ocfg.minCleanableDirtyRatio = 0.5;          // 50% dirty before compaction fires
+            ocfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
 
             // Transport: real Aeron transport if available, else no-op InMemoryTransport.
             rune::replication::PartitionTransport* offsetTransport = replTransport_.get();
@@ -696,6 +703,9 @@ void BrokerNode::buildGateway() {
             tcfg.maxFetchBytes        = 1 << 20;
             // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
             tcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            // CP-2: compaction tuning for __transaction_state sentinel topic.
+            tcfg.minCleanableDirtyRatio = 0.5;          // 50% dirty before compaction fires
+            tcfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
 
             rune::replication::PartitionTransport* txnTransport = replTransport_.get();
             if (!txnTransport) {
