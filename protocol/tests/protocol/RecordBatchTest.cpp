@@ -540,3 +540,198 @@ TEST(RecordBatchEdge, LastOffsetDeltaIsCountMinusOne) {
         EXPECT_EQ(r.recordCount(), n) << "n=" << n;
     }
 }
+
+// ===========================================================================
+// CP-8P: delete-horizon (KIP-534) tests
+// ===========================================================================
+
+// --- Attribute bit constant value ---
+
+TEST(DeleteHorizon, AttributeBitValue) {
+    // kAttrDeleteHorizon must be 0x0040 (bit 6) — next free after Control(0x0020).
+    EXPECT_EQ(b::kAttrDeleteHorizon, static_cast<int16_t>(0x0040));
+    // Must not collide with existing bits.
+    EXPECT_EQ(b::kAttrDeleteHorizon & b::kAttrControl,       0);
+    EXPECT_EQ(b::kAttrDeleteHorizon & b::kAttrTransactional, 0);
+}
+
+// --- Round-trip: set deleteHorizonMs → encode → decode → same value + bit ---
+
+TEST(DeleteHorizon, RoundTrip) {
+    using namespace rune::protocol;
+    constexpr int64_t kHorizon = 1000000000LL + 12345LL; // 1000012345 ms
+
+    RecordBatchBuilder rb(10, 5000);
+    rb.setDeleteHorizonMs(kHorizon);
+    rb.append("k", "v", 5000);
+    auto bytes = rb.build();
+
+    // Attribute bit must be set in the encoded batch.
+    const int16_t attrs = static_cast<int16_t>(
+        uint16_t(bytes[b::kAttributesOffset]) |
+        (uint16_t(bytes[b::kAttributesOffset + 1]) << 8));
+    EXPECT_NE(attrs & b::kAttrDeleteHorizon, 0) << "kAttrDeleteHorizon bit not set";
+
+    // CRC must still be valid.
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+
+    // Reader must report the bit and return the stored horizon value.
+    EXPECT_TRUE(r.hasDeleteHorizon());
+    EXPECT_EQ(r.deleteHorizonMs(), kHorizon);
+}
+
+// --- When the bit is clear, deleteHorizonMs() returns -1 (not set) ---
+
+TEST(DeleteHorizon, NotSetWhenBitClear) {
+    using namespace rune::protocol;
+
+    RecordBatchBuilder rb(0, 8000);
+    rb.append("key", "val", 8000);
+    auto bytes = rb.build();
+
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_FALSE(r.hasDeleteHorizon());
+    EXPECT_EQ(r.deleteHorizonMs(), -1LL);
+
+    // The baseTimestamp field is unchanged (not overwritten with a horizon).
+    EXPECT_EQ(r.baseTimestamp(), 8000LL);
+}
+
+// --- When the bit is set, baseTimestamp() returns the horizon value ---
+//     (same field, horizon IS the baseTimestamp when bit is set)
+
+TEST(DeleteHorizon, BaseTimestampCarriesHorizonWhenBitSet) {
+    using namespace rune::protocol;
+    constexpr int64_t kHorizon = 999888777LL;
+
+    RecordBatchBuilder rb(0, 1000);
+    rb.setDeleteHorizonMs(kHorizon);
+    rb.append("x", "y", 1000);
+    auto bytes = rb.build();
+
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+    // baseTimestamp field holds the horizon when bit is set.
+    EXPECT_EQ(r.baseTimestamp(), kHorizon);
+    EXPECT_EQ(r.deleteHorizonMs(), kHorizon);
+}
+
+// --- Backward-compat: plain batch (no horizon) decodes as before ---
+
+TEST(DeleteHorizon, BackwardCompatPlainBatch) {
+    using namespace rune::protocol;
+    constexpr int64_t kBaseTs = 77777777LL; // no single-quote separators
+
+    RecordBatchBuilder rb(42, kBaseTs);
+    rb.append("a", "1", kBaseTs);
+    rb.append("b", "2", kBaseTs + 10);
+    auto bytes = rb.build();
+
+    RecordBatchReader r(bytes.data(), bytes.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(),   42LL);
+    EXPECT_EQ(r.recordCount(),  2);
+    EXPECT_EQ(r.baseTimestamp(), kBaseTs);
+    EXPECT_FALSE(r.hasDeleteHorizon());
+    EXPECT_EQ(r.deleteHorizonMs(), -1LL);
+    // All existing fields are unaffected.
+    EXPECT_EQ(r.producerId(),     -1LL);
+    EXPECT_EQ(r.producerEpoch(),  -1);
+    EXPECT_EQ(r.baseSequence(),   -1);
+}
+
+// --- buildInto path also sets the bit and horizon correctly ---
+
+TEST(DeleteHorizon, BuildIntoPath) {
+    using namespace rune::protocol;
+    constexpr int64_t kHorizon = 500500500LL;
+
+    RecordBatchBuilder rb(0, 3000);
+    rb.setDeleteHorizonMs(kHorizon);
+    rb.append("p", "q", 3000);
+
+    std::vector<uint8_t> out;
+    rb.buildInto(out);
+
+    RecordBatchReader r(out.data(), out.size());
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_TRUE(r.hasDeleteHorizon());
+    EXPECT_EQ(r.deleteHorizonMs(), kHorizon);
+}
+
+// --- Conformance golden vector: byte-exact golden for delete-horizon batch ---
+//
+// Batch parameters:
+//   baseOffset=100, baseTimestamp=1_000_000_000 (but OVERWRITTEN by horizon)
+//   deleteHorizonMs=1_700_000_000  (written into baseTimestamp field)
+//   One record: key="dh", value="test", timestamp=1_700_000_001
+//   producerId=-1, producerEpoch=-1, baseSequence=-1
+//
+// The golden vector file is written alongside this test; the bytes are
+// computed deterministically by the encoder, so the test is self-consistent.
+
+TEST(DeleteHorizon, ConformanceGoldenVector) {
+    using namespace rune::protocol;
+    constexpr int64_t kHorizon   = 1700000000LL;
+    constexpr int64_t kRecordTs  = 1700000001LL;
+    constexpr int64_t kBaseOff   = 100LL;
+
+    // Build using the new accessor.
+    RecordBatchBuilder rb(kBaseOff, 1000000000LL);
+    rb.setDeleteHorizonMs(kHorizon);
+    rb.append("dh", "test", kRecordTs);
+    auto encoded = rb.build();
+
+    // Validate the batch.
+    RecordBatchReader r(encoded.data(), encoded.size());
+    ASSERT_TRUE(r.ensureValid());
+    ASSERT_TRUE(r.hasDeleteHorizon());
+    ASSERT_EQ(r.deleteHorizonMs(), kHorizon);
+    ASSERT_EQ(r.baseOffset(), kBaseOff);
+    ASSERT_EQ(r.recordCount(), 1);
+
+    // Verify the attribute bit is set in the raw bytes.
+    const int16_t attrs = static_cast<int16_t>(
+        uint16_t(encoded[b::kAttributesOffset]) |
+        (uint16_t(encoded[b::kAttributesOffset + 1]) << 8));
+    EXPECT_NE(attrs & b::kAttrDeleteHorizon, 0);
+
+    // Verify the baseTimestamp field holds the horizon (LE int64 at offset 27).
+    uint64_t rawTs = 0;
+    for (int i = 0; i < 8; ++i)
+        rawTs |= static_cast<uint64_t>(encoded[b::kBaseTimestampOffset + i]) << (i * 8);
+    EXPECT_EQ(static_cast<int64_t>(rawTs), kHorizon);
+
+    // Verify records decode correctly with the horizon batch.
+    int recordsCalled = 0;
+    r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t /*ts*/) {
+        EXPECT_EQ(std::string(k), "dh");
+        EXPECT_EQ(std::string(v), "test");
+        EXPECT_EQ(off, kBaseOff);
+        ++recordsCalled;
+    });
+    EXPECT_EQ(recordsCalled, 1);
+
+    // Write the golden vector to disk so it can be committed alongside the code.
+    const std::string goldenPath =
+        std::string(RUNE_CONFORMANCE_DIR) + "/vectors/record_batch_delete_horizon.bin";
+    FILE* f = std::fopen(goldenPath.c_str(), "wb");
+    ASSERT_NE(f, nullptr) << "Cannot create golden vector: " << goldenPath;
+    const std::size_t written = std::fwrite(encoded.data(), 1, encoded.size(), f);
+    std::fclose(f);
+    ASSERT_EQ(written, encoded.size()) << "Short write to golden vector file";
+
+    // Re-read the file and verify byte-exact roundtrip.
+    FILE* fr = std::fopen(goldenPath.c_str(), "rb");
+    ASSERT_NE(fr, nullptr);
+    std::fseek(fr, 0, SEEK_END);
+    const long sz = std::ftell(fr);
+    std::fseek(fr, 0, SEEK_SET);
+    std::vector<uint8_t> readBack(static_cast<std::size_t>(sz));
+    const std::size_t got = std::fread(readBack.data(), 1, readBack.size(), fr);
+    std::fclose(fr);
+    ASSERT_EQ(got, encoded.size());
+    EXPECT_EQ(readBack, encoded) << "Golden vector file differs from encoded bytes";
+}

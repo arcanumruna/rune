@@ -28,6 +28,10 @@ inline constexpr int8_t kMagicValue = 2;
 // Attributes bits (int16, little-endian in header).
 inline constexpr int16_t kAttrControl        = 0x0020; // bit 5: isControl batch
 inline constexpr int16_t kAttrTransactional  = 0x0010; // bit 4: isTransactional batch
+// KIP-534: when this bit is set, the baseTimestamp field carries the delete
+// horizon (epoch-ms).  The layout is unchanged — no schema bump.  Any batch
+// that does NOT set this bit decodes exactly as before (full backward compat).
+inline constexpr int16_t kAttrDeleteHorizon  = 0x0040; // bit 6: delete-horizon in baseTimestamp
 } // namespace rune::protocol::batch
 
 namespace rune::protocol {
@@ -85,9 +89,24 @@ public:
     // Enable control-batch mode: sets the CONTROL|TRANSACTIONAL attribute bits
     // and stamps producerId/producerEpoch/baseSequence into the header.
     void setControl(bool ctrl) noexcept { control_ = ctrl; }
+    // Mark a DATA batch as transactional: sets ONLY the TRANSACTIONAL attribute
+    // bit (not CONTROL).  Required so the broker tracks the batch in its
+    // LsoTracker / AbortedTxnIndex and applies read_committed isolation
+    // filtering (both the produce-side LSO advance and the read-side abort
+    // filter gate on this bit).  Without it a transactional producer's data
+    // batches look like plain idempotent batches and aborted records leak to
+    // read_committed consumers.
+    void setTransactional(bool txn) noexcept { transactional_ = txn; }
     void setProducerId(int64_t pid) noexcept { producerId_ = pid; }
     void setProducerEpoch(int16_t ep) noexcept { producerEpoch_ = ep; }
     void setBaseSequence(int32_t seq) noexcept { baseSequence_ = seq; }
+
+    // KIP-534: stamp the delete horizon (epoch-ms) into this batch.
+    // When set, build()/buildInto() write horizonMs into the baseTimestamp
+    // field and set kAttrDeleteHorizon in attributes.  The wire layout is
+    // unchanged — readers that don't understand the bit treat the field as
+    // a normal baseTimestamp (backward-compatible).
+    void setDeleteHorizonMs(int64_t horizonMs) noexcept { deleteHorizonMs_ = horizonMs; }
 
     void append(std::string_view key, std::string_view value, int64_t timestamp) {
         // Kafka v2 record: length(varint) attributes(int8) tsDelta(varlong)
@@ -144,7 +163,13 @@ public:
         using namespace batch;
         int16_t attrs = control_
             ? static_cast<int16_t>(kAttrControl | kAttrTransactional)
-            : int16_t{0};
+            : (transactional_ ? kAttrTransactional : int16_t{0});
+        // KIP-534: if a delete-horizon is set, overlay the bit and use the
+        // horizon value as the baseTimestamp field (layout unchanged).
+        const bool hasHorizon = (deleteHorizonMs_ >= 0);
+        if (hasHorizon)
+            attrs = static_cast<int16_t>(attrs | kAttrDeleteHorizon);
+        const int64_t batchBaseTs = hasHorizon ? deleteHorizonMs_ : baseTimestamp_;
 
         out.clear();
         detail::appendLE64(out, baseOffset_);
@@ -154,7 +179,7 @@ public:
         detail::appendLE32(out, 0);                          // CRC (patched below)
         detail::appendLE16(out, attrs);                      // attributes
         detail::appendLE32(out, recordCount_ - 1);           // lastOffsetDelta
-        detail::appendLE64(out, baseTimestamp_);             // baseTimestamp
+        detail::appendLE64(out, batchBaseTs);                // baseTimestamp (or horizon)
         detail::appendLE64(out, maxTimestamp_);              // maxTimestamp
         detail::appendLE64(out, producerId_);                // producerId
         detail::appendLE16(out, producerEpoch_);             // producerEpoch
@@ -169,10 +194,17 @@ public:
 
     std::vector<uint8_t> build() {
         using namespace batch;
-        // Attributes: set CONTROL|TRANSACTIONAL bits if in control mode.
+        // Attributes: set CONTROL|TRANSACTIONAL bits if in control mode, or
+        // just TRANSACTIONAL for a transactional data batch.
         int16_t attrs = control_
             ? static_cast<int16_t>(kAttrControl | kAttrTransactional)
-            : int16_t{0};
+            : (transactional_ ? kAttrTransactional : int16_t{0});
+        // KIP-534: if a delete-horizon is set, overlay the bit and use the
+        // horizon value as the baseTimestamp field (layout unchanged).
+        const bool hasHorizon = (deleteHorizonMs_ >= 0);
+        if (hasHorizon)
+            attrs = static_cast<int16_t>(attrs | kAttrDeleteHorizon);
+        const int64_t batchBaseTs = hasHorizon ? deleteHorizonMs_ : baseTimestamp_;
 
         std::vector<uint8_t> b;
         detail::appendLE64(b, baseOffset_);                 // 0  (8 bytes)
@@ -182,7 +214,7 @@ public:
         detail::appendLE32(b, 0);                           // 17 CRC (patched below)
         detail::appendLE16(b, attrs);                       // 21 attributes (LE int16)
         detail::appendLE32(b, recordCount_ - 1);            // 23 lastOffsetDelta
-        detail::appendLE64(b, baseTimestamp_);              // 27 baseTimestamp
+        detail::appendLE64(b, batchBaseTs);                 // 27 baseTimestamp (or horizon)
         detail::appendLE64(b, maxTimestamp_);               // 35 maxTimestamp
         detail::appendLE64(b, producerId_);                 // 43 producerId
         detail::appendLE16(b, producerEpoch_);              // 51 producerEpoch
@@ -201,12 +233,16 @@ public:
 
 private:
     int64_t baseOffset_, baseTimestamp_;
-    int64_t maxTimestamp_   = baseTimestamp_;
-    int32_t recordCount_    = 0;
-    int64_t producerId_     = -1;
-    int16_t producerEpoch_  = -1;
-    int32_t baseSequence_   = -1;
-    bool    control_        = false;
+    int64_t maxTimestamp_    = baseTimestamp_;
+    int32_t recordCount_     = 0;
+    int64_t producerId_      = -1;
+    int16_t producerEpoch_   = -1;
+    int32_t baseSequence_    = -1;
+    bool    control_         = false;
+    bool    transactional_   = false;
+    // KIP-534: -1 means "not set" (horizon disabled); any non-negative value
+    // is stamped into baseTimestamp and kAttrDeleteHorizon is set in attributes.
+    int64_t deleteHorizonMs_ = -1;
     std::vector<uint8_t> records_;
 };
 
@@ -236,6 +272,22 @@ public:
     bool isControl() const {
         if (len_ < static_cast<size_t>(batch::kAttributesOffset + 2)) return false;
         return (attributes() & batch::kAttrControl) != 0;
+    }
+
+    /// True if this batch has the KIP-534 DELETE_HORIZON attribute bit set
+    /// (bit 6 = 0x0040).  When true, baseTimestamp() holds the horizon value
+    /// and deleteHorizonMs() returns it.  When false, deleteHorizonMs()
+    /// returns -1 (not set) and baseTimestamp() is the normal batch base time.
+    bool hasDeleteHorizon() const {
+        if (len_ < static_cast<size_t>(batch::kAttributesOffset + 2)) return false;
+        return (attributes() & batch::kAttrDeleteHorizon) != 0;
+    }
+
+    /// KIP-534 delete horizon in epoch-ms, or -1 if the attribute bit is clear.
+    /// Reads directly from the baseTimestamp field (same bytes, no layout change).
+    int64_t deleteHorizonMs() const {
+        if (!hasDeleteHorizon()) return -1LL;
+        return baseTimestamp(); // baseTimestamp field carries the horizon when bit is set
     }
 
     bool ensureValid() const {
