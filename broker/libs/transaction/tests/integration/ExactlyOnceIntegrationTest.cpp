@@ -507,7 +507,7 @@ TEST(ExactlyOnce, IdempotentProducerRetry_WindowWraps_OldDupAccepted)
     // If still in window (kRetryWindowSize+1 items, window size = 5),
     // batch 0 is evicted → OOS → -1.  This tests OOS rejection.
     auto vr = h.partition(0).psm.validate(
-                  ir.producerId, 0, ir.producerEpoch, 0, 0);
+                  /*topicId=*/0, ir.producerId, 0, ir.producerEpoch, 0, 0);
     // With window size = 5, appending 6 batches evicts batch 0.
     // Retrying an evicted batch is OOS (not a known dup).
     EXPECT_TRUE(vr.isOos() || vr.isDuplicate())
@@ -530,7 +530,7 @@ TEST(ExactlyOnce, IdempotentProducerOutOfOrderSequence_Rejected)
 
     // Send seq=5 when 1 is expected → OOS.
     auto vr = h.partition(0).psm.validate(
-                  ir.producerId, 0, ir.producerEpoch, 5, 5);
+                  /*topicId=*/0, ir.producerId, 0, ir.producerEpoch, 5, 5);
     EXPECT_TRUE(vr.isOos())
         << "Sequence gap (seq=5 when 1 expected) must be OOS";
 }
@@ -557,7 +557,7 @@ TEST(ZombieFencing, ZombieProducer_OldEpochFencedFromProduce)
 
     // Old producer (epoch 0) tries to validate → Fenced.
     auto vr = h.partition(0).psm.validate(
-                  ir1.producerId, 0, ir1.producerEpoch, 0, 0);
+                  /*topicId=*/0, ir1.producerId, 0, ir1.producerEpoch, 0, 0);
     // PSM alone doesn't know about coordinator epochs — but when the
     // NEW producer uses the same PID with a higher epoch, any call by
     // the old epoch is fenced by PSM's epoch tracking AFTER one batch
