@@ -1,0 +1,635 @@
+// ---------------------------------------------------------------------------
+// ReadCommittedPushTest.cpp — TX-4 Task 9 + Step 6:
+//   read_committed LSO bound + aborted-txn filter + control-marker skip
+//   on both client subscriptions and group subscriptions (push path).
+//
+// Tests:
+//   1. OpenTxnHiddenBelowLso
+//      - Append non-txn committed batches 0..4, then open-txn batch at offset 5.
+//      - LSO = 5; HW = 6.
+//      - read_committed subscriber receives offsets 0..4 only.
+//      - read_uncommitted sees through to HW (all 6 batches).
+//
+//   2. AbortedRecordsFilteredControlMarkersNeverDelivered
+//      - txn pid=9 writes batches at 5..7; ABORT control marker at 8.
+//      - Non-txn batch at 9.
+//      - read_committed delivers 0..4 and 9; never 5..7 (aborted) or 8 (marker).
+//      - read_uncommitted delivers 0..7, 9; never 8 (control marker, always filtered).
+//
+//   3. GroupReadCommitted (Step 6)
+//      - Group subscription with isolation=1 honours LSO cap.
+//      - Receives only committed non-txn batches; open-txn batch hidden.
+//
+// Harness:
+//   - Embedded Aeron media driver (aeron_driver_t, manual main loop thread).
+//   - Uses onEgressFrame_ callback to capture Records frames without real clients.
+//   - addGroupSubscription is the no-Aeron subscription path.
+//   - Log is obtained from TopicRegistry (registry owns partition logs).
+//   - No PartitionReplica needed: single-node, LSO tests don't need acks=All.
+// ---------------------------------------------------------------------------
+
+#include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
+#include <rune/node/NodeConfig.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/transaction/ControlMarker.h>
+#include <rune/transaction/ReadCommittedView.h>
+#include <rune/transaction/Types.h>
+#include <rune/storage/Log.h>
+
+#include <Aeron.h>
+#include <concurrent/AtomicBuffer.h>
+
+#include <gtest/gtest.h>
+
+extern "C" {
+#include <aeronmd/aeronmd.h>
+}
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
+namespace pc = rune::protocol::client;
+namespace tx = rune::transaction;
+using rune::node::TopicSpec;
+
+namespace rune::gateway {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Unique temp dir generator.
+// ---------------------------------------------------------------------------
+static fs::path makeTempDir(std::string_view tag = "")
+{
+    static std::atomic<uint32_t> g_seq{0};
+    const auto seq  = g_seq.fetch_add(1, std::memory_order_relaxed);
+    auto name = std::string("rune_rcpush_") + std::string(tag) +
+                std::to_string(static_cast<long>(::getpid())) +
+                "_" + std::to_string(seq);
+    return fs::temp_directory_path() / name;
+}
+
+struct TempDir {
+    fs::path path;
+    explicit TempDir(std::string_view tag = "") : path(makeTempDir(tag)) {}
+    ~TempDir() { std::error_code ec; fs::remove_all(path, ec); }
+};
+
+static int64_t nowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// ---------------------------------------------------------------------------
+// TopicSpec helper.
+// ---------------------------------------------------------------------------
+static TopicSpec makeSpec(std::string name, int32_t partCount, int32_t topicId)
+{
+    TopicSpec ts;
+    ts.name           = std::move(name);
+    ts.partitionCount = partCount;
+    ts.topicId        = topicId;
+    return ts;
+}
+
+// ---------------------------------------------------------------------------
+// Build a transactional data batch (TRANSACTIONAL bit set, no CONTROL bit).
+// Layout: 61-byte header + 7-byte inline record.
+// Attributes = 0x0010 (TRANSACTIONAL). One record. baseOffset stamped.
+// ---------------------------------------------------------------------------
+static std::vector<uint8_t> makeTxnDataBatch(int64_t pid, int16_t epoch,
+                                              int64_t baseOffset)
+{
+    constexpr std::size_t HEADER = 61;
+    const uint8_t rec[] = {0x00, 0x00, 0x00, 0x00, 0x02, 0x42, 0x00};
+    const std::size_t total = HEADER + sizeof(rec);
+
+    std::vector<uint8_t> out(total, 0);
+
+    // baseOffset (LE64@0).
+    {
+        uint64_t u = static_cast<uint64_t>(baseOffset);
+        for (int i = 0; i < 8; ++i) out[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    // batchLengthBytes (LE32@8) = total - 12.
+    {
+        const uint32_t bl = static_cast<uint32_t>(total - 12);
+        out[8]  = static_cast<uint8_t>(bl);
+        out[9]  = static_cast<uint8_t>(bl >> 8);
+        out[10] = static_cast<uint8_t>(bl >> 16);
+        out[11] = static_cast<uint8_t>(bl >> 24);
+    }
+    // partitionLeaderEpoch (LE32@12) = -1.
+    out[12] = 0xFF; out[13] = 0xFF; out[14] = 0xFF; out[15] = 0xFF;
+    // magic @16 = 2.
+    out[16] = 2;
+    // attributes (LE16@21) = 0x0010 (TRANSACTIONAL).
+    out[21] = 0x10; out[22] = 0x00;
+    // lastOffsetDelta (LE32@23) = 0 (one record).
+    // producerId (LE64@43).
+    {
+        uint64_t u = static_cast<uint64_t>(pid);
+        for (int i = 0; i < 8; ++i) out[43 + i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    // producerEpoch (LE16@51).
+    out[51] = static_cast<uint8_t>(epoch);
+    out[52] = static_cast<uint8_t>(static_cast<uint16_t>(epoch) >> 8);
+    // numRecords (LE32@57) = 1.
+    out[57] = 1;
+    // Record bytes.
+    std::memcpy(out.data() + HEADER, rec, sizeof(rec));
+
+    // CRC32C over [21..end].
+    auto crc32c = [](const uint8_t* data, std::size_t len) -> uint32_t {
+        uint32_t tbl[256];
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+            tbl[i] = c;
+        }
+        uint32_t crc = 0xFFFFFFFFu;
+        for (std::size_t i = 0; i < len; ++i) crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+        return crc ^ 0xFFFFFFFFu;
+    };
+    const uint32_t crc = crc32c(out.data() + 21, total - 21);
+    out[17] = static_cast<uint8_t>(crc);
+    out[18] = static_cast<uint8_t>(crc >> 8);
+    out[19] = static_cast<uint8_t>(crc >> 16);
+    out[20] = static_cast<uint8_t>(crc >> 24);
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Build a non-transactional data batch with one record.
+// Attributes = 0x0000. producerId = -1.
+// ---------------------------------------------------------------------------
+static std::vector<uint8_t> makeNonTxnBatch(int64_t baseOffset)
+{
+    constexpr std::size_t HEADER = 61;
+    const uint8_t rec[] = {0x00, 0x00, 0x00, 0x00, 0x02, 0x43, 0x00};
+    const std::size_t total = HEADER + sizeof(rec);
+    std::vector<uint8_t> out(total, 0);
+
+    // baseOffset (LE64@0).
+    {
+        uint64_t u = static_cast<uint64_t>(baseOffset);
+        for (int i = 0; i < 8; ++i) out[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    // batchLengthBytes (LE32@8).
+    {
+        const uint32_t bl = static_cast<uint32_t>(total - 12);
+        out[8]  = static_cast<uint8_t>(bl);
+        out[9]  = static_cast<uint8_t>(bl >> 8);
+        out[10] = static_cast<uint8_t>(bl >> 16);
+        out[11] = static_cast<uint8_t>(bl >> 24);
+    }
+    // partitionLeaderEpoch (LE32@12) = -1.
+    out[12] = 0xFF; out[13] = 0xFF; out[14] = 0xFF; out[15] = 0xFF;
+    // magic @16 = 2.
+    out[16] = 2;
+    // attributes @21 = 0x00 (non-txn, non-control).
+    // producerId (non-txn) = -1 (LE64@43).
+    for (int i = 0; i < 8; ++i) out[43 + i] = 0xFF;
+    // numRecords (LE32@57) = 1.
+    out[57] = 1;
+    std::memcpy(out.data() + HEADER, rec, sizeof(rec));
+
+    // CRC.
+    auto crc32c = [](const uint8_t* data, std::size_t len) -> uint32_t {
+        uint32_t tbl[256];
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j) c = (c & 1) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
+            tbl[i] = c;
+        }
+        uint32_t crc = 0xFFFFFFFFu;
+        for (std::size_t i = 0; i < len; ++i) crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+        return crc ^ 0xFFFFFFFFu;
+    };
+    const uint32_t crc = crc32c(out.data() + 21, total - 21);
+    out[17] = static_cast<uint8_t>(crc);
+    out[18] = static_cast<uint8_t>(crc >> 8);
+    out[19] = static_cast<uint8_t>(crc >> 16);
+    out[20] = static_cast<uint8_t>(crc >> 24);
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Extract baseOffsets from captured Records frames filtered by sessionId.
+// ---------------------------------------------------------------------------
+static std::vector<int64_t> extractBaseOffsets(
+    int64_t filterSid,
+    const std::vector<std::pair<int64_t,std::vector<uint8_t>>>& frames)
+{
+    std::vector<int64_t> offsets;
+    for (const auto& [sid, frame] : frames) {
+        if (sid != filterSid) continue;
+        auto recOpt = pc::Records::decode(frame.data(), frame.size());
+        if (!recOpt) continue;
+        offsets.push_back(recOpt->baseOffset);
+    }
+    return offsets;
+}
+
+} // namespace (anonymous — helper functions only)
+
+// ===========================================================================
+// ReadCommittedPushFixture
+// (MUST be outside anonymous namespace so GTest factory can instantiate it.)
+// ===========================================================================
+class ReadCommittedPushFixture : public ::testing::Test {
+public:
+    static constexpr int32_t kIngressStream = 7001;
+    static constexpr int32_t kTopicId       = 0;   // "events" → vector index 0
+    static constexpr int32_t kPartition     = 0;
+    static constexpr int     kPumpIter      = 50'000;
+
+    // All captured egress frames: (sessionId, encoded bytes).
+    // Single shared callback; tests filter by sessionId.
+    std::vector<std::pair<int64_t,std::vector<uint8_t>>> allFrames_;
+
+    void SetUp() override
+    {
+        tmpDir_  = std::make_unique<TempDir>("fix");
+        dataDir_ = std::make_unique<TempDir>("data");
+        fs::create_directories(dataDir_->path);
+
+        startDriver();
+        connectAeron();
+
+        // TopicRegistry owns the partition log.
+        std::vector<TopicSpec> specs = { makeSpec("events", /*partitions=*/1, /*topicId=*/0) };
+        registry_ = std::make_unique<TopicRegistry>(specs, dataDir_->path.string());
+
+        gw_ = std::make_unique<ClientGateway>(
+            aeron_, "aeron:ipc", kIngressStream, /*thisNodeId=*/1);
+        gw_->setTopicRegistry(registry_.get());
+
+        // Single shared egress capture callback: routes all frames to allFrames_.
+        gw_->setOnEgressFrame([this](int64_t sid, const uint8_t* buf, std::size_t len) {
+            allFrames_.push_back({sid, std::vector<uint8_t>(buf, buf + len)});
+        });
+    }
+
+    void TearDown() override
+    {
+        gw_.reset();
+        registry_.reset();
+        aeron_.reset();
+        stopDriver();
+        dataDir_.reset();
+        tmpDir_.reset();
+    }
+
+    // -----------------------------------------------------------------------
+    // Append a batch directly to the log (bypassing gateway produce path).
+    // Returns the base offset of the appended batch.
+    // -----------------------------------------------------------------------
+    int64_t appendToLog(const std::vector<uint8_t>& batch)
+    {
+        rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+        if (!log || batch.size() < 27u) return -1;
+
+        // Read lastOffsetDelta (LE32@23).
+        const uint8_t* p = batch.data() + 23;
+        const int32_t lod = static_cast<int32_t>(
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+
+        const int64_t base = log->logEndOffset();
+        const int64_t last = base + static_cast<int64_t>(lod >= 0 ? lod : 0);
+        log->append(batch.data(), batch.size(), last);
+        return base;
+    }
+
+    // -----------------------------------------------------------------------
+    // Pump doWork until condition is met or kPumpIter is exceeded.
+    // -----------------------------------------------------------------------
+    void pump(std::function<bool()> done, int iterations = kPumpIter)
+    {
+        using clock = std::chrono::steady_clock;
+        const auto deadline = clock::now() + std::chrono::seconds{10};
+        for (int i = 0; i < iterations && clock::now() < deadline && !done(); ++i) {
+            gw_->doWork(nowNs());
+            aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Inject a test session. Returns its sessionId.
+    // -----------------------------------------------------------------------
+    int64_t injectSession()
+    {
+        return gw_->injectTestSession(nowNs());
+    }
+
+protected:
+    std::unique_ptr<TempDir>         tmpDir_, dataDir_;
+    std::unique_ptr<TopicRegistry>   registry_;
+    std::unique_ptr<ClientGateway>   gw_;
+    std::shared_ptr<aeron::Aeron>    aeron_;
+
+    aeron_driver_context_t*          driverCtx_     = nullptr;
+    aeron_driver_t*                  driver_        = nullptr;
+    std::atomic<bool>                driverRunning_{false};
+    std::thread                      driverThread_;
+
+private:
+    // -----------------------------------------------------------------------
+    // Aeron driver lifecycle.
+    // -----------------------------------------------------------------------
+    void startDriver()
+    {
+        const std::string aeronDir = (tmpDir_->path / "aeron").string();
+        fs::create_directories(aeronDir);
+
+        aeron_driver_context_init(&driverCtx_);
+        aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
+        aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
+        aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
+        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
+        aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
+        aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
+        aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
+
+        ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0)
+            << "aeron_driver_init failed: " << aeron_errmsg();
+        ASSERT_EQ(aeron_driver_start(driver_, /*manual_main_loop=*/true), 0)
+            << "aeron_driver_start failed: " << aeron_errmsg();
+
+        driverRunning_.store(true, std::memory_order_release);
+        driverThread_ = std::thread([this]() {
+            while (driverRunning_.load(std::memory_order_acquire)) {
+                aeron_driver_main_idle_strategy(
+                    driver_, aeron_driver_main_do_work(driver_));
+            }
+        });
+
+        // Wait for CnC file.
+        const std::string cncPath = aeronDir + "/cnc.dat";
+        for (int i = 0; i < 400; ++i) {
+            aeron_driver_main_do_work(driver_);
+            if (fs::exists(cncPath)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        ASSERT_TRUE(fs::exists(cncPath)) << "Aeron CnC file not created";
+    }
+
+    void connectAeron()
+    {
+        const std::string aeronDir = (tmpDir_->path / "aeron").string();
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        aeron_ = aeron::Aeron::connect(ctx);
+        ASSERT_NE(aeron_, nullptr) << "Aeron::connect failed";
+    }
+
+    void stopDriver()
+    {
+        if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
+            if (driverThread_.joinable()) driverThread_.join();
+        }
+        if (driver_) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (aeron_driver_main_do_work(driver_) == 0) break;
+                std::this_thread::sleep_for(std::chrono::microseconds{200});
+            }
+            aeron_driver_close(driver_);
+            driver_ = nullptr;
+        }
+        if (driverCtx_) {
+            aeron_driver_context_close(driverCtx_);
+            driverCtx_ = nullptr;
+        }
+    }
+
+};
+
+// ===========================================================================
+// Test 1: OpenTxnHiddenBelowLso
+//
+// Scenario:
+//   - Offsets 0..4: non-txn committed batches.
+//   - Offset 5: transactional batch (pid=7, no marker → open txn).
+//   - HW (= LEO in no-replica mode) = 6.
+//
+// Expected:
+//   - read_uncommitted (isolation=0): sees all 6 batches (0..5).
+//   - read_committed  (isolation=1): sees only 0..4 (LSO=5 hides offset 5).
+// ===========================================================================
+TEST_F(ReadCommittedPushFixture, OpenTxnHiddenBelowLso)
+{
+    // Append 5 non-txn batches (offsets 0..4).
+    for (int i = 0; i < 5; ++i) {
+        appendToLog(makeNonTxnBatch(i));
+    }
+
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // Append transactional batch at offset 5 (pid=7, no marker → open txn).
+    appendToLog(makeTxnDataBatch(/*pid=*/7, /*epoch=*/0, /*baseOffset=*/5));
+    ASSERT_EQ(log->logEndOffset(), 6);
+
+    // Feed LSO tracker: open txn for pid=7 at offset 5.
+    gw_->notifyTransactionalBatch(kTopicId, kPartition, /*pid=*/7, /*baseOffset=*/5);
+
+    // Inject two sessions.
+    const int64_t sidU = injectSession();
+    const int64_t sidC = injectSession();
+
+    // Create group subscriptions (no-Aeron path).
+    const int64_t subU = gw_->addGroupSubscription(sidU, kTopicId, kPartition, 0, /*isolation=*/0);
+    const int64_t subC = gw_->addGroupSubscription(sidC, kTopicId, kPartition, 0, /*isolation=*/1);
+    ASSERT_GT(subU, 0);
+    ASSERT_GT(subC, 0);
+
+    // Drive pushSubscriptions until both converge.
+    pump([&]() {
+        return extractBaseOffsets(sidU, allFrames_).size() >= 6 &&
+               extractBaseOffsets(sidC, allFrames_).size() >= 5;
+    });
+
+    const auto offsU = extractBaseOffsets(sidU, allFrames_);
+    const auto offsC = extractBaseOffsets(sidC, allFrames_);
+
+    // read_uncommitted: 6 batches (0..5).
+    EXPECT_EQ(offsU.size(), 6u)
+        << "[TX-4] read_uncommitted should deliver all 6 batches (0..5)";
+    for (int64_t i = 0; i < 6; ++i) {
+        EXPECT_TRUE(std::find(offsU.begin(), offsU.end(), i) != offsU.end())
+            << "[TX-4] read_uncommitted missing batch at offset " << i;
+    }
+
+    // read_committed: 5 batches (0..4). LSO=5 hides offset 5.
+    EXPECT_EQ(offsC.size(), 5u)
+        << "[TX-4] read_committed should deliver only 5 batches (0..4)";
+    for (int64_t i = 0; i < 5; ++i) {
+        EXPECT_TRUE(std::find(offsC.begin(), offsC.end(), i) != offsC.end())
+            << "[TX-4] read_committed missing committed batch at offset " << i;
+    }
+    EXPECT_TRUE(std::find(offsC.begin(), offsC.end(), int64_t{5}) == offsC.end())
+        << "[TX-4] read_committed must NOT deliver open-txn batch at offset 5";
+}
+
+// ===========================================================================
+// Test 2: AbortedRecordsFilteredControlMarkersNeverDelivered
+//
+// Scenario:
+//   - Offsets 0..4: non-txn committed batches.
+//   - Offsets 5..7: txn batches (pid=9), aborted.
+//   - Offset 8: ABORT control batch for pid=9.
+//   - Offset 9: non-txn committed batch.
+//
+// Expected:
+//   - read_committed:  delivers 0..4 and 9; never 5..7 (aborted), never 8 (control).
+//   - read_uncommitted: delivers 0..7 and 9; never 8 (control, always filtered).
+// ===========================================================================
+TEST_F(ReadCommittedPushFixture, AbortedRecordsFilteredControlMarkersNeverDelivered)
+{
+    // Append offsets 0..4 (non-txn committed).
+    for (int i = 0; i < 5; ++i) {
+        appendToLog(makeNonTxnBatch(i));
+    }
+
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // Append offsets 5..7 (txn pid=9, will be aborted).
+    for (int i = 5; i <= 7; ++i) {
+        appendToLog(makeTxnDataBatch(/*pid=*/9, /*epoch=*/0, i));
+        gw_->notifyTransactionalBatch(kTopicId, kPartition, /*pid=*/9, i);
+    }
+    ASSERT_EQ(log->logEndOffset(), 8);
+
+    // Append ABORT control batch at offset 8 for pid=9.
+    auto abortMarker = tx::ControlMarker::build(/*pid=*/9, /*epoch=*/0,
+                                                tx::ControlType::Abort, /*coordEpoch=*/0);
+    // Stamp baseOffset=8 into the marker (LE64@0).
+    {
+        uint64_t u = 8ULL;
+        for (int i = 0; i < 8; ++i)
+            abortMarker[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    // Compute lastOffset from lastOffsetDelta (LE32@23).
+    int32_t lod = 0;
+    if (abortMarker.size() >= 27u) {
+        const uint8_t* p = abortMarker.data() + 23;
+        lod = static_cast<int32_t>(
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+    }
+    log->append(abortMarker.data(), abortMarker.size(), /*lastOffset=*/8 + lod);
+    ASSERT_EQ(log->logEndOffset(), 9);
+
+    // Notify gateway: ABORT marker for pid=9 at offset 8.
+    gw_->notifyControlMarker(kTopicId, kPartition, /*pid=*/9, /*markerOffset=*/8, /*commit=*/false);
+
+    // Append offset 9 (non-txn committed).
+    appendToLog(makeNonTxnBatch(9));
+    ASSERT_EQ(log->logEndOffset(), 10);
+
+    // Inject sessions.
+    const int64_t sidU = injectSession();
+    const int64_t sidC = injectSession();
+
+    const int64_t subU = gw_->addGroupSubscription(sidU, kTopicId, kPartition, 0, /*isolation=*/0);
+    const int64_t subC = gw_->addGroupSubscription(sidC, kTopicId, kPartition, 0, /*isolation=*/1);
+    ASSERT_GT(subU, 0);
+    ASSERT_GT(subC, 0);
+
+    // Pump until both see expected counts.
+    // read_uncommitted: 9 batches (0..7, 9). Never offset 8 (control).
+    // read_committed:   6 batches (0..4, 9). Never 5..7 (aborted), never 8 (control).
+    pump([&]() {
+        return extractBaseOffsets(sidU, allFrames_).size() >= 9 &&
+               extractBaseOffsets(sidC, allFrames_).size() >= 6;
+    });
+
+    const auto ou = extractBaseOffsets(sidU, allFrames_);
+    const auto oc = extractBaseOffsets(sidC, allFrames_);
+
+    // read_uncommitted: 0..7, 9 (=9 batches). Never offset 8 (control).
+    EXPECT_EQ(ou.size(), 9u)
+        << "[TX-4] read_uncommitted should deliver 9 batches (0..7,9)";
+    EXPECT_TRUE(std::find(ou.begin(), ou.end(), int64_t{8}) == ou.end())
+        << "[TX-4] read_uncommitted must NEVER deliver control batch at offset 8";
+    for (int64_t i = 0; i < 8; ++i) {
+        EXPECT_TRUE(std::find(ou.begin(), ou.end(), i) != ou.end())
+            << "[TX-4] read_uncommitted missing batch at offset " << i;
+    }
+    EXPECT_TRUE(std::find(ou.begin(), ou.end(), int64_t{9}) != ou.end())
+        << "[TX-4] read_uncommitted should deliver committed batch at offset 9";
+
+    // read_committed: 0..4, 9 (=6 batches). Never 5..7 (aborted), never 8 (control).
+    EXPECT_EQ(oc.size(), 6u)
+        << "[TX-4] read_committed should deliver 6 batches (0..4, 9)";
+    for (int64_t i = 5; i <= 8; ++i) {
+        EXPECT_TRUE(std::find(oc.begin(), oc.end(), i) == oc.end())
+            << "[TX-4] read_committed must NOT deliver batch at offset " << i
+            << " (aborted: 5..7; control: 8)";
+    }
+    EXPECT_TRUE(std::find(oc.begin(), oc.end(), int64_t{9}) != oc.end())
+        << "[TX-4] read_committed should deliver committed batch at offset 9";
+}
+
+// ===========================================================================
+// Test 3 (Step 6): GroupReadCommitted
+//
+// Scenario: group subscription with isolation=1 honours LSO cap.
+//   - Offsets 0..4: non-txn committed.
+//   - Offset 5: open transactional batch (pid=42, no marker yet).
+//
+// Expected:
+//   - Group subscriber (isolation=1) receives only 0..4.
+// ===========================================================================
+TEST_F(ReadCommittedPushFixture, GroupReadCommitted)
+{
+    // Append 5 non-txn batches (offsets 0..4).
+    for (int i = 0; i < 5; ++i) {
+        appendToLog(makeNonTxnBatch(i));
+    }
+
+    // Append open-txn batch at offset 5 (pid=42).
+    appendToLog(makeTxnDataBatch(/*pid=*/42, /*epoch=*/0, /*baseOffset=*/5));
+    gw_->notifyTransactionalBatch(kTopicId, kPartition, /*pid=*/42, /*baseOffset=*/5);
+
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_EQ(log->logEndOffset(), 6);
+
+    // Group subscriber with isolation=1.
+    const int64_t sid   = injectSession();
+    const int64_t subId = gw_->addGroupSubscription(
+        sid, kTopicId, kPartition, /*fromOffset=*/0, /*isolation=*/1);
+    ASSERT_GT(subId, 0);
+
+    pump([&]() {
+        return extractBaseOffsets(sid, allFrames_).size() >= 5;
+    });
+
+    const auto offs = extractBaseOffsets(sid, allFrames_);
+    EXPECT_EQ(offs.size(), 5u)
+        << "[TX-4 Step6] Group read_committed should deliver 5 batches (0..4)";
+    EXPECT_TRUE(std::find(offs.begin(), offs.end(), int64_t{5}) == offs.end())
+        << "[TX-4 Step6] Group read_committed must NOT deliver open-txn batch at offset 5";
+}
+
+} // namespace rune::gateway

@@ -17,7 +17,7 @@ target_include_directories(rune_gateway PUBLIC
 # (raw path) to avoid a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
 # rune_replication is linked PUBLIC so ReplicaRegistry.h (which includes PartitionReplica.h)
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
-target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication)
+target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
 
 if(aeron_FOUND)
@@ -143,6 +143,19 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_idempotent_tests
                 PROPERTIES TIMEOUT 120)
+
+            # TX-4 Task 9 + Step 6: read_committed LSO bound + aborted-txn filter +
+            # control-marker skip in pushSubscriptions + group push path.
+            add_executable(rune_gateway_read_committed_push_tests
+                tests/integration/ReadCommittedPushTest.cpp)
+            target_link_libraries(rune_gateway_read_committed_push_tests PRIVATE
+                rune_gateway
+                rune_transaction
+                rune_replication
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_read_committed_push_tests
+                PROPERTIES TIMEOUT 180)
         endif()
     endif()
 endif()

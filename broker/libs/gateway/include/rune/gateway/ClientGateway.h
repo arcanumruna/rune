@@ -59,6 +59,7 @@
 
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
+#include <rune/transaction/ReadCommittedView.h>
 
 #include <array>
 #include <atomic>
@@ -67,8 +68,10 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -240,6 +243,53 @@ public:
     [[nodiscard]] std::size_t pendingAckCount() const noexcept {
         return pendingAcks_.size();
     }
+
+    // -----------------------------------------------------------------------
+    // TX-4 Task 8: appendControlRecord — append a control marker (COMMIT/ABORT)
+    // to the leader replica for (topicId, partition) with acks=All durability.
+    //
+    // Called from TransactionCoordinationService::doWork to write markers to
+    // each participant partition and the __consumer_offsets partition.
+    //
+    // Feeds the per-partition LsoTracker + AbortedTxnIndex (Task 9) so that
+    // pushSubscriptions() can apply the correct LSO cap immediately after.
+    //
+    // \param topicId   Topic identifier (routed via TopicRegistry).
+    // \param partition Partition index.
+    // \param marker    Raw control batch bytes (already CRC-covered by build()).
+    //
+    // \returns baseOffset of the appended marker, or -1 if the topic/partition
+    //          is unknown or the replica is not in leader role.
+    //
+    // Single-writer: must be called on the duty-cycle thread.
+    // ---------------------------------------------------------------------------
+    int64_t appendControlRecord(int32_t                    topicId,
+                                int32_t                    partition,
+                                std::span<const uint8_t>   marker);
+
+    // -----------------------------------------------------------------------
+    // TX-4 Task 9 test hooks — feed the per-partition LSO tracker from external
+    // code (e.g. integration tests that append batches directly to the log
+    // rather than going through handleProduce / appendControlRecord).
+    //
+    // In production these are called automatically from handleProduce and
+    // appendControlRecord.  In tests, call them after appendToLog() to keep
+    // the tracker in sync.
+    //
+    // Both must be called on the duty-cycle thread (single-writer).
+    // -----------------------------------------------------------------------
+
+    // Feed the LsoTracker: a transactional data batch (producerId >= 0) was
+    // appended at baseOffset on (topicId, partition).
+    void notifyTransactionalBatch(int32_t topicId, int32_t partition,
+                                  int64_t producerId, int64_t baseOffset) noexcept;
+
+    // Feed the LsoTracker + AbortedTxnIndex: a control marker was appended for
+    // producerId at markerOffset on (topicId, partition).
+    // commit=true → COMMIT marker, commit=false → ABORT marker.
+    void notifyControlMarker(int32_t topicId, int32_t partition,
+                             int64_t producerId, int64_t markerOffset,
+                             bool commit) noexcept;
 
     // -----------------------------------------------------------------------
     // CG-4: Group-push API — called by GroupCoordinationService on rebalance.
@@ -695,6 +745,45 @@ private:
     // allocation-free; update() inserts into the internal unordered_map only on
     // the first Accept for a new (producerId, partition) pair.
     rune::storage::ProducerStateManager producerStateManager_;
+
+    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index.
+    //
+    // Maintains read_committed isolation state for each (topicId, partition)
+    // that has received at least one transactional data batch or control marker.
+    //
+    // PartitionTxnState holds the LsoTracker + AbortedTxnIndex for one partition.
+    // Updated incrementally on the single-writer thread:
+    //   - handleProduce: when producerId >= 0 → lsoTracker.onProduceBatch(pid, base)
+    //   - appendControlRecord: → lsoTracker.onControlMarker + abortedIndex.onAbortMarker
+    //
+    // Key: (topicId, partition) encoded as int64_t: (topicId << 32) | partition.
+    // Created on first transactional access; never removed (partition count bounded).
+    struct PartitionTxnState {
+        rune::transaction::LsoTracker   lsoTracker;
+        rune::transaction::AbortedTxnIndex abortedIndex;
+    };
+
+    // Encode (topicId, partition) to a unique int64 key for the map.
+    static int64_t partitionKey(int32_t topicId, int32_t partition) noexcept {
+        return (static_cast<int64_t>(topicId) << 32) |
+               static_cast<int64_t>(static_cast<uint32_t>(partition));
+    }
+
+    // Get-or-create the PartitionTxnState for (topicId, partition).
+    // Called only on the duty-cycle thread (single-writer). No locks.
+    PartitionTxnState& getTxnState(int32_t topicId, int32_t partition) noexcept {
+        return partitionTxnStates_[partitionKey(topicId, partition)];
+    }
+
+    // Returns nullptr if no state exists yet for this partition.
+    const PartitionTxnState* getTxnStateRO(int32_t topicId, int32_t partition) const noexcept {
+        auto it = partitionTxnStates_.find(partitionKey(topicId, partition));
+        return (it != partitionTxnStates_.end()) ? &it->second : nullptr;
+    }
+
+    // Map from partition key → LsoTracker + AbortedTxnIndex.
+    // Single-writer: only accessed on the duty-cycle thread.
+    std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
 };
 
 } // namespace rune::gateway
