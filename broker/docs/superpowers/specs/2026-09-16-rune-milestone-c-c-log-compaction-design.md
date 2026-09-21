@@ -25,7 +25,8 @@ MC-A/MC-B — but with **one load-bearing prerequisite** (§4.1) that must land 
 ## 2. Scope & non-goals
 
 **In scope (v1):**
-- Replica/append path carries a **record key** (`append(key, value)`) — the prerequisite.
+- Re-key the internal topics through the existing key-capable record builder (plus minimal
+  key plumbing at the replica callsite if needed) — the prerequisite (§4.1).
 - Re-key the internal topics: `__consumer_offsets` keyed by `(group,topic,partition)`,
   `__transaction_state` keyed by `transactionalId`.
 - `LogCleaner` + `OffsetMap` wired as a **bounded background duty-cycle pass** over
@@ -56,12 +57,20 @@ MC-A/MC-B — but with **one load-bearing prerequisite** (§4.1) that must land 
 
 ## 4. Architecture: components & boundaries
 
-### 4.1 Prerequisite — `append(key, value)` at the replica layer (load-bearing)
-Today `PartitionReplica::append` / `makeBatch` write records with an **empty key**
-(payload identity lives in the value). Compaction cannot dedup without a key, so first:
-- Extend the replica/append path (and the RecordBatch record encoding it drives) to
-  carry an optional **record key** alongside the value — `append(key, value, acks)`.
-- Re-key the internal topics written in MC-A/MC-B:
+### 4.1 Prerequisite — re-key the internal topics (load-bearing)
+> **Correction from codebase exploration (2026-09-16):** `RecordBatch`/
+> `RecordBatchBuilder::append(key, value, …)` **already encode a record key**
+> (varint-length-prefixed). So this prerequisite is NOT a deep new encoder — it is
+> re-keying the internal topics through the existing key-capable builder + plumbing the
+> key at the `ReplicatedOffsetStore`/replica callsite. `LogCleaner`/`OffsetMap` already
+> dedup on the record key correctly.
+
+Today `ReplicatedOffsetStore` (MC-A) writes records with an **empty key** — the
+`(group,tp)` identity is stuffed in the value. Compaction dedups by key, so it can't
+compact these topics until they carry a real key. So first:
+- Re-key the internal topics written in MC-A/MC-B (build the record with a real key via
+  the existing `RecordBatchBuilder::append(key, value, …)`; add minimal key plumbing at
+  the replica callsite only if the pre-built-batch `append` can't carry it):
   - `__consumer_offsets`: key = `(group, topic, partition)` (was empty; identity was in
     the value) — so compaction keeps the latest committed offset per `(group,tp)`.
   - `__transaction_state`: key = `transactionalId` — latest txn state per id.
