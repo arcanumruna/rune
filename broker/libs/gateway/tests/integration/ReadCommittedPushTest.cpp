@@ -809,4 +809,121 @@ TEST_F(ReadCommittedPushFixture, GroupSubscribeCarrierReadCommittedNoLeak)
     }
 }
 
+// ===========================================================================
+// Test 6 (TX-6b regression): GroupReadUncommittedSeesAbortedAfterCarrier
+//
+// Repro for the Docker E2E failure in test_tx_read_committed_smoke:
+//   - A read_uncommitted group consumer missed aborted-txn records because the
+//     group subscription was created with the conservative default isolation=1,
+//     the broker pushed records (skipping aborted ones + advancing nextOffset),
+//     and by the time the Subscribe carrier arrived with isolation=0, nextOffset
+//     was already past the aborted records (permanently lost).
+//
+// Fix: the push loop stalls at the first aborted transactional batch for a
+// pre-carrier group sub (!groupCarrierReceived).  The carrier then arrives,
+// sets groupCarrierReceived=true and isolation=0, and the next push cycle
+// delivers the aborted records as required by read_uncommitted semantics.
+//
+// Scenario:
+//   - Offsets 0..4: non-txn committed.
+//   - Offsets 5..7: txn pid=9, aborted.
+//   - Offset 8: ABORT control marker.
+//   - Offset 9: non-txn committed.
+//
+// Expected (after fix — this test was RED before the fix):
+//   - Group sub created with isolation=1 (default, pre-carrier).
+//   - Several push cycles run WITHOUT the carrier: no record is delivered from
+//     offset 5 onward yet (stall at offset 5 = first aborted batch).
+//   - Carrier arrives with isolation=0.
+//   - After pumping: batches 0..7 and 9 are delivered (9 batches); offset 8
+//     (control) is never delivered in either isolation mode.
+// ===========================================================================
+TEST_F(ReadCommittedPushFixture, GroupReadUncommittedSeesAbortedAfterCarrier)
+{
+    // Offsets 0..4: non-txn committed.
+    for (int i = 0; i < 5; ++i) appendToLog(makeNonTxnBatch(i));
+
+    rune::storage::Log* log = registry_->log(kTopicId, kPartition);
+    ASSERT_EQ(log->logEndOffset(), 5);
+
+    // Offsets 5..7: txn pid=9, aborted.
+    for (int i = 5; i <= 7; ++i) {
+        appendToLog(makeTxnDataBatch(/*pid=*/9, /*epoch=*/0, i));
+        gw_->notifyTransactionalBatch(kTopicId, kPartition, /*pid=*/9, i);
+    }
+    // ABORT control marker at offset 8 (resolves the txn).
+    auto abortMarker = tx::ControlMarker::build(/*pid=*/9, /*epoch=*/0,
+                                                tx::ControlType::Abort, /*coordEpoch=*/0);
+    {
+        uint64_t u = 8ULL;
+        for (int i = 0; i < 8; ++i)
+            abortMarker[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    int32_t lod = 0;
+    if (abortMarker.size() >= 27u) {
+        const uint8_t* p = abortMarker.data() + 23;
+        lod = static_cast<int32_t>(
+            static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+    }
+    log->append(abortMarker.data(), abortMarker.size(), /*lastOffset=*/8 + lod);
+    gw_->notifyControlMarker(kTopicId, kPartition, /*pid=*/9, /*markerOffset=*/8,
+                             /*commit=*/false);
+    // Offset 9: non-txn committed.
+    appendToLog(makeNonTxnBatch(9));
+    ASSERT_EQ(log->logEndOffset(), 10);
+
+    // Coordinator creates group subscription with default isolation=1 (pre-carrier).
+    const int64_t sid   = injectSession();
+    const int64_t subId = gw_->addGroupSubscription(
+        sid, kTopicId, kPartition, /*fromOffset=*/0, /*isolation=*/1, /*pendingCarrier=*/true);
+    ASSERT_GT(subId, 0);
+
+    // Pump several cycles WITHOUT sending the carrier.
+    // Before the fix: nextOffset would advance past the aborted records.
+    // After the fix: nextOffset stalls at offset 5 (first aborted batch).
+    pump([&]() { return false; }, 200);  // run 200 duty cycles unconditionally
+
+    // Verify: pre-carrier, batches 0..4 may have been delivered but NOT 5..7 or 9.
+    // (nextOffset must not have advanced past 5 into the aborted records.)
+    const auto preCarrierOffsets = extractBaseOffsets(sid, allFrames_);
+    for (int64_t i = 5; i <= 9; ++i) {
+        EXPECT_TRUE(std::find(preCarrierOffsets.begin(), preCarrierOffsets.end(), i)
+                    == preCarrierOffsets.end())
+            << "[TX-6b] pre-carrier: batch at offset " << i
+            << " must NOT be delivered before the isolation carrier arrives";
+    }
+
+    // Now send the isolation carrier: read_uncommitted (isolation=0).
+    const auto frame = buildSubscribeFrame(sid, kTopicId, kPartition, /*isolation=*/0);
+    gw_->applySubscribeForTest(frame.data(), frame.size());
+    ASSERT_EQ(gw_->subscriptionIsolationForTest(sid, kTopicId, kPartition), 0)
+        << "[TX-6b] carrier must set isolation=read_uncommitted";
+
+    // Pump until all 9 expected batches (0..7, 9) are delivered.
+    pump([&]() {
+        return extractBaseOffsets(sid, allFrames_).size() >= 9;
+    });
+
+    const auto allOffsets = extractBaseOffsets(sid, allFrames_);
+
+    // read_uncommitted: must see 0..7 and 9 (=9 batches). Never offset 8 (control).
+    EXPECT_GE(allOffsets.size(), 9u)
+        << "[TX-6b] read_uncommitted group consumer should deliver >= 9 batches "
+           "(0..7, 9) after carrier arrival";
+
+    // Aborted records 5..7 MUST be present.
+    for (int64_t i = 5; i <= 7; ++i) {
+        EXPECT_TRUE(std::find(allOffsets.begin(), allOffsets.end(), i) != allOffsets.end())
+            << "[TX-6b] read_uncommitted must deliver aborted batch at offset " << i
+            << " after isolation carrier sets isolation=0";
+    }
+    // Control batch (offset 8) MUST NOT be present.
+    EXPECT_TRUE(std::find(allOffsets.begin(), allOffsets.end(), int64_t{8}) == allOffsets.end())
+        << "[TX-6b] control batch at offset 8 must never be delivered";
+    // Non-txn post-abort batch (offset 9) MUST be present.
+    EXPECT_TRUE(std::find(allOffsets.begin(), allOffsets.end(), int64_t{9}) != allOffsets.end())
+        << "[TX-6b] non-txn batch at offset 9 must be delivered";
+}
+
 } // namespace rune::gateway

@@ -1526,7 +1526,16 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                 Subscription& gsub = subIt->second;
                 if (gsub.isGroup && gsub.topicId == msg.topicId &&
                     gsub.partition == partition) {
-                    gsub.isolation = msg.isolation;
+                    // TX-6b: Mark carrier received and update isolation.
+                    // The push loop stalls pre-carrier group subs at any transactional
+                    // batch that would be abort-filtered (so nextOffset has NOT advanced
+                    // past aborted records yet).  Marking groupCarrierReceived=true here
+                    // unblocks the push loop on the next duty cycle with the correct
+                    // isolation level: isolation=0 will deliver aborted records;
+                    // isolation=1 will skip them — both correctly, without duplicates or
+                    // permanent record loss.
+                    gsub.isolation            = msg.isolation;
+                    gsub.groupCarrierReceived = true;
                     spdlog::debug("ClientGateway: Subscribe carries isolation={} to group "
                                   "sub sessionId={} subId={} topic={} partition={} "
                                   "(no duplicate subscription)",
@@ -1681,6 +1690,11 @@ void ClientGateway::pushSubscriptions()
             // If no txn state exists yet, no transactional batches written → bound = hw.
         }
 
+        if (sub.isolation == 0 && sub.nextOffset < log->logEndOffset()) {
+            spdlog::warn("DBGRU sub={} t={} p={} iso={} hw={} leo={} bound={} next={}",
+                         subId, sub.topicId, sub.partition, sub.isolation, hw,
+                         log->logEndOffset(), bound, sub.nextOffset);
+        }
         if (sub.nextOffset >= bound) continue; // nothing committed to push yet
 
         // Fetch a bounded chunk of bytes from the log starting at nextOffset.
@@ -1837,6 +1851,26 @@ void ClientGateway::pushSubscriptions()
             //
             // No alloc: AbortedTxnIndex::isAborted is O(ranges) = O(tiny) with a
             // vector scan; in practice at most a few concurrent aborted txns.
+            //
+            // TX-6b pre-carrier guard: group subscriptions are created with the
+            // conservative default isolation=1 (read_committed) before the client's
+            // Subscribe carrier frame arrives carrying the TRUE isolation level.
+            // If we advance nextOffset past an aborted batch under isolation=1 and
+            // the client then sends a carrier with isolation=0 (read_uncommitted),
+            // those aborted records are permanently lost (nextOffset is already past
+            // them).  To avoid this, if the subscription is a group sub whose carrier
+            // hasn't arrived yet (!groupCarrierReceived), we STOP pushing at the first
+            // transactional batch that would be isolation-filtered: break out of this
+            // subscription's push loop without advancing nextOffset.  On the next
+            // duty cycle — either after the carrier arrived (groupCarrierReceived=true,
+            // correct isolation applied) or while still waiting (same stall, no harm)
+            // — the batch is re-evaluated under the correct semantics.
+            //
+            // This stall is bounded: the carrier arrives within one client duty cycle
+            // after SyncGroup and is processed on the SAME broker duty-cycle thread
+            // (no cross-thread race).  The pre-carrier stall never affects non-group
+            // subscriptions (isGroup=false never sets groupCarrierReceived=false in any
+            // ambiguous way) and does not affect already-confirmed group subs.
             if (sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted)
                 && (batchAttrs & kTransactionalBit)) {
                 // Read producerId (LE64 at kProducerIdOffset=43).
@@ -1849,6 +1883,16 @@ void ClientGateway::pushSubscriptions()
 
                     if (const PartitionTxnState* ts = getTxnStateRO(sub.topicId, sub.partition)) {
                         if (ts->abortedIndex.isAborted(batchPid, baseOffset)) {
+                            // TX-6b: pre-carrier group sub: do NOT advance past this
+                            // aborted batch.  Break so we re-evaluate after the carrier
+                            // arrives with the true isolation level.
+                            if (sub.isGroup && !sub.groupCarrierReceived) {
+                                spdlog::debug("ClientGateway: push sub={} pre-carrier group "
+                                              "sub stalling at aborted batch offset={} "
+                                              "(waiting for isolation carrier)",
+                                              subId, baseOffset);
+                                break;
+                            }
                             // Skip aborted batch — advance past it.
                             chunkPos += batchSize;
                             sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
@@ -2342,7 +2386,8 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
                                             int32_t topicId,
                                             int32_t partition,
                                             int64_t fromOffset,
-                                            uint8_t isolation)
+                                            uint8_t isolation,
+                                            bool    pendingCarrier)
 {
     // Require a known session.
     Session* session = sessions_.find(memberSessionId);
@@ -2383,13 +2428,20 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     const int64_t subId = ++nextSubscriptionId_;
 
     Subscription sub;
-    sub.subscriptionId = subId;
-    sub.sessionId      = memberSessionId;
-    sub.topicId        = topicId;
-    sub.partition      = partition;
-    sub.nextOffset     = nextOffset;
-    sub.isolation      = isolation;
-    sub.isGroup        = true;
+    sub.subscriptionId       = subId;
+    sub.sessionId            = memberSessionId;
+    sub.topicId              = topicId;
+    sub.partition            = partition;
+    sub.nextOffset           = nextOffset;
+    sub.isolation            = isolation;
+    sub.isGroup              = true;
+    // TX-6b: stall pre-carrier ONLY when the caller signals that a Subscribe
+    // carrier frame is still in flight (pendingCarrier=true).  This is set
+    // exclusively by GroupCoordinationService, which seeds the sub with the
+    // conservative default isolation=1 and expects the client to send a carrier
+    // with the true isolation level.  All other callers (explicit isolation,
+    // tests) pass pendingCarrier=false and behave normally from the start.
+    sub.groupCarrierReceived = !pendingCarrier;
 
     subscriptions_.emplace(subId, std::move(sub));
 

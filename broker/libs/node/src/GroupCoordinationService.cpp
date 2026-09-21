@@ -508,7 +508,8 @@ size_t GroupCoordinationService::handleSyncGroup(
             // for the few ms until its carrier downgrades this sub to isolation=0
             // — a harmless, self-correcting delay, never a correctness violation.
             const int64_t subId = gateway_->addGroupSubscription(
-                msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/1);
+                msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/1,
+                /*pendingCarrier=*/true);
             if (subId < 0) {
                 spdlog::warn("GroupCoordinationService::handleSyncGroup: "
                              "addGroupSubscription failed for member '{}' topic={} partition={}",

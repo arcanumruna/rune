@@ -302,11 +302,20 @@ public:
     // pushSubscriptions() machinery.  Marks the subscription as a group sub so
     // revokeGroupSubscriptions() removes it without touching client subs.
     // Returns subscriptionId (> 0) on success, or -1 if sessionId is unknown.
+    //
+    // TX-6b: `pendingCarrier` — set to true only when GroupCoordinationService
+    // creates the sub with the conservative default isolation=1 and expects a
+    // Subscribe carrier frame to arrive with the true isolation level.  When
+    // true, the push loop stalls at the first aborted batch until the carrier
+    // arrives (preventing nextOffset from advancing past aborted records under
+    // the wrong isolation).  Pass false (the default) for all other callers
+    // (explicit isolation, tests, etc.) — the sub behaves normally from the start.
     int64_t addGroupSubscription(int64_t memberSessionId,
                                  int32_t topicId,
                                  int32_t partition,
                                  int64_t fromOffset,
-                                 uint8_t isolation);
+                                 uint8_t isolation,
+                                 bool    pendingCarrier = false);
 
     // revokeGroupSubscriptions — remove ALL push subscriptions that were created
     // via addGroupSubscription for a member session.  Normal client subscriptions
@@ -471,6 +480,15 @@ private:
         int64_t nextOffset     = 0;
         uint8_t isolation      = 0;   // 0=read_uncommitted, 1=read_committed
         bool    isGroup        = false; // CG-4: true = created by addGroupSubscription
+        // TX-6b: group sub starts with the conservative default isolation=1.
+        // groupCarrierReceived tracks whether the Subscribe carrier (which carries
+        // the true isolation) has arrived from the client.  Until it arrives, the
+        // push loop stalls at the first transactional batch that would be abort-
+        // filtered so that nextOffset does NOT advance past aborted records before
+        // the true isolation is known.  Once the carrier arrives (flag=true) the
+        // correct isolation is applied on the next duty cycle — no data loss, no
+        // premature skip under a wrong isolation assumption.
+        bool    groupCarrierReceived = false;
     };
 
     // -----------------------------------------------------------------------
