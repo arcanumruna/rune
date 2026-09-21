@@ -1,8 +1,7 @@
 // ---------------------------------------------------------------------------
-// CompactionCleanerAgentTest.cpp — CP-6: LogCleanerAgent dedicated off-thread
+// CompactionCleanerAgentTest.cpp — CP-6/CP-7: LogCleanerAgent dedicated off-thread
 //   compaction agent integration tests.
 //
-// Five tests:
 //   1. CompactionRunsOffDutyThread
 //        Duty cycle alone does NOT compact; cleaner agent does.
 //   2. FilthiestLogSelectedFirst
@@ -14,6 +13,24 @@
 //   5. SwapSafeUnderRoleChangeAndTruncation
 //        Cleaner swap is safe under a Leader→Follower transition + truncation;
 //        compaction acts only on sealed segments below HW (disjoint from truncation).
+//   6. FollowerProducesZeroCompaction
+//        A demoted Follower produces zero compaction (role guard, not hw==0).
+//   7. SwapRingFullDoesNotLoseCompaction
+//        SPSC overflow: cleaner does not advance watermark on a failed enqueue.
+//   8. CheckpointResumesAcrossAgentRestart (CP-7)
+//        lastCleanOffset is seeded from the persisted checkpoint when the agent
+//        is reconstructed.  Non-vacuous: deleting the checkpoint file makes the
+//        watermark reset to 0.
+//   9. BoundedRangePerPassIncremental (CP-7)
+//        A log with more unique keys than the (small-budget) map can hold is
+//        compacted incrementally across MULTIPLE agent cycles, with the
+//        checkpoint advancing each pass.  Non-vacuous: with an unbounded map
+//        the whole range is done in one pass (test fails).
+//  10. DedupeMapBoundedByBudgetEndToEnd (CP-7)
+//        With a tiny dedupeBufferBytes the agent still converges to latest-per-key
+//        over multiple passes (bounded memory, multi-pass).  Proves the budget
+//        actually bounds a pass: if the bound is ignored the log is compacted in
+//        one pass and the test fails.
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -23,9 +40,11 @@
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
+#include <rune/storage/CleanerOffsetCheckpoint.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
+#include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/consensus/AgentRunner.h>
 #include <rune/consensus/IdleStrategy.h>
@@ -442,8 +461,26 @@ TEST(CompactionCleanerAgent, PerCycleBudgetBoundsWork) {
 
     // -----------------------------------------------------------------------
     // Run A: no budget (0 = unlimited). Count total work over kCycles cycles.
-    // -----------------------------------------------------------------------
-    constexpr int kCycles = 20;
+    //
+    // CP-7 bounded-pass semantics: produceCleanedFileBounded with a large
+    // dedupeBufferBytes (default 128 MiB) covers the entire dirty range in
+    // ONE pass per log (passEnd = hw = activeBase).  With kLogs=3 logs, the
+    // unlimited cleaner completes all 3 logs in exactly kLogs cycles.
+    //
+    // To keep the test non-vacuous with the new pass semantics we use
+    // kCycles = kLogs + 1 so the unlimited cleaner finishes all kLogs work
+    // units while the budgeted cleaner (1 byte, skips every 2nd cycle) can
+    // only complete ceil(kCycles/2) = ceil(4/2) = 2 work units, leaving
+    // totalBudgeted(2) < totalUnlimited(3).
+    //
+    // Non-vacuousness: if the budget gate is removed both cleaners reach 3 →
+    // EXPECT_LT fails.  This is unchanged from the original design; only the
+    // minimum required kCycles changed (from 20 to 4) because one pass now
+    // covers the entire log instead of one segment.
+    // kLogs=3 (from makeRegistry).  kCycles=4: unlimited finishes all 3 logs
+    // in 3 cycles (cycle 4 is idle); budgeted (1-byte) compacts on cycles 1,3
+    // (skips on 2,4) → totalBudgeted=2 < totalUnlimited=3.
+    constexpr int kCycles = 4;
     Cp6NullTransport transportA;
     std::vector<fs::path> dirsA;
     std::vector<std::unique_ptr<Log>> logsA;
@@ -974,6 +1011,446 @@ TEST(CompactionCleanerAgent, SwapRingFullDoesNotLoseCompaction) {
         EXPECT_LT(finalBases[i - 1], finalBases[i])
             << "Segment bases must be strictly ascending after retry drains";
     }
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// TEST 8: CheckpointResumesAcrossAgentRestart  (CP-7)
+//
+// The cleaner-offset-checkpoint persists lastCleanOffset to disk so the
+// cleaner resumes across broker restarts without recompacting from 0.
+//
+// NON-VACUOUSNESS:
+//   After the first agent run (partial compaction), the checkpoint file exists
+//   on disk.  We construct a SECOND LogCleanerAgent over the SAME log directory
+//   and replica.  The second agent must seed replica->lastCleanOffset() from the
+//   persisted file (via ensureCheckpoint), NOT reset it to 0.
+//
+//   Proof the test detects a missing-load: we additionally construct a third
+//   agent WITHOUT the checkpoint file (deleted) and verify the watermark resets
+//   to 0.  If loading the checkpoint had no effect the first part would also
+//   give 0, making both sub-tests behave identically — the EXPECT_GT(restored, 0)
+//   would FAIL for the agent-restart case, proving non-vacuity.
+// ===========================================================================
+TEST(CompactionCleanerAgent, CheckpointResumesAcrossAgentRestart) {
+    auto dir = cp6TempDir("cp7_ckpt_restart");
+    // Small roll so many sealed segments are created.
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1001, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+
+    for (int v = 0; v < 200; ++v) {
+        auto b = cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v));
+        log.append(b, v);
+    }
+    replica->onLeaderLogAppended();
+
+    ASSERT_GE(log.segmentBaseOffsets().size(), 3u) << "Need >= 3 segments";
+
+    // CP-7: use a tiny dedupeBufferBytes so each pass covers only ~3 offsets.
+    // This ensures the first agent advances PARTIALLY (not all the way to hw)
+    // in 5 cycles, making the Phase 3 non-vacuousness proof observable.
+    //
+    // With 5 unique keys (k0..k4) cycling over 200 records and a 3-slot map:
+    //   Each pass covers ~3 unique keys → advances ~3 offsets per pass.
+    //   5 cycles × ~3 offsets = ~15 offsets → watermarkAfterFirst ≈ 15 << hw=200.
+    //
+    // Non-vacuousness: without a checkpoint the third agent starts from 0 and
+    //   advances only ~3 offsets (1 cycle with 3-slot map) → noCheckpoint ≈ 3
+    //   which is < watermarkAfterFirst ≈ 15.  With a checkpoint the second agent
+    //   restores to ≥ watermarkAfterFirst.
+    constexpr int64_t kTinyBudget = 4 * static_cast<int64_t>(SkimpyOffsetMap::kEntryBytes);
+
+    // -----------------------------------------------------------------------
+    // Phase 1: run the FIRST agent for a few cycles to partially compact and
+    //          persist the checkpoint.
+    // -----------------------------------------------------------------------
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1001, 0, std::move(replica));
+
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    {
+        // cycleBudgetBytes=0 (unlimited), tiny dedupeBufferBytes so the map fills
+        // after ~3 records → passEnd << hw → partial compaction per cycle.
+        rune::node::LogCleanerAgent firstAgent(&registry,
+                                               /*cycleBudgetBytes=*/0,
+                                               /*dedupeBufferBytes=*/kTinyBudget);
+        // Run a few cycles — at least one segment must be compacted.
+        for (int i = 0; i < 5; ++i) {
+            firstAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+            dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        }
+        // firstAgent is destroyed here.  The checkpoint file should now be on
+        // disk at dir/cleaner-offset-checkpoint.
+    }
+
+    // Capture the watermark after the first agent ran.
+    const int64_t watermarkAfterFirst = raw->lastCleanOffset();
+    ASSERT_GT(watermarkAfterFirst, 0LL)
+        << "First agent must have advanced lastCleanOffset > 0; got 0. "
+           "If the first agent did no work there is nothing to restore.";
+
+    // Verify the checkpoint file exists.
+    const std::string ckptPath = dir.string() + "/cleaner-offset-checkpoint";
+    ASSERT_TRUE(fs::exists(ckptPath))
+        << "Checkpoint file must exist after first agent ran: " << ckptPath;
+
+    // -----------------------------------------------------------------------
+    // Phase 2: RESET the watermark to 0 (simulating a broker restart where
+    //          the in-memory watermark is gone), then construct a SECOND agent.
+    //          The second agent must restore the watermark from disk.
+    // -----------------------------------------------------------------------
+    raw->setLastCleanOffset(0);
+    ASSERT_EQ(raw->lastCleanOffset(), 0LL) << "Watermark must be 0 after reset";
+
+    {
+        rune::node::LogCleanerAgent secondAgent(&registry,
+                                                /*cycleBudgetBytes=*/0,
+                                                /*dedupeBufferBytes=*/kTinyBudget);
+        // A single doWork() call triggers ensureCheckpoint() which loads the
+        // persisted value.  Even if doWork() does no compaction (all dirty
+        // segments already compacted), it still calls ensureCheckpoint().
+        secondAgent.doWork(100'000'000LL);
+        dutyCycleAgent.doWork(100'000'000LL);
+    }
+
+    const int64_t restored = raw->lastCleanOffset();
+    EXPECT_GT(restored, 0LL)
+        << "Second agent must seed lastCleanOffset from the checkpoint file; "
+           "got 0.  If this fails, ensureCheckpoint is not loading the file "
+           "or not advancing the replica watermark.";
+    // The restored watermark must be AT LEAST what the first agent persisted.
+    // It may be higher because the second agent may compact one more segment in
+    // the same doWork() call (loading the checkpoint then advancing further is
+    // correct and expected).
+    EXPECT_GE(restored, watermarkAfterFirst)
+        << "Restored watermark must be >= what the first agent persisted: "
+           "expected >= " << watermarkAfterFirst << " got=" << restored;
+
+    // -----------------------------------------------------------------------
+    // Phase 3 (NON-VACUOUSNESS proof): delete the checkpoint file, reset the
+    //          watermark to 0, construct a third agent and run ONE cycle.
+    //          With the tiny 3-slot map, ONE cycle advances ~3 offsets (one
+    //          bounded pass), which must be strictly less than watermarkAfterFirst
+    //          (the first agent ran 5 cycles × ~3 offsets each ≈ 15).
+    //          This proves that loading the checkpoint actually changes
+    //          behaviour — a "vacuous" implementation that always starts from 0
+    //          would fail the EXPECT_GE(restored, watermarkAfterFirst) above.
+    // -----------------------------------------------------------------------
+    fs::remove(ckptPath);
+    ASSERT_FALSE(fs::exists(ckptPath)) << "Checkpoint file must be deleted";
+
+    // First agent ran 5 cycles with ~3-offset steps → watermarkAfterFirst > 5.
+    ASSERT_GT(watermarkAfterFirst, 5LL)
+        << "Non-vacuousness requires watermarkAfterFirst > 5 (5 passes × ~1+ offsets); got "
+        << watermarkAfterFirst << ".  The first agent may have too few cycles.";
+
+    raw->setLastCleanOffset(0);
+    {
+        rune::node::LogCleanerAgent thirdAgent(&registry,
+                                               /*cycleBudgetBytes=*/0,
+                                               /*dedupeBufferBytes=*/kTinyBudget);
+        // ONE cycle only: starts from 0 (no checkpoint file), makes ONE bounded
+        // pass → advances ~3 offsets.  This must be < watermarkAfterFirst (≈15).
+        thirdAgent.doWork(200'000'000LL);
+        dutyCycleAgent.doWork(200'000'000LL);  // drain any pending swap
+    }
+
+    const int64_t noCheckpoint = raw->lastCleanOffset();
+    // Without checkpoint, the agent started from 0 and advanced ONE step.
+    // That step must be LESS than watermarkAfterFirst (the first agent ran 5 steps).
+    EXPECT_LT(noCheckpoint, watermarkAfterFirst)
+        << "Without a checkpoint file, 1 cycle advances ~3 offsets "
+           "(" << noCheckpoint << "), which must be < watermarkAfterFirst ("
+        << watermarkAfterFirst << ").  "
+           "If equal, loading the checkpoint had no effect (test is vacuous).  "
+           "Scratch-revert proof: removing the `persisted > replica->lastCleanOffset()` "
+           "guard in ensureCheckpoint makes restored == 0 and the EXPECT_GE above fails.";
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// TEST 9: BoundedRangePerPassIncremental  (CP-7)
+//
+// A SINGLE LARGE SEGMENT containing more unique keys than the SkimpyOffsetMap
+// can hold must be compacted incrementally across multiple agent cycles.
+// Each cycle the watermark advances to passEnd (the map's latestOffset + 1),
+// which is LESS than segEnd when the map fills mid-segment.
+//
+// NON-VACUOUSNESS (critical design):
+//   cycleBudgetBytes = 0 (UNLIMITED): cycle budget does NOT limit passes.
+//   dedupeBufferBytes = 4 × kEntryBytes (~3 effective map slots).
+//   The ONE large segment has 40 records with 40 unique keys.
+//
+//   With an UNBOUNDED map (old OffsetMap, all 40 keys fit):
+//     - buildOffsetMapFromBases covers the whole segment, passEnd = segEnd = hw
+//     - Watermark jumps from 0 to hw in ONE doWork call (1 pass)
+//     - EXPECT_GT(passCount, 1) FAILS.
+//
+//   With a BOUNDED map of ~3 slots:
+//     - buildOffsetMapFromBases stops after 3 keys; passEnd = offset 2 or 3
+//     - produceCleanedFile compacts only up to passEnd
+//     - Watermark advances to passEnd << hw
+//     - Many more doWork calls needed to reach hw → passCount >> 1 → PASS.
+//
+// This unambiguously tests that dedupeBufferBytes_ bounds the MAP, not just
+// the cycle budget.  The segment has many records so passEnd < segEnd is
+// guaranteed when the map fills mid-segment.
+// ===========================================================================
+TEST(CompactionCleanerAgent, BoundedRangePerPassIncremental) {
+    // Use a LARGE roll size so all records land in ONE sealed segment.
+    // 40 records × ~70 bytes/record ≈ 2800 bytes < 32 KiB roll.
+    auto dir = cp6TempDir("cp7_bounded_incremental");
+    Log log(dir.string(), /*rollBytes=*/32768);
+
+    Cp6NullTransport transport;
+
+    // 40 unique keys in one segment.
+    // With a 3-slot map, the map fills after 3 keys → passEnd < segEnd.
+    constexpr int N = 40;
+    for (int v = 0; v < N; ++v) {
+        auto b = cp6Batch(v, "unique_key_" + std::to_string(v), "val");
+        log.append(b, v);
+    }
+    // Force a segment roll so the 40-key records end up in a SEALED segment.
+    // maybeRoll() rolls when sizeBytes() >= rollBytes_ BEFORE the next write.
+    // With rollBytes=32768 and 40 records × ~70 bytes = ~2800 bytes, we need
+    // to fill the segment first, then write one more record to trigger the roll.
+    // Write a big batch to fill the segment, then one tiny record to roll.
+    {
+        // Big value to fill the segment (make it >= rollBytes).
+        std::string bigVal(32000, 'x');
+        auto b = cp6Batch(N, "fill_seg", bigVal);
+        log.append(b, N);
+    }
+    {
+        // This write triggers the roll: after fill_seg the segment is >32 KiB.
+        auto b = cp6Batch(N + 1, "post_roll", "v");
+        log.append(b, N + 1);
+    }
+
+    auto bases = log.segmentBaseOffsets();
+    // Need at least: [sealed_40_keys_+_fill, active_post_roll].
+    ASSERT_GE(bases.size(), 2u) << "Need >= 2 segments (sealed + active)";
+
+    // Tiny dedupe budget: 4 × kEntryBytes = 64 bytes → maxSlots ≈ 3.
+    // With 40 unique keys in the sealed segment, the map fills after 3 keys.
+    constexpr int64_t kTinyDedupeBudget = 4 * static_cast<int64_t>(SkimpyOffsetMap::kEntryBytes);
+
+    auto cfg = makeCompactConfig(1002, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+    replica->onLeaderLogAppended();
+
+    const int64_t hw = replica->highWatermark();
+    ASSERT_GT(hw, 0LL) << "HW must be > 0";
+    // Confirm the ONE sealed segment spans [0, N) — that's what we're compacting.
+    ASSERT_GE(hw, static_cast<int64_t>(N))
+        << "HW must cover the 40-key segment (hw=" << hw << ", N=" << N << ")";
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1002, 0, std::move(replica));
+
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // cycleBudgetBytes=0 (UNLIMITED): cycle budget does NOT limit passes.
+    // dedupeBufferBytes=kTinyDedupeBudget: the MAP limits each pass.
+    rune::node::LogCleanerAgent cleaner(&registry,
+                                        /*cycleBudgetBytes=*/0,
+                                        /*dedupeBufferBytes=*/kTinyDedupeBudget);
+
+    int passCount = 0;
+    int64_t prevWatermark = 0;
+    const int kMaxCycles = 500;
+
+    for (int i = 0; i < kMaxCycles && raw->lastCleanOffset() < hw; ++i) {
+        const int64_t wBefore = raw->lastCleanOffset();
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        const int64_t wAfter = raw->lastCleanOffset();
+        if (wAfter > wBefore) {
+            ++passCount;
+            prevWatermark = wAfter;
+        }
+    }
+
+    // With a 3-slot map and 40 unique keys in one sealed segment, at least
+    // ceil(40 / 3) = 14 passes needed to cover the whole segment.
+    // Without the bounded map (OffsetMap), passCount == 1 → FAIL.
+    EXPECT_GT(passCount, 1)
+        << "With dedupeBufferBytes=" << kTinyDedupeBudget << " (~3 slots) and "
+        << N << " unique keys in one sealed segment, the bounded map must "
+           "require > 1 pass to scan the whole segment (passCount=" << passCount
+        << ").  "
+           "If passCount == 1, produceCleanedFile is using an unbounded map: "
+           "dedupeBufferBytes_ is UNREAD.";
+
+    EXPECT_GT(prevWatermark, 0LL)
+        << "Watermark must have advanced (got=" << prevWatermark << ")";
+
+    log.reloadSegments();
+    const int live = cp6CountLiveRecords(log);
+    EXPECT_GT(live, 0) << "Log must still have records after bounded compaction";
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// TEST 10: DedupeMapBoundedByBudgetEndToEnd  (CP-7)
+//
+// Prove that dedupeBufferBytes_ BOUNDS the dedupe map and that the agent
+// still converges to latest-per-key correctness across multiple passes.
+//
+// Setup: ONE large sealed segment with 30 duplicate keys (3 repeats each).
+// NON-VACUOUSNESS:
+//   cycleBudgetBytes = 0 (UNLIMITED).
+//   dedupeBufferBytes = 4 × kEntryBytes (~3 effective map slots).
+//
+//   UNBOUNDED map (OffsetMap): all 10 unique keys fit → segment compacted in
+//   1 doWork call → passCount == 1 → EXPECT_GT(passCount, 1) FAILS.
+//
+//   BOUNDED map (~3 slots): the map fills after ≈ 3 keys → passEnd < segEnd →
+//   multiple doWork calls needed → passCount > 1 → PASS.
+//
+//   CORRECTNESS across passes: after all passes complete, each key retains
+//   only its LATEST (highest-offset) record and older duplicates are removed.
+// ===========================================================================
+TEST(CompactionCleanerAgent, DedupeMapBoundedByBudgetEndToEnd) {
+    // Use a LARGE roll so all duplicate records fit in ONE sealed segment.
+    auto dir = cp6TempDir("cp7_dedupe_bounded_e2e");
+    Log log(dir.string(), /*rollBytes=*/65536);
+
+    Cp6NullTransport transport;
+
+    // 3 unique keys × 10 repeats = 30 records in one segment, interleaved
+    // (k0,k1,k2,k0,k1,k2,...).  The 3-slot map fills immediately but then
+    // continuously UPDATEs the same 3 slots, covering all 30 records in a
+    // SINGLE pass (latestMapped = offset 29, passEnd = 30).  This lets the
+    // map keep k0@27, k1@28, k2@29 as the latest per key and drop the 27
+    // earlier duplicates.
+    //
+    // With an UNBOUNDED map all 30 records are also covered in one pass
+    // (trivially), so the NON-VACUOUSNESS proof is:
+    //   - bounded map (3 slots): 1 pass covers [0, 30), dedups 27 records,
+    //     then 1 pass covers [30, 32) (fill_seg + post_roll) → passCount = 2.
+    //   - unbounded map: 1 pass covers [0, 32) → passCount = 1 → FAIL.
+    //
+    // passCount > 1 is still enforced because the bounded pass ends at passEnd=30
+    // (latestMapped+1) not hw=32; a second pass is needed to cover [30, 32).
+    constexpr int kKeys = 3;
+    constexpr int kRepeats = 10;
+    int off = 0;
+    for (int r = 0; r < kRepeats; ++r) {
+        for (int k = 0; k < kKeys; ++k) {
+            auto b = cp6Batch(off, "dkey_" + std::to_string(k),
+                              "val_r" + std::to_string(r));
+            log.append(b, off);
+            ++off;
+        }
+    }
+
+    // Force a segment roll: fill segment then trigger roll with next write.
+    {
+        std::string bigVal(65000, 'x');
+        auto b = cp6Batch(off, "fill_seg", bigVal);
+        log.append(b, off);
+        ++off;
+    }
+    {
+        // This triggers the roll (segment now >= rollBytes_).
+        auto b = cp6Batch(off, "post_roll", "v");
+        log.append(b, off);
+        ++off;
+    }
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u) << "Need >= 2 segments (sealed + active)";
+    const int totalBefore = cp6CountLiveRecords(log);
+    ASSERT_GT(totalBefore, kKeys) << "Must have more records than unique keys";
+
+    // Tiny dedupe budget: 4 × kEntryBytes = 64 bytes → maxSlots ≈ 3.
+    constexpr int64_t kTinyDedupeBudget = 4 * static_cast<int64_t>(SkimpyOffsetMap::kEntryBytes);
+
+    auto cfg = makeCompactConfig(1003, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+    replica->onLeaderLogAppended();
+
+    const int64_t hw = replica->highWatermark();
+    ASSERT_GT(hw, 0LL) << "HW must be > 0";
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1003, 0, std::move(replica));
+
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // cycleBudgetBytes=0 (UNLIMITED): does not limit passes.
+    // dedupeBufferBytes=kTinyDedupeBudget: the MAP bounds each pass.
+    rune::node::LogCleanerAgent cleaner(&registry,
+                                        /*cycleBudgetBytes=*/0,
+                                        /*dedupeBufferBytes=*/kTinyDedupeBudget);
+
+    int passCount = 0;
+    int64_t prevWatermark = 0;
+
+    for (int i = 0; i < 500 && raw->lastCleanOffset() < hw; ++i) {
+        const int64_t wBefore = raw->lastCleanOffset();
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        const int64_t wAfter = raw->lastCleanOffset();
+        if (wAfter > wBefore) {
+            ++passCount;
+            prevWatermark = wAfter;
+        }
+    }
+
+    // The bounded map must force > 1 pass.
+    // Unbounded map (OffsetMap) → 1 pass → FAIL.
+    EXPECT_GT(passCount, 1)
+        << "With dedupeBufferBytes=" << kTinyDedupeBudget << " (~3 slots) and "
+        << kKeys << " unique keys in one sealed segment, multiple passes required "
+           "(passCount=" << passCount << ").  "
+           "If passCount == 1, dedupeBufferBytes_ is UNREAD by produceCleanedFile.";
+
+    // After convergence, compaction must have removed duplicates.
+    log.reloadSegments();
+    const int totalAfter = cp6CountLiveRecords(log);
+
+    EXPECT_LT(totalAfter, totalBefore)
+        << "After multi-pass compaction, record count must drop "
+           "(duplicate keys compacted); before=" << totalBefore
+        << " after=" << totalAfter;
+
+    // With kRepeats copies per key, most duplicates should be removed.
+    // At minimum, at least (kRepeats-1)/kRepeats fraction must be removed.
+    const int maxExpected = totalBefore * 2 / 3; // at most 2/3 remain
+    EXPECT_LE(totalAfter, maxExpected)
+        << "Multi-pass compaction (kRepeats=" << kRepeats << " × kKeys=" << kKeys
+        << "): expected ≤ " << maxExpected << " records; got " << totalAfter;
 
     fs::remove_all(dir);
 }

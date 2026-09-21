@@ -14,10 +14,23 @@
 // as uninitialised and the checkpoint returns 0 (start from the beginning).
 //
 // ## Threading / single-writer discipline
-// The checkpoint is WRITTEN on the single-writer append/drain thread
-// (drainCleanerSwaps context) — NOT from the cleaner thread — so we never
-// race the append-thread-owned Log::segment map.  The read (at startup) is single-threaded
-// (log-open time).
+// The checkpoint is WRITTEN on the CLEANER THREAD (in LogCleanerAgent::doWork
+// after a successful compaction pass).  This is safe because:
+//   (a) The checkpoint mmap file is ONLY touched by the cleaner — no other
+//       thread reads or writes the file after initial construction.
+//   (b) The cleaner is a single dedicated agent (or at most N cleaners with
+//       per-log claims, so only one writer per log at a time).
+//   (c) The checkpoint stores ONLY the lastCleanOffset, which is advanced
+//       monotonically on the cleaner thread.  It does NOT touch any field
+//       owned by the append thread (the in-memory segment map, logEndOffset,
+//       or any other append-thread-owned state).
+// The read (load) happens in ensureCheckpoint(), also on the cleaner thread
+// (first compaction pass for this log after agent construction / restart).
+// The INITIAL construction (and its mmap open) may happen on any thread but
+// is protected by the checkpoints_ map's per-log lazy-init guard.
+// NOTE: the old comment "append/drain thread ONLY" was incorrect — corrected
+// in CP-7 to reflect actual ownership (cleaner thread).  The safety argument
+// above explains why cleaner-thread ownership is correct.
 //
 // ## Truncation-awareness
 // On load, the checkpoint is CLAMPED to `logEndOffset` so a truncated log
@@ -53,8 +66,11 @@ public:
     /// Return the persisted first-dirty-offset (0 if uninitialised or invalid).
     [[nodiscard]] int64_t value() const noexcept { return value_; }
 
-    /// Persist a new checkpoint offset (call on the append/drain thread ONLY).
+    /// Persist a new checkpoint offset.
+    /// Called on the CLEANER THREAD after a successful compaction pass.
     /// Writes the value + magic, then msync()s.
+    /// Thread-safety: only one cleaner agent writes per log at a time (per-log
+    /// inProgress claim); the file is not shared with the append thread.
     void store(int64_t offset) noexcept {
         value_ = offset;
         uint8_t* d = file_.data();
