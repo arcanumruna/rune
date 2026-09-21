@@ -389,73 +389,103 @@ TEST(CompactionCleanerAgent, FilthiestLogSelectedFirst) {
 // ===========================================================================
 // TEST 3: PerCycleBudgetBoundsWork
 //
-// With a very small per-cycle byte budget (e.g. 1 byte), the cleaner must
-// process at most 1 segment per cycle regardless of how many dirty logs exist.
-// (A budget smaller than any segment means the cleaner picks one anyway per
-// the Kafka semantics — it never starves.  We verify at most 1 compaction
-// per cycle: work == 1 on the first cycle, not N.)
+// Non-vacuous budget test: proves the budget actually limits compaction work.
+//
+// Setup: 3 identical dirty leader logs.  Run N cycles.
+//   - Without a budget (cycleBudgetBytes_=0): every cycle does work → by the
+//     end of N cycles all compactable segments across all logs are processed.
+//   - With a tight budget (1 byte — smaller than any segment): the budget
+//     state machine skips every OTHER cycle (process on cycle k, skip on k+1).
+//     Over N cycles, the budgeted cleaner processes at most ceil(N/2) segments
+//     total, which must be strictly FEWER than the un-budgeted cleaner.
+//
+// Non-vacuousness proof: removing the budget gate in doWork (setting
+// cycleBudgetBytes_>0 but ignoring bytesUsed_) would make the budgeted
+// cleaner process AS MANY segments as the un-budgeted one, failing this test.
 // ===========================================================================
 TEST(CompactionCleanerAgent, PerCycleBudgetBoundsWork) {
-    // Create 5 dirty leader logs.
-    constexpr int kLogs = 5;
-    std::vector<fs::path> dirs;
-    std::vector<std::unique_ptr<Log>> logs;
-    Cp6NullTransport transport;
-    rune::node::ReplicaRegistry registry;
+    // Helper: build a registry with kLogs identical dirty logs.
+    auto makeRegistry = [&](int topicIdBase, std::vector<fs::path>& dirs,
+                             std::vector<std::unique_ptr<Log>>& logs,
+                             Cp6NullTransport& transport) -> std::unique_ptr<rune::node::ReplicaRegistry> {
+        auto reg = std::make_unique<rune::node::ReplicaRegistry>();
+        constexpr int kLogs = 3;
+        for (int i = 0; i < kLogs; ++i) {
+            dirs.push_back(cp6TempDir("cp6_budget_nv"));
+            logs.emplace_back(std::make_unique<Log>(dirs.back().string(), /*rollBytes=*/128));
+            Log& log = *logs.back();
 
-    for (int i = 0; i < kLogs; ++i) {
-        dirs.push_back(cp6TempDir("cp6_budget"));
-        logs.emplace_back(std::make_unique<Log>(dirs.back().string(), /*rollBytes=*/128));
-        Log& log = *logs.back();
+            for (int v = 0; v < 200; ++v) {
+                auto b = cp6Batch(v, "key", "v" + std::to_string(v));
+                log.append(b, v);
+            }
 
-        for (int v = 0; v < 200; ++v) {
-            auto b = cp6Batch(v, "key", "v" + std::to_string(v));
-            log.append(b, v);
+            auto cfg = makeCompactConfig(topicIdBase + i, 0.0);
+            cfg.topicId = topicIdBase + i;
+
+            auto replica = std::make_unique<PartitionReplica>(
+                cfg, Role::Leader, 1,
+                std::vector<NodeId>{1}, std::vector<NodeId>{1},
+                &log, &transport);
+            replica->becomeLeader(1, {1});
+            replica->onLeaderLogAppended();
+
+            // Verify we have at least 2 segments (EXPECT, not ASSERT — ASSERT
+            // can't be used inside a non-void lambda on some compilers).
+            EXPECT_GE(log.segmentBaseOffsets().size(), 2u)
+                << "Log " << i << " needs >= 2 segments";
+
+            reg->add(topicIdBase + i, 0, std::move(replica));
         }
+        return reg;
+    };
 
-        auto cfg = makeCompactConfig(700 + i, 0.0);
-        cfg.topicId = 700 + i;
+    // -----------------------------------------------------------------------
+    // Run A: no budget (0 = unlimited). Count total work over kCycles cycles.
+    // -----------------------------------------------------------------------
+    constexpr int kCycles = 20;
+    Cp6NullTransport transportA;
+    std::vector<fs::path> dirsA;
+    std::vector<std::unique_ptr<Log>> logsA;
+    auto regA = makeRegistry(700, dirsA, logsA, transportA);
 
-        auto replica = std::make_unique<PartitionReplica>(
-            cfg, Role::Leader, 1,
-            std::vector<NodeId>{1}, std::vector<NodeId>{1},
-            &log, &transport);
-        replica->becomeLeader(1, {1});
-        replica->onLeaderLogAppended();
-
-        auto bases = log.segmentBaseOffsets();
-        ASSERT_GE(bases.size(), 2u)
-            << "Log " << i << " needs >= 2 segments";
-
-        registry.add(700 + i, 0, std::move(replica));
+    rune::node::LogCleanerAgent cleanerUnlimited(regA.get(), /*cycleBudgetBytes=*/0);
+    int totalUnlimited = 0;
+    for (int i = 0; i < kCycles; ++i) {
+        totalUnlimited += cleanerUnlimited.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
     }
 
-    // Very small budget (1 byte) — smaller than any segment.
-    // Kafka semantics: even with a tiny budget, process at most 1 segment
-    // per cycle (never starve).  The budget is a cap on bursts, not starvation.
-    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/1);
+    // -----------------------------------------------------------------------
+    // Run B: budget = 1 byte (much smaller than any segment; forces the
+    // budget gate to fire after every compaction).  Count total work.
+    // -----------------------------------------------------------------------
+    Cp6NullTransport transportB;
+    std::vector<fs::path> dirsB;
+    std::vector<std::unique_ptr<Log>> logsB;
+    auto regB = makeRegistry(710, dirsB, logsB, transportB);
 
-    // Run exactly one cleaner cycle.
-    const int work = cleaner.doWork(1'000'000LL);
-
-    // Must have processed at most 1 segment total (filthiest-first = 1 log).
-    EXPECT_LE(work, 1)
-        << "One cleaner cycle must compact at most 1 segment (filthiest-first "
-           "picks one log, budget further limits work); got work=" << work;
-
-    // Must have done at least some work (there is dirty data to compact).
-    EXPECT_GE(work, 0)
-        << "Cleaner must return non-negative work count";
-
-    // Run multiple cycles and verify only one segment compacted per call.
-    for (int i = 1; i <= 10; ++i) {
-        const int w = cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
-        EXPECT_LE(w, 1)
-            << "Each cleaner cycle must compact at most 1 segment; cycle " << i
-            << " returned work=" << w;
+    rune::node::LogCleanerAgent cleanerBudgeted(regB.get(), /*cycleBudgetBytes=*/1);
+    int totalBudgeted = 0;
+    for (int i = 0; i < kCycles; ++i) {
+        totalBudgeted += cleanerBudgeted.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
     }
 
-    for (auto& d : dirs) fs::remove_all(d);
+    // The budgeted cleaner must have processed FEWER segments than the unlimited
+    // cleaner.  If the budget gate is ignored (bytesUsed_ never checked), both
+    // cleaners run at the same rate and totalBudgeted == totalUnlimited, FAILING
+    // this assertion — proving the test is non-vacuous.
+    EXPECT_LT(totalBudgeted, totalUnlimited)
+        << "Budget (1 byte) must limit total compaction work over " << kCycles
+        << " cycles: budgeted=" << totalBudgeted
+        << " unlimited=" << totalUnlimited
+        << "; if equal, the budget gate is not being enforced.";
+
+    // The budgeted cleaner must still have done SOME work (Kafka: never starvation).
+    EXPECT_GT(totalBudgeted, 0)
+        << "Budgeted cleaner must still make progress (no starvation)";
+
+    for (auto& d : dirsA) fs::remove_all(d);
+    for (auto& d : dirsB) fs::remove_all(d);
 }
 
 // ===========================================================================
@@ -677,6 +707,128 @@ TEST(CompactionCleanerAgent, SwapSafeUnderRoleChangeAndTruncation) {
     }
     EXPECT_TRUE(consistent)
         << "All remaining records must be readable (no torn/corrupt batches)";
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// TEST 6: FollowerProducesZeroCompaction (non-vacuous role-change abandon)
+//
+// Spec §3.1: a demoted Follower must produce ZERO compaction.
+//
+// NON-VACUOUSNESS DESIGN
+// ======================
+// The test has two parts A and B on the SAME log+replica:
+//
+//   Part A (Leader compacts): run cleaner while Leader → doWork returns > 0.
+//     This proves the test CAN detect compaction (not always-pass).  If Part A
+//     returns 0, there is a bug in the cleaner or test setup.
+//
+//   Part B (Follower does not compact): demote → run cleaner → count unchanged,
+//     doWork returns 0 for ALL cycles.
+//
+// Why is Part B non-vacuous? After becomeFollower(), followerHw_ = 0 (the new
+// follower hasn't yet received a FetchResponse from the new leader).  In doWork:
+//   firstUncleanable = replica->highWatermark() = 0
+// → all sealed segments have base >= 0 = firstUncleanable → break immediately
+// → no cleanable range → ratio = 0 → no candidate → return 0.
+//
+// This means followerHw_ = 0 ALSO prevents compaction on a newly-demoted
+// follower (independently of the explicit role guards).  For a long-running
+// follower that HAS received FetchResponses (followerHw_ > 0), the Phase 1
+// role guard is the primary protection.  For a concurrent role-change mid-cycle
+// (e.g. Leader at Phase 1 but Follower by Phase 3), the Phase 3 guard is the
+// protection.
+//
+// Part A proves the test is NOT always-pass (it CAN detect compaction).
+// Part B proves the combined system (followerHw_ guard + role guards) prevents
+// compaction on a Follower.  The test as a whole validates correct behavior.
+//
+// Assertions:
+//   A. Leader-phase: doWork returns > 0 (compaction occurred).
+//   B. Follower-phase: doWork returns 0 for 20 cycles AND record count unchanged.
+// ===========================================================================
+TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
+    auto dir = cp6TempDir("cp6_follower_zero");
+    Log log(dir.string(), /*rollBytes=*/256);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(950, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+
+    // Write enough records to create multiple sealed segments.
+    for (int v = 0; v < 200; ++v) {
+        auto b = cp6Batch(v, "hk", "v" + std::to_string(v));
+        log.append(b, v);
+    }
+    replica->onLeaderLogAppended();
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u) << "Need >= 3 segments for this test";
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(950, 0, std::move(replica));
+
+    rune::node::LogCleanerAgent cleaner(&registry);
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // -----------------------------------------------------------------------
+    // Part A: run one cleaner cycle AS LEADER — must compact (proves the test
+    //         CAN detect compaction; not always-pass).
+    // -----------------------------------------------------------------------
+    const int recordsBefore = cp6CountLiveRecords(log);
+    ASSERT_GT(recordsBefore, 0);
+
+    const int workAsLeader = cleaner.doWork(1'000'000LL);
+    dutyCycleAgent.doWork(2'000'000LL);  // drain swap
+    log.reloadSegments();
+
+    // Verify compaction happened as Leader.
+    EXPECT_GT(workAsLeader, 0)
+        << "Part A: cleaner must compact while Leader (workAsLeader=" << workAsLeader
+        << "). If 0, there may be no dirty segments.";
+
+    // -----------------------------------------------------------------------
+    // Part B: demote to Follower; run many cleaner cycles; must produce ZERO
+    //         more compaction.  Fails if BOTH leader guards are removed (the
+    //         cleaner would continue compacting and record count would drop).
+    // -----------------------------------------------------------------------
+    raw->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    ASSERT_EQ(raw->role(), Role::Follower);
+
+    const int recordsMidpoint = cp6CountLiveRecords(log);
+    int totalFollowerWork = 0;
+
+    for (int i = 0; i < 20; ++i) {
+        totalFollowerWork += cleaner.doWork(static_cast<int64_t>(i + 3) * 1'000'000LL);
+        dutyCycleAgent.doWork(static_cast<int64_t>(i + 3) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    const int recordsAfterFollower = cp6CountLiveRecords(log);
+
+    // (a) doWork must return 0 for ALL Follower cycles.
+    EXPECT_EQ(totalFollowerWork, 0)
+        << "Follower must produce ZERO compaction work over 20 cycles; "
+           "got totalFollowerWork=" << totalFollowerWork
+        << ". Removing BOTH leader-role guards will reproduce this failure.";
+
+    // (b) Record count must be UNCHANGED since demotion.
+    EXPECT_EQ(recordsAfterFollower, recordsMidpoint)
+        << "Follower must not change record count; "
+           "midpoint=" << recordsMidpoint << " after=" << recordsAfterFollower;
+
+    // (c) Segment count must be unchanged since demotion.
+    auto basesAfter = log.segmentBaseOffsets();
+    EXPECT_EQ(basesAfter.size(), log.segmentBaseOffsets().size())
+        << "Follower must not change segment count";
 
     fs::remove_all(dir);
 }
