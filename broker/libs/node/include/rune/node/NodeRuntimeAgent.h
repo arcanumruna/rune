@@ -157,9 +157,18 @@ public:
             work += gateway_->doWork(nowNs);
         }
 
-        // 6.5. Bounded compaction pass — leader-only, sealed segments only.
-        //      Samples nowNs once per cycle (already done above).
-        work += runBoundedCompaction(nowNs);
+        // 6.5. CP-6: Drain pending cleaner swaps from LogCleanerAgent.
+        //      LogCleanerAgent runs on its own thread and enqueues compacted
+        //      segment bases via Log::enqueueCleanedSegment().  The actual
+        //      in-memory segment-map reload must happen on this single-writer
+        //      thread (not on the cleaner thread), so we drain them here.
+        if (registry_) {
+            for (auto* replica : registry_->allReplicas()) {
+                if (replica && replica->log()) {
+                    work += replica->log()->drainCleanerSwaps();
+                }
+            }
+        }
 
         return work;
     }
