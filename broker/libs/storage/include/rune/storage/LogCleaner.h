@@ -3,8 +3,18 @@
 #include <rune/storage/OffsetMap.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <cstdint>
+#include <functional>
 
 namespace rune::storage {
+
+/// Result of a bounded-range compaction pass.
+/// `compacted` = true if a rewrite ran; `passEnd` = the first-dirty-offset
+/// for the NEXT pass (== activeBase when the map covered the whole range, or
+/// map.latestOffset()+1 when the map filled before covering everything).
+struct CleanPassResult {
+    bool    compacted = false;
+    Offset  passEnd   = -1; ///< Next pass should start from here.
+};
 
 /// Kafka-style log compaction for a single Log.
 ///
@@ -125,35 +135,43 @@ public:
 
     /// CP-6 race-fix: CLEANER-THREAD compaction — PURE FILE WORK, no segments_.
     ///
-    /// Produces the compacted `<segBase>.log` on disk (atomic write→rename, or a
-    /// delete when the segment is fully emptied) WITHOUT touching the writer-owned
-    /// Log::segments_ map: it never calls segmentBaseOffsets(), segmentSize() or
-    /// reloadSegment().  It builds the global offset map and reads segment bytes
-    /// EXCLUSIVELY from the on-disk files, using the base offsets carried in the
-    /// immutable sealed-segment snapshot (`sealedBases`) and the immutable log
-    /// directory (`dir`, obtained via Log::dir() which is race-free).
-    ///
-    /// The in-memory reload of the rewritten segment is the caller's
-    /// responsibility and MUST happen on the single-writer append thread:
-    ///   • LogCleanerAgent (cleaner thread) calls produceCleanedFile(), then
-    ///     enqueues segBase via Log::enqueueCleanedSegment(); the append thread's
-    ///     drainCleanerSwaps() performs reloadSegment(segBase).
+    /// Legacy overload: uses unbounded OffsetMap.  Used by cleanSegment()
+    /// (append-thread path) and legacy tests.  Returns true if a rewrite ran.
     ///
     /// @param dir          Log directory (immutable; from Log::dir()).
-    /// @param sealedBases  Sorted-ascending base offsets of the sealed segments,
-    ///                     derived from the sealed-segment snapshot.  Used only to
-    ///                     bound the offset-map scan; segments_ is never read.
+    /// @param sealedBases  Sorted-ascending base offsets of the sealed segments.
     /// @param segBase      The single sealed segment to rewrite.
-    /// @param activeBase   Upper bound of the dirty range (== active segment base,
-    ///                     conservatively the high-watermark).  Records at/past
-    ///                     this offset are left untouched.
-    /// @param globalDirtyStart  Start of the whole dirty range (cleaned watermark).
-    /// @returns true if a rewrite ran (segment file existed and was processed).
+    /// @param activeBase   Upper bound of the dirty range.
+    /// @param globalDirtyStart  Start of the whole dirty range.
     bool produceCleanedFile(const std::string& dir,
                             const std::vector<int64_t>& sealedBases,
                             Offset segBase, Offset activeBase,
                             Offset globalDirtyStart,
                             int64_t nowNs, int64_t deleteRetentionMs);
+
+    /// CP-7: BOUNDED version of produceCleanedFile — uses SkimpyOffsetMap
+    /// sized by `dedupeBufferBytes`.
+    ///
+    /// The key difference from the unbounded overload: the offset-map scan
+    /// stops when the SkimpyOffsetMap is FULL (bounded-range-per-pass).  The
+    /// returned `passEnd` reflects the highest offset the map covered + 1.
+    /// The caller MUST advance the cleaner watermark to `passEnd` (not to
+    /// `activeBase`), and must compact only the segment if `segBase < passEnd`.
+    ///
+    /// When the map covers the entire [globalDirtyStart, activeBase) range
+    /// without filling up, `passEnd == activeBase` (full-pass, no residue).
+    ///
+    /// @param dedupeBufferBytes  Memory budget for the SkimpyOffsetMap.
+    ///                           Must be > 0.  Sized via
+    ///                           SkimpyOffsetMap::maxSlotsFromBudget().
+    ///
+    /// CLEANER THREAD: PURE FILE WORK — never touches Log::segments_.
+    CleanPassResult produceCleanedFileBounded(const std::string& dir,
+                                              const std::vector<int64_t>& sealedBases,
+                                              Offset segBase, Offset activeBase,
+                                              Offset globalDirtyStart,
+                                              int64_t nowNs, int64_t deleteRetentionMs,
+                                              int64_t dedupeBufferBytes);
 
 private:
     /// Is a record a tombstone?
@@ -165,6 +183,15 @@ private:
         return value.empty();
     }
 
+    /// Rewrite a single segment using a type-erased key lookup.
+    /// `getLatest(key)` returns the latest known offset for the key from the map.
+    /// PURE FILE WORK: reads/writes only <dir>/<segBase>.log{,.new,.index};
+    /// never touches Log::segments_.  Returns true if a file was produced.
+    bool rewriteSegmentImpl(const std::string& dir, int64_t segBase,
+                            const std::function<std::optional<Offset>(std::string_view)>& getLatest,
+                            Offset fromOffset, Offset cleanBoundaryOffset,
+                            int64_t nowNs, int64_t deleteRetentionMs);
+
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
     /// past their delete-retention window are dropped.
@@ -172,6 +199,11 @@ private:
     /// never touches Log::segments_.  Returns true if a file was produced (the
     /// segment was non-empty), false if the source .log was missing/empty.
     bool rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
+                        Offset fromOffset, Offset cleanBoundaryOffset,
+                        int64_t nowNs, int64_t deleteRetentionMs);
+
+    /// SkimpyOffsetMap overload of rewriteSegment.
+    bool rewriteSegment(const std::string& dir, int64_t segBase, SkimpyOffsetMap& map,
                         Offset fromOffset, Offset cleanBoundaryOffset,
                         int64_t nowNs, int64_t deleteRetentionMs);
 };

@@ -8,6 +8,7 @@
 #include <climits>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -251,11 +252,14 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 }
 
 // ---------------------------------------------------------------------------
-// rewriteSegment  (internal)
+// rewriteSegmentImpl  (internal — type-erased core)
 // ---------------------------------------------------------------------------
-bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
-                                Offset fromOffset, Offset cleanBoundaryOffset,
-                                int64_t nowNs, int64_t deleteRetentionMs) {
+bool LogCleaner::rewriteSegmentImpl(
+    const std::string& dir, int64_t segBase,
+    const std::function<std::optional<Offset>(std::string_view)>& getLatest,
+    Offset fromOffset, Offset cleanBoundaryOffset,
+    int64_t nowNs, int64_t deleteRetentionMs)
+{
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
     std::string idxPath   = segmentIndexPath(dir, segBase);
@@ -360,7 +364,10 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
             // are always kept verbatim.
             if (offset < fromOffset) { keep(); return; }
 
-            // Records at/past the clean boundary (HW) are always kept verbatim.
+            // Records at/past the clean boundary (HW / passEnd) are always kept
+            // verbatim.  For bounded-range passes, cleanBoundaryOffset == passEnd
+            // which may be less than activeBase, so records beyond the pass boundary
+            // are preserved for the next pass.
             if (offset >= cleanBoundaryOffset) { keep(); return; }
 
             // Null-key records: always keep (not compactable).
@@ -368,7 +375,7 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
 
             // Record is inside the dirty range [fromOffset, cleanBoundaryOffset).
             // Keep it only if its offset == the latest offset for this key.
-            auto latest = map.get(key);
+            auto latest = getLatest(key);
             if (!latest.has_value() || *latest != offset) {
                 return; // not in map or superseded — drop
             }
@@ -430,6 +437,28 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
     std::filesystem::remove(idxPath);
     buildIndex(idxPath, segBase, outBuf);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// rewriteSegment  (OffsetMap overload — delegates to impl)
+// ---------------------------------------------------------------------------
+bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
+                                Offset fromOffset, Offset cleanBoundaryOffset,
+                                int64_t nowNs, int64_t deleteRetentionMs) {
+    return rewriteSegmentImpl(dir, segBase,
+        [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
+}
+
+// ---------------------------------------------------------------------------
+// rewriteSegment  (SkimpyOffsetMap overload — delegates to impl)
+// ---------------------------------------------------------------------------
+bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyOffsetMap& map,
+                                Offset fromOffset, Offset cleanBoundaryOffset,
+                                int64_t nowNs, int64_t deleteRetentionMs) {
+    return rewriteSegmentImpl(dir, segBase,
+        [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +552,97 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
     // per-record filter drop globally-superseded records.
     return rewriteSegment(dir, segBase, map, globalDirtyStart, activeBase,
                           nowNs, deleteRetentionMs);
+}
+
+// ---------------------------------------------------------------------------
+// produceCleanedFileBounded  (CP-7: CLEANER-THREAD bounded path)
+//
+// Uses a SkimpyOffsetMap sized by dedupeBufferBytes for the dirty-range scan.
+// Bounded-range-per-pass: the map scan stops when the map is full; the pass
+// covers only [globalDirtyStart, passEnd) where passEnd = map.latestOffset()+1.
+// The segment is rewritten with cleanBoundaryOffset = passEnd so records beyond
+// passEnd are preserved verbatim for subsequent passes.
+//
+// Returns CleanPassResult { compacted, passEnd }.  The caller MUST advance the
+// cleaner watermark to passEnd (not to activeBase) and store the checkpoint.
+// ---------------------------------------------------------------------------
+CleanPassResult LogCleaner::produceCleanedFileBounded(
+    const std::string& dir,
+    const std::vector<int64_t>& sealedBases,
+    Offset segBase, Offset activeBase,
+    Offset globalDirtyStart,
+    int64_t nowNs, int64_t deleteRetentionMs,
+    int64_t dedupeBufferBytes)
+{
+    CleanPassResult result{false, activeBase};
+
+    if (sealedBases.empty()) return result;
+    if (segBase >= activeBase) return result;
+    bool found = false;
+    for (int64_t b : sealedBases) { if (b == segBase) { found = true; break; } }
+    if (!found) return result;
+
+    // Clean up stale .log.new temp files.
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".new") {
+            std::filesystem::remove(e.path());
+        }
+    }
+
+    if (globalDirtyStart < 0) globalDirtyStart = 0;
+
+    // Build the bounded SkimpyOffsetMap over [globalDirtyStart, activeBase).
+    // The map scan stops when the map is full; latestOffset() is the boundary.
+    std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
+    SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
+    buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+
+    // passEnd: the first offset NOT covered by this pass.
+    // If the map filled up: latestOffset() < activeBase − 1 → partial pass.
+    // If the map covered everything: latestOffset() == the last-offset-before-activeBase.
+    Offset latestMapped = map.latestOffset();
+    if (latestMapped < 0) {
+        // Map got nothing (no records in range) — nothing to compact.
+        // passEnd stays as activeBase so the watermark advances.
+        return result;
+    }
+    Offset passEnd = latestMapped + 1;  // next pass starts here
+    // Clamp: passEnd can't exceed activeBase.
+    if (passEnd > activeBase) passEnd = activeBase;
+    result.passEnd = passEnd;
+
+    // Only rewrite the segment if its base is within [globalDirtyStart, passEnd).
+    // If segBase >= passEnd, the segment is entirely beyond this pass — skip.
+    if (segBase >= passEnd) {
+        // The segment is past the boundary of this pass.
+        // Return passEnd so the caller advances the watermark correctly.
+        return result;
+    }
+
+    // Rewrite the segment with cleanBoundaryOffset = passEnd (bounded pass).
+    // Records at/past passEnd are preserved verbatim for future passes.
+    //
+    // CP-7 missing-file handling: if the segment .log was already deleted (by a
+    // prior pass that emptied it), rewriteSegmentImpl returns false because
+    // readFile() returns empty.  In that case the segment is already clean —
+    // treat it as successfully compacted so Phase 5 enqueues the base and lets
+    // drainCleanerSwaps / reloadSegment drop the entry from segments_.
+    // This is the correct behaviour when the ring was full on a prior cycle:
+    // the file was written/deleted but the enqueue failed, so we retry the
+    // enqueue next cycle.  We do NOT advance the watermark without a successful
+    // enqueue (preserves the CP-6 ring-full invariant).
+    const bool wrote = rewriteSegment(dir, segBase, map, globalDirtyStart,
+                                      passEnd, nowNs, deleteRetentionMs);
+    // Also treat a missing-file (wrote==false but file absent) as compacted so
+    // Phase 5 will enqueue and drain it.  Check explicitly: if the .log is gone
+    // the segment is already clean (either emptied on a prior pass, or never existed).
+    const std::string logPath = segmentLogPath(dir, segBase);
+    if (wrote || !std::filesystem::exists(logPath)) {
+        result.compacted = true;
+    }
+    // else: wrote==false AND file still exists — genuine I/O error or missing segment;
+    // leave compacted=false so Phase 4's !compacted path fires.
+    return result;
 }
 
 // ---------------------------------------------------------------------------
