@@ -697,10 +697,11 @@ TEST(NodeConfigTest, CP1_TopicSpecDefaultsToDeletePolicy) {
     EXPECT_DOUBLE_EQ(ts.minCleanableDirtyRatio, 0.5);
 }
 
-TEST(NodeConfigTest, CP1_TopicSpecCompactPolicyRoundTripViaParseNodeConfig) {
-    // TopicSpec with Compact policy parsed from RUNE_TOPICS must preserve all fields.
-    // (For now RUNE_TOPICS only carries name:partitionCount — cleanup policy is set
-    //  programmatically.  This test verifies the struct fields themselves.)
+TEST(NodeConfigTest, CP1_TopicSpecFieldsHoldValues) {
+    // TopicSpec with Compact policy must preserve all field values when set
+    // programmatically (RUNE_TOPICS only carries name:partitionCount; cleanup
+    // policy is set directly on the struct — this test verifies the struct holds
+    // the values it is given, not that parseNodeConfig threads them through).
     TopicSpec ts;
     ts.name                   = "events";
     ts.partitionCount         = 4;
