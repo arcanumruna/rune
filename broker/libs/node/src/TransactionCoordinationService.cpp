@@ -23,13 +23,19 @@
 
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
 
+#include <rune/transaction/ControlMarker.h>
+#include <rune/transaction/Types.h>
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/protocol/client/Protocol.h>
+
+#include <spdlog/spdlog.h>
 
 #include <cstdio>
 #include <cstring>
 #include <string_view>
+#include <unordered_map>
 
 namespace pc = rune::protocol::client;
 namespace tx = rune::transaction;
@@ -118,8 +124,109 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     int work = coordinator_.doWork(nowNs);
 
-    // TODO(Task 8): resolve pending markers via ControlMarker + replica appends.
-    // For now, pending markers remain in PrepareAbort/PrepareCommit state.
+    // TX-4 Task 8: Resolve pending markers (internally-initiated aborts).
+    //
+    // pendingMarkerTransactions() returns all PrepareCommit/PrepareAbort entries
+    // whose markersPending==true (set by doWork() timeout path or epoch-fence
+    // abort in initProducerId).  For each, ControlMarker::resolvePendingMarkers()
+    // builds a COMMIT or ABORT control batch for every partition in the txn and
+    // calls appendFn(tp, batch).
+    //
+    // We:
+    //   1. Snapshot pendingMarkerTransactions() BEFORE resolving to get the
+    //      commit/abort info for each (producerId, partition) — needed to feed
+    //      notifyControlMarker() after the append.
+    //   2. Build an appendFn that:
+    //        a. Looks up topicId from the topic name via topics_->topicIdForName.
+    //        b. Calls gateway_->appendControlRecord(topicId, partition, bytes).
+    //        c. Records the (topicId, partition, producerId, markerOffset, commit)
+    //           in a post-process vector for notifyControlMarker() calls.
+    //   3. Call resolvePendingMarkers() (which also calls completeTransaction()).
+    //   4. Feed notifyControlMarker() for all successfully-appended markers.
+    //
+    // Design note: we do NOT call notifyControlMarker() inside appendFn because
+    // completeTransaction() is called AFTER all appendFn calls for a txn — we
+    // want both appendFn and completeTransaction to succeed before feeding LSO.
+    // Using the post-process vector is cleaner and avoids partial state.
+    //
+    // Single-writer (duty-cycle thread): no locks needed.
+    if (gateway_ && topics_) {
+        // Snapshot pending txns to map (producerId → {commit, partitions}) for
+        // commit/abort disambiguation inside appendFn.
+        // Structure: producerId → {commit, partitions}.
+        // (We use producerId as the key because appendFn only receives tp, not txnId.)
+        struct PendingInfo {
+            bool   commit;
+        };
+        std::unordered_map<tx::ProducerId, PendingInfo> pendingByPid;
+        {
+            const auto pending = coordinator_.pendingMarkerTransactions();
+            for (const auto& p : pending) {
+                pendingByPid[p.producerId] = PendingInfo{p.commit};
+            }
+        }
+
+        // Post-process vector: (topicId, partition, producerId, markerOffset, commit).
+        struct MarkerNotify {
+            int32_t topicId;
+            int32_t partition;
+            int64_t producerId;
+            int64_t markerOffset;
+            bool    commit;
+        };
+        std::vector<MarkerNotify> toNotify;
+
+        auto appendFn = [&](const tx::TopicPartition& tp,
+                             const std::vector<uint8_t>& batch)
+        {
+            // Map topic name → topicId.
+            const auto topicIdOpt = topics_->topicIdForName(tp.topic);
+            if (!topicIdOpt.has_value()) {
+                spdlog::warn("TCS::doWork resolvePendingMarkers: unknown topic '{}' partition={} — skipped",
+                             tp.topic, tp.partition);
+                return;
+            }
+            const int32_t topicId = *topicIdOpt;
+
+            // Append the control marker (acks=All via PartitionReplica).
+            const int64_t markerOffset = gateway_->appendControlRecord(
+                topicId, tp.partition,
+                std::span<const uint8_t>(batch.data(), batch.size()));
+            if (markerOffset < 0) {
+                spdlog::warn("TCS::doWork resolvePendingMarkers: appendControlRecord failed "
+                             "topicId={} partition={}", topicId, tp.partition);
+                return;
+            }
+
+            // Extract producerId from the batch (LE64@kProducerIdOffset=43).
+            int64_t pid = -1;
+            if (batch.size() >= 43u + 8u) {
+                for (int bi = 0; bi < 8; ++bi)
+                    pid |= (static_cast<int64_t>(batch[43u + bi]) << (bi * 8));
+            }
+
+            // Determine commit/abort from the snapshot.
+            bool commit = false;
+            if (pid >= 0) {
+                auto it = pendingByPid.find(pid);
+                if (it != pendingByPid.end()) commit = it->second.commit;
+            }
+
+            toNotify.push_back({topicId, tp.partition, pid, markerOffset, commit});
+        };
+
+        const int resolved = tx::ControlMarker::resolvePendingMarkers(coordinator_, appendFn);
+        if (resolved > 0) {
+            work += resolved;
+            // Feed LsoTracker + AbortedTxnIndex for each resolved marker.
+            for (const auto& n : toNotify) {
+                if (n.producerId >= 0) {
+                    gateway_->notifyControlMarker(
+                        n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
+                }
+            }
+        }
+    }
 
     return work;
 }
@@ -461,6 +568,61 @@ size_t TransactionCoordinationService::handleEndTxn(
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
             txnState_->put(*meta, meta->coordinatorEpoch);
+        }
+    }
+
+    // TX-4 Task 8: Write control markers for client-driven commit/abort.
+    //
+    // endTransaction transitions the txn Ongoing→PrepareCommit or
+    // Ongoing→PrepareAbort (markersPending=false for client-driven).
+    // We now write control markers to each participant partition and
+    // call completeTransaction to transition PrepareCommit→CompleteCommit.
+    //
+    // Mirrors the doWork path (resolvePendingMarkers) but using writeMarkers
+    // which handles Ongoing→Prepare internally (already done) and
+    // PrepareCommit/PrepareAbort directly.
+    //
+    // Single-writer: called on the duty-cycle thread.
+    if (result.ok() && gateway_ && topics_) {
+        // Post-process vector for notifyControlMarker after all appends.
+        struct MarkerNotify {
+            int32_t topicId;
+            int32_t partition;
+            int64_t producerId;
+            int64_t markerOffset;
+            bool    commit;
+        };
+        std::vector<MarkerNotify> toNotify;
+
+        const int32_t coordEpoch = [&]() -> int32_t {
+            const auto* m = coordinator_.metadata(txnIdScratch_);
+            return m ? m->coordinatorEpoch : 0;
+        }();
+
+        auto appendFn = [&](const tx::TopicPartition& tp,
+                             const std::vector<uint8_t>& batch)
+        {
+            const auto topicIdOpt = topics_->topicIdForName(tp.topic);
+            if (!topicIdOpt.has_value()) return;
+            const int32_t topicId = *topicIdOpt;
+
+            const int64_t markerOffset = gateway_->appendControlRecord(
+                topicId, tp.partition,
+                std::span<const uint8_t>(batch.data(), batch.size()));
+            if (markerOffset < 0) return;
+
+            toNotify.push_back({topicId, tp.partition, msg.producerId,
+                                 markerOffset, commit});
+        };
+
+        tx::ControlMarker::writeMarkers(
+            coordinator_, txnIdScratch_,
+            msg.producerId, msg.producerEpoch,
+            commit, coordEpoch, nowNs, appendFn);
+
+        for (const auto& n : toNotify) {
+            gateway_->notifyControlMarker(
+                n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
         }
     }
 

@@ -326,6 +326,17 @@ bool ControlMarker::extract(const uint8_t*       buf,
 
 // ---------------------------------------------------------------------------
 // writeMarkers
+//
+// Handles TWO entry scenarios:
+//   (a) txn is Ongoing → calls endTransaction first to move to PrepareCommit /
+//       PrepareAbort, then writes markers + completeTransaction.
+//   (b) txn is already in PrepareCommit / PrepareAbort (e.g. doWork sees a
+//       client-driven txn that handleEndTxn already prepared) → skips the
+//       endTransaction call and reads partitions directly from coordinator
+//       metadata, then writes markers + completeTransaction.
+//
+// In both cases the outcome is: markers written to all partitions, then
+// coordinator advanced to CompleteCommit/CompleteAbort → Empty.
 // ---------------------------------------------------------------------------
 /*static*/
 int ControlMarker::writeMarkers(
@@ -339,16 +350,37 @@ int ControlMarker::writeMarkers(
     const std::function<void(const TopicPartition&,
                               const std::vector<uint8_t>&)>& appendFn)
 {
-    // Drive the coordinator state machine to PrepareCommit / PrepareAbort.
-    auto result = coordinator.endTransaction(txnId, producerId, producerEpoch,
-                                              commit, nowNs);
-    if (!result.ok()) return 0;
+    // Determine current state from coordinator metadata.
+    const TransactionMetadata* meta = coordinator.metadata(txnId);
+    if (!meta) return 0;
+
+    std::vector<TopicPartition> partitions;
+
+    if (meta->state == TxnState::Ongoing) {
+        // Scenario (a): transition Ongoing → PrepareCommit/PrepareAbort first.
+        auto result = coordinator.endTransaction(txnId, producerId, producerEpoch,
+                                                  commit, nowNs);
+        if (!result.ok()) return 0;
+        partitions = std::move(result.partitions);
+    } else if (meta->state == TxnState::PrepareCommit ||
+               meta->state == TxnState::PrepareAbort) {
+        // Scenario (b): already in Prepare* state (e.g. doWork driving a
+        // client-prepared txn or recovering a Prepare* after failover).
+        // Get partitions directly from metadata.
+        partitions.assign(meta->partitions.begin(), meta->partitions.end());
+        // Verify the commit/abort intent matches the current state.
+        // (PrepareCommit → must write COMMIT marker; PrepareAbort → ABORT.)
+        commit = (meta->state == TxnState::PrepareCommit);
+    } else {
+        // Wrong state (e.g. Empty, CompleteCommit, Dead) → nothing to do.
+        return 0;
+    }
 
     const ControlType ct = commit ? ControlType::Commit : ControlType::Abort;
 
     // Write a control batch to each involved partition.
     int count = 0;
-    for (const auto& tp : result.partitions) {
+    for (const auto& tp : partitions) {
         auto batch = ControlMarker::build(producerId, producerEpoch, ct, coordinatorEpoch);
         appendFn(tp, batch);
         ++count;

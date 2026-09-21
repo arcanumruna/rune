@@ -128,6 +128,20 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # TX-4 Task 8: TxnMarkerTest — control marker writes (ControlMarker::writeMarkers)
+    # + coordinator state machine integration.  No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_txn_marker_tests
+        tests/integration/TxnMarkerTest.cpp)
+    target_link_libraries(rune_txn_marker_tests PRIVATE
+        rune_node
+        rune_transaction
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_txn_marker_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # BrokerNode integration tests — embed the Aeron media driver.
     # Gated behind BUILD_BROKER_NODE_TESTS (default ON when BUILD_TESTING=ON)
     # so CI can disable if the embedded driver cannot start in the environment.
