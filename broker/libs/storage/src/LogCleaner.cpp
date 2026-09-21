@@ -10,6 +10,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -258,7 +259,8 @@ bool LogCleaner::rewriteSegmentImpl(
     const std::string& dir, int64_t segBase,
     const std::function<std::optional<Offset>(std::string_view)>& getLatest,
     Offset fromOffset, Offset cleanBoundaryOffset,
-    int64_t nowNs, int64_t deleteRetentionMs)
+    int64_t nowNs, int64_t deleteRetentionMs,
+    int64_t nowMs)
 {
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
@@ -286,6 +288,21 @@ bool LogCleaner::rewriteSegmentImpl(
         // A3: CRC-gate the walk — stop on the first corrupt batch.
         if (!r.ensureValid()) break;
 
+        // CP-8: KIP-534 delete-horizon gate.
+        // CONTRACT: when hasDeleteHorizon() is true, baseTimestamp() IS the horizon
+        // (epoch-ms), NOT a real batch timestamp.  NEVER treat baseTimestamp() as a
+        // wall-clock timestamp on a horizon-stamped batch.
+        //
+        // If the batch has a delete-horizon stamp AND nowMs >= deleteHorizonMs,
+        // all tombstones in this batch have expired their horizon and should be dropped
+        // during the tombstone-check below (we signal this with horizonExpired=true).
+        // If the batch does NOT have a horizon stamp, tombstone retention is by the
+        // legacy nowNs path (backward compat).
+        const bool batchHasHorizon = r.hasDeleteHorizon();
+        const int64_t batchHorizonMs = batchHasHorizon ? r.deleteHorizonMs() : -1;
+        const bool horizonExpired = (batchHasHorizon && nowMs >= 0
+                                     && nowMs >= batchHorizonMs);
+
         // A2: Extract producer identity from the original batch so that surviving
         // records can carry the same producerId / producerEpoch / baseSequence.
         // Kafka's LogCleaner preserves these fields when rewriting compacted segments
@@ -296,6 +313,14 @@ bool LogCleaner::rewriteSegmentImpl(
         int32_t origBaseSequence  = static_cast<int32_t>(
             rune::protocol::detail::getLE32(buf.data() + pos + rune::protocol::batch::kBaseSequenceOffset));
         int64_t batchBaseOffset   = r.baseOffset();
+
+        // CP-8: does this batch contain any tombstone (for horizon stamping)?
+        // We track this as we iterate records and then stamp the batch if needed.
+        // Since we emit each record as its own 1-record batch, we stamp the
+        // individual output batch (not the source batch as a whole).
+        // horizonStampNeeded: for a tombstone that is the LATEST for its key and is
+        // being RETAINED (not yet past horizon), if it doesn't have a horizon yet,
+        // stamp one.  `nowMs + deleteRetentionMs` is the horizon epoch-ms.
 
         // Collect records to keep from this batch.
         // We rebuild the batch only with the surviving records, preserving
@@ -311,8 +336,14 @@ bool LogCleaner::rewriteSegmentImpl(
                       int64_t offset, int64_t timestamp) {
             // Helper: emit this record as its own single-record batch,
             // preserving the original batch's producer identity (A2).
-            auto keep = [&]() {
+            // @param horizonMs  If >= 0, stamp this as a delete-horizon batch.
+            auto keepWithHorizon = [&](int64_t horizonMs) {
                 rune::protocol::RecordBatchBuilder b(offset, timestamp);
+                if (horizonMs >= 0) {
+                    // CP-8: Stamp the output batch with the delete horizon.
+                    // This sets kAttrDeleteHorizon and puts horizonMs into baseTimestamp.
+                    b.setDeleteHorizonMs(horizonMs);
+                }
                 b.append(key, val, timestamp);
                 auto batch = b.build();
 
@@ -360,6 +391,8 @@ bool LogCleaner::rewriteSegmentImpl(
                 outBuf.insert(outBuf.end(), batch.begin(), batch.end());
             };
 
+            auto keep = [&]() { keepWithHorizon(-1); };
+
             // Records before the dirty range (in the already-clean region)
             // are always kept verbatim.
             if (offset < fromOffset) { keep(); return; }
@@ -380,15 +413,44 @@ bool LogCleaner::rewriteSegmentImpl(
                 return; // not in map or superseded — drop
             }
 
-            // This is the latest.  If it's a tombstone, check retention.
+            // This is the latest.  If it's a tombstone, handle delete-horizon.
             if (isTombstone(val)) {
+                // CP-8: KIP-534 delete-horizon stamping/dropping.
+                //
+                // Case A: batch already has a horizon stamp (from a prior clean pass).
+                //   - If nowMs >= horizonMs (horizon expired): drop the tombstone.
+                //   - Otherwise: keep the tombstone, preserve the existing horizon stamp.
+                //
+                // Case B: batch does NOT have a horizon stamp (first time we see this tombstone).
+                //   - If nowMs is available: stamp a horizon (nowMs + deleteRetentionMs).
+                //   - Otherwise: fall back to legacy nowNs retention.
+                if (batchHasHorizon) {
+                    if (horizonExpired) {
+                        return; // horizon passed — fully remove key + tombstone (CP-8)
+                    }
+                    // Horizon not yet passed — keep with existing horizon stamp.
+                    keepWithHorizon(batchHorizonMs);
+                    return;
+                }
+
+                // No horizon stamp yet.
+                if (nowMs >= 0) {
+                    // CP-8: first time compacting this tombstone — stamp the horizon.
+                    // The tombstone is RETAINED in this pass.  It will be dropped
+                    // once nowMs >= (nowMs_at_stamp + deleteRetentionMs).
+                    int64_t horizonMs = nowMs + deleteRetentionMs;
+                    keepWithHorizon(horizonMs);
+                    return;
+                }
+
+                // Legacy nowNs-only path (nowMs not provided — backward compat).
                 int64_t tombstoneTs = timestamp; // timestamp in the record (nanoseconds)
                 if ((nowNs - tombstoneTs) > deleteRetentionNs) {
                     return; // past retention — fully remove key + tombstone
                 }
             }
 
-            // Keep this record.
+            // Keep this record (non-tombstone, or tombstone within retention).
             keep();
         });
 
@@ -444,10 +506,11 @@ bool LogCleaner::rewriteSegmentImpl(
 // ---------------------------------------------------------------------------
 bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
                                 Offset fromOffset, Offset cleanBoundaryOffset,
-                                int64_t nowNs, int64_t deleteRetentionMs) {
+                                int64_t nowNs, int64_t deleteRetentionMs,
+                                int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -455,10 +518,11 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
 // ---------------------------------------------------------------------------
 bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyOffsetMap& map,
                                 Offset fromOffset, Offset cleanBoundaryOffset,
-                                int64_t nowNs, int64_t deleteRetentionMs) {
+                                int64_t nowNs, int64_t deleteRetentionMs,
+                                int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +636,9 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     Offset segBase, Offset activeBase,
     Offset globalDirtyStart,
     int64_t nowNs, int64_t deleteRetentionMs,
-    int64_t dedupeBufferBytes)
+    int64_t dedupeBufferBytes,
+    Throttler* throttler,
+    int64_t nowMs)
 {
     CleanPassResult result{false, activeBase};
 
@@ -595,7 +661,25 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     // The map scan stops when the map is full; latestOffset() is the boundary.
     std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
     SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
-    buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+
+    // CP-8: throttle the offset-map build (read phase).
+    // We read each segment file during buildOffsetMapFromBases; accumulate bytes
+    // and call maybeThrottle after the full map build.
+    {
+        // Read bytes can be estimated from sealedBases sizes (file reads).
+        // For simplicity, throttle after the full map-build pass.
+        buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+        if (throttler) {
+            // Approximate read bytes: size of the segment file being processed.
+            // For the cleaner-thread path we throttle after the map is built.
+            // We use the segment file size as the read-bytes approximation.
+            const std::string segPath = segmentLogPath(dir, segBase);
+            std::error_code ec;
+            auto sz = static_cast<int64_t>(
+                std::filesystem::file_size(segPath, ec));
+            if (!ec && sz > 0) throttler->maybeThrottle(sz);
+        }
+    }
 
     // passEnd: the first offset NOT covered by this pass.
     // If the map filled up: latestOffset() < activeBase − 1 → partial pass.
@@ -632,7 +716,15 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     // enqueue next cycle.  We do NOT advance the watermark without a successful
     // enqueue (preserves the CP-6 ring-full invariant).
     const bool wrote = rewriteSegment(dir, segBase, map, globalDirtyStart,
-                                      passEnd, nowNs, deleteRetentionMs);
+                                      passEnd, nowNs, deleteRetentionMs, nowMs);
+    // CP-8: throttle the write phase.
+    if (wrote && throttler) {
+        const std::string logPath2 = segmentLogPath(dir, segBase);
+        std::error_code ec2;
+        auto wsz = static_cast<int64_t>(
+            std::filesystem::file_size(logPath2, ec2));
+        if (!ec2 && wsz > 0) throttler->maybeThrottle(wsz);
+    }
     // Also treat a missing-file (wrote==false but file absent) as compacted so
     // Phase 5 will enqueue and drain it.  Check explicitly: if the .log is gone
     // the segment is already clean (either emptied on a prior pass, or never existed).
@@ -642,6 +734,274 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     }
     // else: wrote==false AND file still exists — genuine I/O error or missing segment;
     // leave compacted=false so Phase 4's !compacted path fires.
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// groupSegmentsBySize  (CP-8: Kafka-faithful segment coalescing)
+// ---------------------------------------------------------------------------
+std::vector<SegmentGroup> LogCleaner::groupSegmentsBySize(
+    const std::vector<int64_t>& sealedBases,
+    const std::vector<int64_t>& sealedSizes,
+    int64_t segmentRollBytes,
+    int32_t maxIndexEntries)
+{
+    std::vector<SegmentGroup> groups;
+    if (sealedBases.empty()) return groups;
+
+    // Estimate index entries for a segment of `bytes` bytes:
+    //   ~ ceil(bytes / kIndexIntervalBytes) entries.
+    constexpr int64_t kIndexIntervalBytes = 4096;
+    auto estimateIndexEntries = [&](int64_t bytes) -> int64_t {
+        if (bytes <= 0) return 0;
+        return (bytes + kIndexIntervalBytes - 1) / kIndexIntervalBytes;
+    };
+
+    SegmentGroup cur;
+    cur.bases.push_back(sealedBases[0]);
+    cur.combinedBytes = sealedSizes[0];
+    int64_t curIndexEntries = estimateIndexEntries(sealedSizes[0]);
+    // Offset span: last-offset-in-group - first-offset-in-group.
+    // first offset of a segment = its baseOffset.
+    // last offset of a segment ≈ next segment's base - 1 (we use the base as span proxy).
+    int64_t groupFirstBase = sealedBases[0];
+
+    for (std::size_t i = 1; i < sealedBases.size(); ++i) {
+        int64_t nextBase  = sealedBases[i];
+        int64_t nextSize  = sealedSizes[i];
+        int64_t addedIdx  = estimateIndexEntries(nextSize);
+        int64_t newBytes  = cur.combinedBytes + nextSize;
+        int64_t newIdx    = curIndexEntries + addedIdx;
+        // Offset span = (next segment's last offset - groupFirstBase).
+        // We approximate with nextBase - groupFirstBase (the span of base offsets).
+        // The actual span can be slightly larger but this is conservative enough.
+        int64_t offsetSpan = nextBase - groupFirstBase;
+        // Check all three coalescing bounds:
+        bool fitsBytes  = (newBytes <= segmentRollBytes);
+        bool fitsIndex  = (newIdx   <= static_cast<int64_t>(maxIndexEntries));
+        bool fitsOffset = (offsetSpan <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+
+        if (fitsBytes && fitsIndex && fitsOffset) {
+            cur.bases.push_back(nextBase);
+            cur.combinedBytes = newBytes;
+            curIndexEntries   = newIdx;
+        } else {
+            // Start a new group.
+            groups.push_back(std::move(cur));
+            cur = SegmentGroup{};
+            cur.bases.push_back(nextBase);
+            cur.combinedBytes = nextSize;
+            curIndexEntries   = addedIdx;
+            groupFirstBase    = nextBase;
+        }
+    }
+    groups.push_back(std::move(cur));
+    return groups;
+}
+
+// ---------------------------------------------------------------------------
+// produceCleanedGroupBounded  (CP-8: coalesced group rewrite)
+//
+// Compacts an entire SegmentGroup into ONE output segment at group.bases[0].
+// The SkimpyOffsetMap is built over [globalDirtyStart, activeBase) (same as
+// the single-segment path).  All input segments in the group are merged into
+// a single cleaned output file at the group's lowest base offset.
+// Non-group segments (those in sealedBases but NOT in the group) are not
+// touched.  After the write, all group segments EXCEPT the first are deleted
+// on disk (they've been absorbed into the first).
+// The caller must enqueue ALL group.bases via enqueueCleanedSegment — the
+// append thread's drainCleanerSwaps → reloadSegment will:
+//   (a) reload group.bases[0] from the new merged .log
+//   (b) drop group.bases[1..] since their .log files no longer exist.
+// ---------------------------------------------------------------------------
+CleanPassResult LogCleaner::produceCleanedGroupBounded(
+    const std::string& dir,
+    const std::vector<int64_t>& sealedBases,
+    const SegmentGroup& group,
+    Offset activeBase,
+    Offset globalDirtyStart,
+    int64_t nowNs, int64_t deleteRetentionMs,
+    int64_t dedupeBufferBytes,
+    Throttler* throttler,
+    int64_t nowMs)
+{
+    CleanPassResult result{false, activeBase};
+    if (group.bases.empty()) return result;
+
+    // All bases in the group must be < activeBase.
+    for (int64_t b : group.bases) {
+        if (b >= activeBase) return result;
+    }
+
+    // Clean up stale .log.new temp files.
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".new") {
+            std::filesystem::remove(e.path());
+        }
+    }
+
+    if (globalDirtyStart < 0) globalDirtyStart = 0;
+
+    // Build offset map over the full dirty range.
+    std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
+    SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
+    buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+
+    // Throttle the map-build read phase (approx from combined group size).
+    if (throttler && group.combinedBytes > 0) {
+        throttler->maybeThrottle(group.combinedBytes);
+    }
+
+    Offset latestMapped = map.latestOffset();
+    if (latestMapped < 0) return result; // nothing to compact
+
+    Offset passEnd = latestMapped + 1;
+    if (passEnd > activeBase) passEnd = activeBase;
+    result.passEnd = passEnd;
+
+    // Determine which segments in the group fall within [globalDirtyStart, passEnd).
+    // Segments past passEnd are not compacted this pass.
+    std::vector<int64_t> groupInPass;
+    for (int64_t b : group.bases) {
+        if (b < passEnd) groupInPass.push_back(b);
+    }
+    if (groupInPass.empty()) return result;
+
+    // Determine the output base = first segment in the group that is in-pass.
+    int64_t outBase = groupInPass.front();
+
+    // Read and merge all in-pass group segments into one output buffer.
+    // This is the coalescing: we walk all segments in order and apply the
+    // same keep/drop logic as rewriteSegmentImpl, but across multiple input segments.
+    std::string outLogPath = segmentLogPath(dir, outBase);
+    std::string outNewPath = outLogPath + ".new";
+    std::string outIdxPath = segmentIndexPath(dir, outBase);
+    std::filesystem::remove(outNewPath);
+
+    std::vector<uint8_t> outBuf;
+    outBuf.reserve(static_cast<std::size_t>(group.combinedBytes));
+    int64_t deleteRetentionNs = deleteRetentionMs * 1'000'000LL;
+
+    for (int64_t segBase : groupInPass) {
+        auto buf = readFile(segmentLogPath(dir, segBase));
+        if (buf.empty()) continue;
+
+        std::size_t pos = 0;
+        while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
+               <= buf.size()) {
+            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+            int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
+            if (!r.ensureValid()) break;
+
+            // CP-8: horizon gate (same logic as rewriteSegmentImpl).
+            const bool batchHasHorizon  = r.hasDeleteHorizon();
+            const int64_t batchHorizonMs = batchHasHorizon ? r.deleteHorizonMs() : -1;
+            const bool horizonExpired   = (batchHasHorizon && nowMs >= 0
+                                           && nowMs >= batchHorizonMs);
+
+            int64_t origProducerId    = r.producerId();
+            int16_t origProducerEpoch = r.producerEpoch();
+            int32_t origBaseSequence  = static_cast<int32_t>(
+                rune::protocol::detail::getLE32(buf.data() + pos
+                    + rune::protocol::batch::kBaseSequenceOffset));
+            int64_t batchBaseOffset   = r.baseOffset();
+
+            r.forEach([&](std::string_view key, std::string_view val,
+                          int64_t offset, int64_t timestamp) {
+                auto keepWithHorizon2 = [&](int64_t horizonMs2) {
+                    rune::protocol::RecordBatchBuilder b2(offset, timestamp);
+                    if (horizonMs2 >= 0) b2.setDeleteHorizonMs(horizonMs2);
+                    b2.append(key, val, timestamp);
+                    auto batch = b2.build();
+                    // A2: Patch producer identity.
+                    {
+                        uint64_t u = static_cast<uint64_t>(origProducerId);
+                        for (int ii = 0; ii < 8; ++ii)
+                            batch[rune::protocol::batch::kProducerIdOffset + ii] =
+                                static_cast<uint8_t>(u >> (ii * 8));
+                    }
+                    {
+                        uint16_t u = static_cast<uint16_t>(origProducerEpoch);
+                        batch[rune::protocol::batch::kProducerEpochOffset]     = static_cast<uint8_t>(u);
+                        batch[rune::protocol::batch::kProducerEpochOffset + 1] = static_cast<uint8_t>(u >> 8);
+                    }
+                    {
+                        int32_t recSeq = origBaseSequence
+                            + static_cast<int32_t>(offset - batchBaseOffset);
+                        uint32_t u = static_cast<uint32_t>(recSeq);
+                        for (int ii = 0; ii < 4; ++ii)
+                            batch[rune::protocol::batch::kBaseSequenceOffset + ii] =
+                                static_cast<uint8_t>(u >> (ii * 8));
+                    }
+                    uint32_t newCrc = rune::protocol::crc32c(
+                        batch.data() + rune::protocol::batch::kAttributesOffset,
+                        batch.size() - rune::protocol::batch::kAttributesOffset);
+                    batch[rune::protocol::batch::kCrcOffset]     = static_cast<uint8_t>(newCrc);
+                    batch[rune::protocol::batch::kCrcOffset + 1] = static_cast<uint8_t>(newCrc >> 8);
+                    batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(newCrc >> 16);
+                    batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(newCrc >> 24);
+                    outBuf.insert(outBuf.end(), batch.begin(), batch.end());
+                };
+                auto keep2 = [&]() { keepWithHorizon2(-1); };
+
+                if (offset < globalDirtyStart) { keep2(); return; }
+                if (offset >= passEnd)          { keep2(); return; }
+                if (key.empty())                { keep2(); return; }
+
+                auto latest = map.get(key);
+                if (!latest.has_value() || *latest != offset) return;
+
+                if (isTombstone(val)) {
+                    if (batchHasHorizon) {
+                        if (horizonExpired) return;
+                        keepWithHorizon2(batchHorizonMs); return;
+                    }
+                    if (nowMs >= 0) {
+                        keepWithHorizon2(nowMs + deleteRetentionMs); return;
+                    }
+                    if ((nowNs - timestamp) > deleteRetentionNs) return;
+                }
+                keep2();
+            });
+
+            pos += static_cast<size_t>(total);
+        }
+    }
+
+    // Write merged output to outBase's .log.new, then rename.
+    // If outBuf is empty, delete the segment(s).
+    if (outBuf.empty()) {
+        // All records removed — delete all group segments.
+        for (int64_t b : groupInPass) {
+            std::filesystem::remove(segmentLogPath(dir, b));
+            std::filesystem::remove(segmentIndexPath(dir, b));
+        }
+        fsyncDir(dir);
+        result.compacted = true;
+        return result;
+    }
+
+    // Write the merged segment to outBase.
+    writeFileDurable(outNewPath, outBuf);
+    std::filesystem::rename(outNewPath, outLogPath);
+    fsyncDir(dir);
+    std::filesystem::remove(outIdxPath);
+    buildIndex(outIdxPath, outBase, outBuf);
+
+    // Delete all non-first group segments (they've been merged into outBase).
+    for (std::size_t gi = 1; gi < groupInPass.size(); ++gi) {
+        std::filesystem::remove(segmentLogPath(dir, groupInPass[gi]));
+        std::filesystem::remove(segmentIndexPath(dir, groupInPass[gi]));
+    }
+    fsyncDir(dir);
+
+    // Throttle write phase.
+    if (throttler && !outBuf.empty()) {
+        throttler->maybeThrottle(static_cast<int64_t>(outBuf.size()));
+    }
+
+    result.compacted = true;
     return result;
 }
 

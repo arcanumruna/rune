@@ -2,10 +2,20 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/storage/SkimpyOffsetMap.h>
+#include <rune/storage/Throttler.h>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace rune::storage {
+
+/// CP-8: A contiguous group of sealed segments to be coalesced into one
+/// cleaned output segment by groupSegmentsBySize().
+struct SegmentGroup {
+    std::vector<int64_t> bases; ///< Sorted ascending base offsets of the input segments.
+    int64_t combinedBytes = 0;  ///< Approximate combined output size (upper bound).
+};
+
 
 /// Result of a bounded-range compaction pass.
 /// `compacted` = true if a rewrite ran; `passEnd` = the first-dirty-offset
@@ -164,6 +174,13 @@ public:
     /// @param dedupeBufferBytes  Memory budget for the SkimpyOffsetMap.
     ///                           Must be > 0.  Sized via
     ///                           SkimpyOffsetMap::maxSlotsFromBudget().
+    /// @param throttler          Optional shared I/O throttler (may be nullptr).
+    ///                           Called after each segment file read/write.
+    ///                           MUST be called only on the cleaner thread.
+    /// @param nowMs              Current wall-clock epoch-ms (sampled once per pass
+    ///                           by the caller — deterministic).  Used for delete-
+    ///                           horizon stamping/dropping.
+    /// @param deleteRetentionMs  As before — how long to retain tombstones.
     ///
     /// CLEANER THREAD: PURE FILE WORK — never touches Log::segments_.
     CleanPassResult produceCleanedFileBounded(const std::string& dir,
@@ -171,7 +188,63 @@ public:
                                               Offset segBase, Offset activeBase,
                                               Offset globalDirtyStart,
                                               int64_t nowNs, int64_t deleteRetentionMs,
-                                              int64_t dedupeBufferBytes);
+                                              int64_t dedupeBufferBytes,
+                                              Throttler* throttler = nullptr,
+                                              int64_t nowMs = -1);
+
+    /// CP-8: Group consecutive sealed segments into coalesced groups for compaction.
+    ///
+    /// Mirrors Kafka's LogCleaner.groupSegmentsBySize:
+    ///   - Accumulate consecutive sealed segments into a group while:
+    ///       (a) combined data ≤ segmentRollBytes (output fits in one segment)
+    ///       (b) combined index entries ≤ maxIndexEntries (index size limit)
+    ///       (c) offset span ≤ INT32_MAX (4-byte relative offset in OffsetIndex)
+    ///   - Each group produces ONE cleaned output segment in the cleaner.
+    ///   - Segments in [firstUncleanableIdx .. end) are excluded.
+    ///
+    /// @param sealedBases      Sorted-ascending bases of all CLEANABLE sealed segments
+    ///                         (i.e. those with base < firstUncleanable and within
+    ///                          the dirty range).
+    /// @param sealedSizes      Parallel vector of file sizes (bytes) for each base.
+    /// @param segmentRollBytes Max combined output bytes per group.
+    /// @param maxIndexEntries  Max offset-index entries per output segment.
+    ///                         Default: 4096*1024/8 = 524288 (~4 MiB index at 8 B/entry).
+    ///
+    /// @returns Vector of groups (each group has >= 1 base).
+    ///
+    /// PURE COMPUTATION — no file I/O; safe on any thread.
+    static std::vector<SegmentGroup>
+    groupSegmentsBySize(const std::vector<int64_t>& sealedBases,
+                        const std::vector<int64_t>& sealedSizes,
+                        int64_t segmentRollBytes,
+                        int32_t maxIndexEntries = 524288);
+
+    /// CP-8: Compact an entire group of segments (coalescing) into a SINGLE output
+    /// segment at the base of the first segment in the group.
+    ///
+    /// Reads every segment in `group.bases` and writes a single cleaned output at
+    /// `group.bases[0]` (i.e. the group's lowest base offset becomes the output base).
+    /// This is the grouped rewrite path: instead of one call per segment, the cleaner
+    /// calls this once per group when grouping is enabled.
+    ///
+    /// The SkimpyOffsetMap is built over the entire dirty range [globalDirtyStart,
+    /// activeBase) (bounded by dedupeBufferBytes).  The output segment is written as
+    /// a single .log.new file at `dir/<group.bases[0]>.log.new` then renamed over the
+    /// first segment, and all other segments in the group are deleted (they've been
+    /// merged in).
+    ///
+    /// @returns CleanPassResult with compacted=true if a rewrite ran, passEnd set.
+    ///
+    /// CLEANER THREAD: PURE FILE WORK — never touches Log::segments_.
+    CleanPassResult produceCleanedGroupBounded(const std::string& dir,
+                                               const std::vector<int64_t>& sealedBases,
+                                               const SegmentGroup& group,
+                                               Offset activeBase,
+                                               Offset globalDirtyStart,
+                                               int64_t nowNs, int64_t deleteRetentionMs,
+                                               int64_t dedupeBufferBytes,
+                                               Throttler* throttler = nullptr,
+                                               int64_t nowMs = -1);
 
 private:
     /// Is a record a tombstone?
@@ -187,10 +260,14 @@ private:
     /// `getLatest(key)` returns the latest known offset for the key from the map.
     /// PURE FILE WORK: reads/writes only <dir>/<segBase>.log{,.new,.index};
     /// never touches Log::segments_.  Returns true if a file was produced.
+    ///
+    /// @param nowMs  Wall-clock epoch-ms sampled once per pass (for KIP-534 horizon).
+    ///               Pass -1 to use the legacy nowNs-only tombstone retention path.
     bool rewriteSegmentImpl(const std::string& dir, int64_t segBase,
                             const std::function<std::optional<Offset>(std::string_view)>& getLatest,
                             Offset fromOffset, Offset cleanBoundaryOffset,
-                            int64_t nowNs, int64_t deleteRetentionMs);
+                            int64_t nowNs, int64_t deleteRetentionMs,
+                            int64_t nowMs = -1);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
@@ -198,14 +275,19 @@ private:
     /// PURE FILE WORK: reads/writes only <dir>/<segBase>.log{,.new,.index};
     /// never touches Log::segments_.  Returns true if a file was produced (the
     /// segment was non-empty), false if the source .log was missing/empty.
+    ///
+    /// @param nowMs  Wall-clock epoch-ms (for KIP-534 delete-horizon stamping).
+    ///               Pass -1 to use the legacy nowNs-only path.
     bool rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
                         Offset fromOffset, Offset cleanBoundaryOffset,
-                        int64_t nowNs, int64_t deleteRetentionMs);
+                        int64_t nowNs, int64_t deleteRetentionMs,
+                        int64_t nowMs = -1);
 
     /// SkimpyOffsetMap overload of rewriteSegment.
     bool rewriteSegment(const std::string& dir, int64_t segBase, SkimpyOffsetMap& map,
                         Offset fromOffset, Offset cleanBoundaryOffset,
-                        int64_t nowNs, int64_t deleteRetentionMs);
+                        int64_t nowNs, int64_t deleteRetentionMs,
+                        int64_t nowMs = -1);
 };
 
 } // namespace rune::storage
