@@ -488,7 +488,27 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
         // contains fetchOffset).  Loop until we reach highWatermark.
         std::vector<uint8_t> data =
             log.read(fetchOffset, kChunkBytes);
-        if (data.empty()) break;
+        if (data.empty()) {
+            // CP-4: log.read() can return empty even when more segments exist.
+            // After compaction (Compact / CompactDelete policy via
+            // LogCleaner::cleanSegment), records within a segment are removed
+            // and the surviving records may not start at the segment's logical
+            // base offset.  If fetchOffset falls in a gap (e.g. offset N was
+            // compacted away, but the segment's base is < N), read() returns
+            // empty because no batch covers offset N.  Simply breaking here
+            // would stop the rebuild prematurely, leaving producer state for
+            // later segments unseen — yielding spurious OOS errors on retries.
+            //
+            // Fix: when read() returns empty, try to advance fetchOffset to
+            // the start of the next segment whose base is strictly greater
+            // than the current fetchOffset.  If no such segment exists, the
+            // log truly has no more data and we stop.
+            const auto segBases = log.segmentBaseOffsets();
+            auto it = std::upper_bound(segBases.begin(), segBases.end(), fetchOffset);
+            if (it == segBases.end()) break; // no segment after fetchOffset
+            fetchOffset = *it;
+            continue;
+        }
 
         std::size_t pos = 0;
         int64_t     lastBatchEnd = fetchOffset; // progress sentinel

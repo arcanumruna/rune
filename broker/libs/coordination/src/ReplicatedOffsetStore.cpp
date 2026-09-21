@@ -310,12 +310,41 @@ void ReplicatedOffsetStore::rebuildFromLog()
     // worth of bytes per iteration.
     static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB
 
+    // CP-4: start the scan at the log's FIRST surviving segment base, not a
+    // hardcoded 0.  Compaction (Compact / CompactDelete policy via
+    // LogCleaner::cleanSegment) can delete fully-superseded early sealed segments,
+    // advancing the first segment's base past 0.  In that case replica_->read(0)
+    // returns empty and the fetchOffset==0 start would bail immediately,
+    // reconstructing NO committed offsets — silently breaking consumer group
+    // recovery after any compaction on __consumer_offsets.  Beginning at the
+    // first live segment base makes rebuild robust to a compacted log prefix.
+    // (Mirrors the identical CP-3 fix in ProducerStateManager::rebuildFromLog.)
     rune::replication::Offset fetchOffset = 0;
+    {
+        const auto segBases = replica_->log()->segmentBaseOffsets();
+        if (!segBases.empty() && segBases.front() > 0) {
+            fetchOffset = segBases.front();
+        }
+    }
 
     while (fetchOffset < hw) {
         std::vector<uint8_t> data =
             replica_->read(fetchOffset, kChunkBytes);
-        if (data.empty()) break; // no more committed data at this offset
+        if (data.empty()) {
+            // CP-4: log.read() can return empty even when more segments exist.
+            // After compaction (Compact / CompactDelete policy via
+            // LogCleaner::cleanSegment), surviving records within a segment may
+            // not start at the current fetchOffset (earlier records in that
+            // segment were deleted, leaving a gap).  Simply breaking here would
+            // stop the rebuild prematurely, losing committed offsets from later
+            // segments.  Advance to the start of the next segment instead.
+            const auto segBases = replica_->log()->segmentBaseOffsets();
+            auto it = std::upper_bound(segBases.begin(), segBases.end(),
+                                       static_cast<int64_t>(fetchOffset));
+            if (it == segBases.end()) break;
+            fetchOffset = static_cast<rune::replication::Offset>(*it);
+            continue;
+        }
 
         // Walk all RecordBatches in this chunk, applying each record and
         // tracking the next fetchOffset (last batch's committed end + 1).
