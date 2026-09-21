@@ -40,6 +40,11 @@ _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _SUMMARY_RE = re.compile(r"SUMMARY produced=(\d+) delivered=(\d+) mode=(\S+) rc=(\d+)")
 
+# TX-5: txn mode regexes.
+_TXNPRODUCE_RE = re.compile(r"TXNPRODUCE cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+)")
+_TXNRESULT_RE = re.compile(r"TXNRESULT txn_id=(\S+) cid=(-?\d+) outcome=(\S+)")
+_TXNCONSUME_SUMMARY_RE = re.compile(r"TXNCONSUME_SUMMARY cid=(-?\d+) consumed=(\d+) isolation=(\S+)")
+
 # Group-mode regexes.
 # gen=<g> is emitted by dr_client (CG-6 fix2) so single_owner can be
 # generation-aware.  It is optional in the regex for backward compatibility with
@@ -167,6 +172,159 @@ class GroupResults:
             m.exit_code == 0 and m.rc == 0 for m in self.member_results
         )
         return prod_ok and members_ok
+
+
+# ---------------------------------------------------------------------------
+# TX-5: Transactional producer/consumer data structures + run_txn() helper
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TxnMsg:
+    """A single record sent inside a transaction (from TXNPRODUCE output)."""
+    cid: int
+    key: int
+    seq: int
+    partition: int
+
+
+@dataclass
+class TxnResult:
+    """Parsed output of one txn_produce or txn_consume container."""
+    cid: int
+    txn_id: str
+    outcome: str           # "committed" | "aborted" | "" (consume mode)
+    sent: list[TxnMsg] = field(default_factory=list)    # TXNPRODUCE lines
+    delivered: list[Msg] = field(default_factory=list)  # DELIVERED lines (txn_consume)
+    consumed: int = 0
+    isolation: str = ""
+    exit_code: int = 0
+    rc: int = 1
+    raw: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0 and self.rc == 0
+
+
+def _parse_txn_output(cid: int, exit_code: int, out: str) -> TxnResult:
+    """Parse txn_produce or txn_consume container stdout+stderr."""
+    res = TxnResult(cid=cid, txn_id="", outcome="", exit_code=exit_code, raw=out)
+    for m in _TXNPRODUCE_RE.finditer(out):
+        res.sent.append(TxnMsg(int(m[1]), int(m[2]), int(m[3]), int(m[4])))
+    for m in _DELIVERED_RE.finditer(out):
+        res.delivered.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5])))
+    rm = _TXNRESULT_RE.search(out)
+    if rm:
+        res.txn_id = rm[1]
+        res.outcome = rm[3]
+    cs = _TXNCONSUME_SUMMARY_RE.search(out)
+    if cs:
+        res.consumed = int(cs[2])
+        res.isolation = cs[3]
+    sm = _SUMMARY_RE.search(out)
+    if sm:
+        res.rc = int(sm[4])
+    return res
+
+
+def run_txn(
+    *,
+    network: str,
+    target_service: str,
+    cid: int = 0,
+    txn_id: str = "test-txn",
+    commit: bool = True,
+    topics: str = "events:0:1",
+    records: int = 10,
+    keys: int = 1,
+    timeout_ms: int = 15000,
+    timeout_s: int = 120,
+    egress_port: int = 40800,
+) -> TxnResult:
+    """Run one txn_produce container and return the parsed TxnResult.
+
+    The txn_produce mode runs init→begin→send(records)→commit/abort and emits
+    TXNPRODUCE + TXNRESULT + SUMMARY lines that _parse_txn_output decodes.
+    """
+    name = f"dr-txn-{cid}-{uuid.uuid4().hex[:8]}"
+    env = {
+        "RUNE_TARGET": f"aeron:udp?endpoint={target_service}:40200",
+        "RUNE_TARGET_STREAM": "1",
+        "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
+        "RUNE_EGRESS_STREAM": "2",
+        "RUNE_DATA_DIR": "/var/lib/rune-client",
+        "RUNE_TOPICS": topics,
+        "RUNE_CLIENT_ID": str(cid),
+        "RUNE_MODE": "txn_produce",
+        "RUNE_TXN_ID": txn_id,
+        "RUNE_TXN_COMMIT": "1" if commit else "0",
+        "RUNE_RECORDS": str(records),
+        "RUNE_KEYS": str(keys),
+        "RUNE_TIMEOUT_MS": str(timeout_ms),
+    }
+    args = [
+        "docker", "run", "--rm",
+        "--name", name,
+        "--platform", "linux/amd64",
+        "--network", network,
+        "--hostname", name,
+        "--shm-size=64m",
+    ]
+    for k, v in env.items():
+        args += ["-e", f"{k}={v}"]
+    args.append(DR_IMAGE)
+    res = run(args, timeout=timeout_s)
+    return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
+
+
+def run_txn_consume(
+    *,
+    network: str,
+    target_service: str,
+    group_id: str,
+    cid: int = 0,
+    topics: str = "events:0:1",
+    isolation: str = "read_committed",
+    subscribe_ms: int = 20000,
+    autocommit_ms: int = 1000,
+    timeout_ms: int = 15000,
+    timeout_s: int = 90,
+    egress_port: int = 40850,
+) -> TxnResult:
+    """Run one txn_consume container with the given isolation level.
+
+    Returns a TxnResult with .delivered = list of DELIVERED records seen
+    and .isolation = the isolation string used.
+    """
+    name = f"dr-txnc-{cid}-{uuid.uuid4().hex[:8]}"
+    env = {
+        "RUNE_TARGET": f"aeron:udp?endpoint={target_service}:40200",
+        "RUNE_TARGET_STREAM": "1",
+        "RUNE_EGRESS": f"aeron:udp?endpoint={name}:{egress_port}",
+        "RUNE_EGRESS_STREAM": "2",
+        "RUNE_DATA_DIR": "/var/lib/rune-client",
+        "RUNE_TOPICS": topics,
+        "RUNE_CLIENT_ID": str(cid),
+        "RUNE_MODE": "txn_consume",
+        "RUNE_GROUP_ID": group_id,
+        "RUNE_ISOLATION": isolation,
+        "RUNE_SUBSCRIBE_MS": str(subscribe_ms),
+        "RUNE_AUTOCOMMIT_MS": str(autocommit_ms),
+        "RUNE_TIMEOUT_MS": str(timeout_ms),
+    }
+    args = [
+        "docker", "run", "--rm",
+        "--name", name,
+        "--platform", "linux/amd64",
+        "--network", network,
+        "--hostname", name,
+        "--shm-size=64m",
+    ]
+    for k, v in env.items():
+        args += ["-e", f"{k}={v}"]
+    args.append(DR_IMAGE)
+    res = run(args, timeout=timeout_s)
+    return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
 
 
 def _parse_group_member_output(cid: int, exit_code: int, out: str) -> GroupMemberResult:

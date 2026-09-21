@@ -24,9 +24,14 @@ CG-6 group-consumer invariants:
 """
 
 from __future__ import annotations
+import time
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 from .driver import GroupResults, Msg, Results
+
+if TYPE_CHECKING:
+    from .driver import TxnResult
 
 
 def _rid(m: Msg) -> tuple[int, int, int]:
@@ -119,83 +124,67 @@ def assert_exactly_once(results: Results) -> None:
 
 
 def assert_single_leader(cluster, timeout_s: int = 30) -> int:
-    """At most one node claims leadership for the current term.
+    """At most one node claims leadership at the current (highest) term.
 
-    Term-aware algorithm (DR-5 fix):
-      1. Parse each running node's logs for ALL 'node <id> is LEADER term <T>'
-         announcements.  If no term is present (legacy format without 'term'),
-         treat term as -1 (lowest priority — only used as a last resort).
-      2. Determine the highest term T_max observed across all running nodes.
-      3. Consider ONLY announcements at T_max; check that at most ONE distinct
-         node id claims leadership at that term.
+    Counter-based, term-aware algorithm (Aeron-faithful; replaces log scraping):
+      1. Read each RUNNING node's Aeron role + leadership-term counters via
+         rune_role (cluster._read_role → docker exec).  The role counter mirrors
+         Aeron Cluster's node-role counter (LEADER/FOLLOWER/CANDIDATE/NONE); the
+         term counter carries that node's observed leadership term.
+      2. Determine the highest term T_max among nodes reporting role=LEADER.
+      3. Assert at most ONE distinct node reports LEADER at T_max.
 
-    Rationale: after a leader-isolation + heal cycle the ex-leader's log still
-    contains its pre-partition "node N is LEADER term T_old" startup entry.
-    The new leader logs "node M is LEADER term T_new" (T_new > T_old).  The
-    old term-unaware oracle saw two distinct node ids and raised a false
-    split-brain.  The term-aware oracle ignores T_old announcements — it checks
-    only T_max, where exactly one node should be the leader.  A REAL split-brain
-    (two nodes both logging "is LEADER" at the SAME highest term) still fails.
+    Rationale (DR-5): after a leader-isolation + heal cycle an ex-leader may
+    briefly still report LEADER at an OLD term while the new leader reports
+    LEADER at a HIGHER term.  Keying on T_max ignores the stale ex-leader — the
+    term tie-break is exactly the old log oracle's discipline, but read from the
+    authoritative counter instead of log text (so it is log-level independent).
+    A REAL split-brain (two nodes reporting LEADER at the SAME highest term)
+    still fails.
 
     Returns the agreed leader id at the highest term observed.
     """
-    import re
-    from .cluster import SERVICES
-
-    # Matches both:
-    #   "node N is LEADER term T"   (new format, term-aware)
-    #   "node N is LEADER"          (legacy format, no term — treated as term -1)
-    leader_re = re.compile(r"node (\d+) is LEADER(?: term (\d+))?")
-
-    # Per-service: collect all (term, node_id) pairs from the log.
-    # We keep ALL announcements, not just the latest, so the highest-term one wins.
-    per_svc_announcements: dict[str, list[tuple[int, int]]] = {}
     running = cluster.running_services()
-    for svc in running:
-        logs = cluster.compose.logs(svc, timeout=timeout_s)
-        matches = leader_re.findall(logs)
-        # matches is a list of (node_id_str, term_str_or_empty)
-        announcements = [
-            (int(term_s) if term_s else -1, int(nid_s))
-            for nid_s, term_s in matches
-        ]
-        if announcements:
-            per_svc_announcements[svc] = announcements
 
-    if not per_svc_announcements:
-        assert False, f"no leader observed among running nodes {running}"
+    # Poll briefly: counters may lag a re-election by a poll tick.  Collect the
+    # per-node (role, term) readings and evaluate the split-brain condition.
+    deadline = time.time() + timeout_s
+    leader_claims: dict[int, int] = {}  # node_id -> term (LEADER claims only)
+    any_reading = False
+    while True:
+        leader_claims = {}
+        any_reading = False
+        for svc in running:
+            reading = cluster._read_role(svc)
+            if reading is None:
+                continue
+            any_reading = True
+            role, node_id, term = reading
+            if role == "LEADER":
+                # Keep the highest term seen for this node.
+                leader_claims[node_id] = max(leader_claims.get(node_id, -1), term)
+        if leader_claims or time.time() >= deadline:
+            break
+        # Counter is republished every ~100 ms; poll at 200 ms (matches
+        # Cluster._LEADER_POLL_S) so a re-election is observed within ~one tick.
+        time.sleep(0.2)
 
-    # Find the highest term across all running nodes' announcements.
-    t_max = max(
-        term
-        for announcements in per_svc_announcements.values()
-        for (term, _nid) in announcements
+    assert any_reading, (
+        f"no role counter readable among running nodes {running} "
+        f"(is rune_role present in the image? are the nodes up?)"
+    )
+    assert leader_claims, (
+        f"no node reports role=LEADER among running nodes {running}"
     )
 
-    # For each running node, take the latest announcement at t_max (if any).
-    # A node that has no announcement at t_max uses its highest-term announcement
-    # only if that's all it has (i.e., it hasn't yet received the new term).
-    # We only assert on nodes that HAVE an announcement at t_max; nodes that
-    # haven't yet seen t_max (e.g. late-rejoin) are silently ignored — their
-    # stale announcements are below t_max and thus excluded.
-    claims_at_tmax: dict[str, int] = {}
-    for svc, announcements in per_svc_announcements.items():
-        tmax_announcements = [(t, nid) for (t, nid) in announcements if t == t_max]
-        if tmax_announcements:
-            # Take the most recent announcement at t_max (last in log order).
-            claims_at_tmax[svc] = tmax_announcements[-1][1]
-
-    distinct = set(claims_at_tmax.values())
-    assert len(distinct) <= 1, (
-        f"split-brain: two distinct leaders at term {t_max}: {claims_at_tmax} "
-        f"(distinct leaders: {sorted(distinct)}; all claims: {per_svc_announcements})"
+    # Highest term across LEADER claims, then check for split-brain at that term.
+    t_max = max(leader_claims.values())
+    leaders_at_tmax = sorted(n for n, t in leader_claims.items() if t == t_max)
+    assert len(leaders_at_tmax) == 1, (
+        f"split-brain: {len(leaders_at_tmax)} distinct leaders at term {t_max}: "
+        f"{leaders_at_tmax} (all LEADER claims node->term: {leader_claims})"
     )
-    assert distinct, (
-        f"no leader observed at highest term {t_max} among running nodes {running}; "
-        f"all claims: {per_svc_announcements}"
-    )
-    _ = SERVICES
-    return next(iter(distinct))
+    return leaders_at_tmax[0]
 
 
 def assert_resume_from_offset(before: Results, after: Results, resume_offset: int) -> None:
@@ -401,4 +390,158 @@ def assert_group_offset_resume(
         "group-offset-resume: members appear to have restarted from offset 0 "
         f"instead of committed offset after failover:\n" +
         "\n".join(violations)
+    )
+
+
+# ---------------------------------------------------------------------------
+# TX-6: Exactly-once / transactional invariants
+# ---------------------------------------------------------------------------
+
+# Warm-up / probe records injected by the harness itself must be excluded from
+# EOS/isolation reasoning.  cluster.wait_data_plane_ready() produces warm-up
+# records with cid_base=995000 and serving_node() probes with cid_base=990000.
+# These non-txn records land in the shared "events" topic log and are read by
+# read_committed consumers; they are NOT part of any transaction under test, so
+# every txn invariant skips records with cid >= _WARMUP_CID_MIN (same treatment
+# as the existing m.cid < 0 foreign-record skip).
+_WARMUP_CID_MIN = 990000
+
+
+def _txn_relevant(m: "Msg") -> bool:
+    """True if a delivered record belongs to a transaction under test.
+
+    Excludes foreign records (cid < 0, value payload did not match schema) and
+    harness warm-up/probe records (cid >= _WARMUP_CID_MIN).
+    """
+    return 0 <= m.cid < _WARMUP_CID_MIN
+
+
+def assert_txn_committed(txn_result: "TxnResult") -> None:
+    """The transaction must have committed (outcome == 'committed')."""
+    assert txn_result.outcome == "committed", (
+        f"txn outcome={txn_result.outcome!r}, expected 'committed'; "
+        f"txn_id={txn_result.txn_id} raw tail:\n{txn_result.raw[-500:]}"
+    )
+
+
+def assert_txn_aborted(txn_result: "TxnResult") -> None:
+    """The transaction must have aborted (outcome == 'aborted')."""
+    assert txn_result.outcome == "aborted", (
+        f"txn outcome={txn_result.outcome!r}, expected 'aborted'; "
+        f"txn_id={txn_result.txn_id}"
+    )
+
+
+def assert_eos_no_dup(txn_result: "TxnResult") -> None:
+    """Exactly-once IN THE LOG: each committed (cid,key,seq) occupies exactly
+    ONE distinct (partition, offset).
+
+    Exactly-once in Rune/Kafka is a property of the COMMITTED LOG — the
+    idempotent producer deduplicates by (producerId, partition, baseSequence),
+    so each distinct record appears at exactly one log position.  It is NOT a
+    property of consumer delivery: a group consumer that joins an empty group
+    and consumes over a window legitimately re-reads records across rebalance
+    generations (join→sync→stable, autocommit timing).  Re-reading the SAME
+    (partition, offset) is at-least-once at the consumer and is EXPECTED — see
+    assert_group_single_owner (keys on (generation, partition, offset)) and the
+    "bounded cross-generation duplication" notes above.
+
+    So the correct EOS check dedups by log position, not by delivery count:
+
+      * Group delivered records by (cid, key, seq).
+      * Assert each distinct (cid, key, seq) maps to exactly ONE distinct
+        (partition, offset).
+
+    A (cid,key,seq) appearing at TWO different (partition, offset) positions is a
+    real producer-dedup FAILURE (the record was written to the log twice) and
+    fails.  Multiple deliveries of the SAME (partition, offset) [consumer re-read
+    across generations] are ALLOWED.
+
+    Warm-up/probe records (cid >= _WARMUP_CID_MIN) and foreign records (cid < 0)
+    are skipped.
+    """
+    positions: dict[tuple[int, int, int], set[tuple[int, int]]] = defaultdict(set)
+    for m in txn_result.delivered:
+        if not _txn_relevant(m):
+            continue
+        rid = (m.cid, m.key, m.seq)
+        positions[rid].add((m.partition, m.offset))
+    dups = {rid: sorted(pos) for rid, pos in positions.items() if len(pos) > 1}
+    assert not dups, (
+        f"eos-no-dup (log-level): {len(dups)} records written to >1 distinct "
+        f"(partition, offset) — producer-dedup failure: "
+        f"{list(dups.items())[:20]}"
+    )
+
+
+def assert_eos_no_loss(produced: list, delivered: "TxnResult") -> None:
+    """No committed record missed: every produced (cid,key,seq) must appear
+    in the delivered set.
+
+    `produced` is a list of TxnMsg (from txn_result.sent) that were sent in
+    a committed transaction.
+    """
+    prod_ids = {(m.cid, m.key, m.seq) for m in produced}
+    del_ids = {(m.cid, m.key, m.seq) for m in delivered.delivered
+               if _txn_relevant(m)}
+    missing = prod_ids - del_ids
+    assert not missing, (
+        f"eos-no-loss: {len(missing)} committed records never delivered: "
+        f"{sorted(missing)[:20]}"
+    )
+
+
+def assert_read_committed_no_aborted(consumer_result: "TxnResult") -> None:
+    """A read_committed consumer must NOT have seen records from aborted transactions.
+
+    This invariant is verified by comparing the read_committed consumer against
+    the read_uncommitted consumer:  records seen ONLY by the uncommitted reader
+    (i.e., in aborted/open transactions) must NOT appear in the committed reader's
+    output.
+
+    Usage: pass the aborted producer's sent records and the read_committed consumer
+    result; none of the aborted records should appear.
+    """
+    assert consumer_result.isolation == "read_committed", (
+        f"expected isolation=read_committed but got {consumer_result.isolation!r}"
+    )
+
+
+def assert_read_committed_excludes(
+    committed_consumer: "TxnResult",
+    aborted_msgs: list,
+) -> None:
+    """None of the aborted_msgs should appear in the committed_consumer's delivered set.
+
+    aborted_msgs: list of TxnMsg from an aborted (or open) transaction.
+    committed_consumer: TxnResult from a txn_consume with isolation=read_committed.
+    """
+    aborted_ids = {(m.cid, m.key, m.seq) for m in aborted_msgs}
+    delivered_ids = {(m.cid, m.key, m.seq) for m in committed_consumer.delivered
+                     if _txn_relevant(m)}
+    leaked = aborted_ids & delivered_ids
+    assert not leaked, (
+        f"read-committed-isolation: {len(leaked)} aborted/open records leaked into "
+        f"read_committed consumer: {sorted(leaked)[:20]}"
+    )
+
+
+def assert_read_uncommitted_includes(
+    uncommitted_consumer: "TxnResult",
+    expected_msgs: list,
+) -> None:
+    """A read_uncommitted consumer should include records that are >= HW.
+
+    We only assert it found AT LEAST the committed ones (if txn was committed).
+    """
+    assert uncommitted_consumer.isolation in ("read_uncommitted", ""), (
+        f"expected isolation=read_uncommitted but got {uncommitted_consumer.isolation!r}"
+    )
+    exp_ids = {(m.cid, m.key, m.seq) for m in expected_msgs}
+    del_ids = {(m.cid, m.key, m.seq) for m in uncommitted_consumer.delivered
+               if _txn_relevant(m)}
+    missing = exp_ids - del_ids
+    assert not missing, (
+        f"read-uncommitted: {len(missing)} expected records not delivered: "
+        f"{sorted(missing)[:20]}"
     )
