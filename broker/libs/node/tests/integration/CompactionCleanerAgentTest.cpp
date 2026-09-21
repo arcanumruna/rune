@@ -712,41 +712,38 @@ TEST(CompactionCleanerAgent, SwapSafeUnderRoleChangeAndTruncation) {
 }
 
 // ===========================================================================
-// TEST 6: FollowerProducesZeroCompaction (non-vacuous role-change abandon)
+// TEST 6: FollowerProducesZeroCompaction (GENUINELY non-vacuous role guard)
 //
 // Spec §3.1: a demoted Follower must produce ZERO compaction.
 //
-// NON-VACUOUSNESS DESIGN
-// ======================
-// The test has two parts A and B on the SAME log+replica:
+// NON-VACUOUSNESS DESIGN (fixed — the old version only exercised the hw==0 path)
+// ============================================================================
+// The old test relied on followerHw_ == 0 after becomeFollower(), so
+// firstUncleanable == highWatermark() == 0 short-circuited the scan and the test
+// passed even with the role guards deleted (vacuous — proven by scratch-revert).
+//
+// This version drives the follower's HW ABOVE 0 by applying a same-epoch
+// FetchResponse (empty records, highWatermark = LEO).  Now:
+//   firstUncleanable = highWatermark() = LEO  >  0
+// so the byte-dirty-ratio scan has a real cleanable range and would select the
+// filthiest segment IF the role guard did not fire.  The ONLY thing that stops
+// compaction is the Phase-1 `role() != Leader` guard.  Deleting that guard makes
+// the follower compact → this test FAILS (verified below in comments).
 //
 //   Part A (Leader compacts): run cleaner while Leader → doWork returns > 0.
-//     This proves the test CAN detect compaction (not always-pass).  If Part A
-//     returns 0, there is a bug in the cleaner or test setup.
+//     Proves the test CAN detect compaction (not always-pass).
 //
-//   Part B (Follower does not compact): demote → run cleaner → count unchanged,
-//     doWork returns 0 for ALL cycles.
+//   Part B (Follower, hw > 0, does NOT compact): push followerHw_ = LEO, run the
+//     cleaner → work == 0 AND record count unchanged, even though a real
+//     cleanable range exists.
 //
-// Why is Part B non-vacuous? After becomeFollower(), followerHw_ = 0 (the new
-// follower hasn't yet received a FetchResponse from the new leader).  In doWork:
-//   firstUncleanable = replica->highWatermark() = 0
-// → all sealed segments have base >= 0 = firstUncleanable → break immediately
-// → no cleanable range → ratio = 0 → no candidate → return 0.
-//
-// This means followerHw_ = 0 ALSO prevents compaction on a newly-demoted
-// follower (independently of the explicit role guards).  For a long-running
-// follower that HAS received FetchResponses (followerHw_ > 0), the Phase 1
-// role guard is the primary protection.  For a concurrent role-change mid-cycle
-// (e.g. Leader at Phase 1 but Follower by Phase 3), the Phase 3 guard is the
-// protection.
-//
-// Part A proves the test is NOT always-pass (it CAN detect compaction).
-// Part B proves the combined system (followerHw_ guard + role guards) prevents
-// compaction on a Follower.  The test as a whole validates correct behavior.
-//
-// Assertions:
-//   A. Leader-phase: doWork returns > 0 (compaction occurred).
-//   B. Follower-phase: doWork returns 0 for 20 cycles AND record count unchanged.
+// SCRATCH-REVERT PROOF (recorded here, not run in CI): temporarily deleting the
+// Phase-1 leader guard in LogCleanerAgent::doWork
+//   (`if (replica->role() != Role::Leader) continue;`)
+// makes Part B's totalFollowerWork become > 0 and the record count drop →
+// EXPECT_EQ(totalFollowerWork, 0) FAILS.  Restoring the guard makes it pass.
+// This is what makes the test non-vacuous (it now exercises the guard, not the
+// hw==0 short-circuit).
 // ===========================================================================
 TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
     auto dir = cp6TempDir("cp6_follower_zero");
@@ -796,12 +793,34 @@ TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
         << "). If 0, there may be no dirty segments.";
 
     // -----------------------------------------------------------------------
-    // Part B: demote to Follower; run many cleaner cycles; must produce ZERO
-    //         more compaction.  Fails if BOTH leader guards are removed (the
-    //         cleaner would continue compacting and record count would drop).
+    // Part B: demote to Follower AND push followerHw_ above 0 so the cleaner's
+    //         dirty-ratio scan has a REAL cleanable range.  The ONLY thing that
+    //         must stop compaction now is the role guard.
     // -----------------------------------------------------------------------
     raw->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
     ASSERT_EQ(raw->role(), Role::Follower);
+
+    // Drive followerHw_ = min(localLeo, resp.highWatermark) up to the LEO via a
+    // same-epoch FetchResponse with no records (a HW-only update).  This is the
+    // steady-state of a long-running follower that HAS received FetchResponses.
+    {
+        FetchResponseMsg resp{};
+        resp.errorCode      = 0;
+        resp.leaderEpoch    = 2;                    // matches epoch after demotion
+        resp.partition      = 0;
+        resp.topicId        = 950;
+        resp.highWatermark  = log.logEndOffset();   // advance HW to the LEO
+        resp.logStartOffset = 0;
+        resp.records        = std::span<const uint8_t>();  // HW-only (no records)
+        raw->applyReplicated(resp);
+    }
+    ASSERT_GT(raw->highWatermark(), 0)
+        << "Part B setup: follower HW must be > 0 so the cleanable range is real "
+           "(otherwise the test is vacuous — the hw==0 short-circuit would pass "
+           "even with the role guard removed).";
+    // Reset the cleaned watermark to 0 so the WHOLE below-HW range is dirty and
+    // the ratio gate would clearly fire if the role guard were absent.
+    raw->setLastCleanOffset(0);
 
     const int recordsMidpoint = cp6CountLiveRecords(log);
     int totalFollowerWork = 0;
@@ -814,11 +833,12 @@ TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
 
     const int recordsAfterFollower = cp6CountLiveRecords(log);
 
-    // (a) doWork must return 0 for ALL Follower cycles.
+    // (a) doWork must return 0 for ALL Follower cycles — the role guard, not the
+    //     hw==0 short-circuit, is what stops compaction now.
     EXPECT_EQ(totalFollowerWork, 0)
-        << "Follower must produce ZERO compaction work over 20 cycles; "
-           "got totalFollowerWork=" << totalFollowerWork
-        << ". Removing BOTH leader-role guards will reproduce this failure.";
+        << "Follower must produce ZERO compaction work over 20 cycles (hw>0, real "
+           "cleanable range); got totalFollowerWork=" << totalFollowerWork
+        << ". Removing the Phase-1 leader-role guard reproduces this failure.";
 
     // (b) Record count must be UNCHANGED since demotion.
     EXPECT_EQ(recordsAfterFollower, recordsMidpoint)
@@ -829,6 +849,131 @@ TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
     auto basesAfter = log.segmentBaseOffsets();
     EXPECT_EQ(basesAfter.size(), log.segmentBaseOffsets().size())
         << "Follower must not change segment count";
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// TEST 7: SwapRingFullDoesNotLoseCompaction (SPSC-overflow / #5 regression)
+//
+// The swap ring (Log's SPSC ring between the cleaner thread and the append
+// thread) has finite capacity (Log::kSwapRingCapacity = 1024).  If
+// enqueueCleanedSegment() fails because the ring is full, the cleaner MUST NOT
+// advance lastCleanOffset — otherwise the just-compacted segment would be
+// compacted-on-disk but never installed into segments_ AND never re-selected
+// (silent data loss / divergence).
+//
+// Forcing a real 1024-deep overflow through the agent would require >1024 sealed
+// segments and an O(N^2) rescan — far too slow for CI.  Instead we PRE-FILL the
+// ring by calling enqueueCleanedSegment() directly with harmless (nonexistent)
+// bases until it returns false, so the agent's own enqueue is guaranteed to
+// fail on its next compaction.  Then we assert the watermark-safety contract:
+//
+//   (a) With a saturated ring, the cleaner's enqueue fails → doWork returns 0
+//       AND lastCleanOffset is NOT advanced (the segment stays dirty).
+//   (b) After draining the ring (freeing slots), the SAME segment is re-selected,
+//       re-enqueued, drained, and INSTALLED → live record count drops.
+//   (c) No divergence: segment list stays strictly ascending; records readable.
+//
+// Non-vacuousness: if the fix were reverted (advance the watermark even on a
+// failed enqueue), assertion (a) would fail (lastCleanOffset would jump to
+// segEnd) and the dropped swap would be skipped forever, so (b)'s record-count
+// drop would not occur.
+// ===========================================================================
+TEST(CompactionCleanerAgent, SwapRingFullDoesNotLoseCompaction) {
+    auto dir = cp6TempDir("cp6_ring_full");
+    // Moderate roll → a handful of sealed segments (cheap to scan).
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(960, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+
+    for (int v = 0; v < 200; ++v) {
+        auto b = cp6Batch(v, "hot", "v" + std::to_string(v));  // one hot key
+        log.append(b, v);
+    }
+    replica->onLeaderLogAppended();
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u) << "Need several sealed segments";
+    const int totalBefore = cp6CountLiveRecords(log);
+
+    PartitionReplica* raw = replica.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(960, 0, std::move(replica));
+
+    rune::node::LogCleanerAgent cleaner(&registry);
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // -----------------------------------------------------------------------
+    // Phase 1: SATURATE the swap ring directly (no drain) so the agent's next
+    //          enqueue is forced to fail.  Enqueue harmless sentinel bases
+    //          (offsets that don't exist as segments): drainCleanerSwaps →
+    //          reloadSegment() is a no-op for an unknown base, so these sentinels
+    //          are safely absorbed when drained.
+    // -----------------------------------------------------------------------
+    int prefilled = 0;
+    while (log.enqueueCleanedSegment(/*sentinel base=*/-100 - prefilled)) {
+        ++prefilled;
+        if (prefilled > 100000) break; // safety
+    }
+    ASSERT_GT(prefilled, 0) << "Ring must accept some entries before saturating";
+    // The ring is now full — the next enqueue (from the agent) must fail.
+    ASSERT_FALSE(log.enqueueCleanedSegment(-1))
+        << "Ring must be saturated (next enqueue fails)";
+
+    const int64_t watermarkBefore = raw->lastCleanOffset();
+
+    // Run cleaner cycles while the ring is full.  Each produces a cleaned file
+    // but the enqueue fails, so doWork must return 0 and NOT advance the
+    // watermark (the SPSC-overflow fix).
+    int workWhileFull = 0;
+    for (int i = 0; i < 5; ++i) {
+        workWhileFull += cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+    }
+
+    // (a) No work reported and watermark unchanged while the ring was full.
+    EXPECT_EQ(workWhileFull, 0)
+        << "Cleaner must report 0 work when every enqueue fails (ring full)";
+    EXPECT_EQ(raw->lastCleanOffset(), watermarkBefore)
+        << "Watermark must NOT advance on a failed enqueue (else the swap is "
+           "lost forever); before=" << watermarkBefore
+        << " after=" << raw->lastCleanOffset();
+
+    // -----------------------------------------------------------------------
+    // Phase 2: drain the ring (absorbs the sentinels + frees slots), then run
+    //          cleaner + drain to completion.  The previously-dropped segment is
+    //          re-selected and installed → the record count drops.
+    // -----------------------------------------------------------------------
+    dutyCycleAgent.doWork(1'000'000'000LL);   // drain the saturated ring (sentinels)
+
+    for (int i = 0; i < static_cast<int>(bases.size()) + 20; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 2000) * 1'000'000LL);
+        dutyCycleAgent.doWork(static_cast<int64_t>(i + 2000) * 1'000'000LL);
+    }
+
+    log.reloadSegments();
+    const int totalAfter = cp6CountLiveRecords(log);
+
+    // (b) Compaction was EVENTUALLY installed despite the earlier ring overflow.
+    EXPECT_LT(totalAfter, totalBefore)
+        << "Compaction must be installed after the ring drains; "
+           "before=" << totalBefore << " after=" << totalAfter;
+
+    // (c) No divergence: segment list strictly ascending.
+    auto finalBases = log.segmentBaseOffsets();
+    ASSERT_FALSE(finalBases.empty());
+    for (size_t i = 1; i < finalBases.size(); ++i) {
+        EXPECT_LT(finalBases[i - 1], finalBases[i])
+            << "Segment bases must be strictly ascending after retry drains";
+    }
 
     fs::remove_all(dir);
 }

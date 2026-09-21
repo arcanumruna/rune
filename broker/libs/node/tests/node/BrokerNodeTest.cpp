@@ -404,7 +404,9 @@ TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
 
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
 
-    // Add one compact topic.
+    // Add one compact topic with a SMALL segment roll so a modest number of
+    // appends forms multiple sealed segments (Issue #7 fix — the old smoke test
+    // was vacuous because it could not form >1 segment at the 64 MiB prod roll).
     TopicSpec ts;
     ts.name                  = "smoke-compact";
     ts.partitionCount        = 1;
@@ -412,6 +414,7 @@ TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
     ts.cleanupPolicy         = TopicSpec::CleanupPolicy::Compact;
     ts.minCleanableDirtyRatio = 0.0;    // compact immediately (no threshold)
     ts.deleteRetentionMs     = 86'400'000LL;
+    ts.segmentRollBytes      = 128;     // tiny roll → many sealed segments fast
     cfg.topics               = {ts};
 
     BrokerNode node{cfg};
@@ -420,44 +423,88 @@ TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
     ASSERT_TRUE(node.awaitLeader(3s))
         << "CP-6 smoke: node must self-elect within 3 s";
 
-    // Reach into the log via topicRegistryForTest().
+    // Reach into the log + replica via the test hooks.
     rune::gateway::TopicRegistry* tr = node.topicRegistryForTest();
     ASSERT_NE(tr, nullptr) << "TopicRegistry must be wired";
 
     rune::storage::Log* log = tr->log(/*topicId=*/0, /*partition=*/0);
     ASSERT_NE(log, nullptr) << "Log for topic 0 partition 0 must exist";
 
-    // Append many records (same key) to create multiple sealed segments.
-    // Use a small roll size? No — the Log's roll size is the default (64 MiB).
-    // We'll append enough to cause several rolls at 64 MiB, but that's too slow.
-    // Instead, call log->recover() then use log->append() which is the direct path.
-    // Since we cannot change the roll size after construction, we write enough
-    // small batches to at least create 2+ segments by filling 64 MiB.  That
-    // would require too much I/O for a smoke test.
-    //
-    // BLOCKER: The production Log roll size is 64 MiB — creating multiple segments
-    // inline would require writing > 64 MiB.  This is not feasible as a unit smoke
-    // test.  We instead verify that the cleaner IS WIRED (started + not crashed)
-    // by checking the node stops cleanly and the cleaner runner was constructed.
-    //
-    // For a full compaction end-to-end smoke, see CompactionCleanerAgentTest which
-    // uses rollBytes=128 to create multiple segments in < 1 s.
-    //
-    // Here we verify: node starts, cleaner agent doesn't crash, node stops cleanly.
-    // The full compaction behavior is verified by CompactionCleanerAgentTest.
+    rune::replication::PartitionReplica* replica =
+        node.replicaForTest(/*topicId=*/0, /*partition=*/0);
+    ASSERT_NE(replica, nullptr) << "PartitionReplica for topic 0 must exist";
 
-    // Give the cleaner a moment to run (it starts with the node).
-    std::this_thread::sleep_for(200ms);
+    // Helper: count live records across all segments.
+    auto countLive = [](rune::storage::Log& l) {
+        int count = 0;
+        auto bases = l.segmentBaseOffsets();
+        if (bases.empty()) return 0;
+        int64_t cursor = 0;
+        for (size_t si = 0; si < bases.size(); ++si) {
+            int64_t segEnd = (si + 1 < bases.size())
+                ? bases[si + 1] : std::numeric_limits<int64_t>::max();
+            if (cursor < bases[si]) cursor = bases[si];
+            for (;;) {
+                auto bytes = l.read(cursor, 1 << 20);
+                if (bytes.empty()) break;
+                rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+                if (!r.ensureValid()) break;
+                bool advanced = false;
+                r.forEach([&](std::string_view, std::string_view, int64_t off, int64_t) {
+                    ++count; cursor = off + 1; advanced = true;
+                });
+                if (!advanced || cursor >= segEnd) break;
+            }
+        }
+        return count;
+    };
 
-    // node.stop() must complete cleanly — if the cleaner thread crashes or
-    // deadlocks, stopAndJoin() would hang and the test would time out.
+    // Append many records for ONE hot key so compaction has real work.  These
+    // appends happen while the cleaner is idle (replica HW is still 0 — nothing
+    // is cleanable yet), so no other thread mutates segments_ concurrently.
+    constexpr int kRecords = 300;
+    for (int v = 0; v < kRecords; ++v) {
+        rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
+        std::string val = "v" + std::to_string(v);
+        b.append(std::string_view("hot"), std::string_view(val), 1000);
+        auto batch = b.build();
+        log->append(batch, v);
+    }
+    // Advance the leader HW to the LEO so the cleaner sees a cleanable range.
+    // (single-node ISR → HW == LEO after this call).
+    replica->onLeaderLogAppended();
+
+    auto bases = log->segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u)
+        << "Small roll must form multiple sealed segments; got " << bases.size();
+    const int before = countLive(*log);
+    ASSERT_GT(before, 0);
+
+    // Give the cleaner agent (running on its own thread inside the node) time to
+    // compact + the duty cycle to drain the swaps.  We deliberately do NOT read
+    // the log from the test thread while the node is live: constructing a second
+    // Log handle on the same directory races with the cleaner's atomic .log
+    // rename (a segment file is momentarily absent mid-rename).  Instead we wait
+    // a bounded interval, STOP the node (quiescing all writers), then read once.
+    const std::string logDir = log->dir();
+    std::this_thread::sleep_for(2s);
+
+    // Stop the node — quiesces the cleaner + duty-cycle threads.  A hung cleaner
+    // would surface here as a stop-timeout.
     using sclock = std::chrono::steady_clock;
-    const auto before = sclock::now();
+    const auto beforeStop = sclock::now();
     node.stop();
-    const auto elapsed = sclock::now() - before;
-
-    EXPECT_LT(elapsed, 5s)
+    EXPECT_LT(sclock::now() - beforeStop, 5s)
         << "BrokerNode stop() must complete within 5 s with cleaner agent running";
+
+    // Race-free on-disk verification with no live node (single reader).
+    rune::storage::Log finalLog(logDir, 128);
+    finalLog.recover();
+    const int after = countLive(finalLog);
+    EXPECT_LT(after, before)
+        << "CP-6 smoke: LogCleanerAgent (running in the node) must compact the "
+           "hot-key topic — compacted live count (" << after
+        << ") must be < pre-compaction count (" << before << ")";
 }
 
 } // namespace rune::node
