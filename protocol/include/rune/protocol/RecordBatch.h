@@ -261,6 +261,10 @@ public:
     int32_t recordCount()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kRecordCountOffset)); }
     int32_t totalLength()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kLengthOffset)) + 12; }
     int64_t baseTimestamp()   const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kBaseTimestampOffset)); }
+    /// The maximum record timestamp in this batch (wall-clock ms or ns, as written).
+    /// For a horizon-stamped batch this reflects the actual max record ts, not the
+    /// horizon — the horizon is only in baseTimestamp when hasDeleteHorizon() is true.
+    int64_t maxTimestamp()    const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kMaxTimestampOffset)); }
     int64_t producerId()      const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kProducerIdOffset)); }
     int16_t producerEpoch()   const { return static_cast<int16_t>(detail::getLE16(d_ + batch::kProducerEpochOffset)); }
     /// baseSequence: first sequence number in this batch (LE int32 at offset 53).
@@ -302,7 +306,26 @@ public:
 
     void forEach(const std::function<void(std::string_view,std::string_view,int64_t,int64_t)>& fn) const {
         size_t pos = batch::kRecordBatchOverhead;
-        int64_t base = baseOffset(); int64_t baseTs = baseTimestamp();
+        int64_t base = baseOffset();
+        // CP-8 Fix 2: KIP-534 delete-horizon gating.
+        //
+        // When hasDeleteHorizon() is true, baseTimestamp() carries the DELETE HORIZON
+        // (epoch-ms), NOT the real batch base timestamp — the original base ts was
+        // overwritten by the encoder.  Per-record tsDelta values are relative to the
+        // ORIGINAL baseTimestamp, but since that value is gone, computing
+        // baseTimestamp()+tsDelta would yield (horizon+tsDelta), which is WRONG.
+        //
+        // KIP-534 faithful behavior (matches Kafka's LogValidator / RecordBatch):
+        //   A compacted tombstone batch with a horizon stamp reports maxTimestamp()
+        //   as the batch-level timestamp.  We expose maxTimestamp() as the record
+        //   timestamp for every record in a horizon-stamped batch — the real per-record
+        //   wall-clock timestamps are not recoverable from the wire format once the
+        //   horizon overwrites baseTimestamp.
+        //
+        // Non-horizon batches: unchanged — use baseTimestamp()+tsDelta as before.
+        const bool horizonStamped = hasDeleteHorizon();
+        const int64_t batchTs = horizonStamped ? maxTimestamp() : baseTimestamp();
+
         for (int32_t i = 0; i < recordCount(); ++i) {
             (void)readVarint(d_, pos);            // record length
             ++pos;                                // attributes
@@ -315,7 +338,11 @@ public:
             std::string_view val(reinterpret_cast<const char*>(d_ + pos), vlen<0?0:vlen);
             if (vlen > 0) pos += vlen;
             int32_t hcount = readVarint(d_, pos); (void)hcount; // Phase 1: headers unused
-            fn(key, val, base + offDelta, baseTs + tsDelta);
+            // For horizon-stamped batches, batchTs == maxTimestamp() (tsDelta ignored).
+            // For normal batches, batchTs == baseTimestamp() and tsDelta restores the
+            // original per-record timestamp.
+            const int64_t recordTs = horizonStamped ? batchTs : (batchTs + tsDelta);
+            fn(key, val, base + offDelta, recordTs);
         }
     }
 

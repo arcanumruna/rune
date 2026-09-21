@@ -735,3 +735,151 @@ TEST(DeleteHorizon, ConformanceGoldenVector) {
     ASSERT_EQ(got, encoded.size());
     EXPECT_EQ(readBack, encoded) << "Golden vector file differs from encoded bytes";
 }
+
+// ===========================================================================
+// CP-8 Fix 2: forEach horizon-timestamp gating
+//
+// When hasDeleteHorizon() is true, baseTimestamp() holds the delete HORIZON
+// (epoch-ms), not the real batch base timestamp.  forEach must NOT derive
+// per-record timestamps from baseTimestamp() on a horizon-stamped batch —
+// that would yield horizon-epoch values instead of real record timestamps.
+//
+// KIP-534 faithful behavior: the real base timestamp was overwritten by the
+// horizon so per-record wall-clock timestamps are not recoverable via the
+// tsDelta field.  forEach must expose maxTimestamp() as the record timestamp
+// for every record in a horizon-stamped batch.
+//
+// NON-VACUOUS: with the OLD code (baseTs + tsDelta always), the ts returned
+// by forEach on a horizon batch is:
+//   horizonMs + tsDelta  (e.g. 99999 + 0 = 99999 for the first record)
+// which equals horizonMs — NOT recordTs.  The test below asserts ts == recordTs
+// and ts != horizonMs, which FAILS against the unpatched code.
+// ===========================================================================
+
+// CP-8: forEach on a horizon-stamped batch must NOT yield the horizon epoch
+// as a record timestamp.  It must yield maxTimestamp() instead.
+// Non-vacuous: removing the horizon gate in forEach makes the ts equal to
+// horizonMs (the old code path), causing all three EXPECT_* below to fail.
+TEST(DeleteHorizon, ForEachDoesNotYieldHorizonAsTimestamp) {
+    using namespace rune::protocol;
+
+    // Construct a horizon-stamped batch with a CLEARLY DISTINCT horizon vs record ts.
+    constexpr int64_t kHorizonMs  = 99999LL;   // delete horizon (far future epoch-ms)
+    constexpr int64_t kRecordTs   = 12345LL;   // actual record wall-clock timestamp
+    constexpr int64_t kBaseOffset = 42LL;
+
+    RecordBatchBuilder b(kBaseOffset, kRecordTs);
+    b.setDeleteHorizonMs(kHorizonMs);
+    b.append("key", "val", kRecordTs);
+    auto batch = b.build();
+
+    RecordBatchReader r(batch.data(), batch.size());
+    ASSERT_TRUE(r.ensureValid());
+    ASSERT_TRUE(r.hasDeleteHorizon())
+        << "Precondition: batch must have the delete-horizon bit set.";
+
+    // Verify the fields are what we expect.
+    EXPECT_EQ(r.baseTimestamp(),  kHorizonMs)
+        << "baseTimestamp() must carry the horizon (CONTRACT).";
+    EXPECT_EQ(r.maxTimestamp(),   kRecordTs)
+        << "maxTimestamp() must carry the actual record timestamp.";
+    EXPECT_EQ(r.deleteHorizonMs(), kHorizonMs);
+
+    // Now invoke forEach and check the timestamp passed to the callback.
+    int recordsVisited = 0;
+    int64_t observedTs = -1;
+    r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t ts) {
+        EXPECT_EQ(std::string(k), "key")   << "key mismatch";
+        EXPECT_EQ(std::string(v), "val")   << "value mismatch";
+        EXPECT_EQ(off, kBaseOffset)        << "offset mismatch";
+        observedTs = ts;
+        ++recordsVisited;
+    });
+    ASSERT_EQ(recordsVisited, 1) << "Expected exactly one record in the batch.";
+
+    // The timestamp yielded to the callback MUST be maxTimestamp (kRecordTs),
+    // NOT the horizon (kHorizonMs).
+    //
+    // With the OLD unpatched forEach (baseTs + tsDelta always):
+    //   ts = baseTimestamp() + tsDelta = kHorizonMs + 0 = kHorizonMs = 99999
+    //   => EXPECT_NE(observedTs, kHorizonMs) FAILS  [non-vacuous]
+    //   => EXPECT_EQ(observedTs, kRecordTs)  FAILS  [non-vacuous]
+    //
+    // With the FIXED forEach (use maxTimestamp() for horizon batches):
+    //   ts = maxTimestamp() = kRecordTs = 12345
+    //   => both assertions PASS.
+    EXPECT_NE(observedTs, kHorizonMs)
+        << "forEach on a horizon-stamped batch must NOT yield the horizon epoch ("
+        << kHorizonMs << ") as a record timestamp; got ts=" << observedTs
+        << ".  The OLD code path (baseTs+tsDelta) would yield horizonMs here.";
+    EXPECT_EQ(observedTs, kRecordTs)
+        << "forEach on a horizon-stamped batch must yield maxTimestamp() ("
+        << kRecordTs << ") as the record timestamp; got ts=" << observedTs << ".";
+}
+
+// CP-8: multi-record horizon batch — every record gets maxTimestamp(), not
+// horizon+tsDelta.  Also verifies offsets and keys are still correct.
+TEST(DeleteHorizon, ForEachMultiRecordHorizonBatchUsesMaxTimestamp) {
+    using namespace rune::protocol;
+
+    constexpr int64_t kHorizonMs  = 1000000LL;
+    constexpr int64_t kBaseTs     = 500LL;
+    constexpr int64_t kBaseOffset = 10LL;
+    // Three records at timestamps 500, 600, 700. maxTimestamp = 700.
+    constexpr int64_t kMaxTs = 700LL;
+
+    RecordBatchBuilder b(kBaseOffset, kBaseTs);
+    b.setDeleteHorizonMs(kHorizonMs);
+    b.append("k0", "v0", 500LL);
+    b.append("k1", "v1", 600LL);
+    b.append("k2", "v2", 700LL);
+    auto batch = b.build();
+
+    RecordBatchReader r(batch.data(), batch.size());
+    ASSERT_TRUE(r.ensureValid());
+    ASSERT_TRUE(r.hasDeleteHorizon());
+    EXPECT_EQ(r.maxTimestamp(), kMaxTs);
+    EXPECT_EQ(r.baseTimestamp(), kHorizonMs);
+
+    // Every record's ts must be maxTimestamp() (kMaxTs), not horizon+tsDelta.
+    int idx = 0;
+    r.forEach([&](std::string_view k, std::string_view /*v*/, int64_t off, int64_t ts) {
+        EXPECT_EQ(off, kBaseOffset + idx) << "record " << idx;
+        EXPECT_EQ(std::string(k), "k" + std::to_string(idx)) << "record " << idx;
+        EXPECT_EQ(ts, kMaxTs)
+            << "forEach on horizon batch must yield maxTimestamp()=" << kMaxTs
+            << " for every record; got ts=" << ts << " for record " << idx
+            << ".  Old code would yield kHorizonMs+tsDelta=" << (kHorizonMs + idx*100);
+        ++idx;
+    });
+    EXPECT_EQ(idx, 3);
+}
+
+// CP-8: Non-horizon batch forEach is UNCHANGED — still uses baseTimestamp()+tsDelta.
+// Regression guard: the fix must NOT break the non-horizon forEach path.
+TEST(DeleteHorizon, ForEachNonHorizonBatchUnchanged) {
+    using namespace rune::protocol;
+
+    constexpr int64_t kBaseTs    = 2000LL;
+    constexpr int64_t kBaseOffset = 5LL;
+
+    RecordBatchBuilder b(kBaseOffset, kBaseTs);
+    // No setDeleteHorizonMs call — plain batch.
+    b.append("a", "1", kBaseTs + 0);
+    b.append("b", "2", kBaseTs + 10);
+    b.append("c", "3", kBaseTs + 25);
+    auto batch = b.build();
+
+    RecordBatchReader r(batch.data(), batch.size());
+    ASSERT_TRUE(r.ensureValid());
+    ASSERT_FALSE(r.hasDeleteHorizon()) << "Non-horizon batch must have bit clear.";
+
+    std::vector<int64_t> tsSeen;
+    r.forEach([&](std::string_view, std::string_view, int64_t, int64_t ts) {
+        tsSeen.push_back(ts);
+    });
+    ASSERT_EQ(tsSeen.size(), 3u);
+    EXPECT_EQ(tsSeen[0], kBaseTs + 0)  << "Non-horizon: tsDelta path must still work.";
+    EXPECT_EQ(tsSeen[1], kBaseTs + 10) << "Non-horizon: tsDelta path must still work.";
+    EXPECT_EQ(tsSeen[2], kBaseTs + 25) << "Non-horizon: tsDelta path must still work.";
+}
