@@ -280,11 +280,6 @@ int TransactionalProducerImpl::doWork(
             const bool commit = (cmd.kind == CmdKind::EndTxnCommit);
             const int64_t corrId =
                 nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-            {
-                std::lock_guard<std::mutex> lk(pendingSendsMtx_);
-                fprintf(stderr, "CLIENTDBG EndTxn about-to-send commit=%d pendingSendsRemaining=%zu inFlightProduce=%zu\n",
-                        commit ? 1 : 0, pendingSends_.size(), pendingProduceBatches_.size());
-            }
 
             if (sendEndTxn(sessionId, corrId, (cmd.kind == CmdKind::EndTxnCommit), sendFn)) {
                 PendingTxnOp op;
