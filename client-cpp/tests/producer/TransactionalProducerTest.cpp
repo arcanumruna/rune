@@ -1187,3 +1187,173 @@ TEST_F(TransactionalProducerTest, CommitFailsWhenProduceBatchTimesOut)
     EXPECT_FALSE(tp.transactionActive())
         << "the poisoned txn must no longer be active";
 }
+
+// ===========================================================================
+// Test 14: TX-6b BeginTransactionClearsPoisonFlag  (stuck-latch regression)
+//
+//   The stuck-latch scenario (without the fix):
+//     1. TXN-1 is active.  A Produce batch times out → sweepTimedOut() sets
+//        txnFailed_=true.  No commitTransaction() is called, so the EndTxn
+//        poison-check path (which already resets txnFailed_) is never reached.
+//     2. The app abandons TXN-1 (e.g. catches an error and retries).
+//     3. beginTransaction() is called for TXN-2.  Without the fix,
+//        beginTransaction() does NOT clear txnFailed_ — it is still true.
+//     4. TXN-2 sends a record that is promptly acked.
+//     5. commitTransaction() runs: txnFailed_=true && cmd==EndTxnCommit →
+//        SPURIOUS poison exception.  Producer must be reconstructed to recover.
+//
+//   With the fix:
+//     beginTransaction() resets txnFailed_=false (and addedPartitions_), so
+//     TXN-2's commit succeeds normally.
+//
+//   RED trigger: remove the `txnFailed_ = false` line from beginTransaction().
+//   GREEN criterion: TXN-2's commit resolves successfully + EndTxn(commit=1)
+//     was emitted on the wire.
+//
+//   The test also validates the EndTxn send-failure branch fix: the impl
+//   aborts TXN-1 via a failing send (sink.returnOk=false during EndTxn), which
+//   exercises the else-branch added by Fix 2.  Without Fix 2, txnActive_ would
+//   remain true after the send failure, leaving the producer wedged.
+// ===========================================================================
+TEST_F(TransactionalProducerTest, BeginTransactionClearsPoisonFlag)
+{
+    CaptureSink sink;
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;  // expire in-flight batches quickly
+    auto impl = makeImpl("poison-reset-txn-id", cfg);
+    TransactionalProducer tp(impl);
+
+    // ---- Acquire producer identity ------------------------------------------
+    {
+        auto fut = tp.initTransactions();
+        impl->doWork(kSessionId, sink.fn());
+        ASSERT_GE(sink.frames.size(), 1u);
+        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
+        ASSERT_TRUE(opt.has_value());
+        auto resp = makeInitProducerIdResponse(opt->correlationId, /*pid=*/42, /*epoch=*/0);
+        impl->onInitProducerIdResponse(resp.data(), resp.size());
+        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
+        sink.clear();
+    }
+
+    // ---- TXN-1: produce a batch, let it time out (sets txnFailed_) ----------
+    // We do NOT call commitTransaction() here — the app abandons TXN-1 without
+    // going through the poison-check path, so txnFailed_ is left dirty.
+    tp.beginTransaction();
+
+    TopicHandle topic{5, 1};
+    Key key(uint64_t{0});
+    const std::vector<uint8_t> val = {0xDE, 0xAD};
+
+    tp.send(topic, key, std::span<const uint8_t>(val));
+    // NO commitTransaction() — batch will just time out.
+
+    // First doWork: drains the send into an in-flight batch.
+    impl->doWork(kSessionId, sink.fn());
+    sink.clear();
+
+    // Wait for the batch to time out, then tick doWork to run sweepTimedOut().
+    // After this tick: txnFailed_=true (set by sweepTimedOut), txnActive_=true.
+    std::this_thread::sleep_for(40ms);
+    impl->doWork(kSessionId, sink.fn());  // sweeps expired batch → txnFailed_=true
+    sink.clear();
+
+    // txnActive_ is still true (no EndTxn was issued).  Now the app "abandons"
+    // TXN-1: exercises the EndTxn send-failure path (Fix 2) by attempting an
+    // abort with a failing transport.  This leaves txnActive_=false (with Fix 2).
+    {
+        sink.returnOk = false;  // make the EndTxn send fail
+        auto abortFut = tp.abortTransaction();
+        impl->doWork(kSessionId, sink.fn());  // EndTxn send fails → else-branch
+        sink.returnOk = true;
+
+        // With Fix 2: txnActive_=false, txnFailed_=false after the else-branch.
+        // The abort future must be resolved (with exception: send failed).
+        ASSERT_EQ(abortFut.wait_for(0s), std::future_status::ready)
+            << "TXN-1 abort: future must resolve after EndTxn send failure";
+        EXPECT_THROW(abortFut.get(), std::runtime_error)
+            << "TXN-1 abort: must throw on transport send failure";
+        // Fix 2 guarantees txnActive_ is false now.
+        EXPECT_FALSE(tp.transactionActive())
+            << "TXN-1: txnActive_ must be false after EndTxn send failure (Fix 2)";
+        sink.clear();
+    }
+
+    // Now deliberately SET txnFailed_ again to simulate it being dirty —
+    // the only way to do this in the in-process harness is to begin a new txn,
+    // send + timeout again, without issuing any EndTxn.
+    tp.beginTransaction();
+    tp.send(topic, key, std::span<const uint8_t>(val));
+    impl->doWork(kSessionId, sink.fn());   // Produce in-flight
+    sink.clear();
+    std::this_thread::sleep_for(40ms);
+    impl->doWork(kSessionId, sink.fn());   // sweepTimedOut → txnFailed_=true (again)
+    sink.clear();
+    // txnFailed_=true, txnActive_=true — this is the stuck-latch state.
+
+    // ---- TXN-2: beginTransaction() MUST clear txnFailed_ --------------------
+    // Without Fix 1 (beginTransaction reset), txnFailed_ stays true.
+    // With Fix 1, txnFailed_ is cleared and the subsequent healthy commit works.
+    tp.beginTransaction();
+    EXPECT_TRUE(tp.transactionActive());
+
+    tp.send(topic, key, std::span<const uint8_t>(val));
+    auto commitFut2 = tp.commitTransaction();
+
+    // First doWork for TXN-2: emits Produce, defers EndTxn.
+    impl->doWork(kSessionId, sink.fn());
+
+    std::vector<int64_t> prodCorrIds;
+    for (const auto& f : sink.frames) {
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
+            auto opt = rpc::Produce::decode(f.data(), f.size());
+            ASSERT_TRUE(opt.has_value());
+            prodCorrIds.push_back(opt->correlationId);
+        }
+    }
+    ASSERT_EQ(prodCorrIds.size(), 1u) << "TXN-2: exactly one Produce frame expected";
+    sink.clear();
+
+    // Ack the Produce batch.
+    {
+        auto ack = makeProduceResponse(prodCorrIds[0], /*errorCode=*/0, /*baseOffset=*/10);
+        impl->onProduceResponse(ack.data(), ack.size(), sink.fn());
+    }
+    sink.clear();
+
+    // Next doWork: all batches acked → EndTxn(commit=1) MUST be emitted.
+    // Without Fix 1: txnFailed_=true → EndTxn is NOT sent; commitFut2 fails with
+    // "commit aborted — a data batch was not durably acknowledged" (spurious).
+    impl->doWork(kSessionId, sink.fn());
+
+    bool endTxnSent = false;
+    int64_t endTxnCorrId = 0;
+    for (const auto& f : sink.frames) {
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
+            endTxnSent = true;
+            auto opt = rpc::EndTxn::decode(f.data(), f.size());
+            ASSERT_TRUE(opt.has_value());
+            endTxnCorrId = opt->correlationId;
+            EXPECT_EQ(opt->commit, uint8_t{1})
+                << "TXN-2: EndTxn must be a COMMIT — not a stuck-poison refusal";
+            break;
+        }
+    }
+    ASSERT_TRUE(endTxnSent)
+        << "TXN-2: EndTxn(commit=1) must be emitted. "
+           "FAIL here = beginTransaction() did NOT clear txnFailed_ (stuck-latch).";
+
+    // Feed EndTxnResponse → commit future must resolve successfully.
+    {
+        auto resp = makeEndTxnResponse(endTxnCorrId, /*errorCode=*/0);
+        impl->onEndTxnResponse(resp.data(), resp.size());
+    }
+
+    ASSERT_EQ(commitFut2.wait_for(0s), std::future_status::ready)
+        << "TXN-2: commit future must resolve after EndTxnResponse";
+    EXPECT_NO_THROW(commitFut2.get())
+        << "TXN-2: commit must SUCCEED — beginTransaction() cleared txnFailed_ (Fix 1). "
+           "A throw here means the stuck-poison latch was NOT fixed.";
+    EXPECT_FALSE(tp.transactionActive())
+        << "TXN-2: txn must be inactive after successful commit";
+}

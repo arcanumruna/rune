@@ -97,6 +97,13 @@ std::future<void> TransactionalProducerImpl::submitInitTransactions()
 
 void TransactionalProducerImpl::beginTransaction()
 {
+    // TX-6b (stuck-poison fix): defensively reset per-txn state so that a new
+    // transaction always starts clean regardless of how the prior one unwound.
+    // Without this, a txnFailed_=true left over from a prior txn whose EndTxn
+    // transport-send failed would cause the NEXT transaction's commitTransaction()
+    // to hit the poison check and fail spuriously — a stuck latch.
+    txnFailed_        = false;
+    addedPartitions_.clear();
     txnActive_.store(true, std::memory_order_release);
 }
 
@@ -350,6 +357,13 @@ int TransactionalProducerImpl::doWork(
                         std::make_exception_ptr(
                             std::runtime_error("EndTxn: transport send failed")));
                 } catch (...) {}
+                // TX-6b (stuck-poison fix): a send failure still ends the txn —
+                // clean up all per-txn state so the producer is immediately
+                // usable for a new beginTransaction() without the stuck-poison
+                // latch that would occur if txnFailed_ were left set.
+                txnActive_.store(false, std::memory_order_release);
+                addedPartitions_.clear();
+                txnFailed_ = false;
             }
             break;
         }
