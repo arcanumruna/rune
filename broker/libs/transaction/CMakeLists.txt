@@ -2,7 +2,8 @@ add_library(rune_transaction
     src/TransactionCoordinator.cpp
     src/TransactionLog.cpp
     src/ControlMarker.cpp
-    src/ReadCommittedView.cpp)
+    src/ReadCommittedView.cpp
+    src/ReplicatedTxnStateStore.cpp)
 target_include_directories(rune_transaction PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE})
@@ -51,9 +52,11 @@ if(BUILD_TESTING)
         tests/transaction/TransactionMessagesTest.cpp
         tests/transaction/ControlMarkerTest.cpp
         tests/transaction/ReadCommittedViewTest.cpp
-        tests/transaction/ControlBatchBeFormatTest.cpp)
+        tests/transaction/ControlBatchBeFormatTest.cpp
+        tests/transaction/ReplicatedTxnStateStoreTest.cpp)
     target_link_libraries(rune_transaction_tests PRIVATE
         rune_transaction
+        rune_replication
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_transaction_tests)
