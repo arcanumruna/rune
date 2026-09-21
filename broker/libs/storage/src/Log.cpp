@@ -239,4 +239,24 @@ int Log::deleteOldSegments(int64_t retainBytes) {
     }
     return deleted;
 }
+
+void Log::enqueueCleanedSegment(int64_t base) {
+    std::lock_guard<std::mutex> lk(pendingSwapsMu_);
+    pendingSwaps_.push_back(base);
+}
+
+int Log::drainCleanerSwaps() {
+    // Grab pending bases under lock, then process outside the lock on the
+    // single-writer append thread (reloadSegment modifies segments_).
+    std::vector<int64_t> toProcess;
+    {
+        std::lock_guard<std::mutex> lk(pendingSwapsMu_);
+        toProcess.swap(pendingSwaps_);
+    }
+    for (int64_t base : toProcess) {
+        reloadSegment(base);
+    }
+    return static_cast<int>(toProcess.size());
+}
+
 } // namespace rune::storage

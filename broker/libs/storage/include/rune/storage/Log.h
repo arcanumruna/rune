@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 namespace rune::storage {
 
@@ -70,10 +71,43 @@ public:
     /// called for the active segment and does NOT change logEndOffset_ (sealed-
     /// segment rewrites never move the LEO).
     void reloadSegment(int64_t baseOffset);
+
+    /// CP-6: Size in bytes of the segment with the given base offset.
+    /// Returns 0 if the segment is not found.  Thread-safe: reads only immutable
+    /// metadata (sizeBytes is updated on the append thread; sealed segments are
+    /// immutable).
+    int64_t segmentSize(int64_t base) const noexcept {
+        auto it = segments_.find(base);
+        return (it != segments_.end()) ? it->second->sizeBytes() : 0;
+    }
+
+    /// CP-6: Enqueue a cleaner-rewritten segment base for atomic swap on the
+    /// append/duty-cycle thread.  Called by LogCleanerAgent (cleaner thread)
+    /// after atomically renaming <base>.log.new → <base>.log on disk.
+    /// The actual in-memory reload is deferred to drainCleanerSwaps() which
+    /// runs on the single-writer append thread — so no lock is needed on the
+    /// segment map.  Thread-safe: enqueue is protected by pendingSwapsMu_.
+    void enqueueCleanedSegment(int64_t base);
+
+    /// CP-6: Drain pending cleaner swaps on the single-writer append/duty-cycle
+    /// thread.  Called once per duty cycle from NodeRuntimeAgent::doWork.
+    /// For each pending base calls reloadSegment(base) to atomically update the
+    /// in-memory segment map.  The superseded LogSegment is freed here (the map
+    /// slot is on the append thread; no reader can hold it after this call since
+    /// all reads also happen on the append thread — single-writer invariant).
+    /// Returns number of swaps processed (>0 = work done).
+    int drainCleanerSwaps();
+
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     std::map<int64_t, std::unique_ptr<LogSegment>> segments_;
+
+    // CP-6: pending cleaner swaps.  Enqueued by the cleaner thread; drained on
+    // the append/duty-cycle thread.  The mutex guards only the vector; the actual
+    // reloadSegment() call happens OUTSIDE the lock on the single-writer thread.
+    mutable std::mutex   pendingSwapsMu_;
+    std::vector<int64_t> pendingSwaps_;
 };
 } // namespace rune::storage
