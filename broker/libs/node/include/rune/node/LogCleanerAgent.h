@@ -25,31 +25,44 @@
 //   firstUncleanable = min(activeSegmentBase, highWatermark)
 //   dirtyRatio     = cleanableBytes / (cleanBytes + cleanableBytes)
 //
-// Off-hot-path mutex-synchronized swap safety (§3.1):
-//   - Cleaner calls LogCleaner::cleanSegment() which atomically renames
-//     <base>.log.new → <base>.log on disk.
-//   - After the rename, cleaner calls Log::enqueueCleanedSegment(base).
+// SINGLE-WRITER INVARIANT — the cleaner thread NEVER touches Log::segments_ (§3.1):
+//   - Cleaner calls LogCleaner::produceCleanedFile() — PURE FILE WORK.  It reads
+//     segment bytes ONLY from the on-disk .log files, using the base offsets
+//     carried in the IMMUTABLE sealed-segment snapshot (atomic shared_ptr
+//     published by the append thread) + the race-free log directory (Log::dir()).
+//     It NEVER calls segmentBaseOffsets(), segmentSize() or reloadSegment().  It
+//     atomically renames <base>.log.new → <base>.log on disk and returns.
+//   - After the rename, the cleaner calls Log::enqueueCleanedSegment(base) — the
+//     SPSC producer half (release-store publishes the base + the file rename).
 //   - NodeRuntimeAgent::doWork drains these enqueues via drainCleanerSwaps()
-//     on the single-writer append thread — the only thread that mutates the
-//     in-memory segment map.  The mutex in enqueue/drain ensures
-//     happens-before between the cleaner's file write and the append thread's
-//     map update.  The mutex is off the append hot path: enqueue is called
-//     only by the cleaner; drain is called once per duty cycle.
+//     on the single-writer append thread — the ONLY thread that mutates the
+//     in-memory segments_ map (via reloadSegment()).  The release/acquire pair
+//     on the ring establishes happens-before between the cleaner's file write and
+//     the append thread's map update.  No lock on any path.
 //   - Superseded LogSegment objects are freed on the append thread in
 //     reloadSegment() — no reader can hold a reference after that point
 //     because all reads are also on the append thread (single-writer invariant).
+//   This is the CP-6 data-race fix: the previous design ran reloadSegment() AND
+//     segmentBaseOffsets() on the CLEANER thread (cleanSegment), racing the
+//     append thread's maybeRoll() — a TSan-proven write/write race on segments_.
+//
+// SPSC-overflow safety (§3.1):
+//   enqueueCleanedSegment() returns false when the swap ring is momentarily full.
+//   On failure the cleaner does NOT advance lastCleanOffset and does NOT charge
+//   the budget — the segment stays dirty and is re-selected + re-produced +
+//   re-enqueued next cycle (idempotent retry).  A dropped swap is never lost.
 //
 // Role-change abandon (§3.1):
-//   The cleaner checks replica->role() == Leader BEFORE calling cleanSegment.
-//   If the role changed to Follower BEFORE the check, the segment is not
-//   compacted at all.  If the role changes AFTER cleanSegment renames the file
-//   (a race window we must handle safely), we still enqueue the swap — the
-//   append thread's drainCleanerSwaps → reloadSegment will pick up the new
-//   file. This is safe: the compacted data is correct (latest-per-key,
-//   below-HW), and the follower will either truncate above HW (disjoint range)
-//   or transition back to leader and continue.  We do NOT advance
-//   lastCleanOffset on a demoted replica — the watermark only advances when
-//   the replica is confirmed Leader at enqueue time.
+//   The cleaner checks replica->role() == Leader BEFORE calling
+//   produceCleanedFile().  If the role changed to Follower BEFORE the check, the
+//   segment is not compacted at all.  If the role changes AFTER the file is
+//   produced (a race window we handle safely), we still enqueue the swap — the
+//   append thread's drainCleanerSwaps → reloadSegment picks up the new file.
+//   This is safe: the compacted data is correct (latest-per-key, below-HW), and
+//   the follower will either truncate above HW (disjoint range) or transition
+//   back to leader and continue.  We do NOT advance lastCleanOffset on a demoted
+//   replica — the watermark only advances when the replica is confirmed Leader
+//   AND the swap was successfully enqueued.
 //
 // Truncation disjointness (§3.1):
 //   Compaction acts ONLY on sealed segments BELOW highWatermark.
@@ -57,7 +70,7 @@
 //   These ranges are disjoint by construction: HW is the boundary.
 //   The cleaner enforces this by computing firstUncleanable =
 //   min(activeSegmentBase, highWatermark) — segments at or above HW are
-//   never included in cleanableBytes and are never passed to cleanSegment.
+//   never included in cleanableBytes and are never passed to produceCleanedFile.
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -70,6 +83,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace rune::node {
 
@@ -117,6 +133,13 @@ public:
             int64_t                              segBase  = -1;
             int64_t                              segEnd   = -1;
             int64_t                              segBytes = 0;
+            // CP-6 race-fix: retain the immutable snapshot + the derived dir so
+            // the compaction (produceCleanedFile) reads segment bytes WITHOUT
+            // ever touching Log::segments_.  The snapshot shared_ptr keeps the
+            // sealed-base list alive for the whole cycle.
+            std::shared_ptr<const rune::storage::SealedSegmentSnapshot> snap;
+            std::string                          dir;
+            int64_t                              firstUncleanable = 0;
         };
         Candidate best;
 
@@ -197,12 +220,17 @@ public:
 
             // Filthiest-first: keep the candidate with the highest ratio.
             if (dirtyRatio > best.ratio) {
-                best.ratio    = dirtyRatio;
-                best.replica  = replica;
-                best.log      = log;
-                best.segBase  = segBase;
-                best.segEnd   = segEnd;
-                best.segBytes = segBytes;
+                best.ratio            = dirtyRatio;
+                best.replica          = replica;
+                best.log              = log;
+                best.segBase          = segBase;
+                best.segEnd           = segEnd;
+                best.segBytes         = segBytes;
+                // Retain the immutable snapshot + race-free dir for the off-thread
+                // compaction.  dir() returns the immutable dir_ (no segments_).
+                best.snap             = snap;
+                best.dir              = log->dir();
+                best.firstUncleanable = firstUncleanable;
             }
         }
 
@@ -232,41 +260,73 @@ public:
         if (best.replica->role() != rune::replication::Role::Leader) return 0;
 
         // ---------------------------------------------------------------
-        // Phase 4: compact the segment (writes .log.new → renames to .log).
-        // Uses global dirty range for latest-per-key correctness (CP-2).
+        // Phase 4: compact the segment OFF-THREAD — PURE FILE WORK.
+        //
+        // CP-6 race-fix (the load-bearing invariant): the cleaner thread MUST
+        // NOT touch Log::segments_.  We call produceCleanedFile() which reads
+        // segment bytes ONLY from disk using the immutable snapshot base offsets
+        // (best.snap) + the race-free dir (best.dir), writes the compacted .log,
+        // and returns.  It never calls segmentBaseOffsets(), segmentSize() or
+        // reloadSegment().  The in-memory reload is deferred to the append thread
+        // via enqueueCleanedSegment() → drainCleanerSwaps() → reloadSegment().
+        //
+        // Uses the global dirty range for latest-per-key correctness (CP-2).
         // ---------------------------------------------------------------
         const int64_t globalDirtyStart = best.replica->lastCleanOffset();
 
+        // Snapshot-derived sealed base list (no segments_ access).
+        std::vector<int64_t> sealedBases;
+        sealedBases.reserve(best.snap->size());
+        for (const auto& si : *best.snap) sealedBases.push_back(si.baseOffset);
+
         rune::storage::LogCleaner cleaner;
-        const bool compacted = cleaner.cleanSegment(
-            *best.log,
-            /*segBase=*/  best.segBase,
-            /*segEnd=*/   best.segEnd,
+        const bool compacted = cleaner.produceCleanedFile(
+            best.dir,
+            sealedBases,
+            /*segBase=*/     best.segBase,
+            /*activeBase=*/  best.firstUncleanable,
             /*globalDirtyStart=*/ globalDirtyStart,
             nowNs,
             best.replica->deleteRetentionMs());
 
         if (!compacted) return 0;
 
-        // Accumulate bytes consumed by this compaction toward the budget.
-        bytesUsed_ += best.segBytes;
-
         // ---------------------------------------------------------------
-        // Phase 5: enqueue the swap and advance the clean watermark.
+        // Phase 5: enqueue the swap; advance the clean watermark ONLY on
+        //          a successful enqueue.
         //
-        // We always enqueue (even if we raced a role change after the
-        // pre-clean guard) — the append thread's drainCleanerSwaps →
+        // We always ATTEMPT the enqueue (even if we raced a role change after
+        // the pre-clean guard) — the append thread's drainCleanerSwaps →
         // reloadSegment handles both cases safely:
         //   • still leader: picks up the compacted file.
         //   • demoted to follower: reloadSegment updates the in-memory
         //     segment to point at the (valid, below-HW) compacted file.
         //     Subsequent truncation acts on the tail ABOVE HW — disjoint.
         //
-        // Only advance lastCleanOffset when still leader to avoid
-        // corrupting the cleaned-watermark on a demoted replica.
+        // SPSC-OVERFLOW FIX (blocking finding #5): enqueueCleanedSegment()
+        // returns false when the swap ring is momentarily full.  If we advanced
+        // lastCleanOffset in that case, the segment would be compacted-on-disk
+        // but NEVER installed into segments_ AND never re-selected — silent data
+        // loss / divergence.  Instead we DO NOT advance the watermark on enqueue
+        // failure: the segment stays dirty and is re-selected + re-enqueued next
+        // cycle (idempotent retry — produceCleanedFile and reloadSegment are both
+        // idempotent).  We also do NOT count budget bytes for a dropped swap, so
+        // the retry is not throttled away.
         // ---------------------------------------------------------------
-        best.log->enqueueCleanedSegment(best.segBase);
+        const bool enqueued = best.log->enqueueCleanedSegment(best.segBase);
+        if (!enqueued) {
+            // Ring full — leave the segment dirty (watermark unadvanced) so it is
+            // re-selected next cycle.  No budget charge, no watermark skip.
+            return 0;
+        }
 
+        // Accumulate bytes consumed by this compaction toward the budget only
+        // once the swap is durably enqueued for install.
+        bytesUsed_ += best.segBytes;
+
+        // Only advance lastCleanOffset when still leader (avoid corrupting the
+        // cleaned-watermark on a demoted replica) AND only after a successful
+        // enqueue (avoid skipping a lost swap).
         if (best.replica->role() == rune::replication::Role::Leader) {
             best.replica->setLastCleanOffset(best.segEnd);
         }
