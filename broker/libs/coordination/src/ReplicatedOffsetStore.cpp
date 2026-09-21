@@ -33,6 +33,7 @@
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 
