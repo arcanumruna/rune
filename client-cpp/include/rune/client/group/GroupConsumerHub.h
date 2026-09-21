@@ -28,6 +28,7 @@
 #include <rune/client/codec/DataCodec.h>
 
 #include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 
 #include <atomic>
@@ -160,6 +161,14 @@ private:
     static void sendOffsetFetch(GroupConsumerImpl& impl,
                                 int64_t sessionId,
                                 const SendFn& sendFn);
+
+    /// TX-5 (fix-round 1, CRITICAL 2): Send a Subscribe frame for each assigned
+    /// partition, carrying cfg_.isolation so the broker applies the correct
+    /// read isolation level when delivering Records to this group consumer.
+    /// Called after entering Stable (SyncGroupResponse) and after Assign.
+    static void sendSubscribeForPartitions(GroupConsumerImpl& impl,
+                                           int64_t sessionId,
+                                           const SendFn& sendFn);
 
     /// Apply a new assignment to impl: fire revoked+assigned callbacks.
     static void applyAssignment(GroupConsumerImpl& impl,

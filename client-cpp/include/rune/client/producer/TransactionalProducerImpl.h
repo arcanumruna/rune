@@ -1,22 +1,31 @@
 // include/rune/client/producer/TransactionalProducerImpl.h
 //
-// TX-5 — TransactionalProducerImpl: agent-side state for Tier-3 transactional
-// produce + idempotent-by-default sequencing.
+// TX-5 (fix-round 1) — TransactionalProducerImpl: agent-side state for Tier-3
+// transactional produce + idempotent-by-default sequencing.
 //
 // Threading model (DR-BUG-1 discipline):
-//   App threads:  submit commands via the lock-free ring (zero-alloc hot path).
-//   Agent thread: drain ring, emit protocol frames, resolve futures/callbacks.
-//   No lock on the hot send path.  Mutex only on the cold pending-op table.
+//   App threads:  submit commands via cmdQueue_ / pendingSends_ (mutex-guarded cold path).
+//   Agent thread: drain queues, emit protocol frames, resolve futures/callbacks.
+//   No lock on the hot frame encode/send path (single-writer: agent).
 //
-// Idempotent sequence:
-//   Once producerId >= 0, every PartitionState carries a monotonic nextBaseSequence
-//   stamped into the RecordBatch.  Retried sends use the same sequence number so
-//   the broker deduplicates.
+// Idempotent sequence (CRITICAL 1 fix):
+//   Once producerId >= 0, every TxnPartitionState carries a monotonic nextBaseSequence
+//   stamped into the RecordBatch.  Produce frames are sent with a real correlationId
+//   and acks=cfg_.acks so the broker returns a ProduceResponse.  On success the
+//   sequence advances.  On retriable error the SAME in-flight batch (same wire
+//   frame, same baseSequence) is re-sent unchanged — the broker deduplicates via
+//   (producerId, partition, baseSequence).  On OutOfOrderSequence or
+//   InvalidProducerEpoch/ProducerFenced the producer is fenced.
 //
 // Fencing:
 //   On any response with errorCode ∈ {InvalidProducerEpoch, ProducerFenced},
 //   producerId_ is reset to -1 and all pending futures are failed with a
 //   ProducerFenced error.  The caller MUST call initTransactions() again.
+//
+// Timeout sweep:
+//   doWork() sweeps pendingOps_ for expired deadlines and fails those futures
+//   with a timeout error.  In-flight produce batches whose corrId is no longer
+//   in pendingProduceBatches_ are already resolved.
 
 #pragma once
 
@@ -153,6 +162,13 @@ public:
     /// Called when EndTxnResponse (templateId 54) arrives.
     void onEndTxnResponse(const uint8_t* buf, std::size_t len);
 
+    /// Called when ProduceResponse (templateId 17) arrives for a txn produce.
+    /// On success: removes in-flight batch, future resolved if any.
+    /// On retriable error: re-sends the same wire frame (same baseSequence).
+    /// On fencing error: calls handleFencing().
+    void onProduceResponse(const uint8_t* buf, std::size_t len,
+                           std::function<bool(const uint8_t*, std::size_t)> sendFn);
+
     /// Fail all pending ops (called on close).
     void failAll(const std::string& reason);
 
@@ -186,7 +202,8 @@ private:
 
     void handleFencing(int16_t errorCode);
 
-    void resolvePendingOp(int64_t corrId, bool success, const std::string& errorMsg = {});
+    // Sweep pendingOps_ for expired deadlines; fail those futures with timeout.
+    void sweepTimedOut();
 
     // ---- State (agent-thread writes; some atomics for app-thread reads) -----
 
@@ -230,6 +247,19 @@ private:
 
     // Pending async ops keyed by correlationId (agent-thread only).
     std::map<int64_t, PendingTxnOp> pendingOps_;
+
+    // In-flight produce batches keyed by correlationId (agent-thread only).
+    // Retained so that on retry the SAME wire frame (same baseSequence) can be
+    // re-sent without rebuilding the batch.
+    struct InFlightBatch {
+        int32_t              topicId;
+        int32_t              partition;
+        int32_t              baseSequence; // the sequence stamped in the batch header
+        std::vector<uint8_t> wireFrame;    // encoded Produce frame bytes for re-send
+        int32_t              retryCount = 0;
+        static constexpr int kMaxRetries = 5;
+    };
+    std::map<int64_t, InFlightBatch> pendingProduceBatches_; // corrId → in-flight batch
 
     // Encode scratch buffers (agent-thread; no alloc on hot path).
     std::vector<uint8_t> encodeScratch_;

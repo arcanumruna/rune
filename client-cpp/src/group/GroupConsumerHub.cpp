@@ -24,7 +24,9 @@
 //   No locks on runner thread. Cold path (add()) under addMtx_.
 
 #include <rune/client/group/GroupConsumerHub.h>
+#include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader (recordCount)
@@ -265,6 +267,49 @@ void GroupConsumerHub::sendOffsetFetch(GroupConsumerImpl& impl,
     if (len == 0) return;
 
     sendFn(impl.sendBuf.data(), len);
+}
+
+// ---------------------------------------------------------------------------
+// sendSubscribeForPartitions — runner thread (TX-5 CRITICAL 2)
+//
+// After entering Stable state, send a Subscribe frame for each assigned
+// partition so the broker knows the isolation level to apply when delivering
+// Records.  Uses fromOffset=0 (the broker ignores fromOffset for group
+// consumers; position seeding happens via OffsetFetch) and partitionKnown=1.
+//
+// Isolation wire value: static_cast<uint8_t>(impl.cfg.isolation).
+// ---------------------------------------------------------------------------
+
+/*static*/
+void GroupConsumerHub::sendSubscribeForPartitions(GroupConsumerImpl& impl,
+                                                   int64_t sessionId,
+                                                   const SendFn& sendFn)
+{
+    if (impl.assignment.empty()) return;
+
+    const uint8_t isolation = static_cast<uint8_t>(impl.cfg.isolation);
+
+    for (const auto& [tp, _] : impl.assignment) {
+        // Each Subscribe frame is 44 bytes (no key — partitionKnown=1).
+        constexpr std::size_t kSubscribeFrameSize = 44u;
+        ensureBuf(impl, kSubscribeFrameSize);
+
+        const std::size_t len = codec::encodeSubscribe(
+            impl.sendBuf.data(),
+            impl.sendBuf.size(),
+            tp.topicId,
+            tp.partition,
+            /*partitionKnown=*/1,
+            /*fromOffset=*/0,
+            isolation,
+            /*key=*/{},
+            sessionId,
+            /*correlationId=*/0);
+
+        if (len > 0) {
+            sendFn(impl.sendBuf.data(), len);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +567,10 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
 
             impl->state = GroupConsumerState::Stable;
 
+            // (TX-5 CRITICAL 2) Send Subscribe per assigned partition so the broker
+            // applies the correct isolation level when delivering Records.
+            sendSubscribeForPartitions(*impl, sessionId, sendFn);
+
             // (#1a) Seed positions from broker-committed offsets immediately.
             // All assigned partitions have sentinel -1 until this response arrives.
             sendOffsetFetch(*impl, sessionId, sendFn);
@@ -657,6 +706,10 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
         }
 
         applyAssignment(*impl, std::move(newAsgn));
+
+        // (TX-5 CRITICAL 2) Re-send Subscribe frames for newly assigned partitions
+        // so the broker applies the correct isolation level when delivering Records.
+        sendSubscribeForPartitions(*impl, sessionId, sendFn);
 
         // (#1a) Seed positions for any newly added partitions from broker offsets.
         sendOffsetFetch(*impl, sessionId, sendFn);

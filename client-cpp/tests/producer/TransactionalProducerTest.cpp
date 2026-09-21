@@ -9,9 +9,10 @@
 // Test matrix:
 //   1. InitTransactionsAcquiresPidEpoch
 //        initTransactions() emits InitProducerId → response → pid/epoch stored.
-//   2. IdempotentRetryReusesBaseSequence
-//        Two sends to the same partition: second send reuses the same
-//        baseSequence if the first was not acked (retry path).
+//   2. IdempotentRetryReusesBaseSequence (IMPORTANT 3 fix)
+//        Two sends to the same partition: assert actual baseSequence values on
+//        the wire (0 and 1).  Feed a NotLeader ProduceResponse to trigger a
+//        retry; verify the retry carries the ORIGINAL baseSequence=0.
 //   3. BeginSendNewPartitionEmitsAddPartitions
 //        beginTransaction() + send to a new partition → AddPartitionsToTxn
 //        emitted exactly once for that partition.
@@ -27,6 +28,10 @@
 //   8. GroupConsumerReadCommittedConfig
 //        GroupConfig{isolation=ReadCommitted} stores isolation=ReadCommitted
 //        and the impl's cfg carries isolation=1.
+//   9. GroupConsumerReadCommittedHub — hub preserves isolation config.
+//  10. GroupConsumerReadCommittedWireIsolation (IMPORTANT 4 fix)
+//        After SyncGroupResponse, a ReadCommitted group consumer emits
+//        Subscribe frames with isolation=1 on the wire.
 
 #include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/producer/TransactionalProducerImpl.h>
@@ -34,10 +39,13 @@
 #include <rune/client/group/GroupConsumerHub.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/codec/DataCodec.h>
 
 #include <rune/protocol/client/TxnMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
@@ -138,6 +146,23 @@ static std::vector<uint8_t> makeEndTxnResponse(int64_t corrId, int16_t errorCode
     return buf;
 }
 
+/// Build a ProduceResponse frame.
+static std::vector<uint8_t> makeProduceResponse(int64_t corrId,
+                                                  int16_t errorCode = 0,
+                                                  int64_t baseOffset = 0)
+{
+    rpc::ProduceResponse msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = corrId;
+    msg.errorCode     = errorCode;
+    msg.partition     = 0;
+    msg.baseOffset    = baseOffset;
+
+    std::vector<uint8_t> buf(rpc::ProduceResponse::ENCODED_SIZE);
+    msg.encode(buf.data());
+    return buf;
+}
+
 // ---------------------------------------------------------------------------
 // CaptureSink — captures frames sent by the impl.
 // ---------------------------------------------------------------------------
@@ -227,12 +252,50 @@ TEST_F(TransactionalProducerTest, InitTransactionsAcquiresPidEpoch)
     EXPECT_EQ(tp.producerEpoch(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// Decode baseSequence from a Produce wire frame's embedded RecordBatch.
+// RecordBatch layout: baseSequence is at kBaseSequenceOffset=53 within the batch.
+// ---------------------------------------------------------------------------
+static int32_t decodeBaseSeqFromProduce(const std::vector<uint8_t>& frame)
+{
+    using namespace rune::protocol::batch;
+    auto popt = rune::client::codec::decodeProduce(frame.data(), frame.size());
+    if (!popt) return -999;
+    const auto& rb = popt->recordBatch;
+    if (rb.size() < static_cast<std::size_t>(kBaseSequenceOffset + 4)) return -999;
+    const uint8_t* d = rb.data();
+    return static_cast<int32_t>(
+        static_cast<uint32_t>(d[kBaseSequenceOffset])       |
+       (static_cast<uint32_t>(d[kBaseSequenceOffset + 1]) << 8) |
+       (static_cast<uint32_t>(d[kBaseSequenceOffset + 2]) << 16) |
+       (static_cast<uint32_t>(d[kBaseSequenceOffset + 3]) << 24));
+}
+
+// ---------------------------------------------------------------------------
+// Collect correlationIds from all Produce frames in a sink.
+// ---------------------------------------------------------------------------
+static std::vector<int64_t> collectProduceCorrIds(const CaptureSink& sink)
+{
+    std::vector<int64_t> ids;
+    for (const auto& f : sink.frames) {
+        if (peekTemplate(f) != static_cast<uint16_t>(rpc::TemplateId::Produce)) continue;
+        auto opt = rpc::Produce::decode(f.data(), f.size());
+        if (opt) ids.push_back(opt->correlationId);
+    }
+    return ids;
+}
+
 // ===========================================================================
 // Test 2: IdempotentRetryReusesBaseSequence
-//   Two successive sends to the same partition within the same transaction:
-//   the baseSequence advances monotonically (0 then 1 for 1-record batches).
-//   A "retry" with same baseSequence=0 would be sent if we reset — we verify
-//   the sequence is NEVER reset between sends (idempotent ascending).
+//
+//   Part A — Wire sequence values:
+//     Two successive sends to the same (topic,partition).  Each gets a distinct
+//     baseSequence (0 and 1).  Verify by decoding the embedded RecordBatch.
+//
+//   Part B — Genuine retry:
+//     Feed a ProduceResponse with errorCode=NotLeader for the first send.
+//     The impl must re-send the SAME wire frame with the SAME baseSequence (0).
+//     A new fresh batch would use baseSequence=2 — any sequence != 0 is a bug.
 // ===========================================================================
 TEST_F(TransactionalProducerTest, IdempotentRetryReusesBaseSequence)
 {
@@ -240,7 +303,7 @@ TEST_F(TransactionalProducerTest, IdempotentRetryReusesBaseSequence)
     auto impl = makeImpl();
     TransactionalProducer tp(impl);
 
-    // Acquire producer identity first.
+    // ---- Acquire producer identity -------------------------------------------
     {
         auto fut = tp.initTransactions();
         impl->doWork(kSessionId, sink.fn());
@@ -255,45 +318,72 @@ TEST_F(TransactionalProducerTest, IdempotentRetryReusesBaseSequence)
 
     tp.beginTransaction();
 
-    // Send two records to the same partition.
     TopicHandle topic{1, 1};
     Key key(uint64_t{0});
     const std::vector<uint8_t> val = {0xAA, 0xBB};
 
-    tp.send(topic, key, std::span<const uint8_t>(val));
-    tp.send(topic, key, std::span<const uint8_t>(val));
+    // ---- Part A: two sends produce baseSeq 0 and 1 on the wire --------------
 
-    // Drain both sends through doWork.
+    tp.send(topic, key, std::span<const uint8_t>(val)); // first  → baseSeq 0
+    tp.send(topic, key, std::span<const uint8_t>(val)); // second → baseSeq 1
     impl->doWork(kSessionId, sink.fn());
 
-    // Sequences should be 0 and 1 (consecutive, monotonic).
-    // Filter out non-Produce frames (AddPartitionsToTxn etc.).
+    // Filter produce frames.
     std::vector<int32_t> seqsSeen;
     for (const auto& f : sink.frames) {
-        const uint16_t tid = peekTemplate(f);
-        if (tid == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
-            // RecordBatch baseSequence is at offset 53 within the batch bytes.
-            // The Produce frame has a variable header; find the recordBatch span.
-            // We verify that sequences are non-decreasing.
-            // Use protocol decoder for Produce:
-            auto popt = rune::client::codec::decodeProduce(f.data(), f.size());
-            if (popt && popt->recordBatch.size() > 57) {
-                const uint8_t* d = popt->recordBatch.data();
-                int32_t seq = static_cast<int32_t>(
-                    static_cast<uint32_t>(d[53]) |
-                   (static_cast<uint32_t>(d[54]) << 8) |
-                   (static_cast<uint32_t>(d[55]) << 16) |
-                   (static_cast<uint32_t>(d[56]) << 24));
-                seqsSeen.push_back(seq);
-            }
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
+            seqsSeen.push_back(decodeBaseSeqFromProduce(f));
         }
     }
+    ASSERT_EQ(seqsSeen.size(), 2u)
+        << "Expected 2 Produce frames (one per send to the same partition)";
+    EXPECT_EQ(seqsSeen[0], 0) << "First send must have baseSequence=0";
+    EXPECT_EQ(seqsSeen[1], 1) << "Second send must have baseSequence=1";
 
-    // At least 2 sequences must have been seen; verify monotonic increase.
-    // (Due to batching they might be in one batch with seq=0 count=2, which is fine.)
-    // The key invariant: nextBaseSequence NEVER resets within a partition lifetime.
-    EXPECT_GE(impl->producerId(), 0LL)
-        << "producerId must be set after initTransactions";
+    // Grab correlationIds for the two sends.
+    auto corrIds = collectProduceCorrIds(sink);
+    ASSERT_EQ(corrIds.size(), 2u);
+    const int64_t firstCorrId  = corrIds[0];
+    const int64_t secondCorrId = corrIds[1];
+    EXPECT_NE(firstCorrId, 0) << "Produce must use a real correlationId (not 0)";
+    EXPECT_NE(secondCorrId, 0);
+    EXPECT_NE(firstCorrId, secondCorrId) << "Each send must get a unique correlationId";
+
+    // Acknowledge second send (success) — nothing interesting about it.
+    {
+        auto ackResp = makeProduceResponse(secondCorrId, 0, /*baseOffset=*/1);
+        impl->onProduceResponse(ackResp.data(), ackResp.size(), sink.fn());
+    }
+
+    // ---- Part B: retriable error on first send → retry must reuse baseSeq=0 --
+
+    sink.clear();
+
+    // Simulate NotLeader (errorCode=2) for the first send.
+    {
+        const int16_t kNotLeader = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
+        auto errResp = makeProduceResponse(firstCorrId, kNotLeader);
+        impl->onProduceResponse(errResp.data(), errResp.size(), sink.fn());
+    }
+
+    // The impl must have re-sent the same wire frame (same corrId, same baseSeq=0).
+    ASSERT_GE(sink.frames.size(), 1u)
+        << "A retry Produce must be emitted on retriable error";
+    const int32_t retryBaseSeq = decodeBaseSeqFromProduce(sink.frames[0]);
+    EXPECT_EQ(retryBaseSeq, 0)
+        << "Retry MUST reuse the ORIGINAL baseSequence=0 (not a fresh 2). "
+           "A mismatch here means Critical-1 is broken: the retry allocated a "
+           "new sequence, defeating broker dedup.";
+
+    // The retried frame must use the SAME correlationId as the original.
+    auto retryOpt = rpc::Produce::decode(sink.frames[0].data(), sink.frames[0].size());
+    ASSERT_TRUE(retryOpt.has_value());
+    EXPECT_EQ(retryOpt->correlationId, firstCorrId)
+        << "Retry must carry the ORIGINAL correlationId so the response can be matched";
+
+    // producerId must still be valid (no fencing on retriable error).
+    EXPECT_EQ(tp.producerId(), 99LL)
+        << "producerId must remain valid after a retriable NotLeader error";
 }
 
 // ===========================================================================
@@ -676,11 +766,157 @@ TEST(GroupConsumerReadCommittedTest, HubPreservesIsolationConfig)
         << "Hub must preserve isolation config in registered impl";
 }
 
-// Include the DataCodec helper needed for decode in Test 2.
-// (The DataCodec::decodeProduce is a lightweight wrapper — included here for test.)
-namespace rune::client::codec {
-    // Forward-declare to avoid the full DataCodec.h include in test body.
-    // The actual include is below.
+// ===========================================================================
+// Test 10: GroupConsumerReadCommittedWireIsolation  (IMPORTANT 4 fix)
+//
+//   A GroupConsumerHub with a ReadCommitted consumer, after receiving a
+//   SyncGroupResponse that assigns a partition, must emit a Subscribe frame
+//   on the wire with isolation=1 (ReadCommitted).
+//
+//   This test drives GroupConsumerHub directly via its public entry points
+//   (no background thread) and asserts the Subscribe templateId and isolation
+//   byte are correct in the captured output.
+// ===========================================================================
+TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
+{
+    using namespace rune::client;
+    using namespace rune::client::group;
+
+    namespace rpc = rune::protocol::client;
+
+    // Build a GroupConsumerHub with a ReadCommitted consumer.
+    GroupConsumerHub hub;
+
+    GroupConfig cfg;
+    cfg.isolation   = IsolationLevel::ReadCommitted;
+    cfg.autoCommit  = false;
+    cfg.sessionTimeoutMs = 10000;
+
+    auto impl = std::make_shared<GroupConsumerImpl>();
+    impl->groupId   = "rc-wire-group";
+    impl->topicIds  = {42};
+    impl->cfg       = cfg;
+    impl->memberId  = "member-1";
+    impl->generationId = 1;
+    impl->state     = GroupConsumerState::Syncing; // ready to receive SyncGroupResponse
+    impl->active.store(true, std::memory_order_relaxed);
+    impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+
+    hub.add(impl);
+
+    // Capture all frames sent by the hub.
+    std::vector<std::vector<uint8_t>> capturedFrames;
+    SendFn sendFn = [&capturedFrames](const uint8_t* buf, std::size_t len) -> bool {
+        capturedFrames.emplace_back(buf, buf + len);
+        return true;
+    };
+
+    // Build a SyncGroupResponse assigning partition (topicId=42, partition=0).
+    rpc::SyncGroupResponse syncResp;
+    syncResp.sessionId     = kSessionId;
+    syncResp.correlationId = 0;
+    syncResp.errorCode     = 0; // OK
+
+    rpc::TopicPartition32 asgn;
+    asgn.topicId   = 42;
+    asgn.partition = 0;
+    const std::span<const rpc::TopicPartition32> asgnSpan{&asgn, 1};
+
+    const std::size_t sz = rpc::SyncGroupResponse::encodedSizeFor(1);
+    std::vector<uint8_t> syncBuf(sz);
+    const std::size_t written = syncResp.encode(syncBuf.data(), asgnSpan);
+    ASSERT_GT(written, 0u);
+
+    // Feed the SyncGroupResponse into the hub.
+    hub.onSyncGroupResponse(syncBuf.data(), written, kSessionId, sendFn);
+
+    // The hub must now be Stable and must have sent a Subscribe frame.
+    // Filter for Subscribe frames.
+    bool foundSubscribe = false;
+    for (const auto& f : capturedFrames) {
+        const uint16_t tid = peekTemplate(f);
+        if (tid != static_cast<uint16_t>(rpc::TemplateId::Subscribe)) continue;
+
+        // Decode and check isolation.
+        auto subOpt = rune::client::codec::decodeSubscribe(f.data(), f.size());
+        ASSERT_TRUE(subOpt.has_value()) << "Subscribe frame must be decodable";
+        EXPECT_EQ(subOpt->topicId, 42) << "Subscribe must target topicId=42";
+        EXPECT_EQ(subOpt->partition, 0) << "Subscribe must target partition=0";
+        EXPECT_EQ(subOpt->partitionKnown, uint8_t{1}) << "partitionKnown must be 1";
+        EXPECT_EQ(subOpt->isolation, uint8_t{1})
+            << "isolation MUST be 1 (ReadCommitted) on the wire. "
+               "A value of 0 here means Critical-2 is broken: "
+               "the broker sees ReadUncommitted and delivers open-txn records.";
+        foundSubscribe = true;
+        break;
+    }
+    EXPECT_TRUE(foundSubscribe)
+        << "GroupConsumer must emit a Subscribe frame after SyncGroupResponse "
+           "so the broker applies the correct isolation level";
+
+    // Sanity: consumer is now Stable.
+    EXPECT_EQ(impl->state, GroupConsumerState::Stable);
 }
 
-#include <rune/client/codec/DataCodec.h>
+// ===========================================================================
+// Test 11: GroupConsumerReadUncommittedWireIsolation
+//
+//   A GroupConsumerHub with a ReadUncommitted (default) consumer emits
+//   Subscribe frames with isolation=0.
+// ===========================================================================
+TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
+{
+    using namespace rune::client;
+    using namespace rune::client::group;
+
+    namespace rpc = rune::protocol::client;
+
+    GroupConsumerHub hub;
+
+    GroupConfig cfg;  // default: ReadUncommitted
+    cfg.autoCommit       = false;
+    cfg.sessionTimeoutMs = 10000;
+
+    auto impl = std::make_shared<GroupConsumerImpl>();
+    impl->groupId    = "ru-wire-group";
+    impl->topicIds   = {10};
+    impl->cfg        = cfg;
+    impl->memberId   = "m-2";
+    impl->generationId = 1;
+    impl->state      = GroupConsumerState::Syncing;
+    impl->active.store(true, std::memory_order_relaxed);
+    impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+
+    hub.add(impl);
+
+    std::vector<std::vector<uint8_t>> capturedFrames;
+    SendFn sendFn = [&capturedFrames](const uint8_t* buf, std::size_t len) -> bool {
+        capturedFrames.emplace_back(buf, buf + len);
+        return true;
+    };
+
+    rpc::SyncGroupResponse syncResp;
+    syncResp.sessionId     = kSessionId;
+    syncResp.correlationId = 0;
+    syncResp.errorCode     = 0;
+
+    rpc::TopicPartition32 asgn;
+    asgn.topicId   = 10;
+    asgn.partition = 0;
+    const std::span<const rpc::TopicPartition32> asgnSpan{&asgn, 1};
+
+    const std::size_t sz = rpc::SyncGroupResponse::encodedSizeFor(1);
+    std::vector<uint8_t> syncBuf(sz);
+    syncResp.encode(syncBuf.data(), asgnSpan);
+
+    hub.onSyncGroupResponse(syncBuf.data(), syncBuf.size(), kSessionId, sendFn);
+
+    for (const auto& f : capturedFrames) {
+        if (peekTemplate(f) != static_cast<uint16_t>(rpc::TemplateId::Subscribe)) continue;
+        auto subOpt = rune::client::codec::decodeSubscribe(f.data(), f.size());
+        ASSERT_TRUE(subOpt.has_value());
+        EXPECT_EQ(subOpt->isolation, uint8_t{0})
+            << "Default (ReadUncommitted) consumer must send isolation=0";
+        break;
+    }
+}

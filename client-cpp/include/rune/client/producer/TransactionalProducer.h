@@ -15,11 +15,16 @@
 //   frames, and resolves futures/callbacks.  NO lock, NO per-op heap alloc on
 //   the hot path.
 //
-// Idempotent-by-default:
+// Idempotent-by-default (implemented):
 //   Once InitProducerIdResponse arrives the producer has a real (producerId,
-//   epoch).  Thereafter every send stamps a monotonically increasing
-//   baseSequence per (topic, partition) into the RecordBatch header.  Retried
-//   sends REUSE the same sequence so the broker can dedup.
+//   epoch).  Thereafter every send stamps a monotonically increasing baseSequence
+//   per (topic, partition) into the RecordBatch header and sends with a real
+//   correlationId so a ProduceResponse is received.  The encoded wire frame is
+//   retained in-flight.  On a retriable error (NotLeader etc.) the SAME stored
+//   wire frame is re-sent byte-for-byte — same baseSequence, same corrId — so
+//   the broker can deduplicate if the original was already accepted.  On
+//   OutOfOrderSequence / InvalidProducerEpoch / ProducerFenced the producer
+//   is fenced (producerId reset to -1; all pending futures fail).
 //
 // Tier-3 transactional lifecycle:
 //   initTransactions()              → send InitProducerId(transactionalId)

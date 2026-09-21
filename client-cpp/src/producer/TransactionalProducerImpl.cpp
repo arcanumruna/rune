@@ -1,19 +1,25 @@
 // src/producer/TransactionalProducerImpl.cpp
 //
-// TX-5 — TransactionalProducerImpl: Tier-3 transactional produce + idempotent
-// sequencing.
+// TX-5 (fix-round 1) — TransactionalProducerImpl: Tier-3 transactional produce
+// + idempotent-by-default sequencing.
 //
 // Threading discipline (DR-BUG-1 / ProducerHub):
-//   App thread: submitXxx() methods acquire cmdMtx_ and push to cmdQueue_;
+//   App thread: submitXxx() methods acquire cmdMtx_ / pendingSendsMtx_ and push;
 //               returns a std::future immediately (zero blocking).
-//   Agent thread: doWork() drains cmdQueue_ (under brief lock), then emits
-//               the appropriate wire frames via sendFn.
+//   Agent thread: doWork() drains queues (under brief locks), then emits the
+//               appropriate wire frames via sendFn.
 //   No lock on the hot-path frame encode/send path (single-writer: agent).
 //
-// Idempotent sequence:
+// Idempotent sequence (CRITICAL 1 fix):
 //   TxnPartitionState::nextBaseSequence advances monotonically per partition.
-//   On retry (same send), the caller is responsible for re-submitting; the
-//   sequence is NOT reset — the broker sees the same seq and dedups.
+//   Produce frames are sent with a REAL correlationId and acks=cfg_.acks.
+//   The encoded wire frame is retained in pendingProduceBatches_ keyed by
+//   correlationId.  On ProduceResponse:
+//     - OK: batch removed; sequence already advanced at send time.
+//     - Retriable error (e.g. NotLeader): RE-SEND the stored wire frame
+//       unchanged — same baseSequence, same bytes.  Broker deduplicates.
+//     - OutOfOrderSequence: fence (epoch stale).
+//     - InvalidProducerEpoch / ProducerFenced: fence.
 //
 // Fencing:
 //   On ProducerFenced or InvalidProducerEpoch in any response, all pending ops
@@ -24,6 +30,7 @@
 #include <rune/client/codec/DataCodec.h>
 
 #include <rune/protocol/client/TxnMessages.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/Crc32c.h>
@@ -43,29 +50,6 @@ namespace rb  = rune::protocol::batch;
 // ---------------------------------------------------------------------------
 
 namespace {
-
-// Write LE64 into buf at offset.
-inline void writeLE64(uint8_t* buf, int off, int64_t v) noexcept {
-    const uint64_t u = static_cast<uint64_t>(v);
-    for (int i = 0; i < 8; ++i)
-        buf[off + i] = static_cast<uint8_t>(u >> (i * 8));
-}
-
-// Write LE32 into buf at offset.
-inline void writeLE32(uint8_t* buf, int off, int32_t v) noexcept {
-    const uint32_t u = static_cast<uint32_t>(v);
-    buf[off+0] = static_cast<uint8_t>(u);
-    buf[off+1] = static_cast<uint8_t>(u >> 8);
-    buf[off+2] = static_cast<uint8_t>(u >> 16);
-    buf[off+3] = static_cast<uint8_t>(u >> 24);
-}
-
-// Write LE16s into buf at offset.
-inline void writeLE16s(uint8_t* buf, int off, int16_t v) noexcept {
-    const uint16_t u = static_cast<uint16_t>(v);
-    buf[off+0] = static_cast<uint8_t>(u);
-    buf[off+1] = static_cast<uint8_t>(u >> 8);
-}
 
 inline int64_t wallNs() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -340,21 +324,29 @@ int TransactionalProducerImpl::doWork(
         // Stamp idempotent identity.
         builder.setProducerId(pid);
         builder.setProducerEpoch(epoch);
-        builder.setBaseSequence(ps.nextBaseSequence);
+
+        // Snapshot baseSequence BEFORE advancing — this is what we stamp and retain.
+        const int32_t baseSeq = ps.nextBaseSequence;
+        builder.setBaseSequence(baseSeq);
 
         builder.buildInto(batchScratch_);
 
-        // Advance sequence.
+        // Advance sequence NOW (before send) so a duplicate submission from the
+        // app layer cannot collide: the in-flight entry retains the wire frame for
+        // the retry path, which re-sends the same baseSeq unchanged.
         ps.nextBaseSequence += builder.recordCount();
 
-        // Encode Produce frame.
+        // Assign a real correlationId so we receive a ProduceResponse.
+        const int64_t prodCorrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+
+        // Encode Produce frame with real acks (not fire-and-forget).
         rpc::Produce msg;
         msg.sessionId      = sessionId;
-        msg.correlationId  = 0; // acks=None for individual txn records (ack via EndTxn)
+        msg.correlationId  = prodCorrId;
         msg.topicId        = sr.topicId;
         msg.partition      = sr.partition;
         msg.partitionKnown = 1;
-        msg.acks           = 0;
+        msg.acks           = (cfg_.acks != Acks::None) ? uint8_t{1} : uint8_t{0};
         msg.key            = {};
         msg.recordBatch    = std::span<const uint8_t>(batchScratch_);
 
@@ -362,17 +354,97 @@ int TransactionalProducerImpl::doWork(
         if (encodeScratch_.size() < needed) encodeScratch_.resize(needed);
         const std::size_t written = msg.encode(encodeScratch_.data());
         if (written > 0) {
-            sendFn(encodeScratch_.data(), written);
+            if (sendFn(encodeScratch_.data(), written)) {
+                // Retain wire frame for idempotent retry: same bytes = same baseSeq.
+                InFlightBatch ib;
+                ib.topicId      = sr.topicId;
+                ib.partition    = sr.partition;
+                ib.baseSequence = baseSeq;
+                ib.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+                pendingProduceBatches_.emplace(prodCorrId, std::move(ib));
+            }
             ++work;
         }
     }
+
+    // Sweep expired pending ops (timeouts).
+    sweepTimedOut();
 
     return work;
 }
 
 // ---------------------------------------------------------------------------
+// Agent-thread: deadline sweep
+// ---------------------------------------------------------------------------
+
+void TransactionalProducerImpl::sweepTimedOut()
+{
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<int64_t> expired;
+    for (const auto& [corrId, op] : pendingOps_) {
+        if (now >= op.deadline) {
+            expired.push_back(corrId);
+        }
+    }
+    for (const int64_t corrId : expired) {
+        auto it = pendingOps_.find(corrId);
+        if (it == pendingOps_.end()) continue;
+        try {
+            it->second.promise.set_exception(
+                std::make_exception_ptr(
+                    std::runtime_error(
+                        "TransactionalProducer: operation timed out (no response)")));
+        } catch (...) {}
+        pendingOps_.erase(it);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent-thread: response handlers
 // ---------------------------------------------------------------------------
+
+void TransactionalProducerImpl::onProduceResponse(
+    const uint8_t* buf, std::size_t len,
+    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+{
+    auto opt = rpc::ProduceResponse::decode(buf, len);
+    if (!opt) return;
+
+    const int64_t corrId = opt->correlationId;
+    auto it = pendingProduceBatches_.find(corrId);
+    if (it == pendingProduceBatches_.end()) return; // not our produce
+
+    const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
+
+    if (ec == rpc::ErrorCode::OK) {
+        // Success: batch acknowledged; remove from in-flight.
+        pendingProduceBatches_.erase(it);
+        return;
+    }
+
+    // Fencing errors: fence the producer.
+    if (ec == rpc::ErrorCode::OutOfOrderSequence ||
+        ec == rpc::ErrorCode::InvalidProducerEpoch ||
+        ec == rpc::ErrorCode::ProducerFenced) {
+        pendingProduceBatches_.erase(it);
+        handleFencing(opt->errorCode);
+        return;
+    }
+
+    // Retriable error (NotLeader, etc.): re-send the SAME wire frame unchanged.
+    // The frame already carries the original baseSequence — the broker will
+    // deduplicate if it already accepted this batch.
+    InFlightBatch& ib = it->second;
+    if (ib.retryCount >= InFlightBatch::kMaxRetries) {
+        // Exhausted retries — drop (EndTxn will fail or caller can retry the txn).
+        pendingProduceBatches_.erase(it);
+        return;
+    }
+
+    ++ib.retryCount;
+    // Re-send: same bytes, same correlationId in the frame header.
+    sendFn(ib.wireFrame.data(), ib.wireFrame.size());
+}
 
 void TransactionalProducerImpl::onInitProducerIdResponse(const uint8_t* buf,
                                                           std::size_t len)
@@ -586,6 +658,10 @@ void TransactionalProducerImpl::failAll(const std::string& reason)
     }
     pendingOps_.clear();
 
+    // Clear in-flight produce batches (no futures to fail — produce acks
+    // are acknowledged via the in-flight map, not via caller futures).
+    pendingProduceBatches_.clear();
+
     if (pendingOffsetOp_) {
         try {
             pendingOffsetOp_->promise.set_exception(
@@ -740,6 +816,9 @@ void TransactionalProducerImpl::handleFencing(int16_t /*errorCode*/)
     addedPartitions_.clear();
     partitions_.clear();
 
+    // Clear in-flight produce batches (cannot be retried after epoch/pid reset).
+    pendingProduceBatches_.clear();
+
     // Fail all pending ops (including sendOffsets).
     const std::string reason = "TransactionalProducer: ProducerFenced — re-initialize";
     for (auto& [corrId, op] : pendingOps_) {
@@ -757,25 +836,6 @@ void TransactionalProducerImpl::handleFencing(int16_t /*errorCode*/)
         } catch (...) {}
         pendingOffsetOp_.reset();
     }
-}
-
-void TransactionalProducerImpl::resolvePendingOp(int64_t corrId,
-                                                   bool success,
-                                                   const std::string& errorMsg)
-{
-    auto it = pendingOps_.find(corrId);
-    if (it == pendingOps_.end()) return;
-
-    if (success) {
-        try { it->second.promise.set_value(); } catch (...) {}
-    } else {
-        try {
-            it->second.promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(errorMsg)));
-        } catch (...) {}
-    }
-
-    pendingOps_.erase(it);
 }
 
 } // namespace rune::client::producer
