@@ -435,3 +435,105 @@ TEST_F(TransactionCoordinationServiceTest, HandleEndTxnUnknownTxnReturnsInvalidT
     EXPECT_EQ(respOpt->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState))
         << "Unknown txnId → InvalidTxnState";
 }
+
+// ===========================================================================
+// 10. HandleInitProducerIdPersistsTxnState (durability: put() is called)
+// ===========================================================================
+TEST_F(TransactionCoordinationServiceTest, HandleInitProducerIdPersistsTxnState) {
+    const std::size_t reqLen = encodeInitProducerId(
+        reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, "txnPersist");
+    ASSERT_GT(reqLen, 0u);
+    ASSERT_EQ(svc_->handleInitProducerId(
+        reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size()),
+        pc::InitProducerIdResponse::ENCODED_SIZE);
+
+    // The txnStateStore_ should have the metadata (put was called).
+    const auto* meta = txnStore_->get("txnPersist");
+    ASSERT_TRUE(meta) << "handleInitProducerId must persist metadata via ReplicatedTxnStateStore";
+    EXPECT_EQ(meta->txnId, "txnPersist");
+    EXPECT_GE(meta->producerId, 0);
+    EXPECT_EQ(meta->producerEpoch, 0);
+}
+
+// ===========================================================================
+// 11. HandleEndTxnPrepareCommitIsDurable
+// ===========================================================================
+TEST_F(TransactionCoordinationServiceTest, HandleEndTxnPrepareCommitIsDurable) {
+    // Init + AddPartitions + EndTxn(commit) → verify PrepareCommit state is in store.
+    std::size_t reqLen = encodeInitProducerId(
+        reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, "txnDurable");
+    ASSERT_GT(reqLen, 0u);
+    std::size_t outLen = svc_->handleInitProducerId(
+        reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto initResp = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(initResp);
+    const int64_t pid   = initResp->producerId;
+    const int16_t epoch = initResp->producerEpoch;
+
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(),
+                                 1, 2, pid, epoch, "txnDurable", parts);
+    ASSERT_GT(reqLen, 0u);
+    svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+
+    reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(),
+                          1, 3, pid, epoch, /*commit=*/true, "txnDurable");
+    ASSERT_GT(reqLen, 0u);
+    outLen = svc_->handleEndTxn(
+        reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto endResp = pc::EndTxnResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(endResp);
+    ASSERT_EQ(endResp->errorCode, 0);
+
+    // State in the TxnStateStore should be PrepareCommit.
+    const auto* meta = txnStore_->get("txnDurable");
+    ASSERT_TRUE(meta) << "EndTxn must persist PrepareCommit state";
+    EXPECT_EQ(meta->state, tx::TxnState::PrepareCommit)
+        << "State must be PrepareCommit after endTxn(commit=true)";
+}
+
+// ===========================================================================
+// 12. HandleAddOffsetsAndTxnOffsetCommitFlow
+// ===========================================================================
+TEST_F(TransactionCoordinationServiceTest, HandleAddOffsetsAndTxnOffsetCommitFlow) {
+    // Init to get PID.
+    std::size_t reqLen = encodeInitProducerId(
+        reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, "txnOffsets");
+    ASSERT_GT(reqLen, 0u);
+    std::size_t outLen = svc_->handleInitProducerId(
+        reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto initResp = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(initResp);
+    const int64_t pid   = initResp->producerId;
+    const int16_t epoch = initResp->producerEpoch;
+
+    // AddPartitions to move to Ongoing.
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(),
+                                 1, 2, pid, epoch, "txnOffsets", parts);
+    ASSERT_GT(reqLen, 0u);
+    outLen = svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    auto addPartResp = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(addPartResp);
+
+    // AddOffsetsToTxn — register consumer group intent.
+    pc::AddOffsetsToTxn addOffsMsg;
+    addOffsMsg.sessionId       = 1;
+    addOffsMsg.correlationId   = 3;
+    addOffsMsg.producerId      = pid;
+    addOffsMsg.producerEpoch   = epoch;
+    const std::string txnIdStr = "txnOffsets";
+    const std::string grpStr   = "cg1";
+    addOffsMsg.transactionalId = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(txnIdStr.data()), txnIdStr.size());
+    addOffsMsg.groupId = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(grpStr.data()), grpStr.size());
+
+    reqLen = addOffsMsg.encode(reqBuf_.data());
+    ASSERT_GT(reqLen, 0u);
+    outLen = svc_->handleAddOffsets(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    ASSERT_EQ(outLen, pc::AddOffsetsToTxnResponse::ENCODED_SIZE);
+    auto addOffsResp = pc::AddOffsetsToTxnResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(addOffsResp);
+    EXPECT_EQ(addOffsResp->errorCode, 0) << "AddOffsetsToTxn should succeed while Ongoing";
+}
