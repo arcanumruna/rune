@@ -520,23 +520,67 @@ TEST(CompactionCorrectness, OffsetStoreRebuildFromCompactedLog) {
     replica->becomeLeader(1, {1});
 
     // Write offset commits via ReplicatedOffsetStore.
-    // Commit 5 distinct (group, topic, partition) keys, each updated kRounds times.
-    // The latest value per key must survive compaction.
+    //
+    // CP-4 DISCRIMINATING LAYOUT (proven non-vacuous below): to force
+    // rebuildFromLog to traverse an INTER-SEGMENT GAP (the exact condition the
+    // CP-4 fix handles — read() returning empty mid-log because compaction
+    // emptied whole intermediate segments), we:
+    //   1. Commit the kKeys TRACKED keys ONCE, up front (they land in the first
+    //      segment(s) and are the latest-per-key that must survive).
+    //   2. Then flood the log with MANY rounds of a small set of NOISE keys,
+    //      each overwritten dozens of times.  Compaction removes every
+    //      superseded noise record, EMPTYING the middle segments entirely — so
+    //      their .log files are deleted and the surviving segments are
+    //      non-contiguous in offset space.  rebuildFromLog must jump across that
+    //      hole; the pre-CP-4 code (bare break on empty read) would stop at the
+    //      gap and lose either the tracked keys (if the gap precedes them) or the
+    //      noise survivors, and — more importantly — abandon the rest of the log.
     ReplicatedOffsetStore store(replica.get());
 
-    constexpr int kKeys   = 5;
-    constexpr int kRounds = 12; // enough rounds to create multiple sealed segments
+    constexpr int kKeys       = 5;
+    constexpr int kNoiseKeys  = 3;
+    constexpr int kNoiseRounds = 40; // heavy supersession → empties middle segments
 
+    // (1) Tracked keys — committed ONCE, near the front of the log.
     std::vector<int64_t> latestOffset(kKeys);
-    for (int round = 0; round < kRounds; ++round) {
-        for (int k = 0; k < kKeys; ++k) {
-            GroupId      group = "grp" + std::to_string(k);
-            TopicPartition tp{"offsettopic", k};
-            int64_t       committed_offset = static_cast<int64_t>(round * 100 + k);
-            latestOffset[k] = committed_offset; // last write wins
+    for (int k = 0; k < kKeys; ++k) {
+        GroupId      group = "grp" + std::to_string(k);
+        TopicPartition tp{"offsettopic", k};
+        int64_t       committed_offset = static_cast<int64_t>(1000 + k);
+        latestOffset[k] = committed_offset;
+        bool ok = store.commit(group, tp, committed_offset, /*meta=*/"", /*tsNs=*/0);
+        ASSERT_TRUE(ok) << "tracked commit must succeed on single-node leader";
+    }
+
+    // (2) Noise flood — a few keys overwritten many times.  All but the last
+    //     write per noise key is superseded and compacted away, emptying the
+    //     middle segments and creating the inter-segment gap.
+    for (int round = 0; round < kNoiseRounds; ++round) {
+        for (int n = 0; n < kNoiseKeys; ++n) {
+            GroupId      group = "noisegrp" + std::to_string(n);
+            TopicPartition tp{"noisetopic", n};
+            int64_t       committed_offset = static_cast<int64_t>(round * 10 + n);
             bool ok = store.commit(group, tp, committed_offset, /*meta=*/"", /*tsNs=*/0);
-            ASSERT_TRUE(ok) << "commit must succeed on single-node leader";
+            ASSERT_TRUE(ok) << "noise commit must succeed on single-node leader";
         }
+    }
+
+    // (3) A second batch of TRACKED keys committed AFTER the noise flood, so they
+    //     land in the POST-GAP survivor segments (high offsets).  This is what
+    //     makes the test genuinely guard CP-4: rebuildFromLog must TRAVERSE the
+    //     inter-segment gap left by the emptied middle segments to reach these
+    //     records.  The pre-CP-4 code (bare break on empty read) stops at the
+    //     first gap and NEVER sees these post-gap keys → their fetch() returns
+    //     nullopt → the test FAILS.  (Verified by scratch-revert.)
+    constexpr int kPostKeys = 5;
+    std::vector<int64_t> postLatestOffset(kPostKeys);
+    for (int k = 0; k < kPostKeys; ++k) {
+        GroupId      group = "postgrp" + std::to_string(k);
+        TopicPartition tp{"posttopic", k};
+        int64_t       committed_offset = static_cast<int64_t>(9000 + k);
+        postLatestOffset[k] = committed_offset;
+        bool ok = store.commit(group, tp, committed_offset, /*meta=*/"", /*tsNs=*/0);
+        ASSERT_TRUE(ok) << "post-gap tracked commit must succeed on single-node leader";
     }
 
     replica->onLeaderLogAppended();
@@ -560,25 +604,46 @@ TEST(CompactionCorrectness, OffsetStoreRebuildFromCompactedLog) {
     }
     log.reloadSegments();
 
-    // GUARD: compaction must have actually reduced the record count
+    // GUARD 1: compaction must have actually reduced the record count
     // (earlier commits for the same key were superseded and removed).
     int totalAfter = 0;
     {
         auto recs = cp4AllRecords(log);
         totalAfter = static_cast<int>(recs.size());
     }
-    const int totalBefore = kKeys * kRounds; // all appended records
+    const int totalBefore = kKeys + kNoiseKeys * kNoiseRounds + kPostKeys; // all appended records
     ASSERT_LT(totalAfter, totalBefore)
         << "Compaction must have removed superseded offset-commit records "
            "(vacuousness guard); total before=" << totalBefore
         << " total after=" << totalAfter
         << " — if these are equal, compaction did not run.";
 
+    // GUARD 2 (CP-4 gap guard): compaction must have produced an INTER-SEGMENT
+    // GAP — either the first surviving segment base advanced past 0 (leading
+    // segments emptied) or the surviving segment bases are non-contiguous with
+    // the offset stream (middle segments emptied).  Without a gap this test would
+    // not exercise the CP-4 rebuildFromLog gap-skip and would be vacuous.
+    {
+        const auto basesAfter = log.segmentBaseOffsets();
+        ASSERT_FALSE(basesAfter.empty());
+        // A gap exists iff fewer records survive than the offset span they cover:
+        // the compacted log's surviving records are sparse across the base range.
+        const int64_t offsetSpan = log.logEndOffset();          // total offsets ever written
+        const bool sparse = (totalAfter < offsetSpan);          // holes exist in offset space
+        const bool frontAdvanced = (basesAfter.front() > 0);    // leading segments emptied
+        ASSERT_TRUE(sparse || frontAdvanced)
+            << "CP-4 gap guard: compaction must leave an inter-segment gap "
+               "(sparse offsets or advanced front base) so rebuildFromLog must "
+               "traverse it; offsetSpan=" << offsetSpan
+            << " survivors=" << totalAfter
+            << " frontBase=" << basesAfter.front();
+    }
+
     // Rebuild from the compacted log using a fresh store instance.
     ReplicatedOffsetStore store2(rawReplica);
     store2.rebuildFromLog();
 
-    // The latest committed offset per (group, tp) must be intact.
+    // The latest committed offset per PRE-GAP tracked (group, tp) must be intact.
     for (int k = 0; k < kKeys; ++k) {
         GroupId      group = "grp" + std::to_string(k);
         TopicPartition tp{"offsettopic", k};
@@ -590,6 +655,22 @@ TEST(CompactionCorrectness, OffsetStoreRebuildFromCompactedLog) {
             << "After compaction + rebuild: offset for grp" << k
             << " must be the latest committed value ("
             << latestOffset[k] << "); got " << co->offset;
+    }
+
+    // CP-4 CRUX: the POST-GAP tracked keys live in survivor segments AFTER the
+    // inter-segment gap.  rebuildFromLog must traverse the gap to recover them.
+    // The pre-CP-4 code stops at the gap and returns nullopt for all of these.
+    for (int k = 0; k < kPostKeys; ++k) {
+        GroupId      group = "postgrp" + std::to_string(k);
+        TopicPartition tp{"posttopic", k};
+        auto co = store2.fetch(group, tp);
+        ASSERT_TRUE(co.has_value())
+            << "CP-4: post-gap offset for (postgrp" << k << ", posttopic, " << k
+            << ") must be recovered — rebuildFromLog must skip the inter-segment gap";
+        EXPECT_EQ(co->offset, postLatestOffset[k])
+            << "CP-4: post-gap offset for postgrp" << k
+            << " must be the latest committed value (" << postLatestOffset[k]
+            << "); got " << co->offset;
     }
 
     fs::remove_all(dir);
