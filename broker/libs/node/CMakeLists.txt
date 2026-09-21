@@ -181,6 +181,22 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # CP-3: CompactionPolicy integration tests — cleanup.policy routing:
+    #   Compact-never-size-deletes, tombstone delete-retention, CompactDelete
+    #   ordering (compact-first-then-delete), Delete-never-compacts,
+    #   producer-state survival under CompactDelete.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_compaction_policy_tests
+        tests/integration/CompactionPolicyTest.cpp)
+    target_link_libraries(rune_compaction_policy_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        GTest::gtest_main)
+    gtest_discover_tests(rune_compaction_policy_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # BrokerNode integration tests — embed the Aeron media driver.
     # Gated behind BUILD_BROKER_NODE_TESTS (default ON when BUILD_TESTING=ON)
     # so CI can disable if the embedded driver cannot start in the environment.

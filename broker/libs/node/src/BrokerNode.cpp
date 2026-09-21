@@ -410,10 +410,12 @@ void BrokerNode::buildReplication() {
             // the same underlying values (both uint8_t, 0=Delete/1=Compact/2=CompactDelete).
             pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
                 static_cast<uint8_t>(spec->cleanupPolicy));
-            // CP-2: compaction tuning — use PartitionConfig defaults (0.5 ratio,
-            // 1-day deleteRetentionMs).  These may be overridden from TopicSpec
-            // in a future release when per-topic tuning is exposed via the API.
-            // (default values are already set in the PartitionConfig struct definition)
+            // CP-2: compaction tuning — thread from TopicSpec (with sane defaults).
+            pcfg.minCleanableDirtyRatio = spec->minCleanableDirtyRatio;
+            pcfg.deleteRetentionMs      = spec->deleteRetentionMs;
+            // CP-3: size/time retention — thread from TopicSpec (-1 = unbounded).
+            pcfg.retentionBytes         = spec->retentionBytes;
+            pcfg.retentionMs            = spec->retentionMs;
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).

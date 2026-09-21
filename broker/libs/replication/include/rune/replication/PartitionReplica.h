@@ -95,6 +95,9 @@ struct PartitionConfig {
     // CP-2: compaction tuning fields.
     double      minCleanableDirtyRatio = 0.5;        ///< CP-2: min dirty-offset fraction before compaction fires [0.0, 1.0]
     int64_t     deleteRetentionMs      = 86'400'000LL; ///< CP-2: how long (ms) to retain tombstones before removing them
+    // CP-3: size/time retention (used by Delete + CompactDelete policies).
+    int64_t     retentionBytes         = -1;          ///< CP-3: keep this many bytes; -1 = unbounded (no size deletion)
+    int64_t     retentionMs            = -1;          ///< CP-3: keep segments younger than this ms; -1 = unbounded
 };
 
 // ---------------------------------------------------------------------------
@@ -333,6 +336,11 @@ public:
     [[nodiscard]] double      minCleanableDirtyRatio() const noexcept { return cfg_.minCleanableDirtyRatio; }
     /// How long (ms) tombstones are retained before being fully removed.
     [[nodiscard]] int64_t     deleteRetentionMs()      const noexcept { return cfg_.deleteRetentionMs; }
+    // CP-3: size/time retention accessors.
+    /// Max bytes to retain; -1 = unbounded.
+    [[nodiscard]] int64_t     retentionBytes()         const noexcept { return cfg_.retentionBytes; }
+    /// Max age (ms) to retain; -1 = unbounded.
+    [[nodiscard]] int64_t     retentionMs()            const noexcept { return cfg_.retentionMs; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     [[nodiscard]] Offset lastCleanOffset() const noexcept { return lastCleanOffset_; }

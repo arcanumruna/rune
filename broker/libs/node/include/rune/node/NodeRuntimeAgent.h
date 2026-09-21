@@ -165,24 +165,39 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // runBoundedCompaction — CP-2: bounded, leader-only compaction pass.
+    // runBoundedCompaction — CP-2/CP-3: bounded, leader-only compaction pass
+    //   with full cleanup.policy routing.
     //
-    // Iterates all replicas in the registry.  For each replica:
-    //   1. Skip if the replica's role is not Leader.
-    //   2. Skip if the cleanup policy is not Compact (or CompactDelete).
-    //   3. Need at least 2 segments (one sealed, one active).
-    //   4. Dirty-ratio gate: skip if (activeBase - lastCleanOffset) / max(1, activeBase)
-    //      <= minCleanableDirtyRatio.  This prevents re-scanning already-clean logs.
-    //   5. Find the NEXT sealed segment to compact starting from lastCleanOffset.
-    //      Compact exactly ONE sealed segment per cycle (one-segment-per-cycle bound).
-    //   6. After a successful clean, advance the cleaned-watermark (lastCleanOffset)
-    //      to the end of the compacted segment so the next cycle starts fresh.
+    // CP-3 policy routing (all paths are leader-only):
     //
-    // Returns number of compaction passes run (>0 if any work done, 0 when idle).
+    //   Delete       → run size/time retention (deleteOldSegments) ONLY.
+    //                  Never compacts (delete-policy logs are not keyed changelogs).
+    //
+    //   Compact      → run compaction (latest-per-key) ONLY.
+    //                  Never calls deleteOldSegments: compacted keyed changelogs
+    //                  must never be size/time-aged because live keys must survive
+    //                  past any size cap.
+    //
+    //   CompactDelete → run compaction FIRST (compact pass de-duplicates keys),
+    //                  THEN run size/time retention.  Ordering matters: compact
+    //                  before delete ensures the deduplicated-key survivor is not
+    //                  incorrectly removed by the retention pass.
+    //
+    // Compaction path (Compact/CompactDelete) — unchanged from CP-2:
+    //   1. Skip if role != Leader.
+    //   2. Need at least 2 segments.
+    //   3. Dirty-ratio gate.
+    //   4. One-segment-per-cycle bound (watermark advance).
+    //
+    // Retention path (Delete/CompactDelete) — CP-3 addition:
+    //   Calls Log::deleteOldSegments(retentionBytes) when retentionBytes >= 0.
+    //   Retention runs AFTER compaction for CompactDelete so compaction's
+    //   single-survivor is placed before retention culls old segments.
+    //
+    // Returns number of work units performed (>0 if any work done, 0 when idle).
     //
     // Single-writer invariant: called on the AgentRunner duty-cycle thread only.
-    // NEVER touches the active segment (cleanBoundaryOffset == next-segment-base
-    // or activeBase for the last sealed segment).
+    // NEVER touches the active segment (deleteOldSegments always keeps segments_.size()>1).
     // -----------------------------------------------------------------------
     int runBoundedCompaction(int64_t nowNs) {
         if (!registry_) return 0;
@@ -194,17 +209,42 @@ public:
             // 1. Leader-only.
             if (replica->role() != rune::replication::Role::Leader) continue;
 
-            // 2. Compact policy only.
             const auto policy = replica->cleanupPolicy();
-            if (policy == rune::replication::CleanupPolicy::Delete) continue;
 
             // 3. Need a log.
             rune::storage::Log* log = replica->log();
             if (!log) continue;
 
+            // ---------------------------------------------------------------
+            // CP-3: Delete policy — retention ONLY, no compaction.
+            // ---------------------------------------------------------------
+            if (policy == rune::replication::CleanupPolicy::Delete) {
+                // Run size retention when retentionBytes is set (>= 0).
+                const int64_t retBytes = replica->retentionBytes();
+                if (retBytes >= 0) {
+                    const int deleted = log->deleteOldSegments(retBytes);
+                    work += deleted;
+                }
+                continue; // done for this replica — never compact Delete topics
+            }
+
+            // ---------------------------------------------------------------
+            // Compact or CompactDelete: run the compaction pass first.
+            // ---------------------------------------------------------------
+
             // 4. Must have at least 2 segments (one sealed, one active).
             const auto bases = log->segmentBaseOffsets();
-            if (bases.size() < 2) continue;
+            if (bases.size() < 2) {
+                // No sealed segments — skip compaction, but still run retention
+                // for CompactDelete if configured.
+                if (policy == rune::replication::CleanupPolicy::CompactDelete) {
+                    const int64_t retBytes = replica->retentionBytes();
+                    if (retBytes >= 0) {
+                        work += log->deleteOldSegments(retBytes);
+                    }
+                }
+                continue;
+            }
 
             // The active segment is the LAST one (highest base offset).
             const int64_t activeBase = bases.back();
@@ -213,54 +253,59 @@ public:
             //
             // Dirty range = [lastCleanOffset, activeBase).
             // Dirty ratio = (activeBase - firstDirty) / max(1, activeBase).
-            // (Offset-span is the available dirty measure; no byte-level dirty
-            // count is tracked by Log — documented as acceptable approximation.)
             const int64_t firstDirty = replica->lastCleanOffset();
             const double dirtyRatio =
                 static_cast<double>(activeBase - firstDirty) /
                 static_cast<double>(activeBase > 0 ? activeBase : 1);
 
-            if (dirtyRatio <= replica->minCleanableDirtyRatio()) continue;
+            bool compactionRan = false;
+            if (dirtyRatio > replica->minCleanableDirtyRatio()) {
+                // 6. Find the next sealed segment to compact: the first sealed segment
+                //    whose base offset >= firstDirty.  One-segment-per-cycle bound.
+                int64_t segToCompact = -1;
+                int64_t segEnd       = -1;
 
-            // 6. Find the next sealed segment to compact: the first sealed segment
-            //    whose base offset >= firstDirty.  We compact exactly ONE segment
-            //    per cycle (one-segment-per-cycle bound).
-            int64_t segToCompact = -1;
-            int64_t segEnd       = -1;  // start offset of the segment after segToCompact
+                for (std::size_t i = 0; i + 1 < bases.size(); ++i) {
+                    if (bases[i] < firstDirty) continue;
+                    segToCompact = bases[i];
+                    segEnd       = bases[i + 1];
+                    break;
+                }
 
-            for (std::size_t i = 0; i + 1 < bases.size(); ++i) {
-                // bases[i] is a sealed segment (not the active).
-                if (bases[i] < firstDirty) continue;  // already clean — skip
-                segToCompact = bases[i];
-                segEnd       = bases[i + 1];  // next segment base = exclusive end
-                break;
+                if (segToCompact < 0) {
+                    // All sealed segments already clean — advance watermark.
+                    replica->setLastCleanOffset(activeBase);
+                } else {
+                    // 7. Compact exactly this ONE sealed segment via bounded cleaner.
+                    rune::storage::LogCleaner cleaner;
+                    cleaner.cleanSegment(*log,
+                                         /*segBase=*/segToCompact,
+                                         /*segEnd=*/segEnd,
+                                         /*globalDirtyStart=*/firstDirty,
+                                         nowNs,
+                                         replica->deleteRetentionMs());
+
+                    // 8. Advance the cleaned watermark.
+                    replica->setLastCleanOffset(segEnd);
+
+                    ++work;
+                    compactionRan = true;
+                }
             }
 
-            if (segToCompact < 0) {
-                // All sealed segments are already clean (watermark advanced past them).
-                // Advance watermark to activeBase so the dirty-ratio gate fires on
-                // the next produce-batch (new data arrives in the active seg then rolls).
-                replica->setLastCleanOffset(activeBase);
-                continue;
+            // ---------------------------------------------------------------
+            // CP-3: CompactDelete — after compaction, run size retention.
+            // Ordering: compact FIRST (already done above), THEN delete old segments.
+            // ---------------------------------------------------------------
+            if (policy == rune::replication::CleanupPolicy::CompactDelete) {
+                const int64_t retBytes = replica->retentionBytes();
+                if (retBytes >= 0) {
+                    const int deleted = log->deleteOldSegments(retBytes);
+                    work += deleted;
+                }
             }
-
-            // 7. Compact exactly this ONE sealed segment via the bounded cleaner.
-            //    cleanSegment() reloads ONLY the rewritten segment in place
-            //    (Log::reloadSegment) instead of the O(n) full-log reloadSegments(),
-            //    so a per-segment duty-cycle loop is O(n) total, not O(n^2).
-            rune::storage::LogCleaner cleaner;
-            cleaner.cleanSegment(*log,
-                                 /*segBase=*/segToCompact,
-                                 /*segEnd=*/segEnd,
-                                 /*globalDirtyStart=*/firstDirty,
-                                 nowNs,
-                                 replica->deleteRetentionMs());
-
-            // 8. Advance the cleaned watermark to segEnd so the next cycle starts
-            //    from the following sealed segment (forward progress).
-            replica->setLastCleanOffset(segEnd);
-
-            ++work;
+            // Suppress unused-variable warning when compactionRan is not used below.
+            (void)compactionRan;
         }
         return work;
     }
