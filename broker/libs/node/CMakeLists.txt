@@ -213,6 +213,22 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
+    # CP-6: CompactionCleanerAgent integration tests — LogCleanerAgent dedicated
+    #   off-thread compaction: off-duty-thread compaction, filthiest-first selection,
+    #   per-cycle byte budget, append P99 unperturbed, swap safety under role change.
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_compaction_cleaner_agent_tests
+        tests/integration/CompactionCleanerAgentTest.cpp)
+    target_link_libraries(rune_compaction_cleaner_agent_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        GTest::gtest_main)
+    gtest_discover_tests(rune_compaction_cleaner_agent_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # BrokerNode integration tests — embed the Aeron media driver.
     # Gated behind BUILD_BROKER_NODE_TESTS (default ON when BUILD_TESTING=ON)
     # so CI can disable if the embedded driver cannot start in the environment.
