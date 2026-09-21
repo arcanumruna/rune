@@ -139,15 +139,28 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
-// buildOffsetMap
+// buildOffsetMap  (APPEND-THREAD ONLY — derives bases from segments_)
 // ---------------------------------------------------------------------------
 void LogCleaner::buildOffsetMap(Log& log, Offset fromOffset, Offset toOffset,
                                 OffsetMap& map) {
+    // segmentBaseOffsets() reads the writer-owned segments_ map; only safe on the
+    // single-writer append thread.  Delegate the pure-file scan to the shared core.
+    buildOffsetMapFromBases(log.dir(), log.segmentBaseOffsets(),
+                            fromOffset, toOffset, map);
+}
+
+// ---------------------------------------------------------------------------
+// buildOffsetMapFromBases  (CLEANER-SAFE — pure file work, no segments_)
+// ---------------------------------------------------------------------------
+void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
+                                         const std::vector<int64_t>& bases,
+                                         Offset fromOffset, Offset toOffset,
+                                         OffsetMap& map) {
     if (fromOffset >= toOffset) return;
 
-    // Walk segments that overlap [fromOffset, toOffset).
-    auto bases = log.segmentBaseOffsets();
-    const std::string& dir = log.dir();
+    // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
+    // supplied explicitly (from the sealed-segment snapshot on the cleaner thread,
+    // or from segmentBaseOffsets() on the append thread) so we never read segments_.
 
     // S6: The final segment's "end" is toOffset. Records in the active segment
     // at offsets < toOffset are scanned and their keys entered into the map; these
@@ -193,10 +206,9 @@ void LogCleaner::buildOffsetMap(Log& log, Offset fromOffset, Offset toOffset,
 // ---------------------------------------------------------------------------
 // rewriteSegment  (internal)
 // ---------------------------------------------------------------------------
-void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
+bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
                                 Offset fromOffset, Offset cleanBoundaryOffset,
                                 int64_t nowNs, int64_t deleteRetentionMs) {
-    const std::string& dir = log.dir();
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
     std::string idxPath   = segmentIndexPath(dir, segBase);
@@ -206,7 +218,7 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
 
     // Read the current segment.
     auto buf = readFile(logPath);
-    if (buf.empty()) return;
+    if (buf.empty()) return false;
 
     std::vector<uint8_t> outBuf;
     outBuf.reserve(buf.size());
@@ -340,7 +352,7 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
         std::filesystem::remove(logPath);
         std::filesystem::remove(idxPath);
         fsyncDir(dir);
-        return;
+        return true;
     }
 
     // Durable atomic swap: write → fsync file → rename → fsync dir.
@@ -370,6 +382,7 @@ void LogCleaner::rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
     // Also write a fresh .index directly so crash recovery has a valid index.
     std::filesystem::remove(idxPath);
     buildIndex(idxPath, segBase, outBuf);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +410,7 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
     for (int64_t segBase : bases) {
         if (segBase == activeBase) continue;       // active segment — skip
         if (segBase >= cleanBoundaryOffset) break; // at/past HW — stop
-        rewriteSegment(log, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
+        rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
     }
 
     // Reload the log's in-memory state from the rewritten files.
@@ -420,7 +433,60 @@ void LogCleaner::clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOf
 }
 
 // ---------------------------------------------------------------------------
-// cleanSegment  (CP-2: bounded single-segment compaction — O(1) reload)
+// produceCleanedFile  (CP-6 race-fix: CLEANER-THREAD path — PURE FILE WORK)
+//
+// No Log& parameter and no segments_ access whatsoever.  Everything comes from
+// the caller-supplied immutable snapshot-derived `sealedBases` + `dir`.  The
+// in-memory reload is deferred to the append thread (drainCleanerSwaps →
+// reloadSegment); this function ONLY writes the compacted file to disk.
+// ---------------------------------------------------------------------------
+bool LogCleaner::produceCleanedFile(const std::string& dir,
+                                    const std::vector<int64_t>& sealedBases,
+                                    Offset segBase, Offset activeBase,
+                                    Offset globalDirtyStart,
+                                    int64_t nowNs, int64_t deleteRetentionMs) {
+    if (sealedBases.empty()) return false;
+
+    // Guard: segBase must be one of the sealed segments in the snapshot AND must
+    // be strictly below the active/uncleanable boundary.  We NEVER read segments_
+    // to validate this — the snapshot IS the source of truth for the cleaner.
+    if (segBase >= activeBase) return false;
+    bool found = false;
+    for (int64_t b : sealedBases) { if (b == segBase) { found = true; break; } }
+    if (!found) return false;
+
+    // Clean up any stale .log.new temp files left by a previous crashed run.
+    // Pure directory I/O — does not touch segments_.
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".new") {
+            std::filesystem::remove(e.path());
+        }
+    }
+
+    // Build the offset map GLOBALLY over the whole dirty range
+    // [globalDirtyStart, activeBase) using the SNAPSHOT bases — reads segment
+    // bytes straight from the .log files, never via segments_.  This is the
+    // cross-segment latest-per-key correctness (CP-2) computed off-thread.
+    if (globalDirtyStart < 0) globalDirtyStart = 0;
+    OffsetMap map;
+    buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+
+    // Rewrite exactly the ONE segment at segBase (pure file I/O: atomic write→
+    // rename, or delete when emptied).  Passing the GLOBAL bounds makes the
+    // per-record filter drop globally-superseded records.
+    return rewriteSegment(dir, segBase, map, globalDirtyStart, activeBase,
+                          nowNs, deleteRetentionMs);
+}
+
+// ---------------------------------------------------------------------------
+// cleanSegment  (CP-2 APPEND-THREAD path: produce file + reload in place)
+//
+// This overload IS allowed to touch segments_ because it runs on the single-
+// writer append/duty-cycle thread (NodeRuntimeAgent::runBoundedCompaction and
+// synchronous tests).  It derives bases from segmentBaseOffsets(), produces the
+// cleaned file via the shared pure-file core, then reloads the segment in place.
+// The dedicated off-thread cleaner (LogCleanerAgent) must NOT call this — it
+// calls produceCleanedFile() and defers reloadSegment() to drainCleanerSwaps().
 // ---------------------------------------------------------------------------
 bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
                               Offset globalDirtyStart,
@@ -431,41 +497,19 @@ bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
     if (bases.empty()) return false;
     const int64_t activeBase = bases.back();
     if (segBase == activeBase) return false;   // never compact the active segment
-    bool found = false;
-    for (int64_t b : bases) { if (b == segBase) { found = true; break; } }
-    if (!found) return false;
     (void)segEnd; // retained for API symmetry / future byte-budgeted variants
 
-    // Clean up any stale .log.new temp files left by a previous crashed run.
-    for (auto& e : std::filesystem::directory_iterator(log.dir())) {
-        if (e.path().extension() == ".new") {
-            std::filesystem::remove(e.path());
-        }
-    }
-
-    // Build the offset map GLOBALLY over the whole dirty range
-    // [globalDirtyStart, activeBase).  This is the correctness fix: a record in
-    // THIS segment that is superseded by a newer record in a LATER sealed segment
-    // must be dropped, so latest-per-key has to be computed across ALL dirty
-    // segments, not just this one.  (Scanning the whole dirty prefix each cycle is
-    // O(dirty bytes); the expensive part that was O(n^2) — reopening every segment
-    // via reloadSegments() — is avoided by reloadSegment() below.)
-    if (globalDirtyStart < 0) globalDirtyStart = 0;
-    OffsetMap map;
-    buildOffsetMap(log, globalDirtyStart, activeBase, map);
-
-    // Rewrite exactly the ONE segment at segBase.  We pass the GLOBAL bounds
-    // (fromOffset = globalDirtyStart, cleanBoundaryOffset = activeBase) so the
-    // per-record filter inside rewriteSegment consults the global map and drops
-    // globally-superseded records.  rewriteSegment only ever reads+writes the
-    // single segBase .log file, so passing global bounds does not touch any other
-    // segment.
-    rewriteSegment(log, segBase, map, globalDirtyStart, activeBase, nowNs, deleteRetentionMs);
+    // Produce the compacted file off the map — same pure-file core the cleaner
+    // thread uses.  `bases` here is the append-thread's live view (safe on this
+    // thread); the dirty range upper bound is the active-segment base.
+    const bool produced = produceCleanedFile(log.dir(), bases, segBase,
+                                             /*activeBase=*/activeBase,
+                                             globalDirtyStart, nowNs,
+                                             deleteRetentionMs);
+    if (!produced) return false;
 
     // Reload ONLY this segment in place — O(1) in the number of segments.  This
-    // avoids the O(n) full-log reloadSegments() (re-recover() of EVERY segment)
-    // that made a per-segment duty-cycle loop O(n^2) (~22s for 100 segments;
-    // ~128ms after this change).
+    // is a segments_ mutation, but we are on the single-writer append thread.
     log.reloadSegment(segBase);
     return true;
 }

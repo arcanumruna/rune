@@ -34,7 +34,29 @@ public:
     /// populate `map` with key→latest-offset entries.
     /// A tombstone record (value == "" or vlen < 0 in the wire format) is also
     /// recorded — its offset represents "latest delete intent".
+    ///
+    /// APPEND-THREAD ONLY: this overload reads the segment base offsets via
+    /// Log::segmentBaseOffsets() (which iterates the writer-owned segments_ map)
+    /// and must therefore only be called on the single-writer append thread.
+    /// The cleaner thread MUST use buildOffsetMapFromBases() with snapshot-
+    /// derived bases + dir (no segments_ access).
     void buildOffsetMap(Log& log, Offset fromOffset, Offset toOffset, OffsetMap& map);
+
+    /// CP-6 race-fix: pure-file-work offset-map build for the CLEANER THREAD.
+    ///
+    /// Identical scan to buildOffsetMap() but takes the segment base offsets and
+    /// directory EXPLICITLY (derived from the immutable sealed-segment snapshot)
+    /// so it never touches Log::segments_.  Reads segment bytes directly from the
+    /// on-disk .log files (path = <dir>/<base>.log).  Safe to call concurrently
+    /// with the append thread's segments_ mutations.
+    ///
+    /// `bases` must be sorted ascending and cover at least the sealed segments
+    /// overlapping [fromOffset, toOffset).  `toOffset` is used both as the record
+    /// filter boundary and as the synthetic "end" of the last base in `bases`.
+    void buildOffsetMapFromBases(const std::string& dir,
+                                 const std::vector<int64_t>& bases,
+                                 Offset fromOffset, Offset toOffset,
+                                 OffsetMap& map);
 
     /// Compact the log up to `cleanBoundaryOffset` using a previously-built
     /// OffsetMap.
@@ -83,6 +105,38 @@ public:
                       Offset globalDirtyStart,
                       int64_t nowNs, int64_t deleteRetentionMs);
 
+    /// CP-6 race-fix: CLEANER-THREAD compaction — PURE FILE WORK, no segments_.
+    ///
+    /// Produces the compacted `<segBase>.log` on disk (atomic write→rename, or a
+    /// delete when the segment is fully emptied) WITHOUT touching the writer-owned
+    /// Log::segments_ map: it never calls segmentBaseOffsets(), segmentSize() or
+    /// reloadSegment().  It builds the global offset map and reads segment bytes
+    /// EXCLUSIVELY from the on-disk files, using the base offsets carried in the
+    /// immutable sealed-segment snapshot (`sealedBases`) and the immutable log
+    /// directory (`dir`, obtained via Log::dir() which is race-free).
+    ///
+    /// The in-memory reload of the rewritten segment is the caller's
+    /// responsibility and MUST happen on the single-writer append thread:
+    ///   • LogCleanerAgent (cleaner thread) calls produceCleanedFile(), then
+    ///     enqueues segBase via Log::enqueueCleanedSegment(); the append thread's
+    ///     drainCleanerSwaps() performs reloadSegment(segBase).
+    ///
+    /// @param dir          Log directory (immutable; from Log::dir()).
+    /// @param sealedBases  Sorted-ascending base offsets of the sealed segments,
+    ///                     derived from the sealed-segment snapshot.  Used only to
+    ///                     bound the offset-map scan; segments_ is never read.
+    /// @param segBase      The single sealed segment to rewrite.
+    /// @param activeBase   Upper bound of the dirty range (== active segment base,
+    ///                     conservatively the high-watermark).  Records at/past
+    ///                     this offset are left untouched.
+    /// @param globalDirtyStart  Start of the whole dirty range (cleaned watermark).
+    /// @returns true if a rewrite ran (segment file existed and was processed).
+    bool produceCleanedFile(const std::string& dir,
+                            const std::vector<int64_t>& sealedBases,
+                            Offset segBase, Offset activeBase,
+                            Offset globalDirtyStart,
+                            int64_t nowNs, int64_t deleteRetentionMs);
+
 private:
     /// Is a record a tombstone?
     /// Treats empty value (vlen == 0) as a delete marker, matching Kafka behaviour.
@@ -96,8 +150,10 @@ private:
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
     /// past their delete-retention window are dropped.
-    /// Returns the path of the rewritten temp file (already renamed in place).
-    void rewriteSegment(Log& log, int64_t segBase, OffsetMap& map,
+    /// PURE FILE WORK: reads/writes only <dir>/<segBase>.log{,.new,.index};
+    /// never touches Log::segments_.  Returns true if a file was produced (the
+    /// segment was non-empty), false if the source .log was missing/empty.
+    bool rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
                         Offset fromOffset, Offset cleanBoundaryOffset,
                         int64_t nowNs, int64_t deleteRetentionMs);
 };
