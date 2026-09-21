@@ -55,6 +55,10 @@ struct TopicSpec {
     int64_t       retentionBytes          = -1;             // -1 = unbounded
     int64_t       deleteRetentionMs       = 86'400'000;     // tombstone retention (1 day)
     double        minCleanableDirtyRatio  = 0.5;            // dirty-ratio compaction trigger
+    // Segment roll size in bytes.  Default 64 MiB matches Kafka's production
+    // segment.bytes.  Tests may set a small value to form multiple sealed
+    // segments quickly (e.g. to exercise compaction end-to-end).
+    int64_t       segmentRollBytes        = 64LL * 1024 * 1024;
 };
 
 struct PeerConfig {

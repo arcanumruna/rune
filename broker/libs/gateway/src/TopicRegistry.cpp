@@ -39,7 +39,11 @@ TopicRegistry::TopicRegistry(
                     partDir.string() + "': " + ec.message());
             }
 
-            auto logPtr = std::make_unique<rune::storage::Log>(partDir.string());
+            // Honour the topic's configured segment roll size (default 64 MiB;
+            // tests may set a small value to form multiple sealed segments so
+            // compaction can be exercised end-to-end).
+            auto logPtr = std::make_unique<rune::storage::Log>(
+                partDir.string(), spec.segmentRollBytes);
             logPtr->recover();
 
             spdlog::debug(
