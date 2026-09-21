@@ -227,6 +227,9 @@ public:
     int64_t baseTimestamp()   const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kBaseTimestampOffset)); }
     int64_t producerId()      const { return static_cast<int64_t>(detail::getLE64(d_ + batch::kProducerIdOffset)); }
     int16_t producerEpoch()   const { return static_cast<int16_t>(detail::getLE16(d_ + batch::kProducerEpochOffset)); }
+    /// baseSequence: first sequence number in this batch (LE int32 at offset 53).
+    /// -1 for non-idempotent (legacy) batches.
+    int32_t baseSequence()    const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kBaseSequenceOffset)); }
     int16_t attributes()      const { return static_cast<int16_t>(detail::getLE16(d_ + batch::kAttributesOffset)); }
 
     /// True if this batch has the CONTROL attribute bit set (bit 5 = 0x0020).
