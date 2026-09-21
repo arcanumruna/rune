@@ -32,9 +32,14 @@
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/replication/Types.h>
+#include <rune/storage/LogCleaner.h>
+#include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
 
 #include <cstdint>
+#include <limits>
 
 namespace rune::node {
 
@@ -152,6 +157,68 @@ public:
             work += gateway_->doWork(nowNs);
         }
 
+        // 6.5. Bounded compaction pass — leader-only, sealed segments only.
+        //      Samples nowNs once per cycle (already done above).
+        work += runBoundedCompaction(nowNs);
+
+        return work;
+    }
+
+    // -----------------------------------------------------------------------
+    // runBoundedCompaction — CP-2: bounded, leader-only compaction pass.
+    //
+    // Iterates all replicas in the registry.  For each replica:
+    //   1. Skip if the replica's role is not Leader.
+    //   2. Skip if the cleanup policy is not Compact (or CompactDelete).
+    //   3. Compute dirty ratio = (LEO - firstDirty) / LEO; skip if below threshold.
+    //      (Conservative: treat firstDirty == 0 for now — always compact if dirty.)
+    //   4. Determine the sealed range: [0, activeSegmentBase).  If there are no
+    //      sealed segments (only one segment), skip.
+    //   5. Call LogCleaner::clean([0, activeBase), nowNs, deleteRetentionMs=1 day).
+    //
+    // Returns number of compaction passes run (>0 if any work done).
+    //
+    // Single-writer invariant: called on the AgentRunner duty-cycle thread only.
+    // NEVER touches the active segment (cleanBoundaryOffset == activeBase).
+    // -----------------------------------------------------------------------
+    int runBoundedCompaction(int64_t nowNs) {
+        if (!registry_) return 0;
+
+        int work = 0;
+        for (auto* replica : registry_->allReplicas()) {
+            if (!replica) continue;
+
+            // 1. Leader-only.
+            if (replica->role() != rune::replication::Role::Leader) continue;
+
+            // 2. Compact policy only.
+            const auto policy = replica->cleanupPolicy();
+            if (policy == rune::replication::CleanupPolicy::Delete) continue;
+
+            // 3. Need a log.
+            rune::storage::Log* log = replica->log();
+            if (!log) continue;
+
+            // 4. Must have at least 2 segments (one sealed, one active).
+            const auto bases = log->segmentBaseOffsets();
+            if (bases.size() < 2) continue;
+
+            // The active segment is the LAST one (highest base offset).
+            const int64_t activeBase = bases.back();
+
+            // 5. Run LogCleaner::clean over the sealed range [0, activeBase).
+            //    cleanBoundaryOffset == activeBase ensures the active segment
+            //    is NEVER touched (records at offset >= activeBase are left intact).
+            //
+            // deleteRetentionMs: use 1 day default (86_400_000 ms).
+            // Bounded: one clean() call per partition per cycle.
+            rune::storage::LogCleaner cleaner;
+            cleaner.clean(*log, /*firstDirtyOffset=*/0, /*cleanBoundaryOffset=*/activeBase,
+                          nowNs, /*deleteRetentionMs=*/86'400'000LL);
+            log->reloadSegments();
+
+            ++work;
+        }
         return work;
     }
 
