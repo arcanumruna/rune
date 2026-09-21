@@ -467,7 +467,21 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
 
     static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB per read
 
+    // CP-3: start the scan at the log's FIRST surviving segment base, not a
+    // hardcoded 0.  Size retention (Delete / CompactDelete via
+    // Log::deleteOldSegments) can age out the front of the log, advancing the
+    // first segment's base past 0.  In that case log.read(0) returns empty and
+    // a fetchOffset==0 start would bail immediately, reconstructing NO producer
+    // state — silently breaking idempotent dedup after any retention on the
+    // producer-bearing log (e.g. __transaction_state).  Beginning at the first
+    // live segment base makes rebuild robust to a trimmed log prefix.
     int64_t fetchOffset = 0;
+    {
+        const auto segBases = log.segmentBaseOffsets();
+        if (!segBases.empty() && segBases.front() > 0) {
+            fetchOffset = segBases.front();
+        }
+    }
 
     while (fetchOffset < highWatermark) {
         // Log::read() resolves only ONE segment per call (the segment that
