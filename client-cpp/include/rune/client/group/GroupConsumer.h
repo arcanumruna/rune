@@ -73,13 +73,25 @@ enum class OffsetReset {
 };
 
 // ---------------------------------------------------------------------------
+// IsolationLevel — read-isolation level for group consumer.
+//   ReadUncommitted (0): consume all records (including open transactions).
+//   ReadCommitted   (1): consume only records from committed transactions
+//                        (broker filters out aborted/open txn records).
+// ---------------------------------------------------------------------------
+enum class IsolationLevel : uint8_t {
+    ReadUncommitted = 0,  // default: consume all records
+    ReadCommitted   = 1,  // consume only committed transaction records
+};
+
+// ---------------------------------------------------------------------------
 // GroupConfig — consumer-group options.
 // ---------------------------------------------------------------------------
 struct GroupConfig {
-    bool    autoCommit           = true;
-    int32_t autoCommitIntervalMs = 5000;
-    int32_t sessionTimeoutMs     = 30000;
-    OffsetReset autoOffsetReset  = OffsetReset::Latest;
+    bool         autoCommit           = true;
+    int32_t      autoCommitIntervalMs = 5000;
+    int32_t      sessionTimeoutMs     = 30000;
+    OffsetReset  autoOffsetReset      = OffsetReset::Latest;
+    IsolationLevel isolation          = IsolationLevel::ReadUncommitted;  // TX-5: read_committed support
 };
 
 // ---------------------------------------------------------------------------
