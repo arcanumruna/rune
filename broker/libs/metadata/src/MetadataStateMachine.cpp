@@ -181,15 +181,19 @@ LocalRoleDelta MetadataStateMachine::deriveLocalDelta(
         const bool leaderEpochBumped    = (cur.leaderEpoch     > prevPa->leaderEpoch);
         const bool partitionEpochBumped = (cur.partitionEpoch  > prevPa->partitionEpoch);
 
-        if (!partitionEpochBumped) {
+        // Gate: either epoch must have advanced.  leaderEpoch alone is sufficient
+        // to detect a new election (brief: electedLeader keyed on "leaderEpoch changed").
+        if (!leaderEpochBumped && !partitionEpochBumped) {
             // No change — nothing to report
             return;
         }
 
         if (cur.leaderNode == selfNode) {
             if (leaderEpochBumped) {
+                // New election: leaderEpoch advanced (partitionEpoch may or may not have)
                 delta.electedLeaders.push_back(key);
             } else {
+                // Self stays leader, only partitionEpoch bumped (ISR change, no re-election)
                 delta.leaderUpdates.push_back(key);
             }
         } else if (containsNode(cur.replicas, selfNode)) {

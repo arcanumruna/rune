@@ -9,6 +9,7 @@
 #include "rune/protocol/MetadataRecords.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <vector>
@@ -138,9 +139,64 @@ private:
     std::size_t pos_;
 };
 
-// Hash a map by XOR-ing all (key, assignment) fields in canonical sorted order.
-// Used to assert deterministic equality between two MSM states.
-static uint64_t hashMap(const MetadataStateMachine& msm);
+// Hash a map by folding ALL (key, assignment) fields in canonical sorted order.
+// Entries are sorted by (topicId, partition) for a stable traversal order
+// independent of hash-table slot layout, then each field is mixed into the
+// running hash with FNV-1a-style multiplications.  Used to assert deterministic
+// equality between two MSM states (whole-map hash, not just 2 partitions).
+static uint64_t hashMap(const MetadataStateMachine& msm)
+{
+    // Collect all entries into a sortable vector
+    struct Entry {
+        int32_t topicId;
+        int32_t partition;
+        int32_t leaderNode;
+        int32_t leaderEpoch;
+        int32_t partitionEpoch;
+        std::vector<int32_t> isr;     // stored as-is (caller's sort order)
+        std::vector<int32_t> replicas;
+    };
+    std::vector<Entry> entries;
+    msm.committedMap().forEach([&](int32_t t, int32_t p, const PartitionAssignment& pa) {
+        Entry e;
+        e.topicId        = t;
+        e.partition      = p;
+        e.leaderNode     = pa.leaderNode;
+        e.leaderEpoch    = pa.leaderEpoch;
+        e.partitionEpoch = pa.partitionEpoch;
+        e.isr            = pa.isr;
+        e.replicas       = pa.replicas;
+        entries.push_back(std::move(e));
+    });
+
+    // Sort by (topicId, partition) for a canonical, slot-independent order
+    std::sort(entries.begin(), entries.end(), [](const Entry& a, const Entry& b) {
+        if (a.topicId != b.topicId) return a.topicId < b.topicId;
+        return a.partition < b.partition;
+    });
+
+    // Mix every field into a 64-bit hash
+    auto mix = [](uint64_t h, int32_t v) -> uint64_t {
+        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v));
+        h *= UINT64_C(11400714819323198485); // Fibonacci/Knuth multiplier
+        h ^= h >> 33;
+        return h;
+    };
+
+    uint64_t h = UINT64_C(0xcbf29ce484222325); // FNV offset basis
+    for (const Entry& e : entries) {
+        h = mix(h, e.topicId);
+        h = mix(h, e.partition);
+        h = mix(h, e.leaderNode);
+        h = mix(h, e.leaderEpoch);
+        h = mix(h, e.partitionEpoch);
+        h = mix(h, static_cast<int32_t>(e.isr.size()));
+        for (int32_t v : e.isr)     h = mix(h, v);
+        h = mix(h, static_cast<int32_t>(e.replicas.size()));
+        for (int32_t v : e.replicas) h = mix(h, v);
+    }
+    return h;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. AssignmentMap — basic put/get/capacity
@@ -235,29 +291,36 @@ TEST(MetadataStateMachine, UnknownTopicPartitionReturnsNull)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. Deterministic replay — apply same stream twice from empty → identical map
+//    Proved by whole-map hash equality (hashMap(m1) == hashMap(m2)).
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(MetadataStateMachine, DeterministicReplay)
 {
-    // Build a stream of records
-    auto [cbuf, csz] = encodeCreate(1, 2, 2);
+    // Build a stream of records covering 2 topics, 3 partitions, multiple updates
+    auto [cbuf,  csz]  = encodeCreate(1, 2, 2);
+    auto [cb2,   cs2]  = encodeCreate(2, 1, 1);
     auto [ubuf0, usz0] = encodeUpdate({1, 0, 10, {10,11}, {10,11}, 1, 1});
     auto [ubuf1, usz1] = encodeUpdate({1, 1, 11, {11,10}, {10,11}, 1, 1});
-    // Second update to p0
-    auto [ubuf2, usz2] = encodeUpdate({1, 0, 11, {11,10}, {10,11}, 2, 2});
+    auto [ubuf2, usz2] = encodeUpdate({1, 0, 11, {11,10}, {10,11}, 2, 2}); // update p0
+    auto [ubuf3, usz3] = encodeUpdate({2, 0, 20, {20},    {20},    1, 1});
 
     auto applyAll = [&](MetadataStateMachine& m) {
         m.apply(cbuf.data(),  csz,  0); m.commit(0);
-        m.apply(ubuf0.data(), usz0, 1); m.commit(1);
-        m.apply(ubuf1.data(), usz1, 2); m.commit(2);
-        m.apply(ubuf2.data(), usz2, 3); m.commit(3);
+        m.apply(cb2.data(),   cs2,  1); m.commit(1);
+        m.apply(ubuf0.data(), usz0, 2); m.commit(2);
+        m.apply(ubuf1.data(), usz1, 3); m.commit(3);
+        m.apply(ubuf2.data(), usz2, 4); m.commit(4);
+        m.apply(ubuf3.data(), usz3, 5); m.commit(5);
     };
 
     MetadataStateMachine m1, m2;
     applyAll(m1);
     applyAll(m2);
 
-    // Both must have the same content
+    // Whole-map hash equality proves determinism across ALL fields of ALL entries
+    EXPECT_EQ(hashMap(m1), hashMap(m2));
+
+    // Spot-check a couple of entries for clarity
     const auto* a1p0 = m1.assignment(1, 0);
     const auto* a2p0 = m2.assignment(1, 0);
     ASSERT_NE(a1p0, nullptr);
@@ -265,12 +328,51 @@ TEST(MetadataStateMachine, DeterministicReplay)
     EXPECT_EQ(a1p0->leaderNode,      a2p0->leaderNode);
     EXPECT_EQ(a1p0->leaderEpoch,     a2p0->leaderEpoch);
     EXPECT_EQ(a1p0->partitionEpoch,  a2p0->partitionEpoch);
+}
 
-    const auto* a1p1 = m1.assignment(1, 1);
-    const auto* a2p1 = m2.assignment(1, 1);
-    ASSERT_NE(a1p1, nullptr);
-    ASSERT_NE(a2p1, nullptr);
-    EXPECT_EQ(a1p1->leaderNode, a2p1->leaderNode);
+// ─────────────────────────────────────────────────────────────────────────────
+// 3b. FlushPending with >1 entries queued: commit advances past multiple pending
+//     entries in one shot.  The multi-entry sort path in flushPending() is the
+//     determinism-critical path; assert hash equality across two machines that
+//     receive the same records in the same order but only commit once at the end.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(MetadataStateMachine, FlushPendingMultiEntry_Deterministic)
+{
+    auto [cbuf,  csz]  = encodeCreate(1, 3, 2);
+    auto [ubuf0, usz0] = encodeUpdate({1, 0, 10, {10,11}, {10,11}, 1, 1});
+    auto [ubuf1, usz1] = encodeUpdate({1, 1, 11, {11,10}, {10,11}, 1, 1});
+    auto [ubuf2, usz2] = encodeUpdate({1, 2, 12, {12},    {10,11,12}, 1, 1});
+
+    // Apply all records WITHOUT committing — they all queue into pending_.
+    // Then commit once at pos=3, flushing all 3 pending entries in one shot.
+    // This exercises flushPending()'s multi-entry sort on the determinism path.
+    auto applyAllThenCommit = [&](MetadataStateMachine& m) {
+        // CreateTopicRecord at pos=0: commit it so topic exists
+        m.apply(cbuf.data(),  csz,  0);
+        m.commit(0);
+        // Queue 3 assignment records without committing each individually
+        m.apply(ubuf0.data(), usz0, 1);
+        m.apply(ubuf1.data(), usz1, 2);
+        m.apply(ubuf2.data(), usz2, 3);
+        // Single commit flushes all 3 pending entries at once
+        m.commit(3);
+    };
+
+    MetadataStateMachine m1, m2;
+    applyAllThenCommit(m1);
+    applyAllThenCommit(m2);
+
+    // Whole-map hash equality: same result regardless of internal slot order
+    EXPECT_EQ(hashMap(m1), hashMap(m2));
+
+    // Verify all 3 partitions are visible
+    ASSERT_NE(m1.assignment(1, 0), nullptr);
+    ASSERT_NE(m1.assignment(1, 1), nullptr);
+    ASSERT_NE(m1.assignment(1, 2), nullptr);
+    EXPECT_EQ(m1.assignment(1, 0)->leaderNode, 10);
+    EXPECT_EQ(m1.assignment(1, 1)->leaderNode, 11);
+    EXPECT_EQ(m1.assignment(1, 2)->leaderNode, 12);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -346,6 +448,37 @@ TEST(LocalRoleDelta, ElectedLeader)
 
     LocalRoleDelta delta = msm.deriveLocalDelta(/*selfNode=*/1, prev);
 
+    EXPECT_EQ(delta.electedLeaders.size(), 1u);
+    EXPECT_TRUE(delta.leaderUpdates.empty());
+    EXPECT_TRUE(delta.followers.empty());
+    EXPECT_TRUE(delta.deletes.empty());
+
+    EXPECT_EQ(delta.electedLeaders[0].topicId,   1);
+    EXPECT_EQ(delta.electedLeaders[0].partition, 0);
+}
+
+// Case A2: electedLeader detected when ONLY leaderEpoch bumped, partitionEpoch flat.
+// This validates the MINOR fix: the early-return gate must be
+// (leaderEpochBumped || partitionEpochBumped), not just partitionEpochBumped.
+// A controller may bump leaderEpoch without bumping partitionEpoch (e.g. leader
+// re-registered at the same partition epoch after a node restart).
+TEST(LocalRoleDelta, ElectedLeader_OnlyLeaderEpochBumped)
+{
+    // prev: node 1 is leader, le=1, pe=1
+    AssignmentMap prev = singleEntry(1, 0, PartitionAssignment{1, {1,2}, {1,2}, 1, 1});
+
+    // current: leader=1, le=2 (bumped), pe=1 (UNCHANGED)
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(1, 1, 2);
+    msm.apply(cbuf.data(), csz, 0);
+    msm.commit(0);
+    auto [ubuf, usz] = encodeUpdate({1, 0, 1, {1,2}, {1,2}, 2, 1}); // le=2, pe=1
+    msm.apply(ubuf.data(), usz, 1);
+    msm.commit(1);
+
+    LocalRoleDelta delta = msm.deriveLocalDelta(/*selfNode=*/1, prev);
+
+    // leaderEpoch advanced → electedLeaders even though partitionEpoch did not change
     EXPECT_EQ(delta.electedLeaders.size(), 1u);
     EXPECT_TRUE(delta.leaderUpdates.empty());
     EXPECT_TRUE(delta.followers.empty());
@@ -574,7 +707,17 @@ TEST(MetadataStateMachine, RestorePrunesAbsentAssignments)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. Structural sharing: applying one topic's change does not affect another
+// 8. Structural sharing: applying one topic's change does not affect another.
+//
+//    We assert POINTER IDENTITY — the PartitionAssignment* for topic 1 must
+//    remain the same object after a topic-2 update.  A full-rebuild-every-apply
+//    implementation would return a different pointer; our open-addressing map
+//    returns a stable slot pointer as long as no rehash occurs.
+//
+//    Note: this test assumes no rehash of the committed_ map occurs within the
+//    window between capturing the pointer and the final assertion.  With only
+//    2 topics (2 partition entries) in an INITIAL_CAP=16 table, load factor
+//    stays well below 0.60, so no rehash will occur.
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(MetadataStateMachine, StructuralSharing_OtherTopicUnaffected)
@@ -598,21 +741,24 @@ TEST(MetadataStateMachine, StructuralSharing_OtherTopicUnaffected)
     msm.apply(ub2.data(), us2, 3);
     msm.commit(3);
 
-    const PartitionAssignment* before = msm.assignment(1, 0);
-    ASSERT_NE(before, nullptr);
-    int32_t leaderBefore = before->leaderNode;
-    int32_t peBefore     = before->partitionEpoch;
+    // Capture POINTER to topic-1's PartitionAssignment slot BEFORE topic-2 update.
+    // A full-rebuild-every-apply impl would return a different pointer after any
+    // put(); pointer stability proves no rebuild or rehash affected topic 1's slot.
+    const PartitionAssignment* slotBefore = msm.assignment(1, 0);
+    ASSERT_NE(slotBefore, nullptr);
 
-    // Update topic 2's partition
+    // Update topic 2's partition — must not touch topic 1's slot
     auto [ub2b, us2b] = encodeUpdate({2, 0, 21, {21}, {20,21}, 2, 2});
     msm.apply(ub2b.data(), us2b, 4);
     msm.commit(4);
 
-    // Topic 1 assignment must be unchanged
-    const PartitionAssignment* after = msm.assignment(1, 0);
-    ASSERT_NE(after, nullptr);
-    EXPECT_EQ(after->leaderNode,     leaderBefore);
-    EXPECT_EQ(after->partitionEpoch, peBefore);
+    // Topic 1's pointer must be the SAME object (stable slot identity)
+    const PartitionAssignment* slotAfter = msm.assignment(1, 0);
+    ASSERT_NE(slotAfter, nullptr);
+    EXPECT_EQ(slotAfter, slotBefore); // pointer identity: no rebuild/rehash in window
+    // Field values must also be unchanged
+    EXPECT_EQ(slotAfter->leaderNode,     10);
+    EXPECT_EQ(slotAfter->partitionEpoch, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
