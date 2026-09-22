@@ -4,7 +4,8 @@
 **Repos:** rune-broker (primary), rune-client-cpp (client routing)
 **Supersedes:** `2026-09-15-rune-milestone-d-distributed-partition-leadership-DRAFT.md` (idea capture)
 **Rationale:** `2026-09-22-rune-milestone-d-rationale-tradeoffs.md` (why we do this)
-**Kafka parity:** `2026-09-22-rune-milestone-d-kafka-reference-parity.md` (edge-case rules mirrored from Kafka KRaft v4.5)
+**Kafka parity:** `2026-09-22-rune-milestone-d-kafka-reference-parity.md` (edge-case rules mirrored from Kafka KRaft v4.5; Part 2 = second-pass deep dive)
+**Aeron ULL:** `2026-09-22-rune-milestone-d-aeron-ull-reference.md` (low-latency primitives + the Aeron Cluster consensus/apply template)
 **Companion (downstream):** `2026-09-15-rune-db-face-materialized-views-transactions-DRAFT.md` (views ride on this)
 
 ## Goal
@@ -211,6 +212,81 @@ and distributed (fills the existing `// Milestone-D` seams). This makes the
 already-built Tier-2 EOS work in a distributed-leadership world — it is *placement
 generalization*, not new transaction machinery.
 
+### G. Leadership-move correctness — the per-handoff machinery (Kafka parity §13)
+
+Because D moves leadership *routinely*, the correctness that Kafka runs on every
+handoff must be first-class here — not incidental. Rune already has the building
+blocks (Milestone C-B); D exercises them **per-partition on every move**.
+
+- **Producer/EOS state is rebuilt from the replicated log, never shipped.** On
+  Follower→Leader, the new leader reconstructs the idempotent-producer dedup window
+  (≥ max-in-flight batches), last sequence, and producer/coordinator epochs by
+  replaying the committed prefix it already holds — **atomically with truncation**
+  (truncate → drop out-of-range producer snapshots → rebuild at the post-truncation
+  offset, under one lock). *Reuse* the existing `ProducerStateManager` rebuild-from-log
+  (TX-2b) and `LeaderEpochCache` (KIP-101); D only makes them fire on each handoff.
+  Without this, a move can accept a duplicate or reject a valid sequence.
+- **Follower truncation is an epoch-boundary protocol, mandatory on every handoff.**
+  Use the leader-epoch→start-offset history: `endOffsetFor(epoch)` = start of the
+  next-higher epoch; truncate to `min(followerEpochEnd, leaderEnd, followerLEO)`; if
+  the leader answers a lower epoch, intermediate-truncate and re-query (multi-epoch
+  walk-back); re-check the leader epoch didn't change during the round-trip. Prefer
+  the diverging-epoch-in-fetch form (follower sends `lastFetchedEpoch`; leader returns
+  an empty batch + diverging point; follower truncates **without advancing
+  watermarks**). HW-only truncation silently keeps divergent tails — not acceptable.
+- **HW / maximalIsr invariants.** Maintain a two-state ISR: **committed ISR** and
+  **maximalIsr** (the safe superset — on a pending *expand*, committed ∪ {joiner}; on
+  a pending *shrink*, the **old** committed ISR, not the shrunk target). Advance HW to
+  **min LEO over maximalIsr**, and **not at all while under min-ISR**. A new leader
+  **keeps its checkpointed HW and only ever increments it** (never jumps HW to its
+  LEO on election), sets `leaderEpochStartOffset = LEO` (gating ISR rejoin until a
+  follower catches up within the new epoch), and refuses reads while
+  `leaderEpochStart > HW`. A follower clamps HW to `min(leaderHW, ownLEO)`. This
+  jointly prevents exposing uncommitted tail data and losing acked data when a pending
+  shrink is later rejected.
+
+### H. MSM engineering — apply off the hot path, MVCC, bounded, versioned (Kafka parity §14; Aeron ULL Part 2)
+
+- **Apply off the request path.** A single-threaded apply loop consumes *committed*
+  assignment records; the gateway/routing read view is **one immutable image swapped
+  with a single release-store** (Aeron counter / volatile-pointer style). Readers
+  capture the pointer once — no lock shared with the applier, no half-applied image.
+- **Publisher fault isolation.** Each downstream apply step (replica role change,
+  routing update, coordinator placement) is isolated; a throw is routed to a fault
+  handler and does **not** crash the node. Deliberately classify: controller
+  write-side replay failure = fatal; node apply-side failure = non-fatal.
+- **MVCC / timeline reads.** The controller mutates assignment state speculatively as
+  it replays, yet must serve consistent reads at the committed offset: use a
+  versioned structure with O(1) current reads + per-entry deltas + `revert`
+  (discard uncommitted speculation on a lost commit) + a bound on retained history.
+- **Structural sharing.** Assignment state lives in persistent/immutable maps so the
+  next image after a change is O(changed partitions) — untouched topics/partitions
+  shared by reference. No deep copy per commit.
+- **Batching bounds.** Cap records per operation and split a mass reassignment into
+  bounded, individually-snapshotted batches (never one giant atomic batch); enforce a
+  byte ceiling too. A whole-cluster rebalance must not stall the metadata log.
+- **Version-gated records.** Assignment records carry a metadata-version-derived wire
+  version; unsupported fields use a `handleLoss` fallback; the version is not finalized
+  until every node advertises support; downgrade refuses if it would drop assignment
+  metadata. Mixed-version-upgrade safety.
+- **Snapshots are full + self-throttled, and prune on load.** Snapshot the assignment
+  map + membership at a *committed, logged* position; loading must prune assignments
+  absent from the snapshot (else removed assignments resurrect).
+
+### I. Deterministic control-plane — timers/heartbeat as logged records (Aeron ULL Part 2)
+
+The periodic **Balancer tick** and **heartbeat-expiry** must **not** run off a local
+wall-clock timer in the apply path — that diverges replicas. Mirror Aeron Cluster:
+heartbeats arrive as messages that update last-seen time *in applied state*; the
+**leader** holds the authoritative timer (a priority-heap keyed on deadline) polled
+against **cluster/log time**, and on expiry **appends a tick/decision record to the
+log**, which every replica applies deterministically. So "member down → reassign its
+partitions" is itself a committed, replayable entry — identical on the leader, every
+follower, and every recovering node. Liveness (heartbeat contact time) is **soft
+state off the consensus log** (rebuilt on controller failover, eating one
+session-timeout of detection latency); only the *decisions* are logged. Pending
+timers are snapshotted and re-armed against cluster time on election-complete.
+
 ## Data model — per-topic sharding config
 
 Each topic carries (in the MSM topic record):
@@ -291,16 +367,25 @@ The milestone splits cleanly into a **hot path** (must be zero-alloc, <100µs p9
 and a **control plane** (rare, bounded allocation allowed). The design keeps them
 apart deliberately.
 
+*(Primitives and citations: see the Aeron ULL reference doc — ring buffers,
+release/acquire ordering, 128B padding, open-addressing collections, mmap status
+counters.)*
+
 **Hot path — zero allocation, no locks on the fast route:**
-- **Client partition→leader lookup:** the routing map is a **preallocated flat
-  array indexed by `partitionId`** (`partition → {leaderNodeId, leaderEpoch}`),
-  not a per-produce hashmap allocation. `hash(key)→partition` then an O(1) array
-  index. Endpoints are interned (id→endpoint resolved once, cached), so the
-  produce path carries a small integer node id, never a `std::string`.
-- **Gateway per-partition role check:** the "am I the leader of partition P?"
-  test on every produce/subscribe is an O(1) lookup into a preallocated
-  per-partition role array (mirrors `ReplicaRegistry`), no allocation, no map
-  rehash. Reject/redirect uses a preallocated error response.
+- **Client/gateway routing view = a single immutable image swapped atomically**
+  (Kafka `KRaftMetadataCache` + Aeron counter model). The `partitionId →
+  {leaderNodeId, leaderEpoch}` view is published as an immutable snapshot updated
+  by **one release-store**; the read path captures the pointer once and indexes a
+  **preallocated flat array by `partitionId`** — O(1), no lock shared with the
+  applier, no half-applied image, no per-produce allocation. Endpoints are interned
+  (id→endpoint resolved once), so the produce path carries a small integer node id,
+  never a `std::string`.
+- **Gateway per-partition role check:** "am I the leader of partition P?" is an O(1)
+  index into the same immutable image (mirrors `ReplicaRegistry`), no allocation, no
+  rehash; reject/redirect uses a preallocated error response.
+- **acks=all completion** stays purgatory-style (watch-key + timing wheel, signaled
+  by the HW-advance event) — no thread-per-request; D keeps this per-partition
+  (existing GR machinery).
 - **The append/ISR path is untouched** — D adds no allocation to it; that is the
   whole point of keeping this a control-plane milestone.
 
@@ -381,6 +466,24 @@ gate.
   unit to avoid partial-group churn.
 - **Hot partition / skew** → observable per-partition; mitigation is modeling
   (global entities out of user aggregates), not automatic in this milestone.
+- **Topic deletion (Kafka parity §16):** one atomic delete record; nodes process
+  **deletes before creates** (safe same-name recreate); a node offline during a
+  delete quarantines its stale log as a **stray replica** (never resurrects it);
+  topic/partition ids are **never reused** so a stale log is unambiguously identifiable.
+- **Reassignment-cancel liveness (Kafka parity §16):** revert reverts to the original
+  replica set; note that "clean vs unclean" is decided by set membership, not
+  liveness — a "clean" cancel can still leave a partition **transiently leaderless**
+  if surviving originals are down. **Policy (locked): allow-leaderless** (never a
+  silent unclean election); unclean cancel requires the per-topic opt-in.
+- **Controlled shutdown vs min-ISR (Kafka parity §16):** min-ISR is a **produce-time**
+  gate, not an election/shutdown gate. **Policy (locked): match Kafka** — a graceful
+  shutdown may shrink ISR below min-ISR or go leaderless and still let the node
+  leave; it never does a silent unclean election. Write-availability is protected by
+  produce-side min-ISR, not by blocking the move.
+- **Multi-record atomicity (Kafka parity §16):** a multi-record op (create-topic + its
+  partition-assignment records) is one atomic batch that must fit one replication
+  batch or **fail hard** — never a partial apply across batch boundaries (byte
+  ceiling enforced separately from record count).
 
 ## Testing
 
@@ -401,6 +504,20 @@ gate.
   `NO_LEADER`; unclean-election opt-in gating; incarnation zombie guard;
   unfence-after-catch-up; fence-one-at-a-time under multiplied failover; client
   lower-epoch-rejection routing.
+- **Leadership-move correctness tests (parity §13, §17 — the per-handoff core):**
+  producer/EOS dedup window + last-seq + epochs correctly rebuilt-from-log after a
+  move (no duplicate accepted, no valid sequence rejected), atomic with truncation;
+  follower epoch-boundary truncation incl. the multi-epoch walk-back and the
+  leader-epoch-changed-mid-RPC recheck; HW never advances past min-LEO-over-maximalIsr
+  and never under min-ISR; new leader keeps checkpointed HW (no jump-to-LEO) and
+  fences reads while `leaderEpochStart > HW`; a rejected pending-shrink never loses an
+  acked write. **These must be in-process integration tests before the DR matrix.**
+- **MSM engineering tests (parity §14):** apply-off-hot-path (reads never block on
+  apply), publisher-fault isolation (a throwing apply step doesn't crash the node),
+  MVCC revert of uncommitted speculation, version-gated record round-trip, snapshot
+  load prunes removed assignments. **Deterministic-control test:** the balancer /
+  heartbeat-expiry decision is a logged record → identical assignment on leader,
+  follower, and a node recovering from snapshot+replay (replay determinism).
 
 ## Rollout / ownership
 
@@ -420,3 +537,15 @@ gate.
   bumps) — start pull + REDIRECT, evaluate push later.
 - Interaction sequencing with in-flight Milestone C work (coordinator seams must
   not calcify before Phase 3 fills them).
+- Does Rune's current single-leader ISR model already carry a **two-state (committed
+  vs maximalIsr)** distinction, or must it be added? (Kafka parity §13c — needed for
+  correct HW/acks during in-flight ISR change under distributed leadership.) Confirm
+  against `IsrManager`/`PartitionReplica` during planning.
+- **Fetch-from-follower (KIP-392)** for materialized-view **read-replica** queries is
+  captured as the correct read path (parity §15) but is **downstream** (the views
+  milestone), not built in D — confirm it stays deferred.
+
+**Resolved during this pass (previously open):** reassignment-cancel liveness =
+allow-leaderless (never silent unclean); controlled-shutdown vs min-ISR = match Kafka
+(produce-side gate only); deterministic timers = balancer/heartbeat-expiry as logged
+records (§I).

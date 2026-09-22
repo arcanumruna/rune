@@ -301,3 +301,160 @@ none); (b) ELR deferred (accept unclean-or-unavailable in early phases); (c)
 faithful-port constraint — reuse Aeron's encoders/ring buffers, and hold the 100µs
 p99 + near-zero-allocation bar (decision #8) on the hot path, which Kafka (JVM) does
 not target.
+
+---
+
+# Part 2 — Second-pass deep dive (what the first pass missed)
+
+A deeper source read (metadata apply pipeline, broker hot path, and the correctness
+that a leadership *move* triggers) surfaced items the first pass didn't cover.
+**Highest-value theme: because D moves leadership routinely, the machinery that runs
+on every handoff — producer-state rebuild, follower truncation, HW/maximalIsr — must
+be first-class, not incidental.**
+
+## 13. Leadership-move correctness (D triggers this on every handoff)
+
+### 13a. Producer/EOS state is LOG-DERIVED, not shipped
+Producer `.snapshot` files are **not** replicated. Followers update
+`ProducerStateManager` from replicated batches/markers via `appendAsFollower→update`
+(`UnifiedLog.java:1266`); on becoming leader / after truncation the new leader
+**rebuilds producer state by replaying the committed log** (`rebuildProducerState`→
+`loadProducersFromRecords`, `UnifiedLog.java:2540-2616`). Snapshots are a local
+recovery optimization only. Dedup window = last 5 batches
+(`ProducerStateEntry.NUM_BATCHES_TO_RETAIN=5`), matching `max.in.flight=5`; dup
+detection by exact `(firstSeq,lastSeq)` returns the original offsets (silent re-ack,
+no exception); `OutOfOrderSequence` only for `AppendOrigin.CLIENT` (replication is
+not seq-validated). **Truncation + rebuild is one atomic step** under lock:
+`truncateTo` → `deleteProducerSnapshots` → `rebuildProducerState(targetOffset)`
+(`UnifiedLog.java:2366-2383`).
+- **bug prevented:** duplicate accepted or valid sequence rejected after failover;
+  wrong LSO for read_committed; zombie writer un-fenced on the new leader.
+- **Rune:** *already has this* — Milestone C-B TX-2b: PSM failover, HW-bounded
+  rebuild-from-log on Follower→Leader; LeaderEpochCache (KIP-101). D just exercises
+  it **per-partition on every handoff**. Requirement: leadership move must rebuild
+  the dedup window (≥ max in-flight), last-seq, and producer/coordinator epochs from
+  the committed prefix the new leader already holds, atomically with truncation.
+
+### 13b. Follower truncation = epoch-boundary protocol (KIP-101/279/595)
+`LeaderEpochFileCache` = `TreeMap<epoch, startOffset>`; `endOffsetFor(epoch)` =
+**start offset of the next-higher epoch** (`LeaderEpochFileCache.java:284-328`) — an
+epoch's *end* is the successor's *start*, which is what makes "same offset, different
+data" detectable. On becoming follower, truncate to `min(followerEpochEndOffset,
+leaderEndOffset, followerLEO)` (`AbstractFetcherThread.getOffsetTruncationState:604-655`);
+if the leader answers with a *lower* epoch than asked (it was itself a truncated
+follower), do an **intermediate truncation and re-query** — the KIP-279 multi-epoch
+walk-back. **Re-check under lock that the leader epoch didn't change during the RPC**
+(`:213-224`). Modern path (KIP-595) folds this into Fetch: follower sends
+`lastFetchedEpoch`; leader returns an empty batch + `divergingEpoch` when
+`epochEndOffset.leaderEpoch < fetchEpoch || endOffset < fetchOffset`
+(`Partition.scala:1403`); follower truncates from the response **without advancing
+watermarks** — zero extra round-trips, no window to build on divergent data.
+- **bug prevented:** KIP-101 divergent-tail retention; KIP-279 mistruncation when the
+  new leader was a truncated follower; the append-past-divergence race.
+- **Rune:** the truncation-on-handoff protocol is **mandatory**; HW-only truncation
+  silently keeps divergent tails. Reuse the existing LeaderEpochCache; add the
+  epoch-boundary query + `min(...)` + multi-epoch loop + leader-epoch-recheck.
+
+### 13c. HW / LEO / maximalIsr invariants across handoff
+- HW advances to **min LEO over `maximalIsr`**, and **not at all while under
+  min-ISR** (`Partition.maybeIncrementLeaderHW:1012-1055`).
+- **`maximalIsr`** is the *safe superset*: pending **expand** = committed ISR ∪
+  {new replica} (so acks/HW already require the joiner); pending **shrink** = the
+  **old committed ISR**, NOT the shrunk target (HW stays gated on the full set until
+  the controller confirms). Using the target ISR early would ack data that a later
+  leader might not have (`PendingExpandIsr`/`PendingShrinkIsr`).
+- **A new leader keeps its checkpointed HW and only ever increments it**; it sets
+  `leaderEpochStartOffset = LEO` on election (gating ISR rejoin until a follower
+  catches up *within the new epoch*) and refuses client reads while
+  `leaderEpochStart > HW` (`OFFSET_NOT_AVAILABLE`) (`makeLeader:590-688`). A follower
+  clamps HW to `min(leaderHW, ownLEO)` and appends records *before* applying HW.
+- **bug prevented:** exposing uncommitted post-election tail; losing acked data when
+  a pending shrink is rejected and a shrunk-out replica is later elected.
+- **Rune:** adopt the two-state ISR (committed vs pending) + maximalIsr for HW/acks;
+  new-leader HW discipline; the `leaderEpochStart>HW` read fence.
+
+## 14. Metadata apply pipeline & controller performance (MSM engineering)
+
+- **Apply off the request path:** a single-threaded loader queue applies committed
+  deltas; the read cache is **one `volatile` immutable image swapped with a single
+  store** (`KRaftMetadataCache.currentImage`, `:74/:486`); readers capture the ref
+  once (`MetadataImage image = currentImage;`) — no lock shared with the applier.
+- **Publisher fault isolation:** each publisher call is wrapped per-publisher and
+  routed to a FaultHandler, *continuing* to the next (`MetadataLoader.java:362-369`);
+  deliberately choose fatal (controller write-side `replay`,
+  `QuorumController.java:828-834`) vs non-fatal (broker apply-side).
+- **MVCC/timeline reads:** `TimelineHashMap`/`SnapshotRegistry` give O(1)
+  current-version reads + per-entry deltas + `revert(epoch)` (discard uncommitted
+  speculation) + `deleteSnapshotsUpTo` (bound memory) — the controller mutates
+  speculatively yet serves consistent reads at a committed offset without locking.
+- **Structural sharing:** images are immutable, backed by persistent maps; applying a
+  delta reuses untouched topics/partitions by reference → next image is O(changed),
+  not O(total) (`TopicsDelta.apply`).
+- **Batching bounds:** `maxRecordsPerBatch≈10k`; atomic results over the cap **throw**
+  (never sliced); non-atomic are split into per-batch-snapshotted chunks
+  (`QuorumController.appendRecords:889-942`); `BoundedList` caps records/op; also a
+  hard **byte** ceiling (`MAX_BATCH_SIZE_BYTES≈8MB`). A mass reassignment must be
+  bounded, not one giant batch.
+- **Version-gate assignment records:** metadata-version-derived wire version +
+  `handleLoss` on unsupported fields; refuse to finalize the version until **every**
+  broker+controller advertises support; downgrade refuses if it would drop metadata
+  (`FeatureControlManager`, `MetadataVersion.partitionChangeRecordVersion`).
+- **Snapshots are FULL + self-throttled** (20 MiB / 1 h defaults, own queue,
+  single-in-flight debounce); load **prunes** state absent from the snapshot
+  (`finishSnapshot`) — else removed assignments resurrect.
+
+## 15. Broker hot-path techniques (latency)
+
+- **acks=all via purgatory + hierarchical timing wheel** (O(1) insert, one reaper),
+  completion *signaled* by the HW-advance event calling `checkAndComplete(partitionKey)`
+  — not thread-per-request; watcher map sharded (512) to cut lock contention;
+  completion guarded by volatile+lock so timeout/data-arrival race safely.
+- **Network↔work decoupling:** bounded request queue; network threads only do I/O and
+  mute the connection while in-flight (per-connection ordering); slow work parks in
+  purgatory; continuations re-enter via a priority callback queue + selector wakeup.
+- **Incremental fetch sessions (KIP-227):** send only changed-partition deltas;
+  broker caches per-partition cursor; cap+shard the session cache, prioritize
+  internal (follower) sessions on eviction. Essential at high partition counts.
+- **Fetch-from-follower (KIP-392):** route a reader to a follower only if it is
+  **in-ISR and already holds the offset**, serve **capped at committed HW**, with an
+  `(leaderEpoch, endOffsetForEpoch)` probe so the reader detects truncation after a
+  handoff. **Directly the read path for materialized-view read-replicas.**
+- **Zero-copy egress (`transferTo`/sendfile) + page-cache ingress**, fsync decoupled
+  (durability from replication). TLS forfeits sendfile (user-space encrypt copy).
+
+## 16. Other correctness edges
+
+- **Topic deletion** = one atomic `RemoveTopicRecord`; brokers process **deletes
+  before creates** (safe same-name recreate); an offline broker's stale log becomes a
+  **stray replica** quarantined to `-stray` (topic ids never reused). Rune: same
+  ordering + stray-quarantine + non-reusable topic/partition ids.
+- **Reassignment cancel/revert** reverts to `originalReplicas` (strip *adding*, keep
+  *removing*), ISR minus adding; `unclean` is computed from **set membership only,
+  not liveness** — so a "clean" cancel can still yield a *transiently leaderless*
+  partition if surviving originals are down. Rune: decide the policy explicitly
+  (reject / allow-leaderless / allow-unclean) and where liveness is checked.
+- **Controlled shutdown is availability-first:** min-ISR is a **produce-time** gate,
+  **not** an election/shutdown gate — the controller will shrink ISR below min-ISR or
+  go `NO_LEADER` and still let the broker leave, but **never** does a silent unclean
+  election. Rune: match this (rely on produce-side min-ISR) or explicitly choose to
+  block moving the last in-sync leader — do not assume min-ISR gates election.
+- **Multi-record atomicity:** a multi-record op (create-topic + N partition records)
+  is one atomic batch that must fit one replication batch or it **fails hard** — no
+  partial apply across batch boundaries; watch the byte ceiling separately from count.
+
+## 17. Second-pass parity additions checklist
+1. Producer/EOS state **rebuilt from the replicated log** on every leadership move,
+   atomic with truncation (reuse Rune's PSM rebuild-from-log).
+2. Follower **epoch-boundary truncation** protocol mandatory on every handoff
+   (endOffsetFor + min(3) + multi-epoch walk-back + leader-epoch recheck; ideally the
+   diverging-epoch-in-fetch form).
+3. **maximalIsr** two-state ISR + HW=min-LEO-over-maximalIsr + under-min-ISR gate;
+   new-leader keeps checkpointed HW, only increments; `leaderEpochStart>HW` read fence.
+4. MSM apply **off the hot path** (single-thread loader + volatile immutable-image
+   swap); **publisher fault isolation**; **MVCC/timeline** consistent reads + revert +
+   bound; **structural sharing**; **batching bounds**; **version-gated** records;
+   **full self-throttled snapshots that prune on load**.
+5. Hot path: **purgatory + timing wheel** for acks=all; **incremental fetch**;
+   **fetch-from-follower** for view read-replicas; zero-copy + page-cache.
+6. Topic-delete ordering + stray quarantine; reassignment-cancel liveness policy;
+   controlled-shutdown vs min-ISR policy; multi-record atomic-batch bound.
