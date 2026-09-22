@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/Crc32c.h>
+#include <cstdlib>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <cstdint>
 #include <climits>
@@ -714,26 +716,44 @@ TEST(DeleteHorizon, ConformanceGoldenVector) {
     });
     EXPECT_EQ(recordsCalled, 1);
 
-    // Write the golden vector to disk so it can be committed alongside the code.
+    // CP-10 Fix 4: read the committed golden vector and assert byte-exact equality.
+    // The test must NOT regenerate the file on every run — that would silently accept
+    // wire-format regressions.  Regeneration is only permitted when the env var
+    // RUNE_REGEN_GOLDEN_VECTORS is set to "1" (explicit developer opt-in).
     const std::string goldenPath =
         std::string(RUNE_CONFORMANCE_DIR) + "/vectors/record_batch_delete_horizon.bin";
-    FILE* f = std::fopen(goldenPath.c_str(), "wb");
-    ASSERT_NE(f, nullptr) << "Cannot create golden vector: " << goldenPath;
-    const std::size_t written = std::fwrite(encoded.data(), 1, encoded.size(), f);
-    std::fclose(f);
-    ASSERT_EQ(written, encoded.size()) << "Short write to golden vector file";
 
-    // Re-read the file and verify byte-exact roundtrip.
-    FILE* fr = std::fopen(goldenPath.c_str(), "rb");
-    ASSERT_NE(fr, nullptr);
-    std::fseek(fr, 0, SEEK_END);
-    const long sz = std::ftell(fr);
-    std::fseek(fr, 0, SEEK_SET);
-    std::vector<uint8_t> readBack(static_cast<std::size_t>(sz));
-    const std::size_t got = std::fread(readBack.data(), 1, readBack.size(), fr);
-    std::fclose(fr);
-    ASSERT_EQ(got, encoded.size());
-    EXPECT_EQ(readBack, encoded) << "Golden vector file differs from encoded bytes";
+    const char* regenEnv = std::getenv("RUNE_REGEN_GOLDEN_VECTORS");
+    const bool  doRegen  = regenEnv && std::string_view(regenEnv) == "1";
+
+    if (doRegen) {
+        // Developer opt-in: regenerate the committed file (use only after a
+        // deliberate wire-format change with careful review).
+        FILE* f = std::fopen(goldenPath.c_str(), "wb");
+        ASSERT_NE(f, nullptr) << "Cannot create golden vector: " << goldenPath;
+        const std::size_t written = std::fwrite(encoded.data(), 1, encoded.size(), f);
+        std::fclose(f);
+        ASSERT_EQ(written, encoded.size()) << "Short write to golden vector file";
+        SUCCEED() << "RUNE_REGEN_GOLDEN_VECTORS=1: regenerated " << goldenPath;
+    } else {
+        // Normal CI path: read the committed file and assert byte-exact equality.
+        FILE* fr = std::fopen(goldenPath.c_str(), "rb");
+        ASSERT_NE(fr, nullptr)
+            << "Cannot open committed golden vector: " << goldenPath
+            << "  (To regenerate, set RUNE_REGEN_GOLDEN_VECTORS=1 and re-run.)";
+        std::fseek(fr, 0, SEEK_END);
+        const long sz = std::ftell(fr);
+        std::fseek(fr, 0, SEEK_SET);
+        ASSERT_GT(sz, 0) << "Golden vector file is empty: " << goldenPath;
+        std::vector<uint8_t> committedBytes(static_cast<std::size_t>(sz));
+        const std::size_t got = std::fread(committedBytes.data(), 1, committedBytes.size(), fr);
+        std::fclose(fr);
+        ASSERT_EQ(got, committedBytes.size()) << "Short read from golden vector file";
+        EXPECT_EQ(encoded, committedBytes)
+            << "Encoded bytes differ from committed golden vector " << goldenPath
+            << ".  Wire-format regression detected!  "
+            << "If this is intentional, set RUNE_REGEN_GOLDEN_VECTORS=1 and re-run to regenerate.";
+    }
 }
 
 // ===========================================================================
