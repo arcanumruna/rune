@@ -766,13 +766,16 @@ TEST(CompactionCorrectness, HwUnchangedByCompaction) {
     }
     log.reloadSegments();
 
-    // GUARD: compaction must have actually run (records removed from sealed zone).
+    // GUARD + CONVERGENCE: compaction must have actually run AND converged the
+    // hot key to EXACTLY ONE live record (superseded copies GONE).  The prior
+    // `< 150` assertion was a loose vacuousness guard that would pass even if
+    // compaction stalled partway (the watermark-convergence bug); assert full
+    // convergence now.
     const int hot_after = cp4CountKey(log, "hot");
-    // After compaction there should be at most 1 hot record in the sealed zone
-    // (the global latest); we just assert strictly fewer than 150.
-    ASSERT_LT(hot_after, 150)
-        << "Compaction guard: hot key must have been compacted; got "
-        << hot_after << " records (vacuousness — compaction did not run)";
+    EXPECT_EQ(hot_after, 1)
+        << "Compaction must converge the hot key to exactly ONE live record "
+           "(superseded copies removed); got " << hot_after
+        << " records.  '< 150' would have hidden a non-converging cleaner.";
 
     // HW must be unchanged.
     const int64_t hw_after  = rawReplica->highWatermark();

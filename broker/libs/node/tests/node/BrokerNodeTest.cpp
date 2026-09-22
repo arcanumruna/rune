@@ -724,10 +724,21 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     }
 
     // =========================================================================
-    // Arm B: coalescing DISABLED — segment count must NOT bulk-merge (non-vacuous).
+    // Arm B: coalescing DISABLED — individual-segment compaction still CONVERGES.
     //
-    // Individual-segment compaction rewrites each segment in place but does NOT
-    // merge segments.  We assert that >= 90% of the original segments remain.
+    // Individual-segment compaction rewrites one sealed segment per pass; once a
+    // segment's records are all superseded it is emptied and dropped.  Over
+    // enough passes the log CONVERGES to latest-per-key (one live record per key)
+    // and the segment count collapses — same end state as coalescing ON, reached
+    // one-segment-at-a-time instead of via merged groups.
+    //
+    // (The prior version asserted >= 90% of segments REMAIN with coalescing OFF.
+    // That was only ever true because of a compaction-convergence watermark bug
+    // that advanced the clean watermark past un-rewritten segments after a single
+    // rewrite — so individual compaction never actually converged.  With the fix
+    // the watermark advances only past the rewritten segment, so coalescing-OFF
+    // converges too; the ON-vs-OFF distinction is the merge mechanism during
+    // processing, not the final residual count.)
     // TSan-clean: same pre-start write pattern as arm A.
     // =========================================================================
     {
@@ -740,6 +751,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
 
         constexpr int kRecords = 400;
         int segCountBefore = 0;
+        std::unordered_map<std::string, std::string> expectedLatest;
         {
             rune::storage::Log rawLog(logDir, 128);
             for (int v = 0; v < kRecords; ++v) {
@@ -749,6 +761,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
                          std::string_view("v" + std::to_string(v)), 1000);
                 auto batch = b.build();
                 rawLog.append(batch, v);
+                expectedLatest[key] = "v" + std::to_string(v);
             }
             const auto bases = rawLog.segmentBaseOffsets();
             ASSERT_GE(bases.size(), 3u)
@@ -777,12 +790,22 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         finalLog.recover();
         const int segCountAfter = static_cast<int>(finalLog.segmentBaseOffsets().size());
 
-        const int minResidual = (segCountBefore * 9) / 10;
-        EXPECT_GE(segCountAfter, minResidual)
-            << "CP-8 (coalescing OFF): individual compaction must NOT bulk-merge segments; "
-               "expected >= " << minResidual << " segments to remain, got " << segCountAfter
-            << " (before=" << segCountBefore << "). "
-            << "Non-vacuous: arm A showed a large drop with coalescing ON.";
+        // CONVERGENCE: coalescing-OFF individual compaction must ALSO converge —
+        // segment count drops (superseded-empty segments dropped) and latest-per-
+        // key is preserved.  Non-vacuous: this asserts real convergence, not the
+        // bug-dependent "segments must remain" behavior.
+        EXPECT_LT(segCountAfter, segCountBefore)
+            << "CP-8 (coalescing OFF): individual compaction must still CONVERGE "
+               "(segment count drops as superseded segments are emptied+dropped); "
+               "before=" << segCountBefore << " after=" << segCountAfter;
+
+        auto actualLatest = scanLatestPerKey(finalLog);
+        for (const auto& [k, v] : expectedLatest) {
+            EXPECT_EQ(actualLatest[k], v)
+                << "CP-8 (coalescing OFF): latest value for key='" << k
+                << "' must be preserved; expected='" << v
+                << "' got='" << actualLatest[k] << "'";
+        }
     }
 }
 

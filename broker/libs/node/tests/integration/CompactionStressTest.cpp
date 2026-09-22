@@ -224,6 +224,40 @@ stressScanLatestPerKey(Log& log) {
     return latest;
 }
 
+// Scan all live records and return the COUNT of live copies per key.
+// Used to assert convergence (exactly one live copy per key) — a stronger check
+// than stressScanLatestPerKey (which only proves the latest value is present and
+// would silently accept dozens of superseded copies, hiding the
+// compaction-convergence watermark bug).
+static std::unordered_map<std::string, int>
+stressScanCountPerKey(Log& log) {
+    std::unordered_map<std::string, int> counts;
+    auto bases = log.segmentBaseOffsets();
+    if (bases.empty()) return counts;
+    int64_t cursor = 0;
+    for (size_t si = 0; si < bases.size(); ++si) {
+        int64_t segEnd = (si + 1 < bases.size())
+                         ? bases[si + 1]
+                         : std::numeric_limits<int64_t>::max();
+        if (cursor < bases[si]) cursor = bases[si];
+        for (;;) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool advanced = false;
+            r.forEach([&](std::string_view k, std::string_view,
+                          int64_t off, int64_t) {
+                counts[std::string(k)]++;
+                cursor = off + 1;
+                advanced = true;
+            });
+            if (!advanced || cursor >= segEnd) break;
+        }
+    }
+    return counts;
+}
+
 // Verify the segment list is strictly ascending (no duplicates, no disorder).
 static bool stressCheckSegmentsAscending(Log& log) {
     auto bases = log.segmentBaseOffsets();
@@ -292,7 +326,11 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
     constexpr int    kTotalRecords       = kTotalPartitions * kKeysPerPartition * kRecordsPerKey;
 
     constexpr int64_t kSegRoll  = 1024LL;         // 1 KiB roll → ~10-20 sealed segments
-    constexpr int    kPumpCycles = 1000;           // cleaner+duty pump iterations
+    // cleaner+duty pump iterations.  Sized so the filthiest-first cleaner (one
+    // log per cycle, one segment per pass) has enough cycles to fully CONVERGE
+    // every compact partition to one live record per key — the strengthened
+    // convergence assertions below require it.
+    constexpr int    kPumpCycles = 3000;
 
     // 60-second hard wall budget (the test should finish much faster).
     constexpr auto kWallBudget = 60s;
@@ -353,6 +391,21 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
                     rawLog.append(b, off);
                     ++off;
                 }
+            }
+            // Sentinels: write enough unique trailing records to fill (and seal)
+            // past a whole segment so ALL real "ck*" key updates end up in SEALED
+            // segments.  The active (never-compacted) segment then holds only
+            // sentinels — no "ck*" key.  Without this, the last-round updates for
+            // the most-recently-written keys sit in the never-compacted active
+            // segment (active copy + last-sealed copy = 2), making exact
+            // one-live-copy-per-key convergence unachievable.  With a full segment
+            // of sentinels every "ck*" key converges to exactly ONE live copy, so
+            // the convergence assertion below is both strong AND correct.
+            for (int s = 0; s < kKeysPerPartition * 3; ++s) {
+                auto b = stressBatch(off, "csentinel" + std::to_string(s), "s",
+                                     /*ts=*/1000LL + off);
+                rawLog.append(b, off);
+                ++off;
             }
             entry->leoBefore = rawLog.logEndOffset();
             // Expected: last update for each key is r = kRecordsPerKey - 1.
@@ -548,6 +601,7 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
     // Assertions: post-run correctness & stability.
     // -----------------------------------------------------------------------
     int latestKeyFailures      = 0;
+    int convergenceFailures    = 0;
     int hwLeoFailures          = 0;
     int divergenceFailures     = 0;
     int boundedMemoryFailures  = 0;
@@ -606,8 +660,31 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
                     }
                 }
             }
+            // (c2) CONVERGENCE for COMPACT-ONLY partitions: after enough cleaner
+            // cycles, compaction must converge each key to EXACTLY ONE live copy
+            // (superseded copies GONE).  We restrict this to compact-only (no
+            // retention deleting records) so the expected count is deterministic.
+            // stressScanLatestPerKey alone would NOT catch a stalled cleaner that
+            // left dozens of superseded copies — this is the check that guards
+            // the compaction-convergence watermark bug at stress scale.
+            if (e.isCompact && !e.isDelete) {
+                auto counts = stressScanCountPerKey(log);
+                for (auto& [k, cnt] : counts) {
+                    if (cnt != 1) {
+                        ++convergenceFailures;
+                        if (convergenceFailures <= 5) {
+                            ADD_FAILURE()
+                                << "CP-5.4: compact partition " << idx << " (topicId="
+                                << e.topicId << "): key='" << k << "' did not converge "
+                                << "to one live copy; got " << cnt << " copies "
+                                   "(superseded records not removed → non-converging cleaner).";
+                        }
+                    }
+                }
+            }
             // Count total live records across compact partitions.
-            if (!e.isCompact) totalLiveCompact += stressCountLiveRecords(log);
+            if (e.isCompact && !e.isDelete)
+                totalLiveCompact += stressCountLiveRecords(log);
         }
 
         // (d) Bounded memory proxy: segment count must not exceed initial + small slack.
@@ -646,6 +723,10 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
         << "CP-5.4: " << hwLeoFailures << " partitions had HW/LEO violated by compaction/retention";
     EXPECT_EQ(latestKeyFailures, 0)
         << "CP-5.4: " << latestKeyFailures << " latest-per-key mismatches across compact partitions";
+    EXPECT_EQ(convergenceFailures, 0)
+        << "CP-5.4: " << convergenceFailures << " keys in compact-only partitions did "
+           "NOT converge to one live copy (superseded records persisted — the "
+           "compaction-convergence watermark bug at stress scale).";
     EXPECT_EQ(boundedMemoryFailures, 0)
         << "CP-5.4: " << boundedMemoryFailures
         << " partitions had unbounded segment growth (coalescing/retention not working)";
@@ -672,6 +753,17 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
             << "CP-5.4: compaction must have removed superseded records in compact "
                "partitions (non-vacuous); sample before=" << sampleBefore
             << " after=" << sampleLive;
+        // CONVERGENCE (strong): compact-only partitions must converge to EXACTLY
+        // one live record per key.  Each partition has kKeysPerPartition "ck*"
+        // keys (each converges to 1) + kKeysPerPartition*3 unique sentinel keys
+        // (each already unique → 1) = kKeysPerPartition*4 live records.
+        // '< before' alone would pass on a cleaner that stalled halfway.
+        const int sampleConverged = kSample * (kKeysPerPartition * 4);
+        EXPECT_EQ(sampleLive, sampleConverged)
+            << "CP-5.4: compact-only partitions must CONVERGE to exactly one live "
+               "record per key (" << sampleConverged << " total across " << kSample
+            << " sampled partitions); got " << sampleLive
+            << ".  A non-converging cleaner leaves superseded copies.";
     }
 
     // Wall time must be within budget.

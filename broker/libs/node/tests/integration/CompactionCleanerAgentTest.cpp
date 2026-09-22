@@ -1698,24 +1698,37 @@ TEST(CompactionCleanerAgent, CoalescingEndToEndFewSegments) {
            "If segsAfter == segsBefore, produceCleanedGroupBounded is not wired "
            "(or was scratch-neutered); the agent fell back to single-segment compaction.";
 
-    // OFFSET PRESERVATION: surviving records must have their original offsets.
-    // Build map of surviving key→record (latest per key after compaction).
+    // OFFSET PRESERVATION + CONVERGENCE: surviving records must have their
+    // original offsets, AND each key must converge to EXACTLY ONE live record
+    // (superseded copies GONE — not merely "latest present").  Walk per-segment
+    // (not a single read-from-0 cursor) so an emptied leading segment doesn't
+    // truncate the scan.
     struct PostRecord { std::string value; int64_t offset; };
-    std::map<std::string, PostRecord> postMap;
+    std::map<std::string, PostRecord> postMap;   // key → latest (offset/value)
+    std::map<std::string, int>        postCount; // key → # of LIVE copies
     {
+        auto pbases = log.segmentBaseOffsets();
         int64_t cursor = 0;
-        for (;;) {
-            auto bytes = log.read(cursor, 1 << 20);
-            if (bytes.empty()) break;
-            RecordBatchReader r(bytes.data(), bytes.size());
-            if (!r.ensureValid()) break;
-            bool advanced = false;
-            r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t) {
-                postMap[std::string(k)] = {std::string(v), off};
-                cursor = off + 1;
-                advanced = true;
-            });
-            if (!advanced) break;
+        for (size_t si = 0; si < pbases.size(); ++si) {
+            int64_t segEnd = (si + 1 < pbases.size())
+                                 ? pbases[si + 1]
+                                 : std::numeric_limits<int64_t>::max();
+            if (cursor >= segEnd) continue;
+            if (cursor < pbases[si]) cursor = pbases[si];
+            for (;;) {
+                auto bytes = log.read(cursor, 1 << 20);
+                if (bytes.empty()) break;
+                RecordBatchReader r(bytes.data(), bytes.size());
+                if (!r.ensureValid()) break;
+                bool advanced = false;
+                r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t) {
+                    postMap[std::string(k)] = {std::string(v), off};
+                    postCount[std::string(k)]++;
+                    cursor = off + 1;
+                    advanced = true;
+                });
+                if (!advanced) break;
+            }
         }
     }
 
@@ -1726,11 +1739,17 @@ TEST(CompactionCleanerAgent, CoalescingEndToEndFewSegments) {
         expectedLatest[pr.key] = pr;
     }
 
-    // Verify offset preservation and latest-per-key correctness.
+    // Verify offset preservation, latest-per-key correctness, AND convergence
+    // (exactly one live record per key — superseded copies removed).
     for (auto& [key, expected] : expectedLatest) {
         auto it = postMap.find(key);
         ASSERT_NE(it, postMap.end())
             << "Key '" << key << "' must survive compaction (it's the latest copy).";
+        EXPECT_EQ(postCount[key], 1)
+            << "Key '" << key << "' must converge to EXACTLY ONE live record "
+               "(superseded copies GONE); got " << postCount[key] << " copies.  "
+               "A weaker 'latest present' check (postMap only) hid the "
+               "compaction-convergence watermark bug.";
         EXPECT_EQ(it->second.offset, expected.offset)
             << "Key '" << key << "': offset must be preserved after coalescing merge; "
                "expected=" << expected.offset << " got=" << it->second.offset << ".";
