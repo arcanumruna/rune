@@ -438,6 +438,12 @@ std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
     --it;
     return it->second->read(startOffset, maxBytes);
 }
+int64_t Log::logStartOffset() const noexcept {
+    // The oldest segment's base offset (segments_ is an ordered map keyed by base).
+    // Empty map (should not happen post-construction) → 0.
+    if (segments_.empty()) return 0;
+    return segments_.begin()->first;
+}
 int64_t Log::recover() {
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();

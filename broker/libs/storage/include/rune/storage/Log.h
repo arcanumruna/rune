@@ -60,6 +60,13 @@ public:
     int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset);
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
+    /// The lowest offset still readable from this log — the base offset of the
+    /// first (oldest) on-disk segment.  Advances past 0 when retention/compaction
+    /// deletes the earliest segment(s).  An "Earliest" subscriber MUST start here,
+    /// NOT at 0: reading below the first segment base returns empty forever
+    /// (Log::read's upper_bound lands on begin() and yields {}), which silently
+    /// starves the subscriber (0 delivered).  Returns 0 for an empty log.
+    int64_t logStartOffset() const noexcept;
     int64_t recover();
     /// Flush + fdatasync the active segment's .log and msync its .index.
     /// append() already calls this (durable-by-default). External group-commit

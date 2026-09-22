@@ -1518,10 +1518,18 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     } else {
         clampLimit = leo;
     }
+    // CP-5.2 FIX (Earliest-below-logStart starvation): the oldest offset that is
+    // still on disk.  Retention/compaction can delete the earliest segment(s),
+    // advancing the first segment base past 0.  Log::read(offset) for any offset
+    // BELOW the first segment base returns {} forever (upper_bound lands on
+    // begin()), so an Earliest subscriber pinned to 0 gets 0 records for the life
+    // of the subscription.  Resolve Earliest — and clamp any explicit fromOffset
+    // that points into a deleted region — UP to the live log start instead.
+    const int64_t logStart = log->logStartOffset();
     int64_t nextOffset;
     if (msg.fromOffset == kFromEarliest) {
-        // Earliest → from the beginning of the log (offset 0).
-        nextOffset = 0;
+        // Earliest → the oldest offset still readable (NOT hardcoded 0).
+        nextOffset = logStart;
     } else if (msg.fromOffset < 0) {
         // Latest (-1) or any other negative sentinel → subscribe from HW (GR-6).
         (void)kFromLatest;
@@ -1529,6 +1537,11 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     } else if (msg.fromOffset > clampLimit) {
         // Beyond HW → clamp to HW (GR-6: don't skip ahead of committed data).
         nextOffset = clampLimit;
+    } else if (msg.fromOffset < logStart) {
+        // Explicit offset points into a retention/compaction-deleted region →
+        // clamp up to the oldest surviving offset (avoids the same 0-delivered
+        // starvation for a stale client cursor after aggressive retention).
+        nextOffset = logStart;
     } else {
         nextOffset = msg.fromOffset;
     }

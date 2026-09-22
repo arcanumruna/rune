@@ -60,6 +60,58 @@ TEST(Log, SingleSegmentNoRoll) {
     std::filesystem::remove_all(dir);
 }
 
+// ---- Regression (CP-5.2): logStartOffset advances past 0 after old-segment
+//      deletion; an "Earliest" reader MUST start at logStartOffset(), NOT 0.
+//
+// Root cause of the e2e "0-delivered after aggressive retention/compaction"
+// failure: handleSubscribe resolved Earliest to a hardcoded offset 0.  Once
+// retention/compaction deletes the first segment(s), the first surviving segment
+// base is > 0.  Log::read(0) then lands on segments_.begin() via upper_bound and
+// returns {} FOREVER — the subscriber is pinned at 0 and starves (0 delivered),
+// even though the log holds committed data at logStartOffset()..LEO.
+//
+// This test locks in the exact invariant the gateway fix now depends on:
+//   * read(0) returns EMPTY once logStart > 0  (the trap)
+//   * logStartOffset() returns the first surviving base
+//   * read(logStartOffset()) returns the oldest surviving batch
+TEST(Log, EarliestAfterOldSegmentDeletion_ReadFromLogStartNotZero) {
+    auto dir = makeTempDir("rune_log_logstart");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*segmentRollBytes*/ 256); // tiny → many segments
+
+    int64_t off = 0;
+    for (int i = 0; i < 60; ++i) {
+        RecordBatchBuilder b(off, 1000 + i);
+        b.append("k", "val" + std::to_string(i), 1000 + i);
+        off = log.append(b.build(), off);
+    }
+    ASSERT_EQ(log.logEndOffset(), 60);
+    ASSERT_GT(log.segmentBaseOffsets().size(), 1u);
+    ASSERT_EQ(log.logStartOffset(), 0);          // nothing deleted yet
+
+    // Delete old segments (retain almost nothing) → first segment base advances.
+    const int deleted = log.deleteOldSegments(/*retainBytes=*/0);
+    ASSERT_GT(deleted, 0);
+
+    const int64_t logStart = log.logStartOffset();
+    ASSERT_GT(logStart, 0) << "old-segment deletion should advance logStartOffset past 0";
+    EXPECT_EQ(logStart, log.segmentBaseOffsets().front());
+
+    // THE BUG: reading from 0 (what Earliest used to resolve to) returns nothing.
+    EXPECT_TRUE(log.read(0, 1 << 20).empty())
+        << "read(0) below logStart must return empty (this is why Earliest=0 starved)";
+
+    // THE FIX CONTRACT: reading from logStartOffset() returns the oldest survivor.
+    auto bytes = log.read(logStart, 1 << 20);
+    ASSERT_FALSE(bytes.empty())
+        << "read(logStartOffset()) must return the oldest surviving batch";
+    RecordBatchReader r(bytes.data(), bytes.size());
+    ASSERT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), logStart);
+
+    std::filesystem::remove_all(dir);
+}
+
 // ---- Test 3: read boundaries ----
 TEST(Log, ReadBoundaries) {
     auto dir = makeTempDir("rune_log_t3");
