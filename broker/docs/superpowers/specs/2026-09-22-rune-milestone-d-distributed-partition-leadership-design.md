@@ -234,16 +234,19 @@ blocks (Milestone C-B); D exercises them **per-partition on every move**.
   the diverging-epoch-in-fetch form (follower sends `lastFetchedEpoch`; leader returns
   an empty batch + diverging point; follower truncates **without advancing
   watermarks**). HW-only truncation silently keeps divergent tails — not acceptable.
-- **HW / maximalIsr invariants.** Maintain a two-state ISR: **committed ISR** and
-  **maximalIsr** (the safe superset — on a pending *expand*, committed ∪ {joiner}; on
-  a pending *shrink*, the **old** committed ISR, not the shrunk target). Advance HW to
-  **min LEO over maximalIsr**, and **not at all while under min-ISR**. A new leader
-  **keeps its checkpointed HW and only ever increments it** (never jumps HW to its
-  LEO on election), sets `leaderEpochStartOffset = LEO` (gating ISR rejoin until a
-  follower catches up within the new epoch), and refuses reads while
-  `leaderEpochStart > HW`. A follower clamps HW to `min(leaderHW, ownLEO)`. This
-  jointly prevents exposing uncommitted tail data and losing acked data when a pending
-  shrink is later rejected.
+- **HW / ISR invariants (reconciled to Rune's as-built model).** Rune advances HW as
+  **min-LEO over a *majority* of the ISR** (an intentional ULL quorum-durability
+  choice — `HighWatermark.h`), *not* Kafka's min-over-all-ISR; it already has the
+  **under-min-ISR served-HW clamp**, the **new-leader HW floor** (keeps checkpointed
+  HW, never jumps to LEO — `PartitionReplica.cpp:100-136`), and a **majority-report
+  "completeness gate"** that holds served HW on a fresh leader (a *stronger*
+  substitute for Kafka's `leaderEpochStart > HW` read-fence — so that specific fence
+  is **not** needed). The **one net-new correctness item** is a **two-state
+  committed-vs-maximal ISR** (expand = committed ∪ {joiner}; shrink = keep old
+  committed set until confirmed): it is required **only if D moves to controller-owned
+  ISR** (AlterPartition-style round-trip). Today Rune's leader owns ISR locally and
+  seeds it from the metadata bridge — so this hinges on the ISR-ownership decision
+  below. Prevents acking data that a rejected-shrink survivor wouldn't have.
 
 ### H. MSM engineering — apply off the hot path, MVCC, bounded, versioned (Kafka parity §14; Aeron ULL Part 2)
 
@@ -286,6 +289,53 @@ follower, and every recovering node. Liveness (heartbeat contact time) is **soft
 state off the consensus log** (rebuilt on controller failover, eating one
 session-timeout of detection latency); only the *decisions* are logged. Pending
 timers are snapshotted and re-armed against cluster time on election-complete.
+
+## As-built reconciliation (Rune code verified 2026-09-22)
+
+A read of the actual `rune-broker` tree classifies every "reuse existing X"
+assumption as **EXISTS** / **PARTIAL** / **NET-NEW**. Headline: the hard correctness
+machinery mostly **exists** — Phase 1 is largely *wire + generalize*, with a small,
+well-bounded set of genuinely new pieces.
+
+| Assumption | Verdict | Evidence / note |
+|---|---|---|
+| Consensus is elections-only (no replicated SM/log-apply) | **EXISTS (confirmed)** | `Election.h:99-124`, `TermLog.h:72-92` — MSM is genuinely new |
+| MSM apply-loop seam | **PARTIAL seam / NET-NEW log** | Copy the offsets/txn pattern: `Log`+`PartitionReplica`+`ReplicatedStateStore`+service in `NodeRuntimeAgent` (`BrokerNode.h:279-298`); register `metadataReplica_` in `ReplicaRegistry` so the **existing bridge drives its role/epoch for free** |
+| Single-writer + SPSC swap rings + `doWork()/idle` duty cycle | **EXISTS** | `Log.cpp:690-735` (`enqueueCleanedSegment`/`drainCleanerSwaps`), `NodeRuntimeAgent.h:160-181` — mirror verbatim for MSM apply |
+| Role/term (leader-detect) counters | **EXISTS** | `RoleCounter.h`, `BrokerNode.cpp:963-989` |
+| Commit/append-position counters | **NET-NEW** | position lives only in `Election`/`PartitionReplica`; add an MSM commit-position counter |
+| Per-partition role check + `ReplicaRegistry` routing seam | **EXISTS** | `ClientGateway.cpp:997-1019`, `ReplicaRegistry.h:42-49` |
+| REDIRECT (error+endpoint); no `handleMetadata` | **EXISTS** | `ClientGateway.cpp:600-608`; Metadata handler is D's to add |
+| Immutable-image / flat-array routing on hot path | **NET-NEW (optimization)** | today per-call `unordered_map` lookup; D swaps in an immutable image |
+| Coordinator placement hash stubs | **PARTIAL** | `GroupCoordinationService`/`TransactionCoordinationService` `coordinatorFor()` ignore the id, return cluster leader — replace body with `hash(id)→node` |
+| Producer/EOS state rebuild-from-log on leader edge | **EXISTS** | `ProducerStateManager::rebuildFromLog` (HW-bounded, dedup window=5) `ProducerStateManager.cpp:449-575`; txn/coordinator epochs `ReplicatedTxnStateStore.cpp:311-362` |
+| Follower KIP-101 epoch-boundary truncation (+ multi-epoch) | **EXISTS** | deferred `OffsetsForLeaderEpoch` probe + `min(LEO, leaderEnd)` floored at committedHw `PartitionReplica.cpp:950-1017`; walk-back `EpochFencing.h:119-134` |
+| `LeaderEpochCache` API (`endOffsetForEpoch`, assign, truncate) | **EXISTS**, but **in-memory only** | `LeaderEpochCache.h` — **NET-NEW: persist/rebuild across full restart**; no truncate-from-start (minor) |
+| ProducerId allocator watermark recovery from log | **NET-NEW** | `ProducerIdAllocator` is in-memory (deferred "P5-3") — PID monotonicity across failover not yet guaranteed |
+| Truncate + producer-state rebuild atomic | **PARTIAL (safe by construction)** | HW-bounded rebuild + above-HW-only truncation ⇒ safe, but **no re-rebuild if a late truncation lands below the rebuild HW** — D must close this |
+| New-leader HW floor (never jump to LEO) | **EXISTS** | `PartitionReplica.cpp:100-136` + completeness gate `:1527-1553` |
+| Two-state committed/maximal ISR | **NET-NEW** *(only if controller-owned ISR)* | single in-place `isr_` today (`IsrManager.h:265`) |
+| min-ISR / acks=all | **EXISTS** | polled deferred-ack queue, not purgatory (`ClientGateway.cpp:2127-2148`) |
+| HW = min-LEO over **majority** of ISR | **EXISTS (intentional divergence)** | `HighWatermark.h` — reconcile spec wording, not a bug |
+
+**Net-new work for D (the real build list):** (1) the MSM replicated log + state
+machine (from the offsets/txn template) + its apply step + commit-position counter;
+(2) the Balancer + co-partition-group placement + logged deterministic tick;
+(3) client `Metadata` request + immutable-image routing; (4) coordinator hash
+placement (fill the stubs); (5) **LeaderEpochCache persistence** and **ProducerId
+watermark recovery** (so KIP-101 walk-back + PID monotonicity survive a full
+restart); (6) a **re-rebuild of producer state if a divergence truncation lands
+below the rebuild HW**; (7) *conditionally* two-state ISR — see the decision below.
+
+**Decision surfaced — ISR ownership under D.** Kafka moved ISR ownership to the
+controller (AlterPartition), which is what forces the two-state committed/maximal ISR
++ the fencing precedence. Rune today has the **leader own ISR locally** (seeded from
+the metadata bridge). Under D we can either (a) **keep leader-owned ISR** (minimal
+change; no two-state ISR needed; the controller owns *leadership* but not ISR
+membership), or (b) **move ISR to the controller/MSM** (Kafka-faithful; ISR becomes
+durable in the assignment map; requires two-state ISR + AlterPartition-style
+round-trip). This is the main open architectural decision for the plan (recorded in
+Open questions).
 
 ## Data model — per-topic sharding config
 
@@ -383,9 +433,11 @@ counters.)*
 - **Gateway per-partition role check:** "am I the leader of partition P?" is an O(1)
   index into the same immutable image (mirrors `ReplicaRegistry`), no allocation, no
   rehash; reject/redirect uses a preallocated error response.
-- **acks=all completion** stays purgatory-style (watch-key + timing wheel, signaled
-  by the HW-advance event) — no thread-per-request; D keeps this per-partition
-  (existing GR machinery).
+- **acks=all completion** uses Rune's existing **per-duty-cycle polled deferred-ack
+  queue** (`ClientGateway` `drainPendingAcks`), gated on `HW > lastOffset` **and**
+  `|ISR| >= minIsr` at drain time — *not* a Kafka-style purgatory/timing-wheel (a
+  deliberate Rune choice; a single-threaded vector scan, already allocation-light).
+  D keeps this per-partition; no change required.
 - **The append/ISR path is untouched** — D adds no allocation to it; that is the
   whole point of keeping this a control-plane milestone.
 
@@ -537,10 +589,15 @@ gate.
   bumps) — start pull + REDIRECT, evaluate push later.
 - Interaction sequencing with in-flight Milestone C work (coordinator seams must
   not calcify before Phase 3 fills them).
-- Does Rune's current single-leader ISR model already carry a **two-state (committed
-  vs maximalIsr)** distinction, or must it be added? (Kafka parity §13c — needed for
-  correct HW/acks during in-flight ISR change under distributed leadership.) Confirm
-  against `IsrManager`/`PartitionReplica` during planning.
+- **ISR ownership under D (main open decision):** keep **leader-owned ISR** (as
+  today — minimal change, no two-state ISR needed) vs move to **controller/MSM-owned
+  ISR** (Kafka-faithful, ISR durable in the assignment map, requires the net-new
+  two-state committed/maximal ISR + AlterPartition-style round-trip). Verified today:
+  single in-place `isr_` (`IsrManager.h:265`), leader advances HW locally as
+  majority-of-ISR. Decide during planning; it sizes several net-new items.
+- **LeaderEpochCache persistence + ProducerId-watermark recovery** are net-new (both
+  in-memory today) — needed so KIP-101 walk-back and PID monotonicity survive a full
+  restart, not just a live handoff. Scope into Phase 1 or 2.
 - **Fetch-from-follower (KIP-392)** for materialized-view **read-replica** queries is
   captured as the correct read path (parity §15) but is **downstream** (the views
   milestone), not built in D — confirm it stays deferred.
