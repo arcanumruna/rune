@@ -48,6 +48,22 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_role_counter_tests)
 
     # ---------------------------------------------------------------------------
+    # MD1 Task 7: ReplicationMetadataBridge per-partition role application tests.
+    # Tests the FINDING-1 split: INTERNAL partitions follow cluster-consensus
+    # leadership; USER partitions follow the committed AssignmentMap.
+    # No Aeron required (uses MockTransport).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_bridge_per_partition_tests
+        tests/node/ReplicationMetadataBridgePerPartitionTest.cpp)
+    target_link_libraries(rune_bridge_per_partition_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_bridge_per_partition_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService unit tests — injected clock, fake leader toggle.
     # No Aeron required.
     # ---------------------------------------------------------------------------

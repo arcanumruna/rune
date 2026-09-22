@@ -888,6 +888,14 @@ void BrokerNode::buildGateway() {
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
 
+            // MD1 Task 7: wire the MSM into the bridge so USER partitions are
+            // driven per-partition from the committed assignment map.
+            // FINDING-1: internal partitions continue to follow cluster-consensus
+            // leadership (the bridge handles that in Step A of doWork).
+            if (replBridge_) {
+                replBridge_->setMsm(&metadataService_->msmForTest());
+            }
+
             // MD1 Task 6: configure static assignment emit context.
             // Convert NodeConfig::TopicSpec (broker config) to
             // rune::metadata::TopicSpec (balancer input).
