@@ -168,6 +168,18 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_per_partition_routing_tests
                 PROPERTIES TIMEOUT 180)
+
+            # MD1 Task 10: Metadata request/response integration tests.
+            add_executable(rune_metadata_request_tests
+                tests/integration/MetadataRequestTest.cpp)
+            target_link_libraries(rune_metadata_request_tests PRIVATE
+                rune_gateway
+                rune_metadata
+                rune_replication
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_metadata_request_tests
+                PROPERTIES TIMEOUT 180)
         endif()
     endif()
 endif()

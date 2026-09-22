@@ -14,6 +14,7 @@
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
@@ -322,6 +323,10 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
         case pc::TemplateId::Disconnect:
             handleDisconnect(buf, len);
             break;
+        // MD1 Task 10: Metadata request — answerable by any node.
+        case pc::TemplateId::MetadataRequest:
+            handleMetadata(buf, len);
+            break;
         case pc::TemplateId::Produce:
             handleProduce(buf, len);
             break;
@@ -349,8 +354,9 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
             handleTxnMessage(buf, len, nowNs_, fc.templateId);
             break;
         default:
-            // ConnectResponse, ErrorResponse, Pong, ProduceResponse, SubscribeResponse,
-            // Records, Assign, InitProducerIdResponse, AddPartitionsToTxnResponse,
+            // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
+            // ProduceResponse, SubscribeResponse, Records, Assign,
+            // InitProducerIdResponse, AddPartitionsToTxnResponse,
             // AddOffsetsToTxnResponse, TxnOffsetCommitResponse, EndTxnResponse
             // — server→client or other direction; drop.
             break;
@@ -2819,6 +2825,178 @@ void ClientGateway::notifyControlMarker(int32_t topicId, int32_t partition,
     if (!commit && firstOffset >= 0) {
         // ABORT: record the aborted range so pushSubscriptions() can filter it.
         ts.abortedIndex.onAbortMarker(producerId, firstOffset, markerOffset);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handleMetadata (MD1 Task 10) — answer a MetadataRequest from the routing image.
+//
+// ANSWERABLE BY ANY NODE — not just the leader.  Cluster metadata is
+// cluster-wide information; any node can build a MetadataResponse from the
+// RoutingImage (which is published by MetadataService to all nodes via the
+// RoutingImageHolder and then installed into the gateway by
+// setRoutingImageSnapshot()).
+//
+// Response contents:
+//   - brokers[]: one entry per nodeId in nodeEndpointMap_ (nodeId + "host:port"
+//     parsed from the Aeron channel string).  The port is extracted from the
+//     endpoint part of "aeron:udp?endpoint=host:port"; nodeId 0 is the local node
+//     (thisNodeId_) with its own channel.  Empty map → empty brokers list.
+//   - partitions[]: one entry per slot in the routing image that is not the
+//     NO_LEADER sentinel.  The (topicId, partition) pair is recovered from the
+//     GPID via the inverse of the gpid = topicId * kMaxGpidPartitions + partition
+//     scheme.  If topicRegistry_ is wired, only partitions belonging to known topics
+//     are included; otherwise all non-sentinel slots are included.
+//
+// When routingImage_ is null (no metadata published yet) the response carries
+// empty partitions but still includes the broker list (from nodeEndpointMap_).
+//
+// The response is sent back on the session's egress — it must be decoded by the
+// client just like any other broker→client frame.
+//
+// Single-writer: duty-cycle thread only (same as all other handle* methods).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
+{
+    auto reqOpt = pc::MetadataRequest::decode(buf, len);
+    if (!reqOpt) return;  // truncated or bad — drop
+
+    const pc::MetadataRequest& req = *reqOpt;
+
+    Session* session = sessions_.find(req.sessionId);
+    if (!session) return;  // unknown session — drop
+
+    // -----------------------------------------------------------------------
+    // Build BrokerEntry list from nodeEndpointMap_.
+    //
+    // Each value in nodeEndpointMap_ is an Aeron channel string of the form
+    //   "aeron:udp?endpoint=host:port"
+    // We parse out "host" and "port" for the wire encoding.
+    // A missing or unparseable entry is included as port=0 + empty host
+    // (best-effort; the client can still route via the endpoint string).
+    // -----------------------------------------------------------------------
+    constexpr std::size_t kMaxBrokers = 32;
+    static_assert(kMaxBrokers <= 256);
+    std::vector<pc::BrokerEntry> brokers;
+    brokers.reserve(nodeEndpointMap_.size());
+
+    // We keep the parsed host strings alive for the encode pass.
+    std::vector<std::string> hostStore;
+    hostStore.reserve(nodeEndpointMap_.size());
+
+    for (const auto& [nodeId, channel] : nodeEndpointMap_) {
+        pc::BrokerEntry b;
+        b.nodeId = nodeId;
+
+        // Parse "aeron:udp?endpoint=host:port" → host, port.
+        // We look for "endpoint=" and then split on the last ':'.
+        int32_t port = 0;
+        std::string host;
+        const auto epPos = channel.find("endpoint=");
+        if (epPos != std::string::npos) {
+            const std::string_view ep(channel.c_str() + epPos + 9,
+                                       channel.size() - epPos - 9);
+            const auto colonPos = ep.rfind(':');
+            if (colonPos != std::string_view::npos) {
+                host = std::string(ep.substr(0, colonPos));
+                try {
+                    port = std::stoi(std::string(ep.substr(colonPos + 1)));
+                } catch (...) {
+                    port = 0;
+                }
+            } else {
+                host = std::string(ep);
+            }
+        } else {
+            host = channel;  // store whole channel string as fallback
+        }
+        b.port = port;
+        hostStore.push_back(std::move(host));
+        b.host = hostStore.back();  // string_view into hostStore
+        brokers.push_back(b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Build PartitionEntry list from routingImage_.
+    //
+    // The GPID scheme used by BrokerNode/MetadataService:
+    //   gpid = topicId * kMaxGpidPartitions + partition
+    // We iterate all capacity slots and invert: topicId = gpid / kMaxGpidPartitions,
+    //                                            partition = gpid % kMaxGpidPartitions.
+    //
+    // If topicRegistry_ is set, we only include partitions whose topicId is in
+    // range [0, topicRegistry_->topicCount()).  This prevents ghost partitions
+    // from a stale routing image that refers to topics no longer registered.
+    //
+    // If the request carries specific topicIds (topicIds non-empty), filter
+    // to only those topics.
+    // -----------------------------------------------------------------------
+    constexpr int32_t kMaxGpidPartitions = 1024;
+    std::vector<pc::PartitionEntry> parts;
+
+    if (routingImage_) {
+        const rune::metadata::RoutingImage* img = routingImage_.get();
+        const int32_t cap = img->capacity();
+        parts.reserve(std::min(cap, 4096));
+
+        // Build a quick lookup set of requested topicIds (empty = all).
+        // Note: the span<const int32_t> was built from raw LE bytes using
+        // reinterpret_cast.  On this LE platform the int32_t values are
+        // already in native byte order (see MetadataMessages.h decode note).
+        const bool filterTopics = !req.topicIds.empty();
+        std::unordered_set<int32_t> requestedTopics;
+        if (filterTopics) {
+            for (const int32_t rawTid : req.topicIds) {
+                // getLE32 via the raw bytes gives the correct LE→host interpretation.
+                const int32_t topicId = pc::detail::getLE32(
+                    reinterpret_cast<const uint8_t*>(&rawTid), 0);
+                requestedTopics.insert(topicId);
+            }
+        }
+
+        for (int32_t gpid = 0; gpid < cap; ++gpid) {
+            const auto& entry = img->lookup(gpid);
+            if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
+                continue;  // unassigned — skip
+            }
+            const int32_t topicId   = gpid / kMaxGpidPartitions;
+            const int32_t partition = gpid % kMaxGpidPartitions;
+
+            // Filter: known topics only (when topicRegistry_ is wired).
+            if (topicRegistry_ && topicId >= topicRegistry_->topicCount()) {
+                continue;
+            }
+
+            // Filter: requested topics only (when non-empty topic list in request).
+            if (filterTopics && requestedTopics.find(topicId) == requestedTopics.end()) {
+                continue;
+            }
+
+            pc::PartitionEntry p;
+            p.topicId     = topicId;
+            p.partition   = partition;
+            p.leaderId    = entry.leaderNodeId;
+            p.leaderEpoch = entry.leaderEpoch;
+            parts.push_back(p);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode MetadataResponse into scratch buffer.
+    // -----------------------------------------------------------------------
+    pc::MetadataResponse resp;
+    resp.sessionId     = req.sessionId;
+    resp.correlationId = req.correlationId;
+    resp.brokers       = std::span<const pc::BrokerEntry>(brokers.data(), brokers.size());
+    resp.partitions    = std::span<const pc::PartitionEntry>(parts.data(), parts.size());
+
+    const std::size_t needed = resp.encodedSize();
+    if (needed <= scratch_.size()) {
+        const std::size_t encoded = resp.encode(scratch_.data());
+        sendTo(*session, scratch_.data(), encoded);
+    } else {
+        spdlog::warn("ClientGateway: MetadataResponse too large ({} bytes); scratch={} — dropped",
+                     needed, scratch_.size());
     }
 }
 

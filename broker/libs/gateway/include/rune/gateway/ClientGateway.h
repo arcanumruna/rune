@@ -561,6 +561,8 @@ private:
     void handleKeepalive (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handlePing      (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleDisconnect(const uint8_t* buf, std::size_t len);
+    // MD1 Task 10: Metadata request — answerable by any node (reads routingImage_ + nodeEndpointMap_).
+    void handleMetadata     (const uint8_t* buf, std::size_t len);
     // GB-2: Produce handler — offset-assignment + leader-local append.
     void handleProduce      (const uint8_t* buf, std::size_t len);
     // GB-3: Subscribe/Unsubscribe handlers.
