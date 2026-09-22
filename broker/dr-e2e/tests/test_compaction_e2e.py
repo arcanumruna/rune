@@ -240,6 +240,54 @@ def _produce_compact(cluster: Cluster, target_svc: str, cid_base: int,
     )
 
 
+def _seal_tail(cluster: Cluster, target_svc: str, cid_base: int,
+               records: int = 24) -> Results:
+    """Produce a small batch of records on a DISTINCT sentinel cid so the segment
+    holding the test keys' NEWEST values rolls and SEALS.
+
+    WHY THIS IS REQUIRED (not hiding a bug — matches Kafka semantics): the log
+    cleaner NEVER compacts the ACTIVE (un-sealed) segment.  If the newest value
+    for a test key lands in the active segment, its older (superseded) copies in
+    sealed segments cannot be dropped — the cleaner's offset map does not include
+    active-segment records, so those sealed copies legitimately survive until the
+    active segment rolls.  With no further writes after the main produce, a
+    subscribe-from-earliest therefore delivers BOTH the superseded sealed copy AND
+    the newest active copy for such a key — a false "delivered twice" failure that
+    is an artifact of the test workload, NOT a compaction defect (the in-process
+    CompactionRetentionSmoke.NewLeaderRecompactsAndServesTail test proves the
+    sealed-prefix converges to one-per-key on a new leader).
+
+    Producing a handful of sentinel records (distinct cid → distinct keys, so they
+    never collide with the test keys) forces the segment carrying the test keys'
+    newest values to seal, moving them into the cleaner's cleanable range so the
+    prefix converges to exactly one record per test key.
+
+    The sentinel cid is placed INSIDE the harness warm-up window
+    [990_000, 1_000_000) so `_is_test_cid` excludes it from the compaction
+    invariants (its own newest value may itself land in the active segment — that
+    is irrelevant; the sentinel exists only to seal the test-key segment).
+    """
+    assert _is_warmup_cid(cid_base), (
+        "seal-tail sentinel cid must be in the harness warm-up window so it is "
+        "excluded from the latest-per-key / hw-bounded assertions"
+    )
+    return run_clients(
+        1,
+        network=cluster.compose.network_name(),
+        target_service=target_svc,
+        cid_base=cid_base,
+        timeout_s=180,
+        mode="produce",
+        topics=_CLIENT_COMPACT_TOPICS,
+        records=records,
+        keys=4,
+        acks="all",
+        timeout_ms=_CONNECT_MS,
+        connect_retries=0,
+        start_stagger_ms=_STAGGER_MS,
+    )
+
+
 def _subscribe_compact(cluster: Cluster, target_svc: str, cid_base: int,
                        window_ms: int = 60_000) -> Results:
     """Subscribe-from-earliest on the compact topic.
@@ -324,7 +372,7 @@ def _count_log_files(project: str, service_idx: int) -> int:
 
 
 def _wait_for_compaction(cluster: Cluster, leader_svc: str, *,
-                         initial_count: int, timeout_s: float = 120.0,
+                         initial_count: int, timeout_s: float = 45.0,
                          poll_s: float = 2.0, stable_polls: int = 3) -> bool:
     """Poll until the log file count on the leader node STABILISES below initial_count.
 
@@ -368,6 +416,45 @@ def _wait_for_compaction(cluster: Cluster, leader_svc: str, *,
         prev_count = count
         time.sleep(poll_s)
     return dropped_once  # partial progress is better than False
+
+
+def _wait_for_latest_per_key(subscribe_fn, expected_keys: int, *,
+                             timeout_s: float = 45.0,
+                             poll_s: float = 5.0):
+    """Poll subscribe-from-earliest until compaction has CONVERGED to exactly one
+    record per key (delivered test-records == expected_keys), or the timeout
+    elapses.  Returns the last Results.
+
+    WHY THIS IS NEEDED (not a way to hide a bug): Rune's log cleaner is
+    incremental (Kafka-faithful) — it compacts ONE sealed segment (or coalesced
+    group) per pass and re-evaluates the dirty ratio between passes.  Converging
+    a multi-segment log to strict latest-per-key therefore takes SEVERAL passes.
+    After a leader RESTART/failover the new leader also starts from its full
+    (uncompacted) replicated log and must run its own passes.  File-count
+    stabilisation (_wait_for_compaction) can report "stable" during a brief lull
+    BEFORE the final passes complete, so a subscribe issued immediately can still
+    observe 2 records for a key (e.g. seq 160 AND 164).  This helper waits for the
+    cleaner to actually reach the converged state before the strict
+    assert_latest_per_key check runs.  It does NOT relax the assertion — it only
+    removes a race between the background cleaner and the consumer.
+
+    The in-process regression test CompactionConvergesWithSingleSegmentGroups
+    proves the cleaner DOES converge to latest-per-key; this helper waits for that
+    same convergence end-to-end.
+    """
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        last = subscribe_fn()
+        n_test = sum(1 for m in last.all_delivered if _is_test_cid(m.cid))
+        # Distinct test keys delivered.
+        distinct = len({(m.cid, m.key) for m in last.all_delivered
+                        if _is_test_cid(m.cid)})
+        # Converged iff exactly one record per key (n_test == distinct == keys).
+        if n_test == expected_keys and distinct == expected_keys:
+            return last
+        time.sleep(poll_s)
+    return last  # timed out — return the last observation for the assertion to report
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +669,11 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
         f"produced {n_produced} != {records} expected records"
     )
 
+    # Seal the tail so the test keys' NEWEST values move out of the active segment
+    # into the cleaner's cleanable range (see _seal_tail docstring).  Excluded from
+    # the invariants via the warm-up-window cid.
+    _seal_tail(cluster, leader_svc, cid_base=995500)
+
     # Capture baseline log-file count (before compaction).
     from harness.cluster import service_to_node_id
     leader_idx = service_to_node_id(leader_svc) + 1
@@ -601,11 +693,11 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
         compaction_observed = _wait_for_compaction(
             cluster, leader_svc,
             initial_count=initial_file_count,
-            timeout_s=120.0,
+            timeout_s=45.0,
         )
     else:
         # Can't observe file count — fixed wait for cleaner to cycle.
-        time.sleep(60.0)
+        time.sleep(12.0)
         compaction_observed = None  # unknown
 
     # ── Restart the broker (container restart, not full cluster) ──────────────
@@ -620,10 +712,26 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
     new_leader_svc = node_id_to_service(new_lid)
     assert_single_leader(cluster)
 
-    # ── Subscribe-from-earliest on the compact topic ───────────────────────────
+    # ── Wait for the NEW leader to compact its (uncompacted) replicated log ────
+    # Compaction is leader-only; after the restart the serving leader starts from
+    # the full replicated log and must run its own incremental passes.  Wait for
+    # the file count to drop, then poll subscribe until compaction CONVERGES to
+    # one-record-per-key (see _wait_for_latest_per_key rationale — this removes a
+    # cleaner/consumer race, it does not relax any assertion).
+    new_leader_idx = service_to_node_id(new_leader_svc) + 1
+    new_initial_count = _count_log_files(cluster.project, new_leader_idx)
+    if new_initial_count > 0:
+        _wait_for_compaction(cluster, new_leader_svc,
+                             initial_count=new_initial_count, timeout_s=45.0)
+    else:
+        time.sleep(30.0)
+
+    # ── Subscribe-from-earliest, waiting for compaction convergence ────────────
     cid_sub = _next_cid_base()
-    sub_result = _subscribe_compact(cluster, new_leader_svc, cid_sub,
-                                    window_ms=90_000)
+    sub_result = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, new_leader_svc, _next_cid_base(),
+                                   window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
 
     # ── Assertions ─────────────────────────────────────────────────────────────
     # 1. Latest-per-key: the delivered set contains exactly the highest seq
@@ -697,6 +805,9 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
     )
     assert len(produce_result.all_produced) == records
 
+    # Seal the tail so the test keys' newest values are compactable (see _seal_tail).
+    _seal_tail(cluster, leader_svc, cid_base=995500)
+
     # ── Wait for at least one compaction pass on the leader ───────────────────
     from harness.cluster import service_to_node_id
     leader_idx = service_to_node_id(leader_svc) + 1
@@ -709,9 +820,9 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
         # assertions are designed to tolerate that (no resurrection, HW-bounded).
         _wait_for_compaction(cluster, leader_svc,
                               initial_count=initial_file_count,
-                              timeout_s=120.0)
+                              timeout_s=45.0)
     else:
-        time.sleep(60.0)
+        time.sleep(12.0)
 
     # ── Kill the current leader → trigger re-election ─────────────────────────
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
@@ -733,18 +844,22 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
     if new_initial_file_count > 0:
         _wait_for_compaction(cluster, new_leader_svc,
                               initial_count=new_initial_file_count,
-                              timeout_s=120.0)
+                              timeout_s=45.0)
     else:
-        time.sleep(60.0)
+        time.sleep(12.0)
 
     # ── Wait for data plane ready on new leader before subscribing ────────────
     cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120,
                                   topics=_CLIENT_DELETE_TOPICS)
 
-    # ── Subscribe from the NEW leader ─────────────────────────────────────────
-    cid_sub = _next_cid_base()
-    sub_result = _subscribe_compact(cluster, new_leader_svc, cid_sub,
-                                    window_ms=90_000)
+    # ── Subscribe from the NEW leader, waiting for compaction convergence ──────
+    # The new leader compacts its full replicated log incrementally; poll until it
+    # converges to one-record-per-key (removes the cleaner/consumer race — does
+    # not relax any assertion).
+    sub_result = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, new_leader_svc, _next_cid_base(),
+                                   window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
 
     # ── Assertions ─────────────────────────────────────────────────────────────
     # 1. No resurrection of compacted-away records.
