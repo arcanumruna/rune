@@ -6,6 +6,7 @@
 //   1. SingleNode_AssignmentVisibleOnlyAfterHwAdvance
 //      Append assignment records via metadataReplica_, drive doWork,
 //      assert assignment() reflects them ONLY after commit (HW advance).
+//      Also asserts the assignment is NULL before doWork/HW advance.
 //
 //   2. ThreeNode_RecordsVisibleOnAllFollowersAfterMajorityHw
 //      3-in-process nodes. Records committed on the leader become visible
@@ -19,9 +20,16 @@
 //      A produce/read served while an assignment applies — no shared-lock
 //      stall (assert both operations complete within a tight deadline).
 //
-//   5. MetadataReplicaRoleFollowsClusterLeadership
-//      Assert leader/follower role on the metadata partition tracks cluster
-//      leadership (driven by the existing bridge via ReplicaRegistry).
+//   5. MetadataReplicaRoleFollowsBridgeDrivenClusterLeadership
+//      The metadata partition's role is driven by ReplicationMetadataBridge
+//      via ReplicaRegistry.  Bridge cluster-leader = self → replica becomes
+//      Leader; bridge cluster-leader = another node → replica becomes Follower.
+//      Exercises the real FINDING-1 wiring path end-to-end.
+//
+//   6. FollowerHwGatedVisibility_AssignmentNotVisibleBeforeReplication
+//      Assert leader/follower HW-gated correctness: a metadata service on a
+//      follower node does NOT see records that have not yet been replicated
+//      (HW-gated committed-only discrimination).
 //
 // NO Docker. All waits are bounded (kDriverCap + ASSERT_TRUE). No busy-spin.
 // ---------------------------------------------------------------------------
@@ -29,6 +37,8 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/MetadataService.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/MetadataRecords.h>
@@ -186,7 +196,11 @@ TEST(MetadataReplicationTest, SingleNode_AssignmentVisibleOnlyAfterHwAdvance) {
                                           /*leaderNode=*/1, isr1, replicas1);
     ASSERT_GE(base, 0) << "single-node append must succeed";
 
-    // BEFORE doWork: HW may not have advanced yet; MSM may not have applied it.
+    // BEFORE doWork (HW not yet advanced): the record is appended to the log
+    // but not yet committed — assignment() must return null (pre-commit state).
+    EXPECT_EQ(svc.assignment(10, 0), nullptr)
+        << "assignment must be NULL before doWork/HW advance (committed-only invariant)";
+
     // After the first doWork call, the single-node leader advances HW to LEO.
     int64_t clock = 0;
     clock += 2'000'000LL; // 2 ms
@@ -420,15 +434,83 @@ TEST(MetadataReplicationTest, ApplyIsOffRequestPath_NoLockStall) {
 }
 
 // ===========================================================================
-// Test 5: Metadata replica role follows cluster leadership
+// Test 5: Bridge-driven role flip — metadata replica's role tracks cluster
+//         leadership through ReplicationMetadataBridge + ReplicaRegistry.
 //
-// When the bridge drives becomeLeader/becomeFollower on the metadata replica
-// via the ReplicaRegistry, the MetadataService should only apply committed
-// records (post-HW) after the leader's HW has advanced — not before.
-// This test asserts that a metadata service on a follower node does NOT
-// see records that have not yet been replicated (HW-gated correctness).
+// This is the real FINDING-1 path:
+//   - Create a ReplicaRegistry.
+//   - Register the metadata PartitionReplica (topicId=-3) as Role::Follower,
+//     epoch 0 (starting state before any leader is known).
+//   - Construct a ReplicationMetadataBridge (selfId=kSelf, allReplicaIds).
+//   - Drive bridge.doWork(clusterLeader=kSelf, epoch=1):
+//       bridge broadcasts becomeLeader(1, allReplicas) → replica becomes Leader.
+//   - Assert replica->role() == Role::Leader.
+//   - Drive bridge.doWork(clusterLeader=kOther, epoch=2):
+//       bridge broadcasts becomeFollower(2, kOther) → replica becomes Follower.
+//   - Assert replica->role() == Role::Follower.
+//
+// This proves the metadata partition's role tracks cluster leadership through
+// the bridge+registry wiring (the path tested here is the same path used by
+// BrokerNode: register in registry, bridge drives roles per cycle).
 // ===========================================================================
-TEST_F(MetadataThreeNodeTest, MetadataReplicaRoleFollowsClusterLeadership) {
+TEST(MetadataReplicationTest, MetadataReplicaRoleFollowsBridgeDrivenClusterLeadership) {
+    MrtTempDir dir("bridge_role");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    constexpr NodeId kSelf  = 1;
+    constexpr NodeId kOther = 2;
+    const std::vector<NodeId> allNodes = {kSelf, kOther};
+
+    // InMemoryTransport is required by PartitionReplica (transport must not be null).
+    // No leader is set — the replica starts as a Follower before any bridge call.
+    InMemoryTransport transport;
+
+    // Build the metadata replica starting as Follower, epoch 0.
+    // (Mirrors BrokerNode state before the bridge has fired for the first time.)
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(kSelf, /*minIsr=*/1),
+        Role::Follower, /*epoch=*/0,
+        allNodes, allNodes, &log, &transport);
+
+    ASSERT_EQ(replica->role(), Role::Follower) << "replica must start as Follower";
+
+    // Register the replica in a ReplicaRegistry (this is what BrokerNode does).
+    rune::node::ReplicaRegistry registry;
+    registry.add(/*topicId=*/-3, /*partition=*/0, std::move(replica));
+    PartitionReplica* rawReplica = registry.lookup(/*topicId=*/-3, /*partition=*/0);
+    ASSERT_NE(rawReplica, nullptr) << "replica must be findable in registry";
+
+    // Construct the bridge (selfId=kSelf).
+    rune::node::ReplicationMetadataBridge bridge(kSelf, allNodes, registry);
+
+    // --- Step 1: cluster-leader = self → replica becomes Leader ---
+    bridge.doWork(/*currentLeaderId=*/kSelf, /*currentEpoch=*/1);
+    EXPECT_EQ(rawReplica->role(), Role::Leader)
+        << "replica must become Leader when bridge cluster-leader == self";
+    EXPECT_TRUE(bridge.isLeader())
+        << "bridge must report isLeader() == true";
+
+    // --- Step 2: cluster-leader = other node → replica becomes Follower ---
+    bridge.doWork(/*currentLeaderId=*/kOther, /*currentEpoch=*/2);
+    EXPECT_EQ(rawReplica->role(), Role::Follower)
+        << "replica must become Follower when bridge cluster-leader != self";
+    EXPECT_FALSE(bridge.isLeader())
+        << "bridge must report isLeader() == false";
+
+    // Epoch must have advanced monotonically (2 > 1).
+    EXPECT_EQ(bridge.lastEpoch(), static_cast<rune::replication::Epoch>(2))
+        << "bridge epoch must reflect latest cluster epoch";
+}
+
+// ===========================================================================
+// Test 6: HW-gated follower visibility — assignment not visible before
+//         replication completes on the follower.
+//
+// Asserts that a metadata service on a follower node does NOT see records
+// that have not yet been replicated (HW-gated committed-only discrimination).
+// ===========================================================================
+TEST_F(MetadataThreeNodeTest, FollowerHwGatedVisibility_AssignmentNotVisibleBeforeReplication) {
     // Leader appends a record WITHOUT driving replication first.
     const std::vector<int32_t> isr1      = {kNode1, kNode2, kNode3};
     const std::vector<int32_t> replicas1 = {kNode1, kNode2, kNode3};
