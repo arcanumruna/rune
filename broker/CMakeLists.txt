@@ -101,7 +101,8 @@ if(BUILD_BENCHMARKS)
         benchmark/GatewayBench.cpp
         benchmark/GatewayDataBench.cpp
         benchmark/ProduceMajorityAckBench.cpp
-        benchmark/GroupCoordinationBench.cpp)
+        benchmark/GroupCoordinationBench.cpp
+        benchmark/CompactionBenchmark.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
