@@ -146,6 +146,18 @@ private:
     void publishSealedSnapshot();
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
+    /// CP-8 incremental largestTimestamp: running max of maxTimestamp() across all
+    /// batches appended to the ACTIVE segment since the last roll.  Reset to 0 at
+    /// each roll (after publishSealedSnapshot captures it for the newly-sealed
+    /// segment).  Updated on every append() / appendNoSync() call so publishSeal-
+    /// edSnapshot never needs to re-scan the file for a freshly-sealed segment.
+    int64_t activeSegmentMaxTs_ = 0;
+    /// CP-8: max-ts for the MOST RECENTLY SEALED segment, captured from
+    /// activeSegmentMaxTs_ in maybeRoll() just before the reset.  Consumed by
+    /// publishSealedSnapshot() to populate the newly-sealed SegInfo entry without
+    /// any file I/O.  Only meaningful on the append thread (where maybeRoll and
+    /// publishSealedSnapshot are always called in sequence).
+    int64_t newlySealedMaxTs_ = 0;
     std::map<int64_t, std::unique_ptr<LogSegment>> segments_;
 
     // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.

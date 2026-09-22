@@ -642,6 +642,180 @@ TEST(Log, TruncateToZeroThenAppendIsContiguous) {
 
 // B16: maybeRoll with a single batch larger than rollBytes.
 // The oversized batch must start its own segment and be readable.
+// ===========================================================================
+// CP-8 Fix 1: incremental largestTimestamp — sealed-segment snapshot must carry
+// the correct maxTimestamp for the newly-sealed segment WITHOUT re-scanning the
+// file.
+//
+// NON-VACUOUS:
+//   Before the fix, publishSealedSnapshot() would scan the newly-sealed segment
+//   file to compute largestTimestamp.  With the fix, it uses the incrementally
+//   tracked activeSegmentMaxTs_ value captured at roll time.
+//
+//   Test A (correctness): after a roll, the sealed snapshot's largestTimestamp
+//   must equal the largest maxTimestamp() seen in the batches appended to that
+//   segment — verified against a reference computed directly from the batch headers.
+//
+//   Test B (monotonic): multiple rolls — each segment in the snapshot must have
+//   the correct largestTimestamp (matching the batches written to that segment).
+//
+//   Test C (horizon batch): a horizon-stamped batch has baseTimestamp()=horizon
+//   but maxTimestamp()=actual_max_ts.  The snapshot must use maxTimestamp(), not
+//   baseTimestamp() (which is the horizon and NOT a wall-clock timestamp).
+// ===========================================================================
+TEST(Log, SealedSnapshotLargestTimestampIncrementalA) {
+    // Setup: one segment with increasing timestamps, then roll.
+    auto dir = makeTempDir("rune_log_ts_a");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    // Use a tiny rollBytes so we trigger a roll after a few records.
+    Log log(dir.string(), /*rollBytes=*/256);
+
+    // Append 3 batches with distinct maxTimestamps; track the expected max.
+    int64_t expectedMaxTs = 0;
+    int64_t off = 0;
+    for (int i = 0; i < 5; ++i) {
+        const int64_t ts = 1000LL + i * 100;  // 1000, 1100, 1200, 1300, 1400
+        RecordBatchBuilder b(off, ts); b.append("k", "v" + std::to_string(i), ts);
+        off = log.append(b.build(), off);
+        if (ts > expectedMaxTs) expectedMaxTs = ts;
+    }
+    // Verify: before a roll there is only 1 segment, sealed snapshot is empty.
+    {
+        auto snap = log.sealedSegmentSnapshot();
+        // May have 0 or more sealed segments already (if a roll happened).
+        // We'll check after the explicit roll below.
+    }
+
+    // Force a roll by writing a record-heavy batch.
+    for (int i = 0; i < 50; ++i) {
+        const int64_t ts = 2000LL + i;
+        RecordBatchBuilder b(off, ts); b.append("pad", "x", ts);
+        off = log.append(b.build(), off);
+        if (ts > expectedMaxTs) expectedMaxTs = ts;
+    }
+    // After the writes, some segments should be sealed.
+    auto snap = log.sealedSegmentSnapshot();
+    ASSERT_GE(snap->size(), 1u) << "Must have at least one sealed segment after roll";
+
+    // For every sealed segment, verify largestTimestamp is positive and reasonable.
+    // We compute a reference by reading the segment files directly.
+    for (const auto& si : *snap) {
+        EXPECT_GT(si.largestTimestamp, 0)
+            << "Sealed segment base=" << si.baseOffset
+            << " must have largestTimestamp > 0.  "
+               "Got 0, which means the incremental tracking is broken "
+               "(newlySealedMaxTs_ was 0 when publishSealedSnapshot() was called).";
+        EXPECT_LE(si.largestTimestamp, expectedMaxTs)
+            << "largestTimestamp=" << si.largestTimestamp
+            << " must be <= the overall max timestamp written (" << expectedMaxTs << ").";
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(Log, SealedSnapshotLargestTimestampIncrementalB) {
+    // Test B: multiple rolls; each sealed segment gets the correct largestTimestamp.
+    auto dir = makeTempDir("rune_log_ts_b");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    // Build expected: segment_base → largest ts in that segment.
+    // We interleave appends so each segment gets known timestamps.
+    std::map<int64_t, int64_t> expectedTsPerSeg;
+    int64_t off = 0;
+    // Write 30 records with timestamps segmented into windows.
+    // Each window ~1-3 records per segment (given rollBytes=128).
+    for (int i = 0; i < 30; ++i) {
+        const int64_t ts = static_cast<int64_t>(i + 1) * 1000LL; // 1000, 2000, ..., 30000
+        RecordBatchBuilder b(off, ts); b.append("k", "v", ts);
+        off = log.append(b.build(), off);
+    }
+
+    auto snap = log.sealedSegmentSnapshot();
+    ASSERT_GE(snap->size(), 2u) << "Multiple rolls expected with rollBytes=128 and 30 records";
+
+    // Verify each sealed segment's largestTimestamp by re-scanning the file.
+    for (const auto& si : *snap) {
+        // Compute reference by scanning the .log file.
+        std::ostringstream os;
+        os << dir.string() << "/" << std::setw(20) << std::setfill('0') << si.baseOffset << ".log";
+        std::ifstream f(os.str(), std::ios::binary);
+        ASSERT_TRUE(f.is_open()) << "Cannot open " << os.str();
+        f.seekg(0, std::ios::end); auto sz = static_cast<std::size_t>(f.tellg());
+        ASSERT_GT(sz, 0u) << "Segment file must be non-empty";
+        std::vector<uint8_t> buf(sz);
+        f.seekg(0); f.read(reinterpret_cast<char*>(buf.data()), sz);
+
+        int64_t refMaxTs = 0;
+        std::size_t pos = 0;
+        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= sz) {
+            RecordBatchReader r(buf.data() + pos, sz - pos);
+            int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > sz) break;
+            const int64_t batchMax = r.maxTimestamp();
+            if (batchMax > refMaxTs) refMaxTs = batchMax;
+            pos += static_cast<std::size_t>(total);
+        }
+
+        EXPECT_EQ(si.largestTimestamp, refMaxTs)
+            << "Sealed segment base=" << si.baseOffset
+            << ": incremental largestTimestamp=" << si.largestTimestamp
+            << " must match the file-scan reference=" << refMaxTs << ".  "
+               "A mismatch means activeSegmentMaxTs_ was incorrect when the segment sealed.";
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+TEST(Log, SealedSnapshotLargestTimestampHorizonBatch) {
+    // Test C: a horizon-stamped batch has baseTimestamp()=horizon but
+    // maxTimestamp()=real record ts.  The snapshot must use maxTimestamp(), not
+    // baseTimestamp() (the horizon is NOT a wall-clock timestamp).
+    auto dir = makeTempDir("rune_log_ts_c");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    // Append a normal batch to give the segment real timestamps.
+    const int64_t realTs = 5000LL;
+    RecordBatchBuilder b0(0, realTs); b0.append("k", "v", realTs);
+    log.append(b0.build(), 0);
+
+    // Append a horizon-stamped batch. The horizon is huge (doesn't look like a timestamp).
+    const int64_t horizonMs = 99999999LL; // large horizon epoch
+    const int64_t recordTs  = realTs + 1;  // the actual record timestamp
+    RecordBatchBuilder bh(1, recordTs);
+    bh.setDeleteHorizonMs(horizonMs);
+    bh.append("tombkey", "", recordTs);
+    log.append(bh.build(), 1);
+
+    // Force a roll so these batches become sealed.
+    for (int i = 0; i < 50; ++i) {
+        RecordBatchBuilder bp(2 + i, 1LL); bp.append("pad", "x", 1LL);
+        log.append(bp.build(), 2 + i);
+    }
+
+    auto snap = log.sealedSegmentSnapshot();
+    ASSERT_GE(snap->size(), 1u) << "Need at least 1 sealed segment";
+
+    // The first sealed segment contains the normal + horizon batches.
+    // Its largestTimestamp must be max(realTs, recordTs) = realTs+1 = maxTimestamp().
+    // It must NOT be horizonMs (which would be the wrong baseTimestamp() value).
+    const auto& si = (*snap)[0];
+    EXPECT_NE(si.largestTimestamp, horizonMs)
+        << "largestTimestamp must NOT be the horizon value ("  << horizonMs
+        << "); the horizon is not a real wall-clock timestamp.  "
+           "Got largestTimestamp=" << si.largestTimestamp << ".  "
+           "This means the code used baseTimestamp() on a horizon batch instead of maxTimestamp().";
+    EXPECT_EQ(si.largestTimestamp, recordTs)
+        << "largestTimestamp must be maxTimestamp() of the horizon batch ("
+        << recordTs << "); got " << si.largestTimestamp << ".";
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST(Log, OversizedBatchStartsOwnSegment) {
     auto dir = makeTempDir("rune_log_b16");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);

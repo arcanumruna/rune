@@ -41,8 +41,16 @@ void Log::maybeRoll() {
         activeSegment().sync();
         int64_t base = logEndOffset_;
         segments_[base] = std::make_unique<LogSegment>(dir_, base);
+        // CP-8 FIX (incremental largestTimestamp): capture the running max we
+        // tracked for the about-to-be-sealed segment, then reset for the new
+        // active segment.  publishSealedSnapshot will use this captured value
+        // (via newlySealedMaxTs_) instead of re-scanning the file.
+        newlySealedMaxTs_ = activeSegmentMaxTs_;
+        activeSegmentMaxTs_ = 0;
         // Publish snapshot: a new sealed segment just appeared.
         publishSealedSnapshot();
+        // Clear the seal-time hint after the snapshot consumed it.
+        newlySealedMaxTs_ = 0;
     }
 }
 
@@ -51,9 +59,14 @@ void Log::publishSealedSnapshot() {
     // last/active).  Called on the single-writer append thread only.
     // The active segment is excluded: its sizeBytes is mutated on appends.
     //
-    // CP-8: also carry largestTimestamp per sealed segment so the cleaner thread
-    // can gate on minCompactionLagMs without touching segments_.  We derive it
-    // from the existing snapshot if available (avoid re-scanning unchanged segs).
+    // CP-8 FIX (incremental largestTimestamp): we NO LONGER re-scan the file for
+    // a newly-sealed segment.  Instead, maybeRoll() maintains activeSegmentMaxTs_
+    // (a running max of maxTimestamp() across every batch appended to the active
+    // segment) and stores it in newlySealedMaxTs_ just before calling us.
+    // For segments already present in the previous snapshot, we reuse the
+    // cached largestTimestamp value (sealed segments are immutable).
+    // For the newly-sealed segment (not yet in prevSnap), we use newlySealedMaxTs_.
+    // Zero extra I/O on the append path: NO file open, NO read, NO heap allocation.
     auto prevSnap = std::atomic_load(&sealedSnapshot_);
 
     auto snap = std::make_shared<SealedSegmentSnapshot>();
@@ -72,33 +85,11 @@ void Log::publishSealedSnapshot() {
                     if (si.baseOffset == base) { largestTs = si.largestTimestamp; break; }
                 }
             }
-            // If not found in previous snapshot (newly sealed), scan the file.
+            // If not found in the previous snapshot, this is the NEWLY SEALED
+            // segment.  Use the incrementally tracked max timestamp instead of
+            // re-scanning the file (CP-8 fix: zero append-path I/O at seal time).
             if (largestTs == 0) {
-                std::string logPath = it->second->logPath();
-                std::ifstream f(logPath, std::ios::binary);
-                if (f.is_open()) {
-                    f.seekg(0, std::ios::end);
-                    auto sz = static_cast<std::size_t>(f.tellg());
-                    if (sz > 0) {
-                        std::vector<uint8_t> buf(sz);
-                        f.seekg(0);
-                        f.read(reinterpret_cast<char*>(buf.data()),
-                               static_cast<std::streamsize>(sz));
-                        std::size_t pos = 0;
-                        while (pos + static_cast<std::size_t>(
-                                   rune::protocol::batch::kRecordBatchOverhead) <= sz) {
-                            rune::protocol::RecordBatchReader r(buf.data() + pos, sz - pos);
-                            int32_t total = r.totalLength();
-                            if (total <= 0 ||
-                                pos + static_cast<std::size_t>(total) > sz) break;
-                            // Use maxTimestamp (the actual record timestamps,
-                            // not the horizon-overloaded baseTimestamp).
-                            int64_t batchMax = r.maxTimestamp();
-                            if (batchMax > largestTs) largestTs = batchMax;
-                            pos += static_cast<std::size_t>(total);
-                        }
-                    }
-                }
+                largestTs = newlySealedMaxTs_;
             }
             snap->push_back({base, bytes, largestTs});
         }
@@ -108,8 +99,20 @@ void Log::publishSealedSnapshot() {
 int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // Zero-alloc hot path: LogSegment::append(pointer) writes directly from the
     // caller's buffer — no std::vector construction on the produce path.
+    // CP-8: call maybeRoll() FIRST (which may seal the old segment and reset
+    // activeSegmentMaxTs_), THEN update activeSegmentMaxTs_ for the NEW batch
+    // being written to the (possibly freshly-started) active segment.
+    // This ensures the incremental counter tracks batches that land on the
+    // current active segment, NOT the batch that caused the roll.
     maybeRoll();
     logEndOffset_ = activeSegment().append(data, len, lastOffset);
+    // Update incremental largestTimestamp AFTER the write (and after any roll)
+    // so this batch's maxTimestamp is attributed to the segment it was written to.
+    if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader r(data, len);
+        int64_t batchMaxTs = r.maxTimestamp();
+        if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
+    }
     return logEndOffset_;
 }
 int64_t Log::append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
@@ -121,8 +124,14 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     // maybeRoll() is still needed to start a fresh segment when the active one
     // is full; the new segment starts empty (no prior un-flushed data to lose).
     // The caller (gateway doWork) calls sync() once after the ingress batch.
+    // CP-8: same post-roll update pattern as append() above.
     maybeRoll();
     logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
+    if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader r(data, len);
+        int64_t batchMaxTs = r.maxTimestamp();
+        if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
+    }
     return logEndOffset_;
 }
 std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
