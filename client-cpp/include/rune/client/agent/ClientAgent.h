@@ -175,6 +175,18 @@ public:
     /// Set the ProduceResponse routing hook.  MUST be called before start().
     void setProduceResponseFn(ProduceResponseFn fn) noexcept;
 
+    // -------------------------------------------------------------------------
+    // MD1 Task 10: MetadataResponse hook (setup-phase only; call before start())
+    // -------------------------------------------------------------------------
+
+    /// Callback invoked on the agent thread when a MetadataResponse arrives.
+    /// Signature: (decoded MetadataResponse) -> void.
+    using MetadataResponseFn =
+        std::function<void(const codec::MetadataResponseDecoded&)>;
+
+    /// Set the MetadataResponse routing hook.  MUST be called before start().
+    void setMetadataResponseFn(MetadataResponseFn fn) noexcept;
+
     /// Return the session state snapshot published by the agent thread.
     /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
     /// state at the end of the most recent doWork() call.  Safe to call from
@@ -292,6 +304,9 @@ private:
     // ---- CB-2: Producer hooks (agent thread only; set before start()) --------
     ProducerDrainFn    producerDrainFn_;
     ProduceResponseFn  produceResponseFn_;
+
+    // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
+    MetadataResponseFn metadataResponseFn_;
 
     // ---- Thread-safe observer snapshot (BrokerNode mirror pattern) ----------
     // FIX F1 + F3: (state, sessionId) are packed into ONE atomic uint64_t and

@@ -41,6 +41,8 @@
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/session/SessionMachine.h>
 #include <rune/client/codec/Codec.h>
+#include <rune/client/metadata/MetadataCache.h>
+#include <rune/client/metadata/PartitionRouter.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerHub.h>
@@ -421,6 +423,24 @@ private:
     // Touched only on the runner/agent thread (onEgressFrame); atomic for
     // publication safety.
     std::atomic<bool> redirectPending_ {false};
+
+    // ---- MD1 Task 10: Metadata cache + partition router ----------------------
+    // MetadataCache is populated from MetadataResponse frames (on connect and
+    // after a zero-RTT reroute).  PartitionRouter maps key → partition → node.
+    // Both are agent-thread-only (runner thread); no mutex required.
+    metadata::MetadataCache  metadataCache_;
+    metadata::PartitionRouter partitionRouter_;
+
+    // correlationId for the most recently sent MetadataRequest (0 = none).
+    int64_t pendingMetadataCorrId_ {0};
+
+    // sendMetadataRequest() — encodes and submits a MetadataRequest for all
+    // topics to the agent ring.  Called on the runner thread after ConnectResponse{OK}.
+    void sendMetadataRequest(int64_t sessionId) noexcept;
+
+    // onMetadataResponse() — updates the cache from a decoded MetadataResponse.
+    // Called on the runner thread via the metadataResponseFn_ hook.
+    void onMetadataResponse(const codec::MetadataResponseDecoded& resp) noexcept;
 };
 
 } // namespace rune::client

@@ -23,9 +23,11 @@
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
 
+#include <array>
 #include <cassert>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace rune::client {
 
@@ -77,6 +79,7 @@ Client::Client(ClientConfig cfg)
     , agent_(makeAgentConfig(cfg_))
     , nextSweep_(std::chrono::steady_clock::now() +
                  std::chrono::milliseconds(kSweepIntervalMs))
+    , partitionRouter_(metadataCache_)
 {
     // Wire the egress observer BEFORE starting the agent (CC-5 contract).
     agent_.setEgressObserver([this](codec::TemplateId tid,
@@ -108,6 +111,13 @@ Client::Client(ClientConfig cfg)
     agent_.setProduceResponseFn(
         [this](int64_t correlationId, int64_t baseOffset) {
             producerHub_.onProduceResponse(correlationId, baseOffset);
+        });
+
+    // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
+    // on the agent (runner) thread without any extra lock.
+    agent_.setMetadataResponseFn(
+        [this](const codec::MetadataResponseDecoded& resp) {
+            onMetadataResponse(resp);
         });
 
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence;
@@ -566,6 +576,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     };
                 groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
             }
+
+            // MD1 Task 10: on each successful connect, request a full metadata
+            // refresh so the cache is populated for zero-RTT partition routing.
+            sendMetadataRequest(opt->assignedSessionId);
 
             // Fire onConnected.
             if (cbConnected_) {
@@ -1174,6 +1188,72 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
     std::lock_guard<std::mutex> lk(txnHubMtx_);
     txnProducers_.push_back(impl);
     return TransactionalProducer(std::move(impl));
+}
+
+// ---------------------------------------------------------------------------
+// MD1 Task 10: sendMetadataRequest() — request all-topic metadata from the broker
+// ---------------------------------------------------------------------------
+
+void Client::sendMetadataRequest(int64_t sessionId) noexcept {
+    // Allocate a fresh correlationId.
+    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+    pendingMetadataCorrId_ = corrId;
+
+    // Encode a MetadataRequest (empty topicIds span = all topics).
+    std::array<uint8_t, 256> buf{};
+    const std::span<const int32_t> emptyTopics;
+    const std::size_t n = codec::encodeMetadataRequest(
+        buf.data(), buf.size(),
+        emptyTopics,
+        sessionId,
+        corrId);
+    if (n == 0) return;  // encoding failed — silently ignore
+
+    // Submit to the agent ring (thread-safe, non-blocking).
+    agent_.submitSend(buf.data(), n);
+}
+
+// ---------------------------------------------------------------------------
+// MD1 Task 10: onMetadataResponse() — update MetadataCache from decoded response
+// ---------------------------------------------------------------------------
+
+void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noexcept {
+    // Convert codec view types to metadata cache types.
+    std::vector<metadata::BrokerEntry>    brokers;
+    std::vector<metadata::PartitionEntry> partitions;
+
+    brokers.reserve(resp.brokers.size());
+    for (const auto& b : resp.brokers) {
+        metadata::BrokerEntry e;
+        e.nodeId = b.nodeId;
+        e.port   = b.port;
+        e.host   = std::string(b.host);
+        brokers.push_back(std::move(e));
+    }
+
+    partitions.reserve(resp.partitions.size());
+    for (const auto& p : resp.partitions) {
+        metadata::PartitionEntry e;
+        e.topicId     = p.topicId;
+        e.partition   = p.partition;
+        e.leaderId    = p.leaderId;
+        e.leaderEpoch = p.leaderEpoch;
+        partitions.push_back(e);
+    }
+
+    metadataCache_.updateFromResponse(brokers, partitions);
+
+    // Update partitionRouter partition counts from the response.
+    // Derive per-topic partition count from the maximum partition number seen.
+    // (The server sends all partitions for each topic in the response.)
+    std::unordered_map<int32_t, int32_t> maxPartition;
+    for (const auto& p : partitions) {
+        auto& maxP = maxPartition[p.topicId];
+        if (p.partition > maxP) maxP = p.partition;
+    }
+    for (const auto& [topicId, maxP] : maxPartition) {
+        partitionRouter_.setTopicPartitionCount(topicId, maxP + 1);
+    }
 }
 
 } // namespace rune::client

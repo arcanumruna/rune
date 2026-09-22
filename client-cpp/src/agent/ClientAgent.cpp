@@ -273,6 +273,10 @@ void ClientAgent::setProduceResponseFn(ProduceResponseFn fn) noexcept {
     produceResponseFn_ = std::move(fn);
 }
 
+void ClientAgent::setMetadataResponseFn(MetadataResponseFn fn) noexcept {
+    metadataResponseFn_ = std::move(fn);
+}
+
 void ClientAgent::publishSnapshot() noexcept {
     // Pack (state, sessionId) into ONE atomic value and publish (release).
     // Guard the sessionId range so the packing assumption (48 bits) holds.
@@ -370,6 +374,21 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     case codec::TemplateId::Pong: {
         session_.onActivity(nowNs);
         publishSnapshot();  // FIX F1: fresh snapshot before observer
+        if (egressObserver_) {
+            egressObserver_(tid, buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::MetadataResponse: {
+        // MD1 Task 10: route MetadataResponse to the cache-update hook.
+        if (metadataResponseFn_) {
+            auto opt = codec::decodeMetadataResponse(buf, len);
+            if (opt) {
+                metadataResponseFn_(*opt);
+            }
+        }
+        // Also forward to egress observer if wired.
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }

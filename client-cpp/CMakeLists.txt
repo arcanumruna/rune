@@ -487,6 +487,23 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_subscriber_tests)
     endif()
 
+    # ── MD1 Task 10: Metadata cache + partition router tests ──────────────────
+    # No Aeron dependency: MetadataCache and PartitionRouter are header-only
+    # data structures; MetadataIntegrationTest uses the protocol codec directly.
+    add_executable(rune_metadata_client_tests
+        tests/metadata/MetadataCacheTest.cpp
+        tests/metadata/PartitionRouterTest.cpp
+        tests/metadata/MetadataIntegrationTest.cpp
+    )
+    target_include_directories(rune_metadata_client_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_metadata_client_tests PRIVATE
+        rune_client
+        GTest::gtest_main
+    )
+    gtest_discover_tests(rune_metadata_client_tests)
+
     # ── Group consumer tests (CG-5) — state machine, records routing, commit ──
     # No Aeron dependency: GroupConsumerHub is self-contained (no transport).
     add_executable(rune_group_tests

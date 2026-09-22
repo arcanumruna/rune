@@ -19,13 +19,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
+#include <vector>
 
 // Pull in the rune-protocol client codecs (header-only, sibling include path
 // injected into the build by CMakeLists.txt).
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -350,6 +353,96 @@ inline std::optional<PongView> decodePong(const uint8_t* buf, std::size_t len) n
     v.correlationId = opt->correlationId;
     v.echo          = opt->echo;
     return v;
+}
+
+// ===========================================================================
+// MD1 Task 10: MetadataRequest / MetadataResponse codec adapters
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// BrokerEntryView — a single broker entry decoded from a MetadataResponse
+// ---------------------------------------------------------------------------
+struct BrokerEntryView {
+    int32_t          nodeId = -1;
+    int32_t          port   = 0;
+    std::string_view host;    // view into the original buffer
+};
+
+// ---------------------------------------------------------------------------
+// PartitionEntryView — a single partition entry decoded from MetadataResponse
+// ---------------------------------------------------------------------------
+struct PartitionEntryView {
+    int32_t topicId     = 0;
+    int32_t partition   = 0;
+    int32_t leaderId    = -1;
+    int32_t leaderEpoch = -1;
+};
+
+// ---------------------------------------------------------------------------
+// MetadataResponseDecoded — fully decoded MetadataResponse (owns heap copies)
+// ---------------------------------------------------------------------------
+struct MetadataResponseDecoded {
+    int64_t                        sessionId     = 0;
+    int64_t                        correlationId = 0;
+    // Owned copies (host strings from the response buffer are transferred here).
+    // Using the protocol-layer Decoded type directly for zero re-implementation.
+    std::vector<BrokerEntryView>    brokers;
+    std::vector<PartitionEntryView> partitions;
+};
+
+/// Encode a MetadataRequest frame into buf[0..cap-1].
+/// topicIds is the list of topic ids to query; empty span means all topics.
+/// Returns bytes written, or 0 if cap is insufficient.
+inline std::size_t encodeMetadataRequest(uint8_t*                     buf,
+                                          std::size_t                  cap,
+                                          std::span<const int32_t>     topicIds,
+                                          int64_t                      sessionId,
+                                          int64_t                      correlationId) noexcept
+{
+    const std::size_t needed = rpc::MessageHeader::ENCODED_SIZE
+                             + rpc::MetadataRequest::BODY_FIXED
+                             + 2u                       // uint16 topicId count
+                             + topicIds.size() * 4u;    // 4 bytes per topicId
+    if (cap < needed) return 0u;
+    rpc::MetadataRequest msg;
+    msg.sessionId     = sessionId;
+    msg.correlationId = correlationId;
+    msg.topicIds      = topicIds;
+    return msg.encode(buf);
+}
+
+/// Decode a MetadataResponse frame.
+/// Returns nullopt on truncation, version mismatch, or templateId mismatch.
+inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
+    const uint8_t* buf, std::size_t len) noexcept
+{
+    auto opt = rpc::MetadataResponse::decode(buf, len);
+    if (!opt) return std::nullopt;
+
+    MetadataResponseDecoded result;
+    result.sessionId     = opt->sessionId;
+    result.correlationId = opt->correlationId;
+
+    result.brokers.reserve(opt->brokers.size());
+    for (const auto& b : opt->brokers) {
+        BrokerEntryView bv;
+        bv.nodeId = b.nodeId;
+        bv.port   = b.port;
+        bv.host   = b.host;
+        result.brokers.push_back(bv);
+    }
+
+    result.partitions.reserve(opt->partitions.size());
+    for (const auto& p : opt->partitions) {
+        PartitionEntryView pv;
+        pv.topicId     = p.topicId;
+        pv.partition   = p.partition;
+        pv.leaderId    = p.leaderId;
+        pv.leaderEpoch = p.leaderEpoch;
+        result.partitions.push_back(pv);
+    }
+
+    return result;
 }
 
 // ===========================================================================
