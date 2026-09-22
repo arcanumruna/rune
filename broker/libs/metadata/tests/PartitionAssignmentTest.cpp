@@ -153,14 +153,14 @@ TEST(PartitionAssignmentBumpRules, LeaderAndIsrChange_BothEpochsBump)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 8. Leader unchanged (same value, not sentinel) ⟹ only ISR change bumps
-//    partitionEpoch; leaderEpoch stays
+// 8. Leader sentinel (NO_LEADER_CHANGE) + ISR change ⟹ only partitionEpoch bumps;
+//    leaderEpoch stays.  This is the sentinel/unchanged path.
 // ─────────────────────────────────────────────────────────────────────────────
-TEST(PartitionAssignmentBumpRules, LeaderSameValue_IsrChange_OnlyPartitionEpochBumps)
+TEST(PartitionAssignmentBumpRules, LeaderSentinel_IsrChange_OnlyPartitionEpochBumps)
 {
     auto cur = makeAssignment(/*leader=*/1, {1, 2, 3}, {1, 2, 3});
     AssignmentChange change;
-    change.newLeader   = NO_LEADER_CHANGE;  // explicitly no leader change
+    change.newLeader   = NO_LEADER_CHANGE;  // sentinel: leave leader field untouched
     change.newIsr      = {1, 2};
     change.newReplicas = NO_REPLICA_CHANGE;
 
@@ -168,6 +168,29 @@ TEST(PartitionAssignmentBumpRules, LeaderSameValue_IsrChange_OnlyPartitionEpochB
 
     EXPECT_EQ(next.leaderEpoch,    cur.leaderEpoch);
     EXPECT_EQ(next.partitionEpoch, cur.partitionEpoch + 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8b. Leader explicit same value (NOT sentinel) + ISR change ⟹
+//     only partitionEpoch bumps; leaderEpoch stays.
+//     Re-asserting the same leader is not a leader *change* — no leaderEpoch bump.
+//     This test targets the branch: change.newLeader != NO_LEADER_CHANGE
+//       but change.newLeader == cur.leaderNode.
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(PartitionAssignmentBumpRules, LeaderExplicitSameValue_IsrChange_OnlyPartitionEpochBumps)
+{
+    auto cur = makeAssignment(/*leader=*/1, {1, 2, 3}, {1, 2, 3});
+    AssignmentChange change;
+    change.newLeader   = 1;                 // explicit equal value, NOT NO_LEADER_CHANGE (-2)
+    change.newIsr      = {1, 2};            // ISR change — ensures partitionEpoch bumps
+    change.newReplicas = NO_REPLICA_CHANGE;
+
+    auto next = mergeChange(cur, change);
+
+    // Re-asserting the same leader must NOT bump leaderEpoch.
+    EXPECT_EQ(next.leaderNode,     1);
+    EXPECT_EQ(next.leaderEpoch,    cur.leaderEpoch);          // NO bump
+    EXPECT_EQ(next.partitionEpoch, cur.partitionEpoch + 1);   // ISR change bumps PE
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

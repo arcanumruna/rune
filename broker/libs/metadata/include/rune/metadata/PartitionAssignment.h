@@ -1,7 +1,5 @@
 // PartitionAssignment.h — two-epoch in-memory assignment model.
 // Consumed by: MSM apply, balancer, replication bridge, routing image.
-//
-// STUB — tests will be compiled against this; implementation follows TDD RED phase.
 
 #pragma once
 
