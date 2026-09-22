@@ -97,7 +97,19 @@ struct SmokeDir {
 // Build a single-node NodeConfig with configurable topics.
 // consensusPort is irrelevant for single-node (NullSink) but must be set.
 // ---------------------------------------------------------------------------
+// CP-10 Fix 5: per-invocation unique ports to avoid bind conflicts under ctest -j.
+// Each makeSmokeConfig() call consumes two port slots from a shared atomic counter
+// anchored at 40300 (clear of BrokerNodeTest:40111 and prior smoke port 40211).
+// Base range: consensus 40300+2i, client 50300+2i (i = g_smoke_seq value).
+// With 256 distinct values the smoke suite spans 40300-40811 / 50300-50811 —
+// no overlap with production defaults.
+static std::atomic<uint16_t> g_smoke_port_seq{0};
+
 static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
+    const uint16_t slot       = g_smoke_port_seq.fetch_add(1, std::memory_order_relaxed);
+    const uint16_t cPort      = static_cast<uint16_t>(40300u + slot * 2u);
+    const uint16_t clientPort = static_cast<uint16_t>(50300u + slot * 2u);
+
     rune::node::NodeConfig cfg;
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
@@ -106,10 +118,11 @@ static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
     rune::node::PeerConfig self;
     self.id            = 0;
     self.host          = "127.0.0.1";
-    self.consensusPort = 40211;  // distinct from BrokerNodeTest (40111)
+    self.consensusPort = cPort;
     cfg.peers          = {self};
 
-    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50211";
+    cfg.clientEndpoint.channel  =
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
     cfg.clientEndpoint.streamId = 1;
 
     return cfg;
