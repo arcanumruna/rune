@@ -460,4 +460,38 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_gateway_psm_failover_tests
             PROPERTIES TIMEOUT 300)
     endif()
+
+    # ---------------------------------------------------------------------------
+    # CP-5 Phase 1: CompactionRetentionSmoke — end-to-end integration gate.
+    #
+    # Cohesive smoke suite that drives a REAL BrokerNode (NodeRuntimeAgent +
+    # LogCleanerAgent on their own threads, config-driven coalescing on) for 10
+    # scenarios:
+    #   1. CompactHappyPath_LatestPerKey
+    #   2. TombstoneLifecycle_KIP534
+    #   3. DeleteRetention_TimeAndSize
+    #   4. CompactDelete_BothRun_NoDoubleDelete
+    #   5. InternalTopic_Recovery_CompactedLog
+    #   6. IdempotentDedup_SurvivesRetention
+    #   7. RestartResume_Checkpoint
+    #   8. HwLeo_NonPerturbation
+    #   9. AppendDuringCompaction_Correctness
+    #  10. Failover_HwBounded_NoResurrection
+    #
+    # Requires: BrokerNode (embedded Aeron driver).
+    # Gated behind BUILD_BROKER_NODE_TESTS + aeron_FOUND (same as BrokerNodeTest).
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_compaction_retention_smoke_tests
+            tests/integration/CompactionRetentionSmokeTest.cpp)
+        target_link_libraries(rune_compaction_retention_smoke_tests PRIVATE
+            rune_node
+            rune_coordination
+            rune_replication
+            rune_storage
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_compaction_retention_smoke_tests
+            PROPERTIES TIMEOUT 300)
+    endif()
 endif()

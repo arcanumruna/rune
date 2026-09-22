@@ -429,6 +429,14 @@ void BrokerNode::buildReplication() {
             pcfg.maxCompactionLagMs     = spec->maxCompactionLagMs;
             // CP-8: per-topic segment roll bytes for coalescing group bound.
             pcfg.segmentRollBytes       = spec->segmentRollBytes;
+            // CP-9: retention scheduler cadence + async-delete delay.
+            // These were missing from BrokerNode::buildReplication (product bug
+            // exposed by the CP-5.1 smoke suite) — fixes retention not firing
+            // at the configured cadence when retentionCheckMs/fileDeleteDelayMs
+            // are set to small values in tests.
+            pcfg.retentionCheckMs       = spec->retentionCheckMs;
+            pcfg.fileDeleteDelayMs      = spec->fileDeleteDelayMs;
+            pcfg.logStartOffset         = spec->logStartOffset;
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).
@@ -571,7 +579,8 @@ void BrokerNode::buildGateway() {
             fs::create_directories(offsetDir);
 
             // One partition Log for all committed offsets (compact key/value encoding).
-            offsetLog_ = std::make_unique<rune::storage::Log>(offsetDir.string());
+            offsetLog_ = std::make_unique<rune::storage::Log>(
+                offsetDir.string(), config_.offsetLogSegmentRollBytes);
             offsetLog_->recover();
 
             // Wrap in a PartitionReplica for the __consumer_offsets topic.

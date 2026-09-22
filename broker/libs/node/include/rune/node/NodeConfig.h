@@ -148,6 +148,12 @@ struct NodeConfig {
     // Overridable via RUNE_ENABLE_COALESCING env var ("0" or "false" → off).
     bool enableCompactionCoalescing = true;
 
+    // Segment roll size (bytes) for the internal __consumer_offsets log.
+    // Default 64 MiB matches TopicSpec::segmentRollBytes.
+    // Tests may set a small value (e.g. 128) to force multiple sealed segments
+    // so LogCleanerAgent can run compaction on the offset log.
+    int64_t offsetLogSegmentRollBytes = 64LL * 1024 * 1024;
+
     /// Returns the peer entry whose id == nodeId.
     /// Precondition: parse succeeded (peers non-empty, nodeId in peers).
     const PeerConfig& self() const;

@@ -153,6 +153,13 @@ int64_t Log::recover() {
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();
     logEndOffset_ = next;
+    // Publish sealed snapshot so the LogCleanerAgent can see pre-existing
+    // sealed segments immediately after recovery (without waiting for the first
+    // new append to trigger maybeRoll()).  Without this, the cleaner skips the
+    // log on the first doWork() call after a restart (sealedSegmentSnapshot()
+    // returns nullptr → candidate selection skips this replica) and the
+    // persisted checkpoint is never loaded via ensureCheckpoint().
+    publishSealedSnapshot();
     return next;
 }
 void Log::sync() { activeSegment().sync(); }
