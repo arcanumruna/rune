@@ -1623,6 +1623,21 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
     const std::vector<NodeId>& isrList = isrManager_->isr();
     if (isrList.empty()) return;
 
+    // Single-writer guard: if the ISR contains only self (no followers), there
+    // is nothing to push.  Advance lastPushedOffset_ and return WITHOUT touching
+    // the log — log_->read() races with the duty-cycle thread's drainCleanerSwaps
+    // (segments_ mutation) and any concurrent fetch from a test or internal caller.
+    {
+        bool hasFollower = false;
+        for (NodeId id : isrList) {
+            if (id != cfg_.selfId) { hasFollower = true; break; }
+        }
+        if (!hasFollower) {
+            lastPushedOffset_ = log_->logEndOffset();
+            return;
+        }
+    }
+
     // Nothing new to push if fromOffset is at or above current LEO.
     Offset currentLeo = log_->logEndOffset();
     if (fromOffset >= currentLeo) {

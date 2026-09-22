@@ -401,9 +401,14 @@ public:
     [[nodiscard]] int64_t     logStartOffset()         const noexcept { return cfg_.logStartOffset; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
-    [[nodiscard]] Offset lastCleanOffset() const noexcept { return lastCleanOffset_; }
+    /// Atomic so test threads can poll without a TSan race (cleaner/duty threads write it).
+    [[nodiscard]] Offset lastCleanOffset() const noexcept {
+        return lastCleanOffset_.load(std::memory_order_relaxed);
+    }
     /// CP-2: advance the cleaned watermark (called by NodeRuntimeAgent after each segment).
-    void setLastCleanOffset(Offset o) noexcept { lastCleanOffset_ = o; }
+    void setLastCleanOffset(Offset o) noexcept {
+        lastCleanOffset_.store(o, std::memory_order_relaxed);
+    }
 
     /// Non-owning pointer to the underlying Log (for test inspection and replay seeding).
     [[nodiscard]] rune::storage::Log* log() const noexcept { return log_; }
@@ -544,7 +549,8 @@ private:
     // been applied.  Starts at 0 (nothing compacted).  NodeRuntimeAgent advances
     // this after each successful segment compaction so already-clean prefixes are
     // never re-scanned or re-rewritten on the next duty-cycle call.
-    Offset lastCleanOffset_ = 0;
+    // Atomic: cleaner/duty threads write; test threads may poll it concurrently.
+    std::atomic<Offset> lastCleanOffset_{0};
 
     // GR-10: push tracking — last offset that was pushed to followers.
     // Avoids re-pushing bytes already pushed in the same append cycle.
