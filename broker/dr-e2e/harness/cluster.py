@@ -202,7 +202,8 @@ class Cluster:
 
     # ---- data-plane readiness --------------------------------------------
 
-    def wait_data_plane_ready(self, max_attempts: int = 5, timeout_s: int = 60) -> str:
+    def wait_data_plane_ready(self, max_attempts: int = 5, timeout_s: int = 60,
+                              topics: str = "events:0:1") -> str:
         """Block until the data plane (Aeron media driver + broker ingress) is
         fully warm on the current leader and return the leader service name.
 
@@ -218,6 +219,12 @@ class Cluster:
         service is cached as the known-serving node so ``serving_node()`` need not
         re-probe.  Uses cid_base=995000 — disjoint from test cids and from the
         990000 window used by ``serving_node()``.
+
+        The ``topics`` parameter controls which topic/topicId is used for the
+        warm-up probe.  Callers with a non-standard topic layout (e.g. the
+        compaction cluster where topicId=0 is "compact_log", not "events")
+        MUST pass the appropriate topic string so that the warm-up records do
+        NOT land on a test topic and skew invariant checks.
 
         Raises RuntimeError if no warm-up succeeds within the budget.
         """
@@ -248,6 +255,7 @@ class Cluster:
                 timeout_ms=12000,
                 cid_base=995000,  # warm-up cid window; disjoint from test cids
                 timeout_s=45,
+                topics=topics,
             )
             if res.ok and len(res.all_produced) == 5:
                 # Cache so serving_node() does not re-probe for this Cluster.

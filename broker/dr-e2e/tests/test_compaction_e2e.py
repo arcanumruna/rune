@@ -192,7 +192,12 @@ def compaction_cluster() -> Iterator[Cluster]:
     c = Cluster(project="rune-dr-compact", override_files=[override])
     try:
         c.up(build=build, leader_timeout=120)
-        c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
+        # CP-5.2: probe via delete_log (topicId=1, delete policy) so the warm-up
+        # records (cid=995000) do NOT land on compact_log (topicId=0).  Warm-up
+        # records on a compact-policy log interleave with test survivors and
+        # cause false failures in assert_hw_bounded / assert_latest_per_key.
+        c.wait_data_plane_ready(max_attempts=5, timeout_s=60,
+                                topics=_CLIENT_DELETE_TOPICS)
         yield c
     finally:
         faults.heal_all(c)
@@ -319,30 +324,85 @@ def _count_log_files(project: str, service_idx: int) -> int:
 
 
 def _wait_for_compaction(cluster: Cluster, leader_svc: str, *,
-                         initial_count: int, timeout_s: float = 60.0,
-                         poll_s: float = 2.0) -> bool:
-    """Poll until the log file count on the leader node drops below initial_count.
+                         initial_count: int, timeout_s: float = 120.0,
+                         poll_s: float = 2.0, stable_polls: int = 3) -> bool:
+    """Poll until the log file count on the leader node STABILISES below initial_count.
 
     Compaction reduces the number of sealed .log files (by dropping superseded
-    records and optionally coalescing segments).  When the count goes below
-    `initial_count`, at least one compaction pass has completed.
+    records and optionally coalescing segments).  This function waits until:
+      1. The count has dropped below `initial_count` (at least one pass done), AND
+      2. The count has not changed for `stable_polls` consecutive polls (all
+         passes complete — the cleaner has nothing more to compact).
 
-    Returns True if compaction was detected within the timeout, False otherwise.
+    This prevents the test from proceeding after only the first compaction pass
+    when multiple passes are needed to reach the fully-compacted state (latest-
+    per-key for each dirty segment).
+
+    Returns True if stable compaction was detected within the timeout, False
+    otherwise.
     """
     from harness.cluster import service_to_node_id
     node_idx = service_to_node_id(leader_svc) + 1  # 1-based volume index
     deadline = time.time() + timeout_s
+    prev_count = initial_count
+    stable_streak = 0
+    dropped_once = False
+
     while time.time() < deadline:
         count = _count_log_files(cluster.project, node_idx)
-        if count != -1 and count < initial_count:
-            return True
+        if count == -1:
+            time.sleep(poll_s)
+            continue
+
+        if count < initial_count:
+            dropped_once = True
+
+        if dropped_once:
+            if count == prev_count:
+                stable_streak += 1
+                if stable_streak >= stable_polls:
+                    return True
+            else:
+                # Still decreasing — reset streak (compaction is still running).
+                stable_streak = 0
+        prev_count = count
         time.sleep(poll_s)
-    return False
+    return dropped_once  # partial progress is better than False
 
 
 # ---------------------------------------------------------------------------
 # Compaction-specific invariants
 # ---------------------------------------------------------------------------
+
+# Harness-internal cid WINDOW: the data-plane warm-up (cid_base=995000) and the
+# serving_node() probe (cid_base=990000) each produce a handful of records whose
+# cids fall in [990_000, 1_000_000).  Those records are NOT part of the test's
+# committed set and must be excluded from the compaction invariant checks.
+#
+# CRITICAL (bug-2 root cause): the TEST's own produce cid_base is
+# `2_000_000 + n*5000` (see _next_cid_base), i.e. >= 2_000_000.  A prior
+# "exclude cid >= 990_000" filter therefore discarded the TEST's OWN delivered
+# records, leaving delivered_map EMPTY so assert_latest_per_key reported every
+# key (196..199) as "missing" — a pure test artifact, not a product bug.  The
+# correct filter is a bounded WINDOW around the harness cids, never an open-ended
+# ">= 990_000" that also swallows the 2_000_000+ test range.
+_WARMUP_CID_LO = 990_000
+_WARMUP_CID_HI = 1_000_000  # exclusive upper bound of the harness cid window
+
+
+def _is_warmup_cid(cid: int) -> bool:
+    """True iff `cid` is a harness warm-up/probe record (NOT a test record)."""
+    return _WARMUP_CID_LO <= cid < _WARMUP_CID_HI
+
+
+def _is_test_cid(cid: int) -> bool:
+    """True iff `cid` is a real test-produced record (non-negative, not harness)."""
+    return cid >= 0 and not _is_warmup_cid(cid)
+
+
+# Back-compat alias: some callers imported _WARMUP_CID_MIN.  Keep it defined but
+# it must NEVER be used as an upper bound on test records (see note above).
+_WARMUP_CID_MIN = _WARMUP_CID_LO
 
 def assert_latest_per_key(produced: Results, delivered: Results) -> None:
     """After compaction, each (cid, key) must appear at most once in delivered,
@@ -367,10 +427,13 @@ def assert_latest_per_key(produced: Results, delivered: Results) -> None:
         k = (m.cid, m.key)
         max_seq[k] = max(max_seq.get(k, -1), m.seq)
 
-    # Check delivered set.
+    # Check delivered set.  Exclude ONLY harness warm-up/probe records (cids in
+    # the [990_000, 1_000_000) window) — NOT the test's own 2_000_000+ records.
+    # These harness records land on delete_log (topicId=1) and are not part of
+    # the compaction invariants under test.
     delivered_map: dict[tuple[int, int], int] = {}  # (cid, key) -> seq
     for m in delivered.all_delivered:
-        if m.cid < 0:
+        if not _is_test_cid(m.cid):
             continue
         k = (m.cid, m.key)
         if k in delivered_map:
@@ -440,10 +503,16 @@ def assert_hw_bounded(produced: Results, delivered: Results) -> None:
     Specifically: no delivered record's (cid, key, seq) should be absent from
     the produced set.  This is the HW-bound invariant: readers must not see
     records past the High-Water Mark.
+
+    Only harness warm-up/probe records (cids in [990_000, 1_000_000)) are
+    excluded; the TEST's own 2_000_000+ records ARE checked (using the old open-
+    ended ">= 990_000" here would have made this invariant VACUOUS by skipping
+    every real record).
     """
     produced_ids = {(m.cid, m.key, m.seq) for m in produced.all_produced if m.cid >= 0}
     phantom = [m for m in delivered.all_delivered
-               if m.cid >= 0 and (m.cid, m.key, m.seq) not in produced_ids]
+               if _is_test_cid(m.cid)
+               and (m.cid, m.key, m.seq) not in produced_ids]
     assert not phantom, (
         f"hw-bounded: {len(phantom)} phantom records in delivered set "
         f"(records not present in produced set): "
@@ -518,30 +587,34 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
     leader_idx = service_to_node_id(leader_svc) + 1
     initial_file_count = _count_log_files(cluster.project, leader_idx)
 
-    # ── Wait for the cleaner to compact at least one pass ─────────────────────
+    # ── Wait for full compaction to stabilise ─────────────────────────────────
     # The cleaner runs on a background thread; tiny 4 KiB segments means the
-    # log will have sealed many segments.  Poll until at least one compaction
-    # round completes (file count drops).  Give the cleaner up to 60 s.
+    # log will have sealed many segments.  Poll until the file count stops
+    # decreasing (all passes done → latest-per-key state reached).
+    # Give the cleaner up to 120 s to fully compact 200 records × 4 keys.
     #
     # NOTE: If the file count is -1 (volume not accessible from outside — e.g.
     # Docker Desktop with restricted volume access), we fall back to a fixed
-    # wait of 30 s and skip the file-count assertion.
+    # wait of 60 s and skip the file-count assertion.
     compaction_observed = False
     if initial_file_count > 0:
         compaction_observed = _wait_for_compaction(
             cluster, leader_svc,
             initial_count=initial_file_count,
-            timeout_s=60.0,
+            timeout_s=120.0,
         )
     else:
         # Can't observe file count — fixed wait for cleaner to cycle.
-        time.sleep(30.0)
+        time.sleep(60.0)
         compaction_observed = None  # unknown
 
     # ── Restart the broker (container restart, not full cluster) ──────────────
     faults.restart(cluster, leader_svc)
-    # After restart, wait for the leader to re-elect and warm up.
-    time.sleep(10.0)
+    # After restart, wait for the leader to re-elect and the data plane to be
+    # ready before subscribing.  Use delete_log (topicId=1) for the warm-up probe
+    # so post-restart warm-up records do NOT land on compact_log (topicId=0).
+    cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120,
+                                  topics=_CLIENT_DELETE_TOPICS)
 
     new_lid = cluster.wait_for_leader(timeout_s=60)
     new_leader_svc = node_id_to_service(new_lid)
@@ -558,24 +631,30 @@ def test_cp5_compaction_survives_restart(compaction_cluster):
     assert_latest_per_key(produce_result, sub_result)
 
     # 2. HW-bounded: no phantom records past the committed set.
+    #    (warm-up records are excluded — see assert_hw_bounded docstring)
     assert_hw_bounded(produce_result, sub_result)
 
     # 3. Single leader (cluster health).
     assert_single_leader(cluster)
 
-    # 4. Compaction actually ran (fewer records delivered than produced).
-    n_delivered = len(sub_result.all_delivered)
-    assert n_delivered < n_produced, (
+    # 4. Compaction actually ran (fewer TEST records delivered than produced).
+    #    Count only the test's own records (excluding the harness warm-up/probe
+    #    window); the harness records land on delete_log and are disjoint anyway.
+    n_test_delivered = sum(1 for m in sub_result.all_delivered
+                           if _is_test_cid(m.cid))
+    assert n_test_delivered < n_produced, (
         f"compaction did not reduce delivered count: produced={n_produced}, "
-        f"delivered={n_delivered} (expected < {n_produced} after compaction; "
+        f"test-records-delivered={n_test_delivered} "
+        f"(expected < {n_produced} after compaction; "
         f"compaction_observed={compaction_observed})"
     )
 
     # 5. Delivered count matches expected latest-per-key count (= distinct keys).
     #    The dr_client uses key = (cid * 1_000_000 + seq % keys), and cid_produce
     #    is fixed, so there are exactly `keys` distinct keys.
-    assert n_delivered == keys, (
-        f"after compaction: delivered {n_delivered} records, expected {keys} "
+    #    Only the test's own records are counted (harness warm-up window excluded).
+    assert n_test_delivered == keys, (
+        f"after compaction: {n_test_delivered} test records delivered, expected {keys} "
         f"(one per distinct key); compaction left extra or missing records"
     )
 
@@ -624,11 +703,15 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
     initial_file_count = _count_log_files(cluster.project, leader_idx)
 
     if initial_file_count > 0:
+        # Wait for stable compaction (all passes done).  The failover test only
+        # needs at least one pass to have completed before the kill — the new
+        # leader may not have the compacted segments immediately but the
+        # assertions are designed to tolerate that (no resurrection, HW-bounded).
         _wait_for_compaction(cluster, leader_svc,
                               initial_count=initial_file_count,
-                              timeout_s=60.0)
+                              timeout_s=120.0)
     else:
-        time.sleep(30.0)
+        time.sleep(60.0)
 
     # ── Kill the current leader → trigger re-election ─────────────────────────
     faults.kill_node(cluster, leader_svc, signal.SIGKILL)
@@ -637,6 +720,26 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
     assert new_leader_svc != leader_svc
 
     assert_single_leader(cluster)
+
+    # ── Wait for the NEW leader to compact its (uncompacted) copy of the log ──
+    # In Rune, compaction runs on the leader only.  After failover, the new leader
+    # has the full uncompacted log (followers don't receive the compacted segments
+    # from the old leader — they replicated the raw append stream).  We wait for
+    # the new leader to run its own compaction passes before subscribing so that
+    # assert_latest_per_key can pass.  This also confirms that compaction is
+    # idempotent and that the cleaner picks up where it left off on a new leader.
+    new_leader_idx = service_to_node_id(new_leader_svc) + 1
+    new_initial_file_count = _count_log_files(cluster.project, new_leader_idx)
+    if new_initial_file_count > 0:
+        _wait_for_compaction(cluster, new_leader_svc,
+                              initial_count=new_initial_file_count,
+                              timeout_s=120.0)
+    else:
+        time.sleep(60.0)
+
+    # ── Wait for data plane ready on new leader before subscribing ────────────
+    cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120,
+                                  topics=_CLIENT_DELETE_TOPICS)
 
     # ── Subscribe from the NEW leader ─────────────────────────────────────────
     cid_sub = _next_cid_base()
@@ -648,15 +751,22 @@ def test_cp5_compaction_survives_failover(compaction_cluster):
     assert_no_resurrection(produce_result, sub_result)
 
     # 2. HW-bounded: no phantom records past the committed set.
+    #    (warm-up records are excluded — see assert_hw_bounded docstring)
     assert_hw_bounded(produce_result, sub_result)
 
-    # 3. Latest-per-key: new leader serves only the compacted state.
-    #    (If compaction had not propagated to followers, this may show all records;
-    #     the assertion still holds because compaction is bounded below HW and
-    #     followers replicate compacted segments once the leader swaps them.)
+    # 3. Latest-per-key: new leader has run its own compaction and serves the
+    #    compacted state (exactly one record per distinct key).
     assert_latest_per_key(produce_result, sub_result)
 
-    # 4. Single leader.
+    # 4. Delivered count: exactly `keys` test records after full compaction.
+    n_test_delivered = sum(1 for m in sub_result.all_delivered
+                           if _is_test_cid(m.cid))
+    assert n_test_delivered == keys, (
+        f"after failover + compaction: {n_test_delivered} test records delivered, "
+        f"expected {keys} (one per distinct key)"
+    )
+
+    # 5. Single leader.
     assert_single_leader(cluster)
 
 
