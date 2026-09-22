@@ -229,6 +229,186 @@ TEST(CompactionCleanerAgent, CompactionRunsOffDutyThread) {
 }
 
 // ===========================================================================
+// REPRO (bug): convergence at the PRODUCTION default dirty ratio (0.5).
+//
+// The Docker DR e2e (drcp1/3/4) fail with "key delivered more than once
+// (seq 37 AND 41)" because compaction STOPS mid-sweep once the running
+// dirtyRatio dips to <= minCleanableDirtyRatio, leaving ~2 copies/key.
+// Every in-process convergence test masked this by using dirtyRatio=0.0
+// (gate effectively off).  This reproduces at the production default 0.5.
+// Expectation: after a clean round STARTS (ratio > 0.5), compaction must
+// run the log's whole dirty range to completion -> exactly 1 live copy per
+// key in the SEALED region (Kafka clean-round semantics).
+// ===========================================================================
+TEST(CompactionCleanerAgent, ConvergesToOnePerKeyAtDefaultDirtyRatio) {
+    auto dir = cp6TempDir("cp6_converge_050");
+    // Multi-record segments (DR-faithful): the mid-sweep ratio-gate stop then
+    // leaves TRACKED-KEY dupes in un-compacted segments, not just unique tails.
+    Log log(dir.string(), /*rollBytes=*/2048);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(660, /*dirtyRatio=*/0.5);   // PRODUCTION default
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->becomeLeader(1, {1});
+
+    const int kKeys = 4, kRecords = 200;
+    for (int v = 0; v < kRecords; ++v) {
+        std::string key = "k" + std::to_string(v % kKeys);
+        auto b = cp6Batch(v, key, "v" + std::to_string(v));
+        log.append(b, v);
+    }
+    // Seal the tail: append sentinel records with distinct keys so k0..k3's
+    // newest values land in a SEALED segment (the active segment is never
+    // compacted — Kafka-identical).
+    for (int v = kRecords; v < kRecords + 40; ++v) {
+        auto b = cp6Batch(v, "sentinel" + std::to_string(v), "s");
+        log.append(b, v);
+    }
+    replica->onLeaderLogAppended();
+    ASSERT_GE(log.segmentBaseOffsets().size(), 2u);
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(660, 0, std::move(replica));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry);
+
+    for (int i = 0; i < 500; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    // Count live records per key.
+    std::map<std::string, int> perKey;
+    auto bases = log.segmentBaseOffsets();
+    for (size_t si = 0; si < bases.size(); ++si) {
+        int64_t cursor = bases[si];
+        int64_t segEnd = (si + 1 < bases.size())
+                             ? bases[si + 1]
+                             : std::numeric_limits<int64_t>::max();
+        while (cursor < segEnd) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool adv = false;
+            r.forEach([&](std::string_view k, std::string_view, int64_t off, int64_t) {
+                perKey[std::string(k)]++; cursor = off + 1; adv = true;
+            });
+            if (!adv) break;
+        }
+    }
+    for (int k = 0; k < kKeys; ++k) {
+        std::string key = "k" + std::to_string(k);
+        EXPECT_EQ(perKey[key], 1)
+            << "key " << key << " has " << perKey[key] << " live copies (expected 1) "
+            << "— compaction did NOT converge at production dirtyRatio=0.5";
+    }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// TEST 1c: ConvergesUnderInterleavedProduceAndClean  (drcp1/3/4 REGRESSION)
+//
+// Reproduces the DR failure the upfront-produce ConvergesToOnePerKey test misses:
+// the cleaner runs CONCURRENTLY with produce, so its watermark advances INTO the
+// log while later same-key writes are still arriving.  With the old per-segment
+// design the cleaner only deduped [watermark, hw) and never re-cleaned the prefix,
+// so an early copy compacted below the watermark stranded when the SAME key was
+// rewritten above it (the "key delivered seq 37 AND 197" DR bug).  The Kafka
+// doClean-from-log-start sweep re-cleans the whole prefix against the dirty map
+// every pass, so every key must converge to EXACTLY ONE live copy.
+//
+// NON-VACUOUS: on the pre-fix cleaner this leaves ≥2 live copies for the hot keys
+// and the EXPECT_EQ(perKey[key], 1) fails.
+// ===========================================================================
+TEST(CompactionCleanerAgent, ConvergesUnderInterleavedProduceAndClean) {
+    auto dir = cp6TempDir("cp_interleave_converge");
+    // Small roll so segments seal DURING produce (the cleaner can advance its
+    // watermark mid-stream — the essential precondition for the DR stranding).
+    Log log(dir.string(), /*rollBytes=*/512);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(661, /*dirtyRatio=*/0.0);  // always eligible
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->becomeLeader(1, {1});
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(661, 0, std::move(replica));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry);
+
+    const int kKeys = 4;
+    int64_t off = 0;
+    int64_t tick = 1;
+    // Interleave: each round produces a wave of updates for all keys, then lets the
+    // cleaner run a few cycles so its watermark advances into the log WHILE more
+    // updates for the same keys are still coming — exactly the DR race.
+    for (int round = 0; round < 8; ++round) {
+        for (int i = 0; i < 20; ++i) {
+            std::string key = "k" + std::to_string(off % kKeys);
+            auto b = cp6Batch(off, key, "v" + std::to_string(off));
+            log.append(b, off);
+            ++off;
+        }
+        raw->onLeaderLogAppended();
+        for (int c = 0; c < 3; ++c) {
+            cleaner.doWork(tick++ * 1'000'000LL);
+            duty.doWork(tick++ * 1'000'000LL);
+        }
+    }
+    // Seal the tail so the newest per-key values land in a SEALED segment (the
+    // active segment is never compacted — Kafka-identical).
+    for (int i = 0; i < 40; ++i) {
+        auto b = cp6Batch(off, "sentinel" + std::to_string(off), "s");
+        log.append(b, off);
+        ++off;
+    }
+    raw->onLeaderLogAppended();
+    // Drive to convergence.
+    for (int c = 0; c < 500; ++c) {
+        cleaner.doWork(tick++ * 1'000'000LL);
+        duty.doWork(tick++ * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    std::map<std::string, int> perKey;
+    auto bases = log.segmentBaseOffsets();
+    for (size_t si = 0; si < bases.size(); ++si) {
+        int64_t cursor = bases[si];
+        int64_t segEnd = (si + 1 < bases.size())
+                             ? bases[si + 1]
+                             : std::numeric_limits<int64_t>::max();
+        while (cursor < segEnd) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool adv = false;
+            r.forEach([&](std::string_view k, std::string_view, int64_t o, int64_t) {
+                perKey[std::string(k)]++; cursor = o + 1; adv = true;
+            });
+            if (!adv) break;
+        }
+    }
+    for (int k = 0; k < kKeys; ++k) {
+        std::string key = "k" + std::to_string(k);
+        EXPECT_EQ(perKey[key], 1)
+            << "key " << key << " has " << perKey[key] << " live copies after "
+               "interleaved produce+clean (expected 1) — the cleaner stranded a "
+               "superseded copy below its advancing watermark.";
+    }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
 // TEST 2: FilthiestLogSelectedFirst
 //
 // Three leader logs A, B, C with different byte dirty ratios.
@@ -1049,8 +1229,16 @@ TEST(CompactionCleanerAgent, CheckpointResumesAcrossAgentRestart) {
         &log, &transport);
     replica->becomeLeader(1, {1});
 
+    // DISTINCT keys (one per record): this test targets WATERMARK/CHECKPOINT
+    // persistence, not compaction.  With unique keys nothing is ever superseded, so
+    // the from-log-start cleaner rewrites nothing and the on-disk log is never
+    // mutated — the watermark then creeps deterministically by exactly one bounded-
+    // map fill per cycle, independent of how many agents have run.  (With repeating
+    // keys the earlier agents would compact/reload the log, so the third agent would
+    // see a different layout than the first and the non-vacuousness comparison below
+    // would no longer hold.)
     for (int v = 0; v < 200; ++v) {
-        auto b = cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v));
+        auto b = cp6Batch(v, "k" + std::to_string(v), "v" + std::to_string(v));
         log.append(b, v);
     }
     replica->onLeaderLogAppended();
@@ -1061,8 +1249,9 @@ TEST(CompactionCleanerAgent, CheckpointResumesAcrossAgentRestart) {
     // This ensures the first agent advances PARTIALLY (not all the way to hw)
     // in 5 cycles, making the Phase 3 non-vacuousness proof observable.
     //
-    // With 5 unique keys (k0..k4) cycling over 200 records and a 3-slot map:
-    //   Each pass covers ~3 unique keys → advances ~3 offsets per pass.
+    // With 200 unique keys and a 3-slot map, buildOffsetMapFromBases stops at the
+    // first key that overflows the map (the 4th distinct key):
+    //   Each pass covers ~3 offsets → the watermark advances ~3 offsets per pass.
     //   5 cycles × ~3 offsets = ~15 offsets → watermarkAfterFirst ≈ 15 << hw=200.
     //
     // Non-vacuousness: without a checkpoint the third agent starts from 0 and

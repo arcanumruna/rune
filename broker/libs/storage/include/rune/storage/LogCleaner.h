@@ -26,6 +26,17 @@ struct CleanPassResult {
     Offset  passEnd   = -1; ///< Next pass should start from here.
 };
 
+/// Result of a from-log-start range compaction pass (produceCleanedRangeBounded).
+/// `passEnd` is the next-pass watermark (map coverage clamp).  `rewrittenBases`
+/// lists ONLY the segments whose on-disk .log actually changed this pass (dropped
+/// records or deleted) — the caller enqueues a swap for exactly these; unchanged
+/// prefix segments are left untouched and are NOT enqueued.
+struct RangeCleanResult {
+    bool                 compacted = false;
+    Offset               passEnd   = -1;
+    std::vector<int64_t> rewrittenBases;
+};
+
 /// Kafka-style log compaction for a single Log.
 ///
 /// Mirrors Kafka's LogCleaner semantics:
@@ -192,6 +203,48 @@ public:
                                               Throttler* throttler = nullptr,
                                               int64_t nowMs = -1);
 
+    /// CONVERGENCE FIX: Kafka `doClean`-from-log-start range compaction.
+    ///
+    /// Builds ONE bounded SkimpyOffsetMap over the dirty section
+    /// [globalDirtyStart, activeBase), then re-copies EVERY sealed segment whose
+    /// base < passEnd (i.e. the whole log prefix + dirty section up to the map's
+    /// coverage boundary) against that map.  This is the load-bearing correctness
+    /// property that produceCleanedFileBounded (single dirty-tail segment) lacked:
+    /// a key written BEFORE the cleaner watermark and rewritten AFTER it has its
+    /// stale prefix copy dropped here, so compaction converges to exactly one live
+    /// record per key even when producers interleave with the cleaner (drcp1/3/4).
+    ///
+    /// Only segments whose content actually changed are returned in
+    /// `rewrittenBases` (via the rewriteSegmentImpl `changed` out-param) — the
+    /// caller enqueues a swap for exactly those; already-clean prefix segments are
+    /// left untouched on disk and are NOT enqueued (no churn).
+    ///
+    /// `passEnd` == activeBase when the map covered the whole dirty range; it is
+    /// map.latestOffset()+1 (< activeBase) when the bounded map filled first — the
+    /// caller advances the watermark to passEnd and the next pass resumes there.
+    ///
+    /// CLEANER THREAD: PURE FILE WORK — never touches Log::segments_.
+    /// @param sealedSizes   Parallel to sealedBases; on-disk file sizes.  Used only
+    ///                      when useCoalescing=true, to group adjacent segments.
+    /// @param useCoalescing When true, adjacent in-pass segments are merged into
+    ///                      one output (Kafka segment grouping) via mergeGroupWithMap;
+    ///                      when false, each in-pass segment is rewritten in place.
+    /// @param groupRollBytes  Max combined output bytes per coalesced group.
+    /// @param map  REUSABLE dedupe map (sized to the budget once by the caller);
+    ///             cleared and refilled here so the backing array is not
+    ///             re-allocated every pass (ULL: near-zero per-pass heap traffic).
+    RangeCleanResult produceCleanedRangeBounded(const std::string& dir,
+                                                const std::vector<int64_t>& sealedBases,
+                                                const std::vector<int64_t>& sealedSizes,
+                                                Offset activeBase,
+                                                Offset globalDirtyStart,
+                                                int64_t nowNs, int64_t deleteRetentionMs,
+                                                SkimpyOffsetMap& map,
+                                                bool useCoalescing,
+                                                int64_t groupRollBytes,
+                                                Throttler* throttler = nullptr,
+                                                int64_t nowMs = -1);
+
     /// CP-8: Group consecutive sealed segments into coalesced groups for compaction.
     ///
     /// Mirrors Kafka's LogCleaner.groupSegmentsBySize:
@@ -263,11 +316,16 @@ private:
     ///
     /// @param nowMs  Wall-clock epoch-ms sampled once per pass (for KIP-534 horizon).
     ///               Pass -1 to use the legacy nowNs-only tombstone retention path.
+    /// @param changed  Optional out-param: set to true iff this pass altered the
+    ///                 segment's logical content (dropped a record, dropped or
+    ///                 first-stamped a tombstone).  When false, the on-disk .log
+    ///                 is left untouched and is byte-valid — the caller should NOT
+    ///                 enqueue a swap for this segment.  Nullptr = don't report.
     bool rewriteSegmentImpl(const std::string& dir, int64_t segBase,
                             const std::function<std::optional<Offset>(std::string_view)>& getLatest,
                             Offset fromOffset, Offset cleanBoundaryOffset,
                             int64_t nowNs, int64_t deleteRetentionMs,
-                            int64_t nowMs = -1);
+                            int64_t nowMs = -1, bool* changed = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
@@ -288,6 +346,17 @@ private:
                         Offset fromOffset, Offset cleanBoundaryOffset,
                         int64_t nowNs, int64_t deleteRetentionMs,
                         int64_t nowMs = -1);
+
+    /// Coalesce the in-pass segments of one group into the group's lowest base,
+    /// filtering every record against the PREBUILT dirty `map` (built once over the
+    /// whole dirty range so cross-segment supersession is honoured).  Sets *changed
+    /// iff the group's on-disk layout changed.  PURE FILE WORK — no segments_.
+    void mergeGroupWithMap(const std::string& dir,
+                           const std::vector<int64_t>& groupInPass,
+                           SkimpyOffsetMap& map,
+                           Offset globalDirtyStart, Offset passEnd,
+                           int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs,
+                           Throttler* throttler, bool* changed);
 };
 
 } // namespace rune::storage

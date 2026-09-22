@@ -133,6 +133,7 @@ public:
         , throttler_(ioMaxBytesPerSec)
         , useCoalescing_(useCoalescing)
         , coalescingRollBytes_(coalescingRollBytes)
+        , dedupeMap_(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes_))
     {}
 
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
@@ -222,11 +223,9 @@ public:
             rune::storage::Log*                  log      = nullptr;
             double                               ratio    = 0.0;
             bool                                 forced   = false; // maxCompactionLag forced
-            int64_t                              segBase  = -1;
-            int64_t                              segEnd   = -1;
-            int64_t                              segBytes = 0;
-            // CP-6 race-fix: retain the immutable snapshot + the derived dir so
-            // the compaction (produceCleanedFile) reads segment bytes WITHOUT
+            int64_t                              dirtyBytes = 0;    // cleanableBytes (budget charge)
+            // CP-6 race-fix: retain the immutable snapshot + the derived dir so the
+            // compaction (produceCleanedRangeBounded) reads segment bytes WITHOUT
             // ever touching Log::segments_.  The snapshot shared_ptr keeps the
             // sealed-base list alive for the whole cycle.
             std::shared_ptr<const rune::storage::SealedSegmentSnapshot> snap;
@@ -258,17 +257,21 @@ public:
             // HW is safe: compaction is always bounded strictly below it.
             const int64_t hw               = replica->cleanerHighWatermark();
 
-            // The active segment base is just beyond the last sealed segment.
-            // We approximate it from the snapshot: any segment whose base is
-            // not in the snapshot is either active or not yet published.
-            // For the firstUncleanable calculation we use hw (conservative):
-            // if hw == 0 (no writes yet), nothing is cleanable.
-            // The active segment base is also needed; since the snapshot only
-            // contains SEALED segments, we infer it as the high watermark
-            // (conservative — no active-base pollution in the dirty scan).
-            // Note: hw == logEndOffset() when the active segment is small, but
-            // that's fine: we just include slightly less in the dirty window.
-            int64_t firstUncleanable = hw;  // min(active_base, hw); conservative
+            // firstUncleanable = min(activeSegmentBase, hw).
+            //
+            // The active segment base is the exclusive end of the LAST sealed
+            // segment (snap->back().endOffset) — carried in the immutable snapshot,
+            // so this is race-free (no segments_ access).  This is CRITICAL for
+            // convergence: the cleaner must NEVER advance its watermark past the
+            // sealed region into the active segment.  If we used hw (which can be
+            // ABOVE activeBase, inside the still-growing active segment), an empty
+            // sealed dirty range would advance the watermark past active records;
+            // when those records later seal they land BELOW the watermark and are
+            // never compacted → a stale copy strands forever (the drcp1/3/4 bug).
+            // Clamping to hw keeps compaction strictly below the committed HW.
+            const int64_t activeBase = snap->back().endOffset;
+            int64_t firstUncleanable = std::min(activeBase, hw);
+            if (firstUncleanable < 0) firstUncleanable = 0;
 
             // CP-8: minCompactionLagMs — shrink firstUncleanable so segments
             // whose largestTimestamp is within the lag window are excluded from
@@ -349,48 +352,21 @@ public:
                 if (ageMs > maxLagMs) needCompactionNow = true;
             }
 
-            if (!needCompactionNow &&
-                dirtyRatio <= replica->minCleanableDirtyRatio()) continue;
+            // Ratio gate (Kafka min.cleanable.dirty.ratio): a log becomes eligible
+            // when its byte-dirty ratio exceeds the threshold, OR when
+            // maxCompactionLag forced it.  Unlike the old per-segment design, a
+            // single selected pass re-cleans the WHOLE log prefix [logStart, passEnd)
+            // against the dirty map (produceCleanedRangeBounded), so once a log is
+            // picked it converges to latest-per-key in that pass — there is no
+            // mid-sweep round state to keep, and no way to strand a superseded copy
+            // below the watermark (the drcp1/3/4 "key delivered seq 37 AND 197" bug).
+            const bool wouldSkip =
+                (!needCompactionNow &&
+                 dirtyRatio <= replica->minCleanableDirtyRatio());
+            if (wouldSkip) continue;
 
-            // Find the sealed segment that CONTAINS or starts at firstDirtyOffset.
-            //
-            // CP-7 bounded-range-per-pass: after a partial pass, lastCleanOffset
-            // (= firstDirtyOffset) may be in the MIDDLE of a segment (e.g.
-            // firstDirtyOffset=3 while the only sealed segment has base=0).  We
-            // must select that segment — not skip it because base < firstDirtyOffset.
-            //
-            // Selection rule: pick the FIRST sealed segment s such that:
-            //   s.segEnd > firstDirtyOffset  AND  s.base < firstUncleanable
-            // where segEnd = next segment's base (or firstUncleanable for the last).
-            // This selects the segment whose byte range overlaps [firstDirtyOffset, ∞).
-            int64_t segBase  = -1;
-            int64_t segEnd   = -1;
-            int64_t segBytes = 0;
-            for (std::size_t i = 0; i < snap->size(); ++i) {
-                const auto& si = (*snap)[i];
-                if (si.baseOffset >= firstUncleanable) break;
-                // Compute this segment's logical end.
-                int64_t sEnd = (i + 1 < snap->size())
-                               ? (*snap)[i + 1].baseOffset
-                               : firstUncleanable;
-                // The segment is cleanable if its range overlaps [firstDirtyOffset, ∞):
-                //   sEnd > firstDirtyOffset  (segment ends AFTER the dirty start)
-                // AND  si.baseOffset < firstUncleanable  (segment starts before HW)
-                if (sEnd <= firstDirtyOffset) continue; // entirely before dirty range
-                segBase  = si.baseOffset;
-                segEnd   = sEnd;
-                segBytes = si.sizeBytes;
-                break;
-            }
-            if (segBase < 0) {
-                // All sealed segments in the dirty range are already clean.
-                // Advance the watermark.
-                replica->setLastCleanOffset(firstUncleanable);
-                continue;
-            }
-
-            // Filthiest-first: keep the candidate with the highest ratio.
-            // Forced logs (maxCompactionLag) win over any non-forced log.
+            // Filthiest-first: keep the highest-ratio candidate; a forced log
+            // (maxCompactionLag) always beats a non-forced one.
             bool dominates = false;
             if (!best.replica) {
                 dominates = true;
@@ -406,9 +382,7 @@ public:
                 best.forced           = needCompactionNow;
                 best.replica          = replica;
                 best.log              = log;
-                best.segBase          = segBase;
-                best.segEnd           = segEnd;
-                best.segBytes         = segBytes;
+                best.dirtyBytes       = cleanableBytes;
                 // Retain the immutable snapshot + race-free dir for the off-thread
                 // compaction.  dir() returns the immutable dir_ (no segments_).
                 best.snap             = snap;
@@ -444,262 +418,102 @@ public:
         if (best.replica->cleanerRole() != rune::replication::Role::Leader) return 0;
 
         // ---------------------------------------------------------------
-        // Phase 4: compact the segment OFF-THREAD — PURE FILE WORK.
+        // Phase 4: compact OFF-THREAD — PURE FILE WORK (never touches segments_).
         //
-        // CP-6 race-fix (the load-bearing invariant): the cleaner thread MUST
-        // NOT touch Log::segments_.  We call produceCleanedFileBounded() which
-        // reads segment bytes ONLY from disk using the immutable snapshot base
-        // offsets (best.snap) + the race-free dir (best.dir), writes the
-        // compacted .log, and returns.  It never calls segmentBaseOffsets(),
-        // segmentSize() or reloadSegment().  The in-memory reload is deferred
-        // to the append thread via enqueueCleanedSegment() → drainCleanerSwaps()
-        // → reloadSegment().
+        // produceCleanedRangeBounded builds ONE bounded SkimpyOffsetMap over the
+        // dirty section [globalDirtyStart, firstUncleanable) and re-copies EVERY
+        // sealed segment with base < passEnd against it (Kafka doClean-from-log-
+        // start).  This drops a stale prefix copy whose key reappears in the dirty
+        // section, so compaction converges to latest-per-key in the SELECTED pass —
+        // even when producers interleave with the cleaner (the drcp1/3/4 fix).  It
+        // reads segment bytes only via the immutable snapshot bases (best.snap) +
+        // race-free dir (best.dir); the in-memory reload is deferred to the append
+        // thread via enqueueCleanedSegment() → drainCleanerSwaps() → reloadSegment().
         //
-        // Uses the global dirty range for latest-per-key correctness (CP-2).
-        //
-        // CP-7: produceCleanedFileBounded builds a SkimpyOffsetMap bounded by
-        // dedupeBufferBytes_.  When the map fills before covering the whole dirty
-        // range, it returns passEnd < activeBase so the watermark advances only
-        // to passEnd (bounded-range-per-pass).  The next cycle resumes from
-        // passEnd.  The segment is rewritten with cleanBoundaryOffset = passEnd
-        // so records beyond passEnd survive to be revisited.
+        // When the bounded map fills before covering the whole dirty range, passEnd
+        // < firstUncleanable and the next cycle resumes there (bounded-range-per-
+        // pass); records at/beyond passEnd are preserved verbatim.
         // ---------------------------------------------------------------
 
-        // CP-7 lazy checkpoint init: open (or create) the per-log checkpoint
-        // file on first use, seeding lastCleanOffset from the persisted value.
-        // MUST be called BEFORE reading globalDirtyStart (= lastCleanOffset())
-        // so the compaction starts from the persisted watermark, not 0.
-        // Pure file I/O — never touches Log::segments_.
-        // TSan fix: uses best.firstUncleanable (race-free, from Phase-1 snapshot)
-        // as the truncation-clamp bound instead of log->logEndOffset().
+        // CP-7 lazy checkpoint init: open/create the per-log checkpoint, seeding
+        // lastCleanOffset from the persisted value BEFORE reading globalDirtyStart.
+        // Pure file I/O.  Uses best.firstUncleanable (race-free) as the clamp bound.
         ensureCheckpoint(best.log, best.dir, best.replica, best.firstUncleanable);
 
-        // Re-read globalDirtyStart AFTER ensureCheckpoint so it reflects any
-        // value loaded from the persisted checkpoint file.
+        // globalDirtyStart = the (possibly checkpoint-restored) clean watermark.
         const int64_t globalDirtyStart = best.replica->lastCleanOffset();
 
-        // Snapshot-derived sealed base list (no segments_ access).
-        std::vector<int64_t> sealedBases;
-        sealedBases.reserve(best.snap->size());
-        for (const auto& si : *best.snap) sealedBases.push_back(si.baseOffset);
+        // Snapshot-derived sealed base + size lists (no segments_ access).  Reuse
+        // the agent-owned scratch vectors — cleared, not re-allocated (ULL).
+        scratchBases_.clear();
+        scratchSizes_.clear();
+        scratchBases_.reserve(best.snap->size());
+        scratchSizes_.reserve(best.snap->size());
+        for (const auto& si : *best.snap) {
+            scratchBases_.push_back(si.baseOffset);
+            scratchSizes_.push_back(si.sizeBytes);
+        }
+        const std::vector<int64_t>& sealedBases = scratchBases_;
+        const std::vector<int64_t>& sealedSizes = scratchSizes_;
+
+        // CP-8 per-topic roll: coalesce up to the replica's own segmentRollBytes so a
+        // 4 KiB-roll topic coalesces to 4 KiB and a 64 MiB topic to 64 MiB.
+        const int64_t replicaRoll    = best.replica->segmentRollBytes();
+        const int64_t groupRollBytes = (replicaRoll > 0) ? replicaRoll : coalescingRollBytes_;
 
         rune::storage::LogCleaner cleaner;
+        rune::storage::RangeCleanResult passResult = cleaner.produceCleanedRangeBounded(
+            best.dir,
+            sealedBases,
+            sealedSizes,
+            /*activeBase=*/       best.firstUncleanable,
+            /*globalDirtyStart=*/ globalDirtyStart,
+            nowNs,
+            best.replica->deleteRetentionMs(),
+            /*map=*/              dedupeMap_,
+            /*useCoalescing=*/    useCoalescing_,
+            /*groupRollBytes=*/   groupRollBytes,
+            /*throttler=*/        &throttler_,
+            /*nowMs=*/            nowMs);
 
-        // CP-8 Fix 3: segment coalescing.
-        //
-        // When useCoalescing_=true, group consecutive sealed segments with
-        // total size <= coalescingRollBytes into one group and compact the
-        // group into a SINGLE output via produceCleanedGroupBounded.
-        // This eliminates the O(N) per-segment fsync overhead when many small
-        // segments exist, and reduces total segment count on each pass.
-        //
-        // When useCoalescing_=false, fall back to the single-segment path
-        // (prior behavior, fully backward-compatible).
-        //
-        // Coalescing is LOAD-BEARING: scratch-neutering produceCleanedGroupBounded
-        // (returning {false, activeBase}) falls back to single-segment compaction
-        // and the CoalescingEndToEndFewSegments test fails (segment count
-        // unchanged rather than reduced).
-
-        rune::storage::CleanPassResult passResult{false, best.firstUncleanable};
-        // groupBases: the bases in the coalesced group (1 element = single-seg path).
-        std::vector<int64_t> groupBases{best.segBase};
-
-        if (useCoalescing_ && sealedBases.size() > 1) {
-            // Build parallel sizes vector from the snapshot.
-            std::vector<int64_t> sealedSizes;
-            sealedSizes.reserve(best.snap->size());
-            for (const auto& si : *best.snap) sealedSizes.push_back(si.sizeBytes);
-
-            // CP-8 per-topic roll: use the replica's own segmentRollBytes as the
-            // coalescing group bound so a topic with a 128-byte roll coalesces to
-            // 128 bytes and a 64 MiB topic coalesces to 64 MiB — not a single
-            // global constant.  Fall back to coalescingRollBytes_ (ctor default)
-            // if the replica returns 0 or negative (safety guard).
-            const int64_t replicaRoll = best.replica->segmentRollBytes();
-            const int64_t groupRollBytes = (replicaRoll > 0) ? replicaRoll : coalescingRollBytes_;
-
-            // Compute coalescing groups over ALL sealed segments.
-            auto groups = rune::storage::LogCleaner::groupSegmentsBySize(
-                sealedBases, sealedSizes, groupRollBytes);
-
-            // Find the group that contains best.segBase.
-            const rune::storage::SegmentGroup* chosenGroup = nullptr;
-            for (const auto& g : groups) {
-                for (int64_t b : g.bases) {
-                    if (b == best.segBase) { chosenGroup = &g; break; }
-                }
-                if (chosenGroup) break;
-            }
-
-            if (chosenGroup && chosenGroup->bases.size() > 1) {
-                // Multi-segment group: use coalescing path.
-                groupBases = chosenGroup->bases;
-                passResult = cleaner.produceCleanedGroupBounded(
-                    best.dir,
-                    sealedBases,
-                    *chosenGroup,
-                    /*activeBase=*/      best.firstUncleanable,
-                    /*globalDirtyStart=*/globalDirtyStart,
-                    nowNs,
-                    best.replica->deleteRetentionMs(),
-                    /*dedupeBufferBytes=*/dedupeBufferBytes_,
-                    /*throttler=*/       &throttler_,
-                    /*nowMs=*/           nowMs);
-            } else {
-                // Single-segment group (or best.segBase not in any multi-seg group):
-                // fall back to single-segment path.
-                passResult = cleaner.produceCleanedFileBounded(
-                    best.dir,
-                    sealedBases,
-                    /*segBase=*/         best.segBase,
-                    /*activeBase=*/      best.firstUncleanable,
-                    /*globalDirtyStart=*/globalDirtyStart,
-                    nowNs,
-                    best.replica->deleteRetentionMs(),
-                    /*dedupeBufferBytes=*/dedupeBufferBytes_,
-                    /*throttler=*/       &throttler_,
-                    /*nowMs=*/           nowMs);
-            }
-        } else {
-            // Coalescing disabled or only one sealed segment: single-segment path.
-            passResult = cleaner.produceCleanedFileBounded(
-                best.dir,
-                sealedBases,
-                /*segBase=*/         best.segBase,
-                /*activeBase=*/      best.firstUncleanable,
-                /*globalDirtyStart=*/globalDirtyStart,
-                nowNs,
-                best.replica->deleteRetentionMs(),
-                /*dedupeBufferBytes=*/dedupeBufferBytes_,
-                /*throttler=*/       &throttler_,
-                /*nowMs=*/           nowMs);
-        }
-
-        // CP-7: passResult.passEnd is the offset-map coverage boundary.  When the
-        // map covered the entire dirty range, it == activeBase.  When the map was
-        // bounded and filled before the end, it < activeBase.
-        //
-        // CONVERGENCE FIX (watermark over-advance): the map coverage boundary is
-        // NOT the same as what was actually REWRITTEN.  A single pass rewrites
-        // exactly ONE segment (single-segment path) or ONE coalesced group — but
-        // the SkimpyOffsetMap is built over the WHOLE dirty range for
-        // latest-per-key correctness (CP-2), so with small segments its coverage
-        // (passResult.passEnd) reaches activeBase (the whole dirty range) even
-        // though only one segment/group was rewritten.  Advancing lastCleanOffset
-        // to that map boundary would mark the OTHER (un-rewritten) dirty segments
-        // "clean" — their superseded records would persist forever, dirtyRatio
-        // would drop below minCleanableDirtyRatio, and compaction would
-        // disqualify itself and never converge.
-        //
-        // The watermark must advance ONLY to the end of what was actually
-        // rewritten this pass (rewrittenEnd = the logical end of the highest
-        // rewritten segment's byte range = the base of the next sealed segment,
-        // or firstUncleanable/activeBase if it was the last sealed segment).
-        // The next pass then picks up the next dirty segment → converges over
-        // passes.  We take min(mapPassEnd, rewrittenEnd) so the CP-7
-        // bounded-range-per-pass semantics still hold: when the map filled
-        // mid-segment (mapPassEnd < rewrittenEnd) we advance only to mapPassEnd
-        // and the same segment is revisited next pass.
-        const int64_t mapPassEnd = passResult.passEnd;
-
-        // Compute rewrittenEnd from the immutable snapshot: the highest base we
-        // rewrote this pass is groupBases.back() (groupBases holds the coalesced
-        // group, or a single element for the single-segment path).  Its logical
-        // end = the base of the next sealed segment above it, or
-        // best.firstUncleanable when it is the last sealed segment.
-        int64_t rewrittenEnd = best.firstUncleanable;
-        {
-            const int64_t highestRewrittenBase = groupBases.back();
-            int64_t nextBaseAbove = best.firstUncleanable;
-            for (const auto& si : *best.snap) {
-                if (si.baseOffset > highestRewrittenBase &&
-                    si.baseOffset < nextBaseAbove) {
-                    nextBaseAbove = si.baseOffset;
-                }
-            }
-            rewrittenEnd = nextBaseAbove;
-        }
-
-        // Advance only past what was actually rewritten, but never past the
-        // map's coverage boundary (bounded-range-per-pass).
-        const int64_t passEnd = std::min(mapPassEnd, rewrittenEnd);
-
-        if (!passResult.compacted) {
-            // No segment was rewritten.  This can happen when:
-            //   (a) latestMapped < 0: map got no records in dirty range → advance
-            //       to passEnd=activeBase so we don't stall (nothing to clean).
-            //   (b) segBase >= passEnd: segment is beyond the bounded pass boundary.
-            //       Advance to passEnd so next cycle resumes from the right place.
-            // In both cases we only advance if there's no enqueue outstanding.
-            // No enqueue is needed since no file was produced; just move the watermark.
-            // NOTE: do NOT advance if passEnd == globalDirtyStart (no progress).
-            if (passEnd > globalDirtyStart) {
-                if (best.replica->cleanerRole() == rune::replication::Role::Leader) {
-                    best.replica->setLastCleanOffset(passEnd);
-                    if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
-                        it->second->store(passEnd);
-                    }
-                }
-            }
-            return 0;
-        }
+        const int64_t passEnd = passResult.passEnd;
 
         // ---------------------------------------------------------------
-        // Phase 5: enqueue the swap(s); advance the clean watermark ONLY on
-        //          a successful enqueue of ALL group bases.
-        //
-        // For a coalesced group: enqueue ALL bases in the group.
-        //   - group.bases[0] → reloadSegment picks up the merged .log file.
-        //   - group.bases[1..] → reloadSegment finds the .log deleted, drops them.
-        // For a single-segment path: enqueue just the one base (unchanged).
-        //
-        // Watermark advances to passEnd (not segEnd as before).  When the
-        // SkimpyOffsetMap was bounded (map filled mid-segment), passEnd <
-        // activeBase — this is the bounded-range-per-pass semantics: the
-        // next cycle resumes from passEnd and recompacts the same segment
-        // (now partially clean, with records up to passEnd removed).
-        //
-        // SPSC-OVERFLOW FIX: enqueueCleanedSegment() returns false when the
-        // swap ring is full.  We DO NOT advance the watermark on failure.
+        // Phase 5: enqueue swaps for the rewritten/deleted segments, then advance
+        // the clean watermark.  SPSC-overflow: if ANY enqueue fails (ring full) we
+        // do NOT advance the watermark, so the segments stay dirty and are
+        // re-selected + re-produced next cycle (idempotent retry — never lost).
+        //   - a rewritten base → reloadSegment picks up the new .log.
+        //   - a merged/emptied base → reloadSegment finds the .log gone, drops it.
         // ---------------------------------------------------------------
-        // Enqueue ALL group bases atomically (SPSC: one-by-one, contiguous).
-        // If ANY enqueue fails (ring full), do not advance the watermark.
         bool allEnqueued = true;
-        for (int64_t gb : groupBases) {
-            if (!best.log->enqueueCleanedSegment(gb)) {
-                allEnqueued = false;
-                break;
-            }
+        for (int64_t gb : passResult.rewrittenBases) {
+            if (!best.log->enqueueCleanedSegment(gb)) { allEnqueued = false; break; }
         }
         if (!allEnqueued) {
-            // Ring full — leave the segment(s) dirty so they are re-selected next cycle.
+            // Ring full — leave the segment(s) dirty; retry next cycle.  Do not
+            // advance the watermark (preserves the CP-6 ring-full invariant).
             return 0;
         }
 
-        // Accumulate bytes consumed by this compaction toward the budget.
-        bytesUsed_ += best.segBytes;
+        // Charge the dirty bytes swept this pass toward the per-window budget.
+        bytesUsed_ += best.dirtyBytes;
 
-        // Advance lastCleanOffset to passEnd (= min(mapPassEnd, rewrittenEnd),
-        // i.e. only past the segment/group actually rewritten — the convergence
-        // fix).  The watermark is MONOTONIC: only advance when passEnd makes
-        // forward progress (passEnd > globalDirtyStart).  This guard also covers
-        // the ensureCheckpoint ordering hazard: Phase-1 selects best.segBase from
-        // the pre-checkpoint watermark, but ensureCheckpoint may then bump the
-        // watermark forward (restored from disk).  If the (now stale) selected
-        // segment lies entirely below the restored globalDirtyStart, rewrittenEnd
-        // — and thus passEnd — can fall below it; we must NOT regress.
+        // Advance lastCleanOffset to passEnd (MONOTONIC: forward-only, leader-only).
+        // The guard also covers the ensureCheckpoint ordering hazard (a restored
+        // checkpoint may already have bumped the watermark past passEnd).
         if (passEnd > globalDirtyStart &&
             best.replica->cleanerRole() == rune::replication::Role::Leader) {
             best.replica->setLastCleanOffset(passEnd);
-            // CP-7: persist the checkpoint to passEnd (not segEnd).
-            // Pure file I/O (mmap write + msync); cleaner-thread-safe.
+            // CP-7: persist the checkpoint (pure file I/O; cleaner-thread-safe).
             if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
                 it->second->store(passEnd);
             }
         }
 
-        return 1;
+        // Return 1 when a segment was actually rewritten/deleted this pass; 0 when
+        // the pass only advanced the watermark over an already-clean dirty range.
+        return passResult.compacted ? 1 : 0;
     }
 
 private:
@@ -958,6 +772,14 @@ private:
     // CP-8 Fix 3: segment coalescing.
     bool    useCoalescing_       = false;          // if true, group consecutive segments and merge
     int64_t coalescingRollBytes_ = 64LL * 1024 * 1024; // max combined output bytes per group
+
+    // ULL: reusable per-pass scratch (this agent runs on ONE AgentRunner thread, so
+    // no synchronization is needed).  The dedupe map is sized ONCE to the budget and
+    // clear()ed each pass; the base/size vectors are cleared and refilled — so a
+    // steady-state cleaner cycle performs near-zero heap allocation.
+    rune::storage::SkimpyOffsetMap dedupeMap_;
+    std::vector<int64_t> scratchBases_;
+    std::vector<int64_t> scratchSizes_;
 
     // CP-7: per-log cleaner-offset-checkpoint (lazy init on first compaction).
     // Key = Log* (non-owning, lives as long as the replica registry).

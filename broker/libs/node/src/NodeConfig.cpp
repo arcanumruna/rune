@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <cstdlib>
 #include <sstream>
@@ -333,9 +334,11 @@ ConfigResult parseNodeConfig(
     // --- RUNE_TOPICS (optional) ---
     // Format: comma-separated entries, each of the form:
     //   name:partitionCount[:policy[:segmentRollBytes[:deleteRetentionMs
-    //       [:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs]]]]]]]
+    //       [:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs
+    //       [:minCleanableDirtyRatio[:maxCompactionLagMs]]]]]]]]]
     //
-    // Optional fields (all backward-compatible — older format "name:N" still works):
+    // Optional fields (all backward-compatible — older format "name:N" still works;
+    // any field may be left empty to keep its default, e.g. "n:1:compact:4096::::::0.0"):
     //   policy          — "delete" (default), "compact", or "compact_delete".
     //   segmentRollBytes — positive int64 bytes; default 64 MiB.  Set small (e.g.
     //                      4096) in tests to force segment sealing quickly so that
@@ -348,6 +351,12 @@ ConfigResult parseNodeConfig(
     //                      Set 1 in tests for near-immediate retention checks.
     //   fileDeleteDelayMs — delay before .deleted files are physically removed (ms);
     //                       default 60000.  Set 1 in tests.
+    //   minCleanableDirtyRatio — Kafka min.cleanable.dirty.ratio, double [0.0,1.0];
+    //                       default 0.5.  0.0 = compact to latest-per-key every pass
+    //                       (no threshold gating); used by tests asserting full
+    //                       convergence and by latency-sensitive compacted topics.
+    //   maxCompactionLagMs — Kafka max.compaction.lag.ms; -1 = disabled (default).
+    //                       Force compaction of a dirty segment once it ages past this.
     //
     // Empty/absent → no topics (valid — produce/subscribe returns UnknownTopic).
     {
@@ -468,6 +477,30 @@ ConfigResult parseNodeConfig(
                 // Field 8 (optional): fileDeleteDelayMs (positive int64)
                 {
                     std::string err = parseOptField(8, "fileDeleteDelayMs", ts.fileDeleteDelayMs, false);
+                    if (!err.empty()) return {{}, err};
+                }
+
+                // Field 9 (optional): minCleanableDirtyRatio (double in [0.0, 1.0]).
+                // Kafka min.cleanable.dirty.ratio.  Default 0.5.  Set 0.0 to make the
+                // compaction cleaner sweep the whole log to latest-per-key every pass
+                // (no threshold gating) — e.g. for tests that assert full convergence.
+                if (fields.size() > 9 && !fields[9].empty()) {
+                    std::string s(fields[9]);
+                    char* endp = nullptr;
+                    errno = 0;
+                    double v = std::strtod(s.c_str(), &endp);
+                    if (endp != s.c_str() + s.size() || errno != 0)
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + std::string(entry)};
+                    if (v < 0.0 || v > 1.0)
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + std::string(entry)};
+                    ts.minCleanableDirtyRatio = v;
+                }
+
+                // Field 10 (optional): maxCompactionLagMs (-1 = disabled, or positive ms).
+                // Kafka max.compaction.lag.ms — force compaction of a dirty segment once
+                // it ages past this, even below minCleanableDirtyRatio.
+                {
+                    std::string err = parseOptField(10, "maxCompactionLagMs", ts.maxCompactionLagMs, true);
                     if (!err.empty()) return {{}, err};
                 }
 

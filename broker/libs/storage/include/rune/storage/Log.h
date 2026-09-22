@@ -22,6 +22,13 @@ struct SegInfo {
     /// gating on the cleaner thread — no segments_ access required.
     /// 0 = unknown / not yet scanned (treats segment as very old = cleanable).
     int64_t largestTimestamp = 0;
+    /// Exclusive end offset of this sealed segment = the base offset of the NEXT
+    /// segment in the log (which is the ACTIVE segment for the last sealed entry).
+    /// Lets the cleaner thread compute exact segment boundaries AND the true
+    /// first-uncleanable offset (= the active segment base = the last sealed
+    /// entry's endOffset) WITHOUT reading the writer-owned segments_ map — so the
+    /// cleaner never advances its watermark past not-yet-sealed (active) records.
+    int64_t endOffset        = 0;
 };
 using SealedSegmentSnapshot = std::vector<SegInfo>;
 

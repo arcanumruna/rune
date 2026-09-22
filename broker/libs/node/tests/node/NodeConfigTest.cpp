@@ -885,6 +885,57 @@ TEST(NodeConfigTest, CP52_ExtendedTopics_FullSpec_Compact) {
     EXPECT_EQ(ts.fileDeleteDelayMs, 1LL);
 }
 
+TEST(NodeConfigTest, CCC_ExtendedTopics_WithMinCleanableDirtyRatio) {
+    // Field 9: minCleanableDirtyRatio (double).  0.0 = compact every pass.
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:0.0";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.0);
+}
+
+TEST(NodeConfigTest, CCC_ExtendedTopics_MinCleanableDirtyRatio_Midpoint) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:0.75";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.75);
+}
+
+TEST(NodeConfigTest, CCC_ExtendedTopics_MinCleanableDirtyRatio_OutOfRange_Rejected) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:1.5";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty()) << "should reject minCleanableDirtyRatio > 1.0";
+}
+
+TEST(NodeConfigTest, CCC_ExtendedTopics_MinCleanableDirtyRatio_NonNumber_Rejected) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:abc";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty()) << "should reject non-numeric minCleanableDirtyRatio";
+}
+
+TEST(NodeConfigTest, CCC_ExtendedTopics_WithMaxCompactionLagMs) {
+    // Field 10: maxCompactionLagMs (-1 = disabled, or positive ms).
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1:0.0:5000";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.0);
+    EXPECT_EQ(r.config->topics[0].maxCompactionLagMs, 5000LL);
+}
+
+TEST(NodeConfigTest, CCC_ExtendedTopics_NewFieldsDefaultWhenAbsent) {
+    // Omitting fields 9/10 keeps the Kafka defaults (0.5 / -1).
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_DOUBLE_EQ(r.config->topics[0].minCleanableDirtyRatio, 0.5);
+    EXPECT_EQ(r.config->topics[0].maxCompactionLagMs, -1LL);
+}
+
 TEST(NodeConfigTest, CP52_ExtendedTopics_FullSpec_Delete) {
     // Full extended spec as used by retention e2e tests.
     auto env = base3node();

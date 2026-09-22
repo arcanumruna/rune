@@ -149,6 +149,10 @@ void Log::publishSealedSnapshot() {
         for (; it != end; ++it) {
             int64_t base  = it->first;
             int64_t bytes = it->second->sizeBytes();
+            // Exclusive end = next segment's base (the active segment's base for the
+            // last sealed entry).  std::next(it) is always valid here (it != end,
+            // and end == the active segment).
+            int64_t endOff = std::next(it)->first;
             // Try to reuse largestTimestamp from the previous snapshot for this
             // segment (sealed segments are immutable after they are created).
             int64_t largestTs = 0;
@@ -173,7 +177,7 @@ void Log::publishSealedSnapshot() {
                     }
                 }
             }
-            snap->push_back({base, bytes, largestTs});
+            snap->push_back({base, bytes, largestTs, endOff});
         }
     }
     // CP-5.1: clear the recovery map after first use — it is only needed for the
@@ -649,7 +653,14 @@ void Log::reloadSegment(int64_t baseOffset) {
     auto it = segments_.find(baseOffset);
     if (it == segments_.end()) return; // unknown segment — nothing to do
 
-    const std::string logPath = it->second->logPath();
+    // Check the CANONICAL <base>.log path, NOT it->second->logPath().  The cleaner
+    // thread always reads/writes/deletes the canonical <base>.log; a segment that
+    // was pre-provisioned via the append-p99 staging mechanism can still carry a
+    // stale staging logPath_ (updated only after drainStagingRenamesDone), so
+    // checking logPath_ would see a "missing" staging file and WRONGLY erase a
+    // segment the cleaner actually rewrote and KEPT — its data then strands on disk
+    // (present under <base>.log) and resurfaces on the next full reloadSegments().
+    const std::string logPath = logPathForBase(baseOffset);
     if (!std::filesystem::exists(logPath)) {
         // Cleaner emptied + deleted this segment; drop it from the map.
         segments_.erase(it);

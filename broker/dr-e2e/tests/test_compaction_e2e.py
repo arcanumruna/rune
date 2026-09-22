@@ -82,7 +82,7 @@ _STAGGER_MS = 400
 # They MUST match the RUNE_TOPICS in the compose override AND the client RUNE_TOPICS.
 #
 # Client RUNE_TOPICS format: "name:topicId:partitions"
-# Broker RUNE_TOPICS format (extended): "name:partitions:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs]]]]]]"
+# Broker RUNE_TOPICS format (extended): "name:partitions:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs[:minCleanableDirtyRatio[:maxCompactionLagMs]]]]]]]]"
 #
 # compact_log (topicId=0, 1 partition): compact policy; tiny 4 KiB segments so
 #   the cleaner seals multiple segments quickly; 100 ms deleteRetentionMs so
@@ -140,6 +140,10 @@ def _write_compose_override(tmp_dir: str) -> str:
         f":-1"                                      # retentionBytes = unbounded
         f":1"                                       # retentionCheckMs = 1 ms
         f":1"                                       # fileDeleteDelayMs = 1 ms
+        f":0.0"                                     # minCleanableDirtyRatio = 0.0:
+                                                    #   compact to latest-per-key every
+                                                    #   pass so the tests can assert full
+                                                    #   convergence (no threshold gating).
     )
     delete_topic_spec = (
         f"{_DELETE_TOPIC_NAME}:{_DELETE_TOPIC_PARTS}:delete"
