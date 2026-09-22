@@ -1,11 +1,13 @@
 #include <rune/node/NodeConfig.h>
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdlib>
 #include <sstream>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 namespace rune::node {
 
@@ -329,7 +331,24 @@ ConfigResult parseNodeConfig(
     }
 
     // --- RUNE_TOPICS (optional) ---
-    // Format: comma-separated "name:partitionCount" entries.
+    // Format: comma-separated entries, each of the form:
+    //   name:partitionCount[:policy[:segmentRollBytes[:deleteRetentionMs
+    //       [:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs]]]]]]]
+    //
+    // Optional fields (all backward-compatible — older format "name:N" still works):
+    //   policy          — "delete" (default), "compact", or "compact_delete".
+    //   segmentRollBytes — positive int64 bytes; default 64 MiB.  Set small (e.g.
+    //                      4096) in tests to force segment sealing quickly so that
+    //                      the compaction/retention cleaner can actually run.
+    //   deleteRetentionMs — tombstone delete-retention window (ms); default 86400000.
+    //                       Set 0 to expire tombstones immediately after compaction.
+    //   retentionMs     — time-based retention limit (ms); -1 = unbounded (default).
+    //   retentionBytes  — size-based retention limit (bytes); -1 = unbounded (default).
+    //   retentionCheckMs — how often the retention pass runs (ms); default 300000.
+    //                      Set 1 in tests for near-immediate retention checks.
+    //   fileDeleteDelayMs — delay before .deleted files are physically removed (ms);
+    //                       default 60000.  Set 1 in tests.
+    //
     // Empty/absent → no topics (valid — produce/subscribe returns UnknownTopic).
     {
         const char* rawTopics = getenv_fn("RUNE_TOPICS");
@@ -348,12 +367,26 @@ ConfigResult parseNodeConfig(
                 if (entry.empty())
                     return {{}, "RUNE_TOPICS contains an empty entry (leading, trailing, or double comma)"};
 
-                auto colon = entry.find(':');
-                if (colon == std::string_view::npos)
+                // Split the entry by ':' into up to 8 fields.
+                // Field 0: name, Field 1: partitionCount, Field 2: policy,
+                // Field 3: segmentRollBytes, Field 4: deleteRetentionMs,
+                // Field 5: retentionMs, Field 6: retentionBytes,
+                // Field 7: retentionCheckMs, Field 8: fileDeleteDelayMs
+                std::vector<std::string_view> fields;
+                {
+                    std::string_view rem = entry;
+                    while (!rem.empty()) {
+                        auto c = rem.find(':');
+                        fields.push_back(trim(c == std::string_view::npos ? rem : rem.substr(0, c)));
+                        rem.remove_prefix(c == std::string_view::npos ? rem.size() : c + 1);
+                    }
+                }
+
+                if (fields.size() < 2)
                     return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + std::string(entry)};
 
-                std::string_view namePart  = trim(entry.substr(0, colon));
-                std::string_view countPart = trim(entry.substr(colon + 1));
+                std::string_view namePart  = fields[0];
+                std::string_view countPart = fields[1];
 
                 if (namePart.empty())
                     return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + std::string(entry)};
@@ -370,6 +403,74 @@ ConfigResult parseNodeConfig(
                 ts.name           = std::move(name);
                 ts.partitionCount = partCount;
                 ts.topicId        = topicIdx++;
+
+                // Field 2 (optional): policy — "delete", "compact", "compact_delete"
+                if (fields.size() >= 3 && !fields[2].empty()) {
+                    std::string pol(fields[2]);
+                    // Case-insensitive comparison.
+                    for (auto& ch : pol) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    if (pol == "delete") {
+                        ts.cleanupPolicy = TopicSpec::CleanupPolicy::Delete;
+                    } else if (pol == "compact") {
+                        ts.cleanupPolicy = TopicSpec::CleanupPolicy::Compact;
+                    } else if (pol == "compact_delete" || pol == "compactdelete") {
+                        ts.cleanupPolicy = TopicSpec::CleanupPolicy::CompactDelete;
+                    } else {
+                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + pol + " in entry: " + std::string(entry)};
+                    }
+                }
+
+                // Helper: parse an optional int64 field (positive or -1).
+                auto parseOptField = [&](std::size_t idx, const char* fieldName, int64_t& out, bool allowNeg1) -> std::string {
+                    if (fields.size() <= idx || fields[idx].empty()) return {};
+                    int64_t v{};
+                    auto [ptr, ec] = std::from_chars(fields[idx].data(), fields[idx].data() + fields[idx].size(), v);
+                    if (ec != std::errc{} || ptr != fields[idx].data() + fields[idx].size())
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + std::string(entry);
+                    if (!allowNeg1 && v < 1)
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + std::string(entry);
+                    if (allowNeg1 && v < -1)
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + std::string(entry);
+                    out = v;
+                    return {};
+                };
+
+                // Field 3 (optional): segmentRollBytes (positive int64)
+                {
+                    std::string err = parseOptField(3, "segmentRollBytes", ts.segmentRollBytes, false);
+                    if (!err.empty()) return {{}, err};
+                }
+
+                // Field 4 (optional): deleteRetentionMs (non-negative int64)
+                {
+                    std::string err = parseOptField(4, "deleteRetentionMs", ts.deleteRetentionMs, false);
+                    if (!err.empty()) return {{}, err};
+                }
+
+                // Field 5 (optional): retentionMs (-1 = unbounded, or positive ms)
+                {
+                    std::string err = parseOptField(5, "retentionMs", ts.retentionMs, true);
+                    if (!err.empty()) return {{}, err};
+                }
+
+                // Field 6 (optional): retentionBytes (-1 = unbounded, or positive bytes)
+                {
+                    std::string err = parseOptField(6, "retentionBytes", ts.retentionBytes, true);
+                    if (!err.empty()) return {{}, err};
+                }
+
+                // Field 7 (optional): retentionCheckMs (positive int64)
+                {
+                    std::string err = parseOptField(7, "retentionCheckMs", ts.retentionCheckMs, false);
+                    if (!err.empty()) return {{}, err};
+                }
+
+                // Field 8 (optional): fileDeleteDelayMs (positive int64)
+                {
+                    std::string err = parseOptField(8, "fileDeleteDelayMs", ts.fileDeleteDelayMs, false);
+                    if (!err.empty()) return {{}, err};
+                }
+
                 cfg.topics.push_back(std::move(ts));
             }
         }

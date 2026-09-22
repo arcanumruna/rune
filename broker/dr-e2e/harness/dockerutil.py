@@ -55,14 +55,28 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False)
 
 
 class Compose:
-    """Bound to a specific docker-compose.yml + project name."""
+    """Bound to a specific docker-compose.yml + project name.
 
-    def __init__(self, compose_file: str, project: str):
+    An optional list of override compose files can be supplied via
+    ``override_files``.  Each override is appended as a second ``-f`` argument
+    so Docker Compose merges them in order (later files override earlier ones).
+    This is used by the compaction/retention e2e tests, which need to inject
+    RUNE_TOPICS with compact/delete policy and small segment sizes via a
+    compose override — without touching the canonical docker-compose.yml.
+    """
+
+    def __init__(self, compose_file: str, project: str,
+                 override_files: list[str] | None = None):
         self.compose_file = compose_file
         self.project = project
+        self._override_files: list[str] = list(override_files or [])
 
     def _base(self) -> list[str]:
-        return ["docker", "compose", "-f", self.compose_file, "-p", self.project]
+        args = ["docker", "compose", "-f", self.compose_file]
+        for ov in self._override_files:
+            args += ["-f", ov]
+        args += ["-p", self.project]
+        return args
 
     def up(self, *services: str, timeout: int = 180) -> CmdResult:
         return run(self._base() + ["up", "-d", *services], timeout=timeout, check=True)

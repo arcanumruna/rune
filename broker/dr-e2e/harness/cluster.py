@@ -45,10 +45,24 @@ def service_to_node_id(service: str) -> int:
 
 
 class Cluster:
-    def __init__(self, project: str = "rune-dr", topics: str = "events:1"):
+    def __init__(self, project: str = "rune-dr", topics: str = "events:1",
+                 override_files: list[str] | None = None):
+        """Initialise a Cluster.
+
+        Args:
+            project:        Docker Compose project name.
+            topics:         Legacy/informational field (unused by the harness;
+                            the actual RUNE_TOPICS value comes from the compose
+                            file or a compose override file in override_files).
+            override_files: Optional list of additional docker-compose YAML
+                            files to merge on top of the canonical compose file.
+                            Used by compaction/retention e2e tests to inject
+                            custom RUNE_TOPICS with compact policy + small
+                            segment sizes without modifying docker-compose.yml.
+        """
         self.project = project
         self.topics = topics
-        self.compose = Compose(COMPOSE_FILE, project)
+        self.compose = Compose(COMPOSE_FILE, project, override_files=override_files)
         self._up = False
         self._serving_cache: str | None = None
 

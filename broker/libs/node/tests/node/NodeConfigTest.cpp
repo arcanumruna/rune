@@ -726,4 +726,250 @@ TEST(NodeConfigTest, CP1_CleanupPolicyEnumValues) {
     EXPECT_EQ(static_cast<uint8_t>(TopicSpec::CleanupPolicy::CompactDelete), 2u);
 }
 
+// ---------------------------------------------------------------------------
+// CP-5.2: Extended RUNE_TOPICS format tests
+// (name:partitions[:policy[:segmentRollBytes[:deleteRetentionMs[:retentionMs[:retentionBytes[:retentionCheckMs[:fileDeleteDelayMs]]]]]]]])
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_BackwardCompatible_TwoFields) {
+    // "name:N" (2-field) still works exactly as before: Delete policy, defaults.
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "events:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << "unexpected error: " << err;
+    ASSERT_EQ(cfg->topics.size(), 1u);
+    EXPECT_EQ(cfg->topics[0].name,          "events");
+    EXPECT_EQ(cfg->topics[0].partitionCount, 1);
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy,  TopicSpec::CleanupPolicy::Delete);
+    // Default retentionMs and retentionBytes are -1 (unbounded).
+    EXPECT_EQ(cfg->topics[0].retentionMs,   -1LL);
+    EXPECT_EQ(cfg->topics[0].retentionBytes,-1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_CompactPolicy) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:2:compact";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(cfg->topics.size(), 1u);
+    EXPECT_EQ(cfg->topics[0].name,          "compact_log");
+    EXPECT_EQ(cfg->topics[0].partitionCount, 2);
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy,  TopicSpec::CleanupPolicy::Compact);
+    // Other fields default.
+    EXPECT_EQ(cfg->topics[0].segmentRollBytes, 64LL * 1024 * 1024);
+    EXPECT_EQ(cfg->topics[0].retentionMs,   -1LL);
+    EXPECT_EQ(cfg->topics[0].retentionBytes,-1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_DeletePolicy_Explicit) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "log:1:delete";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(cfg->topics.size(), 1u);
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::Delete);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_CompactDeletePolicy) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "mixed:3:compact_delete";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(cfg->topics.size(), 1u);
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::CompactDelete);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_PolicyCaseInsensitive) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "a:1:Compact";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::Compact);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_WithSegmentRollBytes) {
+    auto env = base3node();
+    // Set 4 KiB segment roll to force quick sealing in tests.
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(cfg->topics.size(), 1u);
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy,    TopicSpec::CleanupPolicy::Compact);
+    EXPECT_EQ(cfg->topics[0].segmentRollBytes, 4096LL);
+    EXPECT_EQ(cfg->topics[0].deleteRetentionMs, 86'400'000LL);  // default
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_WithDeleteRetentionMs) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].segmentRollBytes,   4096LL);
+    EXPECT_EQ(cfg->topics[0].deleteRetentionMs,  100LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_WithRetentionMs) {
+    auto env = base3node();
+    // retentionMs = -1 means unbounded.
+    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy,    TopicSpec::CleanupPolicy::Delete);
+    EXPECT_EQ(cfg->topics[0].segmentRollBytes, 4096LL);
+    EXPECT_EQ(cfg->topics[0].retentionMs,      -1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_WithRetentionBytes) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].retentionBytes,  32768LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_WithRetentionCheckMs) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].retentionCheckMs, 1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_WithFileDeleteDelayMs) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768:1:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].fileDeleteDelayMs, 1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_FullSpec_Compact) {
+    // Full extended spec as used by compaction e2e tests.
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "compact_log:1:compact:4096:100:-1:-1:1:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    const auto& ts = cfg->topics[0];
+    EXPECT_EQ(ts.name,             "compact_log");
+    EXPECT_EQ(ts.partitionCount,   1);
+    EXPECT_EQ(ts.cleanupPolicy,    TopicSpec::CleanupPolicy::Compact);
+    EXPECT_EQ(ts.segmentRollBytes, 4096LL);
+    EXPECT_EQ(ts.deleteRetentionMs, 100LL);
+    EXPECT_EQ(ts.retentionMs,      -1LL);
+    EXPECT_EQ(ts.retentionBytes,   -1LL);
+    EXPECT_EQ(ts.retentionCheckMs, 1LL);
+    EXPECT_EQ(ts.fileDeleteDelayMs, 1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_FullSpec_Delete) {
+    // Full extended spec as used by retention e2e tests.
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "delete_log:1:delete:4096:1:-1:32768:1:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    const auto& ts = cfg->topics[0];
+    EXPECT_EQ(ts.cleanupPolicy,    TopicSpec::CleanupPolicy::Delete);
+    EXPECT_EQ(ts.segmentRollBytes, 4096LL);
+    EXPECT_EQ(ts.deleteRetentionMs, 1LL);
+    EXPECT_EQ(ts.retentionMs,      -1LL);
+    EXPECT_EQ(ts.retentionBytes,   32768LL);
+    EXPECT_EQ(ts.retentionCheckMs, 1LL);
+    EXPECT_EQ(ts.fileDeleteDelayMs, 1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_MultipleTopics_MixedPolicies) {
+    // Two topics: one compact, one delete — as used by compaction e2e overlay.
+    auto env = base3node();
+    env["RUNE_TOPICS"] =
+        "compact_log:1:compact:4096:100:-1:-1:1:1,"
+        "delete_log:1:delete:4096:1:-1:32768:1:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    ASSERT_EQ(cfg->topics.size(), 2u);
+    EXPECT_EQ(cfg->topics[0].name,          "compact_log");
+    EXPECT_EQ(cfg->topics[0].cleanupPolicy, TopicSpec::CleanupPolicy::Compact);
+    EXPECT_EQ(cfg->topics[1].name,          "delete_log");
+    EXPECT_EQ(cfg->topics[1].cleanupPolicy, TopicSpec::CleanupPolicy::Delete);
+    // TopicId is 0-based declaration order.
+    EXPECT_EQ(cfg->topics[0].topicId, 0);
+    EXPECT_EQ(cfg->topics[1].topicId, 1);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_InvalidPolicy) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "log:1:bad_policy";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    EXPECT_FALSE(err.empty()) << "should reject unknown policy 'bad_policy'";
+    EXPECT_NE(err.find("bad_policy"), std::string::npos);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_InvalidSegmentRollBytes_Zero) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "log:1:compact:0";   // 0 is not a positive integer
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    EXPECT_FALSE(err.empty()) << "should reject segmentRollBytes=0";
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_InvalidSegmentRollBytes_Negative) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "log:1:compact:-1";  // negative is invalid for roll bytes
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    EXPECT_FALSE(err.empty()) << "should reject negative segmentRollBytes";
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_RetentionBytes_MinusOneAllowed) {
+    // retentionBytes = -1 means unbounded — this is a valid configuration.
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "log:1:delete:4096:1:-1:-1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg->topics[0].retentionBytes, -1LL);
+}
+
+TEST(NodeConfigTest, CP52_ExtendedTopics_RetentionBytes_BelowMinusOne_Rejected) {
+    // retentionBytes < -1 is invalid.
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "log:1:delete:4096:1:-1:-2";
+    auto r = parseNodeConfig(fakeEnv(env));
+    auto& err = r.error;
+    auto& cfg = r.config;
+    EXPECT_FALSE(err.empty()) << "should reject retentionBytes=-2";
+}
+
 } // namespace rune::node
