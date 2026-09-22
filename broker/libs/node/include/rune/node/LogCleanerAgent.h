@@ -138,6 +138,12 @@ public:
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
     LogCleanerAgent& operator=(const LogCleanerAgent&) = delete;
 
+    /// Test-only accessor: return the configured I/O throttle rate.
+    /// -1 = unlimited.  Used by BrokerNodeTest to prove Fix-1 wiring.
+    [[nodiscard]] int64_t throttleRateForTest() const noexcept {
+        return throttler_.maxBytesPerSec();
+    }
+
     // -----------------------------------------------------------------------
     // Agent::doWork — one cleaner cycle.
     //

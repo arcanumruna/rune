@@ -185,6 +185,13 @@ public:
         return gateway_.get();
     }
 
+    /// Test-only: return the I/O throttle rate wired into the LogCleanerAgent.
+    /// -1 = unlimited.  Valid after start().  Used by CP-10 Fix-1 wiring test.
+    [[nodiscard]] int64_t cleanerThrottleRateForTest() const noexcept {
+        if (!cleanerAgent_) return -2; // -2 = no cleaner (sentinel for test)
+        return cleanerAgent_->throttleRateForTest();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers

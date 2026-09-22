@@ -621,6 +621,9 @@ void BrokerNode::buildGateway() {
             // CP-2: compaction tuning for __consumer_offsets sentinel topic.
             ocfg.minCleanableDirtyRatio = 0.5;          // 50% dirty before compaction fires
             ocfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
+            // CP-10 Fix 3: match segmentRollBytes to the offset log's actual roll so
+            // the coalescer group bound is consistent with what the cleaner uses per-topic.
+            ocfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
 
             // Transport: real Aeron transport if available, else no-op InMemoryTransport.
             rune::replication::PartitionTransport* offsetTransport = replTransport_.get();
@@ -730,6 +733,9 @@ void BrokerNode::buildGateway() {
             // CP-2: compaction tuning for __transaction_state sentinel topic.
             tcfg.minCleanableDirtyRatio = 0.5;          // 50% dirty before compaction fires
             tcfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
+            // CP-10 Fix 3: __transaction_state uses the same roll size as the offset log
+            // (offsetLogSegmentRollBytes) so the coalescer group bound is consistent.
+            tcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
 
             rune::replication::PartitionTransport* txnTransport = replTransport_.get();
             if (!txnTransport) {
@@ -824,18 +830,35 @@ void BrokerNode::buildGateway() {
         // (default: true for Kafka parity).  The coalescingRollBytes ctor param is kept
         // as a fallback default (64 MiB); per-topic roll is read from each replica's
         // segmentRollBytes() at compaction time inside LogCleanerAgent::doWork.
+
+        // CP-10 Fix 1: thread ioMaxBytesPerSecond from TopicSpec into the Throttler.
+        // The LogCleanerAgent uses a single shared Throttler across all topics; we
+        // derive the effective rate as the MINIMUM positive ioMaxBytesPerSecond across
+        // all configured topics (so the strictest topic limit governs the cleaner).
+        // If no topic sets a limit (all -1), the throttle remains unlimited (-1).
+        int64_t cleanerIoMaxBytesPerSec = -1; // -1 = unlimited (Kafka default)
+        for (const auto& ts : config_.topics) {
+            if (ts.ioMaxBytesPerSecond > 0) {
+                if (cleanerIoMaxBytesPerSec < 0 ||
+                    ts.ioMaxBytesPerSecond < cleanerIoMaxBytesPerSec) {
+                    cleanerIoMaxBytesPerSec = ts.ioMaxBytesPerSecond;
+                }
+            }
+        }
+
         cleanerAgent_ = std::make_unique<LogCleanerAgent>(
             replicaRegistry_.get(),
             /*cycleBudgetBytes=*/   128LL * 1024 * 1024,
             /*dedupeBufferBytes=*/  -1,
-            /*ioMaxBytesPerSec=*/   -1,
+            /*ioMaxBytesPerSec=*/   cleanerIoMaxBytesPerSec,
             /*useCoalescing=*/      config_.enableCompactionCoalescing,
             /*coalescingRollBytes=*/64LL * 1024 * 1024);
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
-        spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={})",
+        spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={}, ioThrottle={})",
                      nodeId, replicaRegistry_->replicaCount(),
-                     config_.enableCompactionCoalescing ? "on" : "off");
+                     config_.enableCompactionCoalescing ? "on" : "off",
+                     cleanerIoMaxBytesPerSec < 0 ? "unlimited" : std::to_string(cleanerIoMaxBytesPerSec) + "B/s");
     }
 }
 
