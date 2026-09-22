@@ -164,6 +164,27 @@ public:
     int doWork(int64_t nowNs) override {
         if (!registry_) return 0;
 
+        // Append-p99 fix: keep every log's NEXT segment pre-provisioned on THIS
+        // (background) thread, and finalize any deferred staging→base renames the
+        // append thread enqueued at its last roll.  This is the background half of
+        // the roll-cost-off-the-hot-path mechanism (Log::preprovisionPending /
+        // finalizeStagingRenames — both NEVER touch segments_, preserving the
+        // single-writer invariant).  Runs EVERY cycle, before any early return, and
+        // for ALL replicas (followers roll too), independent of leader/compaction
+        // gating.
+        //
+        // Its work count is deliberately NOT folded into doWork()'s return value:
+        // doWork()'s return is the cleaner's COMPACTION/RETENTION signal (tests and
+        // callers treat >0 as "a segment was compacted / retention ran").  Pre-
+        // provisioning is background housekeeping that reaches steady state (returns
+        // 0) after building one segment, so excluding it keeps that signal clean.
+        for (auto* r : registry_->allReplicas()) {
+            if (r && r->log()) {
+                r->log()->preprovisionPending();
+                r->log()->finalizeStagingRenames();
+            }
+        }
+
         // CP-8: sample wall-clock epoch-ms ONCE per cycle (deterministic horizon).
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();

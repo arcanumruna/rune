@@ -27,7 +27,17 @@ namespace rune::storage {
 ///   leader crash before the next sync() may lose un-flushed acked records.
 class LogSegment {
 public:
-    LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096);
+    /// @param indexMaxBytes  initial size of the mmap-backed .index.  Historically
+    ///   a fixed 8 MiB (64x over-provisioned for a 64 MiB segment at 4 KiB
+    ///   interval).  Now RIGHT-SIZED by Log (Log::indexMaxBytesFor) so the roll's
+    ///   ftruncate + mmap + msync touch a few KiB, not 8 MiB.  OffsetIndex grows
+    ///   the mapping on demand if a segment ever exceeds the estimate, so any
+    ///   value is safe.  Defaulted to 8 MiB for callers that don't specify it.
+    /// @param prefaultIndex  touch every index page at construction so the cold
+    ///   minor-page-faults are paid HERE.  Set true by the background segment
+    ///   pre-provisioner so the append/roll hot path never faults index pages.
+    LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096,
+               int32_t indexMaxBytes = 8 * 1024 * 1024, bool prefaultIndex = false);
     ~LogSegment();
     /// Raw-pointer overload — avoids heap allocation on the produce hot path.
     /// [data, data+len) must be a valid record batch.  Returns nextOffset.
@@ -64,15 +74,76 @@ public:
     int64_t sizeBytes() const noexcept { return logSize_; }
     int64_t nextOffset() const noexcept { return nextOffset_; }
     std::string logPath() const { return logPath_; }
+
+    // -----------------------------------------------------------------------
+    // Background segment pre-provisioning (append-p99 fix).
+    //
+    // The expensive part of a segment roll is CREATING the next segment: 2-3
+    // open()s + ftruncate + mmap (+cold page-faults) of the .index.  On APFS a
+    // single open() is ~35µs p50 / 62µs p99 with multi-ms tail spikes, so doing
+    // this on the append/roll hot path is what produces the append-p99 tail.
+    //
+    // Fix: a BACKGROUND thread pre-builds a staging segment (files opened,
+    // index ftruncated + mmap'd + prefaulted) UNDER A TEMPORARY NAME ahead of
+    // time.  At roll the append thread ADOPTS it: a single rename() of the
+    // staging .log → <base>.log (rename doesn't disturb the already-open fd or
+    // the index mmap) plus an O(1) in-memory rebase.  No open()/ftruncate/mmap
+    // on the hot path.  The seal fsync of the OUTGOING segment stays fully
+    // synchronous (durability unchanged) — only the NEXT (empty) segment's
+    // creation moves off the hot path.
+    //
+    // The staging .index keeps its temporary name while the segment is active
+    // (the in-memory mmap works regardless of the on-disk filename, and
+    // recover() ALWAYS rebuilds .index fresh from .log so the on-disk index
+    // name is irrelevant to correctness).  Orphaned staging files left by a
+    // crash are swept at Log construction (see Log::kStagingPrefix handling).
+    // -----------------------------------------------------------------------
+
+    /// Build a staging segment on a BACKGROUND thread.  Creates
+    /// <dir>/<stagingName>.log and <dir>/<stagingName>.index, opens the fds and
+    /// mmaps + prefaults the (right-sized) index.  baseOffset is provisional (0);
+    /// call adoptAsActive(base) on the append thread to rebase + rename at roll.
+    static std::unique_ptr<LogSegment> prepareStaging(
+        const std::string& stagingLogPath, const std::string& stagingIndexPath,
+        int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes);
+
+    /// The staging sequence number this segment was pre-provisioned under (so the
+    /// append thread can tell the background thread which staging files to rename
+    /// after adoption).  Only meaningful for a pre-provisioned segment.
+    int64_t stagingSeq() const noexcept { return stagingSeq_; }
+
+    /// Adopt a staging segment as the live segment at `base` (append thread only).
+    /// PURE IN-MEMORY rebase — ZERO syscalls (no rename/open/mmap).  The staging
+    /// files keep their temp names on disk; writes go through the already-open fd
+    /// + index mmap (both name-agnostic).  The disk rename to <base>.{log,index}
+    /// is deferred to the background thread.  MUST be called exactly once, before
+    /// any append to this segment.
+    void adoptAsActive(int64_t base);
+
+    /// True if this segment is still in the staging (un-adopted) state.
+    bool isStaging() const noexcept { return staging_; }
+
+    /// Update the in-memory .log path after the background thread renamed the
+    /// staging file to its final <base>.log on disk (append thread only).  The
+    /// open fd_ / mmap are unaffected by the rename; this only keeps logPath_
+    /// (used by recover()/reload) in sync with the on-disk name.
+    void setLogPath(const std::string& p) noexcept;
+
 private:
+    /// Empty ctor used only by prepareStaging() (fields set by the factory).
+    LogSegment() : baseOffset_(0), indexIntervalBytes_(4096),
+                   indexMaxBytes_(8 * 1024 * 1024), nextOffset_(0) {}
     static std::string fname(std::string dir, int64_t base, const char* ext);
     /// Shared write core: update index, write bytes, advance nextOffset_.
     /// Does NOT call sync(). Called by append() and appendNoSync().
     int64_t writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset);
     int64_t baseOffset_; int32_t indexIntervalBytes_;
+    int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
     std::string logPath_; std::fstream log_;
     int fd_ = -1;   // POSIX fd for fdatasync — mirrors log_ (write path uses fstream)
     std::unique_ptr<OffsetIndex> index_;
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
+    bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
+    int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 };
 } // namespace rune::storage

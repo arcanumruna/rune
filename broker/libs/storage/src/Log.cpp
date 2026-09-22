@@ -12,9 +12,33 @@ namespace {
 inline std::string indexPathForLog(const std::string& logPath) {
     return logPath.substr(0, logPath.size() - 4) + ".index";
 }
+// Default index sampling interval — MUST match LogSegment's default
+// indexIntervalBytes so index right-sizing matches the actual sampling rate.
+constexpr int32_t kDefaultIndexIntervalBytes = 4096;
 } // anonymous namespace
 
+int32_t Log::indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noexcept {
+    // Entries needed for a full rollBytes segment: one per indexIntervalBytes,
+    // plus the first-batch entry, plus generous headroom (2x) for dense-index
+    // corner cases (many small batches each crossing the interval).  OffsetIndex
+    // grows the mapping on demand anyway, so this is only an initial estimate.
+    if (indexIntervalBytes <= 0) indexIntervalBytes = kDefaultIndexIntervalBytes;
+    int64_t entries = (rollBytes / indexIntervalBytes) + 2;
+    int64_t bytes   = entries * 8 /*kEntrySize*/ * 2 /*headroom*/;
+    constexpr int64_t kMin = 16 * 1024;          // floor: tiny segments still get a page or two
+    constexpr int64_t kMax = 8 * 1024 * 1024;    // cap: never exceed the old 8 MiB
+    if (bytes < kMin) bytes = kMin;
+    if (bytes > kMax) bytes = kMax;
+    return static_cast<int32_t>(bytes);
+}
+
 Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
+    indexMaxBytes_ = indexMaxBytesFor(rollBytes_, kDefaultIndexIntervalBytes);
+    // Reconcile any staging segment files left by a crash BEFORE discovering real
+    // segments: an adopted-but-not-yet-renamed staging.log has its true base
+    // recovered from the first batch header and is renamed into place (no data
+    // loss); un-adopted / empty staging files are removed.
+    recoverStagingFiles();
     // Discover existing segments; else create the first at offset 0.
     std::vector<int64_t> bases;
     for (auto& e : std::filesystem::directory_iterator(dir_)) {
@@ -30,9 +54,36 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     }
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
-    for (int64_t b : bases) segments_[b] = std::make_unique<LogSegment>(dir_, b);
+    for (int64_t b : bases)
+        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
     logEndOffset_ = activeSegment().nextOffset();
 }
+Log::~Log() {
+    // The background thread has been stopped by the owner before Log destruction,
+    // so these are single-threaded.  Finalize any pending staging→base renames so
+    // a clean shutdown leaves correctly-named files on disk (otherwise the next
+    // recover() would reconcile them anyway — this is just hygiene).
+    {
+        const std::size_t head = renameReqHead_.load(std::memory_order_relaxed);
+        const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed);
+        for (std::size_t i = head; i != tail; ++i) {
+            const auto rr = renameReqRing_[i & kRenameRingMask];
+            renameStagingToBase(rr.seq, rr.base);
+        }
+    }
+    // Free any prepared-but-unconsumed staging segment (raw ptr handed via the
+    // atomic handoff slot).  Its destructor closes fds / unmaps; then remove its
+    // orphaned staging files from disk.
+    LogSegment* prepared = preparedSegment_.exchange(nullptr, std::memory_order_acq_rel);
+    if (prepared) {
+        const int64_t seq = prepared->stagingSeq();
+        delete prepared;
+        std::error_code ec;
+        std::filesystem::remove(stagingLogPathFor(seq), ec);
+        std::filesystem::remove(stagingIndexPathFor(seq), ec);
+    }
+}
+
 void Log::maybeRoll() {
     // CL6: Roll decision is made BEFORE writing the new batch (Kafka-style).
     // A segment can therefore exceed rollBytes by at most one batch.
@@ -49,7 +100,12 @@ void Log::maybeRoll() {
         // across all segment boundaries".
         activeSegment().sync();
         int64_t base = logEndOffset_;
-        segments_[base] = std::make_unique<LogSegment>(dir_, base);
+        // Install the NEXT segment.  Adopts the background-pre-provisioned staging
+        // segment (ZERO syscalls: in-memory rebase; the staging→<base> disk rename
+        // is deferred to the bg thread) when ready; otherwise falls back to a
+        // synchronous create.  The seal fsync above is unchanged and fully
+        // synchronous (durability preserved).
+        installNextSegment(base);
         // CP-8 FIX (incremental largestTimestamp): capture the running max we
         // tracked for the about-to-be-sealed segment, then reset for the new
         // active segment.  publishSealedSnapshot will use this captured value
@@ -126,6 +182,218 @@ void Log::publishSealedSnapshot() {
     recoveryMaxTimestamps_.clear();
     std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap)));
 }
+// ---------------------------------------------------------------------------
+// Background segment pre-provisioning.
+// ---------------------------------------------------------------------------
+int Log::preprovisionPending() {
+    // BACKGROUND thread only.  Keep exactly ONE staging segment ready at all
+    // times so the append thread never pays a create at roll.  NEVER touches
+    // segments_ (single-writer invariant): it only builds a detached LogSegment
+    // (file I/O) and publishes it via the atomic handoff slot.
+    //
+    // preprovInFlight_ guards against building two segments and against a race
+    // with the append-thread synchronous fallback (installNextSegment):
+    //   - We CAS false→true to claim the build.  If it was already true, either a
+    //     prepared segment is waiting (append thread hasn't consumed it) or a
+    //     build is in progress — either way, nothing to do.
+    bool expected = false;
+    if (!preprovInFlight_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return 0; // already prepared or building
+    }
+    // If a prepared segment somehow already exists (shouldn't, given the flag),
+    // release the claim and bail — never leak a second one.
+    if (preparedSegment_.load(std::memory_order_acquire) != nullptr) {
+        preprovInFlight_.store(false, std::memory_order_release);
+        return 0;
+    }
+    // Build the staging segment (the expensive open + ftruncate + mmap + prefault
+    // all happen HERE, on this background thread).
+    const int64_t seq = static_cast<int64_t>(stagingSeq_++);
+    std::unique_ptr<LogSegment> seg;
+    try {
+        seg = LogSegment::prepareStaging(stagingLogPathFor(seq), stagingIndexPathFor(seq), seq,
+                                         kDefaultIndexIntervalBytes, indexMaxBytes_);
+    } catch (...) {
+        // On any failure, release the claim so the append thread falls back to a
+        // synchronous create and we retry next cycle.
+        preprovInFlight_.store(false, std::memory_order_release);
+        return 0;
+    }
+    // Publish: release-store hands the fully-built segment (files + mmap) to the
+    // append thread's acquire-load in installNextSegment().
+    preparedSegment_.store(seg.release(), std::memory_order_release);
+    return 1;
+}
+
+void Log::installNextSegment(int64_t base) {
+    // APPEND thread only.  Adopt the pre-provisioned staging segment if ready;
+    // else synchronously create one (correctness fallback — slower, only when the
+    // bg thread hasn't produced one yet, e.g. right after startup or two rolls in
+    // quick succession).
+    LogSegment* prepared = preparedSegment_.exchange(nullptr, std::memory_order_acq_rel);
+    if (prepared) {
+        // ADOPT — ZERO syscalls on the hot path: pure in-memory rebase.  The
+        // staging .log/.index keep their temp names on disk for now; we enqueue
+        // the disk rename (staging → <base>.{log,index}) for the background
+        // thread to perform off the hot path.
+        std::unique_ptr<LogSegment> seg(prepared);
+        const int64_t stagingSeq = seg->stagingSeq();
+        seg->adoptAsActive(base);            // in-memory only
+        segments_[base] = std::move(seg);
+        // Enqueue the deferred rename (single-slot-safe SPSC; rolls are rare so
+        // the small ring never fills).  If it somehow can't be enqueued, do the
+        // rename synchronously as a fallback (still correct, just slower).
+        if (!enqueueStagingRename(base, stagingSeq)) {
+            renameStagingToBase(stagingSeq, base);
+            auto it = segments_.find(base);
+            if (it != segments_.end())
+                it->second->setLogPath(logPathForBase(base));
+        }
+        // Release the in-flight claim so the bg thread builds the NEXT staging
+        // segment on its following cycle.
+        preprovInFlight_.store(false, std::memory_order_release);
+    } else {
+        // No prepared segment yet (startup, or two rolls closer together than one
+        // bg cycle).  Correctness fallback: synchronous create.  A build in
+        // progress will publish a segment that the NEXT roll consumes; we do NOT
+        // touch preprovInFlight_ here.
+        segments_[base] = std::make_unique<LogSegment>(
+            dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+    }
+}
+
+// --- Staging path helpers (background-pre-provisioning naming convention) ---
+// NOTE: staging files use NON-".log"/".index" extensions (.stlog/.stidx) so they
+// are invisible to any directory scan that keys off ".log"/".index" (segment
+// discovery, retention size counts, tests).  Only the adopt-time rename gives the
+// file its final <base>.log/.index name.  The already-open fd/mmap are extension-
+// agnostic, so the zero-syscall in-memory adopt is unaffected.
+std::string Log::stagingLogPathFor(int64_t seq) const {
+    return dir_ + "/" + kStagingPrefix + std::to_string(seq) + ".stlog";
+}
+std::string Log::stagingIndexPathFor(int64_t seq) const {
+    return dir_ + "/" + kStagingPrefix + std::to_string(seq) + ".stidx";
+}
+std::string Log::logPathForBase(int64_t base) const {
+    // Mirror LogSegment::fname formatting: 20-digit zero-padded base.
+    std::string s = std::to_string(base);
+    if (s.size() < 20) s = std::string(20 - s.size(), '0') + s;
+    return dir_ + "/" + s + ".log";
+}
+std::string Log::indexPathForBase(int64_t base) const {
+    std::string s = std::to_string(base);
+    if (s.size() < 20) s = std::string(20 - s.size(), '0') + s;
+    return dir_ + "/" + s + ".index";
+}
+
+void Log::renameStagingToBase(int64_t seq, int64_t base) noexcept {
+    // Rename the staging .log/.index files to their final <base>.{log,index}
+    // names.  rename() preserves the append thread's open fd_ and index mmap
+    // (they keep pointing at the same inode).  Best-effort: if a rename fails the
+    // in-memory segment still works (fd/mmap are name-agnostic) and recovery will
+    // reconcile on the next restart.
+    std::error_code ec;
+    std::filesystem::rename(stagingLogPathFor(seq),   logPathForBase(base),   ec);
+    std::filesystem::rename(stagingIndexPathFor(seq), indexPathForBase(base), ec);
+}
+
+bool Log::enqueueStagingRename(int64_t base, int64_t seq) noexcept {
+    // SPSC producer (append thread) → background thread.  Rolls are rare so the
+    // small ring never fills in practice; a full ring returns false and the
+    // caller renames synchronously (still correct).
+    const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed);
+    const std::size_t head = renameReqHead_.load(std::memory_order_acquire);
+    if (tail - head >= kRenameRingCapacity) return false;
+    renameReqRing_[tail & kRenameRingMask] = {base, seq};
+    renameReqTail_.store(tail + 1, std::memory_order_release);
+    return true;
+}
+
+int Log::finalizeStagingRenames() {
+    // SPSC consumer (BACKGROUND thread): perform the deferred staging→base disk
+    // renames, then publish each completed base to the append thread so it can
+    // update logPath_.  NEVER touches segments_.
+    const std::size_t head = renameReqHead_.load(std::memory_order_relaxed);
+    const std::size_t tail = renameReqTail_.load(std::memory_order_acquire);
+    int count = 0;
+    for (std::size_t i = head; i != tail; ++i) {
+        const auto rr = renameReqRing_[i & kRenameRingMask];
+        renameStagingToBase(rr.seq, rr.base);
+        // Publish the completed base to the append-thread done-ring (best effort:
+        // if the done-ring is full the append thread will still work — the fd/mmap
+        // are name-agnostic; logPath_ just stays at the staging name until a later
+        // reconcile, and recovery rebuilds correctly regardless).
+        const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed);
+        const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire);
+        if (dt - dh < kRenameRingCapacity) {
+            renameDoneRing_[dt & kRenameRingMask] = rr.base;
+            renameDoneTail_.store(dt + 1, std::memory_order_release);
+        }
+        ++count;
+    }
+    if (count > 0) renameReqHead_.store(tail, std::memory_order_release);
+    return count;
+}
+
+int Log::drainStagingRenamesDone() {
+    // SPSC consumer (APPEND thread): for each completed rename, update the
+    // in-memory logPath_ to the final <base>.log so recover()/reload use the
+    // correct on-disk name.  The open fd_/mmap are unaffected.
+    const std::size_t head = renameDoneHead_.load(std::memory_order_relaxed);
+    const std::size_t tail = renameDoneTail_.load(std::memory_order_acquire);
+    int count = 0;
+    for (std::size_t i = head; i != tail; ++i) {
+        const int64_t base = renameDoneRing_[i & kRenameRingMask];
+        auto it = segments_.find(base);
+        if (it != segments_.end()) it->second->setLogPath(logPathForBase(base));
+        ++count;
+    }
+    if (count > 0) renameDoneHead_.store(tail, std::memory_order_release);
+    return count;
+}
+
+void Log::recoverStagingFiles() {
+    // Called from the constructor (append thread, no concurrency yet).  Reconcile
+    // staging files left by a crash:
+    //   - staging.log with data → the segment was adopted in-memory but the bg
+    //     rename didn't complete before the crash.  Recover the true base from the
+    //     first batch header and rename staging.log → <base>.log (drop the stale
+    //     staging.index; recover() rebuilds .index from .log).  NO DATA LOSS.
+    //   - empty staging.log (never written) → the segment was pre-provisioned but
+    //     never adopted; safe to delete.
+    //   - orphan staging.index with no matching staging.log → delete.
+    std::error_code ec;
+    std::vector<std::filesystem::path> stagingLogs, stagingIdx;
+    for (auto& e : std::filesystem::directory_iterator(dir_, ec)) {
+        const std::string fn = e.path().filename().string();
+        if (fn.rfind(kStagingPrefix, 0) != 0) continue;
+        if (e.path().extension() == ".stlog")      stagingLogs.push_back(e.path());
+        else if (e.path().extension() == ".stidx") stagingIdx.push_back(e.path());
+    }
+    for (const auto& lp : stagingLogs) {
+        std::ifstream f(lp, std::ios::binary);
+        int64_t fileSize = 0;
+        if (f.is_open()) { f.seekg(0, std::ios::end); fileSize = f.tellg(); f.seekg(0, std::ios::beg); }
+        if (fileSize >= static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            // Read the first batch header to recover the true base offset.
+            std::vector<uint8_t> hdr(static_cast<std::size_t>(
+                std::min<int64_t>(fileSize, rune::protocol::batch::kRecordBatchOverhead + 64)));
+            f.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+            f.close();
+            rune::protocol::RecordBatchReader r(hdr.data(), hdr.size());
+            int64_t base = r.baseOffset();
+            std::filesystem::rename(lp, logPathForBase(base), ec);
+            // Drop any co-named staging.index (recover() rebuilds the index).
+        } else {
+            f.close();
+            std::filesystem::remove(lp, ec); // empty / torn — never adopted
+        }
+    }
+    // Remove any leftover staging .index files (rebuilt by recover() when needed).
+    for (const auto& ip : stagingIdx) std::filesystem::remove(ip, ec);
+}
+
 int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // Zero-alloc hot path: LogSegment::append(pointer) writes directly from the
     // caller's buffer — no std::vector construction on the produce path.
@@ -259,7 +527,7 @@ void Log::truncateTo(int64_t truncateOffset) {
     if (segments_.empty()) {
         // Re-create a fresh segment at truncateOffset (or 0 if negative).
         int64_t base = std::max<int64_t>(0, truncateOffset);
-        segments_[base] = std::make_unique<LogSegment>(dir_, base);
+        segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
         logEndOffset_ = base;
         return;
     }
@@ -334,7 +602,7 @@ void Log::truncateTo(int64_t truncateOffset) {
     // Rebuild the active segment from disk.
     int64_t base = seg.baseOffset();
     segments_.erase(base);
-    segments_[base] = std::make_unique<LogSegment>(dir_, base);
+    segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
     // Re-run recover to rebuild the index and set nextOffset correctly.
     // Use the segment's actual nextOffset_ (derived from the physically truncated
     // file) rather than hard-coding truncateOffset, so that LEO and the segment's
@@ -353,7 +621,8 @@ void Log::reloadSegments() {
             bases.push_back(std::stoll(e.path().stem().string()));
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
-    for (int64_t b : bases) segments_[b] = std::make_unique<LogSegment>(dir_, b);
+    for (int64_t b : bases)
+        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
     // Run recover() to rebuild indices and set nextOffset_ for each segment.
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();
@@ -383,7 +652,7 @@ void Log::reloadSegment(int64_t baseOffset) {
 
     // Reconstruct just this segment (closes the old fd via unique_ptr reset) and
     // recover() it so its in-memory index reflects the rewritten bytes.
-    it->second = std::make_unique<LogSegment>(dir_, baseOffset);
+    it->second = std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_);
     it->second->recover();
 }
 

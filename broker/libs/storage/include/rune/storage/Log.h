@@ -35,6 +35,7 @@ using SealedSegmentSnapshot = std::vector<SegInfo>;
 class Log {
 public:
     Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024);
+    ~Log();
     /// Zero-copy span overload — avoids per-call vector construction on the hot path.
     /// Appends [data, data+len) as a batch with the given lastOffset.
     /// Calls sync() after writing (durable-by-default).
@@ -170,6 +171,56 @@ public:
     /// Returns number of segments erased from segments_.
     int drainRetentionDeletes();
 
+    // -----------------------------------------------------------------------
+    // Background segment pre-provisioning (append-p99 tail fix).
+    //
+    // The next-segment CREATION (open + ftruncate + mmap of the .index) is the
+    // 100% cause of the append-p99 tail: on APFS a single open() is ~35µs p50 /
+    // 62µs p99 with multi-ms spikes, so a roll that creates the next segment on
+    // the append thread produces a ~200-460µs tail.  We move that creation to a
+    // BACKGROUND thread: it pre-builds ONE staging segment (files opened, index
+    // ftruncated + mmap'd + prefaulted) under a temporary name.  At roll the
+    // append thread ADOPTS it with ZERO syscalls — a pure in-memory rebase (the
+    // already-open fd + index mmap are name-agnostic).  The staging → <base>.{log,
+    // index} disk rename is DEFERRED to the background thread (finalizeStaging-
+    // Renames), off the hot path.  The seal fsync of the OUTGOING segment stays
+    // fully synchronous (durability unchanged).
+    //
+    // Crash-safety: a staging.log adopted-but-not-yet-renamed at crash time holds
+    // real data; Log construction recovers its true base from the first batch
+    // header and renames it into place (recoverStagingFiles) — no data loss.
+    //
+    // All cross-thread handoff is wait-free release/acquire.  The APPEND thread is
+    // the ONLY mutator of segments_ (single-writer invariant preserved); the
+    // BACKGROUND thread only does file I/O and never touches segments_:
+    //   preparedSegment_ : bg builds + release-stores; append takes (exchange).
+    //   preprovInFlight_ : guards the bg from building two + the fallback race.
+    //   renameReq ring   : append → bg  (deferred staging→base disk rename).
+    //   renameDone ring  : bg → append  (update logPath_ after the disk rename).
+    // -----------------------------------------------------------------------
+
+    /// Background thread: build the next staging segment if none is ready and one
+    /// isn't already in flight.  Pure file I/O + object construction on the
+    /// caller (background) thread; NEVER touches segments_.  Idempotent and cheap
+    /// when a segment is already prepared.  Returns 1 if it built a segment (work
+    /// done), 0 otherwise — so it can participate in an agent's doWork idle loop.
+    int preprovisionPending();
+
+    /// Background thread: perform any deferred staging→base disk renames enqueued
+    /// by the append thread at roll, and publish each completed base back to the
+    /// append thread.  NEVER touches segments_.  Returns number of renames done.
+    /// Call each background (cleaner) cycle alongside preprovisionPending().
+    int finalizeStagingRenames();
+
+    /// Append thread: apply completed staging renames (update in-memory logPath_).
+    /// Call each duty cycle from NodeRuntimeAgent::doWork.  Returns count applied.
+    int drainStagingRenamesDone();
+
+    /// Right-sized initial .index mmap bytes for a segment holding `rollBytes` of
+    /// data at `indexIntervalBytes` sampling.  Was a fixed 8 MiB (64x over-sized);
+    /// now ~ (rollBytes/interval + headroom) * 8, clamped to a sane [16 KiB, 8 MiB].
+    static int32_t indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noexcept;
+
     /// CP-9: physically remove .deleted files whose rename epoch is older than
     /// fileDeleteDelayMs.  Called by the cleaner agent once per retention cycle.
     /// Pure file I/O (fs::remove) — safe on the cleaner thread.
@@ -264,5 +315,61 @@ private:
     // physicallyRemoveExpiredDeletedFiles.  Both are called ONLY on the cleaner
     // thread so no synchronization is needed.
     std::vector<std::pair<std::string, int64_t>> pendingPhysicalDeletes_;
+
+    // -----------------------------------------------------------------------
+    // Background segment pre-provisioning state.
+    // -----------------------------------------------------------------------
+    /// Right-sized initial .index mmap size for THIS log (derived from rollBytes_
+    /// and the default index interval).  Passed to every LogSegment we create.
+    int32_t indexMaxBytes_;
+
+    /// Temp-name prefix for pre-provisioned staging segment files.  Files named
+    /// <dir>/<kStagingPrefix><seq>.log / .index.  Swept at Log construction if
+    /// left over from a crash (they hold no acked data — a crash before the roll
+    /// means the segment was never activated).
+    static constexpr const char* kStagingPrefix = ".staging-";
+    /// Monotonic counter so successive staging files get distinct names (avoids
+    /// reusing a name whose fd/mmap the append thread may still hold post-adopt).
+    /// Bg-thread-owned (only preprovisionPending writes it).
+    std::size_t stagingSeq_ = 0;
+
+    /// Prepared staging segment: bg-thread builds + publishes via release-store;
+    /// append-thread takes it (acquire + exchange to nullptr) at roll.  Raw owning
+    /// pointer handed across the atomic; whoever sets it to nullptr owns deletion.
+    std::atomic<LogSegment*> preparedSegment_{nullptr};
+    /// True while a staging segment is prepared OR being built — prevents the bg
+    /// thread from building a second one and lets the append thread know a segment
+    /// is (or will be) available.  Set by bg thread before building; cleared by
+    /// the append thread after it adopts (or discards) the prepared segment.
+    std::atomic<bool> preprovInFlight_{false};
+
+    /// Adopt the pre-provisioned staging segment as the active segment at `base`
+    /// (in-memory; enqueues the deferred rename), or synchronously create one if
+    /// none is ready (append thread only).
+    void installNextSegment(int64_t base);
+    /// Reconcile staging files left by a crash (append thread, constructor only).
+    void recoverStagingFiles();
+
+    // Staging path helpers (naming convention shared by build/rename/recovery).
+    std::string stagingLogPathFor(int64_t seq) const;
+    std::string stagingIndexPathFor(int64_t seq) const;
+    std::string logPathForBase(int64_t base) const;
+    std::string indexPathForBase(int64_t base) const;
+    /// Rename staging .log/.index → <base>.{log,index} (bg thread / fallback).
+    void renameStagingToBase(int64_t seq, int64_t base) noexcept;
+    /// Enqueue a deferred staging→base rename (append thread → bg).  Returns false
+    /// if the ring is momentarily full (caller renames synchronously as fallback).
+    bool enqueueStagingRename(int64_t base, int64_t seq) noexcept;
+
+    // Deferred-rename SPSC rings (rolls are rare → tiny capacity suffices).
+    struct RenameReq { int64_t base; int64_t seq; };
+    static constexpr std::size_t kRenameRingCapacity = 64; // power of two
+    static constexpr std::size_t kRenameRingMask     = kRenameRingCapacity - 1;
+    std::array<RenameReq, kRenameRingCapacity> renameReqRing_{};
+    alignas(64) std::atomic<std::size_t> renameReqHead_{0}; // bg (consumer)
+    alignas(64) std::atomic<std::size_t> renameReqTail_{0}; // append (producer)
+    std::array<int64_t, kRenameRingCapacity> renameDoneRing_{};
+    alignas(64) std::atomic<std::size_t> renameDoneHead_{0}; // append (consumer)
+    alignas(64) std::atomic<std::size_t> renameDoneTail_{0}; // bg (producer)
 };
 } // namespace rune::storage

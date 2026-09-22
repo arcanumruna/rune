@@ -6,16 +6,32 @@ namespace rune::storage {
 struct OffsetPosition { int64_t offset; int32_t position; };
 class OffsetIndex {
 public:
-    OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes);
+    /// @param maxBytes  initial size of the mmap-backed index file.  This is now
+    ///   RIGHT-SIZED per segment (see Log::indexMaxBytesFor) rather than a fixed
+    ///   8 MiB over-provision; append() grows the mapping on demand if a segment
+    ///   ever needs more entries than the initial estimate (rare — only oversized
+    ///   segments), so a small initial size is always safe.
+    /// @param prefault  touch every page of the fresh mapping so the cold
+    ///   minor-page-faults are paid HERE (ideally on a background thread) rather
+    ///   than on the append/roll hot path at the first index write.
+    OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes, bool prefault = false);
     void append(int64_t offset, int64_t position);
     OffsetPosition lookup(int64_t targetOffset) const;
-    void sync() { file_->sync(); }  // msync the mmap to disk
+    // CP-10: msync only the written prefix (entries_ * kEntrySize) instead of the
+    // full over-provisioned 8 MiB mapping.  The untouched tail is zero-filled and
+    // never dirtied, so syncing it is pure waste on every seal / durable append.
+    void sync() { file_->sync(static_cast<size_t>(entries_) * static_cast<size_t>(kEntrySize)); }
     /// Rescan the mmap to count valid entries written by a previous process.
     /// Call after opening an existing index file (e.g. after recover() renames
     /// .index.tmp → .index and reopens from the canonical path).
     void rebuildEntries();
     int entries() const noexcept { return entries_; }
     int64_t baseOffset() const noexcept { return baseOffset_; }
+    /// Rebase an EMPTY index (used when adopting a staging segment: the index was
+    /// built at a provisional base 0 with zero entries; adopting the segment at
+    /// its real base just updates the relative-offset origin).  Only valid while
+    /// entries_ == 0.
+    void setBaseOffset(int64_t base) noexcept { baseOffset_ = base; }
     int lastSearchLow() const { return lastSearchLow_; }
 protected:
     int slotFor(int64_t target) const;         // largest-lower-bound slot, -1 if none

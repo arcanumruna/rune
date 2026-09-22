@@ -3,9 +3,9 @@
 #include <cstring>
 #include <stdexcept>
 namespace rune::storage {
-OffsetIndex::OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes)
+OffsetIndex::OffsetIndex(std::string path, int64_t baseOffset, int32_t maxBytes, bool prefault)
     : baseOffset_(baseOffset) {
-    file_ = std::make_unique<MappedFile>(std::move(path), maxBytes, true);
+    file_ = std::make_unique<MappedFile>(std::move(path), maxBytes, true, prefault);
 }
 void OffsetIndex::append(int64_t offset, int64_t position) {
     // C4: Guard the 2GiB position limit here (where the cast happens) so all callers
@@ -15,6 +15,21 @@ void OffsetIndex::append(int64_t offset, int64_t position) {
     int32_t rel = static_cast<int32_t>(offset - baseOffset_);
     if (rel < 0) throw std::runtime_error("offset below base");
     int32_t pos32 = static_cast<int32_t>(position);
+    // Grow-on-demand: the index mapping is now RIGHT-SIZED per segment (small
+    // initial mmap instead of a fixed 8 MiB over-provision).  If a segment ever
+    // produces more entries than the initial estimate (e.g. an oversized segment
+    // or an unusually dense index interval), double the mapping so the write
+    // never runs past the end.  In steady state this never fires — the initial
+    // size (Log::indexMaxBytesFor) already covers a full rollBytes segment plus
+    // generous headroom.  Growth is off the append fast path (only on overflow).
+    const size_t needBytes = (static_cast<size_t>(entries_) + 1) *
+                             static_cast<size_t>(kEntrySize);
+    if (needBytes > file_->size()) {
+        size_t newSize = file_->size();
+        if (newSize == 0) newSize = static_cast<size_t>(kEntrySize);
+        while (newSize < needBytes) newSize *= 2;
+        file_->resize(newSize);
+    }
     uint8_t* p = file_->data() + entries_ * static_cast<size_t>(kEntrySize);
     std::memcpy(p, &rel, 4);
     std::memcpy(p + 4, &pos32, 4);

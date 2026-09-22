@@ -172,6 +172,10 @@ public:
                 if (replica && replica->log()) {
                     work += replica->log()->drainCleanerSwaps();
                     work += replica->log()->drainRetentionDeletes();
+                    // Append-p99 fix: apply completed staging→base renames the
+                    // background (cleaner) thread performed, so logPath_ tracks the
+                    // on-disk name (append-thread-only segments_ access).
+                    work += replica->log()->drainStagingRenamesDone();
                 }
             }
         }

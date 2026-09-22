@@ -8,6 +8,7 @@
 #include <sstream>
 #include <filesystem>
 #include <system_error>
+#include <cerrno>
 namespace rune::storage {
 
 namespace {
@@ -28,8 +29,60 @@ std::string LogSegment::fname(std::string dir, int64_t base, const char* ext) {
     return os.str();
 }
 
-LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes)
-    : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes), nextOffset_(baseOffset) {
+// ---------------------------------------------------------------------------
+// Background pre-provisioning (append-p99 fix).
+// ---------------------------------------------------------------------------
+std::unique_ptr<LogSegment> LogSegment::prepareStaging(
+    const std::string& stagingLogPath, const std::string& stagingIndexPath,
+    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
+    // Construct at provisional base 0.  All the expensive syscalls (2 open()s for
+    // the .log fstream+fd, 1 open() + ftruncate + mmap + prefault for the .index)
+    // happen HERE, on the background thread.  The staging files use non-.log/.index
+    // extensions (invisible to segment/retention scans); the adopt-time rename
+    // gives them their final <base>.log/.index names.
+    auto seg = std::unique_ptr<LogSegment>(new LogSegment());
+    seg->baseOffset_        = 0;
+    seg->indexIntervalBytes_= indexIntervalBytes;
+    seg->indexMaxBytes_     = indexMaxBytes;
+    seg->nextOffset_        = 0;
+    seg->staging_           = true;
+    seg->stagingSeq_        = stagingSeq;
+    seg->logPath_           = stagingLogPath;
+    const std::string& idxPath = stagingIndexPath;
+    seg->log_.open(seg->logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+    if (!seg->log_.is_open()) { std::ofstream(seg->logPath_, std::ios::binary).close();
+        seg->log_.open(seg->logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app); }
+    seg->fd_ = ::open(seg->logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
+    // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
+    seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
+                                                /*prefault*/true);
+    return seg;
+}
+
+void LogSegment::adoptAsActive(int64_t base) {
+    // Append thread only.  PURE IN-MEMORY rebase — ZERO syscalls on the hot path.
+    // The staging .log / .index files keep their temporary names on disk for now;
+    // all writes go through the already-open fd_ (pwrite) and the index mmap, both
+    // of which are name-agnostic.  The disk rename staging → <base>.{log,index} is
+    // performed OFF the hot path by the background thread (Log enqueues it), which
+    // then hands the final logPath_ back for the append thread to install.
+    //
+    // Crash-safety: if we crash after this in-memory adopt but before the bg
+    // rename, the staging .log holds real (page-cache-or-fsync'd) data.  Log
+    // recovery (recoverStagingFiles) reads the first batch header to recover the
+    // true base and renames it into place — no data loss.
+    baseOffset_ = base;
+    nextOffset_ = base;
+    if (index_) index_->setBaseOffset(base);
+    staging_ = false;
+}
+
+void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; }
+
+LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
+                       int32_t indexMaxBytes, bool prefaultIndex)
+    : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
+      indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
     log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
     if (!log_.is_open()) { std::ofstream(logPath_, std::ios::binary).close();
@@ -39,10 +92,14 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // mixed-mode slowdown on macOS.  Writes still go through fstream for
     // simplicity; fd_ is used for fdatasync and pread only.
     fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
-    // 8 MiB index map: over-provisioned (~64x) for a 64 MiB segment at 4 KiB interval.
-    // Acceptable trade-off: simplifies growth logic. Each segment uses at most 128 KiB
-    // of actual index data; the rest is zero-padded and evicted by the OS.
-    index_ = std::make_unique<OffsetIndex>(fname(dir, baseOffset, ".index"), baseOffset, 8 * 1024 * 1024);
+    // Right-sized .index mmap (was a fixed 8 MiB / ~64x over-provision).  A full
+    // rollBytes segment at indexIntervalBytes interval needs only a few KiB of
+    // real entries; OffsetIndex grows the mapping on demand if a segment ever
+    // exceeds indexMaxBytes_, so the smaller size is always safe.  prefaultIndex
+    // (set by the background pre-provisioner) touches the pages up front so the
+    // append/roll hot path never faults them.
+    index_ = std::make_unique<OffsetIndex>(fname(dir, baseOffset, ".index"), baseOffset,
+                                           indexMaxBytes_, prefaultIndex);
 }
 
 LogSegment::~LogSegment() {
@@ -197,7 +254,7 @@ int64_t LogSegment::recover() {
     std::string indexTmp  = indexBase + ".index.tmp";
     // Remove any leftover .tmp from a previous crash
     std::filesystem::remove(indexTmp);
-    index_ = std::make_unique<OffsetIndex>(indexTmp, baseOffset_, 8*1024*1024);
+    index_ = std::make_unique<OffsetIndex>(indexTmp, baseOffset_, indexMaxBytes_);
 
     size_t pos = 0; int64_t validBytes = 0; int64_t next = baseOffset_;
     // C2: seed bytesSinceIndex_ identically to append() so the index is reproducible.
@@ -237,7 +294,7 @@ int64_t LogSegment::recover() {
         if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
     }
     // Reopen index_ from the canonical path and recount entries from mmap data.
-    index_ = std::make_unique<OffsetIndex>(indexPath, baseOffset_, 8*1024*1024);
+    index_ = std::make_unique<OffsetIndex>(indexPath, baseOffset_, indexMaxBytes_);
     index_->rebuildEntries();
 
     return nextOffset_;

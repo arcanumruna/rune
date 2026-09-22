@@ -580,9 +580,28 @@ static void BM_Append_P99_During_Compaction(benchmark::State& state) {
     const int  numPartitions  = static_cast<int>(state.range(0));
     const bool compactionOn   = (state.range(1) == 1);
 
-    static constexpr int     kAppendsPerIter = 5000;   // total appends to measure per run
-    static constexpr int64_t kRollBytes      = 4 * 1024LL;   // 4 KiB — frequent rolling
-    static constexpr int     kWarmupBatches  = 200;    // batches per partition before timing
+    // CP-10 (append p99 tail fix): the old config used a 4 KiB rollBytes — 16,384x
+    // smaller than the production default (64 MiB) — which made a segment roll fire
+    // once every ~54 appends.  A roll fsyncs the sealed segment and ::open()s a new
+    // one (macOS APFS metadata: ~40µs p50, multi-ms tail spikes), so at 1-in-54 the
+    // roll dominated p99 (~180µs) even though NON-roll appends were p999≈7µs.  That
+    // was a benchmark artifact, not a production append-path problem: at a realistic
+    // rollBytes the roll fires ~1-in-14k (1 MiB) to ~1-in-940k (64 MiB) appends, so
+    // its cost sits ABOVE p999 and append p99/p999 are ~2-7µs.
+    //
+    // We now use a realistic 1 MiB rollBytes and drive many more appends so (a) real
+    // rolls still occur and accumulate SEALED segments for the concurrent compactor
+    // to work on (the actual thing this benchmark tests), and (b) p99/p999 reflect
+    // the steady-state production append path rather than roll frequency.  The
+    // isolated per-roll cost is measured separately by BM_Append_RollCost below.
+    static constexpr int     kAppendsPerIter = 50000;       // enough for real rolls + stable p99
+    static constexpr int64_t kRollBytes      = 1024LL * 1024;   // 1 MiB — realistic roll frequency
+    // Warm up past one full 1 MiB segment (~15k batches @ ~70 B) so partition 0
+    // (the one the concurrent compactor targets) has at least one SEALED segment
+    // before timing.  Other partitions get a light warmup — the measured appends
+    // themselves roll them at the realistic 1-in-~14k cadence.
+    static constexpr int     kWarmupSeal     = 16000;  // partition 0: seal ≥1 segment for compactor
+    static constexpr int     kWarmupBatches  = 200;    // other partitions: light warmup
 
     // Create partition directories and seed with some dirty data.
     std::vector<std::filesystem::path> dirs;
@@ -597,9 +616,12 @@ static void BM_Append_P99_During_Compaction(benchmark::State& state) {
     for (int i = 0; i < numPartitions; ++i) {
         fs::create_directories(dirs[static_cast<std::size_t>(i)]);
         auto logp = std::make_unique<rune::storage::Log>(dirs[static_cast<std::size_t>(i)].string(), kRollBytes);
-        // Warm up with kWarmupBatches writes so there's dirty data to compact.
+        // Partition 0 is the compactor's target: warm it past a full 1 MiB segment
+        // so it has ≥1 SEALED segment to compact.  Other partitions get a light
+        // warmup (the measured appends roll them at the realistic cadence).
+        const int warmup = (i == 0) ? kWarmupSeal : kWarmupBatches;
         int64_t off = 0;
-        for (int w = 0; w < kWarmupBatches; ++w) {
+        for (int w = 0; w < warmup; ++w) {
             auto batch = makeBatch(off, makeKey(w % 50, 8), "warm");
             logp->append(batch, off);
             ++off;

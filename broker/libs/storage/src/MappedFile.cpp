@@ -4,13 +4,30 @@
 #include <unistd.h>
 #include <stdexcept>
 namespace rune::storage {
-MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable)
+MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault)
     : path_(std::move(path)), size_(initialBytes), writable_(writable) {
     fd_ = ::open(path_.c_str(), writable ? (O_RDWR|O_CREAT) : O_RDONLY, 0644);
     if (fd_ < 0) throw std::runtime_error("open failed: " + path_);
+    // Never SHRINK an existing file: the index is now right-sized and may have
+    // grown-on-demand in a prior run.  Opening it with a smaller initialBytes must
+    // not ftruncate away written entries.  Map at least the existing file size.
+    {
+        off_t existing = ::lseek(fd_, 0, SEEK_END);
+        if (existing > 0 && static_cast<size_t>(existing) > size_)
+            size_ = static_cast<size_t>(existing);
+        ::lseek(fd_, 0, SEEK_SET);
+    }
     if (writable && ::ftruncate(fd_, static_cast<off_t>(size_)) != 0)
         throw std::runtime_error("ftruncate failed: " + path_);
     mapNow();
+    if (prefault && writable_ && data_) {
+        // Touch one byte per page so the pages are resident + zero-filled before
+        // the first write.  Moves the cold fault cost off the append/roll path.
+        const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+        for (size_t off = 0; off < size_; off += page) {
+            data_[off] = data_[off];
+        }
+    }
 }
 void MappedFile::mapNow() {
     int prot = writable_ ? (PROT_READ|PROT_WRITE) : PROT_READ;
@@ -26,5 +43,15 @@ void MappedFile::resize(size_t newBytes) {
     mapNow();
 }
 void MappedFile::sync() { if (data_) ::msync(data_, size_, MS_SYNC); }
+void MappedFile::sync(size_t bytes) {
+    if (!data_) return;
+    // Round the sync length up to a page boundary and clamp to the mapping size
+    // so we never msync past the mapping.  Syncing only the written prefix avoids
+    // walking the ~2048 zero pages of the over-provisioned 8 MiB index.
+    static const size_t kPage = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    size_t aligned = bytes == 0 ? kPage : ((bytes + kPage - 1) / kPage) * kPage;
+    if (aligned > size_) aligned = size_;
+    ::msync(data_, aligned, MS_SYNC);
+}
 MappedFile::~MappedFile() { if (data_) ::munmap(data_, size_); if (fd_>=0) ::close(fd_); }
 } // namespace rune::storage
