@@ -494,4 +494,39 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_compaction_retention_smoke_tests
             PROPERTIES TIMEOUT 300)
     endif()
+
+    # ---------------------------------------------------------------------------
+    # CP-5 Phase 4: CompactionStress — in-process compaction+retention stress/
+    #   endurance test at scale.
+    #
+    # Three tests:
+    #   1. ManyPartitions_LatestPerKey_Stress
+    #        300 partitions (200 compact + 50 compact+delete + 50 delete),
+    #        20 keys/partition, 30 records/key → 180 000 total records.
+    #        Asserts: latest-per-key, HW/LEO invariant, no divergence,
+    #        bounded segment count, checkpoint advancement.
+    #
+    #   2. ConcurrentCleaner_TSan_Stress
+    #        30 compact partitions, 10 keys, 20 records/key.
+    #        LogCleanerAgent on its own thread (AgentRunner), duty-cycle on test
+    #        thread.  TSan build: run under -fsanitize=thread → 0 races.
+    #        Asserts same properties as (1); wall budget 30 s.
+    #
+    #   3. CheckpointCoalescing_Bounded_Stress
+    #        Single partition, 15 keys, 50 records/key, 1500 cleaner cycles.
+    #        Asserts: checkpoint monotone, segment count bounded by coalescing,
+    #        latest-per-key, no divergence.
+    #
+    # No Aeron required (no BrokerNode; uses standalone Log + PartitionReplica
+    # + LogCleanerAgent + NodeRuntimeAgent directly).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_compaction_stress_tests
+        tests/integration/CompactionStressTest.cpp)
+    target_link_libraries(rune_compaction_stress_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        GTest::gtest_main)
+    gtest_discover_tests(rune_compaction_stress_tests
+        PROPERTIES TIMEOUT 180)
 endif()
