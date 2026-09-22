@@ -86,8 +86,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -146,6 +149,10 @@ public:
     // within a single budget window), additional segments are skipped until
     // reset. A budget of 0 means unlimited.
     //
+    // CP-9: Also runs retention on a separate cadence (retentionCheckMs).
+    // Retention runs BEFORE compaction selection so the snapshot used for
+    // filthiest-first is already up-to-date after deletions are enqueued.
+    //
     // Returns 1 if a compaction segment was processed, 0 when idle.
     // -----------------------------------------------------------------------
     int doWork(int64_t nowNs) override {
@@ -154,6 +161,28 @@ public:
         // CP-8: sample wall-clock epoch-ms ONCE per cycle (deterministic horizon).
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // ---------------------------------------------------------------
+        // CP-9: Retention cadence — run retention if retentionCheckMs has
+        // elapsed since the last run.  Use the MINIMUM retentionCheckMs
+        // across all replicas in the registry (so fast-test replicas with
+        // retentionCheckMs=1 are served promptly).
+        // ---------------------------------------------------------------
+        {
+            int64_t minCheckMs = retentionCheckMs_; // default from ctor
+            // Scan replicas for the smallest retentionCheckMs configured.
+            if (registry_) {
+                for (auto* r : registry_->allReplicas()) {
+                    if (!r) continue;
+                    const int64_t rc = r->retentionCheckMs();
+                    if (rc > 0 && rc < minCheckMs) minCheckMs = rc;
+                }
+            }
+            if (nowMs - lastRetentionCheckMs_ >= minCheckMs) {
+                runRetention(nowMs);
+                lastRetentionCheckMs_ = nowMs;
+            }
+        }
 
         // ---------------------------------------------------------------
         // Phase 1: scan all eligible leader logs; compute byte-dirty ratio
@@ -590,6 +619,214 @@ public:
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // CP-9: Retention scheduler — runRetention(nowMs)
+    //
+    // Called from doWork() when the retentionCheckMs cadence has elapsed.
+    // For each leader-owned replica with a Delete or CompactDelete policy:
+    //   1. Load the immutable sealed-segment snapshot (no segments_ access).
+    //   2. Compute the set of deletable segments via three predicates
+    //      (time, size, log-start-offset).  Active segment EXCLUDED.
+    //      Bounded by high-watermark (only compacted/committed range).
+    //   3. For each deletable segment:
+    //      (a) Rename <base>.log → <base>.log.deleted on disk (pure file work —
+    //          safe on the cleaner thread).
+    //      (b) Enqueue the base via Log::enqueueDeletedSegment() so the
+    //          append thread erases it from segments_ in drainRetentionDeletes().
+    //      (c) Record the .deleted path for deferred physical removal.
+    //   4. Run physicallyRemoveExpiredDeletedFiles(nowMs, fileDeleteDelayMs)
+    //      to physically remove .deleted files whose delay has elapsed.
+    //
+    // SINGLE-WRITER INVARIANT:
+    //   - The cleaner thread ONLY renames files and enqueues bases.
+    //   - segments_ mutation happens ONLY on the append thread (step 3b via
+    //     drainRetentionDeletes).
+    //   - No lock on any path.
+    //
+    // compact,delete coordination:
+    //   - For CompactDelete replicas, compaction may have already rewritten a
+    //     segment.  The segment's .log file still exists (compaction renames
+    //     <base>.log.new → <base>.log atomically).  Retention then renames the
+    //     final .log → .deleted.  There is no double-delete because:
+    //     (a) compaction enqueues via the SWAP ring (drainCleanerSwaps →
+    //         reloadSegment, which updates the in-memory segment pointer);
+    //     (b) retention enqueues via the DELETE ring (drainRetentionDeletes →
+    //         segments_.erase).  A segment is never in both rings simultaneously:
+    //         the cleaner selects a segment for EITHER compaction OR deletion in a
+    //         single cycle, never both.  The compaction's log file is the latest
+    //         on disk; retention renames that latest file to .deleted.
+    // -----------------------------------------------------------------------
+    void runRetention(int64_t nowMs) {
+        if (!registry_) return;
+
+        for (auto* replica : registry_->allReplicas()) {
+            if (!replica) continue;
+            // Retention is leader-only (failover-safe: a demoted leader stops
+            // retention because role() != Leader).
+            if (replica->role() != rune::replication::Role::Leader) continue;
+
+            const auto policy = replica->cleanupPolicy();
+            // Retention applies to Delete and CompactDelete topics only.
+            if (policy == rune::replication::CleanupPolicy::Compact) continue;
+
+            rune::storage::Log* log = replica->log();
+            if (!log) continue;
+
+            const int64_t retentionMs     = replica->retentionMs();
+            const int64_t retentionBytes  = replica->retentionBytes();
+            const int64_t logStartOffset  = replica->logStartOffset();
+            const int64_t fileDelayMs     = replica->fileDeleteDelayMs();
+
+            // If no retention policy is active, skip.
+            if (retentionMs < 0 && retentionBytes < 0 && logStartOffset <= 0) continue;
+
+            // Load the immutable sealed-segment snapshot (no segments_ access).
+            auto snap = log->sealedSegmentSnapshot();
+            if (!snap || snap->empty()) continue;
+
+            // High-watermark: never delete the active segment or segments that
+            // are above (or at) the high-watermark.
+            const int64_t hw = replica->highWatermark();
+
+            // Build the list of deletable segments using the three predicates.
+            // Active segment = last in the log; we must never delete it.
+            // We iterate over SEALED segments only (all in the snapshot).
+            // A segment is deletable if ANY predicate fires for it.
+            //
+            // Predicate 1 — Time: now - seg.largestTimestamp > retentionMs
+            //   largestTimestamp = 0 → unknown → treat as ancient (deletable).
+            //   Only fires when retentionMs >= 0.
+            //
+            // Predicate 2 — Size (oldest-first): running total of sealed-segment
+            //   bytes from OLDEST to NEWEST; once the running total exceeds
+            //   retentionBytes, older segments are deletable.
+            //   Active segment is excluded (it's not in the snapshot).
+            //   Only fires when retentionBytes >= 0.
+            //
+            // Predicate 3 — Log-start-offset: seg whose nextSegment.baseOffset
+            //   (= next element's base, or hw for the last sealed) <= logStartOffset.
+            //   In other words: if the entire segment's offset range falls below
+            //   logStartOffset, delete it.
+            //
+            // For size predicate: compute total sealed bytes first.
+            int64_t totalSealedBytes = 0;
+            for (const auto& si : *snap) {
+                if (si.baseOffset >= hw) break; // stop at hw boundary
+                totalSealedBytes += si.sizeBytes;
+            }
+
+            // Running size from newest → oldest (to find which oldest segs to drop).
+            // We walk from newest sealed to oldest; once keepBytes < retentionBytes,
+            // anything older is deletable.
+            int64_t keepBytes = totalSealedBytes;
+
+            // Build the deletable set (base offsets to delete).
+            std::vector<int64_t> toDelete;
+
+            for (std::size_t i = 0; i < snap->size(); ++i) {
+                const auto& si = (*snap)[i];
+                if (si.baseOffset >= hw) break; // never touch at/above HW
+
+                // Compute this segment's logical end (next segment's base or hw).
+                const int64_t segEnd = (i + 1 < snap->size())
+                                       ? (*snap)[i + 1].baseOffset
+                                       : hw;
+
+                bool deletable = false;
+
+                // Predicate 1: Time.
+                if (!deletable && retentionMs >= 0) {
+                    const int64_t largestTs = si.largestTimestamp;
+                    // largestTs == 0 → unknown → treat as very old → deletable.
+                    if (largestTs == 0 || (nowMs - largestTs) > retentionMs) {
+                        deletable = true;
+                    }
+                }
+
+                // Predicate 2: Size (oldest-first).
+                if (!deletable && retentionBytes >= 0) {
+                    // keepBytes starts at totalSealedBytes; as we walk oldest→newest
+                    // we subtract each segment we consider keeping.  But we need to
+                    // determine if this segment is one of the "excess" oldest ones.
+                    // Simple approach: accumulate size from the end (newest to oldest
+                    // is index snap->size()-1 to 0).  For index i (oldest end),
+                    // keepBytes reflects all bytes EXCLUDING segments [0..i-1].
+                    // At index i, keepBytes = totalSealedBytes - Σ(sizeBytes[j] for j<i)
+                    // = Σ(sizeBytes[j] for j>=i).  If keepBytes > retentionBytes,
+                    // the OLDEST segment (index 0) can be dropped → but we need to
+                    // track which are excess.
+                    //
+                    // Simpler: recompute as prefix sum from oldest.
+                    // deletable if Σ(bytes[0..i]) + all remaining bytes > retentionBytes
+                    // is implied by keepBytes > retentionBytes before subtracting si.
+                    // We want: remove segments starting from oldest until keepBytes <= retentionBytes.
+                    // So: deletable at index i if keepBytes > retentionBytes.
+                    if (keepBytes > retentionBytes) {
+                        deletable = true;
+                        keepBytes -= si.sizeBytes;
+                    }
+                }
+
+                // Predicate 3: Log-start-offset.
+                if (!deletable && logStartOffset > 0) {
+                    // Delete if the segment's entire range is below logStartOffset.
+                    // segEnd <= logStartOffset means nextSeg.base <= logStartOffset
+                    // → this segment's records are all before logStartOffset.
+                    if (segEnd <= logStartOffset) {
+                        deletable = true;
+                    }
+                }
+
+                if (!deletable) continue;
+
+                // -------------------------------------------------------
+                // Async delete: rename .log → .deleted on disk (file work
+                // — safe on the cleaner thread), then enqueue for
+                // segments_ removal on the append thread.
+                // -------------------------------------------------------
+                // Mirror LogSegment::fname: zero-pad base to 20 digits.
+                std::ostringstream pathBuf;
+                pathBuf << log->dir() << "/"
+                        << std::setw(20) << std::setfill('0') << si.baseOffset << ".log";
+                std::string logPath = pathBuf.str();
+                std::string deletedPath = logPath + ".deleted";
+
+                // Only rename if .log still exists (idempotent: a prior cycle
+                // may have already renamed it but the enqueue failed).
+                if (!std::filesystem::exists(logPath)) {
+                    // Already renamed (or never existed); try to enqueue again.
+                    // Record the .deleted path for deferred physical removal if
+                    // not already recorded.
+                    if (std::filesystem::exists(deletedPath)) {
+                        log->recordDeletedFile(deletedPath, nowMs);
+                    }
+                } else {
+                    // Rename .log → .deleted (atomic on most POSIX filesystems).
+                    std::error_code ec;
+                    std::filesystem::rename(logPath, deletedPath, ec);
+                    if (!ec) {
+                        log->recordDeletedFile(deletedPath, nowMs);
+                    }
+                    // Whether rename succeeded or not, we try to enqueue.
+                    // If rename failed, the segment is still intact — no harm.
+                }
+
+                // Enqueue for segments_ removal on the append thread.
+                // enqueueDeletedSegment returns false if the ring is full;
+                // in that case the rename has already happened, so next cycle
+                // we'll retry (find logPath absent → directly record .deleted).
+                log->enqueueDeletedSegment(si.baseOffset);
+                toDelete.push_back(si.baseOffset);
+            }
+
+            // ---------------------------------------------------------------
+            // Deferred physical removal: sweep .deleted files whose delay
+            // has elapsed.  Safe to call every retention cycle.
+            // ---------------------------------------------------------------
+            log->physicallyRemoveExpiredDeletedFiles(nowMs, fileDelayMs);
+        }
+    }
+
     // CP-7: Lazy-init the cleaner-offset-checkpoint for `log`.
     // If the checkpoint file already exists, seeds replica->lastCleanOffset()
     // with the persisted value (truncation-aware).  Called on the CLEANER THREAD;
@@ -635,6 +872,14 @@ private:
     std::unordered_map<rune::storage::Log*,
                        std::unique_ptr<rune::storage::CleanerOffsetCheckpoint>>
         checkpoints_;
+
+    // CP-9: retention scheduler state.
+    // retentionCheckMs_:  default cadence (overridden by per-replica minimum).
+    //   Default 300'000 ms = 5 min (Kafka default).  Set to 1 for fast tests.
+    int64_t retentionCheckMs_ = 300'000LL;
+    // lastRetentionCheckMs_: last wall-clock ms when runRetention() was called.
+    //   Initialized to 0 so retention runs on the very first doWork() call.
+    int64_t lastRetentionCheckMs_ = 0;
 };
 
 } // namespace rune::node
