@@ -276,6 +276,13 @@ bool LogCleaner::rewriteSegmentImpl(
     std::vector<uint8_t> outBuf;
     outBuf.reserve(buf.size());
 
+    // CP-10 ULL: reusable single-batch build buffer — avoids one heap allocation
+    // per kept record (the inner keepWithHorizon lambda now calls buildInto() which
+    // clears and reuses this buffer instead of returning a new vector each time).
+    // Typical single-record batch is ~100-200 B; pre-reserve 512 B covers most cases.
+    std::vector<uint8_t> tmpBatch;
+    tmpBatch.reserve(512);
+
     size_t pos = 0;
     int64_t deleteRetentionNs = deleteRetentionMs * 1'000'000LL;
 
@@ -345,7 +352,9 @@ bool LogCleaner::rewriteSegmentImpl(
                     b.setDeleteHorizonMs(horizonMs);
                 }
                 b.append(key, val, timestamp);
-                auto batch = b.build();
+                // CP-10 ULL: use buildInto(tmpBatch) — reuses capacity, avoids per-record alloc.
+                b.buildInto(tmpBatch);
+                auto& batch = tmpBatch;
 
                 // A2: Patch producerId, producerEpoch, baseSequence into the
                 // rebuilt batch.  The record's sequence number within the
