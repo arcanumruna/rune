@@ -162,10 +162,16 @@ public:
         //      segment bases via Log::enqueueCleanedSegment().  The actual
         //      in-memory segment-map reload must happen on this single-writer
         //      thread (not on the cleaner thread), so we drain them here.
+        //
+        //      CP-9: Also drain retention deletions (Log::drainRetentionDeletes).
+        //      The cleaner enqueues bases of segments renamed to .deleted via
+        //      Log::enqueueDeletedSegment().  The segments_ erase MUST happen
+        //      here on the append thread (single-writer invariant).
         if (registry_) {
             for (auto* replica : registry_->allReplicas()) {
                 if (replica && replica->log()) {
                     work += replica->log()->drainCleanerSwaps();
+                    work += replica->log()->drainRetentionDeletes();
                 }
             }
         }
@@ -176,6 +182,16 @@ public:
     // -----------------------------------------------------------------------
     // runBoundedCompaction — CP-2/CP-3: bounded, leader-only compaction pass
     //   with full cleanup.policy routing.
+    //
+    // CP-9 NOTE: Retention (size / time / log-start-offset) has been MOVED to
+    //   LogCleanerAgent (runs on its own cadence off the append thread).
+    //   runBoundedCompaction only handles the legacy inline compaction path
+    //   (used by CompactionDutyCycleTest and CompactionPolicyTest which test
+    //   the old duty-cycle-driven path).  The Delete/CompactDelete retention
+    //   portion is still here for backward-compatibility with existing tests
+    //   that call runBoundedCompaction directly; those tests use deleteOldSegments
+    //   which is a direct synchronous call (not the async-delete path).
+    //   Production code should use LogCleanerAgent for retention.
     //
     // CP-3 policy routing (all paths are leader-only):
     //
@@ -191,17 +207,6 @@ public:
     //                  THEN run size/time retention.  Ordering matters: compact
     //                  before delete ensures the deduplicated-key survivor is not
     //                  incorrectly removed by the retention pass.
-    //
-    // Compaction path (Compact/CompactDelete) — unchanged from CP-2:
-    //   1. Skip if role != Leader.
-    //   2. Need at least 2 segments.
-    //   3. Dirty-ratio gate.
-    //   4. One-segment-per-cycle bound (watermark advance).
-    //
-    // Retention path (Delete/CompactDelete) — CP-3 addition:
-    //   Calls Log::deleteOldSegments(retentionBytes) when retentionBytes >= 0.
-    //   Retention runs AFTER compaction for CompactDelete so compaction's
-    //   single-survivor is placed before retention culls old segments.
     //
     // Returns number of work units performed (>0 if any work done, 0 when idle).
     //
