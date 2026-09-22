@@ -68,10 +68,23 @@ class Cluster:
 
     # ---- lifecycle --------------------------------------------------------
 
-    def up(self, build: bool = False, leader_timeout: int = 90) -> "Cluster":
+    def up(self, build: bool = False, leader_timeout: int = 90,
+           clean: bool = True) -> "Cluster":
         env_topics = os.environ.get("RUNE_TOPICS")
         # RUNE_TOPICS is baked into the compose file's x-broker-env; we honour any
         # override the caller exported, otherwise the compose default applies.
+        #
+        # HERMETIC START: wipe any named data volumes from a PRIOR run of this
+        # project name BEFORE bringing the cluster up.  The fixture teardown calls
+        # `down -v`, but if a prior run was interrupted (crash, SIGKILL, pytest
+        # cancelled, CI timeout) its teardown never ran and its committed records
+        # persist in `<project>_rune-data-N`.  A subsequent `up` would then mount
+        # those DIRTY volumes and serve the prior run's records — surfacing as
+        # bogus "phantom"/resurrection failures (records not in THIS run's produced
+        # set).  A pre-up `down -v` makes every cluster start deterministic and
+        # independent of how the previous run ended.  clean=False opts out.
+        if clean:
+            self.compose.down()  # `down -v --remove-orphans` — wipes stale volumes
         if build:
             self.compose.build(*SERVICES)
         self.compose.up(*SERVICES, timeout=180)
