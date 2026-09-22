@@ -29,6 +29,7 @@ if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)
 endif()
 
+add_subdirectory(libs/metadata)
 add_subdirectory(libs/storage)
 add_subdirectory(libs/consensus)
 add_subdirectory(libs/replication)
