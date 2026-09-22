@@ -1,6 +1,7 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 namespace rune::storage {
@@ -16,9 +17,17 @@ inline std::string indexPathForLog(const std::string& logPath) {
 Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
     // Discover existing segments; else create the first at offset 0.
     std::vector<int64_t> bases;
-    for (auto& e : std::filesystem::directory_iterator(dir_))
+    for (auto& e : std::filesystem::directory_iterator(dir_)) {
         if (e.path().extension() == ".log")
             bases.push_back(std::stoll(e.path().stem().string()));
+        // CP-9 crash-safe: .deleted files from a prior run must be cleaned up.
+        // They were already removed from segments_ (rename happened before crash)
+        // so we schedule immediate physical deletion by recording them with
+        // renamedAtMs=0 (instantly expired on first physicallyRemoveExpiredDeletedFiles call).
+        if (e.path().extension() == ".deleted") {
+            pendingPhysicalDeletes_.emplace_back(e.path().string(), 0LL);
+        }
+    }
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
     for (int64_t b : bases) segments_[b] = std::make_unique<LogSegment>(dir_, b);
@@ -356,6 +365,91 @@ int Log::drainCleanerSwaps() {
         publishSealedSnapshot();
     }
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// CP-9: Retention async-delete — SPSC ring for deletion enqueues.
+// ---------------------------------------------------------------------------
+bool Log::enqueueDeletedSegment(int64_t base) noexcept {
+    // LOCK-FREE SPSC producer (cleaner thread only).
+    // Mirror of enqueueCleanedSegment but for the delete ring.
+    const std::size_t tail = deleteTail_.load(std::memory_order_relaxed);
+    const std::size_t head = deleteHead_.load(std::memory_order_acquire);
+    if (tail - head >= kDeleteRingCapacity) {
+        // Ring full — caller retries next cycle.
+        return false;
+    }
+    deleteRing_[tail & kDeleteRingMask] = base;
+    // Release-store: publishes the base AND the prior .log→.deleted file rename
+    // to the consumer's acquire-load in drainRetentionDeletes.
+    deleteTail_.store(tail + 1, std::memory_order_release);
+    return true;
+}
+
+int Log::drainRetentionDeletes() {
+    // LOCK-FREE SPSC consumer (append/duty-cycle thread only).
+    // For each enqueued base, erase the segment from segments_.
+    // This is the ONLY place segments_ is mutated for retention (single-writer invariant).
+    const std::size_t head = deleteHead_.load(std::memory_order_relaxed);
+    const std::size_t tail = deleteTail_.load(std::memory_order_acquire);
+    int count = 0;
+    for (std::size_t i = head; i != tail; ++i) {
+        const int64_t base = deleteRing_[i & kDeleteRingMask];
+        auto it = segments_.find(base);
+        if (it != segments_.end()) {
+            // Erase the in-memory segment (closes the file descriptor).
+            // The .log file is already renamed to .deleted on disk; no file I/O here.
+            segments_.erase(it);
+            ++count;
+        }
+        // If base is not in segments_ (e.g. idempotent retry), that is fine.
+    }
+    if (count > 0) {
+        // Release new head so the cleaner can reuse slots.
+        deleteHead_.store(tail, std::memory_order_release);
+        // Refresh the sealed snapshot so the cleaner sees the updated segment list.
+        publishSealedSnapshot();
+    }
+    return count;
+}
+
+void Log::recordDeletedFile(const std::string& deletedPath, int64_t renamedAtMs) noexcept {
+    // Called only on the cleaner thread — no synchronization needed.
+    pendingPhysicalDeletes_.emplace_back(deletedPath, renamedAtMs);
+}
+
+void Log::physicallyRemoveExpiredDeletedFiles(int64_t nowMs, int64_t fileDeleteDelayMs) noexcept {
+    // Called only on the cleaner thread — safe to iterate and modify.
+    // The .deleted path is <dir>/<base20>.log.deleted.
+    // Derive the .index path as <dir>/<base20>.index.
+    static const std::string kDeletedSuffix = ".deleted";
+    static const std::string kLogSuffix     = ".log";
+    auto it = pendingPhysicalDeletes_.begin();
+    while (it != pendingPhysicalDeletes_.end()) {
+        const int64_t age = nowMs - it->second;
+        if (age >= fileDeleteDelayMs) {
+            // Delay elapsed: physically remove the .deleted file.
+            std::filesystem::remove(it->first);
+            // Also remove the .index companion.
+            // Path: <stem>.log.deleted → strip ".deleted" → <stem>.log → strip ".log" → <stem>.index
+            const std::string& deletedPath = it->first;
+            if (deletedPath.size() > kDeletedSuffix.size()) {
+                // Strip ".deleted" suffix → original .log path.
+                std::string logPath = deletedPath.substr(
+                    0, deletedPath.size() - kDeletedSuffix.size());
+                if (logPath.size() > kLogSuffix.size() &&
+                    logPath.substr(logPath.size() - kLogSuffix.size()) == kLogSuffix) {
+                    // Strip ".log" → base path, add ".index".
+                    std::string indexPath =
+                        logPath.substr(0, logPath.size() - kLogSuffix.size()) + ".index";
+                    std::filesystem::remove(indexPath);
+                }
+            }
+            it = pendingPhysicalDeletes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 } // namespace rune::storage

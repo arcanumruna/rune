@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 namespace rune::storage {
 
@@ -133,6 +134,55 @@ public:
     /// Returns number of swaps processed (>0 = work done).
     int drainCleanerSwaps();
 
+    // -----------------------------------------------------------------------
+    // CP-9: Retention async-delete API (single-writer invariant preserved).
+    //
+    // The cleaner agent (off the append thread) selects segments eligible for
+    // deletion, renames them to .deleted on disk (pure file work — OK on the
+    // cleaner thread), and enqueues the base via enqueueDeletedSegment().
+    //
+    // The append/duty-cycle thread calls drainRetentionDeletes(), which erases
+    // the segment from segments_ (the ONLY mutation path, preserving the
+    // single-writer invariant).
+    //
+    // Physical removal of .deleted files is deferred: the cleaner calls
+    // physicallyRemoveExpiredDeletedFiles(nowMs, fileDeleteDelayMs) once per
+    // retention cycle to sweep any .deleted files whose rename time has elapsed.
+    //
+    // Crash-safety: Log construction scans for .deleted files left by a prior
+    // crash and records them for immediate physical cleanup (they were already
+    // absent from segments_ since their .log was renamed before crash, so they
+    // cannot be re-opened by a restart).
+    // -----------------------------------------------------------------------
+
+    /// CP-9 SPSC producer (cleaner thread): enqueue a base for retention deletion.
+    /// The .log file has ALREADY been renamed to .deleted on disk (pure file
+    /// work done by the cleaner before calling this).
+    /// Returns false (drops) if the ring is momentarily full; cleaner retries
+    /// next cycle (idempotent — drainRetentionDeletes is a no-op for an unknown
+    /// base).
+    bool enqueueDeletedSegment(int64_t base) noexcept;
+
+    /// CP-9 SPSC consumer (append thread): drain retention-delete enqueues.
+    /// For each pending base, erases the segment from segments_ and updates the
+    /// sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
+    /// all segments_ mutations).
+    /// Returns number of segments erased from segments_.
+    int drainRetentionDeletes();
+
+    /// CP-9: physically remove .deleted files whose rename epoch is older than
+    /// fileDeleteDelayMs.  Called by the cleaner agent once per retention cycle.
+    /// Pure file I/O (fs::remove) — safe on the cleaner thread.
+    /// @param nowMs            current wall-clock epoch-ms.
+    /// @param fileDeleteDelayMs  delay (ms) before physical removal.
+    void physicallyRemoveExpiredDeletedFiles(int64_t nowMs, int64_t fileDeleteDelayMs) noexcept;
+
+    /// CP-9: Record a .deleted file for deferred physical removal.
+    /// Called by the cleaner after renaming .log → .deleted.
+    /// Thread-safe: the cleaner thread is the only caller; the list is read
+    /// back only in physicallyRemoveExpiredDeletedFiles (also cleaner thread).
+    void recordDeletedFile(const std::string& deletedPath, int64_t renamedAtMs) noexcept;
+
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();
@@ -190,5 +240,21 @@ private:
     std::array<int64_t, kSwapRingCapacity> swapRing_{};
     alignas(64) std::atomic<std::size_t>   swapHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>   swapTail_{0}; // producer index
+
+    // CP-9: pending retention deletions — separate SPSC ring (to avoid mixing
+    // compaction swaps with retention deletes; they have different semantics).
+    // Producer = cleaner thread (enqueueDeletedSegment, after .log→.deleted rename).
+    // Consumer = append/duty-cycle thread (drainRetentionDeletes → segments_.erase).
+    static constexpr std::size_t kDeleteRingCapacity = 1024;
+    static constexpr std::size_t kDeleteRingMask     = kDeleteRingCapacity - 1;
+    std::array<int64_t, kDeleteRingCapacity> deleteRing_{};
+    alignas(64) std::atomic<std::size_t>    deleteHead_{0}; // consumer index
+    alignas(64) std::atomic<std::size_t>    deleteTail_{0}; // producer index
+
+    // CP-9: deferred physical-removal list — pairs of (deletedFilePath, renamedAtMs).
+    // Written by the cleaner (recordDeletedFile) and read/cleared by
+    // physicallyRemoveExpiredDeletedFiles.  Both are called ONLY on the cleaner
+    // thread so no synchronization is needed.
+    std::vector<std::pair<std::string, int64_t>> pendingPhysicalDeletes_;
 };
 } // namespace rune::storage
