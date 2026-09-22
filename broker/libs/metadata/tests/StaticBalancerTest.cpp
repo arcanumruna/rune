@@ -31,13 +31,16 @@ using namespace rune::protocol::metadata;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a map: (topicId, partition) → record, for easy lookup in tests.
-static std::map<std::pair<int32_t,int32_t>, BalancerRecord>
+/// Build a map: (topicId, partition) → pointer-to-record, for easy lookup in
+/// tests.  BalancerRecord is move-only (copying would dangle the Int32ArrayViews
+/// inside rec), so we store const pointers into the owning vector.  The vector
+/// must outlive the returned map.
+static std::map<std::pair<int32_t,int32_t>, const BalancerRecord*>
 indexRecords(const std::vector<BalancerRecord>& recs)
 {
-    std::map<std::pair<int32_t,int32_t>, BalancerRecord> m;
+    std::map<std::pair<int32_t,int32_t>, const BalancerRecord*> m;
     for (const auto& r : recs)
-        m[{r.rec.topicId, r.rec.partition}] = r;
+        m[{r.rec.topicId, r.rec.partition}] = &r;
     return m;
 }
 
@@ -141,8 +144,8 @@ TEST(StaticBalancer, CoLocation_TwoTopics_SameGroup)
     auto idx = indexRecords(recs);
 
     for (int32_t p = 0; p < 4; ++p) {
-        int32_t leaderA = idx.at({1, p}).rec.leaderNode;
-        int32_t leaderB = idx.at({2, p}).rec.leaderNode;
+        int32_t leaderA = idx.at({1, p})->rec.leaderNode;
+        int32_t leaderB = idx.at({2, p})->rec.leaderNode;
         EXPECT_EQ(leaderA, leaderB)
             << "partition " << p << ": topicA leader=" << leaderA
             << " topicB leader=" << leaderB;
@@ -163,9 +166,9 @@ TEST(StaticBalancer, CoLocation_ThreeTopics_SameGroup)
 
     auto idx = indexRecords(recs);
     for (int32_t p = 0; p < 3; ++p) {
-        int32_t l1 = idx.at({1, p}).rec.leaderNode;
-        int32_t l2 = idx.at({2, p}).rec.leaderNode;
-        int32_t l3 = idx.at({3, p}).rec.leaderNode;
+        int32_t l1 = idx.at({1, p})->rec.leaderNode;
+        int32_t l2 = idx.at({2, p})->rec.leaderNode;
+        int32_t l3 = idx.at({3, p})->rec.leaderNode;
         EXPECT_EQ(l1, l2) << "p=" << p;
         EXPECT_EQ(l1, l3) << "p=" << p;
     }
@@ -188,11 +191,11 @@ TEST(StaticBalancer, CoLocation_TwoGroups_Independent)
     auto idx = indexRecords(recs);
     // grpA co-location
     for (int32_t p = 0; p < 2; ++p)
-        EXPECT_EQ(idx.at({1,p}).rec.leaderNode, idx.at({2,p}).rec.leaderNode)
+        EXPECT_EQ(idx.at({1,p})->rec.leaderNode, idx.at({2,p})->rec.leaderNode)
             << "grpA p=" << p;
     // grpB co-location
     for (int32_t p = 0; p < 2; ++p)
-        EXPECT_EQ(idx.at({3,p}).rec.leaderNode, idx.at({4,p}).rec.leaderNode)
+        EXPECT_EQ(idx.at({3,p})->rec.leaderNode, idx.at({4,p})->rec.leaderNode)
             << "grpB p=" << p;
 }
 
@@ -452,7 +455,7 @@ TEST(StaticBalancer, CoLocation_WithRF2_LeaderAligned)
 
     auto idx = indexRecords(recs);
     for (int32_t p = 0; p < 4; ++p) {
-        EXPECT_EQ(idx.at({1,p}).rec.leaderNode, idx.at({2,p}).rec.leaderNode)
+        EXPECT_EQ(idx.at({1,p})->rec.leaderNode, idx.at({2,p})->rec.leaderNode)
             << "p=" << p;
     }
 }
@@ -477,4 +480,96 @@ TEST(StaticBalancer, OutputCoversAllPartitions)
         EXPECT_TRUE(idx.count({1, p})) << "topic 1 partition " << p << " missing";
     for (int32_t p = 0; p < 2; ++p)
         EXPECT_TRUE(idx.count({2, p})) << "topic 2 partition " << p << " missing";
+}
+
+// ---------------------------------------------------------------------------
+// 15. Discriminating balance tests for co-located uneven-division case.
+//
+// Scenario: 2 topics, 3 partitions, 2 nodes (partitionCount % nodeCount != 0).
+// nodes (sorted): [0, 1], stripeOffset=0 for the group.
+//   p=0: leaderIdx=(0+0)%2=0 → node 0  (both topics)
+//   p=1: leaderIdx=(0+1)%2=1 → node 1  (both topics)
+//   p=2: leaderIdx=(0+2)%2=0 → node 0  (both topics)
+// Per-node leader counts: node0=4, node1=2  (spread=2 = group member count M=2).
+// This IS the correct, documented behaviour: co-location is preserved exactly
+// (all same-index partitions share one leader), and the residual balance skew
+// is bounded by M (the group's member count) — an inherent consequence of
+// the co-location constraint when partitionCount % nodeCount != 0.
+// ---------------------------------------------------------------------------
+
+TEST(StaticBalancer, CoLocation_UnevenDivision_CoLocationHolds)
+{
+    // 2 topics, 3 partitions, 2 nodes: partitionCount(3) % nodeCount(2) != 0.
+    // Co-location MUST still hold: every same-index pair shares a leader.
+    std::vector<TopicSpec> topics = {
+        TopicSpec{1, 3, 1, "grp", "k"},
+        TopicSpec{2, 3, 1, "grp", "k"},
+    };
+    std::vector<NodeId> nodes = {0, 1};
+
+    auto recs = StaticBalancer::assign(topics, nodes);
+    ASSERT_EQ(recs.size(), 6u);
+
+    auto idx = indexRecords(recs);
+    for (int32_t p = 0; p < 3; ++p) {
+        EXPECT_EQ(idx.at({1, p})->rec.leaderNode, idx.at({2, p})->rec.leaderNode)
+            << "co-location violated at partition " << p;
+    }
+}
+
+TEST(StaticBalancer, CoLocation_UnevenDivision_PerNodeCountsAreDocumentedResidual)
+{
+    // 2 topics, 3 partitions, 2 nodes: partitionCount(3) % nodeCount(2) != 0.
+    // Concrete expected per-node leader counts derived from the algorithm:
+    //   ring=[0,1], stripeOffset=0
+    //   p=0→node0 (×2 topics), p=1→node1 (×2 topics), p=2→node0 (×2 topics)
+    //   node0=4, node1=2  →  spread = M = 2 (group member count).
+    // This is the inherent, accepted co-location residual documented in the spec.
+    std::vector<TopicSpec> topics = {
+        TopicSpec{1, 3, 1, "grp", "k"},
+        TopicSpec{2, 3, 1, "grp", "k"},
+    };
+    std::vector<NodeId> nodes = {0, 1};
+
+    auto recs = StaticBalancer::assign(topics, nodes);
+
+    auto counts = leaderCounts(recs);
+    EXPECT_EQ(counts[0], 4) << "node0 should lead 4 partitions (co-location residual)";
+    EXPECT_EQ(counts[1], 2) << "node1 should lead 2 partitions (co-location residual)";
+    // Spread = M = 2 (group member count): this is the documented bound.
+    EXPECT_EQ(counts[0] - counts[1], 2)
+        << "spread should equal group member count (2) for the uneven-division case";
+}
+
+TEST(StaticBalancer, Balance_EvenDivision_SingletonAndGroup_SpreadAtMostOne)
+{
+    // Confirms that per-node balance IS ≤1 for:
+    //   (a) singleton topics (any partitionCount, any nodeCount)
+    //   (b) co-located group where partitionCount % nodeCount == 0
+
+    // (a) Singleton: 6 partitions, 3 nodes → each node leads exactly 2.
+    {
+        std::vector<TopicSpec> topics = { TopicSpec{1, 6, 1, "", "k"} };
+        std::vector<NodeId> nodes = {1, 2, 3};
+        auto recs = StaticBalancer::assign(topics, nodes);
+        auto counts = leaderCounts(recs);
+        int32_t minC = INT32_MAX, maxC = INT32_MIN;
+        for (auto& [n, c] : counts) { minC = std::min(minC, c); maxC = std::max(maxC, c); }
+        EXPECT_LE(maxC - minC, 1) << "singleton: spread > 1";
+    }
+
+    // (b) Co-located group, partitionCount(6) % nodeCount(3) == 0:
+    //     2 topics × 6 partitions × 3 nodes → each node leads exactly 4.
+    {
+        std::vector<TopicSpec> topics = {
+            TopicSpec{10, 6, 1, "g", "k"},
+            TopicSpec{11, 6, 1, "g", "k"},
+        };
+        std::vector<NodeId> nodes = {1, 2, 3};
+        auto recs = StaticBalancer::assign(topics, nodes);
+        auto counts = leaderCounts(recs);
+        int32_t minC = INT32_MAX, maxC = INT32_MIN;
+        for (auto& [n, c] : counts) { minC = std::min(minC, c); maxC = std::max(maxC, c); }
+        EXPECT_LE(maxC - minC, 1) << "evenly-dividing co-located group: spread > 1";
+    }
 }

@@ -61,6 +61,11 @@ void validateGroup(const std::vector<const TopicSpec*>& members)
 // ---------------------------------------------------------------------------
 // Build an Int32ArrayView that points into a std::vector<int32_t>.
 // The vector must be kept alive for the lifetime of the view.
+//
+// NOTE: Int32ArrayView::operator[] byte-reads in little-endian order, so this
+// is only correct on an LE host.  Rune is an all-LE-host project by convention
+// (see project-wide endianness policy), so this assumption is intentional and
+// accepted here.
 // ---------------------------------------------------------------------------
 rune::protocol::metadata::Int32ArrayView makeView(const std::vector<int32_t>& v)
 {

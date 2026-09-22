@@ -50,6 +50,12 @@ public:
 //
 // Convenience accessors expose the arrays directly as std::vector<int32_t>
 // so tests can compare without worrying about the view lifetime.
+//
+// MOVE-ONLY: copying a BalancerRecord would make rec.isr / rec.replicas dangle
+// (the views would still point into the SOURCE's vectors, not the copy's).
+// The copy constructor and copy-assignment are therefore deleted.  Vectors of
+// move-only types work correctly; the balancer always moves records into the
+// result vector.
 // ---------------------------------------------------------------------------
 struct BalancerRecord {
     rune::protocol::metadata::UpdatePartitionAssignmentRecord rec;
@@ -58,6 +64,15 @@ struct BalancerRecord {
     /// rec.isr / rec.replicas are views into these.
     std::vector<int32_t> isr;
     std::vector<int32_t> replicas;
+
+    BalancerRecord()                                  = default;
+    BalancerRecord(BalancerRecord&&)                  = default;
+    BalancerRecord& operator=(BalancerRecord&&)       = default;
+
+    // Copying is deleted: the views inside rec would dangle into the source's
+    // vectors, not the copy's vectors.
+    BalancerRecord(const BalancerRecord&)             = delete;
+    BalancerRecord& operator=(const BalancerRecord&) = delete;
 };
 
 // ---------------------------------------------------------------------------
@@ -69,11 +84,23 @@ public:
     /// the given live nodes.
     ///
     /// Algorithm guarantees:
-    ///   - Even leadership: per-node leader counts differ by ≤1.
-    ///   - Replica spread: no partition places two replicas on the same node.
     ///   - Co-location: all topics in the same co-partition group have
-    ///     same-index partitions assigned to the SAME leader node.
-    ///   - Determinism: same (topics, liveNodes) inputs ⇒ byte-identical output.
+    ///     same-index partitions assigned to the SAME leader node.  This is
+    ///     the primary constraint and always holds.
+    ///   - Leadership balance (co-partition-stripe granularity): each stripe
+    ///     index advances by 1 through the sorted node ring, so the per-node
+    ///     leader count at the stripe level differs by ≤1.  Concretely:
+    ///       * Singleton topics: per-node leader count differs by ≤1.
+    ///       * Co-located group with partitionCount % nodeCount == 0: per-node
+    ///         leader count differs by ≤1.
+    ///       * Co-located group with partitionCount % nodeCount != 0: all M
+    ///         topics in the group share the same leader per stripe index, so
+    ///         the residual imbalance is multiplied by M.  The per-node leader
+    ///         count spread is bounded by the group's member count M.  This is
+    ///         an inherent, accepted consequence of the co-location constraint.
+    ///   - Replica spread: no partition places two replicas on the same node.
+    ///   - Determinism: same input order ⇒ byte-identical output (named groups
+    ///     are processed in sorted group-name order; singletons in input order).
     ///   - Initial epochs: leaderEpoch=0, partitionEpoch=0 for every record.
     ///
     /// Throws BalancerError on:
@@ -81,8 +108,9 @@ public:
     ///   - Co-partition group members with mismatched partitionCount.
     ///   - Co-partition group members with mismatched partitionKey.
     ///
-    /// @param topics    Topic descriptors (order-independent for determinism).
-    /// @param liveNodes Live broker node IDs (order determines striping seed).
+    /// @param topics    Topic descriptors (named groups sorted by group name for
+    ///                  determinism; singletons emitted in input order).
+    /// @param liveNodes Live broker node IDs (sorted ascending internally).
     /// @return          One BalancerRecord per (topic, partition) pair, in
     ///                  topic-input-order then partition-ascending order.
     static std::vector<BalancerRecord> assign(
