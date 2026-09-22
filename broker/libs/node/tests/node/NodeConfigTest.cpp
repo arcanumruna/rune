@@ -972,4 +972,91 @@ TEST(NodeConfigTest, CP52_ExtendedTopics_RetentionBytes_BelowMinusOne_Rejected) 
     EXPECT_FALSE(err.empty()) << "should reject retentionBytes=-2";
 }
 
+// ===========================================================================
+// CP-10 Fix 2: RUNE_ENABLE_COALESCING parsing
+//
+// NodeConfig.h documents RUNE_ENABLE_COALESCING as an env override but the
+// original NodeConfig.cpp never parsed it.  These tests confirm the fix:
+//   - Absent/empty → default true.
+//   - "0" → false.
+//   - "false" → false (case-insensitive).
+//   - "FALSE" → false.
+//   - "1"  → true.
+//   - "true" → true.
+// ===========================================================================
+
+TEST(NodeConfigTest, CP10_EnableCoalescing_DefaultTrue) {
+    // Absent env var → default enableCompactionCoalescing = true.
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->enableCompactionCoalescing)
+        << "Default must be true (Kafka parity)";
+}
+
+TEST(NodeConfigTest, CP10_EnableCoalescing_Zero_DisablesIt) {
+    auto env = base1node();
+    env["RUNE_ENABLE_COALESCING"] = "0";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_FALSE(r.config->enableCompactionCoalescing)
+        << "RUNE_ENABLE_COALESCING=0 must disable coalescing";
+}
+
+TEST(NodeConfigTest, CP10_EnableCoalescing_FalseLower_DisablesIt) {
+    auto env = base1node();
+    env["RUNE_ENABLE_COALESCING"] = "false";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_FALSE(r.config->enableCompactionCoalescing)
+        << "RUNE_ENABLE_COALESCING=false must disable coalescing";
+}
+
+TEST(NodeConfigTest, CP10_EnableCoalescing_FalseUpper_DisablesIt) {
+    auto env = base1node();
+    env["RUNE_ENABLE_COALESCING"] = "FALSE";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_FALSE(r.config->enableCompactionCoalescing)
+        << "RUNE_ENABLE_COALESCING=FALSE must disable coalescing (case-insensitive)";
+}
+
+TEST(NodeConfigTest, CP10_EnableCoalescing_One_KeepsTrue) {
+    auto env = base1node();
+    env["RUNE_ENABLE_COALESCING"] = "1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->enableCompactionCoalescing)
+        << "RUNE_ENABLE_COALESCING=1 must keep coalescing enabled";
+}
+
+TEST(NodeConfigTest, CP10_EnableCoalescing_True_KeepsTrue) {
+    auto env = base1node();
+    env["RUNE_ENABLE_COALESCING"] = "true";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->enableCompactionCoalescing)
+        << "RUNE_ENABLE_COALESCING=true must keep coalescing enabled";
+}
+
+// ===========================================================================
+// CP-10 Fix 1: ioMaxBytesPerSecond — parsed from TopicSpec, threaded to cleaner
+//
+// The parsing of TopicSpec::ioMaxBytesPerSecond is outside NodeConfig (it lives
+// in TopicSpec directly from RUNE_TOPICS fields).  These tests verify that:
+//   - TopicSpec::ioMaxBytesPerSecond retains its default of -1 when not set in
+//     RUNE_TOPICS (no extra field).
+//   - The BrokerNode wiring picks it up (integration: tested via BrokerNodeTest).
+// ===========================================================================
+
+TEST(NodeConfigTest, CP10_IoMaxBytesPerSecond_DefaultMinusOne) {
+    // With the standard "name:N" topic format the field stays at -1.
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "events:2";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    ASSERT_EQ(r.config->topics.size(), 1u);
+    EXPECT_EQ(r.config->topics[0].ioMaxBytesPerSecond, -1LL)
+        << "ioMaxBytesPerSecond must default to -1 (unlimited)";
+}
+
 } // namespace rune::node

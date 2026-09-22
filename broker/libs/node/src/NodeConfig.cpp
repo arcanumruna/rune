@@ -477,6 +477,28 @@ ConfigResult parseNodeConfig(
         // Absent or empty RUNE_TOPICS → cfg.topics stays empty (valid).
     }
 
+    // --- RUNE_ENABLE_COALESCING (optional, default true) ---
+    // CP-10 Fix 2: parse the env var documented in NodeConfig.h so the documented
+    // off-switch actually works.  "0" or "false" (case-insensitive) disables
+    // compaction coalescing; any other non-empty value (including "1", "true")
+    // keeps the default true.
+    {
+        const char* rawCoalesce = getenv_fn("RUNE_ENABLE_COALESCING");
+        if (rawCoalesce && !std::string_view(rawCoalesce).empty()) {
+            std::string_view sv = trim(std::string_view(rawCoalesce));
+            // Convert to lower-case for case-insensitive comparison.
+            std::string lower(sv);
+            for (auto& ch : lower)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (lower == "0" || lower == "false") {
+                cfg.enableCompactionCoalescing = false;
+            } else {
+                cfg.enableCompactionCoalescing = true;
+            }
+        }
+        // Absent or empty → keep the default (true, set in NodeConfig initializers).
+    }
+
     return {std::move(cfg), {}};
 }
 
