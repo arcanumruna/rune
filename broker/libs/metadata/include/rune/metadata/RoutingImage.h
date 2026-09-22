@@ -97,6 +97,10 @@ public:
     /// function:  gpid = gpidOf(topicId, partition).
     ///
     /// The function must return a non-negative int32_t for every live entry.
+    /// A negative gpid (buggy gpidOf) is defensively skipped — never used to
+    /// index the flat array — so a control-plane bug cannot cause an
+    /// out-of-bounds write or a pathological allocation.  The assert fires in
+    /// debug builds to surface the contract violation early.
     template<typename GpidFn>
     static std::shared_ptr<const RoutingImage>
     buildFromMap(const AssignmentMap& amap, GpidFn&& gpidOf)
@@ -106,7 +110,8 @@ public:
                          const PartitionAssignment& pa)
         {
             const int32_t gpid = gpidOf(topicId, partition);
-            assert(gpid >= 0);
+            assert(gpid >= 0 && "gpidOf must return a non-negative gpid");
+            if (gpid < 0) return;  // release-safe: skip rather than corrupt
             entries.push_back(BuildEntry{gpid, pa.leaderNode, pa.leaderEpoch});
         });
         return build(entries);
@@ -150,18 +155,23 @@ private:
         if (entries.empty()) return;
 
         // Determine required array size (maxGpid + 1).
-        int32_t maxGpid = 0;
+        // Negative gpids are defensively ignored (never used to size or index
+        // the array) so a buggy caller cannot trigger an out-of-bounds write
+        // or a pathological allocation in a release build.
+        int32_t maxGpid = -1;
         for (const auto& e : entries) {
-            assert(e.globalPartitionId >= 0);
+            assert(e.globalPartitionId >= 0 && "gpid must be non-negative");
             if (e.globalPartitionId > maxGpid) {
                 maxGpid = e.globalPartitionId;
             }
         }
+        if (maxGpid < 0) return;  // no valid (non-negative) gpids
 
         // Fill with sentinel, then overwrite assigned slots.
         entries_.assign(static_cast<std::size_t>(maxGpid + 1),
                         Entry{NO_LEADER_NODE_ID, NO_LEADER_EPOCH});
         for (const auto& e : entries) {
+            if (e.globalPartitionId < 0) continue;  // release-safe skip
             entries_[static_cast<std::size_t>(e.globalPartitionId)] =
                 Entry{e.leaderNodeId, e.leaderEpoch};
         }

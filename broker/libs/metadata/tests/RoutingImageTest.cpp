@@ -211,6 +211,11 @@ TEST(RoutingImage, AtomicSwapConcurrentReaderWriter)
     constexpr int kIterations = 10'000;
     std::atomic<bool> done{false};
     std::atomic<int>  reads{0};
+    // Value-consistency counter: the writer only ever publishes leaderNodeId
+    // in [0,7] for pid 0, so a torn/garbage read would surface as an
+    // out-of-range value here.  Run this target under TSan in CI to make the
+    // data-race assertion hard.
+    std::atomic<int>  badValues{0};
 
     // Writer thread: rapidly publishes new images.
     std::thread writer([&] {
@@ -226,9 +231,14 @@ TEST(RoutingImage, AtomicSwapConcurrentReaderWriter)
         while (!done.load(std::memory_order_acquire)) {
             auto snap = holder.current();   // acquire-load
             if (snap) {
-                // lookup must not crash; result is any valid leader or sentinel.
-                auto& e = snap->lookup(0);
+                // Every snapshot the reader observes must be internally
+                // consistent: pid 0 leaderNodeId is always in [0,7]
+                // (writer's i % 8).  Anything else is a torn read.
+                const auto& e = snap->lookup(0);
                 doNotOptimize(e.leaderNodeId);
+                if (e.leaderNodeId < 0 || e.leaderNodeId > 7) {
+                    badValues.fetch_add(1, std::memory_order_relaxed);
+                }
                 reads.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -238,6 +248,8 @@ TEST(RoutingImage, AtomicSwapConcurrentReaderWriter)
     reader.join();
 
     EXPECT_GT(reads.load(), 0) << "reader never ran";
+    EXPECT_EQ(badValues.load(), 0)
+        << "reader observed a torn/inconsistent leaderNodeId";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
