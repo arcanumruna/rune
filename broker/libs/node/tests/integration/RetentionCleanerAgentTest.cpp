@@ -654,6 +654,48 @@ TEST(RetentionCleanerAgent, RetentionOffAppendThread) {
 // NOTE: TSan enforcement is done via the build-tsan/ target (separate binary).
 //       This test just verifies the functional invariant in normal builds.
 // ===========================================================================
+// Build a Delete-policy config with a SECOND replica (follower id=2) so the
+// leader's IsrManager actually SHRINKS/EXPANDS the ISR on the duty thread —
+// exactly the isr_ = std::move(newIsr) churn that races the cleaner's HW read.
+// Small lag window + fast ISR-check cadence maximise the churn frequency.
+static PartitionConfig makeChurningDeleteConfig(int32_t topicId,
+                                                int64_t retentionMs,
+                                                int64_t retentionBytes) {
+    auto cfg = makeDeleteConfig(topicId, retentionMs, retentionBytes,
+                                /*retentionCheckMs=*/1, /*fileDeleteDelayMs=*/1);
+    cfg.minIsr             = 1;                 // stay produce-able with a lone leader
+    cfg.replicaLagMaxMs    = 0;                 // follower time-lags out almost instantly
+    cfg.replicaLagMaxOffset = 0;               // and offset-lags out as the leader appends
+    cfg.isrCheckIntervalNs = 50'000LL;          // 50 µs — churn hard
+    cfg.pushOnAppend       = false;
+    return cfg;
+}
+
+static PartitionConfig makeChurningCompactConfig(int32_t topicId) {
+    auto cfg = makeChurningDeleteConfig(topicId, /*retMs=*/-1, /*retBytes=*/-1);
+    cfg.cleanupPolicy         = CleanupPolicy::Compact;
+    cfg.minCleanableDirtyRatio = 0.0;           // always eligible so compaction fires
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// TEST 6 (STRENGTHENED — TSan): RetentionSingleWriterSafe
+//
+// This test PROVES the cleaner/retention path is race-free against the REAL
+// duty thread.  Unlike the old direct-drain workaround, it drives:
+//   • Duty/single-writer thread: NodeRuntimeAgent::doWork() → replica->doWork()
+//     runs the ACTUAL IsrManager shrink/expand (isr_ = std::move(newIsr)) +
+//     syncIsrToLeaderState + recomputeHw + maybeCompleteLeadership, plus real
+//     replica->append() (segments_ mutation) and the cleaner-swap/delete drains
+//     — all on ONE thread (single-writer invariant preserved).
+//   • Cleaner thread: LogCleanerAgent::doWork() → runRetention() reading the
+//     replica's HW + role CONCURRENTLY.
+//
+// Before the atomic-publication fix the cleaner read highWatermark()/role()
+// which touch isr_/leaderState_/leaderComplete_/lastHealthyHw_ → TSan reports
+// a data race here.  After the fix the cleaner reads only cleanerHighWatermark()
+// / cleanerRole() (atomic acquire) → 0 races.
+// ---------------------------------------------------------------------------
 TEST(RetentionCleanerAgent, RetentionSingleWriterSafe) {
     auto dir = cp9TempDir("cp9_single_writer");
     Log log(dir.string(), /*rollBytes=*/128);
@@ -669,76 +711,177 @@ TEST(RetentionCleanerAgent, RetentionSingleWriterSafe) {
     ASSERT_GE(segsBefore, 3) << "Need >= 3 segments";
 
     Cp9NullTransport transport;
-    auto cfg = makeDeleteConfig(950, /*retMs=*/1LL, /*retBytes=*/-1, 1, 1);
+    // Two replicas so the ISR genuinely churns on the duty thread.
+    auto cfg = makeChurningDeleteConfig(950, /*retMs=*/1LL, /*retBytes=*/-1);
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, 1,
-        std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
-    replica->becomeLeader(1, {1});
+        std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    replica->becomeLeader(1, {1, 2});
     replica->onLeaderLogAppended();
+    PartitionReplica* raw = replica.get();
 
     rune::node::ReplicaRegistry registry;
     registry.add(950, 0, std::move(replica));
     rune::node::LogCleanerAgent cleaner(&registry);
+    Cp9MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
 
-    // Run the cleaner on a background thread while the main thread drives appends
-    // + drains (mimicking the single-writer pattern).
-    //
-    // Note: we do NOT use NodeRuntimeAgent::doWork() concurrently because that drives
-    // replica->doWork() → ISR shrink/expand, which mutates the ISR vector
-    // concurrently with the cleaner reading replica->highWatermark()
-    // (which reads from the ISR vector) — a data race that is pre-existing in
-    // the compaction cleaner agent and is not introduced by CP-9.
-    // In production the cleaner thread and the duty-cycle thread are core-pinned
-    // on separate CPUs; the ISR read from the cleaner is inherently safe under
-    // the memory model used (each doWork(nowNs) call has a dedicated nowNs
-    // from a single clock source on the duty thread, and ISR updates are
-    // published via the leader-state with appropriate barriers in PartitionReplica).
-    // For this test we mimic the invariant by draining only the log (segments_)
-    // directly — the segments_ drain is what this test validates.
     std::atomic<bool> done{false};
+
+    // Cleaner thread — runs retention + compaction concurrently with the duty thread.
     std::thread cleanerThread([&]() {
-        for (int i = 0; i < 30 && !done.load(); ++i) {
+        for (int i = 0; !done.load(std::memory_order_relaxed); ++i) {
             cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::this_thread::yield();
         }
     });
 
-    // Main (append/single-writer) thread: drain + append concurrently.
-    // Use direct drain calls (not duty.doWork()) to avoid the pre-existing
-    // ISR-vector race that is outside CP-9 scope.
-    for (int i = 0; i < 50; ++i) {
-        // Append a new record (mutates segments_ via maybeRoll, single-writer OK).
-        auto b = cp9Batch(off, "new_k", "new_v", static_cast<int64_t>(i));
-        off = log.append(b, off);
-        // Drain retention deletes (single-writer: only here segments_ is erased).
-        log.drainRetentionDeletes();
-        // Drain compaction swaps (single-writer: only here segments_ is reloaded).
-        log.drainCleanerSwaps();
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    // Duty/single-writer thread == this test thread.  Drives the REAL ISR churn
+    // (replica->doWork via NodeRuntimeAgent), appends (segments_ mutation), a
+    // periodic follower fetch (re-expands id=2 into the ISR → shrink/expand churn),
+    // and the cleaner-swap/retention-delete drains.  All on ONE thread.
+    for (int i = 0; i < 4000; ++i) {
+        const int64_t nowNs = static_cast<int64_t>(i) * 100'000LL; // +100 µs / iter
+
+        // Real duty cycle: ISR shrink/expand + HW recompute + drains.
+        duty.doWork(nowNs);
+
+        // Append (grows the log; single-writer segments_ mutation via the replica).
+        auto b = cp9Batch(off, "new_k" + std::to_string(i), "new_v", oldTs);
+        off = raw->append(b, off);
+
+        // Periodically re-expand follower id=2 by feeding it a fetch so the ISR
+        // oscillates (fetch → in-sync → time/offset-lag → shrink → fetch → ...).
+        if ((i & 7) == 0) {
+            FetchRequestMsg fr{};
+            fr.leaderEpoch = 1;
+            fr.partition   = 0;
+            fr.followerId  = 2;
+            fr.fetchOffset = off;              // caught up
+            fr.maxBytes    = 0;                // position-only report
+            fr.topicId     = 950;
+            raw->onFetchRequest(fr, nowNs);
+        }
     }
 
-    done.store(true);
+    done.store(true, std::memory_order_relaxed);
     cleanerThread.join();
 
-    // Allow fileDeleteDelayMs to expire.
+    // Allow fileDeleteDelayMs to expire, then drain to quiescence on the writer.
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
-    // Final drain (direct calls — no concurrent ISR mutation).
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 10; ++i) {
         cleaner.doWork(static_cast<int64_t>(i + 100) * 1'000'000LL);
         log.drainRetentionDeletes();
         log.drainCleanerSwaps();
     }
 
-    // Verify segments_ is consistent (no crash, correct count).
+    // Verify segments_ is consistent (no crash, correct ordering).
     const int segsAfter = countLogSegments(dir);
     EXPECT_GE(segsAfter, 1) << "At least active segment must remain";
 
-    // segments_ must be strictly ascending (no duplicates from race).
     auto bases = log.segmentBaseOffsets();
     for (size_t i = 1; i < bases.size(); ++i) {
         EXPECT_LT(bases[i-1], bases[i])
             << "Segment bases must be strictly ascending after concurrent retention";
+    }
+
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TEST 6b (STRENGTHENED — TSan): CompactionSingleWriterSafe
+//
+// The race ORIGINATED in the compaction path (CP-6): the cleaner's Phase-1
+// scan calls replica->highWatermark() (and role()) while the duty thread churns
+// the ISR.  This test proves the COMPACTION path is race-free too, by driving
+// LogCleanerAgent compaction (Compact policy, dirty ratio always eligible)
+// concurrently with the REAL duty doWork() ISR churn + keyed appends.
+//
+// Pre-fix: TSan race on the highWatermark()/role() read in the compaction scan.
+// Post-fix: cleaner reads cleanerHighWatermark()/cleanerRole() only → 0 races.
+// ---------------------------------------------------------------------------
+TEST(RetentionCleanerAgent, CompactionSingleWriterSafe) {
+    auto dir = cp9TempDir("cp9_compact_single_writer");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    const int64_t oldTs = 1000LL;
+    int64_t off = 0;
+    // Duplicate keys so compaction has real work (latest-per-key).
+    for (int i = 0; i < 60; ++i) {
+        auto b = cp9Batch(off, "key" + std::to_string(i % 6),
+                          "v" + std::to_string(i), oldTs);
+        off = log.append(b, off);
+    }
+
+    const int segsBefore = countLogSegments(dir);
+    ASSERT_GE(segsBefore, 3) << "Need >= 3 segments for compaction";
+
+    Cp9NullTransport transport;
+    auto cfg = makeChurningCompactConfig(951);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    replica->becomeLeader(1, {1, 2});
+    replica->onLeaderLogAppended();
+    PartitionReplica* raw = replica.get();
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(951, 0, std::move(replica));
+    rune::node::LogCleanerAgent cleaner(&registry);
+    Cp9MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    std::atomic<bool> done{false};
+
+    // Cleaner thread — compaction scan (reads HW/role) concurrent with ISR churn.
+    std::thread cleanerThread([&]() {
+        for (int i = 0; !done.load(std::memory_order_relaxed); ++i) {
+            cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+            std::this_thread::yield();
+        }
+    });
+
+    // Duty/single-writer thread: real ISR churn + keyed appends + drains.
+    for (int i = 0; i < 1200; ++i) {
+        const int64_t nowNs = static_cast<int64_t>(i) * 100'000LL;
+
+        duty.doWork(nowNs);
+
+        // Keyed append (rotating keys) so the compaction dirty range keeps growing.
+        auto b = cp9Batch(off, "key" + std::to_string(i % 6),
+                          "nv" + std::to_string(i), oldTs);
+        off = raw->append(b, off);
+
+        if ((i & 7) == 0) {
+            FetchRequestMsg fr{};
+            fr.leaderEpoch = 1;
+            fr.partition   = 0;
+            fr.followerId  = 2;
+            fr.fetchOffset = off;
+            fr.maxBytes    = 0;
+            fr.topicId     = 951;
+            raw->onFetchRequest(fr, nowNs);
+        }
+        if ((i % 400) == 0) std::this_thread::yield(); // give the cleaner airtime
+    }
+
+    done.store(true, std::memory_order_relaxed);
+    cleanerThread.join();
+
+    // Drain to quiescence on the writer thread.
+    for (int i = 0; i < 10; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 100) * 1'000'000LL);
+        log.drainRetentionDeletes();
+        log.drainCleanerSwaps();
+    }
+
+    const int segsAfter = countLogSegments(dir);
+    EXPECT_GE(segsAfter, 1) << "At least active segment must remain";
+
+    auto bases = log.segmentBaseOffsets();
+    for (size_t i = 1; i < bases.size(); ++i) {
+        EXPECT_LT(bases[i-1], bases[i])
+            << "Segment bases must be strictly ascending after concurrent compaction";
     }
 
     fs::remove_all(dir);
