@@ -5,12 +5,14 @@ add_library(rune_node
     src/TransactionCoordinationService.cpp)
 
 target_include_directories(rune_node PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${RUNE_PROTOCOL_INCLUDE})
 
 # BrokerNode needs: consensus engine, gateway (BR-7a), replication (GR-2/GR-3), Aeron, spdlog
 # rune_coordination: GroupCoordinator + ReplicatedOffsetStore (CG-3)
 # rune_transaction: TransactionCoordinator + ReplicatedTxnStateStore (TX-3)
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction)
+# rune_metadata_msm: MetadataStateMachine (MD1 Task 4)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -133,6 +135,29 @@ if(BUILD_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_txn_state_replication_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
+    # tests — 5 test cases:
+    #   1. SingleNode: HW-gated visibility.
+    #   2. 3-node: majority-HW visibility on all followers.
+    #   3. Restart: snapshot + replay yields identical map.
+    #   4. Apply off request path: no lock stall.
+    #   5. Metadata replica role follows cluster leadership.
+    #
+    # Uses InMemoryTransport (no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_metadata_replication_tests
+        tests/integration/MetadataReplicationTest.cpp)
+    target_include_directories(rune_metadata_replication_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_metadata_replication_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_metadata_replication_tests
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------

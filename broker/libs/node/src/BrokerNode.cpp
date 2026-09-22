@@ -18,6 +18,8 @@
 // TX-3 wiring: transaction coordination service + replicated state store.
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
+// MD1 Task 4: MetadataService for __cluster_metadata.
+#include <rune/node/MetadataService.h>
 
 namespace fs = std::filesystem;
 using namespace rune::consensus;
@@ -794,6 +796,109 @@ void BrokerNode::buildGateway() {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // MD1 Task 4: Build MetadataService + replicated __cluster_metadata log.
+    //
+    // Mirrors the GroupCoordinationService / TransactionCoordinationService
+    // wiring above.  topicId=-3 is the sentinel for __cluster_metadata
+    // (offsets=-1, txn=-2).
+    //
+    // FINDING-1: the metadata partition's OWN leadership follows
+    // cluster-consensus leadership, NOT the assignment map.  We register
+    // metadataReplica_ in replicaRegistry_ so the existing
+    // ReplicationMetadataBridge drives its leader/follower role from cluster
+    // leadership automatically.  Do NOT try to make the metadata partition
+    // follow the assignment map.
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   runtimeAgent_ → metadataService_ → metadataReplica_ (in registry)
+    //   → metadataLog_ → …
+    // -----------------------------------------------------------------------
+    if (gateway_) {
+        try {
+            const fs::path metaDir = fs::path{config_.dataDir} / "__cluster_metadata";
+            fs::create_directories(metaDir);
+
+            metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string());
+            metadataLog_->recover();
+
+            const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+            std::vector<NodeId> allNodeIds;
+            allNodeIds.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                allNodeIds.push_back(static_cast<NodeId>(peer.id));
+            }
+
+            rune::replication::PartitionConfig mcfg;
+            mcfg.topicId              = -3;   // sentinel: __cluster_metadata
+            mcfg.partitionId          = 0;
+            mcfg.selfId               = selfId;
+            // minIsr=1: metadata records are leader-local in Phase 1 (same as
+            // offsets).  A later task may raise this once multi-node assignment
+            // is wired end-to-end.
+            mcfg.minIsr               = 1;
+            mcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            mcfg.replicaLagMaxOffset  = 10'000;
+            mcfg.fetchIntervalNs      = 5'000'000LL;
+            mcfg.isrCheckIntervalNs   = 10'000'000LL;
+            mcfg.maxFetchBytes        = 1 << 20;
+            // __cluster_metadata: compacted log (keep latest assignment per key).
+            mcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            mcfg.minCleanableDirtyRatio = 0.5;
+            mcfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
+            mcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
+
+            // Transport: real Aeron transport if available, else no-op InMemoryTransport.
+            rune::replication::PartitionTransport* metaTransport = replTransport_.get();
+            if (!metaTransport) {
+                nullTransports_.push_back(
+                    std::make_unique<rune::replication::InMemoryTransport>());
+                metaTransport = nullTransports_.back().get();
+            }
+
+            metadataReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                mcfg,
+                rune::replication::Role::Follower, // bridge promotes on first doWork
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                metadataLog_.get(),
+                metaTransport);
+
+            // Register with Aeron transport (topicId=-3, partitionId=0).
+            if (replTransport_) {
+                replTransport_->registerReplica(-3, 0, metadataReplica_.get());
+            }
+
+            // Add to replicaRegistry_ so the metadata bridge drives role
+            // transitions and NodeRuntimeAgent::doWork calls replica->doWork.
+            if (replicaRegistry_) {
+                replicaRegistry_->add(-3, 0, std::move(metadataReplica_));
+                metadataReplica_.reset(); // ownership transferred to registry
+            }
+
+            // Re-acquire raw pointer for MetadataService construction.
+            rune::replication::PartitionReplica* metaReplicaRaw =
+                replicaRegistry_ ? replicaRegistry_->lookup(-3, 0) : nullptr;
+
+            // MetadataService: applies committed records on doWork; exposes assignment().
+            metadataService_ = std::make_unique<MetadataService>(
+                metaReplicaRaw, nodeId);
+            // Rebuild any previously committed assignments from the local Log.
+            metadataService_->rebuildFromLog();
+
+            spdlog::info("BrokerNode[{}]: MetadataService wired (__cluster_metadata at {})",
+                         nodeId, metaDir.string());
+        } catch (const std::exception& ex) {
+            spdlog::error("BrokerNode[{}]: MetadataService setup failed: {}; "
+                          "cluster metadata will not be tracked", nodeId, ex.what());
+            metadataService_.reset();
+            metadataReplica_.reset();
+            metadataLog_.reset();
+        }
+    }
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
@@ -809,7 +914,8 @@ void BrokerNode::buildGateway() {
         replicaRegistry_.get(),   // GR-3: replica registry (may be null if no topics)
         gateway_.get(),
         groupCoordService_.get(), // CG-6: group coordinator (null-safe if setup failed)
-        txnCoordService_.get());  // TX-3: txn coordinator (null-safe if setup failed)
+        txnCoordService_.get(),   // TX-3: txn coordinator (null-safe if setup failed)
+        metadataService_.get());  // MD1: metadata service (null-safe if setup failed)
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
@@ -1048,6 +1154,10 @@ void BrokerNode::stop() {
     // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
     groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
+    // MD1 Task 4: destroy metadata service before replicaRegistry_.
+    metadataService_.reset(); // MetadataService (holds raw ptr to metadata replica in registry)
+    metadataReplica_.reset(); // no-op: ownership transferred to replicaRegistry_ in buildGateway
+    metadataLog_.reset();     // Log for __cluster_metadata (file flush on dtor)
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
     txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
     txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway

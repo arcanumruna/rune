@@ -29,6 +29,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/node/MetadataService.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -185,6 +186,14 @@ public:
         return gateway_.get();
     }
 
+    /// Test-only: return the MetadataService (for assignment() queries in tests).
+    /// Non-null after start() if metadata service construction succeeded.
+    /// NOT safe for concurrent use — call only when duty cycle is between
+    /// doWork calls or when the node is stopped.
+    MetadataService* metadataServiceForTest() const noexcept {
+        return metadataService_.get();
+    }
+
     /// Test-only: return the I/O throttle rate wired into the LogCleanerAgent.
     /// -1 = unlimited.  Valid after start().  Used by CP-10 Fix-1 wiring test.
     [[nodiscard]] int64_t cleanerThrottleRateForTest() const noexcept {
@@ -296,6 +305,26 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>            txnReplica_;
     std::unique_ptr<rune::transaction::ReplicatedTxnStateStore>     txnState_;
     std::unique_ptr<TransactionCoordinationService>                 txnCoordService_;
+
+    // -----------------------------------------------------------------------
+    // Cluster metadata (MD1 wiring — created in buildGateway()).
+    // metadataLog_     — durable Log for __cluster_metadata (one partition).
+    // metadataReplica_ — PartitionReplica wrapping the metadata Log.
+    //                    Registered in ReplicaRegistry so the bridge drives
+    //                    its leader/follower role from cluster leadership
+    //                    (FINDING-1: DO NOT follow the assignment map).
+    // metadataService_ — MetadataService: applies committed records on doWork,
+    //                    exposes assignment(topicId, partition).
+    //
+    // topicId=-3 is the sentinel for __cluster_metadata (offsets=-1, txn=-2).
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   runtimeAgent_ → metadataService_ → metadataReplica_ (in registry)
+    //   → metadataLog_ → …
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::storage::Log>                   metadataLog_;
+    std::unique_ptr<rune::replication::PartitionReplica>  metadataReplica_;
+    std::unique_ptr<MetadataService>                      metadataService_;
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;

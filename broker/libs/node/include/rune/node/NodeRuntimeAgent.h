@@ -29,6 +29,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/node/MetadataService.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -71,15 +72,18 @@ public:
     // @param registry        ReplicaRegistry (may be nullptr). Non-owning.
     // @param gateway         ClientGateway pointer (may be null). Non-owning.
     // @param groupService    GroupCoordinationService pointer (may be null). Non-owning.
-    // @param txnService      TransactionCoordinationService pointer (may be null). Non-owning.
+    // @param txnService        TransactionCoordinationService pointer (may be null). Non-owning.
+    // @param metadataService   MetadataService pointer (may be null). Non-owning.
+    //                          MD1 Task 4: drives MSM apply loop + routing-image publish.
     NodeRuntimeAgent(rune::consensus::Agent&            consensusAgent,
                      rune::consensus::Election*          election,
                      ReplicationMetadataBridge*          bridge,
                      rune::replication::AeronPartitionTransport* transport,
                      ReplicaRegistry*                    registry,
                      rune::gateway::ClientGateway*       gateway,
-                     GroupCoordinationService*           groupService = nullptr,
-                     TransactionCoordinationService*     txnService   = nullptr) noexcept
+                     GroupCoordinationService*           groupService    = nullptr,
+                     TransactionCoordinationService*     txnService      = nullptr,
+                     MetadataService*                    metadataService = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(election)
         , bridge_(bridge)
@@ -88,13 +92,15 @@ public:
         , gateway_(gateway)
         , groupService_(groupService)
         , txnService_(txnService)
+        , metadataService_(metadataService)
     {}
 
     // Backward-compatible constructor for single-node / tests without replication.
     NodeRuntimeAgent(rune::consensus::Agent&        consensusAgent,
                      rune::gateway::ClientGateway*  gateway,
-                     GroupCoordinationService*      groupService = nullptr,
-                     TransactionCoordinationService* txnService  = nullptr) noexcept
+                     GroupCoordinationService*      groupService    = nullptr,
+                     TransactionCoordinationService* txnService     = nullptr,
+                     MetadataService*                metadataService = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(nullptr)
         , bridge_(nullptr)
@@ -103,6 +109,7 @@ public:
         , gateway_(gateway)
         , groupService_(groupService)
         , txnService_(txnService)
+        , metadataService_(metadataService)
     {}
 
     NodeRuntimeAgent(const NodeRuntimeAgent&)            = delete;
@@ -123,6 +130,16 @@ public:
             const rune::replication::Epoch epoch =
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
             work += bridge_->doWork(lid, epoch);
+        }
+
+        // 2b. Metadata service — apply committed assignment records.
+        //     MD1 Task 4: drives MetadataStateMachine apply loop.
+        //     Runs right after the bridge so the replica's role is already
+        //     correct before we check highWatermark() (leader vs follower gate).
+        //     FINDING-1: the metadata replica's role is driven by cluster
+        //     leadership (bridge), NOT the assignment map — this is correct.
+        if (metadataService_) {
+            work += metadataService_->doWork(nowNs);
         }
 
         // 3. Group coordination service — drive after bridge (sees current leadership).
@@ -335,8 +352,9 @@ private:
     rune::replication::AeronPartitionTransport*        transport_;  // non-owning; null-safe
     ReplicaRegistry*                                   registry_;   // non-owning; null-safe
     rune::gateway::ClientGateway*                      gateway_;    // non-owning; null-safe
-    GroupCoordinationService*                          groupService_; // non-owning; null-safe (CG-3)
-    TransactionCoordinationService*                    txnService_;   // non-owning; null-safe (TX-3)
+    GroupCoordinationService*                          groupService_;    // non-owning; null-safe (CG-3)
+    TransactionCoordinationService*                    txnService_;      // non-owning; null-safe (TX-3)
+    MetadataService*                                   metadataService_; // non-owning; null-safe (MD1)
 };
 
 } // namespace rune::node
