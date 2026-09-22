@@ -79,6 +79,13 @@ if(BUILD_PING_PROBE)
 endif()
 
 if(BUILD_BENCHMARKS)
+    # ── RoutingImageBench — standalone (header-only dep, fast to build) ─────────
+    add_executable(RoutingImageBench
+        benchmark/RoutingImageBench.cpp)
+    target_link_libraries(RoutingImageBench PRIVATE
+        rune_metadata
+        benchmark::benchmark_main)
+
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp
         benchmark/StorageBenchmark.cpp
@@ -104,7 +111,8 @@ if(BUILD_BENCHMARKS)
         benchmark/ProduceMajorityAckBench.cpp
         benchmark/GroupCoordinationBench.cpp
         benchmark/CompactionBenchmark.cpp
-        benchmark/MetadataApplyBench.cpp)
+        benchmark/MetadataApplyBench.cpp
+        benchmark/RoutingImageBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
