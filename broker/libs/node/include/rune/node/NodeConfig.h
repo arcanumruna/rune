@@ -130,6 +130,14 @@ struct NodeConfig {
     // Also forwarded to PartitionConfig::minIsr in buildReplication().
     int32_t gatewayMinIsr = 1;
 
+    // CP-8: enable segment coalescing in the LogCleanerAgent.
+    // When true (default), consecutive sealed segments that together fit within
+    // each topic's segmentRollBytes are merged into a single output segment per
+    // compaction pass (Kafka parity).  When false, each segment is compacted
+    // individually (prior behavior — useful for diagnostics or rollback).
+    // Overridable via RUNE_ENABLE_COALESCING env var ("0" or "false" → off).
+    bool enableCompactionCoalescing = true;
+
     /// Returns the peer entry whose id == nodeId.
     /// Precondition: parse succeeded (peers non-empty, nodeId in peers).
     const PeerConfig& self() const;

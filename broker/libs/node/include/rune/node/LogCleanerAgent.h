@@ -448,9 +448,17 @@ public:
             sealedSizes.reserve(best.snap->size());
             for (const auto& si : *best.snap) sealedSizes.push_back(si.sizeBytes);
 
+            // CP-8 per-topic roll: use the replica's own segmentRollBytes as the
+            // coalescing group bound so a topic with a 128-byte roll coalesces to
+            // 128 bytes and a 64 MiB topic coalesces to 64 MiB — not a single
+            // global constant.  Fall back to coalescingRollBytes_ (ctor default)
+            // if the replica returns 0 or negative (safety guard).
+            const int64_t replicaRoll = best.replica->segmentRollBytes();
+            const int64_t groupRollBytes = (replicaRoll > 0) ? replicaRoll : coalescingRollBytes_;
+
             // Compute coalescing groups over ALL sealed segments.
             auto groups = rune::storage::LogCleaner::groupSegmentsBySize(
-                sealedBases, sealedSizes, coalescingRollBytes_);
+                sealedBases, sealedSizes, groupRollBytes);
 
             // Find the group that contains best.segBase.
             const rune::storage::SegmentGroup* chosenGroup = nullptr;

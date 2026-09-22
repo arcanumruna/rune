@@ -101,6 +101,9 @@ struct PartitionConfig {
     // CP-8: compaction lag gates.
     int64_t     minCompactionLagMs     = 0;           ///< CP-8: dirty segment uncleanable if largestTs within lag. Default 0.
     int64_t     maxCompactionLagMs     = -1;          ///< CP-8: force compaction if oldest dirty seg exceeds this age. Default -1=disabled.
+    // CP-8: per-topic segment roll size — used as the coalescing group bound so
+    // each topic coalesces to its own roll threshold, not a global constant.
+    int64_t     segmentRollBytes       = 64LL * 1024 * 1024; ///< CP-8: max combined bytes per coalesced group. Default 64 MiB.
 };
 
 // ---------------------------------------------------------------------------
@@ -349,6 +352,8 @@ public:
     [[nodiscard]] int64_t     minCompactionLagMs()     const noexcept { return cfg_.minCompactionLagMs; }
     /// Force compaction when oldest dirty seg exceeds this age (ms). -1 = disabled.
     [[nodiscard]] int64_t     maxCompactionLagMs()     const noexcept { return cfg_.maxCompactionLagMs; }
+    /// CP-8: per-topic segment roll threshold used as coalescing group bound.
+    [[nodiscard]] int64_t     segmentRollBytes()       const noexcept { return cfg_.segmentRollBytes; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     [[nodiscard]] Offset lastCleanOffset() const noexcept { return lastCleanOffset_; }

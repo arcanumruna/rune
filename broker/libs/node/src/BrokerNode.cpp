@@ -427,6 +427,8 @@ void BrokerNode::buildReplication() {
             // CP-8: compaction lag gates — thread from TopicSpec.
             pcfg.minCompactionLagMs     = spec->minCompactionLagMs;
             pcfg.maxCompactionLagMs     = spec->maxCompactionLagMs;
+            // CP-8: per-topic segment roll bytes for coalescing group bound.
+            pcfg.segmentRollBytes       = spec->segmentRollBytes;
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).
@@ -809,11 +811,22 @@ void BrokerNode::buildGateway() {
     // cycleBudgetBytes default (128 MiB) matches Kafka's default dedupe buffer.
     // -----------------------------------------------------------------------
     if (replicaRegistry_) {
-        cleanerAgent_  = std::make_unique<LogCleanerAgent>(replicaRegistry_.get());
+        // CP-8: enable segment coalescing when config_.enableCompactionCoalescing is true
+        // (default: true for Kafka parity).  The coalescingRollBytes ctor param is kept
+        // as a fallback default (64 MiB); per-topic roll is read from each replica's
+        // segmentRollBytes() at compaction time inside LogCleanerAgent::doWork.
+        cleanerAgent_ = std::make_unique<LogCleanerAgent>(
+            replicaRegistry_.get(),
+            /*cycleBudgetBytes=*/   128LL * 1024 * 1024,
+            /*dedupeBufferBytes=*/  -1,
+            /*ioMaxBytesPerSec=*/   -1,
+            /*useCoalescing=*/      config_.enableCompactionCoalescing,
+            /*coalescingRollBytes=*/64LL * 1024 * 1024);
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
-        spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas)",
-                     nodeId, replicaRegistry_->replicaCount());
+        spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={})",
+                     nodeId, replicaRegistry_->replicaCount(),
+                     config_.enableCompactionCoalescing ? "on" : "off");
     }
 }
 
