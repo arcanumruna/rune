@@ -87,6 +87,9 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
             epochCache_.assign(static_cast<int32_t>(epoch_), /*startOffset=*/0);
         }
     }
+
+    // Seed the cleaner-visible snapshots from the initial state.
+    publishCleanerState();
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +189,10 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // and normal HW serving is never gated — the gate only ever HOLDS when there is
     // a genuine live survivor we still need to hear from / reconcile.
     maybeCompleteLeadership();
+
+    // Publish the new role + served HW so the cleaner observes this node as
+    // Leader (and the gated HW) without reading the live leader/ISR state.
+    publishCleanerState();
 }
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
@@ -235,6 +242,10 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     followerHw_ = 0;
     lastFetchEmitNs_ = 0;
     reconcileTarget_ = -1;
+
+    // Publish the demotion so the cleaner stops treating this node as Leader
+    // (cleanerRole() flips to Follower) — no live-state read on the cleaner.
+    publishCleanerState();
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +271,9 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
     // Leader self-advances HW (leader always in ISR, so majority includes leader).
     recomputeHw();
+
+    // Mirror the advanced HW into the cleaner-visible atomic (release-store).
+    publishCleanerState();
 
     // GR-10: push newly-appended bytes to ISR followers immediately (best-effort).
     // Collapsed to ~RTT from the follower-poll floor.
@@ -299,6 +313,9 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
     recomputeHw();
 
+    // Mirror the advanced HW into the cleaner-visible atomic (release-store).
+    publishCleanerState();
+
     if (cfg_.pushOnAppend) {
         pushToFollowers(baseOffset);
     }
@@ -319,6 +336,9 @@ void PartitionReplica::onLeaderLogAppended() noexcept
     // ISR satisfied the HW advances to cover the newly-appended bytes exactly as
     // it would after append()).
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+
+    // setLeaderLogEndOffset() recomputes HW eagerly — mirror it to the cleaner.
+    publishCleanerState();
 
     // GR-10: push newly-appended bytes to ISR followers immediately (best-effort).
     if (cfg_.pushOnAppend) {
@@ -385,6 +405,10 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         epochProbeEpoch_    = req.leaderEpoch; // epoch we are transitioning INTO
         epochProbeFloor_    = committedHw;      // never truncate below this
         epochProbeAttempts_ = 0;
+
+        // Self-demotion: publish the role change so the cleaner stops treating
+        // this node as Leader (no live-state read on the cleaner thread).
+        publishCleanerState();
 
         FetchResponseMsg::encode(
             encodeScratch_.data(), 0,
@@ -1360,6 +1384,13 @@ int PartitionReplica::doWork(int64_t nowNs)
         }
     }
 
+    // Publish the current served HW + role for the cleaner (release-store).
+    // This is the steady-state publication site: it covers every HW/ISR/
+    // completeness/role change made on this duty tick (ISR shrink/expand,
+    // completeness gate, fetch-driven HW advances) so the cleaner's acquire-load
+    // converges to the current committed HW without ever reading the live state.
+    publishCleanerState();
+
     return work;
 }
 
@@ -1367,7 +1398,11 @@ int PartitionReplica::doWork(int64_t nowNs)
 // Accessors
 // ---------------------------------------------------------------------------
 
-Offset PartitionReplica::highWatermark() const noexcept
+// Pure, side-effect-free computation of the served committed HW.  Does NOT
+// touch lastHealthyHw_ (the mutable floor) — that write is done ONLY by
+// highWatermark() below, on the duty thread.  Reads leaderState_/isrManager_
+// non-atomically → duty-thread only.
+Offset PartitionReplica::computeServedHw() const noexcept
 {
     if (role_ != Role::Leader) {
         return followerHw_;
@@ -1376,52 +1411,56 @@ Offset PartitionReplica::highWatermark() const noexcept
     // Raw majority-of-ISR HW from the leader state (spec §4).
     const Offset rawHw = leaderState_.highWatermark();
 
-    // DR-BUG-6 LEADER-COMPLETENESS GATE.
-    //
-    // While a newly-promoted leader has not yet reconciled up to the majority
-    // committed frontier, HOLD the served committed HW at the pre-failover floor.
-    // This is the fix for the residual DR-8 loss: a data-lagging node elected by
-    // the blind consensus must NOT advertise its own regressed frontier (which
-    // would let the acks=All drain / HW-bounded subscribers observe a view that
-    // MISSES a committed record still held on an up-to-date survivor).  The floor
-    // is exactly the last majority-committed offset captured at failover, so it
-    // never exposes uncommitted data and never regresses below what was already
-    // committed.  Once maybeCompleteLeadership() proves we hold the frontier
-    // (leaderComplete_ == true) the normal min-ISR-gated raw HW is served, which
-    // is >= the floor (monotonic).  A complete leader is the common steady state.
+    // DR-BUG-6 LEADER-COMPLETENESS GATE.  While incomplete, hold the served HW
+    // at the pre-failover floor (see the field comment / becomeLeader).
     if (!leaderComplete_) {
         return completenessFloor_;
     }
 
-    // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.
-    //
-    // computeHw() takes the majority-th highest LEO across the CURRENT ISR.
-    // When the ISR shrinks to a lone minority survivor (|ISR|==1, majority-of-1
-    // == leaderLeo), rawHw jumps to the leader's own LEO — offsets that no real
-    // majority holds.  Exposing that as "committed" would let the acks=All drain
-    // ack it and HW-bounded subscribers (GR-6) read it, only for it to be
-    // truncated on failover.  So: while the ISR is BELOW minIsr, the effective
-    // committed HW must not advance past the last offset committed while the ISR
-    // was healthy.
-    //
-    // lastHealthyHw_ tracks that frozen floor.  It advances (monotonically) only
-    // while |ISR| >= minIsr; below minIsr it is held constant and clamps rawHw.
+    // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.  While the ISR is BELOW
+    // minIsr the effective committed HW must not advance past the last offset
+    // committed while the ISR was healthy (lastHealthyHw_).
     const int minIsr  = (cfg_.minIsr >= 1) ? cfg_.minIsr : 1;
     const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
 
     if (isrSize >= minIsr) {
-        // Healthy ISR: rawHw is a legitimate majority-committed offset.  Advance
-        // the frozen floor and expose the raw HW.
-        if (rawHw > lastHealthyHw_) {
-            lastHealthyHw_ = rawHw;
-        }
-        return rawHw;
+        // Healthy ISR: rawHw is a legitimate majority-committed offset.
+        // (The floor advance to lastHealthyHw_ happens in highWatermark().)
+        return (rawHw > lastHealthyHw_) ? rawHw : lastHealthyHw_;
     }
 
-    // ISR below minIsr: do not advance past the last majority-committed offset.
-    // (rawHw may be at or above lastHealthyHw_ due to the monotonic prevHw_
-    // floor; clamp down to the frozen healthy value.)
+    // ISR below minIsr: clamp down to the frozen healthy value.
     return (rawHw < lastHealthyHw_) ? rawHw : lastHealthyHw_;
+}
+
+Offset PartitionReplica::highWatermark() const noexcept
+{
+    const Offset served = computeServedHw();
+
+    // DR-BUG-3: advance the frozen floor while the ISR is healthy.  This is the
+    // ONLY write to lastHealthyHw_; it is a duty-thread-only side effect.  The
+    // cleaner NEVER calls highWatermark() (it uses cleanerHighWatermark()), so
+    // this write never races with the cleaner thread.
+    if (role_ == Role::Leader && leaderComplete_) {
+        const int minIsr  = (cfg_.minIsr >= 1) ? cfg_.minIsr : 1;
+        const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
+        if (isrSize >= minIsr) {
+            const Offset rawHw = leaderState_.highWatermark();
+            if (rawHw > lastHealthyHw_) lastHealthyHw_ = rawHw;
+        }
+    }
+
+    return served;
+}
+
+// Publish the served HW + role into the cleaner-visible atomics.  DUTY-THREAD
+// ONLY.  Uses computeServedHw() (no lastHealthyHw_ write, no floor mutation) so
+// publication itself is a pure read of already-duty-owned state; the release
+// store makes it visible to the cleaner's acquire load.
+void PartitionReplica::publishCleanerState() noexcept
+{
+    publishedHwForCleaner_.store(computeServedHw(), std::memory_order_release);
+    publishedRoleForCleaner_.store(static_cast<int>(role_), std::memory_order_release);
 }
 
 const std::vector<NodeId>& PartitionReplica::isr() const noexcept

@@ -38,6 +38,7 @@
 // log buffers.
 // ---------------------------------------------------------------------------
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -337,6 +338,37 @@ public:
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return log_->logEndOffset(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
+
+    // -----------------------------------------------------------------------
+    // CLEANER-THREAD-SAFE SNAPSHOTS (TSan race fix — see publishCleanerState()).
+    //
+    // The LogCleanerAgent runs on its OWN thread (cleanerRunner_) concurrently
+    // with the duty/append thread (NodeRuntimeAgent on agentRunner_).  It MUST
+    // NOT read the live leader/ISR state (leaderState_, isrManager_->isr(),
+    // leaderComplete_, lastHealthyHw_, role_) — those are mutated by the duty
+    // thread without synchronisation (torn std::vector reads, non-atomic scalar
+    // writes → UB, TSan-proven).
+    //
+    // Instead the duty thread PUBLISHES a snapshot of the served HW and the role
+    // to these atomics (release-store) whenever they change, and the cleaner
+    // READS them (acquire-load).  A slightly-stale HW/role is always SAFE for
+    // compaction/retention: both operate strictly BELOW a conservative HW, and
+    // a demoted-but-not-yet-observed leader simply does one extra harmless
+    // pure-file cycle that is dropped (the swap/delete rings are drained by the
+    // append thread which is authoritative).  The duty/append HW semantics are
+    // completely unchanged; this only mirrors the value into an atomic.
+    //
+    // cleanerHighWatermark(): the served committed HW as of the last duty-thread
+    //   publication.  Monotone-ish (tracks highWatermark()); the cleaner uses it
+    //   as the conservative firstUncleanable / retention upper bound.
+    // cleanerRole(): the role as of the last duty-thread publication.  The
+    //   cleaner gates all work on cleanerRole() == Leader.
+    [[nodiscard]] Offset cleanerHighWatermark() const noexcept {
+        return publishedHwForCleaner_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] Role cleanerRole() const noexcept {
+        return static_cast<Role>(publishedRoleForCleaner_.load(std::memory_order_acquire));
+    }
     [[nodiscard]] int32_t     topicId()        const noexcept { return cfg_.topicId; }
     [[nodiscard]] PartitionId partitionId()    const noexcept { return cfg_.partitionId; }
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
@@ -407,6 +439,21 @@ private:
 
     /// (Leader) Recompute HW from ReplicaLeaderState and propagate to leader ISR.
     void recomputeHw();
+
+    /// Compute the served committed high-watermark WITHOUT mutating any state.
+    ///
+    /// This is the pure, side-effect-free core of highWatermark() (no write to
+    /// the mutable lastHealthyHw_ floor).  Both highWatermark() (which then also
+    /// advances lastHealthyHw_) and publishCleanerState() call it.  Duty-thread
+    /// only (reads leaderState_/isrManager_ non-atomically).
+    [[nodiscard]] Offset computeServedHw() const noexcept;
+
+    /// Publish the current served HW + role into the cleaner-visible atomics
+    /// (release-store).  MUST be called on the DUTY/append thread only, at every
+    /// site that can change the served HW, the ISR, the completeness gate, or the
+    /// role.  The LogCleanerAgent reads these via cleanerHighWatermark() /
+    /// cleanerRole() (acquire-load) so it never touches the live racy state.
+    void publishCleanerState() noexcept;
 
     /// (Leader) Propagate current ISR into ReplicaLeaderState.
     void syncIsrToLeaderState();
@@ -586,6 +633,21 @@ private:
     // last majority-committed offset.  It is monotonic (only advances) and is
     // refreshed on every leader HW read/recompute while the ISR is healthy.
     mutable Offset lastHealthyHw_ = 0;
+
+    // TSan race fix — cleaner-thread-visible snapshots.
+    //
+    // publishedHwForCleaner_:  the served committed HW, mirrored from
+    //   highWatermark()/computeServedHw() by the duty thread via
+    //   publishCleanerState() (release-store).  The LogCleanerAgent reads it via
+    //   cleanerHighWatermark() (acquire-load) as its conservative compaction /
+    //   retention upper bound.  Slightly-stale-but-safe: compaction/retention are
+    //   always below a conservative HW.
+    // publishedRoleForCleaner_:  the role (as int), mirrored the same way.  The
+    //   cleaner gates all work on cleanerRole()==Leader so it never reads role_.
+    //
+    // Both are the ONLY leader/HW/role state the cleaner thread ever observes.
+    std::atomic<Offset> publishedHwForCleaner_{0};
+    std::atomic<int>    publishedRoleForCleaner_{static_cast<int>(Role::Follower)};
 };
 
 // ---------------------------------------------------------------------------

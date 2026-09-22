@@ -53,7 +53,7 @@
 //   re-enqueued next cycle (idempotent retry).  A dropped swap is never lost.
 //
 // Role-change abandon (§3.1):
-//   The cleaner checks replica->role() == Leader BEFORE calling
+//   The cleaner checks replica->cleanerRole() == Leader BEFORE calling
 //   produceCleanedFile().  If the role changed to Follower BEFORE the check, the
 //   segment is not compacted at all.  If the role changes AFTER the file is
 //   produced (a race window we handle safely), we still enqueue the swap — the
@@ -210,7 +210,9 @@ public:
 
         for (auto* replica : registry_->allReplicas()) {
             if (!replica) continue;
-            if (replica->role() != rune::replication::Role::Leader) continue;
+            // TSan race fix: gate on the cleaner-visible role snapshot (atomic
+            // acquire), NOT role() which reads the duty-thread-mutated role_.
+            if (replica->cleanerRole() != rune::replication::Role::Leader) continue;
 
             const auto policy = replica->cleanupPolicy();
             if (policy == rune::replication::CleanupPolicy::Delete) continue;
@@ -223,7 +225,11 @@ public:
             if (!snap || snap->size() < 1) continue;  // need at least one sealed segment
 
             const int64_t firstDirtyOffset = replica->lastCleanOffset();
-            const int64_t hw               = replica->highWatermark();
+            // TSan race fix: use the cleaner-visible HW snapshot (atomic acquire),
+            // NOT highWatermark() which reads leaderState_/isr_/leaderComplete_/
+            // lastHealthyHw_ concurrently with the duty thread.  A slightly-stale
+            // HW is safe: compaction is always bounded strictly below it.
+            const int64_t hw               = replica->cleanerHighWatermark();
 
             // The active segment base is just beyond the last sealed segment.
             // We approximate it from the snapshot: any segment whose base is
@@ -406,8 +412,9 @@ public:
 
         // ---------------------------------------------------------------
         // Phase 3: role-change guard — abort if no longer leader.
+        // TSan race fix: read the cleaner-visible role snapshot (atomic acquire).
         // ---------------------------------------------------------------
-        if (best.replica->role() != rune::replication::Role::Leader) return 0;
+        if (best.replica->cleanerRole() != rune::replication::Role::Leader) return 0;
 
         // ---------------------------------------------------------------
         // Phase 4: compact the segment OFF-THREAD — PURE FILE WORK.
@@ -558,7 +565,7 @@ public:
             // No enqueue is needed since no file was produced; just move the watermark.
             // NOTE: do NOT advance if passEnd == globalDirtyStart (no progress).
             if (passEnd > globalDirtyStart) {
-                if (best.replica->role() == rune::replication::Role::Leader) {
+                if (best.replica->cleanerRole() == rune::replication::Role::Leader) {
                     best.replica->setLastCleanOffset(passEnd);
                     if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
                         it->second->store(passEnd);
@@ -606,7 +613,7 @@ public:
         // Advance lastCleanOffset to passEnd (the bounded-range boundary).
         // When not bounded, passEnd == best.firstUncleanable (== activeBase),
         // which naturally marks the whole dirty range as clean.
-        if (best.replica->role() == rune::replication::Role::Leader) {
+        if (best.replica->cleanerRole() == rune::replication::Role::Leader) {
             best.replica->setLastCleanOffset(passEnd);
             // CP-7: persist the checkpoint to passEnd (not segEnd).
             // Pure file I/O (mmap write + msync); cleaner-thread-safe.
@@ -662,8 +669,9 @@ private:
         for (auto* replica : registry_->allReplicas()) {
             if (!replica) continue;
             // Retention is leader-only (failover-safe: a demoted leader stops
-            // retention because role() != Leader).
-            if (replica->role() != rune::replication::Role::Leader) continue;
+            // retention because cleanerRole() != Leader).
+            // TSan race fix: read the cleaner-visible role snapshot (atomic acquire).
+            if (replica->cleanerRole() != rune::replication::Role::Leader) continue;
 
             const auto policy = replica->cleanupPolicy();
             // Retention applies to Delete and CompactDelete topics only.
@@ -686,7 +694,10 @@ private:
 
             // High-watermark: never delete the active segment or segments that
             // are above (or at) the high-watermark.
-            const int64_t hw = replica->highWatermark();
+            // TSan race fix: use the cleaner-visible HW snapshot (atomic acquire),
+            // NOT highWatermark() (races leaderState_/isr_/leaderComplete_).  A
+            // stale-low HW is safe: retention only deletes strictly below it.
+            const int64_t hw = replica->cleanerHighWatermark();
 
             // Build the list of deletable segments using the three predicates.
             // Active segment = last in the log; we must never delete it.
