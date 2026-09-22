@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // StaticAssignmentEmitTest.cpp — MD1 Task 6: on becoming the metadata-consensus
 // leader, run StaticBalancer::assign() over configured topics and append the
-// resulting assignment records to the replicated metadata log in bounded batches.
+// resulting assignment records to the replicated metadata log.
 //
 // Test cases:
 //   1. SingleLeader_EmitsBalancedAssignmentOnLeaderClaim
@@ -9,26 +9,36 @@
 //      and doWork() fires the emission path, ALL nodes' MSMs show the balanced
 //      + co-located assignment map (co-partition group co-location asserted).
 //
-//   2. Idempotent_NoDoubleEmitOnSameMembership
-//      After the first emission the MSM already has assignments.  Re-running the
-//      leader-claim edge (simulate by calling emitStaticAssignmentIfNeeded()
-//      again) must produce ZERO additional appends — the idempotency guard fires.
+//   2. Idempotent_NoDoubleEmitOnRePromotion
+//      Drive a genuine demotion→re-promotion flap (Leader→Follower→Leader).
+//      After the first emission, demote the replica to Follower (re-arms the
+//      assigned_ / wasLeader_ guards), then promote a fresh MetadataService
+//      over the same already-populated log (restart scenario) and assert that
+//      the second leader-claim produces ZERO additional log entries —
+//      msmAlreadyHasAllAssignments() must fire and suppress re-emission.
+//      The test FAILS if the guard doesn't prevent re-emit.
 //
-//   3. BoundedBatching_LargeTopicSetSplitIntoBatches
-//      64 single-partition topics with batchSize=16 → ≥4 batches emitted, none
-//      exceeding 16 records.  Asserts >1 batch (no single oversized mega-append).
+//   3. OneRecordPerAppend_LargeTopicSetNeverMegaAppend
+//      Real one-record-per-append invariant: emit for 64 single-partition
+//      topics and assert logEndOffset() advanced by EXACTLY 64 (one log entry
+//      per assignment record).  If records were concatenated into a single
+//      mega-append, logEndOffset() would advance by 1 and this test would fail.
 //
 //   4. FollowerDoesNotEmit
 //      A follower MetadataService must NOT call emitStaticAssignmentIfNeeded();
 //      the MSM on a follower stays empty until records replicate.
 //
+//   5. BalancerError_IncrementCounterEmitsNothing
+//      A misconfigured topic set (RF > liveNodes) trips balancerErrorCount()
+//      and leaves the log empty.
+//
 // Dependencies:
-//   - MetadataService::configure(topics, liveNodes, batchSize) — called by
-//     BrokerNode after construction to wire topic+node context into the service.
+//   - MetadataService::configure(topics, liveNodes) — called by BrokerNode
+//     after construction to wire topic+node context into the service.
 //   - MetadataService::emitStaticAssignmentIfNeeded() — internal helper exposed
 //     for test-only inspection; called by doWork() on the Follower→Leader edge.
-//   - MetadataService::emitBatchCount() — test-only counter: total batch appends
-//     performed since last reset; used by test 3.
+//   - MetadataService::balancerErrorCount() — diagnostic counter; incremented
+//     when BalancerError is caught inside emitStaticAssignmentIfNeeded().
 //
 // Uses InMemoryTransport (no Aeron required).
 // NO busy-spin: all waits use bounded drive loops.
@@ -138,7 +148,7 @@ TEST(StaticAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim
     // Build MetadataService for the leader (node1).
     // configure() tells the service which topics + nodes to assign.
     MetadataService svc1(r1.get(), kNode1);
-    svc1.configure(topics, allNodes, /*batchSize=*/64);
+    svc1.configure(topics, allNodes);
 
     // Trigger leader-claim emission:
     // The wasLeader_ gate fires when we first call doWork() as a Leader.
@@ -234,10 +244,16 @@ TEST(StaticAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim
 }
 
 // ===========================================================================
-// Test 2: Idempotency — re-running on the same membership produces no
-//         duplicate/divergent assignment.
+// Test 2: Genuine idempotency via demotion→re-promotion flap.
+//
+// Drives: Leader (emit) → Follower (re-arms guards) → Leader again.
+// The second leader-claim must NOT produce additional log entries because
+// msmAlreadyHasAllAssignments() fires on rebuild from the already-populated log.
+//
+// Failure mode: if the guard is broken, logEndOffset() advances after the
+// second promotion and this test fails.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, Idempotent_NoDoubleEmitOnSameMembership) {
+TEST(StaticAssignmentEmitTest, Idempotent_NoDoubleEmitOnRePromotion) {
     SaeTempDir dir("t2");
     rune::storage::Log log(dir.path);
     log.recover();
@@ -256,29 +272,28 @@ TEST(StaticAssignmentEmitTest, Idempotent_NoDoubleEmitOnSameMembership) {
     };
 
     MetadataService svc(replica.get(), selfId);
-    svc.configure(topics, nodes, /*batchSize=*/64);
+    svc.configure(topics, nodes);
 
     int64_t clock = 0;
 
-    // First doWork: triggers leader claim → emission.
+    // --- First leadership term: emit ---
     clock += 2'000'000LL;
     replica->doWork(clock);
     transport.pump(clock);
-    svc.doWork(clock);
+    svc.doWork(clock);  // Follower→Leader edge: emits records
 
-    // Drive to advance HW.
-    for (int i = 0; i < 50; ++i) {
+    // Drive until all records are committed (HW advances).
+    for (int i = 0; i < 200; ++i) {
         clock += 2'000'000LL;
         replica->doWork(clock);
         transport.pump(clock);
     }
     svc.doWork(clock);
 
-    // Record the LEO after first emission.
     const Offset leoAfterFirst = replica->logEndOffset();
     ASSERT_GT(leoAfterFirst, 0) << "first emission must produce records";
 
-    // Verify assignments are visible.
+    // Verify all assignments are visible.
     for (int p = 0; p < 2; ++p) {
         ASSERT_NE(svc.assignment(0, p), nullptr) << "topic 0 partition " << p << " must be visible";
     }
@@ -286,24 +301,65 @@ TEST(StaticAssignmentEmitTest, Idempotent_NoDoubleEmitOnSameMembership) {
         ASSERT_NE(svc.assignment(1, p), nullptr) << "topic 1 partition " << p << " must be visible";
     }
 
-    // Simulate a second leader-claim edge by calling emitStaticAssignmentIfNeeded()
-    // directly (the idempotency guard must suppress it).
-    svc.emitStaticAssignmentIfNeeded();
+    // --- Demotion: flip replica to Follower (re-arms assigned_ / wasLeader_) ---
+    // becomeFollower() on the replica changes its role; doWork() on the service
+    // will detect !amLeader && wasLeader_ and reset wasLeader_ + assigned_.
+    replica->becomeFollower(/*epoch=*/2, /*leaderId=*/99);
+    svc.doWork(clock);  // service detects demotion, re-arms
 
-    const Offset leoAfterSecond = replica->logEndOffset();
-    EXPECT_EQ(leoAfterFirst, leoAfterSecond)
-        << "second call must not append any new records (idempotency guard)";
+    // Confirm re-arm: wasLeader_ is reset so the next Leader transition will
+    // fire the leader-edge again.
 
-    // Also drive doWork() once more — the wasLeader_ gate should NOT re-fire.
-    svc.doWork(clock);
-    EXPECT_EQ(replica->logEndOffset(), leoAfterFirst)
-        << "doWork() must not re-emit when already assigned (idempotency)";
+    // --- Re-promotion: construct a FRESH MetadataService over the same log ---
+    // This is the most stringent test: a fresh service has no memory of the
+    // first emit.  On becoming leader it calls rebuildFromLog() then
+    // emitStaticAssignmentIfNeeded().  The msmAlreadyHasAllAssignments() guard
+    // must detect the committed records from the first term and skip re-emission.
+    replica->becomeLeader(/*epoch=*/3, /*isr=*/nodes);
+    transport.setLeader(replica.get()); // re-wire transport
+
+    MetadataService svc2(replica.get(), selfId);
+    svc2.configure(topics, nodes);
+
+    clock += 2'000'000LL;
+    replica->doWork(clock);
+    transport.pump(clock);
+    svc2.doWork(clock);  // Follower→Leader edge on the fresh service
+
+    // Drive a few more cycles so any (erroneous) appends could commit.
+    for (int i = 0; i < 50; ++i) {
+        clock += 2'000'000LL;
+        replica->doWork(clock);
+        transport.pump(clock);
+    }
+    svc2.doWork(clock);
+
+    const Offset leoAfterRepromotion = replica->logEndOffset();
+    EXPECT_EQ(leoAfterFirst, leoAfterRepromotion)
+        << "re-promoted service must NOT append any new records "
+           "(msmAlreadyHasAllAssignments guard must fire)";
+
+    // All assignments must still be visible on the new service (built from replay).
+    for (int p = 0; p < 2; ++p) {
+        EXPECT_NE(svc2.assignment(0, p), nullptr) << "topic 0 partition " << p << " must be visible after re-promotion";
+    }
+    for (int p = 0; p < 3; ++p) {
+        EXPECT_NE(svc2.assignment(1, p), nullptr) << "topic 1 partition " << p << " must be visible after re-promotion";
+    }
 }
 
 // ===========================================================================
-// Test 3: Bounded batching — large topic set is split into ≤batchSize batches.
+// Test 3: One-record-per-append invariant — large topic set must NOT become
+//         a single mega-append.
+//
+// Emits for 64 single-partition topics and asserts logEndOffset() advanced by
+// EXACTLY 64 (one log entry per metadata record).
+//
+// Failure mode: if records were concatenated into one mega-append payload,
+// logEndOffset() would advance by 1 (not 64) and this test would fail.
+// This is the discriminating test for the "one append per record" invariant.
 // ===========================================================================
-TEST(StaticAssignmentEmitTest, BoundedBatching_LargeTopicSetSplitIntoBatches) {
+TEST(StaticAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend) {
     SaeTempDir dir("t3");
     rune::storage::Log log(dir.path);
     log.recover();
@@ -316,24 +372,32 @@ TEST(StaticAssignmentEmitTest, BoundedBatching_LargeTopicSetSplitIntoBatches) {
         makeMetaCfg(selfId, 1), Role::Leader, 1, nodes, nodes, &log, &transport);
     transport.setLeader(replica.get());
 
-    // 64 single-partition topics → 64 records total.
-    // With batchSize=16 → at least 4 batches required.
+    // 64 single-partition topics → expect exactly 64 log entries after emission.
+    constexpr int kTopicCount = 64;
     std::vector<TopicSpec> topics;
-    topics.reserve(64);
-    for (int i = 0; i < 64; ++i) {
+    topics.reserve(kTopicCount);
+    for (int i = 0; i < kTopicCount; ++i) {
         topics.push_back(TopicSpec{i, /*partitionCount=*/1, /*rf=*/1, /*coPartitionGroup=*/"", "key"});
     }
 
     MetadataService svc(replica.get(), selfId);
-    svc.configure(topics, nodes, /*batchSize=*/16);
+    svc.configure(topics, nodes);
 
     int64_t clock = 0;
 
-    // Trigger emission.
+    // Trigger emission (Follower→Leader edge).
     clock += 2'000'000LL;
     replica->doWork(clock);
     transport.pump(clock);
     svc.doWork(clock);
+
+    // LEO immediately after append: should be exactly kTopicCount if each record
+    // got its own append call.  If a mega-append was used, this would be 1.
+    const Offset leoAfterEmit = replica->logEndOffset();
+    EXPECT_EQ(leoAfterEmit, static_cast<Offset>(kTopicCount))
+        << "logEndOffset must advance by exactly " << kTopicCount
+        << " (one log entry per assignment record); got " << leoAfterEmit
+        << " — a value of 1 means records were incorrectly mega-appended";
 
     // Drive until all records are committed.
     for (int i = 0; i < kDriveCap; ++i) {
@@ -346,15 +410,14 @@ TEST(StaticAssignmentEmitTest, BoundedBatching_LargeTopicSetSplitIntoBatches) {
     svc.doWork(clock);
 
     // All 64 topics must have assignments.
-    for (int t = 0; t < 64; ++t) {
+    for (int t = 0; t < kTopicCount; ++t) {
         ASSERT_NE(svc.assignment(t, 0), nullptr)
             << "topic " << t << " partition 0 must be assigned";
     }
 
-    // The emit batch count must be > 1 (i.e., NOT a single mega-append).
-    // batchSize=16, 64 records → exactly 4 batches.
-    EXPECT_GE(svc.emitBatchCount(), 4u)
-        << "64 records with batchSize=16 must produce ≥4 batches (bounded batching §14)";
+    // Confirm: HW must equal the number of records (not 1).
+    EXPECT_GE(replica->highWatermark(), static_cast<Offset>(kTopicCount))
+        << "highWatermark must cover all " << kTopicCount << " records";
 }
 
 // ===========================================================================
@@ -381,7 +444,7 @@ TEST(StaticAssignmentEmitTest, FollowerDoesNotEmit) {
     };
 
     MetadataService svc(replica.get(), selfId);
-    svc.configure(topics, nodes, /*batchSize=*/64);
+    svc.configure(topics, nodes);
 
     int64_t clock = 0;
     for (int i = 0; i < 10; ++i) {
@@ -405,4 +468,55 @@ TEST(StaticAssignmentEmitTest, FollowerDoesNotEmit) {
     svc.emitStaticAssignmentIfNeeded();
     EXPECT_EQ(replica->logEndOffset(), 0)
         << "emitStaticAssignmentIfNeeded() on follower must be a no-op";
+}
+
+// ===========================================================================
+// Test 5: BalancerError increments counter and emits nothing.
+//
+// A misconfigured topic set (RF > liveNodes) must:
+//   - NOT append any records to the log.
+//   - Increment balancerErrorCount() by at least 1.
+//
+// Failure mode: if the error is swallowed silently without incrementing the
+// counter, balancerErrorCount() returns 0 and this test fails.
+// ===========================================================================
+TEST(StaticAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
+    SaeTempDir dir("t5");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};  // only 1 node
+    InMemoryTransport transport;
+
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, 1), Role::Leader, 1, nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    // rf=3 but only 1 live node → StaticBalancer must throw BalancerError.
+    std::vector<TopicSpec> topics = {
+        TopicSpec{0, 2, /*rf=*/3, "", "key"},  // RF=3 > 1 node: invalid
+    };
+
+    MetadataService svc(replica.get(), selfId);
+    svc.configure(topics, nodes);
+
+    int64_t clock = 0;
+    clock += 2'000'000LL;
+    replica->doWork(clock);
+    transport.pump(clock);
+    svc.doWork(clock);  // triggers emitStaticAssignmentIfNeeded(); balancer must throw
+
+    // No records must have been appended.
+    EXPECT_EQ(replica->logEndOffset(), 0)
+        << "no assignment records must be appended when BalancerError is thrown";
+
+    // The error counter must be non-zero.
+    EXPECT_GT(svc.balancerErrorCount(), 0u)
+        << "balancerErrorCount() must be non-zero after a BalancerError "
+           "(verify StaticBalancer throws for RF > liveNodes)";
+
+    // MSM must remain empty.
+    EXPECT_EQ(svc.assignment(0, 0), nullptr)
+        << "assignment must be absent when balancer threw an error";
 }

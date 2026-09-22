@@ -916,11 +916,10 @@ void BrokerNode::buildGateway() {
                 for (const auto nid : allNodeIds) {
                     balancerNodes.push_back(static_cast<rune::metadata::NodeId>(nid));
                 }
-                metadataService_->configure(
-                    balancerTopics, balancerNodes, /*batchSize=*/256);
+                metadataService_->configure(balancerTopics, balancerNodes);
                 spdlog::info(
                     "BrokerNode[{}]: MetadataService configured for assignment emit "
-                    "({} user topics, {} nodes, batchSize=256)",
+                    "({} user topics, {} nodes)",
                     nodeId, balancerTopics.size(), balancerNodes.size());
             }
 

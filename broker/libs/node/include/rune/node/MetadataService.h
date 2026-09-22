@@ -34,15 +34,19 @@
 //   drive its own replica's role.
 //
 // MD1 Task 6 — Controller emits static assignment on leader claim:
-//   - configure(topics, liveNodes, batchSize): supplies the topic + node
-//     context for StaticBalancer::assign().  Must be called before start().
+//   - configure(topics, liveNodes): supplies the topic + node context for
+//     StaticBalancer::assign().  Must be called before start().
 //   - emitStaticAssignmentIfNeeded(): called by doWork() on the Follower→Leader
-//     edge.  Runs StaticBalancer::assign() and appends records to replica_ in
-//     bounded batches (batchSize records per append call).
+//     edge.  Runs StaticBalancer::assign() and appends one record per
+//     replica_->append() call — each metadata record occupies its own log slot.
+//     This is the ONLY correct design: concatenating N encoded records into one
+//     payload would cause only the first record to be decoded on replay.
 //     Idempotency: if the MSM already has assignments for ALL user topics in
 //     topics_, emitting is skipped.  The "assigned_" flag latches after the
 //     first successful emit so re-observing leadership is also a no-op.
-//   - emitBatchCount(): test-only counter of total batch appends performed.
+//   - balancerErrorCount(): error counter; incremented when BalancerError is
+//     caught (misconfigured group, RF > nodes, etc.).  Non-zero = silent failure;
+//     use this to detect bad config in tests or monitoring.
 //
 // Only USER topics (topicId >= 0) are assigned.
 // Internal partitions (__cluster_metadata=-3, __consumer_offsets=-1,
@@ -97,13 +101,11 @@ public:
     ///                    filtered out automatically).
     /// @param liveNodes   Live broker NodeIds (sorted ascending internally by
     ///                    StaticBalancer::assign).
-    /// @param batchSize   Maximum number of assignment records per append call
-    ///                    (Kafka parity §14: bounded batching).  Default 256.
     ///
     /// Must be called on the duty-cycle thread before start().
     void configure(const std::vector<rune::metadata::TopicSpec>& topics,
                    const std::vector<rune::metadata::NodeId>&    liveNodes,
-                   int32_t batchSize = 256)
+                   int32_t /*batchSize_unused*/ = 256)
     {
         // Filter: only user topics (topicId >= 0).
         configuredTopics_.clear();
@@ -113,10 +115,8 @@ public:
                 configuredTopics_.push_back(ts);
             }
         }
-        liveNodes_   = liveNodes;
-        batchSize_   = (batchSize > 0) ? batchSize : 256;
-        assigned_    = false;
-        emitBatches_ = 0;
+        liveNodes_ = liveNodes;
+        assigned_  = false;
     }
 
     /// Emit static assignment records to the metadata log if needed.
@@ -124,7 +124,8 @@ public:
     /// This is the leader-claim action.  It:
     ///   1. Checks the idempotency guard (assigned_ flag + MSM already-has-all).
     ///   2. Runs StaticBalancer::assign(configuredTopics_, liveNodes_).
-    ///   3. Appends records in bounded batches of batchSize_ records each.
+    ///   3. Appends one record per replica_->append() call — each metadata record
+    ///      occupies its own log slot (the ONLY correct design; see comment below).
     ///
     /// No-op if:
     ///   - This replica is not the Leader.
@@ -155,9 +156,11 @@ public:
             records = rune::metadata::StaticBalancer::assign(configuredTopics_, liveNodes_);
         } catch (const rune::metadata::BalancerError& ex) {
             // Balancer validation failure (e.g. RF > nodes, co-partition mismatch).
-            // Log and skip — do NOT crash the duty-cycle.  This should not happen
-            // in production when config is validated at startup.
+            // Increment the error counter so callers / tests can detect silent failure.
+            // Do NOT crash the duty-cycle — this must not happen in production when
+            // config is validated at startup.
             (void)ex;
+            ++balancerErrors_;
             return;
         }
 
@@ -168,52 +171,43 @@ public:
 
         // Encode + append records to the metadata log.
         //
-        // Kafka §14 bounded-batching parity:
+        // One-record-per-append invariant (required by the read path):
         //   Each replica_->append() stores its payload as the VALUE of exactly
         //   ONE log record (one RecordBatch entry on disk).  Concatenating N
-        //   metadata records' bytes into one payload would make them all look
-        //   like ONE apply() call in doWork(), causing all but the first record
-        //   to be silently ignored.  Therefore we call append() once PER metadata
-        //   record so each record occupies its own log slot.
+        //   metadata records' bytes into a single payload would make all N look
+        //   like ONE apply() call in doWork() — only the first record would be
+        //   decoded; the rest would be silently ignored.  Therefore we MUST call
+        //   append() exactly once per metadata record so each occupies its own
+        //   log slot and advances logEndOffset() by exactly 1.
         //
-        //   The "bounded batch" invariant is tracked at the GROUP level: every
-        //   batchSize_ consecutive appends constitute one "batch".  This ensures
-        //   the emit is split into ≥ ceil(N/batchSize_) observable groups, none
-        //   of which is an unbounded atomic write.  emitBatches_ counts groups,
-        //   not individual appends.
-        //
-        // Per-record encode buffer.  Max: prefix(3) + topicId(4) + partition(4)
-        // + leaderNode(4) + isr(2+n*4) + leaderEpoch(4) + partitionEpoch(4)
-        // + replicas(2+n*4).  With 1024 nodes RF≤1024 per side: ~8.2 KiB.
+        // Per-record encode buffer.
+        //   Max size: prefix(3) + topicId(4) + partition(4) + leaderNode(4)
+        //   + isr(2+n*4) + leaderEpoch(4) + partitionEpoch(4) + replicas(2+n*4).
+        //   With RF≤1024 per side: ~8.2 KiB.  The 16 KiB stack buffer bounds
+        //   per-record size for Phase-1 scale.  A record that encodes larger
+        //   than kEncBufSize (very large ISR/replica array) returns n==0 and is
+        //   skipped — flagged for a future guard that adds a hard startup check.
         static constexpr std::size_t kEncBufSize = 16 * 1024;
         uint8_t encBuf[kEncBufSize];
 
-        const std::size_t total = records.size();
-        const auto batchSz = static_cast<std::size_t>(batchSize_);
-
-        for (std::size_t idx = 0; idx < total; ++idx) {
-            const auto& br = records[idx];
+        for (const auto& br : records) {
             const std::size_t n = br.rec.encode(encBuf, kEncBufSize);
-            if (n == 0) continue; // should not happen for valid records
+            if (n == 0) continue; // encode overflow (should not occur at Phase-1 scale)
 
             replica_->append(
                 std::span<const uint8_t>(encBuf, n),
                 /*acksAll=*/false);
-
-            // Increment batch counter at every batchSize_-th record boundary.
-            // (First record at idx=0 starts batch 1.)
-            if (idx % batchSz == 0) {
-                ++emitBatches_;
-            }
         }
 
         assigned_ = true;
     }
 
     // -----------------------------------------------------------------------
-    // Test-only: number of batch appends performed by emitStaticAssignmentIfNeeded().
+    // Test-only / diagnostic: error counter for BalancerError catch path.
+    // Non-zero indicates a misconfigured topic set (RF > nodes, co-partition
+    // mismatch, etc.) — no assignment was emitted when this is non-zero.
     // -----------------------------------------------------------------------
-    [[nodiscard]] std::size_t emitBatchCount() const noexcept { return emitBatches_; }
+    [[nodiscard]] uint64_t balancerErrorCount() const noexcept { return balancerErrors_; }
 
     // -----------------------------------------------------------------------
     // Duty-cycle entry point (single-writer thread)
@@ -463,13 +457,10 @@ private:
     std::vector<rune::metadata::TopicSpec>  configuredTopics_;
     /// Live node IDs for the balancer.
     std::vector<rune::metadata::NodeId>     liveNodes_;
-    /// Max records per batch append (Kafka §14 bounded batching).
-    int32_t batchSize_ = 256;
     /// Idempotency latch: true after the first successful emit.
     bool assigned_ = false;
-    /// Test-only counter: total batch group boundaries crossed during emit.
-    /// Incremented at every batchSize_-th record (idx % batchSize_ == 0).
-    std::size_t emitBatches_ = 0;
+    /// Error counter: incremented when BalancerError is caught.
+    uint64_t balancerErrors_ = 0;
 };
 
 } // namespace rune::node
