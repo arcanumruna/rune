@@ -73,6 +73,16 @@ struct TopicSpec {
     // CP-8: shared I/O throttler budget (bytes/sec across all cleaner threads).
     //   Default -1 = unlimited — same as Kafka.
     int64_t       ioMaxBytesPerSecond     = -1;
+
+    // CP-9: retention scheduler cadence + async-delete delay.
+    // retentionCheckMs: how often the cleaner runs retention (ms).
+    //   Default 300000 (5 min) = Kafka default.  Tests set 1.
+    int64_t       retentionCheckMs        = 300'000LL;
+    // fileDeleteDelayMs: delay (ms) before .deleted files are physically removed.
+    //   Default 60000 (1 min) = Kafka default.  Tests set 1.
+    int64_t       fileDeleteDelayMs       = 60'000LL;
+    // logStartOffset: delete segments entirely below this offset.  0 = disabled.
+    int64_t       logStartOffset          = 0;
 };
 
 struct PeerConfig {

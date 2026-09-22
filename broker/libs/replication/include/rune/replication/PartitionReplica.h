@@ -104,6 +104,12 @@ struct PartitionConfig {
     // CP-8: per-topic segment roll size — used as the coalescing group bound so
     // each topic coalesces to its own roll threshold, not a global constant.
     int64_t     segmentRollBytes       = 64LL * 1024 * 1024; ///< CP-8: max combined bytes per coalesced group. Default 64 MiB.
+    // CP-9: retention scheduler cadence + async-delete delay.
+    int64_t     retentionCheckMs       = 300'000LL;   ///< CP-9: how often to run retention (ms). Default 5 min (Kafka). 1 for tests.
+    int64_t     fileDeleteDelayMs      = 60'000LL;    ///< CP-9: ms before .deleted files are physically removed. Default 1 min.
+    // CP-9: log-start-offset retention — delete segments entirely below this offset.
+    // 0 = disabled (no log-start-offset deletion).
+    int64_t     logStartOffset         = 0;           ///< CP-9: lower bound; segs entirely below here are deleted. 0=disabled.
 };
 
 // ---------------------------------------------------------------------------
@@ -354,6 +360,13 @@ public:
     [[nodiscard]] int64_t     maxCompactionLagMs()     const noexcept { return cfg_.maxCompactionLagMs; }
     /// CP-8: per-topic segment roll threshold used as coalescing group bound.
     [[nodiscard]] int64_t     segmentRollBytes()       const noexcept { return cfg_.segmentRollBytes; }
+    // CP-9: retention scheduler + async-delete config.
+    /// How often (ms) the cleaner runs retention. Default 5 min.
+    [[nodiscard]] int64_t     retentionCheckMs()       const noexcept { return cfg_.retentionCheckMs; }
+    /// Delay (ms) before a .deleted file is physically removed. Default 1 min.
+    [[nodiscard]] int64_t     fileDeleteDelayMs()      const noexcept { return cfg_.fileDeleteDelayMs; }
+    /// Log-start-offset: segments entirely below this are deleted. 0 = disabled.
+    [[nodiscard]] int64_t     logStartOffset()         const noexcept { return cfg_.logStartOffset; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     [[nodiscard]] Offset lastCleanOffset() const noexcept { return lastCleanOffset_; }
