@@ -60,6 +60,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ReadCommittedView.h>
+#include <rune/metadata/RoutingImage.h>
 
 #include <array>
 #include <atomic>
@@ -218,6 +219,38 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] rune::gateway::ITxnRequestHandler* txnService() const noexcept {
         return txnService_;
+    }
+
+    // -----------------------------------------------------------------------
+    // MD1 Task 9: Per-partition routing image.
+    //
+    // setRoutingImageSnapshot — install a new routing image snapshot.
+    // Called from BrokerNode::buildGateway() and MetadataService on every
+    // duty cycle when the routing image is updated.
+    //
+    // The snapshot is a shared_ptr captured ONCE per duty cycle (capture-once
+    // discipline) inside handleProduce / handleSubscribe / doWork.  The caller
+    // MUST call this from the duty-cycle thread (single-writer).
+    //
+    // setNodeEndpointMap — wire in the nodeId → client endpoint map.
+    // Maps each peer's nodeId to its clientChannel string
+    // (e.g. "aeron:udp?endpoint=host:port").  Built from NodeConfig::peers.
+    // Must be called before doWork() if per-partition routing is desired.
+    // May be empty (no-op for routing — falls back to NotLeader error).
+    // -----------------------------------------------------------------------
+    void setRoutingImageSnapshot(
+            std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
+        routingImage_ = std::move(img);
+    }
+
+    [[nodiscard]]
+    const rune::metadata::RoutingImage* routingImage() const noexcept {
+        return routingImage_.get();
+    }
+
+    void setNodeEndpointMap(
+            std::unordered_map<int32_t, std::string> nodeEndpoints) noexcept {
+        nodeEndpointMap_ = std::move(nodeEndpoints);
     }
 
     // -----------------------------------------------------------------------
@@ -674,6 +707,23 @@ private:
     // (TransactionCoordinationService) lives in rune_node — no circular dependency.
     // Single-writer: only accessed on the duty-cycle thread.
     rune::gateway::ITxnRequestHandler* txnService_ = nullptr;
+
+    // MD1 Task 9: Per-partition RoutingImage (capture-once per duty cycle).
+    //
+    // routingImage_: the current routing image snapshot, captured once at the
+    //   start of doWork() (or set directly by tests via setRoutingImageSnapshot).
+    //   All per-produce/subscribe lookup() calls use this raw pointer (no
+    //   atomic_load per produce — the single capture-once discipline ensures
+    //   zero per-produce lock/alloc on Apple libc++ and Linux alike).
+    //   Null until the first MetadataService emit (or test injection).
+    //
+    // nodeEndpointMap_: maps nodeId → client endpoint string for REDIRECT.
+    //   Built from NodeConfig::peers in BrokerNode::buildGateway().
+    //   Immutable after construction; single-writer (duty-cycle thread).
+    //   Keyed by int32_t nodeId; value is the "aeron:udp?endpoint=…" string.
+    //   Empty until wired in (no routing image = no redirects).
+    std::shared_ptr<const rune::metadata::RoutingImage> routingImage_;
+    std::unordered_map<int32_t, std::string>             nodeEndpointMap_;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;

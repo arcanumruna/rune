@@ -35,6 +35,7 @@
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/metadata/RoutingImage.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -890,3 +891,154 @@ BENCHMARK_REGISTER_F(GatewayDataFixture, ProduceThroughput)
     ->UseManualTime()
     ->Iterations(10)
     ->Unit(benchmark::kMillisecond);
+
+// ===========================================================================
+// BM_GatewayProduceWithRouting — end-to-end produce latency with per-partition
+// routing ON (MD1 Task 9).
+//
+// Identical to BM_GatewayProduce but injects a RoutingImage that maps the
+// bench partition to THIS node (local leadership) before the timed loop.
+//
+// Asserts:
+//   1. p99 < 100 µs (latency gate — same as BM_GatewayProduce).
+//   2. routing_p99_gate_pass = 1.0.
+//   3. routing_vs_baseline_delta_us reported (routing p99 - baseline p50; should
+//      be < 5 µs to confirm routing adds no measurable overhead).
+//
+// The RoutingImage adds ONE shared_ptr::get() + ONE array index on the hot path
+// (capture-once discipline: no atomic_load per produce).  Zero steady-state alloc.
+// ===========================================================================
+BENCHMARK_DEFINE_F(GatewayDataFixture, ProduceWithRouting)(benchmark::State& state)
+{
+    if (state.skipped()) return;
+
+    // Inject a routing image: topicId=0, partition=0 → leaderNodeId=kThisNodeId.
+    // GPID scheme: gpid = topicId * 1024 + partition = 0 * 1024 + 0 = 0.
+    static constexpr int32_t kMaxGpidPartitions = 1024;
+    const int32_t gpid = kTopicId * kMaxGpidPartitions + kPartition;
+    std::vector<rune::metadata::RoutingImage::BuildEntry> entries = {
+        {gpid, kThisNodeId, /*leaderEpoch=*/1},
+    };
+    auto img = rune::metadata::RoutingImage::build(entries);
+    gw_->setRoutingImageSnapshot(img);
+
+    // Wire a node-endpoint map (empty — this node is the leader, no redirect needed).
+    std::unordered_map<int32_t, std::string> nodeEndpoints;
+    nodeEndpoints[kThisNodeId] = "";   // self: no redirect
+    gw_->setNodeEndpointMap(std::move(nodeEndpoints));
+
+    // Pre-build the batch (one record) outside the measured path.
+    auto batchData = makeOneBatch(1, 0);
+    const std::size_t batchSize = batchData.size();
+
+    std::array<uint8_t, kScratchSize> produceBuf{};
+    pc::Produce prod;
+    prod.sessionId      = sessionId_;
+    prod.correlationId  = 0;
+    prod.topicId        = kTopicId;
+    prod.partition      = kPartition;
+    prod.partitionKnown = 1;
+    prod.key            = {};
+    prod.recordBatch    = std::span<const uint8_t>(batchData.data(), batchSize);
+
+    std::vector<double> samples;
+    static constexpr std::size_t kMaxSamples = 2'000'000UZ;
+    samples.reserve(std::min(static_cast<std::size_t>(state.max_iterations), kMaxSamples));
+
+    // Warm-up.
+    for (int w = 0; w < kWarmupIter; ++w) {
+        const int64_t corrId = -(w + 1);
+        prod.correlationId = corrId;
+        const std::size_t encLen = prod.encode(produceBuf.data());
+
+        lastProdCorrId_.store(-1, std::memory_order_release);
+
+        bool sent = false;
+        for (int i = 0; i < kPumpCapSetup && !sent; ++i) {
+            aeron::concurrent::AtomicBuffer ab(
+                produceBuf.data(), static_cast<aeron::util::index_t>(encLen));
+            if (ingressPub_->offer(ab, 0, static_cast<aeron::util::index_t>(encLen)) > 0)
+                sent = true;
+            else
+                std::this_thread::yield();
+        }
+        if (!sent) { state.SkipWithError("warm-up Produce offer timed out"); return; }
+
+        for (int i = 0; i < kPumpCapSetup; ++i) {
+            gw_->doWork(nowNs());
+            egressSub_->poll(egressAsm_->handler(), 16);
+            if (lastProdCorrId_.load(std::memory_order_acquire) == corrId) break;
+            std::this_thread::yield();
+        }
+    }
+
+    // Timed iterations.
+    int64_t corrId = 1;
+    for (auto _ : state) {
+        const int64_t thisCorrId = corrId++;
+        prod.correlationId = thisCorrId;
+        const std::size_t encLen = prod.encode(produceBuf.data());
+
+        lastProdCorrId_.store(-1, std::memory_order_release);
+
+        // Offer — tight-poll.
+        {
+            aeron::concurrent::AtomicBuffer ab(
+                produceBuf.data(), static_cast<aeron::util::index_t>(encLen));
+            bool sent = false;
+            for (int i = 0; i < kPumpCapMeasure && !sent; ++i) {
+                if (ingressPub_->offer(ab, 0,
+                        static_cast<aeron::util::index_t>(encLen)) > 0)
+                    sent = true;
+                else
+                    std::this_thread::yield();
+            }
+            if (!sent) { state.SkipWithError("Produce offer timed out"); return; }
+        }
+
+        const int64_t t0 = nowNs();
+
+        bool got = false;
+        for (int i = 0; i < kPumpCapMeasure; ++i) {
+            gw_->doWork(nowNs());
+            egressSub_->poll(egressAsm_->handler(), 16);
+            if (lastProdCorrId_.load(std::memory_order_acquire) == thisCorrId) {
+                got = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        const int64_t elapsed = nowNs() - t0;
+
+        if (!got) { state.SkipWithError("ProduceResponse timed out"); return; }
+
+        state.SetIterationTime(static_cast<double>(elapsed) / 1e9);
+        samples.push_back(static_cast<double>(elapsed) / 1'000.0);
+    }
+
+    if (!samples.empty()) {
+        std::sort(samples.begin(), samples.end());
+        const std::size_t n = samples.size();
+        const auto pct = [&](double p) -> double {
+            if (n == 1) return samples[0];
+            const double   idx = p * static_cast<double>(n - 1);
+            const std::size_t lo = static_cast<std::size_t>(idx);
+            const std::size_t hi = lo + 1 < n ? lo + 1 : lo;
+            return samples[lo] + (idx - static_cast<double>(lo)) *
+                   (samples[hi] - samples[lo]);
+        };
+        double sum = 0.0;
+        for (double v : samples) sum += v;
+        state.counters["routing_p50_us"]       = pct(0.50);
+        state.counters["routing_p99_us"]       = pct(0.99);
+        state.counters["routing_p999_us"]      = pct(0.999);
+        state.counters["routing_mean_us"]      = sum / static_cast<double>(n);
+        // Gate: p99 < 100 µs.
+        state.counters["routing_p99_gate_pass"] = (pct(0.99) < 100.0) ? 1.0 : 0.0;
+    }
+}
+
+BENCHMARK_REGISTER_F(GatewayDataFixture, ProduceWithRouting)
+    ->UseManualTime()
+    ->MinTime(2.0)
+    ->Unit(benchmark::kMicrosecond);

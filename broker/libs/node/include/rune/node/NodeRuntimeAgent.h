@@ -38,6 +38,7 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
+#include <rune/metadata/RoutingImage.h>
 
 #include <cstdint>
 #include <limits>
@@ -138,8 +139,31 @@ public:
         //     correct before we check highWatermark() (leader vs follower gate).
         //     FINDING-1: the metadata replica's role is driven by cluster
         //     leadership (bridge), NOT the assignment map — this is correct.
+        //
+        //     MD1 Task 9: After MetadataService::doWork() returns, rebuild the
+        //     RoutingImage from the committed AssignmentMap and push it to the
+        //     gateway's routingImage_ snapshot.  This is the capture-once path:
+        //     we build the image once per duty cycle (on the single-writer thread)
+        //     and the gateway uses it for ALL per-produce/subscribe lookups within
+        //     that cycle.  Zero atomic_load per produce on the hot path.
         if (metadataService_) {
-            work += metadataService_->doWork(nowNs);
+            const int metaWork = metadataService_->doWork(nowNs);
+            work += metaWork;
+
+            // Rebuild RoutingImage and push to gateway each cycle.
+            // This is cheap (shared_ptr swap + array copy) and done on the
+            // duty-cycle thread — no cross-thread synchronisation needed.
+            // The image is captured by the gateway's doWork on the SAME thread,
+            // so there is no cross-thread race on routingImage_.
+            if (gateway_) {
+                static constexpr int32_t kMaxGpidPartitions = 1024;
+                auto img = rune::metadata::RoutingImage::buildFromMap(
+                    metadataService_->committedMap(),
+                    [](int32_t topicId, int32_t partition) -> int32_t {
+                        return topicId * kMaxGpidPartitions + partition;
+                    });
+                gateway_->setRoutingImageSnapshot(std::move(img));
+            }
         }
 
         // 3. Group coordination service — drive after bridge (sees current leadership).

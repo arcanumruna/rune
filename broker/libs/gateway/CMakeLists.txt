@@ -17,7 +17,7 @@ target_include_directories(rune_gateway PUBLIC
 # (raw path) to avoid a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
 # rune_replication is linked PUBLIC so ReplicaRegistry.h (which includes PartitionReplica.h)
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
-target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction)
+target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
 
 if(aeron_FOUND)
@@ -155,6 +155,18 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_read_committed_push_tests
+                PROPERTIES TIMEOUT 180)
+
+            # MD1 Task 9: per-partition routing + partition-leader REDIRECT tests.
+            add_executable(rune_gateway_per_partition_routing_tests
+                tests/integration/GatewayPerPartitionRoutingTest.cpp)
+            target_link_libraries(rune_gateway_per_partition_routing_tests PRIVATE
+                rune_gateway
+                rune_metadata
+                rune_replication
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_per_partition_routing_tests
                 PROPERTIES TIMEOUT 180)
         endif()
     endif()

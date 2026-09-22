@@ -4,6 +4,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
+#include <rune/metadata/RoutingImage.h>
 // GroupCoordinationService.h is NOT included here (CG-4 fix: break rune_gateway→rune_node
 // symbol cycle).  ClientGateway dispatches group messages through IGroupRequestHandler
 // (defined in this lib); the concrete type lives in rune_node.
@@ -889,33 +890,48 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // GB-4: Leadership check — data ops MUST reach the leader (correctness).
-    // // TODO(future): optional internal proxy for single-endpoint transparency.
-    if (leaderView_) {
+    // GB-4 / MD1-9: Leadership check — data ops MUST reach the partition leader.
+    //
+    // Two-path routing decision:
+    //   (A) Per-partition routing (MD1 Task 9): when routingImage_ is set, we
+    //       resolve the partition first, then look up the routing image to determine
+    //       whether this node is the partition leader.  If not → REDIRECT to that
+    //       partition's leader endpoint.  This replaces the cluster-level boolean
+    //       check for the per-partition case.
+    //
+    //   (B) Cluster-level fallback: when routingImage_ is null (no metadata service
+    //       wired in yet, or single-node bypass), fall back to the original
+    //       leaderView_-based check for backward compatibility.
+    //
+    // Helper: send a redirect/notleader error response (used by both paths).
+    auto sendRedirect = [&](const std::string& endpoint, int64_t corrId) {
+        pc::ErrorResponse errResp;
+        errResp.sessionId     = msg.sessionId;
+        errResp.correlationId = corrId;
+        if (!endpoint.empty()) {
+            errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+            errResp.message = endpoint;
+            spdlog::debug("ClientGateway: Produce per-partition redirect sessionId={} → {}",
+                          msg.sessionId, endpoint);
+        } else {
+            errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            spdlog::debug("ClientGateway: Produce per-partition NotLeader (endpoint unknown) sessionId={}",
+                          msg.sessionId);
+        }
+        const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                   pc::ErrorResponse::BODY_FIXED + 2 +
+                                   errResp.message.size();
+        if (needed <= scratch_.size()) {
+            const std::size_t encoded = errResp.encode(scratch_.data());
+            sendTo(*session, scratch_.data(), encoded);
+        }
+    };
+
+    // Cluster-level fallback (path B): only when routingImage_ is null.
+    if (!routingImage_ && leaderView_) {
         const LeaderView lv = leaderView_();
         if (!lv.isLeader) {
-            pc::ErrorResponse errResp;
-            errResp.sessionId     = msg.sessionId;
-            errResp.correlationId = msg.correlationId;
-            if (!lv.leaderClientEndpoint.empty()) {
-                // Known leader endpoint → redirect.
-                errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-                errResp.message = lv.leaderClientEndpoint;
-                spdlog::debug("ClientGateway: Produce redirect sessionId={} → {}",
-                              msg.sessionId, lv.leaderClientEndpoint);
-            } else {
-                // Leader unknown → NotLeader (client backs off + retries).
-                errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-                spdlog::debug("ClientGateway: Produce NotLeader (endpoint unknown) sessionId={}",
-                              msg.sessionId);
-            }
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2 +
-                                       errResp.message.size();
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = errResp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
-            }
+            sendRedirect(lv.leaderClientEndpoint, msg.correlationId);
             return;  // engine untouched
         }
     }
@@ -949,6 +965,62 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
             return;
         }
+    }
+
+    // 3b. MD1 Task 9: Per-partition routing image check (path A).
+    //
+    // When routingImage_ is set, look up the global partition id for this
+    // (topicId, partition) to determine the authoritative leader for this
+    // partition.  The GPID scheme: gpid = topicId * kMaxGpidPartitions + partition.
+    // This must match the scheme used by BrokerNode/MetadataService when building
+    // the RoutingImage.
+    //
+    // Capture-once discipline (MD1-8 ruling):
+    //   routingImage_ is a shared_ptr captured ONCE at the point we check it here.
+    //   All lookup() calls within this handler use `img` (the raw pointer from the
+    //   captured shared_ptr), never calling routingImage_ again.
+    //   This avoids per-produce atomic_load (Apple libc++ global lock / Linux CAS).
+    if (routingImage_) {
+        // Capture the snapshot once (the shared_ptr was already stored in routingImage_
+        // on the duty-cycle thread — no cross-thread atomic_load needed here).
+        const rune::metadata::RoutingImage* img = routingImage_.get();
+        static constexpr int32_t kMaxGpidPartitions = 1024;
+        const int32_t gpid = msg.topicId * kMaxGpidPartitions + partition;
+        const auto& entry = img->lookup(gpid);
+
+        if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
+            // Unassigned partition — return NotLeader.
+            spdlog::debug("ClientGateway: Produce unassigned partition (topicId={} part={}) sessionId={}",
+                          msg.topicId, partition, msg.sessionId);
+            pc::ErrorResponse errResp;
+            errResp.sessionId     = msg.sessionId;
+            errResp.correlationId = msg.correlationId;
+            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2;
+            if (needed <= scratch_.size()) {
+                const std::size_t encoded = errResp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+            }
+            return;  // engine untouched
+        }
+
+        if (entry.leaderNodeId != thisNodeId_) {
+            // This partition is led by a different node — REDIRECT.
+            const std::string& redirectEndpoint = [&]() -> const std::string& {
+                auto it = nodeEndpointMap_.find(entry.leaderNodeId);
+                if (it != nodeEndpointMap_.end()) return it->second;
+                static const std::string kEmpty;
+                return kEmpty;
+            }();
+            spdlog::debug("ClientGateway: Produce per-partition redirect "
+                          "(topicId={} part={} leader={} epoch={}) sessionId={} → {}",
+                          msg.topicId, partition, entry.leaderNodeId, entry.leaderEpoch,
+                          msg.sessionId, redirectEndpoint);
+            sendRedirect(redirectEndpoint, msg.correlationId);
+            return;  // engine untouched
+        }
+        // entry.leaderNodeId == thisNodeId_ → serve locally (fall through).
     }
 
     // 4. Lookup Log.
@@ -1398,33 +1470,37 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // GB-4: Leadership check — data ops MUST reach the leader (correctness).
-    // // TODO(future): optional internal proxy for single-endpoint transparency.
-    if (leaderView_) {
+    // GB-4 / MD1-9: Leadership check — data ops MUST reach the partition leader.
+    //
+    // Helper: send redirect/notleader error response for subscribe.
+    auto sendSubRedirect = [&](const std::string& endpoint, int64_t corrId) {
+        pc::ErrorResponse errResp;
+        errResp.sessionId     = msg.sessionId;
+        errResp.correlationId = corrId;
+        if (!endpoint.empty()) {
+            errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+            errResp.message = endpoint;
+            spdlog::debug("ClientGateway: Subscribe per-partition redirect sessionId={} → {}",
+                          msg.sessionId, endpoint);
+        } else {
+            errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            spdlog::debug("ClientGateway: Subscribe per-partition NotLeader (endpoint unknown) sessionId={}",
+                          msg.sessionId);
+        }
+        const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                   pc::ErrorResponse::BODY_FIXED + 2 +
+                                   errResp.message.size();
+        if (needed <= scratch_.size()) {
+            const std::size_t encoded = errResp.encode(scratch_.data());
+            sendTo(*session, scratch_.data(), encoded);
+        }
+    };
+
+    // Cluster-level fallback: only when routingImage_ is null.
+    if (!routingImage_ && leaderView_) {
         const LeaderView lv = leaderView_();
         if (!lv.isLeader) {
-            pc::ErrorResponse errResp;
-            errResp.sessionId     = msg.sessionId;
-            errResp.correlationId = msg.correlationId;
-            if (!lv.leaderClientEndpoint.empty()) {
-                // Known leader endpoint → redirect.
-                errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-                errResp.message = lv.leaderClientEndpoint;
-                spdlog::debug("ClientGateway: Subscribe redirect sessionId={} → {}",
-                              msg.sessionId, lv.leaderClientEndpoint);
-            } else {
-                // Leader unknown → NotLeader (client backs off + retries).
-                errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-                spdlog::debug("ClientGateway: Subscribe NotLeader (endpoint unknown) sessionId={}",
-                              msg.sessionId);
-            }
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2 +
-                                       errResp.message.size();
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = errResp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
-            }
+            sendSubRedirect(lv.leaderClientEndpoint, msg.correlationId);
             return;  // engine untouched, no subscription registered
         }
     }
@@ -1457,6 +1533,47 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
             return;
         }
+    }
+
+    // 3b. MD1 Task 9: Per-partition routing image check.
+    // Mirrors the produce path: capture-once discipline (routingImage_.get()).
+    if (routingImage_) {
+        const rune::metadata::RoutingImage* img = routingImage_.get();
+        static constexpr int32_t kMaxGpidPartitions = 1024;
+        const int32_t gpid = msg.topicId * kMaxGpidPartitions + partition;
+        const auto& entry = img->lookup(gpid);
+
+        if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
+            spdlog::debug("ClientGateway: Subscribe unassigned partition (topicId={} part={}) sessionId={}",
+                          msg.topicId, partition, msg.sessionId);
+            pc::ErrorResponse errResp;
+            errResp.sessionId     = msg.sessionId;
+            errResp.correlationId = msg.correlationId;
+            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                       pc::ErrorResponse::BODY_FIXED + 2;
+            if (needed <= scratch_.size()) {
+                const std::size_t encoded = errResp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+            }
+            return;  // engine untouched
+        }
+
+        if (entry.leaderNodeId != thisNodeId_) {
+            const std::string& redirectEndpoint = [&]() -> const std::string& {
+                auto it = nodeEndpointMap_.find(entry.leaderNodeId);
+                if (it != nodeEndpointMap_.end()) return it->second;
+                static const std::string kEmpty;
+                return kEmpty;
+            }();
+            spdlog::debug("ClientGateway: Subscribe per-partition redirect "
+                          "(topicId={} part={} leader={} epoch={}) sessionId={} → {}",
+                          msg.topicId, partition, entry.leaderNodeId, entry.leaderEpoch,
+                          msg.sessionId, redirectEndpoint);
+            sendSubRedirect(redirectEndpoint, msg.correlationId);
+            return;  // engine untouched, no subscription registered
+        }
+        // entry.leaderNodeId == thisNodeId_ → serve locally (fall through).
     }
 
     // 4. Validate topic + partition.

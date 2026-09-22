@@ -555,6 +555,26 @@ void BrokerNode::buildGateway() {
         gateway_->setMinIsr(config_.gatewayMinIsr);
         spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
                      nodeId, config_.gatewayMinIsr, config_.peers.size());
+
+        // MD1 Task 9: Build nodeId → client endpoint map for per-partition REDIRECT.
+        // Built from NodeConfig::peers: each peer carries a clientPort (GB-4 per-peer
+        // client endpoint).  A zero clientPort means no known client endpoint (empty
+        // string); the gateway will fall back to NotLeader in that case.
+        {
+            std::unordered_map<int32_t, std::string> nodeEndpoints;
+            nodeEndpoints.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers) {
+                // Self: no self-redirect (empty string).
+                if (peer.id == config_.nodeId) {
+                    nodeEndpoints[peer.id] = "";
+                } else {
+                    nodeEndpoints[peer.id] = peer.clientChannel();
+                }
+            }
+            gateway_->setNodeEndpointMap(std::move(nodeEndpoints));
+            spdlog::info("BrokerNode[{}]: gateway nodeEndpointMap wired ({} entries)",
+                         nodeId, config_.peers.size());
+        }
     } catch (const std::exception& ex) {
         spdlog::warn("BrokerNode[{}]: ClientGateway construction failed: {}; proceeding without gateway",
                      nodeId, ex.what());
