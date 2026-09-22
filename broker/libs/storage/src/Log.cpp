@@ -69,13 +69,20 @@ void Log::publishSealedSnapshot() {
     // The active segment is excluded: its sizeBytes is mutated on appends.
     //
     // CP-8 FIX (incremental largestTimestamp): we NO LONGER re-scan the file for
-    // a newly-sealed segment.  Instead, maybeRoll() maintains activeSegmentMaxTs_
-    // (a running max of maxTimestamp() across every batch appended to the active
-    // segment) and stores it in newlySealedMaxTs_ just before calling us.
+    // a newly-sealed segment on the hot append path.  Instead, maybeRoll() maintains
+    // activeSegmentMaxTs_ (a running max of maxTimestamp() across every batch appended
+    // to the active segment) and stores it in newlySealedMaxTs_ just before calling us.
     // For segments already present in the previous snapshot, we reuse the
     // cached largestTimestamp value (sealed segments are immutable).
     // For the newly-sealed segment (not yet in prevSnap), we use newlySealedMaxTs_.
     // Zero extra I/O on the append path: NO file open, NO read, NO heap allocation.
+    //
+    // CP-5.1 FIX (retention-after-restart): recover() populates recoveryMaxTimestamps_
+    // with the REAL per-segment largestTimestamp obtained via a one-time batch scan.
+    // When a segment is not found in prevSnap AND newlySealedMaxTs_ == 0 (the recover()
+    // publish path), we look up the recovery map before falling back to 0.
+    // The map is drained (cleared) here after its first use so it never persists past
+    // recovery.  This ensures time-retention gets correct timestamps after a restart.
     auto prevSnap = std::atomic_load(&sealedSnapshot_);
 
     auto snap = std::make_shared<SealedSegmentSnapshot>();
@@ -94,15 +101,29 @@ void Log::publishSealedSnapshot() {
                     if (si.baseOffset == base) { largestTs = si.largestTimestamp; break; }
                 }
             }
-            // If not found in the previous snapshot, this is the NEWLY SEALED
-            // segment.  Use the incrementally tracked max timestamp instead of
-            // re-scanning the file (CP-8 fix: zero append-path I/O at seal time).
+            // If not found in the previous snapshot, this is either:
+            //   (a) A NEWLY SEALED segment from maybeRoll(): use newlySealedMaxTs_
+            //       (CP-8 fix — zero append-path I/O at seal time).
+            //   (b) A segment recovered from disk by recover(): use recoveryMaxTimestamps_
+            //       (CP-5.1 fix — real timestamps to prevent retention-after-restart data loss).
             if (largestTs == 0) {
-                largestTs = newlySealedMaxTs_;
+                if (newlySealedMaxTs_ != 0) {
+                    largestTs = newlySealedMaxTs_;
+                } else {
+                    // CP-5.1: check the recovery map (populated by recover() batch scan).
+                    auto rmIt = recoveryMaxTimestamps_.find(base);
+                    if (rmIt != recoveryMaxTimestamps_.end()) {
+                        largestTs = rmIt->second;
+                    }
+                }
             }
             snap->push_back({base, bytes, largestTs});
         }
     }
+    // CP-5.1: clear the recovery map after first use — it is only needed for the
+    // one-time recover() publishSealedSnapshot() call; subsequent calls (from
+    // maybeRoll()/drainCleanerSwaps()) must not inherit stale recovery values.
+    recoveryMaxTimestamps_.clear();
     std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap)));
 }
 int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
@@ -153,12 +174,65 @@ int64_t Log::recover() {
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();
     logEndOffset_ = next;
+
+    // CP-5.1 FIX (retention-after-restart): compute the REAL largestTimestamp for
+    // every SEALED segment by scanning its batches for the max maxTimestamp() value.
+    //
+    // Problem: before this fix, publishSealedSnapshot() was called with
+    // newlySealedMaxTs_ == 0 (no prevSnap to reuse from, and no new seal just fired),
+    // so every sealed segment got largestTimestamp = 0.  The retention predicate in
+    // LogCleanerAgent::runRetention() treated largestTimestamp == 0 as "ancient →
+    // deletable", so after ANY restart the first retention pass would delete ALL sealed
+    // segments on a Delete/CompactDelete topic with retentionMs >= 0 — regardless of
+    // the segments' true age.
+    //
+    // Fix: iterate over all sealed segments (all except the last/active) and read
+    // their on-disk batch headers to extract the real maxTimestamp values.  Recovery
+    // is a ONE-TIME, non-hot-path operation so a per-segment file read is acceptable
+    // (unlike the CP-8 seal-time scan which had to be incremental on the append path).
+    // The computed values are stored in recoveryMaxTimestamps_ and consumed by the
+    // immediately-following publishSealedSnapshot() call.
+    recoveryMaxTimestamps_.clear();
+    if (segments_.size() > 1) {
+        auto sealedEnd = std::prev(segments_.end()); // stop before active
+        for (auto it = segments_.begin(); it != sealedEnd; ++it) {
+            int64_t base = it->first;
+            const std::string& logPath = it->second->logPath();
+            // Read the segment file and scan all batches for the max maxTimestamp.
+            std::ifstream f(logPath, std::ios::binary);
+            if (!f.is_open()) continue;
+            f.seekg(0, std::ios::end);
+            std::streamsize fileSize = f.tellg();
+            if (fileSize <= 0) continue;
+            f.seekg(0, std::ios::beg);
+            std::vector<uint8_t> buf(static_cast<std::size_t>(fileSize));
+            f.read(reinterpret_cast<char*>(buf.data()), fileSize);
+            f.close();
+
+            int64_t segMaxTs = 0;
+            std::size_t pos = 0;
+            while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+                rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+                int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+                if (!r.ensureValid()) break;
+                int64_t batchMaxTs = r.maxTimestamp();
+                if (batchMaxTs > segMaxTs) segMaxTs = batchMaxTs;
+                pos += static_cast<std::size_t>(total);
+            }
+            if (segMaxTs > 0) {
+                recoveryMaxTimestamps_[base] = segMaxTs;
+            }
+        }
+    }
+
     // Publish sealed snapshot so the LogCleanerAgent can see pre-existing
     // sealed segments immediately after recovery (without waiting for the first
     // new append to trigger maybeRoll()).  Without this, the cleaner skips the
     // log on the first doWork() call after a restart (sealedSegmentSnapshot()
     // returns nullptr → candidate selection skips this replica) and the
     // persisted checkpoint is never loaded via ensureCheckpoint().
+    // CP-5.1: recoveryMaxTimestamps_ is consumed (and cleared) by this call.
     publishSealedSnapshot();
     return next;
 }

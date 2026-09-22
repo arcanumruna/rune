@@ -208,6 +208,14 @@ private:
     /// any file I/O.  Only meaningful on the append thread (where maybeRoll and
     /// publishSealedSnapshot are always called in sequence).
     int64_t newlySealedMaxTs_ = 0;
+    /// CP-5.1 (retention-after-restart fix): populated by recover() via a one-time
+    /// per-segment batch scan.  Maps baseOffset → real largestTimestamp for every
+    /// sealed segment found on disk at recovery time.  publishSealedSnapshot() uses
+    /// this map as a fallback when a segment is not present in prevSnap AND
+    /// newlySealedMaxTs_ == 0 (i.e. we are on the recover() publish path, not a
+    /// hot-path maybeRoll() call).  The map is cleared after the first
+    /// publishSealedSnapshot() call consumes it so it does not persist past recovery.
+    std::map<int64_t, int64_t> recoveryMaxTimestamps_;
     std::map<int64_t, std::unique_ptr<LogSegment>> segments_;
 
     // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.

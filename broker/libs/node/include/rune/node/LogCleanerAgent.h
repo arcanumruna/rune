@@ -748,8 +748,13 @@ private:
                 // Predicate 1: Time.
                 if (!deletable && retentionMs >= 0) {
                     const int64_t largestTs = si.largestTimestamp;
-                    // largestTs == 0 → unknown → treat as very old → deletable.
-                    if (largestTs == 0 || (nowMs - largestTs) > retentionMs) {
+                    // CP-5.1 defensive guard: largestTs == 0 means UNKNOWN — treat
+                    // as NOT deletable by time.  A missing timestamp must never cause
+                    // accidental deletion (belt-and-suspenders alongside the CP-5.1
+                    // recover() scan that populates real values; this guard prevents
+                    // data loss if any path still leaves largestTs as 0).
+                    // largestTs > 0 → apply the normal age predicate.
+                    if (largestTs > 0 && (nowMs - largestTs) > retentionMs) {
                         deletable = true;
                     }
                 }
