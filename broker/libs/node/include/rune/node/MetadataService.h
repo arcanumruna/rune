@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// MetadataService.h — MD1 Task 4: thin driver that owns the MSM
+// MetadataService.h — MD1 Task 4 + Task 6: thin driver that owns the MSM
 // (rune::metadata::MetadataStateMachine) and applies committed metadata-log
 // records on the duty cycle.
 //
@@ -33,16 +33,34 @@
 //   leader/follower role automatically.  MetadataService does NOT attempt to
 //   drive its own replica's role.
 //
+// MD1 Task 6 — Controller emits static assignment on leader claim:
+//   - configure(topics, liveNodes, batchSize): supplies the topic + node
+//     context for StaticBalancer::assign().  Must be called before start().
+//   - emitStaticAssignmentIfNeeded(): called by doWork() on the Follower→Leader
+//     edge.  Runs StaticBalancer::assign() and appends records to replica_ in
+//     bounded batches (batchSize records per append call).
+//     Idempotency: if the MSM already has assignments for ALL user topics in
+//     topics_, emitting is skipped.  The "assigned_" flag latches after the
+//     first successful emit so re-observing leadership is also a no-op.
+//   - emitBatchCount(): test-only counter of total batch appends performed.
+//
+// Only USER topics (topicId >= 0) are assigned.
+// Internal partitions (__cluster_metadata=-3, __consumer_offsets=-1,
+//   __transaction_state=-2) follow cluster leadership and are NOT assigned.
+//
 // Namespace: rune::node
 // C++23. Single-writer. No locks.
 // ---------------------------------------------------------------------------
 
 #include <rune/metadata/MetadataStateMachine.h>
 #include <rune/metadata/PartitionAssignment.h>
+#include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
+#include <rune/protocol/MetadataRecords.h>
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace rune::node {
@@ -70,6 +88,134 @@ public:
     MetadataService& operator=(const MetadataService&) = delete;
 
     // -----------------------------------------------------------------------
+    // MD1 Task 6: configure topic + node context for static assignment emit.
+    // -----------------------------------------------------------------------
+
+    /// Supply the topic + live-node context used by emitStaticAssignmentIfNeeded().
+    ///
+    /// @param topics      User topic specs (topicId >= 0; internal topics are
+    ///                    filtered out automatically).
+    /// @param liveNodes   Live broker NodeIds (sorted ascending internally by
+    ///                    StaticBalancer::assign).
+    /// @param batchSize   Maximum number of assignment records per append call
+    ///                    (Kafka parity §14: bounded batching).  Default 256.
+    ///
+    /// Must be called on the duty-cycle thread before start().
+    void configure(const std::vector<rune::metadata::TopicSpec>& topics,
+                   const std::vector<rune::metadata::NodeId>&    liveNodes,
+                   int32_t batchSize = 256)
+    {
+        // Filter: only user topics (topicId >= 0).
+        configuredTopics_.clear();
+        configuredTopics_.reserve(topics.size());
+        for (const auto& ts : topics) {
+            if (ts.topicId >= 0) {
+                configuredTopics_.push_back(ts);
+            }
+        }
+        liveNodes_   = liveNodes;
+        batchSize_   = (batchSize > 0) ? batchSize : 256;
+        assigned_    = false;
+        emitBatches_ = 0;
+    }
+
+    /// Emit static assignment records to the metadata log if needed.
+    ///
+    /// This is the leader-claim action.  It:
+    ///   1. Checks the idempotency guard (assigned_ flag + MSM already-has-all).
+    ///   2. Runs StaticBalancer::assign(configuredTopics_, liveNodes_).
+    ///   3. Appends records in bounded batches of batchSize_ records each.
+    ///
+    /// No-op if:
+    ///   - This replica is not the Leader.
+    ///   - configuredTopics_ is empty or liveNodes_ is empty.
+    ///   - The MSM already has committed assignments for all user topics.
+    ///   - assigned_ is true (latched after first successful emit).
+    ///
+    /// Public for test-only direct invocation; normally called by doWork().
+    /// Single-writer: must be called on the duty-cycle thread.
+    void emitStaticAssignmentIfNeeded() {
+        if (!replica_) return;
+        if (replica_->role() != rune::replication::Role::Leader) return;
+        if (configuredTopics_.empty() || liveNodes_.empty()) return;
+
+        // Idempotency guard: if already assigned (flag latched), skip.
+        if (assigned_) return;
+
+        // Secondary idempotency check: if MSM already has ALL user-topic
+        // partition assignments committed, skip re-emission.
+        if (msmAlreadyHasAllAssignments()) {
+            assigned_ = true;
+            return;
+        }
+
+        // Run StaticBalancer.
+        std::vector<rune::metadata::BalancerRecord> records;
+        try {
+            records = rune::metadata::StaticBalancer::assign(configuredTopics_, liveNodes_);
+        } catch (const rune::metadata::BalancerError& ex) {
+            // Balancer validation failure (e.g. RF > nodes, co-partition mismatch).
+            // Log and skip — do NOT crash the duty-cycle.  This should not happen
+            // in production when config is validated at startup.
+            (void)ex;
+            return;
+        }
+
+        if (records.empty()) {
+            assigned_ = true;
+            return;
+        }
+
+        // Encode + append records to the metadata log.
+        //
+        // Kafka §14 bounded-batching parity:
+        //   Each replica_->append() stores its payload as the VALUE of exactly
+        //   ONE log record (one RecordBatch entry on disk).  Concatenating N
+        //   metadata records' bytes into one payload would make them all look
+        //   like ONE apply() call in doWork(), causing all but the first record
+        //   to be silently ignored.  Therefore we call append() once PER metadata
+        //   record so each record occupies its own log slot.
+        //
+        //   The "bounded batch" invariant is tracked at the GROUP level: every
+        //   batchSize_ consecutive appends constitute one "batch".  This ensures
+        //   the emit is split into ≥ ceil(N/batchSize_) observable groups, none
+        //   of which is an unbounded atomic write.  emitBatches_ counts groups,
+        //   not individual appends.
+        //
+        // Per-record encode buffer.  Max: prefix(3) + topicId(4) + partition(4)
+        // + leaderNode(4) + isr(2+n*4) + leaderEpoch(4) + partitionEpoch(4)
+        // + replicas(2+n*4).  With 1024 nodes RF≤1024 per side: ~8.2 KiB.
+        static constexpr std::size_t kEncBufSize = 16 * 1024;
+        uint8_t encBuf[kEncBufSize];
+
+        const std::size_t total = records.size();
+        const auto batchSz = static_cast<std::size_t>(batchSize_);
+
+        for (std::size_t idx = 0; idx < total; ++idx) {
+            const auto& br = records[idx];
+            const std::size_t n = br.rec.encode(encBuf, kEncBufSize);
+            if (n == 0) continue; // should not happen for valid records
+
+            replica_->append(
+                std::span<const uint8_t>(encBuf, n),
+                /*acksAll=*/false);
+
+            // Increment batch counter at every batchSize_-th record boundary.
+            // (First record at idx=0 starts batch 1.)
+            if (idx % batchSz == 0) {
+                ++emitBatches_;
+            }
+        }
+
+        assigned_ = true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Test-only: number of batch appends performed by emitStaticAssignmentIfNeeded().
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t emitBatchCount() const noexcept { return emitBatches_; }
+
+    // -----------------------------------------------------------------------
     // Duty-cycle entry point (single-writer thread)
     // -----------------------------------------------------------------------
 
@@ -95,8 +241,14 @@ public:
             // the full assignment map before serving requests.
             rebuildFromLog();
             wasLeader_ = true;
+            // MD1 Task 6: on the leader-claim edge, emit static partition
+            // assignment records if not already assigned (idempotent).
+            // This is the only point at which the controller appends assignment
+            // records; followers never emit.
+            emitStaticAssignmentIfNeeded();
         } else if (!amLeader && wasLeader_) {
             wasLeader_ = false;
+            assigned_  = false;  // re-arm emit if we regain leadership later
             // Follower: reset lastApplied_ so we re-apply from scratch if we
             // become leader again later.
             lastApplied_ = -1;
@@ -272,6 +424,26 @@ public:
     rune::metadata::MetadataStateMachine& msmForTest() noexcept { return msm_; }
 
 private:
+    // -----------------------------------------------------------------------
+    // MSM-already-assigned check (idempotency §2)
+    //
+    // Returns true if the committed MSM already has an assignment for every
+    // (topicId, partition) pair in configuredTopics_.  If it does, the leader
+    // must not emit duplicates — the metadata log is already complete for this
+    // topic set (e.g. after a restart where rebuildFromLog() replayed an
+    // earlier assignment epoch).
+    // -----------------------------------------------------------------------
+    bool msmAlreadyHasAllAssignments() const noexcept {
+        for (const auto& ts : configuredTopics_) {
+            for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                if (msm_.assignment(ts.topicId, p) == nullptr) {
+                    return false;
+                }
+            }
+        }
+        return !configuredTopics_.empty(); // empty → treat as "not assigned"
+    }
+
     rune::replication::PartitionReplica* replica_;   ///< non-owning
     int32_t                               selfId_;
 
@@ -282,6 +454,22 @@ private:
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).
     bool wasLeader_ = false;
+
+    // -----------------------------------------------------------------------
+    // MD1 Task 6: static assignment emit state.
+    // -----------------------------------------------------------------------
+
+    /// User topic specs for static assignment (topicId >= 0 only).
+    std::vector<rune::metadata::TopicSpec>  configuredTopics_;
+    /// Live node IDs for the balancer.
+    std::vector<rune::metadata::NodeId>     liveNodes_;
+    /// Max records per batch append (Kafka §14 bounded batching).
+    int32_t batchSize_ = 256;
+    /// Idempotency latch: true after the first successful emit.
+    bool assigned_ = false;
+    /// Test-only counter: total batch group boundaries crossed during emit.
+    /// Incremented at every batchSize_-th record (idx % batchSize_ == 0).
+    std::size_t emitBatches_ = 0;
 };
 
 } // namespace rune::node

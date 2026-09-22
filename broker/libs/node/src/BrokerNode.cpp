@@ -888,6 +888,42 @@ void BrokerNode::buildGateway() {
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
 
+            // MD1 Task 6: configure static assignment emit context.
+            // Convert NodeConfig::TopicSpec (broker config) to
+            // rune::metadata::TopicSpec (balancer input).
+            // rf defaults to cluster size (all nodes replicate every partition);
+            // coPartitionGroup + partitionKey are empty (not in NodeConfig v1 —
+            // NOTE: group co-location config is not yet in NodeConfig; tests that
+            // require co-location must construct TopicSpec directly in tests).
+            {
+                std::vector<rune::metadata::TopicSpec> balancerTopics;
+                balancerTopics.reserve(config_.topics.size());
+                const auto rf = static_cast<int16_t>(
+                    std::max(1, static_cast<int>(allNodeIds.size())));
+                for (const auto& ts : config_.topics) {
+                    if (ts.topicId < 0) continue; // skip internal topics
+                    rune::metadata::TopicSpec bs;
+                    bs.topicId          = ts.topicId;
+                    bs.partitionCount   = ts.partitionCount;
+                    bs.rf               = rf;
+                    bs.coPartitionGroup = ""; // not in NodeConfig v1
+                    bs.partitionKey     = ""; // not in NodeConfig v1
+                    balancerTopics.push_back(std::move(bs));
+                }
+                // Convert allNodeIds (vector<NodeId>) to vector<int32_t> for balancer.
+                std::vector<rune::metadata::NodeId> balancerNodes;
+                balancerNodes.reserve(allNodeIds.size());
+                for (const auto nid : allNodeIds) {
+                    balancerNodes.push_back(static_cast<rune::metadata::NodeId>(nid));
+                }
+                metadataService_->configure(
+                    balancerTopics, balancerNodes, /*batchSize=*/256);
+                spdlog::info(
+                    "BrokerNode[{}]: MetadataService configured for assignment emit "
+                    "({} user topics, {} nodes, batchSize=256)",
+                    nodeId, balancerTopics.size(), balancerNodes.size());
+            }
+
             spdlog::info("BrokerNode[{}]: MetadataService wired (__cluster_metadata at {})",
                          nodeId, metaDir.string());
         } catch (const std::exception& ex) {

@@ -12,7 +12,7 @@ target_include_directories(rune_node PUBLIC
 # rune_coordination: GroupCoordinator + ReplicatedOffsetStore (CG-3)
 # rune_transaction: TransactionCoordinator + ReplicatedTxnStateStore (TX-3)
 # rune_metadata_msm: MetadataStateMachine (MD1 Task 4)
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -158,6 +158,30 @@ if(BUILD_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_metadata_replication_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # MD1 Task 6: StaticAssignmentEmit integration tests — on becoming the
+    # metadata-consensus leader, MetadataService runs StaticBalancer::assign()
+    # over configured topics and appends the resulting assignment records to
+    # the metadata replica in bounded batches.
+    #
+    # Test cases: leader-claim emission visible on all nodes, idempotency guard,
+    # bounded batching (batchSize), follower no-op.
+    #
+    # Uses InMemoryTransport (no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_static_assignment_emit_tests
+        tests/integration/StaticAssignmentEmitTest.cpp)
+    target_include_directories(rune_static_assignment_emit_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_static_assignment_emit_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_static_assignment_emit_tests
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
