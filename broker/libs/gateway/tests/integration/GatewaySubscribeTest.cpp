@@ -97,12 +97,14 @@ static int64_t nowNs()
 // ---------------------------------------------------------------------------
 // Helper: build a TopicSpec.
 // ---------------------------------------------------------------------------
-static TopicSpec makeSpec(std::string name, int32_t partitions, int32_t id)
+static TopicSpec makeSpec(std::string name, int32_t partitions, int32_t id,
+                          int64_t segmentRollBytes = 64LL * 1024 * 1024)
 {
     TopicSpec ts;
-    ts.name           = std::move(name);
-    ts.partitionCount = partitions;
-    ts.topicId        = id;
+    ts.name             = std::move(name);
+    ts.partitionCount   = partitions;
+    ts.topicId          = id;
+    ts.segmentRollBytes = segmentRollBytes;
     return ts;
 }
 
@@ -132,6 +134,13 @@ public:
     static constexpr int32_t kPartitionA0 = 0;
     static constexpr int32_t kPartitionA1 = 1;
 
+    // CP-5.2 (bug-1 regression): a 1-partition topic with a tiny 256-byte
+    // segment roll so a handful of directAppend()s seal multiple segments,
+    // letting deleteOldSegments() advance logStartOffset() past 0.  Used to
+    // prove the ClientGateway Earliest->logStartOffset resolution is real.
+    static constexpr int32_t kTopicIdC    = 1;   // "smallseg", 1 partition
+    static constexpr int32_t kPartitionC0 = 0;
+
     void SetUp() override
     {
         tmpDir_  = std::make_unique<TempDir>("fix_");
@@ -143,6 +152,8 @@ public:
 
         std::vector<TopicSpec> specs = {
             makeSpec("events", 4, kTopicIdA),
+            // Tiny 256-byte segments → old-segment deletion advances logStart.
+            makeSpec("smallseg", 1, kTopicIdC, /*segmentRollBytes=*/256),
         };
         registry_ = std::make_unique<TopicRegistry>(specs, dataDir_->path.string());
 
@@ -633,6 +644,119 @@ TEST_F(GatewaySubscribeFixture, Subscribe_FromLatest)
     for (const auto& rec : received) {
         EXPECT_GE(rec.baseOffset, 3)
             << "Received record before subscribe from Latest (baseOffset=" << rec.baseOffset << ")";
+    }
+}
+
+// ===========================================================================
+// TEST 3b (CP-5.2 bug-1 regression): Subscribe-from-Earliest AFTER the head
+// segment has been deleted (logStartOffset advanced past 0).
+//
+// This is the NON-VACUOUS proof for the ClientGateway Earliest->logStartOffset
+// fix.  Before the fix, handleSubscribe resolved the Earliest sentinel (-2) to
+// offset 0.  Once retention/compaction deletes the head segment(s),
+// Log::read(0) returns {} forever (upper_bound lands on begin()), so an
+// Earliest subscriber pinned to 0 gets ZERO records for the life of the
+// subscription — the exact starvation this test guards against.
+//
+// Scratch-revert proof: change the fix at ClientGateway.cpp (the
+// `msg.fromOffset == kFromEarliest` branch) from `nextOffset = logStart` back
+// to `nextOffset = 0` and this test FAILS (0 records delivered), while the
+// happy-path Subscribe_From0/FromLatest tests still pass.
+// ===========================================================================
+TEST_F(GatewaySubscribeFixture, Subscribe_FromEarliest_AfterHeadSegmentDeleted)
+{
+    // From::Earliest sentinel on the wire (mirrors client From::toWire()).
+    static constexpr int64_t kFromEarliest = -2;
+
+    // Produce enough single-record batches on the tiny-segment topic that the
+    // log seals several segments (256-byte roll → a few records per segment).
+    // Each directAppend here writes one 1-record batch.
+    constexpr int kRecords = 40;
+    for (int i = 0; i < kRecords; ++i) {
+        directAppend(kTopicIdC, kPartitionC0, /*recordCount=*/1);
+    }
+
+    rune::storage::Log* log = registry_->log(kTopicIdC, kPartitionC0);
+    ASSERT_NE(log, nullptr);
+    ASSERT_GT(log->segmentBaseOffsets().size(), 1u)
+        << "tiny 256-byte roll should have sealed multiple segments";
+    ASSERT_EQ(log->logStartOffset(), 0);
+
+    // Delete old segments so the head is dropped and logStartOffset advances.
+    const int deleted = log->deleteOldSegments(/*retainBytes=*/0);
+    ASSERT_GT(deleted, 0);
+    const int64_t logStart = log->logStartOffset();
+    ASSERT_GT(logStart, 0)
+        << "old-segment deletion must advance logStartOffset past 0";
+
+    // Sanity: reading from 0 (the OLD Earliest resolution) yields nothing —
+    // this is precisely why the un-fixed gateway starved Earliest subscribers.
+    ASSERT_TRUE(log->read(0, 1 << 20).empty())
+        << "read(0) below logStart must be empty (the starvation trap)";
+    // Sanity: reading from logStart via the SAME log the gateway will use must
+    // return the oldest survivor (proves the push path has data to deliver).
+    ASSERT_FALSE(log->read(logStart, 1 << 20).empty())
+        << "read(logStart) must return the oldest surviving batch";
+    ASSERT_LT(logStart, log->logEndOffset())
+        << "logStart must be below LEO so the push bound admits delivery";
+
+    // Now subscribe FROM EARLIEST (-2).  The fix must resolve this to logStart,
+    // so the subscriber receives the oldest SURVIVING batch, not zero records.
+    auto client = makeClient(kEgressBase + 31);
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/31, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+
+    sendSubscribe(*client.ingressPub, sid, /*corrId=*/310,
+                  kTopicIdC, kPartitionC0, /*partitionKnown=*/1,
+                  /*fromOffset=*/kFromEarliest, /*isolation=*/0);
+
+    auto subResp = recvSubscribeResponse(*client.egressSub, "SubRespEarliest");
+    ASSERT_TRUE(subResp.has_value());
+    EXPECT_EQ(subResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    const int64_t subId = subResp->subscriptionId;
+
+    std::vector<pc::Records> received;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                      aeron::util::index_t offset,
+                                      aeron::util::index_t len,
+                                      aeron::Header&) {
+        auto dec = pc::Records::decode(
+            reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+            static_cast<std::size_t>(len));
+        if (dec && dec->subscriptionId == subId) received.push_back(*dec);
+    });
+
+    // Append one record AFTER subscribe: the push loop is level-driven from the
+    // duty cycle, and this fresh append is a reliable delivery trigger for the
+    // in-process pump.  It does NOT change WHERE Earliest resolves — the
+    // subscription's nextOffset was already fixed at subscribe time (to logStart
+    // under the fix, or to 0 under the reverted code).  Because the reverted code
+    // pins nextOffset=0 and Log::read(0) is permanently empty after head-segment
+    // deletion, the push loop delivers NOTHING even after this trigger append —
+    // that is exactly the starvation the fix cures.
+    directAppend(kTopicIdC, kPartitionC0, /*recordCount=*/1);
+
+    pump([&]() { return !received.empty(); },
+         &*client.egressSub, &asm_, kPumpIter, "EarliestRecv");
+
+    // THE FIX CONTRACT (non-vacuous): with the fix, handleSubscribe resolves the
+    // Earliest sentinel (-2) to logStartOffset(), so the subscription's
+    // nextOffset lands on a LIVE offset and the push loop delivers records.
+    // With the fix REVERTED (nextOffset = 0), the subscriber is pinned below the
+    // deleted head; Log::read(0) returns {} forever, so this vector stays EMPTY
+    // and the pump times out — this ASSERT fires.  That divergence is the proof.
+    ASSERT_FALSE(received.empty())
+        << "Earliest subscriber received ZERO records after head-segment "
+           "deletion — the Earliest->logStartOffset fix regressed (or was reverted)";
+    // Every delivered batch must live at/above the live log start — never a
+    // batch from the deleted (pre-logStart) region.
+    for (const auto& rec : received) {
+        EXPECT_GE(rec.baseOffset, logStart)
+            << "delivered batch below live logStartOffset (baseOffset="
+            << rec.baseOffset << ", logStart=" << logStart << ")";
+        EXPECT_FALSE(rec.recordBatch.empty());
     }
 }
 
