@@ -1572,6 +1572,177 @@ TEST(CompactionCleanerAgent, SegmentsCoalesceIntoFewerGroups) {
 }
 
 // ===========================================================================
+// TEST 11b: CoalescingEndToEndFewSegments  (CP-8 Fix 3)
+//
+// PRODUCTION LOAD-BEARING TEST — fails if produceCleanedGroupBounded is
+// neutered (scratch-neuter proof).
+//
+// Setup: many small sealed segments (force tiny rollBytes) with the SAME hot
+// key so all except the last copy are superseded.
+//   - Without coalescing: agent compacts ONE segment per cycle; each cycle
+//     leaves N-1 segments (just fewer records).  After many cycles, segment
+//     count is UNCHANGED (each cleaned segment is rewritten in-place).
+//   - WITH coalescing: the agent groups several consecutive small segments into
+//     one group and merges them into a SINGLE output via
+//     produceCleanedGroupBounded.  After the agent pass, segment count is
+//     STRICTLY FEWER than before.
+//
+// NON-VACUOUS: scratch-neuter produceCleanedGroupBounded (e.g. make it always
+// return {false, activeBase}) → the agent falls back to single-segment path →
+// segment count unchanged → EXPECT_LT(segsAfter, segsBefore) FAILS.
+//
+// OFFSET PRESERVATION: every record surviving the coalesced compaction must
+// have the exact same offset as before the merge.
+//
+// LATEST-PER-KEY CORRECTNESS: after merge, each key retains exactly its
+// latest record value.
+// ===========================================================================
+TEST(CompactionCleanerAgent, CoalescingEndToEndFewSegments) {
+    // Use tiny rollBytes (1) so every batch triggers an immediate roll.
+    // This gives us many sealed segments cheaply.
+    auto dir = cp6TempDir("cp8_coalesce_e2e");
+    Log log(dir.string(), /*rollBytes=*/1);
+
+    Cp6NullTransport transport;
+
+    // Write N records with 3 distinct keys cycling.  Many duplicates exist.
+    // The hot key "k0" appears every 3 records, so N/3 copies of k0 land in
+    // N/3 separate sealed segments.  All copies except the last are superseded.
+    constexpr int N = 12;
+    for (int v = 0; v < N; ++v) {
+        std::string key = "k" + std::to_string(v % 3);
+        auto b = cp6Batch(v, key, "val_v" + std::to_string(v), /*ts=*/1000 + v);
+        log.append(b, v);
+    }
+    // Force one more record to ensure N records are in sealed segments.
+    {
+        auto b = cp6Batch(N, "sentinel", "s", 2000);
+        log.append(b, N);
+    }
+
+    auto basesBefore = log.segmentBaseOffsets();
+    // We need at least 3 sealed segments + 1 active.
+    ASSERT_GE(basesBefore.size(), 4u)
+        << "Need >= 4 segments (3+ sealed + active); rollBytes=1 should produce one per batch.";
+    const size_t segsBefore = basesBefore.size() - 1; // sealed count (exclude active)
+
+    // Collect all records and their offsets BEFORE compaction (for offset preservation check).
+    struct PreRecord { std::string key, value; int64_t offset; };
+    std::vector<PreRecord> preRecords;
+    {
+        int64_t cursor = 0;
+        for (;;) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool advanced = false;
+            r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t) {
+                preRecords.push_back({std::string(k), std::string(v), off});
+                cursor = off + 1;
+                advanced = true;
+            });
+            if (!advanced) break;
+        }
+    }
+    ASSERT_EQ(static_cast<int>(preRecords.size()), N + 1) << "Must have N+1 records before";
+
+    // Replica setup.
+    auto cfg = makeCompactConfig(1100, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+    replica->onLeaderLogAppended();
+    ASSERT_GT(replica->highWatermark(), 0);
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(1100, 0, std::move(replica));
+
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // Use large rollBytes for the coalescing group size (so all segments coalesce).
+    // The LogCleanerAgent's coalescing uses segmentRollBytes from the config.
+    // Use cycleBudgetBytes=0 (unlimited) and large dedupeBufferBytes.
+    // useCoalescing=true (enabled via the constructor flag).
+    rune::node::LogCleanerAgent cleaner(&registry,
+                                        /*cycleBudgetBytes=*/0,
+                                        /*dedupeBufferBytes=*/1024LL * 1024,
+                                        /*ioMaxBytesPerSec=*/-1,
+                                        /*useCoalescing=*/true,
+                                        /*coalescingRollBytes=*/64LL * 1024 * 1024);
+
+    // Run enough cycles to let the cleaner coalesce the sealed segments.
+    // With N=12 sealed segments and coalescing, ONE pass should merge them.
+    // Without coalescing (fallback single-segment path), many passes are needed
+    // and segment count stays the same.
+    for (int i = 0; i < static_cast<int>(segsBefore) + 5; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    auto basesAfter = log.segmentBaseOffsets();
+    const size_t segsAfter = basesAfter.size() > 0 ? basesAfter.size() - 1 : 0; // sealed count
+
+    // CORE ASSERTION: coalescing reduced the number of segments.
+    // Without coalescing (scratch-neutered produceCleanedGroupBounded), the agent
+    // compacts each segment individually → segment count stays at segsBefore
+    // (rewritten in-place, no merging) → this FAILS.
+    EXPECT_LT(segsAfter, segsBefore)
+        << "Coalescing must reduce segment count: before=" << segsBefore
+        << " after=" << segsAfter << ".  "
+           "If segsAfter == segsBefore, produceCleanedGroupBounded is not wired "
+           "(or was scratch-neutered); the agent fell back to single-segment compaction.";
+
+    // OFFSET PRESERVATION: surviving records must have their original offsets.
+    // Build map of surviving key→record (latest per key after compaction).
+    struct PostRecord { std::string value; int64_t offset; };
+    std::map<std::string, PostRecord> postMap;
+    {
+        int64_t cursor = 0;
+        for (;;) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool advanced = false;
+            r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t) {
+                postMap[std::string(k)] = {std::string(v), off};
+                cursor = off + 1;
+                advanced = true;
+            });
+            if (!advanced) break;
+        }
+    }
+
+    // Build expected map from pre-records (latest per key).
+    std::map<std::string, PreRecord> expectedLatest;
+    for (auto& pr : preRecords) {
+        // Later in the vector = higher offset = latest.
+        expectedLatest[pr.key] = pr;
+    }
+
+    // Verify offset preservation and latest-per-key correctness.
+    for (auto& [key, expected] : expectedLatest) {
+        auto it = postMap.find(key);
+        ASSERT_NE(it, postMap.end())
+            << "Key '" << key << "' must survive compaction (it's the latest copy).";
+        EXPECT_EQ(it->second.offset, expected.offset)
+            << "Key '" << key << "': offset must be preserved after coalescing merge; "
+               "expected=" << expected.offset << " got=" << it->second.offset << ".";
+        EXPECT_EQ(it->second.value, expected.value)
+            << "Key '" << key << "': value must be preserved; "
+               "expected='" << expected.value << "' got='" << it->second.value << "'.";
+    }
+
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
 // TEST 12: ThrottleBoundsCleanerBytesPerSec  (CP-8)
 //
 // (a) Unlimited throttler (-1): no sleep, fast.

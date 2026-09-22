@@ -96,20 +96,31 @@ namespace rune::node {
 
 class LogCleanerAgent final : public rune::consensus::Agent {
 public:
-    /// @param registry          Non-owning pointer to the replica registry.
-    ///                          Must outlive this agent.
-    /// @param cycleBudgetBytes  Maximum bytes of compaction work per doWork() call.
-    ///                          Default 128 MiB matches Kafka's default.
-    ///                          0 = unlimited per-cycle budget.
-    /// @param dedupeBufferBytes Memory budget for the SkimpyOffsetMap dedupe pass.
-    ///                          Default -1 = use cycleBudgetBytes (or 128 MiB if
-    ///                          cycleBudgetBytes is 0).  The map is sized to
-    ///                          floor(dedupeBufferBytes / kEntryBytes × loadFactor).
-    /// @param ioMaxBytesPerSec  Shared I/O throttle (bytes/sec). -1 = unlimited.
+    /// @param registry           Non-owning pointer to the replica registry.
+    ///                           Must outlive this agent.
+    /// @param cycleBudgetBytes   Maximum bytes of compaction work per doWork() call.
+    ///                           Default 128 MiB matches Kafka's default.
+    ///                           0 = unlimited per-cycle budget.
+    /// @param dedupeBufferBytes  Memory budget for the SkimpyOffsetMap dedupe pass.
+    ///                           Default -1 = use cycleBudgetBytes (or 128 MiB if
+    ///                           cycleBudgetBytes is 0).  The map is sized to
+    ///                           floor(dedupeBufferBytes / kEntryBytes × loadFactor).
+    /// @param ioMaxBytesPerSec   Shared I/O throttle (bytes/sec). -1 = unlimited.
+    /// @param useCoalescing      CP-8: enable segment coalescing — when true,
+    ///                           consecutive sealed segments that together fit
+    ///                           within coalescingRollBytes are merged into ONE
+    ///                           output segment via produceCleanedGroupBounded.
+    ///                           When false (default-compatible), each segment is
+    ///                           compacted individually (prior behavior).
+    /// @param coalescingRollBytes  Max combined output bytes for a coalesced group.
+    ///                           Default 64 MiB (matches the standard segment roll
+    ///                           threshold so groups fit within a single segment).
     explicit LogCleanerAgent(ReplicaRegistry* registry,
-                             int64_t cycleBudgetBytes  = 128LL * 1024 * 1024,
-                             int64_t dedupeBufferBytes = -1,
-                             int64_t ioMaxBytesPerSec  = -1) noexcept
+                             int64_t cycleBudgetBytes    = 128LL * 1024 * 1024,
+                             int64_t dedupeBufferBytes   = -1,
+                             int64_t ioMaxBytesPerSec    = -1,
+                             bool    useCoalescing        = false,
+                             int64_t coalescingRollBytes  = 64LL * 1024 * 1024) noexcept
         : registry_(registry)
         , cycleBudgetBytes_(cycleBudgetBytes)
         , dedupeBufferBytes_(dedupeBufferBytes >= 0
@@ -117,6 +128,8 @@ public:
                              : (cycleBudgetBytes > 0 ? cycleBudgetBytes
                                                      : 128LL * 1024 * 1024))
         , throttler_(ioMaxBytesPerSec)
+        , useCoalescing_(useCoalescing)
+        , coalescingRollBytes_(coalescingRollBytes)
     {}
 
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
@@ -408,17 +421,89 @@ public:
         for (const auto& si : *best.snap) sealedBases.push_back(si.baseOffset);
 
         rune::storage::LogCleaner cleaner;
-        const auto passResult = cleaner.produceCleanedFileBounded(
-            best.dir,
-            sealedBases,
-            /*segBase=*/         best.segBase,
-            /*activeBase=*/      best.firstUncleanable,
-            /*globalDirtyStart=*/globalDirtyStart,
-            nowNs,
-            best.replica->deleteRetentionMs(),
-            /*dedupeBufferBytes=*/dedupeBufferBytes_,
-            /*throttler=*/       &throttler_,
-            /*nowMs=*/           nowMs);
+
+        // CP-8 Fix 3: segment coalescing.
+        //
+        // When useCoalescing_=true, group consecutive sealed segments with
+        // total size <= coalescingRollBytes into one group and compact the
+        // group into a SINGLE output via produceCleanedGroupBounded.
+        // This eliminates the O(N) per-segment fsync overhead when many small
+        // segments exist, and reduces total segment count on each pass.
+        //
+        // When useCoalescing_=false, fall back to the single-segment path
+        // (prior behavior, fully backward-compatible).
+        //
+        // Coalescing is LOAD-BEARING: scratch-neutering produceCleanedGroupBounded
+        // (returning {false, activeBase}) falls back to single-segment compaction
+        // and the CoalescingEndToEndFewSegments test fails (segment count
+        // unchanged rather than reduced).
+
+        rune::storage::CleanPassResult passResult{false, best.firstUncleanable};
+        // groupBases: the bases in the coalesced group (1 element = single-seg path).
+        std::vector<int64_t> groupBases{best.segBase};
+
+        if (useCoalescing_ && sealedBases.size() > 1) {
+            // Build parallel sizes vector from the snapshot.
+            std::vector<int64_t> sealedSizes;
+            sealedSizes.reserve(best.snap->size());
+            for (const auto& si : *best.snap) sealedSizes.push_back(si.sizeBytes);
+
+            // Compute coalescing groups over ALL sealed segments.
+            auto groups = rune::storage::LogCleaner::groupSegmentsBySize(
+                sealedBases, sealedSizes, coalescingRollBytes_);
+
+            // Find the group that contains best.segBase.
+            const rune::storage::SegmentGroup* chosenGroup = nullptr;
+            for (const auto& g : groups) {
+                for (int64_t b : g.bases) {
+                    if (b == best.segBase) { chosenGroup = &g; break; }
+                }
+                if (chosenGroup) break;
+            }
+
+            if (chosenGroup && chosenGroup->bases.size() > 1) {
+                // Multi-segment group: use coalescing path.
+                groupBases = chosenGroup->bases;
+                passResult = cleaner.produceCleanedGroupBounded(
+                    best.dir,
+                    sealedBases,
+                    *chosenGroup,
+                    /*activeBase=*/      best.firstUncleanable,
+                    /*globalDirtyStart=*/globalDirtyStart,
+                    nowNs,
+                    best.replica->deleteRetentionMs(),
+                    /*dedupeBufferBytes=*/dedupeBufferBytes_,
+                    /*throttler=*/       &throttler_,
+                    /*nowMs=*/           nowMs);
+            } else {
+                // Single-segment group (or best.segBase not in any multi-seg group):
+                // fall back to single-segment path.
+                passResult = cleaner.produceCleanedFileBounded(
+                    best.dir,
+                    sealedBases,
+                    /*segBase=*/         best.segBase,
+                    /*activeBase=*/      best.firstUncleanable,
+                    /*globalDirtyStart=*/globalDirtyStart,
+                    nowNs,
+                    best.replica->deleteRetentionMs(),
+                    /*dedupeBufferBytes=*/dedupeBufferBytes_,
+                    /*throttler=*/       &throttler_,
+                    /*nowMs=*/           nowMs);
+            }
+        } else {
+            // Coalescing disabled or only one sealed segment: single-segment path.
+            passResult = cleaner.produceCleanedFileBounded(
+                best.dir,
+                sealedBases,
+                /*segBase=*/         best.segBase,
+                /*activeBase=*/      best.firstUncleanable,
+                /*globalDirtyStart=*/globalDirtyStart,
+                nowNs,
+                best.replica->deleteRetentionMs(),
+                /*dedupeBufferBytes=*/dedupeBufferBytes_,
+                /*throttler=*/       &throttler_,
+                /*nowMs=*/           nowMs);
+        }
 
         // CP-7: passEnd is the next-pass boundary.  When the map covered the
         // entire dirty range, passEnd == activeBase.  When the map was bounded
@@ -447,8 +532,13 @@ public:
         }
 
         // ---------------------------------------------------------------
-        // Phase 5: enqueue the swap; advance the clean watermark ONLY on
-        //          a successful enqueue.
+        // Phase 5: enqueue the swap(s); advance the clean watermark ONLY on
+        //          a successful enqueue of ALL group bases.
+        //
+        // For a coalesced group: enqueue ALL bases in the group.
+        //   - group.bases[0] → reloadSegment picks up the merged .log file.
+        //   - group.bases[1..] → reloadSegment finds the .log deleted, drops them.
+        // For a single-segment path: enqueue just the one base (unchanged).
         //
         // Watermark advances to passEnd (not segEnd as before).  When the
         // SkimpyOffsetMap was bounded (map filled mid-segment), passEnd <
@@ -459,9 +549,17 @@ public:
         // SPSC-OVERFLOW FIX: enqueueCleanedSegment() returns false when the
         // swap ring is full.  We DO NOT advance the watermark on failure.
         // ---------------------------------------------------------------
-        const bool enqueued = best.log->enqueueCleanedSegment(best.segBase);
-        if (!enqueued) {
-            // Ring full — leave the segment dirty so it is re-selected next cycle.
+        // Enqueue ALL group bases atomically (SPSC: one-by-one, contiguous).
+        // If ANY enqueue fails (ring full), do not advance the watermark.
+        bool allEnqueued = true;
+        for (int64_t gb : groupBases) {
+            if (!best.log->enqueueCleanedSegment(gb)) {
+                allEnqueued = false;
+                break;
+            }
+        }
+        if (!allEnqueued) {
+            // Ring full — leave the segment(s) dirty so they are re-selected next cycle.
             return 0;
         }
 
@@ -514,11 +612,14 @@ private:
         checkpoints_.emplace(log, std::move(ckpt));
     }
 
-    ReplicaRegistry*        registry_;         // non-owning
-    int64_t                 cycleBudgetBytes_; // 0 = unlimited; >0 = soft bytes-per-window cap
-    int64_t                 dedupeBufferBytes_;// dedupe map byte budget (SkimpyOffsetMap, > 0 always)
-    int64_t                 bytesUsed_ = 0;    // bytes consumed so far in the current budget window
-    rune::storage::Throttler throttler_;       // CP-8: shared I/O throttler (cleaner-thread only)
+    ReplicaRegistry*        registry_;            // non-owning
+    int64_t                 cycleBudgetBytes_;    // 0 = unlimited; >0 = soft bytes-per-window cap
+    int64_t                 dedupeBufferBytes_;   // dedupe map byte budget (SkimpyOffsetMap, > 0 always)
+    int64_t                 bytesUsed_ = 0;       // bytes consumed so far in the current budget window
+    rune::storage::Throttler throttler_;          // CP-8: shared I/O throttler (cleaner-thread only)
+    // CP-8 Fix 3: segment coalescing.
+    bool    useCoalescing_       = false;          // if true, group consecutive segments and merge
+    int64_t coalescingRollBytes_ = 64LL * 1024 * 1024; // max combined output bytes per group
 
     // CP-7: per-log cleaner-offset-checkpoint (lazy init on first compaction).
     // Key = Log* (non-owning, lives as long as the replica registry).
