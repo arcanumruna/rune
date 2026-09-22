@@ -55,6 +55,8 @@ if(BUILD_TESTING)
     # ---------------------------------------------------------------------------
     add_executable(rune_bridge_per_partition_tests
         tests/node/ReplicationMetadataBridgePerPartitionTest.cpp)
+    target_include_directories(rune_bridge_per_partition_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_bridge_per_partition_tests PRIVATE
         rune_node
         rune_metadata_msm

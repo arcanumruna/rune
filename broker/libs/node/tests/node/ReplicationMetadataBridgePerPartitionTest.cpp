@@ -11,13 +11,18 @@
 // Test cases:
 //   1. UserPartition_ThisNode_BecomeLeader
 //      Committed map assigns this node as leader → becomeLeader(perPartEpoch, perPartISR).
+//      Per-partition leaderEpoch (5) ≠ cluster epoch (10): epoch assert FAILS if
+//      the bridge accidentally uses the cluster term instead.
 //
 //   2. UserPartition_OtherNode_BecomeFollower
 //      Committed map assigns another node as leader → becomeFollower(perPartEpoch, leaderNode).
+//      Per-partition leaderEpoch (3) ≠ cluster epoch (10): epoch assert FAILS if
+//      the bridge accidentally uses the cluster term.
 //
 //   3. DifferentUserPartitions_DifferentLeaders
-//      Two user partitions with different leaders → each gets the correct role
-//      in one doWork pass (per-partition, NOT uniform).
+//      Two user partitions with DISTINCT per-partition epochs (7 and 9, both ≠
+//      cluster epoch 10) → each gets its own correct epoch AND role in one
+//      doWork pass.
 //
 //   4. InternalPartitions_FollowClusterLeadership
 //      Internal partitions (-1/-2/-3) use cluster-consensus leadership
@@ -32,6 +37,10 @@
 //   7. UserPartition_RemovedFromNode_BecomeFollower
 //      A user partition previously led by this node, now reassigned → becomeFollower.
 //
+// All tests drive the bridge through the PRODUCTION path:
+//   MetadataStateMachine msm; msm.apply(...); msm.commit(...); bridge.setMsm(&msm).
+// No test-only directMap_ / deriveLocalDeltaFromMap copy is used.
+//
 // Single-writer / no-Aeron tests.
 // ---------------------------------------------------------------------------
 
@@ -44,7 +53,9 @@
 #include <rune/metadata/PartitionAssignment.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/protocol/MetadataRecords.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -56,6 +67,7 @@
 using namespace rune::node;
 using namespace rune::replication;
 using namespace rune::metadata;
+using namespace rune::protocol::metadata;
 
 // ---------------------------------------------------------------------------
 // TempDir helper
@@ -109,20 +121,72 @@ static PartitionConfig makeCfg(int32_t topicId, PartitionId partId, NodeId selfI
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build a PartitionAssignment.
+// Wire-encoding helpers for MetadataStateMachine::apply().
+// Mirrors the helpers in MetadataStateMachineTest.cpp.
 // ---------------------------------------------------------------------------
-static PartitionAssignment makePA(int32_t leaderNode,
-                                   int32_t leaderEpoch,
-                                   int32_t partitionEpoch,
-                                   std::vector<int32_t> isr,
-                                   std::vector<int32_t> replicas = {}) {
-    PartitionAssignment pa;
-    pa.leaderNode      = leaderNode;
-    pa.leaderEpoch     = leaderEpoch;
-    pa.partitionEpoch  = partitionEpoch;
-    pa.isr             = std::move(isr);
-    pa.replicas        = replicas.empty() ? pa.isr : std::move(replicas);
-    return pa;
+
+static std::pair<std::array<uint8_t, 256>, std::size_t> encodeCreate(
+    int32_t topicId, int32_t partitionCount, int16_t rf,
+    std::string_view name = "t")
+{
+    CreateTopicRecord rec;
+    rec.topicId        = topicId;
+    rec.partitionCount = partitionCount;
+    rec.rf             = rf;
+    rec.name           = name;
+    rec.partitionKey   = "";
+    rec.placementMode  = 0;
+    rec.coPartitionGroup = "";
+
+    std::array<uint8_t, 256> buf{};
+    std::size_t sz = rec.encode(buf.data(), buf.size());
+    return {buf, sz};
+}
+
+struct UpdateArgs {
+    int32_t topicId;
+    int32_t partition;
+    int32_t leaderNode;
+    std::vector<int32_t> isr;
+    std::vector<int32_t> replicas;
+    int32_t leaderEpoch    = 0;
+    int32_t partitionEpoch = 0;
+};
+
+static std::pair<std::array<uint8_t, 512>, std::size_t> encodeUpdate(const UpdateArgs& a)
+{
+    std::array<uint8_t, 512> buf{};
+
+    std::vector<uint8_t> isrBytes(a.isr.size() * 4u);
+    for (std::size_t i = 0; i < a.isr.size(); ++i) {
+        uint32_t v = static_cast<uint32_t>(a.isr[i]);
+        isrBytes[i*4+0] = static_cast<uint8_t>(v);
+        isrBytes[i*4+1] = static_cast<uint8_t>(v >> 8);
+        isrBytes[i*4+2] = static_cast<uint8_t>(v >> 16);
+        isrBytes[i*4+3] = static_cast<uint8_t>(v >> 24);
+    }
+    std::vector<uint8_t> repBytes(a.replicas.size() * 4u);
+    for (std::size_t i = 0; i < a.replicas.size(); ++i) {
+        uint32_t v = static_cast<uint32_t>(a.replicas[i]);
+        repBytes[i*4+0] = static_cast<uint8_t>(v);
+        repBytes[i*4+1] = static_cast<uint8_t>(v >> 8);
+        repBytes[i*4+2] = static_cast<uint8_t>(v >> 16);
+        repBytes[i*4+3] = static_cast<uint8_t>(v >> 24);
+    }
+
+    UpdatePartitionAssignmentRecord rec;
+    rec.topicId        = a.topicId;
+    rec.partition      = a.partition;
+    rec.leaderNode     = a.leaderNode;
+    rec.leaderEpoch    = a.leaderEpoch;
+    rec.partitionEpoch = a.partitionEpoch;
+    rec.isr     = Int32ArrayView(reinterpret_cast<const int32_t*>(isrBytes.data()),
+                                 static_cast<uint16_t>(a.isr.size()));
+    rec.replicas = Int32ArrayView(reinterpret_cast<const int32_t*>(repBytes.data()),
+                                  static_cast<uint16_t>(a.replicas.size()));
+
+    std::size_t sz = rec.encode(buf.data(), buf.size());
+    return {buf, sz};
 }
 
 // ===========================================================================
@@ -158,10 +222,16 @@ protected:
         return raw;
     }
 
-    // Build a bridge (no initial map).
-    std::unique_ptr<ReplicationMetadataBridge> makeBridge() {
+    // Build a bridge with an attached MSM (production path).
+    std::unique_ptr<ReplicationMetadataBridge> makeBridge(
+        const MetadataStateMachine* msm = nullptr)
+    {
         const std::vector<NodeId> allNodes = {kSelf, kNode2, kNode3};
-        return std::make_unique<ReplicationMetadataBridge>(kSelf, allNodes, registry_);
+        auto bridge = std::make_unique<ReplicationMetadataBridge>(kSelf, allNodes, registry_);
+        if (msm) {
+            bridge->setMsm(msm);
+        }
+        return bridge;
     }
 
     MockTransport transport_;
@@ -173,25 +243,42 @@ protected:
 // ===========================================================================
 // Test 1: USER partition — this node is the assigned leader
 //         → becomeLeader(perPartitionEpoch, perPartitionISR)
+//
+// Per-partition leaderEpoch = 5; cluster epoch = 10.
+// EXPECT_EQ(rep->epoch(), 5u) FAILS if the bridge uses the cluster epoch instead.
 // ===========================================================================
 TEST_F(BridgePerPartitionTest, UserPartition_ThisNode_BecomeLeader) {
     // Replica starts as Follower.
     PartitionReplica* rep = addReplica(/*topicId=*/0, 0, kSelf, Role::Follower, 1);
 
-    // Build committed map: topic=0, partition=0, leader=kSelf.
-    AssignmentMap cmap;
-    cmap.put(0, 0, makePA(kSelf, /*leaderEpoch=*/5, /*partitionEpoch=*/7,
-                           {kSelf, kNode2}));
+    // Populate the real MSM: topic=0, partition=0, leader=kSelf,
+    // per-partition leaderEpoch=5 (deliberately different from cluster epoch=10).
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(0, 1, 1);
+    msm.apply(cbuf.data(), csz, /*pos=*/0);
+    msm.commit(0);
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&cmap);
+    auto [ubuf, usz] = encodeUpdate({0, 0, kSelf,
+                                     {kSelf, kNode2},     // ISR: 2 nodes
+                                     {kSelf, kNode2},
+                                     /*leaderEpoch=*/5,
+                                     /*partitionEpoch=*/7});
+    msm.apply(ubuf.data(), usz, /*pos=*/1);
+    msm.commit(1);
 
-    // Call doWork. cluster-leader = kSelf, but user partitions use the map.
+    auto bridge = makeBridge(&msm);
+
+    // doWork with cluster-leader=kSelf, clusterEpoch=10.
+    // User partitions must use the map epoch (5), not the cluster epoch (10).
     const int work = bridge->doWork(kSelf, /*clusterEpoch=*/10);
 
     EXPECT_GE(work, 1) << "bridge must report work done on first call with a new map";
     EXPECT_EQ(rep->role(), Role::Leader)
         << "user partition must become Leader when committed map names this node";
+
+    // Epoch must be the PER-PARTITION leaderEpoch (5), not the cluster epoch (10).
+    EXPECT_EQ(rep->epoch(), 5u)
+        << "epoch must be the per-partition leaderEpoch from the MSM, not the cluster term";
 
     // ISR must come from the map (size 2: {kSelf, kNode2}), not allReplicaIds (size 3).
     EXPECT_EQ(rep->isr().size(), 2u) << "ISR must match the per-partition map ISR";
@@ -200,18 +287,29 @@ TEST_F(BridgePerPartitionTest, UserPartition_ThisNode_BecomeLeader) {
 // ===========================================================================
 // Test 2: USER partition — another node is the assigned leader
 //         → becomeFollower(perPartitionEpoch, leaderNode)
+//
+// Per-partition leaderEpoch = 3; cluster epoch = 10.
+// EXPECT_EQ(rep->epoch(), 3u) FAILS if the bridge uses the cluster epoch instead.
 // ===========================================================================
 TEST_F(BridgePerPartitionTest, UserPartition_OtherNode_BecomeFollower) {
     // Replica starts as Leader.
     PartitionReplica* rep = addReplica(/*topicId=*/0, 0, kSelf, Role::Leader, 1);
 
-    // Build committed map: leader is kNode2 (not this node).
-    AssignmentMap cmap;
-    cmap.put(0, 0, makePA(kNode2, /*leaderEpoch=*/3, /*partitionEpoch=*/4,
-                           {kSelf, kNode2, kNode3}));
+    // Committed map: leader is kNode2 (not this node), per-partition leaderEpoch=3.
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(0, 1, 1);
+    msm.apply(cbuf.data(), csz, 0);
+    msm.commit(0);
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&cmap);
+    auto [ubuf, usz] = encodeUpdate({0, 0, kNode2,
+                                     {kSelf, kNode2, kNode3},  // ISR: all 3
+                                     {kSelf, kNode2, kNode3},
+                                     /*leaderEpoch=*/3,
+                                     /*partitionEpoch=*/4});
+    msm.apply(ubuf.data(), usz, 1);
+    msm.commit(1);
+
+    auto bridge = makeBridge(&msm);
 
     // Even if cluster-leader = kSelf, user partitions use the map.
     const int work = bridge->doWork(kSelf, /*clusterEpoch=*/10);
@@ -219,29 +317,64 @@ TEST_F(BridgePerPartitionTest, UserPartition_OtherNode_BecomeFollower) {
     EXPECT_GE(work, 1) << "bridge must report work done when map changes role";
     EXPECT_EQ(rep->role(), Role::Follower)
         << "user partition must become Follower when committed map names another node";
+
+    // Epoch must be the PER-PARTITION leaderEpoch (3), not the cluster epoch (10).
+    EXPECT_EQ(rep->epoch(), 3u)
+        << "epoch must be the per-partition leaderEpoch from the MSM, not the cluster term";
 }
 
 // ===========================================================================
-// Test 3: Different user partitions → different leaders in ONE doWork pass
+// Test 3: Different user partitions → different leaders AND different epochs
+//         in ONE doWork pass.
+//
+// Partition 0: per-partition leaderEpoch=7, leader=kSelf.
+// Partition 1: per-partition leaderEpoch=9, leader=kNode2.
+// Cluster epoch = 10 (differs from BOTH per-partition epochs).
+// Each assert on rep->epoch() FAILS if the cluster term is used for either.
 // ===========================================================================
 TEST_F(BridgePerPartitionTest, DifferentUserPartitions_DifferentLeaders) {
-    // Partition 0: leader = kSelf. Partition 1: leader = kNode2.
     PartitionReplica* rep0 = addReplica(0, 0, kSelf, Role::Follower, 1);
     PartitionReplica* rep1 = addReplica(0, 1, kSelf, Role::Leader,   1);
 
-    AssignmentMap cmap;
-    cmap.put(0, 0, makePA(kSelf,  2, 3, {kSelf, kNode2}));
-    cmap.put(0, 1, makePA(kNode2, 2, 3, {kSelf, kNode2, kNode3}));
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(0, 2, 1);
+    msm.apply(cbuf.data(), csz, 0);
+    msm.commit(0);
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&cmap);
-    const int work = bridge->doWork(kSelf, 10);
+    // Partition 0: this node is leader, leaderEpoch=7 (≠ cluster epoch 10).
+    auto [ubuf0, usz0] = encodeUpdate({0, 0, kSelf,
+                                       {kSelf, kNode2},
+                                       {kSelf, kNode2},
+                                       /*leaderEpoch=*/7,
+                                       /*partitionEpoch=*/8});
+    msm.apply(ubuf0.data(), usz0, 1);
+    msm.commit(1);
+
+    // Partition 1: kNode2 is leader, leaderEpoch=9 (≠ cluster epoch 10, ≠ p0 epoch 7).
+    auto [ubuf1, usz1] = encodeUpdate({0, 1, kNode2,
+                                       {kSelf, kNode2, kNode3},
+                                       {kSelf, kNode2, kNode3},
+                                       /*leaderEpoch=*/9,
+                                       /*partitionEpoch=*/11});
+    msm.apply(ubuf1.data(), usz1, 2);
+    msm.commit(2);
+
+    auto bridge = makeBridge(&msm);
+    const int work = bridge->doWork(kSelf, /*clusterEpoch=*/10);
 
     EXPECT_GE(work, 1);
+
+    // Partition 0: this node is leader in the map → Leader, epoch must be 7.
     EXPECT_EQ(rep0->role(), Role::Leader)
         << "partition 0: this node is leader in the map → must be Leader";
+    EXPECT_EQ(rep0->epoch(), 7u)
+        << "partition 0: epoch must be per-partition leaderEpoch=7, not cluster epoch=10";
+
+    // Partition 1: kNode2 is leader → this node is Follower, epoch must be 9.
     EXPECT_EQ(rep1->role(), Role::Follower)
         << "partition 1: kNode2 is leader in the map → this node must be Follower";
+    EXPECT_EQ(rep1->epoch(), 9u)
+        << "partition 1: epoch must be per-partition leaderEpoch=9, not cluster epoch=10";
 }
 
 // ===========================================================================
@@ -253,15 +386,11 @@ TEST_F(BridgePerPartitionTest, InternalPartitions_FollowClusterLeadership) {
     PartitionReplica* rTxn  = addReplica(-2, 0, kSelf, Role::Follower, 1);
     PartitionReplica* rMeta = addReplica(-3, 0, kSelf, Role::Follower, 1);
 
-    // Committed map with bogus internal entries claiming kNode2 is leader.
-    // Bridge MUST ignore these for internal partitions.
-    AssignmentMap cmap;
-    cmap.put(-1, 0, makePA(kNode2, 1, 1, {kNode2}));
-    cmap.put(-2, 0, makePA(kNode2, 1, 1, {kNode2}));
-    cmap.put(-3, 0, makePA(kNode2, 1, 1, {kNode2}));
+    // MSM is empty (no user assignments) — internal partitions must still respond
+    // to cluster leadership even with no MSM assignments.
+    MetadataStateMachine msm;
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&cmap);
+    auto bridge = makeBridge(&msm);
 
     // Cluster leader = kSelf → internal partitions must all become Leader.
     const int work1 = bridge->doWork(kSelf, 5);
@@ -279,17 +408,29 @@ TEST_F(BridgePerPartitionTest, InternalPartitions_FollowClusterLeadership) {
 }
 
 // ===========================================================================
-// Test 5: Apply-committed-only — empty committed map → no role change for
-//          user partition.
+// Test 5: Apply-committed-only — uncommitted assignment NOT visible.
+//          Record is applied at pos=5 but NOT committed (committedPos remains
+//          below 5) → bridge sees an empty map → no role change.
 // ===========================================================================
 TEST_F(BridgePerPartitionTest, ApplyCommittedOnly_PendingMapNotApplied) {
     PartitionReplica* rep = addReplica(0, 0, kSelf, Role::Follower, 1);
 
-    // Empty committed map — no user assignments committed yet.
-    AssignmentMap emptyMap;
+    // Apply a CreateTopic and an assignment, but do NOT commit the assignment.
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(0, 1, 1);
+    msm.apply(cbuf.data(), csz, 0);
+    msm.commit(0);  // CreateTopic committed
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&emptyMap);
+    // Assignment at pos=5: applied but NOT committed.
+    auto [ubuf, usz] = encodeUpdate({0, 0, kSelf,
+                                     {kSelf, kNode2},
+                                     {kSelf, kNode2},
+                                     /*leaderEpoch=*/3,
+                                     /*partitionEpoch=*/4});
+    msm.apply(ubuf.data(), usz, /*pos=*/5);
+    // No msm.commit(5) — the record remains pending.
+
+    auto bridge = makeBridge(&msm);
 
     // cluster-leader = kSelf; but user partition has no committed assignment.
     // No internal partitions registered either.
@@ -309,48 +450,79 @@ TEST_F(BridgePerPartitionTest, ApplyCommittedOnly_PendingMapNotApplied) {
 TEST_F(BridgePerPartitionTest, NoOpFastPath_UnchangedMapAndLeadership) {
     PartitionReplica* rep = addReplica(0, 0, kSelf, Role::Follower, 1);
 
-    AssignmentMap cmap;
-    cmap.put(0, 0, makePA(kSelf, 2, 3, {kSelf, kNode2}));
+    MetadataStateMachine msm;
+    auto [cbuf, csz] = encodeCreate(0, 1, 1);
+    msm.apply(cbuf.data(), csz, 0);
+    msm.commit(0);
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&cmap);
+    auto [ubuf, usz] = encodeUpdate({0, 0, kSelf,
+                                     {kSelf, kNode2},
+                                     {kSelf, kNode2},
+                                     /*leaderEpoch=*/2,
+                                     /*partitionEpoch=*/3});
+    msm.apply(ubuf.data(), usz, 1);
+    msm.commit(1);
+
+    auto bridge = makeBridge(&msm);
 
     // First call: applies the map → role flips to Leader.
     const int work1 = bridge->doWork(kSelf, 10);
     EXPECT_GE(work1, 1);
     EXPECT_EQ(rep->role(), Role::Leader);
 
-    // Second call: same map pointer AND same cluster leader → 0 work.
+    // Second call: same MSM (no new commits) AND same cluster leader → 0 work.
     // Delta is empty because prevMap_ was snapshotted after the first call.
     const int work2 = bridge->doWork(kSelf, 10);
     EXPECT_EQ(work2, 0)
-        << "unchanged map + unchanged cluster leader must return 0 work (no-op fast path)";
+        << "unchanged MSM + unchanged cluster leader must return 0 work (no-op fast path)";
 }
 
 // ===========================================================================
-// Test 7: User partition reassigned away from this node → becomeFollower
+// Test 7: User partition reassigned away from this node → becomeFollower.
+// Two separate MSM instances represent the before/after committed state.
 // ===========================================================================
 TEST_F(BridgePerPartitionTest, UserPartition_RemovedFromNode_BecomeFollower) {
     // Start as Leader on this node.
     PartitionReplica* rep = addReplica(0, 0, kSelf, Role::Leader, 1);
 
-    // Initial map: this node is leader.
-    AssignmentMap map1;
-    map1.put(0, 0, makePA(kSelf, 1, 1, {kSelf, kNode2}));
+    // MSM1: initial assignment — this node is leader, leaderEpoch=1.
+    MetadataStateMachine msm1;
+    {
+        auto [cbuf, csz] = encodeCreate(0, 1, 1);
+        msm1.apply(cbuf.data(), csz, 0);
+        msm1.commit(0);
+        auto [ubuf, usz] = encodeUpdate({0, 0, kSelf,
+                                         {kSelf, kNode2},
+                                         {kSelf, kNode2},
+                                         /*leaderEpoch=*/1,
+                                         /*partitionEpoch=*/1});
+        msm1.apply(ubuf.data(), usz, 1);
+        msm1.commit(1);
+    }
 
-    auto bridge = makeBridge();
-    bridge->setCommittedMap(&map1);
+    auto bridge = makeBridge(&msm1);
 
     const int work1 = bridge->doWork(kSelf, 10);
     EXPECT_GE(work1, 1);
-    EXPECT_EQ(rep->role(), Role::Leader) << "initially this node is leader per map";
+    EXPECT_EQ(rep->role(), Role::Leader) << "initially this node is leader per MSM";
 
-    // Reassign: kNode2 becomes leader (bump epochs).
-    AssignmentMap map2;
-    map2.put(0, 0, makePA(kNode2, 2, 2, {kSelf, kNode2, kNode3}));
+    // MSM2: reassignment — kNode2 becomes leader, epochs bumped.
+    MetadataStateMachine msm2;
+    {
+        auto [cbuf, csz] = encodeCreate(0, 1, 1);
+        msm2.apply(cbuf.data(), csz, 0);
+        msm2.commit(0);
+        auto [ubuf, usz] = encodeUpdate({0, 0, kNode2,
+                                         {kSelf, kNode2, kNode3},
+                                         {kSelf, kNode2, kNode3},
+                                         /*leaderEpoch=*/2,
+                                         /*partitionEpoch=*/2});
+        msm2.apply(ubuf.data(), usz, 1);
+        msm2.commit(1);
+    }
 
-    // Point the bridge at the new map.
-    bridge->setCommittedMap(&map2);
+    // Switch the bridge to the new MSM (simulates the committed map advancing).
+    bridge->setMsm(&msm2);
 
     const int work2 = bridge->doWork(kSelf, 10);
     EXPECT_GE(work2, 1);

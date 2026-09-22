@@ -111,21 +111,6 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // [Test-only] setCommittedMap — supply an AssignmentMap directly (no MSM).
-    //
-    // Used by per-partition unit tests that construct AssignmentMap objects
-    // directly rather than going through MetadataStateMachine.  In production
-    // code, setMsm() is the correct entry point.
-    //
-    // Must be called on the duty-cycle thread.
-    // -----------------------------------------------------------------------
-    void setCommittedMap(const rune::metadata::AssignmentMap* map) noexcept {
-        directMap_ = map;
-        msm_       = nullptr;  // directMap_ takes precedence when msm_ is null
-        prevMap_   = rune::metadata::AssignmentMap{};
-    }
-
-    // -----------------------------------------------------------------------
     // doWork — single duty-cycle step.
     //
     // Called each cycle AFTER consensus.doWork() (so the consensus state is
@@ -200,19 +185,9 @@ public:
 
         // ── Step B: USER partitions ───────────────────────────────────────────
         // Drive user partitions (topicId >= 0) from the committed assignment map.
-        //
-        // The map source can be:
-        //   (a) msm_->committedMap()  — production path (MetadataStateMachine)
-        //   (b) directMap_            — test-only path (raw AssignmentMap pointer)
-        const rune::metadata::AssignmentMap* currentMap = nullptr;
+        // Requires msm_ to be set (production wiring via setMsm()).
         if (msm_ != nullptr) {
-            currentMap = &msm_->committedMap();
-        } else if (directMap_ != nullptr) {
-            currentMap = directMap_;
-        }
-
-        if (currentMap != nullptr) {
-            work += applyUserPartitionRoles(*currentMap);
+            work += applyUserPartitionRoles(msm_->committedMap());
         }
 
         return work;
@@ -256,28 +231,19 @@ private:
     // -----------------------------------------------------------------------
     // applyUserPartitionRoles
     //
-    // Compute deriveLocalDelta(selfId_, prevMap_) on the current committed map.
+    // Compute msm_->deriveLocalDelta(selfId_, prevMap_) on the current committed map.
     // For each changed user partition, call becomeLeader or becomeFollower.
     // Snapshot prevMap_ for the next cycle.
     //
     // Returns 1 if any role transition was performed, 0 if no-op.
+    // Pre-condition: msm_ != nullptr (caller guarantees this).
     // -----------------------------------------------------------------------
     int applyUserPartitionRoles(
         const rune::metadata::AssignmentMap& currentMap) noexcept
     {
-        // Compute delta using deriveLocalDelta via the MSM (if available) or
-        // via direct map comparison using a temporary MSM shell.
-        rune::metadata::LocalRoleDelta delta;
-        if (msm_ != nullptr) {
-            delta = msm_->deriveLocalDelta(
-                static_cast<int32_t>(selfId_), prevMap_);
-        } else {
-            // Test-only path: build a temporary MSM with currentMap as committed,
-            // then derive delta.  We use the committed-map copy trick:
-            // wrap the call through a shared helper.
-            delta = deriveLocalDeltaFromMap(currentMap, prevMap_,
-                                            static_cast<int32_t>(selfId_));
-        }
+        // Compute delta via the production MetadataStateMachine::deriveLocalDelta.
+        rune::metadata::LocalRoleDelta delta =
+            msm_->deriveLocalDelta(static_cast<int32_t>(selfId_), prevMap_);
 
         const bool anyChange =
             !delta.electedLeaders.empty() ||
@@ -314,78 +280,6 @@ private:
         prevMap_ = currentMap;
 
         return 1;
-    }
-
-    // -----------------------------------------------------------------------
-    // deriveLocalDeltaFromMap — standalone delta computation on two AssignmentMaps.
-    //
-    // Mirrors MetadataStateMachine::deriveLocalDelta but operates on plain
-    // AssignmentMap objects (used by the test-only directMap_ path).
-    // -----------------------------------------------------------------------
-    static rune::metadata::LocalRoleDelta deriveLocalDeltaFromMap(
-        const rune::metadata::AssignmentMap& current,
-        const rune::metadata::AssignmentMap& prev,
-        int32_t selfNode)
-    {
-        rune::metadata::LocalRoleDelta delta;
-
-        auto containsNode = [](const std::vector<int32_t>& vec, int32_t node) {
-            for (int32_t v : vec)
-                if (v == node) return true;
-            return false;
-        };
-
-        // Walk current map
-        current.forEach([&](int32_t topicId, int32_t partition,
-                            const rune::metadata::PartitionAssignment& cur) {
-            const rune::metadata::PartitionAssignment* prevPa =
-                prev.get(topicId, partition);
-            const rune::metadata::PartitionKey key{topicId, partition};
-
-            if (prevPa == nullptr) {
-                // Brand-new
-                if (cur.leaderNode == selfNode) {
-                    delta.electedLeaders.push_back(key);
-                } else if (containsNode(cur.replicas, selfNode)) {
-                    delta.followers.push_back(key);
-                }
-                return;
-            }
-
-            const bool leaderEpochBumped    = (cur.leaderEpoch    > prevPa->leaderEpoch);
-            const bool partitionEpochBumped = (cur.partitionEpoch > prevPa->partitionEpoch);
-
-            if (!leaderEpochBumped && !partitionEpochBumped) return;
-
-            if (cur.leaderNode == selfNode) {
-                if (leaderEpochBumped) {
-                    delta.electedLeaders.push_back(key);
-                } else {
-                    delta.leaderUpdates.push_back(key);
-                }
-            } else if (containsNode(cur.replicas, selfNode)) {
-                delta.followers.push_back(key);
-            } else if (containsNode(prevPa->replicas, selfNode)) {
-                delta.deletes.push_back(key);
-            }
-        });
-
-        // Walk prev for removed partitions
-        prev.forEach([&](int32_t topicId, int32_t partition,
-                         const rune::metadata::PartitionAssignment& prevPa) {
-            if (current.get(topicId, partition) == nullptr) {
-                auto containsNodeLocal = [](const std::vector<int32_t>& v, int32_t n) {
-                    for (int32_t x : v) if (x == n) return true;
-                    return false;
-                };
-                if (containsNodeLocal(prevPa.replicas, selfNode)) {
-                    delta.deletes.push_back(
-                        rune::metadata::PartitionKey{topicId, partition});
-                }
-            }
-        });
-
-        return delta;
     }
 
     void applyBecomeLeaderForKey(
@@ -442,11 +336,9 @@ private:
     ReplicaRegistry&                               registry_;
 
     // Production path: non-owning pointer to the MetadataStateMachine.
+    // Set via setMsm() after BrokerNode::start() wires the MetadataService.
     // Accessed only on the duty-cycle thread.
     const rune::metadata::MetadataStateMachine*    msm_       = nullptr;
-
-    // Test-only path: raw AssignmentMap pointer (when msm_ is null).
-    const rune::metadata::AssignmentMap*           directMap_ = nullptr;
 
     // Snapshot of the committed map as of the last applyUserPartitionRoles call.
     // Used to compute the delta on subsequent cycles.
