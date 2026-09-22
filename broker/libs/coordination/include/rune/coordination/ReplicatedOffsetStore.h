@@ -103,7 +103,15 @@ public:
     ///
     /// Typical use: new coordinator leader calls this once after becoming
     /// leader before accepting any new OffsetCommit requests.
-    void rebuildFromLog();
+    ///
+    /// @returns true if the rebuild was EFFECTIVE (the replica's high-watermark
+    ///          was > 0, so the log was actually scanned).  Returns false when
+    ///          hw <= 0 (nothing to replay yet) — the caller should RETRY on a
+    ///          later duty cycle (see CP-5.2 cold-restart fix in
+    ///          GroupCoordinationService::doWork): on a cold cluster restart the
+    ///          HW is briefly gated at 0 while the ISR re-expands, and a one-shot
+    ///          rebuild here would silently recover no committed offsets.
+    bool rebuildFromLog();
 
 private:
     // -----------------------------------------------------------------------

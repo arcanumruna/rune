@@ -144,15 +144,32 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     // committed offsets that were replicated to this node while it was a follower
     // are visible before serving any JoinGroup / SyncGroup requests.
     const bool amLeader = isLocalCoordinator();
-    if (amLeader && !wasLeader_) {
-        spdlog::info("GroupCoordinationService::doWork: became coordinator — rebuilding offset index");
-        if (offsets_) {
-            offsets_->rebuildFromLog();
+    if (amLeader) {
+        if (!wasLeader_) {
+            // First duty cycle after becoming coordinator — attempt the rebuild.
+            wasLeader_ = true;
+            offsetsRebuilt_ = false; // arm the retry for this leadership term
         }
-        wasLeader_ = true;
+        // CP-5.2 cold-restart fix: RETRY the offset-index rebuild every duty cycle
+        // until it is EFFECTIVE (hw>0).  On a cold cluster restart the
+        // __consumer_offsets HW is briefly gated at 0 while the ISR re-expands, so
+        // a one-shot rebuild recovers nothing and consumer groups resume from 0.
+        // rebuildFromLog() now returns false while hw<=0 (and does NOT clear the
+        // index in that case), so retrying is safe and idempotent; once it runs
+        // with hw>0 we latch offsetsRebuilt_ and stop retrying.  This retry window
+        // is before any group resumes committing, so re-running the rebuild cannot
+        // clobber a live in-memory commit.
+        if (!offsetsRebuilt_ && offsets_) {
+            if (offsets_->rebuildFromLog()) {
+                offsetsRebuilt_ = true;
+                spdlog::info("GroupCoordinationService::doWork: became coordinator "
+                             "— offset index rebuilt from __consumer_offsets");
+            }
+        }
     } else if (!amLeader && wasLeader_) {
         // Lost leadership — mark so the next election triggers another rebuild.
         wasLeader_ = false;
+        offsetsRebuilt_ = false;
     }
 
     if (coordinators_.empty()) return 0;

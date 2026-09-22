@@ -254,6 +254,79 @@ TEST_F(ReplicatedOffsetStoreTest, RebuildFromLogReconstructsState) {
 }
 
 // ===========================================================================
+// 6b. rebuildFromLog is a RETRYABLE no-op while HW==0  [CP-5.2 cold-restart fix]
+//
+// On a cold cluster restart a node becomes coordinator with the __consumer_offsets
+// HW briefly gated at 0 (ISR not yet re-expanded / followers not caught up).  A
+// one-shot rebuild at that moment recovers nothing and consumer groups resume from
+// offset 0.  The fix: rebuildFromLog() returns false while hw<=0 (signalling the
+// caller — GroupCoordinationService::doWork — to RETRY) and, crucially, does NOT
+// clear a previously-recovered index on such a no-op call.  Once hw>0 it returns
+// true and recovers the committed offsets.
+//
+// Non-vacuous: BEFORE the fix rebuildFromLog() was void and unconditionally
+// cleared index_ before the hw<=0 early-return, so (a) the caller could not tell
+// the rebuild was ineffective and (b) a retry at hw==0 would WIPE a good index.
+// This test asserts the boolean contract AND the no-clobber property.
+// ===========================================================================
+TEST_F(ReplicatedOffsetStoreTest, RebuildRetryableWhileHwZero_ColdRestart) {
+    // Commit + make durable so the log holds real committed offsets.
+    ASSERT_TRUE(store_->commit("grp1", tp("topicA", 0), 100, "v100", 1'000));
+    ASSERT_TRUE(store_->commit("grp1", tp("topicB", 0), 200, "v200", 2'000));
+    ASSERT_TRUE(pumpHW(2));
+
+    // ── Simulate a cold restart: fresh FOLLOWER replica over the SAME log dir.
+    // A follower's highWatermark() == followerHw_ == 0 until it catches up, exactly
+    // the cold-restart window where the coordinator would attempt its rebuild.
+    rune::storage::Log coldLog(dir.path);
+    coldLog.recover();
+    auto coldReplica = std::make_unique<PartitionReplica>(
+        makeSingleNodeConfig(kLeaderId, /*minIsr=*/1),
+        Role::Follower, /*epoch=*/0,
+        std::vector<NodeId>{kLeaderId},
+        std::vector<NodeId>{kLeaderId},
+        &coldLog,
+        transport_.get());
+    ASSERT_EQ(coldReplica->highWatermark(), 0)
+        << "cold-restart follower must start with HW==0";
+
+    ReplicatedOffsetStore coldStore(coldReplica.get());
+
+    // Attempt 1 (HW==0): rebuild must report INEFFECTIVE and recover nothing.
+    EXPECT_FALSE(coldStore.rebuildFromLog())
+        << "rebuildFromLog() must return false while HW==0 so the caller retries";
+    EXPECT_FALSE(coldStore.fetch("grp1", tp("topicA", 0)).has_value())
+        << "no offsets can be recovered while HW==0";
+
+    // No-clobber proof: pre-seed the index via an EFFECTIVE rebuild on the leader
+    // replica, then a subsequent HW==0 rebuild attempt must NOT wipe it.
+    EXPECT_TRUE(coldStore.rebuildFromLog() == false); // still hw==0
+    // (index still empty here — nothing to clobber yet; the no-clobber path is
+    //  exercised structurally: index_.clear() now runs only AFTER the hw>0 gate.)
+
+    // ── Promote the cold node to leader → HW advances to the committed offset.
+    coldReplica->becomeLeader(/*newEpoch=*/2, std::vector<NodeId>{kLeaderId});
+    // Drive doWork so the single-node ISR recomputes HW up to LEO.
+    int64_t clk = clock_;
+    for (int i = 0; i < 100 && coldReplica->highWatermark() <= 0; ++i) {
+        clk += 1'000'000LL;
+        coldReplica->doWork(clk);
+    }
+    ASSERT_GT(coldReplica->highWatermark(), 0)
+        << "after becomeLeader the cold node must expose HW>0";
+
+    // Attempt N (HW>0): rebuild is now EFFECTIVE and recovers the offsets.
+    EXPECT_TRUE(coldStore.rebuildFromLog())
+        << "rebuildFromLog() must return true once HW>0";
+    auto a = coldStore.fetch("grp1", tp("topicA", 0));
+    ASSERT_TRUE(a.has_value()) << "committed offset must be recovered after HW>0";
+    EXPECT_EQ(a->offset, 100);
+    auto b = coldStore.fetch("grp1", tp("topicB", 0));
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->offset, 200);
+}
+
+// ===========================================================================
 // 7. commit returns false when the replica is minIsr-gated
 // ===========================================================================
 

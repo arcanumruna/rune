@@ -196,6 +196,18 @@ private:
     // subsequent re-election triggers another rebuild).
     bool wasLeader_ = false;
 
+    // CP-5.2 cold-restart fix: the offset-index rebuild is a NO-OP while the
+    // __consumer_offsets partition's high-watermark is still 0 (rebuildFromLog
+    // bails on hw<=0).  On a COLD cluster restart a node becomes coordinator with
+    // HW temporarily gated at 0 (ISR not yet re-expanded to minIsr / followers not
+    // yet caught up), so a one-shot rebuild on the leader transition recovers
+    // NOTHING and consumer groups resume from offset 0.  We therefore RETRY the
+    // rebuild every coordinator doWork until it actually runs with hw>0
+    // (offsetsRebuilt_ latches true only then).  This retry window is BEFORE any
+    // group resumes committing, so re-running rebuild (clear+repopulate from the
+    // log) cannot clobber a live in-memory commit.
+    bool offsetsRebuilt_ = false;
+
     // CG-4: ClientGateway — non-owning; may be null (tests without push subs).
     rune::gateway::ClientGateway*              gateway_ = nullptr;
 

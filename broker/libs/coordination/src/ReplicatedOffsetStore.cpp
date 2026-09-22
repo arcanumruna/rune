@@ -298,12 +298,11 @@ void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
 // or no progress made) or when fetchOffset >= hw.
 // ---------------------------------------------------------------------------
 
-void ReplicatedOffsetStore::rebuildFromLog()
+bool ReplicatedOffsetStore::rebuildFromLog()
 {
-    index_.clear();
-
     const rune::replication::Offset hw = replica_->highWatermark();
-    if (hw <= 0) return; // nothing committed yet
+    if (hw <= 0) return false; // nothing committed yet — caller should retry
+    index_.clear();
 
     // Chunk size: large enough to read an entire typical segment in one call.
     // INT32_MAX would work but is unnecessarily large; 64 MiB matches the
@@ -388,6 +387,7 @@ void ReplicatedOffsetStore::rebuildFromLog()
 
         fetchOffset = lastBatchEnd;
     }
+    return true; // effective rebuild (hw > 0 scanned)
 }
 
 } // namespace rune::coordination
