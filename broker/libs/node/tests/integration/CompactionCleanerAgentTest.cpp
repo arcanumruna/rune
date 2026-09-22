@@ -2214,3 +2214,163 @@ TEST(CompactionCleanerAgent, MaxCompactionLagForcesLowDirtyLog) {
         fs::remove_all(dir);
     }
 }
+
+// ===========================================================================
+// TEST: CompactionConvergesWithSingleSegmentGroups  (watermark-convergence bug)
+//
+// Regression guard for the watermark-over-advance bug: with coalescing ON
+// (production default) and a SMALL segmentRollBytes, each small sealed segment
+// forms its OWN single-segment coalescing group.  The cleaner therefore
+// rewrites ONE segment per pass, but the offset map covers the WHOLE dirty
+// range → passEnd == activeBase → the watermark advances past EVERY dirty
+// segment even though only one was rewritten.  The other dirty segments get
+// marked "clean" without ever being rewritten, their superseded records
+// persist forever, the dirtyRatio then drops below minCleanableDirtyRatio,
+// compaction disqualifies itself, and the log NEVER converges to
+// latest-per-key.
+//
+// This test drives the cleaner DETERMINISTICALLY (no sleeps) over many cycles
+// and asserts the log CONVERGES to exactly ONE live record per key (superseded
+// copies GONE, not merely "latest present").  It MUST FAIL on the buggy
+// watermark logic and PASS after the fix that advances the watermark only past
+// the segment/group that was actually rewritten.
+// ===========================================================================
+TEST(CompactionCleanerAgent, CompactionConvergesWithSingleSegmentGroups) {
+    auto dir = cp6TempDir("cp_converge_single_seg_groups");
+    // rollBytes=1 → every batch rolls into its OWN sealed segment, giving us
+    // MANY small sealed segments cheaply (same trick as CoalescingEndToEnd).
+    Log log(dir.string(), /*rollBytes=*/1);
+
+    Cp6NullTransport transport;
+
+    // A FEW keys, MANY updates each → dozens of segments, all superseded except
+    // the last copy of each key.
+    constexpr int kNumKeys      = 3;
+    constexpr int kUpdatesEach  = 50;
+    constexpr int kTotal        = kNumKeys * kUpdatesEach; // 150 records
+    int off = 0;
+    for (int u = 0; u < kUpdatesEach; ++u) {
+        for (int k = 0; k < kNumKeys; ++k) {
+            std::string key = "k" + std::to_string(k);
+            std::string val = "v" + std::to_string(u);
+            auto b = cp6Batch(off, key, val, /*ts=*/1000 + off);
+            log.append(b, off);
+            ++off;
+        }
+    }
+    // Sentinel so the last real records live in a SEALED (not active) segment.
+    {
+        auto b = cp6Batch(off, "sentinel", "s", 5000);
+        log.append(b, off);
+        ++off;
+    }
+
+    auto basesBefore = log.segmentBaseOffsets();
+    const size_t sealedBefore = basesBefore.size() > 0 ? basesBefore.size() - 1 : 0;
+    ASSERT_GE(sealedBefore, 8u)
+        << "Need many small sealed segments to exercise single-segment groups; "
+           "sealed=" << sealedBefore;
+
+    const int totalBefore = cp6CountLiveRecords(log);
+    ASSERT_EQ(totalBefore, kTotal + 1)
+        << "All " << (kTotal + 1) << " records (incl sentinel) must be present pre-compaction.";
+
+    // Replica setup.  Compact policy, dirtyRatio gate 0.5 (production-ish) so
+    // the "watermark over-advance drops the ratio → disqualifies" failure mode
+    // is reproduced.  CRITICAL: segmentRollBytes SMALL so each small segment is
+    // its own single-segment coalescing group (the bug trigger).
+    auto cfg = makeCompactConfig(1300, /*dirtyRatio=*/0.5);
+    // Tiny group bound: each single-batch segment already exceeds it, so every
+    // group is a SINGLE segment → one rewrite per pass (the exact bug trigger).
+    cfg.segmentRollBytes = 1;
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, &transport);
+    replica->becomeLeader(1, {1});
+    replica->onLeaderLogAppended();
+    ASSERT_GT(replica->highWatermark(), 0);
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(1300, 0, std::move(replica));
+
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(
+        dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+
+    // Coalescing ON (production default).  Large dedupe budget so the map is
+    // NEVER the limiting factor — the ONLY thing that can stop convergence is
+    // the watermark logic under test.  cycleBudgetBytes=0 (unlimited).
+    rune::node::LogCleanerAgent cleaner(&registry,
+                                        /*cycleBudgetBytes=*/0,
+                                        /*dedupeBufferBytes=*/64LL * 1024 * 1024,
+                                        /*ioMaxBytesPerSec=*/-1,
+                                        /*useCoalescing=*/true,
+                                        /*coalescingRollBytes=*/64LL * 1024 * 1024);
+
+    // Drive DETERMINISTICALLY: one cleaner cycle rewrites (at most) one segment,
+    // so give it generously more cycles than there are sealed segments.  NO
+    // sleeps, NO monitor polling — deterministic doWork() driving only.
+    const int kCycles = static_cast<int>(sealedBefore) * 4 + 50;
+    for (int i = 0; i < kCycles; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    // Count LIVE records per key.  Convergence == exactly ONE per key.
+    // Walk per-segment (like cp6CountLiveRecords) — a single read-from-0 cursor
+    // stops at the first emptied/deleted leading segment (offset-0's segment is
+    // fully superseded after convergence), so we must iterate segment bases.
+    std::map<std::string, int> perKeyCount;
+    std::map<std::string, std::string> perKeyLatest;
+    {
+        auto bases = log.segmentBaseOffsets();
+        int64_t cursor = 0;
+        for (size_t si = 0; si < bases.size(); ++si) {
+            int64_t segEnd = (si + 1 < bases.size())
+                                 ? bases[si + 1]
+                                 : std::numeric_limits<int64_t>::max();
+            if (cursor >= segEnd) continue;
+            if (cursor < bases[si]) cursor = bases[si];
+            for (;;) {
+                auto bytes = log.read(cursor, 1 << 20);
+                if (bytes.empty()) break;
+                RecordBatchReader r(bytes.data(), bytes.size());
+                if (!r.ensureValid()) break;
+                bool advanced = false;
+                r.forEach([&](std::string_view k, std::string_view v, int64_t o, int64_t) {
+                    perKeyCount[std::string(k)]++;
+                    perKeyLatest[std::string(k)] = std::string(v);
+                    cursor = o + 1;
+                    advanced = true;
+                });
+                if (!advanced) break;
+            }
+        }
+    }
+
+    const int totalAfter = cp6CountLiveRecords(log);
+
+    // CORE ASSERTION: every key converges to EXACTLY ONE live record.
+    // On the buggy watermark logic, superseded copies persist (dozens per key)
+    // and this FAILS.  After the fix, each key has exactly one copy.
+    for (int k = 0; k < kNumKeys; ++k) {
+        std::string key = "k" + std::to_string(k);
+        EXPECT_EQ(perKeyCount[key], 1)
+            << "Key '" << key << "' must converge to exactly ONE live record "
+               "(superseded copies GONE); got " << perKeyCount[key]
+            << " copies.  If > 1, the watermark over-advanced and marked "
+               "un-rewritten segments 'clean' → compaction never converged.";
+        EXPECT_EQ(perKeyLatest[key], "v" + std::to_string(kUpdatesEach - 1))
+            << "Key '" << key << "' surviving copy must be the LATEST value.";
+    }
+
+    // Total live records == kNumKeys latest + 1 sentinel.
+    EXPECT_EQ(totalAfter, kNumKeys + 1)
+        << "Log must converge to " << (kNumKeys + 1) << " live records "
+           "(one per key + sentinel); got " << totalAfter
+        << " (before=" << totalBefore << ").";
+
+    fs::remove_all(dir);
+}

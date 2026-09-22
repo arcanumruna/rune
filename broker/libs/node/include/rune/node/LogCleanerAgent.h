@@ -576,11 +576,54 @@ public:
                 /*nowMs=*/           nowMs);
         }
 
-        // CP-7: passEnd is the next-pass boundary.  When the map covered the
-        // entire dirty range, passEnd == activeBase.  When the map was bounded
-        // and filled before the end, passEnd < activeBase — the watermark
-        // advances only to passEnd.
-        const int64_t passEnd = passResult.passEnd;
+        // CP-7: passResult.passEnd is the offset-map coverage boundary.  When the
+        // map covered the entire dirty range, it == activeBase.  When the map was
+        // bounded and filled before the end, it < activeBase.
+        //
+        // CONVERGENCE FIX (watermark over-advance): the map coverage boundary is
+        // NOT the same as what was actually REWRITTEN.  A single pass rewrites
+        // exactly ONE segment (single-segment path) or ONE coalesced group — but
+        // the SkimpyOffsetMap is built over the WHOLE dirty range for
+        // latest-per-key correctness (CP-2), so with small segments its coverage
+        // (passResult.passEnd) reaches activeBase (the whole dirty range) even
+        // though only one segment/group was rewritten.  Advancing lastCleanOffset
+        // to that map boundary would mark the OTHER (un-rewritten) dirty segments
+        // "clean" — their superseded records would persist forever, dirtyRatio
+        // would drop below minCleanableDirtyRatio, and compaction would
+        // disqualify itself and never converge.
+        //
+        // The watermark must advance ONLY to the end of what was actually
+        // rewritten this pass (rewrittenEnd = the logical end of the highest
+        // rewritten segment's byte range = the base of the next sealed segment,
+        // or firstUncleanable/activeBase if it was the last sealed segment).
+        // The next pass then picks up the next dirty segment → converges over
+        // passes.  We take min(mapPassEnd, rewrittenEnd) so the CP-7
+        // bounded-range-per-pass semantics still hold: when the map filled
+        // mid-segment (mapPassEnd < rewrittenEnd) we advance only to mapPassEnd
+        // and the same segment is revisited next pass.
+        const int64_t mapPassEnd = passResult.passEnd;
+
+        // Compute rewrittenEnd from the immutable snapshot: the highest base we
+        // rewrote this pass is groupBases.back() (groupBases holds the coalesced
+        // group, or a single element for the single-segment path).  Its logical
+        // end = the base of the next sealed segment above it, or
+        // best.firstUncleanable when it is the last sealed segment.
+        int64_t rewrittenEnd = best.firstUncleanable;
+        {
+            const int64_t highestRewrittenBase = groupBases.back();
+            int64_t nextBaseAbove = best.firstUncleanable;
+            for (const auto& si : *best.snap) {
+                if (si.baseOffset > highestRewrittenBase &&
+                    si.baseOffset < nextBaseAbove) {
+                    nextBaseAbove = si.baseOffset;
+                }
+            }
+            rewrittenEnd = nextBaseAbove;
+        }
+
+        // Advance only past what was actually rewritten, but never past the
+        // map's coverage boundary (bounded-range-per-pass).
+        const int64_t passEnd = std::min(mapPassEnd, rewrittenEnd);
 
         if (!passResult.compacted) {
             // No segment was rewritten.  This can happen when:
@@ -637,10 +680,17 @@ public:
         // Accumulate bytes consumed by this compaction toward the budget.
         bytesUsed_ += best.segBytes;
 
-        // Advance lastCleanOffset to passEnd (the bounded-range boundary).
-        // When not bounded, passEnd == best.firstUncleanable (== activeBase),
-        // which naturally marks the whole dirty range as clean.
-        if (best.replica->cleanerRole() == rune::replication::Role::Leader) {
+        // Advance lastCleanOffset to passEnd (= min(mapPassEnd, rewrittenEnd),
+        // i.e. only past the segment/group actually rewritten — the convergence
+        // fix).  The watermark is MONOTONIC: only advance when passEnd makes
+        // forward progress (passEnd > globalDirtyStart).  This guard also covers
+        // the ensureCheckpoint ordering hazard: Phase-1 selects best.segBase from
+        // the pre-checkpoint watermark, but ensureCheckpoint may then bump the
+        // watermark forward (restored from disk).  If the (now stale) selected
+        // segment lies entirely below the restored globalDirtyStart, rewrittenEnd
+        // — and thus passEnd — can fall below it; we must NOT regress.
+        if (passEnd > globalDirtyStart &&
+            best.replica->cleanerRole() == rune::replication::Role::Leader) {
             best.replica->setLastCleanOffset(passEnd);
             // CP-7: persist the checkpoint to passEnd (not segEnd).
             // Pure file I/O (mmap write + msync); cleaner-thread-safe.
