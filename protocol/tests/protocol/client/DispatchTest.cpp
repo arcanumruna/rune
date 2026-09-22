@@ -658,12 +658,28 @@ TEST(DispatchCheckFrame, UnknownTemplateZero) {
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateEight) {
-    // 8 = first reserved-but-unassigned in control range
+TEST(DispatchCheckFrame, KnownTemplateEight) {
+    // 8 = MetadataRequest — now assigned by MD1 Task 10; must be Ok.
     auto buf = makeValidHeaderBuf(8);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
-    EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
     EXPECT_EQ(fc.templateId, 8u);
+}
+
+TEST(DispatchCheckFrame, KnownTemplateNine) {
+    // 9 = MetadataResponse — now assigned by MD1 Task 10; must be Ok.
+    auto buf = makeValidHeaderBuf(9);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, 9u);
+}
+
+TEST(DispatchCheckFrame, UnknownTemplateTen) {
+    // 10 = still unassigned in control range
+    auto buf = makeValidHeaderBuf(10);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.templateId, 10u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateFifteen) {
@@ -769,7 +785,7 @@ TEST(DispatchPeekTemplateId, ReturnsIdForOkFrame) {
     // Verify peekTemplateId returns the correct id for all known templates:
     // Milestone A control (1..7), Milestone B produce/subscribe (16..21),
     // Milestone C consumer-groups (32..44).
-    for (uint16_t tid = 1; tid <= 7; ++tid) {
+    for (uint16_t tid = 1; tid <= 9; ++tid) {
         auto buf = makeValidHeaderBuf(tid);
         const auto opt = rpc::peekTemplateId(buf.data(), buf.size());
         ASSERT_TRUE(opt.has_value()) << "Expected Some for templateId=" << tid;
@@ -806,6 +822,7 @@ TEST(DispatchNoOverread, ExactSizeBufferAllKnownTemplates) {
     // + Milestone C consumer-groups (32..44).
     constexpr uint16_t kKnown[] = {
         1, 2, 3, 4, 5, 6, 7,
+        8, 9,  // MD1 Task 10: MetadataRequest + MetadataResponse
         16, 17, 18, 19, 20, 21,
         32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
     };
@@ -850,10 +867,14 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
 
-    // Not known: 0, 8..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
+    // MD1 Task 10: MetadataRequest=8, MetadataResponse=9 are now known.
+    EXPECT_TRUE(rpc::isKnownTemplate(8));
+    EXPECT_TRUE(rpc::isKnownTemplate(9));
+
+    // Not known: 0, 10..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
     //            55..63 (unassigned groups/txn gap after TX-1), 64+ (view range), 65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
-    EXPECT_FALSE(rpc::isKnownTemplate(8));
+    EXPECT_FALSE(rpc::isKnownTemplate(10));
     EXPECT_FALSE(rpc::isKnownTemplate(15));
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));

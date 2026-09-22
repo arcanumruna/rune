@@ -33,7 +33,8 @@ if(BUILD_TESTING)
             tests/protocol/client/OffsetMessagesTest.cpp
             tests/protocol/client/ConformanceTest.cpp
             tests/protocol/client/DispatchTest.cpp
-            tests/protocol/client/TxnProtocolTest.cpp)
+            tests/protocol/client/TxnProtocolTest.cpp
+            tests/protocol/client/MetadataMessagesTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(rune_protocol_tests PRIVATE
             RUNE_CONFORMANCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/conformance")

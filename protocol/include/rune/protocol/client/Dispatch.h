@@ -14,7 +14,7 @@
 //   1. TooShort          — avail < MessageHeader::ENCODED_SIZE
 //   2. WrongSchema       — header.schemaId != kSchemaId
 //   3. UnsupportedVersion— header.version  >  kProtocolVersion
-//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 16..21 MB; 32..44 MC)
+//   4. UnknownTemplate   — templateId not in the known set (1..7 MA; 8-9 MD1; 16..21 MB; 32..44 MC)
 //   5. Ok
 //
 // Future tickets extend isKnownTemplate() as new template ids are assigned
@@ -51,12 +51,14 @@ struct FrameCheck {
 
 // ---------------------------------------------------------------------------
 // isKnownTemplate — true for templateIds handled in Milestone A (1..7),
+//                   MD1 Task 10 Metadata (8..9),
 //                   Milestone B produce/subscribe range (16..21),
 //                   Milestone C consumer-group range (32..44), and
 //                   Milestone C-B txn range (45..54).
 //
 // Reserved ranges (from Protocol.h):
-//   control         1-15   (Connect=1 .. Pong=7 assigned; 8-15 gap → UnknownTemplate)
+//   control         1-15   (Connect=1 .. Pong=7; MetadataRequest=8, MetadataResponse=9 assigned;
+//                            10-15 gap → UnknownTemplate)
 //   produce/consume 16-31  (Produce=16 .. Unsubscribe=21 assigned; 22-31 gap → UnknownTemplate)
 //   groups/txn      32-63  (JoinGroup=32 .. Assign=44; InitProducerId=45..EndTxnResponse=54)
 //   view            64-95
@@ -67,6 +69,11 @@ struct FrameCheck {
     // Milestone A control range: 1..7
     if (tid >= static_cast<uint16_t>(TemplateId::Connect) &&
         tid <= static_cast<uint16_t>(TemplateId::Pong)) {
+        return true;
+    }
+    // MD1 Task 10: Metadata request/response: 8..9
+    if (tid == static_cast<uint16_t>(TemplateId::MetadataRequest) ||
+        tid == static_cast<uint16_t>(TemplateId::MetadataResponse)) {
         return true;
     }
     // Milestone B produce/subscribe range: 16..21
