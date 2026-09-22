@@ -53,9 +53,21 @@ milestone.
    `partition → {leaderNode, ISR, leaderEpoch, partitionEpoch, replicas}` map
    (two epochs — see §D). One consensus group, N partitions. (Not per-partition
    Raft.)
-2. **Replication is orthogonal and retained.** Every partition stays RF-way
-   ISR-replicated across machines; D distributes only the *leader role*. A leader
-   is only ever assigned from a partition's current ISR (no committed loss).
+2. **Replication is orthogonal and retained; durability is quorum-based with a
+   per-topic knob (LOCKED — optimizes latency+throughput+durability).** Every
+   partition stays RF-way replicated; D distributes only the *leader role*.
+   **ISR stays leader-owned** (no controller-owned ISR, no AlterPartition
+   round-trip, no two-state ISR). Failover is **position/lineage election**: on a
+   leader's death the controller elects the **most-complete surviving replica on the
+   current epoch lineage** (Aeron `compareLog`), and the existing **completeness
+   gate** holds served HW until a majority reports — quorum intersection guarantees
+   no committed loss for any quorum setting. Durability is a **per-topic quorum
+   knob**: default **`majority`** (HW = min-LEO over a *majority* of ISR — lowest
+   latency, highest throughput, one slow replica never stalls a write); dial to
+   **`all-in-sync`** (HW = min-LEO over the full in-sync set + high min-ISR) for
+   diamond-durable topics (payments / IAP / currency). Gameplay topics use
+   `majority`; money topics use `all-in-sync` — the same per-topic axis as
+   co-partition groups.
 3. **Co-partition groups are first-class from Phase 1.** A topic may declare a
    co-partition group; the controller co-locates *same-index* partitions of all
    group members on one leader node. This is a deliberate addition over Kafka's
@@ -234,19 +246,23 @@ blocks (Milestone C-B); D exercises them **per-partition on every move**.
   the diverging-epoch-in-fetch form (follower sends `lastFetchedEpoch`; leader returns
   an empty batch + diverging point; follower truncates **without advancing
   watermarks**). HW-only truncation silently keeps divergent tails — not acceptable.
-- **HW / ISR invariants (reconciled to Rune's as-built model).** Rune advances HW as
-  **min-LEO over a *majority* of the ISR** (an intentional ULL quorum-durability
-  choice — `HighWatermark.h`), *not* Kafka's min-over-all-ISR; it already has the
+- **HW / ISR invariants (LOCKED: quorum model, leader-owned ISR — decision #2).**
+  Rune advances HW as **min-LEO over a *majority* of the ISR** (`HighWatermark.h`) by
+  default — one slow replica never stalls a write. It already has the
   **under-min-ISR served-HW clamp**, the **new-leader HW floor** (keeps checkpointed
   HW, never jumps to LEO — `PartitionReplica.cpp:100-136`), and a **majority-report
-  "completeness gate"** that holds served HW on a fresh leader (a *stronger*
-  substitute for Kafka's `leaderEpochStart > HW` read-fence — so that specific fence
-  is **not** needed). The **one net-new correctness item** is a **two-state
-  committed-vs-maximal ISR** (expand = committed ∪ {joiner}; shrink = keep old
-  committed set until confirmed): it is required **only if D moves to controller-owned
-  ISR** (AlterPartition-style round-trip). Today Rune's leader owns ISR locally and
-  seeds it from the metadata bridge — so this hinges on the ISR-ownership decision
-  below. Prevents acking data that a rejected-shrink survivor wouldn't have.
+  completeness gate** that holds served HW on a fresh leader (a *stronger* substitute
+  for Kafka's `leaderEpochStart > HW` read-fence — so that fence is **not** needed).
+  **Failover election is position/lineage-based:** the controller picks the
+  most-complete surviving replica on the epoch lineage (`compareLog`), not "any ISR
+  member"; the completeness gate + quorum intersection give no-committed-loss for any
+  durability setting. **Two-state committed/maximal ISR is NOT needed** (that was only
+  required for controller-owned/AlterPartition ISR, which we rejected).
+- **Per-topic durability quorum knob (LOCKED).** `majority` (default) vs
+  `all-in-sync` (HW = min-LEO over the full in-sync set + `minIsr = RF` so acks
+  require every replica). Diamond-durable topics (payments/IAP) set `all-in-sync`;
+  gameplay stays `majority`. The HW-quorum rule becomes a per-topic parameter (Rune is
+  majority-only today → a bounded net-new). Election safety is identical for both.
 
 ### H. MSM engineering — apply off the hot path, MVCC, bounded, versioned (Kafka parity §14; Aeron ULL Part 2)
 
@@ -314,7 +330,8 @@ well-bounded set of genuinely new pieces.
 | ProducerId allocator watermark recovery from log | **NET-NEW** | `ProducerIdAllocator` is in-memory (deferred "P5-3") — PID monotonicity across failover not yet guaranteed |
 | Truncate + producer-state rebuild atomic | **PARTIAL (safe by construction)** | HW-bounded rebuild + above-HW-only truncation ⇒ safe, but **no re-rebuild if a late truncation lands below the rebuild HW** — D must close this |
 | New-leader HW floor (never jump to LEO) | **EXISTS** | `PartitionReplica.cpp:100-136` + completeness gate `:1527-1553` |
-| Two-state committed/maximal ISR | **NET-NEW** *(only if controller-owned ISR)* | single in-place `isr_` today (`IsrManager.h:265`) |
+| Two-state committed/maximal ISR | **NOT NEEDED** *(decision #2: leader-owned ISR + position/lineage election)* | single in-place `isr_` today (`IsrManager.h:265`) stays as-is |
+| Per-topic durability-quorum HW rule (`majority`/`all-in-sync`) | **NET-NEW (small)** | Rune is majority-only today (`HighWatermark.h`); add the `all-in-sync` option |
 | min-ISR / acks=all | **EXISTS** | polled deferred-ack queue, not purgatory (`ClientGateway.cpp:2127-2148`) |
 | HW = min-LEO over **majority** of ISR | **EXISTS (intentional divergence)** | `HighWatermark.h` — reconcile spec wording, not a bug |
 
@@ -325,17 +342,18 @@ machine (from the offsets/txn template) + its apply step + commit-position count
 placement (fill the stubs); (5) **LeaderEpochCache persistence** and **ProducerId
 watermark recovery** (so KIP-101 walk-back + PID monotonicity survive a full
 restart); (6) a **re-rebuild of producer state if a divergence truncation lands
-below the rebuild HW**; (7) *conditionally* two-state ISR — see the decision below.
+below the rebuild HW**; (7) the **per-topic durability-quorum HW rule**
+(`majority` default / `all-in-sync`) — small. Two-state ISR is **not** on this list.
 
-**Decision surfaced — ISR ownership under D.** Kafka moved ISR ownership to the
-controller (AlterPartition), which is what forces the two-state committed/maximal ISR
-+ the fencing precedence. Rune today has the **leader own ISR locally** (seeded from
-the metadata bridge). Under D we can either (a) **keep leader-owned ISR** (minimal
-change; no two-state ISR needed; the controller owns *leadership* but not ISR
-membership), or (b) **move ISR to the controller/MSM** (Kafka-faithful; ISR becomes
-durable in the assignment map; requires two-state ISR + AlterPartition-style
-round-trip). This is the main open architectural decision for the plan (recorded in
-Open questions).
+**Decision RESOLVED — ISR ownership (decision #2): leader-owned ISR +
+position/lineage failover election + per-topic durability-quorum knob.** Chosen to
+maximize latency + throughput + durability: majority-quorum acks as the low-latency
+default (one slow replica never stalls a write), `all-in-sync` per-topic for diamond
+durability, **no controller-owned ISR / no AlterPartition / no two-state ISR**.
+Failover safety = elect the most-complete survivor on the epoch lineage
+(`compareLog`) + completeness gate; quorum intersection preserves committed data at
+any durability setting. The controller needs soft per-replica `(epoch, position)` to
+elect — which the net-new commit/append-position counters supply.
 
 ## Data model — per-topic sharding config
 
@@ -589,12 +607,6 @@ gate.
   bumps) — start pull + REDIRECT, evaluate push later.
 - Interaction sequencing with in-flight Milestone C work (coordinator seams must
   not calcify before Phase 3 fills them).
-- **ISR ownership under D (main open decision):** keep **leader-owned ISR** (as
-  today — minimal change, no two-state ISR needed) vs move to **controller/MSM-owned
-  ISR** (Kafka-faithful, ISR durable in the assignment map, requires the net-new
-  two-state committed/maximal ISR + AlterPartition-style round-trip). Verified today:
-  single in-place `isr_` (`IsrManager.h:265`), leader advances HW locally as
-  majority-of-ISR. Decide during planning; it sizes several net-new items.
 - **LeaderEpochCache persistence + ProducerId-watermark recovery** are net-new (both
   in-memory today) — needed so KIP-101 walk-back and PID monotonicity survive a full
   restart, not just a live handoff. Scope into Phase 1 or 2.
@@ -602,7 +614,9 @@ gate.
   captured as the correct read path (parity §15) but is **downstream** (the views
   milestone), not built in D — confirm it stays deferred.
 
-**Resolved during this pass (previously open):** reassignment-cancel liveness =
-allow-leaderless (never silent unclean); controlled-shutdown vs min-ISR = match Kafka
-(produce-side gate only); deterministic timers = balancer/heartbeat-expiry as logged
-records (§I).
+**Resolved (previously open):** **ISR ownership = leader-owned ISR + position/lineage
+failover election + per-topic durability-quorum knob (`majority` default /
+`all-in-sync`) — no two-state ISR, no AlterPartition (decision #2);**
+reassignment-cancel liveness = allow-leaderless (never silent unclean);
+controlled-shutdown vs min-ISR = match Kafka (produce-side gate only); deterministic
+timers = balancer/heartbeat-expiry as logged records (§I).
