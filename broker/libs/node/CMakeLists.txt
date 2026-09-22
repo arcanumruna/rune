@@ -229,6 +229,23 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
+    # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
+    #   retention: time (largestTimestamp), size, log-start-offset; async delete
+    #   (.deleted rename + delayed physical remove); retention off append thread;
+    #   single-writer safety; compact+delete combined without double-delete.
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_retention_cleaner_agent_tests
+        tests/integration/RetentionCleanerAgentTest.cpp)
+    target_link_libraries(rune_retention_cleaner_agent_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        GTest::gtest_main)
+    gtest_discover_tests(rune_retention_cleaner_agent_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # BrokerNode integration tests — embed the Aeron media driver.
     # Gated behind BUILD_BROKER_NODE_TESTS (default ON when BUILD_TESTING=ON)
     # so CI can disable if the embedded driver cannot start in the environment.
