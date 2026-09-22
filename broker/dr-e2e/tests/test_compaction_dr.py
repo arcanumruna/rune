@@ -58,7 +58,9 @@ from tests.test_compaction_e2e import (
     _write_compose_override,
     _count_log_files,
     _wait_for_compaction,
+    _wait_for_latest_per_key,
     _produce_compact,
+    _seal_tail,
     _subscribe_compact,
     assert_latest_per_key,
     assert_no_resurrection,
@@ -169,6 +171,11 @@ def test_drcp1_follower_kill_during_compaction(compaction_dr_cluster):
     )
     assert len(produce_result.all_produced) == records
 
+    # Seal the tail so the test keys' newest values are compactable (see _seal_tail
+    # in test_compaction_e2e.py — keys whose newest lands in the never-compacted
+    # active segment otherwise keep their superseded sealed copies).
+    _seal_tail(cluster, leader_svc, cid_base=995500)
+
     # Capture baseline file count on leader.
     leader_idx = service_to_node_id(leader_svc) + 1
     initial_file_count = _count_log_files(cluster.project, leader_idx)
@@ -182,9 +189,9 @@ def test_drcp1_follower_kill_during_compaction(compaction_dr_cluster):
     if initial_file_count > 0:
         _wait_for_compaction(cluster, leader_svc,
                               initial_count=initial_file_count,
-                              timeout_s=120.0)
+                              timeout_s=45.0)
     else:
-        time.sleep(60.0)
+        time.sleep(12.0)
 
     # ── Subscribe from leader ─────────────────────────────────────────────────
     cid_sub_leader = _next_dr_cid_base()
@@ -214,12 +221,38 @@ def test_drcp1_follower_kill_during_compaction(compaction_dr_cluster):
     cluster.wait_data_plane_ready(max_attempts=5, timeout_s=60)
     new_lid, new_leader_svc = cluster.identify_leader()
 
-    cid_sub_follower = _next_dr_cid_base()
-    sub_follower = _subscribe_compact(cluster, new_leader_svc, cid_sub_follower,
-                                      window_ms=60_000)
+    # Compaction is PER-REPLICA, background, best-effort (Kafka-identical): the
+    # serving leader after failover starts from its FULL (uncompacted) replicated
+    # log and must run its own incremental cleaner passes to converge to
+    # latest-per-key.  A subscribe issued before those passes complete legitimately
+    # observes superseded OLD versions ALONGSIDE the latest — that is correct
+    # compaction semantics, NOT a resurrection bug.  Rune's guarantee (like Kafka)
+    # is: (1) the latest value per key is NEVER lost across failover, and
+    # (2) superseded versions are EVENTUALLY compacted away once the new leader
+    # re-cleans.  So: wait for the new leader to re-compact, then poll subscribe
+    # until it converges to one-record-per-key, THEN assert the guarantee.
+    new_leader_idx = service_to_node_id(new_leader_svc) + 1
+    new_initial_count = _count_log_files(cluster.project, new_leader_idx)
+    if new_initial_count > 0:
+        _wait_for_compaction(cluster, new_leader_svc,
+                             initial_count=new_initial_count, timeout_s=45.0)
 
-    # Assertions on revived path (served through new_leader, which might be the
-    # revived follower if it re-won election, or the original leader).
+    cid_sub_follower = _next_dr_cid_base()
+    sub_follower = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, new_leader_svc, _next_dr_cid_base(),
+                                   window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
+
+    # Non-loss (checked immediately by assert_latest_per_key below) + eventual
+    # convergence (no superseded left once the new leader has re-compacted).
+    #  - assert_latest_per_key: the LATEST seq per key IS present (no data loss)
+    #    AND each key appears at most once (convergence reached).
+    #  - assert_no_resurrection: no superseded record survives after convergence.
+    # These remain NON-VACUOUS: if the latest value were lost, assert_latest_per_key
+    # fails ("missing"/"wrong seq"); if the cleaner never converged, the poll times
+    # out with >1 record/key and assert_latest_per_key fails ("delivered more than
+    # once"); a genuine resurrection past convergence still trips assert_no_resurrection.
+    assert_latest_per_key(produce_result, sub_follower)
     assert_no_resurrection(produce_result, sub_follower)
     assert_hw_bounded(produce_result, sub_follower)
     assert_single_leader(cluster)
@@ -270,6 +303,9 @@ def test_drcp2_leader_kill_during_active_compaction(compaction_dr_cluster):
     )
     assert len(produce_result.all_produced) == records
 
+    # Seal the tail so the test keys' newest values are compactable (see _seal_tail).
+    _seal_tail(cluster, leader_svc, cid_base=995500)
+
     leader_idx = service_to_node_id(leader_svc) + 1
     initial_file_count = _count_log_files(cluster.project, leader_idx)
 
@@ -290,9 +326,9 @@ def test_drcp2_leader_kill_during_active_compaction(compaction_dr_cluster):
     if new_initial_count > 0:
         _wait_for_compaction(cluster, new_leader_svc,
                               initial_count=new_initial_count,
-                              timeout_s=120.0)
+                              timeout_s=45.0)
     else:
-        time.sleep(60.0)
+        time.sleep(12.0)
 
     # Wait for data plane ready before subscribing.
     cluster.wait_data_plane_ready(max_attempts=8, timeout_s=120)
@@ -360,15 +396,18 @@ def test_drcp3_truncation_interplay_with_compaction(compaction_dr_cluster):
     assert produce_result.ok, "DR-COMPACT-3 produce failed"
     assert len(produce_result.all_produced) == records
 
+    # Seal the tail so the test keys' newest values are compactable (see _seal_tail).
+    _seal_tail(cluster, leader_svc, cid_base=995500)
+
     # ── Wait for full compaction on leader ────────────────────────────────────
     leader_idx = service_to_node_id(leader_svc) + 1
     initial_count = _count_log_files(cluster.project, leader_idx)
     if initial_count > 0:
         _wait_for_compaction(cluster, leader_svc,
                               initial_count=initial_count,
-                              timeout_s=120.0)
+                              timeout_s=45.0)
     else:
-        time.sleep(60.0)
+        time.sleep(12.0)
 
     # ── Kill follower, truncate its log, restart ──────────────────────────────
     faults.kill_node(cluster, follower_svc, signal.SIGKILL)
@@ -386,11 +425,30 @@ def test_drcp3_truncation_interplay_with_compaction(compaction_dr_cluster):
     new_lid, new_leader_svc = cluster.identify_leader()
 
     # ── Subscribe from the cluster (current leader may be the revived follower) ─
+    # Per-replica, best-effort compaction (Kafka-identical): after the follower
+    # re-syncs and the serving leader may have changed, the current leader must run
+    # its own cleaner passes over its full replicated log before it converges to
+    # latest-per-key.  Superseded OLD versions coexisting with the latest BEFORE
+    # convergence is correct semantics, not a resurrection bug; the guarantee is
+    # non-loss of the latest value + EVENTUAL removal of superseded versions.  Wait
+    # for the leader to re-compact, then poll subscribe until convergence, THEN assert.
+    new_leader_idx = service_to_node_id(new_leader_svc) + 1
+    new_initial_count = _count_log_files(cluster.project, new_leader_idx)
+    if new_initial_count > 0:
+        _wait_for_compaction(cluster, new_leader_svc,
+                             initial_count=new_initial_count, timeout_s=45.0)
+
     cid_sub = _next_dr_cid_base()
-    sub_result = _subscribe_compact(cluster, new_leader_svc, cid_sub,
-                                    window_ms=60_000)
+    sub_result = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, new_leader_svc, _next_dr_cid_base(),
+                                   window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
 
     # ── Assertions ────────────────────────────────────────────────────────────
+    # NON-VACUOUS: assert_latest_per_key fails if the latest value were lost
+    # (missing/wrong seq) OR if the cleaner never converged (>1 record per key);
+    # assert_no_resurrection still catches a genuine post-convergence resurrection.
+    assert_latest_per_key(produce_result, sub_result)
     assert_no_resurrection(produce_result, sub_result)
     assert_hw_bounded(produce_result, sub_result)
     assert_single_leader(cluster)
@@ -441,6 +499,9 @@ def test_drcp4_network_partition_during_compaction(compaction_dr_cluster):
     assert produce_result.ok, "DR-COMPACT-4 produce failed"
     assert len(produce_result.all_produced) == records
 
+    # Seal the tail so the test keys' newest values are compactable (see _seal_tail).
+    _seal_tail(cluster, leader_svc, cid_base=995500)
+
     leader_idx = service_to_node_id(leader_svc) + 1
     initial_count = _count_log_files(cluster.project, leader_idx)
 
@@ -451,9 +512,9 @@ def test_drcp4_network_partition_during_compaction(compaction_dr_cluster):
     if initial_count > 0:
         _wait_for_compaction(cluster, leader_svc,
                               initial_count=initial_count,
-                              timeout_s=120.0)
+                              timeout_s=45.0)
     else:
-        time.sleep(60.0)
+        time.sleep(12.0)
 
     # ── Heal the partition and wait for re-sync ────────────────────────────────
     faults.heal(cluster, follower_svc)
@@ -465,11 +526,30 @@ def test_drcp4_network_partition_during_compaction(compaction_dr_cluster):
     new_lid, new_leader_svc = cluster.identify_leader()
 
     # ── Subscribe from current leader ─────────────────────────────────────────
+    # Per-replica, best-effort compaction (Kafka-identical): once the partition
+    # heals and the follower re-syncs, the serving leader must run its own cleaner
+    # passes to converge to latest-per-key.  Superseded OLD versions coexisting
+    # with the latest BEFORE convergence is correct compaction semantics, not a
+    # resurrection bug; the guarantee is non-loss of the latest value + EVENTUAL
+    # removal of superseded versions.  Wait for the leader to re-compact, then poll
+    # subscribe until convergence, THEN assert.
+    new_leader_idx = service_to_node_id(new_leader_svc) + 1
+    new_initial_count = _count_log_files(cluster.project, new_leader_idx)
+    if new_initial_count > 0:
+        _wait_for_compaction(cluster, new_leader_svc,
+                             initial_count=new_initial_count, timeout_s=45.0)
+
     cid_sub = _next_dr_cid_base()
-    sub_result = _subscribe_compact(cluster, new_leader_svc, cid_sub,
-                                    window_ms=60_000)
+    sub_result = _wait_for_latest_per_key(
+        lambda: _subscribe_compact(cluster, new_leader_svc, _next_dr_cid_base(),
+                                   window_ms=60_000),
+        expected_keys=keys, timeout_s=45.0)
 
     # ── Assertions ────────────────────────────────────────────────────────────
+    # NON-VACUOUS: assert_latest_per_key fails if the latest value were lost
+    # (missing/wrong seq) OR if the cleaner never converged (>1 record per key);
+    # assert_no_resurrection still catches a genuine post-convergence resurrection.
+    assert_latest_per_key(produce_result, sub_result)
     assert_no_resurrection(produce_result, sub_result)
     assert_hw_bounded(produce_result, sub_result)
     assert_single_leader(cluster)
