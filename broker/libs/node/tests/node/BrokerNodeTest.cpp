@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -79,6 +80,61 @@ struct TempDir {
         fs::remove_all(path, ec); // best-effort
     }
 };
+
+// ---------------------------------------------------------------------------
+// Build the on-disk partition log directory used by BrokerNode.
+// Path: dataDir/topics/<name>/<partition>/  (mirrors TopicRegistry logic)
+// Must be called BEFORE node.start() so BrokerNode recovers pre-written data.
+// ---------------------------------------------------------------------------
+static fs::path makePartitionDir(const fs::path& dataDir,
+                                  const std::string& topicName,
+                                  int32_t partition = 0) {
+    fs::path d = dataDir / "topics" / topicName / std::to_string(partition);
+    std::error_code ec;
+    fs::create_directories(d, ec);
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// Count live records across all segments of a Log (post-stop, single reader).
+// ---------------------------------------------------------------------------
+static int countLiveRecords(rune::storage::Log& log) {
+    int count = 0;
+    auto bases = log.segmentBaseOffsets();
+    if (bases.empty()) return 0;
+    int64_t cursor = 0;
+    for (size_t si = 0; si < bases.size(); ++si) {
+        int64_t segEnd = (si + 1 < bases.size())
+                         ? bases[si + 1]
+                         : std::numeric_limits<int64_t>::max();
+        if (cursor < bases[si]) cursor = bases[si];
+        for (;;) {
+            auto bytes = log.read(cursor, 1 << 20);
+            if (bytes.empty()) break;
+            rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+            if (!r.ensureValid()) break;
+            bool advanced = false;
+            r.forEach([&](std::string_view, std::string_view, int64_t off, int64_t) {
+                ++count; cursor = off + 1; advanced = true;
+            });
+            if (!advanced || cursor >= segEnd) break;
+        }
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// Poll pred() until it returns true or the deadline is reached.
+// ---------------------------------------------------------------------------
+template <typename Pred>
+static bool waitFor(Pred&& pred, std::chrono::steady_clock::duration timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    return true;
+}
 
 } // namespace
 
@@ -392,12 +448,12 @@ TEST(BrokerNodeTest, NodeConsensusAgentLeaderMap_InitAndLeader) {
 // smoke check for CP-6/Issue 4: LogCleanerAgent constructed in BrokerNode
 // and running on its own AgentRunner.
 //
-// Setup: single-node BrokerNode with one compact topic (minCleanableDirtyRatio=0).
-// Action: append many records (all same key → 100% dirty) directly into the
-//   Log to create multiple sealed segments.  Wait up to 10 s for the cleaner
-//   to run (it runs on its own thread).  Drain swaps via a brief sleep (the
-//   duty cycle runs ~100 Hz via BackoffIdleStrategy).
-// Assert: live record count decreases (compaction ran).
+// TSan-clean single-writer design:
+//   Phase A (pre-start): all Log::append() calls happen via a STANDALONE Log
+//     before node.start().  No duty thread is running yet — single writer.
+//   Phase B (post-start): test thread does NOT touch Log or PartitionReplica.
+//     becomeLeader() on the duty thread advances HW; the cleaner runs.
+//   Phase C (post-stop): race-free verification via a fresh Log after stop().
 // ===========================================================================
 TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
     TempDir tmp{"cp6_smoke_"};
@@ -405,8 +461,7 @@ TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
 
     // Add one compact topic with a SMALL segment roll so a modest number of
-    // appends forms multiple sealed segments (Issue #7 fix — the old smoke test
-    // was vacuous because it could not form >1 segment at the 64 MiB prod roll).
+    // appends forms multiple sealed segments.
     TopicSpec ts;
     ts.name                  = "smoke-compact";
     ts.partitionCount        = 1;
@@ -417,90 +472,63 @@ TEST(BrokerNodeTest, LogCleanerAgent_CompactsViaBrokerNode) {
     ts.segmentRollBytes      = 128;     // tiny roll → many sealed segments fast
     cfg.topics               = {ts};
 
+    // -----------------------------------------------------------------------
+    // Phase A (pre-start): write all data via a STANDALONE Log.
+    // No BrokerNode / duty-cycle thread running → single-writer, TSan-clean.
+    // -----------------------------------------------------------------------
+    const fs::path partDir = makePartitionDir(tmp.path, ts.name);
+    const std::string logDir = partDir.string();
+
+    constexpr int kRecords = 300;
+    int before = 0;
+    {
+        rune::storage::Log rawLog(logDir, 128);
+        for (int v = 0; v < kRecords; ++v) {
+            rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
+            std::string val = "v" + std::to_string(v);
+            b.append(std::string_view("hot"), std::string_view(val), 1000);
+            auto batch = b.build();
+            rawLog.append(batch, v);
+        }
+        auto bases = rawLog.segmentBaseOffsets();
+        ASSERT_GE(bases.size(), 2u)
+            << "Small roll must form multiple sealed segments; got " << bases.size();
+        before = countLiveRecords(rawLog);
+        ASSERT_GT(before, 0);
+    } // rawLog destroyed (closed); BrokerNode recovers these files.
+
+    // -----------------------------------------------------------------------
+    // Phase B (post-start): start BrokerNode.  The duty thread calls
+    // becomeLeader() which advances HW to LEO — no test-thread replica calls
+    // needed.  The LogCleanerAgent runs on its own thread.
+    // -----------------------------------------------------------------------
     BrokerNode node{cfg};
     node.start();
 
     ASSERT_TRUE(node.awaitLeader(3s))
         << "CP-6 smoke: node must self-elect within 3 s";
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
+        << "CP-6 smoke: replication bridge must propagate leadership within 2 s";
+    // HW is now at LEO (set by becomeLeader() on the duty thread).
+    // Test thread does NOT touch Log or PartitionReplica while node is live
+    // (duty-thread-only invariant → TSan-clean).
 
-    // Reach into the log + replica via the test hooks.
-    rune::gateway::TopicRegistry* tr = node.topicRegistryForTest();
-    ASSERT_NE(tr, nullptr) << "TopicRegistry must be wired";
-
-    rune::storage::Log* log = tr->log(/*topicId=*/0, /*partition=*/0);
-    ASSERT_NE(log, nullptr) << "Log for topic 0 partition 0 must exist";
-
-    rune::replication::PartitionReplica* replica =
-        node.replicaForTest(/*topicId=*/0, /*partition=*/0);
-    ASSERT_NE(replica, nullptr) << "PartitionReplica for topic 0 must exist";
-
-    // Helper: count live records across all segments.
-    auto countLive = [](rune::storage::Log& l) {
-        int count = 0;
-        auto bases = l.segmentBaseOffsets();
-        if (bases.empty()) return 0;
-        int64_t cursor = 0;
-        for (size_t si = 0; si < bases.size(); ++si) {
-            int64_t segEnd = (si + 1 < bases.size())
-                ? bases[si + 1] : std::numeric_limits<int64_t>::max();
-            if (cursor < bases[si]) cursor = bases[si];
-            for (;;) {
-                auto bytes = l.read(cursor, 1 << 20);
-                if (bytes.empty()) break;
-                rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
-                if (!r.ensureValid()) break;
-                bool advanced = false;
-                r.forEach([&](std::string_view, std::string_view, int64_t off, int64_t) {
-                    ++count; cursor = off + 1; advanced = true;
-                });
-                if (!advanced || cursor >= segEnd) break;
-            }
-        }
-        return count;
-    };
-
-    // Append many records for ONE hot key so compaction has real work.  These
-    // appends happen while the cleaner is idle (replica HW is still 0 — nothing
-    // is cleanable yet), so no other thread mutates segments_ concurrently.
-    constexpr int kRecords = 300;
-    for (int v = 0; v < kRecords; ++v) {
-        rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
-        std::string val = "v" + std::to_string(v);
-        b.append(std::string_view("hot"), std::string_view(val), 1000);
-        auto batch = b.build();
-        log->append(batch, v);
-    }
-    // Advance the leader HW to the LEO so the cleaner sees a cleanable range.
-    // (single-node ISR → HW == LEO after this call).
-    replica->onLeaderLogAppended();
-
-    auto bases = log->segmentBaseOffsets();
-    ASSERT_GE(bases.size(), 2u)
-        << "Small roll must form multiple sealed segments; got " << bases.size();
-    const int before = countLive(*log);
-    ASSERT_GT(before, 0);
-
-    // Give the cleaner agent (running on its own thread inside the node) time to
-    // compact + the duty cycle to drain the swaps.  We deliberately do NOT read
-    // the log from the test thread while the node is live: constructing a second
-    // Log handle on the same directory races with the cleaner's atomic .log
-    // rename (a segment file is momentarily absent mid-rename).  Instead we wait
-    // a bounded interval, STOP the node (quiescing all writers), then read once.
-    const std::string logDir = log->dir();
+    // Give the cleaner agent time to compact + duty cycle to drain swaps.
     std::this_thread::sleep_for(2s);
 
-    // Stop the node — quiesces the cleaner + duty-cycle threads.  A hung cleaner
-    // would surface here as a stop-timeout.
+    // Stop the node — quiesces the cleaner + duty-cycle threads.
     using sclock = std::chrono::steady_clock;
     const auto beforeStop = sclock::now();
     node.stop();
     EXPECT_LT(sclock::now() - beforeStop, 5s)
         << "BrokerNode stop() must complete within 5 s with cleaner agent running";
 
-    // Race-free on-disk verification with no live node (single reader).
+    // -----------------------------------------------------------------------
+    // Phase C (post-stop): race-free on-disk verification; single reader.
+    // -----------------------------------------------------------------------
     rune::storage::Log finalLog(logDir, 128);
     finalLog.recover();
-    const int after = countLive(finalLog);
+    const int after = countLiveRecords(finalLog);
     EXPECT_LT(after, before)
         << "CP-6 smoke: LogCleanerAgent (running in the node) must compact the "
            "hot-key topic — compacted live count (" << after
@@ -542,7 +570,6 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         for (const auto& entry : fs::directory_iterator(dir, ec)) {
             if (!entry.is_regular_file(ec)) continue;
             auto name = entry.path().filename().string();
-            // Segment files end with ".log" but NOT ".log.new" (temp files).
             if (name.size() > 4 &&
                 name.substr(name.size() - 4) == ".log" &&
                 name.substr(name.size() - 8) != ".log.new") {
@@ -553,8 +580,8 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     };
 
     // -------------------------------------------------------------------------
-    // Helper: build a NodeConfig for the test — same helper as the other tests
-    // but with a compact topic and a configurable coalescing flag.
+    // Helper: build a NodeConfig for the test with a compact topic and a
+    // configurable coalescing flag.
     // -------------------------------------------------------------------------
     auto makeCoalescingConfig = [](const fs::path& dataDir, bool coalesce) -> NodeConfig {
         NodeConfig cfg;
@@ -571,23 +598,21 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
         cfg.clientEndpoint.streamId = 1;
 
-        // Tiny segment roll → many sealed segments from few appends.
         TopicSpec ts;
         ts.name                   = "coalesce-test";
         ts.partitionCount         = 1;
         ts.topicId                = 0;
         ts.cleanupPolicy          = TopicSpec::CleanupPolicy::Compact;
-        ts.minCleanableDirtyRatio = 0.0;     // compact immediately
+        ts.minCleanableDirtyRatio = 0.0;
         ts.deleteRetentionMs      = 86'400'000LL;
-        ts.segmentRollBytes       = 128;     // tiny roll → many sealed segments
+        ts.segmentRollBytes       = 128;
 
         cfg.topics = {ts};
         cfg.enableCompactionCoalescing = coalesce;
         return cfg;
     };
 
-    // Helper: count unique last-value per key by scanning a Log.
-    // Returns a map<key, last_value> for verification.
+    // Helper: scan latest-per-key from a (post-stop) Log.
     auto scanLatestPerKey = [](rune::storage::Log& l) {
         std::unordered_map<std::string, std::string> latest;
         auto bases = l.segmentBaseOffsets();
@@ -616,56 +641,56 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
 
     // =========================================================================
     // Arm A: coalescing ENABLED — segment count must DROP.
+    //
+    // TSan-clean single-writer design:
+    //   Phase A (pre-start): all Log::append() via standalone Log; no duty thread.
+    //   Phase B (post-start): test thread does NOT touch Log or PartitionReplica;
+    //     becomeLeader() on duty thread advances HW; cleaner coalesces.
+    //   Phase C (post-stop): race-free verification with a fresh Log.
     // =========================================================================
     {
         TempDir tmp{"cp8_coal_on_"};
         NodeConfig cfg = makeCoalescingConfig(tmp.path, /*coalesce=*/true);
 
-        BrokerNode node{cfg};
-        node.start();
-        ASSERT_TRUE(node.awaitLeader(3s))
-            << "CP-8 coalescing (on): node must self-elect within 3 s";
+        // --- Phase A (pre-start) ---
+        const fs::path partDir = makePartitionDir(tmp.path, "coalesce-test");
+        const std::string logDir = partDir.string();
 
-        rune::gateway::TopicRegistry* tr = node.topicRegistryForTest();
-        ASSERT_NE(tr, nullptr);
-
-        rune::storage::Log* log = tr->log(/*topicId=*/0, /*partition=*/0);
-        ASSERT_NE(log, nullptr);
-
-        rune::replication::PartitionReplica* replica =
-            node.replicaForTest(/*topicId=*/0, /*partition=*/0);
-        ASSERT_NE(replica, nullptr);
-
-        // Produce many records with a handful of keys — creates lots of superseded
-        // versions across many small sealed segments.
         constexpr int kRecords = 400;
-        for (int v = 0; v < kRecords; ++v) {
-            // Rotate among 4 keys so each key has many superseded values.
-            std::string key = "key" + std::to_string(v % 4);
-            rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
-            b.append(std::string_view(key), std::string_view("v" + std::to_string(v)), 1000);
-            auto batch = b.build();
-            log->append(batch, v);
-        }
-        replica->onLeaderLogAppended();
-
-        const auto basesBefore = log->segmentBaseOffsets();
-        ASSERT_GE(basesBefore.size(), 3u)
-            << "Need >= 3 sealed segments to test coalescing; got "
-            << basesBefore.size();
-        const int segCountBefore = static_cast<int>(basesBefore.size());
-
-        // Record expected latest-per-key values (from the raw log BEFORE compaction).
-        // We know key0..key3 each have their last value at offset 399, 398, 397, 396.
+        int segCountBefore = 0;
         std::unordered_map<std::string, std::string> expectedLatest;
+        {
+            rune::storage::Log rawLog(logDir, 128);
+            for (int v = 0; v < kRecords; ++v) {
+                std::string key = "key" + std::to_string(v % 4);
+                rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
+                b.append(std::string_view(key),
+                         std::string_view("v" + std::to_string(v)), 1000);
+                auto batch = b.build();
+                rawLog.append(batch, v);
+            }
+            const auto bases = rawLog.segmentBaseOffsets();
+            ASSERT_GE(bases.size(), 3u)
+                << "Need >= 3 sealed segments to test coalescing; got "
+                << bases.size();
+            segCountBefore = static_cast<int>(bases.size());
+        } // rawLog closed; BrokerNode will recover.
+
+        // Expected latest: last write for each key.
         for (int v = kRecords - 4; v < kRecords; ++v) {
             expectedLatest["key" + std::to_string(v % 4)] = "v" + std::to_string(v);
         }
 
-        const std::string logDir = log->dir();
+        // --- Phase B (post-start) ---
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(3s))
+            << "CP-8 coalescing (on): node must self-elect within 3 s";
+        ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
+            << "CP-8 (coalescing on): replication bridge must propagate within 2 s";
+        // HW advanced to LEO by becomeLeader() on the duty thread.
+        // Test thread does NOT touch Log or PartitionReplica (TSan-clean).
 
-        // Wait for the cleaner (runs on its own thread) to coalesce + for the duty
-        // cycle to drain swaps.  2 s is generous for 400 tiny records.
         std::this_thread::sleep_for(2s);
 
         using sclock = std::chrono::steady_clock;
@@ -674,7 +699,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         EXPECT_LT(sclock::now() - t0, 5s)
             << "CP-8 (coalescing on): stop() must complete within 5 s";
 
-        // Race-free on-disk verification.
+        // --- Phase C (post-stop) ---
         const int onDiskAfter = countSegmentFiles(logDir);
 
         rune::storage::Log finalLog(logDir, 128);
@@ -685,7 +710,6 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
             << "CP-8 (coalescing ON): segment count must DROP after coalescing; "
                "before=" << segCountBefore << " after=" << segCountAfter;
 
-        // Latest-per-key must be preserved.
         auto actualLatest = scanLatestPerKey(finalLog);
         for (const auto& [k, v] : expectedLatest) {
             EXPECT_EQ(actualLatest[k], v)
@@ -694,78 +718,52 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
                 << "' got='" << actualLatest[k] << "'";
         }
 
-        // Sanity: on-disk .log file count matches the in-memory segment count.
         EXPECT_EQ(onDiskAfter, segCountAfter)
             << "CP-8 (coalescing ON): on-disk .log file count must match "
                "in-memory segment count";
     }
 
     // =========================================================================
-    // Arm B: coalescing DISABLED — segment count drop must be significantly
-    //        less than arm A (non-vacuous).
+    // Arm B: coalescing DISABLED — segment count must NOT bulk-merge (non-vacuous).
     //
     // Individual-segment compaction rewrites each segment in place but does NOT
-    // merge segments.  After compaction the segment count may drop by at most a
-    // handful (e.g. if some empty tail segments coalesce naturally), but it
-    // CANNOT drop by anywhere near what coalescing produces.
-    //
-    // Non-vacuous assertion: the residual segment count in arm B must be
-    // strictly greater than the residual count in arm A (arm A coalesced many
-    // segments into far fewer; arm B left them largely intact).
+    // merge segments.  We assert that >= 90% of the original segments remain.
+    // TSan-clean: same pre-start write pattern as arm A.
     // =========================================================================
-    int coalescingOnSegCountAfter = 0;  // captured from arm A above (see scope)
-
-    // Re-run arm A to capture its final count for comparison.
-    // (Arm A already PASSED above, so we just need its segCountAfter value.)
-    // To avoid repeating the whole arm, we track it via a shared local:
-    // The variable was already assigned inside arm A's scope above.
-    // Actually, arm A was in its own {} scope — we can't reach it here.
-    // Simplest solution: move arm A's final count outside the scope.
-    // Since arm A already ran and the test passed that arm, we use a known
-    // lower bound: after coalescing ON, count must be < segCountBefore_A.
-    // We capture segCountBefore_A for arm B by using the same record count.
-    //
-    // SIMPLER: restructure to capture the arm-A result directly.
-    // We'll redo this as a single nested scope.
-    (void)coalescingOnSegCountAfter; // suppress unused warning
-
     {
         TempDir tmp{"cp8_coal_off_"};
         NodeConfig cfg = makeCoalescingConfig(tmp.path, /*coalesce=*/false);
 
+        // --- Phase A (pre-start) ---
+        const fs::path partDir = makePartitionDir(tmp.path, "coalesce-test");
+        const std::string logDir = partDir.string();
+
+        constexpr int kRecords = 400;
+        int segCountBefore = 0;
+        {
+            rune::storage::Log rawLog(logDir, 128);
+            for (int v = 0; v < kRecords; ++v) {
+                std::string key = "key" + std::to_string(v % 4);
+                rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
+                b.append(std::string_view(key),
+                         std::string_view("v" + std::to_string(v)), 1000);
+                auto batch = b.build();
+                rawLog.append(batch, v);
+            }
+            const auto bases = rawLog.segmentBaseOffsets();
+            ASSERT_GE(bases.size(), 3u)
+                << "Need >= 3 sealed segments; got " << bases.size();
+            segCountBefore = static_cast<int>(bases.size());
+        } // rawLog closed; BrokerNode will recover.
+
+        // --- Phase B (post-start) ---
         BrokerNode node{cfg};
         node.start();
         ASSERT_TRUE(node.awaitLeader(3s))
             << "CP-8 coalescing (off): node must self-elect within 3 s";
+        ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
+            << "CP-8 (coalescing off): replication bridge must propagate within 2 s";
 
-        rune::gateway::TopicRegistry* tr = node.topicRegistryForTest();
-        ASSERT_NE(tr, nullptr);
-
-        rune::storage::Log* log = tr->log(/*topicId=*/0, /*partition=*/0);
-        ASSERT_NE(log, nullptr);
-
-        rune::replication::PartitionReplica* replica =
-            node.replicaForTest(/*topicId=*/0, /*partition=*/0);
-        ASSERT_NE(replica, nullptr);
-
-        constexpr int kRecords = 400;
-        for (int v = 0; v < kRecords; ++v) {
-            std::string key = "key" + std::to_string(v % 4);
-            rune::protocol::RecordBatchBuilder b(v, /*ts=*/1000);
-            b.append(std::string_view(key), std::string_view("v" + std::to_string(v)), 1000);
-            auto batch = b.build();
-            log->append(batch, v);
-        }
-        replica->onLeaderLogAppended();
-
-        const auto basesBefore = log->segmentBaseOffsets();
-        ASSERT_GE(basesBefore.size(), 3u)
-            << "Need >= 3 sealed segments; got " << basesBefore.size();
-        const int segCountBefore = static_cast<int>(basesBefore.size());
-
-        const std::string logDir = log->dir();
-
-        // Wait the same duration as arm A.
         std::this_thread::sleep_for(2s);
 
         using sclock = std::chrono::steady_clock;
@@ -774,15 +772,11 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         EXPECT_LT(sclock::now() - t0, 5s)
             << "CP-8 (coalescing off): stop() must complete within 5 s";
 
+        // --- Phase C (post-stop) ---
         rune::storage::Log finalLog(logDir, 128);
         finalLog.recover();
         const int segCountAfter = static_cast<int>(finalLog.segmentBaseOffsets().size());
 
-        // With coalescing OFF: individual-segment compaction does NOT merge segments.
-        // The drop (if any) should be at most a handful — we assert that at least
-        // HALF the original segments remain (no bulk merging occurred).
-        // With 200 segments and coalescing OFF, count must stay >= 90% of original.
-        // (Coalescing ON drops to ~a handful — a much more dramatic reduction.)
         const int minResidual = (segCountBefore * 9) / 10;
         EXPECT_GE(segCountAfter, minResidual)
             << "CP-8 (coalescing OFF): individual compaction must NOT bulk-merge segments; "

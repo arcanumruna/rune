@@ -97,18 +97,32 @@ struct SmokeDir {
 // Build a single-node NodeConfig with configurable topics.
 // consensusPort is irrelevant for single-node (NullSink) but must be set.
 // ---------------------------------------------------------------------------
-// CP-10 Fix 5: per-invocation unique ports to avoid bind conflicts under ctest -j.
-// Each makeSmokeConfig() call consumes two port slots from a shared atomic counter
-// anchored at 40300 (clear of BrokerNodeTest:40111 and prior smoke port 40211).
-// Base range: consensus 40300+2i, client 50300+2i (i = g_smoke_seq value).
-// With 256 distinct values the smoke suite spans 40300-40811 / 50300-50811 —
-// no overlap with production defaults.
+// CP-10 Fix 5 (revised): per-PROCESS unique ports to avoid cross-process bind
+// conflicts under ctest -j.  ctest spawns one OS process per test binary, so a
+// process-local atomic starting at 0 gives every parallel process the same
+// first port → EADDRINUSE.
+//
+// Solution: seed the port base from getpid() so parallel ctest processes land in
+// disjoint port bands.  Within a single process, a slot counter keeps multiple
+// makeSmokeConfig() calls unique.
+//
+// Formula (ports are all localhost-only):
+//   pid_band   = (getpid() & 0x3F)          // 0..63
+//   consensus  = 40000 + pid_band * 32 + slot * 2
+//   client     = 50000 + pid_band * 32 + slot * 2
+//
+// Range per process: consensus 40000..42044, client 50000..52044 (disjoint).
+// BrokerNodeTest uses 40111/50001 (a separate test binary → separate process →
+// no clash).  Port recycling across tests is fine because Aeron releases ports
+// before the next test picks up the same slot.
 static std::atomic<uint16_t> g_smoke_port_seq{0};
 
 static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
-    const uint16_t slot       = g_smoke_port_seq.fetch_add(1, std::memory_order_relaxed);
-    const uint16_t cPort      = static_cast<uint16_t>(40300u + slot * 2u);
-    const uint16_t clientPort = static_cast<uint16_t>(50300u + slot * 2u);
+    const uint16_t slot     = g_smoke_port_seq.fetch_add(1, std::memory_order_relaxed);
+    const uint16_t pid_band = static_cast<uint16_t>(::getpid() & 0x3Fu);
+    const uint16_t base     = static_cast<uint16_t>(pid_band * 32u + slot * 2u);
+    const uint16_t cPort      = static_cast<uint16_t>(40000u + base);
+    const uint16_t clientPort = static_cast<uint16_t>(50000u + base);
 
     rune::node::NodeConfig cfg;
     cfg.nodeId            = 0;
