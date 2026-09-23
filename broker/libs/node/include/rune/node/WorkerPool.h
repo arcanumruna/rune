@@ -21,6 +21,7 @@
 
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/Worker.h>
+#include <rune/node/WorkerOp.h>
 #include <rune/metadata/ShardRouter.h>
 
 #include <cassert>
@@ -114,6 +115,37 @@ public:
         int work = 0;
         for (auto& w : workers_) work += w->doWork(nowNs);
         return work;
+    }
+
+    // -----------------------------------------------------------------------
+    // E2 inc2a: enqueue a WorkerOp to the worker that owns (topicId, partition).
+    //
+    // Returns true on success, false when the ring is full (back-pressure).
+    // The caller must retry on the next duty cycle.
+    //
+    // ASSIGNMENT-TIME lookup (ownerWorkerId) is acceptable here: the assignment
+    // is stable within a duty cycle and only changes on reconcile(), which is
+    // driven before doWork() on the same thread.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] bool tryEnqueueOp(int32_t topicId, int32_t partition,
+                                    WorkerOp op) {
+        const int32_t wid = ownerWorkerId(topicId, partition);
+        return workers_[static_cast<std::size_t>(wid)]->tryEnqueueOp(std::move(op));
+    }
+
+    // -----------------------------------------------------------------------
+    // E2 inc2a: drain all workers' return rings, calling fn for each result.
+    //
+    // Called by the gateway in gateway::doWork to collect results from the
+    // previous cycle and send the corresponding egress frames.
+    // -----------------------------------------------------------------------
+    template <typename Fn>
+    std::size_t drainAllReturns(Fn&& fn) {
+        std::size_t total = 0;
+        for (auto& w : workers_) {
+            total += w->drainReturn(std::forward<Fn>(fn));
+        }
+        return total;
     }
 
     // Re-derive shard→worker ownership when the registry's replica set changes.

@@ -25,7 +25,9 @@ if(aeron_FOUND)
             -Wl,--no-as-needed uuid -Wl,--as-needed)
     endif()
 endif()
-target_link_libraries(rune_node PRIVATE spdlog::spdlog)
+# spdlog is PUBLIC because Worker.h (a PUBLIC header) uses spdlog calls inline.
+# E2 inc2a: Worker.h was extended with inline execute methods that log via spdlog.
+target_link_libraries(rune_node PUBLIC spdlog::spdlog)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)

@@ -19,11 +19,16 @@ if(aeron_FOUND)
     add_library(rune_replication_aeron
         src/AeronPartitionTransport.cpp)
     target_include_directories(rune_replication_aeron PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        ${RUNE_NODE_INCLUDE})
     target_link_libraries(rune_replication_aeron PUBLIC
         rune_replication
+        rune_consensus
+        rune_metadata
         aeron::aeron)
-    target_link_libraries(rune_replication_aeron PRIVATE spdlog::spdlog)
+    # spdlog PUBLIC because AeronPartitionTransport.h includes WorkerPool.h→Worker.h
+    # which uses spdlog inline methods; consumers must see spdlog headers.
+    target_link_libraries(rune_replication_aeron PUBLIC spdlog::spdlog)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING

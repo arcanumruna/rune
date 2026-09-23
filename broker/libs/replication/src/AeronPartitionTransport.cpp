@@ -6,6 +6,13 @@
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationMessages.h>
 
+// E2 inc2a: WorkerPool + WorkerOp for SPSC ApplyReplicated routing.
+// Included here (not in the header) to avoid pulling consensus/spdlog headers
+// into consumers of rune_replication_aeron that don't need them.
+// rune_replication_aeron has RUNE_NODE_INCLUDE set in its CMakeLists.txt.
+#include <rune/node/WorkerPool.h>
+#include <rune/node/WorkerOp.h>
+
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -341,7 +348,45 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
                           resp.topicId, resp.partition);
             return;
         }
-        it->second->applyReplicated(resp);
+        // E2 inc2a: when a WorkerPool is wired, route the applyReplicated call
+        // through the owning worker's SPSC ingress ring instead of calling it
+        // inline within the Aeron fragment callback.
+        //
+        // BUFFER LIFETIME: FetchResponseMsg::records is a span into the Aeron
+        // term buffer, which is ONLY valid inside this callback.  We COPY the
+        // record bytes into a std::vector<uint8_t> owned by the WorkerOp at
+        // enqueue time (before we return from the callback) — this is the
+        // mandated approach from the inc2a brief.
+        if (workerPool_) {
+            rune::node::WorkerOp op;
+            op.type                              = rune::node::WorkerOp::Type::ApplyReplicated;
+            op.topicId                           = resp.topicId;
+            op.partition                         = resp.partition;
+            op.replica                           = it->second;
+            op.logPtr                            = nullptr; // not needed for ApplyReplicated
+            op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
+            op.replicatedPayload.partition       = resp.partition;
+            op.replicatedPayload.highWatermark   = resp.highWatermark;
+            op.replicatedPayload.logStartOffset  = resp.logStartOffset;
+            op.replicatedPayload.errorCode       = resp.errorCode;
+            op.replicatedPayload.topicId         = resp.topicId;
+            // Copy records span bytes into an owned vector (buffer lifetime).
+            if (!resp.records.empty()) {
+                op.replicatedPayload.records.assign(
+                    resp.records.data(),
+                    resp.records.data() + resp.records.size());
+            }
+            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition,
+                                           std::move(op))) {
+                spdlog::warn(
+                    "AeronPartitionTransport: worker ring full for "
+                    "ApplyReplicated (topicId={}, partition={}); dropping frame",
+                    resp.topicId, resp.partition);
+            }
+        } else {
+            // INLINE path (no WorkerPool): call applyReplicated synchronously.
+            it->second->applyReplicated(resp);
+        }
 
     } else if (tid == OffsetsForLeaderEpochReqMsg::TEMPLATE_ID) {
         // DR-BUG-6: KIP-101 epoch-boundary query → leader answers.

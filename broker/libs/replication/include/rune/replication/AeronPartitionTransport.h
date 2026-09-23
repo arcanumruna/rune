@@ -51,6 +51,12 @@
 //   this synchronously.
 // ---------------------------------------------------------------------------
 
+// E2 inc2a: WorkerPool forward-declaration for SPSC ApplyReplicated routing.
+// Only the pointer is stored in this header (setWorkerPool takes WorkerPool*).
+// The full WorkerPool.h / WorkerOp.h are included in AeronPartitionTransport.cpp
+// (compiled under rune_replication_aeron which has RUNE_NODE_INCLUDE).
+namespace rune::node { class WorkerPool; }
+
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 
@@ -166,6 +172,20 @@ public:
     int poll(int64_t nowNs);
 
     // -----------------------------------------------------------------------
+    // E2 inc2a: WorkerPool wiring
+    // -----------------------------------------------------------------------
+
+    /// Wire in the WorkerPool so inbound FetchResponse frames are routed to the
+    /// owning worker's SPSC ingress ring instead of calling applyReplicated()
+    /// inline within the Aeron poll callback.
+    ///
+    /// Must be called BEFORE the first poll() that can receive FetchResponses.
+    /// May be null (inline fallback path remains active when unset).
+    void setWorkerPool(rune::node::WorkerPool* pool) noexcept {
+        workerPool_ = pool;
+    }
+
+    // -----------------------------------------------------------------------
     // Accessors (for tests)
     // -----------------------------------------------------------------------
 
@@ -250,6 +270,10 @@ private:
 
     // Pre-allocated scratch buffer — zero per-op alloc on the send path.
     std::vector<uint8_t> encodeScratch_;
+
+    // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
+    // enqueued to the owning worker instead of calling applyReplicated inline.
+    rune::node::WorkerPool* workerPool_ = nullptr;
 };
 
 } // namespace rune::replication

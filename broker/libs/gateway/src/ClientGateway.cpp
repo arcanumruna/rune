@@ -12,6 +12,11 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/IsrManager.h>
 
+// E2 inc2a: SPSC worker routing (included via RUNE_NODE_INCLUDE raw path to
+// avoid a circular CMake target dep; rune_gateway does NOT link rune_node).
+#include <rune/node/WorkerPool.h>
+#include <rune/node/WorkerOp.h>
+
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -100,6 +105,18 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
 // ---------------------------------------------------------------------------
 int ClientGateway::doWork(int64_t nowNs) {
     nowNs_ = nowNs;
+
+    // E2 inc2a: drain the workers' return rings FIRST — send responses from the
+    // previous cycle's produce-appends and push-reads before processing any new
+    // ingress.  This keeps produce responses strictly ordered before push-Records
+    // (same session, different op types) and ensures deferred acks=All are
+    // checked with the latest HW from the previous cycle.
+    //
+    // Guard: only active when a WorkerPool is wired in.  Falls back gracefully
+    // to the pre-E2 inline-execution path when workerPool_ is null.
+    if (workerPool_) {
+        drainWorkerReturns_();
+    }
 
     // TX-2b: Detect Follower→Leader transition and rebuild the PSM from the
     // partition Logs.  Mirrors TransactionCoordinationService::doWork().
@@ -1408,6 +1425,62 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
     }
 
+    // E2 inc2a: When a WorkerPool is wired, route the append to the owning worker
+    // via the SPSC ingress ring.  The worker executes appendNoSync +
+    // onLeaderLogAppended; the response (or pending-ack) is completed in
+    // drainWorkerReturns_() at the top of the NEXT doWork() cycle.
+    //
+    // When no WorkerPool is wired (null), fall through to the original inline path.
+    if (workerPool_) {
+        // Build the op envelope.
+        rune::node::WorkerOp op;
+        op.type         = rune::node::WorkerOp::Type::Produce;
+        op.topicId      = msg.topicId;
+        op.partition    = partition;
+        op.replica      = replica;
+        op.logPtr       = log;
+        op.sessionId    = msg.sessionId;
+        op.correlationId = msg.correlationId;
+        op.acks          = msg.acks;
+        op.producerId    = msg.producerId;
+        op.producerEpoch = msg.producerEpoch;
+        op.baseSequence  = msg.baseSequence;
+        op.lastOffsetDelta = lastOffsetDelta;
+        op.recordCount   = recordCount;
+        op.deferAck      = acksAll && replica && committedMetadataReady_;
+        op.enqueuedAtNs  = nowNs_;
+
+        // Capture batch attributes for LSO tracking (forwarded in return).
+        constexpr std::size_t kAttrOffset =
+            static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset);
+        if (batchLen >= kAttrOffset + 2u) {
+            op.batchAttrs = static_cast<uint16_t>(
+                static_cast<uint16_t>(restampScratch_[kAttrOffset]) |
+                (static_cast<uint16_t>(restampScratch_[kAttrOffset + 1u]) << 8));
+        }
+
+        // Copy the restamped batch bytes into the op (worker-owned buffer).
+        // The worker will re-stamp the base offset with its own logEndOffset().
+        // The CRC region starts at kAttributesOffset=21 (after the base-offset
+        // field at [0..7]), so the re-stamp is CRC-safe.
+        op.recordBatchBytes.assign(restampScratch_.data(),
+                                   restampScratch_.data() + batchLen);
+
+        // Enqueue to the worker.  tryEnqueueOp returns false if the ring is full
+        // (back-pressure). In the cooperative single-thread model, the ring drains
+        // on every duty cycle, so this should rarely be full. If it is full, we
+        // send an Internal error (the same outcome as if the append had failed).
+        if (!workerPool_->tryEnqueueOp(msg.topicId, partition, std::move(op))) {
+            spdlog::warn("ClientGateway: worker ring full for topicId={} partition={}; "
+                         "ProduceResponse Internal (back-pressure)", msg.topicId, partition);
+            sendResp(pc::ErrorCode::Internal, partition, 0);
+        }
+        // Response (or pending-ack) will be processed in drainWorkerReturns_().
+        return;
+    }
+
+    // ---------------------------------------------------------------------------
+    // INLINE path (pre-E2 / no WorkerPool):
     // GB-5p2: use appendNoSync — page-cache write only, no fsync on the hot path.
     // flushDirtyLogs() is called once per doWork() cycle (after all ingress has
     // been processed) to fsync all touched partition Logs in one pass → group-commit.
@@ -1986,6 +2059,53 @@ void ClientGateway::pushSubscriptions()
 
         if (sub.nextOffset >= bound) continue; // nothing committed to push yet
 
+        // E2 inc2a: When a WorkerPool is wired, route the log read through the
+        // owning worker's SPSC ingress ring.  The chunk is returned via the
+        // return ring and processed in drainWorkerReturns_() next cycle.
+        //
+        // Skip this subscription if it already has an in-flight PushRead (the
+        // previous cycle's read has not yet returned).  This preserves the
+        // strictly-ordered delivery guarantee: we never issue a second read
+        // before the first one's response has been sent.
+        if (workerPool_) {
+            if (pendingWorkerReads_.count(subId) > 0) {
+                // In-flight — skip until the return is processed.
+                continue;
+            }
+
+            // Look up the owning replica (for the log accessor in the worker).
+            const rune::replication::PartitionReplica* repForRead = nullptr;
+            if (replicaRegistry_) {
+                repForRead = replicaRegistry_->lookup(sub.topicId, sub.partition);
+            }
+
+            rune::node::WorkerOp op;
+            op.type                = rune::node::WorkerOp::Type::PushRead;
+            op.topicId             = sub.topicId;
+            op.partition           = sub.partition;
+            op.replica             = const_cast<rune::replication::PartitionReplica*>(repForRead);
+            op.logPtr              = log;
+            op.subscriptionId      = subId;
+            op.sessionId           = sub.sessionId;
+            op.nextOffset          = sub.nextOffset;
+            op.hwBound             = bound;
+            op.isolation           = sub.isolation;
+            op.isGroup             = sub.isGroup;
+            op.groupCarrierReceived = sub.groupCarrierReceived;
+
+            if (!workerPool_->tryEnqueueOp(sub.topicId, sub.partition, std::move(op))) {
+                spdlog::warn("ClientGateway: worker ring full for push sub={}; retrying next cycle",
+                             subId);
+                // Ring full — skip this cycle; pendingWorkerReads_ not set so
+                // we retry next cycle.
+            } else {
+                // Successfully enqueued — mark as in-flight.
+                pendingWorkerReads_.insert(subId);
+            }
+            continue; // Gateway will process the return in the next cycle.
+        }
+
+        // INLINE path (pre-E2 / no WorkerPool):
         // Fetch a bounded chunk of bytes from the log starting at nextOffset.
         std::vector<uint8_t> chunk;
         try {
@@ -2276,6 +2396,364 @@ void ClientGateway::pushSubscriptions()
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// drainWorkerReturns_ (E2 inc2a) — collect results from per-worker SPSC rings
+// and complete the corresponding in-flight gateway operations.
+//
+// Called at the top of doWork() (before ingress poll) when workerPool_ is set.
+// This ensures that results from the PREVIOUS cycle's produce-appends and
+// push-reads are delivered before processing new ingress — preserving the
+// session-level ordering guarantee.
+//
+// ProduceResult handling:
+//   1. If errorCode != 0: find session, send ProduceResponse{Internal, partition, 0}.
+//   2. If success:
+//      a. Update idempotent PSM (producerStateManager_.update) if producerId >= 0.
+//      b. Feed LsoTracker for transactional data batches (TRANSACTIONAL bit in batchAttrs).
+//      c. Mark log dirty for group-commit fsync (dirtyLogs_.insert).
+//      d. If deferAck: enqueue PendingAck (same as inline path).
+//      e. Else: send ProduceResponse{OK, partition, baseOffset}.
+//
+// PushReadResult handling:
+//   1. Remove subscriptionId from pendingWorkerReads_.
+//   2. If chunk is empty → done (nothing to push this cycle).
+//   3. Iterate whole record batches in the chunk (same loop as inline path).
+//   4. Encode + tryClaim Records frames; advance sub.nextOffset on success only.
+//      Back-pressure: stop for this subscription (same invariant as inline path).
+//
+// Single-writer: duty-cycle thread only.
+// ---------------------------------------------------------------------------
+void ClientGateway::drainWorkerReturns_()
+{
+    using namespace rune::protocol::batch;
+
+    workerPool_->drainAllReturns([this](rune::node::WorkerReturn ret) {
+
+        // ===================================================================
+        // ProduceResult
+        // ===================================================================
+        if (ret.type == rune::node::WorkerReturn::Type::ProduceResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) {
+                // Session gone — drop result silently.
+                return;
+            }
+
+            // Error path: worker failed to append (e.g. Log threw).
+            if (ret.errorCode != 0) {
+                pc::ProduceResponse resp;
+                resp.sessionId     = ret.sessionId;
+                resp.correlationId = ret.correlationId;
+                resp.errorCode     = ret.errorCode;
+                resp.partition     = ret.partition;
+                resp.baseOffset    = 0;
+                static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                              "scratch too small for ProduceResponse");
+                const std::size_t encoded = resp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+                return;
+            }
+
+            // Success: TX-2 idempotent PSM update.
+            if (ret.producerId >= 0) {
+                const int32_t lastSeqInBatch =
+                    ret.baseSequence + ret.recordCount - 1;
+                producerStateManager_.update(
+                    ret.topicId, ret.producerId, ret.partition,
+                    ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
+                    ret.baseOffset);
+
+                // TX-4 Task 9: Feed LsoTracker for transactional data batches.
+                constexpr uint16_t kTransactionalBit = 0x10u;
+                if (ret.batchAttrs & kTransactionalBit) {
+                    getTxnState(ret.topicId, ret.partition)
+                        .lsoTracker.onProduceBatch(ret.producerId, ret.baseOffset);
+                }
+            }
+
+            // Mark log dirty for group-commit fsync.
+            if (topicRegistry_) {
+                rune::storage::Log* log =
+                    topicRegistry_->log(ret.topicId, ret.partition);
+                if (log) {
+                    dirtyLogs_.insert(log);
+                }
+            }
+
+            // Deferred ack (acks=All) or immediate ack (acks=Leader/None).
+            if (ret.deferAck) {
+                if (pendingAcks_.size() >= kMaxPendingAcks) {
+                    spdlog::warn(
+                        "ClientGateway: drainWorkerReturns_ pendingAcks_ full "
+                        "({} entries); acks=All result rejected with MinIsrViolation "
+                        "sessionId={} topicId={} partition={}",
+                        kMaxPendingAcks, ret.sessionId, ret.topicId, ret.partition);
+                    pc::ProduceResponse errResp;
+                    errResp.sessionId     = ret.sessionId;
+                    errResp.correlationId = ret.correlationId;
+                    errResp.errorCode     =
+                        static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
+                    errResp.partition     = ret.partition;
+                    errResp.baseOffset    = 0;
+                    const std::size_t encoded = errResp.encode(scratch_.data());
+                    sendTo(*session, scratch_.data(), encoded);
+                    return;
+                }
+
+                PendingAck entry;
+                entry.sessionId     = ret.sessionId;
+                entry.correlationId = ret.correlationId;
+                entry.partition     = ret.partition;
+                entry.baseOffset    = ret.baseOffset;
+                entry.lastOffset    = ret.lastOffset;
+                entry.enqueuedAtNs  = ret.enqueuedAtNs;
+                entry.replica       = ret.replica;
+                pendingAcks_.push_back(entry);
+
+                spdlog::debug(
+                    "ClientGateway: drainWorkerReturns_ acks=All produce enqueued "
+                    "pending-ack sessionId={} partition={} baseOffset={} lastOffset={}",
+                    ret.sessionId, ret.partition, ret.baseOffset, ret.lastOffset);
+            } else {
+                // Immediate ack.
+                pc::ProduceResponse okResp;
+                okResp.sessionId     = ret.sessionId;
+                okResp.correlationId = ret.correlationId;
+                okResp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
+                okResp.partition     = ret.partition;
+                okResp.baseOffset    = ret.baseOffset;
+                const std::size_t encoded = okResp.encode(scratch_.data());
+                sendTo(*session, scratch_.data(), encoded);
+            }
+            return;
+        }
+
+        // ===================================================================
+        // PushReadResult
+        // ===================================================================
+        if (ret.type == rune::node::WorkerReturn::Type::PushReadResult) {
+            // Always clear the in-flight marker regardless of outcome.
+            pendingWorkerReads_.erase(ret.subscriptionId);
+
+            if (ret.chunk.empty()) return; // nothing to push this cycle
+
+            // Find the owning session.
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+
+            // Find the subscription (it may have been removed if the client
+            // unsubscribed while the read was in-flight).
+            auto subIt = subscriptions_.find(ret.subscriptionId);
+            if (subIt == subscriptions_.end()) return;
+            Subscription& sub = subIt->second;
+
+            // Iterate whole record batches in the chunk — mirrors the inline
+            // pushSubscriptions() loop exactly.
+            const std::vector<uint8_t>& chunk = ret.chunk;
+            std::size_t chunkPos  = 0;
+            const std::size_t chunkSize = chunk.size();
+            int batchesPushed = 0;
+            bool backPressured = false;
+
+            while (chunkPos < chunkSize
+                   && batchesPushed < kMaxBatchesPerSubPerCycle
+                   && !backPressured)
+            {
+                constexpr std::size_t kMinBatchHdr =
+                    static_cast<std::size_t>(kRecordCountOffset) + 4u;
+                if (chunkPos + kMinBatchHdr > chunkSize) break;
+
+                const uint8_t* batchPtr = chunk.data() + chunkPos;
+
+                // Read baseOffset (LE64@0).
+                int64_t baseOffset = 0;
+                for (int i = 0; i < 8; ++i)
+                    baseOffset |= (static_cast<int64_t>(batchPtr[i]) << (i * 8));
+
+                // Isolation bound check (bound was captured at enqueue time).
+                if (baseOffset >= ret.hwBound) break;
+
+                // Read length field (LE32@8) → batchSize = 12 + length.
+                uint32_t lengthField = 0;
+                {
+                    const uint8_t* p = batchPtr + kLengthOffset;
+                    lengthField = static_cast<uint32_t>(p[0]) |
+                                  (static_cast<uint32_t>(p[1]) << 8) |
+                                  (static_cast<uint32_t>(p[2]) << 16) |
+                                  (static_cast<uint32_t>(p[3]) << 24);
+                }
+                const std::size_t batchSize =
+                    12u + static_cast<std::size_t>(lengthField);
+
+                if (chunkPos + batchSize > chunkSize) break;
+
+                // Read attributes (LE16@kAttributesOffset=21).
+                uint16_t batchAttrs = 0;
+                {
+                    constexpr std::size_t kAttrOff =
+                        static_cast<std::size_t>(kAttributesOffset);
+                    if (chunkPos + kAttrOff + 2u <= chunkSize) {
+                        batchAttrs = static_cast<uint16_t>(
+                            static_cast<uint16_t>(batchPtr[kAttrOff]) |
+                            (static_cast<uint16_t>(batchPtr[kAttrOff + 1u]) << 8));
+                    }
+                }
+                constexpr uint16_t kControlBit      = 0x20u;
+                constexpr uint16_t kTransactionalBit = 0x10u;
+
+                // Skip control batches unconditionally.
+                if (batchAttrs & kControlBit) {
+                    const uint8_t* prc = batchPtr + kRecordCountOffset;
+                    int32_t ctlRc = static_cast<int32_t>(
+                        static_cast<uint32_t>(prc[0]) |
+                        (static_cast<uint32_t>(prc[1]) << 8) |
+                        (static_cast<uint32_t>(prc[2]) << 16) |
+                        (static_cast<uint32_t>(prc[3]) << 24));
+                    if (ctlRc < 1) ctlRc = 1;
+                    chunkPos += batchSize;
+                    sub.nextOffset = baseOffset + static_cast<int64_t>(ctlRc);
+                    continue;
+                }
+
+                // Read recordCount (LE32@57).
+                int32_t recordCount = 0;
+                {
+                    const uint8_t* p = batchPtr + kRecordCountOffset;
+                    recordCount = static_cast<int32_t>(
+                        static_cast<uint32_t>(p[0]) |
+                        (static_cast<uint32_t>(p[1]) << 8) |
+                        (static_cast<uint32_t>(p[2]) << 16) |
+                        (static_cast<uint32_t>(p[3]) << 24));
+                }
+
+                if (recordCount < 1) {
+                    spdlog::warn(
+                        "ClientGateway: push (worker) sub={} corrupt batch at "
+                        "chunkPos={} recordCount={} baseOffset={} — skipping",
+                        ret.subscriptionId, chunkPos, recordCount, baseOffset);
+                    chunkPos += batchSize;
+                    sub.nextOffset = baseOffset + 1;
+                    continue;
+                }
+
+                // TX-4: Aborted-txn filter for read_committed.
+                if (ret.isolation == static_cast<uint8_t>(
+                        rune::transaction::IsolationLevel::ReadCommitted)
+                    && (batchAttrs & kTransactionalBit))
+                {
+                    constexpr std::size_t kPidOff =
+                        static_cast<std::size_t>(kProducerIdOffset);
+                    if (chunkPos + kPidOff + 8u <= chunkSize) {
+                        int64_t batchPid = 0;
+                        for (int bi = 0; bi < 8; ++bi)
+                            batchPid |= (static_cast<int64_t>(
+                                batchPtr[kPidOff + bi]) << (bi * 8));
+
+                        if (const PartitionTxnState* ts =
+                                getTxnStateRO(ret.readTopicId, ret.readPartition))
+                        {
+                            if (ts->abortedIndex.isAborted(batchPid, baseOffset)) {
+                                if (sub.isGroup && !sub.groupCarrierReceived) {
+                                    spdlog::debug(
+                                        "ClientGateway: push (worker) sub={} "
+                                        "pre-carrier group sub stalling at aborted "
+                                        "batch offset={}",
+                                        ret.subscriptionId, baseOffset);
+                                    break;
+                                }
+                                chunkPos += batchSize;
+                                sub.nextOffset =
+                                    baseOffset + static_cast<int64_t>(recordCount);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Guard: batch too large for scratch.
+                const std::size_t needed =
+                    pc::Records::BODY_FIXED + pc::MessageHeader::ENCODED_SIZE
+                    + 2u + batchSize;
+                if (needed > kScratchSize) {
+                    spdlog::warn(
+                        "ClientGateway: push (worker) sub={} batch too large "
+                        "({} > {}); skipping",
+                        ret.subscriptionId, needed, kScratchSize);
+                    chunkPos += batchSize;
+                    sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
+                    continue;
+                }
+                if (batchSize > 65535u) {
+                    spdlog::warn(
+                        "ClientGateway: push (worker) sub={} batchSize {} > u16 max; "
+                        "skipping",
+                        ret.subscriptionId, batchSize);
+                    chunkPos += batchSize;
+                    sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
+                    continue;
+                }
+
+                // Encode Records frame.
+                pc::Records rec;
+                rec.sessionId      = ret.sessionId;
+                rec.correlationId  = 0;
+                rec.subscriptionId = ret.subscriptionId;
+                rec.topicId        = ret.readTopicId;
+                rec.partition      = ret.readPartition;
+                rec.baseOffset     = baseOffset;
+                rec.recordBatch    =
+                    std::span<const uint8_t>(batchPtr, batchSize);
+
+                const std::size_t encoded = rec.encode(scratch_.data());
+
+                // tryClaim / null-egress path — identical to inline pushSubscriptions.
+                int64_t pos = -1;
+                if (!session->egress) {
+                    if (onEgressFrame_) {
+                        onEgressFrame_(session->sessionId, scratch_.data(), encoded);
+                        pos = 1;
+                    }
+                } else {
+                    aeron::ExclusivePublication& pub = *session->egress;
+                    if (pub.isConnected() &&
+                        encoded <= static_cast<std::size_t>(pub.maxPayloadLength()))
+                    {
+                        aeron::concurrent::logbuffer::BufferClaim claim;
+                        pos = pub.tryClaim(
+                            static_cast<aeron::util::index_t>(encoded), claim);
+                        if (pos > 0) {
+                            auto* mutableBuf =
+                                const_cast<uint8_t*>(scratch_.data());
+                            aeron::concurrent::AtomicBuffer atomicBuf(
+                                mutableBuf,
+                                static_cast<aeron::util::index_t>(encoded));
+                            claim.buffer().putBytes(
+                                claim.offset(), atomicBuf, 0,
+                                static_cast<aeron::util::index_t>(encoded));
+                            claim.commit();
+                        }
+                    }
+                }
+
+                if (pos > 0) {
+                    sub.nextOffset =
+                        baseOffset + static_cast<int64_t>(recordCount);
+                    chunkPos += batchSize;
+                    ++batchesPushed;
+                } else {
+                    backPressured = true;
+                    spdlog::debug(
+                        "ClientGateway: push (worker) sub={} back-pressured at "
+                        "offset={} (pos={})",
+                        ret.subscriptionId, baseOffset, pos);
+                }
+            }
+            return;
+        }
+
+    }); // drainAllReturns
 }
 
 // ---------------------------------------------------------------------------

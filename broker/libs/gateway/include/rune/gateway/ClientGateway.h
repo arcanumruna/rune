@@ -49,6 +49,11 @@
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 
+// Forward-declared to avoid pulling the full WorkerPool header (and its heavy
+// chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
+// header.  All WorkerPool calls are in ClientGateway.cpp.
+namespace rune::node { class WorkerPool; }
+
 #include <Aeron.h>
 #include <Subscription.h>
 #include <ExclusivePublication.h>
@@ -288,6 +293,27 @@ public:
     void setNodeEndpointMap(
             std::unordered_map<int32_t, std::string> nodeEndpoints) noexcept {
         nodeEndpointMap_ = std::move(nodeEndpoints);
+    }
+
+    // -----------------------------------------------------------------------
+    // E2 inc2a: setWorkerPool — wire in the WorkerPool for per-partition SPSC
+    // routing.  When set, produce-append and pushSubscriptions log-reads are
+    // enqueued to the owning worker's ingress ring and the return ring is
+    // drained at the start of doWork() to send deferred responses.
+    //
+    // When null (default), the gateway falls back to direct inline execution
+    // (pre-E2 path — required for tests and single-node configurations that
+    // do not wire a WorkerPool).
+    //
+    // Must be called before doWork() on the duty-cycle thread (single-writer).
+    // The pointer is non-owning; the WorkerPool must outlive the gateway.
+    // -----------------------------------------------------------------------
+    void setWorkerPool(rune::node::WorkerPool* pool) noexcept {
+        workerPool_ = pool;
+    }
+
+    [[nodiscard]] rune::node::WorkerPool* workerPool() const noexcept {
+        return workerPool_;
     }
 
     // -----------------------------------------------------------------------
@@ -744,6 +770,20 @@ private:
     // Single-writer: only accessed on the duty-cycle thread.
     rune::node::ReplicaRegistry*         replicaRegistry_ = nullptr;
 
+    // E2 inc2a: WorkerPool for per-partition SPSC routing (non-owning).
+    // Null until wired via setWorkerPool(). When set, handleProduce() and
+    // pushSubscriptions() route log work through the owning worker's ring;
+    // drainWorkerReturns_() sends deferred responses at the top of doWork().
+    rune::node::WorkerPool* workerPool_ = nullptr;
+
+    // E2 inc2a: Set of subscriptionIds that have an outstanding PushRead op in
+    // the worker's ingress ring.  A subscription must not get a second PushRead
+    // until the first one's return has been processed (exactly-once ordering).
+    // Cleared in handlePushReadReturn_ after the send completes (or fails with
+    // back-pressure — in the back-pressure case we clear it so the next cycle
+    // re-enqueues from the same nextOffset).
+    std::unordered_set<int64_t> pendingWorkerReads_;
+
     // Group request handler (CG-3/CG-4 fix) — non-owning; set via setGroupService().
     // Null until wired in; group messages (templateIds 32–43) are dispatched here.
     // IGroupRequestHandler is defined in this lib (gateway); the concrete impl
@@ -916,6 +956,25 @@ private:
     //
     // Cold path: allocations acceptable.  Single-writer: duty-cycle thread only.
     void rebuildProducerStateFromLogs();
+
+    // -----------------------------------------------------------------------
+    // E2 inc2a: drainWorkerReturns_ — drain all workers' return rings and
+    // process each result.
+    //
+    // Called at the TOP of doWork() (before ingress poll) so that produce
+    // responses and push-read chunks from the PREVIOUS cycle are sent before
+    // any new ingress is processed.  This preserves strictly-ordered delivery:
+    // a produce response is never reordered past subsequent ingress frames.
+    //
+    // ProduceResult: complete the PSM update, send ProduceResponse (or enqueue
+    //   PendingAck for acks=All).
+    // PushReadResult: iterate the chunk's batches, encode Records frames, send
+    //   them on the session egress (same back-pressure logic as pushSubscriptions).
+    //
+    // Only called when workerPool_ is set (guarded in doWork).
+    // WorkerReturn type is fully defined in the .cpp (WorkerOp.h included there).
+    // -----------------------------------------------------------------------
+    void drainWorkerReturns_();
 
     // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index.
     //

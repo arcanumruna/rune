@@ -1052,6 +1052,17 @@ void BrokerNode::buildGateway() {
     // txn, and metadata replicas all added). The pool holds non-owning ptrs.
     buildWorkerPool();
 
+    // E2 inc2a: Wire the WorkerPool into the gateway and the replication
+    // transport so their per-partition log work is routed through the owning
+    // worker's SPSC ingress ring.  Both setters are null-safe (no-op when
+    // workerPool_ is null, which happens when no topics are configured).
+    if (gateway_ && workerPool_) {
+        gateway_->setWorkerPool(workerPool_.get());
+    }
+    if (replTransport_ && workerPool_) {
+        replTransport_->setWorkerPool(workerPool_.get());
+    }
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
