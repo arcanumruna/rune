@@ -363,7 +363,8 @@ void BrokerNode::buildReplication() {
 
         try {
             replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
-                aeron_, ingressChannel, ingressStream, selfId);
+                aeron_, ingressChannel, ingressStream, selfId,
+                config_.replicationOutboundRingBytes);
 
             // Add each peer (excluding self) as an egress destination.
             for (const auto& peer : config_.peers) {
@@ -566,7 +567,9 @@ void BrokerNode::buildWorkerPool() {
         // ungrouped topics: router uses topicId as-is (ShardRouter default).
     }
 
-    workerPool_ = std::make_unique<WorkerPool>(wc, std::move(router));
+    workerPool_ = std::make_unique<WorkerPool>(
+        wc, std::move(router),
+        static_cast<std::size_t>(config_.workerRingCapacity));  // NodeConfig-configurable
 
     if (replicaRegistry_) {
         // Ordinal-invariant assert: routing uses partitionId() as the partition

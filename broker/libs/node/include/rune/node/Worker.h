@@ -76,10 +76,12 @@ public:
     // When inc2b adds per-worker threads, this may be tuned up.
     static constexpr std::size_t kRingCapacity = 256;
 
-    explicit Worker(int32_t workerId) noexcept
+    // ringCapacity: per-worker ingress/return SPSC ring slots — NodeConfig
+    // configurable (workerRingCapacity). Default kRingCapacity for tests/back-compat.
+    explicit Worker(int32_t workerId, std::size_t ringCapacity = kRingCapacity) noexcept
         : workerId_(workerId)
-        , ingress_(kRingCapacity)
-        , ret_(kRingCapacity)
+        , ingress_(ringCapacity)
+        , ret_(ringCapacity)
     {
         // Verify the raw-pointer atomic is lock-free on this platform.
         // std::atomic<pointer> is lock-free on x86_64 and arm64 (the only

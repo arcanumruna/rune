@@ -99,10 +99,13 @@ public:
     /// The ingress Subscription is registered synchronously (bounded 5 s wait)
     /// in the constructor — this is the only synchronous resolve; it runs once
     /// at startup, never on the duty-cycle hot path.
+    /// \param outboundRingBytes Payload bytes of the outbound ManyToOne ring
+    ///        (NodeConfig::replicationOutboundRingBytes). Power of two.
     AeronPartitionTransport(std::shared_ptr<aeron::Aeron> aeron,
                             const std::string&             ingressChannel,
                             int32_t                        ingressStreamId,
-                            NodeId                         selfId);
+                            NodeId                         selfId,
+                            int                            outboundRingBytes = 4 * 1024 * 1024);
 
     ~AeronPartitionTransport() override = default;
 
@@ -310,9 +313,9 @@ private:
 
     // Outbound marshalling ring (agrona ManyToOneRingBuffer via IngressRing).
     // Producers = worker threads (sends); consumer = control thread (drainOutbound).
-    // Sized to hold the largest wire frame (fetch response ≤ pub maxMessageLength).
-    static constexpr int kOutboundRingBytes = 4 * 1024 * 1024;
-    rune::consensus::IngressRing outboundRing_{kOutboundRingBytes};
+    // Size is NodeConfig-configurable (replicationOutboundRingBytes) — passed to
+    // the ctor and used to construct this ring in the init list.
+    rune::consensus::IngressRing outboundRing_;
 
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.

@@ -29,7 +29,8 @@ AeronPartitionTransport::AeronPartitionTransport(
         std::shared_ptr<aeron::Aeron> aeron,
         const std::string&             ingressChannel,
         int32_t                        ingressStreamId,
-        NodeId                         selfId)
+        NodeId                         selfId,
+        int                            outboundRingBytes)
     : aeron_(std::move(aeron))
     , assembler_([this](aeron::concurrent::AtomicBuffer& buf,
                         aeron::util::index_t             offset,
@@ -38,6 +39,7 @@ AeronPartitionTransport::AeronPartitionTransport(
           onFragment(buf, offset, length, hdr);
       })
     , selfId_(selfId)
+    , outboundRing_(outboundRingBytes)  // NodeConfig-configurable ring size
 {
     // Register ingress subscription.  One bounded synchronous wait at
     // construction — never called on the duty-cycle hot path.

@@ -190,6 +190,16 @@ struct NodeConfig {
     };
     WorkerIdleStrategy workerIdleStrategy = WorkerIdleStrategy::Backoff;
 
+    // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread
+    // communication is via agrona ring buffers; their sizes are tunable per
+    // deployment (no hardcoded ring capacities). Powers of two.
+    //   - replicationOutboundRingBytes: payload bytes of the transport's outbound
+    //     ManyToOne ring (worker sends → control-thread drain). RUNE_REPL_OUTBOUND_RING_BYTES.
+    //   - workerRingCapacity: slot count of each per-worker ingress/return SPSC
+    //     ring (inc2a). RUNE_WORKER_RING_CAPACITY.
+    int32_t replicationOutboundRingBytes = 4 * 1024 * 1024;
+    int32_t workerRingCapacity           = 256;
+
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
     // each topic's segmentRollBytes are merged into a single output segment per

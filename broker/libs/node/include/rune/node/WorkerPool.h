@@ -60,7 +60,10 @@ public:
 
     // Construct N workers (ids 0..N-1) and take ownership of the router.
     // Precondition: workerCount >= 1 and must match router.workerCount().
-    WorkerPool(int32_t workerCount, rune::metadata::ShardRouter router)
+    // ringCapacity: per-worker ingress/return SPSC ring slots (NodeConfig
+    // workerRingCapacity). Default Worker::kRingCapacity for tests/back-compat.
+    WorkerPool(int32_t workerCount, rune::metadata::ShardRouter router,
+               std::size_t ringCapacity = Worker::kRingCapacity)
         : router_(std::move(router))
     {
         assert(workerCount >= 1 && "workerCount must be >= 1");
@@ -71,7 +74,7 @@ public:
         retainRings_.resize(n);
         retainHeads_.resize(n, 0);
         for (int32_t i = 0; i < workerCount; ++i)
-            workers_.emplace_back(std::make_unique<Worker>(i));
+            workers_.emplace_back(std::make_unique<Worker>(i, ringCapacity));
     }
 
     // Non-copyable; movable (runners not yet started at construction).

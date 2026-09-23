@@ -609,6 +609,17 @@ ConfigResult parseNodeConfig(
         cfg.workerCount = 1;
     }
 
+    // --- Ring-buffer sizes (shared-nothing conformance) — optional, power-of-two. ---
+    auto parsePow2 = [](const char* raw, int32_t& out) {
+        if (!raw || std::string_view(raw).empty()) return;   // keep default
+        char* end = nullptr;
+        const long v = std::strtol(raw, &end, 10);
+        // Accept only positive powers of two; else keep the default.
+        if (end != raw && v > 0 && (v & (v - 1)) == 0) out = static_cast<int32_t>(v);
+    };
+    parsePow2(getenv_fn("RUNE_REPL_OUTBOUND_RING_BYTES"), cfg.replicationOutboundRingBytes);
+    parsePow2(getenv_fn("RUNE_WORKER_RING_CAPACITY"),     cfg.workerRingCapacity);
+
     // --- RUNE_WORKER_IDLE (optional) — Milestone E1/E2: per-worker idle strategy selector. ---
     // E1: parsed + stored here; no per-worker AgentRunner yet (driven cooperatively).
     // E2: will wire this into each worker's AgentRunner.
