@@ -530,7 +530,7 @@ void BrokerNode::buildReplication() {
 // identical shard identities. Ungrouped topics fall back to their topicId.
 //
 // Ordinal invariant: partitionId() == partition ordinal (pcfg.partitionId = part
-// at BrokerNode.cpp:432). ShardRouter uses the ordinal as the partition index.
+// at BrokerNode.cpp:434). ShardRouter uses the ordinal as the partition index.
 // The assert below documents + enforces this; if partitionId ever becomes a
 // global gpid this will fire, preventing silent co-partition affinity breakage.
 // ---------------------------------------------------------------------------
@@ -558,7 +558,7 @@ void BrokerNode::buildWorkerPool() {
 
     if (replicaRegistry_) {
         // Ordinal-invariant assert: routing uses partitionId() as the partition
-        // ordinal. This holds because pcfg.partitionId = part (BrokerNode.cpp:432),
+        // ordinal. This holds because pcfg.partitionId = part (BrokerNode.cpp:434),
         // i.e. partitionId() == the 0-based partition ordinal within the topic.
         // If partitionId ever becomes a global gpid this assertion will fire,
         // preventing silent co-partition affinity routing breakage. Internal

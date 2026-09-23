@@ -37,6 +37,7 @@ public:
         const Key key{topicId, partition};
         map_[key] = std::move(replica);
         ordered_.push_back(map_[key].get());
+        ++generation_;
     }
 
     // -----------------------------------------------------------------------
@@ -101,12 +102,22 @@ public:
 
         // Destroy the owned PartitionReplica.
         map_.erase(it);
+        ++generation_;
     }
 
     // -----------------------------------------------------------------------
     // replicaCount
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t replicaCount() const noexcept { return ordered_.size(); }
+
+    // -----------------------------------------------------------------------
+    // generation — monotonic counter incremented on every real mutation
+    // (add or successful remove).  WorkerPool::reconcile() compares this
+    // instead of replicaCount() so that a same-count add()+remove() pair
+    // (net-zero count change) is still detected as a change — preventing a
+    // latent use-after-free once E2 introduces runtime add().
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
 
 private:
     struct Key {
@@ -126,6 +137,7 @@ private:
 
     std::unordered_map<Key, std::unique_ptr<rune::replication::PartitionReplica>, KeyHash> map_;
     std::vector<rune::replication::PartitionReplica*> ordered_;  // stable insertion order
+    std::uint64_t generation_ = 0;
 };
 
 } // namespace rune::node

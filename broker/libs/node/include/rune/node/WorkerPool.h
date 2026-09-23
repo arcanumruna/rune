@@ -73,7 +73,7 @@ public:
     // Must be called on the single duty-cycle thread only.
     //
     // partitionIndex used for routing = static_cast<int32_t>(r->partitionId()).
-    // Correctness invariant (verified in BrokerNode.cpp:432):
+    // Correctness invariant (verified in BrokerNode.cpp:434):
     //   partitionId() == the partition ordinal (pcfg.partitionId = part).
     // If partitionId ever becomes a global gpid this must be updated to use a
     // separate ordinal accessor; the ShardRouter test (Task 1) already guards
@@ -87,7 +87,7 @@ public:
             const int32_t wid = ownerWorkerId(tid, pid);
             workers_[static_cast<std::size_t>(wid)].ownReplica(r);
         }
-        lastReplicaCount_ = registry.replicaCount();  // seed for reconcile()
+        lastGeneration_ = registry.generation();  // seed for reconcile()
     }
 
     // Fan out doWork over all workers and return the total work count.
@@ -100,21 +100,22 @@ public:
     }
 
     // Re-derive shard→worker ownership when the registry's replica set changes.
-    // Cheap: compares replicaCount(); a full re-derivation (assignFromRegistry)
-    // only runs on change. Deterministic + single-writer.
+    // Cheap: compares ReplicaRegistry::generation() (O(1); correct under runtime
+    // add()+remove(), unlike a count proxy which misses a same-count add+remove —
+    // a latent UAF once E2 adds shards at runtime); a full re-derivation
+    // (assignFromRegistry) only runs on change. Deterministic + single-writer.
     // Called every duty cycle before workerPool_->doWork (D dynamic rebalance).
     void reconcile(const ReplicaRegistry& registry) {
-        const std::size_t n = registry.replicaCount();
-        if (n != lastReplicaCount_) {
-            assignFromRegistry(registry);
-            // lastReplicaCount_ is updated inside assignFromRegistry.
+        const std::uint64_t g = registry.generation();
+        if (g != lastGeneration_) {
+            assignFromRegistry(registry);   // updates lastGeneration_
         }
     }
 
 private:
     rune::metadata::ShardRouter router_;
     std::vector<Worker>         workers_;
-    std::size_t                 lastReplicaCount_ = static_cast<std::size_t>(-1); // sentinel: not yet assigned
+    std::uint64_t               lastGeneration_ = static_cast<std::uint64_t>(-1); // sentinel: not yet assigned
 };
 
 } // namespace rune::node
