@@ -7,7 +7,7 @@
 // Test matrix:
 //   1. DrivesOnlyOwnedReplicas — owns() / ownedCount() / workerId() correct;
 //      doWork does not crash and returns >= 0.
-//   2. ClearOwnedResetsOwnership — clearOwned drops all replicas.
+//   2. PublishOwnedResetsOwnership — publishOwned with empty set drops all replicas.
 // ---------------------------------------------------------------------------
 
 #include <rune/node/Worker.h>
@@ -69,7 +69,7 @@ TEST(Worker, DrivesOnlyOwnedReplicas) {
     ReplicaFixture b(/*topicId=*/0, /*partition=*/1);
 
     Worker w(/*workerId=*/0);
-    w.ownReplica(a.replica.get());
+    w.publishOwned(std::make_shared<const Worker::OwnedSet>(Worker::OwnedSet{a.replica.get()}));
 
     EXPECT_TRUE(w.owns(a.replica.get()));
     EXPECT_FALSE(w.owns(b.replica.get()));
@@ -84,12 +84,13 @@ TEST(Worker, DrivesOnlyOwnedReplicas) {
     EXPECT_GE(work, 0);
 }
 
-TEST(Worker, ClearOwnedResetsOwnership) {
+TEST(Worker, PublishOwnedResetsOwnership) {
     ReplicaFixture a(0, 0);
     Worker w(1);
-    w.ownReplica(a.replica.get());
+    w.publishOwned(std::make_shared<const Worker::OwnedSet>(Worker::OwnedSet{a.replica.get()}));
     ASSERT_EQ(w.ownedCount(), 1u);
-    w.clearOwned();
+    // Publishing an empty set clears ownership (empty, not null).
+    w.publishOwned(std::make_shared<const Worker::OwnedSet>());
     EXPECT_EQ(w.ownedCount(), 0u);
     EXPECT_FALSE(w.owns(a.replica.get()));
 }

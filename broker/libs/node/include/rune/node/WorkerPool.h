@@ -4,9 +4,9 @@
 //
 // Single-owner-per-shard is guaranteed by the ShardRouter being a total,
 // deterministic function of (topicId, partitionIndex): assignFromRegistry
-// clears all workers and re-derives ownership, so a shard is never held by two
-// workers simultaneously. Reassignment (single-writer control plane) is just a
-// re-run of assignFromRegistry — the shard is never concurrently owned.
+// publishes fresh immutable OwnedSets for all workers, so a shard is never
+// held by two workers simultaneously. Reassignment (single-writer control plane)
+// is just a re-run of assignFromRegistry — the shard is never concurrently owned.
 //
 // ShardRouter lookups are ASSIGNMENT-TIME only (assignFromRegistry / ownerWorkerId).
 // doWork iterates already-assigned workers with NO ShardRouter / map lookups on
@@ -15,6 +15,9 @@
 // E1: driven cooperatively by the single AgentRunner (no per-worker thread).
 // No virtual calls on the hot path (WorkerPool::doWork calls Worker::doWork
 // as a direct concrete call; Worker is non-virtual).
+//
+// E2 prep: Worker is non-movable (atomic<shared_ptr>), so WorkerPool stores
+// workers as std::vector<std::unique_ptr<Worker>>.
 
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/Worker.h>
@@ -22,6 +25,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -39,10 +43,11 @@ public:
                "router.workerCount() must match pool workerCount");
         workers_.reserve(static_cast<std::size_t>(workerCount));
         for (int32_t i = 0; i < workerCount; ++i)
-            workers_.emplace_back(i);
+            workers_.emplace_back(std::make_unique<Worker>(i));
     }
 
-    // Non-copyable; move-only (Worker is move-only).
+    // Non-copyable; non-movable (workers_ contains unique_ptr<Worker> where
+    // Worker itself is non-movable, but unique_ptr is movable — left as default).
     WorkerPool(const WorkerPool&)            = delete;
     WorkerPool& operator=(const WorkerPool&) = delete;
     WorkerPool(WorkerPool&&)                 = default;
@@ -54,7 +59,7 @@ public:
 
     [[nodiscard]] Worker& worker(int32_t id) noexcept {
         assert(id >= 0 && id < workerCount());
-        return workers_[static_cast<std::size_t>(id)];
+        return *workers_[static_cast<std::size_t>(id)];
     }
 
     [[nodiscard]] const rune::metadata::ShardRouter& router() const noexcept {
@@ -68,8 +73,10 @@ public:
         return router_.workerForPartition(topicId, partition);
     }
 
-    // Clear all workers, then re-derive ownership deterministically from the
-    // registry. Every replica maps to exactly one worker (total assignment).
+    // Re-derive ownership deterministically from the registry and publish an
+    // immutable OwnedSet to each worker. Every replica maps to exactly one worker
+    // (total assignment). Idle workers (no replicas) receive an empty published
+    // set — not null — so doWork() returns 0 cleanly.
     // Must be called on the single duty-cycle thread only.
     //
     // partitionIndex used for routing = static_cast<int32_t>(r->partitionId()).
@@ -79,14 +86,24 @@ public:
     // separate ordinal accessor; the ShardRouter test (Task 1) already guards
     // the router given the ordinal — this is the wiring guard.
     void assignFromRegistry(const ReplicaRegistry& registry) {
-        for (auto& w : workers_) w.clearOwned();
+        const std::size_t n = static_cast<std::size_t>(workerCount());
+
+        // Build per-worker vectors.
+        std::vector<Worker::OwnedSet> perWorker(n);
         for (auto* r : registry.allReplicas()) {
             if (!r) continue;
             const int32_t tid = r->topicId();
             const int32_t pid = static_cast<int32_t>(r->partitionId());
             const int32_t wid = ownerWorkerId(tid, pid);
-            workers_[static_cast<std::size_t>(wid)].ownReplica(r);
+            perWorker[static_cast<std::size_t>(wid)].push_back(r);
         }
+
+        // Publish each worker's snapshot (empty set for idle workers, not null).
+        for (std::size_t i = 0; i < n; ++i) {
+            workers_[i]->publishOwned(
+                std::make_shared<const Worker::OwnedSet>(std::move(perWorker[i])));
+        }
+
         lastGeneration_ = registry.generation();  // seed for reconcile()
     }
 
@@ -95,7 +112,7 @@ public:
     // pre-assigned workers directly (concrete, non-virtual Worker::doWork).
     int doWork(int64_t nowNs) {
         int work = 0;
-        for (auto& w : workers_) work += w.doWork(nowNs);
+        for (auto& w : workers_) work += w->doWork(nowNs);
         return work;
     }
 
@@ -113,9 +130,9 @@ public:
     }
 
 private:
-    rune::metadata::ShardRouter router_;
-    std::vector<Worker>         workers_;
-    std::uint64_t               lastGeneration_ = static_cast<std::uint64_t>(-1); // sentinel: not yet assigned
+    rune::metadata::ShardRouter          router_;
+    std::vector<std::unique_ptr<Worker>> workers_;
+    std::uint64_t                        lastGeneration_ = static_cast<std::uint64_t>(-1); // sentinel: not yet assigned
 };
 
 } // namespace rune::node

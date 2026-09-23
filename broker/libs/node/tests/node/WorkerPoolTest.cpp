@@ -89,7 +89,7 @@ struct Rep {
 
 // ---------------------------------------------------------------------------
 // Test 1: every replica is owned by exactly one worker.
-// Drives ownerWorkerId + ownReplica directly (bypasses assignFromRegistry).
+// Drives ownerWorkerId + publishOwned directly (bypasses assignFromRegistry).
 // ---------------------------------------------------------------------------
 TEST(WorkerPool, EveryReplicaOwnedByExactlyOneWorker) {
     std::vector<std::unique_ptr<Rep>> keep;
@@ -100,12 +100,18 @@ TEST(WorkerPool, EveryReplicaOwnedByExactlyOneWorker) {
     ShardRouter router(3);
     WorkerPool  pool(3, router);
 
-    // Assign directly via ownerWorkerId (mirrors what assignFromRegistry does).
+    // Assign directly via ownerWorkerId + publishOwned (mirrors what assignFromRegistry does).
+    std::vector<rune::node::Worker::OwnedSet> perWorker(static_cast<std::size_t>(pool.workerCount()));
     for (auto& rep : keep) {
         const int32_t tid = rep->replica->topicId();
         const int32_t pid = static_cast<int32_t>(rep->replica->partitionId());
         const int32_t wid = pool.ownerWorkerId(tid, pid);
-        pool.worker(wid).ownReplica(rep->replica.get());
+        perWorker[static_cast<std::size_t>(wid)].push_back(rep->replica.get());
+    }
+    for (int32_t w = 0; w < pool.workerCount(); ++w) {
+        pool.worker(w).publishOwned(
+            std::make_shared<const rune::node::Worker::OwnedSet>(
+                std::move(perWorker[static_cast<std::size_t>(w)])));
     }
 
     // Totality: each replica owned by exactly one worker.
@@ -507,8 +513,9 @@ TEST(WorkerPool, WorkerDoWorkOnlyDrivesOwnedReplicas) {
     // Two-worker pool; manually assign ALL replicas to worker 0, none to worker 1.
     ShardRouter router(2);
     WorkerPool  pool(2, router);
-    pool.worker(0).ownReplica(r0.get());
-    pool.worker(0).ownReplica(r1.get());
+    pool.worker(0).publishOwned(std::make_shared<const rune::node::Worker::OwnedSet>(
+        rune::node::Worker::OwnedSet{r0.get(), r1.get()}));
+    pool.worker(1).publishOwned(std::make_shared<const rune::node::Worker::OwnedSet>());
     // worker 1 owns nothing.
 
     ASSERT_EQ(pool.worker(0).ownedCount(), static_cast<std::size_t>(2));
