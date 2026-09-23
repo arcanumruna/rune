@@ -157,6 +157,24 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_txn_coordination_service_tests)
 
     # ---------------------------------------------------------------------------
+    # E3 Task 4: AsyncDurability integration tests — Worker Strict-tier produce
+    # defers the ack until the IoBackend (PortableFlushBackend) fsync completion
+    # is reaped in doWork.  Three tests:
+    #   1. StrictProduceAcksOnlyAfterFlushCompletion
+    #   2. FlushFailureErrorsTheAckNeverOK
+    #   3. SubmitRingFullHoldsProduce
+    # No Aeron required (disk-backed Log + PartitionReplica + Worker directly).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_async_durability_tests
+        tests/integration/AsyncDurabilityTest.cpp)
+    target_link_libraries(rune_async_durability_tests PRIVATE
+        rune_node
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_async_durability_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService integration tests — drive real Join→doWork→
     # Sync→OffsetCommit→OffsetFetch through GroupCoordinationService against real
     # GroupCoordinator + ReplicatedOffsetStore.

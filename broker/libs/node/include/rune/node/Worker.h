@@ -47,6 +47,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/SpscRing.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/IoBackend.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -72,13 +73,26 @@ public:
     // When inc2b adds per-worker threads, this may be tuned up.
     static constexpr std::size_t kRingCapacity = 256;
 
+    // Default IoBackend ring depths (power-of-two).  NodeConfig wiring (Task 7)
+    // will pass these explicitly; for now the constructor defaults are sensible.
+    static constexpr std::size_t kIoSubmitDepth     = 1024;
+    static constexpr std::size_t kIoCompletionDepth = 1024;
+
+    // Pre-reserve capacity for the durablePending_ vector (no alloc on hot path).
+    static constexpr std::size_t kDurablePendingReserve = 1024;
+
     // ringCapacity: per-worker ingress/return SPSC ring slots — NodeConfig
     // configurable (workerRingCapacity). Default kRingCapacity for tests/back-compat.
-    explicit Worker(int32_t workerId, std::size_t ringCapacity = kRingCapacity) noexcept
+    explicit Worker(int32_t workerId,
+                    std::size_t ringCapacity    = kRingCapacity,
+                    std::size_t ioSubmitDepth   = kIoSubmitDepth,
+                    std::size_t ioComplDepth    = kIoCompletionDepth) noexcept
         : workerId_(workerId)
         , ingress_(ringCapacity)
         , ret_(ringCapacity)
+        , io_(ioSubmitDepth, ioComplDepth)
     {
+        durablePending_.reserve(kDurablePendingReserve);
     }
 
     // Non-copyable and non-movable (std::atomic<OwnedSet*> + SpscRing are not
@@ -150,6 +164,11 @@ public:
     int doWork(int64_t nowNs) override {
         int work = 0;
 
+        // Step E3: reap async-durability completions from the IoBackend FIRST so
+        // that completions from the previous cycle fire before the next produce
+        // cycle's ops are processed.  Per-worker, no shared state.
+        work += reapDurableCompletions_();
+
         // Step 0: drain ingress ring (E2 inc2a). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         work += static_cast<int>(drainIngress_());
@@ -174,6 +193,57 @@ public:
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // reapDurableCompletions_ — drain IoBackend completions and fire the
+    // deferred acks for completed Strict-tier produces.
+    //
+    // Called at the TOP of doWork so completions from the prior cycle fire
+    // before the current cycle's produce ops are executed.
+    //
+    // Shared-nothing: io_, durablePending_, and ret_ are all owned by this
+    // worker thread.  No locks, no atomics outside the SPSC ring internals.
+    // -----------------------------------------------------------------------
+    int reapDurableCompletions_() {
+        if (durablePending_.empty()) {
+            // Fast path: nothing pending — still drain completions to keep the
+            // completion ring from filling (the flusher may emit completions
+            // even for submits that were not strict-tier, though in practice
+            // this doesn't happen; the drain is cheap either way).
+            return io_.reap([](const FlushCompletion&) {});
+        }
+
+        int fired = 0;
+        io_.reap([&](const FlushCompletion& c) {
+            // Find every pending entry matching this completion token and fire it.
+            for (std::size_t i = 0; i < durablePending_.size(); ) {
+                auto& entry = durablePending_[i];
+                if (entry.token == c.token) {
+                    if (c.errorCode != 0) {
+                        // fsync failure: ack with a non-OK error code — never ack OK.
+                        spdlog::error("Worker {}: IoBackend fsync completion error={} "
+                                      "for token={} lastOffset={}; acking Internal error",
+                                      workerId_, c.errorCode, c.token, entry.lastOffset);
+                        entry.ret.errorCode = static_cast<int16_t>(6); // Internal
+                        // No replica unhealthy-flag exists on PartitionReplica yet
+                        // (noted for Task 9 wiring); log the error here so it is
+                        // observable without silently swallowing the failure.
+                    } else {
+                        entry.ret.errorCode = 0; // OK
+                    }
+                    ret_.tryEnqueue(std::move(entry.ret));
+                    // Erase by swap-with-back + pop (O(1), order irrelevant for acks).
+                    durablePending_[i] = std::move(durablePending_.back());
+                    durablePending_.pop_back();
+                    ++fired;
+                    // Do NOT advance i — the swapped entry needs to be checked.
+                } else {
+                    ++i;
+                }
+            }
+        });
+        return fired;
+    }
+
     // -----------------------------------------------------------------------
     // drainIngress_ — execute all queued ops and enqueue results to ret_.
     //
@@ -294,7 +364,28 @@ private:
             op.replica->onLeaderLogAppended();
         }
 
-        // Success: no errorCode (0 = OK).
+        // E3: Strict durability tier — defer ack until fsync completion is reaped.
+        // Only applicable to disk-backed logs (memory logs have no fd to fsync).
+        if (op.durabilityTier == 2 && log->isDiskBacked()) {
+            CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
+            if (t == kNoToken) {
+                // Submit ring full — back-pressure: return Internal error immediately
+                // so the client can retry.  Never drop; never ack OK.
+                spdlog::warn("Worker {}: io_.submit ring full for topicId={} partition={}; "
+                             "returning Internal (back-pressure)",
+                             workerId_, op.topicId, op.partition);
+                ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
+                ret_.tryEnqueue(std::move(ret));
+            } else {
+                // Defer the ack — push into pending list, not into ret_.
+                // The ack will be enqueued when reapDurableCompletions_ fires.
+                ret.errorCode = 0; // tentatively OK; will be updated on completion
+                durablePending_.push_back({t, ret.lastOffset, std::move(ret)});
+            }
+            return;
+        }
+
+        // Default (tier 0 / tier 1) or memory-backed: enqueue immediately (unchanged).
         ret.errorCode = 0;
         ret_.tryEnqueue(std::move(ret));
     }
@@ -459,6 +550,24 @@ private:
     // threaded) and via SetOwnership ring ops at runtime (applied in executeOp_
     // on this worker's own thread). The control thread NEVER touches it.
     OwnedSet owned_{};
+
+    // E3: per-worker async I/O backend.
+    // Owned exclusively by this worker thread — submit()/reap() are called ONLY
+    // from executeProduce_() and reapDurableCompletions_() which both run on
+    // the worker thread.  No shared state ([[rune-shared-nothing-law]]).
+    IoBackend io_;
+
+    // E3: deferred Strict-tier produce acks waiting for fsync completion.
+    // Each entry holds the CompletionToken from io_.submit(), the lastOffset
+    // of the append (for logging/diagnostics), and the fully-built WorkerReturn
+    // that will be enqueued once the completion is reaped.
+    // Worker-thread only — plain vector, no atomics needed.
+    struct DurablePending {
+        CompletionToken token      = 0;
+        int64_t         lastOffset = 0;
+        WorkerReturn    ret;
+    };
+    std::vector<DurablePending> durablePending_;
 };
 
 } // namespace rune::node

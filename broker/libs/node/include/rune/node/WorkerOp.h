@@ -115,6 +115,14 @@ struct WorkerOp {
     // Forwarded in WorkerReturn so the gateway knows to enqueue PendingAck.
     bool deferAck = false;
 
+    // durabilityTier: controls when the ProduceResult ack is emitted.
+    //   0 = Leader  — ack immediately after appendNoSync (today's default).
+    //   1 = Majority — ack after HW advance (gateway-side gate, same as today).
+    //   2 = Strict  — ack only after the local fsync completion is reaped.
+    // Default 0 preserves existing behaviour for all callers that do not set
+    // this field (parity with all pre-E3 tests).
+    uint8_t durabilityTier = 0;
+
     // enqueuedAtNs: timestamp at enqueue time (for pending-ack timeout).
     int64_t enqueuedAtNs = 0;
 
