@@ -660,3 +660,43 @@ TEST(MetadataRecords, WrongRecordType_NodeJoinAsNodeLeave) {
 
     EXPECT_FALSE(rmd::NodeLeaveRecord::decode(buf.data(), written).has_value());
 }
+
+// ===========================================================================
+// Task M1: CreateTopicRecord persistence field (v>=1)
+// ===========================================================================
+
+TEST(CreateTopicRecord, PersistenceRoundTripsAtVersion1) {
+    rmd::CreateTopicRecord in; in.topicId=2; in.name="presence"; in.partitionCount=2; in.rf=2;
+    in.recordVersion=1; in.durability=0; in.persistence=1; // memory
+    uint8_t buf[256]; auto n=in.encode(buf,sizeof buf); ASSERT_GT(n,0u);
+    auto out=rmd::CreateTopicRecord::decode(buf,n); ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->persistence, 1);
+    EXPECT_EQ(out->durability, 0);
+}
+
+TEST(CreateTopicRecord, PersistenceDefaultsZeroAtVersion0) {
+    rmd::CreateTopicRecord in; in.topicId=1; in.name="x"; in.partitionCount=1; in.rf=1;
+    in.recordVersion=0; // v0: no persistence field
+    uint8_t buf[256]; auto n=in.encode(buf,sizeof buf); ASSERT_GT(n,0u);
+    auto out=rmd::CreateTopicRecord::decode(buf,n); ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->persistence, 0); // defaults to Disk
+    EXPECT_EQ(out->durability, 0);  // defaults to Majority
+}
+
+TEST(CreateTopicRecord, PersistenceAndDurabilityRoundTripAtVersion1) {
+    rmd::CreateTopicRecord in; in.topicId=3; in.name="wallet"; in.partitionCount=4; in.rf=3;
+    in.recordVersion=1; in.durability=1; in.persistence=0; // AllInSync + Disk
+    uint8_t buf[256]; auto n=in.encode(buf,sizeof buf); ASSERT_GT(n,0u);
+    auto out=rmd::CreateTopicRecord::decode(buf,n); ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->durability, 1);
+    EXPECT_EQ(out->persistence, 0);
+}
+
+TEST(CreateTopicRecord, TruncatedPersistenceAtVersion1) {
+    // v1 record with durability but MISSING persistence byte → should return nullopt
+    rmd::CreateTopicRecord in; in.topicId=2; in.name="p"; in.partitionCount=1; in.rf=1;
+    in.recordVersion=1; in.durability=0; in.persistence=1;
+    uint8_t buf[256]; auto n=in.encode(buf,sizeof buf); ASSERT_GT(n,0u);
+    // Trim the last byte (persistence) to simulate truncation
+    EXPECT_FALSE(rmd::CreateTopicRecord::decode(buf, n-1).has_value());
+}

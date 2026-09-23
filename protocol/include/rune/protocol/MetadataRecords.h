@@ -263,6 +263,7 @@ struct CreateTopicRecord {
     std::string_view coPartitionGroup;
     uint8_t          recordVersion    = 0;
     uint8_t          durability       = 0;   // 0 = Majority (default), 1 = AllInSync. Only encoded when recordVersion >= 1.
+    uint8_t          persistence      = 0;   // 0 = Disk (default), 1 = Memory. Only encoded when recordVersion >= 1, after durability.
 
     static constexpr uint16_t RECORD_TYPE_ID =
         static_cast<uint16_t>(MetadataRecordType::CreateTopic); // 1
@@ -279,7 +280,7 @@ struct CreateTopicRecord {
             + 2u + partitionKey.size()  // partitionKey
             + 1u                        // placementMode
             + 2u + coPartitionGroup.size() // coPartitionGroup
-            + (v1 ? 1u : 0u);           // durability byte (v1+ only)
+            + (v1 ? 2u : 0u);           // durability byte + persistence byte (v1+ only)
         if (bufLen < needed) return 0u;
 
         // Write type (2 bytes) + version (1 byte) — version from the record, not kCurrentVersion.
@@ -306,8 +307,11 @@ struct CreateTopicRecord {
         // Var: coPartitionGroup
         pos += detail::putVarStr(buf + pos, coPartitionGroup);
 
-        // v1+: durability byte
-        if (v1) buf[pos++] = durability;
+        // v1+: durability byte + persistence byte
+        if (v1) {
+            buf[pos++] = durability;
+            buf[pos++] = persistence;
+        }
 
         return pos;
     }
@@ -354,12 +358,15 @@ struct CreateTopicRecord {
         // coPartitionGroup
         if (!detail::getVarStr(buf, avail, pos, rec.coPartitionGroup)) return std::nullopt;
 
-        // durability — present only in v1+
+        // durability + persistence — present only in v1+
         if (rec.recordVersion >= 1) {
             if (pos + 1u > avail) return std::nullopt;
             rec.durability = buf[pos++];
+            if (pos + 1u > avail) return std::nullopt;
+            rec.persistence = buf[pos++];
         } else {
-            rec.durability = 0; // Majority default for legacy v0 records
+            rec.durability  = 0; // Majority default for legacy v0 records
+            rec.persistence = 0; // Disk default for legacy v0 records
         }
 
         return rec;
