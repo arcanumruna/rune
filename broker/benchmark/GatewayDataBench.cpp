@@ -36,6 +36,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/metadata/Gpid.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -599,8 +600,14 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, Produce)(benchmark::State& state)
         state.counters["produce_p99_us"]  = pct(0.99);
         state.counters["produce_p999_us"] = pct(0.999);
         state.counters["produce_mean_us"] = sum / static_cast<double>(n);
-        // Gate flag: 1.0 = pass (<100µs), 0.0 = fail.
-        state.counters["produce_p99_gate_pass"] = (pct(0.99) < 100.0) ? 1.0 : 0.0;
+        // HARD gate: p99 > 100 µs is a build/bench failure (MD1-12 mandate).
+        // state.SkipWithError() marks the benchmark as failed so CI can detect it.
+        const double p99 = pct(0.99);
+        state.counters["produce_p99_gate_pass"] = (p99 < 100.0) ? 1.0 : 0.0;
+        if (p99 >= 100.0) {
+            state.SkipWithError("LATENCY GATE FAILED: produce p99 >= 100 µs");
+            return;
+        }
     }
 }
 
@@ -759,7 +766,13 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, SubscribeDelivery)(benchmark::State& stat
         state.counters["subdeliv_p99_us"]  = pct(0.99);
         state.counters["subdeliv_p999_us"] = pct(0.999);
         state.counters["subdeliv_mean_us"] = sum / static_cast<double>(n);
-        state.counters["subdeliv_p99_gate_pass"] = (pct(0.99) < 100.0) ? 1.0 : 0.0;
+        // HARD gate: p99 > 100 µs is a bench failure.
+        const double p99sub = pct(0.99);
+        state.counters["subdeliv_p99_gate_pass"] = (p99sub < 100.0) ? 1.0 : 0.0;
+        if (p99sub >= 100.0) {
+            state.SkipWithError("LATENCY GATE FAILED: subdeliv p99 >= 100 µs");
+            return;
+        }
     }
 }
 
@@ -913,9 +926,8 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, ProduceWithRouting)(benchmark::State& sta
     if (state.skipped()) return;
 
     // Inject a routing image: topicId=0, partition=0 → leaderNodeId=kThisNodeId.
-    // GPID scheme: gpid = topicId * 1024 + partition = 0 * 1024 + 0 = 0.
-    static constexpr int32_t kMaxGpidPartitions = 1024;
-    const int32_t gpid = kTopicId * kMaxGpidPartitions + kPartition;
+    // GPID scheme: gpid = gpidOf(topicId, partition).  Uses the single source of truth.
+    const int32_t gpid = rune::metadata::gpidOf(kTopicId, kPartition);
     std::vector<rune::metadata::RoutingImage::BuildEntry> entries = {
         {gpid, kThisNodeId, /*leaderEpoch=*/1},
     };
@@ -1033,8 +1045,13 @@ BENCHMARK_DEFINE_F(GatewayDataFixture, ProduceWithRouting)(benchmark::State& sta
         state.counters["routing_p99_us"]       = pct(0.99);
         state.counters["routing_p999_us"]      = pct(0.999);
         state.counters["routing_mean_us"]      = sum / static_cast<double>(n);
-        // Gate: p99 < 100 µs.
-        state.counters["routing_p99_gate_pass"] = (pct(0.99) < 100.0) ? 1.0 : 0.0;
+        // HARD gate: routing p99 > 100 µs is a bench failure (MD1-12 mandate).
+        const double p99r = pct(0.99);
+        state.counters["routing_p99_gate_pass"] = (p99r < 100.0) ? 1.0 : 0.0;
+        if (p99r >= 100.0) {
+            state.SkipWithError("LATENCY GATE FAILED: routing p99 >= 100 µs");
+            return;
+        }
     }
 }
 

@@ -112,7 +112,8 @@ if(BUILD_BENCHMARKS)
         benchmark/GroupCoordinationBench.cpp
         benchmark/CompactionBenchmark.cpp
         benchmark/MetadataApplyBench.cpp
-        benchmark/RoutingImageBench.cpp)
+        benchmark/RoutingImageBench.cpp
+        benchmark/MultiLeaderProduceBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
