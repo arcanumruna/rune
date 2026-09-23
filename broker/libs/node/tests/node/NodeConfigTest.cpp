@@ -1323,4 +1323,63 @@ TEST(NodeConfig, TopicSpecDurabilityTierDefaultIsMajority) {
         << "default durabilityTier must be 1 (Majority)";
 }
 
+// ---------------------------------------------------------------------------
+// E4: CPU affinity — RUNE_WORKER_CORE_BASE parse tests.
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfig, WorkerCoreBaseDefaultIsDisabled) {
+    // Absent env var → workerCoreBase defaults to -1 (affinity disabled).
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCoreBase, -1)
+        << "default workerCoreBase must be -1 (affinity disabled)";
+}
+
+TEST(NodeConfig, WorkerCoreBaseZero) {
+    // RUNE_WORKER_CORE_BASE=0 → worker 0 pins to core 0.
+    auto base = base1node();
+    base["RUNE_WORKER_CORE_BASE"] = "0";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCoreBase, 0);
+}
+
+TEST(NodeConfig, WorkerCoreBasePositive) {
+    // RUNE_WORKER_CORE_BASE=2 → worker i pins to core 2+i.
+    auto base = base1node();
+    base["RUNE_WORKER_CORE_BASE"] = "2";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCoreBase, 2);
+}
+
+TEST(NodeConfig, WorkerCoreBaseNegativeOneDisables) {
+    // RUNE_WORKER_CORE_BASE=-1 → explicitly disabled.
+    auto base = base1node();
+    base["RUNE_WORKER_CORE_BASE"] = "-1";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCoreBase, -1);
+}
+
+TEST(NodeConfig, WorkerCoreBaseLessThanNegativeOneClampedToDisabled) {
+    // Values < -1 are clamped to -1 (disabled) — safe degradation.
+    auto base = base1node();
+    base["RUNE_WORKER_CORE_BASE"] = "-5";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCoreBase, -1)
+        << "values < -1 must be clamped to -1 (disabled)";
+}
+
+TEST(NodeConfig, WorkerCoreBaseUnparsableKeepsDefault) {
+    // Unparseable value → default -1 (safe degradation, no error).
+    auto base = base1node();
+    base["RUNE_WORKER_CORE_BASE"] = "notanumber";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCoreBase, -1)
+        << "unparseable RUNE_WORKER_CORE_BASE must keep default -1";
+}
+
 } // namespace rune::node

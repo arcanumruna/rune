@@ -83,6 +83,13 @@
 
 #include <spdlog/spdlog.h>
 
+// E4: CPU affinity helper — self-pin the calling thread to a specific core.
+// Linux-only implementation; macOS is a deliberate no-op (mac build stays GREEN).
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 namespace rune::node {
 
 class Worker : public rune::consensus::Agent {
@@ -155,6 +162,18 @@ public:
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
+
+    // E4: assign the core this worker's AgentRunner thread should be pinned to.
+    //
+    // Shared-nothing ([[rune-shared-nothing-law]]): setCoreId is called BEFORE the
+    // AgentRunner starts (startup, single-threaded, WorkerPool::startRunners), so
+    // there is no cross-thread write to coreId_ at runtime.  After the runner
+    // starts, coreId_ is read-only (the self-pin fires once on first doWork).
+    //
+    // -1 (default) = no pinning.  Any value >= 0 causes a one-time self-pin on
+    // the FIRST doWork call (running on the worker's AgentRunner thread — exactly
+    // the thread we want pinned).
+    void setCoreId(int c) noexcept { coreId_ = c; }
 
     // owns()/ownedCount() read the plain owned_ — worker-thread only (call from
     // the worker thread, or before runners start / from single-threaded tests).
@@ -279,6 +298,22 @@ public:
     // Ownership snapshot is loaded ONCE (acquire) at the top of the call.
     int doWork(int64_t nowNs) override {
         int work = 0;
+
+        // E4: self-pin this thread to the assigned core on the FIRST doWork call.
+        // Runs on the AgentRunner thread (the exact thread to pin).  One-shot:
+        // pinned_ prevents repeat attempts.  Shared-nothing: coreId_ and pinned_
+        // are worker-owned; setCoreId() was called before the runner started.
+        if (coreId_ >= 0 && !pinned_) {
+            pinned_ = true; // set before the call so a spurious failure doesn't retry
+            if (pinCurrentThreadToCore_(coreId_)) {
+                spdlog::info("Worker {}: pinned AgentRunner thread to core {}",
+                             workerId_, coreId_);
+            } else {
+                spdlog::warn("Worker {}: failed to pin AgentRunner thread to core {} "
+                             "(Linux: check RUNE_WORKER_CORE_BASE; macOS: no-op)",
+                             workerId_, coreId_);
+            }
+        }
 
         // Step E3: reap async-durability completions from the IoBackend FIRST so
         // that completions from the previous cycle fire before the next produce
@@ -885,6 +920,30 @@ private:
     // E3 Task 5: cumulative count of successful io_.submit calls in
     // submitCoalescedFlushes_.  Used by tests (ioSubmitCountForTest()).
     uint64_t io_submitCount_ = 0;
+
+    // E4: CPU affinity — core to pin this worker's AgentRunner thread to.
+    // -1 = disabled (default, no pinning).  Set via setCoreId() at startup,
+    // before the AgentRunner starts.  Read-only at runtime (single writer).
+    int  coreId_ = -1;
+
+    // E4: true after the one-shot self-pin attempt fires in doWork.
+    // Prevents repeated pin attempts on every doWork call.
+    bool pinned_ = false;
+
+    // E4: pin the calling thread to the given core.
+    // Linux: uses pthread_setaffinity_np.  macOS: deliberate no-op (returns false).
+    // Called ONCE per worker, from doWork on the AgentRunner thread.
+    static bool pinCurrentThreadToCore_(int core) noexcept {
+#if defined(__linux__)
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(core, &set);
+        return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
+#else
+        (void)core;
+        return false; // no-op on macOS and other non-Linux platforms
+#endif
+    }
 };
 
 } // namespace rune::node

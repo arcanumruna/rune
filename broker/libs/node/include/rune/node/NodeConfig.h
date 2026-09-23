@@ -199,6 +199,23 @@ struct NodeConfig {
     };
     WorkerIdleStrategy workerIdleStrategy = WorkerIdleStrategy::Backoff;
 
+    // E4: per-worker CPU affinity base core (Linux-only; macOS is a no-op).
+    //
+    // When >= 0, worker i pins its own AgentRunner thread to core
+    // (workerCoreBase + i) on the first doWork call (self-pin on entry).
+    //
+    // -1 (default) = affinity DISABLED — no pinning, current behaviour preserved.
+    //   All existing tests are parity-unchanged at the default.
+    //
+    // Example: with workerCoreBase=2 and workerCount=4, workers pin to cores
+    //   2, 3, 4, 5 — reserving cores 0 and 1 for the control thread, Aeron
+    //   media driver, and kernel housekeeping (see AffinityConfig in the E4 spec).
+    //
+    // Overridable via RUNE_WORKER_CORE_BASE env var.
+    //   Absent or empty → -1 (disabled).
+    //   Any value < -1   → -1 (clamped to disabled).
+    int32_t workerCoreBase = -1;
+
     // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread
     // communication is via agrona ring buffers; their sizes are tunable per
     // deployment (no hardcoded ring capacities). Powers of two.

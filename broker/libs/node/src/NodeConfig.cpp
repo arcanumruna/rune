@@ -644,6 +644,20 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (Backoff).
 
+    // --- RUNE_WORKER_CORE_BASE (optional) — E4: CPU affinity base core. ---
+    // -1 = disabled (no pinning, default).  >= 0 → worker i pins to core base+i.
+    // Values < -1 are clamped to -1 (disabled).
+    if (const char* wcb = getenv_fn("RUNE_WORKER_CORE_BASE")) {
+        if (wcb && !std::string_view(wcb).empty()) {
+            int32_t v{};
+            if (parseInt32(wcb, v)) {
+                cfg.workerCoreBase = (v < -1) ? -1 : v;
+            }
+            // Unparseable → keep default -1 (disabled; no error — safe degradation).
+        }
+    }
+    // Absent → keep NodeConfig default (-1 = disabled).
+
     return {std::move(cfg), {}};
 }
 

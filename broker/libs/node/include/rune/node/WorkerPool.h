@@ -60,10 +60,15 @@ public:
     //                     Default Worker::kIoSubmitDepth.
     // ioCompletionDepth:  IoBackend completion ring depth (NodeConfig ioCompletionRingDepth).
     //                     Default Worker::kIoCompletionDepth.
+    // workerCoreBase:     E4: base core for CPU affinity (NodeConfig workerCoreBase).
+    //                     -1 (default) = affinity disabled (no pinning).
+    //                     >= 0 → worker i is assigned core (workerCoreBase + i);
+    //                     setCoreId() is called here (ctor, before runners start).
     WorkerPool(int32_t workerCount, rune::metadata::ShardRouter router,
                std::size_t ringCapacity      = Worker::kRingCapacity,
                std::size_t ioSubmitDepth     = Worker::kIoSubmitDepth,
-               std::size_t ioCompletionDepth = Worker::kIoCompletionDepth)
+               std::size_t ioCompletionDepth = Worker::kIoCompletionDepth,
+               int32_t     workerCoreBase    = -1)
         : router_(std::move(router))
     {
         assert(workerCount >= 1 && "workerCount must be >= 1");
@@ -71,9 +76,16 @@ public:
                "router.workerCount() must match pool workerCount");
         const std::size_t n = static_cast<std::size_t>(workerCount);
         workers_.reserve(n);
-        for (int32_t i = 0; i < workerCount; ++i)
+        for (int32_t i = 0; i < workerCount; ++i) {
             workers_.emplace_back(std::make_unique<Worker>(i, ringCapacity,
                                                            ioSubmitDepth, ioCompletionDepth));
+            // E4: assign core affinity before the runner thread starts.
+            // Shared-nothing ([[rune-shared-nothing-law]]): setCoreId is called here
+            // (ctor, single-threaded) — no AgentRunner is running yet.
+            if (workerCoreBase >= 0) {
+                workers_.back()->setCoreId(static_cast<int>(workerCoreBase + i));
+            }
+        }
     }
 
     // Non-copyable; movable (runners not yet started at construction).
