@@ -77,6 +77,14 @@ if(BUILD_TESTING)
     target_include_directories(rune_control_plane_timer_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE})
 
+    add_executable(rune_failover_election_tests
+        tests/FailoverElectionTest.cpp)
+    target_link_libraries(rune_failover_election_tests PRIVATE
+        rune_metadata
+        rune_replication
+        rune_consensus
+        GTest::gtest_main)
+
     include(GoogleTest)
     gtest_discover_tests(rune_partition_assignment_tests)
     gtest_discover_tests(rune_metadata_state_machine_tests)
@@ -85,4 +93,5 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_replica_position_table_tests)
     gtest_discover_tests(rune_membership_state_tests)
     gtest_discover_tests(rune_control_plane_timer_tests)
+    gtest_discover_tests(rune_failover_election_tests)
 endif()
