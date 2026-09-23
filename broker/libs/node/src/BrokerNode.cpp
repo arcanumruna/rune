@@ -931,8 +931,15 @@ void BrokerNode::buildGateway() {
     // Destruction order (reverse of construction, in stop()):
     //   runtimeAgent_ → metadataService_ → metadataReplica_ (in registry)
     //   → metadataLog_ → …
-    // -----------------------------------------------------------------------
-    if (gateway_) {
+    //
+    // NOTE: MetadataService is intentionally NOT gated on gateway_ being set.
+    // The MetadataService drives user-partition leader election (via the
+    // committed assignment map → ReplicationMetadataBridge Step B), which must
+    // work even when the ClientGateway fails to start (e.g. port conflict in
+    // tests).  Without MetadataService, the bridge's MSM pointer is null and
+    // user-partition replicas never leave the Follower role, so compaction and
+    // retention never engage (CP-6 / CP-8 regression).
+    {
         try {
             const fs::path metaDir = fs::path{config_.dataDir} / "__cluster_metadata";
             fs::create_directories(metaDir);
@@ -1057,7 +1064,7 @@ void BrokerNode::buildGateway() {
             metadataReplica_.reset();
             metadataLog_.reset();
         }
-    }
+    } // end MetadataService setup (unconditional — not gated on gateway_)
 
     // E1: Build the WorkerPool + assign replicas to workers.
     // Must run AFTER replicaRegistry_ is fully populated (user topics, offset,
