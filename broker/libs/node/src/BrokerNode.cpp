@@ -569,7 +569,9 @@ void BrokerNode::buildWorkerPool() {
 
     workerPool_ = std::make_unique<WorkerPool>(
         wc, std::move(router),
-        static_cast<std::size_t>(config_.workerRingCapacity));  // NodeConfig-configurable
+        static_cast<std::size_t>(config_.workerRingCapacity),      // NodeConfig-configurable
+        static_cast<std::size_t>(config_.ioSubmitRingDepth),       // E3 Task 7: io-ring depths
+        static_cast<std::size_t>(config_.ioCompletionRingDepth));  // E3 Task 7
 
     if (replicaRegistry_) {
         // Ordinal-invariant assert: routing uses partitionId() as the partition

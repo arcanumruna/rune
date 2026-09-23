@@ -108,6 +108,15 @@ struct TopicSpec {
     //   durability so the data is replicated to peer nodes before acknowledgement.
     PersistenceMode persistence = PersistenceMode::Disk;
     uint8_t         durability  = 0;   // 0 = Majority, 1 = AllInSync
+
+    // E3 Task 7: async-durability tier (orthogonal to the replication-quorum `durability`
+    // field above).  Controls WHEN the worker fires the produce ack relative to local
+    // fsync.  Values match the design-decision §2 tiers:
+    //   0 = Leader  — ack immediately after append (today's default behaviour).
+    //   1 = Majority — ack after HW advance (today's Majority path, gateway-side gate). [DEFAULT]
+    //   2 = Strict  — ack only after local fsync completion AND (if acks=All) HW advance.
+    // Default Majority (1) so all existing tests are parity-unchanged.
+    uint8_t         durabilityTier = 1;  // 0=Leader, 1=Majority, 2=Strict
 };
 
 struct PeerConfig {
@@ -197,8 +206,17 @@ struct NodeConfig {
     //     ManyToOne ring (worker sends → control-thread drain). RUNE_REPL_OUTBOUND_RING_BYTES.
     //   - workerRingCapacity: slot count of each per-worker ingress/return SPSC
     //     ring (inc2a). RUNE_WORKER_RING_CAPACITY.
+    //   - ioSubmitRingDepth: slot depth of each worker's IoBackend submission ring.
+    //     RUNE_IO_SUBMIT_RING_DEPTH. Default 1024 (matches Worker::kIoSubmitDepth).
+    //   - ioCompletionRingDepth: slot depth of each worker's IoBackend completion ring.
+    //     RUNE_IO_COMPLETION_RING_DEPTH. Default 1024 (matches Worker::kIoCompletionDepth).
+    //   - memoryLogRingBytes: byte capacity of each InMemoryLog single-owner ring.
+    //     RUNE_MEMORY_LOG_RING_BYTES. Default 8 MiB.
     int32_t replicationOutboundRingBytes = 4 * 1024 * 1024;
     int32_t workerRingCapacity           = 256;
+    int32_t ioSubmitRingDepth            = 1024;
+    int32_t ioCompletionRingDepth        = 1024;
+    int32_t memoryLogRingBytes           = 8 * 1024 * 1024;
 
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within

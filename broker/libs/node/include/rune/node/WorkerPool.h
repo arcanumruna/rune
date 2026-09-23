@@ -54,10 +54,16 @@ public:
 
     // Construct N workers (ids 0..N-1) and take ownership of the router.
     // Precondition: workerCount >= 1 and must match router.workerCount().
-    // ringCapacity: per-worker ingress/return SPSC ring slots (NodeConfig
-    // workerRingCapacity). Default Worker::kRingCapacity for tests/back-compat.
+    // ringCapacity:       per-worker ingress/return SPSC ring slots (NodeConfig
+    //                     workerRingCapacity). Default Worker::kRingCapacity for tests/back-compat.
+    // ioSubmitDepth:      IoBackend submission ring depth (NodeConfig ioSubmitRingDepth).
+    //                     Default Worker::kIoSubmitDepth.
+    // ioCompletionDepth:  IoBackend completion ring depth (NodeConfig ioCompletionRingDepth).
+    //                     Default Worker::kIoCompletionDepth.
     WorkerPool(int32_t workerCount, rune::metadata::ShardRouter router,
-               std::size_t ringCapacity = Worker::kRingCapacity)
+               std::size_t ringCapacity      = Worker::kRingCapacity,
+               std::size_t ioSubmitDepth     = Worker::kIoSubmitDepth,
+               std::size_t ioCompletionDepth = Worker::kIoCompletionDepth)
         : router_(std::move(router))
     {
         assert(workerCount >= 1 && "workerCount must be >= 1");
@@ -66,7 +72,8 @@ public:
         const std::size_t n = static_cast<std::size_t>(workerCount);
         workers_.reserve(n);
         for (int32_t i = 0; i < workerCount; ++i)
-            workers_.emplace_back(std::make_unique<Worker>(i, ringCapacity));
+            workers_.emplace_back(std::make_unique<Worker>(i, ringCapacity,
+                                                           ioSubmitDepth, ioCompletionDepth));
     }
 
     // Non-copyable; movable (runners not yet started at construction).

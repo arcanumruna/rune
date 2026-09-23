@@ -619,6 +619,9 @@ ConfigResult parseNodeConfig(
     };
     parsePow2(getenv_fn("RUNE_REPL_OUTBOUND_RING_BYTES"), cfg.replicationOutboundRingBytes);
     parsePow2(getenv_fn("RUNE_WORKER_RING_CAPACITY"),     cfg.workerRingCapacity);
+    parsePow2(getenv_fn("RUNE_IO_SUBMIT_RING_DEPTH"),     cfg.ioSubmitRingDepth);
+    parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
+    parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
 
     // --- RUNE_WORKER_IDLE (optional) — Milestone E1/E2: per-worker idle strategy selector. ---
     // E1: parsed + stored here; no per-worker AgentRunner yet (driven cooperatively).

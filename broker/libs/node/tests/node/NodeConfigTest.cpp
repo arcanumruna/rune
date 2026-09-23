@@ -1250,4 +1250,77 @@ TEST(NodeConfig, RuneWorkerIdleGarbageFloorsToBackoff) {
         << "unrecognised value must floor to Backoff";
 }
 
+// ---------------------------------------------------------------------------
+// E3 Task 7: io-ring depths + memory-log ring bytes (RUNE_IO_SUBMIT_RING_DEPTH,
+// RUNE_IO_COMPLETION_RING_DEPTH, RUNE_MEMORY_LOG_RING_BYTES)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfig, IoRingDepthsParseFromEnvPow2) {
+    // Override two of the three fields; confirm the third stays at its default.
+    auto base = base1node();
+    base["RUNE_IO_SUBMIT_RING_DEPTH"]  = "2048";
+    base["RUNE_MEMORY_LOG_RING_BYTES"] = "16777216"; // 16 MiB = 2^24
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->ioSubmitRingDepth,    2048);
+    EXPECT_EQ(res.config->memoryLogRingBytes,   16 * 1024 * 1024);
+    // ioCompletionRingDepth was NOT overridden — must stay at default (1024).
+    EXPECT_EQ(res.config->ioCompletionRingDepth, 1024);
+}
+
+TEST(NodeConfig, IoRingDepthsDefaultValues) {
+    // No overrides — all three fields must carry their documented defaults.
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->ioSubmitRingDepth,     1024);
+    EXPECT_EQ(res.config->ioCompletionRingDepth, 1024);
+    EXPECT_EQ(res.config->memoryLogRingBytes,    8 * 1024 * 1024);
+}
+
+TEST(NodeConfig, IoRingDepthsNonPow2KeepsDefault) {
+    // Non-power-of-two values must be silently ignored (default kept).
+    auto base = base1node();
+    base["RUNE_IO_SUBMIT_RING_DEPTH"]     = "1000";  // not a power of two
+    base["RUNE_IO_COMPLETION_RING_DEPTH"] = "3000";  // not a power of two
+    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "7";     // not a power of two
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->ioSubmitRingDepth,     1024) << "non-pow2 must keep default";
+    EXPECT_EQ(res.config->ioCompletionRingDepth, 1024) << "non-pow2 must keep default";
+    EXPECT_EQ(res.config->memoryLogRingBytes,    8 * 1024 * 1024) << "non-pow2 must keep default";
+}
+
+TEST(NodeConfig, IoRingDepthsNegativeKeepsDefault) {
+    // Negative values are not valid powers of two and must keep the default.
+    auto base = base1node();
+    base["RUNE_IO_SUBMIT_RING_DEPTH"] = "-1024";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->ioSubmitRingDepth, 1024) << "negative value must keep default";
+}
+
+TEST(NodeConfig, IoRingDepthsAllThreeOverridden) {
+    // All three fields can be overridden simultaneously.
+    auto base = base1node();
+    base["RUNE_IO_SUBMIT_RING_DEPTH"]     = "512";
+    base["RUNE_IO_COMPLETION_RING_DEPTH"] = "256";
+    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "4194304"; // 4 MiB = 2^22
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->ioSubmitRingDepth,     512);
+    EXPECT_EQ(res.config->ioCompletionRingDepth, 256);
+    EXPECT_EQ(res.config->memoryLogRingBytes,    4 * 1024 * 1024);
+}
+
+TEST(NodeConfig, TopicSpecDurabilityTierDefaultIsMajority) {
+    // durabilityTier defaults to 1 (Majority) so existing tests are parity-unchanged.
+    auto base = base1node();
+    base["RUNE_TOPICS"] = "events:2";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    ASSERT_EQ(res.config->topics.size(), 1u);
+    EXPECT_EQ(res.config->topics[0].durabilityTier, 1u)
+        << "default durabilityTier must be 1 (Majority)";
+}
+
 } // namespace rune::node
