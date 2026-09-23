@@ -765,14 +765,22 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     agent_.submitReconnect();
                 }
             } else {
-                // Retarget failed — fail the pending op(s) promptly.
-                // M2 FIX: also fail pending subscribes (not just produces) and
-                // reset redirectPending_ so it does not latch into a later connect.
-                producerHub_.failAll("Redirect retarget failed");
+                // Retarget failed — fail ONLY the produce that triggered this
+                // redirect (identified by opt->correlationId).  This is Fix 7b:
+                // a failed retarget to a dead partition-leader must not cascade
+                // into failAll() and kill produces for other (alive) partitions.
+                // The transport stays on the current node; the next produce
+                // attempt for an alive partition will succeed on the same session.
+                //
+                // We still call failPendingSubscribes() and reset redirectPending_
+                // so the subscribe side and reconnect-pending latch are clean.
+                const std::string retargetReason =
+                    "Redirect retarget failed for endpoint: " + newEndpoint;
+                producerHub_.failPending(opt->correlationId, retargetReason);
                 subscriberHub_.failPendingSubscribes("Redirect retarget failed");
                 redirectPending_.store(false, std::memory_order_release);
                 if (cbError_) {
-                    cbError_("Redirect retarget failed for endpoint: " + newEndpoint);
+                    cbError_(retargetReason);
                 }
             }
             break; // Redirect is handled; don't fall through to the error path.

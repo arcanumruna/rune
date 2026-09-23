@@ -62,10 +62,15 @@
 //                            model a slow/backpressured consumer, default 0.
 //                            NB: applied OFF the agent thread (buffered) so we
 //                            never violate the "handler must not block" rule.
-//     RUNE_SUB_PARTITIONS  number of partitions to subscribe to (0..N-1),
+//     RUNE_SUB_PARTITIONS  number of partitions to subscribe to,
 //                            default 1 (= partition 0 only, backward-compatible).
 //                            Set to the topic's partitionCount to cover ALL
 //                            partitions in multi-partition end-to-end tests.
+//     RUNE_SUB_PARTITION_BASE  first partition index to subscribe to,
+//                            default 0.  Combined with RUNE_SUB_PARTITIONS=K,
+//                            subscribes to partitions [base..base+K-1].  Used
+//                            in multi-leader tests to target a single partition
+//                            on its correct leader without triggering redirects.
 //
 //   Group consumer (RUNE_MODE=group):
 //     RUNE_GROUP_ID        consumer-group id (required for group mode)
@@ -232,9 +237,11 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
         if (fut.wait_until(deadline) != std::future_status::ready) {
+            // MD1 Fix 7c: log the timeout but continue (same resilience as the
+            // exception path below — individual timeouts must not abort the batch).
             std::cerr << "CLIENT: FAIL produce cid=" << cid << " seq=" << seq
                       << " TIMEOUT\n";
-            return acked;
+            continue;
         }
         try {
             const int64_t offset = fut.get();
@@ -243,9 +250,13 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
             std::cout.flush();
             ++acked;
         } catch (const std::exception& ex) {
+            // MD1 Fix 7c: log the failure but continue the produce loop.
+            // A single-record failure (e.g. NotLeader / dead partition leader
+            // in Phase-1 availability tests) must not abort the entire batch;
+            // the alive partitions must still get their records.
             std::cerr << "CLIENT: FAIL produce cid=" << cid << " seq=" << seq
                       << ": " << ex.what() << "\n";
-            return acked;
+            continue;
         }
     }
     return acked;
@@ -255,10 +266,15 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 // Subscribe from `from` and collect until `expect` records (or timeout).
 // Emits "DELIVERED ..." per record.  Returns #delivered.
 //
-// `subPartitions`: number of partitions to subscribe to (0..subPartitions-1).
-//   1 (default) = partition 0 only (backward-compatible single-partition mode).
-//   >1           = subscribe to ALL partitions 0..subPartitions-1 so that the
+// `subPartitions`: number of partitions to subscribe to.
+//   1 (default) = 1 partition starting at subPartitionBase.
+//   >1           = subscribe to ALL partitions [base..base+N-1] so that the
 //                  harness can assert assert_no_committed_loss across all of them.
+// `subPartitionBase`: first partition index (default 0).  Combined with
+//   subPartitions=K subscribes to partitions [base..base+K-1].  Used in
+//   multi-leader tests to target one partition on its correct leader directly,
+//   avoiding the session-retarget bounce that single-session cross-leader
+//   subscribes cause.
 //
 // The agent-thread handler only COPIES the record into a queue (never blocks).
 // A separate drain thread emits the DELIVERED lines and applies the optional
@@ -267,7 +283,8 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 // ---------------------------------------------------------------------------
 static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
                        int windowMs, int slowMs, int expectCidMin,
-                       int expectCidExact, int subPartitions) {
+                       int expectCidExact, int subPartitions,
+                       int subPartitionBase = 0) {
     struct Rec { int64_t offset; int32_t partition; std::string value; };
     std::mutex mtx;
     std::deque<Rec> q;
@@ -279,10 +296,12 @@ static int doSubscribe(Client& c, const TopicHandle& th, From from, int expect,
 
     // Subscribe to each partition and keep handles alive until we're done.
     // Thread the partition index into each handler so DELIVERED lines carry part=.
-    const int nParts = (subPartitions > 0) ? subPartitions : 1;
+    const int nParts     = (subPartitions > 0) ? subPartitions : 1;
+    const int partBase   = (subPartitionBase >= 0) ? subPartitionBase : 0;
     std::vector<Subscription> subs;
     subs.reserve(nParts);
-    for (int part = 0; part < nParts; ++part) {
+    for (int i = 0; i < nParts; ++i) {
+        const int part = partBase + i;
         subs.push_back(c.subscribe(th, part, opts, [&mtx, &q, part](const Record& r) {
             std::string v(reinterpret_cast<const char*>(r.value.data()), r.value.size());
             std::lock_guard<std::mutex> lk(mtx);
@@ -692,10 +711,15 @@ int main() {
     const int         expectCidMin = getEnvInt("RUNE_EXPECT_CID_MIN", -2147483647);
     // If >=0, ONLY records with this exact cid count toward `expect` (own-cid).
     const int         expectCidExact = getEnvInt("RUNE_EXPECT_CID_EXACT", -1);
-    // RUNE_SUB_PARTITIONS: number of partitions to subscribe (0..N-1).
+    // RUNE_SUB_PARTITIONS: number of partitions to subscribe.
     // Default 1 = partition 0 only (backward-compatible).  Set to the topic's
     // partitionCount (from RUNE_TOPICS) to cover ALL partitions end-to-end.
-    const int         subPartitions  = getEnvInt("RUNE_SUB_PARTITIONS", 1);
+    const int         subPartitions     = getEnvInt("RUNE_SUB_PARTITIONS", 1);
+    // RUNE_SUB_PARTITION_BASE: first partition index to subscribe, default 0.
+    // Combined with RUNE_SUB_PARTITIONS=K subscribes partitions [base..base+K-1].
+    // Use this to target a single partition on its correct leader without
+    // triggering cross-leader session-retarget bounces.
+    const int         subPartitionBase  = getEnvInt("RUNE_SUB_PARTITION_BASE", 0);
 
     // RUNE_ACKS: "leader" (default) | "all".
     // "all" → Acks::All so the broker holds the ProduceResponse until a
@@ -745,6 +769,7 @@ int main() {
               << " keys=" << keys << " rateHz=" << rateHz
               << " from(wire)=" << from.toWire() << " expect=" << expect
               << " slowMs=" << slowMs << " subPartitions=" << subPartitions
+              << " subPartitionBase=" << subPartitionBase
               << " acks=" << acksStr << "\n";
 
     ClientConfig cfg;
@@ -860,7 +885,8 @@ int main() {
 
         if (doS && rc == 0) {
             delivered = doSubscribe(c, th, from, expect, subWindowMs, slowMs,
-                                    expectCidMin, expectCidExact, subPartitions);
+                                    expectCidMin, expectCidExact, subPartitions,
+                                    subPartitionBase);
             if (expect > 0 && delivered < expect) {
                 std::cerr << "CLIENT: FAIL delivered " << delivered << "/" << expect << "\n";
                 rc = 1;

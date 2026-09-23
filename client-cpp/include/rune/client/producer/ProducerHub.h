@@ -108,6 +108,12 @@ public:
     /// Fail all pending acks on close.
     void failAll(const std::string& reason);
 
+    /// Fail a single pending ack identified by correlationId.
+    /// Used by the Redirect retarget-failure path to fail ONLY the produce that
+    /// triggered the redirect, leaving all other pending produces intact so the
+    /// client session can continue serving other partitions.
+    void failPending(int64_t corrId, const std::string& reason);
+
     /// Sweep timed-out acks (called from Client::sweepTimeouts).
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 

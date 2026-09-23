@@ -94,6 +94,13 @@ void ProducerHub::failAll(const std::string& reason) {
     }
 }
 
+void ProducerHub::failPending(int64_t corrId, const std::string& reason) {
+    const ImplList* snap = snapshot_.load(std::memory_order_acquire);
+    for (auto& impl : *snap) {
+        impl->failPending(corrId, reason);
+    }
+}
+
 bool ProducerHub::retryRedirectedProduce(
     int64_t corrId,
     std::function<bool(const uint8_t*, std::size_t)> sendFn)
