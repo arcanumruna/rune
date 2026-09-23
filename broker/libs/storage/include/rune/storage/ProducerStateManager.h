@@ -247,11 +247,32 @@ public:
     // @param partition      The partition id to use as the key (producer state
     //                       is keyed by (topicId, producerId, partition)).
     //
+    // Sets rebuildHw_ = highWatermark on every call so callers can test whether
+    // a subsequent truncation falls below the last rebuild bound.
+    //
+    // Called from ClientGateway::rebuildProducerStateFromLogs (production) and
+    // from PartitionReplica::truncateLog when a divergence truncation lands below
+    // the rebuild HW (Task 11 atomicity fix).
+    //
     // Cold path — allocations are acceptable here.
     // Single-writer: call only on the duty-cycle thread.
     // -----------------------------------------------------------------------
     template<class LogT>
     void rebuildFromLog(int32_t topicId, LogT& log, int64_t highWatermark, int32_t partition);
+
+    // -----------------------------------------------------------------------
+    // rebuildHighWatermark — the log high-watermark at which the last rebuild ran.
+    //
+    // Tracks rebuildHw_, which is set to the highWatermark argument on every
+    // rebuildFromLog call.  Returns -1 if rebuildFromLog has never been called.
+    //
+    // Used by PartitionReplica::truncateLog to decide whether a divergence
+    // truncation (KIP-101) falls below the PSM rebuild bound: if
+    //   truncateOffset <= rebuildHighWatermark()
+    // the dedup window may contain state for offsets that no longer exist, so
+    // truncateLog re-rebuilds the PSM atomically with the log truncation.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int64_t rebuildHighWatermark() const noexcept { return rebuildHw_; }
 
     // -----------------------------------------------------------------------
     // Accessors (for tests / Phase-5 coordinator)
@@ -264,6 +285,11 @@ private:
     ProducerStateEntry& getOrCreate(int32_t topicId, int64_t producerId, int32_t partition);
 
     std::unordered_map<ProducerPartitionKey, ProducerStateEntry> map_;
+
+    // Task 11: the log high-watermark at which the last rebuildFromLog ran.
+    // -1 = never rebuilt.  Used by PartitionReplica::truncateLog to decide
+    // whether a KIP-101 divergence truncation must trigger a re-rebuild.
+    int64_t rebuildHw_ = -1;
 };
 
 } // namespace rune::storage

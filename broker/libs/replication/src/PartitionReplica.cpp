@@ -1672,6 +1672,33 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
 
     onLog([&](auto& L){ L.truncateTo(truncateOffset); });
 
+    // Task 11: PSM re-rebuild on low truncation.
+    //
+    // The PSM rebuild (rebuildFromLog) is HW-bounded by design: the dedup
+    // window only contains state for offsets in [0, rebuildHw_).  This is
+    // safe UNLESS a KIP-101 divergence truncation later lands AT OR BELOW
+    // rebuildHw_: after the truncation the log no longer contains those
+    // offsets, so the dedup window holds stale state — it would either:
+    //   • accept a genuine producer retry as a duplicate (because the
+    //     window saw seq N at offset X that no longer exists), or
+    //   • reject a valid in-order sequence (because lastSequence is above
+    //     the surviving log end and the next batch looks like a gap).
+    //
+    // Fix: when truncateOffset <= psm_.rebuildHighWatermark(), re-run
+    // rebuildFromLog atomically with the log truncation (the log has already
+    // been truncated above, so the scan naturally stops at truncateOffset).
+    // This is called on the single-writer duty-thread and is inseparable from
+    // the truncation, so there is no window of observable inconsistency.
+    //
+    // When truncateOffset > rebuildHw_ the PSM window only covers offsets
+    // that all survive the truncation; no stale state, no re-rebuild needed.
+    if (psm_.rebuildHighWatermark() >= 0
+        && truncateOffset <= psm_.rebuildHighWatermark()) {
+        onLog([&](auto& L) {
+            psm_.rebuildFromLog(cfg_.topicId, L, truncateOffset, cfg_.partitionId);
+        });
+    }
+
     // Conservatively cap followerHw_.
     if (followerHw_ > truncateOffset) {
         followerHw_ = truncateOffset;

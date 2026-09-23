@@ -56,6 +56,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/LeaderEpochCache.h>
+#include <rune/storage/ProducerStateManager.h>
 
 namespace rune::replication {
 
@@ -464,6 +465,16 @@ public:
         return epochCache_;
     }
 
+    /// Task 11: test accessor — exposes the internal ProducerStateManager for
+    /// PSM re-rebuild-on-truncation tests.  Single-writer; do not call from
+    /// the cleaner/test threads concurrently.
+    [[nodiscard]] rune::storage::ProducerStateManager& producerStateManagerForTest() noexcept {
+        return psm_;
+    }
+    [[nodiscard]] const rune::storage::ProducerStateManager& producerStateManagerForTest() const noexcept {
+        return psm_;
+    }
+
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
     /// replica is disk-backed — asserts !memoryBacked_.  Callers MUST gate on
@@ -590,6 +601,14 @@ private:
 
     // Epoch caches (both roles need one for truncation)
     rune::storage::LeaderEpochCache epochCache_;
+
+    // Task 11: per-partition producer dedup state.
+    //
+    // Rebuilt from the log on becomeLeader (via callers such as
+    // ClientGateway::rebuildProducerStateFromLogs) and re-rebuilt atomically
+    // when a KIP-101 divergence truncation lands below the last rebuild HW
+    // (truncateLog → conditional rebuildFromLog).  Single-writer; no locks.
+    rune::storage::ProducerStateManager psm_;
 
     // Timing state
     int64_t lastIsrCheckNs_  = 0;   ///< last ISR shrink/expand timestamp

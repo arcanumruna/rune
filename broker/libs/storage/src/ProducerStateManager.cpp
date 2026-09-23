@@ -441,11 +441,17 @@ int ProducerStateManager::recover(const std::string& path)
 // duplicate-reported offset pointing at a truncated-away (non-existent) log
 // position — acknowledged data loss.
 //
-// takeSnapshot / recover: still available but not called anywhere in the
-// current codebase.  They are a future Phase-5 optimisation for fast restart
-// on large logs (skip the full scan with a pre-built PSM image).
+// takeSnapshot / recover: not called in the current codebase hot path.  They
+// are a future Phase-5 optimisation for fast restart on large logs (skip the
+// full scan with a pre-built PSM image).
 //
-// Cold path: called once on leader election / restart.  Allocations acceptable.
+// Production callers of rebuildFromLog:
+//   • ClientGateway::rebuildProducerStateFromLogs (ClientGateway.cpp:212) —
+//     called on leader election / restart over every (topicId, partition).
+//   • PartitionReplica::truncateLog (Task 11) — re-rebuild fired atomically
+//     when a KIP-101 divergence truncation lands at or below the rebuild HW.
+//
+// Cold path: allocations acceptable.
 // ---------------------------------------------------------------------------
 template<class LogT>
 void ProducerStateManager::rebuildFromLog(int32_t topicId,
@@ -453,6 +459,11 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
                                            int64_t highWatermark,
                                            int32_t partition)
 {
+    // Task 11: record the HW bound for this rebuild so PartitionReplica::truncateLog
+    // can detect when a subsequent KIP-101 divergence truncation falls below it and
+    // must trigger a re-rebuild to keep the dedup window consistent.
+    rebuildHw_ = highWatermark;
+
     // TX-2c multi-partition fix: clear ONLY the keys for this (topicId, partition)
     // instead of the whole map.  ClientGateway::rebuildProducerStateFromLogs calls
     // this method in a loop over every (topicId, partition) on ONE shared PSM.

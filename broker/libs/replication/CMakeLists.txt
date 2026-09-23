@@ -64,6 +64,14 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_replication_tests)
 
     # ---------------------------------------------------------------------------
+    # Task 11: PSM re-rebuild on low-truncation tests (restart-durability trio).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_psm_rerebuild_tests
+        tests/replication/PsmReRebuildOnLowTruncationTest.cpp)
+    target_link_libraries(rune_psm_rerebuild_tests PRIVATE rune_replication GTest::gtest_main)
+    gtest_discover_tests(rune_psm_rerebuild_tests)
+
+    # ---------------------------------------------------------------------------
     # AeronPartitionTransport in-process integration test (GR-1).
     # Gated behind BUILD_AERON_REPLICATION_TESTS (default ON when aeron is found).
     # Requires the embedded media driver (same as BUILD_BROKER_NODE_TESTS).
