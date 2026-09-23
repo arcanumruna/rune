@@ -86,6 +86,9 @@ struct DynamicBalancerInputs {
     std::vector<TopicSpec>  topics;                ///< Topic descriptors with co-partition info.
     ReplicaPositionTable*   positions = nullptr;   ///< Soft position table (may be nullptr).
     int                     maxPreferredElectionsPerCycle = 1000; ///< Budget cap.
+    /// Maximum BalancerRecords returned per rebalance() call.  Excess changes are
+    /// deferred to the next cycle so one mass failover cannot stall the metadata log.
+    int                     maxRecordsPerCycle = 4096;
 };
 
 // ---------------------------------------------------------------------------

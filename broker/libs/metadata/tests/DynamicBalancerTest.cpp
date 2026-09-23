@@ -14,11 +14,18 @@
 #include <rune/metadata/DynamicBalancer.h>
 #include <rune/metadata/ReplicaPositionTable.h>
 #include <gtest/gtest.h>
+#include <functional>
 using namespace rune::metadata;
 
 static void seed(AssignmentMap& m, int topicId, int parts,
                  std::function<PartitionAssignment(int)> f) {
     for (int p = 0; p < parts; ++p) m.put(topicId, p, f(p));
+}
+
+/// Test-local helper: linear membership check (mirrors the static isIn in .cpp).
+static bool isIn_pub(int32_t node, const std::vector<int32_t>& vec) noexcept {
+    for (int32_t x : vec) if (x == node) return true;
+    return false;
 }
 
 TEST(DynamicBalancer, ReverseIndexDeathCostIsPerNode) {
@@ -152,6 +159,146 @@ TEST(DynamicBalancer, CapPreferredElectionsPerCycle) {
     in.maxPreferredElectionsPerCycle = 0;
     auto recs = bal.rebalance(in);
     EXPECT_TRUE(recs.empty()) << "cap=0 → no preferred-leader elections allowed → no records";
+}
+
+// CoPartitionGroupDivergentIsrNeverAssignsUnsafeLeader:
+//
+// Case A: topic7 ISR={1,3}, topic8 ISR={1,2}, dead=1.
+//   Intersection of live ISRs = {3} ∩ {2} = {} → whole group goes NO_LEADER.
+//   Verify: no member gets a leader outside its own ISR.
+//
+// Case B: topic7 ISR={1,2,3}, topic8 ISR={1,2}, dead=1.
+//   Intersection = {2,3} ∩ {2} = {2} → node 2 leads both.
+TEST(DynamicBalancer, CoPartitionGroupDivergentIsrNeverAssignsUnsafeLeader) {
+    // ── Case A: empty intersection → NO_LEADER for all ──────────────────────
+    {
+        AssignmentMap m;
+        // topic7 p0: led by dead node 1, ISR={1,3}
+        m.put(7, 0, PartitionAssignment{1, {1,3}, {1,2,3}, 0, 0});
+        // topic8 p0: led by dead node 1, ISR={1,2}
+        m.put(8, 0, PartitionAssignment{1, {1,2}, {1,2,3}, 0, 0});
+
+        ReplicaPositionTable pos;
+        pos.report({7,0,3,0,10});
+        pos.report({8,0,2,0,10});
+
+        DynamicBalancer bal;
+        DynamicBalancerInputs in;
+        in.cur = &m;
+        in.liveNodes = {2, 3};  // node 1 is dead
+        in.positions = &pos;
+        in.topics = {
+            TopicSpec{7, 1, 3, "grpA", "key"},
+            TopicSpec{8, 1, 3, "grpA", "key"}
+        };
+
+        auto recs = bal.rebalance(in);
+
+        // Records may or may not be emitted for NO_LEADER, but NEVER assign a
+        // leader that is outside a member's ISR.
+        for (auto& r : recs) {
+            if (r.rec.leaderNode == NO_LEADER) continue;
+            // Determine which topic this record belongs to and verify leader in ISR.
+            if (r.rec.topicId == 7) {
+                const PartitionAssignment* pa = m.get(7, 0);
+                ASSERT_TRUE(pa != nullptr);
+                EXPECT_TRUE(isIn_pub(r.rec.leaderNode, pa->isr))
+                    << "topic7: leader " << r.rec.leaderNode << " not in topic7 ISR";
+            }
+            if (r.rec.topicId == 8) {
+                const PartitionAssignment* pa = m.get(8, 0);
+                ASSERT_TRUE(pa != nullptr);
+                EXPECT_TRUE(isIn_pub(r.rec.leaderNode, pa->isr))
+                    << "topic8: leader " << r.rec.leaderNode << " not in topic8 ISR";
+            }
+        }
+
+        // Primary assertion: intersection {3}∩{2}=∅ → group goes NO_LEADER.
+        // Either zero records emitted, or records with leaderNode == NO_LEADER.
+        for (auto& r : recs) {
+            EXPECT_EQ(r.rec.leaderNode, NO_LEADER)
+                << "Case A: no common safe survivor → must be NO_LEADER";
+        }
+    }
+
+    // ── Case B: common survivor exists → both members get node 2 ────────────
+    {
+        AssignmentMap m;
+        // topic7 p0: led by dead node 1, ISR={1,2,3}
+        m.put(7, 0, PartitionAssignment{1, {1,2,3}, {1,2,3}, 0, 0});
+        // topic8 p0: led by dead node 1, ISR={1,2}
+        m.put(8, 0, PartitionAssignment{1, {1,2}, {1,2,3}, 0, 0});
+
+        ReplicaPositionTable pos;
+        // Make node 2 the best candidate by highest position.
+        pos.report({7,0,2,0,50});
+        pos.report({7,0,3,0,30});
+        pos.report({8,0,2,0,50});
+
+        DynamicBalancer bal;
+        DynamicBalancerInputs in;
+        in.cur = &m;
+        in.liveNodes = {2, 3};  // node 1 is dead
+        in.positions = &pos;
+        in.topics = {
+            TopicSpec{7, 1, 3, "grpB", "key"},
+            TopicSpec{8, 1, 3, "grpB", "key"}
+        };
+
+        auto recs = bal.rebalance(in);
+
+        // Both topics must be reassigned, and the leader must be in each member's ISR.
+        ASSERT_EQ(recs.size(), 2u) << "Case B: both group members need reassignment";
+        for (auto& r : recs) {
+            EXPECT_NE(r.rec.leaderNode, NO_LEADER)
+                << "Case B: common survivor {2} exists → must elect a leader";
+            // Verify leader is in ISR for the respective topic.
+            if (r.rec.topicId == 7) {
+                const PartitionAssignment* pa = m.get(7, 0);
+                ASSERT_TRUE(pa != nullptr);
+                EXPECT_TRUE(isIn_pub(r.rec.leaderNode, pa->isr))
+                    << "Case B topic7: leader not in ISR";
+            }
+            if (r.rec.topicId == 8) {
+                const PartitionAssignment* pa = m.get(8, 0);
+                ASSERT_TRUE(pa != nullptr);
+                EXPECT_TRUE(isIn_pub(r.rec.leaderNode, pa->isr))
+                    << "Case B topic8: leader not in ISR";
+            }
+        }
+        // Both members must elect the same leader (co-partition unit move).
+        EXPECT_EQ(recs[0].rec.leaderNode, recs[1].rec.leaderNode)
+            << "Case B: co-partition group must elect same leader for all members";
+    }
+}
+
+// BatchIsBounded: a failover producing more than maxRecordsPerCycle changes
+// returns a batch capped at the limit; the remainder is deferred.
+TEST(DynamicBalancer, BatchIsBounded) {
+    // 20 partitions, all led by dead node 1, ISR={1,2}.
+    AssignmentMap m;
+    constexpr int kParts = 20;
+    seed(m, 30, kParts, [](int /*p*/){
+        PartitionAssignment a;
+        a.leaderNode = 1;
+        a.isr = {1,2}; a.replicas = {1,2};
+        a.leaderEpoch = 0; a.partitionEpoch = 0;
+        return a;
+    });
+    ReplicaPositionTable pos;
+    for (int p = 0; p < kParts; ++p) pos.report({30, p, 2, 0, 50});
+
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {2}; in.positions = &pos;
+    in.topics = { TopicSpec{30, kParts, 2, "", ""} };
+    in.maxRecordsPerCycle = 5;  // cap well below kParts
+
+    auto recs = bal.rebalance(in);
+    EXPECT_LE(static_cast<int>(recs.size()), in.maxRecordsPerCycle)
+        << "batch must be capped at maxRecordsPerCycle=" << in.maxRecordsPerCycle;
+    EXPECT_GT(static_cast<int>(recs.size()), 0)
+        << "at least one record must be emitted";
 }
 
 // Skip no-ops: partition that already has optimal assignment → not emitted.

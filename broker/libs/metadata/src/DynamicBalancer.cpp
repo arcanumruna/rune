@@ -246,32 +246,111 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
             // Determine elected leader.
             if (groupAction == Action::Failover) {
-                const PartitionAssignment* driverCur = in.cur->get(driver->topicId, p);
-                if (!driverCur) continue;
+                // ── Safety: elect from the INTERSECTION of ALL member ISRs ∩ liveNodes.
+                //
+                // Each (topic,partition) replicates independently so member ISRs can
+                // diverge over the cluster's lifetime.  A leader elected from only the
+                // driver's ISR can be outside a sibling member's ISR → committed loss.
+                // We build the group ISR as the set of nodes that are in-sync for ALL
+                // members, then run FailoverElection on that intersected ISR.  If the
+                // intersection is empty the whole group goes NO_LEADER (safety > avail).
+                // ─────────────────────────────────────────────────────────────────────
 
-                ElectionInputs ei;
-                ei.cur       = *driverCur;
-                ei.liveNodes = in.liveNodes;
-                ei.positions = in.positions;
+                // Build groupIsr = ∩(member.isr) ∩ liveNodes, seeded from liveNodes.
+                std::vector<int32_t> groupIsr = in.liveNodes;
 
-                ElectionOutcome outcome = FailoverElection::elect(driver->topicId, p, ei);
+                for (const TopicSpec* ts : members) {
+                    const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
+                    if (!mc) { groupIsr.clear(); break; }
 
-                if (outcome.change.newLeader == NO_LEADER_CHANGE) {
-                    // Current leader is still live+in ISR (shouldn't happen given leaderDead check,
-                    // but guard against it).
-                    continue;
+                    // Retain in groupIsr only nodes that are also in mc->isr.
+                    groupIsr.erase(
+                        std::remove_if(groupIsr.begin(), groupIsr.end(),
+                            [&mc](int32_t node){ return !isIn(node, mc->isr); }),
+                        groupIsr.end());
+
+                    if (groupIsr.empty()) break;
                 }
-                computedLeader = outcome.change.newLeader;
+
+                if (groupIsr.empty()) {
+                    // No node is in-ISR for all members AND live → NO_LEADER for all.
+                    computedLeader = NO_LEADER;
+                } else {
+                    // Run FailoverElection with the intersected ISR to pick a winner.
+                    // We synthesise a proxy PartitionAssignment whose ISR is the group
+                    // ISR; the driver's replicas/epochs supply the other fields.
+                    const PartitionAssignment* driverCur = in.cur->get(driver->topicId, p);
+                    if (!driverCur) continue;
+
+                    PartitionAssignment proxyPa   = *driverCur;
+                    proxyPa.isr                   = groupIsr;
+                    // Force leaderNode to a dead value so FailoverElection always
+                    // proceeds (current leader is dead — that's why we're here).
+                    proxyPa.leaderNode             = NO_LEADER;
+
+                    ElectionInputs ei;
+                    ei.cur       = proxyPa;
+                    ei.liveNodes = in.liveNodes;
+                    ei.positions = in.positions;
+
+                    ElectionOutcome outcome = FailoverElection::elect(driver->topicId, p, ei);
+
+                    if (outcome.change.newLeader == NO_LEADER_CHANGE) {
+                        // Election decided current leader is still fine — shouldn't
+                        // happen since we forced leaderNode = NO_LEADER, but guard.
+                        continue;
+                    }
+                    computedLeader = outcome.change.newLeader;
+                }
+
+                // Per-member safety assert: computedLeader must be in member.isr ∧ live,
+                // OR computedLeader == NO_LEADER (intersection was empty).
+                // If intersection logic is correct this always holds; assert defensively.
+                if (computedLeader != NO_LEADER) {
+                    for (const TopicSpec* ts : members) {
+                        const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
+                        if (!mc) continue;
+                        if (!isIn(computedLeader, mc->isr) || !isIn(computedLeader, in.liveNodes)) {
+                            // Should never reach here — intersection guarantees safety.
+                            // Defensively fall back to NO_LEADER rather than violate safety.
+                            computedLeader = NO_LEADER;
+                            break;
+                        }
+                    }
+                }
             } else {
                 // Preferred-leader: use replicas[0] of the driver.
                 const PartitionAssignment* driverCur = in.cur->get(driver->topicId, p);
                 if (!driverCur || driverCur->replicas.empty()) continue;
-                computedLeader = driverCur->replicas[0];
+                const int32_t candidate = driverCur->replicas[0];
+
+                // ── Safety: the candidate must be in EVERY member's ISR ∩ liveNodes.
+                //
+                // Preferred-leader is a best-effort optimisation, not a safety op.
+                // If the group can't move as a unit safely (candidate missing from any
+                // member's ISR or not live), skip the whole group — don't move it.
+                // ─────────────────────────────────────────────────────────────────────
+                bool safeForAll = isIn(candidate, in.liveNodes);
+                if (safeForAll) {
+                    for (const TopicSpec* ts : members) {
+                        const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
+                        if (!mc || !isIn(candidate, mc->isr)) {
+                            safeForAll = false;
+                            break;
+                        }
+                    }
+                }
+                if (!safeForAll) continue;  // can't move group as unit safely → skip
+
+                computedLeader = candidate;
                 ++preferredElectionsUsed;
             }
 
             // Apply `computedLeader` to ALL members in the group for partition p.
             for (const TopicSpec* ts : members) {
+                // Enforce batch cap: stop emitting once the limit is reached.
+                if (static_cast<int>(result.size()) >= in.maxRecordsPerCycle) return;
+
                 const PartitionAssignment* cur = in.cur->get(ts->topicId, p);
                 if (!cur) continue;
 
@@ -279,7 +358,9 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 chg.newLeader = computedLeader;
 
                 if (groupAction == Action::Failover) {
-                    // New ISR = cur.isr ∩ liveNodes, with elected leader first.
+                    // New ISR = cur.isr ∩ liveNodes ∩ groupIsr-winner neighbourhood,
+                    // with elected leader first.  For the NO_LEADER case the new ISR
+                    // is empty (no live in-sync replica for this member).
                     std::vector<int32_t> newIsr;
                     newIsr.reserve(cur->isr.size());
                     if (computedLeader != NO_LEADER) {
