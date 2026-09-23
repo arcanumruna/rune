@@ -6,7 +6,7 @@
 // WorkerOp carries exactly the data needed to EXECUTE one log operation on the
 // owning worker AND to respond to the originator (gateway / control thread).
 //
-// Three op types:
+// Five op types:
 //   Produce         — gateway → worker; execute appendNoSync + onLeaderLogAppended
 //                     on the owning partition's Log+Replica; return ProduceReturn.
 //   PushRead        — gateway → worker; execute Log::read() for a subscription
@@ -14,6 +14,10 @@
 //   ApplyReplicated — transport → worker; execute PartitionReplica::applyReplicated;
 //                     no return (fire-and-forget — the follower has no response to
 //                     send back to the gateway).
+//   BecomeLeader    — bridge → worker; execute PartitionReplica::becomeLeader on
+//                     the owning worker thread (shared-nothing E2 role-change fix).
+//   BecomeFollower  — bridge → worker; execute PartitionReplica::becomeFollower on
+//                     the owning worker thread (shared-nothing E2 role-change fix).
 //
 // Buffer lifetime (correctness-first):
 //   Aeron fragment buffers (FetchResponseMsg::records span) are ONLY valid inside
@@ -51,6 +55,8 @@ struct WorkerOp {
         Produce,          ///< gateway produce-append
         PushRead,         ///< gateway pushSubscriptions log-read
         ApplyReplicated,  ///< transport applyReplicated
+        BecomeLeader,     ///< bridge → worker: promote replica to leader
+        BecomeFollower,   ///< bridge → worker: demote replica to follower
     };
 
     Type    type    = Type::Produce;
@@ -123,6 +129,25 @@ struct WorkerOp {
     uint8_t isolation      = 0;      ///< 0=read_uncommitted, 1=read_committed
     bool    isGroup        = false;
     bool    groupCarrierReceived = false;
+
+    // -----------------------------------------------------------------------
+    // BecomeLeader / BecomeFollower-specific fields
+    //
+    // Bridge enqueues these when routing replica role changes to the owning
+    // worker (Part 1 of the E2 shared-nothing fix).
+    //
+    // BecomeLeader: roleEpoch + isr carries the per-partition epoch and ISR.
+    // BecomeFollower: roleEpoch + roleLeaderId carries the new leader.
+    // -----------------------------------------------------------------------
+
+    // Epoch for BecomeLeader / BecomeFollower (per-partition or cluster epoch).
+    rune::replication::Epoch roleEpoch = 0;
+
+    // ISR for BecomeLeader (copied by value — bridge owns nothing beyond enqueue).
+    std::vector<rune::replication::NodeId> isr;
+
+    // Leader node for BecomeFollower (-1 = no leader / NO_LEADER).
+    rune::replication::NodeId roleLeaderId = -1;
 
     // -----------------------------------------------------------------------
     // ApplyReplicated-specific fields

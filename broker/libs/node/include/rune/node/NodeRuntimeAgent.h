@@ -233,18 +233,38 @@ public:
         // The control thread MUST NOT call workerPool_->doWork() — that would
         // double-drive and cause data races.
         //
-        // What the control thread DOES do (still on this thread):
+        // SHARED-NOTHING SPLIT:
+        //   USER partitions (topicId >= 0): owned + driven by workers.
+        //   INTERNAL partitions (topicId < 0): driven by the control thread here.
+        //     Rationale: MetadataService, GroupCoordinationService, and
+        //     TransactionCoordinationService all run on the control thread and
+        //     read/write the internal replicas (role(), doWork, becomeLeader/
+        //     becomeFollower).  Keeping internal replicas on the control thread
+        //     eliminates the MetadataService::doWork ↔ Worker::becomeLeader race
+        //     (second TSan-confirmed race, same binary).
+        //
+        // What the control thread DOES do (always, when workerPool_ is wired):
         //   reconcile() — re-derives shard→worker ownership when the registry
         //   changes (O(1) generation check; re-derive only on change).
         //   Ownership publish is control-thread-only; workers read it lock-free.
+        //   doWork + log-drains for INTERNAL partitions.
         //
         // When workerPool_ is null (single-thread mode, passthrough, tests
         // without a pool), fall back to the pre-E1 registry loop unchanged.
         if (workerPool_) {
-            if (registry_) workerPool_->reconcile(*registry_);
-            // Workers self-drive — do NOT call workerPool_->doWork() here.
+            if (registry_) {
+                workerPool_->reconcile(*registry_);
+                // Drive internal (topicId < 0) replicas on the control thread.
+                // Workers self-drive USER partitions — do NOT call
+                // workerPool_->doWork() here.
+                for (auto* replica : registry_->allReplicas()) {
+                    if (replica && replica->topicId() < 0) {
+                        work += replica->doWork(nowNs);
+                    }
+                }
+            }
         } else if (registry_) {
-            // Pre-E1 path: iterate registry directly.
+            // Pre-E1 path: iterate registry directly (all replicas).
             for (auto* replica : registry_->allReplicas()) {
                 if (replica) work += replica->doWork(nowNs);
             }
@@ -266,11 +286,20 @@ public:
         //      Log::enqueueDeletedSegment().  The segments_ erase MUST happen
         //      here on the append thread (single-writer invariant).
         //
-        //      E1: when workerPool_ is wired, Worker::doWork already handles
-        //      these drains for each owned shard (Worker runs replica->doWork +
-        //      log drains together). Skip the registry loop here to avoid double-
-        //      draining.
-        if (!workerPool_ && registry_) {
+        //      E1/E2: when workerPool_ is wired:
+        //        - INTERNAL replicas: drained here (control thread owns them).
+        //        - USER replicas: Worker::doWork already handles these drains
+        //          for each owned shard. Skip them here to avoid double-draining.
+        if (workerPool_ && registry_) {
+            for (auto* replica : registry_->allReplicas()) {
+                // Only internal replicas — user replicas are drained by workers.
+                if (replica && replica->topicId() < 0 && replica->isDiskBacked()) {
+                    work += replica->log()->drainCleanerSwaps();
+                    work += replica->log()->drainRetentionDeletes();
+                    work += replica->log()->drainStagingRenamesDone();
+                }
+            }
+        } else if (!workerPool_ && registry_) {
             for (auto* replica : registry_->allReplicas()) {
                 // Task M1 precondition #2: skip memory-backed replicas.
                 // drainCleanerSwaps/drainRetentionDeletes/drainStagingRenamesDone are

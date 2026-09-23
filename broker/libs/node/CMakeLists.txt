@@ -1,6 +1,7 @@
 add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
+    src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp)
 

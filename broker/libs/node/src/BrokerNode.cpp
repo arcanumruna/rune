@@ -932,7 +932,20 @@ void BrokerNode::buildGateway() {
     //   runtimeAgent_ → metadataService_ → metadataReplica_ (in registry)
     //   → metadataLog_ → …
     // -----------------------------------------------------------------------
-    if (gateway_) {
+    // E2 shared-nothing fix (Part 2): MetadataService is now created
+    // unconditionally (no longer guarded by `if (gateway_)`).
+    //
+    // Previously this guard prevented single-node user-partition promotion:
+    // without gateway_, MetadataService was never wired, so the bridge's
+    // applyUserPartitionRoles() never fired, and user partitions stayed
+    // Follower → compaction/retention skipped them (LogCleanerAgent_CompactsViaBrokerNode
+    // + CoalescingEndToEndViaBrokerNode both failed for this reason).
+    //
+    // This is now safe because Part 1 routes all becomeLeader/becomeFollower
+    // calls from the bridge to the owning worker's SPSC ingress — eliminating
+    // the control-thread vs worker-thread data race that the guard was implicitly
+    // protecting against.
+    {
         try {
             const fs::path metaDir = fs::path{config_.dataDir} / "__cluster_metadata";
             fs::create_directories(metaDir);
@@ -1073,6 +1086,13 @@ void BrokerNode::buildGateway() {
     }
     if (replTransport_ && workerPool_) {
         replTransport_->setWorkerPool(workerPool_.get());
+    }
+    // E2 shared-nothing fix (Part 1): route replica role changes (becomeLeader/
+    // becomeFollower) to the owning worker's SPSC ingress so they execute on the
+    // worker thread — eliminating the control-thread vs worker-thread data race
+    // confirmed by TSan (bridge control thread ↔ Worker::doWork on worker thread).
+    if (replBridge_ && workerPool_) {
+        replBridge_->setWorkerPool(workerPool_.get());
     }
 
     // Build the composite runtime agent:

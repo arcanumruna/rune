@@ -54,6 +54,7 @@
 //   by external observers (not modified by other threads during doWork).
 
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/WorkerOp.h>
 #include <rune/replication/Types.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/consensus/Types.h>
@@ -67,6 +68,13 @@
 #include <vector>
 
 namespace rune::node {
+
+// Forward declaration: WorkerPool is defined in WorkerPool.h.
+// Not included here to avoid pulling in NodeConfig.h (rune::node::TopicSpec),
+// which conflicts with rune::metadata::TopicSpec in tests using both namespaces.
+// The routing methods that call WorkerPool::tryEnqueueOp are implemented in
+// ReplicationMetadataBridge.cpp where WorkerPool.h is included directly.
+class WorkerPool;
 
 class ReplicationMetadataBridge {
 public:
@@ -108,6 +116,26 @@ public:
         msm_ = msm;
         // Reset the prev-map snapshot so the next doWork re-derives the full delta.
         prevMap_ = rune::metadata::AssignmentMap{};
+    }
+
+    // -----------------------------------------------------------------------
+    // setWorkerPool — wire the WorkerPool so role changes are routed to the
+    // owning worker's SPSC ingress instead of calling becomeLeader/becomeFollower
+    // directly on the control thread.
+    //
+    // Called from BrokerNode::buildGateway after buildWorkerPool() creates
+    // the pool.  When non-null, ALL replica role changes (both INTERNAL and
+    // USER partitions) are enqueued as WorkerOp::BecomeLeader/BecomeFollower
+    // to the owning worker — eliminating the control-thread ↔ worker-thread
+    // data race confirmed by TSan (E2 shared-nothing fix).
+    //
+    // When nullptr (bridge unit tests, single-thread fallback):
+    // becomeLeader/becomeFollower are called DIRECTLY as before.
+    //
+    // Must be called on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setWorkerPool(WorkerPool* pool) noexcept {
+        workerPool_ = pool;
     }
 
     // -----------------------------------------------------------------------
@@ -163,11 +191,11 @@ public:
                 if (replica->topicId() >= 0) continue;  // skip user partitions
 
                 if (selfIsClusterLeader) {
-                    replica->becomeLeader(currentEpoch, allReplicaIds_);
+                    routeBecomeLeader_(replica, currentEpoch, allReplicaIds_);
                 } else {
                     const auto repl_leader =
                         static_cast<rune::replication::NodeId>(currentLeaderId);
-                    replica->becomeFollower(currentEpoch, repl_leader);
+                    routeBecomeFollower_(replica, currentEpoch, repl_leader);
                 }
                 anyInternalFlip = true;
             }
@@ -286,6 +314,31 @@ private:
         return 1;
     }
 
+    // -----------------------------------------------------------------------
+    // routeBecomeLeader_ / routeBecomeFollower_
+    //
+    // When workerPool_ != nullptr: enqueue a BecomeLeader/BecomeFollower op
+    // to the owning worker's SPSC ingress so the role change executes on the
+    // worker thread (shared-nothing E2 fix — eliminates the control-thread
+    // vs worker-thread data race confirmed by TSan).
+    //
+    // When workerPool_ == nullptr: call becomeLeader/becomeFollower directly
+    // (bridge unit tests; single-thread / cooperative fallback).
+    //
+    // Non-inline: implemented in ReplicationMetadataBridge.cpp to avoid
+    // pulling WorkerPool.h (and transitively NodeConfig.h / rune::node::TopicSpec)
+    // into headers that also use rune::metadata::TopicSpec (ambiguity).
+    // -----------------------------------------------------------------------
+    void routeBecomeLeader_(
+        rune::replication::PartitionReplica*          replica,
+        rune::replication::Epoch                      epoch,
+        std::vector<rune::replication::NodeId>        isr) noexcept;
+
+    void routeBecomeFollower_(
+        rune::replication::PartitionReplica*  replica,
+        rune::replication::Epoch              epoch,
+        rune::replication::NodeId             leaderId) noexcept;
+
     void applyBecomeLeaderForKey(
         const rune::metadata::PartitionKey& key,
         const rune::metadata::AssignmentMap& currentMap) noexcept
@@ -307,7 +360,7 @@ private:
             isr.push_back(static_cast<rune::replication::NodeId>(n));
         }
 
-        replica->becomeLeader(perPartEpoch, std::move(isr));
+        routeBecomeLeader_(replica, perPartEpoch, std::move(isr));
     }
 
     void applyBecomeFollowerForKey(
@@ -328,7 +381,7 @@ private:
             leaderNode   = static_cast<rune::replication::NodeId>(pa->leaderNode);
         }
 
-        replica->becomeFollower(perPartEpoch, leaderNode);
+        routeBecomeFollower_(replica, perPartEpoch, leaderNode);
     }
 
     // -----------------------------------------------------------------------
@@ -376,6 +429,12 @@ private:
     rune::consensus::NodeId                        selfId_;
     std::vector<rune::replication::NodeId>         allReplicaIds_;
     ReplicaRegistry&                               registry_;
+
+    // Non-owning pointer to the WorkerPool.  When non-null, role changes are
+    // routed to the owning worker's SPSC ingress (shared-nothing E2 fix).
+    // When null (bridge unit tests / single-thread fallback), becomeLeader/
+    // becomeFollower are called directly on the control thread.
+    WorkerPool*                                    workerPool_ = nullptr;
 
     // Production path: non-owning pointer to the MetadataStateMachine.
     // Set via setMsm() after BrokerNode::start() wires the MetadataService.

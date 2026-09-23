@@ -227,6 +227,12 @@ private:
         case WorkerOp::Type::ApplyReplicated:
             executeApplyReplicated_(std::move(op));
             break;
+        case WorkerOp::Type::BecomeLeader:
+            executeBecomeLeader_(std::move(op));
+            break;
+        case WorkerOp::Type::BecomeFollower:
+            executeBecomeFollower_(std::move(op));
+            break;
         }
     }
 
@@ -394,6 +400,52 @@ private:
             spdlog::warn("Worker {}: applyReplicated threw: {}", workerId_, ex.what());
         } catch (...) {
             spdlog::warn("Worker {}: applyReplicated threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // executeBecomeLeader_ — apply a replica role-change (Leader) on the
+    // worker thread.  Fire-and-forget (no WorkerReturn needed).
+    //
+    // Enqueued by ReplicationMetadataBridge when workerPool_ != nullptr
+    // (E2 shared-nothing fix: bridge runs on control thread, must not mutate
+    // a replica whose doWork() runs on this worker thread).
+    // -------------------------------------------------------------------
+    void executeBecomeLeader_(WorkerOp op) {
+        if (!op.replica) {
+            spdlog::warn("Worker {}: executeBecomeLeader_ — null replica for "
+                         "topicId={} partition={}", workerId_, op.topicId, op.partition);
+            return;
+        }
+        try {
+            op.replica->becomeLeader(op.roleEpoch, std::move(op.isr));
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: becomeLeader threw for topicId={} partition={}: {}",
+                         workerId_, op.topicId, op.partition, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: becomeLeader threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // executeBecomeFollower_ — apply a replica role-change (Follower) on
+    // the worker thread.  Fire-and-forget (no WorkerReturn needed).
+    //
+    // Enqueued by ReplicationMetadataBridge when workerPool_ != nullptr.
+    // -------------------------------------------------------------------
+    void executeBecomeFollower_(WorkerOp op) {
+        if (!op.replica) {
+            spdlog::warn("Worker {}: executeBecomeFollower_ — null replica for "
+                         "topicId={} partition={}", workerId_, op.topicId, op.partition);
+            return;
+        }
+        try {
+            op.replica->becomeFollower(op.roleEpoch, op.roleLeaderId);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: becomeFollower threw for topicId={} partition={}: {}",
+                         workerId_, op.topicId, op.partition, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: becomeFollower threw unknown exception", workerId_);
         }
     }
 

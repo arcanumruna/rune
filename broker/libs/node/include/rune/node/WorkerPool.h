@@ -116,9 +116,23 @@ public:
         const std::size_t n = static_cast<std::size_t>(workerCount());
 
         // Build per-worker vectors.
+        // SHARED-NOTHING RULE: only USER partitions (topicId >= 0) are owned by
+        // workers. Internal / control-plane partitions (topicId < 0, e.g.
+        // __cluster_metadata topicId=-3, __consumer_offsets topicId=-1,
+        // __transaction_state topicId=-2) remain driven by the CONTROL THREAD
+        // (NodeRuntimeAgent::doWork).
+        //
+        // Rationale: MetadataService, GroupCoordinationService, and
+        // TransactionCoordinationService all run on the control thread and
+        // read/drive the internal replicas (replica->role(), replica->doWork).
+        // If those replicas were assigned to workers, the control-thread
+        // services would race with the worker's doWork + role changes — a second
+        // TSan-confirmed data race (MetadataService::doWork reading role() while
+        // the worker executes becomeLeader).
         std::vector<Worker::OwnedSet> perWorker(n);
         for (auto* r : registry.allReplicas()) {
             if (!r) continue;
+            if (r->topicId() < 0) continue;  // internal partitions: control-thread-driven
             const int32_t tid = r->topicId();
             const int32_t pid = static_cast<int32_t>(r->partitionId());
             const int32_t wid = ownerWorkerId(tid, pid);
