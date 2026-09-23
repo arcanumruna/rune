@@ -3,7 +3,8 @@ add_library(rune_node
     src/BrokerNode.cpp
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
-    src/TransactionCoordinationService.cpp)
+    src/TransactionCoordinationService.cpp
+    src/PortableFlushBackend.cpp)
 
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -49,9 +50,10 @@ if(BUILD_TESTING)
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
-    # Unit tests (NodeConfig only — no Aeron driver)
+    # Unit tests (NodeConfig + PortableFlushBackend — no Aeron driver)
     add_executable(rune_node_tests
-        tests/node/NodeConfigTest.cpp)
+        tests/node/NodeConfigTest.cpp
+        tests/node/PortableFlushBackendTest.cpp)
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
         GTest::gtest_main)
