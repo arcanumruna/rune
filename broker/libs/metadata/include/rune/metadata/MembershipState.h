@@ -217,6 +217,43 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // Controlled-shutdown support
+    // -----------------------------------------------------------------------
+
+    /// Begin a graceful controlled shutdown for `nodeId`.
+    /// Sets the node state to ControlledShutdown and records the log offset up
+    /// to which all live nodes must consume before the node may safely leave.
+    /// `controlledShutdownOffset` is typically the controller's current committed
+    /// log end offset at the moment the shutdown drain is initiated.
+    /// No-op if nodeId is not present.
+    void beginControlledShutdown(int32_t nodeId, int64_t controlledShutdownOffset) {
+        auto it = members_.find(nodeId);
+        if (it == members_.end()) return;
+        it->second.state = NodeControlState::ControlledShutdown;
+        controlledShutdownOffsets_[nodeId] = controlledShutdownOffset;
+    }
+
+    /// Returns true when all live nodes have consumed the leadership moves
+    /// initiated by the controlled shutdown of `nodeId`.
+    ///
+    /// Per Kafka parity: `lowestActiveConsumedOffset` is the lowest consumed
+    /// offset among all live nodes.  The shutdown is complete once every live
+    /// node has consumed at least `controlledShutdownOffset` (i.e.
+    /// `controlledShutdownOffset <= lowestActiveConsumedOffset`).
+    ///
+    /// A graceful shutdown MAY leave a partition leaderless or shrink ISR below
+    /// min-ISR; this check does NOT gate on those conditions (min-ISR is a
+    /// produce-time gate only).
+    ///
+    /// Returns false if nodeId has no pending controlled-shutdown record.
+    [[nodiscard]] bool shutdownComplete(int32_t nodeId,
+                                        int64_t lowestActiveConsumedOffset) const noexcept {
+        auto it = controlledShutdownOffsets_.find(nodeId);
+        if (it == controlledShutdownOffsets_.end()) return false;
+        return it->second <= lowestActiveConsumedOffset;
+    }
+
+    // -----------------------------------------------------------------------
     // Overload valve
     // -----------------------------------------------------------------------
 
@@ -253,6 +290,8 @@ private:
     // State
     // -----------------------------------------------------------------------
     std::unordered_map<int32_t, MemberInfo> members_;
+    /// Maps nodeId → controlledShutdownOffset for in-progress graceful shutdowns.
+    std::unordered_map<int32_t, int64_t>    controlledShutdownOffsets_;
     bool    overloaded_       = false;
     int64_t sessionTimeoutNs_ = kDefaultSessionTimeoutNs;
 };
