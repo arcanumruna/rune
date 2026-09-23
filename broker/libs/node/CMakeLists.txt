@@ -50,10 +50,12 @@ if(BUILD_TESTING)
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
-    # Unit tests (NodeConfig + PortableFlushBackend — no Aeron driver)
+    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + WorkerWire)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
-        tests/node/PortableFlushBackendTest.cpp)
+        tests/node/PortableFlushBackendTest.cpp
+        tests/node/OneToOneByteRingTest.cpp
+        tests/node/WorkerWireTest.cpp)
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
         GTest::gtest_main)
