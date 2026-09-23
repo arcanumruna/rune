@@ -9,16 +9,23 @@
 // Shared-nothing: a Worker touches ONLY the PartitionReplicas it owns. The
 // ReplicaRegistry still OWNS the PartitionReplica objects; Worker holds
 // non-owning pointers. Single-writer: doWork runs on the duty-cycle thread only.
+//
+// E1 rework: Worker now implements rune::consensus::Agent so it can be driven
+// by an AgentRunner (with a configurable IdleStrategy) in E2. The Agent
+// virtual dispatch occurs ONCE PER DUTY CYCLE (the Aeron model); per-record
+// paths inside doWork remain concrete — no additional virtuals introduced.
 
+#include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace rune::node {
 
-class Worker {
+class Worker : public rune::consensus::Agent {
 public:
     explicit Worker(int32_t workerId) noexcept : workerId_(workerId) {}
 
@@ -40,6 +47,10 @@ public:
         return std::find(owned_.begin(), owned_.end(), r) != owned_.end();
     }
 
+    // -----------------------------------------------------------------------
+    // rune::consensus::Agent interface
+    // -----------------------------------------------------------------------
+
     // Run the per-replica duty steps for owned replicas only. Mirrors
     // NodeRuntimeAgent::doWork steps 5 + 6.5 exactly:
     //   Step 5:   replica->doWork(nowNs) for every owned replica.
@@ -47,8 +58,9 @@ public:
     //             drainStagingRenamesDone() for disk-backed replicas only.
     //             Memory-backed replicas must be skipped — replica->log()
     //             asserts isDiskBacked(), matching the NodeRuntimeAgent guard.
-    // NON-virtual: called via Worker& (concrete direct call, no vtable).
-    int doWork(int64_t nowNs) {
+    // Virtual dispatch occurs once per duty cycle (AgentRunner call site);
+    // the per-record paths inside remain fully concrete.
+    int doWork(int64_t nowNs) override {
         int work = 0;
 
         // Step 5: per-replica ISR checks / follower fetch emission.
