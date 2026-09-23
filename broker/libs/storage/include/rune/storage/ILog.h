@@ -92,6 +92,11 @@ public:
     /// single-element vector {logStartOffset()} so that PSM rebuildFromLog's
     /// CP-3/CP-4 segment-gap logic works correctly (InMemoryLog has no gaps).
     [[nodiscard]] virtual std::vector<int64_t> segmentBaseOffsets() const = 0;
+
+    /// True for on-disk Log implementations; false for InMemoryLog.
+    /// Used by PartitionReplica::log() to guard against UB from static_cast<Log*>
+    /// on a non-disk-backed ILog pointer.
+    [[nodiscard]] virtual bool isDiskBacked() const noexcept = 0;
 };
 
 } // namespace rune::storage

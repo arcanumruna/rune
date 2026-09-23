@@ -39,6 +39,7 @@
 // ---------------------------------------------------------------------------
 
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -424,6 +425,7 @@ public:
     /// a rune::storage::Log* — production paths always are.  Test code that passes
     /// InMemoryLog must use ilog() instead.
     [[nodiscard]] rune::storage::Log* log() const noexcept {
+        assert(log_->isDiskBacked() && "log(): backend is not a disk Log — use ilog()");
         return static_cast<rune::storage::Log*>(log_);
     }
 

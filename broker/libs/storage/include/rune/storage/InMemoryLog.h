@@ -50,6 +50,8 @@ public:
         assert(maxRecords > 0 && "InMemoryLog: maxRecords must be > 0");
         // Pre-allocate ring storage to maxBytes to avoid steady-state reallocation.
         ring_.reserve(maxBytes);
+        // Pre-allocate entry descriptor vector to maxRecords to avoid steady-state reallocation.
+        entries_.reserve(maxRecords);
     }
 
     ~InMemoryLog() override = default;
@@ -92,7 +94,11 @@ public:
                 continue;
             }
             const std::size_t batchBytes = e.length;
-            if (static_cast<int32_t>(out.size() + batchBytes) > maxBytes) break;
+            // Mirror LogSegment::read "return at least one batch" semantics so a
+            // consumer can always make forward progress even when a single batch
+            // exceeds the maxBytes budget.
+            if (!out.empty() &&
+                static_cast<int32_t>(out.size() + batchBytes) > maxBytes) break;
 
             const uint8_t* src = ring_.data() + e.ringOffset;
             out.insert(out.end(), src, src + batchBytes);
@@ -143,6 +149,8 @@ public:
         return {logStartOffset_};
     }
 
+    [[nodiscard]] bool isDiskBacked() const noexcept override { return false; }
+
 private:
     // -----------------------------------------------------------------------
     // Entry descriptor: points into ring_.
@@ -161,22 +169,24 @@ private:
         // Determine the base offset = current LEO.
         const int64_t baseOffset = logEndOffset_;
 
+        // Evict oldest batches BEFORE inserting the new one so that ring_
+        // never momentarily exceeds the reserved maxBytes_ capacity.
+        // Keep at least one entry so we always make forward progress.
+        while (!entries_.empty() &&
+               (bytesUsed_ + len > maxBytes_ || entries_.size() >= maxRecords_)) {
+            evictOldest();
+            if (entries_.empty()) break; // all entries gone — stop evicting
+        }
+
         // Append to ring (simple linear buffer — steady-state no realloc because
-        // we reserved maxBytes in the constructor; eviction contracts ring_.size()
-        // back toward zero by reassigning).
+        // we reserved maxBytes in the constructor; eviction above has already freed
+        // space so ring_.size() + len <= maxBytes_ in steady state).
         const std::size_t ringPos = ring_.size();
         ring_.insert(ring_.end(), data, data + len);
 
         entries_.push_back(Entry{baseOffset, lastOffset, ringPos, len});
         bytesUsed_ += len;
         logEndOffset_ = lastOffset + 1;
-
-        // Evict oldest batches until caps are satisfied.
-        // Keep at least one entry (the one we just appended).
-        while (entries_.size() > 1 &&
-               (bytesUsed_ > maxBytes_ || entries_.size() > maxRecords_)) {
-            evictOldest();
-        }
 
         return baseOffset;
     }

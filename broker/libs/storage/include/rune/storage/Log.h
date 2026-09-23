@@ -91,6 +91,7 @@ public:
     int deleteOldSegments(int64_t retainBytes);
     /// Directory that contains this log's segment files.
     const std::string& dir() const noexcept override { return dir_; }
+    [[nodiscard]] bool isDiskBacked() const noexcept override { return true; }
     /// Reload all segments from disk (close + reopen every LogSegment).
     /// Used by LogCleaner after atomically rewriting segment files on disk,
     /// so that in-memory file handles reflect the new file contents.
