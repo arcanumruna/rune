@@ -266,14 +266,18 @@ private:
             applyBecomeLeaderForKey(key, currentMap);
         }
 
-        // followers + deletes → becomeFollower
+        // followers → becomeFollower
         for (const auto& key : delta.followers) {
             if (key.topicId < 0) continue;
             applyBecomeFollowerForKey(key, currentMap);
         }
+
+        // deletes → stop the replica AND quarantine it out of routing (Note B /
+        // spec §16).  Must NOT call becomeFollower(0, NO_LEADER) — that would
+        // leave the replica visible to routing as a stray.
         for (const auto& key : delta.deletes) {
             if (key.topicId < 0) continue;
-            applyBecomeFollowerForKey(key, currentMap);
+            applyDeleteForKey(key, currentMap);
         }
 
         // Snapshot current committed map for next cycle's delta computation.
@@ -325,6 +329,44 @@ private:
         }
 
         replica->becomeFollower(perPartEpoch, leaderNode);
+    }
+
+    // -----------------------------------------------------------------------
+    // applyDeleteForKey — Note B fix / spec §16 stray-replica quarantine.
+    //
+    // Called for each `deletes` delta key: the committed map no longer lists
+    // this node as a replica for (topicId, partition).
+    //
+    // 1. Fence the replica: becomeFollower(lastKnownEpoch, NO_LEADER) stamps the
+    //    epoch so any in-flight FetchRequests from this (now-removed) leader will
+    //    be stale-epoch-rejected by peers.  Uses the prev map's leaderEpoch when
+    //    available (currentMap no longer has an entry for a deleted partition).
+    // 2. Remove from registry: registry_.remove() erases the replica from the
+    //    routing map so it can never be looked up again.  The replica's unique_ptr
+    //    is destroyed; the underlying Log data is NOT touched (owned by topology).
+    //
+    // Topic/partition ids are never reused so a quarantined log is never
+    // resurrected by a later add() with the same key.
+    // -----------------------------------------------------------------------
+    void applyDeleteForKey(
+        const rune::metadata::PartitionKey& key,
+        const rune::metadata::AssignmentMap& /*currentMap*/) noexcept
+    {
+        auto* replica = registry_.lookup(key.topicId, key.partition);
+        if (!replica) return;
+
+        // Fence: stamp the replica as a NO_LEADER follower so any late epoch
+        // interactions are rejected.  prevMap_ still holds the last-known epoch
+        // for this key (the map snapshot before this cycle's delta).
+        const rune::metadata::PartitionAssignment* pa =
+            prevMap_.get(key.topicId, key.partition);
+        const rune::replication::Epoch fenceEpoch =
+            pa ? static_cast<rune::replication::Epoch>(pa->leaderEpoch) : 0;
+
+        replica->becomeFollower(fenceEpoch, rune::metadata::NO_LEADER);
+
+        // Quarantine: erase from routing.  The replica is destroyed here.
+        registry_.remove(key.topicId, key.partition);
     }
 
     // -----------------------------------------------------------------------

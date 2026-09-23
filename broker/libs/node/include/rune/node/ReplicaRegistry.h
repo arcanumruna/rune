@@ -11,6 +11,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -67,6 +68,40 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] const std::vector<rune::replication::PartitionReplica*>&
     allReplicas() const noexcept { return ordered_; }
+
+    // -----------------------------------------------------------------------
+    // remove — quarantine (erase) the replica keyed by (topicId, partition).
+    //
+    // Called by ReplicationMetadataBridge::applyDeleteForKey when the committed
+    // assignment map no longer includes this node for the partition (Note B /
+    // spec §16 stray-replica quarantine).  After removal, lookup() returns
+    // nullptr for that key so the deleted partition can never be routed to again.
+    //
+    // The replica's unique_ptr is destroyed here — the underlying Log and disk
+    // data are NOT touched (they are owned by the TopicRegistry / the caller's
+    // layer).  A replica id is never reused: if the same topic/partition is
+    // later recreated with a new (topicId, partition) pair it will be a fresh
+    // add() call; the old quarantined log is never resurrected.
+    //
+    // Complexity: O(n) for the ordered_ erase (n = total registered replicas;
+    // typically small).  Hot path is add/lookup; remove is uncommon (assignment
+    // change).
+    // -----------------------------------------------------------------------
+    void remove(int32_t topicId, int32_t partition)
+    {
+        const Key key{topicId, partition};
+        auto it = map_.find(key);
+        if (it == map_.end()) return;  // already absent — idempotent
+
+        // Remove the raw pointer from ordered_ before destroying the unique_ptr
+        // so ordered_ never holds a dangling pointer even transiently.
+        auto* raw = it->second.get();
+        auto  oit = std::find(ordered_.begin(), ordered_.end(), raw);
+        if (oit != ordered_.end()) ordered_.erase(oit);
+
+        // Destroy the owned PartitionReplica.
+        map_.erase(it);
+    }
 
     // -----------------------------------------------------------------------
     // replicaCount

@@ -66,6 +66,25 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 12: ReplicationMetadataBridge churn tests (Note B fix + TSan).
+    # Tests: delete-delta tears down replica, stray-replica quarantine,
+    # leader<->follower churn from the changing committed map, follower
+    # epoch-boundary truncation on handoff, concurrent apply-vs-lookup TSan-clean.
+    # No Aeron required (uses MockTransport + on-disk Log).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_bridge_churn_tests
+        tests/node/ReplicationMetadataBridgeChurnTest.cpp)
+    target_include_directories(rune_bridge_churn_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_bridge_churn_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_bridge_churn_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService unit tests — injected clock, fake leader toggle.
     # No Aeron required.
     # ---------------------------------------------------------------------------
