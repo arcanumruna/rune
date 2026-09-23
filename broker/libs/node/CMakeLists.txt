@@ -4,7 +4,9 @@ add_library(rune_node
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
-    src/PortableFlushBackend.cpp)
+    src/PortableFlushBackend.cpp
+    # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
+    src/UringFlushBackend.cpp)
 
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -174,6 +176,20 @@ if(BUILD_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_async_durability_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # E3 Task 8a: UringDurabilityTest — raw io_uring backend integration tests.
+    # The test source is entirely wrapped in #if defined(__linux__); on macOS
+    # this binary compiles and links but registers ZERO tests (gtest main exits 0).
+    # Run the real tests on the Hetzner Linux box.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_uring_durability_tests
+        tests/integration/UringDurabilityTest.cpp)
+    target_link_libraries(rune_uring_durability_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_uring_durability_tests
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
