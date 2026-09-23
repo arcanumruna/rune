@@ -56,6 +56,10 @@ struct ElectionOutcome {
     AssignmentChange change;       ///< Apply via mergeChange(cur, change).
     bool             leaderChanged = false;
     bool             wentNoLeader  = false;
+    /// Set when an unclean election fires: a non-ISR replica was elected,
+    /// ISR was forced to {newLeader}, and committed data may have been lost.
+    /// Only ever true when ElectionInputs::allowUnclean == true.
+    bool             recovering    = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -102,8 +106,71 @@ public:
             }
         }
 
-        // ── Rule 4: no ISR survivor → NO_LEADER ─────────────────────────────
+        // ── getPos helper — shared by clean and unclean paths ────────────────
+        // Sentinel for a member with no position report: epoch=-1, leo=-1.
+        // compareLog(lhsEpoch, lhsLeo, rhsEpoch, rhsLeo): +1 if lhs more recent.
+        auto getPos = [&](int32_t node)
+            -> std::pair<rune::consensus::Term, int64_t>
+        {
+            auto opt = in.positions ? in.positions->get(topicId, partition, node)
+                                    : std::nullopt;
+            if (!opt.has_value()) return { -1LL, -1LL };
+            return { static_cast<rune::consensus::Term>(opt->leaderEpoch),
+                     opt->logEndPosition };
+        };
+
+        // ── Rule 4: no ISR survivor → NO_LEADER (or unclean if opted-in) ───────
         if (proposedIsr.empty()) {
+            // ── Unclean opt-in: per-topic override, default OFF ───────────────
+            // ONLY fires when allowUnclean==true AND there is at least one live
+            // replica in cur.replicas (ignoring ISR membership). This is the
+            // SOLE place the no-committed-loss invariant is intentionally
+            // relaxed. Pick the most-complete live replica, force ISR={newLeader},
+            // and mark recovering=true.
+            if (in.allowUnclean) {
+                // Collect live replicas (cur.replicas ∩ liveNodes), ignoring ISR.
+                std::vector<int32_t> liveCandidates;
+                liveCandidates.reserve(cur.replicas.size());
+                for (int32_t node : cur.replicas) {
+                    if (isIn(node, in.liveNodes)) {
+                        liveCandidates.push_back(node);
+                    }
+                }
+
+                if (!liveCandidates.empty()) {
+                    // Pick the most-complete live replica by compareLog;
+                    // tie-break: lowest nodeId (same ordering as clean path).
+                    int32_t uncleanLeader = liveCandidates[0];
+                    auto [bestU, bestULeo] = getPos(uncleanLeader);
+
+                    for (std::size_t i = 1; i < liveCandidates.size(); ++i) {
+                        int32_t candidate = liveCandidates[i];
+                        auto [cEpoch, cLeo] = getPos(candidate);
+
+                        int cmp = rune::consensus::ClusterMember::compareLog(
+                            cEpoch, cLeo, bestU, bestULeo);
+
+                        if (cmp > 0) {
+                            uncleanLeader = candidate;
+                            bestU         = cEpoch;
+                            bestULeo      = cLeo;
+                        } else if (cmp == 0 && candidate < uncleanLeader) {
+                            uncleanLeader = candidate;
+                        }
+                    }
+
+                    ElectionOutcome out;
+                    out.leaderChanged        = true;
+                    out.wentNoLeader         = false;
+                    out.recovering           = true;
+                    out.change.newLeader     = uncleanLeader;
+                    out.change.newIsr        = { uncleanLeader };  // forced single-member ISR
+                    out.change.newReplicas   = {};  // empty → mergeChange keeps cur.replicas
+                    return out;
+                }
+            }
+
+            // Default (allowUnclean==false, or no live replicas): unavailable.
             ElectionOutcome out;
             out.leaderChanged = true;
             out.wentNoLeader  = true;
@@ -114,19 +181,7 @@ public:
         }
 
         // ── Rule 2: pick the most-complete proposed member ───────────────────
-        // Sentinel for a member with no position report: epoch=-1, leo=-1.
-        // compareLog(lhsEpoch, lhsLeo, rhsEpoch, rhsLeo): +1 if lhs more recent.
         // Tie-break: lowest nodeId (stable sort order).
-
-        auto getPos = [&](int32_t node)
-            -> std::pair<rune::consensus::Term, int64_t>
-        {
-            auto opt = in.positions ? in.positions->get(topicId, partition, node)
-                                    : std::nullopt;
-            if (!opt.has_value()) return { -1LL, -1LL };
-            return { static_cast<rune::consensus::Term>(opt->leaderEpoch),
-                     opt->logEndPosition };
-        };
 
         int32_t elected = proposedIsr[0];
         auto [bestEpoch, bestLeo] = getPos(elected);

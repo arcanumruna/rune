@@ -104,6 +104,26 @@ TEST(FailoverElection, NoPositionReportIsLeastComplete) {
     EXPECT_EQ(out.change.newLeader, 3) << "node with a position report beats one with no report";
 }
 
+TEST(FailoverElection, UncleanOptInElectsOutOfIsrAndFlagsRecovering) {
+    ReplicaPositionTable pos;
+    pos.report({7,0,3, /*epoch*/4, /*leo*/70}); // 3 not in ISR but live + most complete
+    auto cur = mk(1, {1}, {1,2,3}, 5, 9);         // ISR={1}, 1 dead
+    ElectionInputs in{cur, {2,3}, &pos, /*allowUnclean*/true};
+    auto out = FailoverElection::elect(7, 0, in);
+    EXPECT_TRUE(out.recovering);
+    EXPECT_EQ(out.change.newLeader, 3);
+    ASSERT_EQ(out.change.newIsr.size(), 1u);
+    EXPECT_EQ(out.change.newIsr[0], 3);
+}
+TEST(FailoverElection, UncleanRefusedWhenLeaderAlreadyExists) {
+    ReplicaPositionTable pos;
+    auto cur = mk(1, {1,2,3}, {1,2,3}, 5, 9);
+    ElectionInputs in{cur, {1,2,3}, &pos, /*allowUnclean*/true};
+    auto out = FailoverElection::elect(7, 0, in);
+    EXPECT_FALSE(out.leaderChanged); // ELECTION_NOT_NEEDED
+    EXPECT_FALSE(out.recovering);
+}
+
 // ISR shrink without leader change must NOT bump leaderEpoch.
 TEST(FailoverElection, IsrShrinkWithoutLeaderChangeNoLeaderEpochBump) {
     ReplicaPositionTable pos;
