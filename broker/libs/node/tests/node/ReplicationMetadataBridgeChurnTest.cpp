@@ -492,21 +492,26 @@ TEST_F(BridgeChurnTest, FollowerEpochBoundaryTruncation_OnHandoff) {
 }
 
 // ===========================================================================
-// Test 5: Concurrent apply-vs-lookup — TSan-clean under -fsanitize=thread.
+// Test 5: ConcurrentApplyVsLookup_TSanClean — single-writer invariant, TSan-clean.
 //
-// The single-writer invariant means all MUTATIONS (doWork, setMsm) run on the
-// duty thread.  The gateway/routing calls allReplicas() / lookup() on the SAME
-// duty thread in production.  However, under TSan stress with a reader thread
-// we verify that the read-side (allReplicas, lookup) concurrent with the duty
-// thread's writes is data-race-free.
+// CORRECTNESS MODEL (not a "concurrent apply-vs-route race stress"):
+//   Safety here derives from the SINGLE-WRITER invariant, NOT from locking a
+//   genuinely-racing apply-vs-route path.  In production, apply (doWork/setMsm),
+//   route (lookup) and remove all run on the ONE AgentRunner (duty) thread — they
+//   never actually execute concurrently, so there is no apply-vs-route data race
+//   to stress.  The registry's mutable role/MSM state is single-writer by
+//   construction.
 //
-// This test does NOT violate the single-writer rule: all registry MUTATIONS
-// happen on the duty thread (this thread, via doWork/setMsm).  The reader
-// thread only reads.  The point is to let TSan detect any missing memory
-// barriers on the read path (e.g. atomics on ordered_ size, map_ iteration).
+//   The reader thread in this test only reads IMMUTABLE per-replica IDENTITY
+//   (the stable ordered_ snapshot / lookup by key), which is published once and
+//   never mutated after registration.  The purpose is narrow: let TSan confirm
+//   that this identity-only read path carries the memory barriers it claims to
+//   (no torn reads of the ordered_ snapshot), NOT to prove that concurrent
+//   apply+route is safe — that scenario does not occur under the single-writer
+//   design and is deliberately not exercised.
 //
 // The single MSM is advanced from leader→follower→leader cyclically so the
-// bridge makes real role transitions each even/odd iteration.
+// bridge makes real role transitions each even/odd iteration on the duty thread.
 // ===========================================================================
 TEST_F(BridgeChurnTest, ConcurrentApplyVsLookup_TSanClean) {
     addReplica(/*topicId=*/11, /*partitionId=*/0, Role::Follower, 1);

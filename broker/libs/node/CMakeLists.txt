@@ -198,6 +198,27 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Milestone D Phase-2 Task 14 (EXIT): rebalance + failover in-process.
+    # Deterministic control-plane tick (ControlTickRecord) → DynamicBalancer /
+    # FailoverElection over MembershipState::eligibleNodes() → emitDynamicAssignment
+    # → real 3-node KIP-101 handoff with NO committed loss (majority + all-in-sync
+    # + memory topics).  Uses InMemoryTransport (no Aeron).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_rebalance_failover_tests
+        tests/integration/RebalanceFailoverIntegrationTest.cpp)
+    target_include_directories(rune_rebalance_failover_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_rebalance_failover_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_dynamic_balancer
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_rebalance_failover_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 6: StaticAssignmentEmit integration tests — on becoming the
     # metadata-consensus leader, MetadataService runs StaticBalancer::assign()
     # over configured topics and appends the resulting assignment records to

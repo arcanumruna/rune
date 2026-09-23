@@ -61,6 +61,9 @@
 #include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/Gpid.h>
 #include <rune/metadata/StaticBalancer.h>
+#include <rune/metadata/DynamicBalancer.h>       // Task 14: rebalance-on-tick
+#include <rune/metadata/ControlPlaneTimer.h>     // Task 14: deterministic logged tick
+#include <rune/metadata/ReplicaPositionTable.h>  // Task 14: election position input
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
 #include <rune/protocol/MetadataRecords.h>
@@ -244,6 +247,101 @@ public:
             pendingDynamicRecords_.push_back(std::move(br));
         }
         recs.clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 14: Deterministic control-plane tick wiring.
+    //
+    // The LEADER owns a ControlPlaneTimer.  On each control-plane poll it checks
+    // the timer against CLUSTER/LOG time; when a timer fires it APPENDS a
+    // ControlTickRecord to the metadata log (monotonic tickSeq) so EVERY replica —
+    // leader, follower, recovering — observes the SAME tick from the SAME log
+    // entry.  The reassignment DECISION (DynamicBalancer/FailoverElection) is a
+    // pure deterministic function of the committed AssignmentMap + eligibleNodes +
+    // ReplicaPositionTable, so it replays identically on every node that applies
+    // the tick boundary.  Mirrors Aeron Cluster's timer-tick: no replica uses a
+    // local wall-clock for control decisions.
+    //
+    // Single-writer: must be called on the control-plane / duty-cycle thread.
+    // -----------------------------------------------------------------------
+
+    /// Arm a control-plane timer to fire at (or after) deadlineNs (cluster time).
+    void armControlTick(int64_t deadlineNs, int32_t timerId = 0) {
+        controlTimer_.arm(deadlineNs, timerId);
+    }
+
+    /// Leader-only: poll the control-plane timer against clusterNowNs.  If a
+    /// timer is due, APPEND one ControlTickRecord (with the next monotonic
+    /// tickSeq) to the metadata log and return true.  Returns false if not the
+    /// leader or no timer is due.  At most ONE tick is appended per call (the
+    /// earliest-due timer) — callers loop or re-arm as needed.
+    ///
+    /// The appended tick becomes visible (committed) on all replicas once HW
+    /// advances past it; the balancer decision is then driven by
+    /// runDynamicRebalanceOnTick() on whichever node is the leader.
+    bool pollAndAppendControlTick(int64_t clusterNowNs) {
+        if (!replica_) return false;
+        if (replica_->role() != rune::replication::Role::Leader) return false;
+
+        int32_t firedId = 0;
+        if (!controlTimer_.poll(clusterNowNs, firedId)) return false;
+
+        rune::protocol::metadata::ControlTickRecord tick;
+        tick.tickTimeNs = clusterNowNs;
+        tick.tickSeq    = nextTickSeq_++;   // monotonic across emitted ticks
+
+        uint8_t buf[rune::protocol::metadata::ControlTickRecord::ENCODED_SIZE];
+        const std::size_t n = tick.encode(buf, sizeof(buf));
+        if (n == 0) return false;
+        replica_->append(std::span<const uint8_t>(buf, n), /*acksAll=*/false);
+        lastEmittedTickSeq_ = tick.tickSeq;
+        return true;
+    }
+
+    /// Leader-only: run the delta rebalance (failover + preferred-leader +
+    /// co-partition unit move) over the committed AssignmentMap using the
+    /// eligibleNodes() live set (Unfenced ∧ caughtUp ∧ ¬expired — NEVER raw
+    /// liveNodes()) and the soft ReplicaPositionTable, then enqueue the resulting
+    /// BalancerRecords via emitDynamicAssignment() (bounded batched emit).
+    ///
+    /// This is the control-plane action taken WHEN a control tick fires: the tick
+    /// marks the deterministic boundary; the leader computes and emits the
+    /// reassignment.  Followers do NOT emit — they apply the emitted records from
+    /// the committed log (the deterministic-apply guarantee).
+    ///
+    /// @returns the number of BalancerRecords enqueued (0 = steady state / no-op).
+    std::size_t runDynamicRebalanceOnTick(
+        const std::vector<rune::metadata::NodeId>& eligibleNodes,
+        rune::metadata::ReplicaPositionTable*      positions,
+        int maxPreferredElectionsPerCycle = 1000,
+        int maxRecordsPerCycle            = 4096)
+    {
+        if (!replica_) return 0;
+        if (replica_->role() != rune::replication::Role::Leader) return 0;
+        if (configuredTopics_.empty()) return 0;
+
+        rune::metadata::DynamicBalancerInputs in;
+        in.cur       = &msm_.committedMap();
+        in.liveNodes = eligibleNodes;   // eligibleNodes(), not raw liveNodes()
+        in.topics    = configuredTopics_;
+        in.positions = positions;
+        in.maxPreferredElectionsPerCycle = maxPreferredElectionsPerCycle;
+        in.maxRecordsPerCycle            = maxRecordsPerCycle;
+
+        rune::metadata::DynamicBalancer bal;
+        std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
+        const std::size_t count = recs.size();
+        if (count > 0) emitDynamicAssignment(recs);
+        return count;
+    }
+
+    /// Diagnostics: the tickSeq of the most-recently appended ControlTickRecord
+    /// (-1 if none appended yet).  Monotonic across emitted ticks.
+    [[nodiscard]] int64_t lastEmittedTickSeq() const noexcept { return lastEmittedTickSeq_; }
+
+    /// Diagnostics: number of pending timers armed on the control-plane timer.
+    [[nodiscard]] std::size_t pendingControlTimers() const noexcept {
+        return controlTimer_.size();
     }
 
     // -----------------------------------------------------------------------
@@ -599,6 +697,16 @@ private:
     // invalidate existing elements.
     // -----------------------------------------------------------------------
     std::deque<rune::metadata::BalancerRecord> pendingDynamicRecords_;
+
+    // -----------------------------------------------------------------------
+    // Task 14: control-plane tick state (leader-owned).
+    // -----------------------------------------------------------------------
+    /// Deterministic priority-heap timer polled against cluster/log time.
+    rune::metadata::ControlPlaneTimer controlTimer_;
+    /// Next monotonic tickSeq to stamp on the next appended ControlTickRecord.
+    int64_t nextTickSeq_        = 0;
+    /// tickSeq of the last appended ControlTickRecord (-1 = none yet).
+    int64_t lastEmittedTickSeq_ = -1;
 };
 
 } // namespace rune::node
