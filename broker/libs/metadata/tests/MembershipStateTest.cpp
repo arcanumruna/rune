@@ -7,6 +7,8 @@
 //   - Overload valve: setState suppressed while overloaded
 //   - markCatchUpComplete / unfence-after-catch-up
 //   - liveNodes filtering
+//   - §8 eligibleNodes gate: joined but not caught-up is live but not eligible
+//   - New incarnation resets eligibility until re-catch-up
 
 #include <rune/metadata/MembershipState.h>
 #include <gtest/gtest.h>
@@ -156,4 +158,55 @@ TEST(MembershipState, IdempotentAmendUpdatesEndpoint) {
     // Node should still be live
     auto live = m.liveNodes(0, 10'000);
     EXPECT_EQ(live.size(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// §8 parity: eligibleNodes gate
+// ---------------------------------------------------------------------------
+
+TEST(MembershipState, JustJoinedNodeNotEligibleUntilCaughtUp) {
+    MembershipState m;
+    m.onJoin(1, "h1", 100, 10, 0);
+
+    // Node appears in liveNodes immediately after join (Unfenced, session valid)
+    auto live = m.liveNodes(0, 10'000);
+    ASSERT_EQ(live.size(), 1u);
+    EXPECT_EQ(live[0], 1);
+
+    // But NOT in eligibleNodes — caughtUp is still false
+    auto eligible = m.eligibleNodes(0, 10'000);
+    EXPECT_TRUE(eligible.empty());
+
+    // After markCatchUpComplete the node becomes eligible
+    EXPECT_TRUE(m.markCatchUpComplete(1));
+    eligible = m.eligibleNodes(0, 10'000);
+    ASSERT_EQ(eligible.size(), 1u);
+    EXPECT_EQ(eligible[0], 1);
+}
+
+TEST(MembershipState, NewIncarnationDropsEligibilityUntilRecatchUp) {
+    // Use a short session timeout (500 ns) so the incumbent expires quickly.
+    MembershipState m{500};
+
+    // First incarnation joins, catches up, becomes eligible.
+    m.onJoin(1, "h1", 100, 10, 0);
+    m.markCatchUpComplete(1);
+    ASSERT_EQ(m.eligibleNodes(0, 10'000).size(), 1u);
+
+    // Wait for session to expire (heartbeat at t=100, re-join at t=1000 → 900 > 500).
+    m.onHeartbeat(1, 100);
+    auto result = m.onJoin(1, "h1-new", /*newInc*/200, 11, 1000);
+    EXPECT_EQ(result, MembershipState::JoinResult::Accepted);
+
+    // New incarnation: in liveNodes but NOT yet eligible (caughtUp reset to false).
+    auto live = m.liveNodes(1000, 10'000);
+    ASSERT_EQ(live.size(), 1u);
+    auto eligible = m.eligibleNodes(1000, 10'000);
+    EXPECT_TRUE(eligible.empty());
+
+    // Re-catch-up restores eligibility.
+    m.markCatchUpComplete(1);
+    eligible = m.eligibleNodes(1000, 10'000);
+    ASSERT_EQ(eligible.size(), 1u);
+    EXPECT_EQ(eligible[0], 1);
 }

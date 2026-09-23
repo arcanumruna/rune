@@ -25,8 +25,8 @@ namespace rune::metadata {
 // NodeControlState — mirrors Kafka KIP-631 §8 broker state machine.
 // ---------------------------------------------------------------------------
 enum class NodeControlState {
-    Fenced,            // new join; catching up; default state
-    Unfenced,          // caught up; eligible to serve
+    Fenced,            // controller-directed fence (e.g. overload/reassignment)
+    Unfenced,          // fence lifted; node may serve once caughtUp==true
     ControlledShutdown,// graceful drain in progress
     ShutdownNow,       // immediate shutdown (no drain)
 };
@@ -53,6 +53,7 @@ public:
         int64_t          brokerEpoch     = 0;
         int64_t          lastHeartbeatNs = 0;
         NodeControlState state           = NodeControlState::Unfenced;
+        bool             caughtUp        = false; // §8 gate: true only after markCatchUpComplete()
     };
 
     enum class JoinResult {
@@ -66,16 +67,20 @@ public:
     // -----------------------------------------------------------------------
 
     /// Process a broker registration attempt.
-    ///   - New nodeId              → insert as Fenced,    return Accepted.
-    ///   - Same incarnationId      → amend endpoint,      return IdempotentAmend.
+    ///   - New nodeId              → insert as Unfenced, caughtUp=false, return Accepted.
+    ///   - Same incarnationId      → amend endpoint/epoch only (caughtUp preserved), return IdempotentAmend.
     ///   - Different incarnationId + session still valid  → RejectedZombie.
-    ///   - Different incarnationId + session expired      → replace,  return Accepted.
+    ///   - Different incarnationId + session expired      → replace, caughtUp=false, return Accepted.
+    ///
+    /// NOTE: a freshly joined node is Unfenced but NOT yet eligible (caughtUp==false).
+    /// Call markCatchUpComplete() once the node has replayed the metadata log.
+    /// Use eligibleNodes() — not liveNodes() — for assignment/election consumers.
     JoinResult onJoin(int32_t nodeId, std::string endpoint,
                       int64_t incarnationId, int64_t brokerEpoch,
                       int64_t nowNs) {
         auto it = members_.find(nodeId);
         if (it == members_.end()) {
-            // Brand-new node — starts Unfenced (catches up inline with join).
+            // Brand-new node — starts Unfenced but not yet eligible (caughtUp=false).
             MemberInfo info;
             info.nodeId          = nodeId;
             info.endpoint        = std::move(endpoint);
@@ -83,6 +88,7 @@ public:
             info.brokerEpoch     = brokerEpoch;
             info.lastHeartbeatNs = nowNs;
             info.state           = NodeControlState::Unfenced;
+            info.caughtUp        = false;
             members_.emplace(nodeId, std::move(info));
             return JoinResult::Accepted;
         }
@@ -91,6 +97,7 @@ public:
 
         if (existing.incarnationId == incarnationId) {
             // Same incarnation — idempotent re-registration; amend mutable fields.
+            // caughtUp is NOT reset: a live, already-caught-up node stays eligible.
             existing.endpoint        = std::move(endpoint);
             existing.brokerEpoch     = brokerEpoch;
             existing.lastHeartbeatNs = nowNs;
@@ -109,11 +116,13 @@ public:
         }
 
         // Session expired: replace with new incarnation.
+        // Fresh incarnation must re-catch-up before becoming eligible (caughtUp=false).
         existing.endpoint        = std::move(endpoint);
         existing.incarnationId   = incarnationId;
         existing.brokerEpoch     = brokerEpoch;
         existing.lastHeartbeatNs = nowNs;
         existing.state           = NodeControlState::Unfenced;
+        existing.caughtUp        = false;
         return JoinResult::Accepted;
     }
 
@@ -145,6 +154,8 @@ public:
     }
 
     /// All members whose session is not expired AND whose state is not Fenced or ShutdownNow.
+    /// NOTE: liveness != eligibility.  A just-joined node appears here but is NOT yet
+    /// eligible for assignment/election (caughtUp==false).  Use eligibleNodes() for that.
     [[nodiscard]] std::vector<int32_t> liveNodes(int64_t nowNs,
                                                    int64_t sessionTimeoutNs) const {
         std::vector<int32_t> result;
@@ -162,20 +173,37 @@ public:
         return result;
     }
 
+    /// KIP-631 §8 eligibility: Unfenced AND caughtUp AND session not expired.
+    /// Assignment and election consumers MUST use this instead of liveNodes().
+    [[nodiscard]] std::vector<int32_t> eligibleNodes(int64_t nowNs,
+                                                      int64_t sessionTimeoutNs) const {
+        std::vector<int32_t> result;
+        result.reserve(members_.size());
+        for (const auto& [id, info] : members_) {
+            if (info.state != NodeControlState::Unfenced) continue;
+            if (!info.caughtUp) continue;
+            if (isExpiredWith(info.lastHeartbeatNs, nowNs, sessionTimeoutNs)) continue;
+            result.push_back(id);
+        }
+        return result;
+    }
+
     // -----------------------------------------------------------------------
     // State transitions
     // -----------------------------------------------------------------------
 
-    /// Move a node to Unfenced after it has caught up with metadata.
-    /// Returns true if the transition was applied (node exists and was Fenced).
+    /// Signal that nodeId has replayed the metadata log and is eligible to serve.
+    /// Sets caughtUp=true unconditionally (regardless of fence state).
+    /// Also promotes Fenced → Unfenced if the node was fenced (backwards-compat).
+    /// Returns true if nodeId exists (false = unknown node, no-op).
     bool markCatchUpComplete(int32_t nodeId) {
         auto it = members_.find(nodeId);
         if (it == members_.end()) return false;
+        it->second.caughtUp = true;
         if (it->second.state == NodeControlState::Fenced) {
             it->second.state = NodeControlState::Unfenced;
-            return true;
         }
-        return false;
+        return true;
     }
 
     /// Transition a node's control state.  No-op while overloaded_ is true
