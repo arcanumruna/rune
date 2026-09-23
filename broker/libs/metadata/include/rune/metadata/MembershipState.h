@@ -135,8 +135,11 @@ public:
     }
 
     /// Remove a node entirely (clean leave).
+    /// Also erases any pending controlled-shutdown offset so a stale drain
+    /// record cannot linger after the node fully departs.
     void onLeave(int32_t nodeId) {
         members_.erase(nodeId);
+        controlledShutdownOffsets_.erase(nodeId);
     }
 
     // -----------------------------------------------------------------------

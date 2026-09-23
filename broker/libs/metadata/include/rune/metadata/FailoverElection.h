@@ -46,7 +46,12 @@ struct ElectionInputs {
     PartitionAssignment       cur;          ///< Current committed assignment.
     std::vector<int32_t>      liveNodes;    ///< Caller MUST supply eligibleNodes().
     ReplicaPositionTable*     positions;    ///< Soft position table (may be stale).
-    bool                      allowUnclean = false; ///< reserved; currently unused.
+    bool                      allowUnclean = false; ///< Per-topic unclean-election opt-in (Task 6).
+                                                   ///< When true and proposedIsr is empty, elect
+                                                   ///< the most-complete live replica, force
+                                                   ///< ISR={newLeader}, and set recovering=true.
+                                                   ///< Must remain false on controlled-shutdown
+                                                   ///< paths to preserve the never-unclean invariant.
 };
 
 // ---------------------------------------------------------------------------
