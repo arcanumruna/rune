@@ -22,6 +22,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/metadata/Gpid.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/MetadataMessages.h>
@@ -96,11 +97,11 @@ static TopicSpec makeSpec(std::string name, int32_t partCount, int32_t id)
     return ts;
 }
 
-// GPID scheme (must match ClientGateway.cpp).
-static constexpr int32_t kMaxGpidPartitions = 1024;
+// GPID helper — delegates to the single source of truth in Gpid.h.
+// Local alias `gpid` keeps the existing call sites unchanged.
 static int32_t gpid(int32_t topicId, int32_t partition)
 {
-    return topicId * kMaxGpidPartitions + partition;
+    return rune::metadata::gpidOf(topicId, partition);
 }
 
 static const std::string kNode1Endpoint = "aeron:udp?endpoint=node1:40200";

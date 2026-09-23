@@ -44,6 +44,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/metadata/Gpid.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/MetadataRecords.h>
@@ -69,8 +70,9 @@ namespace pmd = rune::protocol::metadata;
 // Constants
 // ===========================================================================
 
-// Must match NodeRuntimeAgent::doWork (MD1-9 RoutingImage build).
-static constexpr int32_t kMaxGpidPartitions = 1024;
+// kMaxGpidPartitions is imported from rune/metadata/Gpid.h (single source of truth).
+// Bring it into this TU's scope to avoid repeating the namespace qualifier.
+using rune::metadata::kMaxGpidPartitions;
 
 // Driver iteration cap — all waits are bounded here.
 static constexpr int kDriverCap = 2000;
@@ -529,9 +531,7 @@ TEST_F(MultiLeaderProduceFixture, ConcurrentMultiLeaderProduce_AllRecordsLand) {
     // ---- Build RoutingImage from committed AssignmentMap (same path as NodeRuntimeAgent) ----
     auto routingImg = rune::metadata::RoutingImage::buildFromMap(
         metaSvc1_->committedMap(),
-        [](int32_t topicId, int32_t partition) -> int32_t {
-            return topicId * kMaxGpidPartitions + partition;
-        });
+        rune::metadata::gpidOf);
     ASSERT_NE(routingImg, nullptr) << "RoutingImage must be buildable from committed map";
 
     // ---- Route each produce through the RoutingImage/gpid lookup ----
@@ -822,9 +822,7 @@ TEST_F(MultiLeaderProduceFixture, RoutingImage_GpidScheme_CorrectLeaderLookup) {
     // Build a RoutingImage from the committed assignment map (same as NodeRuntimeAgent).
     auto img = rune::metadata::RoutingImage::buildFromMap(
         metaSvc1_->committedMap(),
-        [](int32_t topicId, int32_t partition) -> int32_t {
-            return topicId * kMaxGpidPartitions + partition;
-        });
+        rune::metadata::gpidOf);
 
     ASSERT_NE(img, nullptr) << "RoutingImage must be buildable from committed map";
 

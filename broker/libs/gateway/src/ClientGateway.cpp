@@ -5,6 +5,7 @@
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/metadata/Gpid.h>
 // GroupCoordinationService.h is NOT included here (CG-4 fix: break rune_gateway→rune_node
 // symbol cycle).  ClientGateway dispatches group messages through IGroupRequestHandler
 // (defined in this lib); the concrete type lives in rune_node.
@@ -977,7 +978,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     // When routingImage_ is set, look up the global partition id for this
     // (topicId, partition) to determine the authoritative leader for this
-    // partition.  The GPID scheme: gpid = topicId * kMaxGpidPartitions + partition.
+    // partition.  The GPID scheme: gpid = gpidOf(topicId, partition).
     // This must match the scheme used by BrokerNode/MetadataService when building
     // the RoutingImage.
     //
@@ -990,8 +991,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // Capture the snapshot once (the shared_ptr was already stored in routingImage_
         // on the duty-cycle thread — no cross-thread atomic_load needed here).
         const rune::metadata::RoutingImage* img = routingImage_.get();
-        static constexpr int32_t kMaxGpidPartitions = 1024;
-        const int32_t gpid = msg.topicId * kMaxGpidPartitions + partition;
+        const int32_t gpid = rune::metadata::gpidOf(msg.topicId, partition);
         const auto& entry = img->lookup(gpid);
 
         if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
@@ -1545,8 +1545,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // Mirrors the produce path: capture-once discipline (routingImage_.get()).
     if (routingImage_) {
         const rune::metadata::RoutingImage* img = routingImage_.get();
-        static constexpr int32_t kMaxGpidPartitions = 1024;
-        const int32_t gpid = msg.topicId * kMaxGpidPartitions + partition;
+        const int32_t gpid = rune::metadata::gpidOf(msg.topicId, partition);
         const auto& entry = img->lookup(gpid);
 
         if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
@@ -2920,9 +2919,10 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     // Build PartitionEntry list from routingImage_.
     //
     // The GPID scheme used by BrokerNode/MetadataService:
-    //   gpid = topicId * kMaxGpidPartitions + partition
-    // We iterate all capacity slots and invert: topicId = gpid / kMaxGpidPartitions,
-    //                                            partition = gpid % kMaxGpidPartitions.
+    //   gpid = gpidOf(topicId, partition)  [= topicId * kMaxGpidPartitions + partition]
+    // We iterate all capacity slots and invert:
+    //   topicId   = gpid / kMaxGpidPartitions
+    //   partition = gpid % kMaxGpidPartitions
     //
     // If topicRegistry_ is set, we only include partitions whose topicId is in
     // range [0, topicRegistry_->topicCount()).  This prevents ghost partitions
@@ -2931,7 +2931,7 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     // If the request carries specific topicIds (topicIds non-empty), filter
     // to only those topics.
     // -----------------------------------------------------------------------
-    constexpr int32_t kMaxGpidPartitions = 1024;
+    using rune::metadata::kMaxGpidPartitions;
     std::vector<pc::PartitionEntry> parts;
 
     if (routingImage_) {

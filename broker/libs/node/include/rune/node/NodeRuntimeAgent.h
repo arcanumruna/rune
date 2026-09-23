@@ -39,6 +39,7 @@
 #include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/metadata/Gpid.h>
 
 #include <cstdint>
 #include <limits>
@@ -156,12 +157,9 @@ public:
             // The image is captured by the gateway's doWork on the SAME thread,
             // so there is no cross-thread race on routingImage_.
             if (gateway_) {
-                static constexpr int32_t kMaxGpidPartitions = 1024;
                 auto img = rune::metadata::RoutingImage::buildFromMap(
                     metadataService_->committedMap(),
-                    [](int32_t topicId, int32_t partition) -> int32_t {
-                        return topicId * kMaxGpidPartitions + partition;
-                    });
+                    rune::metadata::gpidOf);
                 gateway_->setRoutingImageSnapshot(std::move(img));
             }
         }
