@@ -15,6 +15,9 @@
 //   6. DoubleAssignFromRegistryIsStable — calling assignFromRegistry twice on
 //      the same pool yields stable ownership (no leak / duplication).
 //   7. ReconcileDetectsRegistryChange — reconcile re-derives after add().
+//   8. ReconcileHandlesSameCountAddRemove — generation-counter reconcile.
+//   9. WorkerDoWorkOnlyDrivesOwnedReplicas — carry (a): owned-only proof.
+//  10. ConcurrentDisjointWorkersAreRaceFree — TSan shared-nothing proof.
 // ---------------------------------------------------------------------------
 
 #include <rune/node/WorkerPool.h>
@@ -29,6 +32,7 @@
 
 #include <memory>
 #include <set>
+#include <thread>
 #include <vector>
 
 using rune::node::WorkerPool;
@@ -457,4 +461,139 @@ TEST(WorkerPool, ReconcileHandlesSameCountAddRemove) {
         totalOwned2 += pool.worker(w).ownedCount();
     EXPECT_EQ(totalOwned2, totalOwned)
         << "reconcile must be a no-op when generation is unchanged";
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: WorkerDoWorkOnlyDrivesOwnedReplicas (carry a) — owned-only proof.
+//
+// Build a two-worker pool where worker 0 owns ALL replicas and worker 1 owns
+// NONE. Drive worker 1's doWork and verify it returns 0 (no replicas driven).
+// Drive worker 0's doWork and verify it returns > 0 (fresh-leader ISR check
+// fires on the first duty tick, incrementing work by 1 per owned replica).
+// This observably proves that each Worker drives ONLY its own owned set.
+//
+// Note: disk-backed drain-branch coverage (carry b) is not included here
+// because constructing a disk-backed PartitionReplica requires a real on-disk
+// Log directory (rune::storage::Log), which is out of scope for a unit test
+// using existing helpers. The InMemoryLog::isDiskBacked() always returns false
+// so the Worker::doWork Step 6.5 drain branch is not reachable in this suite
+// without new production seams. Skipped per brief instructions.
+// ---------------------------------------------------------------------------
+TEST(WorkerPool, WorkerDoWorkOnlyDrivesOwnedReplicas) {
+    // Two replicas on topic 0, partitions 0 and 1.
+    std::vector<std::unique_ptr<InMemoryLog>>   logs;
+    std::vector<std::unique_ptr<NullTransport>> transports;
+
+    auto mk = [&](int32_t topicId, int32_t partition) -> std::unique_ptr<PartitionReplica> {
+        logs.push_back(std::make_unique<InMemoryLog>(1024 * 1024, 1000));
+        transports.push_back(std::make_unique<NullTransport>());
+        PartitionConfig cfg{};
+        cfg.topicId     = topicId;
+        cfg.partitionId = static_cast<rune::replication::PartitionId>(partition);
+        cfg.selfId      = 1;
+        cfg.minIsr      = 1;
+        return std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            logs.back().get(), transports.back().get());
+    };
+
+    // Build standalone replicas (not via registry) so we control assignment.
+    auto r0 = mk(0, 0);
+    auto r1 = mk(0, 1);
+
+    // Two-worker pool; manually assign ALL replicas to worker 0, none to worker 1.
+    ShardRouter router(2);
+    WorkerPool  pool(2, router);
+    pool.worker(0).ownReplica(r0.get());
+    pool.worker(0).ownReplica(r1.get());
+    // worker 1 owns nothing.
+
+    ASSERT_EQ(pool.worker(0).ownedCount(), static_cast<std::size_t>(2));
+    ASSERT_EQ(pool.worker(1).ownedCount(), static_cast<std::size_t>(0));
+
+    // Worker 1 doWork must return 0 — it has no replicas to drive.
+    // Use nowNs beyond the 10ms ISR-check interval so Leader ticks fire.
+    const int64_t nowNs = 20'000'000LL;  // 20ms > isrCheckIntervalNs default (10ms)
+    const int w1Work = pool.worker(1).doWork(nowNs);
+    EXPECT_EQ(w1Work, 0) << "empty worker must report 0 work";
+
+    // Worker 0 doWork must return > 0 — two fresh Leader replicas each fire
+    // their first ISR-check cycle (increments work by at least 1 per replica).
+    const int w0Work = pool.worker(0).doWork(nowNs);
+    EXPECT_GT(w0Work, 0) << "worker owning two Leader replicas must report >0 work on first tick";
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: ConcurrentDisjointWorkersAreRaceFree — TSan shared-nothing proof.
+//
+// Assign a multi-topic / multi-partition registry to a WorkerPool(4), then
+// drive each Worker::doWork on a SEPARATE std::thread concurrently (~100
+// iterations each). The real assertion is TSan reporting ZERO data races:
+// because each worker owns a DISJOINT replica set, concurrent doWork calls
+// are shared-nothing and must be race-free.
+//
+// If TSan reports a race it means ownership is NOT disjoint (a shard mapped to
+// two workers, or replicas sharing state) — the defect must be fixed at the
+// source (Task 1/3 assignment), NOT suppressed.
+// ---------------------------------------------------------------------------
+TEST(WorkerPool, ConcurrentDisjointWorkersAreRaceFree) {
+    // Keep logs + transports alive for the test's duration.
+    std::vector<std::unique_ptr<InMemoryLog>>   logs;
+    std::vector<std::unique_ptr<NullTransport>> transports;
+
+    auto mk = [&](int32_t topicId, int32_t partition) -> std::unique_ptr<PartitionReplica> {
+        logs.push_back(std::make_unique<InMemoryLog>(1024 * 1024, 1000));
+        transports.push_back(std::make_unique<NullTransport>());
+        PartitionConfig cfg{};
+        cfg.topicId     = topicId;
+        cfg.partitionId = static_cast<rune::replication::PartitionId>(partition);
+        cfg.selfId      = 1;
+        cfg.minIsr      = 1;
+        return std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            logs.back().get(), transports.back().get());
+    };
+
+    // Two topics × four partitions = 8 replicas total.
+    ReplicaRegistry reg;
+    for (int32_t t = 0; t < 2; ++t)
+        for (int32_t p = 0; p < 4; ++p)
+            reg.add(t, p, mk(t, p));
+
+    // Four workers; route by partitionId ordinal (ShardRouter default).
+    ShardRouter router(4);
+    WorkerPool  pool(4, router);
+    pool.assignFromRegistry(reg);
+
+    // Verify baseline: every replica is owned by exactly one worker.
+    for (auto* r : reg.allReplicas()) {
+        int owners = 0;
+        for (int32_t w = 0; w < pool.workerCount(); ++w) {
+            if (pool.worker(w).owns(r)) ++owners;
+        }
+        ASSERT_EQ(owners, 1) << "pre-concurrent: replica must be owned by exactly one worker";
+    }
+
+    // Drive every worker concurrently — disjoint ownership => race-free.
+    // TSan is the real assertion: it instruments each memory access and will
+    // report a data race if two threads touch the same memory unsynchronised.
+    std::vector<std::thread> ths;
+    ths.reserve(static_cast<std::size_t>(pool.workerCount()));
+    for (int32_t w = 0; w < pool.workerCount(); ++w) {
+        ths.emplace_back([&pool, w] {
+            for (int i = 0; i < 100; ++i) {
+                pool.worker(w).doWork(static_cast<int64_t>(i) * 1'000'000);
+            }
+        });
+    }
+    for (auto& th : ths) th.join();
+
+    // If we reach here without a crash or TSan report, shared-nothing is proven.
+    SUCCEED();
 }
