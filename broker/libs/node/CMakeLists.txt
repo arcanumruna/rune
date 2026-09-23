@@ -35,10 +35,16 @@ if(BUILD_TESTING)
     # the Aeron-based node test targets so `ctest` runs are clean while rune-side
     # races still fail. See cmake/tsan-aeron.supp for the exact (aeron::-only)
     # signatures — no rune symbol is suppressed.
+    #
+    # NOTE: CTest ENVIRONMENT *replaces* TSAN_OPTIONS (it does not merge), so we
+    # fold in halt_on_error=1 here to match the Milestone-E1 plan's prescription
+    # (stop at the first real race). Without this, these targets would fall back
+    # to TSan's default halt_on_error=0 (races still reported + non-zero exit, but
+    # not stopped at first). A real rune-side race still fails the build either way.
     set(RUNE_TSAN_AERON_SUPP
         "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
     set(RUNE_AERON_TSAN_ENV
-        "TSAN_OPTIONS=suppressions=${RUNE_TSAN_AERON_SUPP}")
+        "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
     # Unit tests (NodeConfig only — no Aeron driver)
     add_executable(rune_node_tests
