@@ -81,6 +81,9 @@ public:
     // Pre-reserve capacity for the durablePending_ vector (no alloc on hot path).
     static constexpr std::size_t kDurablePendingReserve = 1024;
 
+    // Pre-reserve capacity for the per-cycle dirty-log set (dedup, small).
+    static constexpr std::size_t kDirtySetReserve = 64;
+
     // ringCapacity: per-worker ingress/return SPSC ring slots — NodeConfig
     // configurable (workerRingCapacity). Default kRingCapacity for tests/back-compat.
     explicit Worker(int32_t workerId,
@@ -93,6 +96,7 @@ public:
         , io_(ioSubmitDepth, ioComplDepth)
     {
         durablePending_.reserve(kDurablePendingReserve);
+        dirtyThisCycle_.reserve(kDirtySetReserve);
     }
 
     // Non-copyable and non-movable (std::atomic<OwnedSet*> + SpscRing are not
@@ -147,6 +151,16 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // E3 Task 5: test accessor — cumulative count of successful io_.submit calls
+    // in submitCoalescedFlushes_().  Used by the GroupCommit test to assert
+    // that 8 produces to one partition produce exactly 1 submit per cycle.
+    // Worker-thread only; call only from single-threaded tests.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] uint64_t ioSubmitCountForTest() const noexcept {
+        return io_submitCount_;
+    }
+
+    // -----------------------------------------------------------------------
     // rune::consensus::Agent interface
     // -----------------------------------------------------------------------
 
@@ -171,7 +185,13 @@ public:
 
         // Step 0: drain ingress ring (E2 inc2a). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
+        // Strict-tier produces record their log in dirtyThisCycle_ (token=0).
         work += static_cast<int>(drainIngress_());
+
+        // Step E3 coalesce: after all this-cycle produces are appended, submit
+        // ONE fsync per dirty log and stamp the completion token onto every pending
+        // entry for that log.  submitCoalescedFlushes_ clears dirtyThisCycle_.
+        work += submitCoalescedFlushes_();
 
         // Shared-nothing: owned_ is a plain member touched only by this thread.
         // Step 5: per-replica ISR checks / follower fetch emission.
@@ -194,6 +214,65 @@ public:
 
 private:
     // -----------------------------------------------------------------------
+    // submitCoalescedFlushes_ — group-commit: submit ONE fsync per dirty log.
+    //
+    // Called from doWork AFTER drainIngress_ (so all this-cycle appends are
+    // recorded) and BEFORE the per-replica doWork loop.
+    //
+    // For each log in dirtyThisCycle_:
+    //   - Call io_.submit(log->activeSegmentFd(), log->flushBoundary()).
+    //   - If submit returns kNoToken (ring full — back-pressure): for every
+    //     durablePending_ entry with token==0 && logPtr==log, immediately
+    //     return Internal (6) and erase the entry.  Never drop; never false-OK.
+    //   - If submit succeeds: stamp the returned token onto every pending entry
+    //     with token==0 && logPtr==log (the completion covers all of them).
+    //
+    // dirtyThisCycle_ is cleared at the end.  Returns work units done.
+    // -----------------------------------------------------------------------
+    int submitCoalescedFlushes_() {
+        if (dirtyThisCycle_.empty()) return 0;
+
+        int work = 0;
+        for (rune::storage::Log* log : dirtyThisCycle_) {
+            CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
+            if (t == kNoToken) {
+                // Submit ring full — back-pressure: ack all pending entries for
+                // this log with Internal error immediately.  Never drop; never
+                // silently hold forever.
+                spdlog::warn("Worker {}: submitCoalescedFlushes_ ring full for log@{}; "
+                             "back-pressure: acking pending entries Internal",
+                             workerId_, static_cast<const void*>(log));
+                for (std::size_t i = 0; i < durablePending_.size(); ) {
+                    auto& entry = durablePending_[i];
+                    if (entry.token == kNoToken && entry.logPtr == log) {
+                        entry.ret.errorCode = static_cast<int16_t>(6); // Internal
+                        ret_.tryEnqueue(std::move(entry.ret));
+                        // O(1) erase by swap-with-back.
+                        durablePending_[i] = std::move(durablePending_.back());
+                        durablePending_.pop_back();
+                        ++work;
+                        // Do NOT advance i — the swapped entry must be checked.
+                    } else {
+                        ++i;
+                    }
+                }
+            } else {
+                // Successful submit: stamp the token onto every pending entry
+                // for this log (all appends this cycle share one fsync token).
+                for (auto& entry : durablePending_) {
+                    if (entry.token == kNoToken && entry.logPtr == log) {
+                        entry.token = t;
+                    }
+                }
+                ++io_submitCount_;
+                ++work;
+            }
+        }
+        dirtyThisCycle_.clear();
+        return work;
+    }
+
+    // -----------------------------------------------------------------------
     // reapDurableCompletions_ — drain IoBackend completions and fire the
     // deferred acks for completed Strict-tier produces.
     //
@@ -214,10 +293,14 @@ private:
 
         int fired = 0;
         io_.reap([&](const FlushCompletion& c) {
-            // Find every pending entry matching this completion token and fire it.
+            // Group-commit semantics: a completion with token T and flushBoundary B
+            // covers EVERY pending entry with the same token whose lastOffset <= B.
+            // Entries with token==0 (not yet submitted) are never matched here.
             for (std::size_t i = 0; i < durablePending_.size(); ) {
                 auto& entry = durablePending_[i];
-                if (entry.token == c.token) {
+                if (entry.token != 0 &&
+                    entry.token == c.token &&
+                    entry.lastOffset <= c.flushBoundary) {
                     if (c.errorCode != 0) {
                         // fsync failure: ack with a non-OK error code — never ack OK.
                         spdlog::error("Worker {}: IoBackend fsync completion error={} "
@@ -364,24 +447,26 @@ private:
             op.replica->onLeaderLogAppended();
         }
 
-        // E3: Strict durability tier — defer ack until fsync completion is reaped.
+        // E3 Task 5: Strict durability tier — defer ack until fsync completion is reaped.
         // Only applicable to disk-backed logs (memory logs have no fd to fsync).
+        //
+        // Group-commit coalescing: we do NOT submit the fsync here.  Instead we
+        // push a DurablePending entry with token=0 (un-flushed-yet) and record the
+        // log in dirtyThisCycle_ (dedup — only if not already present this cycle).
+        // After ALL this-cycle produces are appended (drainIngress_ returns),
+        // submitCoalescedFlushes_() submits ONE io_.submit per dirty log and stamps
+        // the resulting token onto every pending entry for that log.
         if (op.durabilityTier == 2 && log->isDiskBacked()) {
-            CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
-            if (t == kNoToken) {
-                // Submit ring full — back-pressure: return Internal error immediately
-                // so the client can retry.  Never drop; never ack OK.
-                spdlog::warn("Worker {}: io_.submit ring full for topicId={} partition={}; "
-                             "returning Internal (back-pressure)",
-                             workerId_, op.topicId, op.partition);
-                ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
-                ret_.tryEnqueue(std::move(ret));
-            } else {
-                // Defer the ack — push into pending list, not into ret_.
-                // The ack will be enqueued when reapDurableCompletions_ fires.
-                ret.errorCode = 0; // tentatively OK; will be updated on completion
-                durablePending_.push_back({t, ret.lastOffset, std::move(ret)});
+            ret.errorCode = 0; // tentatively OK; updated in submitCoalescedFlushes_ or on completion
+            // token=0 means "not yet submitted" — reapDurableCompletions_ will never fire this.
+            durablePending_.push_back({kNoToken, ret.lastOffset, log, std::move(ret)});
+
+            // Record this log as dirty for this cycle (dedup).
+            bool found = false;
+            for (auto* dl : dirtyThisCycle_) {
+                if (dl == log) { found = true; break; }
             }
+            if (!found) dirtyThisCycle_.push_back(log);
             return;
         }
 
@@ -558,16 +643,32 @@ private:
     IoBackend io_;
 
     // E3: deferred Strict-tier produce acks waiting for fsync completion.
-    // Each entry holds the CompletionToken from io_.submit(), the lastOffset
-    // of the append (for logging/diagnostics), and the fully-built WorkerReturn
-    // that will be enqueued once the completion is reaped.
+    //
+    // token: 0 (kNoToken) means "appended but not yet submitted to IoBackend" —
+    //   submitCoalescedFlushes_() assigns the real token after drainIngress_.
+    //   reapDurableCompletions_() skips token==0 entries (not yet flushed).
+    // logPtr: the disk Log this entry was appended to (used by
+    //   submitCoalescedFlushes_ to match the dirty-log set and stamp tokens).
+    // lastOffset: the log offset after this append.  A group-commit completion
+    //   with flushBoundary B fires every pending entry with lastOffset <= B.
+    //
     // Worker-thread only — plain vector, no atomics needed.
     struct DurablePending {
-        CompletionToken token      = 0;
-        int64_t         lastOffset = 0;
-        WorkerReturn    ret;
+        CompletionToken         token      = 0;      ///< 0 = not yet submitted
+        int64_t                 lastOffset = 0;
+        rune::storage::Log*     logPtr     = nullptr; ///< which log (for coalescing)
+        WorkerReturn            ret;
     };
     std::vector<DurablePending> durablePending_;
+
+    // E3 Task 5: per-cycle set of logs that have had at least one Strict-tier
+    // append this cycle.  submitCoalescedFlushes_ drains this and submits one
+    // io_.submit per log.  Worker-thread only — plain vector, reserved in ctor.
+    std::vector<rune::storage::Log*> dirtyThisCycle_;
+
+    // E3 Task 5: cumulative count of successful io_.submit calls in
+    // submitCoalescedFlushes_.  Used by tests (ioSubmitCountForTest()).
+    uint64_t io_submitCount_ = 0;
 };
 
 } // namespace rune::node

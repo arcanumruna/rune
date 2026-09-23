@@ -480,6 +480,8 @@ void BrokerNode::buildReplication() {
             // Task M1 / precondition #1: forward parsed durability into PartitionConfig.
             // 0 = Majority (default), 1 = AllInSync.
             pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec->durability);
+            // E3 Task 5: forward async-durability tier (0=Leader, 1=Majority, 2=Strict).
+            pcfg.durabilityTier = spec->durabilityTier;
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).

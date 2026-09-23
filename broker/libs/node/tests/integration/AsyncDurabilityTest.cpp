@@ -266,51 +266,164 @@ TEST(AsyncDurability, FlushFailureErrorsTheAckNeverOK) {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: Submit ring full returns Internal (back-pressure), never false OK.
+// Test 4: Group-commit coalescing — N Strict produces in one cycle share ONE fsync.
 //
-// Use a Worker with a tiny IoBackend submit ring (depth=2) and flood it
-// with Strict-tier produces WITHOUT draining completions.
-// At least one produce must come back with a non-OK errorCode.
+// Enqueue 8 Strict-tier produces to the SAME partition and run exactly ONE
+// doWork cycle.  submitCoalescedFlushes_ must submit exactly ONE io_.submit
+// (one fsync covers all 8 appends).  After the flush completes, all 8 produces
+// must be acked OK.
 // ---------------------------------------------------------------------------
-TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
-    // Tiny IoBackend depths so the submit ring fills quickly.
-    // We need more than depth produces queued before the flusher drains them.
-    WorkerHarness h(/*ioSubmitDepth=*/2, /*ioComplDepth=*/2);
+TEST(AsyncDurability, GroupCommitCoalescesManyProducesIntoOneFlush) {
+    WorkerHarness h;
 
-    // Enqueue many Strict-tier produces (each appends + submits one flush).
-    // With depth=2 the submit ring can only hold 2 pending flushes; any beyond
-    // that should return kNoToken and the worker sends Internal immediately.
-    const int kProduces = 10;
+    // Enqueue 8 Strict-tier produces to the same partition (1 record each).
+    const int kProduces = 8;
     for (int i = 0; i < kProduces; ++i) {
         h.enqueueProduce(/*tier=*/2, /*numRecords=*/1,
                          /*sessionId=*/static_cast<int64_t>(i + 1),
                          /*correlationId=*/static_cast<int64_t>(i + 1));
     }
 
-    // One doWork cycle processes all enqueued ops.
+    // ONE doWork cycle: drainIngress_ appends all 8; submitCoalescedFlushes_
+    // must submit exactly ONE flush (one dirty log, deduped).
     h.worker->doWork(/*nowNs=*/1);
 
-    // Drain immediately — back-pressure acks (Internal) fire synchronously
-    // during the doWork call above (ring full → immediate enqueue to ret_).
+    // Assert exactly ONE io_.submit was issued (group-commit invariant).
+    EXPECT_EQ(h.worker->ioSubmitCountForTest(), 1u)
+        << "8 Strict produces to the same partition in one cycle must yield exactly 1 io_.submit";
+
+    // No acks yet — the flusher has not completed yet (we just called doWork once
+    // with no spin; the PortableFlushBackend flusher is async).
+    // Spin doWork until all 8 acks drain.
+    int acks = 0;
+    for (int i = 0; i < 2'000'000 && acks < kProduces; ++i) {
+        h.worker->doWork(static_cast<int64_t>(i + 2));
+        acks += h.drainReturns();
+    }
+
+    EXPECT_EQ(acks, kProduces)
+        << "All 8 produces must be acked after the single flush completes";
+    EXPECT_EQ(h.lastReturn.errorCode, 0)
+        << "All produces must be acked OK (not an error)";
+    // io_submitCount must still be exactly 1 — no additional submits from reap.
+    EXPECT_EQ(h.worker->ioSubmitCountForTest(), 1u)
+        << "io_submitCount must not increase during reap spin";
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: Submit ring full returns Internal (back-pressure), never false OK.
+//
+// With group-commit coalescing, back-pressure fires when the number of dirty
+// logs in one doWork cycle exceeds the submit ring depth.
+//
+// Setup: worker owns THREE disk-backed replicas (3 different logs) and the
+// submit ring has depth=2 (minimum power-of-two that is valid, holds 2 items).
+// One doWork cycle with one Strict-tier produce per partition → 3 dirty logs →
+// 3 submits attempted → the 3rd returns kNoToken → produces for log-3 are acked
+// Internal immediately (never dropped, never silently held).
+// ---------------------------------------------------------------------------
+
+// Helper: build a WorkerOp for a partition other than partition-0.
+static WorkerOp makeProduceOp(int32_t topicId, int32_t partition,
+                               PartitionReplica* replica, Log* log,
+                               int64_t sessionId, int64_t correlationId) {
+    auto batch = makeBatch(1);
+    int32_t lod = 0;
+    if (batch.size() >= 27u) {
+        lod = static_cast<int32_t>(
+            static_cast<uint32_t>(batch[23]) |
+            (static_cast<uint32_t>(batch[24]) << 8) |
+            (static_cast<uint32_t>(batch[25]) << 16) |
+            (static_cast<uint32_t>(batch[26]) << 24));
+    }
+    WorkerOp op;
+    op.type             = WorkerOp::Type::Produce;
+    op.topicId          = topicId;
+    op.partition        = partition;
+    op.replica          = replica;
+    op.logPtr           = log;
+    op.sessionId        = sessionId;
+    op.correlationId    = correlationId;
+    op.lastOffsetDelta  = lod;
+    op.recordCount      = 1;
+    op.durabilityTier   = 2;  // Strict
+    op.recordBatchBytes = std::move(batch);
+    return op;
+}
+
+TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
+    // Submit ring depth=2: holds exactly 2 in-flight submits.
+    // With 3 dirty logs in one cycle the 3rd submit returns kNoToken.
+    WorkerHarness h(/*ioSubmitDepth=*/2, /*ioComplDepth=*/4);
+
+    // Build two additional disk-backed replicas (partitions 1 and 2).
+    struct ExtraReplica {
+        fs::path                          dir;
+        std::unique_ptr<Log>              log;
+        NullTransport                     transport;
+        std::unique_ptr<PartitionReplica> replica;
+    };
+    std::vector<ExtraReplica> extras(2);
+    for (int p = 0; p < 2; ++p) {
+        auto& e = extras[p];
+        e.dir = makeTempDir("async_dur_bp");
+        e.log = std::make_unique<Log>(e.dir.string(), 64LL * 1024 * 1024);
+        e.log->recover();
+        PartitionConfig cfg{};
+        cfg.topicId             = 1;
+        cfg.partitionId         = static_cast<int32_t>(p + 1);
+        cfg.selfId              = 1;
+        cfg.minIsr              = 1;
+        cfg.replicaLagMaxMs     = 10'000;
+        cfg.replicaLagMaxOffset = 10'000;
+        cfg.fetchIntervalNs     = 1'000'000LL;
+        cfg.isrCheckIntervalNs  = 1'000'000LL;
+        cfg.maxFetchBytes       = 1 << 20;
+        cfg.pushOnAppend        = false;
+        e.replica = std::make_unique<PartitionReplica>(
+            cfg, rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            e.log.get(), &e.transport);
+    }
+
+    // Give the worker all three replicas.
+    h.worker->setOwnedDirect(Worker::OwnedSet{
+        h.replica.get(),
+        extras[0].replica.get(),
+        extras[1].replica.get()
+    });
+
+    // Enqueue one Strict-tier produce for each of the 3 partitions (3 dirty logs).
+    h.enqueueProduce(/*tier=*/2, /*numRecords=*/1, /*sessionId=*/1, /*correlationId=*/1);
+    ASSERT_TRUE(h.worker->tryEnqueueOp(
+        makeProduceOp(1, 1, extras[0].replica.get(), extras[0].log.get(), 2, 2)));
+    ASSERT_TRUE(h.worker->tryEnqueueOp(
+        makeProduceOp(1, 2, extras[1].replica.get(), extras[1].log.get(), 3, 3)));
+
+    // One doWork cycle: all 3 produces appended, submitCoalescedFlushes_ attempts
+    // 3 submits but depth=2 → the 3rd returns kNoToken → back-pressure.
+    h.worker->doWork(/*nowNs=*/1);
+
+    // Collect acks synchronously (back-pressure acks fired during doWork).
     int returned = 0;
     bool sawNonOk = false;
     auto drainFn = [&](WorkerReturn ret) {
         ++returned;
         if (ret.errorCode != 0) sawNonOk = true;
     };
-
     h.worker->drainReturn(drainFn);
 
-    // Spin for the remaining deferred OK acks (from flushes that succeeded).
-    for (int i = 0; i < 2'000'000 && returned < kProduces; ++i) {
+    // Spin for the remaining deferred acks (the two that flushed successfully).
+    const int kTotal = 3;
+    for (int i = 0; i < 2'000'000 && returned < kTotal; ++i) {
         h.worker->doWork(static_cast<int64_t>(i + 2));
         h.worker->drainReturn(drainFn);
     }
 
-    EXPECT_EQ(returned, kProduces)
-        << "All produces must be acked (either OK after flush or Internal back-pressure) — "
-           "never silently dropped";
+    EXPECT_EQ(returned, kTotal)
+        << "All 3 produces must be acked (2 OK after flush, 1 Internal back-pressure)";
     EXPECT_TRUE(sawNonOk)
-        << "With submit ring depth=2 and " << kProduces << " Strict produces, "
-           "at least one must be back-pressured (Internal)";
+        << "With submit ring depth=2 and 3 dirty logs in one cycle, "
+           "the 3rd submit must be back-pressured (Internal)";
 }

@@ -1449,6 +1449,10 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.recordCount   = recordCount;
         op.deferAck      = acksAll && replica && committedMetadataReady_;
         op.enqueuedAtNs  = nowNs_;
+        // E3 Task 5: plumb the topic's async-durability tier so the worker
+        // knows whether to defer the ack until fsync completion (Strict=2).
+        // Majority (1) is the default — keeps existing behavior unchanged.
+        op.durabilityTier = replica ? replica->durabilityTier() : 1;
 
         // Capture batch attributes for LSO tracking (forwarded in return).
         constexpr std::size_t kAttrOffset =

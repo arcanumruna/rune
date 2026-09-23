@@ -128,6 +128,9 @@ struct PartitionConfig {
     int64_t     logStartOffset         = 0;           ///< CP-9: lower bound; segs entirely below here are deleted. 0=disabled.
     DurabilityMode durability = DurabilityMode::Majority; ///< per-topic durability quorum rule.
     // When AllInSync, minIsr is forced to the replica-set size (RF) so acks require every replica.
+    // E3 Task 5: async-durability tier (0=Leader, 1=Majority, 2=Strict).
+    // Strict (2) = ack only after local fsync completion; others ack on append.
+    uint8_t durabilityTier = 1;  // default Majority — parity-safe (existing tests unchanged)
 };
 
 // ---------------------------------------------------------------------------
@@ -486,6 +489,9 @@ public:
 
     /// The durability mode configured for this partition (Task M1).
     [[nodiscard]] DurabilityMode durability() const noexcept { return cfg_.durability; }
+
+    /// E3 Task 5: async-durability tier (0=Leader, 1=Majority, 2=Strict).
+    [[nodiscard]] uint8_t durabilityTier() const noexcept { return cfg_.durabilityTier; }
 
     /// ISR as seen by the leader (empty for follower).
     [[nodiscard]] const std::vector<NodeId>& isr() const noexcept;
