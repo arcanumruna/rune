@@ -59,6 +59,34 @@
 - [ ] **TSan**: `build-tsan` + `ctest -j1` with `TSAN_OPTIONS="suppressions=$(pwd)/cmake/tsan-aeron.supp halt_on_error=1"` on Worker/WorkerPool/BrokerNode/AsyncDurability/GatewayReplicationWiring — ZERO races.
 - [ ] Commit: `refactor(rings): flush rings→agrona OneToOne; remove hand-rolled SpscRing; TSan clean`.
 
+## Task R5: End-to-end back-pressure audit + spec-conformance + test coverage (MILESTONE GATE — runs LAST)
+
+**Runs after R1–R4 AND E3 Task 8 (io_uring) + Task 9 (wiring)** — it audits the FINAL state of every ring and the whole client path. This is an audit + documentation + test-gap-closure task, not a feature.
+
+**Scope — every ring in the broker + the client-facing path:**
+| Ring | Producer(s) | Consumer | Data class | Full-policy contract |
+|---|---|---|---|---|
+| worker ingress (OneToOne) | control (gateway/transport/bridge/pool) | owning worker | produce=commit-critical; applyReplicated/role/ownership=retriable | `tryEnqueueOp` false → hold, do NOT ack, client retries |
+| worker return (OneToOne) | worker | control/gateway | ack/read-result | full → retry next cycle; ack not lost |
+| IoBackend submit (OneToOne) | worker | flusher/io_uring | strict-produce durability | `kNoToken` → Internal/try-again, never false-OK |
+| IoBackend completion (OneToOne) | flusher/io_uring | worker | completion tokens | flusher spins on full (off worker path) |
+| transport outbound (ManyToOne→per-worker OneToOne follow-up) | workers | control | replication (retriable) | full → skip+retry (observed), never silent |
+| consensus ingress (ManyToOne) | network | consensus agent | consensus frames | faithful-Aeron |
+| Log cleaner swap/delete/staging (SPSC) | cleaner thread | owner | compaction results | full → don't advance watermark, retry idempotently |
+| InMemoryLog (per-partition byte buffer) | owning worker | (storage) | memory-topic data | DropOldest (default) or BackPressure (opt-in) |
+
+- [ ] **A. Audit + document.** Produce `docs/superpowers/back-pressure-workflow.md`: for EACH ring above — producer/consumer, capacity + NodeConfig knob, exact full-policy, data class (retriable vs commit-critical), and how a full condition PROPAGATES outward. Cross-check every entry against the code AND the specs: [[rune-shared-nothing-law]] back-pressure rules (never silently drop correctness-critical data; commit-critical MUST back-pressure the source; never block), the thread-per-core spec (`docs/superpowers/specs/2026-09-23-rune-thread-per-core-runtime-design.md` §"Back-pressure, not blocking"), and the client wire-protocol spec (find it under `libs/protocol` / docs). List any DIVERGENCE between code and spec as a finding.
+- [ ] **B. Client's perspective.** Trace + document what a client actually experiences under each back-pressure condition: produce to a full worker ring / full IoBackend submit / full log → is it an explicit error code, a throttle/try-again signal, or a silent no-ack→timeout→retry? Compare to what the protocol SHOULD do (does the ProduceResponse carry a retriable/throttle code? is there a Kafka-style `throttle_time_ms`?). If the current behavior is "no-ack → client timeout," record whether the spec wants an explicit try-again/throttle response and file it as a finding (fix if small; else ticket it).
+- [ ] **C. Close test-coverage gaps (e2e + integration).** For EACH behaviour in the table, ensure a test exists and asserts it; ADD the missing ones. Minimum set:
+  - worker ingress full → produce NOT acked (or try-again), client retries, NO data loss / NO false-OK.
+  - IoBackend submit full → strict produce back-pressured (Internal/try-again), never false-durable-ack (extend AsyncDurabilityTest).
+  - transport outbound full → replication skip+retry converges (no committed loss) — extend a GatewayReplicationWiring/DR test.
+  - InMemoryLog BackPressure mode full → memory-topic produce back-pressured; DropOldest mode → oldest evicted (both already unit-tested in InMemoryLogRing; add an integration-level memory-topic produce-under-pressure test).
+  - worker return full → ack delivered eventually, not dropped.
+  - an **e2e** test (real BrokerNode + client/session) that drives a producer hard enough to hit worker-ingress back-pressure and asserts the client-observable contract (retry-and-succeed, no loss, no dup beyond idempotent-producer guarantees).
+  Label any behaviour that is genuinely untestable in-process and say why.
+- [ ] **D.** Commit: `test(back-pressure): e2e+integration coverage for all ring full-policies + workflow doc`. Update the ledger with the findings list (spec divergences) and any follow-up tickets.
+
 ## Self-Review
 - Every cross-thread ring (worker ingress, worker return, flush submit, flush completion) → agrona OneToOne. ✅
 - No cooked objects / no heap in any ring slot (flat header + inline tail). ✅
