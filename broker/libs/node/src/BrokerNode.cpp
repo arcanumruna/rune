@@ -1255,6 +1255,7 @@ void BrokerNode::stop() {
     offsetLog_.reset();       // Log for __consumer_offsets (file flush on dtor)
     replBridge_.reset();      // ReplicationMetadataBridge (no Aeron resources)
     replicaRegistry_.reset(); // PartitionReplicas + offsetReplica (destroyed before transport)
+    memoryLogs_.clear();      // InMemoryLogs outlive replicas — clear after replicaRegistry_ on stop() path
     replTransport_.reset();   // AeronPartitionTransport: deregisters replication Subscription + ExclusivePubs
     nullTransports_.clear();  // Per-replica no-op transports (no Aeron resources)
     topicRegistry_.reset();   // TopicRegistry: Logs are files (flushed/synced by Log dtor)

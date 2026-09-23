@@ -188,8 +188,11 @@ public:
         // Transition to follower under the current epoch.
         replica->becomeFollower(meta_.leaderEpoch, meta_.leader);
 
-        // Bootstrap from recorded log via replay.
-        if (store != nullptr) {
+        // Bootstrap from recorded log via replay — disk-backed partitions only.
+        // Memory-backed partitions (test/in-memory replicas) skip replay: calling
+        // replica->log() on a memory-backed partition asserts isDiskBacked().
+        if (store != nullptr &&
+            replica->ilog() && replica->ilog()->isDiskBacked()) {
             PartitionReplay replay(store);
             Offset leaderLeo = leaderReplica->logEndOffset();
             replay.replayIntoLog(*replica->log(), 0, leaderLeo);
@@ -425,9 +428,15 @@ public:
     // -----------------------------------------------------------------------
 
     /// Return the log of a registered replica (for test inspection).
+    /// Returns nullptr for memory-backed replicas (isDiskBacked() == false) to
+    /// avoid the disk-backed assert inside PartitionReplica::log().
     [[nodiscard]] rune::storage::Log* logOf(NodeId nodeId) const noexcept {
         for (const auto& e : entries_) {
             if (e.nodeId == nodeId && e.replica != nullptr) {
+                // Guard: only access log() on disk-backed replicas.
+                if (!e.replica->ilog() || !e.replica->ilog()->isDiskBacked()) {
+                    return nullptr;
+                }
                 return e.replica->log();
             }
         }

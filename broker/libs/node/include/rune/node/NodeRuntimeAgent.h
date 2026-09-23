@@ -312,7 +312,11 @@ public:
 
             const auto policy = replica->cleanupPolicy();
 
-            // 3. Need a log.
+            // 3. Need a disk-backed log — skip memory-backed partitions (e.g.
+            //    test-only InMemoryLog replicas).  Calling replica->log() on a
+            //    memory-backed partition asserts isDiskBacked(); guard here so
+            //    the invariant holds universally (precondition #2 completeness).
+            if (!replica->ilog() || !replica->ilog()->isDiskBacked()) continue;
             rune::storage::Log* log = replica->log();
             if (!log) continue;
 

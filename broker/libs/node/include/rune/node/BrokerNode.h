@@ -260,16 +260,21 @@ private:
     // Destruction order in stop() (reverse of construction):
     //   runtimeAgent_ → gateway_ → replicaRegistry_ → replTransport_
     //   → replBridge_ → topicRegistry_
+    //
+    // memoryLogs_ is declared BEFORE replicaRegistry_ so that in the implicit
+    // destructor (members destroyed in reverse declaration order) the replicas
+    // are destroyed BEFORE the InMemoryLog instances they point at, preventing
+    // dangling-ILog* accesses on the destructor-only teardown path.
     // -----------------------------------------------------------------------
+    // InMemoryLog instances for memory-backed user-topic partitions (Task M1).
+    // Owned here so their lifetime exceeds replicaRegistry_ (see ordering note).
+    std::vector<std::unique_ptr<rune::storage::InMemoryLog>> memoryLogs_;
     std::unique_ptr<ReplicaRegistry>                        replicaRegistry_;
     std::unique_ptr<rune::replication::AeronPartitionTransport> replTransport_;
     std::unique_ptr<ReplicationMetadataBridge>              replBridge_;
     // Per-replica no-op InMemoryTransport instances used when replTransport_ is null.
     // Prevents PartitionReplica assert(transport!=nullptr) in single-node / no-repl-port nodes.
     std::vector<std::unique_ptr<rune::replication::InMemoryTransport>> nullTransports_;
-    // InMemoryLog instances for memory-backed user-topic partitions (Task M1).
-    // Owned here so their lifetime matches the BrokerNode.
-    std::vector<std::unique_ptr<rune::storage::InMemoryLog>> memoryLogs_;
 
     // -----------------------------------------------------------------------
     // Client gateway (BR-7a) — runs inside the duty-cycle via NodeRuntimeAgent.
