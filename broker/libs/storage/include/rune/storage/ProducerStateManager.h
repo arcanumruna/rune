@@ -45,11 +45,11 @@
 #include <unordered_map>
 #include <utility>
 
-// Forward-declare Log so the header does not pull in Log.h (and transitively
+// Forward-declare ILog so the header does not pull in Log.h (and transitively
 // the whole segment/filesystem machinery) everywhere ProducerStateManager.h
 // is included.  The out-of-line rebuildFromLog() implementation in
-// ProducerStateManager.cpp includes the full Log.h.
-namespace rune::storage { class Log; }
+// ProducerStateManager.cpp includes the full ILog.h + Log.h.
+namespace rune::storage { class ILog; }
 
 namespace rune::storage {
 
@@ -247,7 +247,7 @@ public:
     // Cold path — allocations are acceptable here.
     // Single-writer: call only on the duty-cycle thread.
     // -----------------------------------------------------------------------
-    void rebuildFromLog(int32_t topicId, Log& log, int64_t highWatermark, int32_t partition);
+    void rebuildFromLog(int32_t topicId, ILog& log, int64_t highWatermark, int32_t partition);
 
     // -----------------------------------------------------------------------
     // Accessors (for tests / Phase-5 coordinator)

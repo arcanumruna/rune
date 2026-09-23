@@ -1,4 +1,5 @@
 #pragma once
+#include <rune/storage/ILog.h>
 #include <rune/storage/LogSegment.h>
 #include <array>
 #include <atomic>
@@ -39,16 +40,16 @@ using SealedSegmentSnapshot = std::vector<SegInfo>;
 /// offset of the last segment (not the true LEO) and the in-memory index for
 /// each segment is empty (reads fall back to O(segment) scan from position 0).
 /// PartitionApi always calls recover() — any other user must do the same.
-class Log {
+class Log : public ILog {
 public:
     Log(std::string dir, int64_t segmentRollBytes = 64LL*1024*1024);
     ~Log();
     /// Zero-copy span overload — avoids per-call vector construction on the hot path.
     /// Appends [data, data+len) as a batch with the given lastOffset.
     /// Calls sync() after writing (durable-by-default).
-    int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset);
+    int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset) override;
     /// Vector overload (kept for compatibility; delegates to the span overload).
-    int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset);
+    int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset) override;
 
     /// No-sync append — writes to page cache only; does NOT call sync().
     ///
@@ -64,32 +65,32 @@ public:
     ///
     /// Callers MUST NOT advance the durable ISR high-watermark past an offset
     /// before sync() has returned for that offset.
-    int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset);
-    std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
-    int64_t logEndOffset() const noexcept { return logEndOffset_; }
+    int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) override;
+    std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes) override;
+    int64_t logEndOffset() const noexcept override { return logEndOffset_; }
     /// The lowest offset still readable from this log — the base offset of the
     /// first (oldest) on-disk segment.  Advances past 0 when retention/compaction
     /// deletes the earliest segment(s).  An "Earliest" subscriber MUST start here,
     /// NOT at 0: reading below the first segment base returns empty forever
     /// (Log::read's upper_bound lands on begin() and yields {}), which silently
     /// starves the subscriber (0 delivered).  Returns 0 for an empty log.
-    int64_t logStartOffset() const noexcept;
-    int64_t recover();
+    int64_t logStartOffset() const noexcept override;
+    int64_t recover() override;
     /// Flush + fdatasync the active segment's .log and msync its .index.
     /// append() already calls this (durable-by-default). External group-commit
     /// callers may batch appends and call sync() once — but MUST NOT advance
     /// the high-watermark past an offset before sync() returns for that offset.
-    void sync();
+    void sync() override;
     /// Truncate all records with baseOffset >= truncateOffset.
     /// The log's logEndOffset is reset to truncateOffset.
     /// Segments entirely beyond truncateOffset are deleted.
     /// The active segment is physically truncated at the correct byte boundary.
-    void truncateTo(int64_t truncateOffset);
-    std::vector<int64_t> segmentBaseOffsets() const;
+    void truncateTo(int64_t truncateOffset) override;
+    std::vector<int64_t> segmentBaseOffsets() const override;
     int64_t totalBytes() const;
     int deleteOldSegments(int64_t retainBytes);
     /// Directory that contains this log's segment files.
-    const std::string& dir() const noexcept { return dir_; }
+    const std::string& dir() const noexcept override { return dir_; }
     /// Reload all segments from disk (close + reopen every LogSegment).
     /// Used by LogCleaner after atomically rewriting segment files on disk,
     /// so that in-memory file handles reflect the new file contents.

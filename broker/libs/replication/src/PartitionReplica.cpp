@@ -48,7 +48,7 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
                                    Epoch                    epoch,
                                    std::vector<NodeId>      replicas,
                                    std::vector<NodeId>      isr,
-                                   rune::storage::Log*      log,
+                                   rune::storage::ILog*     log,
                                    PartitionTransport*      transport)
     : cfg_(cfg)
     , role_(role)

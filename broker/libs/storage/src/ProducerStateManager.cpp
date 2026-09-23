@@ -32,6 +32,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/ILog.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -447,7 +448,7 @@ int ProducerStateManager::recover(const std::string& path)
 // Cold path: called once on leader election / restart.  Allocations acceptable.
 // ---------------------------------------------------------------------------
 void ProducerStateManager::rebuildFromLog(int32_t topicId,
-                                           Log&     log,
+                                           ILog&    log,
                                            int64_t highWatermark,
                                            int32_t partition)
 {

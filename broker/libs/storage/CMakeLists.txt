@@ -1,4 +1,4 @@
-add_library(rune_storage src/dummy.cpp src/MappedFile.cpp src/OffsetIndex.cpp src/LogSegment.cpp src/Log.cpp src/PartitionApi.cpp src/OffsetMap.cpp src/LogCleaner.cpp src/ProducerStateManager.cpp)
+add_library(rune_storage src/dummy.cpp src/MappedFile.cpp src/OffsetIndex.cpp src/LogSegment.cpp src/Log.cpp src/PartitionApi.cpp src/OffsetMap.cpp src/LogCleaner.cpp src/ProducerStateManager.cpp src/InMemoryLog.cpp)
 target_include_directories(rune_storage PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         ${RUNE_PROTOCOL_INCLUDE})
@@ -6,6 +6,9 @@ target_include_directories(rune_storage PUBLIC
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp)
+    add_executable(rune_in_memory_log_tests tests/storage/InMemoryLogTest.cpp)
+    target_link_libraries(rune_in_memory_log_tests PRIVATE rune_storage GTest::gtest_main)
+    gtest_discover_tests(rune_in_memory_log_tests)
     target_link_libraries(rune_storage_tests PRIVATE rune_storage GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_storage_tests)

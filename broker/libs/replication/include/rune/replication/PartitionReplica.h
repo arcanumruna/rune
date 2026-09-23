@@ -52,6 +52,7 @@
 #include <rune/replication/IsrManager.h>
 #include <rune/replication/EpochFencing.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/storage/ILog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LeaderEpochCache.h>
 
@@ -181,13 +182,15 @@ public:
     /// \param replicas   Full replica set (NodeIds, including self).
     /// \param isr        Initial ISR (subset of replicas; often == replicas at start).
     /// \param log        Owning pointer to the partition Log (pre-constructed).
+    ///                   Accepts any rune::storage::ILog* — a concrete Log* upcasts
+    ///                   automatically; InMemoryLog* works for testing.
     /// \param transport  Injected transport (fake for tests, Aeron for prod).
     PartitionReplica(PartitionConfig                       cfg,
                      Role                                   role,
                      Epoch                                  epoch,
                      std::vector<NodeId>                    replicas,
                      std::vector<NodeId>                    isr,
-                     rune::storage::Log*                    log,
+                     rune::storage::ILog*                   log,
                      PartitionTransport*                    transport);
 
     // -----------------------------------------------------------------------
@@ -412,8 +415,17 @@ public:
         lastCleanOffset_.store(o, std::memory_order_relaxed);
     }
 
-    /// Non-owning pointer to the underlying Log (for test inspection and replay seeding).
-    [[nodiscard]] rune::storage::Log* log() const noexcept { return log_; }
+    /// Non-owning pointer to the underlying ILog seam.
+    /// Use this when the log may be an InMemoryLog (tests, DR harness).
+    [[nodiscard]] rune::storage::ILog* ilog() const noexcept { return log_; }
+
+    /// Non-owning pointer to the underlying Log (for cleaner / compaction code that
+    /// needs concrete Log methods).  Safe only when the replica was constructed with
+    /// a rune::storage::Log* — production paths always are.  Test code that passes
+    /// InMemoryLog must use ilog() instead.
+    [[nodiscard]] rune::storage::Log* log() const noexcept {
+        return static_cast<rune::storage::Log*>(log_);
+    }
 
     /// ISR as seen by the leader (empty for follower).
     [[nodiscard]] const std::vector<NodeId>& isr() const noexcept;
@@ -483,7 +495,7 @@ private:
     Epoch                epoch_;
     NodeId               leaderId_;           ///< (follower) leader's NodeId; -1 if unknown
 
-    rune::storage::Log*         log_;         ///< non-owning (owner is the test/container)
+    rune::storage::ILog*        log_;         ///< non-owning (owner is the test/container)
     PartitionTransport*         transport_;   ///< non-owning
 
     // Leader-side components
