@@ -18,13 +18,21 @@
 //   - User-partition replicas: separate InMemoryTransport per partition, each
 //     wired to a different leader per the committed assignment.
 //   - Bridge: drives user-partition roles from the committed AssignmentMap.
-//   - Produce: direct PartitionReplica::append() on each partition's leader
-//     replica (the in-process test can address all 3 nodes; no client
-//     indirection needed — the goal is proving the broker's multi-leader
-//     produce + co-location + quorum-ack paths).
+//   - Produce: Test 3 routes each produce through a RoutingImage/gpid lookup —
+//     the same path used by NodeRuntimeAgent (MD1-9) — to prove that a wrong
+//     leaderNodeId in the image causes a mis-delivery and the test FAILS.
+//     All other tests address replicas directly by (topicId, partition) key.
 //
 // GPID scheme: topicId * kMaxGpidPartitions + partition  (MD1-9/RoutingImage).
 // Reuses the SAME kMaxGpidPartitions = 1024 constant as NodeRuntimeAgent.
+//
+// Concurrency / TSan note:
+//   All tests run single-threaded (interleaved-sequential appends via
+//   synchronous InMemoryTransport, mutex-guarded pending queues).  There are
+//   no background threads; the duty-cycle loop IS the only thread.  TSan-0
+//   therefore reflects the mutex-protection on the transport, not genuine
+//   concurrent access.  A genuinely concurrent apply-vs-routing-read TSan test
+//   is deferred to MD1-12 (multi-threaded produce harness).
 //
 // NO Docker. All waits are bounded (kDriverCap + ASSERT_TRUE). No busy-spin.
 // ---------------------------------------------------------------------------
@@ -49,7 +57,6 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -313,6 +320,7 @@ protected:
             transport->setLeader(replica.get());
 
             userReplicas_[{kTopicA, p}] = replica.get();
+            topicAReplicaByNode_[leader]   = replica.get();
             userReplicaOwners_.push_back(std::move(replica));
         }
 
@@ -444,6 +452,9 @@ protected:
     std::map<PartKey, PartitionReplica*> userReplicas_;
     // Solo follower replicas (for quorum-ack test).
     std::map<int, PartitionReplica*> soloFollowerReplicas_;
+    // nodeId → topicA leader replica (populated in setupUserPartitions).
+    // Used by Test 3 to deliver by resolved leaderNodeId from RoutingImage.
+    std::map<NodeId, PartitionReplica*> topicAReplicaByNode_;
 
     int64_t metaClock_ = 0;
 };
@@ -496,9 +507,16 @@ TEST_F(MultiLeaderProduceFixture, CoPartitionGroup_SameIndexSameLeader) {
 
 // ===========================================================================
 // Test 3: Concurrent multi-leader produce — all records land, HW advances on
-// each partition's own leader, no cross-node produce.
+// each partition's routed leader, no cross-node funneling.
 //
-// We produce to each topicA partition directly on its leader replica.
+// ROUTING DISCIPLINE (what makes this genuinely discriminating):
+//   Each produce is routed through the RoutingImage, exactly as NodeRuntimeAgent
+//   does in production.  We compute gpid = topicId*kMaxGpidPartitions+partition,
+//   look up leaderNodeId from the RoutingImage, then deliver the batch to the
+//   replica for THAT leaderNodeId.  If the RoutingImage returned a wrong or
+//   funneled leaderNodeId the produce would land on the wrong replica and the
+//   HW assertion below would FAIL — a single-leader impl cannot pass this test.
+//
 // RF=1 → single leader-only replica; minIsr=1 → HW advances immediately
 // after each append().  PartitionReplica::append() stores one log entry per
 // call (lastOffsetDelta=0), so N calls → LEO=N.
@@ -508,60 +526,92 @@ TEST_F(MultiLeaderProduceFixture, ConcurrentMultiLeaderProduce_AllRecordsLand) {
     // Number of append() calls per partition (each advances LEO by 1).
     constexpr int kAppendsPerPartition = 3;
 
-    // ---- Produce to each topicA partition leader ----
-    // RF=1: the leader is the only replica → HW advances immediately (minIsr=1).
+    // ---- Build RoutingImage from committed AssignmentMap (same path as NodeRuntimeAgent) ----
+    auto routingImg = rune::metadata::RoutingImage::buildFromMap(
+        metaSvc1_->committedMap(),
+        [](int32_t topicId, int32_t partition) -> int32_t {
+            return topicId * kMaxGpidPartitions + partition;
+        });
+    ASSERT_NE(routingImg, nullptr) << "RoutingImage must be buildable from committed map";
+
+    // ---- Route each produce through the RoutingImage/gpid lookup ----
+    // For each topicA partition:
+    //   1. Compute gpid (same scheme as NodeRuntimeAgent).
+    //   2. Resolve leaderNodeId from the RoutingImage.
+    //   3. Deliver the batch to the replica for THAT leaderNodeId.
+    //
+    // A wrong/funneled leaderNodeId (e.g. all→node1) would route all produces to
+    // the same replica; the 3-distinct-node assertion below would then FAIL.
     for (int p = 0; p < 3; ++p) {
-        PartitionReplica* leaderReplica = userReplicas_.at({kTopicA, p});
-        ASSERT_NE(leaderReplica, nullptr);
-        ASSERT_EQ(leaderReplica->role(), Role::Leader)
-            << "topicA partition " << p << " replica must be in Leader role";
+        const int32_t gpid = kTopicA * kMaxGpidPartitions + p;
+        const auto& entry = routingImg->lookup(gpid);
+        ASSERT_NE(entry.leaderNodeId, rune::metadata::RoutingImage::NO_LEADER_NODE_ID)
+            << "RoutingImage must have a valid leader for topicA partition " << p;
+
+        // Resolve replica by routed leaderNodeId — NOT by (topic,partition) direct lookup.
+        auto it = topicAReplicaByNode_.find(entry.leaderNodeId);
+        ASSERT_NE(it, topicAReplicaByNode_.end())
+            << "No topicA replica registered for routed leaderNodeId="
+            << entry.leaderNodeId << " (topicA partition " << p << ")";
+        PartitionReplica* routedReplica = it->second;
+
+        ASSERT_EQ(routedReplica->role(), Role::Leader)
+            << "topicA partition " << p << " routed replica must be in Leader role";
 
         for (int k = 0; k < kAppendsPerPartition; ++k) {
             auto batch = makeBatch(1);  // 1 record per batch
-            const Offset base = leaderReplica->append(
+            const Offset base = routedReplica->append(
                 std::span<const uint8_t>(batch.data(), batch.size()),
                 /*acksAll=*/false);
 
             EXPECT_GE(base, 0)
-                << "append " << k << " to topicA partition " << p << " must succeed; "
-                << "leader node=" << leaderReplica->selfId();
+                << "append " << k << " to topicA partition " << p
+                << " via routed leaderNodeId=" << entry.leaderNodeId << " must succeed";
         }
     }
 
     // Drive each partition's transport a few cycles to settle HW.
     for (int p = 0; p < 3; ++p) {
-        PartitionReplica* leaderReplica = userReplicas_.at({kTopicA, p});
+        const int32_t gpid = kTopicA * kMaxGpidPartitions + p;
+        const auto& entry = routingImg->lookup(gpid);
+        PartitionReplica* routedReplica = topicAReplicaByNode_.at(entry.leaderNodeId);
         InMemoryTransport* transport = transportForTopicA(p);
-        const Offset targetHw = leaderReplica->logEndOffset();
+        const Offset targetHw = routedReplica->logEndOffset();
         ASSERT_GT(targetHw, 0) << "LEO must be > 0 after appends";
 
         bool hwAdvanced = driveUserUntil(
-            [&]{ return leaderReplica->highWatermark() >= targetHw; },
-            *transport, leaderReplica);
+            [&]{ return routedReplica->highWatermark() >= targetHw; },
+            *transport, routedReplica);
 
         ASSERT_TRUE(hwAdvanced)
             << "topicA partition " << p << " HW must advance to LEO=" << targetHw
-            << " after produce; leader node=" << leaderReplica->selfId();
+            << " after produce via routed leaderNodeId=" << entry.leaderNodeId;
     }
 
-    // ---- Assert: each partition's HW advanced on its OWN leader ----
+    // ---- Assert: HW advanced on THREE DISTINCT routed leader nodes ----
+    // This fails if any two partitions resolved the same leaderNodeId (funneling).
     std::set<NodeId> leadersWithAdvancedHw;
     for (int p = 0; p < 3; ++p) {
-        PartitionReplica* r = userReplicas_.at({kTopicA, p});
+        const int32_t gpid = kTopicA * kMaxGpidPartitions + p;
+        const auto& entry = routingImg->lookup(gpid);
+        PartitionReplica* r = topicAReplicaByNode_.at(entry.leaderNodeId);
         const Offset leo = r->logEndOffset();
         EXPECT_EQ(r->highWatermark(), leo)
             << "topicA partition " << p << " HW must equal LEO=" << leo
-            << " (leader=" << r->selfId() << ")";
+            << " on routed leaderNodeId=" << entry.leaderNodeId;
         EXPECT_EQ(leo, static_cast<Offset>(kAppendsPerPartition))
             << "topicA partition " << p << " LEO must equal number of appends";
-        leadersWithAdvancedHw.insert(r->selfId());
+        leadersWithAdvancedHw.insert(entry.leaderNodeId);
     }
     EXPECT_EQ(static_cast<int>(leadersWithAdvancedHw.size()), 3)
-        << "HW must advance on THREE distinct leader nodes (multi-leader produce)";
+        << "HW must advance on THREE distinct routed leader nodes (no cross-node funneling); "
+        << "a single-leader or funneled impl would resolve fewer distinct leaderNodeIds";
 
     // ---- Records are readable per-partition (HW-bounded) ----
     for (int p = 0; p < 3; ++p) {
-        PartitionReplica* r = userReplicas_.at({kTopicA, p});
+        const int32_t gpid = kTopicA * kMaxGpidPartitions + p;
+        const auto& entry = routingImg->lookup(gpid);
+        PartitionReplica* r = topicAReplicaByNode_.at(entry.leaderNodeId);
         const std::vector<uint8_t> data = r->read(/*fetchOffset=*/0, /*maxBytes=*/1 << 20);
         EXPECT_FALSE(data.empty())
             << "topicA partition " << p << " must have readable records after HW advance";
@@ -740,20 +790,14 @@ TEST_F(MultiLeaderProduceFixture, LaggingFollower_MinIsrGate_RejectsAcksAll) {
         if (static_cast<int>(leader->isr().size()) < 2) isrShrank = true;
     }
 
-    if (!isrShrank) {
-        // ISR shrink path depends on time-based eviction. If it didn't shrink
-        // (e.g. the replica doesn't evict without real follower presence),
-        // we still need to verify the minIsr gate. Attempt a direct shrink by
-        // making the follower re-appear but NOT fetch, then verifying append behavior.
-        //
-        // Test what we can observe: with ISR size < minIsr, acks=all must return -1.
-        // If ISR didn't shrink, we skip this particular sub-assertion (not a failure
-        // of the multi-leader-produce exit criterion itself).
-        GTEST_SKIP() << "ISR shrink requires real time passage (replicaLagMaxMs=10s); "
-                     << "skipping minIsr-gate sub-assertion (ISR size="
-                     << leader->isr().size() << "). "
-                     << "The majority-quorum-ack path is proven in Test 5.";
-    }
+    // The brief REQUIRES proving that minIsr eviction fires deterministically
+    // under the simulated clock.  We advance 15 000ms > replicaLagMaxMs=10 000ms,
+    // so the eviction MUST have fired.  If it did not, the ISR-shrink eviction
+    // path is broken and we want a hard failure here, not a silent skip.
+    ASSERT_TRUE(isrShrank)
+        << "ISR must have shrunk within 15s simulated time (replicaLagMaxMs=10s); "
+        << "current ISR size=" << leader->isr().size()
+        << " — time-based ISR eviction path is broken";
 
     // ---- Assert: acks=all produce is REJECTED when ISR < minIsr ----
     ASSERT_LT(static_cast<int>(leader->isr().size()), 2)
@@ -805,6 +849,89 @@ TEST_F(MultiLeaderProduceFixture, RoutingImage_GpidScheme_CorrectLeaderLookup) {
             << "Co-partitioned topics A+B at partition " << p
             << " must share leaderNodeId in RoutingImage";
     }
+}
+
+// ===========================================================================
+// Test 9: RF=3 majority quorum — one lagging follower does NOT stall acks=all.
+//
+// With RF=3 and minIsr=2 (majority=2), acks=all must be satisfied once the
+// leader + ONE follower have replicated.  The second (lagging) follower is
+// removed from the transport before the produce.  The test asserts that HW
+// advances to LEO — i.e., the acks=all ack fires — WITHOUT the lagging follower.
+//
+// This is an independent in-fixture RF=3 setup (no shared state with the main
+// topicSolo RF=2 partitions) to keep concerns isolated.
+// ===========================================================================
+TEST_F(MultiLeaderProduceFixture, Rf3_LaggingFollower_MajorityQuorumAckFires) {
+    // ---- RF=3 partition: one InMemoryTransport, leader=node1, followers=node2+node3 ----
+    // minIsr=2: majority for RF=3; acks=all satisfied once leader+1 follower replicated.
+    MlpTempDir dirL("rf3_L"), dirF1("rf3_F1"), dirF2("rf3_F2");
+    rune::storage::Log logL(dirL.path), logF1(dirF1.path), logF2(dirF2.path);
+    InMemoryTransport transport3;
+
+    const std::vector<NodeId> rf3Nodes = {kNode1, kNode2, kNode3};
+    PartitionConfig cfgL  = makeUserCfg(kNode1, /*topicId=*/99, /*partition=*/0, /*minIsr=*/2);
+    PartitionConfig cfgF1 = makeUserCfg(kNode2, /*topicId=*/99, /*partition=*/0, /*minIsr=*/2);
+    PartitionConfig cfgF2 = makeUserCfg(kNode3, /*topicId=*/99, /*partition=*/0, /*minIsr=*/2);
+
+    PartitionReplica leader(cfgL,  Role::Leader,   /*epoch=*/1, rf3Nodes, rf3Nodes, &logL,  &transport3);
+    PartitionReplica follower1(cfgF1, Role::Follower, /*epoch=*/1, rf3Nodes, rf3Nodes, &logF1, &transport3);
+    PartitionReplica follower2(cfgF2, Role::Follower, /*epoch=*/1, rf3Nodes, rf3Nodes, &logF2, &transport3);
+
+    transport3.setLeader(&leader);
+    transport3.addFollower(kNode2, &follower1);
+    transport3.addFollower(kNode3, &follower2);
+
+    // ---- Verify initial ISR has all 3 members ----
+    ASSERT_EQ(static_cast<int>(leader.isr().size()), 3)
+        << "RF=3 partition must start with ISR size 3";
+
+    // ---- Remove the lagging follower (node3) BEFORE producing ----
+    // node3 (follower2) will not receive any fetch requests.
+    // After this, only leader + follower1 (node2) can replicate.
+    transport3.removeFollower(kNode3);
+
+    // ---- acks=all append must SUCCEED (ISR still has 3 members; ISR gate passes) ----
+    // Note: ISR hasn't shrunk yet — the replica hasn't had time to evict node3.
+    // minIsr=2 is satisfied because ISR=3 >= 2.
+    auto batch = makeBatch(2);
+    const Offset base = leader.append(
+        std::span<const uint8_t>(batch.data(), batch.size()),
+        /*acksAll=*/true);
+    ASSERT_GE(base, 0)
+        << "acks=all append must succeed when ISR size=3 >= minIsr=2";
+
+    const Offset leaderLeo = leader.logEndOffset();
+    ASSERT_GT(leaderLeo, 0);
+
+    // HW must NOT advance yet (majority not met: only leader side so far).
+    EXPECT_LT(leader.highWatermark(), leaderLeo)
+        << "HW must not advance before majority replication";
+
+    // ---- Drive leader + follower1 (the non-lagging follower) ----
+    // follower2 (node3) is removed from transport — it will NOT receive data.
+    // Majority = 2 (leader + follower1).  HW must advance once follower1 fetches.
+    bool hwAdvanced = false;
+    for (int i = 0; i < kDriverCap && !hwAdvanced; ++i) {
+        metaClock_ += 1'000'000LL;
+        leader.doWork(metaClock_);
+        follower1.doWork(metaClock_);
+        // follower2 does NOT doWork — it is partitioned away
+        transport3.pump(metaClock_);
+        if (leader.highWatermark() >= leaderLeo) hwAdvanced = true;
+    }
+
+    ASSERT_TRUE(hwAdvanced)
+        << "HW must advance to LEO=" << leaderLeo
+        << " with majority (leader + follower1) even though follower2 lags; "
+        << "RF=3 majority quorum is 2 nodes";
+
+    EXPECT_EQ(leader.highWatermark(), leaderLeo)
+        << "leader HW must equal LEO after majority replication";
+    EXPECT_GE(follower1.logEndOffset(), leaderLeo)
+        << "follower1 (non-lagging) must have replicated to leader LEO";
+    EXPECT_EQ(follower2.logEndOffset(), static_cast<Offset>(0))
+        << "follower2 (lagging, partitioned) must have 0 LEO — it received nothing";
 }
 
 // ===========================================================================
