@@ -1168,4 +1168,30 @@ TEST(NodeConfig, UnknownKeyValueOptionRejected) {
     EXPECT_NE(res.error.find("badkey"), std::string::npos);
 }
 
+// ===========================================================================
+// E1 Task 4: NodeConfig.workerCount + RUNE_WORKERS parsing
+// ===========================================================================
+
+TEST(NodeConfig, ParsesWorkerCountDefaultsToOne) {
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));  // RUNE_WORKERS unset
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCount, 1);  // default
+}
+
+TEST(NodeConfig, ParsesRuneWorkersEnv) {
+    auto base = base1node();
+    base["RUNE_WORKERS"] = "4";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCount, 4);
+}
+
+TEST(NodeConfig, RuneWorkersFloorsToOne) {
+    auto base = base1node();
+    base["RUNE_WORKERS"] = "0";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerCount, 1) << "0/negative/garbage floors to 1";
+}
+
 } // namespace rune::node

@@ -600,6 +600,15 @@ ConfigResult parseNodeConfig(
         // Absent or empty → keep the default (true, set in NodeConfig initializers).
     }
 
+    // --- RUNE_WORKERS (optional) — Milestone E1: in-process partition worker count (floor 1). ---
+    if (const char* w = getenv_fn("RUNE_WORKERS")) {
+        char* end = nullptr;
+        const long v = std::strtol(w, &end, 10);
+        cfg.workerCount = (end != w && v >= 1) ? static_cast<int32_t>(v) : 1;
+    } else {
+        cfg.workerCount = 1;
+    }
+
     return {std::move(cfg), {}};
 }
 

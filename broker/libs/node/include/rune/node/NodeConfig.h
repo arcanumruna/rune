@@ -165,6 +165,12 @@ struct NodeConfig {
     // Also forwarded to PartitionConfig::minIsr in buildReplication().
     int32_t gatewayMinIsr = 1;
 
+    // Milestone E1: number of in-process partition workers. Each owned shard is
+    // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
+    // (single-owner, identical to the pre-E1 single-agent behaviour). Overridable
+    // via RUNE_WORKERS. Floored to 1.
+    int32_t workerCount = 1;
+
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
     // each topic's segmentRollBytes are merged into a single output segment per
