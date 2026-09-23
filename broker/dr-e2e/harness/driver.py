@@ -587,6 +587,7 @@ def _run_one_client(
         "RUNE_SUBSCRIBE_MS": str(cfg.get("subscribe_ms", 30000)),
         "RUNE_SLOW_SUBSCRIBER_MS": str(cfg.get("slow_subscriber_ms", 0)),
         "RUNE_SUB_PARTITIONS": str(cfg.get("sub_partitions", 1)),
+        "RUNE_SUB_PARTITION_BASE": str(cfg.get("sub_partition_base", 0)),
         "RUNE_ACKS": cfg.get("acks", "leader"),
     }
     if "expect" in cfg:
@@ -675,6 +676,8 @@ def run_clients(
 
     cfg keys (all optional): mode, records, keys, rate_hz, from, topics,
     timeout_ms, subscribe_ms, slow_subscriber_ms, expect, sub_partitions,
+    sub_partition_base (default 0 — first partition index; combined with
+    sub_partitions=K subscribes partitions [base..base+K-1]),
     acks ("leader" default | "all" for majority-durable; maps to RUNE_ACKS),
     connect_retries (default 0 — first-try clean; fault tickets may set > 0),
     start_stagger_ms (default 400 — delay between launching each client so N

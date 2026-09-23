@@ -156,11 +156,52 @@ public:
             // duty-cycle thread — no cross-thread synchronisation needed.
             // The image is captured by the gateway's doWork on the SAME thread,
             // so there is no cross-thread race on routingImage_.
+            //
+            // BOOTSTRAP FIX (MD1-13): publish a RoutingImage on every duty cycle.
+            //
+            // Two-path strategy:
+            //
+            // STEADY STATE (committedMap non-empty):
+            //   Build from the committed assignment map and push to the gateway.
+            //   This is Path A — per-partition routing using the authoritative
+            //   committed assignment (driven by MetadataStateMachine).
+            //
+            // BOOTSTRAP WINDOW (committedMap empty — metadata log not yet replicated):
+            //   Build from StaticBalancer directly (deterministic: same output on
+            //   ALL nodes given the same topic+node config wired at startup).
+            //   Publishing the static routing image immediately means ALL nodes
+            //   (Raft leader AND followers) have routingImage_ set from the very
+            //   first duty cycle — eliminating the asymmetry window where the
+            //   Raft leader (which gets committedMap first) redirects to a
+            //   follower whose routingImage_ is still null, causing a redirect loop
+            //   (Raft leader Path A → follower Path B → Raft leader → exhausted).
+            //
+            //   If buildStaticRoutingImage() returns null (no topics configured,
+            //   or BalancerError), leave routingImage_ null → Path B (pre-MD1
+            //   cluster-leader fallback) serves the produce.
             if (gateway_) {
-                auto img = rune::metadata::RoutingImage::buildFromMap(
-                    metadataService_->committedMap(),
-                    rune::metadata::gpidOf);
-                gateway_->setRoutingImageSnapshot(std::move(img));
+                const auto& cmap = metadataService_->committedMap();
+                if (!cmap.empty()) {
+                    // Steady state: use the committed assignment map.
+                    auto img = rune::metadata::RoutingImage::buildFromMap(
+                        cmap, rune::metadata::gpidOf);
+                    gateway_->setRoutingImageSnapshot(std::move(img));
+                    // Signal that committed metadata is available.
+                    // GR-4 (per-partition NotLeader defence) and GR-5 (ISR gate)
+                    // only activate in steady state so that the bootstrap window
+                    // (replica still in Follower role before bridge Step B fires)
+                    // does not falsely reject produces.
+                    gateway_->setCommittedMetadataReady(true);
+                } else {
+                    // Bootstrap window: build from StaticBalancer (deterministic).
+                    // All nodes compute the same image; no replication wait needed.
+                    auto img = metadataService_->buildStaticRoutingImage();
+                    if (img) {
+                        gateway_->setRoutingImageSnapshot(std::move(img));
+                    }
+                    // committedMetadataReady_ remains false → GR-4 / GR-5 suppressed.
+                    // If null (no topics / BalancerError): leave routingImage_ null too.
+                }
             }
         }
 

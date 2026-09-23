@@ -693,6 +693,11 @@ TEST_F(GatewayPerPartitionRoutingFixture, NotLeaderDefence_ImageSaysLocal_Replic
     buildGateway();
     // Routing image: partition 0 → this node (local).
     injectRoutingImage(/*leaderEpoch=*/1, kThisNodeId, kOtherNodeId);
+    // Signal steady state (committedMetadataReady = true) so GR-4 fires.
+    // In production, NodeRuntimeAgent sets this when committedMap() is non-empty.
+    // Without this, GR-4 is suppressed (bootstrap window) and the test would pass
+    // the produce through — defeating the purpose of the defence-in-depth check.
+    gw_->setCommittedMetadataReady(true);
 
     // Build a real ReplicaRegistry with partition 0 in Follower role.
     // We'll inject it AFTER building the gateway.
@@ -828,10 +833,18 @@ TEST_F(GatewayPerPartitionRoutingFixture, NotLeaderDefence_ImageSaysLocal_Replic
 }
 
 // ===========================================================================
-// PPR-7: Unassigned partition (sentinel in routing image) → error, not crash.
+// PPR-7: Unassigned partition (sentinel in routing image) — no crash.
 //
-// The routing image has partition 0 unassigned (sentinel -1/-1).
-// Produce to partition 0 must return an error (NotLeader / Internal).
+// The routing image has partition 0 unassigned (sentinel -1/-1), but this
+// node IS the Raft leader (leaderView_=always-leader).
+//
+// After MD1-13: when the routing image returns NO_LEADER for a partition, the
+// gateway falls back to the cluster-leader check (Path B).  Since this node IS
+// the Raft leader, the produce is served locally → ProduceResponse{OK}.
+//
+// The original intent of PPR-7 was "no crash" and "safe fallback".  Both are
+// satisfied: no crash occurs, and the cluster leader safely serves the produce
+// during the bootstrap window when assignments have not yet converged.
 // ===========================================================================
 TEST_F(GatewayPerPartitionRoutingFixture, UnassignedPartition_ErrorNotCrash)
 {
@@ -849,7 +862,7 @@ TEST_F(GatewayPerPartitionRoutingFixture, UnassignedPartition_ErrorNotCrash)
     prod.sessionId      = sid;
     prod.correlationId  = 700;
     prod.topicId        = kTopicId;
-    prod.partition      = kLocalPart;   // unassigned partition
+    prod.partition      = kLocalPart;   // unassigned partition (NO_LEADER in image)
     prod.partitionKnown = 1;
     auto batch = makeBatch();
     prod.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
@@ -858,8 +871,12 @@ TEST_F(GatewayPerPartitionRoutingFixture, UnassignedPartition_ErrorNotCrash)
     const std::size_t len = prod.encode(buf);
     offerBounded(*client.ingressPub, buf, len, "Produce");
 
-    // Expect ErrorResponse (any non-OK error — NotLeader or Internal).
-    std::optional<pc::ErrorResponse> errResp;
+    // MD1-13: after the bootstrap-window fix, the NO_LEADER sentinel in the
+    // routing image falls back to the cluster-leader check.  buildGateway()
+    // supplies leaderView_=always-leader → the produce is served locally.
+    // Accept both ProduceResponse and ErrorResponse — either is safe.
+    // The key assertion: the process did NOT crash (no abort / SIGSEGV).
+    std::optional<pc::ErrorResponse>   errResp;
     std::optional<pc::ProduceResponse> prodResp;
     aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& ab,
                                       aeron::util::index_t offset,
@@ -885,24 +902,124 @@ TEST_F(GatewayPerPartitionRoutingFixture, UnassignedPartition_ErrorNotCrash)
         std::this_thread::sleep_for(std::chrono::microseconds{100});
     }
 
-    // Either a non-OK ProduceResponse or an ErrorResponse is acceptable.
-    // The key assertion: the process did NOT crash (no abort / SIGSEGV).
-    if (errResp.has_value()) {
+    // After the MD1-13 fix: leaderView_=always-leader means the cluster leader
+    // serves the produce → ProduceResponse{OK}.  This is the correct behavior
+    // for the bootstrap window (no redirect loop, no NotLeader for the leader).
+    if (prodResp.has_value()) {
+        EXPECT_EQ(prodResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+            << "Cluster leader must serve produce for unassigned partition (bootstrap window)";
+        // Engine was touched — the leader appended locally.
+        auto* log = topicReg_->log(kTopicId, kLocalPart);
+        ASSERT_NE(log, nullptr);
+        EXPECT_GT(log->logEndOffset(), 0)
+            << "Log must have an entry after leader-served bootstrap-window produce";
+    } else if (errResp.has_value()) {
+        // A non-OK error response is still acceptable (safe fallback, no crash).
         EXPECT_NE(errResp->code, static_cast<int16_t>(pc::ErrorCode::OK))
-            << "Unassigned partition must return an error";
-    } else if (prodResp.has_value()) {
-        EXPECT_NE(prodResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
-            << "Unassigned partition must return an error in ProduceResponse";
+            << "Error response must be non-OK";
+        SUCCEED() << "ErrorResponse received — no crash, PASS";
     } else {
-        // If no response was received either path is fine — the gateway dropped
-        // the produce. The important assertion is: no crash.
+        // No response: gateway silently dropped it.  Still safe — no crash.
         SUCCEED() << "No response for unassigned partition (dropped) — no crash, PASS";
     }
+}
 
-    // Engine must not be touched.
+// ===========================================================================
+// PPR-8: Bootstrap-window regression (MD1-13).
+//
+// Scenario: routingImage_ is set (non-null) but was built from an EMPTY
+// committed assignment map — i.e. every partition lookup returns NO_LEADER.
+// This is the state NodeRuntimeAgent was in before the MD1-13 fix: it called
+// setRoutingImageSnapshot on EVERY duty cycle, even the first, when
+// committedMap() is still empty.
+//
+// Before the fix:
+//   - Path B (cluster-level fallback) is disabled because routingImage_ != null.
+//   - handleProduce reaches Path A, sees NO_LEADER → returns NotLeader.
+//   - Client retries on another node, gets the same answer → "Redirect exhausted".
+//
+// After the fix (defense-in-depth in handleProduce/handleSubscribe):
+//   - Path A sees NO_LEADER → falls back to Path B.
+//   - leaderView_ says "this node IS the leader".
+//   - Produce is served locally → ProduceResponse{OK}.
+//
+// This test uses:
+//   - leaderView_ always returning isLeader=true (this node IS the Raft leader).
+//   - routingImage_ = RoutingImage::build({}) — empty entries → every lookup returns
+//     the NO_LEADER sentinel (same as buildFromMap on an empty committedMap).
+//   - Produce to partition 0 of the test topic.
+//   - Expect ProduceResponse{OK} (not NotLeader / Redirect).
+// ===========================================================================
+TEST_F(GatewayPerPartitionRoutingFixture, BootstrapWindow_EmptyRoutingImage_LeaderServesLocally)
+{
+    buildGateway();
+
+    // Inject an empty routing image: built from zero entries.
+    // Every lookup will return NO_LEADER — this reproduces the
+    // "committedMap was empty when buildFromMap was called" state.
+    auto emptyImg = md::RoutingImage::build({});
+    gw_->setRoutingImageSnapshot(emptyImg);
+
+    auto client = makeClient(kEgressBase + 8);
+    pump([&]() { return client.ingressPub->isConnected(); },
+         nullptr, nullptr, kPumpIter, "waitConnected");
+
+    const int64_t sid = connectClient(client);
+    ASSERT_GT(sid, 0);
+
+    // Produce to partition 0.  Before the fix this would return NotLeader;
+    // after the fix the defense-in-depth fallback to Path B serves it locally.
+    pc::Produce prod;
+    prod.sessionId      = sid;
+    prod.correlationId  = 800;
+    prod.topicId        = kTopicId;
+    prod.partition      = kLocalPart;   // partition 0
+    prod.partitionKnown = 1;
+    auto batch = makeBatch();
+    prod.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+
+    uint8_t buf[4096] = {};
+    const std::size_t len = prod.encode(buf);
+    offerBounded(*client.ingressPub, buf, len, "Produce");
+
+    // Accept either ProduceResponse (OK) or ErrorResponse — capture both.
+    std::optional<pc::ProduceResponse> prodResp;
+    std::optional<pc::ErrorResponse>   errResp;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& ab,
+                                      aeron::util::index_t offset,
+                                      aeron::util::index_t flen,
+                                      aeron::Header&) {
+        const auto* ptr = reinterpret_cast<const uint8_t*>(ab.buffer() + offset);
+        const auto  sz  = static_cast<std::size_t>(flen);
+        {
+            auto dec = pc::ProduceResponse::decode(ptr, sz);
+            if (dec) { prodResp = *dec; return; }
+        }
+        {
+            auto dec = pc::ErrorResponse::decode(ptr, sz);
+            if (dec) { errResp = *dec; }
+        }
+    });
+
+    pump([&]() { return prodResp.has_value() || errResp.has_value(); },
+         &*client.egressSub, &asm_, kPumpIter, "ProduceResponse(BootstrapWindow)");
+
+    // PRIMARY ASSERTION: must receive a ProduceResponse{OK}, not an error.
+    // Before the MD1-13 fix this asserted an ErrorResponse{NotLeader} — the regression.
+    ASSERT_TRUE(prodResp.has_value())
+        << "Bootstrap-window produce must be served by the cluster leader (not NotLeader). "
+           "Got errResp code="
+           << (errResp.has_value() ? errResp->code : -999);
+    EXPECT_EQ(prodResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+        << "Produce must succeed when this node is the Raft leader and partition is "
+           "not yet in the routing image (bootstrap window)";
+    EXPECT_EQ(prodResp->correlationId, prod.correlationId);
+
+    // The engine must have been touched (log advanced).
     auto* log = topicReg_->log(kTopicId, kLocalPart);
     ASSERT_NE(log, nullptr);
-    EXPECT_EQ(log->logEndOffset(), 0) << "Engine must not be touched for unassigned partition";
+    EXPECT_GT(log->logEndOffset(), 0)
+        << "Log must have an entry after a leader-served bootstrap-window produce";
 }
 
 } // namespace

@@ -248,6 +248,43 @@ public:
         return routingImage_.get();
     }
 
+    // -----------------------------------------------------------------------
+    // setCommittedMetadataReady — signal that the committed assignment map is
+    // non-empty (metadata log has replicated and at least one assignment is
+    // committed).
+    //
+    // MD1-13 BOOTSTRAP FIX (Fix 5):
+    //   With the static-routing-image bootstrap fix, routingImage_ is now set
+    //   on EVERY duty cycle (even during the bootstrap window, using the
+    //   StaticBalancer-derived image).  This means the old gate
+    //   "if (routingImage_)" can NO LONGER be used to distinguish bootstrap
+    //   from steady state in GR-4 (per-partition NotLeader defence) and GR-5
+    //   (ISR gate / deferred-ack).
+    //
+    //   Use this flag instead:
+    //     - false (default): bootstrap window — GR-4 and GR-5 ISR gate are
+    //       SUPPRESSED.  User replicas start as Follower; bridge Step B
+    //       (ReplicationMetadataBridge) has not yet fired.  During this window,
+    //       the partition leader serves produces via Path A (static routing image)
+    //       without the GR-4 role check or the ISR min-size gate.
+    //     - true: steady state — GR-4 and GR-5 fire normally.  committedMap is
+    //       non-empty → bridge Step B has promoted the correct replicas to Leader.
+    //
+    //   NodeRuntimeAgent calls setCommittedMetadataReady(true) on the first duty
+    //   cycle where committedMap() is non-empty.  Once true it is never reset
+    //   (committedMap only grows after the first assignment is committed).
+    //
+    //   Single-writer: must be called on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setCommittedMetadataReady(bool ready) noexcept {
+        committedMetadataReady_ = ready;
+    }
+
+    [[nodiscard]]
+    bool committedMetadataReady() const noexcept {
+        return committedMetadataReady_;
+    }
+
     void setNodeEndpointMap(
             std::unordered_map<int32_t, std::string> nodeEndpoints) noexcept {
         nodeEndpointMap_ = std::move(nodeEndpoints);
@@ -719,12 +756,18 @@ private:
     //   zero per-produce lock/alloc on Apple libc++ and Linux alike).
     //   Null until the first MetadataService emit (or test injection).
     //
+    // committedMetadataReady_: set to true when committedMap() is first non-empty.
+    //   Used as the gate for GR-4 (per-partition NotLeader defence) and GR-5
+    //   (ISR min-size gate / deferred-ack) instead of routingImage_ (see Fix 5 /
+    //   MD1-13 comment on setCommittedMetadataReady()).
+    //
     // nodeEndpointMap_: maps nodeId → client endpoint string for REDIRECT.
     //   Built from NodeConfig::peers in BrokerNode::buildGateway().
     //   Immutable after construction; single-writer (duty-cycle thread).
     //   Keyed by int32_t nodeId; value is the "aeron:udp?endpoint=…" string.
     //   Empty until wired in (no routing image = no redirects).
     std::shared_ptr<const rune::metadata::RoutingImage> routingImage_;
+    bool                                                 committedMetadataReady_ = false;
     std::unordered_map<int32_t, std::string>             nodeEndpointMap_;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).

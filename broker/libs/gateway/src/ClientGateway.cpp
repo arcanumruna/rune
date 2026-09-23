@@ -385,11 +385,34 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     const auto& req = *reqOpt;
 
     // -----------------------------------------------------------------------
-    // BR-5: check leadership before creating a session.
+    // BR-5 / MD1 Fix 6: check leadership before creating a session.
+    //
+    // MD1 Fix 6 (per-partition routing session gate):
+    //   When routingImage_ is set (per-partition routing is active — either from
+    //   StaticBalancer during the bootstrap window, or from committedMap in steady
+    //   state), this node can accept sessions regardless of Raft leadership.
+    //   The produce / subscribe handlers route each op to the correct partition
+    //   leader via Path A (routingImage_ lookup), so the session host does NOT
+    //   need to be the Raft leader.
+    //
+    //   Rationale: without this gate, Raft-follower nodes that are partition
+    //   leaders (e.g. rune-1 = node 0 holds events:0) could never accept client
+    //   sessions, because their leaderView_.isLeader == false caused
+    //   handleConnect to enqueue an ErrorResponse{Redirect} back to the Raft
+    //   leader.  Combined with Fix 5 (StaticBalancer immediate routingImage_ on
+    //   all nodes), this caused a redirect loop:
+    //     rune-2 (Raft leader) → Path A → Redirect produce to rune-1
+    //     rune-1 (Raft follower) → handleConnect → Redirect session to rune-2
+    //     → kMaxRedirects exhausted.
+    //
+    //   When routingImage_ is null (not yet set), fall back to the original
+    //   Raft-leader gate (Path B / pre-MD1 behaviour).
     // -----------------------------------------------------------------------
     bool capturedIsLeader = true;
     std::string capturedLeaderEndpoint;
-    if (leaderView_) {
+    if (leaderView_ && !routingImage_) {
+        // No per-partition routing image yet: use the Raft-leader gate (Path B /
+        // pre-MD1 bootstrap).  Raft followers redirect sessions to the Raft leader.
         const LeaderView lv = leaderView_();
         capturedIsLeader        = lv.isLeader;
         capturedLeaderEndpoint  = lv.leaderClientEndpoint;
@@ -424,6 +447,10 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         // ALSO via the same async machinery (isLeader captured true / redirect
         // endpoint empty ⇒ pollPendingConnects sends ConnectResponse{OK}).
     }
+    // else: routingImage_ is set → capturedIsLeader remains true (accept session
+    //       on any node; per-partition routing in the produce/subscribe handlers
+    //       routes each op to the correct partition leader).  This is the MD1
+    //       steady-state and bootstrap-window path (Fix 5 + Fix 6 together).
 
     // -----------------------------------------------------------------------
     // Async accept path (BR-7a): never block the duty-cycle thread.
@@ -987,6 +1014,16 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   All lookup() calls within this handler use `img` (the raw pointer from the
     //   captured shared_ptr), never calling routingImage_ again.
     //   This avoids per-produce atomic_load (Apple libc++ global lock / Linux CAS).
+    //
+    // BOOTSTRAP FIX — defense-in-depth (MD1-13):
+    //   Even after the primary fix (NodeRuntimeAgent gates setRoutingImageSnapshot
+    //   on a non-empty committedMap), a convergence window exists where routingImage_
+    //   is non-null but contains NO_LEADER for a partition that is legitimately not
+    //   yet assigned (e.g. rolling assignment commit, or a topic added mid-flight).
+    //   When that happens, fall back to Path B (cluster-leader check) rather than
+    //   returning NotLeader — this avoids redirect-exhaustion for genuinely
+    //   bootstrap-window produces.  A steady-state unassigned partition (where the
+    //   Raft leader cannot serve it either) will still reject via Path B.
     if (routingImage_) {
         // Capture the snapshot once (the shared_ptr was already stored in routingImage_
         // on the duty-cycle thread — no cross-thread atomic_load needed here).
@@ -995,23 +1032,25 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         const auto& entry = img->lookup(gpid);
 
         if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
-            // Unassigned partition — return NotLeader.
-            spdlog::debug("ClientGateway: Produce unassigned partition (topicId={} part={}) sessionId={}",
+            // Partition not yet assigned in the routing image — bootstrap window or
+            // genuinely unassigned.  Fall back to Path B (cluster-leader fallback)
+            // instead of returning NotLeader directly, so the Raft leader can serve
+            // the produce if it is the cluster leader and has the log locally.
+            // Path B is applied immediately below (outside this if-block) when
+            // leaderView_ is set; if leaderView_ is null, we fall through to the
+            // log lookup (single-node passthrough, always-leader).
+            spdlog::debug("ClientGateway: Produce partition not in routing image "
+                          "(topicId={} part={}) — falling back to cluster-leader path, sessionId={}",
                           msg.topicId, partition, msg.sessionId);
-            pc::ErrorResponse errResp;
-            errResp.sessionId     = msg.sessionId;
-            errResp.correlationId = msg.correlationId;
-            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2;
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = errResp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+            if (leaderView_) {
+                const LeaderView lv = leaderView_();
+                if (!lv.isLeader) {
+                    sendRedirect(lv.leaderClientEndpoint, msg.correlationId);
+                    return;  // engine untouched
+                }
             }
-            return;  // engine untouched
-        }
-
-        if (entry.leaderNodeId != thisNodeId_) {
+            // leaderView_ says we ARE the leader (or is null) — serve locally (fall through).
+        } else if (entry.leaderNodeId != thisNodeId_) {
             // This partition is led by a different node — REDIRECT.
             const std::string& redirectEndpoint = [&]() -> const std::string& {
                 auto it = nodeEndpointMap_.find(entry.leaderNodeId);
@@ -1058,21 +1097,54 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // reject the produce BEFORE touching the Log.  This is belt-and-suspenders
     // beyond the cluster-level leaderView_ check above: the cluster check uses a
     // coarse atomic observer that may lag a partition-level role transition
-    // (particularly during epoch changes or single-node bootstrap where
-    // replicaRegistry_ is set but the bridge has not yet called becomeLeader).
+    // (particularly during epoch changes).
+    //
+    // BOOTSTRAP WINDOW EXCEPTION (MD1-13):
+    //   When routingImage_ is null, we are in the bootstrap window — no partition
+    //   assignments have been committed yet.  User partition replicas start in
+    //   Follower role (per BrokerNode wiring) and are only promoted to Leader
+    //   AFTER the metadata log records replicate and commit (bridge Step B).
+    //   Before MD1, bridge Step A promoted ALL replicas from cluster leadership.
+    //   After MD1, user replicas are only promoted via committedMap (Step B).
+    //   During the bootstrap window (routingImage_ null), the Raft leader MUST
+    //   be able to serve produces via Path B — the GR-4 check must NOT fire here
+    //   because the Follower-role state of user replicas is EXPECTED (not an error).
+    //   Without this gate, every produce to the Raft leader during bootstrap
+    //   returns NotLeader and the client redirect-loops to exhaustion.
+    //
+    // When routingImage_ IS set (assignments committed, steady state), the check
+    // fires normally: if the image says "local" but the replica is Follower, that
+    // IS a conflict and the NotLeader rejection is correct.
     //
     // We accept the produce when:
-    //   a) replicaRegistry_ is null (replication not wired in — passthrough, e.g. tests
-    //      that exercise the gateway without replication).
-    //   b) no replica found for this (topicId, partition) — replica map is sparse
-    //      (same passthrough).
+    //   a) replicaRegistry_ is null (replication not wired in — passthrough).
+    //   b) no replica found for this (topicId, partition) — sparse replica map.
     //   c) replica.role() == Leader.
+    //   d) routingImage_ is null (bootstrap window — no metadata assignment yet;
+    //      Raft leader serves all partitions, replica role is expected Follower).
     //
-    // We reject (NotLeader) when replica.role() == Follower.
+    // We reject (NotLeader) when replica.role() == Follower AND routingImage_ is
+    // set (steady state: conflicting routing image vs replica role).
     //
     // O(1) lookup (unordered_map): zero per-op alloc, lock-free (single-writer).
     rune::replication::PartitionReplica* replica = nullptr;
-    if (replicaRegistry_) {
+    if (replicaRegistry_ && committedMetadataReady_) {
+        // GR-4 check: only in steady state (committedMetadataReady_ = committedMap
+        // non-empty, bridge Step B has promoted replicas to correct roles).
+        //
+        // BOOTSTRAP WINDOW EXCEPTION (MD1-13 Fix 3 + Fix 5):
+        //   committedMetadataReady_ is false when committedMap() is empty — even
+        //   when routingImage_ is set (e.g. built from StaticBalancer in Fix 5).
+        //   During the bootstrap window, user replicas start in Follower role and
+        //   are only promoted to Leader AFTER the metadata log records replicate
+        //   and commit (bridge Step B).  Applying GR-4 here would reject every
+        //   produce from the designated partition leader (who IS correct per the
+        //   routing image but whose replica is still Follower) with NotLeader.
+        //
+        //   In steady state (committedMetadataReady_ = true), GR-4 is correct:
+        //   bridge Step B has fired, replicas are in the right roles.  If the
+        //   routing image says "local" but the replica is Follower, that IS a
+        //   real conflict and NotLeader is the right response.
         replica = replicaRegistry_->lookup(msg.topicId, partition);
         if (replica && replica->role() != rune::replication::Role::Leader) {
             // Per-partition NotLeader: reject without appending.
@@ -1094,6 +1166,10 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
         // replica is either nullptr (no replica for this partition — passthrough)
         // or role == Leader (allow produce through).
+    } else if (replicaRegistry_ && !committedMetadataReady_) {
+        // Bootstrap window: look up replica for later (acks=All ISR check) but
+        // do NOT reject based on role — bridge Step B has not yet fired.
+        replica = replicaRegistry_->lookup(msg.topicId, partition);
     }
 
     // 5. Assign offsets (CRC-safe restamp).
@@ -1273,11 +1349,25 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   - The pending-ack queue is untouched.
     //
     // passthrough (replica==nullptr): no ISR check — single-node / test mode.
+    //
+    // BOOTSTRAP WINDOW EXCEPTION (MD1-13 Fix 5):
+    //   When committedMetadataReady_ is false (committedMap still empty — bootstrap
+    //   window), the replica is still a Follower (bridge Step B has not promoted it).
+    //   In this state:
+    //     - replica->isr() returns empty (Follower) → ISR check would always reject.
+    //     - onLeaderLogAppended() is a no-op on Followers → HW never advances →
+    //       the deferred-ack queue would stall until timeout.
+    //   Instead, treat acks=All as acks=Leader during bootstrap (immediate ack after
+    //   local append).  This matches pre-MD1 cluster startup behaviour and is safe:
+    //   the designated partition leader owns the log; once committedMetadataReady_ is
+    //   true (committedMap non-empty, bridge Step B fired), the leader replica has a
+    //   valid ISR and acks=All works end-to-end with majority-commit semantics.
     const bool acksAll = (msg.acks == 1);
-    if (acksAll && replica) {
+    if (acksAll && replica && committedMetadataReady_) {
         // min-ISR gate: require ISR size >= minIsr_ for acks=All durability.
+        // Skipped during bootstrap window (committedMetadataReady_ false) — see above.
         // replica->isr() returns the leader's current ISR (as of the last
-        // maybeShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
+        // maybyShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
         const int currentMinIsr = minIsr_.load(std::memory_order_relaxed);
         const int isrSize = static_cast<int>(replica->isr().size());
         if (isrSize < currentMinIsr) {
@@ -1373,11 +1463,19 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // acks=Leader / None: ack immediately after page-cache write.
     // acks=All:           enqueue a PendingAck; drainPendingAcks() will send the
     //                     response once replica->highWatermark() >= lastOffset.
-    if (!acksAll || !replica) {
-        // Immediate ack: acks=Leader (or no replica wired = passthrough mode).
+    //
+    // BOOTSTRAP WINDOW EXCEPTION (MD1-13 Fix 5): when committedMetadataReady_ is
+    // false, we are in the bootstrap window.  The replica is a Follower:
+    // onLeaderLogAppended() is a no-op and highWatermark() never advances, so the
+    // deferred-ack queue would stall until timeout.  Treat acks=All as acks=Leader
+    // in the bootstrap window (immediate ack after local append) — see GR-5 comment.
+    const bool deferAck = acksAll && replica && committedMetadataReady_;
+    if (!deferAck) {
+        // Immediate ack: acks=Leader, no replica wired (passthrough), or
+        // bootstrap window (committedMetadataReady_ false — acks=All → acks=Leader).
         sendResp(pc::ErrorCode::OK, partition, base);
     } else {
-        // acks=All deferred ack path.
+        // acks=All deferred ack path (steady state: routingImage_ set).
         // Cap check: if the queue is full, reject rather than silently overflowing.
         if (pendingAcks_.size() >= kMaxPendingAcks) {
             spdlog::warn("ClientGateway: pendingAcks_ full ({} entries); acks=All produce rejected "
@@ -1543,28 +1641,29 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 
     // 3b. MD1 Task 9: Per-partition routing image check.
     // Mirrors the produce path: capture-once discipline (routingImage_.get()).
+    //
+    // BOOTSTRAP FIX — defense-in-depth (MD1-13): same as handleProduce.
+    // When the image is set but this partition is NO_LEADER (not yet assigned),
+    // fall back to Path B (cluster-leader) rather than returning NotLeader.
     if (routingImage_) {
         const rune::metadata::RoutingImage* img = routingImage_.get();
         const int32_t gpid = rune::metadata::gpidOf(msg.topicId, partition);
         const auto& entry = img->lookup(gpid);
 
         if (entry.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID) {
-            spdlog::debug("ClientGateway: Subscribe unassigned partition (topicId={} part={}) sessionId={}",
+            // Partition not yet assigned — fall back to cluster-leader path.
+            spdlog::debug("ClientGateway: Subscribe partition not in routing image "
+                          "(topicId={} part={}) — falling back to cluster-leader path, sessionId={}",
                           msg.topicId, partition, msg.sessionId);
-            pc::ErrorResponse errResp;
-            errResp.sessionId     = msg.sessionId;
-            errResp.correlationId = msg.correlationId;
-            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2;
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = errResp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+            if (leaderView_) {
+                const LeaderView lv = leaderView_();
+                if (!lv.isLeader) {
+                    sendSubRedirect(lv.leaderClientEndpoint, msg.correlationId);
+                    return;  // engine untouched, no subscription registered
+                }
             }
-            return;  // engine untouched
-        }
-
-        if (entry.leaderNodeId != thisNodeId_) {
+            // leaderView_ says we ARE the leader (or is null) — serve locally (fall through).
+        } else if (entry.leaderNodeId != thisNodeId_) {
             const std::string& redirectEndpoint = [&]() -> const std::string& {
                 auto it = nodeEndpointMap_.find(entry.leaderNodeId);
                 if (it != nodeEndpointMap_.end()) return it->second;

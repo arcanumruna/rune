@@ -58,6 +58,8 @@
 
 #include <rune/metadata/MetadataStateMachine.h>
 #include <rune/metadata/PartitionAssignment.h>
+#include <rune/metadata/RoutingImage.h>
+#include <rune/metadata/Gpid.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
@@ -408,6 +410,53 @@ public:
     [[nodiscard]]
     const rune::metadata::AssignmentMap& committedMap() const noexcept {
         return msm_.committedMap();
+    }
+
+    // -----------------------------------------------------------------------
+    // MD1-13 Bootstrap fix: build a RoutingImage from the static assignment.
+    //
+    // When committedMap() is empty (metadata log not yet replicated), every
+    // node can independently compute the same deterministic RoutingImage via
+    // StaticBalancer::assign().  This eliminates the asymmetry window where
+    // the Raft leader (which applies metadata first) has routingImage_ set
+    // while followers still have null routingImage_ → redirect loop.
+    //
+    // Returns nullptr when:
+    //   - configuredTopics_ or liveNodes_ is empty (not yet configured).
+    //   - StaticBalancer throws BalancerError (misconfigured topic set).
+    //
+    // Safe to call on any node (Raft leader or follower): the static
+    // assignment is deterministic — same output on all nodes given the same
+    // topic+node configuration, which is wired during BrokerNode startup.
+    //
+    // Single-writer: must be called on the duty-cycle thread.
+    // Control-plane path (not hot): allocates BalancerRecord + BuildEntry vectors.
+    // -----------------------------------------------------------------------
+    [[nodiscard]]
+    std::shared_ptr<const rune::metadata::RoutingImage> buildStaticRoutingImage() const {
+        if (configuredTopics_.empty() || liveNodes_.empty()) return nullptr;
+        try {
+            const auto records =
+                rune::metadata::StaticBalancer::assign(configuredTopics_, liveNodes_);
+            if (records.empty()) return nullptr;
+
+            std::vector<rune::metadata::RoutingImage::BuildEntry> entries;
+            entries.reserve(records.size());
+            for (const auto& br : records) {
+                const int32_t gpid =
+                    rune::metadata::gpidOf(br.rec.topicId, br.rec.partition);
+                if (gpid < 0) continue; // defensive: gpidOf is always >= 0 for user topics
+                entries.push_back(rune::metadata::RoutingImage::BuildEntry{
+                    gpid, br.rec.leaderNode, br.rec.leaderEpoch});
+            }
+            return rune::metadata::RoutingImage::build(entries);
+        } catch (const rune::metadata::BalancerError&) {
+            // Misconfigured topic set (e.g. RF > nodes).  Emit is already
+            // suppressed in emitStaticAssignmentIfNeeded; same guard here.
+            return nullptr;
+        } catch (...) {
+            return nullptr;
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -21,10 +21,13 @@ Proves two things that are ALREADY proven by unit+integration (MD1-1..12):
    leader's partition to recover (which would be a Phase-2 feature).
 
 Phase-1 boundary contract (documented here for clarity):
-  * StaticBalancer: for ``multi:3`` on nodes 0,1,2 → partition p → node p.
-  * If node 0 (Raft-follower, partition-0 leader) is killed:
-      - partition 0 is UNAVAILABLE until Phase-2 re-election.
-      - partitions 1+2 (led by nodes 1+2) KEEP SERVING.
+  * StaticBalancer: for ``multi:3`` on nodes 0,1,2 with stripe offset 1 (events:1
+    precedes multi in RUNE_TOPICS) → partition p → node (p+1)%3.
+      partition 0 → node 1 (rune-2), partition 1 → node 2 (rune-3),
+      partition 2 → node 0 (rune-1).
+  * If node 0 (Raft-follower, partition-2 leader) is killed:
+      - partition 2 is UNAVAILABLE until Phase-2 re-election.
+      - partitions 0+1 (led by nodes 1+2) KEEP SERVING.
   * No split-brain: only ONE Raft consensus leader at any time
     (assert_single_leader, counter-based per DR-HARNESS convention).
 
@@ -103,21 +106,53 @@ _STAGGER_MS   = 400
 _SUBSCRIBE_MS = 60_000
 
 # ---------------------------------------------------------------------------
-# StaticBalancer determinism: for ``multi:3`` on nodes 0,1,2 the balancer
-# assigns partition p to node p (round-robin stripe; proven by unit tests
-# MD1-5).  This lets us predict partition → leader node without log scraping.
+# StaticBalancer determinism — stripe offset correction for the ``multi`` topic.
+#
+# The cluster is configured with RUNE_TOPICS = "events:1,multi:3,cg:4".
+# StaticBalancer assigns partitions in topic-declaration order using a global
+# leader counter (stripe).  Each topic advances the stripe by its partitionCount:
+#
+#   events (1 partition):  stripe_offset=0 → events:0 → node 0
+#   multi  (3 partitions): stripe_offset=1 → multi:p  → node (1+p) % 3
+#   cg     (4 partitions): stripe_offset=4 → ...
+#
+# So for multi:3 on nodes [0,1,2]:
+#    partition 0 → node 1 (rune-2)   [(1+0)%3 = 1]
+#    partition 1 → node 2 (rune-3)   [(1+1)%3 = 2]
+#    partition 2 → node 0 (rune-1)   [(1+2)%3 = 0]
+#
+# Inverse: node n leads partition (n - 1 + 3) % 3.
+#
+# This is the actual StaticBalancer output (verified by MD1-5 unit tests).
 # ---------------------------------------------------------------------------
+
+# Stripe offset for the ``multi`` topic = sum of partitionCounts of all topics
+# declared before it in RUNE_TOPICS = events (1 partition) = 1.
+_MULTI_STRIPE_OFFSET = 1   # events:1 precedes multi in RUNE_TOPICS
+
 
 def _expected_partition_leader(partition: int) -> int:
     """Return the node ID expected to lead ``partition`` of the ``multi`` topic.
 
-    StaticBalancer's even-stripe assignment: partition p → node (p % N) where
-    N = number of nodes (3).  For ``multi:3`` on nodes [0,1,2]:
-       partition 0 → node 0 (rune-1)
-       partition 1 → node 1 (rune-2)
-       partition 2 → node 2 (rune-3)
+    StaticBalancer with stripe offset ``_MULTI_STRIPE_OFFSET``:
+        multi:p → node (_MULTI_STRIPE_OFFSET + p) % N  where N=3.
+    For the current topic config (events:1 before multi:3):
+       partition 0 → node 1 (rune-2)
+       partition 1 → node 2 (rune-3)
+       partition 2 → node 0 (rune-1)
     """
-    return partition % len(SERVICES)
+    n = len(SERVICES)
+    return (_MULTI_STRIPE_OFFSET + partition) % n
+
+
+def _partition_led_by_node(node_id: int) -> int:
+    """Return the ``multi`` partition led by ``node_id``.
+
+    Inverse of _expected_partition_leader:
+        node n → partition (n - _MULTI_STRIPE_OFFSET + N) % N.
+    """
+    n = len(SERVICES)
+    return (node_id - _MULTI_STRIPE_OFFSET + n) % n
 
 
 def _service_of_partition_leader(partition: int) -> str:
@@ -447,8 +482,9 @@ def test_md1_availability_phase1_boundary(md1_cluster: Cluster) -> None:
       2. Identify the current Raft consensus leader.
       3. Kill one NON-Raft-leader node.  In Phase-1, each node is the partition
          leader for one partition of ``multi:3`` (StaticBalancer: partition p →
-         node p).  Killing a follower node kills the partition leader for one
-         partition without disrupting Raft consensus.
+         node (p+1)%3 with stripe offset 1 from events:1 topic).  Killing a
+         Raft-follower node kills the partition leader for one partition without
+         disrupting Raft consensus.
       4. Wait for the surviving 2-node Raft quorum to stabilise.
       5. Post-kill produce: attempt 20 records per surviving partition (keys
          that hash to partitions led by ALIVE nodes).  Assert these succeed.
@@ -493,7 +529,8 @@ def test_md1_availability_phase1_boundary(md1_cluster: Cluster) -> None:
     #   a) Keep the Raft consensus on the surviving 2 nodes uninterrupted.
     #   b) Kill the partition leader for the partition assigned to that node.
     #
-    # StaticBalancer: partition p → node p.  Raft followers are any node ≠ Raft leader.
+    # StaticBalancer: partition p → node (p+1)%3 (stripe offset = 1 for events:1).
+    # Each Raft-follower node is the partition leader for one multi partition.
     # We pick the first Raft follower.
     killed_svc: Optional[str] = None
     for svc in SERVICES:
@@ -503,8 +540,10 @@ def test_md1_availability_phase1_boundary(md1_cluster: Cluster) -> None:
     assert killed_svc is not None, "No follower node found to kill"
 
     killed_node_id = service_to_node_id(killed_svc)
-    # The partition whose leader was just killed (StaticBalancer: partition p → node p).
-    dead_partition = killed_node_id
+    # The partition whose leader was just killed.
+    # StaticBalancer assigns multi:p → node (stripe+p)%N (stripe=_MULTI_STRIPE_OFFSET=1).
+    # Inverse: node n leads partition (n - stripe + N) % N = _partition_led_by_node(n).
+    dead_partition = _partition_led_by_node(killed_node_id)
 
     # The partitions whose leaders are on surviving nodes.
     alive_partitions = [p for p in range(_MULTI_PARTITIONS) if p != dead_partition]
@@ -622,14 +661,54 @@ def test_md1_availability_phase1_boundary(md1_cluster: Cluster) -> None:
     # Only check the pre-kill records on alive partitions (the dead partition's
     # pre-kill records are majority-durable, but the dead leader cannot serve
     # them — this is also the Phase-1 boundary and is expected).
+    #
+    # IMPORTANT: we subscribe to each alive partition SEPARATELY, each from its
+    # correct leader node.  A single multi-partition subscribe that targets one
+    # gateway and relies on broker-side REDIRECT to bounce between nodes causes
+    # an infinite session-retarget loop (the single-session client retargets on
+    # every redirect, causing all pending subscribes to be re-sent on the new
+    # node — including partitions that DON'T live there — triggering a redirect
+    # back, etc.).  By targeting each partition's own leader directly we avoid
+    # all redirects and each subscribe delivers its records cleanly.
+    #
+    # Each per-partition subscribe uses RUNE_SUB_PARTITION_BASE=p + SUB_PARTITIONS=1
+    # so dr_client subscribes ONLY partition p from node (p+stripe_offset)%3.
     pre_alive_produced = [
         m for m in pre_res.all_produced if m.partition in alive_partitions
     ]
-    cid_sub = _next_cid_base()
-    sub_after_kill = _subscribe_multi(cluster, surviving_leader_svc, cid_sub)
+
+    import dataclasses
+
+    all_sub_clients = []
+    for p in alive_partitions:
+        leader_svc = _service_of_partition_leader(p)
+        cid_sub_p = _next_cid_base()
+        sub_p = run_clients(
+            1,
+            network=cluster.compose.network_name(),
+            target_service=leader_svc,
+            cid_base=cid_sub_p,
+            timeout_s=180,
+            mode="subscribe",
+            topics=_CLIENT_MULTI_TOPICS,
+            sub_partitions=1,
+            sub_partition_base=p,
+            keys=_KEYS,
+            from_="earliest",
+            expect=0,
+            subscribe_ms=_SUBSCRIBE_MS,
+            timeout_ms=_CONNECT_MS,
+            start_stagger_ms=_STAGGER_MS,
+        )
+        all_sub_clients.extend(sub_p.clients)
+        print(
+            f"[MD1-avail] Subscribe partition {p} from {leader_svc}: "
+            f"{len(sub_p.all_delivered)} records delivered"
+        )
+
+    sub_after_kill = Results(clients=all_sub_clients)
 
     # Build a filtered Results over the alive partitions only.
-    import dataclasses
     # We create a fake producer result with only the alive-partition records
     # to assert no committed loss on those partitions.
     alive_produce_clients = [
