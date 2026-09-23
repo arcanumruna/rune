@@ -10,10 +10,17 @@
 //      same router config yield identical ownerWorkerId results.
 //   4. AssignFromRegistryOwnsAllRegisteredReplicas — production path:
 //      assignFromRegistry clears + re-derives ownership from the real registry.
+//   5. NodeRuntimeAgentDelegatesReplicaIterationToPool — E1: NodeRuntimeAgent
+//      with a WorkerPool delegates per-replica iteration to the pool.
+//   6. DoubleAssignFromRegistryIsStable — calling assignFromRegistry twice on
+//      the same pool yields stable ownership (no leak / duplication).
+//   7. ReconcileDetectsRegistryChange — reconcile re-derives after add().
 // ---------------------------------------------------------------------------
 
 #include <rune/node/WorkerPool.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/NodeRuntimeAgent.h>
+#include <rune/consensus/ConsensusAgent.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/InMemoryLog.h>
@@ -32,6 +39,11 @@ using rune::replication::PartitionConfig;
 using rune::storage::InMemoryLog;
 
 namespace {
+
+// Stub consensus agent for NodeRuntimeAgent delegation tests.
+struct StubAgent final : rune::consensus::Agent {
+    int doWork(int64_t) override { return 0; }
+};
 
 // Minimal no-op transport (same pattern as WorkerTest.cpp).
 class NullTransport : public rune::replication::PartitionTransport {
@@ -176,5 +188,164 @@ TEST(WorkerPool, AssignFromRegistryOwnsAllRegisteredReplicas) {
             if (pool.worker(w).owns(r)) ++owners;
         }
         EXPECT_EQ(owners, 1) << "replica must be owned by exactly one worker after assignFromRegistry";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: NodeRuntimeAgent with a WorkerPool delegates per-replica iteration
+// to the pool (not the direct registry loop).
+// ---------------------------------------------------------------------------
+TEST(WorkerPool, NodeRuntimeAgentDelegatesReplicaIterationToPool) {
+    // Logs + transports must outlive the replicas.
+    std::vector<std::unique_ptr<InMemoryLog>>   logs;
+    std::vector<std::unique_ptr<NullTransport>> transports;
+
+    ReplicaRegistry reg;
+    for (int32_t p = 0; p < 3; ++p) {
+        logs.push_back(std::make_unique<InMemoryLog>(1024 * 1024, 1000));
+        transports.push_back(std::make_unique<NullTransport>());
+        PartitionConfig cfg{};
+        cfg.topicId     = 0;
+        cfg.partitionId = static_cast<rune::replication::PartitionId>(p);
+        cfg.selfId      = 1;
+        cfg.minIsr      = 1;
+        reg.add(0, p, std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            logs.back().get(), transports.back().get()));
+    }
+
+    ShardRouter router(2);
+    WorkerPool  pool(2, router);
+    pool.assignFromRegistry(reg);
+
+    StubAgent stub;
+    // Full ctor with workerPool appended; all other ptrs null.
+    rune::node::NodeRuntimeAgent agent(
+        stub,
+        /*election=*/nullptr, /*bridge=*/nullptr, /*transport=*/nullptr,
+        /*registry=*/&reg,    /*gateway=*/nullptr, /*group=*/nullptr,
+        /*txn=*/nullptr,      /*metadata=*/nullptr, /*workerPool=*/&pool);
+
+    // Must not crash and must return a non-negative work count;
+    // replicas are driven via the pool, not the registry loop.
+    EXPECT_GE(agent.doWork(/*nowNs=*/1), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: double assignFromRegistry (simulates a committed-map change).
+// Call assignFromRegistry TWICE on the same pool and verify:
+//   - every replica is still owned by exactly one worker (no leak / duplication).
+//   - worker sets are stable across the reassign.
+// ---------------------------------------------------------------------------
+TEST(WorkerPool, DoubleAssignFromRegistryIsStable) {
+    std::vector<std::unique_ptr<InMemoryLog>>   logs;
+    std::vector<std::unique_ptr<NullTransport>> transports;
+
+    auto mk = [&](int32_t topicId, int32_t partition) -> std::unique_ptr<PartitionReplica> {
+        logs.push_back(std::make_unique<InMemoryLog>(1024 * 1024, 1000));
+        transports.push_back(std::make_unique<NullTransport>());
+        PartitionConfig cfg{};
+        cfg.topicId     = topicId;
+        cfg.partitionId = static_cast<rune::replication::PartitionId>(partition);
+        cfg.selfId      = 1;
+        cfg.minIsr      = 1;
+        return std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            logs.back().get(), transports.back().get());
+    };
+
+    ReplicaRegistry reg;
+    for (int32_t p = 0; p < 4; ++p) reg.add(0, p, mk(0, p));
+
+    ShardRouter router(2);
+    WorkerPool  pool(2, router);
+
+    // First assign.
+    pool.assignFromRegistry(reg);
+    // Record the worker id for each replica after first assign.
+    std::vector<int32_t> firstOwner(4, -1);
+    for (auto* r : reg.allReplicas()) {
+        const int32_t pid = static_cast<int32_t>(r->partitionId());
+        for (int32_t w = 0; w < pool.workerCount(); ++w) {
+            if (pool.worker(w).owns(r)) firstOwner[static_cast<std::size_t>(pid)] = w;
+        }
+    }
+
+    // Second assign (simulates a rebalance with the same registry content).
+    pool.assignFromRegistry(reg);
+
+    // Verify: every replica owned by exactly one worker, same worker as before.
+    for (auto* r : reg.allReplicas()) {
+        int owners = 0;
+        int32_t ownerW = -1;
+        for (int32_t w = 0; w < pool.workerCount(); ++w) {
+            if (pool.worker(w).owns(r)) { ++owners; ownerW = w; }
+        }
+        EXPECT_EQ(owners, 1) << "replica must be owned by exactly one worker after second assign";
+        const int32_t pid = static_cast<int32_t>(r->partitionId());
+        EXPECT_EQ(ownerW, firstOwner[static_cast<std::size_t>(pid)])
+            << "ownership must be stable across reassign for partition " << pid;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: reconcile detects a registry change (replica added) and re-derives
+// ownership so the new replica is owned by exactly one worker.
+// ---------------------------------------------------------------------------
+TEST(WorkerPool, ReconcileDetectsRegistryChange) {
+    std::vector<std::unique_ptr<InMemoryLog>>   logs;
+    std::vector<std::unique_ptr<NullTransport>> transports;
+
+    auto mk = [&](int32_t topicId, int32_t partition) -> std::unique_ptr<PartitionReplica> {
+        logs.push_back(std::make_unique<InMemoryLog>(1024 * 1024, 1000));
+        transports.push_back(std::make_unique<NullTransport>());
+        PartitionConfig cfg{};
+        cfg.topicId     = topicId;
+        cfg.partitionId = static_cast<rune::replication::PartitionId>(partition);
+        cfg.selfId      = 1;
+        cfg.minIsr      = 1;
+        return std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            logs.back().get(), transports.back().get());
+    };
+
+    ReplicaRegistry reg;
+    reg.add(0, 0, mk(0, 0));
+    reg.add(0, 1, mk(0, 1));
+
+    ShardRouter router(2);
+    WorkerPool  pool(2, router);
+    pool.assignFromRegistry(reg);
+
+    // Reconcile with no change — must be a no-op (count unchanged).
+    pool.reconcile(reg);
+    EXPECT_EQ(pool.worker(0).ownedCount() + pool.worker(1).ownedCount(),
+              reg.replicaCount())
+        << "reconcile with no change must not alter ownership";
+
+    // Add a new replica to the registry.
+    reg.add(0, 2, mk(0, 2));
+
+    // Reconcile detects the count change and re-derives.
+    pool.reconcile(reg);
+
+    // Every replica (including the new one) must be owned by exactly one worker.
+    for (auto* r : reg.allReplicas()) {
+        int owners = 0;
+        for (int32_t w = 0; w < pool.workerCount(); ++w) {
+            if (pool.worker(w).owns(r)) ++owners;
+        }
+        EXPECT_EQ(owners, 1)
+            << "replica p=" << static_cast<int32_t>(r->partitionId())
+            << " must be owned by exactly one worker after reconcile";
     }
 }

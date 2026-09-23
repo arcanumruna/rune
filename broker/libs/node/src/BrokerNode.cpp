@@ -4,8 +4,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -517,6 +519,64 @@ void BrokerNode::buildReplication() {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::buildWorkerPool — E1: create WorkerPool and assign replicas.
+//
+// Must be called AFTER replicaRegistry_ is fully populated (i.e. AFTER
+// buildGateway() has added all user, offset, txn, and metadata replicas).
+//
+// Grouping rule: distinct non-empty TopicSpec::coPartitionGroup strings are
+// sorted and mapped to negative group keys (-1, -2, …) in sorted order. This
+// mirrors StaticBalancer's sorted-group-name determinism so all nodes derive
+// identical shard identities. Ungrouped topics fall back to their topicId.
+//
+// Ordinal invariant: partitionId() == partition ordinal (pcfg.partitionId = part
+// at BrokerNode.cpp:432). ShardRouter uses the ordinal as the partition index.
+// The assert below documents + enforces this; if partitionId ever becomes a
+// global gpid this will fire, preventing silent co-partition affinity breakage.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildWorkerPool() {
+    const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+
+    // Assign a stable negative group key to each distinct non-empty
+    // coPartitionGroup, in sorted group-name order (matches StaticBalancer
+    // determinism so every node derives identical shard identities).
+    std::set<std::string> groups;
+    for (const auto& ts : config_.topics)
+        if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
+    std::unordered_map<std::string, int32_t> groupKey;
+    int32_t next = -1;
+    for (const auto& g : groups) groupKey[g] = next--;
+
+    rune::metadata::ShardRouter router(wc);
+    for (const auto& ts : config_.topics) {
+        if (!ts.coPartitionGroup.empty())
+            router.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
+        // ungrouped topics: router uses topicId as-is (ShardRouter default).
+    }
+
+    workerPool_ = std::make_unique<WorkerPool>(wc, std::move(router));
+
+    if (replicaRegistry_) {
+        // Ordinal-invariant assert: routing uses partitionId() as the partition
+        // ordinal. This holds because pcfg.partitionId = part (BrokerNode.cpp:432),
+        // i.e. partitionId() == the 0-based partition ordinal within the topic.
+        // If partitionId ever becomes a global gpid this assertion will fire,
+        // preventing silent co-partition affinity routing breakage. Internal
+        // system replicas (topicId < 0) use partitionId = 0 — also valid.
+        for (auto* r : replicaRegistry_->allReplicas()) {
+            if (!r) continue;
+            assert(static_cast<int32_t>(r->partitionId()) >= 0 &&
+                   "partitionId() must be a non-negative ordinal (pcfg.partitionId = part)");
+        }
+        workerPool_->assignFromRegistry(*replicaRegistry_);
+    }
+
+    spdlog::info("BrokerNode[{}]: WorkerPool built ({} workers, {} replicas assigned)",
+                 config_.nodeId, wc,
+                 replicaRegistry_ ? replicaRegistry_->replicaCount() : std::size_t(0));
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::buildGateway — create the ClientGateway and NodeRuntimeAgent.
 //
 // Called AFTER buildConsensusObjects() (so agent_ / nodeAgent_ are valid)
@@ -987,6 +1047,11 @@ void BrokerNode::buildGateway() {
         }
     }
 
+    // E1: Build the WorkerPool + assign replicas to workers.
+    // Must run AFTER replicaRegistry_ is fully populated (user topics, offset,
+    // txn, and metadata replicas all added). The pool holds non-owning ptrs.
+    buildWorkerPool();
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
@@ -1003,7 +1068,8 @@ void BrokerNode::buildGateway() {
         gateway_.get(),
         groupCoordService_.get(), // CG-6: group coordinator (null-safe if setup failed)
         txnCoordService_.get(),   // TX-3: txn coordinator (null-safe if setup failed)
-        metadataService_.get());  // MD1: metadata service (null-safe if setup failed)
+        metadataService_.get(),   // MD1: metadata service (null-safe if setup failed)
+        workerPool_.get());       // E1: shard→worker pool (null-safe if no topics)
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
@@ -1237,6 +1303,7 @@ void BrokerNode::stop() {
     //    BR-3b teardown ordering: AgentRunner stop → release gateway/nodeAgent/ingress/sink
     //    → close aeron → stop driver.
     runtimeAgent_.reset();    // composite agent (holds refs to inner agent + gateway + replication)
+    workerPool_.reset();      // E1: holds non-owning replica ptrs; drop before replicaRegistry_ frees them
     // TX-3: destroy txn coordination service before gateway (holds gateway* + txnState*).
     txnCoordService_.reset(); // TransactionCoordinationService (no Aeron resources, holds gateway*)
     // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).

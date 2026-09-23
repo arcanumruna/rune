@@ -30,6 +30,7 @@
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -213,6 +214,7 @@ private:
     void buildMultiNodeConsensus();
     void buildReplication();   // GR-2/GR-3: replicas + transport + bridge
     void buildGateway();
+    void buildWorkerPool();    // E1: shard→worker assignment (must call after replicaRegistry_ is fully built)
 
     // -----------------------------------------------------------------------
     // Configuration (immutable after construction)
@@ -334,6 +336,14 @@ private:
     std::unique_ptr<rune::storage::Log>                   metadataLog_;
     std::unique_ptr<rune::replication::PartitionReplica>  metadataReplica_;
     std::unique_ptr<MetadataService>                      metadataService_;
+
+    // -----------------------------------------------------------------------
+    // E1: WorkerPool — shard→worker ownership map (built after replicaRegistry_).
+    // Destroyed AFTER runtimeAgent_ (which holds a non-owning ptr) and BEFORE
+    // replicaRegistry_ (pool holds non-owning replica ptrs; registry owns them).
+    // Declaration order enforces this via reverse-destruction in the destructor.
+    // -----------------------------------------------------------------------
+    std::unique_ptr<WorkerPool> workerPool_;  // E1: shard->worker ownership
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;

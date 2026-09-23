@@ -1194,4 +1194,60 @@ TEST(NodeConfig, RuneWorkersFloorsToOne) {
     EXPECT_EQ(res.config->workerCount, 1) << "0/negative/garbage floors to 1";
 }
 
+// E1 Task 5: RUNE_WORKER_IDLE parsing + WorkerIdleStrategy field
+TEST(NodeConfig, RuneWorkerIdleDefault) {
+    // RUNE_WORKER_IDLE absent → default Backoff (must NOT be busy-spin).
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIdleStrategy,
+              rune::node::NodeConfig::WorkerIdleStrategy::Backoff)
+        << "default must be Backoff (must not peg a core)";
+}
+
+TEST(NodeConfig, RuneWorkerIdleBackoff) {
+    auto base = base1node();
+    base["RUNE_WORKER_IDLE"] = "backoff";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIdleStrategy,
+              rune::node::NodeConfig::WorkerIdleStrategy::Backoff);
+}
+
+TEST(NodeConfig, RuneWorkerIdleBusySpin) {
+    auto base = base1node();
+    base["RUNE_WORKER_IDLE"] = "busyspin";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIdleStrategy,
+              rune::node::NodeConfig::WorkerIdleStrategy::BusySpin);
+}
+
+TEST(NodeConfig, RuneWorkerIdleYielding) {
+    auto base = base1node();
+    base["RUNE_WORKER_IDLE"] = "YIELDING";  // upper-case — must be case-insensitive
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIdleStrategy,
+              rune::node::NodeConfig::WorkerIdleStrategy::Yielding);
+}
+
+TEST(NodeConfig, RuneWorkerIdleSleeping) {
+    auto base = base1node();
+    base["RUNE_WORKER_IDLE"] = "sleeping";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIdleStrategy,
+              rune::node::NodeConfig::WorkerIdleStrategy::Sleeping);
+}
+
+TEST(NodeConfig, RuneWorkerIdleGarbageFloorsToBackoff) {
+    auto base = base1node();
+    base["RUNE_WORKER_IDLE"] = "turbo_ultra_fast_999";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIdleStrategy,
+              rune::node::NodeConfig::WorkerIdleStrategy::Backoff)
+        << "unrecognised value must floor to Backoff";
+}
+
 } // namespace rune::node

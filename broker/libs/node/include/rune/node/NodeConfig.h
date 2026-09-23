@@ -171,6 +171,25 @@ struct NodeConfig {
     // via RUNE_WORKERS. Floored to 1.
     int32_t workerCount = 1;
 
+    // Milestone E1 / E2: per-worker idle strategy selector.
+    // E1 does NOT use this (no per-worker AgentRunner yet — workers are driven
+    // cooperatively on the single AgentRunner). E2 will give each worker its own
+    // AgentRunner and read this field to select the IdleStrategy.
+    //
+    // Valid values (parsed from RUNE_WORKER_IDLE env var, case-insensitive):
+    //   "backoff"   — BackoffIdleStrategy (default; safe for shared cores).
+    //   "busyspin"  — BusySpinIdleStrategy (pegs a core; use only on dedicated CPU).
+    //   "yielding"  — YieldingIdleStrategy (yield-loop; moderate CPU usage).
+    //   "sleeping"  — SleepingIdleStrategy (OS sleep; lowest CPU, highest latency).
+    // Any unrecognised value is floored to "backoff" (must NOT default to busy-spin).
+    enum class WorkerIdleStrategy : uint8_t {
+        Backoff   = 0,  ///< BackoffIdleStrategy — DEFAULT. Must not peg a core.
+        BusySpin  = 1,  ///< BusySpinIdleStrategy — lowest latency; pegs core.
+        Yielding  = 2,  ///< YieldingIdleStrategy — moderate CPU.
+        Sleeping  = 3,  ///< SleepingIdleStrategy — lowest CPU, highest latency.
+    };
+    WorkerIdleStrategy workerIdleStrategy = WorkerIdleStrategy::Backoff;
+
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
     // each topic's segmentRollBytes are merged into a single output segment per

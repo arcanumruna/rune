@@ -87,6 +87,7 @@ public:
             const int32_t wid = ownerWorkerId(tid, pid);
             workers_[static_cast<std::size_t>(wid)].ownReplica(r);
         }
+        lastReplicaCount_ = registry.replicaCount();  // seed for reconcile()
     }
 
     // Fan out doWork over all workers and return the total work count.
@@ -98,9 +99,22 @@ public:
         return work;
     }
 
+    // Re-derive shard→worker ownership when the registry's replica set changes.
+    // Cheap: compares replicaCount(); a full re-derivation (assignFromRegistry)
+    // only runs on change. Deterministic + single-writer.
+    // Called every duty cycle before workerPool_->doWork (D dynamic rebalance).
+    void reconcile(const ReplicaRegistry& registry) {
+        const std::size_t n = registry.replicaCount();
+        if (n != lastReplicaCount_) {
+            assignFromRegistry(registry);
+            // lastReplicaCount_ is updated inside assignFromRegistry.
+        }
+    }
+
 private:
     rune::metadata::ShardRouter router_;
     std::vector<Worker>         workers_;
+    std::size_t                 lastReplicaCount_ = static_cast<std::size_t>(-1); // sentinel: not yet assigned
 };
 
 } // namespace rune::node

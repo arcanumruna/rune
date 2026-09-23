@@ -609,6 +609,27 @@ ConfigResult parseNodeConfig(
         cfg.workerCount = 1;
     }
 
+    // --- RUNE_WORKER_IDLE (optional) — Milestone E1/E2: per-worker idle strategy selector. ---
+    // E1: parsed + stored here; no per-worker AgentRunner yet (driven cooperatively).
+    // E2: will wire this into each worker's AgentRunner.
+    // Unrecognised values are floored to "backoff" (must NOT default to busy-spin).
+    if (const char* wi = getenv_fn("RUNE_WORKER_IDLE")) {
+        std::string s(wi);
+        // Case-insensitive compare via tolower.
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "busyspin" || s == "busy_spin" || s == "busy-spin") {
+            cfg.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
+        } else if (s == "yielding") {
+            cfg.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::Yielding;
+        } else if (s == "sleeping") {
+            cfg.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::Sleeping;
+        } else {
+            // "backoff" or any unrecognised value → default (safe, no core pegging).
+            cfg.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::Backoff;
+        }
+    }
+    // Absent → keep NodeConfig default (Backoff).
+
     return {std::move(cfg), {}};
 }
 

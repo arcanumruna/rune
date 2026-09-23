@@ -32,6 +32,7 @@
 #include <rune/node/MetadataService.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
@@ -85,7 +86,8 @@ public:
                      rune::gateway::ClientGateway*       gateway,
                      GroupCoordinationService*           groupService    = nullptr,
                      TransactionCoordinationService*     txnService      = nullptr,
-                     MetadataService*                    metadataService = nullptr) noexcept
+                     MetadataService*                    metadataService = nullptr,
+                     WorkerPool*                         workerPool      = nullptr) noexcept
         : consensus_(consensusAgent)
         , election_(election)
         , bridge_(bridge)
@@ -95,6 +97,7 @@ public:
         , groupService_(groupService)
         , txnService_(txnService)
         , metadataService_(metadataService)
+        , workerPool_(workerPool)
     {}
 
     // Backward-compatible constructor for single-node / tests without replication.
@@ -112,6 +115,7 @@ public:
         , groupService_(groupService)
         , txnService_(txnService)
         , metadataService_(metadataService)
+        , workerPool_(nullptr)
     {}
 
     NodeRuntimeAgent(const NodeRuntimeAgent&)            = delete;
@@ -223,12 +227,23 @@ public:
             work += transport_->poll(nowNs);
         }
 
-        // 5. Per-replica duty cycle — ISR checks (leader) / fetch emission (follower).
-        if (registry_) {
+        // 5 + 6.5. Per-replica duty cycle + disk-log cleaner/retention drains.
+        // E1: when a WorkerPool is wired, each Worker runs these steps for ITS
+        // owned shards only (shared-nothing, single-owner). Driven cooperatively
+        // here on the single AgentRunner thread (no new threads in E1).
+        // When workerPool_ is null, fall back to the pre-E1 single-agent path.
+        //
+        // reconcile() checks the registry's replica count; if it changed (D
+        // dynamic rebalance: replica added or removed by the metadata bridge),
+        // re-derives shard→worker ownership deterministically. Cheap: O(1) check,
+        // re-derive only on change. Single-writer invariant holds.
+        if (workerPool_) {
+            if (registry_) workerPool_->reconcile(*registry_);
+            work += workerPool_->doWork(nowNs);
+        } else if (registry_) {
+            // Pre-E1 path: iterate registry directly.
             for (auto* replica : registry_->allReplicas()) {
-                if (replica) {
-                    work += replica->doWork(nowNs);
-                }
+                if (replica) work += replica->doWork(nowNs);
             }
         }
 
@@ -247,7 +262,12 @@ public:
         //      The cleaner enqueues bases of segments renamed to .deleted via
         //      Log::enqueueDeletedSegment().  The segments_ erase MUST happen
         //      here on the append thread (single-writer invariant).
-        if (registry_) {
+        //
+        //      E1: when workerPool_ is wired, Worker::doWork already handles
+        //      these drains for each owned shard (Worker runs replica->doWork +
+        //      log drains together). Skip the registry loop here to avoid double-
+        //      draining.
+        if (!workerPool_ && registry_) {
             for (auto* replica : registry_->allReplicas()) {
                 // Task M1 precondition #2: skip memory-backed replicas.
                 // drainCleanerSwaps/drainRetentionDeletes/drainStagingRenamesDone are
@@ -425,6 +445,7 @@ private:
     GroupCoordinationService*                          groupService_;    // non-owning; null-safe (CG-3)
     TransactionCoordinationService*                    txnService_;      // non-owning; null-safe (TX-3)
     MetadataService*                                   metadataService_; // non-owning; null-safe (MD1)
+    WorkerPool*                                        workerPool_;      // non-owning; null = pre-E1 path
 };
 
 } // namespace rune::node
