@@ -69,6 +69,14 @@ if(BUILD_TESTING)
         rune_metadata
         GTest::gtest_main)
 
+    add_executable(rune_control_plane_timer_tests
+        tests/ControlPlaneTimerTest.cpp)
+    target_link_libraries(rune_control_plane_timer_tests PRIVATE
+        rune_metadata
+        GTest::gtest_main)
+    target_include_directories(rune_control_plane_timer_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+
     include(GoogleTest)
     gtest_discover_tests(rune_partition_assignment_tests)
     gtest_discover_tests(rune_metadata_state_machine_tests)
@@ -76,4 +84,5 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_routing_image_tests)
     gtest_discover_tests(rune_replica_position_table_tests)
     gtest_discover_tests(rune_membership_state_tests)
+    gtest_discover_tests(rune_control_plane_timer_tests)
 endif()
