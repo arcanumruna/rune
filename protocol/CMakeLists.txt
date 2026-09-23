@@ -26,6 +26,7 @@ if(BUILD_TESTING)
             tests/protocol/MetadataRecordsTest.cpp
             tests/protocol/CreateTopicRecordTest.cpp
             tests/protocol/NodeJoinRecordTest.cpp
+            tests/protocol/ControlTickRecordTest.cpp
             tests/protocol/client/MessageHeaderTest.cpp
             tests/protocol/client/ControlMessagesConnectTest.cpp
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp

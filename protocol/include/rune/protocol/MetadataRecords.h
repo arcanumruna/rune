@@ -37,6 +37,7 @@ enum class MetadataRecordType : uint16_t {
     UpdatePartitionAssignment = 2,
     NodeJoin                 = 3,
     NodeLeave                = 4,
+    ControlTick              = 5,   // deterministic control-plane logged tick (Task 4)
 };
 
 // ---------------------------------------------------------------------------
@@ -578,6 +579,65 @@ struct NodeLeaveRecord {
         NodeLeaveRecord rec;
         rec.recordVersion = buf[2];
         rec.nodeId        = detail::getS32(buf, static_cast<int>(detail::kPrefixSize));
+
+        return rec;
+    }
+};
+
+// ===========================================================================
+// ControlTickRecord  (recordType = 5)
+//
+// Logged by the LEADER to the MSM log when a control-plane timer fires.
+// Every replica — including recovering nodes — applies the same record,
+// making heartbeat-expiry and reassignment decisions deterministic and
+// replayable.  Mirrors Aeron Cluster's timer-tick approach: the LEADER
+// appends this record; no replica uses a local wall-clock for decisions.
+//
+// Wire layout (all little-endian):
+//   [0..1]   recordType     uint16 LE = 5
+//   [2]      recordVersion  uint8  = 0
+//   [3..10]  tickTimeNs     int64 LE  — cluster-time at which timer fired
+//   [11..18] tickSeq        int64 LE  — monotonic sequence (0-based)
+//
+// Total encoded size: 19 bytes.
+// ===========================================================================
+struct ControlTickRecord {
+    int64_t tickTimeNs    = 0;
+    int64_t tickSeq       = 0;
+    uint8_t recordVersion = 0;
+
+    static constexpr uint16_t RECORD_TYPE_ID =
+        static_cast<uint16_t>(MetadataRecordType::ControlTick); // 5
+
+    static constexpr std::size_t ENCODED_SIZE =
+        detail::kPrefixSize + 8u + 8u; // prefix(3) + tickTimeNs(8) + tickSeq(8) = 19
+
+    /// Encode into buf[0..bufLen-1].  Returns total bytes written (19), or 0 if too small.
+    std::size_t encode(uint8_t* buf, std::size_t bufLen) const noexcept {
+        if (bufLen < ENCODED_SIZE) return 0u;
+
+        detail::encodePrefixAt(buf, MetadataRecordType::ControlTick);
+        std::size_t pos = detail::kPrefixSize;
+
+        detail::putS64(buf, static_cast<int>(pos), tickTimeNs); pos += 8u;
+        detail::putS64(buf, static_cast<int>(pos), tickSeq);    pos += 8u;
+
+        return pos; // == ENCODED_SIZE
+    }
+
+    /// Decode from buf[0..avail-1].  Returns nullopt on any error.
+    static std::optional<ControlTickRecord> decode(const uint8_t* buf,
+                                                    std::size_t avail) noexcept {
+        if (!detail::validatePrefix(buf, avail, MetadataRecordType::ControlTick))
+            return std::nullopt;
+        if (avail < ENCODED_SIZE) return std::nullopt;
+
+        ControlTickRecord rec;
+        rec.recordVersion = buf[2];
+        std::size_t pos   = detail::kPrefixSize;
+
+        rec.tickTimeNs = detail::getS64(buf, static_cast<int>(pos)); pos += 8u;
+        rec.tickSeq    = detail::getS64(buf, static_cast<int>(pos));
 
         return rec;
     }
