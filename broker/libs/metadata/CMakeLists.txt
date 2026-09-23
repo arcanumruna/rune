@@ -114,6 +114,12 @@ if(BUILD_TESTING)
     target_include_directories(rune_controlled_shutdown_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE})
 
+    add_executable(rune_shard_router_tests
+        tests/ShardRouterTest.cpp)
+    target_link_libraries(rune_shard_router_tests PRIVATE
+        rune_metadata
+        GTest::gtest_main)
+
     include(GoogleTest)
     gtest_discover_tests(rune_partition_assignment_tests)
     gtest_discover_tests(rune_metadata_state_machine_tests)
@@ -125,4 +131,5 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_failover_election_tests)
     gtest_discover_tests(rune_dynamic_balancer_tests)
     gtest_discover_tests(rune_controlled_shutdown_tests)
+    gtest_discover_tests(rune_shard_router_tests)
 endif()
