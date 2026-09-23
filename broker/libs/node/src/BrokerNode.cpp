@@ -425,11 +425,16 @@ void BrokerNode::buildReplication() {
             if (isMemory) {
                 // Memory-backed partition: create an InMemoryLog.
                 // Recovery SKIPS memory partitions — they start empty (precondition #3).
-                constexpr std::size_t kMemLogMaxBytes   = 256UL * 1024 * 1024; // 256 MiB
+                // Use config_.memoryLogRingBytes (default 8 MiB, env RUNE_MEMORY_LOG_RING_BYTES)
+                // as the fixed circular-ring capacity.  Keep DropOldest (not BackPressure)
+                // so existing memory-persistence tests are parity-unchanged.
+                const std::size_t kMemLogMaxBytes =
+                    static_cast<std::size_t>(config_.memoryLogRingBytes);
                 constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
                 memoryLogs_.push_back(
                     std::make_unique<rune::storage::InMemoryLog>(
-                        kMemLogMaxBytes, kMemLogMaxRecords));
+                        kMemLogMaxBytes, kMemLogMaxRecords,
+                        rune::storage::FullPolicy::DropOldest));
                 memLogPtr = memoryLogs_.back().get();
                 spdlog::debug("BrokerNode[{}]: topic '{}' partition {} using InMemoryLog",
                               config_.nodeId, spec->name, part);
