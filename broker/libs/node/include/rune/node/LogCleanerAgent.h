@@ -180,7 +180,9 @@ public:
         // provisioning is background housekeeping that reaches steady state (returns
         // 0) after building one segment, so excluding it keeps that signal clean.
         for (auto* r : registry_->allReplicas()) {
-            if (r && r->log()) {
+            // Task M1 precondition #2: skip memory-backed replicas.
+            // r->log() asserts isDiskBacked() — never call it on an InMemoryLog.
+            if (r && r->ilog() && r->ilog()->isDiskBacked()) {
                 r->log()->preprovisionPending();
                 r->log()->finalizeStagingRenames();
             }
@@ -239,6 +241,10 @@ public:
             // TSan race fix: gate on the cleaner-visible role snapshot (atomic
             // acquire), NOT role() which reads the duty-thread-mutated role_.
             if (replica->cleanerRole() != rune::replication::Role::Leader) continue;
+
+            // Task M1 precondition #2: skip memory-backed replicas.
+            // Compaction/retention only applies to on-disk logs.
+            if (!replica->ilog() || !replica->ilog()->isDiskBacked()) continue;
 
             const auto policy = replica->cleanupPolicy();
             if (policy == rune::replication::CleanupPolicy::Delete) continue;
@@ -563,6 +569,10 @@ private:
             // retention because cleanerRole() != Leader).
             // TSan race fix: read the cleaner-visible role snapshot (atomic acquire).
             if (replica->cleanerRole() != rune::replication::Role::Leader) continue;
+
+            // Task M1 precondition #2: skip memory-backed replicas.
+            // Retention only applies to on-disk logs.
+            if (!replica->ilog() || !replica->ilog()->isDiskBacked()) continue;
 
             const auto policy = replica->cleanupPolicy();
             // Retention applies to Delete and CompactDelete topics only.

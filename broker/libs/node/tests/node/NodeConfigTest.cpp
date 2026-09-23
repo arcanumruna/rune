@@ -1110,4 +1110,62 @@ TEST(NodeConfigTest, CP10_IoMaxBytesPerSecond_DefaultMinusOne) {
         << "ioMaxBytesPerSecond must default to -1 (unlimited)";
 }
 
+// ===========================================================================
+// Task M1: co-partition group, partition key, persistence, durability
+// ===========================================================================
+
+TEST(NodeConfig, ParsesCoPartitionGroupKeyAndPersistence) {
+    auto env = [](const char* k)->const char*{
+        std::string s=k;
+        if (s=="RUNE_NODE_ID") return "0";
+        if (s=="RUNE_PEERS") return "0@h:1";
+        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2";
+        if (s=="RUNE_DATA_DIR") return "/tmp/x";
+        if (s=="RUNE_TOPICS") return "wallet:4:group=acct:key=userId:durability=all-in-sync,presence:2:persistence=memory";
+        return nullptr;
+    };
+    auto res = rune::node::parseNodeConfig(env);
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    const auto& ts = res.config->topics;
+    ASSERT_EQ(ts.size(), 2u);
+    EXPECT_EQ(ts[0].coPartitionGroup, "acct");
+    EXPECT_EQ(ts[0].partitionKey, "userId");
+    EXPECT_EQ(ts[0].durability, 1);
+    EXPECT_EQ(ts[1].persistence, rune::node::PersistenceMode::Memory);
+}
+
+TEST(NodeConfig, LegacyTopicGrammarStillParses) {
+    auto env=[](const char* k)->const char*{ std::string s=k;
+        if (s=="RUNE_NODE_ID") return "0"; if (s=="RUNE_PEERS") return "0@h:1";
+        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2"; if (s=="RUNE_DATA_DIR") return "/tmp/x";
+        if (s=="RUNE_TOPICS") return "inventory:8,chat:1"; return nullptr; };
+    auto res=rune::node::parseNodeConfig(env);
+    ASSERT_TRUE(res.config.has_value());
+    EXPECT_EQ(res.config->topics[0].coPartitionGroup, "");
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Disk);
+}
+
+TEST(NodeConfig, PersistenceMemoryDurabilityAllInSync) {
+    // Memory topic + AllInSync durability is a valid configuration.
+    // It means: every write must be acked by ALL replicas (but stored in RAM).
+    auto env=[](const char* k)->const char*{ std::string s=k;
+        if (s=="RUNE_NODE_ID") return "0"; if (s=="RUNE_PEERS") return "0@h:1";
+        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2"; if (s=="RUNE_DATA_DIR") return "/tmp/x";
+        if (s=="RUNE_TOPICS") return "ephemeral:2:persistence=memory:durability=all-in-sync"; return nullptr; };
+    auto res=rune::node::parseNodeConfig(env);
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Memory);
+    EXPECT_EQ(res.config->topics[0].durability, 1u);
+}
+
+TEST(NodeConfig, UnknownKeyValueOptionRejected) {
+    auto env=[](const char* k)->const char*{ std::string s=k;
+        if (s=="RUNE_NODE_ID") return "0"; if (s=="RUNE_PEERS") return "0@h:1";
+        if (s=="RUNE_CLIENT_ENDPOINT") return "h:2"; if (s=="RUNE_DATA_DIR") return "/tmp/x";
+        if (s=="RUNE_TOPICS") return "t:2:badkey=badval"; return nullptr; };
+    auto res=rune::node::parseNodeConfig(env);
+    EXPECT_FALSE(res.config.has_value()) << "unknown key=value option must be rejected";
+    EXPECT_NE(res.error.find("badkey"), std::string::npos);
+}
+
 } // namespace rune::node

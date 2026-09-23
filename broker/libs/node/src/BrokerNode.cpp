@@ -15,6 +15,7 @@
 // CG-6 wiring: storage + replication headers for __consumer_offsets.
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
 // TX-3 wiring: transaction coordination service + replicated state store.
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
@@ -397,11 +398,31 @@ void BrokerNode::buildReplication() {
         if (!spec) continue;
 
         for (int32_t part = 0; part < spec->partitionCount; ++part) {
-            rune::storage::Log* logPtr = topicRegistry_->log(topicId, part);
-            if (!logPtr) {
-                spdlog::warn("BrokerNode[{}]: log not found for topic {} partition {}; skipping replica",
-                             config_.nodeId, spec->name, part);
-                continue;
+            // Task M1: select log backend by persistence mode.
+            // Memory-backed: create an InMemoryLog (large caps — production-suitable).
+            // Disk-backed: use the Log from TopicRegistry (recovered on startup).
+            rune::storage::ILog* ilogPtr = nullptr;
+            const bool isMemory = (spec->persistence == rune::node::PersistenceMode::Memory);
+
+            if (isMemory) {
+                // Memory-backed partition: create an InMemoryLog.
+                // Recovery SKIPS memory partitions — they start empty (precondition #3).
+                constexpr std::size_t kMemLogMaxBytes   = 256UL * 1024 * 1024; // 256 MiB
+                constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
+                memoryLogs_.push_back(
+                    std::make_unique<rune::storage::InMemoryLog>(
+                        kMemLogMaxBytes, kMemLogMaxRecords));
+                ilogPtr = memoryLogs_.back().get();
+                spdlog::debug("BrokerNode[{}]: topic '{}' partition {} using InMemoryLog",
+                              config_.nodeId, spec->name, part);
+            } else {
+                rune::storage::Log* logPtr = topicRegistry_->log(topicId, part);
+                if (!logPtr) {
+                    spdlog::warn("BrokerNode[{}]: log not found for topic {} partition {}; skipping replica",
+                                 config_.nodeId, spec->name, part);
+                    continue;
+                }
+                ilogPtr = logPtr;
             }
 
             PartitionConfig pcfg;
@@ -439,6 +460,9 @@ void BrokerNode::buildReplication() {
             pcfg.retentionCheckMs       = spec->retentionCheckMs;
             pcfg.fileDeleteDelayMs      = spec->fileDeleteDelayMs;
             pcfg.logStartOffset         = spec->logStartOffset;
+            // Task M1 / precondition #1: forward parsed durability into PartitionConfig.
+            // 0 = Majority (default), 1 = AllInSync.
+            pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec->durability);
 
             // Determine the transport: real Aeron transport if available,
             // otherwise a per-replica InMemoryTransport (no-op: no peers wired).
@@ -456,7 +480,7 @@ void BrokerNode::buildReplication() {
                 /*epoch=*/0,
                 allNodeIds,
                 allNodeIds,
-                logPtr,
+                ilogPtr,
                 transport
             );
 
@@ -919,10 +943,9 @@ void BrokerNode::buildGateway() {
             // MD1 Task 6: configure static assignment emit context.
             // Convert NodeConfig::TopicSpec (broker config) to
             // rune::metadata::TopicSpec (balancer input).
-            // rf defaults to cluster size (all nodes replicate every partition);
-            // coPartitionGroup + partitionKey are empty (not in NodeConfig v1 —
-            // NOTE: group co-location config is not yet in NodeConfig; tests that
-            // require co-location must construct TopicSpec directly in tests).
+            // rf defaults to cluster size (all nodes replicate every partition).
+            // Task M1 Note C fix: coPartitionGroup + partitionKey are now forwarded
+            // from the parsed TopicSpec (previously hard-coded empty strings).
             {
                 std::vector<rune::metadata::TopicSpec> balancerTopics;
                 balancerTopics.reserve(config_.topics.size());
@@ -934,8 +957,8 @@ void BrokerNode::buildGateway() {
                     bs.topicId          = ts.topicId;
                     bs.partitionCount   = ts.partitionCount;
                     bs.rf               = rf;
-                    bs.coPartitionGroup = ""; // not in NodeConfig v1
-                    bs.partitionKey     = ""; // not in NodeConfig v1
+                    bs.coPartitionGroup = ts.coPartitionGroup; // Note C fix: from parsed config
+                    bs.partitionKey     = ts.partitionKey;     // Note C fix: from parsed config
                     balancerTopics.push_back(std::move(bs));
                 }
                 // Convert allNodeIds (vector<NodeId>) to vector<int32_t> for balancer.

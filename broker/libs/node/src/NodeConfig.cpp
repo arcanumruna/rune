@@ -376,11 +376,14 @@ ConfigResult parseNodeConfig(
                 if (entry.empty())
                     return {{}, "RUNE_TOPICS contains an empty entry (leading, trailing, or double comma)"};
 
-                // Split the entry by ':' into up to 8 fields.
-                // Field 0: name, Field 1: partitionCount, Field 2: policy,
-                // Field 3: segmentRollBytes, Field 4: deleteRetentionMs,
-                // Field 5: retentionMs, Field 6: retentionBytes,
-                // Field 7: retentionCheckMs, Field 8: fileDeleteDelayMs
+                // Split the entry by ':'.
+                // Field 0: name, Field 1: partitionCount.
+                // Remaining fields can be either:
+                //   (a) Positional legacy fields (no '=' in token): policy, segmentRollBytes, etc.
+                //   (b) Named key=value tokens (contain '='): group=<g>, key=<k>,
+                //       persistence=memory|disk, durability=majority|all-in-sync.
+                // Both formats are backward-compatible: a token is key=value iff it
+                // contains '='; otherwise it is a positional legacy field.
                 std::vector<std::string_view> fields;
                 {
                     std::string_view rem = entry;
@@ -413,9 +416,73 @@ ConfigResult parseNodeConfig(
                 ts.partitionCount = partCount;
                 ts.topicId        = topicIdx++;
 
-                // Field 2 (optional): policy — "delete", "compact", "compact_delete"
-                if (fields.size() >= 3 && !fields[2].empty()) {
-                    std::string pol(fields[2]);
+                // Separate remaining fields into positional and key=value slots.
+                // A token is key=value iff it contains exactly one '='.
+                // Positional tokens (legacy) occupy fields[2..N] in order; key=value
+                // tokens are routed by their key name.  Mixing is allowed: the format
+                // "name:N:compact:group=acct" would set policy=compact + group=acct.
+                std::vector<std::string_view> positional; // legacy positional fields[2..]
+                for (std::size_t fi = 2; fi < fields.size(); ++fi) {
+                    const std::string_view f = fields[fi];
+                    if (f.empty()) {
+                        // Empty colon-field in positional format: keep a placeholder so
+                        // later positional fields land at the right index.
+                        positional.push_back(f);
+                        continue;
+                    }
+                    auto eq = f.find('=');
+                    if (eq == std::string_view::npos) {
+                        // Positional legacy field.
+                        positional.push_back(f);
+                        continue;
+                    }
+                    // key=value token.
+                    std::string_view kname = trim(f.substr(0, eq));
+                    std::string_view kval  = trim(f.substr(eq + 1));
+
+                    // Convert key to lower-case for comparison.
+                    std::string klower(kname);
+                    for (auto& ch : klower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+
+                    if (klower == "group") {
+                        ts.coPartitionGroup = std::string(kval);
+                    } else if (klower == "key") {
+                        ts.partitionKey = std::string(kval);
+                    } else if (klower == "persistence") {
+                        std::string vlow(kval);
+                        for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        if (vlow == "memory") {
+                            ts.persistence = PersistenceMode::Memory;
+                        } else if (vlow == "disk") {
+                            ts.persistence = PersistenceMode::Disk;
+                        } else {
+                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'memory', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                        }
+                    } else if (klower == "durability") {
+                        std::string vlow(kval);
+                        for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        if (vlow == "majority") {
+                            ts.durability = 0;
+                        } else if (vlow == "all-in-sync") {
+                            ts.durability = 1;
+                        } else {
+                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                        }
+                    } else {
+                        return {{}, std::string("RUNE_TOPICS unknown option '") + std::string(kname) + "' in entry: " + std::string(entry)};
+                    }
+                }
+
+                // Process legacy positional fields (using positional[] vector so index
+                // 0 = policy, 1 = segmentRollBytes, etc., equivalent to fields[2..]).
+                // Helper: access positional field by 0-based index.
+                auto posField = [&](std::size_t idx) -> std::string_view {
+                    return idx < positional.size() ? positional[idx] : std::string_view{};
+                };
+
+                // Positional[0] (optional): policy — "delete", "compact", "compact_delete"
+                if (!posField(0).empty()) {
+                    std::string pol(posField(0));
                     // Case-insensitive comparison.
                     for (auto& ch : pol) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
                     if (pol == "delete") {
@@ -429,12 +496,13 @@ ConfigResult parseNodeConfig(
                     }
                 }
 
-                // Helper: parse an optional int64 field (positive or -1).
+                // Helper: parse an optional positional int64 field (positive or -1).
                 auto parseOptField = [&](std::size_t idx, const char* fieldName, int64_t& out, bool allowNeg1) -> std::string {
-                    if (fields.size() <= idx || fields[idx].empty()) return {};
+                    const auto sv = posField(idx);
+                    if (sv.empty()) return {};
                     int64_t v{};
-                    auto [ptr, ec] = std::from_chars(fields[idx].data(), fields[idx].data() + fields[idx].size(), v);
-                    if (ec != std::errc{} || ptr != fields[idx].data() + fields[idx].size())
+                    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
+                    if (ec != std::errc{} || ptr != sv.data() + sv.size())
                         return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + std::string(entry);
                     if (!allowNeg1 && v < 1)
                         return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + std::string(entry);
@@ -444,48 +512,48 @@ ConfigResult parseNodeConfig(
                     return {};
                 };
 
-                // Field 3 (optional): segmentRollBytes (positive int64)
+                // Positional[1] (optional): segmentRollBytes (positive int64)
                 {
-                    std::string err = parseOptField(3, "segmentRollBytes", ts.segmentRollBytes, false);
+                    std::string err = parseOptField(1, "segmentRollBytes", ts.segmentRollBytes, false);
                     if (!err.empty()) return {{}, err};
                 }
 
-                // Field 4 (optional): deleteRetentionMs (non-negative int64)
+                // Positional[2] (optional): deleteRetentionMs (non-negative int64)
                 {
-                    std::string err = parseOptField(4, "deleteRetentionMs", ts.deleteRetentionMs, false);
+                    std::string err = parseOptField(2, "deleteRetentionMs", ts.deleteRetentionMs, false);
                     if (!err.empty()) return {{}, err};
                 }
 
-                // Field 5 (optional): retentionMs (-1 = unbounded, or positive ms)
+                // Positional[3] (optional): retentionMs (-1 = unbounded, or positive ms)
                 {
-                    std::string err = parseOptField(5, "retentionMs", ts.retentionMs, true);
+                    std::string err = parseOptField(3, "retentionMs", ts.retentionMs, true);
                     if (!err.empty()) return {{}, err};
                 }
 
-                // Field 6 (optional): retentionBytes (-1 = unbounded, or positive bytes)
+                // Positional[4] (optional): retentionBytes (-1 = unbounded, or positive bytes)
                 {
-                    std::string err = parseOptField(6, "retentionBytes", ts.retentionBytes, true);
+                    std::string err = parseOptField(4, "retentionBytes", ts.retentionBytes, true);
                     if (!err.empty()) return {{}, err};
                 }
 
-                // Field 7 (optional): retentionCheckMs (positive int64)
+                // Positional[5] (optional): retentionCheckMs (positive int64)
                 {
-                    std::string err = parseOptField(7, "retentionCheckMs", ts.retentionCheckMs, false);
+                    std::string err = parseOptField(5, "retentionCheckMs", ts.retentionCheckMs, false);
                     if (!err.empty()) return {{}, err};
                 }
 
-                // Field 8 (optional): fileDeleteDelayMs (positive int64)
+                // Positional[6] (optional): fileDeleteDelayMs (positive int64)
                 {
-                    std::string err = parseOptField(8, "fileDeleteDelayMs", ts.fileDeleteDelayMs, false);
+                    std::string err = parseOptField(6, "fileDeleteDelayMs", ts.fileDeleteDelayMs, false);
                     if (!err.empty()) return {{}, err};
                 }
 
-                // Field 9 (optional): minCleanableDirtyRatio (double in [0.0, 1.0]).
+                // Positional[7] (optional): minCleanableDirtyRatio (double in [0.0, 1.0]).
                 // Kafka min.cleanable.dirty.ratio.  Default 0.5.  Set 0.0 to make the
                 // compaction cleaner sweep the whole log to latest-per-key every pass
                 // (no threshold gating) — e.g. for tests that assert full convergence.
-                if (fields.size() > 9 && !fields[9].empty()) {
-                    std::string s(fields[9]);
+                if (!posField(7).empty()) {
+                    std::string s(posField(7));
                     char* endp = nullptr;
                     errno = 0;
                     double v = std::strtod(s.c_str(), &endp);
@@ -496,11 +564,11 @@ ConfigResult parseNodeConfig(
                     ts.minCleanableDirtyRatio = v;
                 }
 
-                // Field 10 (optional): maxCompactionLagMs (-1 = disabled, or positive ms).
+                // Positional[8] (optional): maxCompactionLagMs (-1 = disabled, or positive ms).
                 // Kafka max.compaction.lag.ms — force compaction of a dirty segment once
                 // it ages past this, even below minCleanableDirtyRatio.
                 {
-                    std::string err = parseOptField(10, "maxCompactionLagMs", ts.maxCompactionLagMs, true);
+                    std::string err = parseOptField(8, "maxCompactionLagMs", ts.maxCompactionLagMs, true);
                     if (!err.empty()) return {{}, err};
                 }
 

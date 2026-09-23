@@ -42,6 +42,16 @@
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
+// PersistenceMode — controls the log backend for a topic's partitions.
+// ---------------------------------------------------------------------------
+enum class PersistenceMode : uint8_t {
+    Disk   = 0,   ///< On-disk Log (default). Survives node restarts.
+    Memory = 1,   ///< In-memory InMemoryLog. Zero-disk, zero-recovery (data lost on restart).
+                  ///  A memory topic that must survive node deaths MUST use a durable
+                  ///  mode (majority or all-in-sync) so data is replicated to other nodes.
+};
+
+// ---------------------------------------------------------------------------
 // TopicSpec — one declared topic (GB-1).
 // topicId is the 0-based declaration index assigned by parseNodeConfig.
 // ---------------------------------------------------------------------------
@@ -83,6 +93,21 @@ struct TopicSpec {
     int64_t       fileDeleteDelayMs       = 60'000LL;
     // logStartOffset: delete segments entirely below this offset.  0 = disabled.
     int64_t       logStartOffset          = 0;
+
+    // Task M1: co-partition group and partition key for co-located topics.
+    // coPartitionGroup: if non-empty, this topic shares its partition assignment with
+    //   all topics in the same group (balancer ensures matching partition→node mapping).
+    // partitionKey: if non-empty, overrides the hash key used for partition routing.
+    std::string   coPartitionGroup;
+    std::string   partitionKey;
+
+    // Task M1: persistence and durability modes.
+    // persistence: selects the log backend (Disk = default, Memory = InMemoryLog).
+    // durability: 0 = Majority (default), 1 = AllInSync.  Forwarded to PartitionConfig.
+    //   Memory topics that must survive a node death MUST use majority or all-in-sync
+    //   durability so the data is replicated to peer nodes before acknowledgement.
+    PersistenceMode persistence = PersistenceMode::Disk;
+    uint8_t         durability  = 0;   // 0 = Majority, 1 = AllInSync
 };
 
 struct PeerConfig {

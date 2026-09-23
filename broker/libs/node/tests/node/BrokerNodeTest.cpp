@@ -887,4 +887,89 @@ TEST(BrokerNodeTest, CP10_IoMaxBytesPerSecond_ReachesThrottler) {
     }
 }
 
+// ===========================================================================
+// Task M1 precondition #1: durability=all-in-sync wires end-to-end.
+//
+// A topic declared with durability=1 (AllInSync) must yield a PartitionReplica
+// whose durability() == DurabilityMode::AllInSync.  On a single-node cluster
+// Majority and AllInSync are equivalent (only one node → ISR={self}), but the
+// config field must be forwarded correctly from TopicSpec → PartitionConfig →
+// PartitionReplica.
+// ===========================================================================
+TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
+    TempDir tmp{"m1_dur_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    TopicSpec ts;
+    ts.name           = "wallet";
+    ts.partitionCount = 1;
+    ts.topicId        = 0;
+    ts.durability     = 1; // AllInSync
+
+    cfg.topics = {ts};
+
+    BrokerNode node{cfg};
+    node.start();
+
+    ASSERT_TRUE(node.awaitLeader(2s)) << "single-node must self-elect within 2 s";
+
+    auto* replica = node.replicaForTest(0, 0);
+    ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
+
+    EXPECT_EQ(replica->durability(), rune::replication::DurabilityMode::AllInSync)
+        << "Task M1 precondition #1: durability=1 in TopicSpec must produce AllInSync "
+           "PartitionReplica — durability field was not threaded through to PartitionConfig";
+
+    node.stop();
+}
+
+// ===========================================================================
+// Task M1 precondition #2: memory-backed partition skips cleaner / log().
+//
+// A topic declared with persistence=Memory uses an InMemoryLog.
+// The LogCleanerAgent must not call replica->log() (which asserts isDiskBacked())
+// on such a replica.  The test verifies this by:
+//   1. Creating a compact memory-backed topic (normally the cleaner would run).
+//   2. Starting the node and waiting for leadership + cleaner time.
+//   3. No crash (no assert failure) — proves the isDiskBacked() guard works.
+//
+// Also verifies ilog()->isDiskBacked() == false for the memory replica.
+// ===========================================================================
+TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
+    TempDir tmp{"m1_mem_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+
+    TopicSpec ts;
+    ts.name                  = "presence";
+    ts.partitionCount        = 1;
+    ts.topicId               = 0;
+    ts.cleanupPolicy         = TopicSpec::CleanupPolicy::Compact;
+    ts.minCleanableDirtyRatio = 0.0;  // would fire immediately on disk topics
+    ts.persistence           = PersistenceMode::Memory;
+
+    cfg.topics = {ts};
+
+    BrokerNode node{cfg};
+    node.start();
+
+    ASSERT_TRUE(node.awaitLeader(2s)) << "single-node must self-elect within 2 s";
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
+        << "replication bridge must propagate leadership";
+
+    // Give the cleaner time to run (it must NOT crash on the memory-backed replica).
+    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+
+    auto* replica = node.replicaForTest(0, 0);
+    ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
+
+    // Verify the log is memory-backed.
+    ASSERT_NE(replica->ilog(), nullptr) << "ilog() must be non-null";
+    EXPECT_FALSE(replica->ilog()->isDiskBacked())
+        << "Task M1: persistence=Memory must produce a non-disk-backed ILog (InMemoryLog)";
+
+    // If we reach here without a crash/assertion, the cleaner correctly skipped
+    // the memory-backed replica's log() call.
+    node.stop();
+}
+
 } // namespace rune::node

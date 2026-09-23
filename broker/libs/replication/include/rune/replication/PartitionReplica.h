@@ -448,6 +448,9 @@ public:
         return static_cast<rune::storage::Log*>(log_);
     }
 
+    /// The durability mode configured for this partition (Task M1).
+    [[nodiscard]] DurabilityMode durability() const noexcept { return cfg_.durability; }
+
     /// ISR as seen by the leader (empty for follower).
     [[nodiscard]] const std::vector<NodeId>& isr() const noexcept;
 

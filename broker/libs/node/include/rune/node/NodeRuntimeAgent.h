@@ -249,7 +249,10 @@ public:
         //      here on the append thread (single-writer invariant).
         if (registry_) {
             for (auto* replica : registry_->allReplicas()) {
-                if (replica && replica->log()) {
+                // Task M1 precondition #2: skip memory-backed replicas.
+                // drainCleanerSwaps/drainRetentionDeletes/drainStagingRenamesDone are
+                // disk-Log-only operations; replica->log() asserts isDiskBacked().
+                if (replica && replica->ilog() && replica->ilog()->isDiskBacked()) {
                     work += replica->log()->drainCleanerSwaps();
                     work += replica->log()->drainRetentionDeletes();
                     // Append-p99 fix: apply completed staging→base renames the

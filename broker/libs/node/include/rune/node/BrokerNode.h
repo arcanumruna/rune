@@ -36,6 +36,7 @@
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
 
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
@@ -266,6 +267,9 @@ private:
     // Per-replica no-op InMemoryTransport instances used when replTransport_ is null.
     // Prevents PartitionReplica assert(transport!=nullptr) in single-node / no-repl-port nodes.
     std::vector<std::unique_ptr<rune::replication::InMemoryTransport>> nullTransports_;
+    // InMemoryLog instances for memory-backed user-topic partitions (Task M1).
+    // Owned here so their lifetime matches the BrokerNode.
+    std::vector<std::unique_ptr<rune::storage::InMemoryLog>> memoryLogs_;
 
     // -----------------------------------------------------------------------
     // Client gateway (BR-7a) — runs inside the duty-cycle via NodeRuntimeAgent.

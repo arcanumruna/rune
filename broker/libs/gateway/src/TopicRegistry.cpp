@@ -28,6 +28,19 @@ TopicRegistry::TopicRegistry(
         entry.partitions.reserve(static_cast<std::size_t>(spec.partitionCount));
 
         for (int32_t p = 0; p < spec.partitionCount; ++p) {
+            PartitionEntry pe;
+
+            // Memory-backed topics (PersistenceMode::Memory) do NOT create disk
+            // directories or Log objects.  The PartitionEntry is left with log=nullptr.
+            // BrokerNode::buildReplication() detects this and substitutes an InMemoryLog.
+            if (spec.persistence == rune::node::PersistenceMode::Memory) {
+                spdlog::debug(
+                    "TopicRegistry: topic='{}' partition={} [memory-backed, no disk log]",
+                    spec.name, p);
+                entry.partitions.push_back(std::move(pe));
+                continue;
+            }
+
             // dataDir/topics/<name>/<partition>/
             fs::path partDir = root / "topics" / spec.name / std::to_string(p);
 
@@ -50,7 +63,6 @@ TopicRegistry::TopicRegistry(
                 "TopicRegistry: topic='{}' partition={} dir='{}' LEO={}",
                 spec.name, p, partDir.string(), logPtr->logEndOffset());
 
-            PartitionEntry pe;
             pe.log = std::move(logPtr);
             entry.partitions.push_back(std::move(pe));
         }
