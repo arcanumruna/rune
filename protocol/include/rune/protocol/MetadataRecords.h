@@ -133,6 +133,28 @@ inline int32_t getS32(const uint8_t* buf, int off) noexcept {
                | (uint32_t(buf[off+3]) << 24);
     return static_cast<int32_t>(v);
 }
+inline void putS64(uint8_t* buf, int off, int64_t v) noexcept {
+    uint64_t u = static_cast<uint64_t>(v);
+    buf[off]     = static_cast<uint8_t>(u);
+    buf[off + 1] = static_cast<uint8_t>(u >> 8);
+    buf[off + 2] = static_cast<uint8_t>(u >> 16);
+    buf[off + 3] = static_cast<uint8_t>(u >> 24);
+    buf[off + 4] = static_cast<uint8_t>(u >> 32);
+    buf[off + 5] = static_cast<uint8_t>(u >> 40);
+    buf[off + 6] = static_cast<uint8_t>(u >> 48);
+    buf[off + 7] = static_cast<uint8_t>(u >> 56);
+}
+inline int64_t getS64(const uint8_t* buf, int off) noexcept {
+    uint64_t v = uint64_t(buf[off])
+               | (uint64_t(buf[off+1]) << 8)
+               | (uint64_t(buf[off+2]) << 16)
+               | (uint64_t(buf[off+3]) << 24)
+               | (uint64_t(buf[off+4]) << 32)
+               | (uint64_t(buf[off+5]) << 40)
+               | (uint64_t(buf[off+6]) << 48)
+               | (uint64_t(buf[off+7]) << 56);
+    return static_cast<int64_t>(v);
+}
 
 // Write a var-string field: uint16 LE length + bytes.  Returns bytes written.
 inline std::size_t putVarStr(uint8_t* buf, std::string_view s) noexcept {
@@ -439,52 +461,80 @@ struct UpdatePartitionAssignmentRecord {
 // ===========================================================================
 // NodeJoinRecord  (recordType = 3)
 //
-// Wire layout (all little-endian):
-//   [0..1]   recordType     uint16 LE = 3
-//   [2]      recordVersion  uint8  = 0
-//   [3..6]   nodeId         int32
+// v0 wire layout (all little-endian):
+//   [0..1]   recordType      uint16 LE = 3
+//   [2]      recordVersion   uint8  = 0
+//   [3..6]   nodeId          int32
 //   [7..8]   endpoint length uint16
 //   [9..]    endpoint bytes
+//
+// v1 appends (only when recordVersion >= 1):
+//   [+0..+7] incarnationId   int64 LE
+//   [+8..+15] brokerEpoch    int64 LE
 // ===========================================================================
 struct NodeJoinRecord {
     int32_t          nodeId        = 0;
     std::string_view endpoint;
     uint8_t          recordVersion = 0;
+    int64_t          incarnationId = 0;  // v1+: process incarnation UUID/timestamp
+    int64_t          brokerEpoch   = 0;  // v1+: registration log offset (set by MSM apply)
 
     static constexpr uint16_t RECORD_TYPE_ID =
         static_cast<uint16_t>(MetadataRecordType::NodeJoin); // 3
 
     /// Encode into buf[0..bufLen-1].  Returns total bytes written, or 0 if buf too small.
     std::size_t encode(uint8_t* buf, std::size_t bufLen) const noexcept {
+        const bool v1 = (recordVersion >= 1);
         const std::size_t needed = detail::kPrefixSize
             + 4u                      // nodeId
-            + 2u + endpoint.size();   // endpoint
+            + 2u + endpoint.size()    // endpoint
+            + (v1 ? 16u : 0u);        // incarnationId(8) + brokerEpoch(8) — v1 only
         if (bufLen < needed) return 0u;
 
-        std::size_t pos = 0;
-        detail::encodePrefixAt(buf, MetadataRecordType::NodeJoin);
-        pos = detail::kPrefixSize;
+        // Write type (2 bytes) + version (1 byte) from the record field.
+        detail::putU16(buf, 0, static_cast<uint16_t>(MetadataRecordType::NodeJoin));
+        buf[2] = recordVersion;
+        std::size_t pos = detail::kPrefixSize;
 
         detail::putS32(buf, static_cast<int>(pos), nodeId); pos += 4u;
         pos += detail::putVarStr(buf + pos, endpoint);
+
+        if (v1) {
+            detail::putS64(buf, static_cast<int>(pos), incarnationId); pos += 8u;
+            detail::putS64(buf, static_cast<int>(pos), brokerEpoch);   pos += 8u;
+        }
 
         return pos;
     }
 
     /// Decode from buf[0..avail-1].  Returns nullopt on any error.
+    /// Accepts recordVersion 0 or 1; rejects unknown versions (>1).
     static std::optional<NodeJoinRecord> decode(const uint8_t* buf,
                                                  std::size_t avail) noexcept {
-        if (!detail::validatePrefix(buf, avail, MetadataRecordType::NodeJoin))
-            return std::nullopt;
+        // Inline prefix check: accept versions 0 and 1 (not via validatePrefix
+        // which only accepts kCurrentVersion == 0).
+        if (avail < detail::kPrefixSize) return std::nullopt;
+        const uint16_t typeId = detail::getU16(buf, 0);
+        if (typeId != static_cast<uint16_t>(MetadataRecordType::NodeJoin)) return std::nullopt;
+        const uint8_t ver = buf[2];
+        if (ver > 1u) return std::nullopt;  // unknown future version — clean reject
 
         std::size_t pos = detail::kPrefixSize;
 
         if (pos + 4u > avail) return std::nullopt;
         NodeJoinRecord rec;
-        rec.recordVersion = buf[2];
+        rec.recordVersion = ver;
         rec.nodeId        = detail::getS32(buf, static_cast<int>(pos)); pos += 4u;
 
         if (!detail::getVarStr(buf, avail, pos, rec.endpoint)) return std::nullopt;
+
+        // v1+: read incarnationId and brokerEpoch if present.
+        if (ver >= 1) {
+            if (pos + 16u > avail) return std::nullopt;
+            rec.incarnationId = detail::getS64(buf, static_cast<int>(pos)); pos += 8u;
+            rec.brokerEpoch   = detail::getS64(buf, static_cast<int>(pos)); pos += 8u;
+        }
+        // else: incarnationId=0, brokerEpoch=0 (default — v0 compat)
 
         return rec;
     }
