@@ -1544,8 +1544,41 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
     }
 
-    // Mark this Log dirty so flushDirtyLogs() will sync it at end of cycle.
-    dirtyLogs_.insert(log);
+    // E3 Task 9: Strict-tier sync() fallback on the inline (no-WorkerPool) path.
+    //
+    // This path is only reached when workerPool_ is null — i.e. in test fixtures
+    // that bypass BrokerNode/WorkerPool construction, or (theoretically) if
+    // workerCount == 0.  In a fully started BrokerNode workerPool_ is ALWAYS
+    // non-null and user produces NEVER reach this branch (they go through the
+    // worker path above at line 1434).
+    //
+    // Internal partitions (topicId < 0) always have durabilityTier=1 (Majority)
+    // and are handled by the control thread — they never carry durabilityTier=2.
+    //
+    // Defensive correctness: if a Strict-tier (durabilityTier==2) produce
+    // somehow reaches this path, perform a SYNCHRONOUS log->sync() before the ack
+    // so Strict still means "durable before acked".  This is blocking on the
+    // control thread — deliberately so: it is a fallback for a path that should
+    // never fire in production.  An async IoBackend for the control thread is
+    // out of scope (parked as a future E4 item).
+    const uint8_t effectiveTier = replica ? replica->durabilityTier() : 1;
+    if (effectiveTier == 2) {
+        // Synchronous sync() — the blocking fallback for the no-worker path.
+        try {
+            log->sync();
+            // Log is now durable; remove from dirtyLogs_ so flushDirtyLogs()
+            // doesn't double-sync it at end of cycle.
+            dirtyLogs_.erase(log);
+        } catch (const std::exception& ex) {
+            spdlog::error("ClientGateway: inline Strict-tier sync() failed: {}; "
+                          "sending Internal error", ex.what());
+            sendResp(pc::ErrorCode::Internal, partition, 0);
+            return;
+        }
+    } else {
+        // Mark this Log dirty so flushDirtyLogs() will sync it at end of cycle.
+        dirtyLogs_.insert(log);
+    }
 
     // GR-4: Reconcile the leader replica's tracked LEO/HW (Mode A seam).
     //
