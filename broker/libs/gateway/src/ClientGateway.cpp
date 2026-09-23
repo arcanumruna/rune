@@ -2940,16 +2940,14 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
         parts.reserve(std::min(cap, 4096));
 
         // Build a quick lookup set of requested topicIds (empty = all).
-        // Note: the span<const int32_t> was built from raw LE bytes using
-        // reinterpret_cast.  On this LE platform the int32_t values are
-        // already in native byte order (see MetadataMessages.h decode note).
+        // After the MISALIGNMENT FIX in MetadataMessages.h (decode() now copies
+        // each int32 via getLE32 into an owned, naturally-aligned vector),
+        // req.topicIds elements are already correct native int32 values — no
+        // reinterpret_cast workaround needed here.
         const bool filterTopics = !req.topicIds.empty();
         std::unordered_set<int32_t> requestedTopics;
         if (filterTopics) {
-            for (const int32_t rawTid : req.topicIds) {
-                // getLE32 via the raw bytes gives the correct LE→host interpretation.
-                const int32_t topicId = pc::detail::getLE32(
-                    reinterpret_cast<const uint8_t*>(&rawTid), 0);
+            for (const int32_t topicId : req.topicIds) {
                 requestedTopics.insert(topicId);
             }
         }
