@@ -376,10 +376,15 @@ Each topic carries (in the MSM topic record):
 - **`disk`** (default) — today's behavior: mmap segment log, fsync, crash-recoverable
   from the log.
 - **`memory`** — records are **never written to disk** (no segment files, no mmap, no
-  fsync, no segment roll). Each partition is a **bounded drop-oldest ring** in memory
-  (per-topic byte/count cap); on overflow the oldest batch is evicted and
-  `logStartOffset` advances (a too-slow consumer/follower past the start gets
-  offset-out-of-range → reset, a bounded and accepted loss). Memory partitions are
+  fsync, no segment roll). Each partition is a **bounded back-pressure ring** in memory
+  (per-topic byte/count cap): a fixed preallocated wrap-around buffer with a monotonic
+  write cursor, records overwritten **never** while un-reclaimed — when the ring is full
+  the producer **back-pressures** (append returns a retriable "not enough space",
+  handled like the min-ISR gate), it does NOT silently drop committed-undelivered data.
+  Space is reclaimed as the trailing floor advances (`min` of the replication-safe/HW
+  point and live reader positions); `logStartOffset` = that floor. This is the Agrona
+  `ManyToOneRingBuffer` discipline (claim/commit, back-pressure-when-full, O(1),
+  zero-copy, no memmove — [[aeron-is-the-bible]]). Memory partitions are
   **still RF-replicated** (to peers' *memory*) and partitioned/co-located like any
   topic, so a single-node crash is survived via the surviving in-memory replicas.
 
@@ -393,14 +398,21 @@ topic replicates to a surviving quorum* — so memory topics that need failover-
 use the `majority` (or `all-in-sync`) durability knob; a `memory`+leader-only-acked
 write is only in the leader's RAM and dies with it (the same acks caveat as disk).
 
-**Reclaim policy — drop-oldest ring (LOCKED 2026-09-23).** Bounded per-partition ring
-with a byte/count cap; on overflow evict the oldest batch and advance `logStartOffset`.
-This reconciles the earlier persistence-axis decision (2026-09-21: "reclaim past-HW +
-delivered-to-all-current-subscribers, with a lag/age cap so one absent consumer can't
-pin memory") — the ring's hard cap **is** that lag/age cap: eviction naturally targets
-the oldest (typically already-delivered, past-HW) data first, and the cap guarantees a
-stuck/absent subscriber can never pin memory (it just falls off the tail → OOR reset).
-No backpressure/reject path (rejected in favor of bounded memory + newest-always-live).
+**Reclaim policy — bounded back-pressure ring (LOCKED 2026-09-23, supersedes the
+earlier drop-oldest choice).** Fixed preallocated wrap-around ring with a byte/count
+cap, Agrona `ManyToOneRingBuffer` discipline: **NO memmove, NO overwrite of
+un-reclaimed data, O(1) append.** Space frees only as the trailing reclaim floor
+advances = `min`(replication-safe/HW point, live reader positions); `logStartOffset` =
+floor; reads valid in `[floor, writePos)`. When a write would lap `floor + capacity`
+the producer **back-pressures** — `append` returns a retriable back-pressure sentinel
+(handled like the min-ISR produce gate), never silently dropping committed-undelivered
+records. This reverses the earlier "drop-oldest / reader-loses-tail" model (chosen
+2026-09-23 by the user for reliability): a memory topic is a bounded *reliable* ring,
+not a lossy one. **Follow-up knob:** under pure back-pressure a single stuck/absent
+consumer can stall producers; a per-topic **lag/age cap** (force-advance the floor past
+a pathologically-slow reader, reintroducing bounded tail-loss for that reader only)
+reconciles the 2026-09-21 "one absent consumer can't pin memory" note — deferred as an
+opt-in knob unless the operator needs it.
 
 **Reuses Phase-2 machinery unchanged:** an `InMemoryLog` implements the same `Log`
 interface (append / offset-addressable read / LEO / logStartOffset / epoch-boundary
