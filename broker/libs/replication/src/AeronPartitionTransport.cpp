@@ -39,8 +39,6 @@ AeronPartitionTransport::AeronPartitionTransport(
       })
     , selfId_(selfId)
 {
-    encodeScratch_.resize(kScratchSize);
-
     // Register ingress subscription.  One bounded synchronous wait at
     // construction — never called on the duty-cycle hot path.
     static constexpr int kResolveMaxMs  = 5000;
@@ -103,36 +101,19 @@ void AeronPartitionTransport::registerReplica(int32_t           topicId,
 // ---------------------------------------------------------------------------
 void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 {
-    // Encode into scratch buffer (zero alloc).
-    // DR-BUG-5: pass req.topicId so the leader can route to the correct
-    // replica.  The default topicId=0 caused multi-topic FetchRequests to be
-    // misrouted to topic-0 replicas, starving multi-topic ISRs and blocking
-    // all acks=All produces to any topic with id != 0.
+    // Shared-nothing: encode into a per-call STACK buffer (no shared state),
+    // then marshal to the control thread via the outbound ring. FetchRequest is
+    // a broadcast (leader NodeId not on the wire) → kBroadcast target.
+    uint8_t wire[kMaxWireFrame];
     const std::size_t len = FetchRequestMsg::encode(
-        encodeScratch_.data(), 0,
+        wire, 0,
         req.leaderEpoch,
         req.partition,
         req.followerId,
         req.fetchOffset,
         req.maxBytes,
         req.topicId);
-
-    // The leader is identified by the replica's leaderId field; the follower
-    // knows the leader's NodeId from its PartitionConfig (set via becomeFollower).
-    // The FetchRequest itself doesn't carry the leader NodeId on the wire — the
-    // transport must know which peer is the leader.  For GR-1 we route the
-    // FetchRequest to ALL known peers whose pub is resolved and connected — the
-    // leader will handle it (others will reject with kErrNotLeader).  This is a
-    // simple broadcast; GR-3 will narrow it to the specific leader NodeId once
-    // the metadata bridge (GR-2) is in place.
-    //
-    // NOTE: FetchRequestMsg.followerId == selfId_ (set by PartitionReplica::nextFetch).
-    // The leader uses that to track per-follower LEO.
-    for (auto& [nodeId, peer] : peers_) {
-        if (!peer.pub) continue;           // not yet resolved — skip
-        if (!peer.pub->isConnected()) continue;
-        sendOnPub(*peer.pub, encodeScratch_.data(), len);
-    }
+    enqueueOutbound(kBroadcast, wire, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -141,26 +122,11 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
                                                  const FetchResponseMsg& resp)
 {
-    PeerPub* peer = findPeer(toFollower);
-    if (!peer || !peer->pub) {
-        // Publication not yet resolved — drop (follower will retry on next fetch).
-        spdlog::trace("AeronPartitionTransport: sendFetchResponse drop (pub not ready) "
-                      "follower={}", toFollower);
-        return;
-    }
-    if (!peer->pub->isConnected()) {
-        spdlog::trace("AeronPartitionTransport: sendFetchResponse drop (not connected) "
-                      "follower={}", toFollower);
-        return;
-    }
-
-    // Encode FetchResponse + records into scratch buffer.
-    // DR-BUG-5: pass resp.topicId so the follower can route to the correct
-    // replica.  The default topicId=0 caused multi-topic FetchResponses to be
-    // misrouted to topic-0 replicas on the follower side, so multi-topic
-    // replicas never applied replicated data.
+    // Shared-nothing: encode into a stack buffer, marshal to control thread via
+    // the outbound ring (peers_/pubs are control-owned; drainOutbound offers).
+    uint8_t wire[kMaxWireFrame];
     const std::size_t len = FetchResponseMsg::encode(
-        encodeScratch_.data(), 0,
+        wire, 0,
         resp.leaderEpoch,
         resp.partition,
         resp.highWatermark,
@@ -168,8 +134,7 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
         resp.errorCode,
         resp.records,
         resp.topicId);
-
-    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+    enqueueOutbound(toFollower, wire, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,13 +143,12 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
 void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
         NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req)
 {
-    PeerPub* peer = findPeer(toLeader);
-    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    uint8_t wire[kMaxWireFrame];
     const std::size_t len = OffsetsForLeaderEpochReqMsg::encode(
-        encodeScratch_.data(), 0,
+        wire, 0,
         req.currentEpoch, req.partition, req.followerId,
         req.requestedEpoch, req.followerLeo, req.topicId);
-    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+    enqueueOutbound(toLeader, wire, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,13 +157,12 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
 void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
         NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp)
 {
-    PeerPub* peer = findPeer(toFollower);
-    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    uint8_t wire[kMaxWireFrame];
     const std::size_t len = OffsetsForLeaderEpochRespMsg::encode(
-        encodeScratch_.data(), 0,
+        wire, 0,
         resp.leaderEpoch, resp.partition, resp.responseEpoch,
         resp.endOffset, resp.errorCode, resp.topicId);
-    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+    enqueueOutbound(toFollower, wire, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,14 +172,13 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
 void AeronPartitionTransport::sendReconcileRequest(
         NodeId toPeer, const FetchRequestMsg& req)
 {
-    PeerPub* peer = findPeer(toPeer);
-    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    uint8_t wire[kMaxWireFrame];
     const std::size_t len = FetchRequestMsg::encode(
-        encodeScratch_.data(), 0,
+        wire, 0,
         req.leaderEpoch, req.partition, req.followerId,
         req.fetchOffset, req.maxBytes, req.topicId);
-    stampTemplateId(encodeScratch_.data(), 0, kReconcileFetchReqTemplateId);
-    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+    stampTemplateId(wire, 0, kReconcileFetchReqTemplateId);
+    enqueueOutbound(toPeer, wire, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -226,14 +188,72 @@ void AeronPartitionTransport::sendReconcileRequest(
 void AeronPartitionTransport::sendReconcileResponse(
         NodeId toPeer, const FetchResponseMsg& resp)
 {
-    PeerPub* peer = findPeer(toPeer);
-    if (!peer || !peer->pub || !peer->pub->isConnected()) return;
+    uint8_t wire[kMaxWireFrame];
     const std::size_t len = FetchResponseMsg::encode(
-        encodeScratch_.data(), 0,
+        wire, 0,
         resp.leaderEpoch, resp.partition, resp.highWatermark,
         resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
-    stampTemplateId(encodeScratch_.data(), 0, kReconcileFetchRespTemplateId);
-    sendOnPub(*peer->pub, encodeScratch_.data(), len);
+    stampTemplateId(wire, 0, kReconcileFetchRespTemplateId);
+    enqueueOutbound(toPeer, wire, len);
+}
+
+// ---------------------------------------------------------------------------
+// enqueueOutbound — WORKER-thread side of the shared-nothing send path.
+// Frames [int32 targetNodeId][wire bytes] into a stack buffer and writes it to
+// the outbound ring (agrona ManyToOneRingBuffer). No peers_/pubs access here.
+// Back-pressure: on a full ring, bump the counter and return false — the send is
+// skipped (replication is retriable; caller re-drives next cycle). Never blocks.
+// ---------------------------------------------------------------------------
+bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
+                                              const uint8_t* wire,
+                                              std::size_t    len)
+{
+    if (kOutboundHeaderSize + len > kMaxWireFrame) {
+        spdlog::warn("AeronPartitionTransport: outbound frame too large ({} bytes) — dropped", len);
+        return false;
+    }
+    uint8_t framed[kMaxWireFrame];
+    std::memcpy(framed, &targetNodeId, kOutboundHeaderSize);
+    std::memcpy(framed + kOutboundHeaderSize, wire, len);
+    if (!outboundRing_.write(framed, kOutboundHeaderSize + len)) {
+        ++outboundRingFullCount_;  // back-pressure: skipped (retriable)
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// drainOutbound — CONTROL-thread side. Reads framed outbound messages and does
+// the real peer offers. ONLY this path (control thread) touches peers_/pubs on
+// the send side, preserving shared-nothing.
+// ---------------------------------------------------------------------------
+int AeronPartitionTransport::drainOutbound()
+{
+    auto handler = [this](std::int32_t /*msgTypeId*/,
+                          aeron::concurrent::AtomicBuffer& buf,
+                          aeron::util::index_t offset,
+                          aeron::util::index_t length) {
+        const uint8_t* p = buf.buffer() + offset;
+        int32_t target = 0;
+        std::memcpy(&target, p, kOutboundHeaderSize);
+        const uint8_t* wire = p + kOutboundHeaderSize;
+        const std::size_t wlen = static_cast<std::size_t>(length) - kOutboundHeaderSize;
+
+        if (target == kBroadcast) {
+            for (auto& [nodeId, peer] : peers_) {
+                if (peer.pub && peer.pub->isConnected())
+                    sendOnPub(*peer.pub, wire, wlen);
+            }
+        } else {
+            PeerPub* peer = findPeer(target);
+            if (peer && peer->pub && peer->pub->isConnected())
+                sendOnPub(*peer->pub, wire, wlen);
+        }
+    };
+    // Mirror the ConsensusAgent pattern: return the count of ring messages
+    // drained so poll()/doWork() folds it into workCount and the AgentRunner's
+    // IdleStrategy idles only when there was genuinely no work.
+    return outboundRing_.drain(handler, /*limit=*/kFragmentLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +266,14 @@ int AeronPartitionTransport::poll(int64_t nowNs)
     // Non-blocking probe: try to resolve pending publications.
     resolvePendingPubs();
 
+    // Shared-nothing: drain worker-marshalled outbound sends and do the real
+    // peer offers here on the control thread (the only thread that touches
+    // peers_/pubs). ([[rune-shared-nothing-law]]) Count folds into work so the
+    // AgentRunner's IdleStrategy sees outbound activity as work (no idle).
+    int work = drainOutbound();
+
     // Drain ingress subscription.
-    int work = sub_->poll(assembler_.handler(), kFragmentLimit);
+    work += sub_->poll(assembler_.handler(), kFragmentLimit);
     return work;
 }
 
@@ -357,7 +383,12 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // record bytes into a std::vector<uint8_t> owned by the WorkerOp at
         // enqueue time (before we return from the callback) — this is the
         // mandated approach from the inc2a brief.
-        if (workerPool_) {
+        // Shared-nothing control/data split ([[rune-shared-nothing-law]]):
+        // route inbound to the owning WORKER only for USER partitions (topicId>=0);
+        // INTERNAL partitions (topicId<0) are control-thread-driven, so apply
+        // inline here (routing them to a worker would race the control thread's
+        // NodeRuntimeAgent doWork on the same internal replica).
+        if (workerPool_ && resp.topicId >= 0) {
             rune::node::WorkerOp op;
             op.type                              = rune::node::WorkerOp::Type::ApplyReplicated;
             op.topicId                           = resp.topicId;

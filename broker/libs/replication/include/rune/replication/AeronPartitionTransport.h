@@ -60,6 +60,8 @@ namespace rune::node { class WorkerPool; }
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 
+#include <rune/consensus/IngressRing.h>  // agrona ManyToOne ring (outbound marshalling)
+
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 #include <Subscription.h>
@@ -227,6 +229,44 @@ private:
     PeerPub* findPeer(NodeId id);
 
     // -----------------------------------------------------------------------
+    // Shared-nothing outbound marshalling ([[rune-shared-nothing-law]]).
+    //
+    // Sends are invoked from WORKER threads (a replica's doWork emits fetch
+    // requests/responses).  Workers must NEVER touch peers_/pubs (control-owned
+    // state) — that would be shared mutable state.  Instead each send encodes
+    // its wire frame into a per-call STACK buffer, prepends a routing header
+    // (targetNodeId; kBroadcast=-1), and writes it to the outbound ring (agrona
+    // ManyToOneRingBuffer via IngressRing — MPSC, lock-free).  The CONTROL thread
+    // drains the ring in poll() and does the actual peers_/pub offers.
+    //
+    // Back-pressure: on a full ring, enqueueOutbound() returns false and bumps
+    // outboundRingFullCount_ — the send is skipped (NOT silently "succeeded").
+    // Replication sends are retriable (follower re-requests / leader re-responds
+    // next cycle), so skip-and-retry is the correct policy here.
+    // -----------------------------------------------------------------------
+    static constexpr int32_t kBroadcast = -1;
+
+    /// Max single wire frame the transport encodes. Kept modest because the
+    /// encode happens in a per-call buffer on WORKER threads, whose stacks are
+    /// small (macOS default ~512 KiB). Bounded by Aeron pub maxMessageLength in
+    /// practice; frames larger than this are dropped+warned. (TODO: make this a
+    /// NodeConfig-configurable max-frame if larger replication terms are needed.)
+    static constexpr std::size_t kMaxWireFrame = 64 * 1024;
+
+    /// Routing-header size prepended to each outbound-ring frame: int32 targetNodeId.
+    static constexpr std::size_t kOutboundHeaderSize = sizeof(int32_t);
+
+    /// WORKER-thread side: encode routing header + wire frame → outbound ring.
+    /// Returns false on full ring (back-pressure; caller's op is retriable).
+    bool enqueueOutbound(int32_t targetNodeId, const uint8_t* wire, std::size_t len);
+
+    /// CONTROL-thread side: drain the outbound ring and do the real peer offers.
+    /// Called from poll().  Only this path touches peers_/pubs on send.
+    /// Returns the count of ring messages drained (folded into poll()'s work
+    /// count so the AgentRunner's IdleStrategy idles only on genuine no-work).
+    int drainOutbound();
+
+    // -----------------------------------------------------------------------
     // Fragment callback — called by FragmentAssembler on each reassembled frame.
     // -----------------------------------------------------------------------
     void onFragment(aeron::concurrent::AtomicBuffer& buffer,
@@ -268,8 +308,15 @@ private:
     };
     std::unordered_map<ReplicaKey, PartitionReplica*, ReplicaKeyHash> replicas_;
 
-    // Pre-allocated scratch buffer — zero per-op alloc on the send path.
-    std::vector<uint8_t> encodeScratch_;
+    // Outbound marshalling ring (agrona ManyToOneRingBuffer via IngressRing).
+    // Producers = worker threads (sends); consumer = control thread (drainOutbound).
+    // Sized to hold the largest wire frame (fetch response ≤ pub maxMessageLength).
+    static constexpr int kOutboundRingBytes = 4 * 1024 * 1024;
+    rune::consensus::IngressRing outboundRing_{kOutboundRingBytes};
+
+    // Back-pressure observability: bumped when the outbound ring is full and a
+    // (retriable) send had to be skipped. Control-thread reads for logging.
+    uint64_t outboundRingFullCount_ = 0;
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.
