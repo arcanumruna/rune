@@ -362,10 +362,60 @@ Each topic carries (in the MSM topic record):
 - `partitionKey` / partitioner — the field that decides `hash(key)→partition`.
 - `placementMode` — `local` (single node) / `partitioned` (co-partitioned, the
   default) / `distributed` (explicitly spread).
+- `persistence` — `disk` (default) / `memory` (see below).
 - `coPartitionGroup` — optional group name. **Constraint:** all members of a group
   MUST share the same `partitionCount` and be keyed by the same aggregate root, or
   co-location is impossible (`hash(key)` lands on different indexes). The
   controller rejects a group join that violates this.
+
+### Persistence tier (LOCKED, 2026-09-23 — folded into Phase 2)
+
+`persistence` is a per-topic axis **orthogonal** to durability-quorum
+(`majority`/`all-in-sync`) and placement. Two values:
+
+- **`disk`** (default) — today's behavior: mmap segment log, fsync, crash-recoverable
+  from the log.
+- **`memory`** — records are **never written to disk** (no segment files, no mmap, no
+  fsync, no segment roll). Each partition is a **bounded drop-oldest ring** in memory
+  (per-topic byte/count cap); on overflow the oldest batch is evicted and
+  `logStartOffset` advances (a too-slow consumer/follower past the start gets
+  offset-out-of-range → reset, a bounded and accepted loss). Memory partitions are
+  **still RF-replicated** (to peers' *memory*) and partitioned/co-located like any
+  topic, so a single-node crash is survived via the surviving in-memory replicas.
+
+**Loss contract (accepted by design):** a **full-cluster / all-replica** loss, or a
+node restart for a partition with no surviving replica, means that data is **gone** —
+this is the deliberate trade for **zero disk involvement** (maximum throughput /
+lowest latency; the segment-roll p99 tail is eliminated entirely). Memory topics are
+for ephemeral state (presence, live positions, transient events) where losing the log
+on a total outage is fine. **A single node/leader death loses nothing** *provided the
+topic replicates to a surviving quorum* — so memory topics that need failover-survival
+use the `majority` (or `all-in-sync`) durability knob; a `memory`+leader-only-acked
+write is only in the leader's RAM and dies with it (the same acks caveat as disk).
+
+**Reclaim policy — drop-oldest ring (LOCKED 2026-09-23).** Bounded per-partition ring
+with a byte/count cap; on overflow evict the oldest batch and advance `logStartOffset`.
+This reconciles the earlier persistence-axis decision (2026-09-21: "reclaim past-HW +
+delivered-to-all-current-subscribers, with a lag/age cap so one absent consumer can't
+pin memory") — the ring's hard cap **is** that lag/age cap: eviction naturally targets
+the oldest (typically already-delivered, past-HW) data first, and the cap guarantees a
+stuck/absent subscriber can never pin memory (it just falls off the tail → OOR reset).
+No backpressure/reject path (rejected in favor of bounded memory + newest-always-live).
+
+**Reuses Phase-2 machinery unchanged:** an `InMemoryLog` implements the same `Log`
+interface (append / offset-addressable read / LEO / logStartOffset / epoch-boundary
+truncate), so `PartitionReplica`, replication transport, HW/quorum, the durability
+knob, KIP-101 truncation, `LeaderEpochCache`, and **position/lineage failover
+election** all operate over in-memory positions with no change. Recovery **skips**
+memory partitions (start empty; a restarted node catches up from the leader's ring,
+bounded). This is why the tier lands in Phase 2 rather than as separate storage work —
+it is a new `Log` backend + a topic-config flag riding the failover/replication path.
+
+**Note (durability tiers, clarified 2026-09-23):** the per-topic durability knob
+stays **two** values (`majority` default / `all-in-sync`). `acks` (0 / leader / all)
+remains a **client per-request** setting, not a per-topic tier — leader-only ack still
+writes to disk on a `disk` topic. "No persistence" is the `memory` tier above, a
+distinct axis, not an `acks` level.
 
 ## Partitioning & co-location guidance (aggregate-root modeling)
 
