@@ -202,10 +202,34 @@ public:
         const std::string tmp = path + ".tmp";
         int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) return; // best-effort; tolerate — caller will detect missing checkpoint on restore
-        (void)::write(fd, buf.data(), total);
-        (void)::fsync(fd);
+
+        // FIX 2: check write and fsync return values; never rename a partial/bad tmp.
+        ssize_t written = ::write(fd, buf.data(), total);
+        if (written != static_cast<ssize_t>(total)) {
+            ::close(fd);
+            ::unlink(tmp.c_str()); // discard partial tmp; old checkpoint (if any) at path remains intact
+            return;
+        }
+        if (::fsync(fd) != 0) {
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return;
+        }
         ::close(fd);
-        (void)::rename(tmp.c_str(), path.c_str());
+
+        if (::rename(tmp.c_str(), path.c_str()) != 0) {
+            ::unlink(tmp.c_str());
+            return;
+        }
+
+        // FIX 1: fsync the containing directory so the renamed directory-entry
+        // survives power loss (mirrors LogSegment.cpp:290-294).
+        {
+            namespace fs = std::filesystem;
+            std::string dir = fs::path(path).parent_path().string();
+            int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+        }
     }
 
     /// Restore from a checkpoint file.  Returns true on success, false if the

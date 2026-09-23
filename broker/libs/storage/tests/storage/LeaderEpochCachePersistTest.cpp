@@ -72,6 +72,39 @@ TEST(LeaderEpochCachePersist, EmptyCacheRoundTrips) {
     std::filesystem::remove(path);
 }
 
+// FIX 2 regression: a checkpoint to a non-existent/unwritable directory must
+// NOT install a partial file and must leave any pre-existing checkpoint intact.
+TEST(LeaderEpochCachePersist, BadPathLeavesNoPollutingFile) {
+    // Write into a directory that does not exist — open() will fail → no rename.
+    const std::string badPath = "/tmp/lec_nonexistent_dir_xyz/lec_ckpt.bin";
+    LeaderEpochCache c;
+    c.assign(0, 0); c.assign(1, 100);
+    // Must not crash; tmp must not remain.
+    c.checkpointToFile(badPath);
+    // Neither the checkpoint nor the .tmp should exist.
+    EXPECT_FALSE(std::filesystem::exists(badPath));
+    EXPECT_FALSE(std::filesystem::exists(badPath + ".tmp"));
+}
+
+// FIX 2 regression: a successful checkpoint survives a restore (write-path
+// integrity end-to-end including the directory fsync branch).
+TEST(LeaderEpochCachePersist, CheckpointIntegrityAfterFixes) {
+    const auto path = std::filesystem::temp_directory_path() / "lec_fix2_ckpt.bin";
+    LeaderEpochCache c;
+    c.assign(0, 0); c.assign(2, 200); c.assign(4, 400);
+    c.checkpointToFile(path.string());
+
+    // The .tmp must be gone (renamed to canonical path).
+    EXPECT_FALSE(std::filesystem::exists(path.string() + ".tmp"));
+
+    LeaderEpochCache c2;
+    ASSERT_TRUE(c2.restoreFromFile(path.string()));
+    EXPECT_EQ(c2.latestEpoch(), 4);
+    EXPECT_EQ(c2.startOffsetFor(2), 200);
+    EXPECT_EQ(c2.startOffsetFor(4), 400);
+    std::filesystem::remove(path);
+}
+
 TEST(LeaderEpochCachePersist, EntriesAccessor) {
     LeaderEpochCache c;
     c.assign(0, 0);
