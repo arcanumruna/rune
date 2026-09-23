@@ -152,6 +152,35 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # E1 Task 7 (EXIT): WorkerPoolParity integration tests.
+    #
+    # Two tests:
+    #   1. MultiWorkerBrokerReachesLeaderAndServes — real BrokerNode at N=4 workers;
+    #      asserts co-group affinity (topic0.p and topic1.p share a worker ∀p) and
+    #      >1 distinct worker ids used (proves N>1 is real, not collapsed to 1).
+    #   2. DynamicReassignmentReconcilesOwnership — ports the NodeDeath_NoCommittedLoss
+    #      rebalance/failover driver from RebalanceFailoverIntegrationTest verbatim;
+    #      asserts no committed loss, single leader, serves after failover.
+    #
+    # The BrokerNode test embeds the Aeron media driver → gated behind aeron_FOUND.
+    # ---------------------------------------------------------------------------
+    if(aeron_FOUND)
+        add_executable(rune_worker_pool_parity_tests
+            tests/integration/WorkerPoolParityTest.cpp)
+        target_include_directories(rune_worker_pool_parity_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_worker_pool_parity_tests PRIVATE
+            rune_node
+            rune_replication
+            rune_metadata
+            rune_dynamic_balancer
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_pool_parity_tests
+            PROPERTIES TIMEOUT 120)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # CG-4: GroupPushDelivery integration tests — assignment→push-subscription
     # translation, resume-from-committed offset, eager revoke on rebalance, and
     # Assign egress control frame encode/decode.

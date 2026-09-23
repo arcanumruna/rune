@@ -203,6 +203,15 @@ public:
         return cleanerAgent_->throttleRateForTest();
     }
 
+    /// Test-only: worker id owning (topicId, partition) per the WorkerPool router.
+    /// Returns -1 if workerPool_ is null (no topics configured or E1 not wired).
+    /// NOT concurrency-safe; call between doWork calls or when the node is stopped.
+    /// Used by WorkerPoolParityTest to assert co-group affinity and N>1 worker usage.
+    [[nodiscard]] int32_t workerForPartitionForTest(int32_t topicId,
+                                                    int32_t partition) const noexcept {
+        return workerPool_ ? workerPool_->ownerWorkerId(topicId, partition) : -1;
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers
