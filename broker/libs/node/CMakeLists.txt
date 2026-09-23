@@ -30,6 +30,16 @@ target_link_libraries(rune_node PRIVATE spdlog::spdlog)
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
 
+    # TSan suppressions for vendored Aeron client internals (conductor↔poll
+    # fence-based ordering TSan cannot model). Applied as a CTest ENVIRONMENT to
+    # the Aeron-based node test targets so `ctest` runs are clean while rune-side
+    # races still fail. See cmake/tsan-aeron.supp for the exact (aeron::-only)
+    # signatures — no rune symbol is suppressed.
+    set(RUNE_TSAN_AERON_SUPP
+        "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+    set(RUNE_AERON_TSAN_ENV
+        "TSAN_OPTIONS=suppressions=${RUNE_TSAN_AERON_SUPP}")
+
     # Unit tests (NodeConfig only — no Aeron driver)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp)
@@ -482,7 +492,8 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_broker_node_tests
-                PROPERTIES TIMEOUT 60)
+                PROPERTIES TIMEOUT 60
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the
@@ -496,7 +507,8 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_role_counter_publish_tests
-                PROPERTIES TIMEOUT 60)
+                PROPERTIES TIMEOUT 60
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
         endif()
     endif()
 
@@ -521,7 +533,8 @@ if(BUILD_TESTING)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_udp_cluster_tests
-                PROPERTIES TIMEOUT 120)
+                PROPERTIES TIMEOUT 120
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
         endif()
     endif()
 
@@ -555,7 +568,8 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_broker_node_gateway_tests
-            PROPERTIES TIMEOUT 120)
+            PROPERTIES TIMEOUT 120
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -573,7 +587,8 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_gateway_replication_wiring_tests
-            PROPERTIES TIMEOUT 180)
+            PROPERTIES TIMEOUT 180
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -591,7 +606,8 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_gateway_produce_replication_tests
-            PROPERTIES TIMEOUT 180)
+            PROPERTIES TIMEOUT 180
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -609,7 +625,8 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_gateway_acks_all_deferred_ack_tests
-            PROPERTIES TIMEOUT 240)
+            PROPERTIES TIMEOUT 240
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -628,7 +645,8 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_gateway_subscribe_hw_bound_tests
-            PROPERTIES TIMEOUT 240)
+            PROPERTIES TIMEOUT 240
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
@@ -726,7 +744,8 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_compaction_retention_smoke_tests
-            PROPERTIES TIMEOUT 300)
+            PROPERTIES TIMEOUT 300
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------

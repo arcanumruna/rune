@@ -37,10 +37,31 @@
 #include <rune/replication/Types.h>
 #include <rune/storage/Log.h>
 
+// Gateway client produce path (safe: the leader's duty-cycle thread owns the
+// replica; the test drives produce over real aeron:udp instead of calling
+// PartitionReplica::append() from the test thread, which would race the duty
+// cycle — see ThreeNode test below).
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/MessageHeader.h>
+
+#include <Aeron.h>
+#include <Publication.h>
+#include <Subscription.h>
+#include <FragmentAssembler.h>
+#include <concurrent/AtomicBuffer.h>
+extern "C" {
+#include <aeronmd/aeronmd.h>
+}
+
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -100,6 +121,101 @@ static std::vector<uint16_t> grDiscoverFreePorts(int n) {
         if (!dup) ports.push_back(p);
     }
     return ports;
+}
+
+namespace pc = rune::protocol::client;
+
+// ---------------------------------------------------------------------------
+// Test-client Aeron driver (mirrors GR-4's Gr4ClientDriver). Used by the
+// ThreeNode test to drive produce over the real gateway client path so the
+// leader replica is mutated ONLY on its own duty-cycle thread (never from the
+// test thread — that would race PartitionReplica's single-writer state).
+// ---------------------------------------------------------------------------
+struct GrClientDriver {
+    aeron_driver_context_t* driverCtx = nullptr;
+    aeron_driver_t*         driver    = nullptr;
+    std::atomic<bool>       running{false};
+    std::thread             thread;
+    std::shared_ptr<aeron::Aeron> aeron;
+
+    explicit GrClientDriver(const fs::path& aeronDir) {
+        fs::create_directories(aeronDir);
+        aeron_driver_context_init(&driverCtx);
+        aeron_driver_context_set_dir(driverCtx, aeronDir.string().c_str());
+        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
+        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
+        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
+        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
+        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
+        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
+
+        EXPECT_EQ(aeron_driver_init(&driver, driverCtx), 0);
+        EXPECT_EQ(aeron_driver_start(driver, /*manual_main_loop=*/true), 0);
+
+        running.store(true, std::memory_order_release);
+        thread = std::thread([this]() {
+            while (running.load(std::memory_order_acquire)) {
+                aeron_driver_main_idle_strategy(
+                    driver, aeron_driver_main_do_work(driver));
+            }
+        });
+
+        const std::string cncPath = aeronDir.string() + "/cnc.dat";
+        for (int i = 0; i < 400; ++i) {
+            aeron_driver_main_do_work(driver);
+            if (fs::exists(cncPath)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir.string());
+        aeron = aeron::Aeron::connect(ctx);
+    }
+
+    ~GrClientDriver() {
+        aeron.reset();
+        if (running.exchange(false, std::memory_order_acq_rel)) {
+            if (thread.joinable()) thread.join();
+        }
+        if (driver) {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (aeron_driver_main_do_work(driver) == 0) {
+                    aeron_driver_main_do_work(driver);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds{200});
+            }
+            aeron_driver_close(driver);
+            driver = nullptr;
+        }
+        if (driverCtx) {
+            aeron_driver_context_close(driverCtx);
+            driverCtx = nullptr;
+        }
+    }
+};
+
+// Build a RecordBatch of recordCount records (one record per key "k"/"v").
+static std::vector<uint8_t> grMakeBatch(int32_t recordCount) {
+    rune::protocol::RecordBatchBuilder b(/*baseOffset=*/0, /*baseTimestamp=*/1000LL);
+    for (int32_t i = 0; i < recordCount; ++i) {
+        b.append("k", "v", 1000LL + i);
+    }
+    return b.build();
+}
+
+// Bounded, non-blocking Aeron offer (no busy-spin beyond the cap).
+static bool grOfferBounded(aeron::Publication& pub,
+                           const uint8_t* buf, std::size_t len,
+                           int maxIter = 100'000) {
+    aeron::concurrent::AtomicBuffer ab(
+        const_cast<uint8_t*>(buf), static_cast<aeron::util::index_t>(len));
+    for (int i = 0; i < maxIter; ++i) {
+        if (pub.offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) return true;
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+    return false;
 }
 
 // Build a 3-node config with consensus + client + replication ports.
@@ -226,21 +342,138 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest())
         << "leader's replication bridge must report isLeader after election convergence";
 
-    // Append 5 records via the leader's PartitionReplica::append().
-    // (GR-4 will route through the gateway later; for GR-3 we prove the
-    // replica machinery — replica assigns offsets, transport delivers to followers.)
+    // Produce N records via the leader's gateway over real aeron:udp.
+    //
+    // IMPORTANT: we do NOT call leaderReplica->append() from the test thread.
+    // PartitionReplica is single-writer (duty-cycle-thread-only); a test-thread
+    // append() races the leader's duty cycle (onFetchRequest → recomputeHw,
+    // pushToFollowers → Aeron publish), which TSan correctly flags. Driving the
+    // append through the gateway keeps ALL replica mutation on the owning duty
+    // thread — the followers/HW convergence reads below use the replica's atomic
+    // snapshot accessors and are safe to poll from the test thread.
     constexpr int kNumRecords = 5;
-    Offset targetLeo = -1;
-    for (int i = 0; i < kNumRecords; ++i) {
-        std::vector<uint8_t> payload(16, static_cast<uint8_t>(0xA0 + i));
-        // Use PartitionReplica::append() which assigns offsets and advances LEO.
-        // acksAll=false (acks=Leader) — we just need the data in the log;
-        // HW will advance once followers fetch.
-        Offset off = leaderReplica->append(payload, /*acksAll=*/false);
-        ASSERT_GE(off, 0) << "leader append failed at record " << i;
-        targetLeo = leaderReplica->logEndOffset();
+
+    // Test-client Aeron driver (separate dir) connecting to the leader gateway.
+    GrTempDir clientDir{"client_"};
+    GrClientDriver clientDrv(clientDir.path / "aeron");
+    ASSERT_NE(clientDrv.aeron, nullptr) << "test-client Aeron::connect failed";
+
+    const std::string leaderClientChannel =
+        "aeron:udp?endpoint=127.0.0.1:" +
+        std::to_string(kPorts[static_cast<std::size_t>(lid)]);
+    constexpr int32_t kClientStreamId = 1;   // matches cfg.clientEndpoint.streamId
+
+    const uint16_t egressPort = grDiscoverFreeUdpPort();
+    const std::string egressChannel =
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(egressPort);
+    constexpr int32_t kEgressStreamId = 9910;
+
+    int64_t ingressPubRegId = clientDrv.aeron->addPublication(leaderClientChannel, kClientStreamId);
+    int64_t egressSubRegId  = clientDrv.aeron->addSubscription(egressChannel, kEgressStreamId);
+
+    std::shared_ptr<aeron::Publication>  ingressPub;
+    std::shared_ptr<aeron::Subscription> egressSub;
+    {
+        const auto rd = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < rd) {
+            if (!ingressPub) ingressPub = clientDrv.aeron->findPublication(ingressPubRegId);
+            if (!egressSub)  egressSub  = clientDrv.aeron->findSubscription(egressSubRegId);
+            if (ingressPub && egressSub) break;
+            std::this_thread::sleep_for(5ms);
+        }
+        ASSERT_NE(ingressPub, nullptr) << "could not resolve ingress publication";
+        ASSERT_NE(egressSub,  nullptr) << "could not resolve egress subscription";
     }
-    ASSERT_GT(targetLeo, 0) << "leader LEO must advance after appends";
+    {
+        const auto rd = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < rd) {
+            if (ingressPub->isConnected()) break;
+            std::this_thread::sleep_for(5ms);
+        }
+        ASSERT_TRUE(ingressPub->isConnected())
+            << "ingress publication not connected to leader gateway";
+    }
+
+    constexpr std::size_t kScratch = 68 * 1024;
+    std::vector<uint8_t> scratch(kScratch, 0);
+
+    // Connect → ConnectResponse to obtain a session id.
+    pc::ConnectRequest connReq;
+    connReq.sessionId      = 0;
+    connReq.correlationId  = 1;
+    connReq.egressStreamId = kEgressStreamId;
+    connReq.clientVersion  = 1;
+    connReq.egressChannel  = egressChannel;
+    const std::size_t connLen = connReq.encode(scratch.data());
+    ASSERT_TRUE(grOfferBounded(*ingressPub, scratch.data(), connLen, 100'000))
+        << "ConnectRequest offer failed";
+
+    int64_t assignedSessionId = -1;
+    {
+        std::optional<pc::ConnectResponse> connResp;
+        aeron::FragmentAssembler connAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t offset,
+                                             aeron::util::index_t len,
+                                             aeron::Header&) {
+            auto dec = pc::ConnectResponse::decode(
+                reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                static_cast<std::size_t>(len));
+            if (dec) connResp = *dec;
+        });
+        const auto rd = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < rd && !connResp.has_value()) {
+            egressSub->poll(connAsm.handler(), 10);
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_TRUE(connResp.has_value()) << "No ConnectResponse from leader gateway";
+        ASSERT_EQ(connResp->code, 0) << "ConnectResponse must be OK (code=0)";
+        assignedSessionId = connResp->assignedSessionId;
+    }
+    ASSERT_GT(assignedSessionId, 0) << "assignedSessionId must be > 0";
+
+    // Produce one batch of kNumRecords records to (topicId=0, partition=0).
+    auto batch = grMakeBatch(kNumRecords);
+    std::span<const uint8_t> emptyKey{};
+    pc::Produce prod;
+    prod.sessionId      = assignedSessionId;
+    prod.correlationId  = 100;
+    prod.topicId        = 0;   // "repl", topicId=0
+    prod.partition      = 0;
+    prod.partitionKnown = 1;
+    prod.key            = emptyKey;
+    prod.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+
+    std::vector<uint8_t> prodScratch(kScratch, 0);
+    const std::size_t prodLen = prod.encode(prodScratch.data());
+    ASSERT_LE(prodLen, kScratch) << "Produce frame too large for scratch";
+    ASSERT_TRUE(grOfferBounded(*ingressPub, prodScratch.data(), prodLen, 100'000))
+        << "Produce offer failed";
+
+    {
+        std::optional<pc::ProduceResponse> prodResp;
+        aeron::FragmentAssembler prodAsm([&](aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t offset,
+                                             aeron::util::index_t len,
+                                             aeron::Header&) {
+            auto dec = pc::ProduceResponse::decode(
+                reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                static_cast<std::size_t>(len));
+            if (dec) prodResp = *dec;
+        });
+        const auto rd = std::chrono::steady_clock::now() + 10s;
+        while (std::chrono::steady_clock::now() < rd && !prodResp.has_value()) {
+            egressSub->poll(prodAsm.handler(), 10);
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_TRUE(prodResp.has_value()) << "No ProduceResponse from leader gateway";
+        EXPECT_EQ(prodResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
+            << "ProduceResponse must be OK; got errorCode=" << prodResp->errorCode;
+    }
+    // ProduceResponse{OK} confirms the leader appended the batch on its own duty
+    // thread. The target committed offset is kNumRecords. We do NOT read the
+    // leader's non-atomic logEndOffset() from the test thread; convergence is
+    // proven below via the duty-thread-published cleanerHighWatermark() atomic.
+    const Offset targetLeo = static_cast<Offset>(kNumRecords);
 
     // Wait up to 10 s for followers to replicate.
     using Wall = std::chrono::steady_clock;
@@ -249,17 +482,31 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
 
     std::array<rune::node::BrokerNode*, 3> allNodes{&node0, &node1, &node2};
 
+    // Convergence is polled via the DUTY-THREAD-PUBLISHED atomic snapshot
+    // cleanerHighWatermark() (acquire-load; the duty thread release-stores it at
+    // every HW change). We do NOT read the non-atomic logEndOffset()/highWatermark()
+    // live state from the test thread — that races the owning duty cycle. Each
+    // replica's served HW advances to kNumRecords once the batch commits across
+    // the ISR, which simultaneously proves the leader committed AND the followers
+    // replicated (HW only advances past an offset the ISR has acknowledged).
+    auto leaderCommittedHw = [&]() -> Offset {
+        return leaderReplica->cleanerHighWatermark();
+    };
+    auto followerCommittedHw = [&](int i) -> Offset {
+        PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
+        return fr ? fr->cleanerHighWatermark() : -1;
+    };
+
     while (Wall::now() < deadline) {
-        bool allFollowersHaveLeo = true;
+        bool allFollowersCommitted = true;
         for (int i = 0; i < 3; ++i) {
             if (allNodes[i] == leaderNode) continue;
-            PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-            if (!fr || fr->logEndOffset() < targetLeo) {
-                allFollowersHaveLeo = false;
+            if (followerCommittedHw(i) < targetLeo) {
+                allFollowersCommitted = false;
                 break;
             }
         }
-        if (allFollowersHaveLeo && leaderReplica->highWatermark() >= targetLeo) {
+        if (allFollowersCommitted && leaderCommittedHw() >= targetLeo) {
             converged = true;
             break;
         }
@@ -268,24 +515,21 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
 
     ASSERT_TRUE(converged)
         << "Replication did not converge within 10 s. "
-        << "Leader LEO=" << targetLeo
-        << " HW=" << leaderReplica->highWatermark();
+        << "targetLeo=" << targetLeo
+        << " leaderHw=" << leaderCommittedHw();
 
-    EXPECT_GE(leaderReplica->highWatermark(), targetLeo)
-        << "Leader HW must advance to LEO after followers ack";
+    EXPECT_GE(leaderCommittedHw(), targetLeo)
+        << "Leader committed HW must advance to LEO after followers ack";
 
-    // Verify at least one follower converged.
-    // NOTE: we do NOT assert fr->role() here (non-atomic, concurrent with duty cycle).
-    // We assert follower LEO convergence instead (observable via the convergence loop above).
+    // At least one follower's committed HW must have reached the target (proves
+    // the bytes replicated AND committed on a follower).
     bool anyFollowerConverged = false;
     for (int i = 0; i < 3; ++i) {
         if (allNodes[i] == leaderNode) continue;
-        PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-        if (fr && fr->logEndOffset() >= targetLeo) {
-            anyFollowerConverged = true;
-        }
+        if (followerCommittedHw(i) >= targetLeo) anyFollowerConverged = true;
     }
-    EXPECT_TRUE(anyFollowerConverged) << "At least one follower must have replicated";
+    EXPECT_TRUE(anyFollowerConverged)
+        << "At least one follower must have replicated and committed";
 
     node0.stop();
     node1.stop();
@@ -427,8 +671,13 @@ TEST(GatewayReplicationWiring, Unit_TermEpochMonotonic_Bridge) {
     constexpr rune::replication::NodeId kSelfId = 1;
     const std::vector<rune::replication::NodeId> allNodes = {1};
 
+    // Per-partition bridge contract (commit 4e70cdf): INTERNAL partitions
+    // (topicId < 0) follow CLUSTER-consensus leadership via bridge Step A; USER
+    // partitions (topicId >= 0) follow the committed assignment map via setMsm().
+    // This test exercises the cluster-consensus term→epoch monotonicity path, so
+    // the replica MUST be an internal partition (topicId = -1).
     rune::replication::PartitionConfig cfg;
-    cfg.partitionId = 0; cfg.selfId = kSelfId;
+    cfg.topicId = -1; cfg.partitionId = 0; cfg.selfId = kSelfId;
     cfg.replicaLagMaxMs = 10000; cfg.replicaLagMaxOffset = 10000;
     cfg.minIsr = 1;
     cfg.fetchIntervalNs = 5'000'000LL;
@@ -441,7 +690,7 @@ TEST(GatewayReplicationWiring, Unit_TermEpochMonotonic_Bridge) {
         cfg, Role::Follower, 0, allNodes, allNodes, &log, &transport);
 
     PartitionReplica* rawReplica = replica.get();
-    registry.add(0, 0, std::move(replica));
+    registry.add(-1, 0, std::move(replica));
 
     rune::node::ReplicationMetadataBridge bridge(kSelfId, allNodes, registry);
 
@@ -500,8 +749,11 @@ TEST(GatewayReplicationWiring, Unit_RoleFlip_RepeatedLeaderChanges) {
     const std::vector<rune::replication::NodeId> allNodes = {1, 2};
     constexpr rune::replication::NodeId kSelf = 1;
 
+    // Per-partition bridge contract (commit 4e70cdf): this test drives role flips
+    // from CLUSTER-consensus leadership changes, so the replica MUST be an internal
+    // partition (topicId < 0). User partitions follow the committed map (setMsm).
     rune::replication::PartitionConfig cfg;
-    cfg.partitionId = 0; cfg.selfId = kSelf;
+    cfg.topicId = -1; cfg.partitionId = 0; cfg.selfId = kSelf;
     cfg.replicaLagMaxMs = 10000; cfg.replicaLagMaxOffset = 10000;
     cfg.minIsr = 1;
     cfg.fetchIntervalNs = 5'000'000LL; cfg.isrCheckIntervalNs = 10'000'000LL;
@@ -511,7 +763,7 @@ TEST(GatewayReplicationWiring, Unit_RoleFlip_RepeatedLeaderChanges) {
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Follower, 0, allNodes, allNodes, &logA, &transport);
     PartitionReplica* r = replica.get();
-    registry.add(0, 0, std::move(replica));
+    registry.add(-1, 0, std::move(replica));
 
     rune::node::ReplicationMetadataBridge bridge(kSelf, allNodes, registry);
 
