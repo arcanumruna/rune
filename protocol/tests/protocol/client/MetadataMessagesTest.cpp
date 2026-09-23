@@ -28,6 +28,7 @@
 #include <rune/protocol/client/Protocol.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -97,12 +98,18 @@ TEST(MetadataMessages, RequestRoundTripWithTopics)
     EXPECT_EQ(opt->sessionId,     sid);
     EXPECT_EQ(opt->correlationId, corr);
     ASSERT_EQ(opt->topicIds.size(), tids.size());
+    // MISALIGNMENT FIX: decode() now copies each int32 via getLE32() into an
+    // owned, naturally-aligned std::vector<int32_t> (ownedTopicIds_) and points
+    // topicIds at it.  So the span can be dereferenced directly as int32_t
+    // WITHOUT the previous reinterpret_cast at a 4-byte-misaligned wire offset.
+    // Assert the backing storage is 4-byte aligned (proves we're not aliasing
+    // the misaligned wire buffer) and that the values decode correctly.
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(opt->topicIds.data()) % alignof(int32_t), 0u)
+        << "decoded topicIds must be naturally aligned (owned vector, not wire buffer)";
+    EXPECT_EQ(opt->topicIds.data(), opt->ownedTopicIds_.data())
+        << "topicIds must view the owned vector after decode";
     for (std::size_t i = 0; i < tids.size(); ++i) {
-        // Reinterpret as LE int32 from raw buffer — on a LE host this is a direct read.
-        const int32_t decoded = rpc::detail::getLE32(
-            reinterpret_cast<const uint8_t*>(opt->topicIds.data()),
-            static_cast<int>(i * 4u));
-        EXPECT_EQ(decoded, tids[i]) << "mismatch at index " << i;
+        EXPECT_EQ(opt->topicIds[i], tids[i]) << "mismatch at index " << i;
     }
 }
 

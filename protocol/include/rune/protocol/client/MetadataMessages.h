@@ -57,9 +57,23 @@ struct MetadataRequest {
     int64_t sessionId     = 0;
     int64_t correlationId = 0;
     /// Topic ids to query.  Empty = all topics.
-    /// Zero-copy view into the source buffer (if decoded); or owned by the
-    /// caller when encoding (the span must stay valid until encode() returns).
+    ///
+    /// ENCODING: Set this span before calling encode().  The span must stay
+    ///   valid until encode() returns.  Typically points into a caller-owned
+    ///   vector or a static array.
+    ///
+    /// DECODING: decode() populates ownedTopicIds_ (below) by copying each
+    ///   int32 via getLE32() to avoid a misaligned aliasing load (pos=26 is
+    ///   NOT 4-byte aligned in the wire buffer, so reinterpret_cast<int32_t*>
+    ///   would be UB — a misaligned load that UBSan traps).  topicIds is then
+    ///   set to point at ownedTopicIds_ so callers iterate topicIds as before.
+    ///   ownedTopicIds_ is an implementation detail; callers should only read
+    ///   through topicIds.
     std::span<const int32_t> topicIds;
+
+    /// Owned storage for decoded topicIds (populated by decode()).
+    /// Non-empty only when this struct was produced by decode().
+    std::vector<int32_t> ownedTopicIds_;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::MetadataRequest); // 8
     static constexpr uint16_t BODY_FIXED  = 0;
@@ -116,15 +130,18 @@ struct MetadataRequest {
         pos += 2;
         // Validate: count * 4 bytes must be present.
         if (avail < pos + static_cast<std::size_t>(count) * 4u) return std::nullopt;
-        // Zero-copy: the span points directly into the receive buffer.
-        // Each int32 is LE in the buffer; the caller decodes on access.
-        // For convenience we expose them as a span<const int32_t> using reinterpret,
-        // which is well-defined on LE platforms (native byte order == LE on x86/ARM LE).
-        // On a BE platform the values would be byte-swapped; but Rune is LE-only
-        // (see rune-endianness-all-le.md), so this is safe.
+        // MISALIGNMENT FIX: pos here (fixedEnd + 2 = 26) is NOT 4-byte aligned,
+        // so reinterpret_cast<const int32_t*>(buf + pos) is undefined behaviour
+        // (a misaligned load that UBSan traps and that the broker previously
+        // dereferenced).  Decode each topicId via getLE32() into an owned vector
+        // and point the span at that vector, so callers iterate topicIds safely.
         if (count > 0) {
-            msg.topicIds = std::span<const int32_t>(
-                reinterpret_cast<const int32_t*>(buf + pos), count);
+            msg.ownedTopicIds_.reserve(count);
+            for (uint16_t i = 0; i < count; ++i) {
+                msg.ownedTopicIds_.push_back(
+                    detail::getLE32(buf, static_cast<int>(pos + i * 4u)));
+            }
+            msg.topicIds = std::span<const int32_t>(msg.ownedTopicIds_);
         }
         return msg;
     }
