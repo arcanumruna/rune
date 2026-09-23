@@ -203,6 +203,36 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # MD1-13 Round-2: BootstrapRoutingImage tests.
+    #
+    # Tests 1-3 (no Aeron): buildStaticRoutingImage() correctness when
+    #   committedMap() is empty — non-null, deterministic, balanced assignment.
+    #   No redirect loop: every partition has a valid leaderNodeId in the image.
+    #
+    # Tests 4-5 (Aeron gated): acks=All during bootstrap → NotLeader (retriable);
+    #   acks=Leader during bootstrap → OK (local append).  Uses the
+    #   applyProduceForTest seam + injectTestSession + setOnEgressFrame.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_bootstrap_routing_image_tests
+        tests/integration/BootstrapRoutingImageTest.cpp)
+    target_include_directories(rune_bootstrap_routing_image_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_bootstrap_routing_image_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_replication
+        GTest::gtest_main)
+    if(aeron_FOUND)
+        target_compile_definitions(rune_bootstrap_routing_image_tests PRIVATE
+            RUNE_AERON_AVAILABLE=1)
+        target_link_libraries(rune_bootstrap_routing_image_tests PRIVATE
+            aeron::aeron)
+    endif()
+    gtest_discover_tests(rune_bootstrap_routing_image_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 11: Multi-leader produce integration (Phase-1 exit criterion).
     #
     # 3-node in-process cluster: static assignment places partition leaders on

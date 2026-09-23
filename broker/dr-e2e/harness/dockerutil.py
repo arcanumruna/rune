@@ -7,12 +7,43 @@ Everything the harness does to Docker funnels through here so we get:
 
 We deliberately shell out to the CLI (rather than the docker SDK) to match the
 existing docker/e2e*.sh scripts and to keep the dependency surface tiny.
+
+IMAGE TAG POLICY
+----------------
+The harness sets RUNE_IMAGE_TAG to the short git HEAD SHA before every
+``docker compose build``.  The docker-compose.yml uses that variable to tag
+the broker image as ``rune-broker-node:<sha>`` (falling back to ``latest``
+when the variable is absent, e.g. manual interactive use).  A commit-specific
+tag means:
+  * Each commit's layers live under a unique name in the containerd snapshot
+    store — no cross-commit layer collision.
+  * Parallel test runs from different commits never stomp each other's images.
+  * Layer sharing still works within a single commit (all three services
+    reference the same ``rune-broker-node:<sha>`` image).
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
+
+
+def _git_sha(repo_root: str) -> str:
+    """Return the short HEAD SHA of the repo at *repo_root* (7 hex chars).
+
+    Falls back to ``"local"`` if git is unavailable or the directory is not a
+    git repo — so the harness still works in bare-binary CI environments.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        sha = result.stdout.strip()
+        return sha if sha else "local"
+    except Exception:
+        return "local"
 
 
 DEFAULT_TIMEOUT = 120  # seconds — generous but hard cap for any single CLI call
@@ -30,14 +61,21 @@ class CmdResult:
         return self.returncode == 0
 
 
-def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False) -> CmdResult:
-    """Run a command with a hard timeout. Never blocks forever."""
+def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
+        env: dict[str, str] | None = None) -> CmdResult:
+    """Run a command with a hard timeout. Never blocks forever.
+
+    ``env``: if supplied, the subprocess inherits this environment instead of
+    the current process environment.  Pass ``os.environ.copy()`` with mutations
+    to extend the current environment rather than replace it.
+    """
     try:
         proc = subprocess.run(
             args,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:  # pragma: no cover - defensive
         raise TimeoutError(
@@ -63,13 +101,21 @@ class Compose:
     This is used by the compaction/retention e2e tests, which need to inject
     RUNE_TOPICS with compact/delete policy and small segment sizes via a
     compose override — without touching the canonical docker-compose.yml.
+
+    ``image_tag``: injected as ``RUNE_IMAGE_TAG`` into every ``build``/``up``
+    call so the broker image is tagged ``rune-broker-node:<tag>`` rather than
+    the project-scoped ``<project>-rune-{1,2,3}:latest``.  When ``None`` the
+    current process environment is passed unchanged (backward-compat / manual
+    use where the caller exported ``RUNE_IMAGE_TAG`` already).
     """
 
     def __init__(self, compose_file: str, project: str,
-                 override_files: list[str] | None = None):
+                 override_files: list[str] | None = None,
+                 image_tag: str | None = None):
         self.compose_file = compose_file
         self.project = project
         self._override_files: list[str] = list(override_files or [])
+        self._image_tag: str | None = image_tag
 
     def _base(self) -> list[str]:
         args = ["docker", "compose", "-f", self.compose_file]
@@ -78,11 +124,21 @@ class Compose:
         args += ["-p", self.project]
         return args
 
+    def _env(self) -> dict[str, str] | None:
+        """Return an env dict with RUNE_IMAGE_TAG injected, or None to inherit."""
+        if self._image_tag is None:
+            return None
+        env = os.environ.copy()
+        env["RUNE_IMAGE_TAG"] = self._image_tag
+        return env
+
     def up(self, *services: str, timeout: int = 180) -> CmdResult:
-        return run(self._base() + ["up", "-d", *services], timeout=timeout, check=True)
+        return run(self._base() + ["up", "-d", *services],
+                   timeout=timeout, check=True, env=self._env())
 
     def build(self, *services: str, timeout: int = 600) -> CmdResult:
-        return run(self._base() + ["build", *services], timeout=timeout, check=True)
+        return run(self._base() + ["build", *services],
+                   timeout=timeout, check=True, env=self._env())
 
     def down(self, timeout: int = 120) -> CmdResult:
         # -v removes named volumes (fresh state), --remove-orphans cleans stragglers.

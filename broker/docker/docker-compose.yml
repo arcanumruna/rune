@@ -4,6 +4,12 @@
 #
 # Platform: linux/amd64 — the builder stage uses gcc:13 (x86_64 cmake binary).
 # On macOS/Apple Silicon, Docker Desktop's Rosetta emulation runs amd64 containers.
+#
+# IMAGE TAGGING: the broker image is tagged rune-broker-node:${RUNE_IMAGE_TAG}.
+# Set RUNE_IMAGE_TAG to the git commit SHA (e.g. export RUNE_IMAGE_TAG=$(git rev-parse --short HEAD))
+# before building so each commit's layers live under a unique tag and never collide
+# with other commits' layers in the containerd snapshot store.  Defaults to "latest"
+# for interactive use but the e2e harness always sets it to the commit SHA.
 
 name: rune-broker
 
@@ -49,6 +55,7 @@ services:
   # ── Node 0 ──────────────────────────────────────────────────────────────────
   rune-1:
     build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
     platform: linux/amd64
     hostname: rune-1
     shm_size: "256m"
@@ -67,6 +74,7 @@ services:
   # ── Node 1 ──────────────────────────────────────────────────────────────────
   rune-2:
     build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
     platform: linux/amd64
     hostname: rune-2
     shm_size: "256m"
@@ -85,6 +93,7 @@ services:
   # ── Node 2 ──────────────────────────────────────────────────────────────────
   rune-3:
     build: *broker-build
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-latest}
     platform: linux/amd64
     hostname: rune-3
     shm_size: "256m"

@@ -475,6 +475,17 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // applyProduceForTest — feed a raw Produce frame through the real
+    // handleProduce() path (test seam).  Lets integration tests exercise the
+    // full produce routing, acks=All bootstrap rejection, and GR-4/GR-5 gates
+    // without a live Aeron client publishing ingress frames.
+    // Single-writer: call only on the duty-cycle thread or before doWork().
+    // -----------------------------------------------------------------------
+    void applyProduceForTest(const uint8_t* buf, std::size_t len) {
+        handleProduce(buf, len);
+    }
+
+    // -----------------------------------------------------------------------
     // subscriptionIsolationForTest — return the isolation level (0/1) of the
     // subscription matching (sessionId, topicId, partition), or -1 if none.
     // For tests to assert the carrier merge updated the group sub in place.

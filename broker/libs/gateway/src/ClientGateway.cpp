@@ -1099,52 +1099,52 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // coarse atomic observer that may lag a partition-level role transition
     // (particularly during epoch changes).
     //
-    // BOOTSTRAP WINDOW EXCEPTION (MD1-13):
-    //   When routingImage_ is null, we are in the bootstrap window — no partition
-    //   assignments have been committed yet.  User partition replicas start in
-    //   Follower role (per BrokerNode wiring) and are only promoted to Leader
-    //   AFTER the metadata log records replicate and commit (bridge Step B).
-    //   Before MD1, bridge Step A promoted ALL replicas from cluster leadership.
-    //   After MD1, user replicas are only promoted via committedMap (Step B).
-    //   During the bootstrap window (routingImage_ null), the Raft leader MUST
-    //   be able to serve produces via Path B — the GR-4 check must NOT fire here
-    //   because the Follower-role state of user replicas is EXPECTED (not an error).
-    //   Without this gate, every produce to the Raft leader during bootstrap
-    //   returns NotLeader and the client redirect-loops to exhaustion.
+    // GATE: committedMetadataReady_ (NOT routingImage_)
     //
-    // When routingImage_ IS set (assignments committed, steady state), the check
-    // fires normally: if the image says "local" but the replica is Follower, that
-    // IS a conflict and the NotLeader rejection is correct.
+    //   The GR-4 check is gated on committedMetadataReady_, not on whether
+    //   routingImage_ is non-null.  Since MD1-13 Fix 5, routingImage_ is ALWAYS
+    //   set — even during bootstrap — using a StaticBalancer-derived image
+    //   (deterministic across all nodes).  The StaticBalancer image assigns each
+    //   partition a designated leader node, but user replicas are still in Follower
+    //   role at this point because bridge Step B (committedMap → per-partition role
+    //   promotion) has not yet fired.
+    //
+    //   committedMetadataReady_ becomes true only when committedMap() is non-empty
+    //   (i.e., the metadata log has replicated, committed, and been applied by the
+    //   MetadataStateMachine).  At that point bridge Step B fires and promotes user
+    //   replicas to the correct roles — GR-4 can then correctly enforce the role
+    //   invariant.
+    //
+    // BOOTSTRAP WINDOW (committedMetadataReady_ false):
+    //   User replicas start in Follower role and are only promoted to Leader AFTER
+    //   the metadata log records replicate and commit (bridge Step B).  Applying
+    //   GR-4 here would reject every produce from the designated partition leader
+    //   (whose replica is still Follower) with NotLeader — incorrect during bootstrap.
+    //   The replica is looked up for later use (acks=All ISR path) but the role
+    //   check is suppressed.
+    //
+    // STEADY STATE (committedMetadataReady_ true):
+    //   Bridge Step B has fired, replicas are in the correct roles.  If routingImage_
+    //   says "local" but the replica is Follower, that IS a genuine conflict and
+    //   the NotLeader rejection is correct.
     //
     // We accept the produce when:
     //   a) replicaRegistry_ is null (replication not wired in — passthrough).
     //   b) no replica found for this (topicId, partition) — sparse replica map.
     //   c) replica.role() == Leader.
-    //   d) routingImage_ is null (bootstrap window — no metadata assignment yet;
-    //      Raft leader serves all partitions, replica role is expected Follower).
+    //   d) committedMetadataReady_ is false (bootstrap window — bridge Step B not
+    //      yet fired; Follower role is expected, not an error).
     //
-    // We reject (NotLeader) when replica.role() == Follower AND routingImage_ is
-    // set (steady state: conflicting routing image vs replica role).
+    // We reject (NotLeader) when replica.role() == Follower AND
+    // committedMetadataReady_ is true (steady state: genuine role conflict).
     //
     // O(1) lookup (unordered_map): zero per-op alloc, lock-free (single-writer).
     rune::replication::PartitionReplica* replica = nullptr;
     if (replicaRegistry_ && committedMetadataReady_) {
-        // GR-4 check: only in steady state (committedMetadataReady_ = committedMap
-        // non-empty, bridge Step B has promoted replicas to correct roles).
+        // GR-4 check: only in steady state (committedMetadataReady_ true —
+        // committedMap non-empty, bridge Step B has promoted replicas to correct
+        // roles).  Skipped during bootstrap (committedMetadataReady_ false).
         //
-        // BOOTSTRAP WINDOW EXCEPTION (MD1-13 Fix 3 + Fix 5):
-        //   committedMetadataReady_ is false when committedMap() is empty — even
-        //   when routingImage_ is set (e.g. built from StaticBalancer in Fix 5).
-        //   During the bootstrap window, user replicas start in Follower role and
-        //   are only promoted to Leader AFTER the metadata log records replicate
-        //   and commit (bridge Step B).  Applying GR-4 here would reject every
-        //   produce from the designated partition leader (who IS correct per the
-        //   routing image but whose replica is still Follower) with NotLeader.
-        //
-        //   In steady state (committedMetadataReady_ = true), GR-4 is correct:
-        //   bridge Step B has fired, replicas are in the right roles.  If the
-        //   routing image says "local" but the replica is Follower, that IS a
-        //   real conflict and NotLeader is the right response.
         replica = replicaRegistry_->lookup(msg.topicId, partition);
         if (replica && replica->role() != rune::replication::Role::Leader) {
             // Per-partition NotLeader: reject without appending.
@@ -1350,24 +1350,53 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     // passthrough (replica==nullptr): no ISR check — single-node / test mode.
     //
-    // BOOTSTRAP WINDOW EXCEPTION (MD1-13 Fix 5):
-    //   When committedMetadataReady_ is false (committedMap still empty — bootstrap
-    //   window), the replica is still a Follower (bridge Step B has not promoted it).
-    //   In this state:
-    //     - replica->isr() returns empty (Follower) → ISR check would always reject.
+    // BOOTSTRAP WINDOW — acks=All DURABILITY CONTRACT (MD1-13 Fix Round 2):
+    //   When committedMetadataReady_ is false (committedMap still empty — no
+    //   majority-committed assignment yet), the replica is still a Follower
+    //   (bridge Step B has not fired).  In this state:
+    //     - The replica's ISR is empty (Follower role) → min-ISR gate would always
+    //       reject with MinIsrViolation.
     //     - onLeaderLogAppended() is a no-op on Followers → HW never advances →
     //       the deferred-ack queue would stall until timeout.
-    //   Instead, treat acks=All as acks=Leader during bootstrap (immediate ack after
-    //   local append).  This matches pre-MD1 cluster startup behaviour and is safe:
-    //   the designated partition leader owns the log; once committedMetadataReady_ is
-    //   true (committedMap non-empty, bridge Step B fired), the leader replica has a
-    //   valid ISR and acks=All works end-to-end with majority-commit semantics.
+    //   SILENTLY downgrading acks=All to acks=Leader (immediate ack after local
+    //   append) violates the diamond-durability contract: the caller requested
+    //   majority-committed durability and the broker would ack without it.
+    //
+    //   Correct behaviour: return NotLeader (a retriable error code) so the client
+    //   retries the produce after bootstrap completes.  NotLeader is retriable by
+    //   the client SDK; once committedMetadataReady_ becomes true the retry lands
+    //   on the steady-state path where acks=All is honored with real majority-
+    //   commit semantics (deferred-ack queue + ISR HW gate).
+    //
+    //   acks=Leader and acks=0 in the bootstrap window are fine to serve locally
+    //   — their contract explicitly does NOT guarantee majority durability.
+    //
+    //   The log is untouched (no append, no LEO advance) for the retriable-error
+    //   path, preserving the "NEVER falsely ack" invariant.
     const bool acksAll = (msg.acks == 1);
+    if (acksAll && !committedMetadataReady_) {
+        // Bootstrap window: acks=All cannot be served with majority durability yet.
+        // Return NotLeader (retriable) so the client retries after bootstrap.
+        spdlog::debug("ClientGateway: acks=All produce rejected (bootstrap: committedMetadataReady_=false) "
+                      "sessionId={} topicId={} partition={} — returning NotLeader (retriable)",
+                      msg.sessionId, msg.topicId, partition);
+        pc::ErrorResponse errResp;
+        errResp.sessionId     = msg.sessionId;
+        errResp.correlationId = msg.correlationId;
+        errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
+                                   pc::ErrorResponse::BODY_FIXED + 2;
+        if (needed <= scratch_.size()) {
+            const std::size_t encoded = errResp.encode(scratch_.data());
+            sendTo(*session, scratch_.data(), encoded);
+        }
+        return;  // log untouched — no append, no LEO advance
+    }
     if (acksAll && replica && committedMetadataReady_) {
         // min-ISR gate: require ISR size >= minIsr_ for acks=All durability.
-        // Skipped during bootstrap window (committedMetadataReady_ false) — see above.
+        // Only reached in steady state (committedMetadataReady_ true — see above).
         // replica->isr() returns the leader's current ISR (as of the last
-        // maybyShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
+        // maybeShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
         const int currentMinIsr = minIsr_.load(std::memory_order_relaxed);
         const int isrSize = static_cast<int>(replica->isr().size());
         if (isrSize < currentMinIsr) {
@@ -1464,18 +1493,17 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // acks=All:           enqueue a PendingAck; drainPendingAcks() will send the
     //                     response once replica->highWatermark() >= lastOffset.
     //
-    // BOOTSTRAP WINDOW EXCEPTION (MD1-13 Fix 5): when committedMetadataReady_ is
-    // false, we are in the bootstrap window.  The replica is a Follower:
-    // onLeaderLogAppended() is a no-op and highWatermark() never advances, so the
-    // deferred-ack queue would stall until timeout.  Treat acks=All as acks=Leader
-    // in the bootstrap window (immediate ack after local append) — see GR-5 comment.
+    // acks=All during the bootstrap window (!committedMetadataReady_) is handled
+    // ABOVE (before the append): a retriable NotLeader is returned and we never
+    // reach this point with acksAll==true && !committedMetadataReady_.  By the
+    // time we land here, either acks != All OR committedMetadataReady_ is true.
     const bool deferAck = acksAll && replica && committedMetadataReady_;
     if (!deferAck) {
-        // Immediate ack: acks=Leader, no replica wired (passthrough), or
-        // bootstrap window (committedMetadataReady_ false — acks=All → acks=Leader).
+        // Immediate ack: acks=Leader or no replica wired (passthrough).
+        // (acks=All in bootstrap window is rejected before the append — never here.)
         sendResp(pc::ErrorCode::OK, partition, base);
     } else {
-        // acks=All deferred ack path (steady state: routingImage_ set).
+        // acks=All deferred ack path (steady state: committedMetadataReady_ true).
         // Cap check: if the queue is full, reject rather than silently overflowing.
         if (pendingAcks_.size() >= kMaxPendingAcks) {
             spdlog::warn("ClientGateway: pendingAcks_ full ({} entries); acks=All produce rejected "

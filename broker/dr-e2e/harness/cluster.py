@@ -14,7 +14,7 @@ import os
 import re
 import time
 
-from .dockerutil import Compose, run
+from .dockerutil import Compose, _git_sha, run
 
 # Repo layout: dr-e2e/ lives inside rune-broker/, compose is at ../docker/.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +62,15 @@ class Cluster:
         """
         self.project = project
         self.topics = topics
-        self.compose = Compose(COMPOSE_FILE, project, override_files=override_files)
+        # RUNE_IMAGE_TAG: use the git HEAD SHA so every commit's broker image is
+        # tagged rune-broker-node:<sha> instead of <project>-rune-{1,2,3}:latest.
+        # This prevents layer-store collisions between builds from different commits
+        # (the root cause of "parent snapshot does not exist" errors when Docker's
+        # containerd snapshot store has stale layers from a previous build).
+        # _git_sha falls back to "local" in bare-binary CI environments.
+        _sha = _git_sha(BROKER_REPO)
+        self.compose = Compose(COMPOSE_FILE, project, override_files=override_files,
+                               image_tag=_sha)
         self._up = False
         self._serving_cache: str | None = None
 
