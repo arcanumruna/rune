@@ -614,7 +614,22 @@ private:
         // Zero-copy append: read directly from the ring frame into the log.
         // appendNoSync copies the bytes into the log's owned segment buffer.
         try {
-            log->appendNoSync(tail, static_cast<std::size_t>(tailLen), ret.lastOffset);
+            const int64_t appended =
+                log->appendNoSync(tail, static_cast<std::size_t>(tailLen), ret.lastOffset);
+            // R5 finding F6 (correctness): a negative return means the append was
+            // REFUSED (e.g. InMemoryLog in BackPressure mode with a full ring).
+            // We MUST NOT ack OK for a record that was never appended — that is a
+            // phantom-durability false-OK.  Return a non-OK error so the client
+            // retries ([[rune-shared-nothing-law]]: never false-OK a commit-critical
+            // produce under back-pressure).
+            if (appended < 0) {
+                spdlog::warn("Worker {}: appendNoSync refused (back-pressure) for "
+                             "topicId={} partition={}; returning Internal",
+                             workerId_, hdr->topicId, hdr->partition);
+                ret.errorCode = static_cast<int16_t>(6); // Internal
+                enqueueReturn_(ret);
+                return;
+            }
         } catch (const std::exception& ex) {
             spdlog::error("Worker {}: appendNoSync threw: {}", workerId_, ex.what());
             ret.errorCode = static_cast<int16_t>(6); // Internal
