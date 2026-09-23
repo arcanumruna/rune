@@ -195,13 +195,21 @@ UringFlushBackend::~UringFlushBackend() {
 // ---------------------------------------------------------------------------
 CompletionToken UringFlushBackend::submit(int fd,
                                           int64_t flushBoundary) noexcept {
+    // Deterministic back-pressure: bound in-flight (submitted-not-yet-reaped)
+    // completions to the configured depth.  The SQ ring itself drains on every
+    // io_uring_enter (the kernel consumes SQEs immediately), so an SQ-fullness
+    // check alone never trips — cap in-flight instead (mirrors PortableFlushBackend).
+    if (inFlight_ >= submitDepth_) {
+        return kNoToken;
+    }
+
     // Load SQ head with acquire semantics — the kernel writes head after
     // consuming SQEs, so we need to observe that write here.
     const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
     const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED);
     const uint32_t mask = *sqRingMask_;
 
-    // SQ ring full: tail - head == ring size (kernel consumes from head).
+    // SQ ring full (defensive; normally never trips given the in-flight cap above).
     if (tail - head >= sqRingSize_) {
         return kNoToken;
     }
@@ -212,7 +220,11 @@ CompletionToken UringFlushBackend::submit(int fd,
         tok = ++nextToken_;
     }
 
-    return submitWithToken(fd, flushBoundary, tok, tail, mask);
+    const CompletionToken result = submitWithToken(fd, flushBoundary, tok, tail, mask);
+    if (result != kNoToken) {
+        ++inFlight_;   // one more submitted-not-yet-reaped
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------

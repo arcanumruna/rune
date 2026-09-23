@@ -54,11 +54,11 @@
 #include <cstddef>
 #include <memory>
 
-// Forward-declare the Linux io_uring kernel structs we use internally so the
-// header stays self-contained without leaking <linux/io_uring.h> into consumers.
-struct io_uring_params;
-struct io_uring_sqe;
-struct io_uring_cqe;
+// Full io_uring kernel struct definitions are required here because reap() is an
+// inline template that dereferences io_uring_cqe::res.  This include sits inside
+// the #if defined(__linux__) guard, so it never reaches the macOS build (which
+// selects PortableFlushBackend and never instantiates this class).
+#include <linux/io_uring.h>
 
 namespace rune::node {
 
@@ -133,6 +133,13 @@ private:
     // Worker-owned next-token counter (starts at 1; 0 == kNoToken is reserved).
     CompletionToken nextToken_{0};
 
+    // Worker-owned in-flight counter (submitted-but-not-yet-reaped).  io_uring's
+    // SQ ring DRAINS on each io_uring_enter (the kernel consumes the SQE), so an
+    // SQ-fullness check never trips; instead we bound in-flight completions to the
+    // configured depth for deterministic back-pressure (mirrors PortableFlushBackend).
+    // submit() returns kNoToken when inFlight_ >= submitDepth_; reap() decrements.
+    std::size_t inFlight_{0};
+
     // Depth actually allocated for the SQ ring (== sqRingSize_).
     std::size_t submitDepth_{0};
 
@@ -182,6 +189,7 @@ int UringFlushBackend::reap(H&& handler) noexcept {
 
         handler(comp);
         ++count;
+        if (inFlight_ > 0) --inFlight_;   // one completion drained → free a slot
 
         // Advance CQ head — store-release so the kernel sees the freed slot.
         __atomic_store_n(cqHead_, head + 1, __ATOMIC_RELEASE);
