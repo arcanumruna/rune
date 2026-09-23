@@ -5,7 +5,7 @@ target_include_directories(rune_storage PUBLIC
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
-    add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp)
+    add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/LeaderEpochCachePersistTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp)
     add_executable(rune_in_memory_log_tests tests/storage/InMemoryLogTest.cpp)
     target_link_libraries(rune_in_memory_log_tests PRIVATE rune_storage GTest::gtest_main)
     gtest_discover_tests(rune_in_memory_log_tests)

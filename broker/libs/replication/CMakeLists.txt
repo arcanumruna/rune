@@ -57,7 +57,8 @@ if(BUILD_TESTING)
         tests/replication/PartitionReplayTest.cpp
         tests/replication/PartitionFailoverTest.cpp
         tests/replication/AeronPartitionTransportTest.cpp
-        tests/replication/DurabilityQuorumTest.cpp)
+        tests/replication/DurabilityQuorumTest.cpp
+        tests/replication/LeaderEpochCacheRestartTest.cpp)
     target_link_libraries(rune_replication_tests PRIVATE rune_replication GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_replication_tests)

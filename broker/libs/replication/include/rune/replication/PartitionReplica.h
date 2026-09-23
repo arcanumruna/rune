@@ -456,6 +456,14 @@ public:
     [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
     [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
 
+    /// Task 9: test accessor — exposes the internal epoch cache for restart-
+    /// durability tests.  Disk-backed only (memory-backed partitions have no
+    /// checkpoint; their epoch cache is always rebuilt from scratch on restart).
+    /// Single-writer; do not call from the cleaner/test threads concurrently.
+    [[nodiscard]] const rune::storage::LeaderEpochCache& leaderEpochCacheForTest() const noexcept {
+        return epochCache_;
+    }
+
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
     /// replica is disk-backed — asserts !memoryBacked_.  Callers MUST gate on

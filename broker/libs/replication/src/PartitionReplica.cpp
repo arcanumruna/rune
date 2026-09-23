@@ -91,6 +91,16 @@ PartitionReplica::PartitionReplica(PartitionConfig            cfg,
 void PartitionReplica::initReplica(std::vector<NodeId> replicas,
                                    std::vector<NodeId> isr)
 {
+    // Task 9: restore the LeaderEpochCache from the durable checkpoint BEFORE any
+    // assign() calls below.  Disk-backed only — memory-backed partitions have no
+    // checkpoint file (and don't survive a full cluster restart by design).
+    // A missing/corrupt checkpoint is silently tolerated: assign() below seeds the
+    // epoch cache from scratch, which is the correct fallback for a fresh log or a
+    // corrupt checkpoint.
+    if (!memoryBacked_ && diskLog_ != nullptr) {
+        (void)epochCache_.restoreFromFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+    }
+
     if (role_ == Role::Leader) {
         isrManagerOwned_ = std::make_unique<IsrManager>(replicas, cfg_.selfId, cfg_.replicaLagMaxMs);
         isrManagerOwned_->setIsr(isr);
@@ -200,6 +210,13 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
         : cfg_.minIsr;
 
     epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
+
+    // Task 9: persist the updated epoch history so a full restart can rebuild it.
+    // Disk-backed only — memory-backed partitions have no durable log (and their
+    // epoch cache is rebuilt from scratch on restart by design).
+    if (!memoryBacked_ && diskLog_ != nullptr) {
+        epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+    }
 
     lastIsrCheckNs_ = 0;
 
@@ -690,6 +707,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         }
         epoch_ = resp.leaderEpoch;
         epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
+        // Task 9: persist the follower's updated epoch history (disk-backed only).
+        if (!memoryBacked_ && diskLog_ != nullptr) {
+            epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        }
     }
 
     // Append replicated records if any.
@@ -784,6 +805,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (resp.leaderEpoch >= 0
         && static_cast<int32_t>(resp.leaderEpoch) > epochCache_.latestEpoch()) {
         epochCache_.assign(static_cast<int32_t>(resp.leaderEpoch), preLeo);
+        // Task 9: persist follower epoch history on new-epoch adoption (disk-backed only).
+        if (!memoryBacked_ && diskLog_ != nullptr) {
+            epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        }
     }
 
     // Advance local HW = min(localLeo, leader's HW).
@@ -1248,6 +1273,10 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
             // Drop the premature boundary and re-assign at the true frontier.
             epochCache_.truncateFromEnd(curEpStart);
             epochCache_.assign(curEp, newLeo);
+            // Task 9: persist the corrected epoch boundary (disk-backed only).
+            if (!memoryBacked_ && diskLog_ != nullptr) {
+                epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+            }
         }
     }
 
@@ -1635,6 +1664,11 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     // all epoch entries whose startOffset >= truncateOffset are pruned; the
     // cache then reflects only epochs that start within the surviving log.
     epochCache_.truncateFromEnd(truncateOffset);
+
+    // Task 9: persist the pruned epoch history (disk-backed only).
+    if (!memoryBacked_ && diskLog_ != nullptr) {
+        epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+    }
 
     onLog([&](auto& L){ L.truncateTo(truncateOffset); });
 
