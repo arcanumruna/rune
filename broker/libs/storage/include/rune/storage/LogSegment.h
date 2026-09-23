@@ -74,6 +74,11 @@ public:
     int64_t sizeBytes() const noexcept { return logSize_; }
     int64_t nextOffset() const noexcept { return nextOffset_; }
     std::string logPath() const { return logPath_; }
+    /// Return the POSIX fd of the open .log file (the same fd used by fdatasync
+    /// in sync()).  Valid for the ACTIVE segment only; -1 if not yet opened.
+    /// Used by the async flusher (IoBackend) to call fdatasync off the worker
+    /// hot path without the worker calling sync() directly.
+    int logFd() const noexcept { return fd_; }
 
     // -----------------------------------------------------------------------
     // Background segment pre-provisioning (append-p99 fix).

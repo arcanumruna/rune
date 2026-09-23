@@ -253,6 +253,19 @@ public:
     /// back only in physicallyRemoveExpiredDeletedFiles (also cleaner thread).
     void recordDeletedFile(const std::string& deletedPath, int64_t renamedAtMs) noexcept;
 
+    /// Return the POSIX fd of the ACTIVE segment's .log file — the fd the
+    /// async flusher (IoBackend) must call fdatasync on to make un-synced
+    /// appendNoSync() writes durable.  Const, noexcept, no allocation, no
+    /// new syscalls — just returns the already-open fd from the active segment.
+    /// Keep sync() for the non-async fallback path (unchanged).
+    int     activeSegmentFd()  const noexcept { return segments_.rbegin()->second->logFd(); }
+
+    /// The byte offset that becomes durable once the active segment's fd is
+    /// fdatasync'd — equal to logEndOffset_.  The async flusher records this
+    /// at submit time so it can fire acks for every pending produce whose
+    /// lastOffset <= flushBoundary after the completion is reaped.
+    int64_t flushBoundary()    const noexcept { return logEndOffset_; }
+
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();

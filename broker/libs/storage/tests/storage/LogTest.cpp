@@ -1360,3 +1360,23 @@ TEST(LogStaging, SealFsyncSynchronousAtRoll) {
     std::filesystem::remove_all(dir);
 }
 
+// ---- Task 3 (E3): activeSegmentFd() returns a valid fsync-able fd; flushBoundary() == logEndOffset() ----
+TEST(Log, ActiveSegmentFdIsFsyncable) {
+    auto dir = makeTempDir("rune_log_fd_test");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string(), /*roll=*/1<<20);
+    log.recover();
+    // Build a minimal record batch using the existing helper pattern.
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", "v", 1000);
+    auto batch = b.build();
+    log.appendNoSync(batch.data(), batch.size(), /*lastOffset=*/0);
+    int fd = log.activeSegmentFd();
+    ASSERT_GE(fd, 0) << "activeSegmentFd() must return the open .log fd (>= 0)";
+    // Use fsync (macOS has no fdatasync; on Linux the flusher will use fdatasync).
+    EXPECT_EQ(::fsync(fd), 0) << "the worker's flusher will call fsync/fdatasync on this fd";
+    EXPECT_EQ(log.flushBoundary(), log.logEndOffset())
+        << "flushBoundary() must equal logEndOffset() so the flusher knows what is durable";
+    std::filesystem::remove_all(dir);
+}
+
