@@ -24,6 +24,7 @@ if(BUILD_TESTING)
             tests/protocol/RecordBatchTest.cpp
             tests/protocol/PartitionHashTest.cpp
             tests/protocol/MetadataRecordsTest.cpp
+            tests/protocol/CreateTopicRecordTest.cpp
             tests/protocol/client/MessageHeaderTest.cpp
             tests/protocol/client/ControlMessagesConnectTest.cpp
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp

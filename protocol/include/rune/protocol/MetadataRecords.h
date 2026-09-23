@@ -239,12 +239,14 @@ struct CreateTopicRecord {
     uint8_t          placementMode    = 0;
     std::string_view coPartitionGroup;
     uint8_t          recordVersion    = 0;
+    uint8_t          durability       = 0;   // 0 = Majority (default), 1 = AllInSync. Only encoded when recordVersion >= 1.
 
     static constexpr uint16_t RECORD_TYPE_ID =
         static_cast<uint16_t>(MetadataRecordType::CreateTopic); // 1
 
     /// Encode into buf[0..bufLen-1].  Returns total bytes written, or 0 if buf too small.
     std::size_t encode(uint8_t* buf, std::size_t bufLen) const noexcept {
+        const bool v1 = (recordVersion >= 1);
         // Calculate required size
         const std::size_t needed = detail::kPrefixSize
             + 4u                        // topicId
@@ -253,13 +255,14 @@ struct CreateTopicRecord {
             + 2u                        // rf
             + 2u + partitionKey.size()  // partitionKey
             + 1u                        // placementMode
-            + 2u + coPartitionGroup.size(); // coPartitionGroup
+            + 2u + coPartitionGroup.size() // coPartitionGroup
+            + (v1 ? 1u : 0u);           // durability byte (v1+ only)
         if (bufLen < needed) return 0u;
 
-        std::size_t pos = 0;
-        // Prefix
-        detail::encodePrefixAt(buf, MetadataRecordType::CreateTopic);
-        pos = detail::kPrefixSize;
+        // Write type (2 bytes) + version (1 byte) — version from the record, not kCurrentVersion.
+        detail::putU16(buf, 0, static_cast<uint16_t>(MetadataRecordType::CreateTopic));
+        buf[2] = recordVersion;                       // version-aware, not kCurrentVersion
+        std::size_t pos = detail::kPrefixSize;
 
         // Fixed fields
         detail::putS32(buf, static_cast<int>(pos), topicId);    pos += 4u;
@@ -280,22 +283,31 @@ struct CreateTopicRecord {
         // Var: coPartitionGroup
         pos += detail::putVarStr(buf + pos, coPartitionGroup);
 
+        // v1+: durability byte
+        if (v1) buf[pos++] = durability;
+
         return pos;
     }
 
     /// Decode from buf[0..avail-1].  Returns nullopt on any error.
     /// Returned string_views are zero-copy into buf — buf must outlive the result.
+    /// Accepts recordVersion 0 or 1; rejects unknown versions (>1).
     static std::optional<CreateTopicRecord> decode(const uint8_t* buf,
                                                     std::size_t avail) noexcept {
-        if (!detail::validatePrefix(buf, avail, MetadataRecordType::CreateTopic))
-            return std::nullopt;
+        // Inline prefix check: accept versions 0 and 1 (not via validatePrefix which only
+        // accepts kCurrentVersion == 0).
+        if (avail < detail::kPrefixSize) return std::nullopt;
+        const uint16_t typeId = detail::getU16(buf, 0);
+        if (typeId != static_cast<uint16_t>(MetadataRecordType::CreateTopic)) return std::nullopt;
+        const uint8_t ver = buf[2];
+        if (ver > 1u) return std::nullopt;  // unknown future version — clean reject
 
         std::size_t pos = detail::kPrefixSize;
 
         // topicId
         if (pos + 4u > avail) return std::nullopt;
         CreateTopicRecord rec;
-        rec.recordVersion  = buf[2];
+        rec.recordVersion  = ver;
         rec.topicId        = detail::getS32(buf, static_cast<int>(pos)); pos += 4u;
 
         // name
@@ -318,6 +330,14 @@ struct CreateTopicRecord {
 
         // coPartitionGroup
         if (!detail::getVarStr(buf, avail, pos, rec.coPartitionGroup)) return std::nullopt;
+
+        // durability — present only in v1+
+        if (rec.recordVersion >= 1) {
+            if (pos + 1u > avail) return std::nullopt;
+            rec.durability = buf[pos++];
+        } else {
+            rec.durability = 0; // Majority default for legacy v0 records
+        }
 
         return rec;
     }
