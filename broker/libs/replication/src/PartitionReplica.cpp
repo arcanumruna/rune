@@ -66,6 +66,12 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
         isrManagerOwned_->setIsr(isr);
         isrManager_ = isrManagerOwned_.get();
 
+        // Durability: set the quorum rule and effective minIsr before seeding ISR/LEO.
+        leaderState_.setDurabilityMode(cfg_.durability);
+        effectiveMinIsr_ = (cfg_.durability == DurabilityMode::AllInSync)
+            ? static_cast<int>(replicas.size())
+            : cfg_.minIsr;
+
         leaderState_.setLeaderId(cfg_.selfId);
         leaderState_.setIsr(isr);
         leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
@@ -123,6 +129,12 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
     leaderState_.setLeaderId(cfg_.selfId);
 
+    // Durability quorum: set the per-topic rule FIRST, before seeding the floor
+    // and ISR/LEO.  setDurabilityMode resets prevHw_ to 0 and recomputes (which
+    // yields 0 since ISR/LEO are not yet set), so it must precede
+    // setHighWatermarkFloor to avoid clobbering the committed-HW floor.
+    leaderState_.setDurabilityMode(cfg_.durability);
+
     // NB1/B2 fix: set the HW floor BEFORE setting the ISR and leader LEO.
     // setIsr() and setLeaderLogEndOffset() both call recomputeHw() eagerly,
     // which advances prevHw_ to max(prevHw_, computeHw()).  If a 1-node ISR
@@ -149,6 +161,13 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
     leaderState_.setIsr(isr);
     leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+
+    // Effective minIsr for the acksAll produce gate:
+    //   Majority  → cfg_.minIsr (user-configured floor)
+    //   AllInSync → RF (= replicas.size()): every replica must be in the ISR.
+    effectiveMinIsr_ = (cfg_.durability == DurabilityMode::AllInSync)
+        ? static_cast<int>(replicas.size())
+        : cfg_.minIsr;
 
     epochCache_.assign(static_cast<int32_t>(epoch_), log_->logEndOffset());
 
@@ -256,7 +275,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 {
     assert(role_ == Role::Leader && "append() called on follower");
 
-    if (!isrManager_->canProduce(cfg_.minIsr, acksAll)) {
+    if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
         return -1; // gated by min-ISR
     }
 
@@ -294,7 +313,7 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
 {
     assert(role_ == Role::Leader && "appendKeyed() called on follower");
 
-    if (!isrManager_->canProduce(cfg_.minIsr, acksAll)) {
+    if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
         return -1; // gated by min-ISR
     }
 
@@ -1418,9 +1437,10 @@ Offset PartitionReplica::computeServedHw() const noexcept
     }
 
     // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.  While the ISR is BELOW
-    // minIsr the effective committed HW must not advance past the last offset
+    // effectiveMinIsr_ the effective committed HW must not advance past the last offset
     // committed while the ISR was healthy (lastHealthyHw_).
-    const int minIsr  = (cfg_.minIsr >= 1) ? cfg_.minIsr : 1;
+    // effectiveMinIsr_ == cfg_.minIsr (Majority) or RF (AllInSync).
+    const int minIsr  = (effectiveMinIsr_ >= 1) ? effectiveMinIsr_ : 1;
     const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
 
     if (isrSize >= minIsr) {
@@ -1442,7 +1462,7 @@ Offset PartitionReplica::highWatermark() const noexcept
     // cleaner NEVER calls highWatermark() (it uses cleanerHighWatermark()), so
     // this write never races with the cleaner thread.
     if (role_ == Role::Leader && leaderComplete_) {
-        const int minIsr  = (cfg_.minIsr >= 1) ? cfg_.minIsr : 1;
+        const int minIsr  = (effectiveMinIsr_ >= 1) ? effectiveMinIsr_ : 1;
         const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
         if (isrSize >= minIsr) {
             const Offset rawHw = leaderState_.highWatermark();

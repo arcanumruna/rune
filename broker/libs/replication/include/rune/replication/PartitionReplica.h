@@ -111,6 +111,8 @@ struct PartitionConfig {
     // CP-9: log-start-offset retention — delete segments entirely below this offset.
     // 0 = disabled (no log-start-offset deletion).
     int64_t     logStartOffset         = 0;           ///< CP-9: lower bound; segs entirely below here are deleted. 0=disabled.
+    DurabilityMode durability = DurabilityMode::Majority; ///< per-topic durability quorum rule.
+    // When AllInSync, minIsr is forced to the replica-set size (RF) so acks require every replica.
 };
 
 // ---------------------------------------------------------------------------
@@ -555,6 +557,12 @@ private:
     // GR-10: push tracking — last offset that was pushed to followers.
     // Avoids re-pushing bytes already pushed in the same append cycle.
     Offset lastPushedOffset_ = 0;
+
+    // Durability: effective minIsr for the acksAll produce gate.
+    // Majority mode: cfg_.minIsr.
+    // AllInSync  mode: replicas.size() (== RF), so every replica must be in ISR.
+    // Computed once in becomeLeader and used in append/appendKeyed.
+    int effectiveMinIsr_ = 1;
 
     // DR-BUG-6: on becomeLeader the follower-lag TIME clock must be reset to the
     // election time so a newly-elected leader does not evict every follower from

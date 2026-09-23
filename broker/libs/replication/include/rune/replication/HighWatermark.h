@@ -67,6 +67,11 @@
 
 namespace rune::replication {
 
+/// Per-topic durability quorum rule.
+///   Majority  — HW advances when a MAJORITY of the ISR holds the batch (spec §4 default).
+///   AllInSync — HW advances only when EVERY ISR member holds the batch (full-ISR min).
+enum class DurabilityMode : uint8_t { Majority = 0, AllInSync = 1 };
+
 /// Pure leader-side state for computing the partition high-watermark.
 ///
 /// Thread-safety: NOT thread-safe. Single-writer per partition (the leader
@@ -124,6 +129,22 @@ public:
         recomputeHw();
     }
 
+    /// Set the durability quorum rule for this leader state.
+    /// Majority (default) — HW = majority-th highest LEO.
+    /// AllInSync — HW = full-ISR minimum LEO.
+    ///
+    /// Changing the mode resets the monotonic HW floor and recomputes from the
+    /// current ISR LEOs under the new rule.  This is safe because setDurabilityMode
+    /// is only called from becomeLeader (a role transition), where the floor is
+    /// re-seeded by setHighWatermarkFloor() immediately before this call.  It must
+    /// NOT be called on a live leader without first re-seeding the floor.
+    void setDurabilityMode(DurabilityMode m) noexcept {
+        durability_ = m;
+        prevHw_  = 0;  // reset floor so the new rule computes from scratch
+        hwFloor_ = 0;  // reset hard floor (will be re-seeded by setHighWatermarkFloor)
+        recomputeHw();
+    }
+
     /// Expose a public recompute trigger for callers that need to force an
     /// HW recalculation (e.g., after setLeaderLogEndOffset when the ISR is
     /// leader-only and no follower fetch triggers recomputation).
@@ -131,11 +152,13 @@ public:
 
     /// Set the initial high-watermark floor (B2 fix: called by becomeLeader to
     /// restore the committed offset so HW never regresses to 0 on failover).
-    /// The floor is applied monotonically: only advances if `floor` > prevHw_.
+    ///
+    /// For Majority mode: advances prevHw_ monotonically.
+    /// For AllInSync mode: records a hard floor so that even a non-monotonic
+    ///   AllInSync recompute cannot go below the pre-failover committed offset.
     void setHighWatermarkFloor(Offset floor) noexcept {
-        if (floor > prevHw_) {
-            prevHw_ = floor;
-        }
+        if (floor > hwFloor_) hwFloor_ = floor;
+        if (floor > prevHw_) prevHw_ = floor;
     }
 
     // -----------------------------------------------------------------------
@@ -164,12 +187,31 @@ public:
 
 private:
     // -----------------------------------------------------------------------
-    // Internal: recompute HW and advance the monotonic floor.
+    // Internal: recompute HW and update the floor.
+    //
+    // Majority (default): prevHw_ is MONOTONIC — only advances.
+    //   A follower truncation does not lower the committed frontier because
+    //   a majority already holds the batch (spec §4).
+    //
+    // AllInSync: prevHw_ tracks the TRUE ISR minimum — it CAN retract when a
+    //   follower falls behind.  This is intentional: the AllInSync guarantee is
+    //   "every ISR member holds the batch", so if any member regresses the HW
+    //   must reflect that.  Consumers using AllInSync topics must tolerate a
+    //   non-monotonic HW (the topic is configured for stricter durability, not
+    //   strict delivery monotonicity at the HW level).
     // -----------------------------------------------------------------------
     void recomputeHw() noexcept {
         Offset computed = computeHw();
-        if (computed > prevHw_) {
-            prevHw_ = computed;
+        if (durability_ == DurabilityMode::AllInSync) {
+            // AllInSync: track the true ISR minimum; may retract on follower lag,
+            // but never below the hard floor set by setHighWatermarkFloor (the
+            // pre-failover committed offset on becomeLeader).
+            prevHw_ = (computed > hwFloor_) ? computed : hwFloor_;
+        } else {
+            // Majority: monotonic floor — only advance, never retract.
+            if (computed > prevHw_) {
+                prevHw_ = computed;
+            }
         }
     }
 
@@ -219,15 +261,23 @@ private:
         // Sort descending: leos[0] = highest LEO.
         std::sort(leos, leos + n, std::greater<Offset>{});
 
-        // majority-th highest = leos[majority - 1].
-        // majority is always in [1, n] so the index is always in-bounds.
-        // E.g. ISR={A=100, B=90, C=80}: majority=2, HW=leos[1]=90.
-        return leos[majority - 1];
+        // Select the HW index based on the durability mode:
+        //   Majority  → majority-th highest (leos[majority - 1])
+        //   AllInSync → full-ISR minimum    (leos[n - 1])
+        // Both majority-1 and n-1 are always in [0, n-1], so always in-bounds.
+        // E.g. ISR={A=100, B=90, C=80}, Majority: majority=2, HW=leos[1]=90.
+        //                               AllInSync: idx=2,      HW=leos[2]=80.
+        const int idx = (durability_ == DurabilityMode::AllInSync)
+            ? (n - 1)             // full-ISR min (last after descending sort)
+            : (majority - 1);     // majority-th highest
+        return leos[idx];
     }
 
-    NodeId  leaderId_  = -1;
-    Offset  leaderLeo_ = 0;
-    Offset  prevHw_    = 0;   ///< Monotonic high-watermark floor.
+    NodeId       leaderId_   = -1;
+    Offset       leaderLeo_ = 0;
+    Offset       prevHw_    = 0;   ///< HW floor (monotonic for Majority; ISR-min for AllInSync, floored by hwFloor_).
+    Offset       hwFloor_   = 0;   ///< Hard floor for AllInSync mode: HW never goes below the pre-failover committed offset.
+    DurabilityMode durability_ = DurabilityMode::Majority; ///< Per-topic HW quorum rule.
 
     std::vector<NodeId>            isr_;          ///< Current in-sync replica set.
     std::unordered_map<NodeId, Offset> followerLeo_; ///< Per-follower LEO.
