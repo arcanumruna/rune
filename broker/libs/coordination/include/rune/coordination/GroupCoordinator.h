@@ -328,8 +328,13 @@ private:
 
     std::vector<MemberInfo> members_;          ///< current membership
 
-    static std::atomic<uint64_t> s_memberSeq; ///< global monotonic counter for memberId generation
-    uint64_t memberSeq_{0};                    ///< per-instance counter (primary)
+    // [[rune-shared-nothing-law]] step 4: the process-global atomic counter was
+    // removed — it was shared mutable state across GroupCoordinator instances that
+    // may live on different threads (multiple in-process nodes).  Cross-instance
+    // memberId uniqueness now derives from this coordinator's own address (distinct
+    // for every live instance in the process); within an instance, memberSeq_ (a
+    // plain single-owner counter) disambiguates successive joins.  No shared state.
+    uint64_t memberSeq_{0};                    ///< per-instance counter (single-owner)
 
     // -----------------------------------------------------------------------
     // P4-3 rebalance state

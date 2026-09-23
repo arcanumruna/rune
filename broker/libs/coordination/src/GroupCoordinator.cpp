@@ -18,11 +18,6 @@
 namespace rune::coordination {
 
 // ---------------------------------------------------------------------------
-// Static member
-// ---------------------------------------------------------------------------
-std::atomic<uint64_t> GroupCoordinator::s_memberSeq{0};
-
-// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 GroupCoordinator::GroupCoordinator(GroupId groupId, int64_t /*nowNs*/)
@@ -290,9 +285,13 @@ std::string GroupCoordinator::generateMemberId()
     // Format: "<groupId>-g<globalSeq>-<localSeq>"
     //   globalSeq: monotonically increasing across ALL coordinators in the process.
     //   localSeq:  per-instance counter (extra disambiguation + readability).
-    uint64_t local  = ++memberSeq_;
-    uint64_t global = s_memberSeq.fetch_add(1, std::memory_order_relaxed);
-    return groupId_ + "-g" + std::to_string(global) + "-" + std::to_string(local);
+    // [[rune-shared-nothing-law]] step 4: no process-global atomic counter.
+    // Cross-instance uniqueness comes from this coordinator's address (distinct
+    // for every live instance in the process, including multiple in-process nodes
+    // on different threads); local disambiguates successive joins within it.
+    uint64_t local          = ++memberSeq_;
+    uintptr_t instanceTag   = reinterpret_cast<uintptr_t>(this);
+    return groupId_ + "-g" + std::to_string(instanceTag) + "-" + std::to_string(local);
 }
 
 MemberInfo* GroupCoordinator::findMember(const std::string& memberId)
