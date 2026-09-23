@@ -124,6 +124,18 @@ void BrokerNode::start() {
     //    consensus + gateway on the single-writer thread).
     agentRunner_->start();
 
+    // 7b. E2 inc2b: start per-worker AgentRunner threads.
+    //     Must start AFTER buildGateway() (owned sets published in buildWorkerPool
+    //     which is called from buildGateway) and AFTER agentRunner_->start()
+    //     (control thread must be live before workers start draining ingress rings).
+    //     Workers are independent of the control agent but their ingress rings are
+    //     fed by the control thread, so the ordering: control first, workers after.
+    if (workerPool_) {
+        workerPool_->startRunners(config_.workerIdleStrategy, clock_);
+        spdlog::info("BrokerNode[{}]: {} worker AgentRunner thread(s) started",
+                     config_.nodeId, workerPool_->workerCount());
+    }
+
     // 8. Start the LogCleanerAgent on its own thread (CP-6).
     //    Must start AFTER agentRunner_ so the duty cycle begins draining swaps
     //    before the cleaner can enqueue any (avoids a window where a swap is
@@ -1291,7 +1303,16 @@ void BrokerNode::stop() {
         return; // idempotent
     }
 
-    // 1a. Stop the LogCleanerAgent BEFORE the main agent runner.
+    // 1a. E2 inc2b: stop per-worker AgentRunner threads FIRST.
+    //     Workers hold non-owning replica pointers; they must be quiesced before
+    //     replicaRegistry_ is torn down.  Stop them before the cleaner and main
+    //     agent so no in-flight worker op races with a replica being freed.
+    if (workerPool_) {
+        workerPool_->stopAndJoinRunners();
+        spdlog::info("BrokerNode[{}]: worker AgentRunner threads stopped", config_.nodeId);
+    }
+
+    // 1b. Stop the LogCleanerAgent BEFORE the main agent runner.
     //     This ensures the cleaner thread stops enqueuing swaps before the
     //     duty cycle stops draining them (avoids a lost-swap scenario where
     //     a swap is enqueued after the last drain).
@@ -1300,7 +1321,7 @@ void BrokerNode::stop() {
     }
     cleanerAgent_.reset();
 
-    // 1b. Stop the main agent runner (signal + join the duty-cycle thread).
+    // 1c. Stop the main agent runner (signal + join the duty-cycle thread).
     if (agentRunner_) {
         agentRunner_->stopAndJoin();
     }

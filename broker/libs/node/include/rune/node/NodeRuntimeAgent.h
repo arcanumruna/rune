@@ -228,18 +228,21 @@ public:
         }
 
         // 5 + 6.5. Per-replica duty cycle + disk-log cleaner/retention drains.
-        // E1: when a WorkerPool is wired, each Worker runs these steps for ITS
-        // owned shards only (shared-nothing, single-owner). Driven cooperatively
-        // here on the single AgentRunner thread (no new threads in E1).
-        // When workerPool_ is null, fall back to the pre-E1 single-agent path.
         //
-        // reconcile() checks the registry's replica count; if it changed (D
-        // dynamic rebalance: replica added or removed by the metadata bridge),
-        // re-derives shard→worker ownership deterministically. Cheap: O(1) check,
-        // re-derive only on change. Single-writer invariant holds.
+        // E2 inc2b: workers self-drive on their own AgentRunner threads.
+        // The control thread MUST NOT call workerPool_->doWork() — that would
+        // double-drive and cause data races.
+        //
+        // What the control thread DOES do (still on this thread):
+        //   reconcile() — re-derives shard→worker ownership when the registry
+        //   changes (O(1) generation check; re-derive only on change).
+        //   Ownership publish is control-thread-only; workers read it lock-free.
+        //
+        // When workerPool_ is null (single-thread mode, passthrough, tests
+        // without a pool), fall back to the pre-E1 registry loop unchanged.
         if (workerPool_) {
             if (registry_) workerPool_->reconcile(*registry_);
-            work += workerPool_->doWork(nowNs);
+            // Workers self-drive — do NOT call workerPool_->doWork() here.
         } else if (registry_) {
             // Pre-E1 path: iterate registry directly.
             for (auto* replica : registry_->allReplicas()) {
