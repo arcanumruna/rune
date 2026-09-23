@@ -401,7 +401,10 @@ void BrokerNode::buildReplication() {
             // Task M1: select log backend by persistence mode.
             // Memory-backed: create an InMemoryLog (large caps — production-suitable).
             // Disk-backed: use the Log from TopicRegistry (recovered on startup).
-            rune::storage::ILog* ilogPtr = nullptr;
+            // De-virtualized seam (Milestone D P2): keep the concrete typed pointer
+            // and construct via the matching PartitionReplica overload — no ILog*.
+            rune::storage::Log*         diskLogPtr = nullptr;
+            rune::storage::InMemoryLog* memLogPtr  = nullptr;
             const bool isMemory = (spec->persistence == rune::node::PersistenceMode::Memory);
 
             if (isMemory) {
@@ -412,17 +415,16 @@ void BrokerNode::buildReplication() {
                 memoryLogs_.push_back(
                     std::make_unique<rune::storage::InMemoryLog>(
                         kMemLogMaxBytes, kMemLogMaxRecords));
-                ilogPtr = memoryLogs_.back().get();
+                memLogPtr = memoryLogs_.back().get();
                 spdlog::debug("BrokerNode[{}]: topic '{}' partition {} using InMemoryLog",
                               config_.nodeId, spec->name, part);
             } else {
-                rune::storage::Log* logPtr = topicRegistry_->log(topicId, part);
-                if (!logPtr) {
+                diskLogPtr = topicRegistry_->log(topicId, part);
+                if (!diskLogPtr) {
                     spdlog::warn("BrokerNode[{}]: log not found for topic {} partition {}; skipping replica",
                                  config_.nodeId, spec->name, part);
                     continue;
                 }
-                ilogPtr = logPtr;
             }
 
             PartitionConfig pcfg;
@@ -474,15 +476,15 @@ void BrokerNode::buildReplication() {
                 transport = nullTransports_.back().get();
             }
 
-            auto replica = std::make_unique<PartitionReplica>(
-                pcfg,
-                Role::Follower,
-                /*epoch=*/0,
-                allNodeIds,
-                allNodeIds,
-                ilogPtr,
-                transport
-            );
+            // De-virtualized seam (Milestone D P2): dispatch to the matching
+            // concrete constructor overload so the replica stores a typed pointer.
+            auto replica = isMemory
+                ? std::make_unique<PartitionReplica>(
+                      pcfg, Role::Follower, /*epoch=*/0,
+                      allNodeIds, allNodeIds, memLogPtr, transport)
+                : std::make_unique<PartitionReplica>(
+                      pcfg, Role::Follower, /*epoch=*/0,
+                      allNodeIds, allNodeIds, diskLogPtr, transport);
 
             if (replTransport_) {
                 // DR-BUG-5: register with composite (topicId, partitionId) key so

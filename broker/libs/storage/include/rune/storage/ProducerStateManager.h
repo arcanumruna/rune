@@ -45,11 +45,11 @@
 #include <unordered_map>
 #include <utility>
 
-// Forward-declare ILog so the header does not pull in Log.h (and transitively
-// the whole segment/filesystem machinery) everywhere ProducerStateManager.h
-// is included.  The out-of-line rebuildFromLog() implementation in
-// ProducerStateManager.cpp includes the full ILog.h + Log.h.
-namespace rune::storage { class ILog; }
+// De-virtualized (Milestone D Phase 2): the former ILog seam is gone.
+// rebuildFromLog() is now a TEMPLATE over the concrete log type (Log /
+// InMemoryLog) so it never dispatches virtually.  The out-of-line template
+// definition + explicit instantiations live in ProducerStateManager.cpp, which
+// includes the full Log.h + InMemoryLog.h; callers only need the concrete type.
 
 namespace rune::storage {
 
@@ -230,8 +230,11 @@ public:
     //
     // @param topicId        The topic id to use as part of the key (TX-2c: ensures
     //                       cross-topic isolation for the same producerId+partition).
-    // @param log            The partition Log to scan (non-const: Log::read is
-    //                       non-const in the current implementation).
+    // @param log            The partition log to scan — a concrete rune::storage::Log
+    //                       or InMemoryLog (template LogT; non-const: read() is
+    //                       non-const in the current implementation).  NO virtual
+    //                       dispatch — the concrete read()/segmentBaseOffsets() are
+    //                       called directly (de-virtualized seam, Milestone D P2).
     // @param highWatermark  Scan up to (exclusive) this log offset.
     //                       MUST be the committed high-watermark (HW), NOT the
     //                       log-end-offset (LEO).  Scanning beyond HW seeds the
@@ -247,7 +250,8 @@ public:
     // Cold path — allocations are acceptable here.
     // Single-writer: call only on the duty-cycle thread.
     // -----------------------------------------------------------------------
-    void rebuildFromLog(int32_t topicId, ILog& log, int64_t highWatermark, int32_t partition);
+    template<class LogT>
+    void rebuildFromLog(int32_t topicId, LogT& log, int64_t highWatermark, int32_t partition);
 
     // -----------------------------------------------------------------------
     // Accessors (for tests / Phase-5 coordinator)

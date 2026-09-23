@@ -32,8 +32,8 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/storage/ProducerStateManager.h>
-#include <rune/storage/ILog.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <fcntl.h>
@@ -447,8 +447,9 @@ int ProducerStateManager::recover(const std::string& path)
 //
 // Cold path: called once on leader election / restart.  Allocations acceptable.
 // ---------------------------------------------------------------------------
+template<class LogT>
 void ProducerStateManager::rebuildFromLog(int32_t topicId,
-                                           ILog&    log,
+                                           LogT&    log,
                                            int64_t highWatermark,
                                            int32_t partition)
 {
@@ -574,5 +575,15 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
         fetchOffset = lastBatchEnd;
     }
 }
+
+// De-virtualized seam (Milestone D Phase 2): explicit instantiations for the two
+// concrete log backends.  These are the only log types rebuildFromLog is ever
+// used with; each instantiation calls read()/segmentBaseOffsets() directly (no
+// vtable).  Keeping the definition out-of-line avoids pulling the segment/
+// filesystem machinery into every translation unit that includes the header.
+template void ProducerStateManager::rebuildFromLog<Log>(
+        int32_t, Log&, int64_t, int32_t);
+template void ProducerStateManager::rebuildFromLog<InMemoryLog>(
+        int32_t, InMemoryLog&, int64_t, int32_t);
 
 } // namespace rune::storage

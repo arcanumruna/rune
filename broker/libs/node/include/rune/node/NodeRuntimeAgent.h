@@ -252,7 +252,7 @@ public:
                 // Task M1 precondition #2: skip memory-backed replicas.
                 // drainCleanerSwaps/drainRetentionDeletes/drainStagingRenamesDone are
                 // disk-Log-only operations; replica->log() asserts isDiskBacked().
-                if (replica && replica->ilog() && replica->ilog()->isDiskBacked()) {
+                if (replica && replica->isDiskBacked()) {
                     work += replica->log()->drainCleanerSwaps();
                     work += replica->log()->drainRetentionDeletes();
                     // Append-p99 fix: apply completed staging→base renames the
@@ -316,7 +316,7 @@ public:
             //    test-only InMemoryLog replicas).  Calling replica->log() on a
             //    memory-backed partition asserts isDiskBacked(); guard here so
             //    the invariant holds universally (precondition #2 completeness).
-            if (!replica->ilog() || !replica->ilog()->isDiskBacked()) continue;
+            if (!replica->isDiskBacked()) continue;
             rune::storage::Log* log = replica->log();
             if (!log) continue;
 

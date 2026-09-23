@@ -48,19 +48,49 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
                                    Epoch                    epoch,
                                    std::vector<NodeId>      replicas,
                                    std::vector<NodeId>      isr,
-                                   rune::storage::ILog*     log,
+                                   rune::storage::Log*      log,
                                    PartitionTransport*      transport)
     : cfg_(cfg)
     , role_(role)
     , epoch_(epoch)
     , leaderId_(-1)
-    , log_(log)
+    , diskLog_(log)
+    , memLog_(nullptr)
+    , memoryBacked_(false)
     , transport_(transport)
     , encodeScratch_(kScratchSize, uint8_t{0})
 {
-    assert(log_       != nullptr && "log must not be null");
+    assert(diskLog_   != nullptr && "log must not be null");
     assert(transport_ != nullptr && "transport must not be null");
+    initReplica(std::move(replicas), std::move(isr));
+}
 
+PartitionReplica::PartitionReplica(PartitionConfig            cfg,
+                                   Role                       role,
+                                   Epoch                      epoch,
+                                   std::vector<NodeId>        replicas,
+                                   std::vector<NodeId>        isr,
+                                   rune::storage::InMemoryLog* log,
+                                   PartitionTransport*        transport)
+    : cfg_(cfg)
+    , role_(role)
+    , epoch_(epoch)
+    , leaderId_(-1)
+    , diskLog_(nullptr)
+    , memLog_(log)
+    , memoryBacked_(true)
+    , transport_(transport)
+    , encodeScratch_(kScratchSize, uint8_t{0})
+{
+    assert(memLog_    != nullptr && "log must not be null");
+    assert(transport_ != nullptr && "transport must not be null");
+    initReplica(std::move(replicas), std::move(isr));
+}
+
+// Shared construction logic for both backend overloads (de-virtualized seam).
+void PartitionReplica::initReplica(std::vector<NodeId> replicas,
+                                   std::vector<NodeId> isr)
+{
     if (role_ == Role::Leader) {
         isrManagerOwned_ = std::make_unique<IsrManager>(replicas, cfg_.selfId, cfg_.replicaLagMaxMs);
         isrManagerOwned_->setIsr(isr);
@@ -74,7 +104,7 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
 
         leaderState_.setLeaderId(cfg_.selfId);
         leaderState_.setIsr(isr);
-        leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+        leaderState_.setLeaderLogEndOffset(logEndOffset_());
 
         // DR-BUG-3: seed the min-ISR-gated committed floor from the initial HW
         // (see becomeLeader for the rationale — prevents a gated HW of 0 from
@@ -83,7 +113,7 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
 
         if (epoch_ >= 0) {
             epochCache_.assign(static_cast<int32_t>(epoch_),
-                               log_->logEndOffset());
+                               logEndOffset_());
         }
     } else {
         // DR-BUG-6: seed the follower's epoch cache so it knows its latest
@@ -109,7 +139,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     //   - Was follower: returns followerHw_ = min(localLeo, lastKnownLeaderHw)
     //   - Was leader:   returns leaderState_.highWatermark() = exact committed HW
     // Either is a safe committed floor (never above the true committed offset).
-    // Do NOT use log_->logEndOffset() (the LEO): a node promoted with an
+    // Do NOT use logEndOffset_() (the LEO): a node promoted with an
     // uncommitted tail (localLeo > committedHw) would mark that tail as committed,
     // causing uncommitted/divergent records to be readable after failover.
     Offset committedHw = highWatermark();
@@ -160,7 +190,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     }
 
     leaderState_.setIsr(isr);
-    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
 
     // Effective minIsr for the acksAll produce gate:
     //   Majority  → cfg_.minIsr (user-configured floor)
@@ -169,7 +199,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
         ? static_cast<int>(replicas.size())
         : cfg_.minIsr;
 
-    epochCache_.assign(static_cast<int32_t>(epoch_), log_->logEndOffset());
+    epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
 
     lastIsrCheckNs_ = 0;
 
@@ -189,7 +219,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     completenessFloor_ = committedHw;
     leaderComplete_    = false;
     survivorFrontier_.clear();
-    survivorFrontier_[cfg_.selfId] = log_->logEndOffset();
+    survivorFrontier_[cfg_.selfId] = logEndOffset_();
     reconcileTarget_   = -1;   // drop any pull latched under a prior term
     reconcileIssuedNs_ = -1;
 
@@ -279,15 +309,15 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
         return -1; // gated by min-ISR
     }
 
-    Offset baseOffset = log_->logEndOffset();
+    Offset baseOffset = logEndOffset_();
 
     // Build a proper RecordBatch so the Log segment scanner works correctly.
     auto batch = makeBatch(baseOffset, records);
     // lastOffset = baseOffset + 0 (one record per batch = lastOffsetDelta=0).
-    log_->append(batch, baseOffset);
+    onLog([&](auto& L){ L.append(batch, baseOffset); });
 
     // Leader LEO is now baseOffset + 1.
-    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
     // Leader self-advances HW (leader always in ISR, so majority includes leader).
     recomputeHw();
 
@@ -317,7 +347,7 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
         return -1; // gated by min-ISR
     }
 
-    Offset baseOffset = log_->logEndOffset();
+    Offset baseOffset = logEndOffset_();
 
     // Build a one-record batch with the real key and value.
     rune::protocol::RecordBatchBuilder builder(baseOffset, /*baseTimestamp=*/0);
@@ -327,9 +357,9 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
         /*timestamp=*/0);
     auto batch = builder.build();
 
-    log_->append(batch, baseOffset);
+    onLog([&](auto& L){ L.append(batch, baseOffset); });
 
-    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
     recomputeHw();
 
     // Mirror the advanced HW into the cleaner-visible atomic (release-store).
@@ -354,7 +384,7 @@ void PartitionReplica::onLeaderLogAppended() noexcept
     // Re-read the log's LEO and recompute HW (leader always in ISR, so with the
     // ISR satisfied the HW advances to cover the newly-appended bytes exactly as
     // it would after append()).
-    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
 
     // setLeaderLogEndOffset() recomputes HW eagerly — mirror it to the cleaner.
     publishCleanerState();
@@ -456,14 +486,14 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // retry).  We never START a lineage-blind pull here.  If no such reconcile is
     // in flight, we serve nothing this round and let the follower's own epoch
     // probe (armed on becomeFollower) drive the lineage-checked decision.
-    if (req.fetchOffset > log_->logEndOffset()) {
+    if (req.fetchOffset > logEndOffset_()) {
         // DR-BUG-6 completeness gate: an ahead follower reached a plain fetch whose
         // tail lineage we cannot validate here — clamp its frontier to our LEO so
         // it never raises the target (the epoch-probe path does the lineage-checked
         // recording that legitimately raises it).  We still (re-)evaluate so a
         // divergent ahead follower does not block completion forever.
         if (!leaderComplete_) {
-            survivorFrontier_[req.followerId] = log_->logEndOffset();
+            survivorFrontier_[req.followerId] = logEndOffset_();
             maybeCompleteLeadership();
         }
         if (reconcileTarget_ == req.followerId) {
@@ -471,7 +501,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
             pull.leaderEpoch = epoch_;
             pull.partition   = cfg_.partitionId;
             pull.followerId  = cfg_.selfId;               // WE are the puller
-            pull.fetchOffset = log_->logEndOffset();      // from our LEO
+            pull.fetchOffset = logEndOffset_();      // from our LEO
             pull.maxBytes    = cfg_.maxFetchBytes;
             pull.topicId     = cfg_.topicId;
             transport_->sendReconcileRequest(req.followerId, pull);
@@ -495,14 +525,14 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // has raised our LEO, subsequent fetches naturally record the higher value.
     if (!leaderComplete_) {
         survivorFrontier_[req.followerId] =
-            std::min<Offset>(req.fetchOffset, log_->logEndOffset());
+            std::min<Offset>(req.fetchOffset, logEndOffset_());
         maybeCompleteLeadership();
     }
 
     // Read records from the log.
     std::vector<uint8_t> logBytes;
-    if (req.maxBytes > 0 && req.fetchOffset < log_->logEndOffset()) {
-        logBytes = log_->read(req.fetchOffset, req.maxBytes);
+    if (req.maxBytes > 0 && req.fetchOffset < logEndOffset_()) {
+        logBytes = onLog([&](auto& L){ return L.read(req.fetchOffset, req.maxBytes); });
 
         // GR-1 fix: whole-batch alignment.
         //
@@ -575,7 +605,7 @@ std::vector<uint8_t> PartitionReplica::read(Offset fetchOffset,
     // C1 fix: clamp read to [fetchOffset, HW) so consumers never receive
     // records with offset >= HW (uncommitted).  Walk the batches returned by
     // the log and drop any that start at or beyond HW.
-    auto raw = log_->read(fetchOffset, maxBytes);
+    auto raw = onLog([&](auto& L){ return L.read(fetchOffset, maxBytes); });
     if (raw.empty()) return {};
 
     // Walk individual RecordBatch frames and stop before any batch whose
@@ -636,7 +666,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     }
 
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
-    const Offset preLeo = log_->logEndOffset();
+    const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
 
     // Epoch change: truncate divergent tail before applying.
@@ -659,7 +689,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             truncateLog(truncOff);
         }
         epoch_ = resp.leaderEpoch;
-        epochCache_.assign(static_cast<int32_t>(epoch_), log_->logEndOffset());
+        epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
     }
 
     // Append replicated records if any.
@@ -699,7 +729,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             // contiguous.  Any batch that starts ABOVE currentLeo (a gap) is also
             // skipped to preserve contiguity invariants.
 
-            Offset currentLeo = log_->logEndOffset();
+            Offset currentLeo = logEndOffset_();
             std::size_t newStart = resp.records.size(); // byte-offset of first new batch
             int64_t lastOff = -1;
             std::size_t pos = 0;
@@ -730,18 +760,18 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                 pos += static_cast<std::size_t>(total);
             }
 
-            if (newStart < resp.records.size() && lastOff >= log_->logEndOffset()) {
+            if (newStart < resp.records.size() && lastOff >= logEndOffset_()) {
                 // Append only the strictly-new suffix.
                 std::vector<uint8_t> raw(resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
                                           resp.records.end());
-                log_->append(raw, lastOff);
+                onLog([&](auto& L){ L.append(raw, lastOff); });
             }
         } else {
             // Fallback: raw user bytes (e.g. injected by unit tests) — wrap in
             // a RecordBatch so the log segment scanner can parse them.
-            Offset baseOffset = log_->logEndOffset();
+            Offset baseOffset = logEndOffset_();
             auto batch = makeBatch(baseOffset, resp.records);
-            log_->append(batch, baseOffset);
+            onLog([&](auto& L){ L.append(batch, baseOffset); });
         }
     }
 
@@ -757,7 +787,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     }
 
     // Advance local HW = min(localLeo, leader's HW).
-    Offset localLeo = log_->logEndOffset();
+    Offset localLeo = logEndOffset_();
     Offset newHw    = std::min(localLeo, resp.highWatermark);
     if (newHw > followerHw_) {
         followerHw_ = newHw;
@@ -773,7 +803,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     //
     // Guard: only fast-ack if new records arrived OR HW advanced.  An empty
     // HW-only push with no actual new data does not warrant an extra round-trip.
-    const Offset postLeo = log_->logEndOffset();
+    const Offset postLeo = logEndOffset_();
     const Offset postHw  = followerHw_;
     if (cfg_.fastAckOnApply && role_ == Role::Follower
         && (postLeo > preLeo || postHw > preHw)) {
@@ -792,7 +822,7 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.leaderEpoch = epoch_;
     req.partition   = cfg_.partitionId;
     req.followerId  = cfg_.selfId;
-    req.fetchOffset = log_->logEndOffset();
+    req.fetchOffset = logEndOffset_();
     req.maxBytes    = cfg_.maxFetchBytes;
     req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     return req;
@@ -806,7 +836,7 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
 bool PartitionReplica::followerTailIsSharedContinuation(
         Epoch requestedEpoch, Offset followerLeo) const
 {
-    const Offset leaderLeo = log_->logEndOffset();
+    const Offset leaderLeo = logEndOffset_();
 
     // The follower must genuinely be AHEAD for a reverse-reconcile to make sense.
     if (followerLeo <= leaderLeo) return false;
@@ -884,7 +914,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
     // recomputes and the survivor stays a live ISR member.  This is pure HW/liveness
     // bookkeeping; it does NOT change any truncation decision below.
     {
-        const Offset trackedLeo = std::min<Offset>(req.followerLeo, log_->logEndOffset());
+        const Offset trackedLeo = std::min<Offset>(req.followerLeo, logEndOffset_());
         if (trackedLeo >= 0) {
             leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
         }
@@ -912,7 +942,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         const Offset onLineage =
             (followerInIsr && sharedCont)
                 ? req.followerLeo
-                : std::min<Offset>(req.followerLeo, log_->logEndOffset());
+                : std::min<Offset>(req.followerLeo, logEndOffset_());
         survivorFrontier_[req.followerId] = onLineage;
         maybeCompleteLeadership();
     }
@@ -929,7 +959,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
             pull.leaderEpoch = epoch_;
             pull.partition   = cfg_.partitionId;
             pull.followerId  = cfg_.selfId;               // WE are the puller
-            pull.fetchOffset = log_->logEndOffset();      // from our LEO
+            pull.fetchOffset = logEndOffset_();      // from our LEO
             pull.maxBytes    = cfg_.maxFetchBytes;
             pull.topicId     = cfg_.topicId;
             transport_->sendReconcileRequest(req.followerId, pull);
@@ -953,7 +983,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
 
     // Authoritative answer from our cache.
     auto r = epochCache_.endOffsetForEpoch(
-        static_cast<int32_t>(req.requestedEpoch), log_->logEndOffset());
+        static_cast<int32_t>(req.requestedEpoch), logEndOffset_());
 
     OffsetsForLeaderEpochRespMsg resp{};
     resp.leaderEpoch   = epoch_;
@@ -995,7 +1025,7 @@ void PartitionReplica::applyOffsetsForLeaderEpochResponse(
         return;
     }
 
-    const Offset currentLeo     = log_->logEndOffset();
+    const Offset currentLeo     = logEndOffset_();
     const Offset committedFloor  = epochProbeFloor_;
 
     // KIP-101 truncation: drop everything at/beyond the leader's end offset for
@@ -1044,9 +1074,9 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
     // a stale HW view, which is exactly the DR-8 case — but every byte it holds
     // up to LEO was part of the committed prefix on the old leader.)
     std::vector<uint8_t> logBytes;
-    Offset leo = log_->logEndOffset();
+    Offset leo = logEndOffset_();
     if (req.maxBytes > 0 && req.fetchOffset < leo) {
-        logBytes = log_->read(req.fetchOffset, req.maxBytes);
+        logBytes = onLog([&](auto& L){ return L.read(req.fetchOffset, req.maxBytes); });
 
         // Whole-batch alignment (same as onFetchRequest) so the encoded frame
         // fits transport limits.
@@ -1129,7 +1159,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
         if (looksLikeRecordBatch) {
             // Append only the strictly-new tail (baseOffset >= current LEO),
             // preserving contiguity — identical idempotent walk to applyReplicated.
-            Offset currentLeo = log_->logEndOffset();
+            Offset currentLeo = logEndOffset_();
             std::size_t newStart = resp.records.size();
             int64_t lastOff = -1;
             std::size_t pos = 0;
@@ -1168,7 +1198,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                 currentLeo = lastOff + 1;
                 pos += static_cast<std::size_t>(total);
             }
-            if (newStart < resp.records.size() && lastOff >= log_->logEndOffset()) {
+            if (newStart < resp.records.size() && lastOff >= logEndOffset_()) {
                 std::vector<uint8_t> raw(
                     resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
                     resp.records.end());
@@ -1192,7 +1222,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                         raw.data() + rp, -1);
                     rp += static_cast<std::size_t>(tl);
                 }
-                log_->append(raw, lastOff);
+                onLog([&](auto& L){ L.append(raw, lastOff); });
             }
         }
     }
@@ -1211,7 +1241,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     // under it yet (LEO advanced solely from the pulled old-epoch records), so
     // moving the boundary up is safe and correct.
     {
-        const Offset newLeo = log_->logEndOffset();
+        const Offset newLeo = logEndOffset_();
         const int32_t curEp = static_cast<int32_t>(epoch_);
         const int64_t curEpStart = epochCache_.startOffsetFor(curEp);
         if (curEpStart >= 0 && curEpStart < newLeo) {
@@ -1222,7 +1252,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     }
 
     // Reflect the pulled records into the leader's own LEO/HW machinery.
-    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
     recomputeHw();
 
     // Reconcile round complete; clear the in-flight marker so a further gap (if
@@ -1234,7 +1264,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     // majority frontier with no pull outstanding, leadership completes and the
     // held HW is released to cover the recovered records.
     if (!leaderComplete_) {
-        survivorFrontier_[cfg_.selfId] = log_->logEndOffset();
+        survivorFrontier_[cfg_.selfId] = logEndOffset_();
         maybeCompleteLeadership();
     }
 
@@ -1268,7 +1298,7 @@ int PartitionReplica::doWork(int64_t nowNs)
             ++work; // ISR check cycle itself counts as work
 
             isrManager_->maybeShrinkIsr(nowNs,
-                                         log_->logEndOffset(),
+                                         logEndOffset_(),
                                          cfg_.replicaLagMaxMs,
                                          cfg_.replicaLagMaxOffset);
             if (isrManager_->isrChanged()) {
@@ -1310,7 +1340,7 @@ int PartitionReplica::doWork(int64_t nowNs)
                 }
 
                 if (reconcileTarget_ < 0) {
-                    const Offset myLeo = log_->logEndOffset();
+                    const Offset myLeo = logEndOffset_();
                     NodeId aheadPeer = -1;
                     Offset aheadLeo  = myLeo;
                     for (NodeId id : isrManager_->isr()) {
@@ -1387,7 +1417,7 @@ int PartitionReplica::doWork(int64_t nowNs)
                 req.followerId     = cfg_.selfId;
                 // Our latest leader-epoch (largest epoch we have records for).
                 req.requestedEpoch = epochCache_.latestEpoch();
-                req.followerLeo    = log_->logEndOffset();
+                req.followerLeo    = logEndOffset_();
                 req.topicId        = cfg_.topicId;
                 transport_->sendOffsetsForLeaderEpochRequest(leaderId_, req);
                 ++work;
@@ -1514,7 +1544,7 @@ const std::vector<NodeId>& PartitionReplica::isr() const noexcept
 // (self + the ahead survivor we pulled from) genuinely holds it.
 Offset PartitionReplica::majorityCommittedFrontier() const
 {
-    Offset target = log_->logEndOffset();   // self is always a live ISR member
+    Offset target = logEndOffset_();   // self is always a live ISR member
     if (!isrManager_) return target;
     for (NodeId id : isrManager_->isr()) {
         auto it = survivorFrontier_.find(id);
@@ -1564,7 +1594,7 @@ void PartitionReplica::maybeCompleteLeadership()
     if (reconcileTarget_ >= 0) return;
 
     // (2) Our LEO covers the on-lineage majority frontier.
-    if (log_->logEndOffset() < majorityCommittedFrontier()) return;
+    if (logEndOffset_() < majorityCommittedFrontier()) return;
 
     // Complete: release the served HW.  The floor was the last majority-committed
     // offset; the raw HW is now >= it (we hold the frontier) so serving resumes
@@ -1578,7 +1608,7 @@ void PartitionReplica::recomputeHw()
     // so a single call is sufficient.  We no longer call
     // updateFollowerFetchOffset(selfId, ...) — that was an incorrect hack that
     // polluted the follower LEO map with the leader's own entry.
-    leaderState_.setLeaderLogEndOffset(log_->logEndOffset());
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
 }
 
 void PartitionReplica::syncIsrToLeaderState()
@@ -1588,7 +1618,7 @@ void PartitionReplica::syncIsrToLeaderState()
 
 void PartitionReplica::truncateLog(Offset truncateOffset)
 {
-    Offset currentLeo = log_->logEndOffset();
+    Offset currentLeo = logEndOffset_();
     if (truncateOffset >= currentLeo) return;
 
     // A10 fix: prune the epoch cache in step with the log truncation.
@@ -1597,7 +1627,7 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     // drops any assign whose startOffset is below the current latest entry.
     // If the epoch cache retains an entry whose startOffset is ABOVE the
     // post-truncation log-end-offset, a subsequent higher-epoch assign
-    // (applyReplicated: epochCache_.assign(epoch_, log_->logEndOffset())) is
+    // (applyReplicated: epochCache_.assign(epoch_, logEndOffset_())) is
     // silently dropped — leaving the cache in an inconsistent state where
     // truncationOffsetForEpochChange() can return a too-high boundary.
     //
@@ -1606,7 +1636,7 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     // cache then reflects only epochs that start within the surviving log.
     epochCache_.truncateFromEnd(truncateOffset);
 
-    log_->truncateTo(truncateOffset);
+    onLog([&](auto& L){ L.truncateTo(truncateOffset); });
 
     // Conservatively cap followerHw_.
     if (followerHw_ > truncateOffset) {
@@ -1653,20 +1683,20 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
             if (id != cfg_.selfId) { hasFollower = true; break; }
         }
         if (!hasFollower) {
-            lastPushedOffset_ = log_->logEndOffset();
+            lastPushedOffset_ = logEndOffset_();
             return;
         }
     }
 
     // Nothing new to push if fromOffset is at or above current LEO.
-    Offset currentLeo = log_->logEndOffset();
+    Offset currentLeo = logEndOffset_();
     if (fromOffset >= currentLeo) {
         lastPushedOffset_ = currentLeo;
         return;
     }
 
     // Read the bytes from the log — same path as onFetchRequest().
-    std::vector<uint8_t> logBytes = log_->read(fromOffset, cfg_.maxFetchBytes);
+    std::vector<uint8_t> logBytes = onLog([&](auto& L){ return L.read(fromOffset, cfg_.maxFetchBytes); });
 
     // Apply whole-batch alignment to avoid partial-batch tails.
     if (!logBytes.empty()) {

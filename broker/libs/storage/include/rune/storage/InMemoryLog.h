@@ -1,6 +1,6 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// InMemoryLog.h — bounded drop-oldest ring implementing ILog.
+// InMemoryLog.h — bounded drop-oldest ring, concrete Log-compatible surface.
 //
 // Zero-disk, zero-alloc steady-state append.  Used for replication tests and
 // disaster-recovery harnesses where a real on-disk Log is not needed.
@@ -26,7 +26,6 @@
 // Namespace: rune::storage   C++23
 // ---------------------------------------------------------------------------
 
-#include <rune/storage/ILog.h>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -36,7 +35,11 @@
 
 namespace rune::storage {
 
-class InMemoryLog : public ILog {
+/// De-virtualized (Milestone D Phase 2): `InMemoryLog` is an INDEPENDENT concrete
+/// class (the former `ILog` base is gone).  It exposes the SAME method surface as
+/// `rune::storage::Log` so `PartitionReplica` can dispatch on a `bool memoryBacked_`
+/// to a concrete pointer with NO vtable on the hot path.
+class InMemoryLog {
 public:
     /// Construct a bounded in-memory log.
     /// @param maxBytes    Soft byte cap — evict oldest batches when total stored
@@ -54,7 +57,7 @@ public:
         entries_.reserve(maxRecords);
     }
 
-    ~InMemoryLog() override = default;
+    ~InMemoryLog() = default;
 
     InMemoryLog(const InMemoryLog&)            = delete;
     InMemoryLog& operator=(const InMemoryLog&) = delete;
@@ -62,22 +65,22 @@ public:
     InMemoryLog& operator=(InMemoryLog&&)      = default;
 
     // -----------------------------------------------------------------------
-    // ILog implementation
+    // Log-compatible surface (concrete; no virtual — de-virtualized seam)
     // -----------------------------------------------------------------------
 
-    int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset) override {
+    int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
         return appendImpl(data, len, lastOffset);
     }
 
-    int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset) override {
+    int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
         return appendImpl(batch.data(), batch.size(), lastOffset);
     }
 
-    int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) override {
+    int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) {
         return appendImpl(data, len, lastOffset);
     }
 
-    std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes) override {
+    std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes) {
         if (startOffset < logStartOffset_ || entries_.empty()) {
             return {};
         }
@@ -107,15 +110,15 @@ public:
         return out;
     }
 
-    [[nodiscard]] int64_t logEndOffset() const noexcept override {
+    [[nodiscard]] int64_t logEndOffset() const noexcept {
         return logEndOffset_;
     }
 
-    [[nodiscard]] int64_t logStartOffset() const noexcept override {
+    [[nodiscard]] int64_t logStartOffset() const noexcept {
         return logStartOffset_;
     }
 
-    void truncateTo(int64_t truncateOffset) override {
+    void truncateTo(int64_t truncateOffset) {
         // Remove all entries with baseOffset >= truncateOffset.
         while (!entries_.empty() &&
                entries_.back().baseOffset >= truncateOffset) {
@@ -128,20 +131,20 @@ public:
         logEndOffset_ = truncateOffset;
     }
 
-    void sync() override {
+    void sync() {
         // No-op: InMemoryLog has no disk path.
     }
 
-    int64_t recover() override {
+    int64_t recover() {
         // No-op: nothing to recover from.
         return logEndOffset_;
     }
 
-    [[nodiscard]] const std::string& dir() const noexcept override {
+    [[nodiscard]] const std::string& dir() const noexcept {
         return syntheticDir_;
     }
 
-    [[nodiscard]] std::vector<int64_t> segmentBaseOffsets() const override {
+    [[nodiscard]] std::vector<int64_t> segmentBaseOffsets() const {
         // Expose a single virtual segment starting at logStartOffset_ so that
         // PSM::rebuildFromLog's CP-3 "start at first live segment" logic works.
         // An empty log returns an empty vector (same as a real Log with no segments).
@@ -149,7 +152,7 @@ public:
         return {logStartOffset_};
     }
 
-    [[nodiscard]] bool isDiskBacked() const noexcept override { return false; }
+    [[nodiscard]] bool isDiskBacked() const noexcept { return false; }
 
 private:
     // -----------------------------------------------------------------------

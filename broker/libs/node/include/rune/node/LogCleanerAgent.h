@@ -182,7 +182,7 @@ public:
         for (auto* r : registry_->allReplicas()) {
             // Task M1 precondition #2: skip memory-backed replicas.
             // r->log() asserts isDiskBacked() — never call it on an InMemoryLog.
-            if (r && r->ilog() && r->ilog()->isDiskBacked()) {
+            if (r && r->isDiskBacked()) {
                 r->log()->preprovisionPending();
                 r->log()->finalizeStagingRenames();
             }
@@ -244,7 +244,7 @@ public:
 
             // Task M1 precondition #2: skip memory-backed replicas.
             // Compaction/retention only applies to on-disk logs.
-            if (!replica->ilog() || !replica->ilog()->isDiskBacked()) continue;
+            if (!replica->isDiskBacked()) continue;
 
             const auto policy = replica->cleanupPolicy();
             if (policy == rune::replication::CleanupPolicy::Delete) continue;
@@ -572,7 +572,7 @@ private:
 
             // Task M1 precondition #2: skip memory-backed replicas.
             // Retention only applies to on-disk logs.
-            if (!replica->ilog() || !replica->ilog()->isDiskBacked()) continue;
+            if (!replica->isDiskBacked()) continue;
 
             const auto policy = replica->cleanupPolicy();
             // Retention applies to Delete and CompactDelete topics only.

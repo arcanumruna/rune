@@ -53,8 +53,8 @@
 #include <rune/replication/IsrManager.h>
 #include <rune/replication/EpochFencing.h>
 #include <rune/replication/ReplicationMessages.h>
-#include <rune/storage/ILog.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/LeaderEpochCache.h>
 
 namespace rune::replication {
@@ -194,16 +194,29 @@ public:
     /// \param epoch      Current leader epoch (stamped on every batch).
     /// \param replicas   Full replica set (NodeIds, including self).
     /// \param isr        Initial ISR (subset of replicas; often == replicas at start).
-    /// \param log        Owning pointer to the partition Log (pre-constructed).
-    ///                   Accepts any rune::storage::ILog* — a concrete Log* upcasts
-    ///                   automatically; InMemoryLog* works for testing.
+    /// \param log        Non-owning pointer to the partition log (pre-constructed;
+    ///                   owner is the test/container).  De-virtualized seam
+    ///                   (Milestone D P2): there are TWO concrete overloads — a
+    ///                   disk-backed rune::storage::Log* and an in-memory
+    ///                   rune::storage::InMemoryLog*.  Exactly one backend is stored
+    ///                   and `memoryBacked_` is fixed at construction, so every
+    ///                   hot-path log op is a DIRECT concrete call (no vtable).
     /// \param transport  Injected transport (fake for tests, Aeron for prod).
     PartitionReplica(PartitionConfig                       cfg,
                      Role                                   role,
                      Epoch                                  epoch,
                      std::vector<NodeId>                    replicas,
                      std::vector<NodeId>                    isr,
-                     rune::storage::ILog*                   log,
+                     rune::storage::Log*                    log,
+                     PartitionTransport*                    transport);
+
+    /// In-memory-backed overload (tests / DR harness / memory-persistence topics).
+    PartitionReplica(PartitionConfig                       cfg,
+                     Role                                   role,
+                     Epoch                                  epoch,
+                     std::vector<NodeId>                    replicas,
+                     std::vector<NodeId>                    isr,
+                     rune::storage::InMemoryLog*            log,
                      PartitionTransport*                    transport);
 
     // -----------------------------------------------------------------------
@@ -354,14 +367,14 @@ public:
 
     [[nodiscard]] Role        role()           const noexcept { return role_; }
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
-    [[nodiscard]] Offset      logEndOffset()   const noexcept { return log_->logEndOffset(); }
+    [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
 
     /// Soft per-replica position snapshot for the controller's election path.
     /// leaderEpoch = epoch(); logEndPosition = logEndOffset().
     [[nodiscard]] ReplicaPositionReport positionReport() const noexcept {
         return ReplicaPositionReport{ cfg_.topicId, cfg_.partitionId, cfg_.selfId,
-                                      static_cast<int32_t>(epoch_), log_->logEndOffset() };
+                                      static_cast<int32_t>(epoch_), logEndOffset_() };
     }
 
     // -----------------------------------------------------------------------
@@ -435,17 +448,21 @@ public:
         lastCleanOffset_.store(o, std::memory_order_relaxed);
     }
 
-    /// Non-owning pointer to the underlying ILog seam.
-    /// Use this when the log may be an InMemoryLog (tests, DR harness).
-    [[nodiscard]] rune::storage::ILog* ilog() const noexcept { return log_; }
+    /// True if this partition is backed by an in-memory ring (InMemoryLog);
+    /// false if backed by an on-disk Log.  Fixed at construction — a partition's
+    /// backend never changes.  Disk-only consumers (LogCleanerAgent, retention,
+    /// NodeRuntimeAgent drains, PartitionFailoverCoordinator) skip memory-backed
+    /// partitions via this predicate.
+    [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
+    [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
 
-    /// Non-owning pointer to the underlying Log (for cleaner / compaction code that
-    /// needs concrete Log methods).  Safe only when the replica was constructed with
-    /// a rune::storage::Log* — production paths always are.  Test code that passes
-    /// InMemoryLog must use ilog() instead.
+    /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
+    /// failover code that needs concrete Log methods).  Safe ONLY when this
+    /// replica is disk-backed — asserts !memoryBacked_.  Callers MUST gate on
+    /// isDiskBacked() (memory-backed partitions have no on-disk Log).
     [[nodiscard]] rune::storage::Log* log() const noexcept {
-        assert(log_->isDiskBacked() && "log(): backend is not a disk Log — use ilog()");
-        return static_cast<rune::storage::Log*>(log_);
+        assert(!memoryBacked_ && "log(): backend is in-memory — gate on isDiskBacked()");
+        return diskLog_;
     }
 
     /// The durability mode configured for this partition (Task M1).
@@ -458,6 +475,11 @@ private:
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Shared construction logic for both backend overloads (disk / in-memory).
+    /// The pointer fields + memoryBacked_ are set in each constructor's init list;
+    /// this seeds the leader/follower state, epoch cache, and cleaner snapshots.
+    void initReplica(std::vector<NodeId> replicas, std::vector<NodeId> isr);
 
     /// (Leader) DR-BUG-6 divergence guard — is an ahead follower's tail a genuine
     /// continuation of THIS leader's OWN epoch lineage (KIP-101), i.e. safe to
@@ -519,8 +541,39 @@ private:
     Epoch                epoch_;
     NodeId               leaderId_;           ///< (follower) leader's NodeId; -1 if unknown
 
-    rune::storage::ILog*        log_;         ///< non-owning (owner is the test/container)
+    // De-virtualized log seam (Milestone D Phase 2).  Exactly ONE of diskLog_ /
+    // memLog_ is non-null; memoryBacked_ (fixed at construction) selects which.
+    // Every hot-path log op branches on memoryBacked_ to the concrete pointer and
+    // calls the concrete (inlinable) method — a perfectly-predicted branch to two
+    // direct call targets, NO vtable.  Both pointers are non-owning (the owner is
+    // the test/container: BrokerNode::memoryLogs_ or TopicRegistry's Log).
+    rune::storage::Log*         diskLog_ = nullptr;  ///< non-null iff !memoryBacked_
+    rune::storage::InMemoryLog* memLog_  = nullptr;  ///< non-null iff  memoryBacked_
+    bool                        memoryBacked_ = false;
     PartitionTransport*         transport_;   ///< non-owning
+
+    // -----------------------------------------------------------------------
+    // De-virtualized hot-path log dispatch.
+    //
+    // onLog(F) applies F to the ACTIVE concrete log.  The single branch on
+    // memoryBacked_ is emitted once per call site; both arms are direct calls to
+    // inlinable concrete methods (Log:: / InMemoryLog::) — no indirect/virtual
+    // dispatch.  All PartitionReplica log operations route through these two
+    // helpers (onLog for the general case, logEndOffset_ for the hottest read).
+    // -----------------------------------------------------------------------
+    template<class F>
+    [[gnu::always_inline]] inline auto onLog(F&& f) {
+        if (memoryBacked_) return f(*memLog_);
+        return f(*diskLog_);
+    }
+    template<class F>
+    [[gnu::always_inline]] inline auto onLog(F&& f) const {
+        if (memoryBacked_) return f(*memLog_);
+        return f(*diskLog_);
+    }
+    [[gnu::always_inline]] inline Offset logEndOffset_() const noexcept {
+        return memoryBacked_ ? memLog_->logEndOffset() : diskLog_->logEndOffset();
+    }
 
     // Leader-side components
     ReplicaLeaderState   leaderState_;        ///< HW + per-follower LEO

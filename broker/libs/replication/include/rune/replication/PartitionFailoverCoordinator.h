@@ -191,8 +191,7 @@ public:
         // Bootstrap from recorded log via replay — disk-backed partitions only.
         // Memory-backed partitions (test/in-memory replicas) skip replay: calling
         // replica->log() on a memory-backed partition asserts isDiskBacked().
-        if (store != nullptr &&
-            replica->ilog() && replica->ilog()->isDiskBacked()) {
+        if (store != nullptr && replica->isDiskBacked()) {
             PartitionReplay replay(store);
             Offset leaderLeo = leaderReplica->logEndOffset();
             replay.replayIntoLog(*replica->log(), 0, leaderLeo);
@@ -434,7 +433,7 @@ public:
         for (const auto& e : entries_) {
             if (e.nodeId == nodeId && e.replica != nullptr) {
                 // Guard: only access log() on disk-backed replicas.
-                if (!e.replica->ilog() || !e.replica->ilog()->isDiskBacked()) {
+                if (!e.replica->isDiskBacked()) {
                     return nullptr;
                 }
                 return e.replica->log();

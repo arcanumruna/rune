@@ -962,10 +962,11 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
     auto* replica = node.replicaForTest(0, 0);
     ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
 
-    // Verify the log is memory-backed.
-    ASSERT_NE(replica->ilog(), nullptr) << "ilog() must be non-null";
-    EXPECT_FALSE(replica->ilog()->isDiskBacked())
-        << "Task M1: persistence=Memory must produce a non-disk-backed ILog (InMemoryLog)";
+    // Verify the log is memory-backed (de-virtualized seam: isMemoryBacked()).
+    EXPECT_TRUE(replica->isMemoryBacked())
+        << "Task M1: persistence=Memory must produce a memory-backed replica (InMemoryLog)";
+    EXPECT_FALSE(replica->isDiskBacked())
+        << "Task M1: persistence=Memory replica must not be disk-backed";
 
     // If we reach here without a crash/assertion, the cleaner correctly skipped
     // the memory-backed replica's log() call.
