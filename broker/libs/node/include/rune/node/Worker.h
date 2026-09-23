@@ -24,29 +24,38 @@
 //     WorkerPool sets owned_ directly via setOwnedDirect().
 //   - RUNTIME (workers live on their own threads): the control thread enqueues a
 //     SetOwnership WorkerOp to this worker's ingress ring; the worker applies it
-//     in executeOp_ on ITS OWN thread. No lock, no atomic, no cross-thread race
+//     in executeFromWire_ on ITS OWN thread. No lock, no atomic, no cross-thread race
 //     by construction.
 //
-// E2 inc2a: Per-worker ingress + return SPSC rings.
+// E2 inc2a: Per-worker ingress + return rings.
 //
 //   ingress_: producer = control thread (gateway + transport); consumer = doWork.
-//   return_:  producer = doWork; consumer = gateway (drains in gateway::doWork).
+//             R2: OneToOneByteRing carrying flat [WorkerOpWire][tail] messages.
+//             Encode (tryEnqueueOp) → scratch → write (1 copy into ring).
+//             Decode (drainIngress_) → zero-copy view into the ring frame.
+//
+//   return_:  SpscRing<WorkerReturn> (unchanged — R3 will migrate this).
+//             producer = doWork; consumer = gateway (drains in gateway::doWork).
 //
 //   doWork order:
 //     1. Drain ingress_ (execute ops, enqueue returns).
 //     2. Run per-replica duty steps (Step 5 + 6.5 from E1).
 //
-//   The rings are LOCK-FREE SPSC (SpscRing<WorkerOp> / SpscRing<WorkerReturn>).
-//   No mutex, no condvar. Back-pressure on tryEnqueue: the caller must retry
-//   on the next duty cycle (never drop, never overwrite).
+//   Back-pressure on tryEnqueueOp: the caller must retry on the next duty cycle
+//   (never drop, never overwrite).
 //
-//   Buffer lifetime: Aeron fragment buffers (ApplyReplicated records span) are
-//   copied into a worker-owned vector at enqueue time — correctness first.
+// Ring sizing:
+//   kIngressByteCapacity = 8 MiB payload bytes (power-of-two).
+//   maxMsgLength() = capacity / 8 = 1 MiB — exceeds any practical produce batch.
+//   // TODO(R4): thread NodeConfig.workerIngressByteCapacity to the ctor for
+//   //            runtime configurability.
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/SpscRing.h>
+#include <rune/node/OneToOneByteRing.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerWire.h>
 #include <rune/node/IoBackend.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
@@ -68,10 +77,18 @@ public:
     // Non-owning pointer set published as an immutable snapshot.
     using OwnedSet = std::vector<rune::replication::PartitionReplica*>;
 
-    // SPSC ring capacity — power of two.
-    // 256 ops per ring: sufficient for bursts under single-thread cooperative.
-    // When inc2b adds per-worker threads, this may be tuned up.
-    static constexpr std::size_t kRingCapacity = 256;
+    // R2: ingress ring byte capacity (power-of-two payload bytes).
+    // maxMsgLength() = capacity / 8 = 1 MiB — sufficient for any produce batch.
+    // TODO(R4): thread NodeConfig.workerIngressByteCapacity here.
+    static constexpr int kIngressByteCapacity = 8 * 1024 * 1024; // 8 MiB
+
+    // Return ring slot capacity (SpscRing<WorkerReturn>, unchanged until R3).
+    // Power of two; 256 slots is sufficient for one duty cycle.
+    static constexpr std::size_t kRetRingCapacity = 256;
+
+    // Legacy alias — callers that pass Worker::kRingCapacity to the ctor still
+    // compile; the value is now used for ret_ (SpscRing slots) only.
+    static constexpr std::size_t kRingCapacity = kRetRingCapacity;
 
     // Default IoBackend ring depths (power-of-two).  NodeConfig wiring (Task 7)
     // will pass these explicitly; for now the constructor defaults are sensible.
@@ -84,22 +101,26 @@ public:
     // Pre-reserve capacity for the per-cycle dirty-log set (dedup, small).
     static constexpr std::size_t kDirtySetReserve = 64;
 
-    // ringCapacity: per-worker ingress/return SPSC ring slots — NodeConfig
-    // configurable (workerRingCapacity). Default kRingCapacity for tests/back-compat.
+    // ctor: ringCapacity is kept for source-compat — it was the SpscRing slot
+    // count; now it is IGNORED (ingress uses kIngressByteCapacity; ret_ uses
+    // kRetRingCapacity). Callers that pass Worker::kRingCapacity still compile.
     explicit Worker(int32_t workerId,
-                    std::size_t ringCapacity    = kRingCapacity,
+                    std::size_t ringCapacity    = kRingCapacity,  // ignored (back-compat)
                     std::size_t ioSubmitDepth   = kIoSubmitDepth,
                     std::size_t ioComplDepth    = kIoCompletionDepth) noexcept
         : workerId_(workerId)
-        , ingress_(ringCapacity)
-        , ret_(ringCapacity)
+        , ingress_(kIngressByteCapacity)
+        , ingressScratch_(sizeof(WorkerOpWire) +
+                          static_cast<std::size_t>(ingress_.maxMsgLength()))
+        , ret_(kRetRingCapacity)
         , io_(ioSubmitDepth, ioComplDepth)
     {
+        (void)ringCapacity; // kept for source-compat; no longer used
         durablePending_.reserve(kDurablePendingReserve);
         dirtyThisCycle_.reserve(kDirtySetReserve);
     }
 
-    // Non-copyable and non-movable (std::atomic<OwnedSet*> + SpscRing are not
+    // Non-copyable and non-movable (OneToOneByteRing + SpscRing<WorkerReturn> are not
     // movable).
     Worker(const Worker&)            = delete;
     Worker& operator=(const Worker&) = delete;
@@ -111,8 +132,8 @@ public:
     // setter is legal ONLY when no worker thread is running yet — i.e. at STARTUP
     // (WorkerPool::assignFromRegistry before startRunners) or in single-threaded
     // unit tests. At RUNTIME, ownership changes arrive as a SetOwnership ring op
-    // (executeSetOwnership_) applied on the worker's own thread — never a
-    // cross-thread write to owned_.
+    // (executeSetOwnership_ from the wire) applied on the worker's own thread —
+    // never a cross-thread write to owned_.
     void setOwnedDirect(OwnedSet set) noexcept {
         owned_ = std::move(set);
     }
@@ -132,18 +153,27 @@ public:
     // -----------------------------------------------------------------------
     // E2 inc2a: ingress ring accessor (producer = control thread).
     //
-    // The gateway and transport call tryEnqueueOp() to route log work to this
-    // worker.  The ring capacity is kRingCapacity; tryEnqueueOp returns false
-    // when full (back-pressure — caller retries next cycle).
+    // R2: encodes the WorkerOp into ingressScratch_ (flat [WorkerOpWire][tail])
+    //     then writes it to the OneToOneByteRing.
+    //
+    // Signature UNCHANGED — all producer call sites (gateway, transport, bridge,
+    // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
-        return ingress_.tryEnqueue(std::move(op));
+        // Encode into the per-worker scratch (no heap allocation).
+        // ingressScratch_ is sized to sizeof(WorkerOpWire) + maxMsgLength(),
+        // which comfortably exceeds the largest produce batch (maxMsgLength = 1 MiB).
+        const std::size_t n = encodeWorkerOp(op, ingressScratch_.data(),
+                                             ingressScratch_.size());
+        // Write into the agrona ring (1 copy: scratch → ring).
+        // Returns false when the ring is full → back-pressure; caller must retry.
+        return ingress_.write(ingressScratch_.data(), n, workerOpMsgTypeId(op));
     }
 
     // -----------------------------------------------------------------------
     // E2 inc2a: return ring accessor (consumer = gateway, on control thread).
     //
-    // The gateway calls drainReturn() to collect results from the previous cycle.
+    // Unchanged — ret_ is still SpscRing<WorkerReturn> until R3.
     // -----------------------------------------------------------------------
     template <typename Fn>
     std::size_t drainReturn(Fn&& fn) {
@@ -183,7 +213,7 @@ public:
         // cycle's ops are processed.  Per-worker, no shared state.
         work += reapDurableCompletions_();
 
-        // Step 0: drain ingress ring (E2 inc2a). This may include SetOwnership
+        // Step 0: drain ingress ring (E2 inc2a / R2). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         // Strict-tier produces record their log in dirtyThisCycle_ (token=0).
         work += static_cast<int>(drainIngress_());
@@ -328,84 +358,99 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // drainIngress_ — execute all queued ops and enqueue results to ret_.
+    // drainIngress_ — decode and execute all queued ops from the agrona ring.
+    //
+    // R2: ingress_ is now a OneToOneByteRing. Each ring frame is a flat
+    //     [WorkerOpWire][optional tail] message. The handler receives a zero-copy
+    //     view into the ring; the view is valid ONLY for the duration of the
+    //     callback — every op is fully consumed before the callback returns.
     //
     // Called from doWork (the consumer side of ingress_).
-    // Single-writer invariant: doWork runs on the duty-cycle thread only in
-    // E2 inc2a (cooperative); in E2 inc2b it runs on the worker's own thread.
+    // Single-writer invariant: doWork runs on the worker's own thread.
     // -----------------------------------------------------------------------
     std::size_t drainIngress_() {
-        return ingress_.drain([this](WorkerOp&& op) {
-            executeOp_(std::move(op));
-        });
+        int drained = ingress_.drain(
+            [this](int32_t /*typeId*/,
+                   aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off,
+                   aeron::util::index_t len)
+            {
+                // Zero-copy view: frame pointer is valid only inside this callback.
+                // Fully consume the message (executeFromWire_) before returning.
+                (void)len;
+                const uint8_t* frame =
+                    reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
+                executeFromWire_(frame);
+            });
+        return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
-    void executeOp_(WorkerOp op) {
-        switch (op.type) {
+    // -----------------------------------------------------------------------
+    // executeFromWire_ — dispatch on WorkerOpWire::type and call the per-type
+    //                    handler.  The frame pointer is a zero-copy view into the
+    //                    agrona ring — valid only inside drainIngress_ callback.
+    // -----------------------------------------------------------------------
+    void executeFromWire_(const uint8_t* frame) {
+        const WorkerOpWire* hdr = decodeWorkerOpHeader(frame);
+        switch (static_cast<WorkerOp::Type>(hdr->type)) {
         case WorkerOp::Type::Produce:
-            executeProduce_(std::move(op));
+            executeProduceWire_(frame, hdr);
             break;
         case WorkerOp::Type::PushRead:
-            executePushRead_(std::move(op));
+            executePushReadWire_(frame, hdr);
             break;
         case WorkerOp::Type::ApplyReplicated:
-            executeApplyReplicated_(std::move(op));
+            executeApplyReplicatedWire_(frame, hdr);
             break;
         case WorkerOp::Type::BecomeLeader:
-            executeBecomeLeader_(std::move(op));
+            executeBecomeLeaderWire_(frame, hdr);
             break;
         case WorkerOp::Type::BecomeFollower:
-            executeBecomeFollower_(std::move(op));
+            executeBecomeFollowerWire_(frame, hdr);
             break;
         case WorkerOp::Type::SetOwnership:
-            // Shared-nothing: apply the new owned set on THIS worker thread.
-            owned_ = std::move(op.ownedSet);
+            executeSetOwnershipWire_(frame, hdr);
             break;
         }
     }
 
     // -------------------------------------------------------------------
-    // executeProduce_ — append the batch to the owning Log and update the
-    // replica's tracked LEO/HW via onLeaderLogAppended().
+    // executeProduceWire_ — append the batch to the owning Log and update
+    // the replica's tracked LEO/HW via onLeaderLogAppended().
     //
-    // The gateway has already:
-    //   1. Validated + restamped the batch with a PLACEHOLDER base offset.
-    //      The actual base offset must be re-stamped here after calling
-    //      log->logEndOffset() so the stamped offset is authoritative.
-    //   2. Validated the CRC (CRC region is AFTER kBaseOffsetOffset, so
-    //      re-stamping base does NOT invalidate the CRC).
+    // The tail view IS the record-batch bytes in the ring. We re-stamp the
+    // base offset in-place (CRC region is after kBaseOffsetOffset=0, so no
+    // CRC recompute) then call log->appendNoSync(tail, tailLen, lastOffset)
+    // — zero-copy READ from the ring into the log.
     //
-    // Returns via WorkerReturn::ProduceResult on the return ring.
+    // CRITICAL: the tail pointer is a zero-copy view valid only for the
+    // duration of this callback — it is fully consumed here (appendNoSync
+    // copies the bytes into the log's owned buffer).
     // -------------------------------------------------------------------
-    void executeProduce_(WorkerOp op) {
+    void executeProduceWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
         WorkerReturn ret;
         ret.type          = WorkerReturn::Type::ProduceResult;
-        ret.sessionId     = op.sessionId;
-        ret.correlationId = op.correlationId;
-        ret.partition     = op.partition;
-        ret.deferAck      = false;
-        ret.replica        = op.replica;
-        ret.producerId     = op.producerId;
-        ret.producerEpoch  = op.producerEpoch;
-        ret.baseSequence   = op.baseSequence;
-        ret.recordCount    = op.recordCount;
-        ret.topicId        = op.topicId;
-        ret.batchAttrs     = op.batchAttrs;
-        ret.deferAck       = op.deferAck;
-        ret.enqueuedAtNs   = op.enqueuedAtNs;
+        ret.sessionId     = hdr->sessionId;
+        ret.correlationId = hdr->correlationId;
+        ret.partition     = hdr->partition;
+        ret.deferAck      = hdr->deferAck != 0;
+        ret.replica       = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        ret.producerId    = hdr->producerId;
+        ret.producerEpoch = hdr->producerEpoch;
+        ret.baseSequence  = hdr->baseSequence;
+        ret.recordCount   = hdr->recordCount;
+        ret.topicId       = hdr->topicId;
+        ret.batchAttrs    = hdr->batchAttrs;
+        ret.enqueuedAtNs  = hdr->enqueuedAtNs;
 
-        // Look up the Log for this (topicId, partition).
-        // The Log pointer is stored in the replica (disk-backed) or obtained from
-        // topicRegistry_. We get it from the op via the replica.
-        //
-        // Invariant: gateway only enqueues Produce ops for valid (topicId, partition)
-        // pairs where a Log exists. We double-check here for safety.
-        rune::storage::Log* log = getLog_(op);
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        auto* log     = getLogFromWire_(hdr);
+
         if (!log) {
-            spdlog::error("Worker {}: executeProduce_ — no Log for topicId={} partition={}; "
+            spdlog::error("Worker {}: executeProduceWire_ — no Log for topicId={} partition={}; "
                           "sending Internal error",
-                          workerId_, op.topicId, op.partition);
-            ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal placeholder
+                          workerId_, hdr->topicId, hdr->partition);
+            ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
             ret_.tryEnqueue(std::move(ret));
             return;
         }
@@ -413,23 +458,28 @@ private:
         // Assign the actual base offset (authoritative — worker is the single writer).
         const int64_t base = log->logEndOffset();
         ret.baseOffset = base;
-        ret.lastOffset = base + static_cast<int64_t>(op.lastOffsetDelta);
+        ret.lastOffset = base + static_cast<int64_t>(hdr->lastOffsetDelta);
 
-        // Re-stamp the base offset in the batch bytes (LE64 at kBaseOffsetOffset=0).
-        // The CRC region starts at kAttributesOffset=21, AFTER the base-offset field,
-        // so re-stamping is CRC-safe.
-        if (op.recordBatchBytes.size() >= 8u) {
-            uint64_t u = static_cast<uint64_t>(base);
+        // Re-stamp the base offset in the tail view (LE64 at kBaseOffsetOffset=0).
+        // The tail is a mutable view in the ring (AtomicBuffer); the ring frame
+        // is not read by the producer again after write() returned — safe to
+        // mutate in-place here.
+        // CRC region starts at kAttributesOffset=21, AFTER the base-offset field,
+        // so re-stamping does NOT invalidate the CRC.
+        uint8_t* tail = const_cast<uint8_t*>(workerOpTail(frame));
+        const uint32_t tailLen = hdr->tailLen;
+        if (tail && tailLen >= 8u) {
+            const uint64_t u = static_cast<uint64_t>(base);
             for (int i = 0; i < 8; ++i) {
-                op.recordBatchBytes[static_cast<std::size_t>(i)] =
+                tail[static_cast<std::size_t>(i)] =
                     static_cast<uint8_t>(u >> (i * 8));
             }
         }
 
-        // Append to the log (no-sync: page-cache write, group-commit later).
-        const std::size_t batchLen = op.recordBatchBytes.size();
+        // Zero-copy append: read directly from the ring frame into the log.
+        // appendNoSync copies the bytes into the log's owned segment buffer.
         try {
-            log->appendNoSync(op.recordBatchBytes.data(), batchLen, ret.lastOffset);
+            log->appendNoSync(tail, static_cast<std::size_t>(tailLen), ret.lastOffset);
         } catch (const std::exception& ex) {
             spdlog::error("Worker {}: appendNoSync threw: {}", workerId_, ex.what());
             ret.errorCode = static_cast<int16_t>(6); // Internal
@@ -443,8 +493,8 @@ private:
         }
 
         // GR-4 Mode A seam: reconcile the replica's tracked LEO/HW.
-        if (op.replica) {
-            op.replica->onLeaderLogAppended();
+        if (replica) {
+            replica->onLeaderLogAppended();
         }
 
         // E3 Task 5: Strict durability tier — defer ack until fsync completion is reaped.
@@ -456,7 +506,7 @@ private:
         // After ALL this-cycle produces are appended (drainIngress_ returns),
         // submitCoalescedFlushes_() submits ONE io_.submit per dirty log and stamps
         // the resulting token onto every pending entry for that log.
-        if (op.durabilityTier == 2 && log->isDiskBacked()) {
+        if (hdr->durabilityTier == 2 && log->isDiskBacked()) {
             ret.errorCode = 0; // tentatively OK; updated in submitCoalescedFlushes_ or on completion
             // token=0 means "not yet submitted" — reapDurableCompletions_ will never fire this.
             durablePending_.push_back({kNoToken, ret.lastOffset, log, std::move(ret)});
@@ -470,31 +520,32 @@ private:
             return;
         }
 
-        // Default (tier 0 / tier 1) or memory-backed: enqueue immediately (unchanged).
+        // Default (tier 0 / tier 1) or memory-backed: enqueue immediately.
         ret.errorCode = 0;
         ret_.tryEnqueue(std::move(ret));
     }
 
     // -------------------------------------------------------------------
-    // executePushRead_ — read a chunk from the log for a push subscription.
+    // executePushReadWire_ — read a chunk from the log for a push subscription.
     //
     // Returns WorkerReturn::PushReadResult carrying the chunk + context.
     // The gateway iterates the chunk, encodes Records frames, and sends them.
+    // No tail for PushRead ops.
     // -------------------------------------------------------------------
-    void executePushRead_(WorkerOp op) {
+    void executePushReadWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
         WorkerReturn ret;
         ret.type                 = WorkerReturn::Type::PushReadResult;
-        ret.subscriptionId       = op.subscriptionId;
-        ret.sessionId            = op.sessionId;  // gateway needs this to find the session
-        ret.readTopicId          = op.topicId;
-        ret.readPartition        = op.partition;
-        ret.newNextOffset        = op.nextOffset; // will be advanced by gateway on success
-        ret.hwBound              = op.hwBound;
-        ret.isolation            = op.isolation;
-        ret.isGroup              = op.isGroup;
-        ret.groupCarrierReceived = op.groupCarrierReceived;
+        ret.subscriptionId       = hdr->subscriptionId;
+        ret.sessionId            = hdr->sessionId; // gateway needs this to find the session
+        ret.readTopicId          = hdr->topicId;
+        ret.readPartition        = hdr->partition;
+        ret.newNextOffset        = hdr->nextOffset; // will be advanced by gateway on success
+        ret.hwBound              = hdr->hwBound;
+        ret.isolation            = hdr->isolation;
+        ret.isGroup              = hdr->isGroup != 0;
+        ret.groupCarrierReceived = hdr->groupCarrierReceived != 0;
 
-        rune::storage::Log* log = getLog_(op);
+        rune::storage::Log* log = getLogFromWire_(hdr);
         if (!log) {
             // No log: return empty chunk (gateway will skip this subscription).
             ret_.tryEnqueue(std::move(ret));
@@ -502,16 +553,16 @@ private:
         }
 
         // Only read if there are records available (within the HW-bound).
-        if (op.nextOffset < op.hwBound) {
+        if (hdr->nextOffset < hdr->hwBound) {
             try {
                 // kMaxChunkBytes constant mirrored here; must stay in sync with
                 // ClientGateway.  Gateway sets hwBound before enqueuing.
                 static constexpr int32_t kMaxChunkBytes =
                     static_cast<int32_t>(512 * 1024); // 512 KiB
-                ret.chunk = log->read(op.nextOffset, kMaxChunkBytes);
+                ret.chunk = log->read(hdr->nextOffset, kMaxChunkBytes);
             } catch (const std::exception& ex) {
                 spdlog::warn("Worker {}: log->read threw for topicId={} partition={}: {}",
-                             workerId_, op.topicId, op.partition, ex.what());
+                             workerId_, hdr->topicId, hdr->partition, ex.what());
                 // Return empty chunk — gateway will skip + retry next cycle.
             } catch (...) {
                 spdlog::warn("Worker {}: log->read threw unknown exception", workerId_);
@@ -522,31 +573,39 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // executeApplyReplicated_ — apply a replicated FetchResponse to the
+    // executeApplyReplicatedWire_ — apply a replicated FetchResponse to the
     // owning follower replica.  Fire-and-forget (no WorkerReturn needed).
+    //
+    // The tail view IS the records bytes. We build a FetchResponseMsg whose
+    // records span points into the ring view, then call applyReplicated within
+    // this callback — applyReplicated copies into the follower log before we return.
     // -------------------------------------------------------------------
-    void executeApplyReplicated_(WorkerOp op) {
-        if (!op.replica) {
-            spdlog::warn("Worker {}: executeApplyReplicated_ — null replica for "
-                         "topicId={} partition={}", workerId_, op.topicId, op.partition);
+    void executeApplyReplicatedWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeApplyReplicatedWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
             return;
         }
 
-        // Reconstruct a FetchResponseMsg whose records span points into the
-        // copied buffer stored in op.replicatedPayload.records.
-        const auto& rp = op.replicatedPayload;
+        const uint8_t* tail    = workerOpTail(frame);
+        const uint32_t tailLen = hdr->tailLen;
+
         rune::replication::FetchResponseMsg msg;
-        msg.leaderEpoch   = rp.leaderEpoch;
-        msg.partition     = rp.partition;
-        msg.highWatermark = rp.highWatermark;
-        msg.logStartOffset = rp.logStartOffset;
-        msg.errorCode     = rp.errorCode;
-        msg.topicId       = rp.topicId;
-        // records is a span into the owned vector in op.replicatedPayload.
-        msg.records       = std::span<const uint8_t>(rp.records.data(), rp.records.size());
+        msg.leaderEpoch    = hdr->replLeaderEpoch;
+        msg.partition      = hdr->replPartition;
+        msg.highWatermark  = hdr->replHighWatermark;
+        msg.logStartOffset = hdr->replLogStartOffset;
+        msg.errorCode      = hdr->replErrorCode;
+        msg.topicId        = hdr->replTopicId;
+        // Zero-copy span: records view into the ring frame.
+        // Valid only inside this callback — applyReplicated copies before we return.
+        msg.records = std::span<const uint8_t>(
+            tail ? tail : static_cast<const uint8_t*>(nullptr),
+            static_cast<std::size_t>(tailLen));
 
         try {
-            op.replica->applyReplicated(msg);
+            replica->applyReplicated(msg);
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: applyReplicated threw: {}", workerId_, ex.what());
         } catch (...) {
@@ -555,85 +614,136 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // executeBecomeLeader_ — apply a replica role-change (Leader) on the
+    // executeBecomeLeaderWire_ — apply a replica role-change (Leader) on the
     // worker thread.  Fire-and-forget (no WorkerReturn needed).
     //
-    // Enqueued by ReplicationMetadataBridge when workerPool_ != nullptr
-    // (E2 shared-nothing fix: bridge runs on control thread, must not mutate
-    // a replica whose doWork() runs on this worker thread).
+    // The tail is the ISR list as NodeId[] (int32_t[], native LE).
+    // BecomeLeader is a rare path — alloc for the vector is acceptable.
     // -------------------------------------------------------------------
-    void executeBecomeLeader_(WorkerOp op) {
-        if (!op.replica) {
-            spdlog::warn("Worker {}: executeBecomeLeader_ — null replica for "
-                         "topicId={} partition={}", workerId_, op.topicId, op.partition);
+    void executeBecomeLeaderWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeBecomeLeaderWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
             return;
         }
+
+        // Rebuild ISR vector from the tail (rare path, alloc OK).
+        const uint8_t* tail    = workerOpTail(frame);
+        const uint32_t tailLen = hdr->tailLen;
+        std::vector<rune::replication::NodeId> isr;
+        if (tail && tailLen > 0) {
+            const std::size_t count = static_cast<std::size_t>(tailLen) /
+                                       sizeof(rune::replication::NodeId);
+            isr.resize(count);
+            std::memcpy(isr.data(), tail, count * sizeof(rune::replication::NodeId));
+        }
+
+        const rune::replication::Epoch epoch =
+            static_cast<rune::replication::Epoch>(hdr->roleEpoch);
+
         try {
-            op.replica->becomeLeader(op.roleEpoch, std::move(op.isr));
+            replica->becomeLeader(epoch, std::move(isr));
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeLeader threw for topicId={} partition={}: {}",
-                         workerId_, op.topicId, op.partition, ex.what());
+                         workerId_, hdr->topicId, hdr->partition, ex.what());
         } catch (...) {
             spdlog::warn("Worker {}: becomeLeader threw unknown exception", workerId_);
         }
     }
 
     // -------------------------------------------------------------------
-    // executeBecomeFollower_ — apply a replica role-change (Follower) on
+    // executeBecomeFollowerWire_ — apply a replica role-change (Follower) on
     // the worker thread.  Fire-and-forget (no WorkerReturn needed).
     //
-    // Enqueued by ReplicationMetadataBridge when workerPool_ != nullptr.
+    // Scalars only (no tail for BecomeFollower).
     // -------------------------------------------------------------------
-    void executeBecomeFollower_(WorkerOp op) {
-        if (!op.replica) {
-            spdlog::warn("Worker {}: executeBecomeFollower_ — null replica for "
-                         "topicId={} partition={}", workerId_, op.topicId, op.partition);
+    void executeBecomeFollowerWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeBecomeFollowerWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
             return;
         }
+        const rune::replication::Epoch  epoch    =
+            static_cast<rune::replication::Epoch>(hdr->roleEpoch);
+        const rune::replication::NodeId leaderId =
+            static_cast<rune::replication::NodeId>(hdr->roleLeaderId);
         try {
-            op.replica->becomeFollower(op.roleEpoch, op.roleLeaderId);
+            replica->becomeFollower(epoch, leaderId);
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeFollower threw for topicId={} partition={}: {}",
-                         workerId_, op.topicId, op.partition, ex.what());
+                         workerId_, hdr->topicId, hdr->partition, ex.what());
         } catch (...) {
             spdlog::warn("Worker {}: becomeFollower threw unknown exception", workerId_);
         }
     }
 
     // -------------------------------------------------------------------
-    // getLog_ — resolve the Log* for the op's (topicId, partition).
+    // executeSetOwnershipWire_ — replace this worker's owned_ set.
     //
-    // Preferentially uses the replica's log() accessor for disk-backed
-    // replicas.  Falls back to topicRegistry_ for memory-backed or if
-    // replica is null.
-    //
-    // topicRegistry_ is set via setTopicRegistry() (below) when the
-    // WorkerPool is wired up by BrokerNode.
+    // The tail is an array of uintptr_t (one per PartitionReplica*).
+    // Shared-nothing ([[rune-shared-nothing-law]]): applied on THIS worker
+    // thread — no cross-thread write to owned_.
     // -------------------------------------------------------------------
-    rune::storage::Log* getLog_(const WorkerOp& op) const noexcept {
-        // Prefer replica->log() for disk-backed (avoids separate registry lookup).
-        if (op.replica && op.replica->isDiskBacked()) {
-            return op.replica->log();
+    void executeSetOwnershipWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
+        const uint8_t* tail    = workerOpTail(frame);
+        const uint32_t tailLen = hdr->tailLen;
+
+        owned_.clear();
+        if (tail && tailLen > 0) {
+            const std::size_t count = static_cast<std::size_t>(tailLen) / sizeof(uintptr_t);
+            owned_.reserve(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                uintptr_t pval = 0;
+                std::memcpy(&pval, tail + i * sizeof(uintptr_t), sizeof(uintptr_t));
+                owned_.push_back(reinterpret_cast<rune::replication::PartitionReplica*>(pval));
+            }
         }
-        // Fall back to direct Log* pointer stored in op (set by gateway at
-        // enqueue time to avoid a registry lookup in doWork).
-        if (op.logPtr) {
-            return op.logPtr;
+    }
+
+    // -------------------------------------------------------------------
+    // getLogFromWire_ — resolve the Log* for the op's (topicId, partition)
+    //                   from the WorkerOpWire scalars.
+    //
+    // Mirrors the old getLog_(const WorkerOp&) but reads from the wire header.
+    // -------------------------------------------------------------------
+    rune::storage::Log* getLogFromWire_(const WorkerOpWire* hdr) const noexcept {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        // Prefer replica->log() for disk-backed (avoids separate registry lookup).
+        if (replica && replica->isDiskBacked()) {
+            return replica->log();
+        }
+        // Fall back to direct Log* pointer stored in wire header (set by gateway
+        // at enqueue time to avoid a registry lookup in doWork).
+        if (hdr->logPtr != 0) {
+            return reinterpret_cast<rune::storage::Log*>(hdr->logPtr);
         }
         return nullptr;
     }
 
     int32_t workerId_;
 
-    // E2 inc2a: per-worker SPSC rings.
-    SpscRing<WorkerOp>     ingress_;  // control thread → worker
-    SpscRing<WorkerReturn> ret_;      // worker → control thread
+    // R2: ingress ring — agrona OneToOneByteRing (SPSC, flat byte messages).
+    // Producer (control thread): tryEnqueueOp encodes into ingressScratch_ then write().
+    // Consumer (worker thread):  drainIngress_ drains → zero-copy view → executeFromWire_.
+    OneToOneByteRing ingress_;
+
+    // Per-worker encode scratch for ingress (producer-side, control-thread-owned).
+    // Sized to sizeof(WorkerOpWire) + ingress_.maxMsgLength() at construction.
+    // No alloc on the hot path — encodeWorkerOp writes into this buffer.
+    std::vector<uint8_t> ingressScratch_;
+
+    // Return ring: SpscRing<WorkerReturn> — unchanged until R3.
+    // worker → control thread.
+    SpscRing<WorkerReturn> ret_;
 
     // Owned replica set — SHARED-NOTHING ([[rune-shared-nothing-law]]): a PLAIN
     // member touched ONLY by the worker thread. No atomic, no cross-thread read.
     // Written via setOwnedDirect() at startup (before runners start, single-
-    // threaded) and via SetOwnership ring ops at runtime (applied in executeOp_
-    // on this worker's own thread). The control thread NEVER touches it.
+    // threaded) and via SetOwnership wire ops at runtime (applied in
+    // executeSetOwnershipWire_ on this worker's own thread). The control thread
+    // NEVER touches it.
     OwnedSet owned_{};
 
     // E3: per-worker async I/O backend.
