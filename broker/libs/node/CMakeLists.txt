@@ -85,6 +85,18 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
+    # E1 Task 2: Worker unit tests — drives per-replica duty steps for owned
+    # shards only (shared-nothing, no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_worker_tests
+        tests/node/WorkerTest.cpp)
+    target_link_libraries(rune_worker_tests PRIVATE
+        rune_node
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_worker_tests)
+
+    # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService unit tests — injected clock, fake leader toggle.
     # No Aeron required.
     # ---------------------------------------------------------------------------
