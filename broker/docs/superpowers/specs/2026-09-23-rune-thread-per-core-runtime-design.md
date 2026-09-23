@@ -103,13 +103,27 @@ internals differ.
 
 ## Components (isolated, well-bounded)
 
-- **`WorkerPool`** — owns N `Worker`s; core-affinity assignment; lifecycle (start/stop/
-  drain). N = (isolated cores − reserved), configurable.
-- **`Worker` (partition-worker agent)** — pinned busy-poll agent owning a set of `Shard`s.
-  `doWork(nowNs)` run-to-completion over owned shards each cycle: poll own ingress →
+- **Built on Aeron `Agent`/`AgentRunner` + configurable `IdleStrategy` (LOCKED — do NOT
+  hand-roll thread/loop machinery).** Rune already has `rune::consensus::Agent`
+  (`virtual int doWork(int64_t nowNs)=0`, faithful Agrona port) + `rune::consensus::AgentRunner`
+  (`AgentRunner(Agent&, IdleStrategy&, Clock)`) and already runs `NodeRuntimeAgent` and
+  `LogCleanerAgent` each on their own `AgentRunner` with a configurable idle strategy. Workers
+  reuse this exactly. **Idle strategy: default `BackoffIdleStrategy`** (spin → yield → park with
+  growing backoff — does NOT peg a core); per-worker configurable (an operator may opt a
+  dedicated isolated core into `BusySpinIdleStrategy`). Never a bare busy-spin default.
+- **`WorkerPool`** — owns N `Worker`s; assigns shards; lifecycle. **E1:** drives the workers
+  cooperatively from the existing single `AgentRunner` (no new threads — workers are Agents but
+  invoked in-line). **E2+:** each `Worker` gets its OWN `rune::consensus::AgentRunner` with its
+  own configurable `IdleStrategy` (default `Backoff`), pinned via affinity in E4 — mirroring how
+  `LogCleanerAgent` runs today. N = (isolated cores − reserved), configurable.
+- **`Worker` (partition-worker agent)** — implements `rune::consensus::Agent`
+  (`int doWork(int64_t nowNs) override`); owns a set of `Shard`s.
+  `doWork` run-to-completion over owned shards each cycle: poll own ingress →
   dispatch produce/fetch to the shard's `PartitionReplica` → reap `io_uring` completions →
   fire due deferred-acks → subscribe-push → poll cross-worker mailbox. Single-threaded; no
-  locks; no shared mutable state with other workers.
+  locks; no shared mutable state with other workers. The one `Agent::doWork` dispatch is
+  once-per-duty-cycle (the Aeron model) — NOT a per-record hot-path virtual, so it complies with
+  [[rune-no-virtual-calls-hot-path]] (the per-record path inside stays concrete).
 - **`Shard`** — `(coPartitionGroup, partitionIndex)` → the set of `PartitionReplica`s for
   that shard's partitions across the group's topics. Owned by exactly one `Worker`.
 - **`ShardRouter`** — pure deterministic functions: `key → (group,index) → shardId` and
