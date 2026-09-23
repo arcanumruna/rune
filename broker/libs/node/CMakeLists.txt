@@ -203,6 +203,30 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # MD1 Task 11: Multi-leader produce integration (Phase-1 exit criterion).
+    #
+    # 3-node in-process cluster: static assignment places partition leaders on
+    # DIFFERENT nodes; concurrent multi-leader produce all records land and HW
+    # advances per-partition on each partition's own leader; co-partition group
+    # co-location asserted end-to-end; majority-quorum ack (acks=all) proven;
+    # records readable per-partition HW-bounded.
+    #
+    # Uses InMemoryTransport (no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_multi_leader_produce_tests
+        tests/integration/MultiLeaderProduceTest.cpp)
+    target_include_directories(rune_multi_leader_produce_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_multi_leader_produce_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_multi_leader_produce_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # TX-2b: ProducerStateManager durability across restart and leader failover.
     # Uses InMemoryTransport (3-in-process nodes, no Aeron required).
     # Verifies that PSM is rebuilt from the partition Log so a duplicate produce
