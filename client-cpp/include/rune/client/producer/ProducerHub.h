@@ -130,6 +130,20 @@ public:
     /// CB-5 B: true if any producer has an in-flight (unacked) batch.
     [[nodiscard]] bool hasInFlight() const noexcept;
 
+    /// MD1 review IMPORTANT-1: find the (topicId, partition) for an in-flight
+    /// corrId across all producers.  Returns true and sets the out params if
+    /// found; false if unknown.  Agent-thread only (redirect handler).
+    [[nodiscard]] bool partitionForCorrId(int64_t corrId,
+                                          int32_t& topicId,
+                                          int32_t& partition) const noexcept;
+
+    /// MD1 review IMPORTANT-2: return the (topicId, partition) of the first
+    /// partition with pending or in-flight produce work across all producers.
+    /// Returns true and sets the out params if any exists; false otherwise.
+    /// Agent-thread only (produce drain routing).
+    [[nodiscard]] bool firstPendingPartition(int32_t& topicId,
+                                             int32_t& partition) const noexcept;
+
 
 private:
     // ---- Wait-free snapshot pointer ------------------------------------------

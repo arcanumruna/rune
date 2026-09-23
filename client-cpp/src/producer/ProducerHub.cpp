@@ -134,4 +134,29 @@ void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now
     }
 }
 
+bool ProducerHub::partitionForCorrId(int64_t corrId,
+                                     int32_t& topicId,
+                                     int32_t& partition) const noexcept
+{
+    const ImplList* snap = snapshot_.load(std::memory_order_acquire);
+    for (const auto& impl : *snap) {
+        if (impl->partitionForCorrId(corrId, topicId, partition)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ProducerHub::firstPendingPartition(int32_t& topicId,
+                                        int32_t& partition) const noexcept
+{
+    const ImplList* snap = snapshot_.load(std::memory_order_acquire);
+    for (const auto& impl : *snap) {
+        if (impl->firstPendingPartition(topicId, partition)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace rune::client::producer

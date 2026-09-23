@@ -394,6 +394,21 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_redirect_tests)
+
+        # ── MD1 Task 10 review — metadata routing against a real gateway ──────
+        add_executable(rune_metadata_routing_tests
+            tests/client/MetadataRoutingTest.cpp
+        )
+        target_include_directories(rune_metadata_routing_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_metadata_routing_tests PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            GTest::gtest_main
+        )
+        gtest_discover_tests(rune_metadata_routing_tests)
     endif()
 
     # ── Producer tests (CB-2) — auto-batch, partitioning, acks, idempotence ──

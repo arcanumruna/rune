@@ -80,6 +80,7 @@ Client::Client(ClientConfig cfg)
     , nextSweep_(std::chrono::steady_clock::now() +
                  std::chrono::milliseconds(kSweepIntervalMs))
     , partitionRouter_(metadataCache_)
+    , currentLeaderChannel_(cfg_.gatewayChannel)  // MD1 IMPORTANT-2: seed w/ initial gateway
 {
     // Wire the egress observer BEFORE starting the agent (CC-5 contract).
     agent_.setEgressObserver([this](codec::TemplateId tid,
@@ -95,6 +96,17 @@ Client::Client(ClientConfig cfg)
     agent_.setProducerDrainFn(
         [this](int64_t nowNs, int64_t sessionId,
                agent::ClientAgent::SendFn sendFn) -> int {
+            // MD1 IMPORTANT-2: before flushing produce frames, consult the
+            // PartitionRouter.  If the pending produce partition's cached leader
+            // endpoint differs from the current connection, retarget+reconnect so
+            // the produce lands DIRECT on the partition leader.  When a retarget
+            // is initiated we skip this drain cycle: drainAndFlush would emit onto
+            // the old (follower) connection with a soon-to-be-stale session.  The
+            // held frames flush on the next ConnectResponse{OK} (redirectPending_
+            // machinery), re-stamped with the leader session — same as a redirect.
+            if (routeProduceToLeader()) {
+                return 1; // did routing work; defer the flush to post-reconnect
+            }
             int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
             // TX-5: drain all transactional producers (rarely >1; mutex is fine).
             std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
@@ -469,6 +481,11 @@ void Client::sweepTimeouts() {
         groupConsumerHub_.doWork(nowNs, snap.sessionId, sendFn);
     }
 
+    // --- MD1 IMPORTANT-3: fire an armed background metadata refresh if due ------
+    // No-op unless a refresh was armed (unknown leader / repeated redirects) and
+    // its exponential-backoff window has elapsed while Connected.
+    tickMetadataRefresh();
+
     // --- M2 FIX: Disconnected-while-redirectPending_ prompt fail ---------------
     // When a redirect-triggered reconnect exhausts its connect retries (SessionMachine
     // tickConnecting → Disconnected), the Client has no Disconnected callback wired
@@ -655,6 +672,52 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
 
             const std::string newEndpoint(opt->message);
+
+            // MD1 IMPORTANT-1: zero-RTT metadata cache update from the REAL
+            // redirect frame — no full MetadataRequest round-trip needed to
+            // reroute.  MD1-9's broker REDIRECT carries the target ENDPOINT in
+            // the message field (the {leaderId,leaderEpoch} were logged, not
+            // wire-encoded).  So we recover the affected partition from OUR OWN
+            // request context (the in-flight produce corrId → topicId/partition)
+            // and resolve the endpoint back to an authoritative nodeId via the
+            // broker set we already cached.  If both resolve, update the cache in
+            // place so the very next route targets the new node immediately.  A
+            // background refresh (with backoff) is also armed so the
+            // authoritative {leaderNode,leaderEpoch} is reconciled shortly after.
+            {
+                int32_t rTopicId = -1, rPartition = -1;
+                if (producerHub_.partitionForCorrId(
+                        opt->correlationId, rTopicId, rPartition)) {
+                    // Normalise the redirect target to the cache's "host:port"
+                    // key: strip an "...endpoint=" prefix if present.
+                    std::string cacheEp = newEndpoint;
+                    const auto epPos = cacheEp.find("endpoint=");
+                    if (epPos != std::string::npos) {
+                        cacheEp = cacheEp.substr(epPos + 9u);
+                    }
+                    const int32_t newNodeId =
+                        metadataCache_.nodeIdForEndpoint(cacheEp);
+                    if (newNodeId != metadata::MetadataCache::kNoLeader) {
+                        // Provisional epoch = current+1 so the staleness rule
+                        // accepts it; the authoritative epoch overwrites it when
+                        // the background MetadataResponse arrives.
+                        const int32_t curEpoch =
+                            metadataCache_.epochFor(rTopicId, rPartition);
+                        const int32_t newEpoch = (curEpoch >= 0) ? (curEpoch + 1) : 0;
+                        metadataCache_.updatePartitionLeader(
+                            rTopicId, rPartition, newNodeId, newEpoch);
+                        // IMPORTANT-2: we now KNOW which node the session is
+                        // following — record it so proactive routing can avoid
+                        // re-sending to the wrong node.
+                        currentLeaderNode_ = newNodeId;
+                    }
+                }
+                // No-progress (unknown corrId / endpoint not in broker set):
+                // arm a background metadata refresh with exponential backoff so
+                // the authoritative map is reconciled without storming.
+                scheduleMetadataRefresh();
+            }
+
             // Retarget transport to the leader's client endpoint.
             // If the endpoint is already a full Aeron channel URI (starts with
             // "aeron:"), use it as-is (test / ipc scenarios).  Otherwise treat
@@ -669,6 +732,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             const bool retargeted = agent_.retarget(newChannel);
 
             if (retargeted) {
+                // MD1 IMPORTANT-2: record the connection's new leader channel so
+                // proactive produce routing compares against the right target.
+                currentLeaderChannel_ = newChannel;
                 // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
                 // rejected by a FOLLOWER.  We must:
                 //   (1) reconnect to the leader with a FRESH session (the leader
@@ -1254,6 +1320,130 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     for (const auto& [topicId, maxP] : maxPartition) {
         partitionRouter_.setTopicPartitionCount(topicId, maxP + 1);
     }
+
+    // MD1 IMPORTANT-3: a fresh authoritative map arrived — reset the backoff to
+    // its initial interval so a future no-progress episode starts from the floor,
+    // and disarm any pending refresh (we just refreshed).
+    metadataBackoffNs_     = kMetadataBackoffInitNs;
+    nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
+}
+
+// ---------------------------------------------------------------------------
+// MD1 IMPORTANT-3: scheduleMetadataRefresh() — arm a backoff-gated refresh
+// ---------------------------------------------------------------------------
+//
+// Called on no-progress (unknown partition leader / repeated redirects).  Arms
+// the next refresh at now+backoff, then DOUBLES the backoff (capped at
+// kMetadataBackoffMaxNs) so a run of redirects can't storm the broker with
+// MetadataRequests.  The armed refresh fires from tickMetadataRefresh().
+void Client::scheduleMetadataRefresh() noexcept {
+    // Idempotent while armed: the drain hook may call this every cycle on a
+    // sustained no-progress condition.  Re-arming each call would push the
+    // deadline forward forever (it would never fire) and blow the backoff to the
+    // cap instantly.  So only arm+double when NOT already armed; the doubling
+    // then happens once per fired-then-rescheduled episode.
+    if (nextMetadataRefreshAt_ != std::chrono::steady_clock::time_point::max()) {
+        return; // already armed — leave the pending deadline in place
+    }
+    nextMetadataRefreshAt_ = std::chrono::steady_clock::now() +
+        std::chrono::nanoseconds(metadataBackoffNs_);
+
+    if (metadataBackoffNs_ <= kMetadataBackoffMaxNs / 2) {
+        metadataBackoffNs_ *= 2;
+    } else {
+        metadataBackoffNs_ = kMetadataBackoffMaxNs;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MD1 IMPORTANT-3: tickMetadataRefresh() — fire an armed refresh if due
+// ---------------------------------------------------------------------------
+//
+// Called from sweepTimeouts() (~kSweepIntervalMs cadence).  Fires a
+// MetadataRequest iff a refresh is armed, its backoff window has elapsed, and
+// the session is Connected.  After firing it disarms (max()) so we don't spam
+// until the next scheduleMetadataRefresh().
+void Client::tickMetadataRefresh() noexcept {
+    if (nextMetadataRefreshAt_ == std::chrono::steady_clock::time_point::max()) {
+        return; // not armed
+    }
+    const auto snap = agent_.stateAndSessionId();
+    if (snap.state != session::SessionState::Connected) return;
+    if (snap.sessionId == 0) return;
+
+    if (std::chrono::steady_clock::now() < nextMetadataRefreshAt_) return;
+
+    nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max(); // disarm
+    sendMetadataRequest(snap.sessionId);
+}
+
+// ---------------------------------------------------------------------------
+// MD1 IMPORTANT-2: routeProduceToLeader() — proactive per-partition routing
+// ---------------------------------------------------------------------------
+//
+// If there is pending/in-flight produce work whose partition leader (per the
+// cached metadata) lives on a DIFFERENT endpoint than the current connection,
+// retarget the transport to that leader and reconnect so the produce lands
+// DIRECT on the partition leader.  The held produce frames flush on the next
+// ConnectResponse{OK} via the redirectPending_ machinery (re-stamped with the
+// leader session).  Returns true if a retarget was initiated this cycle.
+//
+// PHASE-1 LIMITATION: the client transport maintains a SINGLE session /
+// publication.  True multi-endpoint connection management (N simultaneous
+// leader connections) is a larger change deferred beyond Phase 1.  Here,
+// route-selection drives the target endpoint via cached metadata and reuses the
+// existing connect/redirect machinery to REACH that leader on the one session.
+bool Client::routeProduceToLeader() noexcept {
+    // Only route when a reconnect isn't already in flight (avoid churn).
+    if (redirectPending_.load(std::memory_order_acquire)) return false;
+
+    int32_t topicId = -1, partition = -1;
+    if (!producerHub_.firstPendingPartition(topicId, partition)) return false;
+
+    // Resolve the partition leader's node from cached metadata.
+    const int32_t leaderNode = metadataCache_.leaderFor(topicId, partition);
+    if (leaderNode == metadata::MetadataCache::kNoLeader) {
+        // Unknown leader for this partition → no-progress: arm a background
+        // metadata refresh (backoff) and stay put; the broker will REDIRECT if
+        // we're on the wrong node.
+        scheduleMetadataRefresh();
+        return false;
+    }
+
+    // Already following this leader (or we haven't yet learned which node the
+    // initial gateway connection is — currentLeaderNode_ == -1)?  Do NOT
+    // proactively churn the working connection.  When we ARE on the wrong node
+    // the broker REDIRECT teaches us currentLeaderNode_ (see the redirect
+    // handler) and the zero-RTT cache update keeps subsequent routes correct.
+    if (currentLeaderNode_ < 0 || leaderNode == currentLeaderNode_) {
+        return false;
+    }
+
+    // The cached leader differs from the node we're on → route DIRECT to it.
+    const std::string endpoint = metadataCache_.endpointFor(leaderNode);
+    if (endpoint.empty()) {
+        scheduleMetadataRefresh();
+        return false;
+    }
+    const std::string leaderChannel =
+        (endpoint.rfind("aeron:", 0) == 0)
+            ? endpoint
+            : ("aeron:udp?endpoint=" + endpoint);
+    if (leaderChannel == currentLeaderChannel_) return false;
+
+    // Retarget to the partition leader + reconnect; defer the produce flush to
+    // the next ConnectResponse{OK} (redirectPending_) so it carries the leader
+    // session — identical to the redirect-follow contract.
+    if (!agent_.retarget(leaderChannel)) return false;
+    currentLeaderChannel_ = leaderChannel;
+    currentLeaderNode_    = leaderNode;
+
+    bool expected = false;
+    if (redirectPending_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        agent_.submitReconnect();
+    }
+    return true;
 }
 
 } // namespace rune::client

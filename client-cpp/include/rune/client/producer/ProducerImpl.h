@@ -284,6 +284,50 @@ public:
     /// (i.e. a redirect resend would have something to flush).
     [[nodiscard]] bool hasInFlight() const noexcept { return !batchMap_.empty(); }
 
+    /// MD1 review IMPORTANT-1: look up the (topicId, partition) for an in-flight
+    /// corrId.  Returns true and sets topicId+partition if found; false if the
+    /// corrId is not in batchMap_.  Called on the agent thread from the redirect
+    /// handler so the MetadataCache can be updated with the affected partition.
+    [[nodiscard]] bool partitionForCorrId(int64_t corrId,
+                                          int32_t& topicIdOut,
+                                          int32_t& partitionOut) const noexcept {
+        const auto it = batchMap_.find(corrId);
+        if (it == batchMap_.end()) return false;
+        topicIdOut   = it->second.topicId;
+        partitionOut = it->second.partition;
+        return true;
+    }
+
+    /// MD1 review IMPORTANT-2: return the (topicId, partition) of the first
+    /// partition that currently has produce work — either accumulated in a
+    /// PartitionState (records appended / Tier-2 queued) or already in-flight
+    /// (batchMap_).  Returns true and sets the out params if any such partition
+    /// exists; false otherwise.  Called on the agent thread so the produce path
+    /// can resolve the partition leader's endpoint via the PartitionRouter and
+    /// route the produce DIRECT to that leader using cached metadata.
+    [[nodiscard]] bool firstPendingPartition(int32_t& topicIdOut,
+                                             int32_t& partitionOut) const noexcept {
+        // Prefer an accumulated (not-yet-sent) partition: routing it BEFORE the
+        // frame goes out is the zero-extra-hop path.
+        for (const auto& [key, ps] : partitions_) {
+            const bool hasTier1 = (ps.batchStartNs != 0) || ps.flushRequested;
+            const bool hasTier2 = !ps.pendingTier2Entries.empty();
+            if (hasTier1 || hasTier2) {
+                topicIdOut   = ps.topicId;
+                partitionOut = ps.partition;
+                return true;
+            }
+        }
+        // Fall back to an in-flight batch (already sent, awaiting ack).
+        if (!batchMap_.empty()) {
+            const auto& bi = batchMap_.begin()->second;
+            topicIdOut   = bi.topicId;
+            partitionOut = bi.partition;
+            return true;
+        }
+        return false;
+    }
+
     /// Called from Client::sweepTimeouts(): fail acks older than the deadline.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 

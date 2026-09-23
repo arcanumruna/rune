@@ -155,6 +155,17 @@ public:
         return endpoints_.count(nodeId) > 0;
     }
 
+    /// MD1 review IMPORTANT-1: return the nodeId whose "host:port" endpoint
+    /// matches the given string, or kNoLeader if no known broker has it.
+    /// Used to resolve a REDIRECT endpoint back to an authoritative nodeId so a
+    /// zero-RTT cache update can record {partition → leaderNode} in place.
+    [[nodiscard]] int32_t nodeIdForEndpoint(const std::string& endpoint) const noexcept {
+        for (const auto& [nodeId, ep] : endpoints_) {
+            if (ep == endpoint) return nodeId;
+        }
+        return kNoLeader;
+    }
+
     /// Number of known partitions in the cache.
     [[nodiscard]] std::size_t partitionCount() const noexcept {
         return table_.size();

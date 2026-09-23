@@ -434,13 +434,78 @@ private:
     // correlationId for the most recently sent MetadataRequest (0 = none).
     int64_t pendingMetadataCorrId_ {0};
 
+    // ---- MD1 review IMPORTANT-2: proactive per-partition produce routing ------
+    // The channel URI the transport is currently connected to.  Seeded from the
+    // config gateway channel and updated on every retarget (redirect or route).
+    // Agent-thread-only.
+    std::string currentLeaderChannel_;
+
+    // The broker nodeId the session is currently believed to be on, or -1 when
+    // unknown (the initial gateway connection — we don't know which node it is
+    // until a REDIRECT teaches us).  Proactive routing only retargets when the
+    // partition's cached leader node is KNOWN, differs from this, and this is
+    // itself known — so we never churn away from a working initial connection.
+    // Agent-thread-only.
+    int32_t currentLeaderNode_ {-1};
+
+    // ---- MD1 review IMPORTANT-3: background metadata refresh w/ backoff -------
+    // When no-progress is detected (unknown partition leader / repeated
+    // redirects) a metadata refresh is scheduled with EXPONENTIAL backoff so the
+    // client cannot storm the broker.  metadataBackoffNs_ is the wait before the
+    // NEXT scheduled refresh; it doubles per schedule up to the cap and resets on
+    // a successful MetadataResponse.  nextMetadataRefreshAt_ == time_point::max()
+    // means "no refresh armed".  Agent-thread-only.
+    static constexpr int64_t kMetadataBackoffInitNs = 100'000'000LL;    // 100 ms
+    static constexpr int64_t kMetadataBackoffMaxNs  = 30'000'000'000LL; // 30 s
+    int64_t metadataBackoffNs_ {kMetadataBackoffInitNs};
+    std::chrono::steady_clock::time_point nextMetadataRefreshAt_ {
+        std::chrono::steady_clock::time_point::max()};  // max() = not armed
+
     // sendMetadataRequest() — encodes and submits a MetadataRequest for all
-    // topics to the agent ring.  Called on the runner thread after ConnectResponse{OK}.
+    // topics to the agent ring.  Called on the runner thread after
+    // ConnectResponse{OK} and by the backoff refresh sweep.
     void sendMetadataRequest(int64_t sessionId) noexcept;
+
+    // scheduleMetadataRefresh() — arm a background metadata refresh with
+    // exponential backoff (IMPORTANT-3).  Called on no-progress.  The backoff
+    // doubles each call (capped) so the client can't storm.
+    void scheduleMetadataRefresh() noexcept;
+
+    // tickMetadataRefresh() — fire an armed refresh if its backoff window has
+    // elapsed and the session is Connected.  Called from sweepTimeouts().
+    void tickMetadataRefresh() noexcept;
+
+    // routeProduceToLeader() — IMPORTANT-2: if a pending/in-flight produce
+    // partition's cached leader endpoint differs from the current connection,
+    // retarget the transport to that leader and reconnect so the produce lands
+    // DIRECT on the partition leader.  Returns true if a retarget was initiated.
+    // Called on the agent thread from the produce drain hook.
+    bool routeProduceToLeader() noexcept;
 
     // onMetadataResponse() — updates the cache from a decoded MetadataResponse.
     // Called on the runner thread via the metadataResponseFn_ hook.
     void onMetadataResponse(const codec::MetadataResponseDecoded& resp) noexcept;
+
+public:
+    // ---- MD1 review: test-only inspection hooks (agent-thread state) ----------
+    // These expose the routing decision so tests can assert a keyed produce
+    // resolves to the correct partition leader's endpoint via cached metadata,
+    // and that a redirect updates the cache with zero full-refresh round-trip.
+    // NOT part of the production API surface; safe to call only when the runner
+    // is quiescent (tests pump deterministically).
+    [[nodiscard]] std::string testRouteEndpoint(int32_t topicId,
+                                                const Key& key) const {
+        return partitionRouter_.routeKey(topicId, key).channel;
+    }
+    [[nodiscard]] int32_t testLeaderFor(int32_t topicId, int32_t partition) const {
+        return metadataCache_.leaderFor(topicId, partition);
+    }
+    [[nodiscard]] int32_t testEpochFor(int32_t topicId, int32_t partition) const {
+        return metadataCache_.epochFor(topicId, partition);
+    }
+    [[nodiscard]] std::string testCurrentLeaderChannel() const {
+        return currentLeaderChannel_;
+    }
 };
 
 } // namespace rune::client
