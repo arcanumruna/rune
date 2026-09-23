@@ -34,8 +34,21 @@
 //             Encode (tryEnqueueOp) → scratch → write (1 copy into ring).
 //             Decode (drainIngress_) → zero-copy view into the ring frame.
 //
-//   return_:  SpscRing<WorkerReturn> (unchanged — R3 will migrate this).
-//             producer = doWork; consumer = gateway (drains in gateway::doWork).
+//   ret_:     R3: OneToOneByteRing carrying flat [WorkerReturnWire][tail] messages.
+//             producer = doWork (worker thread); consumer = gateway (drains in
+//             gateway::doWork on the control thread).
+//             Encode (worker): encodeWorkerReturn → returnScratch_ → ret_.write().
+//             Decode (gateway): drainReturn() decodes each frame into a WorkerReturn
+//             (scalars from WorkerReturnWire + chunk copied from tail) and calls fn.
+//             Back-pressure: ret_.write() returns false when full → the encode+write
+//             is skipped (the return is dropped for that cycle).
+//             OLD BEHAVIOUR (SpscRing): ret_.tryEnqueue() was [[nodiscard]] but its
+//             return value was NEVER checked at any call site — i.e. full = silent drop.
+//             NEW BEHAVIOUR (R3): write() returns false on full → same silent-drop
+//             semantics. A TODO/warn is left to make this observable.
+//             NOTE: this is safe for best-effort acks (acks=Leader/None), but could
+//             in theory delay a deferred-ack (acks=All) by one drain cycle.
+//             TODO(R5): audit full-ret_ back-pressure; add retry logic if needed.
 //
 //   doWork order:
 //     1. Drain ingress_ (execute ops, enqueue returns).
@@ -45,14 +58,14 @@
 //   (never drop, never overwrite).
 //
 // Ring sizing:
-//   kIngressByteCapacity = 8 MiB payload bytes (power-of-two).
-//   maxMsgLength() = capacity / 8 = 1 MiB — exceeds any practical produce batch.
-//   // TODO(R4): thread NodeConfig.workerIngressByteCapacity to the ctor for
-//   //            runtime configurability.
+//   kIngressByteCapacity  = 8 MiB payload bytes (power-of-two).
+//   kReturnByteCapacity   = 8 MiB payload bytes (power-of-two).
+//   maxMsgLength() = capacity / 8 = 1 MiB — exceeds any practical chunk (512 KiB).
+//   // TODO(R4): thread NodeConfig.*ByteCapacity to the ctor for runtime
+//   //            configurability.
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
-#include <rune/node/SpscRing.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerWire.h>
@@ -82,13 +95,15 @@ public:
     // TODO(R4): thread NodeConfig.workerIngressByteCapacity here.
     static constexpr int kIngressByteCapacity = 8 * 1024 * 1024; // 8 MiB
 
-    // Return ring slot capacity (SpscRing<WorkerReturn>, unchanged until R3).
-    // Power of two; 256 slots is sufficient for one duty cycle.
-    static constexpr std::size_t kRetRingCapacity = 256;
+    // R3: return ring byte capacity (power-of-two payload bytes).
+    // maxMsgLength() = capacity / 8 = 1 MiB — exceeds the 512 KiB max PushRead chunk.
+    // TODO(R4): thread NodeConfig.workerReturnByteCapacity here.
+    static constexpr int kReturnByteCapacity = 8 * 1024 * 1024; // 8 MiB
 
     // Legacy alias — callers that pass Worker::kRingCapacity to the ctor still
-    // compile; the value is now used for ret_ (SpscRing slots) only.
-    static constexpr std::size_t kRingCapacity = kRetRingCapacity;
+    // compile; the value is now ignored (both rings use their *ByteCapacity constants).
+    static constexpr std::size_t kRetRingCapacity = 256;  // kept for back-compat
+    static constexpr std::size_t kRingCapacity    = kRetRingCapacity;
 
     // Default IoBackend ring depths (power-of-two).  NodeConfig wiring (Task 7)
     // will pass these explicitly; for now the constructor defaults are sensible.
@@ -103,7 +118,7 @@ public:
 
     // ctor: ringCapacity is kept for source-compat — it was the SpscRing slot
     // count; now it is IGNORED (ingress uses kIngressByteCapacity; ret_ uses
-    // kRetRingCapacity). Callers that pass Worker::kRingCapacity still compile.
+    // kReturnByteCapacity). Callers that pass Worker::kRingCapacity still compile.
     explicit Worker(int32_t workerId,
                     std::size_t ringCapacity    = kRingCapacity,  // ignored (back-compat)
                     std::size_t ioSubmitDepth   = kIoSubmitDepth,
@@ -112,7 +127,9 @@ public:
         , ingress_(kIngressByteCapacity)
         , ingressScratch_(sizeof(WorkerOpWire) +
                           static_cast<std::size_t>(ingress_.maxMsgLength()))
-        , ret_(kRetRingCapacity)
+        , ret_(kReturnByteCapacity)
+        , returnScratch_(sizeof(WorkerReturnWire) +
+                         static_cast<std::size_t>(ret_.maxMsgLength()))
         , io_(ioSubmitDepth, ioComplDepth)
     {
         (void)ringCapacity; // kept for source-compat; no longer used
@@ -120,8 +137,7 @@ public:
         dirtyThisCycle_.reserve(kDirtySetReserve);
     }
 
-    // Non-copyable and non-movable (OneToOneByteRing + SpscRing<WorkerReturn> are not
-    // movable).
+    // Non-copyable and non-movable (two OneToOneByteRing members are not movable).
     Worker(const Worker&)            = delete;
     Worker& operator=(const Worker&) = delete;
     Worker(Worker&&)                 = delete;
@@ -171,13 +187,69 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // E2 inc2a: return ring accessor (consumer = gateway, on control thread).
+    // R3: return ring drain (consumer = gateway, on control thread).
     //
-    // Unchanged — ret_ is still SpscRing<WorkerReturn> until R3.
+    // ret_ is now a OneToOneByteRing carrying flat [WorkerReturnWire][tail]
+    // messages.  This template drains the ring, decodes each frame into a
+    // WorkerReturn struct (scalars from WorkerReturnWire; chunk copied from the
+    // tail view), and calls fn(WorkerReturn) — same callback signature as before.
+    //
+    // The tail view (PushReadResult chunk) is fully consumed (copied into
+    // WorkerReturn.chunk) before fn returns.  No view escapes the callback.
+    //
+    // fn must be callable as fn(rune::node::WorkerReturn).
     // -----------------------------------------------------------------------
     template <typename Fn>
     std::size_t drainReturn(Fn&& fn) {
-        return ret_.drain(std::forward<Fn>(fn));
+        int drained = ret_.drain(
+            [&fn](int32_t /*typeId*/,
+                  aeron::concurrent::AtomicBuffer& buf,
+                  aeron::util::index_t off,
+                  aeron::util::index_t /*len*/)
+            {
+                const uint8_t* frame =
+                    reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
+                const WorkerReturnWire* hdr = decodeWorkerReturnHeader(frame);
+
+                // Reconstruct WorkerReturn from the wire header.
+                WorkerReturn ret;
+                ret.type                 = static_cast<WorkerReturn::Type>(hdr->type);
+                ret.sessionId            = hdr->sessionId;
+                ret.correlationId        = hdr->correlationId;
+                ret.partition            = hdr->partition;
+                ret.baseOffset           = hdr->baseOffset;
+                ret.lastOffset           = hdr->lastOffset;
+                ret.errorCode            = hdr->errorCode;
+                ret.deferAck             = hdr->deferAck != 0;
+                ret.replica              = reinterpret_cast<
+                    rune::replication::PartitionReplica*>(hdr->replica);
+                ret.producerId           = hdr->producerId;
+                ret.producerEpoch        = hdr->producerEpoch;
+                ret.baseSequence         = hdr->baseSequence;
+                ret.recordCount          = hdr->recordCount;
+                ret.topicId              = hdr->topicId;
+                ret.batchAttrs           = hdr->batchAttrs;
+                ret.enqueuedAtNs         = hdr->enqueuedAtNs;
+                ret.subscriptionId       = hdr->subscriptionId;
+                ret.readTopicId          = hdr->readTopicId;
+                ret.readPartition        = hdr->readPartition;
+                ret.newNextOffset        = hdr->newNextOffset;
+                ret.hwBound              = hdr->hwBound;
+                ret.isolation            = hdr->isolation;
+                ret.isGroup              = hdr->isGroup != 0;
+                ret.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+
+                // Tail: PushReadResult chunk — copy from ring view (1 copy).
+                // The view is valid only for the duration of this callback; we
+                // copy into ret.chunk so fn can access it safely.
+                const uint8_t* tail = workerReturnTail(frame);
+                if (tail && hdr->tailLen > 0) {
+                    ret.chunk.assign(tail, tail + hdr->tailLen);
+                }
+
+                fn(std::move(ret));
+            });
+        return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
     // -----------------------------------------------------------------------
@@ -244,6 +316,34 @@ public:
 
 private:
     // -----------------------------------------------------------------------
+    // enqueueReturn_ — R3: encode a WorkerReturn into returnScratch_ and
+    //                  write it to the ret_ OneToOneByteRing.
+    //
+    // OLD BEHAVIOUR (SpscRing): ret_.tryEnqueue() was [[nodiscard]] but its
+    // return value was NEVER checked at any call site — i.e. a full ring caused
+    // a silent drop of the return message.
+    // NEW BEHAVIOUR (R3): ret_.write() returns false when full → same silent-
+    // drop.  A warn is emitted to make this observable.
+    // TODO(R5): audit full-ret_ back-pressure; consider retry/hold-and-retry.
+    //
+    // Worker-thread only (the producer side of ret_).
+    // -----------------------------------------------------------------------
+    void enqueueReturn_(const WorkerReturn& ret) {
+        std::size_t n = 0;
+        try {
+            n = encodeWorkerReturn(ret, returnScratch_.data(), returnScratch_.size());
+        } catch (const std::exception& ex) {
+            spdlog::error("Worker {}: enqueueReturn_ encode failed: {}", workerId_, ex.what());
+            return;
+        }
+        if (!ret_.write(returnScratch_.data(), n, workerReturnMsgTypeId(ret))) {
+            // TODO(R5): add retry or back-pressure propagation.
+            spdlog::warn("Worker {}: ret_ ring full — WorkerReturn type={} dropped",
+                         workerId_, static_cast<int>(ret.type));
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // submitCoalescedFlushes_ — group-commit: submit ONE fsync per dirty log.
     //
     // Called from doWork AFTER drainIngress_ (so all this-cycle appends are
@@ -276,7 +376,7 @@ private:
                     auto& entry = durablePending_[i];
                     if (entry.token == kNoToken && entry.logPtr == log) {
                         entry.ret.errorCode = static_cast<int16_t>(6); // Internal
-                        ret_.tryEnqueue(std::move(entry.ret));
+                        enqueueReturn_(entry.ret);
                         // O(1) erase by swap-with-back.
                         durablePending_[i] = std::move(durablePending_.back());
                         durablePending_.pop_back();
@@ -343,7 +443,7 @@ private:
                     } else {
                         entry.ret.errorCode = 0; // OK
                     }
-                    ret_.tryEnqueue(std::move(entry.ret));
+                    enqueueReturn_(entry.ret);
                     // Erase by swap-with-back + pop (O(1), order irrelevant for acks).
                     durablePending_[i] = std::move(durablePending_.back());
                     durablePending_.pop_back();
@@ -451,7 +551,7 @@ private:
                           "sending Internal error",
                           workerId_, hdr->topicId, hdr->partition);
             ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
-            ret_.tryEnqueue(std::move(ret));
+            enqueueReturn_(ret);
             return;
         }
 
@@ -483,12 +583,12 @@ private:
         } catch (const std::exception& ex) {
             spdlog::error("Worker {}: appendNoSync threw: {}", workerId_, ex.what());
             ret.errorCode = static_cast<int16_t>(6); // Internal
-            ret_.tryEnqueue(std::move(ret));
+            enqueueReturn_(ret);
             return;
         } catch (...) {
             spdlog::error("Worker {}: appendNoSync threw unknown exception", workerId_);
             ret.errorCode = static_cast<int16_t>(6); // Internal
-            ret_.tryEnqueue(std::move(ret));
+            enqueueReturn_(ret);
             return;
         }
 
@@ -522,7 +622,7 @@ private:
 
         // Default (tier 0 / tier 1) or memory-backed: enqueue immediately.
         ret.errorCode = 0;
-        ret_.tryEnqueue(std::move(ret));
+        enqueueReturn_(ret);
     }
 
     // -------------------------------------------------------------------
@@ -548,7 +648,7 @@ private:
         rune::storage::Log* log = getLogFromWire_(hdr);
         if (!log) {
             // No log: return empty chunk (gateway will skip this subscription).
-            ret_.tryEnqueue(std::move(ret));
+            enqueueReturn_(ret);
             return;
         }
 
@@ -569,7 +669,7 @@ private:
             }
         }
 
-        ret_.tryEnqueue(std::move(ret));
+        enqueueReturn_(ret);
     }
 
     // -------------------------------------------------------------------
@@ -734,9 +834,15 @@ private:
     // No alloc on the hot path — encodeWorkerOp writes into this buffer.
     std::vector<uint8_t> ingressScratch_;
 
-    // Return ring: SpscRing<WorkerReturn> — unchanged until R3.
-    // worker → control thread.
-    SpscRing<WorkerReturn> ret_;
+    // R3: return ring — agrona OneToOneByteRing (SPSC, flat byte messages).
+    // Producer (worker thread): encodeWorkerReturn into returnScratch_ then ret_.write().
+    // Consumer (control thread): drainReturn() drains → decode view → fn(WorkerReturn).
+    OneToOneByteRing ret_;
+
+    // Per-worker encode scratch for return (producer-side, worker-thread-owned).
+    // Sized to sizeof(WorkerReturnWire) + ret_.maxMsgLength() at construction.
+    // No alloc on the hot path — encodeWorkerReturn writes into this buffer.
+    std::vector<uint8_t> returnScratch_;
 
     // Owned replica set — SHARED-NOTHING ([[rune-shared-nothing-law]]): a PLAIN
     // member touched ONLY by the worker thread. No atomic, no cross-thread read.
