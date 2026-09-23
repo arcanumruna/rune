@@ -22,6 +22,7 @@
 
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include "support/TestWorkerCount.h"
 
 #include <gtest/gtest.h>
 
@@ -156,6 +157,8 @@ static NodeConfig makeThreeNodeConfig(
         "aeron:udp?endpoint=127.0.0.1:" +
         std::to_string(clientPorts[static_cast<std::size_t>(nodeId)]);
     cfg.clientEndpoint.streamId = 1;
+
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
 
     return cfg;
 }

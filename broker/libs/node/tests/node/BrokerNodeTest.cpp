@@ -17,6 +17,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
+#include "support/TestWorkerCount.h"
 
 #include <gtest/gtest.h>
 
@@ -64,6 +65,8 @@ static NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
 
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
     cfg.clientEndpoint.streamId = 1;
+
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
 
     return cfg;
 }
@@ -609,6 +612,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
 
         cfg.topics = {ts};
         cfg.enableCompactionCoalescing = coalesce;
+        cfg.workerCount = rune::node::test::workerCountFromEnv();
         return cfg;
     };
 

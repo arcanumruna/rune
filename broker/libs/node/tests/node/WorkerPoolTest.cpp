@@ -597,3 +597,170 @@ TEST(WorkerPool, ConcurrentDisjointWorkersAreRaceFree) {
     // If we reach here without a crash or TSan report, shared-nothing is proven.
     SUCCEED();
 }
+
+// ---------------------------------------------------------------------------
+// Test 11: ReconcileReDerivesOwnershipAfterCommittedMapChange (EXIT-3 direct proof).
+//
+// Simulates a committed-map-style rebalance: a registry is built with replicas
+// from 2 co-partitioned topics (4 partitions each), assigned to a 3-worker pool.
+// Then 2 replicas are removed and 2 new replicas added (same-net-count pair to
+// exercise the generation-counter path), followed by a reconcile().
+//
+// Asserts after reconcile():
+//   A. Every current (live) replica is owned by EXACTLY ONE worker.
+//   B. Each live replica's owner == pool.ownerWorkerId(topicId, partitionId)
+//      (ShardRouter re-derivation is correct).
+//   C. Removed replicas are no longer referenced in any worker's owned set
+//      (no dangling pointer).
+//   D. Co-group affinity preserved: for all partition indices in [0,4),
+//      ownerWorkerId(topic0, idx) == ownerWorkerId(topic1, idx) — same groupKey.
+//   E. Total owned count across workers == registry.replicaCount().
+// ---------------------------------------------------------------------------
+TEST(WorkerPool, ReconcileReDerivesOwnershipAfterCommittedMapChange) {
+    // Keep logs + transports alive for the duration of the test.
+    std::vector<std::unique_ptr<InMemoryLog>>   logs;
+    std::vector<std::unique_ptr<NullTransport>> transports;
+
+    auto mk = [&](int32_t topicId, int32_t partition) -> std::unique_ptr<PartitionReplica> {
+        logs.push_back(std::make_unique<InMemoryLog>(1024 * 1024, 1000));
+        transports.push_back(std::make_unique<NullTransport>());
+        PartitionConfig cfg{};
+        cfg.topicId     = topicId;
+        cfg.partitionId = static_cast<rune::replication::PartitionId>(partition);
+        cfg.selfId      = 1;
+        cfg.minIsr      = 1;
+        return std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1},
+            logs.back().get(), transports.back().get());
+    };
+
+    // -----------------------------------------------------------------------
+    // Step 1: Build registry — 2 co-partitioned topics × 4 partitions = 8 replicas.
+    // Topics 0 and 1 share groupKey -200 (co-partition group).
+    // -----------------------------------------------------------------------
+    ReplicaRegistry reg;
+    for (int32_t p = 0; p < 4; ++p) {
+        reg.add(0, p, mk(0, p));  // topic 0 ("orders"), partitions 0..3
+        reg.add(1, p, mk(1, p));  // topic 1 ("shipments"), same co-group
+    }
+    ASSERT_EQ(reg.replicaCount(), static_cast<std::size_t>(8));
+
+    // -----------------------------------------------------------------------
+    // Step 2: Assign to WorkerPool(3) with co-group routing.
+    // Map both topic IDs to the same groupKey so co-partitioned pairs land on
+    // the same worker (same contract as BrokerNode buildWorkerPool).
+    // -----------------------------------------------------------------------
+    ShardRouter router(3);
+    router.mapTopicToGroupKey(0, -200);
+    router.mapTopicToGroupKey(1, -200);
+    WorkerPool pool(3, router);
+    pool.assignFromRegistry(reg);
+
+    // Baseline: 8 replicas owned across 3 workers.
+    {
+        int totalOwned = 0;
+        for (int32_t w = 0; w < pool.workerCount(); ++w)
+            totalOwned += pool.worker(w).ownedCount();
+        ASSERT_EQ(totalOwned, 8) << "baseline: all 8 replicas must be owned";
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 3: Simulate a committed-map-style rebalance:
+    //   remove (topic=0, partition=2) and (topic=1, partition=3) — 2 replicas gone.
+    //   add   (topic=0, partition=2) and (topic=1, partition=3) — 2 fresh replicas.
+    // Net count is unchanged at 8 (same-count add+remove) but generation advances by 4.
+    // -----------------------------------------------------------------------
+    const std::uint64_t genBefore = reg.generation();
+
+    // Remove 2 replicas (registry destroys them — raw pointers become dangling).
+    reg.remove(0, 2);
+    reg.remove(1, 3);
+
+    EXPECT_EQ(reg.replicaCount(), static_cast<std::size_t>(6))
+        << "after remove: count must be 6";
+
+    // Add 2 new replicas in their place.
+    reg.add(0, 2, mk(0, 2));
+    reg.add(1, 3, mk(1, 3));
+
+    EXPECT_EQ(reg.replicaCount(), static_cast<std::size_t>(8))
+        << "after add: count must be back to 8";
+
+    // generation must have advanced by 4 (2 removes + 2 adds).
+    EXPECT_EQ(reg.generation(), genBefore + 4)
+        << "generation must advance by 4 (2 remove + 2 add)";
+
+    // -----------------------------------------------------------------------
+    // Step 4: reconcile() detects the generation change and re-derives.
+    // -----------------------------------------------------------------------
+    pool.reconcile(reg);
+
+    // -----------------------------------------------------------------------
+    // Assert A: every current live replica is owned by EXACTLY ONE worker.
+    // -----------------------------------------------------------------------
+    for (auto* r : reg.allReplicas()) {
+        ASSERT_NE(r, nullptr);
+        int owners = 0;
+        for (int32_t w = 0; w < pool.workerCount(); ++w) {
+            if (pool.worker(w).owns(r)) ++owners;
+        }
+        EXPECT_EQ(owners, 1)
+            << "replica (topic=" << r->topicId()
+            << " part=" << static_cast<int32_t>(r->partitionId())
+            << ") must be owned by exactly one worker after reconcile";
+    }
+
+    // -----------------------------------------------------------------------
+    // Assert B: each live replica's owner == ShardRouter-designated worker.
+    // -----------------------------------------------------------------------
+    for (auto* r : reg.allReplicas()) {
+        const int32_t tid      = r->topicId();
+        const int32_t pid      = static_cast<int32_t>(r->partitionId());
+        const int32_t expected = pool.ownerWorkerId(tid, pid);
+        int32_t actual = -1;
+        for (int32_t w = 0; w < pool.workerCount(); ++w) {
+            if (pool.worker(w).owns(r)) { actual = w; break; }
+        }
+        EXPECT_EQ(actual, expected)
+            << "replica (topic=" << tid << " part=" << pid
+            << ") owned by worker " << actual
+            << " but ShardRouter says worker " << expected;
+    }
+
+    // -----------------------------------------------------------------------
+    // Assert D: co-group affinity preserved — topic 0 and topic 1 share the same
+    // worker for every partition index in [0, 4).
+    // -----------------------------------------------------------------------
+    for (int32_t p = 0; p < 4; ++p) {
+        EXPECT_EQ(pool.ownerWorkerId(0, p), pool.ownerWorkerId(1, p))
+            << "co-group members (topic0,p=" << p << ") and (topic1,p=" << p
+            << ") must share a worker after reconcile";
+    }
+
+    // -----------------------------------------------------------------------
+    // Assert E: total owned count == registry.replicaCount() (no leak, no
+    // duplication, no orphan).
+    // -----------------------------------------------------------------------
+    {
+        int totalOwned = 0;
+        for (int32_t w = 0; w < pool.workerCount(); ++w)
+            totalOwned += pool.worker(w).ownedCount();
+        EXPECT_EQ(totalOwned, static_cast<int>(reg.replicaCount()))
+            << "total owned count must equal replicaCount() after reconcile";
+    }
+
+    // -----------------------------------------------------------------------
+    // Idempotency: second reconcile with no further change must be a no-op.
+    // -----------------------------------------------------------------------
+    pool.reconcile(reg);
+    {
+        int totalOwned = 0;
+        for (int32_t w = 0; w < pool.workerCount(); ++w)
+            totalOwned += pool.worker(w).ownedCount();
+        EXPECT_EQ(totalOwned, static_cast<int>(reg.replicaCount()))
+            << "second reconcile must be a no-op (generation unchanged)";
+    }
+}

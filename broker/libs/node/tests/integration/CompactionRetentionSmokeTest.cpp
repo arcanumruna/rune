@@ -48,6 +48,7 @@
 
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include "support/TestWorkerCount.h"
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/CleanerOffsetCheckpoint.h>
@@ -138,6 +139,8 @@ static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
     cfg.clientEndpoint.channel  =
         "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
     cfg.clientEndpoint.streamId = 1;
+
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
 
     return cfg;
 }

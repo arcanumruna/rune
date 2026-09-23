@@ -475,6 +475,8 @@ if(BUILD_TESTING)
         else()
             add_executable(rune_broker_node_tests
                 tests/node/BrokerNodeTest.cpp)
+            target_include_directories(rune_broker_node_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_broker_node_tests PRIVATE
                 rune_node
                 aeron::aeron
@@ -487,6 +489,8 @@ if(BUILD_TESTING)
             # rune_role path).  Embeds the media driver → gated with the others.
             add_executable(rune_role_counter_publish_tests
                 tests/integration/RoleCounterPublishTest.cpp)
+            target_include_directories(rune_role_counter_publish_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_role_counter_publish_tests PRIVATE
                 rune_node
                 aeron::aeron
@@ -510,6 +514,8 @@ if(BUILD_TESTING)
         else()
             add_executable(rune_udp_cluster_tests
                 tests/integration/UdpClusterElectionTest.cpp)
+            target_include_directories(rune_udp_cluster_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_udp_cluster_tests PRIVATE
                 rune_node
                 aeron::aeron
@@ -542,6 +548,8 @@ if(BUILD_TESTING)
     if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
         add_executable(rune_broker_node_gateway_tests
             tests/node/BrokerNodeGatewayTest.cpp)
+        target_include_directories(rune_broker_node_gateway_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_broker_node_gateway_tests PRIVATE
             rune_node
             aeron::aeron
@@ -558,6 +566,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_gateway_replication_wiring_tests
             tests/integration/GatewayReplicationWiringTest.cpp)
+        target_include_directories(rune_gateway_replication_wiring_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_gateway_replication_wiring_tests PRIVATE
             rune_node
             aeron::aeron
@@ -574,6 +584,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_gateway_produce_replication_tests
             tests/integration/GatewayProduceReplicationTest.cpp)
+        target_include_directories(rune_gateway_produce_replication_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_gateway_produce_replication_tests PRIVATE
             rune_node
             aeron::aeron
@@ -590,6 +602,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_gateway_acks_all_deferred_ack_tests
             tests/integration/GatewayAcksAllDeferredAckTest.cpp)
+        target_include_directories(rune_gateway_acks_all_deferred_ack_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_gateway_acks_all_deferred_ack_tests PRIVATE
             rune_node
             aeron::aeron
@@ -607,6 +621,8 @@ if(BUILD_TESTING)
     if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
         add_executable(rune_gateway_subscribe_hw_bound_tests
             tests/integration/GatewaySubscribeHwBoundTest.cpp)
+        target_include_directories(rune_gateway_subscribe_hw_bound_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_gateway_subscribe_hw_bound_tests PRIVATE
             rune_node
             aeron::aeron
@@ -700,6 +716,8 @@ if(BUILD_TESTING)
     if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
         add_executable(rune_compaction_retention_smoke_tests
             tests/integration/CompactionRetentionSmokeTest.cpp)
+        target_include_directories(rune_compaction_retention_smoke_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_compaction_retention_smoke_tests PRIVATE
             rune_node
             rune_coordination

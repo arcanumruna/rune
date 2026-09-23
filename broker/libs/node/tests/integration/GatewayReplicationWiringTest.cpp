@@ -30,6 +30,7 @@
 
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/PartitionReplica.h>
@@ -142,6 +143,8 @@ static rune::node::NodeConfig makeGrConfig(
     topic.partitionCount = 1;
     topic.topicId        = 0;
     cfg.topics.push_back(topic);
+
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
 
     return cfg;
 }

@@ -21,6 +21,7 @@
 
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include "support/TestWorkerCount.h"
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
@@ -130,6 +131,8 @@ static NodeConfig makeSingleNodeConfig(const fs::path& dataDir, uint16_t clientP
     cfg.clientEndpoint.channel  =
         "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
     cfg.clientEndpoint.streamId = 1;
+
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
 
     return cfg;
 }
@@ -843,6 +846,8 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
     cfg.clientEndpoint.channel  =
         "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
     cfg.clientEndpoint.streamId = 1;
+
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
 
     TopicSpec topic;
     topic.name           = "smoke-topic";

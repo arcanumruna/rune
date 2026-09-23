@@ -16,6 +16,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
+#include "support/TestWorkerCount.h"
 
 #include <CncFileReader.h>
 #include <concurrent/CountersReader.h>
@@ -55,6 +56,7 @@ NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     cfg.peers          = {self};
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50901";
     cfg.clientEndpoint.streamId = 1;
+    cfg.workerCount = rune::node::test::workerCountFromEnv();
     return cfg;
 }
 
