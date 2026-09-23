@@ -19,6 +19,19 @@ target_include_directories(rune_static_balancer PUBLIC
 target_include_directories(rune_static_balancer PRIVATE
     ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_static_balancer PUBLIC rune_metadata)
+
+# DynamicBalancer — delta rebalance (bit-packed reverse index, preferred-leader-in-ISR, co-partition unit move)
+add_library(rune_dynamic_balancer STATIC
+    src/DynamicBalancer.cpp)
+target_include_directories(rune_dynamic_balancer PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories(rune_dynamic_balancer PRIVATE
+    ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_dynamic_balancer PUBLIC
+    rune_static_balancer
+    rune_metadata
+    rune_replication
+    rune_consensus)
 target_include_directories(rune_metadata_msm PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(rune_metadata_msm PRIVATE
@@ -85,6 +98,14 @@ if(BUILD_TESTING)
         rune_consensus
         GTest::gtest_main)
 
+    add_executable(rune_dynamic_balancer_tests
+        tests/DynamicBalancerTest.cpp)
+    target_link_libraries(rune_dynamic_balancer_tests PRIVATE
+        rune_dynamic_balancer
+        GTest::gtest_main)
+    target_include_directories(rune_dynamic_balancer_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+
     include(GoogleTest)
     gtest_discover_tests(rune_partition_assignment_tests)
     gtest_discover_tests(rune_metadata_state_machine_tests)
@@ -94,4 +115,5 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_membership_state_tests)
     gtest_discover_tests(rune_control_plane_timer_tests)
     gtest_discover_tests(rune_failover_election_tests)
+    gtest_discover_tests(rune_dynamic_balancer_tests)
 endif()
