@@ -51,12 +51,6 @@ namespace rune::node {
 
 class WorkerPool {
 public:
-    // Depth of the per-worker shared_ptr retain ring.
-    // K=4 means the 4 most-recently published OwnedSets are kept alive.
-    // Ownership publishes happen only on registry-generation changes (seconds apart);
-    // with K=4 the evicted set has been unreferenced for at least 3 publish cycles
-    // before it may be freed — far longer than any worker duty cycle.
-    static constexpr std::size_t kRetainRingDepth = 4;
 
     // Construct N workers (ids 0..N-1) and take ownership of the router.
     // Precondition: workerCount >= 1 and must match router.workerCount().
@@ -71,8 +65,6 @@ public:
                "router.workerCount() must match pool workerCount");
         const std::size_t n = static_cast<std::size_t>(workerCount);
         workers_.reserve(n);
-        retainRings_.resize(n);
-        retainHeads_.resize(n, 0);
         for (int32_t i = 0; i < workerCount; ++i)
             workers_.emplace_back(std::make_unique<Worker>(i, ringCapacity));
     }
@@ -142,15 +134,32 @@ public:
             perWorker[static_cast<std::size_t>(wid)].push_back(r);
         }
 
-        // Publish each worker's snapshot (empty set for idle workers, not null).
-        // publishWithRetain() retains the shared_ptr in the K-deep ring first,
-        // then stores the raw pointer with release — safe raw-ptr reclamation.
+        // Hand each worker its new owned set ([[rune-shared-nothing-law]]):
+        //   - Before runners start (startup / cooperative / tests): set DIRECTLY
+        //     — single-threaded, no other thread touches owned_ yet, and keeps
+        //     synchronous owns()/ownedCount() assertions valid immediately.
+        //   - After runners start (runtime reassignment, cross-thread): enqueue a
+        //     SetOwnership ring op; the worker applies it on ITS OWN thread. Never
+        //     a cross-thread write to owned_. Back-pressure: if the ring is full,
+        //     skip — reconcile re-runs every duty cycle and ownership is latest-wins
+        //     (idempotent), so the next cycle re-delivers.
+        bool allDelivered = true;
         for (std::size_t i = 0; i < n; ++i) {
-            publishWithRetain(i,
-                std::make_shared<const Worker::OwnedSet>(std::move(perWorker[i])));
+            if (!runnersStarted_) {
+                workers_[i]->setOwnedDirect(std::move(perWorker[i]));
+            } else {
+                WorkerOp op;
+                op.type     = WorkerOp::Type::SetOwnership;
+                op.ownedSet = std::move(perWorker[i]);
+                if (!workers_[i]->tryEnqueueOp(std::move(op)))
+                    allDelivered = false;  // full ring — retry next reconcile
+            }
         }
 
-        lastGeneration_ = registry.generation();  // seed for reconcile()
+        // Seed generation only if fully delivered; otherwise leave the sentinel
+        // so reconcile() re-derives next duty cycle (latest-wins, idempotent).
+        lastGeneration_ = allDelivered ? registry.generation()
+                                       : static_cast<std::uint64_t>(-1);
     }
 
     // Fan out doWork over all workers and return the total work count.
@@ -250,6 +259,9 @@ public:
                     *workers_[i], *idles_[i], clock));
             runners_.back()->start();
         }
+        // From now on, ownership changes must go via SetOwnership ring ops
+        // (workers are live on their own threads — no direct owned_ writes).
+        runnersStarted_ = true;
     }
 
     // Stop and join every worker AgentRunner.  Called in BrokerNode::stop()
@@ -263,49 +275,17 @@ public:
         }
         runners_.clear();
         idles_.clear();
+        runnersStarted_ = false;  // workers quiesced — direct owned_ writes safe again
     }
 
 private:
-    // -----------------------------------------------------------------------
-    // publishWithRetain — retain the shared_ptr in the K-deep ring, then
-    // store the raw pointer with release.
-    //
-    // Must be called on the single control thread only.
-    //
-    // Order:
-    //   1. Push the new shared_ptr into the per-worker ring (retaining lifetime).
-    //      The oldest entry is evicted.  It is safe to evict because:
-    //        - Publishes happen only on registry-generation changes (seconds apart).
-    //        - Workers execute thousands of doWork iterations per second.
-    //        - With K=4, the evicted set has been unreferenced for ≥3 publish
-    //          cycles before it can be freed — far longer than any worker duty cycle.
-    //   2. Store the raw pointer with release (visible to worker acquire-loads).
-    // -----------------------------------------------------------------------
-    void publishWithRetain(std::size_t workerIdx,
-                           std::shared_ptr<const Worker::OwnedSet> set) noexcept {
-        // Step 1: retain in ring (evict oldest).
-        auto& ring = retainRings_[workerIdx];
-        auto& head = retainHeads_[workerIdx];
-        ring[head % kRetainRingDepth] = std::move(set);
-        // Keep a raw pointer to the new set BEFORE incrementing head.
-        const Worker::OwnedSet* rawPtr =
-            ring[head % kRetainRingDepth].get();
-        ++head;
-
-        // Step 2: store raw pointer with release — worker reads with acquire.
-        workers_[workerIdx]->publishOwned(rawPtr);
-    }
-
     rune::metadata::ShardRouter          router_;
     std::vector<std::unique_ptr<Worker>> workers_;
     std::uint64_t                        lastGeneration_ = static_cast<std::uint64_t>(-1); // sentinel: not yet assigned
 
-    // E2 inc2b: per-worker K-deep retain ring for raw-pointer reclamation.
-    // retainRings_[i][j] keeps the shared_ptr for worker i alive.
-    // retainHeads_[i] is the next slot to write (ring buffer head).
-    using RetainRing = std::array<std::shared_ptr<const Worker::OwnedSet>, kRetainRingDepth>;
-    std::vector<RetainRing>    retainRings_;  // size == workerCount()
-    std::vector<std::size_t>   retainHeads_;  // size == workerCount()
+    // Shared-nothing: true once per-worker AgentRunners are started. Before this,
+    // ownership is set directly (single-threaded); after, via SetOwnership ring ops.
+    bool runnersStarted_ = false;
 
     // E2 inc2b: per-worker idle strategies and agent runners.
     // Populated by startRunners(); cleared by stopAndJoinRunners().

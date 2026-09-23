@@ -57,6 +57,7 @@ struct WorkerOp {
         ApplyReplicated,  ///< transport applyReplicated
         BecomeLeader,     ///< bridge → worker: promote replica to leader
         BecomeFollower,   ///< bridge → worker: demote replica to follower
+        SetOwnership,     ///< control thread → worker: replace the worker's owned set
     };
 
     Type    type    = Type::Produce;
@@ -164,6 +165,13 @@ struct WorkerOp {
         int32_t  topicId        = 0;
         std::vector<uint8_t> records;   ///< copy of the records span
     } replicatedPayload;
+
+    // -----------------------------------------------------------------------
+    // SetOwnership-specific field ([[rune-shared-nothing-law]]): the control
+    // thread hands the worker its new owned set by value via the ring; the
+    // worker moves it into its own (non-atomic, worker-thread-only) owned_.
+    // -----------------------------------------------------------------------
+    std::vector<rune::replication::PartitionReplica*> ownedSet;
 };
 
 // ---------------------------------------------------------------------------

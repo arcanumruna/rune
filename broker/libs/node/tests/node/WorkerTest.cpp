@@ -69,7 +69,7 @@ TEST(Worker, DrivesOnlyOwnedReplicas) {
     ReplicaFixture b(/*topicId=*/0, /*partition=*/1);
 
     Worker w(/*workerId=*/0);
-    w.publishOwned(std::make_shared<const Worker::OwnedSet>(Worker::OwnedSet{a.replica.get()}));
+    w.setOwnedDirect(Worker::OwnedSet{a.replica.get()});
 
     EXPECT_TRUE(w.owns(a.replica.get()));
     EXPECT_FALSE(w.owns(b.replica.get()));
@@ -87,10 +87,10 @@ TEST(Worker, DrivesOnlyOwnedReplicas) {
 TEST(Worker, PublishOwnedResetsOwnership) {
     ReplicaFixture a(0, 0);
     Worker w(1);
-    w.publishOwned(std::make_shared<const Worker::OwnedSet>(Worker::OwnedSet{a.replica.get()}));
+    w.setOwnedDirect(Worker::OwnedSet{a.replica.get()});
     ASSERT_EQ(w.ownedCount(), 1u);
     // Publishing an empty set clears ownership (empty, not null).
-    w.publishOwned(std::make_shared<const Worker::OwnedSet>());
+    w.setOwnedDirect(Worker::OwnedSet{});
     EXPECT_EQ(w.ownedCount(), 0u);
     EXPECT_FALSE(w.owns(a.replica.get()));
 }

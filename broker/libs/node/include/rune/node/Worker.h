@@ -15,21 +15,17 @@
 // virtual dispatch occurs ONCE PER DUTY CYCLE (the Aeron model); per-record
 // paths inside doWork remain concrete — no additional virtuals introduced.
 //
-// E2 inc2b: genuinely lock-free ownership read.
+// Shared-nothing ownership ([[rune-shared-nothing-law]]):
 //
-// owned_ is a raw std::atomic<const OwnedSet*> (acquire/release).
-// Lock-free guarantee: std::atomic<pointer> is lock-free on all supported
-// platforms (x86_64, arm64).  The static_assert in Worker() verifies this at
-// compile time.
-//
-// Lifetime / reclamation (single-writer control thread publishes; single reader
-// per worker on its own AgentRunner thread):
-//   WorkerPool retains a K=4 deep shared_ptr retain ring per worker.  On every
-//   publishOwned() call the new shared_ptr is pushed into the ring (evicting the
-//   oldest).  The raw pointer is stored with release ONLY AFTER the shared_ptr is
-//   retained.  Ownership publishes happen at registry-generation boundaries
-//   (seconds apart); the worker performs thousands of doWork iterations between
-//   publishes, so any evicted set is long unreferenced before it is freed.
+// owned_ is a PLAIN std::vector member touched ONLY by the worker thread — no
+// atomic, no shared state, no cross-thread read. Ownership changes are carried
+// to the worker as messages, never as a shared write:
+//   - STARTUP (before per-worker AgentRunners start, single-threaded): the
+//     WorkerPool sets owned_ directly via setOwnedDirect().
+//   - RUNTIME (workers live on their own threads): the control thread enqueues a
+//     SetOwnership WorkerOp to this worker's ingress ring; the worker applies it
+//     in executeOp_ on ITS OWN thread. No lock, no atomic, no cross-thread race
+//     by construction.
 //
 // E2 inc2a: Per-worker ingress + return SPSC rings.
 //
@@ -83,12 +79,6 @@ public:
         , ingress_(ringCapacity)
         , ret_(ringCapacity)
     {
-        // Verify the raw-pointer atomic is lock-free on this platform.
-        // std::atomic<pointer> is lock-free on x86_64 and arm64 (the only
-        // platforms we target).  If this fires, the ownership-read is not
-        // genuinely lock-free and the design assumption must be revisited.
-        static_assert(std::atomic<const OwnedSet*>::is_always_lock_free,
-                      "std::atomic<const OwnedSet*> must be lock-free");
     }
 
     // Non-copyable and non-movable (std::atomic<OwnedSet*> + SpscRing are not
@@ -98,43 +88,27 @@ public:
     Worker(Worker&&)                 = delete;
     Worker& operator=(Worker&&)      = delete;
 
-    // Publish a new immutable ownership snapshot (release) — raw pointer form.
-    //
-    // Called from WorkerPool::publishWithRetain() on the control thread.
-    // WorkerPool retains the shared_ptr lifetime in its per-worker retain ring
-    // BEFORE calling this, so the raw pointer remains valid for as long as
-    // any worker might still be reading the previous value.
-    //
-    // An empty set (not null) means no replicas — doWork returns 0.
-    void publishOwned(const OwnedSet* rawPtr) noexcept {
-        owned_.store(rawPtr, std::memory_order_release);
-    }
-
-    // Convenience overload for tests / standalone use: retains the shared_ptr
-    // in a local K=4 ring (same reclamation logic as WorkerPool's retain ring)
-    // and then stores the raw pointer with release.
-    //
-    // Use this when driving Worker directly without a WorkerPool (e.g. unit tests).
-    // Production code goes through WorkerPool::publishWithRetain which uses the
-    // pool-level retain ring instead.
-    void publishOwned(std::shared_ptr<const OwnedSet> set) noexcept {
-        const OwnedSet* rawPtr = set.get();
-        // Push into local retain ring (evicts oldest — safe, same reasoning as pool ring).
-        localRetain_[localRetainHead_ % kLocalRetainDepth] = std::move(set);
-        ++localRetainHead_;
-        owned_.store(rawPtr, std::memory_order_release);
+    // Set the owned replica set DIRECTLY. Shared-nothing ([[rune-shared-nothing-law]]):
+    // owned_ is a plain member touched ONLY by the worker thread. This direct
+    // setter is legal ONLY when no worker thread is running yet — i.e. at STARTUP
+    // (WorkerPool::assignFromRegistry before startRunners) or in single-threaded
+    // unit tests. At RUNTIME, ownership changes arrive as a SetOwnership ring op
+    // (executeSetOwnership_) applied on the worker's own thread — never a
+    // cross-thread write to owned_.
+    void setOwnedDirect(OwnedSet set) noexcept {
+        owned_ = std::move(set);
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
 
+    // owns()/ownedCount() read the plain owned_ — worker-thread only (call from
+    // the worker thread, or before runners start / from single-threaded tests).
     [[nodiscard]] std::size_t ownedCount() const noexcept {
-        const OwnedSet* snap = owned_.load(std::memory_order_acquire);
-        return snap ? snap->size() : 0UZ;
+        return owned_.size();
     }
 
     [[nodiscard]] bool owns(const rune::replication::PartitionReplica* r) const noexcept {
-        const OwnedSet* snap = owned_.load(std::memory_order_acquire);
-        return snap && std::find(snap->begin(), snap->end(), r) != snap->end();
+        return std::find(owned_.begin(), owned_.end(), r) != owned_.end();
     }
 
     // -----------------------------------------------------------------------
@@ -174,26 +148,21 @@ public:
     // the per-record paths inside remain fully concrete.
     // Ownership snapshot is loaded ONCE (acquire) at the top of the call.
     int doWork(int64_t nowNs) override {
-        // Acquire the ownership snapshot once.  Raw pointer — genuinely lock-free
-        // (no internal lock pool unlike the old atomic<shared_ptr> free functions).
-        // Lifetime is guaranteed by WorkerPool's per-worker K-deep retain ring.
-        const OwnedSet* snap = owned_.load(std::memory_order_acquire);
-
         int work = 0;
 
-        // Step 0: drain ingress ring (E2 inc2a).
+        // Step 0: drain ingress ring (E2 inc2a). This may include SetOwnership
+        // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         work += static_cast<int>(drainIngress_());
 
-        if (!snap) return work;
-
+        // Shared-nothing: owned_ is a plain member touched only by this thread.
         // Step 5: per-replica ISR checks / follower fetch emission.
-        for (auto* replica : *snap) {
+        for (auto* replica : owned_) {
             if (!replica) continue;
             work += replica->doWork(nowNs);
         }
 
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
-        for (auto* replica : *snap) {
+        for (auto* replica : owned_) {
             if (replica && replica->isDiskBacked()) {
                 work += replica->log()->drainCleanerSwaps();
                 work += replica->log()->drainRetentionDeletes();
@@ -234,6 +203,10 @@ private:
             break;
         case WorkerOp::Type::BecomeFollower:
             executeBecomeFollower_(std::move(op));
+            break;
+        case WorkerOp::Type::SetOwnership:
+            // Shared-nothing: apply the new owned set on THIS worker thread.
+            owned_ = std::move(op.ownedSet);
             break;
         }
     }
@@ -480,31 +453,12 @@ private:
     SpscRing<WorkerOp>     ingress_;  // control thread → worker
     SpscRing<WorkerReturn> ret_;      // worker → control thread
 
-    // Genuinely lock-free ownership read (E2 inc2b).
-    //
-    // Raw pointer: std::atomic<const OwnedSet*> is lock-free on all supported
-    // platforms (verified by static_assert in the constructor above).
-    //
-    // Lifetime / reclamation:
-    //   WorkerPool owns the OwnedSet shared_ptrs.  Before storing a new raw
-    //   pointer here (via publishOwned), WorkerPool retains the shared_ptr in
-    //   a per-worker K=4 deep ring.  The oldest entry is evicted only when the
-    //   ring is full; at that point the evicted set has been unreferenced for at
-    //   least K−1 publish cycles (which happen only on registry-generation
-    //   changes, seconds apart), so no worker is still reading it.
-    //
-    // Single-writer control thread publishes; single reader worker thread reads.
-    //
-    // When Worker is used standalone (unit tests), the local K=4 retain ring
-    // below provides the same reclamation guarantee without a WorkerPool.
-    // In production, WorkerPool uses its own pool-level retain rings; the local
-    // ring here is populated only by the shared_ptr overload of publishOwned().
-    std::atomic<const OwnedSet*> owned_{nullptr};
-
-    // Local retain ring for standalone / unit-test use (publishOwned(shared_ptr)).
-    static constexpr std::size_t kLocalRetainDepth = 4;
-    std::array<std::shared_ptr<const OwnedSet>, kLocalRetainDepth> localRetain_{};
-    std::size_t                                                     localRetainHead_ = 0;
+    // Owned replica set — SHARED-NOTHING ([[rune-shared-nothing-law]]): a PLAIN
+    // member touched ONLY by the worker thread. No atomic, no cross-thread read.
+    // Written via setOwnedDirect() at startup (before runners start, single-
+    // threaded) and via SetOwnership ring ops at runtime (applied in executeOp_
+    // on this worker's own thread). The control thread NEVER touches it.
+    OwnedSet owned_{};
 };
 
 } // namespace rune::node

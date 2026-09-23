@@ -117,9 +117,8 @@ TEST(WorkerPool, EveryReplicaOwnedByExactlyOneWorker) {
         perWorker[static_cast<std::size_t>(wid)].push_back(rep->replica.get());
     }
     for (int32_t w = 0; w < pool.workerCount(); ++w) {
-        pool.worker(w).publishOwned(
-            std::make_shared<const rune::node::Worker::OwnedSet>(
-                std::move(perWorker[static_cast<std::size_t>(w)])));
+        pool.worker(w).setOwnedDirect(
+            std::move(perWorker[static_cast<std::size_t>(w)]));
     }
 
     // Totality: each replica owned by exactly one worker.
@@ -521,9 +520,8 @@ TEST(WorkerPool, WorkerDoWorkOnlyDrivesOwnedReplicas) {
     // Two-worker pool; manually assign ALL replicas to worker 0, none to worker 1.
     ShardRouter router(2);
     WorkerPool  pool(2, router);
-    pool.worker(0).publishOwned(std::make_shared<const rune::node::Worker::OwnedSet>(
-        rune::node::Worker::OwnedSet{r0.get(), r1.get()}));
-    pool.worker(1).publishOwned(std::make_shared<const rune::node::Worker::OwnedSet>());
+    pool.worker(0).setOwnedDirect(rune::node::Worker::OwnedSet{r0.get(), r1.get()});
+    pool.worker(1).setOwnedDirect(rune::node::Worker::OwnedSet{});
     // worker 1 owns nothing.
 
     ASSERT_EQ(pool.worker(0).ownedCount(), static_cast<std::size_t>(2));
