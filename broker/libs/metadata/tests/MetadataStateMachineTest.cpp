@@ -900,3 +900,58 @@ TEST(AssignmentMap, LargeLoad)
         EXPECT_EQ(a->partitionEpoch, i);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15. MVCC revert — discard uncommitted speculation, committed read unchanged
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(MetadataStateMachine, RevertDiscardsUncommittedPending) {
+    MetadataStateMachine msm;
+
+    // Apply two UpdatePartitionAssignmentRecords at pos 0 and pos 1.
+    // Only pos 0 is committed.
+    auto [u0buf, u0sz] = encodeUpdate({10, 0, 5, {5}, {5}, 1, 1});
+    auto [u1buf, u1sz] = encodeUpdate({10, 1, 6, {6}, {6}, 1, 1});
+
+    msm.apply(u0buf.data(), u0sz, /*pos=*/0);
+    msm.apply(u1buf.data(), u1sz, /*pos=*/1);
+
+    // Commit only pos 0 — pos 1 is uncommitted (pending)
+    msm.commit(0);
+
+    // partition 0 must be committed and visible
+    ASSERT_NE(msm.assignment(10, 0), nullptr);
+    EXPECT_EQ(msm.assignment(10, 0)->leaderNode, 5);
+
+    // partition 1 must NOT be visible (uncommitted speculation)
+    EXPECT_EQ(msm.assignment(10, 1), nullptr);
+
+    // revert(0): discard pending records with pos > 0
+    msm.revert(0);
+
+    // committed partition 0 must remain untouched
+    ASSERT_NE(msm.assignment(10, 0), nullptr);
+    EXPECT_EQ(msm.assignment(10, 0)->leaderNode, 5);
+
+    // partition 1 must still be absent (reverted)
+    EXPECT_EQ(msm.assignment(10, 1), nullptr);
+
+    // a later commit(1) must NOT resurrect the reverted pending entry
+    msm.commit(1);
+    EXPECT_EQ(msm.assignment(10, 1), nullptr)
+        << "reverted pending record must not be resurrected by a later commit";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. handleLoss — unknown record version increments lossCount, does not crash
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST(MetadataStateMachine, UnknownRecordVersionIsHandleLossNotCrash) {
+    MetadataStateMachine msm;
+    uint8_t buf[32]{}; // recordType=2 (UpdatePartitionAssignment), version=99
+    buf[0]=2; buf[1]=0; buf[2]=99;
+    msm.apply(buf, sizeof buf, /*pos=*/0);
+    msm.commit(0);
+    EXPECT_EQ(msm.lossCount(), 1u);
+    EXPECT_EQ(msm.committedMap().size(), 0);
+}

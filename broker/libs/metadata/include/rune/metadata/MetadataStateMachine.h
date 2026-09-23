@@ -97,6 +97,16 @@ public:
     // ── Expose the committed map (read-only) for delta derivation. ────────────
     const AssignmentMap& committedMap() const noexcept { return committed_; }
 
+    // ── MVCC revert: discard pending records with pos > toCommittedPos. ───────
+    // Used when a commit is lost (e.g. leader failover).  The committed map is
+    // untouched — only uncommitted speculation in pending_ is pruned.
+    void revert(int64_t toCommittedPos);
+
+    // ── handleLoss counter: records skipped due to unknown recordVersion. ─────
+    // Incremented in apply() when a record's recordVersion is unsupported.
+    // The record is NOT applied and does NOT crash apply().
+    [[nodiscard]] uint64_t lossCount() const noexcept { return lossCount_; }
+
 private:
     // Committed assignments (pos <= committedPos)
     AssignmentMap committed_;
@@ -113,6 +123,9 @@ private:
     std::vector<PendingEntry> pending_;
 
     int64_t committedPos_ = -1;
+
+    // Count of records skipped due to unknown recordVersion (handleLoss).
+    uint64_t lossCount_ = 0;
 
     void flushPending(int64_t upToPos);
 };

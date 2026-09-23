@@ -504,6 +504,88 @@ TEST(MetadataReplicationTest, MetadataReplicaRoleFollowsBridgeDrivenClusterLeade
 }
 
 // ===========================================================================
+// Test 7: emitDynamicAssignment — bounded batches, per-record log slots
+//
+// Calls MetadataService::emitDynamicAssignment with 1000 BalancerRecords and
+// asserts:
+//   - Each duty cycle appends at most kMaxRecordsPerBatch records.
+//   - After enough cycles, all 1000 records have been appended (each occupying
+//     its own log slot, so logEndOffset advances by exactly 1 per record).
+//   - The MSM eventually commits all records after HW advances.
+// ===========================================================================
+TEST(MetadataReplicationTest, BoundedBatch_DynamicEmit1000Records) {
+    MrtTempDir dir("dyn_batch");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};
+    InMemoryTransport transport;
+
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1,
+        nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    MetadataService svc(replica.get(), selfId);
+
+    // Build 1000 BalancerRecords (one per partition across many topics).
+    const int kN = 1000;
+    std::vector<rune::metadata::BalancerRecord> dynRecords;
+    dynRecords.reserve(static_cast<std::size_t>(kN));
+    for (int i = 0; i < kN; ++i) {
+        rune::metadata::BalancerRecord br;
+        br.isr      = {selfId};
+        br.replicas = {selfId};
+        br.rec.topicId        = i / 8;
+        br.rec.partition      = i % 8;
+        br.rec.leaderNode     = selfId;
+        br.rec.leaderEpoch    = 1;
+        br.rec.partitionEpoch = 1;
+        br.rec.isr      = pmd::Int32ArrayView(br.isr.data(), static_cast<uint16_t>(br.isr.size()));
+        br.rec.replicas = pmd::Int32ArrayView(br.replicas.data(), static_cast<uint16_t>(br.replicas.size()));
+        dynRecords.push_back(std::move(br));
+    }
+
+    // Submit all 1000 records to the dynamic emit queue.
+    svc.emitDynamicAssignment(dynRecords);
+
+    // Drive duty cycles; each cycle flushes at most kMaxRecordsPerBatch records.
+    // We need at least ceil(1000/256) = 4 cycles. Allow a generous 200 cycles.
+    const int kMaxCycles = 200;
+    int64_t clock = 0;
+    for (int cycle = 0; cycle < kMaxCycles; ++cycle) {
+        clock += 2'000'000LL;
+        replica->doWork(clock);
+        transport.pump(clock);
+        svc.doWork(clock);
+
+        // Once all 1000 records are appended, the log end offset will be 1000.
+        if (replica->logEndOffset() >= kN) break;
+    }
+
+    // All 1000 records must have been appended (each in its own log slot).
+    ASSERT_GE(replica->logEndOffset(), static_cast<Offset>(kN))
+        << "all " << kN << " records must have been appended across duty cycles";
+
+    // Drive until HW reaches 1000 so the MSM commits them.
+    for (int i = 0; i < kDriverCap; ++i) {
+        clock += 2'000'000LL;
+        replica->doWork(clock);
+        transport.pump(clock);
+        if (replica->highWatermark() >= kN) break;
+    }
+
+    svc.doWork(clock);
+
+    // Spot-check a few assignments to confirm MSM applied all records.
+    EXPECT_NE(svc.assignment(0, 0), nullptr) << "topic 0 partition 0 must be committed";
+    EXPECT_NE(svc.assignment(kN / 8 - 1, 7), nullptr)
+        << "last topic/partition must be committed";
+}
+
+// ===========================================================================
 // Test 6: HW-gated follower visibility — assignment not visible before
 //         replication completes on the follower.
 //

@@ -66,6 +66,7 @@
 #include <rune/protocol/MetadataRecords.h>
 
 #include <cstdint>
+#include <deque>
 #include <span>
 #include <vector>
 
@@ -212,6 +213,40 @@ public:
     [[nodiscard]] uint64_t balancerErrorCount() const noexcept { return balancerErrors_; }
 
     // -----------------------------------------------------------------------
+    // MD1 Task 13: Dynamic assignment — bounded batched emit.
+    //
+    // Enqueues records for background emission in bounded batches across
+    // duty cycles.  Each duty cycle drains at most kMaxRecordsPerBatch records
+    // (and at most kMaxBatchBytes bytes), calling replica_->append() once per
+    // record (the one-record-per-append invariant).
+    //
+    // A mass rebalance (e.g. 1000 reassignments) is split across duty cycles —
+    // NEVER emitted as a single giant atomic batch.
+    //
+    // Called by the controller on the duty-cycle thread (single-writer).
+    // The records vector is moved into the pending queue; the caller must not
+    // use recs after this call returns.
+    // -----------------------------------------------------------------------
+
+    /// Maximum records per duty-cycle batch.
+    static constexpr std::size_t kMaxRecordsPerBatch = 256;
+    /// Maximum byte budget per duty-cycle batch (8 MiB).
+    static constexpr std::size_t kMaxBatchBytes = 8u * 1024u * 1024u;
+
+    /// Enqueue dynamic assignment records for bounded batch emission.
+    ///
+    /// @param recs  BalancerRecords to enqueue.  Ownership of each record's
+    ///              owned isr/replicas vectors is transferred to the queue.
+    ///              (BalancerRecord is move-only.)
+    void emitDynamicAssignment(std::vector<rune::metadata::BalancerRecord>& recs) {
+        // Move each record from recs into the pending queue.
+        for (auto& br : recs) {
+            pendingDynamicRecords_.push_back(std::move(br));
+        }
+        recs.clear();
+    }
+
+    // -----------------------------------------------------------------------
     // Duty-cycle entry point (single-writer thread)
     // -----------------------------------------------------------------------
 
@@ -222,6 +257,7 @@ public:
     ///   2. Read new batches in (lastApplied_, hw] from the log.
     ///   3. For each record in those batches, call msm_.apply().
     ///   4. Call msm_.commit(hw) to move pending→committed.
+    ///   5. If leader: drain pendingDynamicRecords_ (bounded batch).
     ///
     /// On leader-transition edge (wasLeader_ gate):
     ///   - calls rebuildFromLog() to rebuild from the committed tail.
@@ -255,6 +291,8 @@ public:
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
             msm_.commit(hw - 1);
+            // Still drain the dynamic queue even if the log is caught up.
+            if (amLeader) drainDynamicQueue();
             return 0;
         }
 
@@ -317,6 +355,9 @@ public:
         // hw is the next-unwritten offset so the last committed is hw-1).
         msm_.commit(hw - 1);
         if (cursor > lastApplied_) lastApplied_ = cursor;
+
+        // Drain the dynamic assignment queue (bounded per cycle).
+        if (amLeader) drainDynamicQueue();
 
         return applied;
     }
@@ -487,6 +528,44 @@ private:
         return !configuredTopics_.empty(); // empty → treat as "not assigned"
     }
 
+    // -----------------------------------------------------------------------
+    // drainDynamicQueue — emit at most kMaxRecordsPerBatch records per cycle.
+    //
+    // Called by doWork() on the leader path only.  Drains from the front of
+    // pendingDynamicRecords_, encoding each record into a stack buffer and
+    // calling replica_->append() exactly once per record (one-record-per-append
+    // invariant).  Stops when the count OR byte budget for this cycle is
+    // exhausted, leaving the remainder in the queue for the next cycle.
+    // -----------------------------------------------------------------------
+    void drainDynamicQueue() {
+        if (pendingDynamicRecords_.empty()) return;
+        if (!replica_) return;
+
+        static constexpr std::size_t kEncBufSize = 16 * 1024;
+        uint8_t encBuf[kEncBufSize];
+
+        std::size_t cycleRecords = 0;
+        std::size_t cycleBytes   = 0;
+
+        while (!pendingDynamicRecords_.empty()) {
+            if (cycleRecords >= kMaxRecordsPerBatch) break;
+
+            const auto& br = pendingDynamicRecords_.front();
+            const std::size_t n = br.rec.encode(encBuf, kEncBufSize);
+            if (n == 0) {
+                // Encode overflow — skip this record (should not occur at Phase-1 scale).
+                pendingDynamicRecords_.pop_front();
+                continue;
+            }
+            if (cycleBytes + n > kMaxBatchBytes) break;
+
+            replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false);
+            cycleBytes   += n;
+            cycleRecords += 1;
+            pendingDynamicRecords_.pop_front();
+        }
+    }
+
     rune::replication::PartitionReplica* replica_;   ///< non-owning
     int32_t                               selfId_;
 
@@ -510,6 +589,16 @@ private:
     bool assigned_ = false;
     /// Error counter: incremented when BalancerError is caught.
     uint64_t balancerErrors_ = 0;
+
+    // -----------------------------------------------------------------------
+    // MD1 Task 13: dynamic assignment pending queue.
+    //
+    // Records submitted via emitDynamicAssignment() are enqueued here.
+    // drainDynamicQueue() drains from the front across duty cycles.
+    // std::deque is used so pop_front() is O(1) and push_back() doesn't
+    // invalidate existing elements.
+    // -----------------------------------------------------------------------
+    std::deque<rune::metadata::BalancerRecord> pendingDynamicRecords_;
 };
 
 } // namespace rune::node

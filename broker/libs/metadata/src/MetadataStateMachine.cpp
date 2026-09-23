@@ -38,7 +38,11 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
 
     case MetadataRecordType::UpdatePartitionAssignment: {
         auto rec = UpdatePartitionAssignmentRecord::decode(buf, len);
-        if (!rec.has_value()) return;  // bad version or truncated → skip
+        if (!rec.has_value()) {
+            // handleLoss: unknown version or truncated — count but do not crash.
+            ++lossCount_;
+            return;
+        }
 
         // Build a PartitionAssignment directly from the authoritative record values.
         // The controller already carries the correct leaderEpoch/partitionEpoch —
@@ -121,6 +125,29 @@ void MetadataStateMachine::flushPending(int64_t upToPos)
             // Move back to the kept region
             pending_[kept++] = std::move(e);
         }
+    }
+    pending_.resize(kept);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// revert
+// ─────────────────────────────────────────────────────────────────────────────
+
+void MetadataStateMachine::revert(int64_t toCommittedPos)
+{
+    // Discard every pending entry with pos > toCommittedPos.
+    // The committed map is untouched — only uncommitted speculation is pruned.
+    // O(n) in pending_ size, which is bounded by the max number of in-flight
+    // (uncommitted) records.
+    if (pending_.empty()) return;
+
+    std::size_t kept = 0;
+    for (auto& e : pending_) {
+        if (e.pos <= toCommittedPos) {
+            // Keep this entry — it was committed before the revert point.
+            pending_[kept++] = std::move(e);
+        }
+        // else: drop (discard uncommitted speculation)
     }
     pending_.resize(kept);
 }
