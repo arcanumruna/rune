@@ -56,9 +56,17 @@ if(BUILD_TESTING)
         rune_metadata
         GTest::gtest_main)
 
+    add_executable(rune_replica_position_table_tests
+        tests/ReplicaPositionTableTest.cpp)
+    target_link_libraries(rune_replica_position_table_tests PRIVATE
+        rune_metadata
+        rune_replication
+        GTest::gtest_main)
+
     include(GoogleTest)
     gtest_discover_tests(rune_partition_assignment_tests)
     gtest_discover_tests(rune_metadata_state_machine_tests)
     gtest_discover_tests(rune_static_balancer_tests)
     gtest_discover_tests(rune_routing_image_tests)
+    gtest_discover_tests(rune_replica_position_table_tests)
 endif()

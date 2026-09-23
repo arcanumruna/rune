@@ -60,6 +60,18 @@
 namespace rune::replication {
 
 // ---------------------------------------------------------------------------
+// ReplicaPositionReport — soft per-replica position snapshot consumed by the
+// controller's failover-election path.  Off-log (rebuilt on controller restart).
+// ---------------------------------------------------------------------------
+struct ReplicaPositionReport {
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+    int32_t nodeId         = 0;
+    int32_t leaderEpoch    = 0;
+    int64_t logEndPosition = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Role
 // ---------------------------------------------------------------------------
 enum class Role { Leader, Follower };
@@ -344,6 +356,13 @@ public:
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return log_->logEndOffset(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
+
+    /// Soft per-replica position snapshot for the controller's election path.
+    /// leaderEpoch = epoch(); logEndPosition = logEndOffset().
+    [[nodiscard]] ReplicaPositionReport positionReport() const noexcept {
+        return ReplicaPositionReport{ cfg_.topicId, cfg_.partitionId, cfg_.selfId,
+                                      static_cast<int32_t>(epoch_), log_->logEndOffset() };
+    }
 
     // -----------------------------------------------------------------------
     // CLEANER-THREAD-SAFE SNAPSHOTS (TSan race fix — see publishCleanerState()).

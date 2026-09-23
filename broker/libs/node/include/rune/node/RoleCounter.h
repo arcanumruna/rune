@@ -91,12 +91,20 @@ inline bool decodeRoleKey(const std::uint8_t* buf, std::size_t len,
     return true;
 }
 
+// MSM commit-position counter type id (mirrors Aeron Cluster's commit-position
+// counter, id 204).  Published by the metadata state machine on the leader node
+// so observers know how far the MSM log has been committed.
+inline constexpr std::int32_t kMsmCommitPosTypeId = 1'000'204;
+
 // Human-readable counter labels (also useful when browsing counters).
 inline std::string roleCounterLabel(std::int32_t nodeId) {
     return "rune-cluster-node-role node=" + std::to_string(nodeId);
 }
 inline std::string termCounterLabel(std::int32_t nodeId) {
     return "rune-cluster-leadership-term node=" + std::to_string(nodeId);
+}
+inline std::string msmCommitPosLabel(std::int32_t nodeId) {
+    return "rune-msm-commit-position node=" + std::to_string(nodeId);
 }
 
 } // namespace rune::node
