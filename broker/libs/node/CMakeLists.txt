@@ -97,6 +97,20 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_worker_tests)
 
     # ---------------------------------------------------------------------------
+    # E1 Task 3: WorkerPool unit tests — N workers, deterministic single-owner
+    # assignment via ShardRouter, co-partition affinity, assignFromRegistry.
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_worker_pool_tests
+        tests/node/WorkerPoolTest.cpp)
+    target_link_libraries(rune_worker_pool_tests PRIVATE
+        rune_node
+        rune_metadata
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_worker_pool_tests)
+
+    # ---------------------------------------------------------------------------
     # CG-3: GroupCoordinationService unit tests — injected clock, fake leader toggle.
     # No Aeron required.
     # ---------------------------------------------------------------------------
