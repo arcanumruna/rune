@@ -395,6 +395,22 @@ if(BUILD_TESTING)
 
         gtest_discover_tests(rune_redirect_tests)
 
+        # ── Milestone D Phase-2 Task 14 (Note A) — bare NotLeader is retriable ──
+        add_executable(rune_notleader_retry_tests
+            tests/client/ClientNotLeaderRetryTest.cpp
+        )
+        target_include_directories(rune_notleader_retry_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_notleader_retry_tests PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_notleader_retry_tests)
+
         # ── MD1 Task 10 review — metadata routing against a real gateway ──────
         add_executable(rune_metadata_routing_tests
             tests/client/MetadataRoutingTest.cpp

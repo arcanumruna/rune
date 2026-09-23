@@ -786,6 +786,57 @@ void Client::onEgressFrame(codec::TemplateId tid,
             break; // Redirect is handled; don't fall through to the error path.
         }
 
+        // ---- Note A: bare NotLeader is RETRIABLE (not a terminal error) -------
+        // A follower that rejects a data op but does NOT know the leader endpoint
+        // returns ErrorResponse{NotLeader} with an EMPTY message (no endpoint to
+        // follow — contrast with Redirect above, which carries the leader's
+        // endpoint).  This is the transient "leadership just moved / not yet
+        // known" case: the correct client behaviour is to REFRESH metadata and
+        // RETRY the same op with backoff, NOT to fire cbError_ immediately.
+        //
+        // Only handle the bare form here (empty message).  A NotLeader that DOES
+        // carry an endpoint is treated as a Redirect by the broker; if one ever
+        // arrives here it falls through to the generic path below.
+        //
+        // Retry is bounded by ProducerImpl::kMaxRedirects (per-corrId redirect
+        // budget shared with the Redirect resend path).  Only when that budget is
+        // exhausted does retryRedirectedProduce() fail the pending ack — so
+        // cbError_ is never fired for a bare NotLeader until retries run out.
+        if (ec == rpc::ErrorCode::NotLeader && opt->message.empty()) {
+            const bool haveWork =
+                producerHub_.hasInFlight() || subscriberHub_.hasPending();
+            if (!haveWork) {
+                // No in-flight op to retry (late/duplicate NotLeader for an
+                // already-resolved corrId): arm a background refresh so the map
+                // is reconciled, then drop it.  Do NOT fire cbError_.
+                scheduleMetadataRefresh();
+                break;
+            }
+
+            // Mark the affected partition (from our own in-flight request
+            // context) for metadata refresh so the very next route reconciles the
+            // new leader.  We do not know the new leaderNodeId (no endpoint in the
+            // frame), so we cannot update the cache in place — we arm a background
+            // MetadataRequest (exponential-backoff-gated) instead.
+            scheduleMetadataRefresh();
+
+            // Re-enqueue the produce that hit the stale leader.  The stored wire
+            // frame is resent on the SAME session (leadership is expected to have
+            // moved back or the leader to have caught up by the time the retry
+            // lands; the background refresh reroutes if it has genuinely moved).
+            // retryRedirectedProduce() bumps the per-corrId redirect counter and,
+            // on exhausting kMaxRedirects, fails the pending ack itself.
+            const auto snap = agent_.stateAndSessionId();
+            (void)snap;
+            std::function<bool(const uint8_t*, std::size_t)> sendFn =
+                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                };
+            producerHub_.retryRedirectedProduce(opt->correlationId, sendFn);
+
+            break; // bare NotLeader handled: refreshed + retried (or budget-failed).
+        }
+
         std::string msg(opt->message);
         if (msg.empty()) {
             msg = "ErrorResponse code: " + std::to_string(opt->code);
