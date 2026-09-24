@@ -1477,6 +1477,8 @@ void BrokerNode::startEmbeddedDriver() {
     aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
     aeron_driver_context_set_term_buffer_length(
         driverCtx_, static_cast<uint64_t>(config_.aeronTermBufferBytes));
+    aeron_driver_context_set_mtu_length(driverCtx_, static_cast<size_t>(config_.aeronMtuBytes));
+    aeron_driver_context_set_rcv_initial_window_length(driverCtx_, static_cast<size_t>(config_.aeronRcvWindowBytes));
 
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {
         aeron_driver_context_close(driverCtx_);

@@ -1430,4 +1430,21 @@ TEST(NodeConfig, WorkerCoreBaseUnparsableKeepsDefault) {
         << "unparseable RUNE_WORKER_CORE_BASE must keep default -1";
 }
 
+// ---------------------------------------------------------------------------
+// G0.2: Aeron MTU + rcv-window config knobs (RUNE_AERON_MTU / RUNE_AERON_RCV_WINDOW)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
+    auto env = fakeEnv({{"RUNE_NODE_ID",         "0"},
+                        {"RUNE_PEERS",            "0@h:1"},
+                        {"RUNE_CLIENT_ENDPOINT",  "h:2"},
+                        {"RUNE_DATA_DIR",         "/tmp/x"},
+                        {"RUNE_AERON_MTU",        "8192"},
+                        {"RUNE_AERON_RCV_WINDOW", "262144"}});
+    auto res = rune::node::parseNodeConfig(env);
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronMtuBytes,      8192);
+    EXPECT_EQ(res.config->aeronRcvWindowBytes, 262144);
+}
+
 } // namespace rune::node

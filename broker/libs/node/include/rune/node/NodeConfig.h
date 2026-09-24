@@ -242,6 +242,17 @@ struct NodeConfig {
     //     of two in [64 KiB, 1 GiB].  Default 4 MiB; deployments raise it (e.g.
     //     32 MiB via RUNE_AERON_TERM_BUFFER_BYTES) for deep in-flight throughput.
     int32_t aeronTermBufferBytes         = 4 * 1024 * 1024;
+    //   - aeronMtuBytes: Aeron UDP MTU (bytes) for the embedded media driver.
+    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default 65504
+    //     (jumbo-frame MTU, supports deep batched produces without fragmentation
+    //     overhead).  Deployments on standard 1500-byte MTU networks should set
+    //     this to 1408 (Aeron default).
+    int32_t aeronMtuBytes                = 65504;
+    //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
+    //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
+    //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to
+    //     avoid receiver window throttling on large batched produces.
+    int32_t aeronRcvWindowBytes          = 128 * 1024;
 
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
