@@ -278,6 +278,13 @@ inline std::size_t encodeWorkerOp(const WorkerOp& op,
         kind      = TailKind::None;
         tailBytes = 0;
         break;
+    // Task #13: AppendControlRecord — marker bytes carried as RecordBatch tail
+    // (reuses the same TailKind as Produce — raw bytes, no extra framing).
+    case WorkerOp::Type::AppendControlRecord:
+        kind      = TailKind::RecordBatch;
+        tailSrc   = op.recordBatchBytes.data();
+        tailBytes = op.recordBatchBytes.size();
+        break;
     }
 
     hdr.tailKind = static_cast<uint8_t>(kind);

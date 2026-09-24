@@ -1540,6 +1540,13 @@ void PartitionReplica::publishCleanerState() noexcept
 {
     publishedHwForCleaner_.store(computeServedHw(), std::memory_order_release);
     publishedRoleForCleaner_.store(static_cast<int>(role_), std::memory_order_release);
+    // Task #13: publish current ISR size for the gateway's drainPendingAcks()
+    // ISR-health check — closes the live isr().size() read race (Task #13 acks race).
+    // Leader: publish actual ISR size; Follower: publish 0 (not applicable).
+    const int isrSize = (role_ == Role::Leader && isrManager_)
+        ? static_cast<int>(isrManager_->isr().size())
+        : 0;
+    publishedIsrSizeForGateway_.store(isrSize, std::memory_order_release);
 }
 
 const std::vector<NodeId>& PartitionReplica::isr() const noexcept

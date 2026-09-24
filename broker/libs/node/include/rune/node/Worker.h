@@ -662,6 +662,10 @@ private:
         case WorkerOp::Type::ReconcileFetchResp:
             executeReconcileFetchRespWire_(frame, hdr);
             break;
+        // Task #13: AppendControlRecord — worker appends txn control marker
+        case WorkerOp::Type::AppendControlRecord:
+            executeAppendControlRecordWire_(frame, hdr);
+            break;
         }
     }
 
@@ -1120,6 +1124,55 @@ private:
             spdlog::warn("Worker {}: applyReconcileResponse threw: {}", workerId_, ex.what());
         } catch (...) {
             spdlog::warn("Worker {}: applyReconcileResponse threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Task #13: executeAppendControlRecordWire_ — append a txn COMMIT/ABORT
+    // control marker to the worker-owned user partition log.
+    //
+    // Called when the gateway routes an appendControlRecord op here because
+    // per-worker ingress is active (the worker is the sole appender for this
+    // partition — no race).  The gateway pre-computed the base offset from
+    // log->logEndOffset() before enqueueing and stored the pre-stamped marker
+    // bytes in the tail (same layout as Produce).  Here we just call
+    // replica->append(marker, acksAll=true) on the worker thread; append()
+    // reads logEndOffset() again internally — fine since the worker is the sole
+    // appender and no other thread touched the log in between.
+    //
+    // Fire-and-forget: no WorkerReturn needed (the gateway already has the
+    // pre-computed base offset and calls notifyControlMarker synchronously).
+    // -------------------------------------------------------------------
+    void executeAppendControlRecordWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeAppendControlRecordWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+            return;
+        }
+
+        const uint8_t* tail    = workerOpTail(frame);
+        const uint32_t tailLen = hdr->tailLen;
+
+        if (!tail || tailLen == 0) {
+            spdlog::warn("Worker {}: executeAppendControlRecordWire_ — empty marker tail for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+            return;
+        }
+
+        const std::span<const uint8_t> markerSpan(tail, static_cast<std::size_t>(tailLen));
+
+        try {
+            const rune::replication::Offset base = replica->append(markerSpan, /*acksAll=*/true);
+            if (base < 0) {
+                spdlog::warn("Worker {}: executeAppendControlRecordWire_ — replica->append returned {} "
+                             "(minIsr gate?) topicId={} partition={}",
+                             workerId_, base, hdr->topicId, hdr->partition);
+            }
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw unknown", workerId_);
         }
     }
 

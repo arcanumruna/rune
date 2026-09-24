@@ -471,7 +471,7 @@ void ClientGateway::rebuildProducerStateFromLogs()
                 rune::replication::PartitionReplica* replica =
                     replicaRegistry_->lookup(topicId, partition);
                 if (replica) {
-                    scanTo = replica->highWatermark();
+                    scanTo = replica->gatewayHighWatermark();
                 }
             }
 
@@ -2068,7 +2068,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (replicaRegistry_) {
         const rune::replication::PartitionReplica* replica =
             replicaRegistry_->lookup(msg.topicId, partition);
-        clampLimit = replica ? replica->highWatermark() : leo;
+        clampLimit = replica ? replica->gatewayHighWatermark() : leo;
     } else {
         clampLimit = leo;
     }
@@ -2264,7 +2264,7 @@ void ClientGateway::pushSubscriptions()
         if (replicaRegistry_) {
             const rune::replication::PartitionReplica* replica =
                 replicaRegistry_->lookup(sub.topicId, sub.partition);
-            hw = replica ? replica->highWatermark() : log->logEndOffset();
+            hw = replica ? replica->gatewayHighWatermark() : log->logEndOffset();
         } else {
             // No replication wired — single-node pass-through: HW == LEO.
             hw = log->logEndOffset();
@@ -3091,12 +3091,20 @@ void ClientGateway::drainPendingAcks()
         // is robust to any future HW-exposure change.
         // G1.1: use per-cycle snapshot (plain int) instead of per-iteration atomic load.
         const int drainMinIsr = cachedMinIsr_;
+        // Task #13: use gatewayIsrSize() (published-snapshot acquire-load)
+        // instead of the live isr().size() — closes the ISR vector race.
         const bool isrHealthy =
             entry.replica &&
-            static_cast<int>(entry.replica->isr().size()) >= drainMinIsr;
+            entry.replica->gatewayIsrSize() >= drainMinIsr;
+
+        // Task #13: use gatewayHighWatermark() (published-snapshot acquire-load)
+        // instead of the live highWatermark() — closes TSan R5/R6b.
+        const int64_t entryHw = entry.replica
+            ? entry.replica->gatewayHighWatermark()
+            : int64_t{0};
 
         if (entry.replica && isrHealthy &&
-            entry.replica->highWatermark() > entry.lastOffset) {
+            entryHw > entry.lastOffset) {
             // HW advanced past this batch AND ISR is healthy — ack OK.
             Session* session = sessions_.find(entry.sessionId);
             if (session) {
@@ -3116,7 +3124,7 @@ void ClientGateway::drainPendingAcks()
                 spdlog::debug("ClientGateway: acks=All deferred ack sent OK "
                               "sessionId={} partition={} baseOffset={} lastOffset={} hw={}",
                               entry.sessionId, entry.partition, entry.baseOffset,
-                              entry.lastOffset, entry.replica->highWatermark());
+                              entry.lastOffset, entryHw);
             }
             // Session gone (reaped): entry is silently discarded (no way to ack).
             remove = true;
@@ -3140,8 +3148,7 @@ void ClientGateway::drainPendingAcks()
                              "sessionId={} partition={} baseOffset={} lastOffset={} "
                              "hw={} elapsed_ms={}",
                              entry.sessionId, entry.partition, entry.baseOffset,
-                             entry.lastOffset,
-                             entry.replica ? static_cast<long long>(entry.replica->highWatermark()) : -1LL,
+                             entry.lastOffset, entryHw,
                              (nowNs_ - entry.enqueuedAtNs) / 1'000'000LL);
             }
             remove = true;
@@ -3442,7 +3449,7 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     if (replicaRegistry_) {
         const rune::replication::PartitionReplica* replica =
             replicaRegistry_->lookup(topicId, partition);
-        bound = replica ? replica->highWatermark() : leo;
+        bound = replica ? replica->gatewayHighWatermark() : leo;
     } else {
         bound = leo;
     }
@@ -3572,6 +3579,52 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
     rune::replication::PartitionReplica* replica = nullptr;
     if (replicaRegistry_) {
         replica = replicaRegistry_->lookup(topicId, partition);
+    }
+
+    // Task #13: close appendControlRecord write-write race (TSan).
+    //
+    // When per-worker ingress is active, the worker is the SOLE appender for
+    // USER partitions (topicId >= 0).  Appending to a worker-owned log from the
+    // gateway thread is a write-write race.  Route the append to the owning
+    // worker via the SPSC ingress ring instead — the worker executes
+    // replica->append on its own thread (sole writer).  The gateway pre-computes
+    // the expected base offset from log->logEndOffset() (safe: logEndOffset is
+    // atomic) and returns it synchronously so the caller can proceed with
+    // notifyControlMarker() without stalling.
+    //
+    // Preconditions for this path:
+    //   - perWorkerIngressActive_ (worker is sole appender for user partitions)
+    //   - topicId >= 0 (user partition — internal partitions keep the gateway path)
+    //   - replica != nullptr (replica guards the log for this partition)
+    //   - workerPool_ != nullptr (ring routing is available)
+    if (perWorkerIngressActive_ && topicId >= 0 && replica && workerPool_) {
+        if (marker.empty()) return -1;
+
+        // Pre-compute the expected base offset.  Since the worker is the sole
+        // appender, log->logEndOffset() at this moment equals the base offset
+        // the worker will assign when it executes the append.
+        base = log->logEndOffset();
+
+        rune::node::WorkerOp op;
+        op.type      = rune::node::WorkerOp::Type::AppendControlRecord;
+        op.topicId   = topicId;
+        op.partition = partition;
+        op.replica   = replica;
+        op.logPtr    = log;
+        // Copy marker bytes into the op (recordBatchBytes reused as the carrier).
+        op.recordBatchBytes.assign(marker.begin(), marker.end());
+
+        if (!workerPool_->tryEnqueueOp(topicId, partition, std::move(op))) {
+            spdlog::warn("ClientGateway::appendControlRecord: worker ring full for "
+                         "topicId={} partition={} — marker dropped (will retry next TCS cycle)",
+                         topicId, partition);
+            return -1;
+        }
+
+        // Return the pre-computed base offset.  The caller (TCS) will call
+        // notifyControlMarker() with this offset; the actual log append happens
+        // on the worker thread shortly after (single-owner, no race).
+        return base;
     }
 
     if (replica) {

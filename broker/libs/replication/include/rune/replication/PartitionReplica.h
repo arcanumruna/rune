@@ -411,6 +411,27 @@ public:
     [[nodiscard]] Role cleanerRole() const noexcept {
         return static_cast<Role>(publishedRoleForCleaner_.load(std::memory_order_acquire));
     }
+    // Task #13: gatewayHighWatermark() — acquire-load of the same published-HW
+    // atomic used by the LogCleanerAgent.  The owning worker publishes with
+    // release (in publishCleanerState()) whenever the HW changes; the gateway
+    // reads with acquire here.  This is the ONLY correct way for the gateway
+    // (control thread) to observe the worker-owned HW without a TSan race
+    // (closes R5/R6b).  A slightly-stale snapshot is safe: it is used only as
+    // a conservative fetch/ack bound — the acks=All drain will simply wait one
+    // more cycle before the worker's next publishCleanerState() stores the
+    // fresh value.
+    [[nodiscard]] Offset gatewayHighWatermark() const noexcept {
+        return publishedHwForCleaner_.load(std::memory_order_acquire);
+    }
+    // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
+    // The owning worker publishes (in publishCleanerState()) the current ISR size
+    // whenever the HW/ISR state is updated.  The gateway reads it in
+    // drainPendingAcks() instead of directly accessing isrManager_->isr().size()
+    // (which races with the worker's ISR vector mutations).  A stale low count
+    // delays an acks=All drain by at most one cycle — never delivers a false OK.
+    [[nodiscard]] int gatewayIsrSize() const noexcept {
+        return publishedIsrSizeForGateway_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] int32_t     topicId()        const noexcept { return cfg_.topicId; }
     [[nodiscard]] PartitionId partitionId()    const noexcept { return cfg_.partitionId; }
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
@@ -772,20 +793,28 @@ private:
     // refreshed on every leader HW read/recompute while the ISR is healthy.
     mutable Offset lastHealthyHw_ = 0;
 
-    // TSan race fix — cleaner-thread-visible snapshots.
+    // TSan race fix — cleaner/gateway-thread-visible snapshots.
     //
     // publishedHwForCleaner_:  the served committed HW, mirrored from
     //   highWatermark()/computeServedHw() by the duty thread via
     //   publishCleanerState() (release-store).  The LogCleanerAgent reads it via
     //   cleanerHighWatermark() (acquire-load) as its conservative compaction /
     //   retention upper bound.  Slightly-stale-but-safe: compaction/retention are
-    //   always below a conservative HW.
+    //   always below a conservative HW.  Also read by the gateway thread via
+    //   gatewayHighWatermark() (acquire-load) to avoid the R5/R6b race.
     // publishedRoleForCleaner_:  the role (as int), mirrored the same way.  The
     //   cleaner gates all work on cleanerRole()==Leader so it never reads role_.
+    // publishedIsrSizeForGateway_:  the ISR size as last published by the duty
+    //   thread.  The gateway reads it via gatewayIsrSize() (acquire-load) in
+    //   drainPendingAcks() to avoid the live ISR vector race (Task #13).
+    //   Slightly-stale-but-safe: a stale low count delays an acks=All drain by at
+    //   most one publishCleanerState() cycle, never delivers a false OK.
     //
-    // Both are the ONLY leader/HW/role state the cleaner thread ever observes.
+    // All three are the ONLY leader/HW/role/ISR state that cleaner/gateway threads
+    // observe — no direct reads of role_, leaderState_, or isrManager_.
     std::atomic<Offset> publishedHwForCleaner_{0};
     std::atomic<int>    publishedRoleForCleaner_{static_cast<int>(Role::Follower)};
+    std::atomic<int>    publishedIsrSizeForGateway_{0};
 };
 
 // ---------------------------------------------------------------------------

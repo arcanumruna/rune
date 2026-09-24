@@ -63,6 +63,13 @@ struct WorkerOp {
         FetchRequest,             ///< transport → worker: leader handles follower FetchRequest
         OffsetsForLeaderEpochReq, ///< transport → worker: leader handles KIP-101 epoch probe
         ReconcileFetchResp,       ///< transport → worker: deficient leader applies survivor data
+        // Task #13: appendControlRecord race fix — route txn COMMIT/ABORT marker
+        // appends to the owning worker when per-worker ingress is active.
+        // Fire-and-forget (no WorkerReturn): the gateway pre-computes the base
+        // offset from log->logEndOffset() before enqueueing and returns it
+        // synchronously; the worker appends via replica->append(marker, acksAll).
+        // Internal partitions (topicId < 0) never use this path.
+        AppendControlRecord,      ///< gateway → worker: append txn control marker to user partition
     };
 
     Type    type    = Type::Produce;
