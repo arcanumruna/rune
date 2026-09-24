@@ -100,6 +100,27 @@ public:
     /// Maximum single-message payload the ring can hold (capacity / 8).
     aeron::util::index_t maxMsgLength() const { return ring_.maxMsgLength(); }
 
+    /// True when at least one max-message-length slot is available in the ring.
+    /// Used by the G-A6 backpressure guard in Worker::doWork to check whether
+    /// the return ring has capacity before polling the WorkerIngress for more
+    /// produce frames — preventing ack drops under back-pressure.
+    bool hasSpaceForMaxMsg() const {
+        // A message of maxMsgLength() bytes needs (maxMsgLength() + header overhead).
+        // Simpler proxy: the ring has capacity when producerPosition advances by at
+        // most (total_capacity - TRAILER) over consumerPosition.  Since agrona's
+        // internal size field = producerPosition - consumerPosition, we compare
+        // against (capacity / 8) * 8 = capacity which is (total - TRAILER).
+        // Equivalently: if we can still write one maxMsgLength frame, there is space.
+        // agrona ring_.tryClaim returns < 0 on full; we approximate with positions.
+        // capacity() is payload bytes = total - TRAILER; maxMsg = capacity / 8.
+        // used = producerPosition - consumerPosition (in payload-space, not index).
+        const int64_t capacity = static_cast<int64_t>(maxMsgLength()) * 8LL;
+        const int64_t used     = ring_.producerPosition() - ring_.consumerPosition();
+        // Leave room for a max-message frame + minimal alignment overhead (×2 safety).
+        const int64_t needed   = static_cast<int64_t>(maxMsgLength()) * 2LL;
+        return used + needed <= capacity;
+    }
+
 private:
     // Raw storage — zero-initialised so Aeron ring descriptor fields start at 0.
     std::vector<std::byte> bufferStorage_;

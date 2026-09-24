@@ -16,8 +16,8 @@
 // avoid a circular CMake target dep; rune_gateway does NOT link rune_node).
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
-// E5.1.2b: shared produce-batch helper (gateway inline path + worker path share semantics).
-#include <rune/node/ProducePath.h>
+// E5.1.2d: shared produce-batch helper now in rune_storage (leaf lib, no circular dep).
+#include <rune/storage/ProducePath.h>
 
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>

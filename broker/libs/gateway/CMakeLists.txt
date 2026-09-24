@@ -1,17 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
 # rune_gateway — ClientGateway + SessionTable (BR-4) + TopicRegistry (GB-1)
-# E5.1.2b: ProducePath.cpp compiled into rune_gateway (not rune_node) to avoid
-# the circular dependency rune_node → PUBLIC rune_gateway → rune_node.
-# ProducePath.h lives under libs/node/include (RUNE_NODE_INCLUDE, accessible to
-# rune_gateway via the target_include_directories PUBLIC path on line 21).
-# Future worker ingress (E5.1.2d) calls handleProduceBatch via rune_gateway
-# (which rune_node links PUBLIC).
+# E5.1.2d: ProducePath.cpp was moved to rune_storage (leaf lib) — it used to
+# live here as a workaround for the rune_node ↔ rune_gateway circular dep.
+# Now both rune_gateway and rune_node depend on rune_storage which holds the
+# implementation, cleanly eliminating the circular-dep workaround.
 add_library(rune_gateway
     src/ClientGateway.cpp
-    src/TopicRegistry.cpp
-    # E5.1.2b: shared produce-batch helper (gateway + worker reuse).
-    src/ProducePath.cpp)
+    src/TopicRegistry.cpp)
 
 target_include_directories(rune_gateway PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)

@@ -69,9 +69,13 @@
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerWire.h>
+#include <rune/node/WorkerIngress.h>
 #include <rune/node/IoBackend.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/ProducePath.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
 
 #include <algorithm>
 #include <atomic>
@@ -120,6 +124,18 @@ public:
     // Pre-reserve capacity for the per-cycle dirty-log set (dedup, small).
     static constexpr std::size_t kDirtySetReserve = 64;
 
+    // Pre-reserve capacity for the acks=all pending-ack list (worker ingress path).
+    static constexpr std::size_t kPendingAcksAllReserve = 256;
+
+    // Pre-reserve capacity for the overflow ack queue (G-A6: acks that could not
+    // be written to ret_ in the same cycle — flushed before next ingress poll).
+    static constexpr std::size_t kRetOverflowReserve = 64;
+
+    // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
+    // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the
+    // timeout is not too tight.  Configurable via setAckTimeoutNs.
+    static constexpr int64_t kDefaultAckTimeoutNs = 30'000'000'000LL; // 30 s
+
     // ctor: ingressRingBytes / returnRingBytes are the per-worker SPSC ring
     // byte capacities (power of two). They default to the k*ByteCapacity
     // constants; BrokerNode threads NodeConfig.workerIngress/ReturnRingBytes
@@ -140,6 +156,8 @@ public:
     {
         durablePending_.reserve(kDurablePendingReserve);
         dirtyThisCycle_.reserve(kDirtySetReserve);
+        pendingAcksAll_.reserve(kPendingAcksAllReserve);
+        retOverflow_.reserve(kRetOverflowReserve);
     }
 
     // Non-copyable and non-movable (two OneToOneByteRing members are not movable).
@@ -160,6 +178,29 @@ public:
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
+
+    // -----------------------------------------------------------------------
+    // E5.1.2d: per-worker ingress produce path.
+    //
+    // setWorkerIngress — wire up a WorkerIngress and (optionally) activate the
+    // per-worker produce path.  Must be called BEFORE the worker's AgentRunner
+    // starts (startup / single-threaded).
+    //
+    // perWorkerIngressActive_ defaults FALSE so the existing gateway fanout
+    // remains the live path and nothing double-processes.  E5.1.3 will construct
+    // per-worker subscriptions in BrokerNode, wire them here, set active=true,
+    // and retire the gateway fanout — all together.
+    // -----------------------------------------------------------------------
+    void setWorkerIngress(WorkerIngress* ingress, bool active = false) noexcept {
+        workerIngress_          = ingress;
+        perWorkerIngressActive_ = active;
+    }
+
+    // Set acks=all commit-wait timeout.  Default kDefaultAckTimeoutNs (30 s).
+    void setAckTimeoutNs(int64_t timeoutNs) noexcept { ackTimeoutNs_ = timeoutNs; }
+
+    // Expose psm_ for tests (worker-thread only; call only from single-threaded tests).
+    [[nodiscard]] rune::storage::ProducerStateManager& psmForTest() noexcept { return psm_; }
 
     // E4: assign the core this worker's AgentRunner thread should be pinned to.
     //
@@ -294,6 +335,13 @@ public:
     // Virtual dispatch occurs once per duty cycle (AgentRunner call site);
     // the per-record paths inside remain fully concrete.
     // Ownership snapshot is loaded ONCE (acquire) at the top of the call.
+    //
+    // E5.1.2d: G-A6 backpressure loop order (when perWorkerIngressActive_):
+    //   1. Reap async-durability completions.
+    //   2. Flush owed acks FIRST (acks=all pending whose replica HW >= lastOffset).
+    //   3. Poll WorkerIngress ONLY IF ret_ has space AND no owed acks.
+    //      This ensures Aeron term buffer fills → client offer() back-pressures.
+    //      NEVER drop an ack.
     int doWork(int64_t nowNs) override {
         int work = 0;
 
@@ -317,6 +365,27 @@ public:
         // that completions from the previous cycle fire before the next produce
         // cycle's ops are processed.  Per-worker, no shared state.
         work += reapDurableCompletions_();
+
+        // E5.1.2d: G-A6 backpressure path (only active when perWorkerIngressActive_).
+        //
+        // 2a. Flush overflow acks FIRST — acks that could not be written to ret_
+        //     in a prior cycle.  Stops as soon as ret_ is full again.
+        //     While retOverflow_ is non-empty, no new ingress polling occurs.
+        // 2b. Flush owed acks=all — checks each pending ack's replica HW;
+        //     fires the ack when HW >= lastOffset, or a timeout error if overdue.
+        //     While pendingAcksAll_ is non-empty, no new ingress polling occurs.
+        // 3.  Poll WorkerIngress ONLY IF ret_ has space AND retOverflow_ is empty
+        //     AND pendingAcksAll_ is empty.
+        //     Skipping the poll when any ack backlog exists ensures Aeron's term
+        //     buffer fills → client offer() back-pressures.  No ack is ever
+        //     dropped (G-A6 structural enforcement).
+        if (perWorkerIngressActive_) {
+            work += flushRetOverflow_();
+            work += flushOwedAcksAll_(nowNs);
+            if (ret_.hasSpaceForMaxMsg() && retOverflow_.empty() && pendingAcksAll_.empty()) {
+                work += pollWorkerIngress_(nowNs);
+            }
+        }
 
         // Step 0: drain ingress ring (E2 inc2a / R2). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
@@ -352,12 +421,16 @@ private:
     // enqueueReturn_ — R3: encode a WorkerReturn into returnScratch_ and
     //                  write it to the ret_ OneToOneByteRing.
     //
-    // OLD BEHAVIOUR (SpscRing): ret_.tryEnqueue() was [[nodiscard]] but its
-    // return value was NEVER checked at any call site — i.e. a full ring caused
-    // a silent drop of the return message.
-    // NEW BEHAVIOUR (R3): ret_.write() returns false when full → same silent-
-    // drop.  A warn is emitted to make this observable.
-    // TODO(R5): audit full-ret_ back-pressure; consider retry/hold-and-retry.
+    // G-A6 (WorkerIngress path): if ret_.write() fails (ring full), the ack is
+    // pushed to retOverflow_ — a per-worker "ack overflow queue".  The overflow
+    // queue is flushed at the TOP of the perWorkerIngressActive_ block on the
+    // NEXT doWork cycle (before any new ingress polling).  This ensures:
+    //   (a) No ack is ever silently dropped.
+    //   (b) The worker holds back (does not poll more frames) when ret_ is full
+    //       or an overflow ack is pending — G-A6 structural enforcement.
+    //
+    // Non-WorkerIngress path (existing gateway ingress ring): silent drop is
+    // preserved (same as original R3 behaviour — TODO(R5)).
     //
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
@@ -370,9 +443,16 @@ private:
             return;
         }
         if (!ret_.write(returnScratch_.data(), n, workerReturnMsgTypeId(ret))) {
-            // TODO(R5): add retry or back-pressure propagation.
-            spdlog::warn("Worker {}: ret_ ring full — WorkerReturn type={} dropped",
-                         workerId_, static_cast<int>(ret.type));
+            if (perWorkerIngressActive_) {
+                // G-A6: push to overflow queue instead of dropping.
+                // flushRetOverflow_ will retry on the next doWork cycle.
+                retOverflow_.push_back(ret);
+            } else {
+                // Non-WorkerIngress path: preserve existing silent-drop behaviour.
+                // TODO(R5): add retry or back-pressure propagation for this path too.
+                spdlog::warn("Worker {}: ret_ ring full — WorkerReturn type={} dropped",
+                             workerId_, static_cast<int>(ret.type));
+            }
         }
     }
 
@@ -1065,6 +1145,317 @@ private:
         (void)core;
         return false; // no-op on macOS and other non-Linux platforms
 #endif
+    }
+
+    // -----------------------------------------------------------------------
+    // E5.1.2d: per-worker produce path (WorkerIngress → handleProduceBatch → ack).
+    // -----------------------------------------------------------------------
+
+    // Per-worker ProducerStateManager — idempotency for this worker's owned partitions.
+    // Worker-thread only (single-writer per (log, PSM) pair — shared-nothing).
+    //
+    // TODO(E5.1.5): At migration time, reconstruct PSM from the log tail via
+    //   reconstructPsmFromLog(partition) seam (left as an explicit hook here).
+    //   For now, a fresh PSM at construction is safe (loses idempotency window
+    //   across restarts, but that is acceptable for the E5.1.2d gate).
+    rune::storage::ProducerStateManager psm_{};
+
+    // E5.1.2d: gate — true when the worker should poll workerIngress_ for produce.
+    // Default FALSE so the existing gateway fanout remains the live path and
+    // nothing double-processes.  E5.1.3 flips this ON and retires the fanout.
+    bool perWorkerIngressActive_ = false;
+
+    // Non-owning pointer to this worker's Aeron ingress subscription.
+    // Null until setWorkerIngress() is called.  Worker-thread read only (doWork).
+    WorkerIngress* workerIngress_ = nullptr;
+
+    // E5.1.2d: acks=all commit-wait pending list.
+    //
+    // When a produce with acks=all arrives via WorkerIngress, we append it
+    // immediately (like acks=leader) but do NOT ack yet.  Instead we push a
+    // PendingAcksAll entry here with the last offset and the correlation info.
+    // Each cycle in flushOwedAcksAll_() we check each entry against
+    // replica->highWatermark() (safe: worker owns all HW writes).  When HW
+    // passes lastOffset the ack fires; if the timeout elapses first we ack with
+    // a timeout error (never drop — G-A6 no-silent-failure).
+    //
+    // Worker-thread only — plain vector, reserved in ctor.
+    struct PendingAcksAll {
+        rune::replication::PartitionReplica* replica    = nullptr;
+        int64_t                              lastOffset = 0;   ///< fire when replica HW > this
+        int64_t                              deadlineNs = 0;   ///< monotonic ns deadline
+        WorkerReturn                         ret;               ///< ack payload when ready
+    };
+    std::vector<PendingAcksAll> pendingAcksAll_;
+
+    // E5.1.2d: G-A6 overflow ack queue.
+    //
+    // When ret_.write() fails inside enqueueReturn_ (ring full) on the
+    // WorkerIngress path, the ack is pushed here instead of being dropped.
+    // flushRetOverflow_() retries these acks at the top of the next doWork
+    // cycle.  The G-A6 gate (retOverflow_.empty()) prevents new ingress
+    // polling while overflow acks are pending.
+    //
+    // Worker-thread only — plain vector, reserved in ctor.
+    std::vector<WorkerReturn> retOverflow_;
+
+    // E5.1.2d: acks=all commit-wait timeout (ns).
+    int64_t ackTimeoutNs_ = kDefaultAckTimeoutNs;
+
+    // -----------------------------------------------------------------------
+    // flushRetOverflow_ — retry acks that could not be written to ret_ in a
+    //                     prior cycle (G-A6: no silent drop on WorkerIngress path).
+    //
+    // Iterates retOverflow_; writes each ack to ret_ using enqueueReturn_.
+    // Stops as soon as a write fails (ring still full) so as not to spin.
+    // Entries that succeed are removed from the front of the vector.
+    //
+    // Worker-thread only.  Returns number of acks flushed.
+    // -----------------------------------------------------------------------
+    int flushRetOverflow_() {
+        if (retOverflow_.empty()) return 0;
+
+        int flushed = 0;
+        // Iterate front-to-back; stop on first failure (ring still full).
+        // We temporarily disable perWorkerIngressActive_ guard in enqueueReturn_
+        // to avoid re-queuing into retOverflow_ during this flush pass.
+        // We do this by calling ret_.write() directly here.
+        while (!retOverflow_.empty()) {
+            const WorkerReturn& ret = retOverflow_.front();
+            std::size_t n = 0;
+            try {
+                n = encodeWorkerReturn(ret, returnScratch_.data(), returnScratch_.size());
+            } catch (...) {
+                // Encode error: discard this entry and continue.
+                retOverflow_.erase(retOverflow_.begin());
+                continue;
+            }
+            if (!ret_.write(returnScratch_.data(), n, workerReturnMsgTypeId(ret))) {
+                break; // ring still full — stop; retry next cycle
+            }
+            retOverflow_.erase(retOverflow_.begin());
+            ++flushed;
+        }
+        return flushed;
+    }
+
+    // -----------------------------------------------------------------------
+    // flushOwedAcksAll_ — fire acks=all acks whose replica HW has passed
+    //                     the required offset, or whose timeout has elapsed.
+    //
+    // Shared-nothing: reads replica->highWatermark() on THIS worker thread.
+    // Safe because the worker owns ALL HW writes after E5.1.2c.
+    //
+    // Called at the TOP of the perWorkerIngressActive_ block (before polling
+    // ingress) to ensure acks are flushed before new produce is accepted.
+    // Returns the number of acks fired.
+    // -----------------------------------------------------------------------
+    int flushOwedAcksAll_(int64_t nowNs) {
+        if (pendingAcksAll_.empty()) return 0;
+
+        int fired = 0;
+        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
+            auto& entry = pendingAcksAll_[i];
+
+            // HW-passed: the replica has committed past our last offset.
+            const bool hwPassed = entry.replica &&
+                (entry.replica->highWatermark() > entry.lastOffset);
+            // Timeout: this ack has been waiting too long.
+            const bool timedOut = (nowNs >= entry.deadlineNs);
+
+            if (hwPassed || timedOut) {
+                if (timedOut && !hwPassed) {
+                    spdlog::warn("Worker {}: acks=all timeout for partition={} "
+                                 "lastOffset={}; acking timeout error",
+                                 workerId_, entry.ret.partition, entry.lastOffset);
+                    // ErrorCode 7 = RequestTimedOut (or Internal=6 if no dedicated code)
+                    entry.ret.errorCode = static_cast<int16_t>(7);
+                } else {
+                    entry.ret.errorCode = 0; // OK
+                }
+                enqueueReturn_(entry.ret);
+                // O(1) erase by swap-with-back.
+                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
+                pendingAcksAll_.pop_back();
+                ++fired;
+                // Do NOT advance i — the swapped entry needs checking.
+            } else {
+                ++i;
+            }
+        }
+        return fired;
+    }
+
+    // -----------------------------------------------------------------------
+    // getLogAndReplicaForPartition_ — look up the Log* and PartitionReplica*
+    //                                  for (topicId, partition) from owned_.
+    //
+    // Worker-thread only. O(N) over owned_ — acceptable for the produce path
+    // (produce frame rate >> per-batch O(N) owned-set scan, and N is small).
+    // Returns {nullptr, nullptr} if the partition is not owned by this worker.
+    // -----------------------------------------------------------------------
+    std::pair<rune::storage::Log*, rune::replication::PartitionReplica*>
+    getLogAndReplicaForPartition_(int32_t topicId, int32_t partition) const noexcept {
+        for (auto* replica : owned_) {
+            if (!replica) continue;
+            if (replica->topicId() == topicId &&
+                static_cast<int32_t>(replica->partitionId()) == partition) {
+                // Only disk-backed replicas expose a rune::storage::Log*.
+                // Memory-backed (InMemoryLog) replicas are NOT supported on the
+                // WorkerIngress produce path — the gateway fanout handles them
+                // via the existing WorkerOp ring (which carries a logPtr).
+                // Return nullptr for memory-backed so the caller sends an
+                // Internal error rather than crash.
+                rune::storage::Log* log =
+                    replica->isDiskBacked() ? replica->log() : nullptr;
+                return {log, replica};
+            }
+        }
+        return {nullptr, nullptr};
+    }
+
+    // -----------------------------------------------------------------------
+    // pollWorkerIngress_ — poll the worker's Aeron subscription for ONE produce
+    //                       frame per call, run handleProduceBatch, enqueue ack.
+    //
+    // G-A6 contract: this is ONLY called when ret_ has space AND pendingAcksAll_
+    // is empty (enforced by doWork caller).  fragmentLimit=1 ensures we process
+    // at most one frame per doWork cycle so the outer G-A6 space check always
+    // fires before the next poll — no silent ack drops within a batch poll.
+    // Each doWork cycle is: check space → poll 1 → ack → next cycle → check again.
+    // Never drops an ack: errors return error acks on ret_; acks=all go to
+    // pendingAcksAll_ for deferred fire.
+    // -----------------------------------------------------------------------
+    int pollWorkerIngress_(int64_t nowNs) {
+        if (!workerIngress_ || !workerIngress_->resolved()) return 0;
+
+        int polled = 0;
+        workerIngress_->poll(
+            /*fragmentLimit=*/1,   // G-A6: one frame per cycle — space re-checked each cycle
+            [this, nowNs, &polled]
+            (const uint8_t* data, std::size_t len, aeron::Header& /*hdr*/) {
+                polled += handleWorkerIngressFrame_(data, len, nowNs);
+            });
+        return polled;
+    }
+
+    // -----------------------------------------------------------------------
+    // handleWorkerIngressFrame_ — decode one Produce frame from WorkerIngress,
+    //                              run handleProduceBatch, enqueue the ack.
+    //
+    // Frame format: full rune::protocol::client::Produce wire frame.
+    // The data pointer is a zero-copy view into Aeron's term buffer; it is
+    // valid only for the duration of this call.  handleProduceBatch receives a
+    // mutable copy of the batch bytes (restamped in place).
+    // -----------------------------------------------------------------------
+    int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
+                                  int64_t nowNs) {
+        namespace pc = rune::protocol::client;
+
+        // Decode the produce frame.
+        auto msgOpt = pc::Produce::decode(data, len);
+        if (!msgOpt) {
+            spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
+                         "len={}; dropping", workerId_, len);
+            return 0;
+        }
+        const pc::Produce& msg = *msgOpt;
+
+        // Look up the owned Log + replica for this partition.
+        auto [log, replica] = getLogAndReplicaForPartition_(msg.topicId, msg.partition);
+
+        // Build a WorkerReturn shell for this ack.
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::ProduceResult;
+        ret.sessionId     = msg.sessionId;
+        ret.correlationId = msg.correlationId;
+        ret.partition     = msg.partition;
+        ret.topicId       = msg.topicId;
+        ret.producerId    = msg.producerId;
+        ret.producerEpoch = msg.producerEpoch;
+        ret.baseSequence  = msg.baseSequence;
+        ret.replica       = replica;
+
+        if (!log) {
+            spdlog::warn("Worker {}: WorkerIngress: no owned log for topicId={} "
+                         "partition={}; Internal error ack",
+                         workerId_, msg.topicId, msg.partition);
+            ret.errorCode = static_cast<int16_t>(6); // Internal
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // Copy the batch bytes so handleProduceBatch can restamp in place.
+        // The zero-copy Aeron view is only valid during this callback;
+        // we need a mutable local copy for the in-place restamp.
+        const std::span<const uint8_t> rbSpan = msg.recordBatch;
+        if (rbSpan.empty()) {
+            spdlog::warn("Worker {}: WorkerIngress: empty recordBatch topicId={} "
+                         "partition={}; Internal error ack",
+                         workerId_, msg.topicId, msg.partition);
+            ret.errorCode = static_cast<int16_t>(6);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // Local mutable copy (one allocation per batch on this path — acceptable
+        // for the WorkerIngress path; the hot-path avoids this via the existing
+        // ingress_ ring which does a single copy into the ring).
+        std::vector<uint8_t> batchBuf(rbSpan.begin(), rbSpan.end());
+
+        // Determine acks mode.
+        const bool acksAll = (msg.acks != 0);
+
+        // ISR size for the min-ISR gate.
+        const int isrSize = replica ? static_cast<int>(replica->isr().size()) : 0;
+        const int minIsr  = replica ? replica->minIsr() : 1;
+
+        // Durability tier — for the WorkerIngress path we use Majority (tier=1)
+        // so the worker's IoBackend group-commit handles fsync.
+        constexpr uint8_t kDurabilityTier = 1;
+
+        // Call the shared produce helper.
+        rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
+            batchBuf.data(), batchBuf.size(),
+            msg.topicId, msg.partition,
+            msg.producerId, msg.producerEpoch, msg.baseSequence,
+            *log, psm_,
+            acksAll, isrSize, minIsr, kDurabilityTier);
+
+        ret.baseOffset  = outcome.baseOffset;
+        ret.lastOffset  = outcome.lastOffset;
+        ret.recordCount = outcome.recordCount;
+        ret.batchAttrs  = outcome.batchAttrs;
+
+        if (!outcome.isOK()) {
+            ret.errorCode = static_cast<int16_t>(
+                static_cast<int>(outcome.error));
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // GR-4 Mode A: advance the replica's LEO/HW after successful append.
+        if (replica) {
+            replica->onLeaderLogAppended();
+        }
+
+        if (!acksAll || outcome.isDuplicate) {
+            // acks=leader / duplicate: ack immediately.
+            ret.errorCode = 0;
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // acks=all (non-duplicate): register a pending ack; fire when HW passes.
+        // Timeout: nowNs + ackTimeoutNs_ (generous — accounts for fetch-handling
+        // latency added by E5.1.2c, where fetch waits a worker cycle).
+        PendingAcksAll pending;
+        pending.replica    = replica;
+        pending.lastOffset = outcome.lastOffset;
+        pending.deadlineNs = nowNs + ackTimeoutNs_;
+        pending.ret        = std::move(ret);
+        pendingAcksAll_.push_back(std::move(pending));
+        return 1;
     }
 };
 

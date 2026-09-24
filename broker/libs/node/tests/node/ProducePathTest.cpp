@@ -1,4 +1,4 @@
-// ProducePathTest.cpp — Unit tests for rune::node::handleProduceBatch (E5.1.2b).
+// ProducePathTest.cpp — Unit tests for rune::storage::handleProduceBatch (E5.1.2b/d).
 //
 // Drives the shared produce-batch helper DIRECTLY against a real Log +
 // ProducerStateManager — no Aeron, no gateway, no worker.
@@ -25,10 +25,12 @@
 //        producerId==-1 → appends twice without dedup.
 //  10. BatchTooShort_Rejected
 //        batchLen < kMinBatchSize → Internal.
+//  11. (E5.1.2d nit Q3) DurabilityTier2_StrictSync
+//        durabilityTier==2 on a disk-backed log → syncDone=true in the outcome.
 
 #include <gtest/gtest.h>
 
-#include <rune/node/ProducePath.h>
+#include <rune/storage/ProducePath.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/protocol/RecordBatch.h>
@@ -43,7 +45,7 @@
 #include <unistd.h>
 #include <vector>
 
-namespace rune::node {
+namespace rune::storage {
 namespace {
 
 namespace pc  = rune::protocol::client;
@@ -355,5 +357,32 @@ TEST_F(ProducePathTest, BatchTooShort_Rejected)
     EXPECT_EQ(log_.logEndOffset(), leo0);
 }
 
+// ===========================================================================
+// TEST 11: DurabilityTier2_StrictSync (E5.1.2d nit Q3)
+//
+// durabilityTier==2 on a disk-backed log → sync() is called inline and
+// syncDone == true in the outcome.
+// ===========================================================================
+TEST_F(ProducePathTest, DurabilityTier2_StrictSync)
+{
+    auto batch = makeBatch(1);
+
+    // Use tier=2 (Strict).  The fixture's log_ IS disk-backed (real Log on tmpdir),
+    // so sync() runs inline and returns syncDone=true.
+    auto out = callHelper(batch, log_, psm_,
+                          /*topicId=*/1, /*partition=*/0,
+                          /*producerId=*/-1, /*prodEpoch=*/0, /*baseSeq=*/-1,
+                          /*acksAll=*/false, /*isrSize=*/0, /*minIsr=*/1,
+                          /*tier=*/2);
+
+    EXPECT_TRUE(out.isOK());
+    EXPECT_FALSE(out.isDuplicate);
+    EXPECT_EQ(out.baseOffset, 0);
+    EXPECT_EQ(out.lastOffset, 0);
+    EXPECT_TRUE(out.syncDone)
+        << "durabilityTier==2 on a disk-backed log must set syncDone=true";
+    EXPECT_EQ(log_.logEndOffset(), 1);
+}
+
 } // namespace
-} // namespace rune::node
+} // namespace rune::storage

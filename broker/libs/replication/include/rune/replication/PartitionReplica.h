@@ -414,6 +414,8 @@ public:
     [[nodiscard]] int32_t     topicId()        const noexcept { return cfg_.topicId; }
     [[nodiscard]] PartitionId partitionId()    const noexcept { return cfg_.partitionId; }
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
+    /// E5.1.2d: min-ISR required for acks=All produce on this partition.
+    [[nodiscard]] int         minIsr()         const noexcept { return cfg_.minIsr; }
     /// CP-1: the log cleanup policy for this partition (consulted by the LogCleaner).
     [[nodiscard]] CleanupPolicy cleanupPolicy() const noexcept { return cfg_.cleanupPolicy; }
 

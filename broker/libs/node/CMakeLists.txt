@@ -7,9 +7,9 @@ add_library(rune_node
     src/PortableFlushBackend.cpp
     # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
     src/UringFlushBackend.cpp)
-# E5.1.2b note: ProducePath.cpp lives in libs/gateway/src/ (compiled into rune_gateway)
-# to avoid the circular dependency rune_node → PUBLIC rune_gateway → rune_node.
-# rune_node gets handleProduceBatch transitively via its rune_gateway PUBLIC link.
+# E5.1.2d: ProducePath.cpp was moved from libs/gateway/src/ to libs/storage/src/
+# (compiled into rune_storage, a true leaf lib). Both rune_gateway and rune_node
+# depend on rune_storage, so the circular-dep workaround is eliminated.
 
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -624,7 +624,6 @@ if(BUILD_TESTING)
     endif()
 
     # ---------------------------------------------------------------------------
-    # ---------------------------------------------------------------------------
     # E5.1.2a: WorkerIngress unit tests — per-worker Aeron subscription +
     # zero-copy poll delivery mechanism.  Uses an embedded IPC Aeron driver
     # (same fixture as GatewayLoopbackTest).  Gated behind BUILD_BROKER_NODE_TESTS.
@@ -638,6 +637,34 @@ if(BUILD_TESTING)
             GTest::gtest_main)
         gtest_discover_tests(rune_worker_ingress_tests
             PROPERTIES TIMEOUT 60
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # E5.1.2d: WorkerProducePathTest — per-worker ingress produce path tests.
+    #
+    # Tests the full produce path: WorkerIngress → handleProduceBatch → append →
+    # ack via ret_.  Three tests:
+    #   1. AcksLeader_ImmediateAck  — acks=0: ack fires immediately on append.
+    #   2. AcksAll_DeferredAckOnHWAdvance — acks=1: deferred until HW passes.
+    #   3. G_A6_Backpressure_NoDropOnFullRet — structural backpressure: worker
+    #      holds (not drops) acks when ret_ is full; resumes on drain.
+    #
+    # Uses an embedded IPC Aeron driver (same fixture as WorkerIngressTest).
+    # Gated behind BUILD_BROKER_NODE_TESTS (same as WorkerIngressTest).
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_worker_produce_path_tests
+            tests/node/WorkerProducePathTest.cpp)
+        target_include_directories(rune_worker_produce_path_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_worker_produce_path_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_produce_path_tests
+            PROPERTIES TIMEOUT 120
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 

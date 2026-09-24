@@ -1,7 +1,17 @@
-add_library(rune_storage src/dummy.cpp src/MappedFile.cpp src/OffsetIndex.cpp src/LogSegment.cpp src/Log.cpp src/PartitionApi.cpp src/OffsetMap.cpp src/LogCleaner.cpp src/ProducerStateManager.cpp src/InMemoryLog.cpp)
+add_library(rune_storage src/dummy.cpp src/MappedFile.cpp src/OffsetIndex.cpp src/LogSegment.cpp src/Log.cpp src/PartitionApi.cpp src/OffsetMap.cpp src/LogCleaner.cpp src/ProducerStateManager.cpp src/InMemoryLog.cpp
+    # E5.1.2d: ProducePath moved from rune_gateway to rune_storage (leaf lib) to
+    # eliminate the rune_node ↔ rune_gateway circular-dep workaround. Both
+    # rune_gateway and rune_node depend on rune_storage, so this is a true leaf
+    # location callable from both without any circular dependency.
+    src/ProducePath.cpp)
 target_include_directories(rune_storage PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         ${RUNE_PROTOCOL_INCLUDE})
+# ProducePath.cpp uses spdlog (warn/error/debug logging).
+find_package(spdlog QUIET)
+if(spdlog_FOUND)
+    target_link_libraries(rune_storage PUBLIC spdlog::spdlog)
+endif()
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
