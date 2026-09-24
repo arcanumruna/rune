@@ -7,6 +7,9 @@ add_library(rune_node
     src/PortableFlushBackend.cpp
     # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
     src/UringFlushBackend.cpp)
+# E5.1.2b note: ProducePath.cpp lives in libs/gateway/src/ (compiled into rune_gateway)
+# to avoid the circular dependency rune_node → PUBLIC rune_gateway → rune_node.
+# rune_node gets handleProduceBatch transitively via its rune_gateway PUBLIC link.
 
 target_include_directories(rune_node PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -65,6 +68,22 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
+
+    # ---------------------------------------------------------------------------
+    # E5.1.2b: ProducePathTest — unit tests for the shared handleProduceBatch
+    # helper (ProducePath.h/.cpp).  Tests the core batch produce semantics
+    # (restamp, CRC, idempotent dedup, min-ISR gate, append, PSM update) against
+    # a real Log + ProducerStateManager.  No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_produce_path_tests
+        tests/node/ProducePathTest.cpp)
+    target_include_directories(rune_produce_path_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_produce_path_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_produce_path_tests
+        PROPERTIES TIMEOUT 60)
 
     # RoleCounter wire-encoding unit tests (pure header — no Aeron driver).
     add_executable(rune_role_counter_tests

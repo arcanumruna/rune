@@ -16,6 +16,8 @@
 // avoid a circular CMake target dep; rune_gateway does NOT link rune_node).
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
+// E5.1.2b: shared produce-batch helper (gateway inline path + worker path share semantics).
+#include <rune/node/ProducePath.h>
 
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -1468,150 +1470,15 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     }
 
     // Copy the recordBatch bytes into the reusable restamp scratch.
+    // Both the worker path and the inline path operate on restampScratch_.
     std::memcpy(restampScratch_.data(), msg.recordBatch.data(), batchLen);
 
-    // Assign base offset and rewrite the LE64 at kBaseOffsetOffset.
-    // This field sits at bytes [0..7], BEFORE the CRC region that starts at
-    // kAttributesOffset (byte 21) — rewriting it is CRC-safe (identical to Kafka).
-    const int64_t base = log->logEndOffset();
-    {
-        uint64_t u = static_cast<uint64_t>(base);
-        for (int i = 0; i < 8; ++i) {
-            restampScratch_[static_cast<std::size_t>(rune::protocol::batch::kBaseOffsetOffset) + i] =
-                static_cast<uint8_t>(u >> (i * 8));
-        }
-    }
-
-    // M1 fix: derive lastOffset from the CRC-covered lastOffsetDelta field
-    // (kLastOffsetDeltaOffset=23, LE32) rather than trusting client recordCount.
+    // ---------------------------------------------------------------------------
+    // acks=All gateway-policy checks (bootstrap window + ISR gate).
     //
-    // A buggy/malicious client can send recordCount=1 with lastOffsetDelta=1000;
-    // LEO would advance by 1 while the stored batch self-describes as spanning
-    // 1001 offsets — the next produce's baseOffset overlaps the previous batch
-    // (exactly-once violation).  lastOffsetDelta is CRC-covered: the CRC region
-    // starts at kAttributesOffset=21 which precedes kLastOffsetDeltaOffset=23.
-    //
-    // Canonical derivation:
-    //   lastOffset = base + lastOffsetDelta
-    //   count      = lastOffsetDelta + 1
-    // Validate: recordCount (client-supplied) must match lastOffsetDelta+1.
-    // A mismatch means the batch is internally inconsistent → reject (Internal).
-    // Also validate via CRC (ensureValid) to reject any corrupt batch.
-
-    // Read lastOffsetDelta (LE32 at kLastOffsetDeltaOffset=23).
-    int32_t lastOffsetDelta = 0;
-    {
-        const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kLastOffsetDeltaOffset;
-        lastOffsetDelta = static_cast<int32_t>(
-            static_cast<uint32_t>(p[0]) |
-            (static_cast<uint32_t>(p[1]) << 8) |
-            (static_cast<uint32_t>(p[2]) << 16) |
-            (static_cast<uint32_t>(p[3]) << 24));
-    }
-
-    // Read recordCount (LE32 at kRecordCountOffset=57) for consistency validation only.
-    int32_t recordCount = 0;
-    {
-        const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kRecordCountOffset;
-        recordCount = static_cast<int32_t>(
-            static_cast<uint32_t>(p[0]) |
-            (static_cast<uint32_t>(p[1]) << 8) |
-            (static_cast<uint32_t>(p[2]) << 16) |
-            (static_cast<uint32_t>(p[3]) << 24));
-    }
-
-    // lastOffsetDelta must be >= 0 (single-record batch: delta=0 → count=1).
-    if (lastOffsetDelta < 0) {
-        spdlog::debug("ClientGateway: Produce lastOffsetDelta={} < 0; rejected (Internal)",
-                      lastOffsetDelta);
-        sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
-    }
-
-    // recordCount must equal lastOffsetDelta + 1.
-    if (recordCount != lastOffsetDelta + 1) {
-        spdlog::warn("ClientGateway: Produce recordCount={} != lastOffsetDelta+1={}; "
-                     "batch internally inconsistent → rejected (Internal)",
-                     recordCount, lastOffsetDelta + 1);
-        sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
-    }
-
-    // CRC validation: reject corrupt batches before they touch the log.
-    {
-        rune::protocol::RecordBatchReader reader(restampScratch_.data(), batchLen);
-        if (!reader.ensureValid()) {
-            spdlog::warn("ClientGateway: Produce CRC mismatch (corrupt batch) → rejected (Internal)");
-            sendResp(pc::ErrorCode::Internal, partition, 0);
-            return;
-        }
-    }
-
-    // Derive lastOffset from the CRC-covered lastOffsetDelta (single source of truth).
-    // This is the offset of the last record in the batch; LEO advances past it.
-    const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
-
-    // TX-2: Idempotent-producer dedup gate.
-    //
-    // If the produce carries a valid producerId (>= 0), validate the sequence
-    // against the per-gateway ProducerStateManager before touching the log:
-    //
-    //   Accept         → fall through to append; call update() after append.
-    //   Duplicate      → reply with the previously-assigned base offset; NO append.
-    //   OutOfOrder     → reject with OutOfOrderSequence; NO append.
-    //   InvalidEpoch   → reject with InvalidProducerEpoch (zombie fenced); NO append.
-    //
-    // Legacy path (producerId == -1): skip validation entirely (backward compat).
-    //
-    // recordCount == lastOffsetDelta + 1 (validated above); safe to use.
-    // lastSequence = baseSequence + recordCount - 1 — matches ProducerStateManager spec.
-    //
-    // No per-op heap allocation: validate() is noexcept, allocation-free.
-    // update() is called AFTER a successful append (immediately below).
-    if (msg.producerId >= 0) {
-        const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
-        const auto vr = producerStateManager_.validate(
-            msg.topicId, msg.producerId, partition,
-            msg.producerEpoch, msg.baseSequence, lastSeqInBatch);
-
-        if (vr.isDuplicate()) {
-            // Do NOT re-append.  Return the original base offset so the client
-            // can confirm its prior produce was durable.
-            spdlog::debug("ClientGateway: Produce duplicate (pid={} epoch={} baseSeq={} "
-                          "partition={}) → prior baseOffset={} (no re-append)",
-                          msg.producerId, msg.producerEpoch, msg.baseSequence,
-                          partition, vr.retryBaseOffset);
-            sendResp(pc::ErrorCode::OK, partition, vr.retryBaseOffset);
-            return;
-        }
-        if (vr.isOos()) {
-            spdlog::debug("ClientGateway: Produce OutOfOrderSequence "
-                          "(pid={} epoch={} baseSeq={} partition={})",
-                          msg.producerId, msg.producerEpoch, msg.baseSequence, partition);
-            sendResp(pc::ErrorCode::OutOfOrderSequence, partition, 0);
-            return;
-        }
-        if (vr.isFenced()) {
-            spdlog::debug("ClientGateway: Produce InvalidProducerEpoch "
-                          "(pid={} fenced epoch={} tracked partition={})",
-                          msg.producerId, msg.producerEpoch, partition);
-            sendResp(pc::ErrorCode::InvalidProducerEpoch, partition, 0);
-            return;
-        }
-        // Status::Accept — fall through to append below.
-    }
-
-    // GR-5: min-ISR gate for acks=All — checked BEFORE appendNoSync.
-    //
-    // If the produce carries acks=All AND the current ISR is below minIsr_, reject
-    // with MinIsrViolation before touching the log.  A rejected produce MUST NOT
-    // appear in the log at all (no partial state, no LEO advance).
-    //
-    // "NEVER falsely ack": the gate is checked here (before append) so that:
-    //   - MinIsrViolation guarantees logEndOffset did not change.
-    //   - The pending-ack queue is untouched.
-    //
-    // passthrough (replica==nullptr): no ISR check — single-node / test mode.
+    // These checks live in the gateway (not the helper) because they use gateway
+    // state (committedMetadataReady_, replica->isr(), cachedMinIsr_) and may
+    // return non-ProduceResponse error types (ErrorResponse{NotLeader}).
     //
     // BOOTSTRAP WINDOW — acks=All DURABILITY CONTRACT (MD1-13 Fix Round 2):
     //   When committedMetadataReady_ is false (committedMap still empty — no
@@ -1656,30 +1523,129 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
         return;  // log untouched — no append, no LEO advance
     }
-    if (acksAll && replica && committedMetadataReady_) {
-        // min-ISR gate: require ISR size >= minIsr_ for acks=All durability.
-        // Only reached in steady state (committedMetadataReady_ true — see above).
-        // replica->isr() returns the leader's current ISR (as of the last
-        // maybeShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
-        // G1.1: use per-cycle snapshot (plain int) instead of per-produce atomic load.
-        const int currentMinIsr = cachedMinIsr_;
-        const int isrSize = static_cast<int>(replica->isr().size());
-        if (isrSize < currentMinIsr) {
-            spdlog::debug("ClientGateway: acks=All produce rejected (ISR size={} < minIsr={}) "
-                          "sessionId={} topicId={} partition={}",
-                          isrSize, currentMinIsr, msg.sessionId, msg.topicId, partition);
-            sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
-            return;  // log untouched — no append, no LEO advance
-        }
-    }
 
     // E2 inc2a: When a WorkerPool is wired, route the append to the owning worker
     // via the SPSC ingress ring.  The worker executes appendNoSync +
     // onLeaderLogAppended; the response (or pending-ack) is completed in
     // drainWorkerReturns_() at the top of the NEXT doWork() cycle.
     //
-    // When no WorkerPool is wired (null), fall through to the original inline path.
+    // When no WorkerPool is wired (null), fall through to the inline path below.
     if (workerPool_) {
+        // ---------------------------------------------------------------------------
+        // WORKER PATH: Parse + validate the batch inline (same logic as before) so
+        // that the WorkerOp carries the pre-validated fields (lastOffsetDelta,
+        // recordCount) and ISR gate is enforced on the gateway thread.
+        //
+        // M1 fix: derive lastOffset from the CRC-covered lastOffsetDelta field
+        // (kLastOffsetDeltaOffset=23, LE32) rather than trusting client recordCount.
+        //
+        // Assign base offset and rewrite the LE64 at kBaseOffsetOffset.
+        // This field sits at bytes [0..7], BEFORE the CRC region that starts at
+        // kAttributesOffset (byte 21) — rewriting it is CRC-safe (identical to Kafka).
+        const int64_t base = log->logEndOffset();
+        {
+            uint64_t u = static_cast<uint64_t>(base);
+            for (int i = 0; i < 8; ++i) {
+                restampScratch_[static_cast<std::size_t>(rune::protocol::batch::kBaseOffsetOffset) + i] =
+                    static_cast<uint8_t>(u >> (i * 8));
+            }
+        }
+
+        // Read lastOffsetDelta (LE32 at kLastOffsetDeltaOffset=23).
+        int32_t lastOffsetDelta = 0;
+        {
+            const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kLastOffsetDeltaOffset;
+            lastOffsetDelta = static_cast<int32_t>(
+                static_cast<uint32_t>(p[0]) |
+                (static_cast<uint32_t>(p[1]) << 8) |
+                (static_cast<uint32_t>(p[2]) << 16) |
+                (static_cast<uint32_t>(p[3]) << 24));
+        }
+
+        // Read recordCount (LE32 at kRecordCountOffset=57) for consistency validation only.
+        int32_t recordCount = 0;
+        {
+            const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kRecordCountOffset;
+            recordCount = static_cast<int32_t>(
+                static_cast<uint32_t>(p[0]) |
+                (static_cast<uint32_t>(p[1]) << 8) |
+                (static_cast<uint32_t>(p[2]) << 16) |
+                (static_cast<uint32_t>(p[3]) << 24));
+        }
+
+        // lastOffsetDelta must be >= 0 (single-record batch: delta=0 → count=1).
+        if (lastOffsetDelta < 0) {
+            spdlog::debug("ClientGateway: Produce lastOffsetDelta={} < 0; rejected (Internal)",
+                          lastOffsetDelta);
+            sendResp(pc::ErrorCode::Internal, partition, 0);
+            return;
+        }
+
+        // recordCount must equal lastOffsetDelta + 1.
+        if (recordCount != lastOffsetDelta + 1) {
+            spdlog::warn("ClientGateway: Produce recordCount={} != lastOffsetDelta+1={}; "
+                         "batch internally inconsistent → rejected (Internal)",
+                         recordCount, lastOffsetDelta + 1);
+            sendResp(pc::ErrorCode::Internal, partition, 0);
+            return;
+        }
+
+        // CRC validation: reject corrupt batches before they touch the log.
+        {
+            rune::protocol::RecordBatchReader reader(restampScratch_.data(), batchLen);
+            if (!reader.ensureValid()) {
+                spdlog::warn("ClientGateway: Produce CRC mismatch (corrupt batch) → rejected (Internal)");
+                sendResp(pc::ErrorCode::Internal, partition, 0);
+                return;
+            }
+        }
+
+        // TX-2: Idempotent-producer dedup gate (worker path).
+        if (msg.producerId >= 0) {
+            const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
+            const auto vr = producerStateManager_.validate(
+                msg.topicId, msg.producerId, partition,
+                msg.producerEpoch, msg.baseSequence, lastSeqInBatch);
+
+            if (vr.isDuplicate()) {
+                spdlog::debug("ClientGateway: Produce duplicate (pid={} epoch={} baseSeq={} "
+                              "partition={}) → prior baseOffset={} (no re-append)",
+                              msg.producerId, msg.producerEpoch, msg.baseSequence,
+                              partition, vr.retryBaseOffset);
+                sendResp(pc::ErrorCode::OK, partition, vr.retryBaseOffset);
+                return;
+            }
+            if (vr.isOos()) {
+                spdlog::debug("ClientGateway: Produce OutOfOrderSequence "
+                              "(pid={} epoch={} baseSeq={} partition={})",
+                              msg.producerId, msg.producerEpoch, msg.baseSequence, partition);
+                sendResp(pc::ErrorCode::OutOfOrderSequence, partition, 0);
+                return;
+            }
+            if (vr.isFenced()) {
+                spdlog::debug("ClientGateway: Produce InvalidProducerEpoch "
+                              "(pid={} fenced epoch={} tracked partition={})",
+                              msg.producerId, msg.producerEpoch, partition);
+                sendResp(pc::ErrorCode::InvalidProducerEpoch, partition, 0);
+                return;
+            }
+            // Status::Accept — fall through to worker enqueue.
+        }
+
+        // GR-5: min-ISR gate for acks=All (worker path — same gate as inline path).
+        if (acksAll && replica && committedMetadataReady_) {
+            // G1.1: use per-cycle snapshot (plain int) instead of per-produce atomic load.
+            const int currentMinIsr = cachedMinIsr_;
+            const int isrSize = static_cast<int>(replica->isr().size());
+            if (isrSize < currentMinIsr) {
+                spdlog::debug("ClientGateway: acks=All produce rejected (ISR size={} < minIsr={}) "
+                              "sessionId={} topicId={} partition={}",
+                              isrSize, currentMinIsr, msg.sessionId, msg.topicId, partition);
+                sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
+                return;  // log untouched — no append, no LEO advance
+            }
+        }
+
         // Build the op envelope.
         rune::node::WorkerOp op;
         op.type         = rune::node::WorkerOp::Type::Produce;
@@ -1733,9 +1699,15 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // ---------------------------------------------------------------------------
     // INLINE path (pre-E2 / no WorkerPool):
-    // GB-5p2: use appendNoSync — page-cache write only, no fsync on the hot path.
-    // flushDirtyLogs() is called once per doWork() cycle (after all ingress has
-    // been processed) to fsync all touched partition Logs in one pass → group-commit.
+    //
+    // E5.1.2b: Delegate to the shared handleProduceBatch helper.  The helper
+    // performs: base-offset restamp in restampScratch_, lastOffsetDelta/recordCount
+    // parse + consistency check, CRC validation, idempotent-dedup (PSM validate +
+    // update), min-ISR gate (acks=All + isrSize vs minIsr), appendNoSync, and
+    // Strict-tier sync().  Returns a ProduceOutcome.
+    //
+    // The gateway retains ownership of: LSO tracking (getTxnState), dirty-log
+    // set, replica->onLeaderLogAppended(), and deferred-ack queue management.
     //
     // Durability contract — acks=Leader (acks=1):
     //   Records are written to the OS page cache and visible to Log::read()
@@ -1744,87 +1716,62 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   appendNoSync() and sync() may lose the most-recent un-flushed acked
     //   records.  True crash-durability requires acks=All + ISR replication
     //   (GR-5/Milestone C).
-    try {
-        log->appendNoSync(restampScratch_.data(), batchLen, lastOffset);
-    } catch (const std::exception& ex) {
-        spdlog::error("ClientGateway: Log::appendNoSync threw: {}; ProduceResponse Internal", ex.what());
-        sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
-    } catch (...) {
-        spdlog::error("ClientGateway: Log::appendNoSync threw unknown exception; ProduceResponse Internal");
-        sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
-    }
-
-    // TX-2: Update idempotent producer state AFTER successful append.
-    //
-    // Called only on the Accept path (msg.producerId >= 0).  Records the batch
-    // in the retry window so a duplicate retry returns the original base offset.
-    // base was captured from log->logEndOffset() before the append — it is the
-    // assigned baseOffset of the batch that was just appended.
-    if (msg.producerId >= 0) {
-        const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
-        producerStateManager_.update(
-            msg.topicId, msg.producerId, partition,
-            msg.producerEpoch, msg.baseSequence, lastSeqInBatch,
-            base);
-
-        // TX-4 Task 9: Feed LsoTracker for transactional data batches.
-        //
-        // A transactional batch has producerId >= 0 AND the TRANSACTIONAL bit
-        // set in the batch attributes field (bit 4, kAttributesOffset=21 in the
-        // restampScratch_ layout).  We check the TRANSACTIONAL bit to avoid
-        // advancing LSO-tracking for pure idempotent (non-transactional) batches.
-        //
-        // Single-writer (duty-cycle thread); getTxnState creates lazily on first
-        // access — no per-op alloc after the first produce for this partition.
-        constexpr std::size_t kAttrOffset =
-            static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset);
-        if (batchLen >= kAttrOffset + 2u) {
-            const uint16_t attrs = static_cast<uint16_t>(
-                static_cast<uint16_t>(restampScratch_[kAttrOffset]) |
-                (static_cast<uint16_t>(restampScratch_[kAttrOffset + 1u]) << 8));
-            constexpr uint16_t kTransactionalBit = 0x10u;
-            if (attrs & kTransactionalBit) {
-                getTxnState(msg.topicId, partition)
-                    .lsoTracker.onProduceBatch(msg.producerId, base);
-            }
-        }
-    }
-
-    // E3 Task 9: Strict-tier sync() fallback on the inline (no-WorkerPool) path.
-    //
-    // This path is only reached when workerPool_ is null — i.e. in test fixtures
-    // that bypass BrokerNode/WorkerPool construction, or (theoretically) if
-    // workerCount == 0.  In a fully started BrokerNode workerPool_ is ALWAYS
-    // non-null and user produces NEVER reach this branch (they go through the
-    // worker path above at line 1434).
-    //
-    // Internal partitions (topicId < 0) always have durabilityTier=1 (Majority)
-    // and are handled by the control thread — they never carry durabilityTier=2.
-    //
-    // Defensive correctness: if a Strict-tier (durabilityTier==2) produce
-    // somehow reaches this path, perform a SYNCHRONOUS log->sync() before the ack
-    // so Strict still means "durable before acked".  This is blocking on the
-    // control thread — deliberately so: it is a fallback for a path that should
-    // never fire in production.  An async IoBackend for the control thread is
-    // out of scope (parked as a future E4 item).
     const uint8_t effectiveTier = replica ? replica->durabilityTier() : 1;
-    if (effectiveTier == 2) {
-        // Synchronous sync() — the blocking fallback for the no-worker path.
-        try {
-            log->sync();
-            // Log is now durable; remove from dirtyLogs_ so flushDirtyLogs()
-            // doesn't double-sync it at end of cycle.
-            dirtyLogs_.erase(log);
-        } catch (const std::exception& ex) {
-            spdlog::error("ClientGateway: inline Strict-tier sync() failed: {}; "
-                          "sending Internal error", ex.what());
-            sendResp(pc::ErrorCode::Internal, partition, 0);
-            return;
+    // ISR size for min-ISR gate: only applies in steady state (committedMetadataReady_
+    // true) and when a replica is wired.  Zero causes the helper to skip the gate
+    // (passthrough — single-node / bootstrap).
+    // Note: bootstrap-window acks=All is already rejected above before we reach here.
+    const int isrSizeForHelper = (acksAll && replica && committedMetadataReady_)
+                                 ? static_cast<int>(replica->isr().size()) : 0;
+
+    const auto outcome = rune::node::handleProduceBatch(
+        restampScratch_.data(), batchLen,
+        msg.topicId, partition,
+        msg.producerId, msg.producerEpoch, msg.baseSequence,
+        *log, producerStateManager_,
+        acksAll,
+        isrSizeForHelper,
+        cachedMinIsr_,
+        effectiveTier);
+
+    // Handle non-OK / duplicate outcomes (no append occurred).
+    if (!outcome.isOK()) {
+        sendResp(outcome.error, partition, 0);
+        return;
+    }
+    if (outcome.isDuplicate) {
+        // Dedup path: return prior baseOffset, log untouched.
+        sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
+        return;
+    }
+
+    // Successful append — apply post-append gateway-owned side-effects.
+
+    // TX-4 Task 9: Feed LsoTracker for transactional data batches.
+    //
+    // A transactional batch has producerId >= 0 AND the TRANSACTIONAL bit set in
+    // the batch attributes field (bit 4, kAttributesOffset=21).  The helper
+    // returns batchAttrs so we can check this bit without re-reading the scratch.
+    if (msg.producerId >= 0) {
+        constexpr uint16_t kTransactionalBit = 0x10u;
+        if (outcome.batchAttrs & kTransactionalBit) {
+            getTxnState(msg.topicId, partition)
+                .lsoTracker.onProduceBatch(msg.producerId, outcome.baseOffset);
         }
+    }
+
+    // E3 Task 9: Strict-tier sync() was already done by the helper (outcome.syncDone).
+    // For any other tier, mark the Log dirty so flushDirtyLogs() group-commits it.
+    //
+    // This path is only reached when workerPool_ is null — test fixtures that bypass
+    // BrokerNode/WorkerPool construction or (theoretically) workerCount==0.
+    // Internal partitions (topicId < 0) always use durabilityTier=1 (Majority).
+    if (outcome.syncDone) {
+        // Strict-tier: log was sync()'d by the helper; remove from dirtyLogs_ so
+        // flushDirtyLogs() doesn't double-sync it at end of cycle.
+        dirtyLogs_.erase(log);
     } else {
-        // Mark this Log dirty so flushDirtyLogs() will sync it at end of cycle.
+        // Non-strict: mark dirty for group-commit at end of cycle.
         dirtyLogs_.insert(log);
     }
 
@@ -1835,12 +1782,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // onLeaderLogAppended() reads log_->logEndOffset(), refreshes per-follower LEO,
     // and recomputes HW — this is EXACTLY the Mode-A seam described in the spec.
     //
-    // No double-append: the Log was written once by appendNoSync() above.
-    // onLeaderLogAppended() only reads the Log's LEO (log_->logEndOffset()) and
-    // updates in-memory replica state (ReplicaLeaderState + IsrManager).
-    //
-    // No per-op alloc: replica lookup is O(1) (pointer was captured before the
-    // restamp section); onLeaderLogAppended() is noexcept with no allocation.
+    // No double-append: the Log was written once by the helper's appendNoSync().
+    // onLeaderLogAppended() only reads the Log's LEO and updates in-memory state.
     if (replica) {
         replica->onLeaderLogAppended();
     }
@@ -1851,15 +1794,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // acks=All:           enqueue a PendingAck; drainPendingAcks() will send the
     //                     response once replica->highWatermark() >= lastOffset.
     //
-    // acks=All during the bootstrap window (!committedMetadataReady_) is handled
-    // ABOVE (before the append): a retriable NotLeader is returned and we never
-    // reach this point with acksAll==true && !committedMetadataReady_.  By the
-    // time we land here, either acks != All OR committedMetadataReady_ is true.
+    // acks=All during the bootstrap window (!committedMetadataReady_) is rejected
+    // ABOVE before reaching here; by this point either acks != All or
+    // committedMetadataReady_ is true.
     const bool deferAck = acksAll && replica && committedMetadataReady_;
     if (!deferAck) {
         // Immediate ack: acks=Leader or no replica wired (passthrough).
-        // (acks=All in bootstrap window is rejected before the append — never here.)
-        sendResp(pc::ErrorCode::OK, partition, base);
+        sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
     } else {
         // acks=All deferred ack path (steady state: committedMetadataReady_ true).
         // Cap check: if the queue is full, reject rather than silently overflowing.
@@ -1875,8 +1816,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         entry.sessionId     = msg.sessionId;
         entry.correlationId = msg.correlationId;
         entry.partition     = partition;
-        entry.baseOffset    = base;
-        entry.lastOffset    = lastOffset;
+        entry.baseOffset    = outcome.baseOffset;
+        entry.lastOffset    = outcome.lastOffset;
         entry.enqueuedAtNs  = nowNs_;
         entry.replica       = replica;
 
@@ -1884,7 +1825,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
         spdlog::debug("ClientGateway: acks=All produce enqueued pending-ack "
                       "sessionId={} partition={} baseOffset={} lastOffset={}",
-                      msg.sessionId, partition, base, lastOffset);
+                      msg.sessionId, partition, outcome.baseOffset, outcome.lastOffset);
     }
 }
 
