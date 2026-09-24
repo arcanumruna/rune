@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// WorkerTest.cpp — Unit tests for rune::node::Worker (E1 Task 2).
+// WorkerTest.cpp — Unit tests for rune::node::Worker (E1 Task 2 + E5.1.2c).
 //
 // Uses a minimal single-node memory-backed PartitionReplica (minIsr=1,
 // InMemoryLog) so doWork() is a no-op-ish ISR/fetch pass.
@@ -10,19 +10,30 @@
 //   2. PublishOwnedResetsOwnership — publishOwned with empty set drops all replicas.
 //   3. SetCoreIdAndDoWorkNocrash (E4) — setCoreId + doWork does not crash;
 //      on macOS the pin is a no-op and doWork still returns >= 0.
+//   4. FetchRequestRoutedToWorker (E5.1.2c) — enqueue a FetchRequest WorkerOp;
+//      doWork dispatches it to the worker thread via onFetchRequest, which calls
+//      sendFetchResponse.  Asserts the response was emitted — proving the handler
+//      ran on the worker thread (not inline on the node thread).
 // ---------------------------------------------------------------------------
 
 #include <rune/node/Worker.h>
+#include <rune/node/WorkerOp.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/InMemoryLog.h>
 
 #include <gtest/gtest.h>
 #include <memory>
+#include <atomic>
 
 using rune::node::Worker;
+using rune::node::WorkerOp;
 using rune::replication::PartitionReplica;
 using rune::replication::PartitionConfig;
 using rune::replication::InMemoryTransport;
+using rune::replication::FetchRequestMsg;
+using rune::replication::FetchResponseMsg;
+using rune::replication::NodeId;
 using rune::storage::InMemoryLog;
 
 namespace {
@@ -34,6 +45,35 @@ public:
     void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
     void sendFetchResponse(rune::replication::NodeId,
                            const rune::replication::FetchResponseMsg&) override {}
+};
+
+// ---------------------------------------------------------------------------
+// RecordingTransport — captures sendFetchResponse calls for assertion.
+// Used by FetchRequestRoutedToWorker to verify the handler ran.
+// ---------------------------------------------------------------------------
+class RecordingTransport : public rune::replication::PartitionTransport {
+public:
+    std::atomic<int> fetchResponseCount{0};
+    rune::replication::NodeId lastToFollower = -1;
+    rune::replication::Offset lastHw = -1;
+
+    void sendFetchRequest(const FetchRequestMsg&) override {}
+
+    void sendFetchResponse(NodeId toFollower,
+                           const FetchResponseMsg& resp) override {
+        lastToFollower = toFollower;
+        lastHw         = resp.highWatermark;
+        fetchResponseCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void sendOffsetsForLeaderEpochRequest(
+            NodeId, const rune::replication::OffsetsForLeaderEpochReqMsg&) override {}
+    void sendOffsetsForLeaderEpochResponse(
+            NodeId, const rune::replication::OffsetsForLeaderEpochRespMsg&) override {}
+    void sendReconcileRequest(
+            NodeId, const FetchRequestMsg&) override {}
+    void sendReconcileResponse(
+            NodeId, const FetchResponseMsg&) override {}
 };
 
 struct ReplicaFixture {
@@ -135,4 +175,98 @@ TEST(Worker, SetCoreIdAndDoWorkNoCrash) {
         const int work2 = w.doWork(/*nowNs=*/3);
         EXPECT_GE(work2, 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// E5.1.2c: FetchRequestRoutedToWorker
+//
+// Scenario:
+//   - 2-node leader (selfId=1, ISR=[1,2], minIsr=1).
+//   - Append a minimal RecordBatch to the log so LEO > 0.
+//   - Enqueue a FetchRequest WorkerOp from follower 2 (fetchOffset=0) via the
+//     worker's tryEnqueueOp — simulating what AeronPartitionTransport does when
+//     workerPool_ is set.
+//   - Call doWork() once — drains ingress, executes onFetchRequest on the
+//     worker thread.
+//   - Assert that sendFetchResponse was called by checking the recording transport.
+//
+// This proves the FetchRequest leader-state handler runs on the WORKER thread
+// (not inline on the node thread), closing the leaderState_/isrManager_ race
+// described in task-E5.1.2c-brief.md.
+// ---------------------------------------------------------------------------
+TEST(Worker, FetchRequestRoutedToWorker) {
+    // Build a minimal valid RecordBatch (magic=2, sufficient to pass magic check).
+    // Minimal layout: base_offset(8) + batch_length(4) + partition_leader_epoch(4) +
+    //   magic(1) + crc(4) + attributes(2) + last_offset_delta(4) + ...
+    // InMemoryLog::append accepts raw bytes and does not CRC-validate.
+    // We need at least kRecordBatchOverhead bytes.
+    static constexpr std::size_t kBatchBytes = 128;
+    std::vector<uint8_t> batch(kBatchBytes, 0x00);
+    // base_offset = 0 (LE64 @ 0)
+    // batch_length = kBatchBytes - 12 (LE32 @ 8)  [records section after first 12 bytes]
+    int32_t blen = static_cast<int32_t>(kBatchBytes) - 12;
+    std::memcpy(batch.data() + 8, &blen, 4);
+    // magic = 2 @ offset 16
+    batch[16] = 2;
+    // last_offset_delta = 0 @ offset 23 (LE32)  → only 1 record
+
+    InMemoryLog                log(1024 * 1024, 1000);
+    RecordingTransport         transport;
+    std::unique_ptr<PartitionReplica> replica;
+
+    {
+        PartitionConfig cfg{};
+        cfg.topicId             = 7;  // user partition (topicId >= 0)
+        cfg.partitionId         = 0;
+        cfg.selfId              = 1;
+        cfg.minIsr              = 1;
+        cfg.replicaLagMaxMs     = 10'000;
+        cfg.replicaLagMaxOffset = 10'000;
+        cfg.fetchIntervalNs     = 1'000'000LL;
+        cfg.isrCheckIntervalNs  = 1'000'000LL;
+        cfg.maxFetchBytes       = 1 << 20;
+        cfg.pushOnAppend        = false;
+        // 2-node ISR: selfId=1 + followerId=2
+        replica = std::make_unique<PartitionReplica>(
+            cfg,
+            rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<NodeId>{1, 2},   // ISR
+            std::vector<NodeId>{1, 2},   // full replica set
+            &log, &transport);
+    }
+
+    // Append one batch to the leader log so LEO = 1.
+    log.append(batch, /*lastOffset=*/0);
+    replica->onLeaderLogAppended();
+
+    // Build the FetchRequest WorkerOp (mirrors AeronPartitionTransport routing).
+    WorkerOp op;
+    op.type                            = WorkerOp::Type::FetchRequest;
+    op.topicId                         = 7;
+    op.partition                       = 0;
+    op.replica                         = replica.get();
+    op.logPtr                          = nullptr;
+    op.fetchRequestPayload.leaderEpoch = 1;
+    op.fetchRequestPayload.partition   = 0;
+    op.fetchRequestPayload.followerId  = 2;   // follower node
+    op.fetchRequestPayload.fetchOffset = 0;   // follower wants from offset 0
+    op.fetchRequestPayload.maxBytes    = 1 << 20;
+    op.fetchRequestPayload.topicId     = 7;
+    op.fetchRequestPayload.nowNs       = 1'000'000LL;
+
+    Worker w(/*workerId=*/4);
+    w.setOwnedDirect(Worker::OwnedSet{replica.get()});
+
+    // Enqueue via the worker's ingress ring (same path AeronPartitionTransport uses).
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+
+    // Drive the worker once — drains ingress → executeFetchRequestWire_ →
+    // replica->onFetchRequest(req, nowNs) → transport.sendFetchResponse(...).
+    const int work = w.doWork(/*nowNs=*/1'000'000LL);
+    EXPECT_GE(work, 0);
+
+    // The FetchResponse must have been emitted to follower 2.
+    EXPECT_EQ(transport.fetchResponseCount.load(), 1)
+        << "onFetchRequest must be called on the worker thread (FetchRequest routed via ingress ring)";
+    EXPECT_EQ(transport.lastToFollower, 2);
 }

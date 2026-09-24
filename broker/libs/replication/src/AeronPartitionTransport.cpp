@@ -348,7 +348,32 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             }
         }
 
-        it->second->onFetchRequest(req, nowNs_);
+        // E5.1.2c: route leader-side FetchRequest to the owning worker so
+        // leaderState_/isrManager_ is single-owner (worker thread only).
+        // Internal partitions (topicId<0) remain inline (node-thread-owned).
+        if (workerPool_ && req.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                              = rune::node::WorkerOp::Type::FetchRequest;
+            op.topicId                           = req.topicId;
+            op.partition                         = req.partition;
+            op.replica                           = it->second;
+            op.logPtr                            = nullptr;
+            op.fetchRequestPayload.leaderEpoch   = req.leaderEpoch;
+            op.fetchRequestPayload.partition     = req.partition;
+            op.fetchRequestPayload.followerId    = req.followerId;
+            op.fetchRequestPayload.fetchOffset   = req.fetchOffset;
+            op.fetchRequestPayload.maxBytes      = req.maxBytes;
+            op.fetchRequestPayload.topicId       = req.topicId;
+            op.fetchRequestPayload.nowNs         = nowNs_;
+            if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
+                spdlog::warn(
+                    "AeronPartitionTransport: worker ring full for "
+                    "FetchRequest (topicId={}, partition={}); dropping frame",
+                    req.topicId, req.partition);
+            }
+        } else {
+            it->second->onFetchRequest(req, nowNs_);
+        }
 
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
         // Minimum fixed size check (header + fixed block + var length prefix).
@@ -427,7 +452,29 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         auto req = OffsetsForLeaderEpochReqMsg::decode(buf, 0);
         auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
         if (it == replicas_.end() || it->second == nullptr) return;
-        it->second->onOffsetsForLeaderEpochRequest(req);
+        // E5.1.2c: route to owning worker (touches leaderState_/isrManager_).
+        if (workerPool_ && req.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                              = rune::node::WorkerOp::Type::OffsetsForLeaderEpochReq;
+            op.topicId                           = req.topicId;
+            op.partition                         = req.partition;
+            op.replica                           = it->second;
+            op.logPtr                            = nullptr;
+            op.offsEpochReqPayload.currentEpoch   = req.currentEpoch;
+            op.offsEpochReqPayload.partition      = req.partition;
+            op.offsEpochReqPayload.followerId     = req.followerId;
+            op.offsEpochReqPayload.requestedEpoch = req.requestedEpoch;
+            op.offsEpochReqPayload.followerLeo    = req.followerLeo;
+            op.offsEpochReqPayload.topicId        = req.topicId;
+            if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
+                spdlog::warn(
+                    "AeronPartitionTransport: worker ring full for "
+                    "OffsetsForLeaderEpochReq (topicId={}, partition={}); dropping frame",
+                    req.topicId, req.partition);
+            }
+        } else {
+            it->second->onOffsetsForLeaderEpochRequest(req);
+        }
 
     } else if (tid == OffsetsForLeaderEpochRespMsg::TEMPLATE_ID) {
         // DR-BUG-6: KIP-101 epoch-boundary answer → follower truncates.
@@ -468,7 +515,36 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
         auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
         if (it == replicas_.end() || it->second == nullptr) return;
-        it->second->applyReconcileResponse(resp);
+        // E5.1.2c: route to owning worker (applyReconcileResponse touches
+        // leaderState_.setLeaderLogEndOffset + recomputeHw).
+        // Copy records bytes before returning from the Aeron callback (buffer lifetime).
+        if (workerPool_ && resp.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                              = rune::node::WorkerOp::Type::ReconcileFetchResp;
+            op.topicId                           = resp.topicId;
+            op.partition                         = resp.partition;
+            op.replica                           = it->second;
+            op.logPtr                            = nullptr;
+            op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
+            op.replicatedPayload.partition       = resp.partition;
+            op.replicatedPayload.highWatermark   = resp.highWatermark;
+            op.replicatedPayload.logStartOffset  = resp.logStartOffset;
+            op.replicatedPayload.errorCode       = resp.errorCode;
+            op.replicatedPayload.topicId         = resp.topicId;
+            if (!resp.records.empty()) {
+                op.replicatedPayload.records.assign(
+                    resp.records.data(),
+                    resp.records.data() + resp.records.size());
+            }
+            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op))) {
+                spdlog::warn(
+                    "AeronPartitionTransport: worker ring full for "
+                    "ReconcileFetchResp (topicId={}, partition={}); dropping frame",
+                    resp.topicId, resp.partition);
+            }
+        } else {
+            it->second->applyReconcileResponse(resp);
+        }
 
     } else {
         spdlog::trace("AeronPartitionTransport: unknown templateId={} dropped", tid);

@@ -98,12 +98,26 @@ struct WorkerOpWire {
     int32_t  roleLeaderId;   ///< rune::replication::NodeId = int32_t
 
     // --- ApplyReplicated (ReplicatedPayload scalars) ---
+    // Also reused by ReconcileFetchResp (same FetchResponseMsg fields).
     int32_t  replLeaderEpoch;
     int32_t  replPartition;
     int64_t  replHighWatermark;
     int64_t  replLogStartOffset;
     int16_t  replErrorCode;
     int32_t  replTopicId;
+
+    // --- E5.1.2c: FetchRequest (leader-side) fields ---
+    int64_t  frLeaderEpoch;   ///< FetchRequestPayload::leaderEpoch
+    int32_t  frFollowerId;    ///< FetchRequestPayload::followerId
+    int64_t  frFetchOffset;   ///< FetchRequestPayload::fetchOffset
+    int32_t  frMaxBytes;      ///< FetchRequestPayload::maxBytes
+    int64_t  frNowNs;         ///< FetchRequestPayload::nowNs
+
+    // --- E5.1.2c: OffsetsForLeaderEpochReq fields ---
+    int64_t  oleCurrentEpoch;   ///< OffsetsForLeaderEpochReqPayload::currentEpoch
+    int32_t  oleFollowerId;     ///< OffsetsForLeaderEpochReqPayload::followerId
+    int64_t  oleRequestedEpoch; ///< OffsetsForLeaderEpochReqPayload::requestedEpoch
+    int64_t  oleFollowerLeo;    ///< OffsetsForLeaderEpochReqPayload::followerLeo
 
     // --- variable tail descriptor ---
     uint8_t  tailKind;  ///< TailKind cast to uint8_t
@@ -215,6 +229,19 @@ inline std::size_t encodeWorkerOp(const WorkerOp& op,
     hdr.replErrorCode    = op.replicatedPayload.errorCode;
     hdr.replTopicId      = op.replicatedPayload.topicId;
 
+    // E5.1.2c: FetchRequest leader-side payload
+    hdr.frLeaderEpoch  = static_cast<int64_t>(op.fetchRequestPayload.leaderEpoch);
+    hdr.frFollowerId   = static_cast<int32_t>(op.fetchRequestPayload.followerId);
+    hdr.frFetchOffset  = static_cast<int64_t>(op.fetchRequestPayload.fetchOffset);
+    hdr.frMaxBytes     = op.fetchRequestPayload.maxBytes;
+    hdr.frNowNs        = op.fetchRequestPayload.nowNs;
+
+    // E5.1.2c: OffsetsForLeaderEpochReq payload
+    hdr.oleCurrentEpoch   = static_cast<int64_t>(op.offsEpochReqPayload.currentEpoch);
+    hdr.oleFollowerId     = static_cast<int32_t>(op.offsEpochReqPayload.followerId);
+    hdr.oleRequestedEpoch = static_cast<int64_t>(op.offsEpochReqPayload.requestedEpoch);
+    hdr.oleFollowerLeo    = static_cast<int64_t>(op.offsEpochReqPayload.followerLeo);
+
     // Determine tail
     const uint8_t* tailSrc  = nullptr;
     std::size_t    tailBytes = 0;
@@ -227,6 +254,8 @@ inline std::size_t encodeWorkerOp(const WorkerOp& op,
         tailBytes = op.recordBatchBytes.size();
         break;
     case WorkerOp::Type::ApplyReplicated:
+    case WorkerOp::Type::ReconcileFetchResp:
+        // Both use replicatedPayload.records as the tail.
         kind      = TailKind::ReplicatedRecords;
         tailSrc   = op.replicatedPayload.records.data();
         tailBytes = op.replicatedPayload.records.size();
@@ -244,6 +273,8 @@ inline std::size_t encodeWorkerOp(const WorkerOp& op,
         break;
     case WorkerOp::Type::PushRead:
     case WorkerOp::Type::BecomeFollower:
+    case WorkerOp::Type::FetchRequest:
+    case WorkerOp::Type::OffsetsForLeaderEpochReq:
         kind      = TailKind::None;
         tailBytes = 0;
         break;

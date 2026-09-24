@@ -544,6 +544,16 @@ private:
         case WorkerOp::Type::SetOwnership:
             executeSetOwnershipWire_(frame, hdr);
             break;
+        // E5.1.2c: leader-side replication state handlers
+        case WorkerOp::Type::FetchRequest:
+            executeFetchRequestWire_(frame, hdr);
+            break;
+        case WorkerOp::Type::OffsetsForLeaderEpochReq:
+            executeOffsetsForLeaderEpochReqWire_(frame, hdr);
+            break;
+        case WorkerOp::Type::ReconcileFetchResp:
+            executeReconcileFetchRespWire_(frame, hdr);
+            break;
         }
     }
 
@@ -847,6 +857,105 @@ private:
                 std::memcpy(&pval, tail + i * sizeof(uintptr_t), sizeof(uintptr_t));
                 owned_.push_back(reinterpret_cast<rune::replication::PartitionReplica*>(pval));
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // E5.1.2c: executeFetchRequestWire_ — leader handles a follower FetchRequest
+    // on the worker thread so leaderState_/isrManager_ is single-owner.
+    // The FetchResponse is emitted via replica->onFetchRequest which calls
+    // transport_->sendFetchResponse → enqueueOutbound (MPSC outbound ring).
+    // Fire-and-forget: no WorkerReturn needed (FetchResponse goes outbound).
+    // -------------------------------------------------------------------
+    void executeFetchRequestWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeFetchRequestWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+            return;
+        }
+
+        rune::replication::FetchRequestMsg req;
+        req.leaderEpoch = static_cast<rune::replication::Epoch>(hdr->frLeaderEpoch);
+        req.partition   = static_cast<rune::replication::PartitionId>(hdr->partition);
+        req.followerId  = static_cast<rune::replication::NodeId>(hdr->frFollowerId);
+        req.fetchOffset = static_cast<rune::replication::Offset>(hdr->frFetchOffset);
+        req.maxBytes    = hdr->frMaxBytes;
+        req.topicId     = hdr->topicId;
+
+        try {
+            replica->onFetchRequest(req, hdr->frNowNs);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: onFetchRequest threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: onFetchRequest threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // E5.1.2c: executeOffsetsForLeaderEpochReqWire_ — leader handles KIP-101
+    // epoch probe on the worker thread (touches leaderState_/isrManager_).
+    // Fire-and-forget: the response is emitted via transport_->sendOffsetsForLeaderEpochResponse.
+    // -------------------------------------------------------------------
+    void executeOffsetsForLeaderEpochReqWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeOffsetsForLeaderEpochReqWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+            return;
+        }
+
+        rune::replication::OffsetsForLeaderEpochReqMsg req;
+        req.currentEpoch   = static_cast<rune::replication::Epoch>(hdr->oleCurrentEpoch);
+        req.partition      = static_cast<rune::replication::PartitionId>(hdr->partition);
+        req.followerId     = static_cast<rune::replication::NodeId>(hdr->oleFollowerId);
+        req.requestedEpoch = static_cast<rune::replication::Epoch>(hdr->oleRequestedEpoch);
+        req.followerLeo    = static_cast<rune::replication::Offset>(hdr->oleFollowerLeo);
+        req.topicId        = hdr->topicId;
+
+        try {
+            replica->onOffsetsForLeaderEpochRequest(req);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: onOffsetsForLeaderEpochRequest threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: onOffsetsForLeaderEpochRequest threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // E5.1.2c: executeReconcileFetchRespWire_ — deficient leader applies
+    // reconcile records pulled from an ahead survivor, on the worker thread.
+    // Reuses replicatedPayload scalars + records tail (same layout as ApplyReplicated).
+    // Fire-and-forget: no WorkerReturn needed.
+    // -------------------------------------------------------------------
+    void executeReconcileFetchRespWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        if (!replica) {
+            spdlog::warn("Worker {}: executeReconcileFetchRespWire_ — null replica for "
+                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+            return;
+        }
+
+        const uint8_t* tail    = workerOpTail(frame);
+        const uint32_t tailLen = hdr->tailLen;
+
+        rune::replication::FetchResponseMsg msg;
+        msg.leaderEpoch    = hdr->replLeaderEpoch;
+        msg.partition      = hdr->replPartition;
+        msg.highWatermark  = hdr->replHighWatermark;
+        msg.logStartOffset = hdr->replLogStartOffset;
+        msg.errorCode      = hdr->replErrorCode;
+        msg.topicId        = hdr->replTopicId;
+        msg.records = std::span<const uint8_t>(
+            tail ? tail : static_cast<const uint8_t*>(nullptr),
+            static_cast<std::size_t>(tailLen));
+
+        try {
+            replica->applyReconcileResponse(msg);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: applyReconcileResponse threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: applyReconcileResponse threw unknown exception", workerId_);
         }
     }
 

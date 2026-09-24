@@ -52,12 +52,17 @@ namespace rune::node {
 // ---------------------------------------------------------------------------
 struct WorkerOp {
     enum class Type : uint8_t {
-        Produce,          ///< gateway produce-append
-        PushRead,         ///< gateway pushSubscriptions log-read
-        ApplyReplicated,  ///< transport applyReplicated
-        BecomeLeader,     ///< bridge → worker: promote replica to leader
-        BecomeFollower,   ///< bridge → worker: demote replica to follower
-        SetOwnership,     ///< control thread → worker: replace the worker's owned set
+        Produce,                  ///< gateway produce-append
+        PushRead,                 ///< gateway pushSubscriptions log-read
+        ApplyReplicated,          ///< transport applyReplicated (follower-side)
+        BecomeLeader,             ///< bridge → worker: promote replica to leader
+        BecomeFollower,           ///< bridge → worker: demote replica to follower
+        SetOwnership,             ///< control thread → worker: replace the worker's owned set
+        // E5.1.2c: leader-side replication state handlers — routed to the
+        // owning worker so leaderState_/isrManager_ is single-owner (worker thread).
+        FetchRequest,             ///< transport → worker: leader handles follower FetchRequest
+        OffsetsForLeaderEpochReq, ///< transport → worker: leader handles KIP-101 epoch probe
+        ReconcileFetchResp,       ///< transport → worker: deficient leader applies survivor data
     };
 
     Type    type    = Type::Produce;
@@ -180,6 +185,37 @@ struct WorkerOp {
     // worker moves it into its own (non-atomic, worker-thread-only) owned_.
     // -----------------------------------------------------------------------
     std::vector<rune::replication::PartitionReplica*> ownedSet;
+
+    // -----------------------------------------------------------------------
+    // E5.1.2c: FetchRequest-specific fields (leader handles follower fetch).
+    // Copied flat from the FetchRequestMsg + timestamp — no pointer into
+    // the transient Aeron fragment buffer escapes the poll callback.
+    // -----------------------------------------------------------------------
+    struct FetchRequestPayload {
+        rune::replication::Epoch       leaderEpoch  = 0;
+        rune::replication::PartitionId partition    = 0;
+        rune::replication::NodeId      followerId   = -1;
+        rune::replication::Offset      fetchOffset  = 0;
+        int32_t                        maxBytes     = 0;
+        int32_t                        topicId      = 0;
+        int64_t                        nowNs        = 0;
+    } fetchRequestPayload;
+
+    // -----------------------------------------------------------------------
+    // E5.1.2c: OffsetsForLeaderEpochReq-specific fields (leader answers KIP-101).
+    // Copied flat from the OffsetsForLeaderEpochReqMsg.
+    // -----------------------------------------------------------------------
+    struct OffsetsForLeaderEpochReqPayload {
+        rune::replication::Epoch       currentEpoch   = 0;
+        rune::replication::PartitionId partition      = 0;
+        rune::replication::NodeId      followerId     = -1;
+        rune::replication::Epoch       requestedEpoch = 0;
+        rune::replication::Offset      followerLeo    = 0;
+        int32_t                        topicId        = 0;
+    } offsEpochReqPayload;
+
+    // ReconcileFetchResp reuses replicatedPayload (same FetchResponseMsg fields)
+    // + replicatedPayload.records for the variable records tail.
 };
 
 // ---------------------------------------------------------------------------
