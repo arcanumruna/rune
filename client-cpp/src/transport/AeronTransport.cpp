@@ -301,7 +301,8 @@ void AeronTransport::startEmbeddedDriver() {
     aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
     aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
     aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
-    aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
+    aeron_driver_context_set_term_buffer_length(
+        driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
 
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {
         aeron_driver_context_close(driverCtx_);

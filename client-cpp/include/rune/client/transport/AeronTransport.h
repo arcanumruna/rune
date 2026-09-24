@@ -53,6 +53,12 @@ struct TransportConfig {
     std::string egressChannel;    ///< Channel the client subscribes on (← gateway)
     int32_t     egressStreamId;   ///< Stream id for egress subscription
     std::string dataDir;          ///< Root dir; driver lives at dataDir/aeron
+    /// Aeron term buffer length (bytes) for the embedded driver — sizes every
+    /// publication/subscription log buffer on this driver.  Must be a power of
+    /// two in [64 KiB, 1 GiB].  Default 4 MiB (deployments raise it via env, e.g.
+    /// 32 MiB, for deep in-flight on high-throughput small-record producing;
+    /// a 64 KiB buffer caps in-flight to ~50 × 1 KiB).
+    std::size_t termBufferLength = 4u * 1024 * 1024;
 };
 
 // ---------------------------------------------------------------------------

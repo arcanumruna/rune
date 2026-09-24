@@ -44,6 +44,7 @@ agent::AgentConfig makeAgentConfig(const ClientConfig& c) {
     acfg.transport.egressChannel   = c.egressChannel;
     acfg.transport.egressStreamId  = c.egressStreamId;
     acfg.transport.dataDir         = c.dataDir;
+    acfg.transport.termBufferLength = c.termBufferBytes;
 
     // Session egress config (for ConnectRequest body).
     acfg.session.egressChannel  = c.egressChannel;

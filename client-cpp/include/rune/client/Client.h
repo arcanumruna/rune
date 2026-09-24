@@ -104,6 +104,11 @@ struct ClientConfig {
     int64_t connectTimeoutMs   = 5000;
     int64_t pingTimeoutMs      = 5000;
     int64_t produceTimeoutMs   = 5000; // max wait for a ProduceResponse ack
+
+    // Aeron term buffer length (bytes) for the embedded driver's log buffers.
+    // Power of two in [64 KiB, 1 GiB].  Default 4 MiB; raise (e.g. 32 MiB) for
+    // deep in-flight on high-throughput small-record producing.
+    std::size_t termBufferBytes = 4u * 1024 * 1024;
     // M2 FIX [CB-5]: subscribe-request timeout — if a SubscribeResponse does
     // not arrive within this window the pending subscribe is failed (active
     // cleared) so the app is not left polling subscriptionId() forever.
