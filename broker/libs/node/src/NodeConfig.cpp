@@ -635,6 +635,16 @@ ConfigResult parseNodeConfig(
         }
     }
     parsePow2(getenv_fn("RUNE_AERON_RCV_WINDOW"), cfg.aeronRcvWindowBytes);
+    // RUNE_GATEWAY_FRAGMENT_LIMIT: not required to be a power of two — use parseInt32.
+    if (const char* raw = getenv_fn("RUNE_GATEWAY_FRAGMENT_LIMIT")) {
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (parseInt32(raw, v)) {
+                cfg.gatewayFragmentLimit = v;
+            }
+            // Unparseable → keep default 256 (safe degradation).
+        }
+    }
 
     // --- RUNE_WORKER_IDLE (optional) — Milestone E1/E2: per-worker idle strategy selector. ---
     // E1: parsed + stored here; no per-worker AgentRunner yet (driven cooperatively).

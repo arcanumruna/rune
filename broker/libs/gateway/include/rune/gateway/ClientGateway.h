@@ -349,6 +349,23 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // G0.3: setFragmentLimit — configure the maximum fragments polled per
+    // doWork() cycle (RUNE_GATEWAY_FRAGMENT_LIMIT).  Default 256 (raised from
+    // the hard-coded 10 to avoid head-of-line blocking on batched ingress).
+    // Must be called before doWork() on the duty-cycle thread (single-writer).
+    // -----------------------------------------------------------------------
+    void setFragmentLimit(int32_t limit) noexcept {
+        fragmentLimit_ = (limit >= 1) ? limit : 256;
+    }
+
+    // -----------------------------------------------------------------------
+    // fragmentLimit — current fragment poll limit setting.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int32_t fragmentLimit() const noexcept {
+        return fragmentLimit_;
+    }
+
+    // -----------------------------------------------------------------------
     // pendingAckCount — number of deferred acks=All entries waiting for HW.
     // For tests and monitoring.
     // -----------------------------------------------------------------------
@@ -1032,6 +1049,13 @@ private:
     // std::atomic so setMinIsr() can safely be called from a different thread
     // (e.g. a test thread) without data racing the duty-cycle read in handleProduce().
     std::atomic<int>                minIsr_{1};
+
+    // G0.3: Maximum fragments polled per doWork() cycle.
+    // Default 256 (raised from hard-coded 10 to avoid head-of-line blocking on
+    // batched ingress).  Set via setFragmentLimit() from BrokerNode::buildGateway
+    // (sourced from NodeConfig::gatewayFragmentLimit).  Plain int32_t — accessed
+    // only on the duty-cycle thread (single-writer).
+    int32_t                         fragmentLimit_ = 256;
 
     // TX-2: Idempotent-producer dedup state.
     //

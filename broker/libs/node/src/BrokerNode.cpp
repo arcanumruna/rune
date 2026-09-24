@@ -668,6 +668,13 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
                      nodeId, config_.gatewayMinIsr, config_.peers.size());
 
+        // G0.3: Apply the configurable fragment poll limit (RUNE_GATEWAY_FRAGMENT_LIMIT).
+        // Default 256 (raised from hard-coded 10 to avoid head-of-line blocking on
+        // batched ingress); sourced from NodeConfig::gatewayFragmentLimit.
+        gateway_->setFragmentLimit(config_.gatewayFragmentLimit);
+        spdlog::info("BrokerNode[{}]: gateway fragmentLimit set to {}",
+                     nodeId, config_.gatewayFragmentLimit);
+
         // MD1 Task 9: Build nodeId → client endpoint map for per-partition REDIRECT.
         // Built from NodeConfig::peers: each peer carries a clientPort (GB-4 per-peer
         // client endpoint).  A zero clientPort means no known client endpoint (empty

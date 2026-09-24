@@ -347,8 +347,9 @@ int ClientGateway::doWork(int64_t nowNs) {
         }
     }
 
-    constexpr int kFragmentLimit = 10;
-    int work = sub_->poll(assembler_.handler(), kFragmentLimit);
+    // G0.3: fragment limit is configurable (default 256, was hard-coded 10).
+    // Sourced from NodeConfig::gatewayFragmentLimit via setFragmentLimit().
+    int work = sub_->poll(assembler_.handler(), fragmentLimit_);
     pollPendingConnects(nowNs);
     reapExpired(nowNs);
     // GB-5p2: group-commit flush — time-based cadence (kGroupCommitIntervalNs).

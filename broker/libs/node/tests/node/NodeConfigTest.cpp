@@ -1447,4 +1447,32 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
     EXPECT_EQ(res.config->aeronRcvWindowBytes, 262144);
 }
 
+// ---------------------------------------------------------------------------
+// G0.3: Configurable gateway fragment poll limit (RUNE_GATEWAY_FRAGMENT_LIMIT)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfig, FragmentLimitDefaultAndOverride) {
+    // Default: 256 (no env var set).
+    {
+        auto env = fakeEnv({{"RUNE_NODE_ID",        "0"},
+                            {"RUNE_PEERS",           "0@h:1"},
+                            {"RUNE_CLIENT_ENDPOINT", "h:2"},
+                            {"RUNE_DATA_DIR",        "/tmp/x"}});
+        auto res = rune::node::parseNodeConfig(env);
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_EQ(res.config->gatewayFragmentLimit, 256);
+    }
+    // Override via RUNE_GATEWAY_FRAGMENT_LIMIT=1000.
+    {
+        auto env = fakeEnv({{"RUNE_NODE_ID",                 "0"},
+                            {"RUNE_PEERS",                   "0@h:1"},
+                            {"RUNE_CLIENT_ENDPOINT",         "h:2"},
+                            {"RUNE_DATA_DIR",                "/tmp/x"},
+                            {"RUNE_GATEWAY_FRAGMENT_LIMIT",  "1000"}});
+        auto res = rune::node::parseNodeConfig(env);
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_EQ(res.config->gatewayFragmentLimit, 1000);
+    }
+}
+
 } // namespace rune::node
