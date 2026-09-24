@@ -22,14 +22,21 @@
 //      frame (preserves FIFO order for subsequent cycles).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
+#include <rune/node/NodeConfig.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace rune::gateway {
@@ -219,6 +226,105 @@ TEST(ClientGatewayEgress, DrainStopsOnBackpressure)
     EXPECT_EQ(gw.pendingResponseCount(), 0u);
     ASSERT_EQ(pub.deliveredCount(), 1);
     EXPECT_EQ(pub.lastResponse().baseOffset, 99);
+}
+
+// ===========================================================================
+// PRODUCTION-PATH TEST — proves the actual handleProduce ack path is wired to
+// the retry queue (not just the standalone sendRespReliable test-seam).
+//
+// This is the review-mandated guard: drive a real Produce frame through
+// handleProduce() (inline path, no WorkerPool) with a back-pressured egress and
+// assert the OK ack is enqueued (not dropped) and later delivered by
+// drainPendingResponses().  If handleProduce's sendResp lambda ever stops
+// routing through enqueueOrBestEffort_, this test fails.
+// ===========================================================================
+
+namespace fs = std::filesystem;
+using rune::node::TopicSpec;
+
+// Unique temp dir (getpid + atomic counter).
+static fs::path makeTempDir()
+{
+    static std::atomic<uint32_t> seq{0};
+    auto name = std::string("rune_gw_egress_") +
+                std::to_string(static_cast<long>(::getpid())) + "_" +
+                std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
+    return fs::temp_directory_path() / name;
+}
+
+// Build a single-record RecordBatch (baseOffset placeholder; gateway restamps).
+static std::vector<uint8_t> makeBatch()
+{
+    rune::protocol::RecordBatchBuilder b(/*baseOffset=*/0, /*baseTimestamp=*/1000LL);
+    b.append("k", "v", 1000LL);
+    return b.build();
+}
+
+TEST(ClientGatewayEgress, HandleProduceAckIsRetriedNotDropped)
+{
+    // Back-pressure the FIRST egress offer so the OK ack cannot be delivered
+    // synchronously inside handleProduce.
+    FakePublication pub;
+    pub.backpressureNext(1);
+
+    // TopicRegistry with one topic (id=0, 1 partition) backed by a temp dir.
+    const fs::path dir = makeTempDir();
+    std::vector<TopicSpec> specs;
+    {
+        TopicSpec ts;
+        ts.name           = "events";
+        ts.partitionCount = 1;
+        ts.topicId        = 0;
+        specs.push_back(ts);
+    }
+    TopicRegistry registry(specs, dir.string());
+
+    // Gateway wired with the fake egress + topic registry.
+    ClientGateway gw = ClientGateway::makeForTest(pub.makeSendFn(), /*sessionId=*/1);
+    gw.setTopicRegistry(&registry);
+
+    // Inject a session with id=1 (matches makeForTest currentProduceSessionId).
+    const int64_t sid = gw.injectTestSession(/*nowNs=*/0);
+    ASSERT_EQ(sid, 1) << "injected session id must match currentProduceSessionId_";
+
+    // Build + encode a Produce frame for topic 0 / partition 0, acks=Leader.
+    auto batch = makeBatch();
+    pc::Produce prod;
+    prod.sessionId      = sid;
+    prod.correlationId  = 777;
+    prod.topicId        = 0;
+    prod.partition      = 0;
+    prod.partitionKnown = 1;
+    prod.acks           = 0;   // acks=Leader → immediate ack after append
+    prod.producerId     = -1;  // legacy (no idempotent dedup)
+    prod.key            = {};
+    prod.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+
+    std::vector<uint8_t> frame(64 * 1024, 0);
+    const std::size_t frameLen = prod.encode(frame.data());
+
+    // Drive the real production handleProduce() path.
+    gw.applyProduceForTest(frame.data(), frameLen);
+
+    // The OK ack hit back-pressure and MUST have been enqueued (not dropped).
+    EXPECT_EQ(pub.deliveredCount(), 0)
+        << "ack was delivered despite back-pressure — unexpected";
+    ASSERT_EQ(gw.pendingResponseCount(), 1u)
+        << "handleProduce ack was NOT routed through the retry queue "
+           "(silent-drop regression on the production path)";
+
+    // Drain: the ack is now delivered with the correct fields.
+    gw.drainPendingResponses(nowNs());
+    ASSERT_EQ(pub.deliveredCount(), 1);
+    EXPECT_EQ(pub.lastResponse().correlationId, 777);
+    EXPECT_EQ(pub.lastResponse().errorCode,
+              static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(pub.lastResponse().baseOffset, 0);  // first append → offset 0
+    EXPECT_EQ(gw.pendingResponseCount(), 0u);
+
+    // Cleanup temp dir.
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 } // namespace

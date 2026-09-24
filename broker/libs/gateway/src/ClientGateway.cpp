@@ -155,16 +155,60 @@ int64_t ClientGateway::offerBytes_(Session* session,
 }
 
 // ---------------------------------------------------------------------------
-// G0.1: tryDeliverOrEnqueue_ — core of the retry-queue logic.
+// G0.1: enqueueOrBestEffort_ — THE single reliable-egress primitive.
 //
-// Tries to deliver already-encoded bytes (sitting in scratch_[0..encoded-1])
-// via offerBytes_.  On back-pressure: copies them into the ring.
-// On ring-full: logs a warning and sends best-effort (matches pre-fix behaviour
-// for this extreme edge case; should never fire in practice).
+// EVERY produce-path ack / redirect / error response routes through this
+// function (directly or via sendRespReliable_).  It:
+//   1. Tries immediate delivery via offerBytes_(&session).
+//   2. On back-pressure (result <= 0): copies the bytes onto the ring.
+//   3. On ring-full or oversized frame: best-effort sendTo + warn (bounded,
+//      logged last resort — never a silent drop).
 //
-// session may be nullptr when testEgressFn_ is set (test path).
-// Returns true always (we either delivered or queued — never silently drop).
-// Returns false only when encoded == 0 or > PendingResp::kMaxBytes (encode err).
+// The bytes must already be encoded (caller owns encoding into any buffer).
+// len > PendingResp::kMaxBytes → cannot fit a ring slot → best-effort.
+//
+// Single-writer: duty-cycle thread only.
+// ---------------------------------------------------------------------------
+void ClientGateway::enqueueOrBestEffort_(Session&       session,
+                                         const uint8_t* buf,
+                                         std::size_t    len)
+{
+    // Try immediate delivery.
+    const int64_t result = offerBytes_(&session, buf, len);
+    if (result > 0) return;   // delivered
+
+    // Oversized for the fixed ring slot — best-effort (rare long redirect URLs).
+    if (len > PendingResp::kMaxBytes) {
+        spdlog::warn("ClientGateway: egress frame {} bytes > ring slot {}; "
+                     "best-effort send (session={})",
+                     len, PendingResp::kMaxBytes, session.sessionId);
+        sendTo(session, buf, len);
+        return;
+    }
+
+    // Ring full — best-effort (should never fire; back-pressure clears in cycles).
+    if (pendingRespCount_ >= kMaxPendingResponses) {
+        spdlog::warn("ClientGateway: pendingResponses_ ring full ({} entries); "
+                     "best-effort send (session={})",
+                     kMaxPendingResponses, session.sessionId);
+        sendTo(session, buf, len);
+        return;
+    }
+
+    // Enqueue for drainPendingResponses().
+    const std::size_t slot = (pendingRespHead_ + pendingRespCount_) % kMaxPendingResponses;
+    PendingResp& e = pendingResponses_[slot];
+    std::memcpy(e.bytes.data(), buf, len);
+    e.len       = len;
+    e.sessionId = session.sessionId;
+    ++pendingRespCount_;
+    spdlog::debug("ClientGateway: egress back-pressured; enqueued session={} "
+                  "len={} (depth={})", session.sessionId, len, pendingRespCount_);
+}
+
+// ---------------------------------------------------------------------------
+// G0.1: sendRespReliable_ — encode a ProduceResponse into scratch_ and route it
+// through enqueueOrBestEffort_.  Returns false only on an encode error.
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendRespReliable_(Session&          session,
                                       pc::ErrorCode     ec,
@@ -189,30 +233,18 @@ bool ClientGateway::sendRespReliable_(Session&          session,
         return false;
     }
 
-    const int64_t result = offerBytes_(&session, scratch_.data(), encoded);
-    if (result > 0) return true;   // delivered immediately
-
-    // Back-pressure — enqueue for drainPendingResponses().
-    if (pendingRespCount_ >= kMaxPendingResponses) {
-        spdlog::warn("ClientGateway::sendRespReliable_: ring full ({} entries); "
-                     "falling back to best-effort send", kMaxPendingResponses);
-        sendTo(session, scratch_.data(), encoded);
-        return true;
-    }
-    const std::size_t slot = (pendingRespHead_ + pendingRespCount_) % kMaxPendingResponses;
-    PendingResp& e = pendingResponses_[slot];
-    std::memcpy(e.bytes.data(), scratch_.data(), encoded);
-    e.len       = encoded;
-    e.sessionId = session.sessionId;
-    ++pendingRespCount_;
-    spdlog::debug("ClientGateway::sendRespReliable_: enqueued sessionId={} (depth={})",
-                  session.sessionId, pendingRespCount_);
+    enqueueOrBestEffort_(session, scratch_.data(), encoded);
     return true;
 }
 
 // ---------------------------------------------------------------------------
 // G0.1: sendRespReliable — public 4-param test-seam (targets
 // currentProduceSessionId_; set by handleProduce or makeForTest).
+//
+// Production path: look up the session and delegate to sendRespReliable_().
+// Test path (testEgressFn_ set): the ring/offer logic is exercised by wrapping
+// a synthetic Session whose id is currentProduceSessionId_ — offerBytes_ ignores
+// the session pointer entirely when testEgressFn_ is set, so this is safe.
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
                                      int32_t    partition,
@@ -220,32 +252,12 @@ bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
                                      int64_t    correlationId)
 {
     if (testEgressFn_) {
-        // Encode into scratch_ and try the test hook.
-        pc::ProduceResponse resp;
-        resp.sessionId     = currentProduceSessionId_;
-        resp.correlationId = correlationId;
-        resp.errorCode     = static_cast<int16_t>(ec);
-        resp.partition     = partition;
-        resp.baseOffset    = baseOffset;
-        const std::size_t encoded = resp.encode(scratch_.data());
-        if (encoded == 0 || encoded > PendingResp::kMaxBytes) return false;
-
-        const int64_t result = testEgressFn_(scratch_.data(), encoded);
-        if (result > 0) return true;
-
-        // Back-pressured — enqueue.
-        if (pendingRespCount_ >= kMaxPendingResponses) {
-            spdlog::warn("ClientGateway::sendRespReliable: ring full");
-            testEgressFn_(scratch_.data(), encoded);
-            return true;
-        }
-        const std::size_t slot = (pendingRespHead_ + pendingRespCount_) % kMaxPendingResponses;
-        PendingResp& e = pendingResponses_[slot];
-        std::memcpy(e.bytes.data(), scratch_.data(), encoded);
-        e.len       = encoded;
-        e.sessionId = currentProduceSessionId_;
-        ++pendingRespCount_;
-        return true;
+        // No real Session in the test harness — build a synthetic one whose id
+        // matches currentProduceSessionId_.  offerBytes_ routes through
+        // testEgressFn_ and never dereferences the session pointer in test mode.
+        Session synthetic;
+        synthetic.sessionId = currentProduceSessionId_;
+        return sendRespReliable_(synthetic, ec, partition, baseOffset, correlationId);
     }
 
     Session* session = sessions_.find(currentProduceSessionId_);
@@ -261,6 +273,9 @@ bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
 // G0.1: drainPendingResponses — re-offer queued egress frames from the ring.
 // Stops at the first back-pressure (preserves FIFO).
 // Returns number of frames delivered.
+//
+// nowNs is currently unused (no per-entry aging) — kept in the signature for
+// the doWork() call convention and future deadline/timeout support.
 // ---------------------------------------------------------------------------
 int ClientGateway::drainPendingResponses(int64_t /*nowNs*/)
 {
@@ -268,8 +283,15 @@ int ClientGateway::drainPendingResponses(int64_t /*nowNs*/)
     while (pendingRespCount_ > 0) {
         PendingResp& e  = pendingResponses_[pendingRespHead_];
         Session* session = testEgressFn_ ? nullptr : sessions_.find(e.sessionId);
+        // Session reaped (production, non-test) → cannot deliver → discard the
+        // entry (no session to ack) rather than blocking the queue forever.
+        if (!testEgressFn_ && !session) {
+            pendingRespHead_ = (pendingRespHead_ + 1) % kMaxPendingResponses;
+            --pendingRespCount_;
+            continue;
+        }
         const int64_t result = offerBytes_(session, e.bytes.data(), e.len);
-        if (result <= 0) break;   // still back-pressured — stop
+        if (result <= 0) break;   // still back-pressured — stop (preserve FIFO)
         pendingRespHead_ = (pendingRespHead_ + 1) % kMaxPendingResponses;
         --pendingRespCount_;
         ++delivered;
@@ -1162,25 +1184,9 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                                    errResp.message.size();
         if (needed > scratch_.size()) return;   // oversized — drop (same as before)
         const std::size_t encoded = errResp.encode(scratch_.data());
-        if (encoded == 0 || encoded > PendingResp::kMaxBytes) {
-            // Oversized for retry ring — best-effort send (matches old behaviour).
-            sendTo(*session, scratch_.data(), encoded);
-            return;
-        }
-        // G0.1: Try immediate delivery; on back-pressure enqueue for retry.
-        const int64_t result = offerBytes_(session, scratch_.data(), encoded);
-        if (result > 0) return;
-        if (pendingRespCount_ >= kMaxPendingResponses) {
-            spdlog::warn("ClientGateway: sendRedirect ring full; best-effort send");
-            sendTo(*session, scratch_.data(), encoded);
-            return;
-        }
-        const std::size_t slot = (pendingRespHead_ + pendingRespCount_) % kMaxPendingResponses;
-        PendingResp& e = pendingResponses_[slot];
-        std::memcpy(e.bytes.data(), scratch_.data(), encoded);
-        e.len       = encoded;
-        e.sessionId = session->sessionId;
-        ++pendingRespCount_;
+        // G0.1: route through the single reliable-egress primitive (retries on
+        // back-pressure; best-effort fallback for oversized redirect URLs).
+        enqueueOrBestEffort_(*session, scratch_.data(), encoded);
     };
 
     // Cluster-level fallback (path B): only when routingImage_ is null.
@@ -1375,7 +1381,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                                        pc::ErrorResponse::BODY_FIXED + 2;
             if (needed <= scratch_.size()) {
                 const std::size_t encoded = errResp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+                // G0.1: reliable delivery (retry on back-pressure).
+                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
             return;  // engine untouched — no append
         }
@@ -1603,7 +1610,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                                    pc::ErrorResponse::BODY_FIXED + 2;
         if (needed <= scratch_.size()) {
             const std::size_t encoded = errResp.encode(scratch_.data());
-            sendTo(*session, scratch_.data(), encoded);
+            // G0.1: reliable delivery (retry on back-pressure).
+            enqueueOrBestEffort_(*session, scratch_.data(), encoded);
         }
         return;  // log untouched — no append, no LEO advance
     }
@@ -2687,7 +2695,8 @@ void ClientGateway::drainWorkerReturns_()
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 const std::size_t encoded = resp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+                // G0.1: reliable delivery (retry on back-pressure).
+                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 return;
             }
 
@@ -2733,7 +2742,8 @@ void ClientGateway::drainWorkerReturns_()
                     errResp.partition     = ret.partition;
                     errResp.baseOffset    = 0;
                     const std::size_t encoded = errResp.encode(scratch_.data());
-                    sendTo(*session, scratch_.data(), encoded);
+                    // G0.1: reliable delivery (retry on back-pressure).
+                    enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                     return;
                 }
 
@@ -2760,7 +2770,8 @@ void ClientGateway::drainWorkerReturns_()
                 okResp.partition     = ret.partition;
                 okResp.baseOffset    = ret.baseOffset;
                 const std::size_t encoded = okResp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+                // G0.1: reliable delivery (retry on back-pressure).
+                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
             return;
         }
@@ -3100,7 +3111,10 @@ void ClientGateway::drainPendingAcks()
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 const std::size_t encoded = resp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+                // G0.1: reliable delivery (retry on back-pressure) — this is the
+                // highest-durability acks=All OK ack; a silent drop here is the
+                // exact defect #3 the retry queue exists to prevent.
+                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 spdlog::debug("ClientGateway: acks=All deferred ack sent OK "
                               "sessionId={} partition={} baseOffset={} lastOffset={} hw={}",
                               entry.sessionId, entry.partition, entry.baseOffset,
@@ -3122,7 +3136,8 @@ void ClientGateway::drainPendingAcks()
                 resp.partition     = entry.partition;
                 resp.baseOffset    = entry.baseOffset;
                 const std::size_t encoded = resp.encode(scratch_.data());
-                sendTo(*session, scratch_.data(), encoded);
+                // G0.1: reliable delivery (retry on back-pressure).
+                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 spdlog::warn("ClientGateway: acks=All deferred ack timed out "
                              "sessionId={} partition={} baseOffset={} lastOffset={} "
                              "hw={} elapsed_ms={}",

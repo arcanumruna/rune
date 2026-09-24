@@ -742,11 +742,29 @@ private:
     void drainPendingAcks();
 
     // -----------------------------------------------------------------------
+    // G0.1: enqueueOrBestEffort_ — THE single reliable-egress primitive.
+    //
+    // Tries to deliver already-encoded bytes via offerBytes_(session).  On
+    // back-pressure (offer <= 0) copies the bytes onto the pendingResponses_
+    // ring for retry by drainPendingResponses().  When the ring is full, logs a
+    // warning and falls back to a best-effort sendTo (bounded last resort — the
+    // only path that can still drop, and it is documented + logged, never silent).
+    //
+    // EVERY ack / redirect / error response in the produce path routes through
+    // this function so the "no silent drop on back-pressure" invariant holds on
+    // all paths (inline, worker, deferred acks=All, redirects).
+    //
+    // `len` must be <= PendingResp::kMaxBytes; oversized frames (rare long
+    // redirect URLs) are sent best-effort (they cannot fit the fixed ring slot).
+    //
+    // Single-writer: duty-cycle thread only.
+    // -----------------------------------------------------------------------
+    void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+
+    // -----------------------------------------------------------------------
     // G0.1: sendRespReliable_ — private production implementation.
-    // Encodes a ProduceResponse into `bytes` (caller-provided buffer, at least
-    // ProduceResponse::ENCODED_SIZE bytes) and tries to deliver it via the
-    // session's egress publication.  On back-pressure: enqueues to
-    // pendingResponses_.  Always returns true (never silently drops).
+    // Encodes a ProduceResponse into scratch_ and routes it through
+    // enqueueOrBestEffort_.  Always returns true (never silently drops).
     // Returns false only on encode error (shouldn't happen given static_assert).
     //
     // NOTE: The public 4-param sendRespReliable() delegates here using
