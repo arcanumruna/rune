@@ -123,6 +123,29 @@ ClientGateway::ClientGateway(TestConstructTag,
     drainingRegistrations_.reserve(kMaxPendingConnects);
 }
 
+// G1.1: Test-only constructor — also wires leaderView_.
+ClientGateway::ClientGateway(TestConstructTag,
+                             TestEgressFn                egressFn,
+                             std::function<LeaderView()> leaderView,
+                             int64_t                     currentSessionId)
+    : aeron_(nullptr)
+    , clientChannel_()
+    , clientStreamId_(0)
+    , thisNodeId_(0)
+    , sessionTimeoutNs_(kDefaultSessionTimeoutNs)
+    , connectResolveTimeoutNs_(kDefaultConnectResolveTimeoutNs)
+    , leaderView_(std::move(leaderView))
+    , assembler_([](aeron::concurrent::AtomicBuffer&,
+                    aeron::util::index_t,
+                    aeron::util::index_t,
+                    aeron::Header&) {})   // no-op fragment handler
+    , testEgressFn_(std::move(egressFn))
+    , currentProduceSessionId_(currentSessionId)
+{
+    pendingAcks_.reserve(kMaxPendingAcks);
+    drainingRegistrations_.reserve(kMaxPendingConnects);
+}
+
 // ---------------------------------------------------------------------------
 // G0.1: makeForTest — static factory for test-only (no Aeron) construction.
 // ---------------------------------------------------------------------------
@@ -131,6 +154,18 @@ ClientGateway ClientGateway::makeForTest(TestEgressFn egressFn,
 {
     return ClientGateway(TestConstructTag{},
                          std::move(egressFn),
+                         currentProduceSessionId);
+}
+
+// G1.1: makeForTestWithLeaderView — like makeForTest but also wires leaderView_.
+// ---------------------------------------------------------------------------
+ClientGateway ClientGateway::makeForTestWithLeaderView(TestEgressFn             egressFn,
+                                                       std::function<LeaderView()> leaderView,
+                                                       int64_t currentProduceSessionId)
+{
+    return ClientGateway(TestConstructTag{},
+                         std::move(egressFn),
+                         std::move(leaderView),
                          currentProduceSessionId);
 }
 
@@ -305,6 +340,11 @@ int ClientGateway::drainPendingResponses(int64_t /*nowNs*/)
 // ---------------------------------------------------------------------------
 int ClientGateway::doWork(int64_t nowNs) {
     nowNs_ = nowNs;
+
+    // G1.1: Snapshot minIsr_ once per duty-cycle cycle so handleProduce() and
+    // drainPendingAcks() use a plain int load instead of a per-record atomic load.
+    // Safe: cachedMinIsr_ is only accessed on this single-writer thread.
+    cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed);
 
     // G0.1: drain any back-pressured egress frames FIRST — before ingress poll,
     // before worker returns, before everything else.  This ensures a buffered
@@ -1621,7 +1661,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // Only reached in steady state (committedMetadataReady_ true — see above).
         // replica->isr() returns the leader's current ISR (as of the last
         // maybeShrinkIsr run on this duty-cycle thread — no stale cross-thread read).
-        const int currentMinIsr = minIsr_.load(std::memory_order_relaxed);
+        // G1.1: use per-cycle snapshot (plain int) instead of per-produce atomic load.
+        const int currentMinIsr = cachedMinIsr_;
         const int isrSize = static_cast<int>(replica->isr().size());
         if (isrSize < currentMinIsr) {
             spdlog::debug("ClientGateway: acks=All produce rejected (ISR size={} < minIsr={}) "
@@ -3093,7 +3134,8 @@ void ClientGateway::drainPendingAcks()
         // (so HW > lastOffset would already be false for the stranded tail); this
         // explicit gate makes the commit contract unambiguous at the ack site and
         // is robust to any future HW-exposure change.
-        const int drainMinIsr = minIsr_.load(std::memory_order_relaxed);
+        // G1.1: use per-cycle snapshot (plain int) instead of per-iteration atomic load.
+        const int drainMinIsr = cachedMinIsr_;
         const bool isrHealthy =
             entry.replica &&
             static_cast<int>(entry.replica->isr().size()) >= drainMinIsr;

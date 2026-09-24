@@ -65,6 +65,17 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_egress_tests)
 
     # -------------------------------------------------------------------------
+    # G1.1: ClientGateway hot-path regression guards — leaderView_ call count
+    # and minIsr_ per-cycle snapshot.  No Aeron, no driver.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_hotpath_tests
+        tests/gateway/ClientGatewayHotPathTest.cpp)
+    target_link_libraries(rune_gateway_hotpath_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_hotpath_tests)
+
+    # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
     # Gated behind BUILD_GATEWAY_TESTS (default ON when BUILD_TESTING=ON).
     # -------------------------------------------------------------------------

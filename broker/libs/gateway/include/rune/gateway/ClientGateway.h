@@ -150,6 +150,12 @@ public:
     static ClientGateway makeForTest(TestEgressFn egressFn,
                                      int64_t currentProduceSessionId = 1);
 
+    // G1.1: makeForTest overload that also wires a leaderView_ callback.
+    // Used by ClientGatewayHotPathTest to guard against leaderView_ regression.
+    static ClientGateway makeForTestWithLeaderView(TestEgressFn             egressFn,
+                                                   std::function<LeaderView()> leaderView,
+                                                   int64_t currentProduceSessionId = 1);
+
     // -----------------------------------------------------------------------
     // doWork — poll ingress (bounded fragment limit) + dispatch + reap expired.
     // Returns number of fragments processed (work count).
@@ -1050,6 +1056,11 @@ private:
     // (e.g. a test thread) without data racing the duty-cycle read in handleProduce().
     std::atomic<int>                minIsr_{1};
 
+    // G1.1: Per-cycle snapshot of minIsr_.  Refreshed once at the top of doWork()
+    // so handleProduce and drainPendingAcks use a plain int load instead of a
+    // per-record atomic load.  Plain int: accessed only on the duty-cycle thread.
+    int                             cachedMinIsr_{1};
+
     // G0.3: Maximum fragments polled per doWork() cycle.
     // Default 256 (raised from hard-coded 10 to avoid head-of-line blocking on
     // batched ingress).  Set via setFragmentLimit() from BrokerNode::buildGateway
@@ -1196,6 +1207,13 @@ private:
     explicit ClientGateway(TestConstructTag,
                            TestEgressFn  egressFn,
                            int64_t       currentSessionId);
+
+    // G1.1: Private test constructor with leaderView_.
+    // Accessed via makeForTestWithLeaderView() only.
+    explicit ClientGateway(TestConstructTag,
+                           TestEgressFn                egressFn,
+                           std::function<LeaderView()> leaderView,
+                           int64_t                     currentSessionId);
 };
 
 } // namespace rune::gateway
