@@ -19,7 +19,10 @@
 //
 // Lifecycle:
 //   - ctor: spawns the flusher thread.
-//   - dtor: enqueues a sentinel FlushRequest{fd=-1} and joins the thread.
+//   - dtor: sets the atomic stop_ flag (release) and joins the thread.  The dtor
+//     NEVER writes to the submit ring — that ring stays strictly single-producer
+//     (only the worker's submit() ever writes it), so there is no two-producer
+//     data race between the worker and the destroying thread (Task #12 fix).
 //
 // Thread ownership:
 //   - submit(), nextToken_, inFlight_, and submitDepth_ are WORKER-side (only
@@ -43,6 +46,7 @@
 //   = capacity/8) while fitting at least `depth` messages byte-wise.
 
 #include <rune/node/OneToOneByteRing.h>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -108,7 +112,7 @@ public:
     PortableFlushBackend(PortableFlushBackend&&)                  = delete;
     PortableFlushBackend& operator=(PortableFlushBackend&&)       = delete;
 
-    // dtor: signal stop via a sentinel (fd=-1) and join.
+    // dtor: signal stop via the atomic stop_ flag and join (no ring write).
     ~PortableFlushBackend();
 
     // -----------------------------------------------------------------------
@@ -164,9 +168,10 @@ private:
     std::size_t     submitDepth_{0};  // max in-flight submits
     std::size_t     inFlight_{0};     // current in-flight count (worker-side only)
 
-    // Flusher-thread stop flag — written by flusher only after seeing the
-    // sentinel; read by flusher only.  Plain bool: single-writer.
-    bool stop_{false};
+    // Stop flag — set by the DTOR (release) on the destroying thread, read by the
+    // flusher (acquire).  Atomic because it crosses threads; this replaces the old
+    // submit-ring sentinel so the submit ring stays strictly single-producer.
+    std::atomic<bool> stop_{false};
 
     // The dedicated flusher thread — must be last so it starts after all
     // members are initialised.

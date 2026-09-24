@@ -42,16 +42,14 @@ PortableFlushBackend::PortableFlushBackend(std::size_t submitDepth,
 }
 
 PortableFlushBackend::~PortableFlushBackend() {
-    // Enqueue a sentinel FlushRequest{fd=-1} to signal the flusher to stop.
-    // Spin until the ring has space — the flusher is draining continuously.
-    FlushRequest sentinel{};
-    sentinel.fd    = -1;
-    sentinel.token = 0;
-    uint8_t buf[sizeof(FlushRequest)];
-    std::memcpy(buf, &sentinel, sizeof(FlushRequest));
-    while (!submitRing_.write(buf, sizeof(FlushRequest), /*msgTypeId=*/1)) {
-        std::this_thread::yield();
-    }
+    // Task #12 fix: signal the flusher to stop via the atomic stop_ flag —
+    // NOT by writing a sentinel to the submit ring.  The submit ring is a
+    // single-producer/single-consumer ring whose sole producer is the worker's
+    // submit(); if the dtor (which may run on a DIFFERENT thread than the worker)
+    // also wrote to it, that would be a two-producer data race on the ring's
+    // producer position (TSan-flagged).  A release-store here pairs with the
+    // flusher's acquire-load; join() then establishes happens-before for teardown.
+    stop_.store(true, std::memory_order_release);
     flusher_.join();
 }
 
@@ -82,8 +80,10 @@ CompletionToken PortableFlushBackend::submit(int fd,
 
 void PortableFlushBackend::flusherLoop_() {
     // The flusher loop: drain submit ring → fdatasync → post completion.
-    // Loops until a sentinel (fd == -1) is seen.
-    while (!stop_) {
+    // Runs until the dtor sets the atomic stop_ flag (acquire-load below pairs
+    // with the dtor's release-store).  No sentinel: submit() is the ring's sole
+    // producer, so the dtor never writes to it (Task #12).
+    while (!stop_.load(std::memory_order_acquire)) {
         submitRing_.drain(
             [this](int32_t /*msgTypeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
@@ -92,12 +92,6 @@ void PortableFlushBackend::flusherLoop_() {
                 // Zero-copy view into the ring.
                 const FlushRequest* req =
                     reinterpret_cast<const FlushRequest*>(buf.buffer() + offset);
-
-                if (req->fd == -1) {
-                    // Sentinel: the dtor wants us to stop.
-                    stop_ = true;
-                    return;
-                }
 
                 // Perform the datasync (may block — intentional; off the worker path).
                 int rc = rune_fdatasync(req->fd);
@@ -120,10 +114,25 @@ void PortableFlushBackend::flusherLoop_() {
             },
             /*limit=*/16);
 
-        if (!stop_) {
+        if (!stop_.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
     }
+
+    // Teardown final drain: complete any requests enqueued before stop_ so their
+    // data is durable on graceful shutdown.  We do the fdatasync but do NOT post
+    // completions — the worker has stopped reaping, so writing to the (possibly
+    // full) completion ring could spin forever and hang join().
+    submitRing_.drain(
+        [](int32_t /*msgTypeId*/,
+           aeron::concurrent::AtomicBuffer& buf,
+           aeron::util::index_t offset,
+           aeron::util::index_t /*length*/) {
+            const FlushRequest* req =
+                reinterpret_cast<const FlushRequest*>(buf.buffer() + offset);
+            (void)rune_fdatasync(req->fd);
+        },
+        /*limit=*/1 << 30);
 }
 
 } // namespace rune::node
