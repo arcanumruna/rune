@@ -3893,12 +3893,18 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             p.leaderId    = entry.leaderNodeId;
             p.leaderEpoch = entry.leaderEpoch;
             // E5.1: per-worker ingress routing — ingressStreamId = base + workerForPartition.
-            // When workerPool_ is set, use its ShardRouter (same mapping produce uses).
-            // When null (inline/test path), fall back to base stream id (worker 0).
-            p.ingressStreamId = workerIngressBaseStreamId_
-                              + (workerPool_
-                                 ? workerPool_->ownerWorkerId(topicId, partition)
-                                 : 0);
+            // CRITICAL: only advertise a per-worker stream when per-worker ingress is
+            // ACTUALLY ACTIVE (perWorkerIngressActive_). Otherwise the broker has NO
+            // subscriber on the per-worker stream (only the gateway on clientStreamId),
+            // so a client routing there hits NOT_CONNECTED and can't send consistently.
+            // ingressStreamId == 0 tells the client to use its default (gateway) ingress
+            // stream — the correct target when the gateway fanout is the live path.
+            p.ingressStreamId = perWorkerIngressActive_
+                              ? (workerIngressBaseStreamId_
+                                 + (workerPool_
+                                    ? workerPool_->ownerWorkerId(topicId, partition)
+                                    : 0))
+                              : 0;
             parts.push_back(p);
         }
     }
