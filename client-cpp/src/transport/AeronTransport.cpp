@@ -279,6 +279,22 @@ void AeronTransport::startEmbeddedDriver() {
             aeron_errmsg());
     }
 
+    // Silent-failure guard: if an ACTIVE media driver already holds this aeron
+    // dir, dir_delete_on_start cannot wipe it and the start degrades into a
+    // cryptic init failure or an opaque produce timeout (the stale-dir hang we
+    // hit under SIGKILL'd prior clients).  Detect it and fail LOUDLY with a
+    // clear, actionable message instead.
+    if (aeron_is_driver_active(aeronDir.c_str(), /*timeout_ms=*/1000,
+                               +[](const char*){})) {
+        aeron_driver_context_close(driverCtx_);
+        driverCtx_ = nullptr;
+        throw std::runtime_error(
+            "AeronTransport: aeron dir '" + aeronDir + "' is already in use by an "
+            "ACTIVE media driver (a prior client instance may still be running, or "
+            "was killed without clean shutdown so its driver is still holding the "
+            "dir). Use a distinct dataDir, or ensure the previous instance exited.");
+    }
+
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
     aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
     aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
