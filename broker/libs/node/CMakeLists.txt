@@ -697,6 +697,36 @@ if(BUILD_TESTING)
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
+    # ---------------------------------------------------------------------------
+    # E5.1.5: IngressMigrationTest — exactly-once produce across partition
+    # leadership reassignment when per-worker ingress is active (flag ON).
+    #
+    # Three tests:
+    #   1. ExOwner_RejectsWithNotLeader — ex-owner returns NotLeader (retriable).
+    #   2. PsmReconstructionOnOwnershipGain_DedupsAcrossMove — PSM rebuild on
+    #      BecomeLeader; retry of last committed seq returns original baseOffset.
+    #   3. ExactlyOnceAcrossMove_RetrySpanningMove — adversarial retry spanning
+    #      the ownership move; exactly kN+1 records in the final log.
+    #
+    # Uses embedded IPC Aeron driver (same fixture as WorkerProducePathTest).
+    # Gated behind BUILD_BROKER_NODE_TESTS + aeron_FOUND.
+    # TSan: TSAN_OPTIONS=halt_on_error=0 suppressions=cmake/tsan-aeron.supp
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_ingress_migration_tests
+            tests/integration/IngressMigrationTest.cpp)
+        target_include_directories(rune_ingress_migration_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_ingress_migration_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_ingress_migration_tests
+            PROPERTIES TIMEOUT 120
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    endif()
+
     # BrokerNode+Gateway integration tests (BR-7a) — single-node with live gateway.
     # Gated behind BUILD_BROKER_NODE_TESTS (reuses that gate).
     # ---------------------------------------------------------------------------

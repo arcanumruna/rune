@@ -916,6 +916,62 @@ private:
         } catch (...) {
             spdlog::warn("Worker {}: becomeLeader threw unknown exception", workerId_);
         }
+
+        // E5.1.5: PSM reconstruction on ownership GAIN (worker thread).
+        //
+        // When this worker becomes leader of a partition, its ProducerStateManager
+        // must reflect the last sequence per producer so idempotent dedup holds
+        // across a leadership move.  Without this, a retried produce spanning the
+        // move could be re-appended (false Accept) — acknowledged data at a
+        // different (new) offset, i.e. data duplication.
+        //
+        // Reuse the same logic as ClientGateway::rebuildProducerStateFromLogs
+        // (ClientGateway.cpp:474) adapted for the worker-owned PSM:
+        //   - Scan only the committed log tail (HW-bound, NOT LEO) so we never
+        //     seed from uncommitted batches that may be truncated by KIP-101
+        //     divergence resolution (same TX-2b correctness argument).
+        //   - Fallback to LEO when HW is not yet known (replica not yet
+        //     initialized, or passthrough/single-node mode).
+        //   - rebuildFromLog is idempotent for this (topicId, partition) pair —
+        //     it clears and re-seeds only this partition's entries, leaving other
+        //     partitions' state intact.
+        //
+        // Shared-nothing: runs on the WORKER thread (this function is called from
+        // executeBecomeLeaderWire_ which is called from drainIngress_, which runs
+        // on the worker's duty-cycle thread).  No cross-thread access to psm_.
+        //
+        // Cold path: alloc OK (rebuildFromLog is a log scan, not on the hot path).
+        if (perWorkerIngressActive_ && replica->isDiskBacked()) {
+            rune::storage::Log* log = replica->log();
+            if (log) {
+                // TX-2b: use committed HW, not LEO, as the scan upper bound.
+                // highWatermark() is safe to call here on the worker thread — the
+                // worker owns all HW writes (E5.1.2c: FetchRequest/ApplyReplicated
+                // are on the worker thread; becomeLeader itself sets the initial HW).
+                int64_t hw = replica->highWatermark();
+                if (hw <= 0) {
+                    // HW not yet established (very first becomeLeader): fall back
+                    // to LEO.  A new leader with no replication history has no
+                    // uncommitted tail, so LEO == HW is safe.
+                    hw = log->logEndOffset();
+                }
+                try {
+                    psm_.rebuildFromLog(hdr->topicId, *log, hw, hdr->partition);
+                    spdlog::info("Worker {}: PSM rebuilt for topicId={} partition={} "
+                                 "hw={} entries={}",
+                                 workerId_, hdr->topicId, hdr->partition, hw,
+                                 psm_.size());
+                } catch (const std::exception& ex) {
+                    spdlog::error("Worker {}: PSM rebuild threw for topicId={} "
+                                  "partition={}: {}; idempotency window may be stale",
+                                  workerId_, hdr->topicId, hdr->partition, ex.what());
+                } catch (...) {
+                    spdlog::error("Worker {}: PSM rebuild threw unknown exception for "
+                                  "topicId={} partition={}",
+                                  workerId_, hdr->topicId, hdr->partition);
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -1504,11 +1560,33 @@ private:
         ret.replica       = replica;
 
         if (!log) {
-            spdlog::warn("Worker {}: WorkerIngress: no owned log for topicId={} "
-                         "partition={}; Internal error ack",
-                         workerId_, msg.topicId, msg.partition);
-            // E5.1.3 review fix #2: use enum, not magic literal.
-            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            // E5.1.5: distinguish "partition not owned by this worker" (retriable
+            // NotLeader) from "owned but memory-backed log unsupported" (Internal).
+            //
+            // When getLogAndReplicaForPartition_ returns {nullptr, nullptr} the
+            // partition is NOT in owned_ — this worker is no longer the leader.
+            // The client must refresh metadata and re-route to the new owner.
+            // Return NotLeader (retriable), NOT Internal, so the client can retry.
+            //
+            // When it returns {nullptr, replica} (replica != nullptr), the partition
+            // IS owned but its log is memory-backed — the WorkerIngress path
+            // requires a disk-backed log (InMemoryLog is handled by the gateway
+            // fanout via the ingress_ ring).  Return Internal (non-retriable bug).
+            //
+            // Shared-nothing: no cross-worker forwarding per [[rune-shared-nothing-law]].
+            if (!replica) {
+                // Not owned: retriable NotLeader so client re-routes.
+                spdlog::debug("Worker {}: WorkerIngress: partition not owned (topicId={} "
+                              "partition={}); returning NotLeader (retriable)",
+                              workerId_, msg.topicId, msg.partition);
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            } else {
+                // Owned but memory-backed: Internal.
+                spdlog::warn("Worker {}: WorkerIngress: owned but memory-backed log for "
+                             "topicId={} partition={}; Internal error ack",
+                             workerId_, msg.topicId, msg.partition);
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            }
             enqueueReturn_(ret);
             return 1;
         }
