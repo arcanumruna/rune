@@ -234,6 +234,11 @@ struct NodeConfig {
     int32_t ioSubmitRingDepth            = 1024;
     int32_t ioCompletionRingDepth        = 1024;
     int32_t memoryLogRingBytes           = 8 * 1024 * 1024;
+    //   - aeronTermBufferBytes: Aeron term buffer length (bytes) for the embedded
+    //     media driver — sizes every publication/subscription log buffer.  Power
+    //     of two in [64 KiB, 1 GiB].  Default 4 MiB; deployments raise it (e.g.
+    //     32 MiB via RUNE_AERON_TERM_BUFFER_BYTES) for deep in-flight throughput.
+    int32_t aeronTermBufferBytes         = 4 * 1024 * 1024;
 
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
