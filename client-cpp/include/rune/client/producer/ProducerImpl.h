@@ -335,6 +335,12 @@ public:
 
     const ProducerConfig& config() const noexcept { return cfg_; }
 
+    /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
+    uint64_t framesSent()  const noexcept { return framesSent_; }
+
+    /// Total records accepted via drainRing (agent-thread only; plain uint64_t).
+    uint64_t recordsSent() const noexcept { return recordsSent_; }
+
     // ---- Global flush flag (written by app thread, read by agent) -------------
     // Set by submitFlush(); cleared by flushBatches() after processing.
     std::atomic<bool> globalFlushPending_ {false};
@@ -370,6 +376,11 @@ private:
 
     // Shared correlationId counter (also used by Client for ping).
     std::atomic<int64_t>& nextCorrId_;
+
+    // ---- Instrumentation counters (agent-thread only — plain uint64_t) -------
+    // Single-writer (agent thread): no atomics needed per shared-nothing law.
+    uint64_t framesSent_  = 0; // total Aeron frames offered to transport
+    uint64_t recordsSent_ = 0; // total records drained from the ring
 
     // ---- Own ring buffer (MPSC: many app threads write, one agent thread reads)
     // ProducerImpl owns its ring so SEND_RECORD messages are separate from the

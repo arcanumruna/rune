@@ -499,6 +499,24 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_batch_builder_tests)
     endif()
 
+    # ── Producer batching instrumentation tests (Gate-2) ─────────────────────
+    # Tests: framesSent/recordsSent counters + RUNE_LINGER_US/BATCH_BYTES/BATCH_RECORDS env knobs.
+    if(aeron_FOUND)
+        add_executable(rune_producer_batching_tests
+            tests/producer/ProducerBatchingTest.cpp
+        )
+        target_include_directories(rune_producer_batching_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_producer_batching_tests PRIVATE
+            rune_client_producer
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_producer_batching_tests)
+    endif()
+
     # ── Subscriber tests (CB-4) — push RecordHandler, offset tracking, unsub ──
     if(aeron_FOUND)
         add_executable(rune_subscriber_tests

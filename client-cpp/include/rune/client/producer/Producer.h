@@ -64,8 +64,17 @@ struct ProducerConfig {
     Acks    acks           = Acks::Leader;
     int64_t lingerUs       = 5'000;      // max time to accumulate a batch (µs)
     int32_t batchBytes     = 64 * 1024;  // flush when a partition's builder reaches this
+    int32_t batchRecords   = 0;          // flush when a partition's builder reaches this many records (0=disabled)
     int32_t maxInFlight    = 4;          // max outstanding un-acked batches per partition
     int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
+
+    /// Build a ProducerConfig from environment variables, falling back to
+    /// sane defaults for any variable that is not set.
+    ///
+    ///   RUNE_LINGER_US      → lingerUs
+    ///   RUNE_BATCH_BYTES    → batchBytes
+    ///   RUNE_BATCH_RECORDS  → batchRecords
+    static ProducerConfig fromEnv() noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -162,6 +171,20 @@ public:
     /// Force-flush all pending batches immediately (sets the flush flag; the
     /// agent thread does the actual encoding on its next doWork cycle).
     void flush() noexcept;
+
+    // ---- Instrumentation counters (agent-thread written, caller-read after sync)
+    //
+    // These counters are updated on the single-writer agent thread.  They are
+    // plain uint64_t (no atomics) because the producer is single-writer.
+    // The caller must ensure the agent has finished its work (e.g. via flush()
+    // + pump) before reading these from a different thread.
+
+    /// Total Aeron frames offered to transport since this producer was created.
+    uint64_t framesSent() const noexcept;
+
+    /// Total records accepted by send() / batch-add since this producer was
+    /// created.
+    uint64_t recordsSent() const noexcept;
 
 private:
     std::shared_ptr<producer::ProducerImpl> impl_;

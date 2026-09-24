@@ -6,9 +6,31 @@
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/producer/BatchBuilder.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace rune::client {
+
+// ---------------------------------------------------------------------------
+// ProducerConfig::fromEnv
+// ---------------------------------------------------------------------------
+
+ProducerConfig ProducerConfig::fromEnv() noexcept {
+    ProducerConfig cfg{};
+    if (const char* v = std::getenv("RUNE_LINGER_US")) {
+        const long val = std::strtol(v, nullptr, 10);
+        if (val > 0) cfg.lingerUs = static_cast<int64_t>(val);
+    }
+    if (const char* v = std::getenv("RUNE_BATCH_BYTES")) {
+        const long val = std::strtol(v, nullptr, 10);
+        if (val > 0) cfg.batchBytes = static_cast<int32_t>(val);
+    }
+    if (const char* v = std::getenv("RUNE_BATCH_RECORDS")) {
+        const long val = std::strtol(v, nullptr, 10);
+        if (val > 0) cfg.batchRecords = static_cast<int32_t>(val);
+    }
+    return cfg;
+}
 
 Producer::Producer(std::shared_ptr<producer::ProducerImpl> impl) noexcept
     : impl_(std::move(impl))
@@ -98,6 +120,18 @@ BatchBuilder Producer::batch(TopicHandle topic, const Key& key) {
 
 void Producer::flush() noexcept {
     if (impl_) impl_->submitFlush();
+}
+
+// ---------------------------------------------------------------------------
+// Instrumentation counters
+// ---------------------------------------------------------------------------
+
+uint64_t Producer::framesSent() const noexcept {
+    return impl_ ? impl_->framesSent() : 0u;
+}
+
+uint64_t Producer::recordsSent() const noexcept {
+    return impl_ ? impl_->recordsSent() : 0u;
 }
 
 } // namespace rune::client

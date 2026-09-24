@@ -361,11 +361,12 @@ struct BenchFixture {
         if (!th.valid())
             throw std::runtime_error("BenchFixture: bench_topic not found");
 
-        // Warm up produce path.
-        ProducerConfig pcfg;
+        // Warm up produce path (honor env-driven batch knobs for fair batched
+        // throughput measurement: RUNE_LINGER_US, RUNE_BATCH_BYTES, RUNE_BATCH_RECORDS).
+        ProducerConfig pcfg = ProducerConfig::fromEnv();
         pcfg.acks             = Acks::Leader;
-        pcfg.lingerUs         = 1;
-        pcfg.batchBytes       = 1;
+        if (pcfg.lingerUs    == 5'000)    pcfg.lingerUs   = 1; // override default for bench
+        if (pcfg.batchBytes  == 64*1024)  pcfg.batchBytes = 1; // override default for bench
         pcfg.maxInFlight      = 16;
         pcfg.produceTimeoutMs = kOpTimeoutMs;
 
@@ -467,6 +468,13 @@ static void BM_ProduceRTT(benchmark::State& state) {
     state.counters["p999_us"] = pct(0.999);
     state.counters["mean_us"] = mean;
     state.counters["samples"] = static_cast<double>(n);
+
+    // Report coalescing efficiency: records_per_frame (> 1 means batching occurred).
+    const uint64_t frames  = p.framesSent();
+    const uint64_t records = p.recordsSent();
+    state.counters["records_per_frame"] =
+        (frames > 0) ? static_cast<double>(records) / static_cast<double>(frames)
+                     : 0.0;
 
     // Enforce gate: p99 < 100µs.
     if (pct(0.99) >= 100.0) {

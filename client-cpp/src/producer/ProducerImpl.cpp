@@ -354,6 +354,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                 }
 
                 // Enqueue the Tier-2 entry for deferred dispatch in flushBatches.
+                recordsSent_ += static_cast<uint64_t>(entry.recordCount);
                 ps.pendingTier2Entries.push_back(std::move(entry));
 
                 ++drained;
@@ -404,6 +405,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                                       static_cast<std::size_t>(valueLen));
             ps.builder->append(kv, vv, wallNs());
             ps.builderBytes += static_cast<int32_t>(valueLen);
+            ++recordsSent_; // count each record accepted from the ring
 
             ++drained;
         },
@@ -470,6 +472,7 @@ bool ProducerImpl::encodeAndSend(
     const bool ok = sendFn(encodeScratch_.data(), written);
 
     if (ok) {
+        ++framesSent_; // one Aeron frame offered to transport
         if (correlationId != 0) {
             // Increment in-flight counter (decremented on ProduceResponse).
             // Only track ack-expecting batches; acks=None (corrId==0) are
@@ -572,14 +575,17 @@ bool ProducerImpl::encodeAndSendTier2(
 
     const bool ok = sendFn(encodeScratch_.data(), written);
 
-    if (ok && entry.corrId != 0) {
-        ++ps.inFlight;
-        // CB-5 B: store wire frame bytes for redirect resend.
-        BatchInfo bi;
-        bi.topicId   = entry.topicId;
-        bi.partition = entry.partition;
-        bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
-        batchMap_[entry.corrId] = std::move(bi);
+    if (ok) {
+        ++framesSent_; // one Aeron frame offered to transport (Tier-2)
+        if (entry.corrId != 0) {
+            ++ps.inFlight;
+            // CB-5 B: store wire frame bytes for redirect resend.
+            BatchInfo bi;
+            bi.topicId   = entry.topicId;
+            bi.partition = entry.partition;
+            bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+            batchMap_[entry.corrId] = std::move(bi);
+        }
     }
 
     return ok;
@@ -622,11 +628,13 @@ int ProducerImpl::flushBatches(
             // maxInFlight guard: only attempt flush if there's capacity.
             if (ps.inFlight < cfg_.maxInFlight) {
                 // Check flush triggers.
-                const bool lingerExpired = (nowNs - ps.batchStartNs) >= lingerNs;
-                const bool sizeFull      = (ps.builderBytes >= cfg_.batchBytes);
-                const bool doFlush       = lingerExpired || sizeFull ||
-                                           ps.flushRequested || globalFlush ||
-                                           !ps.pendingTier2Entries.empty();
+                const bool lingerExpired  = (nowNs - ps.batchStartNs) >= lingerNs;
+                const bool sizeFull       = (ps.builderBytes >= cfg_.batchBytes);
+                const bool recordsFull    = (cfg_.batchRecords > 0) &&
+                                            (ps.builder->recordCount() >= cfg_.batchRecords);
+                const bool doFlush        = lingerExpired || sizeFull || recordsFull ||
+                                            ps.flushRequested || globalFlush ||
+                                            !ps.pendingTier2Entries.empty();
 
                 if (doFlush) {
                     int64_t corrId = 0;
