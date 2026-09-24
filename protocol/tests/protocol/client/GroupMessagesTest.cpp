@@ -85,7 +85,7 @@ TEST(JoinGroupCodec, RoundTripFull) {
     EXPECT_EQ(leU16(buf.data(), 0), rpc::JoinGroup::BODY_FIXED);   // blockLength = 4
     EXPECT_EQ(leU16(buf.data(), 2), rpc::JoinGroup::TEMPLATE_ID);  // templateId = 32
     EXPECT_EQ(leU16(buf.data(), 4), rpc::kSchemaId);               // 120
-    EXPECT_EQ(leU16(buf.data(), 6), rpc::kProtocolVersion);        // 1
+    EXPECT_EQ(leU16(buf.data(), 6), rpc::kProtocolVersion);        // 2 (E5.1 bump)
     EXPECT_EQ(leS64(buf.data(), 8),  kSession);
     EXPECT_EQ(leS64(buf.data(), 16), kCorrelation);
 
@@ -810,7 +810,7 @@ TEST(GroupConformance, JoinGroupGolden) {
     EXPECT_EQ(leU16(buf.data(),  0), 4u);    // blockLength = BODY_FIXED
     EXPECT_EQ(leU16(buf.data(),  2), 32u);   // templateId = JoinGroup
     EXPECT_EQ(leU16(buf.data(),  4), 120u);  // schemaId
-    EXPECT_EQ(leU16(buf.data(),  6), 1u);    // version
+    EXPECT_EQ(leU16(buf.data(),  6), rpc::kProtocolVersion);    // version (E5.1: now 2)
     EXPECT_EQ(leS64(buf.data(),  8), kGoldSession);
     EXPECT_EQ(leS64(buf.data(), 16), kGoldCorrelation);
 

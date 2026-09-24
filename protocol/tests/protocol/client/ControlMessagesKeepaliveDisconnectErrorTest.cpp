@@ -108,15 +108,15 @@ TEST(KeepaliveCodec, SchemaMismatchReturnsNullopt) {
 }
 
 // ---------------------------------------------------------------------------
-// K-5. Default struct carries schemaId=120 / version=1 when encoded.
+// K-5. Default struct carries schemaId=120 / version=kProtocolVersion when encoded.
 // ---------------------------------------------------------------------------
 TEST(KeepaliveCodec, DefaultSchemaIdAndVersion) {
     rpc::Keepalive ka;
     std::array<uint8_t, 32> buf{};
     ka.encode(buf.data());
 
-    EXPECT_EQ(leU16(buf.data(), 4), 120u);  // kSchemaId
-    EXPECT_EQ(leU16(buf.data(), 6), 1u);    // kProtocolVersion
+    EXPECT_EQ(leU16(buf.data(), 4), 120u);               // kSchemaId
+    EXPECT_EQ(leU16(buf.data(), 6), rpc::kProtocolVersion);  // version=2 (E5.1 bump)
 }
 
 // ---------------------------------------------------------------------------

@@ -587,15 +587,19 @@ TEST(DispatchCheckFrame, WrongSchema65535) {
 }
 
 // ===========================================================================
-// 4. UnsupportedVersion — > kProtocolVersion(1) rejected; 0 and 1 accepted
+// 4. UnsupportedVersion — > kProtocolVersion(2) rejected; 0, 1, 2 accepted
 // ===========================================================================
 
 TEST(DispatchCheckFrame, UnsupportedVersionTwo) {
+    // version=2 is now kProtocolVersion — must be ACCEPTED (E5.1 bump).
     auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 2);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
-    EXPECT_EQ(fc.status, rpc::FrameStatus::UnsupportedVersion);
+    EXPECT_NE(fc.status, rpc::FrameStatus::UnsupportedVersion);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
     EXPECT_EQ(fc.version, 2u);
-    EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
+    // peekTemplateId must return the template (not nullopt) for a valid frame.
+    EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()),
+              std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::Keepalive)));
 }
 
 TEST(DispatchCheckFrame, UnsupportedVersionThree) {
@@ -614,7 +618,7 @@ TEST(DispatchCheckFrame, UnsupportedVersion65535) {
 }
 
 TEST(DispatchCheckFrame, VersionOneAccepted) {
-    // version == kProtocolVersion (1) — must be accepted (boundary: > not >=).
+    // version=1 (older than kProtocolVersion=2) — must be accepted (boundary: > not >=).
     auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 1);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_NE(fc.status, rpc::FrameStatus::UnsupportedVersion);
@@ -626,18 +630,19 @@ TEST(DispatchCheckFrame, VersionZeroAccepted) {
     auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 0);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_NE(fc.status, rpc::FrameStatus::UnsupportedVersion);
-    // templateId 3 is known, schema correct, version 0 <= 1 → Ok.
+    // templateId 3 is known, schema correct, version 0 <= 2 → Ok.
     EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
     EXPECT_EQ(fc.version, 0u);
 }
 
 TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
-    // Data template (tid=16 / Produce) at version > kProtocolVersion → UnsupportedVersion.
+    // Data template (tid=16 / Produce) at version > kProtocolVersion(2) → UnsupportedVersion.
+    // Use version=3 since version=2 is now kProtocolVersion (E5.1 bump).
     // Version guard fires before template check — no mis-parse possible.
-    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Produce), 2);
+    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Produce), 3);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status,  rpc::FrameStatus::UnsupportedVersion);
-    EXPECT_EQ(fc.version, 2u);
+    EXPECT_EQ(fc.version, 3u);
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
 }
 
@@ -770,7 +775,8 @@ TEST(DispatchPeekTemplateId, NulloptForWrongSchema) {
 }
 
 TEST(DispatchPeekTemplateId, NulloptForUnsupportedVersion) {
-    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 2);
+    // version=2 is now kProtocolVersion (E5.1 bump) — use version=3 (truly unsupported).
+    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 3);
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
 }
 

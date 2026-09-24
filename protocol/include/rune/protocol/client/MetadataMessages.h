@@ -34,8 +34,8 @@
 //   [after brokers]
 //             partitionCount : uint16
 //   [after count]
-//             partitions[]:  (each entry = fixed 16 bytes)
-//               topicId(4) + partition(4) + leaderId(4) + leaderEpoch(4)
+//             partitions[]:  (each entry = fixed 20 bytes)
+//               topicId(4) + partition(4) + leaderId(4) + leaderEpoch(4) + ingressStreamId(4)
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
@@ -158,12 +158,14 @@ struct BrokerEntry {
     std::string_view host;  // zero-copy into source buffer
 };
 
-/// One partition entry as decoded from the response (fixed 16 bytes).
+/// One partition entry as decoded from the response (fixed 20 bytes).
+/// E5.1: ingressStreamId added as the 5th field (per-worker ingress routing).
 struct PartitionEntry {
-    int32_t topicId     = 0;
-    int32_t partition   = 0;
-    int32_t leaderId    = 0;
-    int32_t leaderEpoch = 0;
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+    int32_t leaderId       = 0;
+    int32_t leaderEpoch    = 0;
+    int32_t ingressStreamId = 0;  ///< E5.1: Aeron stream id for per-worker ingress.
 };
 
 // ---------------------------------------------------------------------------
@@ -194,10 +196,11 @@ struct MetadataResponse {
     //     hostLen bytes
     //   uint16 partitionCount
     //   for each partition:
-    //     int32 topicId      (LE)
-    //     int32 partition    (LE)
-    //     int32 leaderId     (LE)
-    //     int32 leaderEpoch  (LE)
+    //     int32 topicId        (LE)
+    //     int32 partition      (LE)
+    //     int32 leaderId       (LE)
+    //     int32 leaderEpoch    (LE)
+    //     int32 ingressStreamId (LE)   E5.1: per-worker Aeron stream id
     //
     // Returns total bytes written.
     // buf must be large enough; use encodedSize() to pre-allocate.
@@ -233,7 +236,8 @@ struct MetadataResponse {
             detail::putLE32(buf, static_cast<int>(pos) + 4,  p.partition);
             detail::putLE32(buf, static_cast<int>(pos) + 8,  p.leaderId);
             detail::putLE32(buf, static_cast<int>(pos) + 12, p.leaderEpoch);
-            pos += 16;
+            detail::putLE32(buf, static_cast<int>(pos) + 16, p.ingressStreamId);  // E5.1
+            pos += 20;
         }
         return pos;
     }
@@ -246,7 +250,7 @@ struct MetadataResponse {
             sz += 4u + 4u + 2u + b.host.size();
         }
         sz += 2u;              // partitionCount
-        sz += partitions.size() * 16u;
+        sz += partitions.size() * 20u;  // E5.1: 20 bytes per entry (was 16)
         return sz;
     }
 
@@ -299,14 +303,15 @@ struct MetadataResponse {
         pos += 2;
         result.partitions.reserve(partCount);
 
-        if (pos + static_cast<std::size_t>(partCount) * 16u > avail) return std::nullopt;
+        if (pos + static_cast<std::size_t>(partCount) * 20u > avail) return std::nullopt;  // E5.1: 20 bytes/entry
         for (uint16_t i = 0; i < partCount; ++i) {
             PartitionEntry p;
-            p.topicId     = detail::getLE32(buf, static_cast<int>(pos));
-            p.partition   = detail::getLE32(buf, static_cast<int>(pos) + 4);
-            p.leaderId    = detail::getLE32(buf, static_cast<int>(pos) + 8);
-            p.leaderEpoch = detail::getLE32(buf, static_cast<int>(pos) + 12);
-            pos += 16;
+            p.topicId        = detail::getLE32(buf, static_cast<int>(pos));
+            p.partition      = detail::getLE32(buf, static_cast<int>(pos) + 4);
+            p.leaderId       = detail::getLE32(buf, static_cast<int>(pos) + 8);
+            p.leaderEpoch    = detail::getLE32(buf, static_cast<int>(pos) + 12);
+            p.ingressStreamId = detail::getLE32(buf, static_cast<int>(pos) + 16);  // E5.1
+            pos += 20;
             result.partitions.push_back(p);
         }
         return result;

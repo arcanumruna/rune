@@ -296,6 +296,11 @@ TEST(MetadataMessages, ResponseLEBytesPartition)
     EXPECT_EQ(buf[partBase + 13], 0x00);
     EXPECT_EQ(buf[partBase + 14], 0x00);
     EXPECT_EQ(buf[partBase + 15], 0x00);
+    // ingressStreamId=0 (default) → 4 zero bytes at offset +16..+19
+    EXPECT_EQ(buf[partBase + 16], 0x00);
+    EXPECT_EQ(buf[partBase + 17], 0x00);
+    EXPECT_EQ(buf[partBase + 18], 0x00);
+    EXPECT_EQ(buf[partBase + 19], 0x00);
 }
 
 // MRR-4: truncation reject at various offsets.
@@ -331,7 +336,8 @@ TEST(MetadataMessages, ResponseUnknownVersionReject)
     auto buf = buildRespBuf(0, 0, {}, {});
 
     // Patch version to unsupported value.
-    buf[6] = 0x02;  // version=2 > kProtocolVersion(1)
+    // kProtocolVersion is now 2 (E5.1 bump); use 3 to be unsupported.
+    buf[6] = 0x03;  // version=3 > kProtocolVersion(2)
     buf[7] = 0x00;
 
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
@@ -349,6 +355,75 @@ TEST(MetadataMessages, ResponseTemplateIdKnown)
 
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()),
               std::optional<uint16_t>(static_cast<uint16_t>(rpc::TemplateId::MetadataResponse)));
+}
+
+// MRR-7: E5.1 — ingressStreamId round-trips through encode/decode (new 5th field).
+// Verifies encode stride (20 bytes/entry) and decode reads at offset +16.
+TEST(MetadataMessages, ResponseIngressStreamIdRoundTrip)
+{
+    const int64_t sid  = 0xDEADC0DE00000001LL;
+    const int64_t corr = 0x0000000100000002LL;
+
+    rpc::PartitionEntry p0;
+    p0.topicId        = 1;
+    p0.partition      = 0;
+    p0.leaderId       = 5;
+    p0.leaderEpoch    = 7;
+    p0.ingressStreamId = 1001;
+
+    rpc::PartitionEntry p1;
+    p1.topicId        = 1;
+    p1.partition      = 1;
+    p1.leaderId       = 6;
+    p1.leaderEpoch    = 7;
+    p1.ingressStreamId = 1002;
+
+    rpc::PartitionEntry p2;
+    p2.topicId        = 2;
+    p2.partition      = 0;
+    p2.leaderId       = 5;
+    p2.leaderEpoch    = 3;
+    p2.ingressStreamId = 0;  // default — exercises zero-value path
+
+    auto buf = buildRespBuf(sid, corr, {}, {p0, p1, p2});
+
+    // encodedSize must reflect 3 * 20 = 60 bytes for partitions (not 48).
+    constexpr std::size_t hdrBrokerPart = rpc::MessageHeader::ENCODED_SIZE
+                                        + 2u   // brokerCount
+                                        + 2u;  // partitionCount
+    EXPECT_EQ(buf.size(), hdrBrokerPart + 3u * 20u) << "stride must be 20 bytes/entry";
+
+    auto opt = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(opt.has_value()) << "decode must succeed";
+    EXPECT_EQ(opt->sessionId,     sid);
+    EXPECT_EQ(opt->correlationId, corr);
+    ASSERT_EQ(opt->partitions.size(), 3u);
+
+    EXPECT_EQ(opt->partitions[0].topicId,         1);
+    EXPECT_EQ(opt->partitions[0].partition,        0);
+    EXPECT_EQ(opt->partitions[0].leaderId,         5);
+    EXPECT_EQ(opt->partitions[0].leaderEpoch,      7);
+    EXPECT_EQ(opt->partitions[0].ingressStreamId,  1001);
+
+    EXPECT_EQ(opt->partitions[1].topicId,         1);
+    EXPECT_EQ(opt->partitions[1].partition,        1);
+    EXPECT_EQ(opt->partitions[1].leaderId,         6);
+    EXPECT_EQ(opt->partitions[1].leaderEpoch,      7);
+    EXPECT_EQ(opt->partitions[1].ingressStreamId,  1002);
+
+    EXPECT_EQ(opt->partitions[2].topicId,         2);
+    EXPECT_EQ(opt->partitions[2].partition,        0);
+    EXPECT_EQ(opt->partitions[2].leaderId,         5);
+    EXPECT_EQ(opt->partitions[2].leaderEpoch,      3);
+    EXPECT_EQ(opt->partitions[2].ingressStreamId,  0);
+
+    // LE byte check for ingressStreamId=1001 (0x000003E9) at partition[0]+16.
+    // partBase = hdrBrokerPart (no brokers).
+    constexpr std::size_t partBase = hdrBrokerPart;
+    EXPECT_EQ(buf[partBase + 16], 0xE9);  // 1001 LE: low byte
+    EXPECT_EQ(buf[partBase + 17], 0x03);
+    EXPECT_EQ(buf[partBase + 18], 0x00);
+    EXPECT_EQ(buf[partBase + 19], 0x00);
 }
 
 // ===========================================================================

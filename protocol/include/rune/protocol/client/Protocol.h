@@ -3,7 +3,7 @@
 namespace rune::protocol::client {
 
 inline constexpr uint16_t kSchemaId        = 120;  // client-facing schema (distinct from internal 111-114)
-inline constexpr uint16_t kProtocolVersion = 1;
+inline constexpr uint16_t kProtocolVersion = 2;  // E5.1: PartitionEntry.ingressStreamId (16→20 bytes)
 
 enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/consume 16-31, groups/txn 32-63, view 64-95
     Connect          = 1,

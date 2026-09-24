@@ -572,7 +572,7 @@ TEST(OffsetConformance, OffsetCommitWithMetaGolden) {
     EXPECT_EQ(leU16(buf.data(),  0), 4u);    // blockLength = BODY_FIXED
     EXPECT_EQ(leU16(buf.data(),  2), 40u);   // templateId = OffsetCommit
     EXPECT_EQ(leU16(buf.data(),  4), 120u);  // schemaId
-    EXPECT_EQ(leU16(buf.data(),  6), 1u);    // version
+    EXPECT_EQ(leU16(buf.data(),  6), rpc::kProtocolVersion);    // version (E5.1: now 2)
     EXPECT_EQ(leS64(buf.data(),  8), kGoldSession);
     EXPECT_EQ(leS64(buf.data(), 16), kGoldCorrelation);
 
