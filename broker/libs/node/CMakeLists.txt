@@ -605,6 +605,23 @@ if(BUILD_TESTING)
     endif()
 
     # ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # E5.1.2a: WorkerIngress unit tests — per-worker Aeron subscription +
+    # zero-copy poll delivery mechanism.  Uses an embedded IPC Aeron driver
+    # (same fixture as GatewayLoopbackTest).  Gated behind BUILD_BROKER_NODE_TESTS.
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_worker_ingress_tests
+            tests/node/WorkerIngressTest.cpp)
+        target_link_libraries(rune_worker_ingress_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_ingress_tests
+            PROPERTIES TIMEOUT 60
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    endif()
+
     # BrokerNode+Gateway integration tests (BR-7a) — single-node with live gateway.
     # Gated behind BUILD_BROKER_NODE_TESTS (reuses that gate).
     # ---------------------------------------------------------------------------
