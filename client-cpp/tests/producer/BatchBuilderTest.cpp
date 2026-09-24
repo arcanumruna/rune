@@ -1127,3 +1127,77 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
     agent->stop();
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }
+
+// ===========================================================================
+// A tiny ring filled with Tier-1 records so the NEXT Tier-1 future send fails
+// to enqueue.  The future must resolve IMMEDIATELY with an exception, NOT hang
+// forever waiting for an ack that can never come (regression for the stranded-
+// future-on-ring-full bug).  Same for the callback overload (callback(-1)).
+// ===========================================================================
+TEST(BatchBuilder, RingFullTier1FutureFailsFast) {
+    static constexpr int32_t kInStr = 3019, kEgStr = 3020;
+    const std::string agentDir = uniqueDir("cb5_t1full");
+
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = kInStr;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = kEgStr;
+    cfg.transport.dataDir         = agentDir;
+    cfg.session.egressChannel     = "aeron:ipc";
+    cfg.session.egressStreamId    = kEgStr;
+    cfg.session.keepaliveIntervalNs = 10'000'000'000LL;
+    cfg.ringCapacity              = 4096;
+
+    rprod::ProducerHub   hub;
+    std::atomic<int64_t> nextCorrId_ {1};
+    auto agent = std::make_unique<rca::ClientAgent>(cfg);
+    agent->setProducerDrainFn([](int64_t,int64_t,rca::ClientAgent::SendFn){return 0;});
+    agent->setProduceResponseFn([](int64_t,int64_t){});
+    agent->setEgressObserver([](rcc::TemplateId,const uint8_t*,std::size_t){});
+    agent->start();
+    std::this_thread::sleep_for(150ms);
+
+    ProducerConfig pcfg;
+    pcfg.acks             = Acks::Leader;
+    pcfg.lingerUs         = 1'000'000'000LL;
+    pcfg.batchBytes       = 64 * 1024;
+    pcfg.maxInFlight      = 4;
+    pcfg.produceTimeoutMs = 30'000; // long — must NOT be reached
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_, 4 * 1024);
+    hub.add(impl);
+    Producer p(impl);
+
+    auto topic = makeTopic(32, 1);
+    Key  key(uint64_t{0});
+    const std::vector<uint8_t> val(32, 0xCC);
+
+    // Fill the ring with fire-and-forget records.
+    for (int i = 0; i < 200; ++i) {
+        impl->submitSendRecord(
+            topic.topicId, key.partition(topic.partitionCount),
+            key, std::span<const uint8_t>(val), /*wantAck=*/false, /*corrId=*/0);
+    }
+
+    // Tier-1 future send on a full ring → future must be READY immediately.
+    auto fut = p.send(topic, key, std::span<const uint8_t>(val),
+                      rune::client::want_future_t{});
+    const auto status = fut.wait_for(0ms);
+    EXPECT_EQ(status, std::future_status::ready)
+        << "Tier-1 ring-full must reject the future IMMEDIATELY, not hang";
+    if (status == std::future_status::ready) {
+        EXPECT_THROW({ fut.get(); }, std::runtime_error)
+            << "Ring-full Tier-1 future must throw std::runtime_error";
+    }
+
+    // Callback overload on a full ring → callback must fire with offset=-1.
+    std::atomic<int64_t> cbOffset{0};
+    std::atomic<bool>    cbFired{false};
+    p.send(topic, key, std::span<const uint8_t>(val),
+           [&](int64_t off){ cbOffset.store(off); cbFired.store(true); });
+    EXPECT_TRUE(cbFired.load()) << "Ring-full callback must fire (not be stranded)";
+    EXPECT_EQ(cbOffset.load(), -1) << "Ring-full callback must signal error (-1)";
+
+    agent->stop();
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}

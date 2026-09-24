@@ -42,8 +42,13 @@ void Producer::send(TopicHandle              topic,
     if (!impl_ || !topic.valid()) return;
     const int32_t part   = key.partition(topic.partitionCount);
     const int64_t corrId = impl_->registerCallback(std::move(callback));
-    impl_->submitSendRecord(topic.topicId, part, key, value,
-                             /*wantAck=*/true, corrId);
+    // Back-pressure: if the send ring is full the record never reaches the agent,
+    // so the ack would never arrive — fail the pending callback immediately
+    // (callback fires with offset=-1) rather than stranding it forever.
+    if (!impl_->submitSendRecord(topic.topicId, part, key, value,
+                                 /*wantAck=*/true, corrId)) {
+        impl_->failPending(corrId, "producer send ring full — back-pressure (retry)");
+    }
 }
 
 std::future<int64_t> Producer::send(TopicHandle              topic,
@@ -59,8 +64,13 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
     }
     const int32_t part = key.partition(topic.partitionCount);
     auto [corrId, fut] = impl_->registerFuture();
-    impl_->submitSendRecord(topic.topicId, part, key, value,
-                             /*wantAck=*/true, corrId);
+    // Back-pressure: if the send ring is full the record never reaches the agent,
+    // so the ack would never arrive and future.get() would hang forever. Reject
+    // the future immediately with a retriable error instead of stranding it.
+    if (!impl_->submitSendRecord(topic.topicId, part, key, value,
+                                 /*wantAck=*/true, corrId)) {
+        impl_->failPending(corrId, "producer send ring full — back-pressure (retry)");
+    }
     return std::move(fut);
 }
 
