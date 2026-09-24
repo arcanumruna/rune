@@ -54,6 +54,17 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_topic_registry_tests)
 
     # -------------------------------------------------------------------------
+    # G0.1: ClientGateway egress retry queue unit tests — no Aeron, no driver.
+    # Uses the test-only makeForTest() factory + FakePublication seam.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_egress_tests
+        tests/gateway/ClientGatewayEgressTest.cpp)
+    target_link_libraries(rune_gateway_egress_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_egress_tests)
+
+    # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
     # Gated behind BUILD_GATEWAY_TESTS (default ON when BUILD_TESTING=ON).
     # -------------------------------------------------------------------------

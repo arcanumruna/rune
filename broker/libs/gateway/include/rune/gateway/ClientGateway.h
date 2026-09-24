@@ -66,6 +66,8 @@ namespace rune::node { class WorkerPool; }
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
+// G0.1: ErrorCode enum for sendRespReliable() signature.
+#include <rune/protocol/client/Protocol.h>
 
 #include <array>
 #include <atomic>
@@ -133,6 +135,20 @@ public:
     // Non-copyable, non-movable
     ClientGateway(const ClientGateway&)            = delete;
     ClientGateway& operator=(const ClientGateway&) = delete;
+
+    // -----------------------------------------------------------------------
+    // G0.1: Test-only factory — constructs a ClientGateway without Aeron.
+    // Installs a TestEgressFn override so sendRespReliable / drainPendingResponses
+    // use the callback rather than a real ExclusivePublication offer.
+    // testEgressFn must return > 0 for "delivered" or <= 0 for back-pressure.
+    // currentProduceSessionId is the session id used by sendRespReliable (public
+    // 4-param version) — set to match the session id that the test operates on.
+    // Single-writer: use only from tests on the test thread.
+    // -----------------------------------------------------------------------
+    using TestEgressFn = std::function<int64_t(const uint8_t* buf, std::size_t len)>;
+
+    static ClientGateway makeForTest(TestEgressFn egressFn,
+                                     int64_t currentProduceSessionId = 1);
 
     // -----------------------------------------------------------------------
     // doWork — poll ingress (bounded fragment limit) + dispatch + reap expired.
@@ -338,6 +354,44 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t pendingAckCount() const noexcept {
         return pendingAcks_.size();
+    }
+
+    // -----------------------------------------------------------------------
+    // G0.1: sendRespReliable — encode a ProduceResponse and try to deliver it.
+    // On back-pressure (BACK_PRESSURED / ADMIN_ACTION from the egress offer):
+    //   enqueues the encoded bytes on the pre-allocated pendingResponses_ ring.
+    //   Returns true  — accepted for delivery (will be retried by drainPendingResponses).
+    //   Returns false — only on genuine encode failure (scratch too small).
+    //
+    // This public 4-param overload is intended for test use (it targets the
+    // session whose id was set in currentProduceSessionId_).  Production code
+    // inside handleProduce calls the private sendRespReliable_(Session&, ...).
+    //
+    // Single-writer: call only on the duty-cycle thread (or test thread).
+    // -----------------------------------------------------------------------
+    bool sendRespReliable(rune::protocol::client::ErrorCode ec,
+                          int32_t                           partition,
+                          int64_t                           baseOffset,
+                          int64_t                           correlationId);
+
+    // -----------------------------------------------------------------------
+    // G0.1: drainPendingResponses — re-offer queued egress frames from the head
+    // of pendingResponses_.  Stops on the first back-pressure (preserves FIFO
+    // order).  Returns number of frames successfully delivered this call.
+    //
+    // Called at the TOP of doWork() (before ingress poll) so buffered acks are
+    // sent as soon as the publication clears back-pressure.
+    //
+    // Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    int drainPendingResponses(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // G0.1: pendingResponseCount — number of egress frames queued in the retry
+    // ring.  For tests and monitoring.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::size_t pendingResponseCount() const noexcept {
+        return pendingRespCount_;
     }
 
     // -----------------------------------------------------------------------
@@ -563,6 +617,29 @@ private:
     };
 
     // -----------------------------------------------------------------------
+    // G0.1: PendingResp — one already-encoded response frame waiting for the
+    // egress publication to clear back-pressure.
+    //
+    // Pre-allocated inline (no hot-path heap alloc).  The encoded bytes are
+    // copied into `bytes` at enqueue time (encode-once strategy); `sessionId`
+    // identifies the egress session on drain.
+    //
+    // kMaxBytes = 512 covers ProduceResponse (38 B) and ErrorResponse with a
+    // typical redirect URL (< ~450 B).  Responses that exceed kMaxBytes are
+    // sent best-effort and NOT enqueued (same as pre-fix behaviour for those
+    // rare oversized frames).  A static_assert in sendRespReliable_ ensures the
+    // produce-ack path (ProduceResponse::ENCODED_SIZE = 38) always fits.
+    //
+    // Single-writer: all accesses are on the duty-cycle thread only.
+    // -----------------------------------------------------------------------
+    struct PendingResp {
+        static constexpr std::size_t kMaxBytes = 512;
+        std::array<uint8_t, kMaxBytes> bytes{};
+        std::size_t len       = 0;
+        int64_t     sessionId = 0;
+    };
+
+    // -----------------------------------------------------------------------
     // Subscription — per-session push subscription (GB-3 / GR-6).
     //
     // nextOffset tracks the exact offset to push next.  The push loop advances
@@ -663,6 +740,29 @@ private:
     //                 if enqueuedAtNs + kPendingAckTimeoutNs < nowNs_ → timeout → ProduceResponse{Internal}.
     // Never blocks; never spins.
     void drainPendingAcks();
+
+    // -----------------------------------------------------------------------
+    // G0.1: sendRespReliable_ — private production implementation.
+    // Encodes a ProduceResponse into `bytes` (caller-provided buffer, at least
+    // ProduceResponse::ENCODED_SIZE bytes) and tries to deliver it via the
+    // session's egress publication.  On back-pressure: enqueues to
+    // pendingResponses_.  Always returns true (never silently drops).
+    // Returns false only on encode error (shouldn't happen given static_assert).
+    //
+    // NOTE: The public 4-param sendRespReliable() delegates here using
+    // currentProduceSessionId_.  All internal callers (handleProduce) should
+    // call sendRespReliable_() directly for clarity.
+    // -----------------------------------------------------------------------
+    bool sendRespReliable_(Session& session,
+                           rune::protocol::client::ErrorCode ec,
+                           int32_t                           partition,
+                           int64_t                           baseOffset,
+                           int64_t                           correlationId);
+
+    // G0.1: offerBytes_ — try to offer encoded bytes on the egress.
+    // Returns > 0 on success, <= 0 on back-pressure.
+    // Checks testEgressFn_ first (non-null only in tests), then real sendTo.
+    int64_t offerBytes_(Session* session, const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
     // Egress send helper — tryClaim first, fallback to offer.
@@ -1014,6 +1114,46 @@ private:
     // Map from partition key → LsoTracker + AbortedTxnIndex.
     // Single-writer: only accessed on the duty-cycle thread.
     std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
+
+    // -----------------------------------------------------------------------
+    // G0.1: Egress retry queue — bounded, pre-allocated, no hot-path alloc.
+    //
+    // pendingResponses_: ring buffer of encoded frames waiting for back-pressure
+    //   to clear.  Head/tail/count are maintained as plain indices (single-writer,
+    //   no CAS/atomics needed).  Capacity: kMaxPendingResponses.
+    //
+    // pendingRespHead_:  index of the first (oldest) entry; popped on drain.
+    // pendingRespCount_: number of live entries (0 = empty).
+    //
+    // When the ring is full and a new response must be enqueued, the frame is
+    // sent best-effort via sendTo (same as pre-fix behaviour) and a warning is
+    // logged.  This is a hard-stop guard — the ring should never fill in practice
+    // (back-pressure clears within a few doWork cycles under normal conditions).
+    //
+    // Single-writer: all accesses on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    static constexpr std::size_t kMaxPendingResponses = 64;
+    std::array<PendingResp, kMaxPendingResponses> pendingResponses_{};
+    std::size_t pendingRespHead_  = 0;
+    std::size_t pendingRespCount_ = 0;
+
+    // G0.1: session id captured at the start of handleProduce; used by the
+    // public 4-param sendRespReliable() (test seam) to locate the session.
+    // Only valid during a handleProduce() call.  Zero otherwise.
+    int64_t currentProduceSessionId_ = 0;
+
+    // G0.1: Test-only egress override.  When non-null, sendRespReliable_() and
+    // drainPendingResponses() call this function instead of the real session
+    // egress publication.  Null (= nullptr) in production — zero overhead on
+    // the hot path (one null-check).
+    TestEgressFn testEgressFn_;
+
+    // G0.1: Private test constructor (skips Aeron setup).
+    // Accessed via makeForTest() only.
+    struct TestConstructTag {};
+    explicit ClientGateway(TestConstructTag,
+                           TestEgressFn  egressFn,
+                           int64_t       currentSessionId);
 };
 
 } // namespace rune::gateway
