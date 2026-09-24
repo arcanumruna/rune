@@ -131,6 +131,15 @@ public:
     // don't want to hard-code a liveness window should pass 0.
     std::vector<NodeId> eligibleNodeIds(int64_t nowNs, int64_t timeoutNs = 0) const;
 
+    // The consensus leader-liveness window (max(electionTimeout, 3*statusInterval)).
+    // Consensus uses this short window to detect a dead leader quickly.  Partition
+    // FAILOVER reassignment is a much heavier decision and must use a LONGER window
+    // (a multiple of this) so transient post-election heartbeat jitter is not
+    // mistaken for node death.  Exposed so NodeRuntimeAgent can derive that window.
+    [[nodiscard]] int64_t leaderHeartbeatTimeoutNs() const noexcept {
+        return leaderHeartbeatTimeoutNs_;
+    }
+
     // Returns true when the election has reached the CLOSED terminal state.
     // Election.java:255
     bool isClosed() const noexcept;

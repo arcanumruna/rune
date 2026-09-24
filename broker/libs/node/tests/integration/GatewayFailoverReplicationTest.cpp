@@ -1037,6 +1037,19 @@ TEST(GR7_Integration, LeaderFailover_NoCommittedLoss_GroupCommitReconcile) {
     PartitionReplica* newLeaderReplica = newLeaderNode->replicaForTest(0, 0);
     ASSERT_NE(newLeaderReplica, nullptr);
 
+    // Partition failover (metadata reassignment of the dead leader's partitions)
+    // is ASYNCHRONOUS and completes shortly AFTER consensus re-election — the
+    // reassignment liveness window must expire before the dead node is treated as
+    // gone.  Poll for the partition replica to reach Leader role rather than
+    // asserting it instantaneously (mirrors the consensus-isLeader poll above).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline &&
+               newLeaderReplica->role() != Role::Leader) {
+            std::this_thread::sleep_for(20ms);
+        }
+    }
+
     // Assert: new leader has all committed records (no committed loss).
     EXPECT_GE(newLeaderReplica->logEndOffset(), committedHw)
         << "New leader must hold all committed records: LEO="

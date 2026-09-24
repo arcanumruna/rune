@@ -171,8 +171,21 @@ public:
             // committed map forever, so the surviving nodes' replicas never get
             // promoted to Leader (GR-7 / TX-2b failover would hang).
             if (election_) {
+                // FAILOVER liveness window (2026-09-24 bugfix): reassignment must
+                // NOT use the short consensus heartbeat window (max(electionTimeout,
+                // 3*statusInterval) — only ~300ms with the e2e config).  Right after
+                // election a live follower can go >300ms without an AppendPosition,
+                // so the raw consensus eligible set FLAPS ([0,1,2]→[0,1]→[1]) and the
+                // death-edge gate below fires on that jitter — reassigning ALL
+                // leadership to one node, collapsing ISR and timing out produce on
+                // multi-partition topics.  Use a window 3x the heartbeat timeout:
+                // long enough that a live follower's transient post-election gap
+                // (~1 heartbeat) never reads as death, short enough that a genuinely
+                // dead node is reassigned within ~3 heartbeats (fast failover kept).
+                const int64_t failoverTimeoutNs =
+                    3 * election_->leaderHeartbeatTimeoutNs();
                 const std::vector<rune::metadata::NodeId> eligible =
-                    election_->eligibleNodeIds(nowNs, /*timeoutNs=*/0);
+                    election_->eligibleNodeIds(nowNs, failoverTimeoutNs);
                 // REASSIGN-GATE (2026-09-24 bugfix): only reassign on an actual
                 // node-DEATH edge — a node that WAS eligible last cycle is no
                 // longer. Running reassignDeadPartitionLeaders() every duty cycle

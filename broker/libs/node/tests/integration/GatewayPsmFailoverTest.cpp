@@ -701,6 +701,21 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
 
     PartitionReplica* newReplica = newLeaderNode->replicaForTest(0, 0);
     ASSERT_NE(newReplica, nullptr);
+
+    // Partition failover (metadata reassignment of the dead leader's partitions)
+    // is ASYNCHRONOUS and completes shortly AFTER consensus re-election — the
+    // reassignment liveness window must expire before the dead node is treated as
+    // gone.  Poll for the partition replica to reach Leader role rather than
+    // asserting it instantaneously (mirrors the consensus-isLeader poll above).
+    {
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl &&
+               newReplica->role() != Role::Leader) {
+            std::this_thread::sleep_for(20ms);
+        }
+    }
+    ASSERT_EQ(newReplica->role(), Role::Leader)
+        << "New leader's partition replica must be promoted (async failover)";
     ASSERT_GE(newReplica->logEndOffset(), committedHw)
         << "New leader must hold all committed records (LEO >= committedHw="
         << committedHw << ")";

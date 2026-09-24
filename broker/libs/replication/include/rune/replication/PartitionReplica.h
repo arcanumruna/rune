@@ -628,6 +628,16 @@ private:
     IsrManager*          isrManager_ = nullptr; // heap — allocated on becomeLeader
     std::unique_ptr<IsrManager> isrManagerOwned_; ///< ownership wrapper
 
+    // The full replica set (RF) this partition was assigned at construction.
+    // Captured once in initReplica() so a follower-first replica retains its
+    // replica-set knowledge across a later becomeLeader().  Without this, a
+    // node elected leader with a leader-only ISR would build its IsrManager with
+    // replicas == isr (a single member), making maybeExpandIsr() unable to ever
+    // re-admit the other replicas → ISR permanently pinned at 1 → MinIsrViolation
+    // on acks=all for that partition (observed on multi-partition topics whose
+    // election handed a leader-only ISR).
+    std::vector<NodeId>  configuredReplicas_;
+
     // Epoch caches (both roles need one for truncation)
     rune::storage::LeaderEpochCache epochCache_;
 

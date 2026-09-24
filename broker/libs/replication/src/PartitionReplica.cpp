@@ -13,6 +13,8 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -91,6 +93,11 @@ PartitionReplica::PartitionReplica(PartitionConfig            cfg,
 void PartitionReplica::initReplica(std::vector<NodeId> replicas,
                                    std::vector<NodeId> isr)
 {
+    // Retain the full replica set (RF) for the lifetime of this replica so a
+    // follower-first replica can rebuild a correct IsrManager on a later
+    // becomeLeader() instead of collapsing replicas == isr (see header note).
+    configuredReplicas_ = replicas;
+
     // Task 9: restore the LeaderEpochCache from the durable checkpoint BEFORE any
     // assign() calls below.  Disk-backed only — memory-backed partitions have no
     // checkpoint file (and don't survive a full cluster restart by design).
@@ -157,7 +164,14 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     epoch_ = newEpoch;
     role_  = Role::Leader;
 
-    std::vector<NodeId> replicas = isr; // simplification: replicas == isr at election
+    // Use the full assigned replica set (RF), NOT the (possibly leader-only) ISR,
+    // as the IsrManager's replica set.  Collapsing replicas == isr here would make
+    // maybeExpandIsr() unable to ever re-admit the other replicas, pinning the ISR
+    // at its election size forever (→ MinIsrViolation on acks=all when a partition
+    // is elected with a leader-only ISR).  configuredReplicas_ is seeded at
+    // construction and survives the follower→leader transition.
+    std::vector<NodeId> replicas =
+        !configuredReplicas_.empty() ? configuredReplicas_ : isr;
     if (isrManagerOwned_) {
         // Preserve replica knowledge; just update ISR.
         isrManagerOwned_->setIsr(isr);
@@ -166,6 +180,13 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
         isrManagerOwned_->setIsr(isr);
     }
     isrManager_ = isrManagerOwned_.get();
+
+    spdlog::info(
+        "PartitionReplica[node={}] becomeLeader topic={} part={} epoch={} "
+        "isr.size={} replicaSet.size={} minIsr={}",
+        cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
+        static_cast<long long>(newEpoch), isr.size(), replicas.size(),
+        cfg_.minIsr);
 
     leaderState_.setLeaderId(cfg_.selfId);
 
