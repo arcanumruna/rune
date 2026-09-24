@@ -675,6 +675,14 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: gateway fragmentLimit set to {}",
                      nodeId, config_.gatewayFragmentLimit);
 
+        // E5.1: Apply per-worker ingress base stream id (RUNE_WORKER_INGRESS_BASE_STREAM).
+        // Each PartitionEntry in the MetadataResponse will carry
+        //   ingressStreamId = base + ShardRouter.workerForPartition(topicId, partition)
+        // so the client can connect directly to the owning worker's ingress stream.
+        gateway_->setWorkerIngressBaseStreamId(config_.workerIngressBaseStreamId);
+        spdlog::info("BrokerNode[{}]: workerIngressBaseStreamId set to {}",
+                     nodeId, config_.workerIngressBaseStreamId);
+
         // MD1 Task 9: Build nodeId → client endpoint map for per-partition REDIRECT.
         // Built from NodeConfig::peers: each peer carries a clientPort (GB-4 per-peer
         // client endpoint).  A zero clientPort means no known client endpoint (empty

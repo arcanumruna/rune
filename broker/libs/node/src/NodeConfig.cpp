@@ -274,6 +274,16 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_CLIENT_STREAM_ID is not a valid integer: ") + rawClientStream};
     }
 
+    // --- RUNE_WORKER_INGRESS_BASE_STREAM (optional, default clientStreamId+1) ---
+    // E5.1: base Aeron stream id for per-worker ingress subscriptions.
+    // Resolved after clientStreamId is known; 0 = unset → use clientStreamId+1.
+    int32_t workerIngressBaseStreamId = 0;  // resolved below after NodeConfig is built
+    const char* rawWorkerIngressBase = getenv_fn("RUNE_WORKER_INGRESS_BASE_STREAM");
+    if (rawWorkerIngressBase && !std::string_view(rawWorkerIngressBase).empty()) {
+        if (!parseInt32(rawWorkerIngressBase, workerIngressBaseStreamId))
+            return {{}, std::string("RUNE_WORKER_INGRESS_BASE_STREAM is not a valid integer: ") + rawWorkerIngressBase};
+    }
+
     // --- RUNE_CONSENSUS_STREAM_ID (optional, default 10) ---
     int32_t consensusStreamId = 10;
     const char* rawConsStream = getenv_fn("RUNE_CONSENSUS_STREAM_ID");
@@ -301,6 +311,11 @@ ConfigResult parseNodeConfig(
 
     cfg.clientEndpoint.channel  = std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
+
+    // E5.1: resolve workerIngressBaseStreamId — default to clientStreamId+1 when unset.
+    cfg.workerIngressBaseStreamId = (workerIngressBaseStreamId == 0)
+                                   ? (clientStreamId + 1)
+                                   : workerIngressBaseStreamId;
 
     {
         std::string err;

@@ -76,6 +76,19 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_hotpath_tests)
 
     # -------------------------------------------------------------------------
+    # E5.1: MetadataResponse ingressStreamId unit tests — no Aeron, no driver.
+    # Verifies PartitionEntry.ingressStreamId = base + ShardRouter.workerForPartition.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_metadata_response_tests
+        tests/gateway/MetadataResponseTest.cpp)
+    target_link_libraries(rune_gateway_metadata_response_tests PRIVATE
+        rune_gateway
+        rune_node
+        spdlog::spdlog
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_metadata_response_tests)
+
+    # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
     # Gated behind BUILD_GATEWAY_TESTS (default ON when BUILD_TESTING=ON).
     # -------------------------------------------------------------------------

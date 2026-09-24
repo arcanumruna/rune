@@ -339,6 +339,21 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // E5.1: setWorkerIngressBaseStreamId — configure the base Aeron stream id
+    // for per-worker ingress routing.  The MetadataResponse fills each
+    // PartitionEntry.ingressStreamId as base + workerForPartition(topicId, part).
+    //
+    // Must be called before the first MetadataRequest is handled.
+    // -----------------------------------------------------------------------
+    void setWorkerIngressBaseStreamId(int32_t base) noexcept {
+        workerIngressBaseStreamId_ = base;
+    }
+
+    [[nodiscard]] int32_t workerIngressBaseStreamId() const noexcept {
+        return workerIngressBaseStreamId_;
+    }
+
+    // -----------------------------------------------------------------------
     // setMinIsr — configure the minimum ISR size gate for acks=All produces.
     // Default: 1 (single-node safe; for 3-node clusters, set to 2).
     // Thread-safe (atomic store): may be called from any thread.
@@ -586,6 +601,15 @@ public:
     // -----------------------------------------------------------------------
     void applyProduceForTest(const uint8_t* buf, std::size_t len) {
         handleProduce(buf, len);
+    }
+
+    // -----------------------------------------------------------------------
+    // E5.1: applyMetadataForTest — feed a raw MetadataRequest frame through
+    // the real handleMetadata() path (test seam), parallel to applyProduceForTest.
+    // Single-writer: call only on the duty-cycle thread or before doWork().
+    // -----------------------------------------------------------------------
+    void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
+        handleMetadata(buf, len);
     }
 
     // -----------------------------------------------------------------------
@@ -854,6 +878,7 @@ private:
     std::string                          clientChannel_;
     int32_t                              clientStreamId_;
     int32_t                              thisNodeId_;
+    int32_t                              workerIngressBaseStreamId_ = 0;  // E5.1
     int64_t                              sessionTimeoutNs_;
     int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;

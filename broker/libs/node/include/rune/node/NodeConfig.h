@@ -12,6 +12,7 @@
 //   RUNE_CLIENT_ENDPOINT   — host:port for the client gateway (Required).
 //                            Built into "aeron:udp?endpoint=host:port".
 //   RUNE_CLIENT_STREAM_ID  — int32, default 1.
+//   RUNE_WORKER_INGRESS_BASE_STREAM — int32, default clientStreamId+1. Per-worker ingress stream id base (E5.1).
 //   RUNE_CONSENSUS_STREAM_ID — int32, default 10.
 //   RUNE_REPLICATION_STREAM_ID — int32, default 20. Stream for per-partition replication.
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
@@ -215,6 +216,30 @@ struct NodeConfig {
     //   Absent or empty → -1 (disabled).
     //   Any value < -1   → -1 (clamped to disabled).
     int32_t workerCoreBase = -1;
+
+    // E5.1: per-worker Aeron ingress stream id base.
+    //
+    // Each partition's ingressStreamId in the MetadataResponse is computed as:
+    //   workerIngressBaseStreamId + ShardRouter.workerForPartition(topicId, partition)
+    //
+    // This allows the client to connect to the owning worker's dedicated ingress
+    // stream rather than the gateway's shared stream — the foundation of per-worker
+    // ingress routing (Task E5.1.2 wires the actual Aeron subscription).
+    //
+    // Choice: base stream id defaults to clientEndpoint.streamId + 1 (i.e. 2 when
+    // RUNE_CLIENT_STREAM_ID is the default 1).  That keeps the gateway stream (1)
+    // and the first worker stream (2) non-overlapping without requiring the deployer
+    // to set an env var for single-worker configurations.
+    //
+    // With W workers the allocated range is [base, base+W-1], so deployers with
+    // a custom RUNE_CLIENT_STREAM_ID (e.g. 10) should set
+    //   RUNE_WORKER_INGRESS_BASE_STREAM = 11
+    // to keep the streams consecutive and non-overlapping.
+    //
+    // Overridable via RUNE_WORKER_INGRESS_BASE_STREAM (parseInt32).
+    // The default (0) signals "use clientEndpoint.streamId + 1"; resolved in
+    // parseNodeConfig after clientEndpoint.streamId is known.
+    int32_t workerIngressBaseStreamId = 0;  // 0 = unset; resolved to clientStreamId+1
 
     // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread
     // communication is via agrona ring buffers; their sizes are tunable per

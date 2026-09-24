@@ -3873,6 +3873,13 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             p.partition   = partition;
             p.leaderId    = entry.leaderNodeId;
             p.leaderEpoch = entry.leaderEpoch;
+            // E5.1: per-worker ingress routing — ingressStreamId = base + workerForPartition.
+            // When workerPool_ is set, use its ShardRouter (same mapping produce uses).
+            // When null (inline/test path), fall back to base stream id (worker 0).
+            p.ingressStreamId = workerIngressBaseStreamId_
+                              + (workerPool_
+                                 ? workerPool_->ownerWorkerId(topicId, partition)
+                                 : 0);
             parts.push_back(p);
         }
     }
