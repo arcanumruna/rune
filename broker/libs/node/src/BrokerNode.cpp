@@ -1445,6 +1445,23 @@ void BrokerNode::startEmbeddedDriver() {
     // Use a node-specific aeron dir to avoid collisions in tests.
     const std::string aeronDir =
         (fs::path{config_.dataDir} / "aeron").string();
+
+    // Silent-failure guard: if an ACTIVE media driver already holds this aeron
+    // dir, dir_delete_on_start cannot wipe it and start degrades into a cryptic
+    // init failure or an opaque hang.  Detect it and fail LOUDLY with a clear,
+    // actionable message (a prior broker still running, or SIGKILL'd so its
+    // driver is still holding the dir).
+    if (aeron_is_driver_active(aeronDir.c_str(), /*timeout_ms=*/1000,
+                               +[](const char*){})) {
+        aeron_driver_context_close(driverCtx_);
+        driverCtx_ = nullptr;
+        throw std::runtime_error(
+            "BrokerNode: aeron dir '" + aeronDir + "' is already in use by an "
+            "ACTIVE media driver (a prior broker instance may still be running, or "
+            "was killed without clean shutdown). Use a distinct RUNE_DATA_DIR, or "
+            "ensure the previous instance exited.");
+    }
+
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
 
     // SHARED threading: one background thread for sender+receiver+conductor.
