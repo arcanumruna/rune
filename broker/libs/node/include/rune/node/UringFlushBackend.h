@@ -148,6 +148,13 @@ private:
     // Allocated once in ctor (size = sqRingSize_).  No cross-thread access.
     std::unique_ptr<int64_t[]> boundaryTable_;
 
+    // portableFallback_: set when RUNE_IO_BACKEND=portable and io_uring is not
+    // available (e.g. Docker Desktop on Apple Silicon / Rosetta x86 emulation).
+    // submit() always returns kNoToken; reap() is a no-op.  Workers operating in
+    // this mode never use durability tier 2 (Strict) — tier 0/1 acks are
+    // enqueued synchronously without io_uring involvement.
+    bool portableFallback_{false};
+
     // Internal helper called by submit() after token allocation.
     CompletionToken submitWithToken(int fd, int64_t flushBoundary,
                                     CompletionToken tok,
@@ -159,6 +166,9 @@ private:
 // ---------------------------------------------------------------------------
 template <class H>
 int UringFlushBackend::reap(H&& handler) noexcept {
+    // Portable fallback: no io_uring rings — nothing to reap.
+    if (portableFallback_) { (void)handler; return 0; }
+
     // CQ tail is written by the kernel; acquire fence to observe kernel writes.
     const uint32_t mask = *cqRingMask_;
     int count = 0;

@@ -42,8 +42,11 @@
 #include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/Gpid.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <string>
+#include <vector>
 
 namespace rune::node {
 
@@ -170,8 +173,27 @@ public:
             if (election_) {
                 const std::vector<rune::metadata::NodeId> eligible =
                     election_->eligibleNodeIds(nowNs, /*timeoutNs=*/0);
-                work += static_cast<int>(
-                    metadataService_->reassignDeadPartitionLeaders(eligible));
+                // REASSIGN-GATE (2026-09-24 bugfix): only reassign on an actual
+                // node-DEATH edge — a node that WAS eligible last cycle is no
+                // longer. Running reassignDeadPartitionLeaders() every duty cycle
+                // caused non-convergent churn (63k/run) on a HEALTHY cluster,
+                // collapsing replica sets to RF=1 → ISR stuck at 1 → acks=all
+                // MinIsrViolation. On a stable/growing eligible set we do nothing.
+                bool aNodeDied = false;
+                for (auto id : prevEligible_) {
+                    if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) {
+                        aNodeDied = true;
+                        break;
+                    }
+                }
+                if (aNodeDied) {
+                    std::string es; for (auto id : eligible) es += std::to_string(id) + ",";
+                    std::string ps; for (auto id : prevEligible_) ps += std::to_string(id) + ",";
+                    spdlog::info("REASSIGN-GATE: node-death edge, prevEligible=[{}] eligible=[{}] -> reassigning", ps, es);
+                    work += static_cast<int>(
+                        metadataService_->reassignDeadPartitionLeaders(eligible));
+                }
+                prevEligible_ = eligible;
             }
 
             // Rebuild RoutingImage and push to gateway each cycle.
@@ -489,6 +511,7 @@ public:
 private:
     rune::consensus::Agent&                            consensus_;
     rune::consensus::Election*                         election_;   // non-owning; null when no bridge
+    std::vector<rune::metadata::NodeId>                prevEligible_; // REASSIGN-GATE: last cycle's eligible set (death-edge detection)
     ReplicationMetadataBridge*                         bridge_;     // non-owning; null-safe
     rune::replication::AeronPartitionTransport*        transport_;  // non-owning; null-safe
     ReplicaRegistry*                                   registry_;   // non-owning; null-safe

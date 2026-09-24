@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ──────────────────────────────────────────────────────────────────────────────
-# rune-broker — single-node image (linux/amd64), mirroring world-server's pattern.
+# rune-broker — multi-arch image (linux/amd64 + linux/arm64).
 # Stage 1: builder  — gcc:13 (Debian bookworm) + conan; builds the rune_broker target.
 # Stage 2: runtime  — debian:bookworm-slim (SAME glibc as gcc:13) + the binary.
 # The matching Debian-bookworm glibc across both stages avoids GLIBC version skew;
@@ -26,11 +26,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # aeron's SBE codegen locates the JDK via JAVA_HOME.
 ENV JAVA_HOME=/usr/lib/jvm/default-java
 
-# The project requires CMake >= 3.31; bookworm ships older. Install the pinned
-# official Kitware release into /usr/local (same approach as world-server).
-RUN curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
-    && tar -xzf cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz --strip-components=1 -C /usr/local \
-    && rm cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
+# The project requires CMake >= 3.31; bookworm ships older.  Install the pinned
+# official Kitware release into /usr/local.  Auto-detect the host arch so the
+# image builds natively on both linux/amd64 and linux/arm64 (Docker Desktop on
+# Apple Silicon runs linux/arm64 natively — no Rosetta emulation needed).
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        arm64) CMAKE_ARCH=aarch64 ;; \
+        *)     CMAKE_ARCH=x86_64  ;; \
+    esac \
+    && curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz \
     && cmake --version
 
 WORKDIR /build

@@ -50,6 +50,14 @@ x-broker-env: &broker-env
   # "multi" (topicId 1, 3 partitions) is used by the DR-2 multi-partition matrix.
   # "cg"    (topicId 2, 4 partitions) is used by the CG-6 consumer-group matrix.
   RUNE_TOPICS: "events:1,multi:3,cg:4"
+  # E3 io_uring portability: Docker Desktop on Apple Silicon / Rosetta x86_64
+  # emulation does NOT translate the io_uring_setup(2) syscall (NR 425), causing
+  # the broker to crash on startup.  Setting RUNE_IO_BACKEND=portable activates
+  # UringFlushBackend's graceful fallback (submit() returns kNoToken; tier 0/1
+  # acks are enqueued synchronously without io_uring).  On bare-metal Linux CI
+  # where io_uring IS available, this variable is still safe — tier-2 (Strict)
+  # produces simply see the same back-pressure they would get with a full ring.
+  RUNE_IO_BACKEND: "portable"
 
 services:
   # ── Node 0 ──────────────────────────────────────────────────────────────────
@@ -59,6 +67,12 @@ services:
     platform: linux/amd64
     hostname: rune-1
     shm_size: "256m"
+    # E3: the broker uses raw io_uring_setup(2) for async durability.
+    # Docker Desktop's default seccomp profile blocks io_uring_setup (NR 425)
+    # on macOS — unconfined lets the syscall through.  This does NOT affect CI
+    # or bare-metal Linux where io_uring is allowed by default.
+    security_opt:
+      - seccomp=unconfined
     environment:
       <<: *broker-env
       RUNE_NODE_ID: "0"
@@ -78,6 +92,8 @@ services:
     platform: linux/amd64
     hostname: rune-2
     shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
     environment:
       <<: *broker-env
       RUNE_NODE_ID: "1"
@@ -97,6 +113,8 @@ services:
     platform: linux/amd64
     hostname: rune-3
     shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
     environment:
       <<: *broker-env
       RUNE_NODE_ID: "2"

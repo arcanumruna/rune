@@ -35,8 +35,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 
 // ---------------------------------------------------------------------------
@@ -72,6 +74,20 @@ namespace rune::node {
 UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
                                      std::size_t /*completionDepth*/) {
     if (submitDepth == 0) submitDepth = 1;
+
+    // RUNE_IO_BACKEND=portable: skip io_uring and degrade to synchronous-only
+    // mode.  submit() will always return kNoToken (no token → Worker falls back
+    // to synchronous ack on the same cycle), and reap() is a no-op.  Use this
+    // on environments where io_uring_setup is unavailable (e.g. Docker Desktop
+    // on Apple Silicon / Rosetta x86 emulation where the syscall is not translated).
+    const char* ioBackendEnv = ::getenv("RUNE_IO_BACKEND");
+    if (ioBackendEnv != nullptr && std::string_view(ioBackendEnv) == "portable") {
+        portableFallback_ = true;
+        // Initialise with a valid non-zero submitDepth so the capacity is sane.
+        sqRingSize_  = nextPow2(static_cast<uint32_t>(submitDepth));
+        submitDepth_ = sqRingSize_;
+        return;  // All pointer members stay nullptr / MAP_FAILED (default state).
+    }
 
     // Round up to power of two — the kernel adjusts entries to the next pow2
     // anyway; doing it ourselves lets us reason about the ring size precisely.
@@ -195,6 +211,12 @@ UringFlushBackend::~UringFlushBackend() {
 // ---------------------------------------------------------------------------
 CompletionToken UringFlushBackend::submit(int fd,
                                           int64_t flushBoundary) noexcept {
+    // Portable fallback: no io_uring rings — return kNoToken so tier-2 (Strict)
+    // produces back-pressure immediately.  Tier 0/1 (Leader/Majority) produce
+    // acks are enqueued synchronously before submitCoalescedFlushes_ is called,
+    // so kNoToken here only affects Strict-tier acks (none in the E2E test suite).
+    if (portableFallback_) { (void)fd; (void)flushBoundary; return kNoToken; }
+
     // Deterministic back-pressure: bound in-flight (submitted-not-yet-reaped)
     // completions to the configured depth.  The SQ ring itself drains on every
     // io_uring_enter (the kernel consumes SQEs immediately), so an SQ-fullness
