@@ -29,6 +29,7 @@
 - **G-A2:** On the 4-core build agent, batched throughput scales measurably with worker count (the E5 regression-of-record: it does **not** today), and the per-produce batch is copied **at most once** on the produce hot path (the wire→append path).
 - **G-A3:** All Milestone-D + prior-E tests green under per-worker ingress, including a shard-migration test proving a partition's ingress stream moves with ownership (no dropped/duplicated produces).
 - **G-A4:** Final ≥500k/s + <1 ms batched validation is **deferred to a ≥16-core box** (per the "implement first, defer big box" decision) and is covered by plan E5b's benchmark phase, not here.
+- **G-A5 (shared-nothing / TSan):** After per-worker ingress, each worker is the **sole owner** of its shard's `Log`/`OffsetIndex` — including flush/sync. The **pre-existing data race** TSan found (`Worker::executeProduceWire_ → append` on the worker thread racing `ClientGateway::flushDirtyLogs → Log::sync` on the gateway thread, both touching `OffsetIndex::entries_`) MUST be closed: no thread other than the owning worker touches a shard's Log. Proven by a TSan run of the produce + migration path with **zero race reports**. (Found during the G0 failover retro-review; owned here per you-find-it-you-fix-it, not deferred.)
 
 ---
 
@@ -269,7 +270,7 @@ TEST(WorkerIngress, DecodesRestampsAppendsWithoutRingHop) {
 
 - [ ] **Step 1: Failing test** — after `buildWorkerPool`, worker *i* is subscribed to `baseStream + i`; a produce on `baseStream + i` lands on worker *i*'s log; a produce for a partition owned by worker *j* published to *i*'s stream is rejected/redirected (not misfiled).
 - [ ] **Step 2: Run to confirm fail** — `ctest --test-dir build-fast -R WorkerPoolIngress -V`. Expected: FAIL.
-- [ ] **Step 3: Implement** — thread channel+base stream through `buildWorkerPool`; gate the gateway produce fan-out behind a `produceFanoutLegacy_` flag (default off once per-worker ingress is active). Preserve the ordering/return-drain path for control responses.
+- [ ] **Step 3: Implement** — thread channel+base stream through `buildWorkerPool`; gate the gateway produce fan-out behind a `produceFanoutLegacy_` flag (default off once per-worker ingress is active). Preserve the ordering/return-drain path for control responses. **Close the shared-nothing race (G-A5):** move each shard's `Log` flush/sync (`ClientGateway::flushDirtyLogs → Log::sync`) OFF the gateway thread and ONTO the owning worker's `doWork` — the gateway must no longer reach into any worker-owned `Log`/`OffsetIndex`. After this, only the owning worker touches its shard's Log.
 - [ ] **Step 4: Run tests + full parity** — `ctest --test-dir build-fast -R "WorkerPoolIngress|worker|node_tests|integration" -V`. Expected: PASS (all D tests green).
 - [ ] **Step 5: Commit** — `git commit -m "feat(node): per-worker ingress subscriptions; gateway produce fan-out retired to legacy fallback (E5.1)"` + trailer.
 
