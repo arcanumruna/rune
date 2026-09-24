@@ -36,6 +36,7 @@ extern "C" {
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace rune::client::transport {
 
@@ -98,11 +99,19 @@ public:
     // I/O — single-writer, called from ONE thread only
     // -------------------------------------------------------------------------
 
-    /// Publish buf[0..len-1] to the ingress ExclusivePublication.
-    /// Uses tryClaim for zero-copy; falls back to offer if tryClaim is not
-    /// supported (e.g. MTU-crossing).  Returns true iff accepted (position > 0).
+    /// Publish buf[0..len-1] to the default ingress ExclusivePublication
+    /// (cfg_.ingressStreamId).  Uses tryClaim for zero-copy; falls back to
+    /// offer if tryClaim is not supported.  Returns true iff accepted.
     /// No busy-spin — call site retries if needed.
     bool offer(const uint8_t* buf, std::size_t len) noexcept;
+
+    /// Publish buf[0..len-1] to the per-worker ingress ExclusivePublication
+    /// for the given ingressStreamId.  Resolves / caches a publication for the
+    /// pair (currentChannel, ingressStreamId) on first use.  Falls back to the
+    /// default publication if ingressStreamId == 0 or resolution fails.
+    /// E5.1: called from the ProducerImpl flush path with the per-partition
+    /// worker stream id decoded from the metadata response.
+    bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept;
 
     /// Poll the egress Subscription through the FragmentAssembler.
     /// For each fully reassembled frame calls handler(buf, len) with a zero-copy
@@ -127,6 +136,9 @@ public:
 
     /// Create a new ingress ExclusivePublication on newIngressChannel (same
     /// stream id as the original config) and swap it in for the current one.
+    /// All per-worker publications in pubCache_ are also re-resolved on the new
+    /// channel; the stream ids are PRESERVED (E5.1: REDIRECT changes channel,
+    /// keeps per-partition worker stream ids).
     /// Bounded resolution (kResolveMaxMs hard cap + no busy-spin).
     /// Called only from the agent thread (single-writer contract).
     ///
@@ -157,6 +169,13 @@ private:
     std::shared_ptr<aeron::Subscription>         egressSub_;
     std::unique_ptr<aeron::FragmentAssembler>    assembler_;
 
+    // ---- E5.1: per-worker ingress publication cache -------------------------
+    // Maps ingressStreamId → ExclusivePublication on cfg_.ingressChannel.
+    // Populated on first use in offer(streamId, buf, len); entries are rebuilt
+    // on retarget() so the channel change is transparent to the caller.
+    // Single-writer (agent thread only — same threading contract as offer/poll).
+    std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>> pubCache_;
+
     // ---- Lifecycle CAS flags (idempotent stop) --------------------------------
     std::atomic<bool> started_ {false};
     std::atomic<bool> stopped_ {false};
@@ -164,6 +183,17 @@ private:
     // ---- Poll handler pointer (set during poll(), cleared after) -------------
     // Single-writer: only one thread calls poll() so this is never concurrent.
     const Handler* pollHandler_ = nullptr;
+
+    // ---- Internal helpers ----------------------------------------------------
+    /// Offer buf to a specific ExclusivePublication (shared implementation).
+    bool offerToPub(aeron::ExclusivePublication& pub,
+                    const uint8_t* buf, std::size_t len) noexcept;
+
+    /// Resolve or retrieve a cached ExclusivePublication for ingressStreamId on
+    /// cfg_.ingressChannel.  Returns nullptr on failure (resolve timeout / not
+    /// started).
+    std::shared_ptr<aeron::ExclusivePublication>
+    resolveWorkerPub(int32_t ingressStreamId) noexcept;
 
     // ---- Resolution constants ------------------------------------------------
     static constexpr int kResolveMaxMs   = 5'000; // hard cap for pub/sub resolve

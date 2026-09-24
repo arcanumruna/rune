@@ -499,6 +499,24 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_batch_builder_tests)
     endif()
 
+    # ── E5.1: Per-partition ingress-stream routing tests ──────────────────────
+    # Pure unit test: ProducerImpl::updateIngressRoute + MetadataCache round-trip.
+    # No real Aeron transport — sendFn is a fake lambda that records streamId calls.
+    if(aeron_FOUND)
+        add_executable(rune_per_worker_routing_tests
+            tests/producer/ClientPerWorkerRoutingTest.cpp
+        )
+        target_include_directories(rune_per_worker_routing_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_per_worker_routing_tests PRIVATE
+            rune_client_producer
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_per_worker_routing_tests)
+    endif()
+
     # ── Producer batching instrumentation tests (Gate-2) ─────────────────────
     # Tests: framesSent/recordsSent counters + RUNE_LINGER_US/BATCH_BYTES/BATCH_RECORDS env knobs.
     if(aeron_FOUND)

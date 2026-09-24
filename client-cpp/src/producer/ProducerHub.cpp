@@ -57,7 +57,7 @@ void ProducerHub::add(std::shared_ptr<ProducerImpl> impl)
 
 int ProducerHub::drainAndFlush(int64_t nowNs,
                                 int64_t sessionId,
-                                std::function<bool(const uint8_t*, std::size_t)> sendFn)
+                                std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     // Single wait-free acquire load — no spinlock, no refcount inc/dec.
     const ImplList* snap = snapshot_.load(std::memory_order_acquire);
@@ -103,7 +103,7 @@ void ProducerHub::failPending(int64_t corrId, const std::string& reason) {
 
 bool ProducerHub::retryRedirectedProduce(
     int64_t corrId,
-    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     const ImplList* snap = snapshot_.load(std::memory_order_acquire);
     for (auto& impl : *snap) {
@@ -116,7 +116,7 @@ bool ProducerHub::retryRedirectedProduce(
 
 int ProducerHub::resendAllRedirected(
     int64_t newSessionId,
-    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     const ImplList* snap = snapshot_.load(std::memory_order_acquire);
     int resent = 0;
@@ -164,6 +164,15 @@ bool ProducerHub::firstPendingPartition(int32_t& topicId,
         }
     }
     return false;
+}
+
+void ProducerHub::updateIngressRoute(int32_t topicId, int32_t partition,
+                                     int32_t ingressStreamId) noexcept
+{
+    const ImplList* snap = snapshot_.load(std::memory_order_acquire);
+    for (auto& impl : *snap) {
+        impl->updateIngressRoute(topicId, partition, ingressStreamId);
+    }
 }
 
 } // namespace rune::client::producer

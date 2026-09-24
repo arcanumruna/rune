@@ -291,6 +291,17 @@ bool ProducerImpl::writeToRing(int32_t msgTypeId,
 }
 
 // ---------------------------------------------------------------------------
+// E5.1: Agent-thread: update per-worker ingressStreamId routing
+// ---------------------------------------------------------------------------
+
+void ProducerImpl::updateIngressRoute(int32_t topicId, int32_t partition,
+                                       int32_t ingressStreamId) noexcept
+{
+    PartitionState& ps = getOrCreatePartition(topicId, partition);
+    ps.ingressStreamId = ingressStreamId;
+}
+
+// ---------------------------------------------------------------------------
 // Agent-thread: drain ring
 // ---------------------------------------------------------------------------
 
@@ -423,7 +434,7 @@ bool ProducerImpl::encodeAndSend(
     int64_t nowNs,
     int64_t sessionId,
     int64_t correlationId,
-    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     if (!ps.builder || ps.builder->recordCount() == 0) return false;
 
@@ -468,8 +479,8 @@ bool ProducerImpl::encodeAndSend(
     const std::size_t written = msg.encode(encodeScratch_.data());
     if (written == 0) return false;
 
-    // Offer to transport (tryClaim path via AeronTransport).
-    const bool ok = sendFn(encodeScratch_.data(), written);
+    // Offer to transport — E5.1: pass per-partition ingressStreamId.
+    const bool ok = sendFn(ps.ingressStreamId, encodeScratch_.data(), written);
 
     if (ok) {
         ++framesSent_; // one Aeron frame offered to transport
@@ -480,8 +491,9 @@ bool ProducerImpl::encodeAndSend(
             ++ps.inFlight;
             // CB-5 B: store wire frame bytes for redirect resend.
             BatchInfo bi;
-            bi.topicId   = ps.topicId;
-            bi.partition = ps.partition;
+            bi.topicId        = ps.topicId;
+            bi.partition      = ps.partition;
+            bi.ingressStreamId = ps.ingressStreamId;  // E5.1: preserve stream for resend
             bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
             batchMap_[correlationId] = std::move(bi);
         }
@@ -505,7 +517,7 @@ bool ProducerImpl::encodeAndSendTier2(
     PartitionState& ps,
     Tier2Entry& entry,
     int64_t sessionId,
-    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     if (entry.batchBytes.empty() || entry.recordCount == 0) return false;
 
@@ -573,7 +585,8 @@ bool ProducerImpl::encodeAndSendTier2(
     const std::size_t written = msg.encode(encodeScratch_.data());
     if (written == 0) return false;
 
-    const bool ok = sendFn(encodeScratch_.data(), written);
+    // E5.1: pass per-partition ingressStreamId for per-worker routing.
+    const bool ok = sendFn(ps.ingressStreamId, encodeScratch_.data(), written);
 
     if (ok) {
         ++framesSent_; // one Aeron frame offered to transport (Tier-2)
@@ -581,8 +594,9 @@ bool ProducerImpl::encodeAndSendTier2(
             ++ps.inFlight;
             // CB-5 B: store wire frame bytes for redirect resend.
             BatchInfo bi;
-            bi.topicId   = entry.topicId;
-            bi.partition = entry.partition;
+            bi.topicId        = entry.topicId;
+            bi.partition      = entry.partition;
+            bi.ingressStreamId = ps.ingressStreamId;  // E5.1: preserve stream for resend
             bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
             batchMap_[entry.corrId] = std::move(bi);
         }
@@ -598,7 +612,7 @@ bool ProducerImpl::encodeAndSendTier2(
 int ProducerImpl::flushBatches(
     int64_t nowNs,
     int64_t sessionId,
-    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     // M1 FIX [CB-5]: Do NOT emit any frame while the session is not established
     // (sessionId == 0 means Connecting / post-forceReconnect window).  Records
@@ -766,7 +780,7 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
 
 bool ProducerImpl::retryRedirectedProduce(
     int64_t corrId,
-    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     auto bit = batchMap_.find(corrId);
     if (bit == batchMap_.end()) return false; // unknown corrId
@@ -786,7 +800,8 @@ bool ProducerImpl::retryRedirectedProduce(
     }
 
     ++bi.redirectCount;
-    return sendFn(bi.wireFrame.data(), bi.wireFrame.size());
+    // E5.1: pass ingressStreamId so resend goes to the same per-worker stream.
+    return sendFn(bi.ingressStreamId, bi.wireFrame.data(), bi.wireFrame.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -807,7 +822,7 @@ inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noe
 
 int ProducerImpl::resendAllRedirected(
     int64_t newSessionId,
-    std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     int resent = 0;
     for (auto it = batchMap_.begin(); it != batchMap_.end(); ) {
@@ -832,7 +847,8 @@ int ProducerImpl::resendAllRedirected(
         restampSessionId(bi.wireFrame, newSessionId);
 
         ++bi.redirectCount;
-        if (sendFn(bi.wireFrame.data(), bi.wireFrame.size())) {
+        // E5.1: pass ingressStreamId so resend goes to the per-worker stream.
+        if (sendFn(bi.ingressStreamId, bi.wireFrame.data(), bi.wireFrame.size())) {
             ++resent;
         }
         ++it;

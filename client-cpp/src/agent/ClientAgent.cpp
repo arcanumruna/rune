@@ -181,8 +181,8 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
         const int producerWork = producerDrainFn_(
             nowNs,
             sessId,
-            [this](const uint8_t* buf, std::size_t len) -> bool {
-                return transport_.offer(buf, len);
+            [this](int32_t ingressStreamId, const uint8_t* buf, std::size_t len) -> bool {
+                return transport_.offer(ingressStreamId, buf, len);
             });
         totalWork += producerWork;
     }

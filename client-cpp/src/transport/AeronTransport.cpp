@@ -149,49 +149,109 @@ void AeronTransport::stop() noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// offer
+// offerToPub — shared implementation for default and per-worker offer paths
+// ---------------------------------------------------------------------------
+
+bool AeronTransport::offerToPub(aeron::ExclusivePublication& pub,
+                                 const uint8_t* buf,
+                                 std::size_t    len) noexcept
+{
+    const auto ilen = static_cast<aeron::util::index_t>(len);
+    try {
+        if (len > 0 && ilen <= pub.maxPayloadLength()) {
+            aeron::concurrent::logbuffer::BufferClaim claim;
+            const int64_t claimPos = pub.tryClaim(ilen, claim);
+            if (claimPos > 0) {
+                std::memcpy(claim.buffer().buffer() + claim.offset(), buf, len);
+                claim.commit();
+                return true;
+            }
+        }
+        static uint8_t kEmptyBuf[1] = {};
+        aeron::concurrent::AtomicBuffer ab(
+            const_cast<uint8_t*>(len > 0 ? buf : kEmptyBuf),
+            ilen);
+        const int64_t pos = pub.offer(ab, 0, ilen);
+        return pos > 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// offer (default stream)
 // ---------------------------------------------------------------------------
 
 bool AeronTransport::offer(const uint8_t* buf, std::size_t len) noexcept {
     if (!ingressPub_) return false;
-
-    const auto ilen = static_cast<aeron::util::index_t>(len);
 
     // This method is noexcept but the Aeron publication calls below can throw
     // (e.g. IllegalStateException on a closed pub during a racing teardown).
     // The single-writer lifetime contract makes that unreachable in normal use,
     // but a throw escaping a noexcept fn would std::terminate — so we contain it
     // and report a failed send instead. Aeron never mutates the source buffer.
+    return offerToPub(*ingressPub_, buf, len);
+}
+
+// ---------------------------------------------------------------------------
+// resolveWorkerPub — resolve or retrieve a per-worker publication
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<aeron::ExclusivePublication>
+AeronTransport::resolveWorkerPub(int32_t ingressStreamId) noexcept
+{
+    if (!aeron_) return nullptr;
+
+    // Check the cache first.
+    auto it = pubCache_.find(ingressStreamId);
+    if (it != pubCache_.end()) {
+        return it->second;
+    }
+
+    // Resolve a new publication (bounded, same timeout as start()).
     try {
-        // For messages that fit within maxPayloadLength, use tryClaim (zero-copy —
-        // avoids a memcpy in the client for small messages that fit in one term slot).
-        // For larger messages, tryClaim() would throw IllegalArgumentException, so we
-        // go directly to offer() which calls appendFragmentedMessage() internally.
-        if (len > 0 && ilen <= ingressPub_->maxPayloadLength()) {
-            aeron::concurrent::logbuffer::BufferClaim claim;
-            const int64_t claimPos = ingressPub_->tryClaim(ilen, claim);
-            if (claimPos > 0) {
-                std::memcpy(claim.buffer().buffer() + claim.offset(), buf, len);
-                claim.commit();
-                return true;
-            }
-            // tryClaim returned NOT_CONNECTED / BACK_PRESSURED / ADMIN_ACTION / CLOSED.
-            // Fall through to offer() for a second attempt.
+        const int64_t regId =
+            aeron_->addExclusivePublication(cfg_.ingressChannel, ingressStreamId);
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds{kResolveMaxMs};
+
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pub = aeron_->findExclusivePublication(regId);
+            if (pub) break;
+            std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
         }
 
-        // offer() handles both small messages and multi-frame fragmentation
-        // (calls appendFragmentedMessage() for len > maxPayloadLength).
-        // For empty payloads (len==0) we reach here directly — Aeron accepts a
-        // zero-length offer; kEmptyBuf guards against a null-ptr AtomicBuffer.
-        static uint8_t kEmptyBuf[1] = {};
-        aeron::concurrent::AtomicBuffer ab(
-            const_cast<uint8_t*>(len > 0 ? buf : kEmptyBuf),
-            ilen);
-        const int64_t pos = ingressPub_->offer(ab, 0, ilen);
-        return pos > 0;
+        if (pub) {
+            pubCache_[ingressStreamId] = pub;
+        }
+        return pub;
     } catch (...) {
-        return false;
+        return nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// offer (per-worker stream)
+// ---------------------------------------------------------------------------
+
+bool AeronTransport::offer(int32_t ingressStreamId,
+                            const uint8_t* buf,
+                            std::size_t    len) noexcept
+{
+    // 0 means "legacy / no per-worker stream" — fall back to default.
+    if (ingressStreamId == 0 || ingressStreamId == cfg_.ingressStreamId) {
+        return offer(buf, len);
+    }
+
+    auto pub = resolveWorkerPub(ingressStreamId);
+    if (!pub) {
+        // Resolution failed — fall back to the default publication.
+        return offer(buf, len);
+    }
+
+    return offerToPub(*pub, buf, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +295,8 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
             return false;  // not started — cannot retarget, old state untouched
         }
 
-        // Resolve the NEW publication BEFORE releasing the old one, so a failed
-        // resolve leaves the old pub usable (offer() keeps working).
+        // Resolve the NEW default publication BEFORE releasing the old one, so a
+        // failed resolve leaves the old pub usable (offer() keeps working).
         const int64_t pubRegId =
             aeron_->addExclusivePublication(newIngressChannel, cfg_.ingressStreamId);
 
@@ -256,9 +316,13 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
             return false;
         }
 
-        // Success: swap in the new pub (releasing the old one) and update config.
+        // Success: update channel, swap default pub, clear per-worker pub cache.
+        // E5.1: REDIRECT changes channel — per-worker publications are on the new
+        // channel.  Clear the cache so they are lazily re-resolved with the new
+        // channel on next use (stream ids are PRESERVED — only the channel changes).
         cfg_.ingressChannel = newIngressChannel;
         ingressPub_ = std::move(newPub);
+        pubCache_.clear();  // E5.1: lazy re-resolve with new channel on next offer
         return true;
     } catch (...) {
         // Any Aeron exception → treat as a failed retarget; old pub intact.

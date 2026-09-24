@@ -120,8 +120,12 @@ struct Tier2Entry {
 // PartitionState — per-(topicId,partition) accumulator (agent-thread only).
 // ---------------------------------------------------------------------------
 struct PartitionState {
-    int32_t topicId   = 0;
-    int32_t partition = 0;
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+
+    /// E5.1: per-worker Aeron ingress stream id from metadata.
+    /// 0 = legacy / not yet known — falls back to the default ingress stream.
+    int32_t ingressStreamId = 0;
 
     // Idempotence sequence: monotonically increasing baseSequence.
     int32_t nextBaseSequence = 0;
@@ -250,9 +254,10 @@ public:
 
     /// Flush partition batches that are ready (linger/batchBytes/flush/flushFlag).
     /// Calls encodeAndSend() for each ready batch.
+    /// sendFn: (ingressStreamId, buf, len) → bool (E5.1: per-worker routing).
     /// Returns count of batches flushed.
     int flushBatches(int64_t nowNs, int64_t sessionId,
-                     std::function<bool(const uint8_t*, std::size_t)> sendFn);
+                     std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// Called by the agent when a ProduceResponse arrives.  Resolves the pending
     /// ack (callback/future) by correlationId.
@@ -269,7 +274,7 @@ public:
     /// On failure the pending ack is failed immediately.
     static constexpr int kMaxRedirects = 3;
     bool retryRedirectedProduce(int64_t corrId,
-                                std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                                std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     /// CB-5 B: resend EVERY in-flight (still-unacked) Produce frame after a
     /// leader redirect + reconnect.  Each stored wire frame is re-stamped with
@@ -278,7 +283,7 @@ public:
     /// as unknown-session.  Bounded per-frame by kMaxRedirects; frames that
     /// exceed the budget are failed.  Returns the number of frames resent.
     int resendAllRedirected(int64_t newSessionId,
-                            std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                            std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
     /// (i.e. a redirect resend would have something to flush).
@@ -328,6 +333,16 @@ public:
         return false;
     }
 
+    /// E5.1: Update the per-worker ingressStreamId for a (topicId, partition).
+    /// Called on the agent thread when a MetadataResponse is processed.
+    /// Must be called BEFORE the next flushBatches() cycle so the routing is
+    /// applied to the very next Produce frame for that partition.
+    ///
+    /// This touches PartitionState directly — same threading contract as
+    /// drainRing/flushBatches (agent thread only, no lock needed).
+    void updateIngressRoute(int32_t topicId, int32_t partition,
+                            int32_t ingressStreamId) noexcept;
+
     /// Called from Client::sweepTimeouts(): fail acks older than the deadline.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
@@ -360,7 +375,7 @@ private:
                        int64_t nowNs,
                        int64_t sessionId,
                        int64_t correlationId,
-                       std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                       std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     /// Encode + send a Tier-2 pre-built batch (agent thread only).
     /// Patches baseSequence into the provided batch bytes, then encodes a
@@ -368,7 +383,7 @@ private:
     bool encodeAndSendTier2(PartitionState& ps,
                              Tier2Entry& entry,
                              int64_t sessionId,
-                             std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                             std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     // ---- Members -------------------------------------------------------------
 
@@ -417,6 +432,7 @@ private:
     struct BatchInfo {
         int32_t              topicId;
         int32_t              partition;
+        int32_t              ingressStreamId = 0; // E5.1: per-worker stream for redirect resend
         std::vector<uint8_t> wireFrame;   // CB-5 B: encoded Produce bytes for redirect resend
         int32_t              redirectCount = 0; // bounded redirect attempts
     };

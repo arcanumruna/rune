@@ -110,13 +110,18 @@ Client::Client(ClientConfig cfg)
             }
             int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
             // TX-5: drain all transactional producers (rarely >1; mutex is fine).
+            // Txn producers use the default stream (E5.1 per-worker routing is
+            // regular-producer only); wrap with a legacy adapter.
             std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
             {
                 std::lock_guard<std::mutex> lk(txnHubMtx_);
                 txnSnap = txnProducers_;
             }
+            auto txnSendFn = [&sendFn](const uint8_t* buf, std::size_t len) -> bool {
+                return sendFn(0, buf, len);  // 0 = default ingress stream
+            };
             for (auto& tp : txnSnap) {
-                work += tp->doWork(sessionId, sendFn);
+                work += tp->doWork(sessionId, txnSendFn);
             }
             (void)nowNs;
             return work;
@@ -578,12 +583,23 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // Runs on the agent thread (single-writer): submitSend → agent ring.
             if (redirectPending_.exchange(false, std::memory_order_acq_rel)) {
                 const int64_t newSessionId = opt->assignedSessionId;
-                std::function<bool(const uint8_t*, std::size_t)> sendFn =
-                    [this](const uint8_t* fb, std::size_t fl) -> bool {
+                // E5.1: resend uses per-worker streamId stored in BatchInfo.
+                // submitSend goes through the agent ring → transport_.offer(streamId, ...)
+                // but the ring kMsgSend path uses the default stream.  For correctness
+                // the resend needs to carry the ingressStreamId — however the ring path
+                // does not forward streamId.  As a pragmatic safe fallback we use
+                // stream 0 (default) for the resend after redirect; per-worker routing
+                // resumes on the next fresh produce cycle via flushBatches.
+                std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
+                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     };
                 producerHub_.resendAllRedirected(newSessionId, sendFn);
-                subscriberHub_.resendPending(newSessionId, sendFn);
+                std::function<bool(const uint8_t*, std::size_t)> legacySend =
+                    [this](const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.submitSend(fb, fl);
+                    };
+                subscriberHub_.resendPending(newSessionId, legacySend);
             }
 
             // CG-5: Trigger group consumers to send JoinGroup on connect.
@@ -829,8 +845,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // on exhausting kMaxRedirects, fails the pending ack itself.
             const auto snap = agent_.stateAndSessionId();
             (void)snap;
-            std::function<bool(const uint8_t*, std::size_t)> sendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             producerHub_.retryRedirectedProduce(opt->correlationId, sendFn);
@@ -1360,14 +1376,24 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     partitions.reserve(resp.partitions.size());
     for (const auto& p : resp.partitions) {
         metadata::PartitionEntry e;
-        e.topicId     = p.topicId;
-        e.partition   = p.partition;
-        e.leaderId    = p.leaderId;
-        e.leaderEpoch = p.leaderEpoch;
+        e.topicId        = p.topicId;
+        e.partition      = p.partition;
+        e.leaderId       = p.leaderId;
+        e.leaderEpoch    = p.leaderEpoch;
+        e.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
         partitions.push_back(e);
     }
 
     metadataCache_.updateFromResponse(brokers, partitions);
+
+    // E5.1: propagate per-worker ingressStreamIds to all registered producers.
+    // Called on the agent thread (single-writer) — ProducerImpl::updateIngressRoute
+    // is agent-thread-only, so no lock is needed.
+    for (const auto& p : partitions) {
+        if (p.ingressStreamId != 0) {
+            producerHub_.updateIngressRoute(p.topicId, p.partition, p.ingressStreamId);
+        }
+    }
 
     // Update partitionRouter partition counts from the response.
     // Derive per-topic partition count from the maximum partition number seen.

@@ -372,10 +372,11 @@ struct BrokerEntryView {
 // PartitionEntryView — a single partition entry decoded from MetadataResponse
 // ---------------------------------------------------------------------------
 struct PartitionEntryView {
-    int32_t topicId     = 0;
-    int32_t partition   = 0;
-    int32_t leaderId    = -1;
-    int32_t leaderEpoch = -1;
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+    int32_t leaderId       = -1;
+    int32_t leaderEpoch    = -1;
+    int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
 };
 
 // ---------------------------------------------------------------------------
@@ -435,10 +436,11 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
     result.partitions.reserve(opt->partitions.size());
     for (const auto& p : opt->partitions) {
         PartitionEntryView pv;
-        pv.topicId     = p.topicId;
-        pv.partition   = p.partition;
-        pv.leaderId    = p.leaderId;
-        pv.leaderEpoch = p.leaderEpoch;
+        pv.topicId        = p.topicId;
+        pv.partition      = p.partition;
+        pv.leaderId       = p.leaderId;
+        pv.leaderEpoch    = p.leaderEpoch;
+        pv.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
         result.partitions.push_back(pv);
     }
 

@@ -157,8 +157,10 @@ public:
     // CB-2: Producer duty-cycle hooks (setup-phase only; call before start())
     // -------------------------------------------------------------------------
 
-    /// Send function type: (frame, len) -> bool.
-    using SendFn = std::function<bool(const uint8_t*, std::size_t)>;
+    /// Send function type: (ingressStreamId, frame, len) -> bool.
+    /// ingressStreamId=0 means "use the default ingress stream".
+    /// E5.1: carries the per-worker Aeron stream id for per-partition routing.
+    using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
 
     /// Producer drain+flush callback: invoked on the agent thread every doWork
     /// cycle.  Signature: (nowNs, sessionId, sendFn) -> workCount.

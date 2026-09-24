@@ -33,10 +33,11 @@ namespace rune::client::metadata {
 // PartitionEntry — matches the wire struct in MetadataMessages.h
 // ---------------------------------------------------------------------------
 struct PartitionEntry {
-    int32_t topicId     = 0;
-    int32_t partition   = 0;
-    int32_t leaderId    = -1;  // NO_LEADER = -1
-    int32_t leaderEpoch = -1;
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+    int32_t leaderId       = -1;  // NO_LEADER = -1
+    int32_t leaderEpoch    = -1;
+    int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
 };
 
 // ---------------------------------------------------------------------------
@@ -52,8 +53,9 @@ struct BrokerEntry {
 // RoutingEntry — one slot in the partition routing table
 // ---------------------------------------------------------------------------
 struct RoutingEntry {
-    int32_t leaderNodeId  = -1;  // -1 = no known leader
-    int32_t leaderEpoch   = -1;  // -1 = never seen
+    int32_t leaderNodeId   = -1;  // -1 = no known leader
+    int32_t leaderEpoch    = -1;  // -1 = never seen
+    int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
 };
 
 // ---------------------------------------------------------------------------
@@ -92,19 +94,28 @@ public:
         // Update per-partition routing (staleness-gated).
         for (const auto& p : partitions) {
             if (p.topicId < 0 || p.partition < 0) continue;
-            applyPartitionUpdate(p.topicId, p.partition, p.leaderId, p.leaderEpoch);
+            applyPartitionUpdate(p.topicId, p.partition,
+                                 p.leaderId, p.leaderEpoch, p.ingressStreamId);
         }
     }
 
     /// Zero-RTT reroute: update a SINGLE partition's leader without a full
     /// refresh.  Called when a NotLeader or Redirect response carries
     /// {leaderId, leaderEpoch}.  Staleness rule applies identically.
+    /// ingressStreamId is preserved from the existing entry (caller does not
+    /// know the per-worker stream on a bare redirect — the stream stays stable).
     void updatePartitionLeader(int32_t topicId,
                                int32_t partition,
                                int32_t newLeaderId,
                                int32_t newLeaderEpoch) noexcept
     {
-        applyPartitionUpdate(topicId, partition, newLeaderId, newLeaderEpoch);
+        // Preserve existing ingressStreamId on zero-RTT leader update.
+        const int64_t key = makeKey(topicId, partition);
+        const auto it     = table_.find(key);
+        const int32_t existingStreamId =
+            (it != table_.end()) ? it->second.ingressStreamId : 0;
+        applyPartitionUpdate(topicId, partition, newLeaderId, newLeaderEpoch,
+                             existingStreamId);
     }
 
     /// Update (or add) a broker endpoint without touching partition state.
@@ -166,6 +177,14 @@ public:
         return kNoLeader;
     }
 
+    /// Return the per-worker ingressStreamId for a partition, or 0 if unknown.
+    /// 0 means "not advertised by broker / legacy single-stream mode".
+    [[nodiscard]] int32_t ingressStreamIdFor(int32_t topicId, int32_t partition) const noexcept {
+        const auto it = table_.find(makeKey(topicId, partition));
+        if (it == table_.end()) return 0;
+        return it->second.ingressStreamId;
+    }
+
     /// Number of known partitions in the cache.
     [[nodiscard]] std::size_t partitionCount() const noexcept {
         return table_.size();
@@ -192,7 +211,8 @@ private:
 
     // Staleness-gated update for a single partition.
     void applyPartitionUpdate(int32_t topicId, int32_t partition,
-                              int32_t newLeaderId, int32_t newEpoch) noexcept
+                              int32_t newLeaderId, int32_t newEpoch,
+                              int32_t newIngressStreamId = 0) noexcept
     {
         const int64_t key = makeKey(topicId, partition);
         auto [it, inserted] = table_.emplace(key, RoutingEntry{});
@@ -203,8 +223,9 @@ private:
             return;  // stale update — discard
         }
 
-        entry.leaderNodeId = newLeaderId;
-        entry.leaderEpoch  = newEpoch;
+        entry.leaderNodeId    = newLeaderId;
+        entry.leaderEpoch     = newEpoch;
+        entry.ingressStreamId = newIngressStreamId;
     }
 
     // ---- Members -----
