@@ -696,6 +696,18 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (-1 = disabled).
 
+    // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
+    // When "1" or "true", each worker gets its own Aeron subscription and the
+    // gateway produce fanout is gated off (!perWorkerIngressEnabled).
+    // Default false: gateway fanout remains the live production path.
+    if (const char* pwi = getenv_fn("RUNE_PER_WORKER_INGRESS")) {
+        if (pwi && !std::string_view(pwi).empty()) {
+            std::string_view sv(pwi);
+            cfg.perWorkerIngressEnabled = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+    // Absent → keep NodeConfig default (false = gateway fanout is live path).
+
     return {std::move(cfg), {}};
 }
 

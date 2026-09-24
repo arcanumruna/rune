@@ -292,6 +292,25 @@ struct NodeConfig {
     //     avoid receiver window throttling on large batched produces.
     int32_t aeronRcvWindowBytes          = 128 * 1024;
 
+    // E5.1.3: per-worker Aeron ingress flag.
+    //
+    // When true, BrokerNode::buildWorkerPool creates one WorkerIngress
+    // subscription per worker on stream (workerIngressBaseStreamId + workerId)
+    // and calls worker.setWorkerIngress(ingress, /*active=*/true).
+    //
+    // The gateway produce fanout (tryEnqueueOp for produce) is gated on
+    // !perWorkerIngressEnabled so that produce is NOT double-processed.
+    //
+    // DEFAULT: false — the gateway fanout remains the live production path.
+    // The production flip to true requires the client to publish to per-worker
+    // streams (E5.1.4) and must not happen before that.
+    //
+    // Tests that prove the per-worker path end-to-end set this flag ON via
+    // NodeConfig directly (without an env var lookup) to keep the default safe.
+    //
+    // Overridable via RUNE_PER_WORKER_INGRESS env var ("1" or "true" → true).
+    bool perWorkerIngressEnabled = false;
+
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
     // each topic's segmentRollBytes are merged into a single output segment per

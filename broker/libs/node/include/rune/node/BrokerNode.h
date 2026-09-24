@@ -31,6 +31,7 @@
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/WorkerIngress.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -353,6 +354,14 @@ private:
     // Declaration order enforces this via reverse-destruction in the destructor.
     // -----------------------------------------------------------------------
     std::unique_ptr<WorkerPool> workerPool_;  // E1: shard->worker ownership
+
+    // E5.1.3: per-worker Aeron ingress subscriptions.
+    // One WorkerIngress per worker, allocated in buildWorkerPool() when
+    // perWorkerIngressEnabled is true.  Each WorkerIngress subscribes to
+    // (config_.clientEndpoint.channel, workerIngressBaseStreamId + workerId).
+    // Owned here; workers hold non-owning raw pointers (via setWorkerIngress).
+    // Empty when perWorkerIngressEnabled is false (default).
+    std::vector<std::unique_ptr<WorkerIngress>> workerIngresses_;
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;

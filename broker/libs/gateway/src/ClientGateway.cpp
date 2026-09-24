@@ -1530,7 +1530,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // drainWorkerReturns_() at the top of the NEXT doWork() cycle.
     //
     // When no WorkerPool is wired (null), fall through to the inline path below.
-    if (workerPool_) {
+    // E5.1.3 (e): Gate the gateway produce fanout on !perWorkerIngressActive_.
+    // When per-worker ingress is active, workers consume produce directly from
+    // their own Aeron subscriptions — routing through workerPool_ would double-
+    // process the same produce request (once from the gateway, once from the
+    // worker's own ingress poll).  Skipping here prevents the double-processing.
+    // Default: perWorkerIngressActive_=false → gateway fanout is the live path.
+    if (workerPool_ && !perWorkerIngressActive_) {
         // ---------------------------------------------------------------------------
         // WORKER PATH: Parse + validate the batch inline (same logic as before) so
         // that the WorkerOp carries the pre-validated fields (lastOffsetDelta,
@@ -2701,7 +2707,15 @@ void ClientGateway::drainWorkerReturns_()
             }
 
             // Mark log dirty for group-commit fsync.
-            if (topicRegistry_) {
+            //
+            // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
+            // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
+            // calls syncOwnedLogs_() which drives Log::sync on the owning thread.
+            // The gateway must NOT call Log::sync on worker-owned logs (that would
+            // race with the worker's own appends/sync — TSan race R7).
+            // Internal partitions (topicId < 0) remain on the gateway sync path.
+            const bool workerOwnedLog = perWorkerIngressActive_ && (ret.topicId >= 0);
+            if (!workerOwnedLog && topicRegistry_) {
                 rune::storage::Log* log =
                     topicRegistry_->log(ret.topicId, ret.partition);
                 if (log) {
@@ -3202,8 +3216,19 @@ void ClientGateway::flushDirtyLogs()
     // fsync failure is surfaced here and the dirty state is retained.
     // Note: on Linux, fsync failure may be unrecoverable (EIO/fsyncgate semantics);
     // at Milestone C this path should escalate to a leader step-down.
+    //
+    // E5.1.3 (d) R7 fix: skip any log in workerOwnedLogs_ — those are exclusively
+    // owned by a worker thread (which drives its own sync via syncOwnedLogs_ in
+    // doWork).  Calling Log::sync from the gateway thread while the worker thread
+    // appends is a TSan-confirmed data race (R7).  Internal partitions (topicId<0)
+    // are never added to workerOwnedLogs_ and always take this gateway sync path.
     std::unordered_set<rune::storage::Log*> stillDirty;
     for (rune::storage::Log* log : dirtyLogs_) {
+        // R7 gate: skip worker-owned logs (they sync themselves on the worker thread).
+        if (!workerOwnedLogs_.empty() && workerOwnedLogs_.count(log)) {
+            // Worker-owned: remove from dirtyLogs_ (the worker handles sync).
+            continue;
+        }
         bool synced = false;
         try {
             log->sync();

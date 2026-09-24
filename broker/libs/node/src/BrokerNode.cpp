@@ -597,6 +597,77 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->assignFromRegistry(*replicaRegistry_);
     }
 
+    // -----------------------------------------------------------------------
+    // E5.1.3 (c): Per-worker Aeron ingress subscriptions.
+    //
+    // When RUNE_PER_WORKER_INGRESS=true, allocate one WorkerIngress per worker
+    // on stream (workerIngressBaseStreamId + workerId) and wire it into the
+    // worker via setWorkerIngress(ingress, /*active=*/true).
+    //
+    // DEFAULT: false — the gateway fanout remains the live production path.
+    // The gateway produce fanout is gated on !perWorkerIngressEnabled (deliverable e).
+    //
+    // IMPORTANT: the per-worker ingress is only created here when aeron_ is set
+    // (aeron_ is null in unit tests that do not start the embedded driver).
+    // Tests that need the per-worker path construct WorkerIngress directly.
+    // -----------------------------------------------------------------------
+
+    // Apply desired fragment limit from NodeConfig to each worker (before runners start).
+    for (int32_t i = 0; i < wc; ++i) {
+        workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
+    }
+
+    if (config_.perWorkerIngressEnabled && aeron_) {
+        const std::string& channel  = config_.clientEndpoint.channel;
+        const int32_t      baseStream = config_.workerIngressBaseStreamId;
+
+        workerIngresses_.reserve(static_cast<std::size_t>(wc));
+        for (int32_t i = 0; i < wc; ++i) {
+            const int32_t streamId = baseStream + i;
+            auto ing = std::make_unique<WorkerIngress>(aeron_, channel, streamId);
+            if (!ing->resolved()) {
+                spdlog::warn("BrokerNode[{}]: WorkerIngress for worker {} on stream {} "
+                             "did not resolve within 5s — per-worker ingress disabled for this worker",
+                             config_.nodeId, i, streamId);
+            } else {
+                spdlog::info("BrokerNode[{}]: WorkerIngress for worker {} wired on stream {} (channel={})",
+                             config_.nodeId, i, streamId, channel);
+            }
+            workerPool_->worker(i).setWorkerIngress(ing.get(), /*active=*/ing->resolved());
+            workerIngresses_.push_back(std::move(ing));
+        }
+        // Gate the gateway produce fanout: when per-worker ingress is active,
+        // produce arrives on each worker's dedicated stream — gateway must NOT also
+        // enqueue to workerPool_ (that would double-process the same produce).
+        if (gateway_) {
+            gateway_->setPerWorkerIngressActive(true);
+            spdlog::info("BrokerNode[{}]: gateway produce fanout GATED (perWorkerIngressActive=true)",
+                         config_.nodeId);
+
+            // E5.1.3 (d) R7 fix: register all user-partition logs as worker-owned
+            // so flushDirtyLogs() skips them (the worker calls log->sync on its
+            // own thread — the only thread appending to these logs).
+            if (replicaRegistry_ && topicRegistry_) {
+                for (const auto& ts : config_.topics) {
+                    for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                        rune::storage::Log* log = topicRegistry_->log(ts.topicId, p);
+                        if (log) {
+                            gateway_->addWorkerOwnedLog(log);
+                        }
+                    }
+                }
+                spdlog::info("BrokerNode[{}]: {} user-partition logs marked worker-owned (R7 fix)",
+                             config_.nodeId, config_.topics.size());
+            }
+        }
+        spdlog::info("BrokerNode[{}]: per-worker ingress ACTIVE ({} subscriptions on base stream {})",
+                     config_.nodeId, wc, baseStream);
+    } else if (config_.perWorkerIngressEnabled && !aeron_) {
+        spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_INGRESS=true but aeron_ is null — "
+                     "per-worker ingress NOT activated (no embedded driver)",
+                     config_.nodeId);
+    }
+
     spdlog::info("BrokerNode[{}]: WorkerPool built ({} workers, {} replicas assigned)",
                  config_.nodeId, wc,
                  replicaRegistry_ ? replicaRegistry_->replicaCount() : std::size_t(0));

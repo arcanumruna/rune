@@ -121,6 +121,25 @@ public:
         return used + needed <= capacity;
     }
 
+    /// Number of max-message-length slots that can still be written to the ring.
+    ///
+    /// Used by the E5.1.3 reservation-before-poll logic in Worker::pollWorkerIngress_:
+    ///   K = min(desiredFragmentLimit, freeMaxMsgSlots() − retOverflow_.size())
+    /// This allows K > 1 produce frames per doWork cycle while preserving G-A6
+    /// (never poll more frames than there are available return slots).
+    ///
+    /// Each "slot" accounts for 2×maxMsgLength bytes of ring space (same ×2 safety
+    /// factor as hasSpaceForMaxMsg so the results are consistent).
+    [[nodiscard]] int64_t freeMaxMsgSlots() const noexcept {
+        const int64_t capacity = static_cast<int64_t>(maxMsgLength()) * 8LL;
+        const int64_t used     = ring_.producerPosition() - ring_.consumerPosition();
+        const int64_t free     = capacity - used;
+        const int64_t slotSize = static_cast<int64_t>(maxMsgLength()) * 2LL;
+        if (slotSize <= 0) return 0;
+        const int64_t slots = free / slotSize;
+        return slots > 0 ? slots : 0;
+    }
+
 private:
     // Raw storage — zero-initialised so Aeron ring descriptor fields start at 0.
     std::vector<std::byte> bufferStorage_;

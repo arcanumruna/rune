@@ -339,6 +339,37 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // E5.1.3 (e): setPerWorkerIngressActive — gate the gateway produce fanout.
+    //
+    // When active=true, the gateway's produce path (tryEnqueueOp for Produce)
+    // is skipped entirely; workers poll their own Aeron subscriptions.
+    // When active=false (default), the gateway fanout is the live path.
+    //
+    // Must be called before doWork() on the duty-cycle thread (single-writer).
+    // -----------------------------------------------------------------------
+    void setPerWorkerIngressActive(bool active) noexcept {
+        perWorkerIngressActive_ = active;
+    }
+
+    [[nodiscard]] bool perWorkerIngressActive() const noexcept {
+        return perWorkerIngressActive_;
+    }
+
+    // -----------------------------------------------------------------------
+    // E5.1.3 (d): addWorkerOwnedLog — register a Log* as exclusively owned by
+    // a worker for the R7 fix.
+    //
+    // Called from BrokerNode::buildWorkerPool() for each user-partition log
+    // before runners start (single-threaded startup, no race).
+    // flushDirtyLogs() skips any log in this set, so the gateway never calls
+    // Log::sync on a log the worker is appending to (R7 closed).
+    // Internal partitions (topicId < 0) must NOT be registered here.
+    // -----------------------------------------------------------------------
+    void addWorkerOwnedLog(rune::storage::Log* log) {
+        if (log) workerOwnedLogs_.insert(log);
+    }
+
+    // -----------------------------------------------------------------------
     // E5.1: setWorkerIngressBaseStreamId — configure the base Aeron stream id
     // for per-worker ingress routing.  The MetadataResponse fills each
     // PartitionEntry.ingressStreamId as base + workerForPartition(topicId, part).
@@ -941,6 +972,31 @@ private:
     // pushSubscriptions() route log work through the owning worker's ring;
     // drainWorkerReturns_() sends deferred responses at the top of doWork().
     rune::node::WorkerPool* workerPool_ = nullptr;
+
+    // E5.1.3 (e): per-worker ingress active flag.
+    //
+    // When true, the gateway produce fanout (tryEnqueueOp for Produce) is SKIPPED.
+    // Workers poll their own Aeron subscriptions for produce frames directly.
+    // This prevents double-processing when per-worker ingress is active.
+    //
+    // Default false — the gateway fanout is the live production path.
+    // Set via setPerWorkerIngressActive() from BrokerNode::buildWorkerPool()
+    // when RUNE_PER_WORKER_INGRESS=true.
+    bool perWorkerIngressActive_ = false;
+
+    // E5.1.3 (d) R7 fix: set of Log* pointers owned by workers.
+    //
+    // Populated by addWorkerOwnedLog() called from BrokerNode::buildWorkerPool()
+    // when per-worker ingress is active.  flushDirtyLogs() skips any log in this
+    // set to prevent the control-thread gateway from calling Log::sync on a log
+    // that the owning worker thread is appending to (TSan race R7).
+    //
+    // Internal partitions (topicId < 0) are never added here; they remain on
+    // the gateway sync path.
+    //
+    // Shared-nothing ([[rune-shared-nothing-law]]): this set is built once at
+    // startup (before runners start, single-threaded) and is read-only at runtime.
+    std::unordered_set<rune::storage::Log*> workerOwnedLogs_;
 
     // E2 inc2a: Set of subscriptionIds that have an outstanding PushRead op in
     // the worker's ingress ring.  A subscription must not get a second PushRead

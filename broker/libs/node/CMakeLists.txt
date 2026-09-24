@@ -668,6 +668,35 @@ if(BUILD_TESTING)
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
+    # ---------------------------------------------------------------------------
+    # E5.1.3: WorkerPerWorkerIngressE2ETest — per-worker ingress end-to-end tests.
+    #
+    # Tests with perWorkerIngressActive_=true (flag ON):
+    #   1. MultiPartitionMultiKey_EndToEnd — two workers/partitions, correct routing.
+    #   2. ReservationPoll_MoreThanOnePerCycle — >1 produce per doWork (E5.1.3b).
+    #   3. G_A6_ReservationGate_BackpressureStillHolds — G-A6 preserved under load.
+    #   4. AcksAll_DeferredUntilHW — acks=all on single-node leader.
+    #   5. AcksAll_TimeoutErrorIsInternal — timeout yields errorCode=6, not 7 (E5.1.3a).
+    #   6. WorkerOwnsLogSync_NoGatewayRace — R7 structural: worker owns log sync.
+    #
+    # Uses embedded IPC Aeron driver (same fixture as WorkerProducePathTest).
+    # Gated behind BUILD_BROKER_NODE_TESTS (same gate as WorkerProducePathTest).
+    # ---------------------------------------------------------------------------
+    if(BUILD_BROKER_NODE_TESTS AND aeron_FOUND)
+        add_executable(rune_worker_per_worker_ingress_e2e_tests
+            tests/node/WorkerPerWorkerIngressE2ETest.cpp)
+        target_include_directories(rune_worker_per_worker_ingress_e2e_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_worker_per_worker_ingress_e2e_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_per_worker_ingress_e2e_tests
+            PROPERTIES TIMEOUT 120
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    endif()
+
     # BrokerNode+Gateway integration tests (BR-7a) — single-node with live gateway.
     # Gated behind BUILD_BROKER_NODE_TESTS (reuses that gate).
     # ---------------------------------------------------------------------------

@@ -76,6 +76,7 @@
 #include <rune/storage/ProducePath.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
 
 #include <algorithm>
 #include <atomic>
@@ -198,6 +199,19 @@ public:
 
     // Set acks=all commit-wait timeout.  Default kDefaultAckTimeoutNs (30 s).
     void setAckTimeoutNs(int64_t timeoutNs) noexcept { ackTimeoutNs_ = timeoutNs; }
+
+    // -----------------------------------------------------------------------
+    // E5.1.3: setDesiredFragmentLimit — configure the reservation-before-poll
+    // fragment limit K used in pollWorkerIngress_.
+    //
+    // K = min(desiredFragmentLimit_, freeMaxMsgSlots − retOverflow_.size())
+    //
+    // Source: NodeConfig::gatewayFragmentLimit (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256).
+    // Must be called before doWork() on the worker's thread (before runners start).
+    // -----------------------------------------------------------------------
+    void setDesiredFragmentLimit(int32_t limit) noexcept {
+        desiredFragmentLimit_ = (limit >= 1) ? limit : 256;
+    }
 
     // Expose psm_ for tests (worker-thread only; call only from single-threaded tests).
     [[nodiscard]] rune::storage::ProducerStateManager& psmForTest() noexcept { return psm_; }
@@ -411,6 +425,20 @@ public:
                 work += replica->log()->drainRetentionDeletes();
                 work += replica->log()->drainStagingRenamesDone();
             }
+        }
+
+        // E5.1.3 (d) R7 fix: time-based Log::sync on owned user-partition logs.
+        //
+        // When per-worker ingress is active, the gateway's flushDirtyLogs() skips
+        // worker-owned logs (R7 gate).  Instead, the WORKER calls log->sync() here
+        // on ITS OWN thread — the same thread that appends — eliminating the
+        // append-vs-sync data race (R7 closed).
+        //
+        // Applies only when perWorkerIngressActive_ is true (default: false).
+        // Internal partitions (topicId < 0) are not in owned_ so they keep the
+        // gateway sync path unaffected.
+        if (perWorkerIngressActive_) {
+            work += syncOwnedLogs_(nowNs);
         }
 
         return work;
@@ -1202,6 +1230,68 @@ private:
     // E5.1.2d: acks=all commit-wait timeout (ns).
     int64_t ackTimeoutNs_ = kDefaultAckTimeoutNs;
 
+    // E5.1.3 (d) R7 fix: last time syncOwnedLogs_ was run (ns). 0 = never.
+    // Worker-thread only — no atomic needed.
+    int64_t lastSyncNs_ = 0;
+
+    // E5.1.3: desired fragment poll limit for reservation-before-poll.
+    // K = min(desiredFragmentLimit_, freeMaxMsgSlots − retOverflow_.size()).
+    // Source: NodeConfig::gatewayFragmentLimit (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256).
+    // Set via setDesiredFragmentLimit() before the runner starts.
+    //
+    // retOverflow_ hard cap: retOverflow_ is structurally bounded at K entries
+    // per poll call since K ack slots were reserved before the poll.  When
+    // retOverflow_ is non-empty, the G-A6 gate in doWork suppresses new polling
+    // entirely (retOverflow_.empty() is required) — so the overflow vector never
+    // accumulates more than one poll-batch (K entries) of acks.
+    int32_t desiredFragmentLimit_ = 256;
+
+    // -----------------------------------------------------------------------
+    // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.
+    //
+    // E5.1.3 (d) R7 fix: called from doWork when perWorkerIngressActive_ is true.
+    // Mirrors the gateway's flushDirtyLogs() group-commit interval (10 ms).
+    //
+    // For each owned disk-backed replica (user partition, topicId >= 0):
+    //   - Call log->sync() to flush page-cache writes to disk.
+    //   - If sync throws, log the error (same as gateway: don't crash, just retry).
+    //
+    // Worker-thread only.  Returns number of sync calls that completed.
+    // -----------------------------------------------------------------------
+
+    // Group-commit sync interval (mirrors gateway's kGroupCommitIntervalNs = 10 ms).
+    static constexpr int64_t kWorkerSyncIntervalNs = 10'000'000LL; // 10 ms
+
+    int syncOwnedLogs_(int64_t nowNs) {
+        // Time-gate: only flush when interval has elapsed.
+        if (lastSyncNs_ == 0) {
+            lastSyncNs_ = nowNs;
+            return 0;
+        }
+        if (nowNs - lastSyncNs_ < kWorkerSyncIntervalNs) return 0;
+        lastSyncNs_ = nowNs;
+
+        int synced = 0;
+        for (auto* replica : owned_) {
+            if (!replica || !replica->isDiskBacked()) continue;
+            rune::storage::Log* log = replica->log();
+            if (!log) continue;
+            try {
+                log->sync();
+                ++synced;
+            } catch (const std::exception& ex) {
+                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw for "
+                              "topicId={} partition={}: {}; log may be dirty",
+                              workerId_, replica->topicId(), replica->partitionId(), ex.what());
+            } catch (...) {
+                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw unknown exception "
+                              "for topicId={} partition={}",
+                              workerId_, replica->topicId(), replica->partitionId());
+            }
+        }
+        return synced;
+    }
+
     // -----------------------------------------------------------------------
     // flushRetOverflow_ — retry acks that could not be written to ret_ in a
     //                     prior cycle (G-A6: no silent drop on WorkerIngress path).
@@ -1266,10 +1356,16 @@ private:
             if (hwPassed || timedOut) {
                 if (timedOut && !hwPassed) {
                     spdlog::warn("Worker {}: acks=all timeout for partition={} "
-                                 "lastOffset={}; acking timeout error",
+                                 "lastOffset={}; acking Internal error",
                                  workerId_, entry.ret.partition, entry.lastOffset);
-                    // ErrorCode 7 = RequestTimedOut (or Internal=6 if no dedicated code)
-                    entry.ret.errorCode = static_cast<int16_t>(7);
+                    // E5.1.3 review fix #1: use Internal (6) for acks=all timeout.
+                    // The protocol has no RequestTimedOut code; ErrorCode 7 is
+                    // UnknownTopic — sending 7 would cause the client to misinterpret
+                    // a timeout as a missing topic, a client-facing correctness bug.
+                    // Internal (6) is the correct "unexpected server-side failure" code.
+                    entry.ret.errorCode =
+                        static_cast<int16_t>(
+                            rune::protocol::client::ErrorCode::Internal);
                 } else {
                     entry.ret.errorCode = 0; // OK
                 }
@@ -1315,23 +1411,46 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // pollWorkerIngress_ — poll the worker's Aeron subscription for ONE produce
-    //                       frame per call, run handleProduceBatch, enqueue ack.
+    // pollWorkerIngress_ — poll the worker's Aeron subscription for up to K
+    //                       produce frames per call, run handleProduceBatch,
+    //                       enqueue ack for each.
     //
-    // G-A6 contract: this is ONLY called when ret_ has space AND pendingAcksAll_
-    // is empty (enforced by doWork caller).  fragmentLimit=1 ensures we process
-    // at most one frame per doWork cycle so the outer G-A6 space check always
-    // fires before the next poll — no silent ack drops within a batch poll.
-    // Each doWork cycle is: check space → poll 1 → ack → next cycle → check again.
+    // E5.1.3: Reservation-before-poll (G-A6 + throughput).
+    //
+    // K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
+    //   where freeSlots = ret_.freeMaxMsgSlots().
+    //
+    // This preserves G-A6 (never poll more frames than there are available
+    // return slots) while allowing K > 1 per doWork cycle — removing the
+    // fragmentLimit=1 throughput cap from E5.1.2d.
+    //
+    // retOverflow_ cap: retOverflow_.size() is subtracted from the free-slot
+    // count before computing K.  retOverflow_ is structurally bounded because
+    // a non-empty overflow suppresses new ingress polling entirely (the G-A6
+    // gate in doWork_ requires retOverflow_.empty() to proceed to this function).
+    // When this function is called, retOverflow_.empty() is guaranteed by the
+    // caller, so the subtraction is always zero at this call site — it is
+    // included for defensive correctness if the call-site invariant ever changes.
+    //
     // Never drops an ack: errors return error acks on ret_; acks=all go to
     // pendingAcksAll_ for deferred fire.
     // -----------------------------------------------------------------------
     int pollWorkerIngress_(int64_t nowNs) {
         if (!workerIngress_ || !workerIngress_->resolved()) return 0;
 
+        // Reservation-before-poll (E5.1.3 deliverable b):
+        //   K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
+        // Guard G-A6: never poll more frames than we can ack without dropping.
+        const int64_t freeSlots = ret_.freeMaxMsgSlots();
+        const int64_t overflow  = static_cast<int64_t>(retOverflow_.size());
+        const int64_t available = (freeSlots > overflow) ? (freeSlots - overflow) : 0;
+        const int32_t K = static_cast<int32_t>(
+            std::min(static_cast<int64_t>(desiredFragmentLimit_), available));
+        if (K <= 0) return 0; // no free slots — skip poll (G-A6 preserved)
+
         int polled = 0;
         workerIngress_->poll(
-            /*fragmentLimit=*/1,   // G-A6: one frame per cycle — space re-checked each cycle
+            K,   // E5.1.3: poll up to K frames (reservation guarantees K ack slots)
             [this, nowNs, &polled]
             (const uint8_t* data, std::size_t len, aeron::Header& /*hdr*/) {
                 polled += handleWorkerIngressFrame_(data, len, nowNs);
@@ -1347,6 +1466,14 @@ private:
     // The data pointer is a zero-copy view into Aeron's term buffer; it is
     // valid only for the duration of this call.  handleProduceBatch receives a
     // mutable copy of the batch bytes (restamped in place).
+    //
+    // E5.1.3 review fixes applied here:
+    //   #2: All error-code literals replaced with pc::ErrorCode enum values.
+    //   #3: acksAll derivation: acks != 0 (broader than gateway's acks == 1, but
+    //       safer — catches both acks=Leader (1) and any future all-in-sync flag).
+    //       Gateway uses acks == 1; we use acks != 0 here for defensive correctness:
+    //       the Produce wire field carries 0=NoAck, 1=Leader, -1=All; treating any
+    //       non-zero value as "acks requested" prevents silent false-durability.
     // -----------------------------------------------------------------------
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs) {
@@ -1380,7 +1507,8 @@ private:
             spdlog::warn("Worker {}: WorkerIngress: no owned log for topicId={} "
                          "partition={}; Internal error ack",
                          workerId_, msg.topicId, msg.partition);
-            ret.errorCode = static_cast<int16_t>(6); // Internal
+            // E5.1.3 review fix #2: use enum, not magic literal.
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
             enqueueReturn_(ret);
             return 1;
         }
@@ -1393,7 +1521,8 @@ private:
             spdlog::warn("Worker {}: WorkerIngress: empty recordBatch topicId={} "
                          "partition={}; Internal error ack",
                          workerId_, msg.topicId, msg.partition);
-            ret.errorCode = static_cast<int16_t>(6);
+            // E5.1.3 review fix #2: use enum, not magic literal.
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
             enqueueReturn_(ret);
             return 1;
         }
@@ -1403,7 +1532,13 @@ private:
         // ingress_ ring which does a single copy into the ring).
         std::vector<uint8_t> batchBuf(rbSpan.begin(), rbSpan.end());
 
-        // Determine acks mode.
+        // E5.1.3 review fix #3: acksAll = (acks != 0).
+        // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
+        // Using acks != 0 is safer than acks == 1 (the gateway's rule) because
+        // it covers any non-zero acks field including potential future extension
+        // values, preventing silent false-durability on unknown acks values.
+        // The gateway uses acks == 1 for its inline path; both rules are equivalent
+        // for the current two-value (0 / 1) protocol but we document the difference.
         const bool acksAll = (msg.acks != 0);
 
         // ISR size for the min-ISR gate.
