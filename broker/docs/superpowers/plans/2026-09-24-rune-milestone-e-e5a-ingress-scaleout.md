@@ -321,6 +321,26 @@ TEST(ClientPerWorkerRouting, PublishesPerPartitionStreamAndPreservesOnRedirect) 
 - [ ] **Step 4: Run tests + full D parity + TSan once** — `ctest --test-dir build-fast -R "IngressMigration|integration|node_tests" -V`, then a TSan build of the migration + async-durability tests.
 - [ ] **Step 5: Commit** — `git commit -m "test(node): shard-migration ingress correctness — no dropped/duplicated produce across reassignment (E5.1)"` + trailer.
 
+### Task E5.1.6: E5 in-process integration + backpressure + shared-nothing suite
+
+> Consolidated fast in-process coverage proving the E5 gates end-to-end BEFORE any Docker E2E (per the standing "integration green before E2E" rule). Real client + multi-worker broker in one process (reuse the `GatewayLoopbackFixture` embedded-IPC-driver pattern).
+
+**Files:**
+- Test: `libs/node/tests/integration/E5IngressIntegrationTest.cpp` (new), `libs/node/tests/integration/E5BackpressureTest.cpp` (new)
+
+**Interfaces:**
+- Consumes: the full per-worker-ingress stack (E5.1.1–E5.1.5) + client per-partition routing (E5.1.4).
+- Produces: no product code — this is the E5a integration gate.
+
+- [ ] **Step 1: Per-worker ingress end-to-end** — real client produces across many keys → each partition routed to its owning worker's stream → appended → ack returns; assert every record acked exactly once, correct offsets, correct partition→worker mapping.
+- [ ] **Step 2: Throughput-scaling-vs-worker-count (G-A2 regression-of-record)** — run the same produce load at workerCount ∈ {1,2,4} on the 4-core box; assert measured throughput *increases* with worker count (not flat). Records the curve; a flat curve FAILS (means a residual funnel). (Absolute 500k is E5b/big-box; here we assert the scaling *shape*.)
+- [ ] **Step 3: Batched-produce correctness** — with `RUNE_LINGER_US`/`RUNE_BATCH_RECORDS` set, produce N records; assert coalescing (records_per_frame > 1), all records durably appended in order, one ack per batch.
+- [ ] **Step 4: End-to-end backpressure / no-ack-loss (G-A6)** — block the client egress (unresolvable/stalled egress publication), sustain produces; assert (a) the producer's `offer()` eventually returns `BACK_PRESSURED` (backpressure reached ingress), (b) no record is appended without an owed ack held, (c) on unblock EVERY ack is delivered exactly once (zero lost, zero duplicated). This is the G-A6 proof.
+- [ ] **Step 5: Single-owner-Log TSan (G-A5)** — TSan build; run the ingress end-to-end + migration tests; assert ZERO data races (proves only the owning worker touches its shard's Log).
+- [ ] **Step 6: Run + commit** — `ctest --test-dir build-fast -R "E5Ingress|E5Backpressure|integration"`, then the TSan subset; full suite green. Commit: `git commit -m "test(node): E5 in-process integration — per-worker ingress, scaling, batching, backpressure (G-A6), single-owner TSan (G-A5)"` + trailer.
+
+**Exit:** all E5a acceptance gates (G-A1..G-A3, G-A5, G-A6) proven in-process on the 4-core box. G-A4 (≥500k/<1ms) remains E5b/big-box.
+
 ---
 
 ## Self-Review

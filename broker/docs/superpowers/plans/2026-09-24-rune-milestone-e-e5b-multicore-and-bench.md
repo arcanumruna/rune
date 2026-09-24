@@ -150,6 +150,25 @@ TEST(AffinityConfig, ParsesReservedCores) {
 
 ---
 
+## Phase E5.6 — Dockerized DR / E2E under the sharded runtime
+
+> Runs ONLY after E5a's in-process integration suite (E5.1.6) is green — reproduce any bug in the fast in-process harness first, never debug it first in Docker. `[[feedback_integration_before_e2e]]` `[[rune-dr-e2e-epic]]`
+
+### Task E5.6.1: Multi-node DR/E2E matrix under per-worker ingress + DEDICATED + affinity
+
+**Files:**
+- Test/harness: `tests/e2e/**` (py-testinfra-style dockerized matrix, SHA-tagged images `[[docker-image-tag-policy]]`)
+
+- [ ] **Step 1** — Bring up a multi-node Rune cluster in Docker running the E5 config (per-worker ingress, `DEDICATED`, pinned busy-spin workers), multi-client producers/consumers.
+- [ ] **Step 2 — Correctness under fault** — inject: leader kill (exercises the G0 failover reassignment end-to-end across real nodes), network partition + `netem` latency/loss, worker-core saturation, slow-consumer backpressure. Assert: no committed-data loss, no dropped/duplicated produces across reassignment, **end-to-end backpressure reaches producers with zero ack loss (G-A6) across the real network**, exactly-once where configured.
+- [ ] **Step 3 — Migration under load** — trigger shard reassignment while producing at load; assert each partition's ingress stream follows ownership with no gap/dup (the real-network analogue of E5.1.5).
+- [ ] **Step 4 — Sustained soak** — run the matrix under sustained load for a soak window; assert no leaks, no latency cliff, no race (TSan-instrumented image for a subset).
+- [ ] **Step 5** — Post results to the live dashboard + ledger; commit the harness. `[[rune-session-live-protocol]]`
+
+**Exit:** the sharded E5 runtime survives the full DR/E2E fault matrix with the same durability + backpressure + exactly-once guarantees proven in-process, on a real multi-node network.
+
+---
+
 ## Self-Review
 
 - **Spec coverage:** item 2 (DEDICATED) → E5.2; item 3 (busy-spin+pinning) → E5.3 (worker half already landed in E4; this adds control/driver/cleaner + `AffinityConfig`); item 4 (split consensus) → E5.4 (corrected direction); Testing section (scaling curve, DEDICATED/busy-spin on ≥16-core, `<100µs`/≥Kafka) → E5.5. ✅
