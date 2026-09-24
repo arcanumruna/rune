@@ -1,8 +1,9 @@
 # Rune Thread-Per-Core Partition-Sharded Runtime — Design
 
-**Status:** design (approved in brainstorming 2026-09-23; next → writing-plans)
+**Status:** design (approved in brainstorming 2026-09-23; next → writing-plans).
+E1 + E3 landed; E5 (throughput / ingress scale-out) added 2026-09-24 — see that section.
 **Milestone:** E (follows Milestone D — distributed partition leadership)
-**Author dialogue:** brainstormed with the user 2026-09-23.
+**Author dialogue:** brainstormed with the user 2026-09-23; E5 added 2026-09-24.
 
 ## Goal
 
@@ -221,5 +222,72 @@ affinitized agents instead of one:
   fallback + memory-topic single-owner back-pressure ring (`InMemoryLog` redo).**
 - **E4 — CPU affinity + isolation (`isolcpus`/`nohz_full`/IRQ/SQPOLL pinning) + native/
   Linux benchmark matrix (`<100µs` gate) + DR-E2E under the sharded runtime.**
+- **E5 — Throughput / ingress scale-out (added 2026-09-24).** Realize per-worker ingress
+  (the unbuilt E2), add an Aeron `DEDICATED`-threading-mode knob, realize busy-spin +
+  core-pinning (E4), and split consensus/coordinators off the client-gateway thread. See
+  the "Throughput / ingress scale-out (E5)" section for motivation, evidence, and detail.
 
 Each phase is independently testable and leaves the broker working.
+
+## Throughput / ingress scale-out (E5 — added 2026-09-24)
+
+**Motivation (evidence).** Live profiling on the 4-core Hetzner build agent (2026-09-24)
+showed produce throughput capping at **~30k rec/s** (1 KiB records) vs **Kafka's 47.6k
+unbatched / 79.5k batched** on the same box, while worker threads sat at **~33% CPU —
+starved, not saturated.** The cause is structural, not a worker-parallelism bug: all
+client ingress is serialized on a single thread *before* it reaches the parallel workers.
+Workers do **not** own Aeron subscriptions — they are fed via SPSC rings by
+`ClientGateway::…tryEnqueueOp` (`libs/gateway/src/ClientGateway.cpp:1477`), which runs on
+the **one** `NodeRuntimeAgent` `AgentRunner` thread, fused with consensus + group/txn/
+metadata coordinators (`libs/node/src/BrokerNode.cpp:1131`); and **all** network I/O
+funnels through the single Aeron media-driver thread in `AERON_THREADING_MODE_SHARED`
+(`libs/node/src/BrokerNode.cpp:1469`). Two single-thread funnels in series, in front of
+the otherwise-parallel workers, cap throughput regardless of worker count. E5 removes
+those funnels. (The excellent latency — p50 ~2 ms, 50–100× better than Kafka — comes from
+the same single-writer simplicity; E5 must preserve it, not trade it away.)
+
+1. **Per-worker ingress — realize the unbuilt E2.** Each worker owns the Aeron
+   subscription/stream for *its* partitions and polls the wire directly; clients route
+   `key → shard → worker` straight to the owning worker (extend the D metadata/REDIRECT
+   response to carry the per-worker stream) — **no central gateway funnel, zero cross-thread
+   hops on the hot path.** This is already Core Principle #4, phase **E2**, and the
+   `WorkerIngress` component, but was **not built** (E1/E3 landed; ingress still goes through
+   the one gateway thread). Feasible precisely because Milestone D gives per-partition
+   leadership, so each worker is leader + ingress for its own partitions with **no global
+   ordering thread**. **This is the single biggest structural fix.**
+
+2. **Aeron `DEDICATED` threading mode on multi-core boxes.** Split conductor / sender /
+   receiver into separate threads so network send+receive isn't one thread
+   (`BrokerNode.cpp:1469` currently hard-codes `AERON_THREADING_MODE_SHARED`). SHARED is the
+   correct low-resource choice for small/embedded boxes; make the mode a config knob and
+   select `DEDICATED` when reserved cores are available. Pairs with reserved-core placement
+   (Principle #5 / `AffinityConfig`).
+
+3. **Busy-spin idle + core pinning, thread-count ≈ core-count — realize E4.** Replace the
+   per-hop sleep/backoff latency with `BusySpinIdleStrategy` on pinned, isolated worker
+   cores, and size the pool so threads do not oversubscribe cores. Already Principle #5 and
+   phase E4, but only viable on right-sized hardware — the 4-core test box (6+ threads) is
+   oversubscribed, a large part of its ~30k cap. Keep `Backoff` the default; busy-spin is
+   opt-in per isolated core (never a bare busy-spin default — Component note stands).
+
+4. **Split consensus off the client-gateway thread.** Today `NodeRuntimeAgent` fuses the
+   client gateway (produce/fetch parse + route) with consensus + group/txn/metadata
+   coordinators on one `AgentRunner` (`BrokerNode.cpp:1131`), so client request handling
+   contends with replication/coordinator housekeeping. Move consensus + coordinators onto
+   the reserved-core `ControlAgent` (already defined as a Component / in Principle #5) so the
+   client-facing path and the control plane no longer share a thread. Composes with (1):
+   once ingress is per-worker, the former gateway thread's remaining role shrinks to
+   control-plane only.
+
+**Ordering.** (1) is load-bearing; (2) + (3) unlock its headroom on multi-core hardware;
+(4) removes the residual contention. **Client-side batching** (`lingerUs`/`batchBytes`) is
+orthogonal — it raises throughput within the *current* model by amortizing trips through
+the funnels, so it should be measured **first** to establish the batched baseline (fair
+apples-to-apples vs Kafka's batched 79.5k) before restructuring ingress.
+
+**Testing (adds to the E testing section).** Throughput-scaling vs worker count must show
+near-linear improvement once ingress is per-worker (it currently does not — the E5
+regression-of-record). Per-worker-ingress correctness under D dynamic reassignment (a
+migrating shard's ingress stream moves with ownership, no dropped/duplicated produces).
+`DEDICATED`-mode and busy-spin runs on a right-sized (≥16-core) box confirming the `<100µs`
+p99 gate and throughput ≥ Kafka batched.
