@@ -221,8 +221,10 @@ struct NodeConfig {
     // deployment (no hardcoded ring capacities). Powers of two.
     //   - replicationOutboundRingBytes: payload bytes of the transport's outbound
     //     ManyToOne ring (worker sends → control-thread drain). RUNE_REPL_OUTBOUND_RING_BYTES.
-    //   - workerRingCapacity: slot count of each per-worker ingress/return SPSC
-    //     ring (inc2a). RUNE_WORKER_RING_CAPACITY.
+    //   - workerIngressRingBytes: byte capacity of each per-worker ingress SPSC
+    //     ring (power of two). RUNE_WORKER_INGRESS_RING_BYTES. Default 32 MiB.
+    //   - workerReturnRingBytes: byte capacity of each per-worker return SPSC
+    //     ring (power of two). RUNE_WORKER_RETURN_RING_BYTES. Default 32 MiB.
     //   - ioSubmitRingDepth: slot depth of each worker's IoBackend submission ring.
     //     RUNE_IO_SUBMIT_RING_DEPTH. Default 1024 (matches Worker::kIoSubmitDepth).
     //   - ioCompletionRingDepth: slot depth of each worker's IoBackend completion ring.
@@ -230,7 +232,8 @@ struct NodeConfig {
     //   - memoryLogRingBytes: byte capacity of each InMemoryLog single-owner ring.
     //     RUNE_MEMORY_LOG_RING_BYTES. Default 8 MiB.
     int32_t replicationOutboundRingBytes = 4 * 1024 * 1024;
-    int32_t workerRingCapacity           = 256;
+    int32_t workerIngressRingBytes       = 32 * 1024 * 1024;
+    int32_t workerReturnRingBytes        = 32 * 1024 * 1024;
     int32_t ioSubmitRingDepth            = 1024;
     int32_t ioCompletionRingDepth        = 1024;
     int32_t memoryLogRingBytes           = 8 * 1024 * 1024;

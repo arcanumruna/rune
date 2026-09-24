@@ -123,7 +123,8 @@ struct WorkerHarness {
 
         worker = std::make_unique<Worker>(
             /*workerId=*/0,
-            /*ringCapacity=*/Worker::kRingCapacity,
+            Worker::kIngressByteCapacity,
+            Worker::kReturnByteCapacity,
             ioSubmitDepth,
             ioComplDepth);
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
@@ -498,19 +499,19 @@ TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
 // Label: R5-BackPressure-WorkerIngressFull
 // ---------------------------------------------------------------------------
 TEST(BackPressure, WorkerIngressFullReturnsFalseNoFalseOK) {
-    // Use default ring sizes (8 MiB ingress) — flood until false is returned.
+    // Use default ring sizes (32 MiB ingress) — flood until false is returned.
     WorkerHarness h;
 
     // Build a batch larger than the ring's single-message capacity (maxMsgLength).
-    // Worker::kIngressByteCapacity = 8 MiB; maxMsgLength = capacity/8 = 1 MiB.
-    // A 128-record batch is ~13 KiB — well under 1 MiB.  We use many small
-    // batches to fill the ring byte-wise (ring capacity = 8 MiB; each 13 KiB
+    // Worker::kIngressByteCapacity = 32 MiB; maxMsgLength = capacity/8 = 4 MiB.
+    // A 128-record batch is ~13 KiB — well under 4 MiB.  We use many small
+    // batches to fill the ring byte-wise (ring capacity = 32 MiB; each 13 KiB
     // batch fills ~0.16% → ~640 batches to fill).
     // We drive until tryEnqueueOp returns false — the ring is full.
 
     int enqueued = 0;
     bool gotFull = false;
-    for (int i = 0; i < 100'000; ++i) {
+    for (int i = 0; i < 500'000; ++i) {
         auto batch = makeBatch(1); // 1-record batch
         int32_t lod = 0;
         if (batch.size() >= 27u) {
@@ -541,13 +542,13 @@ TEST(BackPressure, WorkerIngressFullReturnsFalseNoFalseOK) {
         ++enqueued;
     }
 
-    // The ring MUST eventually be full (8 MiB, ~640 small-batch messages fit).
+    // The ring MUST eventually be full (32 MiB ingress ring).
     ASSERT_TRUE(gotFull)
         << "Worker ingress ring must become full when flooded without draining "
            "(expected back-pressure on tryEnqueueOp)";
 
     // Drain the ring to collect acks for the successfully enqueued ops.
-    for (int i = 0; i < 100'000 && static_cast<int>(h.totalReturns) < enqueued; ++i) {
+    for (int i = 0; i < 1'000'000 && static_cast<int>(h.totalReturns) < enqueued; ++i) {
         h.worker->doWork(static_cast<int64_t>(i + 1));
         h.drainReturns();
     }
@@ -587,8 +588,8 @@ TEST(BackPressure, WorkerIngressFullReturnsFalseNoFalseOK) {
 // Label: R5-BackPressure-WorkerReturnFull
 // ---------------------------------------------------------------------------
 TEST(BackPressure, WorkerReturnFullDoesNotCrashAndLogsWarn) {
-    // Use a tiny return ring (kReturnByteCapacity = 8 MiB, but we will observe
-    // the ring filling long before 8 MiB by not draining between doWork() calls).
+    // Use a tiny return ring (kReturnByteCapacity = 32 MiB, but we will observe
+    // the ring filling long before 32 MiB by not draining between doWork() calls).
     WorkerHarness h;
 
     // Flood the return ring: enqueue many ops, run doWork each time (to append

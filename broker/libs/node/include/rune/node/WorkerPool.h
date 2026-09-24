@@ -54,8 +54,10 @@ public:
 
     // Construct N workers (ids 0..N-1) and take ownership of the router.
     // Precondition: workerCount >= 1 and must match router.workerCount().
-    // ringCapacity:       per-worker ingress/return SPSC ring slots (NodeConfig
-    //                     workerRingCapacity). Default Worker::kRingCapacity for tests/back-compat.
+    // ingressRingBytes:   per-worker ingress SPSC ring byte capacity (power of two,
+    //                     NodeConfig workerIngressRingBytes). Default Worker::kIngressByteCapacity.
+    // returnRingBytes:    per-worker return SPSC ring byte capacity (power of two,
+    //                     NodeConfig workerReturnRingBytes). Default Worker::kReturnByteCapacity.
     // ioSubmitDepth:      IoBackend submission ring depth (NodeConfig ioSubmitRingDepth).
     //                     Default Worker::kIoSubmitDepth.
     // ioCompletionDepth:  IoBackend completion ring depth (NodeConfig ioCompletionRingDepth).
@@ -65,7 +67,8 @@ public:
     //                     >= 0 → worker i is assigned core (workerCoreBase + i);
     //                     setCoreId() is called here (ctor, before runners start).
     WorkerPool(int32_t workerCount, rune::metadata::ShardRouter router,
-               std::size_t ringCapacity      = Worker::kRingCapacity,
+               std::size_t ingressRingBytes  = Worker::kIngressByteCapacity,
+               std::size_t returnRingBytes   = Worker::kReturnByteCapacity,
                std::size_t ioSubmitDepth     = Worker::kIoSubmitDepth,
                std::size_t ioCompletionDepth = Worker::kIoCompletionDepth,
                int32_t     workerCoreBase    = -1)
@@ -77,7 +80,8 @@ public:
         const std::size_t n = static_cast<std::size_t>(workerCount);
         workers_.reserve(n);
         for (int32_t i = 0; i < workerCount; ++i) {
-            workers_.emplace_back(std::make_unique<Worker>(i, ringCapacity,
+            workers_.emplace_back(std::make_unique<Worker>(i, ingressRingBytes,
+                                                           returnRingBytes,
                                                            ioSubmitDepth, ioCompletionDepth));
             // E4: assign core affinity before the runner thread starts.
             // Shared-nothing ([[rune-shared-nothing-law]]): setCoreId is called here

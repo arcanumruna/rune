@@ -97,20 +97,17 @@ public:
     // Non-owning pointer set published as an immutable snapshot.
     using OwnedSet = std::vector<rune::replication::PartitionReplica*>;
 
-    // R2: ingress ring byte capacity (power-of-two payload bytes).
-    // maxMsgLength() = capacity / 8 = 1 MiB — sufficient for any produce batch.
-    // TODO(R4): thread NodeConfig.workerIngressByteCapacity here.
-    static constexpr int kIngressByteCapacity = 8 * 1024 * 1024; // 8 MiB
+    // Default ingress ring byte capacity (power-of-two payload bytes).
+    // Used when the ctor is called without an explicit ingressRingBytes;
+    // NodeConfig.workerIngressRingBytes (RUNE_WORKER_INGRESS_RING_BYTES) overrides it.
+    // maxMsgLength() = capacity / 8 = 4 MiB — ample for any produce batch.
+    static constexpr int kIngressByteCapacity = 32 * 1024 * 1024; // 32 MiB
 
-    // R3: return ring byte capacity (power-of-two payload bytes).
-    // maxMsgLength() = capacity / 8 = 1 MiB — exceeds the 512 KiB max PushRead chunk.
-    // TODO(R4): thread NodeConfig.workerReturnByteCapacity here.
-    static constexpr int kReturnByteCapacity = 8 * 1024 * 1024; // 8 MiB
-
-    // Legacy alias — callers that pass Worker::kRingCapacity to the ctor still
-    // compile; the value is now ignored (both rings use their *ByteCapacity constants).
-    static constexpr std::size_t kRetRingCapacity = 256;  // kept for back-compat
-    static constexpr std::size_t kRingCapacity    = kRetRingCapacity;
+    // Default return ring byte capacity (power-of-two payload bytes).
+    // Used when the ctor is called without an explicit returnRingBytes;
+    // NodeConfig.workerReturnRingBytes (RUNE_WORKER_RETURN_RING_BYTES) overrides it.
+    // maxMsgLength() = capacity / 8 = 4 MiB — exceeds the 512 KiB max PushRead chunk.
+    static constexpr int kReturnByteCapacity = 32 * 1024 * 1024; // 32 MiB
 
     // Default IoBackend ring depths (power-of-two).  NodeConfig wiring (Task 7)
     // will pass these explicitly; for now the constructor defaults are sensible.
@@ -123,23 +120,24 @@ public:
     // Pre-reserve capacity for the per-cycle dirty-log set (dedup, small).
     static constexpr std::size_t kDirtySetReserve = 64;
 
-    // ctor: ringCapacity is kept for source-compat — it was the SpscRing slot
-    // count; now it is IGNORED (ingress uses kIngressByteCapacity; ret_ uses
-    // kReturnByteCapacity). Callers that pass Worker::kRingCapacity still compile.
+    // ctor: ingressRingBytes / returnRingBytes are the per-worker SPSC ring
+    // byte capacities (power of two). They default to the k*ByteCapacity
+    // constants; BrokerNode threads NodeConfig.workerIngress/ReturnRingBytes
+    // (RUNE_WORKER_INGRESS_RING_BYTES / RUNE_WORKER_RETURN_RING_BYTES) here.
     explicit Worker(int32_t workerId,
-                    std::size_t ringCapacity    = kRingCapacity,  // ignored (back-compat)
-                    std::size_t ioSubmitDepth   = kIoSubmitDepth,
-                    std::size_t ioComplDepth    = kIoCompletionDepth) noexcept
+                    std::size_t ingressRingBytes = kIngressByteCapacity,
+                    std::size_t returnRingBytes  = kReturnByteCapacity,
+                    std::size_t ioSubmitDepth    = kIoSubmitDepth,
+                    std::size_t ioComplDepth     = kIoCompletionDepth) noexcept
         : workerId_(workerId)
-        , ingress_(kIngressByteCapacity)
+        , ingress_(static_cast<int>(ingressRingBytes))
         , ingressScratch_(sizeof(WorkerOpWire) +
                           static_cast<std::size_t>(ingress_.maxMsgLength()))
-        , ret_(kReturnByteCapacity)
+        , ret_(static_cast<int>(returnRingBytes))
         , returnScratch_(sizeof(WorkerReturnWire) +
                          static_cast<std::size_t>(ret_.maxMsgLength()))
         , io_(ioSubmitDepth, ioComplDepth)
     {
-        (void)ringCapacity; // kept for source-compat; no longer used
         durablePending_.reserve(kDurablePendingReserve);
         dirtyThisCycle_.reserve(kDirtySetReserve);
     }

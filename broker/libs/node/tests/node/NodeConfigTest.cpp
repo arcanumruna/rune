@@ -1312,6 +1312,54 @@ TEST(NodeConfig, IoRingDepthsAllThreeOverridden) {
     EXPECT_EQ(res.config->memoryLogRingBytes,    4 * 1024 * 1024);
 }
 
+TEST(NodeConfig, WorkerRingBytesDefaultValues) {
+    // No overrides — both per-worker ring byte capacities carry the 32 MiB default.
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIngressRingBytes, 32 * 1024 * 1024);
+    EXPECT_EQ(res.config->workerReturnRingBytes,  32 * 1024 * 1024);
+}
+
+TEST(NodeConfig, WorkerRingBytesParseFromEnvPow2) {
+    // Override ingress only; return must stay at its default.
+    auto base = base1node();
+    base["RUNE_WORKER_INGRESS_RING_BYTES"] = "16777216"; // 16 MiB = 2^24
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIngressRingBytes, 16 * 1024 * 1024);
+    EXPECT_EQ(res.config->workerReturnRingBytes,  32 * 1024 * 1024)
+        << "un-overridden return ring must keep default";
+}
+
+TEST(NodeConfig, WorkerRingBytesBothOverridden) {
+    auto base = base1node();
+    base["RUNE_WORKER_INGRESS_RING_BYTES"] = "4194304";  // 4 MiB = 2^22
+    base["RUNE_WORKER_RETURN_RING_BYTES"]  = "8388608";  // 8 MiB = 2^23
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIngressRingBytes, 4 * 1024 * 1024);
+    EXPECT_EQ(res.config->workerReturnRingBytes,  8 * 1024 * 1024);
+}
+
+TEST(NodeConfig, WorkerRingBytesNonPow2KeepsDefault) {
+    // Non-power-of-two values must be silently ignored (32 MiB default kept).
+    auto base = base1node();
+    base["RUNE_WORKER_INGRESS_RING_BYTES"] = "3000000"; // not a power of two
+    base["RUNE_WORKER_RETURN_RING_BYTES"]  = "5";       // not a power of two
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIngressRingBytes, 32 * 1024 * 1024) << "non-pow2 must keep default";
+    EXPECT_EQ(res.config->workerReturnRingBytes,  32 * 1024 * 1024) << "non-pow2 must keep default";
+}
+
+TEST(NodeConfig, WorkerRingBytesNegativeKeepsDefault) {
+    auto base = base1node();
+    base["RUNE_WORKER_INGRESS_RING_BYTES"] = "-33554432";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerIngressRingBytes, 32 * 1024 * 1024) << "negative must keep default";
+}
+
 TEST(NodeConfig, TopicSpecDurabilityTierDefaultIsMajority) {
     // durabilityTier defaults to 1 (Majority) so existing tests are parity-unchanged.
     auto base = base1node();

@@ -618,7 +618,8 @@ ConfigResult parseNodeConfig(
         if (end != raw && v > 0 && (v & (v - 1)) == 0) out = static_cast<int32_t>(v);
     };
     parsePow2(getenv_fn("RUNE_REPL_OUTBOUND_RING_BYTES"), cfg.replicationOutboundRingBytes);
-    parsePow2(getenv_fn("RUNE_WORKER_RING_CAPACITY"),     cfg.workerRingCapacity);
+    parsePow2(getenv_fn("RUNE_WORKER_INGRESS_RING_BYTES"), cfg.workerIngressRingBytes);
+    parsePow2(getenv_fn("RUNE_WORKER_RETURN_RING_BYTES"),  cfg.workerReturnRingBytes);
     parsePow2(getenv_fn("RUNE_IO_SUBMIT_RING_DEPTH"),     cfg.ioSubmitRingDepth);
     parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
     parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);

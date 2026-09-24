@@ -94,7 +94,7 @@ struct RealWorkerFixture {
             cfg, rune::replication::Role::Leader, /*epoch=*/1,
             std::vector<rune::replication::NodeId>{1},
             std::vector<rune::replication::NodeId>{1}, log.get(), &transport);
-        worker = std::make_unique<Worker>(0, Worker::kRingCapacity);
+        worker = std::make_unique<Worker>(0);  // ingress/return rings default to k*ByteCapacity (32 MiB)
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
     }
     ~RealWorkerFixture() { std::error_code ec; fs::remove_all(dir, ec); }
