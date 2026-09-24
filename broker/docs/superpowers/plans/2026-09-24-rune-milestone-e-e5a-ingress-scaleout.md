@@ -198,6 +198,8 @@ TEST(ClientGatewayHotPath, LeaderViewCalledOncePerProduce) {
 
 > This phase eliminates the produce funnel *and* the 2–3× batch copy. After it, a produce is decoded from the Aeron term buffer, offset-restamped in place, and appended by the owning worker on its own thread. The gateway keeps only the control plane.
 
+> **Transport model (confirmed 2026-09-24): Aeron streamId-multiplexing over ONE UDP endpoint — NOT a UDP port per worker.** Each worker owns a distinct Aeron `streamId = workerIngressBaseStreamId + workerId` on the shared client channel and polls its own term buffer; the client publishes each partition straight to its owner's streamId. All streams share one media-driver `ReceiveChannelEndpoint`, so a single receiver thread reads the socket and demuxes frames into per-worker term buffers — this parallelizes the *application* ingress (poll/decode/restamp/append) across worker threads while the socket read stays one thread. That single receiver (multi-million frag/s) is not the bottleneck at the ≥500k/s target once it runs on its own thread via **`DEDICATED` mode (plan E5b, Task E5.2.1)**. **Escalation path (only if E5b's E5.5 scaling curve shows the receiver saturated):** switch to a UDP endpoint/port per worker for NIC-RSS / multi-receiver parallelism — deliberately deferred as a measured decision, not built now.
+
 ### Task E5.1.1: Protocol — add per-worker `ingressStreamId` to `PartitionEntry`
 
 **Files:**
