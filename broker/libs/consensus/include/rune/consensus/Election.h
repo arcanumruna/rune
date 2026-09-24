@@ -114,6 +114,23 @@ public:
     NodeId  thisMemberId()             const noexcept;
     NodeId  leaderMemberId()           const noexcept;
 
+    // eligibleNodeIds — the set of cluster members currently considered LIVE,
+    // for partition-failover reassignment (Task-14 / GR-7).
+    //
+    // A member is live if member.isActive(nowNs, timeoutNs) — i.e. its last
+    // AppendPosition (Aeron's liveness heartbeat) was within `timeoutNs`.  The
+    // leader itself never records an AppendPosition for its own entry, so when
+    // this node is the leader (leaderMemberId() == thisMemberId()) its own id is
+    // ALWAYS included (a leader is trivially live to itself).
+    //
+    // Result is sorted ascending, deduplicated.  Read-only; safe to call on the
+    // duty-cycle thread (same thread that drives doWork()).
+    //
+    // timeoutNs <= 0 means "use the cluster's leaderHeartbeatTimeoutNs" — the
+    // same window consensus itself uses to declare a peer dead.  Callers that
+    // don't want to hard-code a liveness window should pass 0.
+    std::vector<NodeId> eligibleNodeIds(int64_t nowNs, int64_t timeoutNs = 0) const;
+
     // Returns true when the election has reached the CLOSED terminal state.
     // Election.java:255
     bool isClosed() const noexcept;

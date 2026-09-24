@@ -155,6 +155,25 @@ public:
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;
 
+            // GR-7 / Task-14: FAILOVER reassignment of partition leadership.
+            //
+            // After the committed assignment map has been applied, ask the
+            // MetadataService (leader-only, self-gated) to reassign any partition
+            // whose designated leaderNode is no longer among the LIVE cluster
+            // members.  Liveness comes from consensus itself (Election's per-member
+            // AppendPosition timestamps) — the authoritative signal for "which
+            // node is dead", read on this same duty-cycle thread (no race).
+            //
+            // Without this, a killed node's partitions stay assigned to it in the
+            // committed map forever, so the surviving nodes' replicas never get
+            // promoted to Leader (GR-7 / TX-2b failover would hang).
+            if (election_) {
+                const std::vector<rune::metadata::NodeId> eligible =
+                    election_->eligibleNodeIds(nowNs, /*timeoutNs=*/0);
+                work += static_cast<int>(
+                    metadataService_->reassignDeadPartitionLeaders(eligible));
+            }
+
             // Rebuild RoutingImage and push to gateway each cycle.
             // This is cheap (shared_ptr swap + array copy) and done on the
             // duty-cycle thread — no cross-thread synchronisation needed.

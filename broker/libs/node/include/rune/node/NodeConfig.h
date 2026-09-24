@@ -243,11 +243,24 @@ struct NodeConfig {
     //     32 MiB via RUNE_AERON_TERM_BUFFER_BYTES) for deep in-flight throughput.
     int32_t aeronTermBufferBytes         = 4 * 1024 * 1024;
     //   - aeronMtuBytes: Aeron UDP MTU (bytes) for the embedded media driver.
-    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default 65504
-    //     (jumbo-frame MTU, supports deep batched produces without fragmentation
-    //     overhead).  Deployments on standard 1500-byte MTU networks should set
-    //     this to 1408 (Aeron default).
-    int32_t aeronMtuBytes                = 65504;
+    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default 1408
+    //     (Aeron's own AERON_MTU_LENGTH_DEFAULT — the max that fits the default
+    //     socket SO_SNDBUF on all platforms).
+    //
+    //     WHY NOT jumbo (65504): aeron_driver_init() rejects with EINVAL(22) when
+    //     mtu_length > the probed socket SO_SNDBUF max (aeron_driver.c:451).  On
+    //     macOS (and any host with the default ~64 KiB SO_SNDBUF cap) a 65504-byte
+    //     MTU fails driver startup outright — every real embedded-driver test
+    //     (GR-7 / TX-2b failover) crashed at init.  Deployments that raise
+    //     SO_SNDBUF (net.inet.udp.maxdgram / net.core.wmem_max) and want jumbo
+    //     frames for deep batched produces can set RUNE_AERON_MTU=65504.
+    int32_t aeronMtuBytes                = 1408;
+    //   - gatewayFragmentLimit: maximum fragments polled per ClientGateway
+    //     doWork() cycle (RUNE_GATEWAY_FRAGMENT_LIMIT).  Not required to be a
+    //     power of two — parsed with parseInt32.  Default 256 (raised from the
+    //     old hard-coded 10 to prevent head-of-line blocking on batched ingress).
+    //     Also reused for per-worker ingress poll (Task E5.1.2).
+    int32_t gatewayFragmentLimit         = 256;
     //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
     //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
     //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to

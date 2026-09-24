@@ -96,6 +96,36 @@ bool Election::isClosed() const noexcept {
     return state_ == ElectionState::Closed;
 }
 
+// eligibleNodeIds — live cluster members for partition-failover reassignment.
+// A member is live if it appended a position within timeoutNs (Aeron liveness).
+// The leader itself is always included when this node is the leader (it never
+// records its own AppendPosition).  Sorted ascending, deduplicated.
+std::vector<NodeId> Election::eligibleNodeIds(int64_t nowNs,
+                                              int64_t timeoutNs) const {
+    // timeoutNs <= 0 → use the cluster's own leader-liveness window.
+    if (timeoutNs <= 0) {
+        timeoutNs = leaderHeartbeatTimeoutNs_;
+    }
+
+    std::vector<NodeId> out;
+    out.reserve(clusterMembers_.size());
+
+    const NodeId selfId   = thisMemberId_;
+    const bool   selfLeads =
+        (leaderMember_ != nullptr) && (leaderMember_->id == selfId);
+
+    for (const ClusterMember& m : clusterMembers_) {
+        const bool isSelfLeaderEntry = selfLeads && (m.id == selfId);
+        if (isSelfLeaderEntry || m.isActive(nowNs, timeoutNs)) {
+            out.push_back(m.id);
+        }
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 // nextDeadlineNs — returns the next clock deadline this state is waiting on.
 // Tests jump nowNs to exactly this value to avoid busy-spin.
 int64_t Election::nextDeadlineNs() const noexcept {

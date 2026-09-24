@@ -16,7 +16,9 @@ target_include_directories(rune_node PUBLIC
 # rune_coordination: GroupCoordinator + ReplicatedOffsetStore (CG-3)
 # rune_transaction: TransactionCoordinator + ReplicatedTxnStateStore (TX-3)
 # rune_metadata_msm: MetadataStateMachine (MD1 Task 4)
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer)
+# rune_dynamic_balancer: DynamicBalancer + FailoverElection (GR-7 dead-leader reassign,
+#   now ODR-used via MetadataService::reassignDeadPartitionLeaders from NodeRuntimeAgent)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -581,7 +583,8 @@ if(BUILD_TESTING)
                 GTest::gtest_main)
             gtest_discover_tests(rune_udp_cluster_tests
                 PROPERTIES TIMEOUT 120
-                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}"
+                RESOURCE_LOCK rune_udp_ports)  # serialize ephemeral-UDP-port suites
         endif()
     endif()
 
@@ -709,8 +712,13 @@ if(BUILD_TESTING)
             rune_node
             aeron::aeron
             GTest::gtest_main)
+        # RESOURCE_LOCK: these tests bind ephemeral UDP ports discovered via a
+        # bind/close/return-number probe (inherent TOCTOU).  Running two such
+        # real-BrokerNode UDP suites concurrently races for the same freed port
+        # → intermittent "bind: Address already in use".  Serialize all UDP
+        # failover suites on a shared lock so ctest -jN never overlaps them.
         gtest_discover_tests(rune_gateway_failover_replication_tests
-            PROPERTIES TIMEOUT 300)
+            PROPERTIES TIMEOUT 300 RESOURCE_LOCK rune_udp_ports)
     endif()
 
     # ---------------------------------------------------------------------------
@@ -755,7 +763,7 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_gateway_psm_failover_tests
-            PROPERTIES TIMEOUT 300)
+            PROPERTIES TIMEOUT 300 RESOURCE_LOCK rune_udp_ports)
     endif()
 
     # ---------------------------------------------------------------------------

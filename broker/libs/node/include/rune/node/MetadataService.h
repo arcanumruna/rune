@@ -335,6 +335,43 @@ public:
         return count;
     }
 
+    // -----------------------------------------------------------------------
+    // GR-7 / Task-14: Partition-leadership FAILOVER reassignment.
+    //
+    // Called every duty cycle by NodeRuntimeAgent with the current set of live
+    // cluster members (from consensus liveness — Election::eligibleNodeIds()).
+    // Leader-only, self-gated inside runDynamicRebalanceOnTick():
+    //
+    //   For every committed partition whose leaderNode is NOT in eligibleNodes
+    //   (the designated leader died), DynamicBalancer runs FailoverElection over
+    //   the partition's ISR ∩ eligibleNodes and emits a reassignment record
+    //   electing a surviving in-ISR replica.  Partitions whose leader is still
+    //   live are left untouched (min-churn — FailoverElection Rule 1).
+    //
+    // This is what makes a new cluster leader actually take over the partitions
+    // owned by a killed node.  Without it, the committed assignment map keeps
+    // naming the dead node forever and the survivor's replica stays Follower.
+    //
+    // Uses the internal ReplicaPositionTable (positions_); when empty (no
+    // position reports wired), FailoverElection falls back to the lowest-nodeId
+    // in-ISR survivor — safe here because RF == cluster size and every survivor
+    // holds the full committed log.
+    //
+    // Idempotent: once a partition's committed leader is a live node, subsequent
+    // calls emit nothing (DynamicBalancer returns 0 for that partition).
+    //
+    // \returns number of reassignment records emitted this call (0 = steady state).
+    // Single-writer: duty-cycle thread only.
+    // -----------------------------------------------------------------------
+    std::size_t reassignDeadPartitionLeaders(
+        const std::vector<rune::metadata::NodeId>& eligibleNodes)
+    {
+        if (!replica_) return 0;
+        if (replica_->role() != rune::replication::Role::Leader) return 0;
+        if (eligibleNodes.empty()) return 0;
+        return runDynamicRebalanceOnTick(eligibleNodes, &positions_);
+    }
+
     /// Diagnostics: the tickSeq of the most-recently appended ControlTickRecord
     /// (-1 if none appended yet).  Monotonic across emitted ticks.
     [[nodiscard]] int64_t lastEmittedTickSeq() const noexcept { return lastEmittedTickSeq_; }
@@ -707,6 +744,14 @@ private:
     int64_t nextTickSeq_        = 0;
     /// tickSeq of the last appended ControlTickRecord (-1 = none yet).
     int64_t lastEmittedTickSeq_ = -1;
+
+    /// GR-7: soft replica-position table consumed by FailoverElection when
+    /// reassignDeadPartitionLeaders() runs.  Empty in the current wiring (no
+    /// position reports plumbed yet) → FailoverElection deterministically picks
+    /// the lowest-nodeId in-ISR survivor, which is correct when RF == cluster
+    /// size (every survivor holds the full committed log).  Kept as a member so
+    /// future position-report wiring can seed it without an API change.
+    rune::metadata::ReplicaPositionTable positions_;
 };
 
 } // namespace rune::node
