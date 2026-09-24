@@ -1551,14 +1551,35 @@ void BrokerNode::startEmbeddedDriver() {
 
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
 
-    // SHARED threading: one background thread for sender+receiver+conductor.
-    aeron_driver_context_set_threading_mode(driverCtx_,
-                                            AERON_THREADING_MODE_SHARED);
+    // E5.2: configurable Aeron threading mode (default SHARED — byte-identical
+    // to today).  DEDICATED splits conductor/sender/receiver onto 3 threads.
+    {
+        const char* idle = config_.driverIdleStrategy.c_str();
+        switch (config_.aeronThreadingMode) {
+            case NodeConfig::AeronThreadingMode::Shared:
+            default:
+                // SHARED (default): one fused driver thread — conductor + sender + receiver.
+                aeron_driver_context_set_threading_mode(driverCtx_,
+                                                        AERON_THREADING_MODE_SHARED);
+                aeron_driver_context_set_shared_idle_strategy(driverCtx_, idle);
+                break;
+            case NodeConfig::AeronThreadingMode::Dedicated:
+                // DEDICATED: conductor, sender, and receiver on separate threads.
+                // Idle strategy applied to all three via the per-thread setters:
+                //   aeron_driver_context_set_conductor_idle_strategy (aeronmd.h:409)
+                //   aeron_driver_context_set_sender_idle_strategy    (aeronmd.h:401)
+                //   aeron_driver_context_set_receiver_idle_strategy  (aeronmd.h:417)
+                aeron_driver_context_set_threading_mode(driverCtx_,
+                                                        AERON_THREADING_MODE_DEDICATED);
+                aeron_driver_context_set_conductor_idle_strategy(driverCtx_, idle);
+                aeron_driver_context_set_sender_idle_strategy(driverCtx_, idle);
+                aeron_driver_context_set_receiver_idle_strategy(driverCtx_, idle);
+                break;
+        }
+    }
     // Clean up on start/shutdown so tests don't leave stale shm files.
     aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-    // Lightweight idle in the driver thread.
-    aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
     // Small term buffers — plenty for a 1-node broker.
     aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
     aeron_driver_context_set_term_buffer_length(

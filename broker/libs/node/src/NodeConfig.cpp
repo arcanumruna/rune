@@ -696,6 +696,33 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (-1 = disabled).
 
+    // --- RUNE_AERON_THREADING_MODE (optional, default Shared) — E5.2 ---
+    // "shared" (default) or "dedicated" (case-insensitive).
+    // Any unrecognised value floors to Shared (must not change default behaviour).
+    if (const char* atm = getenv_fn("RUNE_AERON_THREADING_MODE")) {
+        if (atm && !std::string_view(atm).empty()) {
+            std::string s(atm);
+            for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (s == "dedicated") {
+                cfg.aeronThreadingMode = NodeConfig::AeronThreadingMode::Dedicated;
+            } else {
+                // "shared" or any unrecognised value → default Shared.
+                cfg.aeronThreadingMode = NodeConfig::AeronThreadingMode::Shared;
+            }
+        }
+    }
+    // Absent → keep NodeConfig default (Shared).
+
+    // --- RUNE_AERON_DRIVER_IDLE (optional, default "sleep-ns") — E5.2 ---
+    // Passed to the Aeron idle-strategy setter(s) for the active threading mode.
+    // Default "sleep-ns" is byte-identical to today's hard-coded value.
+    if (const char* adi = getenv_fn("RUNE_AERON_DRIVER_IDLE")) {
+        if (adi && !std::string_view(adi).empty()) {
+            cfg.driverIdleStrategy = std::string(adi);
+        }
+    }
+    // Absent → keep NodeConfig default ("sleep-ns").
+
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the
     // gateway produce fanout is gated off (!perWorkerIngressEnabled).

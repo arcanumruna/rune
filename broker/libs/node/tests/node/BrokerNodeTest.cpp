@@ -977,4 +977,32 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
     node.stop();
 }
 
+// ===========================================================================
+// E5.2: DEDICATED threading-mode smoke — driver must boot + node must elect
+// ===========================================================================
+// Prove that AERON_THREADING_MODE_DEDICATED (3 driver threads) actually boots
+// the embedded media driver and that the broker self-elects.
+// Does NOT require a round-trip produce/consume — election implies Aeron
+// subscriptions and publications are live (consensus channel is up).
+TEST(BrokerNodeTest, DedicatedAeronThreadingMode_BootsAndElects) {
+    TempDir tmp{"ded_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.aeronThreadingMode = NodeConfig::AeronThreadingMode::Dedicated;
+    // Keep default driverIdleStrategy ("sleep-ns") — lightweight even in DEDICATED mode.
+
+    BrokerNode node{cfg};
+    // Must not throw — aeron_driver_init must accept AERON_THREADING_MODE_DEDICATED.
+    ASSERT_NO_THROW(node.start())
+        << "BrokerNode::start() must not throw with AeronThreadingMode::Dedicated";
+
+    // Driver is up and the consensus channel is live iff the node can elect.
+    ASSERT_TRUE(node.awaitLeader(3s))
+        << "DEDICATED-mode node must self-elect within 3 s (Aeron driver + "
+           "consensus channel must both be live)";
+
+    EXPECT_TRUE(node.isLeader());
+
+    node.stop();
+}
+
 } // namespace rune::node

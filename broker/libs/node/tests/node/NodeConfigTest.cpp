@@ -1475,4 +1475,70 @@ TEST(NodeConfig, FragmentLimitDefaultAndOverride) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// E5.2: RUNE_AERON_THREADING_MODE + RUNE_AERON_DRIVER_IDLE parsing
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfig, ParsesAeronThreadingMode_DefaultIsShared) {
+    // No RUNE_AERON_THREADING_MODE set → must default to Shared.
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronThreadingMode,
+              rune::node::NodeConfig::AeronThreadingMode::Shared)
+        << "default aeronThreadingMode must be Shared";
+}
+
+TEST(NodeConfig, ParsesAeronThreadingMode_DedicatedLowercase) {
+    auto base = base1node();
+    base["RUNE_AERON_THREADING_MODE"] = "dedicated";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronThreadingMode,
+              rune::node::NodeConfig::AeronThreadingMode::Dedicated);
+}
+
+TEST(NodeConfig, ParsesAeronThreadingMode_DedicatedUppercase) {
+    auto base = base1node();
+    base["RUNE_AERON_THREADING_MODE"] = "DEDICATED";  // upper-case — must be case-insensitive
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronThreadingMode,
+              rune::node::NodeConfig::AeronThreadingMode::Dedicated);
+}
+
+TEST(NodeConfig, ParsesAeronThreadingMode_SharedExplicit) {
+    auto base = base1node();
+    base["RUNE_AERON_THREADING_MODE"] = "shared";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronThreadingMode,
+              rune::node::NodeConfig::AeronThreadingMode::Shared);
+}
+
+TEST(NodeConfig, ParsesAeronThreadingMode_GarbageFloorsToShared) {
+    auto base = base1node();
+    base["RUNE_AERON_THREADING_MODE"] = "invoker_turbo_9000";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronThreadingMode,
+              rune::node::NodeConfig::AeronThreadingMode::Shared)
+        << "unrecognised RUNE_AERON_THREADING_MODE must floor to Shared";
+}
+
+TEST(NodeConfig, ParsesAeronDriverIdleDefault) {
+    // No RUNE_AERON_DRIVER_IDLE set → must default to "sleep-ns".
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->driverIdleStrategy, "sleep-ns")
+        << "default driverIdleStrategy must be 'sleep-ns' (byte-identical to prior hard-code)";
+}
+
+TEST(NodeConfig, ParsesAeronDriverIdleOverride) {
+    auto base = base1node();
+    base["RUNE_AERON_DRIVER_IDLE"] = "noop";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->driverIdleStrategy, "noop");
+}
+
 } // namespace rune::node

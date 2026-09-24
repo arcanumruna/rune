@@ -32,6 +32,12 @@
 //
 // For cross-datacenter deployments set these higher (e.g. 1000/200/2000 ms).
 //
+// E5.2: Aeron media-driver threading mode (optional):
+//   RUNE_AERON_THREADING_MODE — "shared" (default) or "dedicated" (case-insensitive).
+//                               Any unrecognised value floors to "shared".
+//   RUNE_AERON_DRIVER_IDLE    — idle strategy string for the driver thread(s);
+//                               default "sleep-ns" (identical to today's hard-coded value).
+//
 // All Aeron channels use the aeron:udp transport (container transport).
 
 #include <cstdint>
@@ -291,6 +297,38 @@ struct NodeConfig {
     //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to
     //     avoid receiver window throttling on large batched produces.
     int32_t aeronRcvWindowBytes          = 128 * 1024;
+
+    // E5.2: Aeron media-driver threading mode.
+    //
+    // Controls how the embedded Aeron media driver allocates its internal
+    // threads for the conductor, sender, and receiver roles.
+    //
+    // Valid values (parsed from RUNE_AERON_THREADING_MODE env var,
+    // case-insensitive):
+    //   "shared"    — SHARED (default): conductor + sender + receiver share one
+    //                 driver thread.  Lowest overhead; good for co-located
+    //                 clusters and test environments.
+    //   "dedicated" — DEDICATED: conductor, sender, and receiver each get their
+    //                 own thread (3 extra threads total).  Better throughput when
+    //                 spare cores are available; the main reason to benchmark.
+    // Any unrecognised value is floored to "shared" (must NOT change default).
+    //
+    // Note: on macOS the driver runs in-process; DEDICATED is fully supported
+    // but may oversubscribe if fewer than 4 spare cores are available.
+    enum class AeronThreadingMode : uint8_t {
+        Shared    = 0,  ///< SHARED — DEFAULT.  Single fused driver thread.
+        Dedicated = 1,  ///< DEDICATED — 3 separate driver threads (conductor/sender/receiver).
+    };
+    AeronThreadingMode aeronThreadingMode = AeronThreadingMode::Shared;
+
+    // E5.2: driver-idle strategy string applied to whichever idle setter(s)
+    // the active threading mode uses (RUNE_AERON_DRIVER_IDLE, default "sleep-ns").
+    //   Shared    mode: passed to aeron_driver_context_set_shared_idle_strategy.
+    //   Dedicated mode: passed to conductor / sender / receiver idle setters.
+    // Any unrecognised value is passed through to Aeron (it will use its own
+    // default on error — safe degradation).  Default "sleep-ns" is identical
+    // to today's hard-coded value so unset env → byte-identical behaviour.
+    std::string driverIdleStrategy = "sleep-ns";
 
     // E5.1.3: per-worker Aeron ingress flag.
     //
