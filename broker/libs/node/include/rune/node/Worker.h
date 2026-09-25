@@ -310,8 +310,17 @@ public:
         case WorkerOp::Type::Produce:
         case WorkerOp::Type::AppendControlRecord:
             tailKind = sbe::TailKind::Value::RECORD_BATCH;
-            tailSrc  = op.recordBatchBytes.data();
-            tailLen  = op.recordBatchBytes.size();
+            // Zero-copy: prefer the read-only view (aliases the Aeron fragment,
+            // valid for this synchronous call) so putTail copies the batch ONCE
+            // into the ring with no intermediate heap vector.  Fall back to the
+            // owning recordBatchBytes vector when no view was supplied.
+            if (!op.recordBatchView.empty()) {
+                tailSrc = op.recordBatchView.data();
+                tailLen = op.recordBatchView.size();
+            } else {
+                tailSrc = op.recordBatchBytes.data();
+                tailLen = op.recordBatchBytes.size();
+            }
             break;
         case WorkerOp::Type::ApplyReplicated:
         case WorkerOp::Type::ReconcileFetchResp:
@@ -1078,32 +1087,18 @@ private:
             return;
         }
 
-        // Assign the actual base offset (authoritative — worker is the single writer).
-        const int64_t base = log->logEndOffset();
-        ret.baseOffset = base;
-        ret.lastOffset = base + static_cast<int64_t>(op.lastOffsetDelta());
-
-        // Re-stamp the base offset in the tail view (LE64 at kBaseOffsetOffset=0).
-        // op.tail() is a view into the mutable ring frame (we wrapped a mutable
-        // buffer for decode); the frame is not read by the producer again after
-        // commit — safe to mutate in-place here.  CRC region starts at
-        // kAttributesOffset=21, AFTER the base-offset field, so re-stamping does
-        // NOT invalidate the CRC.
+        // Zero-copy restamp append: the base offset is assigned from the log's end
+        // offset and patched into the batch header via pwritev (LE64 at bytes
+        // [0..7], before the CRC region) — the ring frame is NOT mutated, so
+        // op.tail() stays a read-only view (no const_cast).  The worker is the
+        // single writer, so the assigned base is authoritative.
         const uint32_t tailLen = op.tailLength();
-        uint8_t* tail = reinterpret_cast<uint8_t*>(const_cast<char*>(op.tail()));
-        if (tail && tailLen >= 8u) {
-            const uint64_t u = static_cast<uint64_t>(base);
-            for (int i = 0; i < 8; ++i) {
-                tail[static_cast<std::size_t>(i)] =
-                    static_cast<uint8_t>(u >> (i * 8));
-            }
-        }
-
-        // Zero-copy append: read directly from the ring frame into the log.
-        // appendNoSync copies the bytes into the log's owned segment buffer.
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        int64_t base = 0;
         try {
             const int64_t appended =
-                log->appendNoSync(tail, static_cast<std::size_t>(tailLen), ret.lastOffset);
+                log->appendNoSyncRestamp(tail, static_cast<std::size_t>(tailLen),
+                                         op.lastOffsetDelta(), base);
             // R5 finding F6 (correctness): a negative return means the append was
             // REFUSED (e.g. InMemoryLog in BackPressure mode with a full ring).
             // We MUST NOT ack OK for a record that was never appended — that is a
@@ -1129,6 +1124,10 @@ private:
             enqueueReturn_(ret);
             return;
         }
+
+        // Base offset assigned by appendNoSyncRestamp (authoritative).
+        ret.baseOffset = base;
+        ret.lastOffset = base + static_cast<int64_t>(op.lastOffsetDelta());
 
         // GR-4 Mode A seam: reconcile the replica's tracked LEO/HW.
         if (replica) {
@@ -2042,9 +2041,8 @@ private:
             return 1;
         }
 
-        // Copy the batch bytes so handleProduceBatch can restamp in place.
-        // The zero-copy Aeron view is only valid during this callback;
-        // we need a mutable local copy for the in-place restamp.
+        // Zero-copy: handleProduceBatch now takes a READ-ONLY view and the log
+        // restamps the base offset in place via pwritev — no mutable local copy.
         const std::span<const uint8_t> rbSpan = msg.recordBatch;
         if (rbSpan.empty()) {
             spdlog::warn("Worker {}: WorkerIngress: empty recordBatch topicId={} "
@@ -2055,11 +2053,6 @@ private:
             enqueueReturn_(ret);
             return 1;
         }
-
-        // Local mutable copy (one allocation per batch on this path — acceptable
-        // for the WorkerIngress path; the hot-path avoids this via the existing
-        // ingress_ ring which does a single copy into the ring).
-        std::vector<uint8_t> batchBuf(rbSpan.begin(), rbSpan.end());
 
         // E5.1.3 review fix #3: acksAll = (acks != 0).
         // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
@@ -2080,7 +2073,7 @@ private:
 
         // Call the shared produce helper.
         rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
-            batchBuf.data(), batchBuf.size(),
+            rbSpan.data(), rbSpan.size(),
             msg.topicId, msg.partition,
             msg.producerId, msg.producerEpoch, msg.baseSequence,
             *log, psm_,

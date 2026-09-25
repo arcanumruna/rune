@@ -1449,11 +1449,14 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // Guard: batch must fit in the restamp scratch.
-    if (batchLen > restampScratch_.size()) {
-        spdlog::warn("ClientGateway: Produce batch too large ({} > {}); dropped",
-                     batchLen, restampScratch_.size());
-        sendResp(pc::ErrorCode::Internal, partition, 0);
+    // Guard: reject an oversized batch LOUDLY (explicit MessageTooLarge), never
+    // silently drop.  The zero-copy append path has no fixed scratch cap anymore;
+    // this bound only protects the worker ingress ring / log segment from an
+    // absurd or malformed length.  The client caps its batch wire-size below this.
+    if (batchLen > maxProduceBatchBytes_) {
+        spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected (MessageTooLarge)",
+                     batchLen, maxProduceBatchBytes_);
+        sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
         return;
     }
 
@@ -1469,9 +1472,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // Copy the recordBatch bytes into the reusable restamp scratch.
-    // Both the worker path and the inline path operate on restampScratch_.
-    std::memcpy(restampScratch_.data(), msg.recordBatch.data(), batchLen);
+    // Zero-copy: the recordBatch is validated + appended directly from the
+    // read-only Aeron fragment (msg.recordBatch) — no restamp scratch copy.  The
+    // base offset is patched into the page cache by Log::appendNoSyncRestamp
+    // (inline path) or by the worker's appendNoSyncRestamp (worker path).
+    const uint8_t* rbData = msg.recordBatch.data();
 
     // ---------------------------------------------------------------------------
     // acks=All gateway-policy checks (bootstrap window + ISR gate).
@@ -1545,22 +1550,14 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // M1 fix: derive lastOffset from the CRC-covered lastOffsetDelta field
         // (kLastOffsetDeltaOffset=23, LE32) rather than trusting client recordCount.
         //
-        // Assign base offset and rewrite the LE64 at kBaseOffsetOffset.
-        // This field sits at bytes [0..7], BEFORE the CRC region that starts at
-        // kAttributesOffset (byte 21) — rewriting it is CRC-safe (identical to Kafka).
-        const int64_t base = log->logEndOffset();
-        {
-            uint64_t u = static_cast<uint64_t>(base);
-            for (int i = 0; i < 8; ++i) {
-                restampScratch_[static_cast<std::size_t>(rune::protocol::batch::kBaseOffsetOffset) + i] =
-                    static_cast<uint8_t>(u >> (i * 8));
-            }
-        }
+        // The base offset is NOT assigned here — the worker's appendNoSyncRestamp
+        // assigns it authoritatively when it appends (worker is the single writer).
+        // We validate the batch on the READ-ONLY fragment and forward it by view.
 
         // Read lastOffsetDelta (LE32 at kLastOffsetDeltaOffset=23).
         int32_t lastOffsetDelta = 0;
         {
-            const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kLastOffsetDeltaOffset;
+            const uint8_t* p = rbData + rune::protocol::batch::kLastOffsetDeltaOffset;
             lastOffsetDelta = static_cast<int32_t>(
                 static_cast<uint32_t>(p[0]) |
                 (static_cast<uint32_t>(p[1]) << 8) |
@@ -1571,7 +1568,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // Read recordCount (LE32 at kRecordCountOffset=57) for consistency validation only.
         int32_t recordCount = 0;
         {
-            const uint8_t* p = restampScratch_.data() + rune::protocol::batch::kRecordCountOffset;
+            const uint8_t* p = rbData + rune::protocol::batch::kRecordCountOffset;
             recordCount = static_cast<int32_t>(
                 static_cast<uint32_t>(p[0]) |
                 (static_cast<uint32_t>(p[1]) << 8) |
@@ -1598,7 +1595,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
         // CRC validation: reject corrupt batches before they touch the log.
         {
-            rune::protocol::RecordBatchReader reader(restampScratch_.data(), batchLen);
+            rune::protocol::RecordBatchReader reader(rbData, batchLen);
             if (!reader.ensureValid()) {
                 spdlog::warn("ClientGateway: Produce CRC mismatch (corrupt batch) → rejected (Internal)");
                 sendResp(pc::ErrorCode::Internal, partition, 0);
@@ -1679,16 +1676,16 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset);
         if (batchLen >= kAttrOffset + 2u) {
             op.batchAttrs = static_cast<uint16_t>(
-                static_cast<uint16_t>(restampScratch_[kAttrOffset]) |
-                (static_cast<uint16_t>(restampScratch_[kAttrOffset + 1u]) << 8));
+                static_cast<uint16_t>(rbData[kAttrOffset]) |
+                (static_cast<uint16_t>(rbData[kAttrOffset + 1u]) << 8));
         }
 
-        // Copy the restamped batch bytes into the op (worker-owned buffer).
-        // The worker will re-stamp the base offset with its own logEndOffset().
-        // The CRC region starts at kAttributesOffset=21 (after the base-offset
-        // field at [0..7]), so the re-stamp is CRC-safe.
-        op.recordBatchBytes.assign(restampScratch_.data(),
-                                   restampScratch_.data() + batchLen);
+        // Zero-copy: forward the batch by READ-ONLY view (aliases the Aeron
+        // fragment, valid for the synchronous tryEnqueueOp call below).  putTail
+        // copies it ONCE into the ring slot — no restampScratch_, no owning heap
+        // vector.  The worker's appendNoSyncRestamp assigns + patches the base
+        // offset (CRC-safe: base-offset field [0..7] precedes the CRC region).
+        op.recordBatchView = msg.recordBatch;
 
         // Enqueue to the worker.  tryEnqueueOp returns false if the ring is full
         // (back-pressure). In the cooperative single-thread model, the ring drains
@@ -1731,7 +1728,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                                  ? static_cast<int>(replica->isr().size()) : 0;
 
     const auto outcome = rune::node::handleProduceBatch(
-        restampScratch_.data(), batchLen,
+        rbData, batchLen,
         msg.topicId, partition,
         msg.producerId, msg.producerEpoch, msg.baseSequence,
         *log, producerStateManager_,
@@ -3744,30 +3741,15 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         const int64_t batchLen = static_cast<int64_t>(marker.size());
         if (batchLen == 0) return -1;
 
-        base = log->logEndOffset();
-
-        // Restamp the baseOffset field (LE64@0) in a scratch copy.
-        // We must not mutate the caller's span — copy into restampScratch_.
-        if (marker.size() > restampScratch_.size()) {
-            spdlog::warn("ClientGateway::appendControlRecord: marker too large ({} > {})",
-                         marker.size(), restampScratch_.size());
-            return -1;
-        }
-        std::memcpy(restampScratch_.data(), marker.data(), marker.size());
-        {
-            uint64_t u = static_cast<uint64_t>(base);
-            for (int i = 0; i < 8; ++i)
-                restampScratch_[static_cast<std::size_t>(i)] =
-                    static_cast<uint8_t>(u >> (i * 8));
-        }
-
-        // lastOffset: read lastOffsetDelta (LE32@23) from the stamped copy.
+        // Zero-copy restamp: read lastOffsetDelta (LE32@23) from the read-only
+        // marker span (we must not mutate the caller's span), then let
+        // appendNoSyncRestamp assign + patch the base offset via pwritev — no copy.
         int32_t lod = 0;
         {
             constexpr std::size_t kLodOff =
                 static_cast<std::size_t>(rune::protocol::batch::kLastOffsetDeltaOffset);
             if (marker.size() >= kLodOff + 4u) {
-                const uint8_t* p = restampScratch_.data() + kLodOff;
+                const uint8_t* p = marker.data() + kLodOff;
                 lod = static_cast<int32_t>(
                     static_cast<uint32_t>(p[0]) |
                     (static_cast<uint32_t>(p[1]) << 8) |
@@ -3775,15 +3757,15 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                     (static_cast<uint32_t>(p[3]) << 24));
             }
         }
-        const int64_t lastOffset = base + static_cast<int64_t>(lod >= 0 ? lod : 0);
 
         try {
-            log->appendNoSync(restampScratch_.data(), marker.size(), lastOffset);
+            log->appendNoSyncRestamp(marker.data(), marker.size(),
+                                     lod >= 0 ? lod : 0, base);
         } catch (const std::exception& ex) {
-            spdlog::error("ClientGateway::appendControlRecord: appendNoSync threw: {}", ex.what());
+            spdlog::error("ClientGateway::appendControlRecord: appendNoSyncRestamp threw: {}", ex.what());
             return -1;
         } catch (...) {
-            spdlog::error("ClientGateway::appendControlRecord: appendNoSync threw unknown exception");
+            spdlog::error("ClientGateway::appendControlRecord: appendNoSyncRestamp threw unknown exception");
             return -1;
         }
 

@@ -111,8 +111,15 @@ struct WorkerOp {
     int16_t producerEpoch = 0;
     int32_t baseSequence  = 0;
 
-    // The restamped RecordBatch bytes (copied from restampScratch_ at enqueue).
-    // Sized to the exact batch length.  Worker owns this buffer.
+    // The RecordBatch bytes for a Produce/AppendControlRecord op.  Two ways to
+    // supply the batch to tryEnqueueOp (which copies it ONCE into the ring slot):
+    //   - recordBatchView (preferred, zero-copy): a READ-ONLY span aliasing the
+    //     source batch (e.g. the Aeron produce fragment).  Valid only for the
+    //     duration of the synchronous tryEnqueueOp call.  When non-empty it is
+    //     used as the tail source and recordBatchBytes is ignored — NO heap copy.
+    //   - recordBatchBytes (legacy / owning): a heap vector.  Used only when
+    //     recordBatchView is empty.
+    std::span<const uint8_t> recordBatchView;
     std::vector<uint8_t> recordBatchBytes;
 
     // lastOffsetDelta from the RecordBatch header (kLastOffsetDeltaOffset=23, LE32).

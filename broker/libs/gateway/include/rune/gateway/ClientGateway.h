@@ -980,11 +980,13 @@ private:
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
 
-    // GB-2: Reusable restamp scratch for offset-assignment (single per-produce
-    // copy of the incoming RecordBatch bytes with baseOffset rewritten in place).
-    // Sized to the same max frame — avoids per-produce heap allocation.
-    // Single-writer: only accessed on the duty-cycle thread via handleProduce().
-    std::array<uint8_t, kScratchSize>    restampScratch_{};
+    // Max accepted produce-batch WIRE size.  A batch above this is rejected LOUDLY
+    // with MessageTooLarge (never silently dropped).  The zero-copy append path no
+    // longer needs a fixed restamp scratch — the base offset is patched into the
+    // page cache / ring slot via pwritev — so this bound only guards against an
+    // absurd/malformed length overrunning the worker ingress ring or a segment.
+    // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
+    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
