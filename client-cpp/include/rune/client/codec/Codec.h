@@ -377,6 +377,8 @@ struct PartitionEntryView {
     int32_t leaderId       = -1;
     int32_t leaderEpoch    = -1;
     int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
+    int32_t egressControlPort = 0; ///< read-rework: per-worker dynamic-MDC control port (0 = legacy egress)
+    int32_t egressStreamId   = 0;  ///< read-rework: per-worker egress stream id
 };
 
 // ---------------------------------------------------------------------------
@@ -441,6 +443,8 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
         pv.leaderId       = p.leaderId;
         pv.leaderEpoch    = p.leaderEpoch;
         pv.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
+        pv.egressControlPort = p.egressControlPort;  // read-rework: per-worker MDC egress
+        pv.egressStreamId  = p.egressStreamId;
         result.partitions.push_back(pv);
     }
 
