@@ -336,8 +336,8 @@ TEST(MetadataMessages, ResponseUnknownVersionReject)
     auto buf = buildRespBuf(0, 0, {}, {});
 
     // Patch version to unsupported value.
-    // kProtocolVersion is now 2 (E5.1 bump); use 3 to be unsupported.
-    buf[6] = 0x03;  // version=3 > kProtocolVersion(2)
+    // kProtocolVersion is now 3 (read-rework bump); use 4 to be unsupported.
+    buf[6] = 0x04;  // version=4 > kProtocolVersion(3)
     buf[7] = 0x00;
 
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
@@ -370,6 +370,8 @@ TEST(MetadataMessages, ResponseIngressStreamIdRoundTrip)
     p0.leaderId       = 5;
     p0.leaderEpoch    = 7;
     p0.ingressStreamId = 1001;
+    p0.egressControlPort = 40300;
+    p0.egressStreamId  = 2001;
 
     rpc::PartitionEntry p1;
     p1.topicId        = 1;
@@ -377,6 +379,8 @@ TEST(MetadataMessages, ResponseIngressStreamIdRoundTrip)
     p1.leaderId       = 6;
     p1.leaderEpoch    = 7;
     p1.ingressStreamId = 1002;
+    p1.egressControlPort = 40301;
+    p1.egressStreamId  = 2002;
 
     rpc::PartitionEntry p2;
     p2.topicId        = 2;
@@ -384,14 +388,16 @@ TEST(MetadataMessages, ResponseIngressStreamIdRoundTrip)
     p2.leaderId       = 5;
     p2.leaderEpoch    = 3;
     p2.ingressStreamId = 0;  // default — exercises zero-value path
+    p2.egressControlPort = 0;
+    p2.egressStreamId  = 0;
 
     auto buf = buildRespBuf(sid, corr, {}, {p0, p1, p2});
 
-    // encodedSize must reflect 3 * 20 = 60 bytes for partitions (not 48).
+    // encodedSize must reflect 3 * 28 = 84 bytes for partitions.
     constexpr std::size_t hdrBrokerPart = rpc::MessageHeader::ENCODED_SIZE
                                         + 2u   // brokerCount
                                         + 2u;  // partitionCount
-    EXPECT_EQ(buf.size(), hdrBrokerPart + 3u * 20u) << "stride must be 20 bytes/entry";
+    EXPECT_EQ(buf.size(), hdrBrokerPart + 3u * 28u) << "stride must be 28 bytes/entry";
 
     auto opt = rpc::MetadataResponse::decode(buf.data(), buf.size());
     ASSERT_TRUE(opt.has_value()) << "decode must succeed";
@@ -416,6 +422,14 @@ TEST(MetadataMessages, ResponseIngressStreamIdRoundTrip)
     EXPECT_EQ(opt->partitions[2].leaderId,         5);
     EXPECT_EQ(opt->partitions[2].leaderEpoch,      3);
     EXPECT_EQ(opt->partitions[2].ingressStreamId,  0);
+
+    // read-rework: egress control port + stream id round-trip (offsets +20, +24).
+    EXPECT_EQ(opt->partitions[0].egressControlPort, 40300);
+    EXPECT_EQ(opt->partitions[0].egressStreamId,    2001);
+    EXPECT_EQ(opt->partitions[1].egressControlPort, 40301);
+    EXPECT_EQ(opt->partitions[1].egressStreamId,    2002);
+    EXPECT_EQ(opt->partitions[2].egressControlPort, 0);
+    EXPECT_EQ(opt->partitions[2].egressStreamId,    0);
 
     // LE byte check for ingressStreamId=1001 (0x000003E9) at partition[0]+16.
     // partBase = hdrBrokerPart (no brokers).

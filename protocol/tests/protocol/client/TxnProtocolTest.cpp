@@ -640,7 +640,7 @@ TEST(TxnConformance, ByteExactInitProducerId) {
         0x04, 0x00,                          // blockLength = 4
         0x2D, 0x00,                          // templateId  = 45
         0x78, 0x00,                          // schemaId    = 120
-        0x02, 0x00,                          // version     = 2 (E5.1 bump)
+        0x03, 0x00,                          // version     = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         // Fixed body (4 bytes): transactionTimeoutMs = 60000 = 0x0000EA60
@@ -700,7 +700,7 @@ TEST(TxnConformance, ByteExactAddPartitionsToTxn) {
         0x0A, 0x00,                          // blockLength = 10
         0x2F, 0x00,                          // templateId  = 47
         0x78, 0x00,                          // schemaId    = 120
-        0x02, 0x00,                          // version     = 2 (E5.1 bump)
+        0x03, 0x00,                          // version     = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         // Fixed body (10 bytes): producerId(8) + producerEpoch(2)
@@ -783,7 +783,7 @@ TEST(TxnConformance, ByteExactTxnOffsetCommit) {
         0x0A, 0x00,                          // blockLength = 10
         0x33, 0x00,                          // templateId  = 51
         0x78, 0x00,                          // schemaId    = 120
-        0x02, 0x00,                          // version     = 2 (E5.1 bump)
+        0x03, 0x00,                          // version     = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         // Fixed body (10 bytes): producerId(8) + producerEpoch(2)
@@ -867,7 +867,7 @@ TEST(TxnConformance, ByteExactEndTxn) {
         0x0B, 0x00,                          // blockLength = 11
         0x35, 0x00,                          // templateId  = 53
         0x78, 0x00,                          // schemaId    = 120
-        0x02, 0x00,                          // version     = 2 (E5.1 bump)
+        0x03, 0x00,                          // version     = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         // Fixed body (11 bytes): producerId(8) + producerEpoch(2) + commit(1)

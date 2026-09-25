@@ -603,10 +603,11 @@ TEST(DispatchCheckFrame, UnsupportedVersionTwo) {
 }
 
 TEST(DispatchCheckFrame, UnsupportedVersionThree) {
-    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Connect), 3);
+    // version=3 is now kProtocolVersion (E5.1 bump) — use version=4 (truly unsupported).
+    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Connect), 4);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnsupportedVersion);
-    EXPECT_EQ(fc.version, 3u);
+    EXPECT_EQ(fc.version, 4u);
 }
 
 TEST(DispatchCheckFrame, UnsupportedVersion65535) {
@@ -636,13 +637,13 @@ TEST(DispatchCheckFrame, VersionZeroAccepted) {
 }
 
 TEST(DispatchCheckFrame, UnsupportedVersionDataTemplate) {
-    // Data template (tid=16 / Produce) at version > kProtocolVersion(2) → UnsupportedVersion.
-    // Use version=3 since version=2 is now kProtocolVersion (E5.1 bump).
+    // Data template (tid=16 / Produce) at version > kProtocolVersion(3) → UnsupportedVersion.
+    // Use version=4 since version=3 is now kProtocolVersion (E5.1 bump).
     // Version guard fires before template check — no mis-parse possible.
-    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Produce), 3);
+    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Produce), 4);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status,  rpc::FrameStatus::UnsupportedVersion);
-    EXPECT_EQ(fc.version, 3u);
+    EXPECT_EQ(fc.version, 4u);
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
 }
 
@@ -775,8 +776,8 @@ TEST(DispatchPeekTemplateId, NulloptForWrongSchema) {
 }
 
 TEST(DispatchPeekTemplateId, NulloptForUnsupportedVersion) {
-    // version=2 is now kProtocolVersion (E5.1 bump) — use version=3 (truly unsupported).
-    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 3);
+    // version=3 is now kProtocolVersion (E5.1 bump) — use version=4 (truly unsupported).
+    auto buf = makeValidHeaderBuf(static_cast<uint16_t>(rpc::TemplateId::Keepalive), 4);
     EXPECT_EQ(rpc::peekTemplateId(buf.data(), buf.size()), std::nullopt);
 }
 

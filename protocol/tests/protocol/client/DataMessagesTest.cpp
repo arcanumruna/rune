@@ -217,7 +217,7 @@ TEST(ProduceCodec, ByteExactness) {
         0x18, 0x00,                              // blockLength = 24
         0x10, 0x00,                              // templateId = 16
         0x78, 0x00,                              // schemaId = 120
-        0x02, 0x00,                              // version = 2 (E5.1 bump)
+        0x03, 0x00,                              // version = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         0x01, 0x00, 0x00, 0x00,                  // topicId = 1
@@ -580,7 +580,7 @@ TEST(ProduceResponseCodec, ByteExactness) {
         0x0E, 0x00,                              // blockLength = 14
         0x11, 0x00,                              // templateId = 17
         0x78, 0x00,                              // schemaId = 120
-        0x02, 0x00,                              // version = 2 (E5.1 bump)
+        0x03, 0x00,                              // version = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         0x00, 0x00,                              // errorCode = 0
@@ -1030,7 +1030,7 @@ TEST(SubscribeCodec, ByteExactness) {
         0x12, 0x00,                              // blockLength = 18
         0x12, 0x00,                              // templateId = 18
         0x78, 0x00,                              // schemaId = 120
-        0x02, 0x00,                              // version = 2 (E5.1 bump)
+        0x03, 0x00,                              // version = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         0x01, 0x00, 0x00, 0x00,                  // topicId = 1
@@ -1418,7 +1418,7 @@ TEST(RecordsCodec, ByteExactness) {
         0x18, 0x00,                              // blockLength = 24
         0x14, 0x00,                              // templateId = 20
         0x78, 0x00,                              // schemaId = 120
-        0x02, 0x00,                              // version = 2 (E5.1 bump)
+        0x03, 0x00,                              // version = 3 (E5.1 bump)
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
         0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // subscriptionId
