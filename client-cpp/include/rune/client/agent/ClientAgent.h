@@ -143,6 +143,14 @@ public:
     /// reuse immediately after this call returns).
     bool submitSend(const uint8_t* frame, std::size_t len) noexcept;
 
+    /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
+    /// subscription so the client receives Records pushed by the owning worker.
+    /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
+    /// thread during egress poll dispatch).  Forwards to the transport.
+    void addEgressSubscription(const std::string& controlChannel, int32_t streamId) noexcept {
+        transport_.addEgressSubscription(controlChannel, streamId);
+    }
+
     // -------------------------------------------------------------------------
     // Observers
     // -------------------------------------------------------------------------

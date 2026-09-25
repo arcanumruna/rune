@@ -1407,6 +1407,25 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         }
     }
 
+    // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
+    // partition whose owner advertises one (per-worker egress active on the broker).
+    // Control host = the leader broker's host; port/stream are per-partition (shared
+    // across partitions on the same worker → addEgressSubscription dedups).  Records
+    // then arrive on these subs and route by subscriptionId in the SubscriberHub.
+    // Agent-thread only (onMetadataResponse runs on the agent thread).
+    for (const auto& p : resp.partitions) {
+        if (p.egressControlPort == 0 || p.egressStreamId == 0) continue;
+        std::string_view host;
+        for (const auto& b : resp.brokers) {
+            if (b.nodeId == p.leaderId) { host = b.host; break; }
+        }
+        if (host.empty()) continue;
+        std::string ctrl = "aeron:udp?control-mode=dynamic|control=" +
+                           std::string(host) + ":" +
+                           std::to_string(p.egressControlPort) + "|fc=min";
+        agent_.addEgressSubscription(ctrl, p.egressStreamId);
+    }
+
     // Update partitionRouter partition counts from the response.
     // Derive per-topic partition count from the maximum partition number seen.
     // (The server sends all partitions for each topic in the response.)

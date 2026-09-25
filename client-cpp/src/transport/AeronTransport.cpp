@@ -132,6 +132,10 @@ void AeronTransport::stop() noexcept {
 
     // Step 1: Release the FragmentAssembler (no Aeron resources held directly).
     assembler_.reset();
+    // read-rework I4: release per-worker egress subscriptions + their assemblers
+    // BEFORE closing the aeron client (same recursive_mutex teardown reason as
+    // pubCache_ below — Subscription dtors deregister via the conductor).
+    egressSubs_.clear();
 
     // Step 2: Release pub/sub BEFORE closing the aeron client.
     //   Resetting shared_ptrs triggers deregistration commands into the conductor.
@@ -266,14 +270,64 @@ bool AeronTransport::offer(int32_t ingressStreamId,
 // ---------------------------------------------------------------------------
 
 int AeronTransport::poll(const Handler& handler, int fragmentLimit) {
-    if (!egressSub_ || !assembler_) return 0;
-
-    // Store handler pointer for this poll cycle.  The lambda in the
-    // FragmentAssembler reads pollHandler_ during the callback.
+    // Store handler pointer for this poll cycle.  Every FragmentAssembler lambda
+    // (default + per-worker) reads pollHandler_ during its callback.
     pollHandler_ = &handler;
-    const int frags = egressSub_->poll(assembler_->handler(), fragmentLimit);
+    int frags = 0;
+    // Default egress subscription (control responses + internal-partition Records).
+    if (egressSub_ && assembler_) {
+        frags += egressSub_->poll(assembler_->handler(), fragmentLimit);
+    }
+    // read-rework I4: per-worker dynamic-MDC egress subscriptions (pushed Records
+    // for user partitions when per-worker egress is active on the broker).
+    for (auto& [key, es] : egressSubs_) {
+        if (es.sub && es.assembler) {
+            frags += es.sub->poll(es.assembler->handler(), fragmentLimit);
+        }
+    }
     pollHandler_ = nullptr;
     return frags;
+}
+
+// ---------------------------------------------------------------------------
+// read-rework I4: open a per-worker dynamic-MDC egress subscription (idempotent).
+// ---------------------------------------------------------------------------
+
+void AeronTransport::addEgressSubscription(const std::string& controlChannel,
+                                           int32_t streamId) noexcept {
+    if (!aeron_ || streamId == 0 || controlChannel.empty()) return;
+    const std::string key = controlChannel + "#" + std::to_string(streamId);
+    if (egressSubs_.find(key) != egressSubs_.end()) return;  // already open
+
+    int64_t regId = -1;
+    try {
+        regId = aeron_->addSubscription(controlChannel, streamId);
+    } catch (...) {
+        return;  // bad channel — skip (never throw on the agent thread)
+    }
+
+    std::shared_ptr<aeron::Subscription> sub;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{kResolveMaxMs};
+    while (std::chrono::steady_clock::now() < deadline) {
+        try { sub = aeron_->findSubscription(regId); } catch (...) { break; }
+        if (sub) break;
+        std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
+    }
+    if (!sub) return;  // resolve timeout — skip; a later metadata cycle retries
+
+    EgressSubscription es;
+    es.sub = std::move(sub);
+    es.assembler = std::make_unique<aeron::FragmentAssembler>(
+        [this](aeron::concurrent::AtomicBuffer& buf,
+               aeron::util::index_t offset, aeron::util::index_t len,
+               aeron::Header&) {
+            if (pollHandler_) {
+                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                (*pollHandler_)(p, static_cast<std::size_t>(len));
+            }
+        });
+    egressSubs_.emplace(key, std::move(es));
 }
 
 // ---------------------------------------------------------------------------

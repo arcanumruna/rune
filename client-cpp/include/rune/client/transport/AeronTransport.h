@@ -113,10 +113,22 @@ public:
     /// worker stream id decoded from the metadata response.
     bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept;
 
-    /// Poll the egress Subscription through the FragmentAssembler.
-    /// For each fully reassembled frame calls handler(buf, len) with a zero-copy
-    /// view.  Returns the number of fragments processed.
+    /// Poll the default egress Subscription AND every per-worker dynamic-MDC egress
+    /// Subscription through their FragmentAssemblers.  For each fully reassembled
+    /// frame calls handler(buf, len) with a zero-copy view.  Returns the total
+    /// number of fragments processed across all egress subscriptions.
     int poll(const Handler& handler, int fragmentLimit);
+
+    /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
+    /// Subscription on controlChannel + streamId so the client receives Records
+    /// pushed by the OWNING worker's egress publication.  Learned from the
+    /// MetadataResponse (control host = leader broker host; port/stream per
+    /// partition).  Agent-thread only (single-writer, same contract as poll()).
+    /// Bounded resolve; on failure it logs nothing and skips (no throw) — the
+    /// worker's cursor only advances on a successful send, so a delayed/absent
+    /// subscription delays but never loses records.  Records route by
+    /// subscriptionId in the SubscriberHub regardless of which sub delivered them.
+    void addEgressSubscription(const std::string& controlChannel, int32_t streamId) noexcept;
 
     // -------------------------------------------------------------------------
     // Readiness
@@ -175,6 +187,18 @@ private:
     // on retarget() so the channel change is transparent to the caller.
     // Single-writer (agent thread only — same threading contract as offer/poll).
     std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>> pubCache_;
+
+    // ---- read-rework I4: per-worker dynamic-MDC egress subscription cache -------
+    // The client opens one Subscription per owning-worker control endpoint (from
+    // the MetadataResponse) and polls them all in poll().  Each Subscription needs
+    // its OWN FragmentAssembler — per-image reassembly state must not be shared
+    // across subscriptions.  Keyed by "channel#streamId".  Single-writer (agent
+    // thread only).  Cleared in stop() before the aeron client is released.
+    struct EgressSubscription {
+        std::shared_ptr<aeron::Subscription>      sub;
+        std::unique_ptr<aeron::FragmentAssembler> assembler;
+    };
+    std::unordered_map<std::string, EgressSubscription> egressSubs_;
 
     // ---- Lifecycle CAS flags (idempotent stop) --------------------------------
     std::atomic<bool> started_ {false};
