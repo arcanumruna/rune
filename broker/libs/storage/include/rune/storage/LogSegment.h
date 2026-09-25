@@ -9,6 +9,22 @@
 #include <unistd.h>
 namespace rune::storage {
 
+/// Zero-copy read result: a span into a segment's read-only mmap covering one or
+/// more WHOLE record batches (never a partial trailing batch).  No heap
+/// allocation, no copy — the bytes are the OS page-cache pages shared with the
+/// writer's fd.
+///
+/// Lifetime: valid until the next readView() on the SAME segment triggers a
+/// remap-on-grow, or the segment is destroyed/reloaded.  A caller must consume
+/// (encode/push) the span before issuing the next readView() on that segment.
+struct LogReadView {
+    const uint8_t* data       = nullptr; // pointer into the segment's read mmap
+    std::size_t    len        = 0;       // bytes spanned (whole record batches)
+    int64_t        baseOffset = 0;       // baseOffset of the FIRST batch in the view
+    int64_t        nextOffset = 0;       // lastOffset of the LAST batch + 1 (cursor advance)
+    bool empty() const noexcept { return data == nullptr || len == 0; }
+};
+
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.
 ///
 /// Durability policy:
@@ -68,6 +84,15 @@ public:
     void sync();
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
+
+    /// Zero-copy read: returns a span into a read-only mmap of the .log covering
+    /// whole record batches starting at the first batch whose lastOffset >=
+    /// startOffset, up to `maxBytes` (always at least one batch — progress
+    /// guarantee).  No heap allocation, no pread copy.  Returns an empty view if
+    /// startOffset is at/after the segment's next offset.  See LogReadView for
+    /// lifetime rules.  Non-const: may lazily create / grow-remap the read mmap.
+    LogReadView readView(int64_t startOffset, int32_t maxBytes);
+
     int64_t recover();
 
     int64_t baseOffset() const noexcept { return baseOffset_; }
@@ -142,6 +167,13 @@ private:
     /// Shared write core: update index, write bytes, advance nextOffset_.
     /// Does NOT call sync(). Called by append() and appendNoSync().
     int64_t writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset);
+
+    /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
+    /// readView() can return a span into the OS page cache.  Grow-remap when the
+    /// active segment has grown past the current mapping.  No-op for logSize_==0
+    /// (mmap of length 0 is EINVAL).  The read mmap shares the page cache with the
+    /// writer's fd, so appendNoSync()/flushed append() bytes are visible at once.
+    void ensureReadMap();
     int64_t baseOffset_; int32_t indexIntervalBytes_;
     int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
     std::string logPath_; std::fstream log_;
@@ -150,5 +182,12 @@ private:
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
+
+    // Lazy read-only mmap of the .log for zero-copy readView().  Created on the
+    // first readView() call (never for a write-only segment), grow-remapped when
+    // the active segment grows.  Separate O_RDONLY fd from the writer's fd_, but
+    // the same inode → shared page cache, so it observes committed appends.
+    std::unique_ptr<MappedFile> readMap_;
+    std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_
 };
 } // namespace rune::storage

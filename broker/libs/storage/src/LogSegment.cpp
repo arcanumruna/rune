@@ -239,6 +239,75 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
     }
 }
 
+void LogSegment::ensureReadMap() {
+    if (logSize_ <= 0) return;                       // mmap(len=0) is EINVAL
+    const std::size_t want = static_cast<std::size_t>(logSize_);
+    if (!readMap_) {
+        // Read-only mapping (writable=false → no ftruncate; never mutates .log).
+        readMap_ = std::make_unique<MappedFile>(logPath_, want, /*writable*/false);
+        readMapSize_ = want;
+    } else if (readMapSize_ < want) {
+        // Active segment grew — remap to expose the newly-committed bytes.  For a
+        // read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate.
+        readMap_->resize(want);
+        readMapSize_ = want;
+    }
+    // readMapSize_ > want (post-truncate) is memory-safe: readView() only accesses
+    // bytes in [0, logSize_), which are still backed by the file/page cache.
+}
+
+LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) {
+    if (logSize_ <= 0) return {};
+    ensureReadMap();
+    const uint8_t* base = readMap_ ? readMap_->data() : nullptr;
+    const std::size_t size = static_cast<std::size_t>(logSize_);
+    if (!base || size == 0) return {};
+
+    using rune::protocol::RecordBatchReader;
+    const std::size_t kOverhead =
+        static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+
+    // Locate the first batch whose lastOffset >= startOffset, scanning forward
+    // from the sparse-index position (which points at or before the target batch).
+    OffsetPosition op = index_->lookup(startOffset);
+    std::size_t pos = op.position > 0 ? static_cast<std::size_t>(op.position) : 0;
+    if (pos > size) pos = size;
+    std::size_t firstPos = size;   // sentinel: not found
+    int64_t firstBase = 0;
+    while (pos + kOverhead <= size) {
+        RecordBatchReader r(base + pos, size - pos);
+        int32_t total = r.totalLength();
+        // Torn / not-yet-fully-written tail — stop (readView never exposes it).
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > size) break;
+        const int64_t batchLast = r.baseOffset() + r.lastOffsetDelta();
+        if (batchLast >= startOffset) { firstPos = pos; firstBase = r.baseOffset(); break; }
+        pos += static_cast<std::size_t>(total);
+    }
+    if (firstPos == size) return {};   // offset not present in this segment
+
+    // Accumulate WHOLE batches from firstPos up to maxBytes.  Always include the
+    // first batch even if it alone exceeds maxBytes (progress guarantee).
+    const std::size_t cap = maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0;
+    std::size_t end = firstPos;
+    int64_t nextOff = firstBase;
+    while (end + kOverhead <= size) {
+        RecordBatchReader r(base + end, size - end);
+        int32_t total = r.totalLength();
+        if (total <= 0 || end + static_cast<std::size_t>(total) > size) break;
+        if (end != firstPos && cap > 0 &&
+            (end - firstPos) + static_cast<std::size_t>(total) > cap) break;
+        end += static_cast<std::size_t>(total);
+        nextOff = r.baseOffset() + r.lastOffsetDelta() + 1;
+    }
+
+    LogReadView v;
+    v.data       = base + firstPos;
+    v.len        = end - firstPos;
+    v.baseOffset = firstBase;
+    v.nextOffset = nextOff;
+    return v;
+}
+
 int64_t LogSegment::recover() {
     log_.seekg(0, std::ios::end);
     int64_t fileSize = log_.tellg();

@@ -70,6 +70,13 @@ public:
     /// before sync() has returned for that offset.
     int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset);
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
+
+    /// Zero-copy read: locate the segment containing startOffset and return a
+    /// span into its read-only mmap covering whole record batches (see
+    /// LogSegment::readView / LogReadView).  No heap allocation, no copy.  Returns
+    /// an empty view if startOffset is below logStartOffset() or at/after the LEO.
+    LogReadView readView(int64_t startOffset, int32_t maxBytes);
+
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     /// The lowest offset still readable from this log — the base offset of the
     /// first (oldest) on-disk segment.  Advances past 0 when retention/compaction
