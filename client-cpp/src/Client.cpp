@@ -415,14 +415,19 @@ void Client::runLoop() {
     //   yields, then parks up to 1 ms.  CPU-friendly for clients that do not
     //   need sub-millisecond reaction time.
     if (cfg_.idleMode == IdleMode::LowLatency) {
-        // Backoff (not a tight yield-loop): spin 5, yield 3, then park 1ms→15ms
-        // when idle.  A pure YieldingIdleStrategy pegs a core even with no work;
-        // this parks an idle client instead of burning CPU.
+        // Backoff (not a tight yield-loop): spin 5, yield 3, then park in the
+        // MICROSECOND range when idle.  The runner drives BOTH the producer drain
+        // and the egress ack-poll, so its park ceiling is the client-side floor on
+        // ack-delivery latency at low load: a park of 1ms→15ms (an earlier setting)
+        // left an arriving ack sitting until the runner woke, giving ~10ms p50 on a
+        // near-idle client.  A 1µs→100µs park keeps LowLatency genuinely low-latency
+        // (finer than Balanced's 1µs–1ms) while still parking a truly idle client so
+        // it does not peg a core.
         aeron::concurrent::BackoffIdleStrategy idleStrategy(
             /*maxSpins=*/5,
             /*maxYields=*/3,
-            /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000'000),   // 1 ms
-            /*maxParkNs=*/std::chrono::duration<long, std::nano>(15'000'000)); // 15 ms
+            /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000),      // 1 µs
+            /*maxParkNs=*/std::chrono::duration<long, std::nano>(100'000));   // 100 µs
 
         while (!stopped_.load(std::memory_order_acquire)) {
             const int64_t now = nowNs();
