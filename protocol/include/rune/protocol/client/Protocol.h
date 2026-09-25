@@ -75,6 +75,8 @@ enum class ErrorCode : uint16_t {
     InvalidTxnState      = 19,
     OutOfOrderSequence   = 20,
     DuplicateSequence    = 21,
+    // produce error codes
+    MessageTooLarge      = 22,  // produce batch exceeds the broker's max batch size
 };
 
 } // namespace rune::protocol::client
