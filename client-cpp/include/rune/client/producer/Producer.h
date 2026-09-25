@@ -65,7 +65,11 @@ struct ProducerConfig {
     int64_t lingerUs       = 5'000;      // max time to accumulate a batch (µs)
     int32_t batchBytes     = 64 * 1024;  // flush when a partition's builder reaches this
     int32_t batchRecords   = 0;          // flush when a partition's builder reaches this many records (0=disabled)
-    int32_t maxInFlight    = 4;          // max outstanding un-acked batches per partition
+    int32_t maxInFlight    = 32;         // max outstanding un-acked batches per partition
+                                          // (deep pipeline: throughput = outstanding / RTT;
+                                          //  Aeron's µs RTT means a shallow window throttles
+                                          //  hard — 32 batches keeps the pipe full while the
+                                          //  idempotent seq window / ackRing bound memory)
     int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
 
     /// Build a ProducerConfig from environment variables, falling back to

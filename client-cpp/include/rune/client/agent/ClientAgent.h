@@ -33,8 +33,7 @@
 #include <rune/client/codec/Codec.h>
 
 #include <concurrent/AtomicBuffer.h>
-#include <concurrent/ringbuffer/ManyToOneRingBuffer.h>
-#include <concurrent/ringbuffer/RingBufferDescriptor.h>
+#include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
 #include <atomic>
 #include <cstddef>
@@ -61,14 +60,16 @@ struct AgentConfig {
     session::SessionConfig session;
 
     // Ring buffer capacity — must be a power of two (bytes of usable space).
-    // Default: 64 KiB of usable space.
-    int32_t ringCapacity = 64 * 1024;
+    // Default: 256 KiB — absorbs command/send bursts without back-pressuring.
+    int32_t ringCapacity = 256 * 1024;
 
     // Maximum command records to drain from the ring per doWork call (bounded).
-    int ringDrainLimit = 16;
+    int ringDrainLimit = 128;
 
-    // Maximum fragments to poll from egress per doWork call (bounded).
-    int egressPollLimit = 16;
+    // Maximum fragments to poll from egress per doWork call (bounded).  This is the
+    // ack-return drain width — raised so a burst of ProduceResponses is drained in
+    // one cycle instead of trickling out 16 at a time.
+    int egressPollLimit = 256;
 };
 
 // ---------------------------------------------------------------------------
@@ -226,7 +227,7 @@ public:
     // Internal accessor for producer tests (CB-2): returns the ring buffer so
     // ProducerImpl can be constructed directly in test harnesses.
     // NOT part of the public API; production code must use Client::producer().
-    aeron::concurrent::ringbuffer::ManyToOneRingBuffer& ringForTesting() noexcept {
+    rune::client::detail::M2ORingBuffer& ringForTesting() noexcept {
         return ring_;
     }
 
@@ -293,8 +294,7 @@ private:
     // Stored as aligned raw bytes; AtomicBuffer wraps it.
     static constexpr std::size_t kRingAlignment = 64; // cache-line aligned
     std::unique_ptr<uint8_t, void(*)(void*)> ringBuf_;
-    aeron::concurrent::AtomicBuffer          ringAtomicBuf_;
-    aeron::concurrent::ringbuffer::ManyToOneRingBuffer ring_;
+    rune::client::detail::M2ORingBuffer      ring_;
 
     // ---- Lifecycle -----------------------------------------------------------
     std::atomic<bool> started_ {false};

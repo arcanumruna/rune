@@ -415,7 +415,14 @@ void Client::runLoop() {
     //   yields, then parks up to 1 ms.  CPU-friendly for clients that do not
     //   need sub-millisecond reaction time.
     if (cfg_.idleMode == IdleMode::LowLatency) {
-        aeron::concurrent::YieldingIdleStrategy idleStrategy;
+        // Backoff (not a tight yield-loop): spin 5, yield 3, then park 1ms→15ms
+        // when idle.  A pure YieldingIdleStrategy pegs a core even with no work;
+        // this parks an idle client instead of burning CPU.
+        aeron::concurrent::BackoffIdleStrategy idleStrategy(
+            /*maxSpins=*/5,
+            /*maxYields=*/3,
+            /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000'000),   // 1 ms
+            /*maxParkNs=*/std::chrono::duration<long, std::nano>(15'000'000)); // 15 ms
 
         while (!stopped_.load(std::memory_order_acquire)) {
             const int64_t now = nowNs();

@@ -220,6 +220,25 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # Network-hop throughput load client (batched/pipelined produce over Aeron).
+    add_executable(rune_produce_throughput
+        examples/rune_produce_throughput.cpp
+    )
+    target_include_directories(rune_produce_throughput PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_produce_throughput PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_produce_throughput PRIVATE ${UUID_LIB})
+        endif()
+    endif()
+
     # DR-1 — configurable disaster-recovery driver (rune-broker/dr-e2e harness)
     add_executable(dr_client
         examples/dr_client.cpp

@@ -135,8 +135,15 @@ void AeronTransport::stop() noexcept {
 
     // Step 2: Release pub/sub BEFORE closing the aeron client.
     //   Resetting shared_ptrs triggers deregistration commands into the conductor.
+    //   pubCache_ (per-worker ingress ExclusivePublications) MUST be released here
+    //   too.  Each ExclusivePublication's destructor calls
+    //   ClientConductor::releaseExclusivePublication(), which locks the conductor's
+    //   admin mutex.  If left to member-teardown they outlive aeron_.reset() below
+    //   and lock a destroyed recursive_mutex → EINVAL → std::terminate (observed on
+    //   client shutdown whenever per-worker ingress had populated the cache).
     ingressPub_.reset();
     egressSub_.reset();
+    pubCache_.clear();
 
     // Step 3: Close the Aeron C++ client (joins the conductor thread; the
     //   conductor's onClose() flushes remaining commands into the CnC ring).

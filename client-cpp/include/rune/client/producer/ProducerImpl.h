@@ -40,8 +40,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <concurrent/AtomicBuffer.h>
-#include <concurrent/ringbuffer/ManyToOneRingBuffer.h>
-#include <concurrent/ringbuffer/RingBufferDescriptor.h>
+#include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
 #include <atomic>
 #include <chrono>
@@ -98,7 +97,19 @@ inline constexpr int kT2TokenSize     = 21;  // total bytes
 inline constexpr uint8_t kFlagWantAck = 0x01;
 
 // Default ring capacity for a producer (per-producer, separate from agent ring).
-inline constexpr int32_t kDefaultProducerRingCap = 256 * 1024; // 256 KiB
+// This is the app→agent handoff buffer (Kafka's buffer.memory analogue): sized to
+// absorb produce bursts before Producer::send() back-pressures.  2 MiB holds
+// several thousand in-flight SEND_RECORDs so a bursty app is not throttled by the
+// agent's drain cadence.
+inline constexpr int32_t kDefaultProducerRingCap = 2 * 1024 * 1024; // 2 MiB
+
+// Per-partition ack-ring capacity (entries; MUST be a power of two).  Holds the
+// corrIds of outstanding (sent, not-yet-acked) records for one partition so
+// ProduceResponse can fan out baseOffset+i to each.  Sized to comfortably exceed
+// the in-flight record count for a partition (maxInFlight batches × batch size);
+// if it ever fills, drainRing force-flushes + stops draining so the producer ring
+// applies backpressure (no corrId is ever dropped).  8 bytes/entry.
+inline constexpr uint32_t kAckRingCapacity = 16384; // 128 KiB/partition
 
 // ---------------------------------------------------------------------------
 // Tier2Entry — pre-built RecordBatch bytes waiting for agent-thread processing.
@@ -145,9 +156,26 @@ struct PartitionState {
     bool flushRequested = false;
 
     // Pending correlationId for the current batch (0 = acks::None or not set).
-    // Populated from the SEND_RECORD's corrId field when wantAck=true.
-    // Used in flushBatches so the Produce frame carries the app-registered corrId.
+    // This is the WIRE corrId the Produce frame carries — the FIRST ack-wanting
+    // record's corrId in the current batch.  The broker echoes it on the
+    // ProduceResponse, which the client uses to look up the batch and fan out.
     int64_t pendingCorrId = 0;
+
+    // Per-record ack fan-out, ZERO-ALLOC ring.  corrIds are NOT contiguous within
+    // a partition (a producer spread across N partitions strides corrIds), so we
+    // cannot use a (base,count) pair — we must remember each record's corrId.
+    // ackRing is a per-partition ring of corrIds in batch-append order,
+    // preallocated ONCE (never per-batch); each flushed batch owns the contiguous
+    // slice [batchAckStart, batchAckStart+batchAckCount).  On ProduceResponse the
+    // slice is walked: corrId = ackRing[(start+i) & ackMask] resolves at
+    // baseOffset + i.  ackTail advances as batches ack (FIFO per partition), so
+    // (ackHead - ackTail) is the outstanding count for overflow backpressure.
+    std::vector<int64_t> ackRing;        // preallocated corrId ring (agent-thread only)
+    uint32_t             ackMask       = 0; // ackRing.size() - 1 (size is pow2)
+    uint64_t             ackHead       = 0; // next write index (monotonic)
+    uint64_t             ackTail       = 0; // oldest unacked index (monotonic)
+    uint64_t             batchAckStart = 0; // ackHead at start of current batch
+    int32_t              batchAckCount = 0; // ack-wanting records in current batch
 
     // Tier-2 batches queued for this partition (agent-thread only, no mutex).
     // Populated by drainRing() when kMsgTier2Batch token is processed.
@@ -247,7 +275,10 @@ public:
     // ---- Agent-thread API (single-writer) ------------------------------------
 
     /// Drain SEND_RECORD ring messages, append to builders.
-    /// Does NOT flush — call flushBatches() after.
+    /// Does NOT flush — call flushBatches() after.  Applies a drain gate: if any
+    /// partition is at batchBytes AND at maxInFlight, returns 0 without reading so
+    /// the producer ring back-pressures the app (bounds every builder to a
+    /// sendable size).
     /// nowNs: current time (NanoClock, sampled once per doWork cycle).
     /// Returns count of records drained.
     int drainRing(int64_t nowNs);
@@ -371,6 +402,11 @@ private:
 
     PartitionState& getOrCreatePartition(int32_t topicId, int32_t partition);
 
+    /// Double a partition's ack-ring, preserving live entries [ackTail, ackHead).
+    /// Called only on overflow (deep single-partition pipeline); steady state
+    /// never reallocs.
+    void growAckRing(PartitionState& ps);
+
     bool encodeAndSend(PartitionState& ps,
                        int64_t nowNs,
                        int64_t sessionId,
@@ -402,8 +438,7 @@ private:
     // ClientAgent command ring (agent command type IDs 1-4 are unrelated).
     static constexpr std::size_t kRingAlignment = 64; // cache-line aligned
     std::unique_ptr<uint8_t, void(*)(void*)> ringBuf_;
-    aeron::concurrent::AtomicBuffer          ringAtomicBuf_;
-    aeron::concurrent::ringbuffer::ManyToOneRingBuffer ring_;
+    rune::client::detail::M2ORingBuffer      ring_;
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 
@@ -435,6 +470,12 @@ private:
         int32_t              ingressStreamId = 0; // E5.1: per-worker stream for redirect resend
         std::vector<uint8_t> wireFrame;   // CB-5 B: encoded Produce bytes for redirect resend
         int32_t              redirectCount = 0; // bounded redirect attempts
+        // Per-record ack fan-out (zero-alloc): this batch owns the ackRing slice
+        // [ackStart, ackStart+ackCount).  onProduceResponse resolves
+        // corrId = ackRing[(ackStart+i) & ackMask] with (baseOffset+i).
+        // ackCount==0 for acks=None batches.
+        uint64_t             ackStart = 0;
+        int32_t              ackCount = 0;
     };
     std::map<int64_t, BatchInfo> batchMap_;
 

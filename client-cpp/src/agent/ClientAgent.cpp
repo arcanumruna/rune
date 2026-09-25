@@ -47,9 +47,9 @@ makeAlignedBuffer(std::size_t size, std::size_t align)
 }
 
 /// Compute the total ring buffer bytes needed for a given usable capacity.
-/// = ringCapacity (power-of-two) + RingBufferDescriptor::TRAILER_LENGTH.
+/// = ringCapacity (power-of-two) + M2ORingBuffer trailer.
 int32_t ringTotalBytes(int32_t cap) noexcept {
-    return cap + aeron::concurrent::ringbuffer::RingBufferDescriptor::TRAILER_LENGTH;
+    return cap + rune::client::detail::M2ORingBuffer::trailerLength();
 }
 
 } // anonymous namespace
@@ -65,9 +65,7 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     , ringBuf_(makeAlignedBuffer(
           static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)),
           kRingAlignment))
-    , ringAtomicBuf_(ringBuf_.get(),
-                     ringTotalBytes(cfg_.ringCapacity))
-    , ring_(ringAtomicBuf_)
+    , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
 {}
 

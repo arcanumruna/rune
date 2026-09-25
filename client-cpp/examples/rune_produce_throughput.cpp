@@ -101,6 +101,16 @@ int main() {
     const int64_t keys = envI64("RUNE_BENCH_KEYS", partitions > 0 ? partitions : 1);
 
     ProducerConfig pcfg = ProducerConfig::fromEnv();
+    // Acks + pipeline depth overrides (fromEnv only covers linger/batch).
+    // For WAN throughput, acks=none (fire-and-forget streaming) + a deep
+    // maxInFlight are what let batching hide the round-trip latency.
+    if (const char* a = std::getenv("RUNE_BENCH_ACKS")) {
+        const std::string am = a;
+        pcfg.acks = (am == "leader") ? Acks::Leader
+                  : (am == "all")    ? Acks::All
+                                     : Acks::None;
+    }
+    pcfg.maxInFlight = static_cast<int32_t>(envI64("RUNE_BENCH_MAX_IN_FLIGHT", pcfg.maxInFlight));
     std::cerr << "THROUGHPUT bench: mode=" << mode
               << " records=" << nRecords << " value=" << valueBytes
               << " topic=" << cfg.topics[0].name << " partitions=" << partitions
@@ -132,10 +142,28 @@ int main() {
 
         if (mode == "acked") {
             std::atomic<uint64_t> acked{0};
+            std::atomic<uint64_t> sent{0};
             std::vector<int64_t> lat;                 // ack latency samples (ns), sparse
             lat.reserve(1 << 16);
             std::atomic<uint64_t> sampleGate{0};
             const auto t0 = clk::now();
+            // DIAG: sample sent/acked every 250ms to see whether acks arrive as a
+            // steady rate or in bursts (RUNE_BENCH_PROGRESS=1 to enable).
+            std::atomic<bool> progDone{false};
+            std::thread prog;
+            if (std::getenv("RUNE_BENCH_PROGRESS")) {
+                prog = std::thread([&]{
+                    uint64_t lastA = 0, lastS = 0;
+                    while (!progDone.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                        const uint64_t a = acked.load(), s = sent.load();
+                        std::cerr << "  t+prog sent=" << s << " (+" << (s-lastS)*4
+                                  << "/s) acked=" << a << " (+" << (a-lastA)*4
+                                  << "/s) inflight=" << (s-a) << "\n";
+                        lastA = a; lastS = s;
+                    }
+                });
+            }
             for (int64_t i = 0; i < nRecords; ++i) {
                 // bounded outstanding — backpressure like Kafka buffer.memory
                 while (static_cast<int64_t>(i - acked.load(std::memory_order_acquire)) >= window)
@@ -149,10 +177,13 @@ int main() {
                                lat.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    clk::now() - sendTs).count());
                        });
+                sent.fetch_add(1, std::memory_order_release);
             }
             p.flush();
             while (acked.load(std::memory_order_acquire) < static_cast<uint64_t>(nRecords))
                 std::this_thread::yield();
+            progDone.store(true, std::memory_order_release);
+            if (prog.joinable()) prog.join();
             const auto t1 = clk::now();
             const double secs = std::chrono::duration<double>(t1 - t0).count();
             const double rps = nRecords / secs;
@@ -174,20 +205,20 @@ int main() {
             for (int64_t i = 0; i < nRecords; ++i) {
                 p.send(th, Key(static_cast<uint64_t>(i % keys)), std::span<const uint8_t>(val));
                 ++attempted;
-                // light pacing: keep the app from lapping the agent ring too hard
-                if ((attempted & 0x3FFF) == 0) {
-                    const uint64_t sent = p.recordsSent() - r0;
-                    while (attempted - sent > window) {
+                // Bounded backpressure: let the agent catch up but NEVER hang.
+                // Cap the spin so a stalled/gated agent can't wedge the fire loop.
+                if ((attempted & 0xFFF) == 0) {
+                    for (int spin = 0; spin < 200000; ++spin) {
+                        if (attempted - (p.recordsSent() - r0) <= static_cast<uint64_t>(window)) break;
                         std::this_thread::yield();
-                        const uint64_t s2 = p.recordsSent() - r0;
-                        if (attempted - s2 <= window) break;
                     }
                 }
             }
             p.flush();
-            // drain: wait until the agent has processed all it will
+            // drain: wait until the agent stops making progress, or a hard cap.
+            const auto drainDeadline = clk::now() + std::chrono::seconds(30);
             uint64_t last = 0; int stable = 0;
-            while (stable < 20) {
+            while (stable < 40 && clk::now() < drainDeadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 const uint64_t sent = p.recordsSent() - r0;
                 if (sent == last) ++stable; else { stable = 0; last = sent; }
