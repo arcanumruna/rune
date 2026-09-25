@@ -753,6 +753,17 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (false = gateway fanout is live path).
 
+    // --- RUNE_PER_WORKER_EGRESS (optional, default false) — read-rework T3/T4 ---
+    // When "1"/"true", each worker gets its own dynamic-MDC egress publication and
+    // the gateway routes Subscribe/Unsubscribe to the owning worker (worker pushes
+    // its owned partitions directly).  Default false: gateway push is the live path.
+    if (const char* pwe = getenv_fn("RUNE_PER_WORKER_EGRESS")) {
+        if (pwe && !std::string_view(pwe).empty()) {
+            std::string_view sv(pwe);
+            cfg.perWorkerEgressEnabled = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+
     return {std::move(cfg), {}};
 }
 

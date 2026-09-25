@@ -1015,7 +1015,7 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     TempDir tmp{"egress_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
     cfg.workerCount             = 2;
-    cfg.perWorkerIngressEnabled = true;
+    cfg.perWorkerEgressEnabled  = true;   // read-rework: gates egress creation
     // Distinct control ports/streams to avoid collision with other tests' endpoints.
     cfg.workerEgressControlHost     = "127.0.0.1";
     cfg.workerEgressControlBasePort = 40360;

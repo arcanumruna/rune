@@ -190,6 +190,31 @@ TEST(NodeConfigTest, NonIntWorkerEgressBaseStreamIsError) {
     EXPECT_FALSE(r.config.has_value());
 }
 
+TEST(NodeConfigTest, PerWorkerEgressFlagDefaultsFalseAndParses) {
+    // Default (unset) → false.
+    {
+        auto r = parseNodeConfig(fakeEnv(base3node()));
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_FALSE(r.config->perWorkerEgressEnabled);
+    }
+    // "1"/"true"/"TRUE" → true.
+    for (const char* v : {"1", "true", "TRUE"}) {
+        auto env = base3node();
+        env["RUNE_PER_WORKER_EGRESS"] = v;
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_TRUE(r.config->perWorkerEgressEnabled) << "value=" << v;
+    }
+    // Other non-empty → false.
+    {
+        auto env = base3node();
+        env["RUNE_PER_WORKER_EGRESS"] = "no";
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_FALSE(r.config->perWorkerEgressEnabled);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Missing required variables (5 cases)
 // ---------------------------------------------------------------------------

@@ -636,33 +636,6 @@ void BrokerNode::buildWorkerPool() {
             workerPool_->worker(i).setWorkerIngress(ing.get(), /*active=*/ing->resolved());
             workerIngresses_.push_back(std::move(ing));
         }
-
-        // read-rework T3/T4 (I1b): per-worker dynamic-MDC EGRESS publication.
-        // Each worker owns ONE ExclusivePublication it alone writes; consumers
-        // self-register via control-mode=dynamic.  Control address = host:(base+W),
-        // streamId = egressBase + W.  Resolve egressBase to keep ingress/egress
-        // stream ranges non-overlapping.
-        int32_t egressBase = config_.workerEgressBaseStreamId;
-        if (egressBase <= 0) egressBase = baseStream + wc;   // just past the ingress range
-        workerEgresses_.reserve(static_cast<std::size_t>(wc));
-        for (int32_t i = 0; i < wc; ++i) {
-            const int32_t     egStream = egressBase + i;
-            const std::string control  = config_.workerEgressControlHost + ":" +
-                std::to_string(config_.workerEgressControlBasePort + i);
-            auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
-            if (!eg->resolved()) {
-                spdlog::warn("BrokerNode[{}]: WorkerEgress for worker {} on stream {} "
-                             "control {} did not resolve within 5s — per-worker egress "
-                             "disabled for this worker",
-                             config_.nodeId, i, egStream, control);
-            } else {
-                spdlog::info("BrokerNode[{}]: WorkerEgress for worker {} wired on stream {} "
-                             "(dynamic-MDC control={})",
-                             config_.nodeId, i, egStream, control);
-            }
-            workerPool_->worker(i).setWorkerEgress(eg.get());
-            workerEgresses_.push_back(std::move(eg));
-        }
         // Gate the gateway produce fanout: when per-worker ingress is active,
         // produce arrives on each worker's dedicated stream — gateway must NOT also
         // enqueue to workerPool_ (that would double-process the same produce).
@@ -692,6 +665,50 @@ void BrokerNode::buildWorkerPool() {
     } else if (config_.perWorkerIngressEnabled && !aeron_) {
         spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_INGRESS=true but aeron_ is null — "
                      "per-worker ingress NOT activated (no embedded driver)",
+                     config_.nodeId);
+    }
+
+    // -----------------------------------------------------------------------
+    // read-rework T3/T4 (I1b/I3b): per-worker dynamic-MDC EGRESS publications.
+    //
+    // Independent of per-worker ingress.  Each worker owns ONE ExclusivePublication
+    // it alone writes; consumers self-register via control-mode=dynamic.  Control
+    // address = host:(basePort+W), streamId = egressBase + W.  egressBase defaults
+    // to workerIngressBaseStreamId + workerCount so the ingress/egress stream ranges
+    // never overlap.  When active, the gateway routes Subscribe/Unsubscribe to the
+    // owning worker and stops pushing user partitions itself (I3b).
+    // -----------------------------------------------------------------------
+    if (config_.perWorkerEgressEnabled && aeron_) {
+        int32_t egressBase = config_.workerEgressBaseStreamId;
+        if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
+        workerEgresses_.reserve(static_cast<std::size_t>(wc));
+        for (int32_t i = 0; i < wc; ++i) {
+            const int32_t     egStream = egressBase + i;
+            const std::string control  = config_.workerEgressControlHost + ":" +
+                std::to_string(config_.workerEgressControlBasePort + i);
+            auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
+            if (!eg->resolved()) {
+                spdlog::warn("BrokerNode[{}]: WorkerEgress for worker {} on stream {} "
+                             "control {} did not resolve within 5s — per-worker egress "
+                             "disabled for this worker",
+                             config_.nodeId, i, egStream, control);
+            } else {
+                spdlog::info("BrokerNode[{}]: WorkerEgress for worker {} wired on stream {} "
+                             "(dynamic-MDC control={})",
+                             config_.nodeId, i, egStream, control);
+            }
+            workerPool_->worker(i).setWorkerEgress(eg.get());
+            workerEgresses_.push_back(std::move(eg));
+        }
+        if (gateway_) {
+            gateway_->setPerWorkerEgressActive(true);
+            spdlog::info("BrokerNode[{}]: per-worker EGRESS ACTIVE — gateway routes "
+                         "Subscribe/Unsubscribe to owning workers (base stream {})",
+                         config_.nodeId, egressBase);
+        }
+    } else if (config_.perWorkerEgressEnabled && !aeron_) {
+        spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_EGRESS=true but aeron_ is null — "
+                     "per-worker egress NOT activated (no embedded driver)",
                      config_.nodeId);
     }
 

@@ -355,6 +355,19 @@ public:
         return perWorkerIngressActive_;
     }
 
+    // read-rework T3/T4 (I3b): setPerWorkerEgressActive — when active, the gateway
+    // ROUTES Subscribe/Unsubscribe for user partitions (topicId >= 0) to the owning
+    // worker via the ingress ring and STOPS pushing those partitions itself (the
+    // worker reads+encodes+pushes on its own dynamic-MDC egress).  Internal
+    // partitions (topicId < 0) stay gateway-pushed.  Default false (gateway push).
+    // Must be called before doWork() on the duty-cycle thread (single-writer).
+    void setPerWorkerEgressActive(bool active) noexcept {
+        perWorkerEgressActive_ = active;
+    }
+    [[nodiscard]] bool perWorkerEgressActive() const noexcept {
+        return perWorkerEgressActive_;
+    }
+
     // -----------------------------------------------------------------------
     // E5.1.3 (d): addWorkerOwnedLog — register a Log* as exclusively owned by
     // a worker for the R7 fix.
@@ -794,6 +807,13 @@ private:
     void handleMetadata     (const uint8_t* buf, std::size_t len);
     // GB-2: Produce handler — offset-assignment + leader-local append.
     void handleProduce      (const uint8_t* buf, std::size_t len);
+    // read-rework T3/T4 (I3b): route subscription lifecycle to the owning worker
+    // (per-worker egress).  Look up the Log/replica for (topicId, partition) and
+    // enqueue a Subscribe/Unsubscribe WorkerOp via workerPool_->tryEnqueueOp.
+    void forwardSubscribeToWorker_(int64_t subId, int64_t sessionId, int32_t topicId,
+                                   int32_t partition, int64_t nextOffset, uint8_t isolation,
+                                   bool isGroup, bool groupCarrierReceived);
+    void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
     // GB-3: Subscribe/Unsubscribe handlers.
     void handleSubscribe    (const uint8_t* buf, std::size_t len);
     void handleUnsubscribe  (const uint8_t* buf, std::size_t len);
@@ -983,6 +1003,12 @@ private:
     // Set via setPerWorkerIngressActive() from BrokerNode::buildWorkerPool()
     // when RUNE_PER_WORKER_INGRESS=true.
     bool perWorkerIngressActive_ = false;
+
+    // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions
+    // are routed to the owning worker (which pushes on its own egress) and the
+    // gateway's pushSubscriptions skips user partitions.  Set via
+    // setPerWorkerEgressActive() from BrokerNode when RUNE_PER_WORKER_EGRESS=true.
+    bool perWorkerEgressActive_ = false;
 
     // E5.1.3 (d) R7 fix: set of Log* pointers owned by workers.
     //

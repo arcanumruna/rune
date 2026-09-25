@@ -1890,6 +1890,48 @@ ClientGateway::resolvePublication(const std::string& channel, int32_t streamId)
 //
 // No heap allocation on the hot path (scratch_ is pre-allocated).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// read-rework T3/T4 (I3b): route subscription lifecycle to the owning worker.
+// ---------------------------------------------------------------------------
+void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
+                                              int32_t topicId, int32_t partition,
+                                              int64_t nextOffset, uint8_t isolation,
+                                              bool isGroup, bool groupCarrierReceived)
+{
+    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(topicId, partition) : nullptr;
+    const rune::replication::PartitionReplica* rep =
+        replicaRegistry_ ? replicaRegistry_->lookup(topicId, partition) : nullptr;
+
+    rune::node::WorkerOp op;
+    op.type                 = rune::node::WorkerOp::Type::Subscribe;
+    op.subscriptionId       = subId;
+    op.sessionId            = sessionId;
+    op.topicId              = topicId;
+    op.partition            = partition;
+    op.nextOffset           = nextOffset;
+    op.isolation            = isolation;
+    op.isGroup              = isGroup;
+    op.groupCarrierReceived = groupCarrierReceived;
+    op.logPtr               = log;
+    op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
+
+    if (!workerPool_->tryEnqueueOp(topicId, partition, std::move(op))) {
+        spdlog::warn("ClientGateway: worker ring full routing Subscribe subId={} "
+                     "topic={} partition={} — client may need to re-subscribe",
+                     subId, topicId, partition);
+    }
+}
+
+void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
+{
+    rune::node::WorkerOp op;
+    op.type           = rune::node::WorkerOp::Type::Unsubscribe;
+    op.subscriptionId = subId;
+    op.topicId        = topicId;
+    op.partition      = partition;
+    (void)workerPool_->tryEnqueueOp(topicId, partition, std::move(op));
+}
+
 void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode.
@@ -2160,6 +2202,17 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 
     subscriptions_.emplace(subId, std::move(sub));
 
+    // read-rework T3/T4 (I3b): when per-worker egress is active, route the push to
+    // the OWNING worker — it owns the cursor and pushes on its own dynamic-MDC
+    // egress.  User partitions only (internal topicId < 0 stay gateway-pushed).
+    // The gateway keeps its subscriptions_ record for setup/teardown; its
+    // pushSubscriptions() skips these subs (see the per-worker-egress guard there).
+    if (perWorkerEgressActive_ && workerPool_ && msg.topicId >= 0) {
+        forwardSubscribeToWorker_(subId, msg.sessionId, msg.topicId, partition,
+                                  nextOffset, msg.isolation,
+                                  /*isGroup=*/false, /*groupCarrierReceived=*/false);
+    }
+
     // Reply SubscribeResponse{OK, partition, subscriptionId}.
     sendResp(pc::ErrorCode::OK, partition, subId);
 
@@ -2180,6 +2233,15 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
         spdlog::debug("ClientGateway: Unsubscribe decode failed — dropped");
         return;
     }
+    // read-rework T3/T4 (I3b): tell the owning worker to drop the cursor too.
+    if (perWorkerEgressActive_ && workerPool_) {
+        auto it = subscriptions_.find(msgOpt->subscriptionId);
+        if (it != subscriptions_.end() && it->second.topicId >= 0) {
+            forwardUnsubscribeToWorker_(msgOpt->subscriptionId,
+                                        it->second.topicId, it->second.partition);
+        }
+    }
+
     const std::size_t removed = subscriptions_.erase(msgOpt->subscriptionId);
     spdlog::debug("ClientGateway: Unsubscribe subId={} removed={}",
                   msgOpt->subscriptionId, removed);
@@ -2243,6 +2305,12 @@ void ClientGateway::pushSubscriptions()
     if (subscriptions_.empty()) return;
 
     for (auto& [subId, sub] : subscriptions_) {
+        // read-rework T3/T4 (I3b): when per-worker egress is active the OWNING worker
+        // reads+encodes+pushes user partitions on its own dynamic-MDC egress — the
+        // gateway must NOT also push them (that would double-deliver).  Internal
+        // partitions (topicId < 0) are not worker-owned, so keep gateway-pushing them.
+        if (perWorkerEgressActive_ && sub.topicId >= 0) continue;
+
         // Find the owning session.
         Session* session = sessions_.find(sub.sessionId);
         if (!session) {

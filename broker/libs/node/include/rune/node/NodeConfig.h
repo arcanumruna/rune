@@ -371,6 +371,22 @@ struct NodeConfig {
     // Overridable via RUNE_PER_WORKER_INGRESS env var ("1" or "true" → true).
     bool perWorkerIngressEnabled = false;
 
+    // read-rework T3/T4: per-worker dynamic-MDC EGRESS flag.
+    //
+    // When true, BrokerNode::buildWorkerPool creates one dynamic-MDC WorkerEgress
+    // per worker and the gateway ROUTES Subscribe/Unsubscribe to the owning worker
+    // (via the ingress ring) instead of driving the push itself — each worker reads
+    // + encodes + pushes its owned partitions directly (shared-nothing, parallel).
+    // The gateway's own pushSubscriptions skips user partitions (topicId >= 0) when
+    // this is on; internal partitions (topicId < 0) stay gateway-pushed.
+    //
+    // DEFAULT: false — the gateway push remains the live path.  The production flip
+    // to true REQUIRES the client to subscribe to per-worker MDC control endpoints
+    // (I4) and must not happen before that.  Independent of perWorkerIngressEnabled.
+    //
+    // Overridable via RUNE_PER_WORKER_EGRESS env var ("1" or "true" → true).
+    bool perWorkerEgressEnabled = false;
+
     // CP-8: enable segment coalescing in the LogCleanerAgent.
     // When true (default), consecutive sealed segments that together fit within
     // each topic's segmentRollBytes are merged into a single output segment per
