@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  rune-internal-ring.xml — SBE schema for Rune's INTERNAL in-process ring-buffer
+  messages (worker op/return + async-flush request/completion).
+
+  IMPORTANT: these messages are PROCESS-LOCAL.  They travel only between threads in
+  one process over SPSC/MPSC byte rings, and some fields (replica, logPtr) are raw
+  in-process pointers carried as opaque uint64.  They MUST NOT be sent across a real
+  wire or persisted.  SBE is used here for the wrap-in-place flyweight codec (encode
+  directly into the claimed ring slot; decode a zero-copy view) and offset-safety —
+  NOT for cross-process schema evolution.
+
+  Distinct schemaId (7) from the client-facing wire schema (120).
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="rune.protocol.internal.sbe"
+                   id="7"
+                   version="0"
+                   semanticVersion="1.0"
+                   description="Rune internal in-process ring messages (process-local)"
+                   byteOrder="littleEndian">
+
+  <types>
+    <composite name="messageHeader" description="SBE message header (fixed 8 bytes)">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId"  primitiveType="uint16"/>
+      <type name="schemaId"    primitiveType="uint16"/>
+      <type name="version"     primitiveType="uint16"/>
+    </composite>
+
+    <!-- Variable-length raw byte tail (record batch / replicated records / isr /
+         owned-set / chunk — interpreted per the tailKind field). -->
+    <composite name="varDataEncoding" description="raw variable-length byte block">
+      <type name="length"  primitiveType="uint32" maxValue="1073741824"/>
+      <type name="varData" primitiveType="uint8" length="0"/>
+    </composite>
+
+    <!-- WorkerOp::Type -->
+    <enum name="OpType" encodingType="uint8">
+      <validValue name="PRODUCE">0</validValue>
+      <validValue name="PUSH_READ">1</validValue>
+      <validValue name="APPLY_REPLICATED">2</validValue>
+      <validValue name="BECOME_LEADER">3</validValue>
+      <validValue name="BECOME_FOLLOWER">4</validValue>
+      <validValue name="SET_OWNERSHIP">5</validValue>
+      <validValue name="FETCH_REQUEST">6</validValue>
+      <validValue name="OFFSETS_FOR_LEADER_EPOCH_REQ">7</validValue>
+      <validValue name="RECONCILE_FETCH_RESP">8</validValue>
+      <validValue name="APPEND_CONTROL_RECORD">9</validValue>
+      <validValue name="SUBSCRIBE">10</validValue>
+      <validValue name="UNSUBSCRIBE">11</validValue>
+    </enum>
+
+    <!-- Which variable field the tail holds (matches TailKind in WorkerWire.h). -->
+    <enum name="TailKind" encodingType="uint8">
+      <validValue name="NONE">0</validValue>
+      <validValue name="RECORD_BATCH">1</validValue>
+      <validValue name="REPLICATED_RECORDS">2</validValue>
+      <validValue name="ISR_LIST">3</validValue>
+      <validValue name="OWNED_SET">4</validValue>
+      <validValue name="CHUNK">5</validValue>
+    </enum>
+
+    <!-- WorkerReturn::Type -->
+    <enum name="ReturnType" encodingType="uint8">
+      <validValue name="PRODUCE_RESULT">0</validValue>
+      <validValue name="PUSH_READ_RESULT">1</validValue>
+    </enum>
+  </types>
+
+  <!-- ====================================================================== -->
+  <!-- WorkerOp (control/transport/bridge → worker)                            -->
+  <!-- ====================================================================== -->
+  <sbe:message name="WorkerOp" id="1" description="op sent to a Worker over its ingress ring">
+    <field name="opType"          id="1"  type="OpType"/>
+    <field name="topicId"         id="2"  type="int32"/>
+    <field name="partition"       id="3"  type="int32"/>
+    <!-- process-local raw pointers carried as opaque uint64 (never cross a wire) -->
+    <field name="replica"         id="4"  type="uint64"/>
+    <field name="logPtr"          id="5"  type="uint64"/>
+    <!-- produce fields -->
+    <field name="sessionId"       id="6"  type="int64"/>
+    <field name="correlationId"   id="7"  type="int64"/>
+    <field name="acks"            id="8"  type="int16"/>
+    <field name="producerId"      id="9"  type="int64"/>
+    <field name="producerEpoch"   id="10" type="int16"/>
+    <field name="baseSequence"    id="11" type="int32"/>
+    <field name="lastOffsetDelta" id="12" type="int32"/>
+    <field name="recordCount"     id="13" type="int32"/>
+    <field name="batchAttrs"      id="14" type="uint16"/>
+    <field name="deferAck"        id="15" type="uint8"/>
+    <field name="durabilityTier"  id="16" type="uint8"/>
+    <field name="enqueuedAtNs"    id="17" type="int64"/>
+    <!-- pushread / subscribe fields -->
+    <field name="subscriptionId"  id="18" type="int64"/>
+    <field name="nextOffset"      id="19" type="int64"/>
+    <field name="hwBound"         id="20" type="int64"/>
+    <field name="isolation"       id="21" type="uint8"/>
+    <field name="isGroup"         id="22" type="uint8"/>
+    <field name="groupCarrierReceived" id="23" type="uint8"/>
+    <!-- become leader/follower fields -->
+    <field name="roleEpoch"       id="24" type="int64"/>
+    <field name="roleLeaderId"    id="25" type="int32"/>
+    <!-- replicated payload scalars (also reused by ReconcileFetchResp) -->
+    <field name="replLeaderEpoch"    id="26" type="int32"/>
+    <field name="replPartition"      id="27" type="int32"/>
+    <field name="replHighWatermark"  id="28" type="int64"/>
+    <field name="replLogStartOffset" id="29" type="int64"/>
+    <field name="replErrorCode"      id="30" type="int16"/>
+    <field name="replTopicId"        id="31" type="int32"/>
+    <!-- FetchRequest (leader-side) fields -->
+    <field name="frLeaderEpoch"   id="32" type="int64"/>
+    <field name="frFollowerId"    id="33" type="int32"/>
+    <field name="frFetchOffset"   id="34" type="int64"/>
+    <field name="frMaxBytes"      id="35" type="int32"/>
+    <field name="frNowNs"         id="36" type="int64"/>
+    <!-- OffsetsForLeaderEpochReq fields -->
+    <field name="oleCurrentEpoch"   id="37" type="int64"/>
+    <field name="oleFollowerId"     id="38" type="int32"/>
+    <field name="oleRequestedEpoch" id="39" type="int64"/>
+    <field name="oleFollowerLeo"    id="40" type="int64"/>
+    <!-- which variable field the tail holds -->
+    <field name="tailKind"        id="41" type="TailKind"/>
+    <!-- variable tail (record batch / replicated records / isr / owned-set) -->
+    <data  name="tail"            id="42" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- WorkerReturn (worker → control over the return ring)                    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="WorkerReturn" id="2" description="result returned from a Worker over its return ring">
+    <field name="returnType"      id="1"  type="ReturnType"/>
+    <!-- ProduceResult fields -->
+    <field name="sessionId"       id="2"  type="int64"/>
+    <field name="correlationId"   id="3"  type="int64"/>
+    <field name="partition"       id="4"  type="int32"/>
+    <field name="baseOffset"      id="5"  type="int64"/>
+    <field name="lastOffset"      id="6"  type="int64"/>
+    <field name="errorCode"       id="7"  type="int16"/>
+    <field name="deferAck"        id="8"  type="uint8"/>
+    <field name="replica"         id="9"  type="uint64"/>  <!-- process-local pointer -->
+    <field name="producerId"      id="10" type="int64"/>
+    <field name="producerEpoch"   id="11" type="int16"/>
+    <field name="baseSequence"    id="12" type="int32"/>
+    <field name="recordCount"     id="13" type="int32"/>
+    <field name="topicId"         id="14" type="int32"/>
+    <field name="batchAttrs"      id="15" type="uint16"/>
+    <field name="enqueuedAtNs"    id="16" type="int64"/>
+    <!-- PushReadResult fields -->
+    <field name="subscriptionId"  id="17" type="int64"/>
+    <field name="readTopicId"     id="18" type="int32"/>
+    <field name="readPartition"   id="19" type="int32"/>
+    <field name="newNextOffset"   id="20" type="int64"/>
+    <field name="hwBound"         id="21" type="int64"/>
+    <field name="isolation"       id="22" type="uint8"/>
+    <field name="isGroup"         id="23" type="uint8"/>
+    <field name="groupCarrierReceived" id="24" type="uint8"/>
+    <!-- PushReadResult chunk (raw record-batch bytes) -->
+    <data  name="chunk"           id="25" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- FlushRequest (worker → flusher, async-durability submit ring)           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FlushRequest" id="3" description="async fdatasync submit">
+    <field name="fd"            id="1" type="int32"/>
+    <field name="flushBoundary" id="2" type="int64"/>
+    <field name="token"         id="3" type="int64"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- FlushCompletion (flusher → worker, async-durability completion ring)    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FlushCompletion" id="4" description="async fdatasync completion">
+    <field name="token"         id="1" type="int64"/>
+    <field name="flushBoundary" id="2" type="int64"/>
+    <field name="errorCode"     id="3" type="int32"/>
+  </sbe:message>
+
+</sbe:messageSchema>
