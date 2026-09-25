@@ -638,6 +638,18 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_worker_ingress_tests
             PROPERTIES TIMEOUT 60
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # read-rework T3/T4 I1: WorkerEgress — per-worker dynamic-MDC egress
+        # publication (UDP MDC driver).  Sole-writer send + fan-out delivery.
+        add_executable(rune_worker_egress_tests
+            tests/node/WorkerEgressTest.cpp)
+        target_link_libraries(rune_worker_egress_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_egress_tests
+            PROPERTIES TIMEOUT 60
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
