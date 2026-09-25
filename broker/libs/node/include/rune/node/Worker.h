@@ -149,11 +149,7 @@ public:
                     std::size_t ioComplDepth     = kIoCompletionDepth) noexcept
         : workerId_(workerId)
         , ingress_(static_cast<int>(ingressRingBytes))
-        , ingressScratch_(sizeof(WorkerOpWire) +
-                          static_cast<std::size_t>(ingress_.maxMsgLength()))
         , ret_(static_cast<int>(returnRingBytes))
-        , returnScratch_(sizeof(WorkerReturnWire) +
-                         static_cast<std::size_t>(ret_.maxMsgLength()))
         , io_(ioSubmitDepth, ioComplDepth)
     {
         durablePending_.reserve(kDurablePendingReserve);
@@ -292,14 +288,16 @@ public:
     // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
-        // Encode into the per-worker scratch (no heap allocation).
-        // ingressScratch_ is sized to sizeof(WorkerOpWire) + maxMsgLength(),
-        // which comfortably exceeds the largest produce batch (maxMsgLength = 1 MiB).
-        const std::size_t n = encodeWorkerOp(op, ingressScratch_.data(),
-                                             ingressScratch_.size());
-        // Write into the agrona ring (1 copy: scratch → ring).
-        // Returns false when the ring is full → back-pressure; caller must retry.
-        return ingress_.write(ingressScratch_.data(), n, workerOpMsgTypeId(op));
+        // Zero-copy: reserve the exact ring slot, then encode the op DIRECTLY into
+        // it (no scratch buffer, no scratch→ring copy).  tryClaim() returns < 0 when
+        // the ring is full → explicit back-pressure; the caller must hold and retry.
+        const std::size_t n = encodedWorkerOpSize(op);
+        const aeron::util::index_t idx =
+            ingress_.tryClaim(workerOpMsgTypeId(op), n);
+        if (idx < 0) return false;  // ring full — back-pressure
+        encodeWorkerOp(op, ingress_.base() + idx, n);
+        ingress_.commit(idx);
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -513,14 +511,17 @@ private:
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
     void enqueueReturn_(const WorkerReturn& ret) {
-        std::size_t n = 0;
+        // Zero-copy: reserve the exact ring slot then encode the return DIRECTLY into
+        // it (no returnScratch_ copy).  tryClaim() < 0 = explicit back-pressure.
+        const std::size_t n = encodedWorkerReturnSize(ret);
+        aeron::util::index_t idx;
         try {
-            n = encodeWorkerReturn(ret, returnScratch_.data(), returnScratch_.size());
+            idx = ret_.tryClaim(workerReturnMsgTypeId(ret), n);
         } catch (const std::exception& ex) {
-            spdlog::error("Worker {}: enqueueReturn_ encode failed: {}", workerId_, ex.what());
+            spdlog::error("Worker {}: enqueueReturn_ tryClaim failed: {}", workerId_, ex.what());
             return;
         }
-        if (!ret_.write(returnScratch_.data(), n, workerReturnMsgTypeId(ret))) {
+        if (idx < 0) {
             if (perWorkerIngressActive_) {
                 // G-A6: push to overflow queue instead of dropping.
                 // flushRetOverflow_ will retry on the next doWork cycle.
@@ -531,7 +532,10 @@ private:
                 spdlog::warn("Worker {}: ret_ ring full — WorkerReturn type={} dropped",
                              workerId_, static_cast<int>(ret.type));
             }
+            return;
         }
+        encodeWorkerReturn(ret, ret_.base() + idx, n);
+        ret_.commit(idx);
     }
 
     // -----------------------------------------------------------------------
@@ -1420,25 +1424,17 @@ private:
     int32_t workerId_;
     std::string threadName_; // "rune-wrk-<id>" — stable storage for name()
 
-    // R2: ingress ring — agrona OneToOneByteRing (SPSC, flat byte messages).
-    // Producer (control thread): tryEnqueueOp encodes into ingressScratch_ then write().
+    // R2: ingress ring — OneToOneByteRing (SPSC, flat byte messages).
+    // Producer (control thread): tryEnqueueOp tryClaim()s + encodes the WorkerOp
+    //   DIRECTLY into the claimed slot (zero-copy) + commit()s.
     // Consumer (worker thread):  drainIngress_ drains → zero-copy view → executeFromWire_.
     OneToOneByteRing ingress_;
 
-    // Per-worker encode scratch for ingress (producer-side, control-thread-owned).
-    // Sized to sizeof(WorkerOpWire) + ingress_.maxMsgLength() at construction.
-    // No alloc on the hot path — encodeWorkerOp writes into this buffer.
-    std::vector<uint8_t> ingressScratch_;
-
-    // R3: return ring — agrona OneToOneByteRing (SPSC, flat byte messages).
-    // Producer (worker thread): encodeWorkerReturn into returnScratch_ then ret_.write().
+    // R3: return ring — OneToOneByteRing (SPSC, flat byte messages).
+    // Producer (worker thread): enqueueReturn_ tryClaim()s + encodes the WorkerReturn
+    //   DIRECTLY into the claimed slot (zero-copy) + commit()s.
     // Consumer (control thread): drainReturn() drains → decode view → fn(WorkerReturn).
     OneToOneByteRing ret_;
-
-    // Per-worker encode scratch for return (producer-side, worker-thread-owned).
-    // Sized to sizeof(WorkerReturnWire) + ret_.maxMsgLength() at construction.
-    // No alloc on the hot path — encodeWorkerReturn writes into this buffer.
-    std::vector<uint8_t> returnScratch_;
 
     // Owned replica set — SHARED-NOTHING ([[rune-shared-nothing-law]]): a PLAIN
     // member touched ONLY by the worker thread. No atomic, no cross-thread read.
@@ -1667,17 +1663,20 @@ private:
         // We do this by calling ret_.write() directly here.
         while (!retOverflow_.empty()) {
             const WorkerReturn& ret = retOverflow_.front();
-            std::size_t n = 0;
+            const std::size_t n = encodedWorkerReturnSize(ret);
+            aeron::util::index_t idx;
             try {
-                n = encodeWorkerReturn(ret, returnScratch_.data(), returnScratch_.size());
+                idx = ret_.tryClaim(workerReturnMsgTypeId(ret), n);
             } catch (...) {
-                // Encode error: discard this entry and continue.
+                // Encode/size error: discard this entry and continue.
                 retOverflow_.erase(retOverflow_.begin());
                 continue;
             }
-            if (!ret_.write(returnScratch_.data(), n, workerReturnMsgTypeId(ret))) {
+            if (idx < 0) {
                 break; // ring still full — stop; retry next cycle
             }
+            encodeWorkerReturn(ret, ret_.base() + idx, n);  // zero-copy in place
+            ret_.commit(idx);
             retOverflow_.erase(retOverflow_.begin());
             ++flushed;
         }

@@ -187,6 +187,49 @@ inline int32_t workerReturnMsgTypeId(const WorkerReturn& ret) {
 }
 
 // ---------------------------------------------------------------------------
+// encodedWorkerOpSize — total encoded byte size (header + variable tail) of an
+// op, WITHOUT encoding.  Lets a producer tryClaim() the exact ring slot and then
+// encode in place (zero-copy).  MUST match encodeWorkerOp's tail selection below.
+// ---------------------------------------------------------------------------
+inline std::size_t encodedWorkerOpSize(const WorkerOp& op) {
+    std::size_t tail = 0;
+    switch (op.type) {
+    case WorkerOp::Type::Produce:
+    case WorkerOp::Type::AppendControlRecord:
+        tail = op.recordBatchBytes.size();
+        break;
+    case WorkerOp::Type::ApplyReplicated:
+    case WorkerOp::Type::ReconcileFetchResp:
+        tail = op.replicatedPayload.records.size();
+        break;
+    case WorkerOp::Type::BecomeLeader:
+        tail = op.isr.size() * sizeof(rune::replication::NodeId);
+        break;
+    case WorkerOp::Type::SetOwnership:
+        tail = op.ownedSet.size() * sizeof(uintptr_t);
+        break;
+    case WorkerOp::Type::PushRead:
+    case WorkerOp::Type::BecomeFollower:
+    case WorkerOp::Type::FetchRequest:
+    case WorkerOp::Type::OffsetsForLeaderEpochReq:
+    case WorkerOp::Type::Subscribe:
+    case WorkerOp::Type::Unsubscribe:
+        tail = 0;
+        break;
+    }
+    return sizeof(WorkerOpWire) + tail;
+}
+
+/// encodedWorkerReturnSize — total encoded size of a return (header + optional
+/// chunk tail), WITHOUT encoding.  MUST match encodeWorkerReturn's tail selection.
+inline std::size_t encodedWorkerReturnSize(const WorkerReturn& ret) {
+    const std::size_t tail =
+        (ret.type == WorkerReturn::Type::PushReadResult && !ret.chunk.empty())
+            ? ret.chunk.size() : 0;
+    return sizeof(WorkerReturnWire) + tail;
+}
+
+// ---------------------------------------------------------------------------
 // encodeWorkerOp — fill scratch with [WorkerOpWire][tail] and return total size.
 //
 // scratch must be at least sizeof(WorkerOpWire) + tailBytes large.
