@@ -3988,6 +3988,16 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                                     ? workerPool_->ownerWorkerId(topicId, partition)
                                     : 0))
                               : 0;
+            // read-rework T3/T4 (I4): advertise the per-worker dynamic-MDC egress
+            // endpoint so the client subscribes to the OWNING worker's control
+            // address + stream to receive this partition's pushed Records.  Control
+            // host = the leader BrokerEntry.host (client-side).  0 when inactive →
+            // client falls back to the legacy per-session egress.
+            if (perWorkerEgressActive_ && workerPool_) {
+                const int32_t wid = workerPool_->ownerWorkerId(topicId, partition);
+                p.egressControlPort = workerEgressControlBasePort_ + wid;
+                p.egressStreamId    = workerEgressBaseStreamId_ + wid;
+            }
             parts.push_back(p);
         }
     }

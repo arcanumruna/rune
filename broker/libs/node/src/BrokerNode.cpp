@@ -702,9 +702,11 @@ void BrokerNode::buildWorkerPool() {
         }
         if (gateway_) {
             gateway_->setPerWorkerEgressActive(true);
+            gateway_->setWorkerEgressParams(config_.workerEgressControlBasePort, egressBase);
             spdlog::info("BrokerNode[{}]: per-worker EGRESS ACTIVE — gateway routes "
-                         "Subscribe/Unsubscribe to owning workers (base stream {})",
-                         config_.nodeId, egressBase);
+                         "Subscribe/Unsubscribe to owning workers (base stream {}, "
+                         "control base port {})",
+                         config_.nodeId, egressBase, config_.workerEgressControlBasePort);
         }
     } else if (config_.perWorkerEgressEnabled && !aeron_) {
         spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_EGRESS=true but aeron_ is null — "

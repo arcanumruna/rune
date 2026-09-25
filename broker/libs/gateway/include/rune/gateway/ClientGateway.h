@@ -397,6 +397,15 @@ public:
         return workerIngressBaseStreamId_;
     }
 
+    // read-rework T3/T4 (I4): configure the per-worker dynamic-MDC egress params so
+    // handleMetadata can advertise each partition's egress control port + stream id
+    // (control port = base + ownerWorker; stream id = base + ownerWorker).  Only
+    // used when perWorkerEgressActive_.  Set by BrokerNode at activation.
+    void setWorkerEgressParams(int32_t controlBasePort, int32_t baseStreamId) noexcept {
+        workerEgressControlBasePort_ = controlBasePort;
+        workerEgressBaseStreamId_    = baseStreamId;
+    }
+
     // -----------------------------------------------------------------------
     // setMinIsr — configure the minimum ISR size gate for acks=All produces.
     // Default: 1 (single-node safe; for 3-node clusters, set to 2).
@@ -930,6 +939,8 @@ private:
     int32_t                              clientStreamId_;
     int32_t                              thisNodeId_;
     int32_t                              workerIngressBaseStreamId_ = 0;  // E5.1
+    int32_t                              workerEgressControlBasePort_ = 0; // read-rework I4
+    int32_t                              workerEgressBaseStreamId_    = 0; // read-rework I4
     int64_t                              sessionTimeoutNs_;
     int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;
