@@ -61,7 +61,7 @@ public:
     {
         if (!aeron_) return;  // null aeron_ → unresolved (unit tests w/o driver)
 
-        channel_ = "aeron:udp?control-mode=dynamic|control=" + controlEndpoint_ + "|fc=min";
+        channel_ = "aeron:udp?control-mode=dynamic|control=" + controlEndpoint_;
 
         int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
         using clock = std::chrono::steady_clock;
