@@ -161,6 +161,7 @@ public:
         pendingAcksAll_.reserve(kPendingAcksAllReserve);
         retOverflow_.reserve(kRetOverflowReserve);
         subs_.reserve(kSubsReserve);
+        egressScratch_.resize(kEgressScratchSize);
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
 
@@ -460,6 +461,12 @@ public:
             if (!replica) continue;
             work += replica->doWork(nowNs);
         }
+
+        // read-rework T3/T4 (I3): in-worker push — read owned partitions and push
+        // Records directly on this worker's egress.  Runs after replica doWork so
+        // the HW bound is fresh.  No-op unless subs_ is populated (Subscribe ops)
+        // AND a WorkerEgress is wired (pre-I3b: gateway still owns push → inert).
+        work += pushOwnedSubscriptions_(nowNs);
 
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
         for (auto* replica : owned_) {
@@ -767,6 +774,120 @@ private:
                 return;
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // read-rework T3/T4 (I3): in-worker push loop.  For each active owned
+    // subscription, zero-copy read whole batches from the cursor (Log::readView),
+    // encode each as a Records frame into egressScratch_, and push it directly on
+    // THIS worker's dynamic-MDC egress publication (workerEgress_).  Advance the
+    // cursor only on a successful send (back-pressure preserves at-least/exactly-
+    // once, same invariant as the gateway push path).
+    //
+    // Shared-nothing: reads only worker-owned state (subs_, the owned Log/replica,
+    // workerEgress_).  Zero heap alloc on the hot path (readView span + preallocated
+    // egressScratch_).  No locks/atomics.
+    //
+    // Bound: read_uncommitted → HW (replica->highWatermark(), or LEO passthrough).
+    // read_committed (LSO/aborted-txn) is NOT yet applied here — that txn state is
+    // gateway-owned; this path is HW-bounded (read_uncommitted) until it migrates.
+    // Control batches are skipped (never delivered to clients).
+    //
+    // Inert until Subscribe ops populate subs_ AND a WorkerEgress is wired, so it
+    // is a no-op in the pre-I3b configuration (gateway still owns push).
+    // -------------------------------------------------------------------
+    int pushOwnedSubscriptions_(int64_t /*nowNs*/) {
+        using namespace rune::protocol::batch;
+        namespace pc = rune::protocol::client;
+        if (!workerEgress_ || subs_.empty()) return 0;
+
+        int work = 0;
+        for (auto& s : subs_) {
+            if (!s.logPtr) continue;
+
+            // HW bound (read_uncommitted).  Worker owns the replica → live HW.
+            const int64_t bound = s.replica ? s.replica->highWatermark()
+                                            : s.logPtr->logEndOffset();
+            if (s.nextOffset >= bound) continue;
+
+            rune::storage::LogReadView view;
+            try {
+                view = s.logPtr->readView(s.nextOffset, kPushMaxChunkBytes);
+            } catch (...) {
+                continue;  // transient read error; retry next cycle
+            }
+            if (view.empty()) continue;
+
+            std::size_t pos = 0;
+            int pushed = 0;
+            bool backPressured = false;
+            while (pos < view.len && pushed < kPushBatchesPerSubPerCycle && !backPressured) {
+                constexpr std::size_t kMinHdr =
+                    static_cast<std::size_t>(kRecordCountOffset) + 4u;
+                if (pos + kMinHdr > view.len) break;  // partial header (should not happen: whole batches)
+                const uint8_t* bp = view.data + pos;
+
+                int64_t baseOffset = 0;
+                for (int i = 0; i < 8; ++i)
+                    baseOffset |= (static_cast<int64_t>(bp[kBaseOffsetOffset + i]) << (i * 8));
+                if (baseOffset >= bound) break;  // reached the HW bound
+
+                uint32_t lengthField = 0;
+                for (int i = 0; i < 4; ++i)
+                    lengthField |= (static_cast<uint32_t>(bp[kLengthOffset + i]) << (i * 8));
+                const std::size_t batchSize = 12u + static_cast<std::size_t>(lengthField);
+                if (pos + batchSize > view.len) break;  // incomplete batch at end
+
+                int32_t recordCount = 0;
+                for (int i = 0; i < 4; ++i)
+                    recordCount |= (static_cast<int32_t>(bp[kRecordCountOffset + i]) << (i * 8));
+
+                uint16_t attrs = static_cast<uint16_t>(
+                    static_cast<uint16_t>(bp[kAttributesOffset]) |
+                    (static_cast<uint16_t>(bp[kAttributesOffset + 1]) << 8));
+                constexpr uint16_t kControlBit = 0x20u;
+
+                if (recordCount < 1) {  // corrupt/empty — skip, make progress
+                    pos += batchSize;
+                    s.nextOffset = baseOffset + 1;
+                    continue;
+                }
+                if (attrs & kControlBit) {  // control marker — never delivered
+                    pos += batchSize;
+                    s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
+                    continue;
+                }
+
+                pc::Records rec;
+                rec.sessionId      = s.sessionId;
+                rec.correlationId  = 0;
+                rec.subscriptionId = s.subscriptionId;
+                rec.topicId        = s.topicId;
+                rec.partition      = s.partition;
+                rec.baseOffset     = baseOffset;
+                rec.recordBatch    = std::span<const uint8_t>(bp, batchSize);
+
+                const std::size_t needed =
+                    pc::MessageHeader::ENCODED_SIZE + pc::Records::BODY_FIXED + 4u + batchSize;
+                if (needed > egressScratch_.size()) {  // unencodable — skip forward
+                    pos += batchSize;
+                    s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
+                    continue;
+                }
+
+                const std::size_t encoded = rec.encode(egressScratch_.data());
+                const int64_t r = workerEgress_->send(egressScratch_.data(), encoded);
+                if (r > 0) {
+                    s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
+                    pos += batchSize;
+                    ++pushed;
+                    ++work;
+                } else {
+                    backPressured = true;  // retry from same cursor next cycle
+                }
+            }
+        }
+        return work;
     }
 
     // -------------------------------------------------------------------
@@ -1418,6 +1539,18 @@ private:
     // control-plane) Subscribe path.
     static constexpr std::size_t kSubsReserve = 4096;
     std::vector<WorkerSubscription> subs_;
+
+    // read-rework T3/T4 (I3): per-worker encode scratch for the in-worker push
+    // loop.  Holds one encoded Records frame (header + one whole record batch).
+    // Reused every push; NO per-batch heap allocation on the read hot path.
+    // Sized like the gateway's push scratch (68 KiB: 50-byte header + up to a
+    // 65535-byte u16-capped batch, rounded up).
+    static constexpr std::size_t kEgressScratchSize = 68 * 1024;
+    // Max whole batches pushed per subscription per doWork cycle (fairness).
+    static constexpr int         kPushBatchesPerSubPerCycle = 1024;
+    // Max bytes fetched per subscription per cycle via readView (matches gateway).
+    static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
+    std::vector<uint8_t> egressScratch_;
 
     // E5.1.2d: acks=all commit-wait pending list.
     //

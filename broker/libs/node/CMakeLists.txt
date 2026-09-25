@@ -662,6 +662,18 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_worker_subscribe_tests
             PROPERTIES TIMEOUT 60
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # read-rework T3/T4 I3a: in-worker read+encode+push loop over its own
+        # dynamic-MDC egress (UDP MDC driver + real disk Log + subscriber).
+        add_executable(rune_worker_push_tests
+            tests/node/WorkerPushTest.cpp)
+        target_link_libraries(rune_worker_push_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_push_tests
+            PROPERTIES TIMEOUT 120
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------
