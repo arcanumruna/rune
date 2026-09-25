@@ -287,6 +287,12 @@ public:
     }
     int32_t recordCount() const { return recordCount_; }
 
+    /// Exact encoded size of the accumulated record bodies so far (bytes).  The
+    /// full batch WIRE size is batch::kRecordBatchOverhead + bodyBytes().  Lets a
+    /// producer flush on true wire size (never overshoot the broker's max batch)
+    /// instead of approximating from value bytes.
+    std::size_t bodyBytes() const { return records_.size(); }
+
 private:
     int64_t baseOffset_, baseTimestamp_;
     int64_t maxTimestamp_    = baseTimestamp_;
