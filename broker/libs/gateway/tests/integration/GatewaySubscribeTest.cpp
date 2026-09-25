@@ -875,9 +875,16 @@ TEST_F(GatewaySubscribeFixture, BackPressure_ExactlyOnce_Gate)
 
     // GB-5 Fix #3: assert back-pressure actually occurred.
     //
+    // The production per-cycle cap is large (kMaxBatchesPerSubPerCycle=1024, raised
+    // for read throughput), so 20 batches would all deliver in one cycle and the
+    // pause path would never run.  Lower the cap to 8 for THIS test so the pause is
+    // exercised deterministically, independent of the production default.
+    constexpr int kTestPerCycleCap = 8;
+    gw_->setMaxBatchesPerSubPerCycleForTest(kTestPerCycleCap);
+    //
     // Strategy: run exactly ONE doWork() without draining the egress.  Since
-    // pushSubscriptions() caps delivery at kMaxBatchesPerSubPerCycle (8) and we
-    // have kBatches (20) > 8, the first doWork can deliver at most 8 batches.
+    // pushSubscriptions() now caps delivery at kTestPerCycleCap (8) and we have
+    // kBatches (20) > 8, the first doWork can deliver at most 8 batches.
     // Additionally, the tiny 64 KiB egress term + the ConnectResponse already
     // sent may fill the ring and cause tryClaim to return back-pressure (pos <= 0)
     // before the cap is hit.
@@ -886,7 +893,7 @@ TEST_F(GatewaySubscribeFixture, BackPressure_ExactlyOnce_Gate)
     // < kBatches — proving that pushSubscriptions() paused and that nextOffset was
     // preserved (no data loss).  The subsequent drain loop resumes delivery from
     // the exact saved offset, exercising the full pause/resume path.
-    gw_->doWork(nowNs()); // one doWork — capped at kMaxBatchesPerSubPerCycle=8
+    gw_->doWork(nowNs()); // one doWork — capped at kTestPerCycleCap=8
     egressSub->poll(combinedAsm.handler(), 32);
     const std::size_t afterOneDoWork = receivedBaseOffsets.size();
 
@@ -896,7 +903,7 @@ TEST_F(GatewaySubscribeFixture, BackPressure_ExactlyOnce_Gate)
     // Either condition means the pause path ran.
     EXPECT_LT(afterOneDoWork, static_cast<std::size_t>(kBatches))
         << "BP gate: expected partial delivery after one doWork() cycle "
-        << "(max-per-cycle=" << 8 << ", kBatches=" << kBatches << "). "
+        << "(max-per-cycle=" << kTestPerCycleCap << ", kBatches=" << kBatches << "). "
         << "Got " << afterOneDoWork << " — the pause/resume path was not reached.";
 
     // Now drive to completion (drain egress between doWork bursts).

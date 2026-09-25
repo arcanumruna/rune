@@ -1100,7 +1100,20 @@ private:
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription
     // per doWork() cycle.  Prevents one busy subscription from starving others.
+    // Default is the production value; the effective cap is the member below so a
+    // test can lower it to deterministically exercise the pause/resume path
+    // independent of the production default.
     static constexpr int kMaxBatchesPerSubPerCycle = 1024;
+    int maxBatchesPerSubPerCycle_ = kMaxBatchesPerSubPerCycle;
+
+public:
+    /// Test-only: override the per-cycle per-subscription batch cap.  Lets a test
+    /// force a partial first cycle (pause) at a small, cap-value-independent bound
+    /// while production keeps the 1024 default.  Not for hot-path use.
+    void setMaxBatchesPerSubPerCycleForTest(int n) noexcept {
+        if (n > 0) maxBatchesPerSubPerCycle_ = n;
+    }
+private:
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.
     // Bounded to avoid reading unbounded data from a fast-filling log.

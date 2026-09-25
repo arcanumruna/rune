@@ -2338,35 +2338,39 @@ void ClientGateway::pushSubscriptions()
         }
 
         // INLINE path (pre-E2 / no WorkerPool):
-        // Fetch a bounded chunk of bytes from the log starting at nextOffset.
-        std::vector<uint8_t> chunk;
+        // Zero-copy: map a bounded span of the log starting at nextOffset — no heap
+        // allocation, no pread copy.  The span aliases the segment's read-only mmap
+        // (shared page cache with the writer), valid until the next readView() on
+        // this log.  We fully consume (encode + push) it within this loop iteration.
+        rune::storage::LogReadView view;
         try {
-            chunk = log->read(sub.nextOffset, kMaxChunkBytes);
+            view = log->readView(sub.nextOffset, kMaxChunkBytes);
         } catch (const std::exception& ex) {
-            spdlog::warn("ClientGateway: Log::read threw for sub={}: {}", subId, ex.what());
+            spdlog::warn("ClientGateway: Log::readView threw for sub={}: {}", subId, ex.what());
             continue;
         } catch (...) {
-            spdlog::warn("ClientGateway: Log::read threw unknown exception for sub={}", subId);
+            spdlog::warn("ClientGateway: Log::readView threw unknown exception for sub={}", subId);
             continue;
         }
 
-        if (chunk.empty()) continue; // nothing returned (nextOffset not yet visible)
+        if (view.empty()) continue; // nothing returned (nextOffset not yet visible)
 
-        // Iterate whole record batches in the chunk.
+        // Iterate whole record batches in the chunk (span into the read mmap).
         // Batch layout: kBaseOffsetOffset=0 (LE64), kLengthOffset=8 (LE32 = bytes after this field),
         //               total batch size = 12 + LE32@8; kRecordCountOffset=57 (LE32).
+        const uint8_t* const chunk = view.data;
         std::size_t chunkPos  = 0;
-        const std::size_t chunkSize = chunk.size();
+        const std::size_t chunkSize = view.len;
         int batchesPushed = 0;
         bool backPressured = false;
 
-        while (chunkPos < chunkSize && batchesPushed < kMaxBatchesPerSubPerCycle && !backPressured) {
+        while (chunkPos < chunkSize && batchesPushed < maxBatchesPerSubPerCycle_ && !backPressured) {
             // Need at least kRecordCountOffset + 4 bytes to read header fields.
             constexpr std::size_t kMinBatchHdr =
                 static_cast<std::size_t>(kRecordCountOffset) + 4u;
             if (chunkPos + kMinBatchHdr > chunkSize) break; // partial header at end of chunk
 
-            const uint8_t* batchPtr = chunk.data() + chunkPos;
+            const uint8_t* batchPtr = chunk + chunkPos;
 
             // Read baseOffset (LE64@0).
             int64_t baseOffset = 0;
@@ -2807,7 +2811,7 @@ void ClientGateway::drainWorkerReturns_()
             bool backPressured = false;
 
             while (chunkPos < chunkSize
-                   && batchesPushed < kMaxBatchesPerSubPerCycle
+                   && batchesPushed < maxBatchesPerSubPerCycle_
                    && !backPressured)
             {
                 constexpr std::size_t kMinBatchHdr =
