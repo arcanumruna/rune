@@ -60,8 +60,8 @@ struct AgentConfig {
     session::SessionConfig session;
 
     // Ring buffer capacity — must be a power of two (bytes of usable space).
-    // Default: 256 KiB — absorbs command/send bursts without back-pressuring.
-    int32_t ringCapacity = 256 * 1024;
+    // Default: 32 MiB — absorbs command/send bursts without back-pressuring.
+    int32_t ringCapacity = 32 * 1024 * 1024;
 
     // Maximum command records to drain from the ring per doWork call (bounded).
     int ringDrainLimit = 128;

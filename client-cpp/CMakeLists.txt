@@ -239,6 +239,25 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # Network-hop READ throughput load client (subscribe/catch-up/tail over Aeron).
+    add_executable(rune_consume_throughput
+        examples/rune_consume_throughput.cpp
+    )
+    target_include_directories(rune_consume_throughput PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_consume_throughput PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_CONSUME uuid)
+        if(UUID_LIB_CONSUME)
+            target_link_libraries(rune_consume_throughput PRIVATE ${UUID_LIB_CONSUME})
+        endif()
+    endif()
+
     # DR-1 — configurable disaster-recovery driver (rune-broker/dr-e2e harness)
     add_executable(dr_client
         examples/dr_client.cpp

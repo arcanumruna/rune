@@ -141,7 +141,9 @@ int main() {
         using clk = std::chrono::steady_clock;
 
         if (mode == "acked") {
-            std::atomic<uint64_t> acked{0};
+            std::atomic<uint64_t> acked{0};      // resolved (success OR failure) — drives window
+            std::atomic<uint64_t> succeeded{0};  // offset >= 0 (actually persisted)
+            std::atomic<uint64_t> failed{0};     // offset < 0 (ring-full / broker error)
             std::atomic<uint64_t> sent{0};
             std::vector<int64_t> lat;                 // ack latency samples (ns), sparse
             lat.reserve(1 << 16);
@@ -170,12 +172,17 @@ int main() {
                     std::this_thread::yield();
                 const auto sendTs = clk::now();
                 p.send(th, Key(static_cast<uint64_t>(i % keys)), std::span<const uint8_t>(val),
-                       [&acked, &lat, &sampleGate, sendTs](int64_t){
+                       [&acked, &succeeded, &failed, &lat, &sampleGate, sendTs](int64_t offset){
                            acked.fetch_add(1, std::memory_order_release);
-                           // sample ~1/256 acks for latency (agent thread; single consumer)
-                           if ((sampleGate.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0)
-                               lat.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   clk::now() - sendTs).count());
+                           if (offset >= 0) {
+                               succeeded.fetch_add(1, std::memory_order_relaxed);
+                               // sample ~1/256 SUCCESSFUL acks for latency
+                               if ((sampleGate.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0)
+                                   lat.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       clk::now() - sendTs).count());
+                           } else {
+                               failed.fetch_add(1, std::memory_order_relaxed);
+                           }
                        });
                 sent.fetch_add(1, std::memory_order_release);
             }
@@ -186,14 +193,19 @@ int main() {
             if (prog.joinable()) prog.join();
             const auto t1 = clk::now();
             const double secs = std::chrono::duration<double>(t1 - t0).count();
-            const double rps = nRecords / secs;
+            const uint64_t ok = succeeded.load(), bad = failed.load();
+            // REAL durable throughput = SUCCEEDED records / wall time (offset>=0).
+            const double rps = ok / secs;
             std::sort(lat.begin(), lat.end());
             auto pct = [&](double q){ return lat.empty() ? 0.0 :
                 lat[std::min(lat.size()-1, (size_t)(lat.size()*q))] / 1000.0; };
-            std::cout << "RESULT mode=acked records=" << nRecords
+            std::cout << "RESULT mode=acked attempted=" << nRecords
+                      << " succeeded=" << ok << " failed=" << bad
                       << " secs=" << secs
                       << " records_per_sec=" << (uint64_t)rps
                       << " MB_per_sec=" << (rps * valueBytes / (1024.0*1024.0))
+                      << " recordsSent=" << p.recordsSent()
+                      << " framesSent=" << p.framesSent()
                       << " p50_us=" << pct(0.50) << " p99_us=" << pct(0.99)
                       << " p999_us=" << pct(0.999) << "\n";
         } else {

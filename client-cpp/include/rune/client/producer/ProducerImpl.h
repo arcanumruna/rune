@@ -101,7 +101,7 @@ inline constexpr uint8_t kFlagWantAck = 0x01;
 // absorb produce bursts before Producer::send() back-pressures.  2 MiB holds
 // several thousand in-flight SEND_RECORDs so a bursty app is not throttled by the
 // agent's drain cadence.
-inline constexpr int32_t kDefaultProducerRingCap = 2 * 1024 * 1024; // 2 MiB
+inline constexpr int32_t kDefaultProducerRingCap = 32 * 1024 * 1024; // 32 MiB
 
 // Per-partition ack-ring capacity (entries; MUST be a power of two).  Holds the
 // corrIds of outstanding (sent, not-yet-acked) records for one partition so
