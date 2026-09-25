@@ -1413,15 +1413,31 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // across partitions on the same worker → addEgressSubscription dedups).  Records
     // then arrive on these subs and route by subscriptionId in the SubscriberHub.
     // Agent-thread only (onMetadataResponse runs on the agent thread).
+    // Fallback control host: the host of the broker the client is CURRENTLY
+    // connected to (currentLeaderChannel_, "aeron:udp?endpoint=<host>:<port>").
+    // Used when the MetadataResponse doesn't advertise the leader's client host
+    // (e.g. a single-node config with no peer client port) — the worker's MDC
+    // control publication binds on that same host.
+    std::string fallbackHost;
+    {
+        const auto ep = currentLeaderChannel_.find("endpoint=");
+        if (ep != std::string::npos) {
+            const std::size_t hs = ep + 9;
+            const std::size_t colon = currentLeaderChannel_.rfind(':');
+            if (colon != std::string::npos && colon > hs)
+                fallbackHost = currentLeaderChannel_.substr(hs, colon - hs);
+        }
+    }
     for (const auto& p : resp.partitions) {
         if (p.egressControlPort == 0 || p.egressStreamId == 0) continue;
         std::string_view host;
         for (const auto& b : resp.brokers) {
             if (b.nodeId == p.leaderId) { host = b.host; break; }
         }
-        if (host.empty()) continue;
+        std::string ctrlHost = host.empty() ? fallbackHost : std::string(host);
+        if (ctrlHost.empty()) continue;
         std::string ctrl = "aeron:udp?control-mode=dynamic|control=" +
-                           std::string(host) + ":" +
+                           ctrlHost + ":" +
                            std::to_string(p.egressControlPort) + "|fc=min";
         agent_.addEgressSubscription(ctrl, p.egressStreamId);
     }
