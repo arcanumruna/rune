@@ -26,7 +26,7 @@ namespace rb  = rune::protocol::batch;
 // handleProduceBatch — implementation.
 // ---------------------------------------------------------------------------
 ProduceOutcome handleProduceBatch(
-    uint8_t*                          batch,
+    const uint8_t*                    batch,
     std::size_t                       batchLen,
     int32_t                           topicId,
     int32_t                           partition,
@@ -62,18 +62,14 @@ ProduceOutcome handleProduceBatch(
     }
 
     // -------------------------------------------------------------------------
-    // 2. Base-offset restamp IN PLACE.
-    //    The base-offset field sits at bytes [0..7], BEFORE the CRC region
-    //    (kAttributesOffset=21), so rewriting it is CRC-safe (identical to Kafka).
+    // 2. Base-offset assignment is DEFERRED to the append (step 7).
+    //    `batch` is READ-ONLY here — the base offset is patched zero-copy into
+    //    the page cache by Log::appendNoSyncRestamp (pwritev), so this helper no
+    //    longer needs a mutable buffer / restamp scratch.  The base-offset field
+    //    [0..7] precedes the CRC region (kAttributesOffset=21), so the restamp is
+    //    CRC-safe.  `base` is filled in by the append below.
     // -------------------------------------------------------------------------
-    const int64_t base = log.logEndOffset();
-    {
-        uint64_t u = static_cast<uint64_t>(base);
-        for (int i = 0; i < 8; ++i) {
-            batch[static_cast<std::size_t>(rb::kBaseOffsetOffset) + i] =
-                static_cast<uint8_t>(u >> (i * 8));
-        }
-    }
+    int64_t base = 0;
 
     // -------------------------------------------------------------------------
     // 3. Parse lastOffsetDelta (LE32 at kLastOffsetDeltaOffset=23) and
@@ -131,8 +127,8 @@ ProduceOutcome handleProduceBatch(
         }
     }
 
-    // Derive lastOffset and populate output fields.
-    const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
+    // lastOffset is derived after the append assigns the base offset (step 7).
+    int64_t lastOffset = 0;
 
     // Read batchAttrs (LE16 at kAttributesOffset) for caller LSO tracking.
     uint16_t batchAttrs = 0;
@@ -197,26 +193,28 @@ ProduceOutcome handleProduceBatch(
     }
 
     // -------------------------------------------------------------------------
-    // 7. Append — appendNoSync (page-cache write only).
+    // 7. Append — appendNoSyncRestamp (zero-copy page-cache write).
+    //    Assigns the base offset from the log's current end offset and patches it
+    //    into bytes [0..7] via pwritev WITHOUT mutating `batch` (no scratch copy).
     //    On success: log's LEO advances past lastOffset.
-    //    The CRC region starts at kAttributesOffset=21, AFTER the base-offset
-    //    field [0..7] that we restamped above — the append writes already-valid bytes.
     // -------------------------------------------------------------------------
     try {
-        const int64_t appended = log.appendNoSync(batch, batchLen, lastOffset);
+        const int64_t appended =
+            log.appendNoSyncRestamp(batch, batchLen, lastOffsetDelta, base);
         if (appended < 0) {
-            // appendNoSync returns negative on back-pressure (e.g. InMemoryLog full).
-            spdlog::warn("ProducePath: appendNoSync refused (back-pressure) "
+            // Returns negative on back-pressure (e.g. InMemoryLog full).
+            spdlog::warn("ProducePath: appendNoSyncRestamp refused (back-pressure) "
                          "topicId={} partition={}", topicId, partition);
             out.error = pc::ErrorCode::Internal;
             return out;
         }
+        lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
     } catch (const std::exception& ex) {
-        spdlog::error("ProducePath: appendNoSync threw: {}; Internal", ex.what());
+        spdlog::error("ProducePath: appendNoSyncRestamp threw: {}; Internal", ex.what());
         out.error = pc::ErrorCode::Internal;
         return out;
     } catch (...) {
-        spdlog::error("ProducePath: appendNoSync threw unknown exception; Internal");
+        spdlog::error("ProducePath: appendNoSyncRestamp threw unknown exception; Internal");
         out.error = pc::ErrorCode::Internal;
         return out;
     }

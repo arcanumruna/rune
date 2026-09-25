@@ -99,7 +99,10 @@ struct ProduceOutcome {
 // ---------------------------------------------------------------------------
 // handleProduceBatch — the shared produce-batch core.
 //
-// @param batch         Mutable batch buffer (base-offset is restamped in place).
+// @param batch         READ-ONLY batch view (may alias an Aeron fragment / ring
+//                      slot).  The base offset is assigned + patched zero-copy
+//                      into the page cache by Log::appendNoSyncRestamp (pwritev);
+//                      `batch` is never mutated — no restamp scratch required.
 // @param batchLen      Number of bytes in `batch`.
 // @param topicId       Topic identifier (for PSM key).
 // @param partition     Partition number (for PSM key + log).
@@ -120,7 +123,7 @@ struct ProduceOutcome {
 // Zero allocation on the success path.
 // ---------------------------------------------------------------------------
 ProduceOutcome handleProduceBatch(
-    uint8_t*                          batch,
+    const uint8_t*                    batch,
     std::size_t                       batchLen,
     int32_t                           topicId,
     int32_t                           partition,
@@ -145,7 +148,7 @@ ProduceOutcome handleProduceBatch(
 namespace rune::node {
     using ProduceOutcome = rune::storage::ProduceOutcome;
     inline ProduceOutcome handleProduceBatch(
-        uint8_t* batch, std::size_t batchLen,
+        const uint8_t* batch, std::size_t batchLen,
         int32_t topicId, int32_t partition,
         int64_t producerId, int16_t producerEpoch, int32_t baseSequence,
         rune::storage::Log& log,
