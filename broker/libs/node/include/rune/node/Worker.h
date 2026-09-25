@@ -160,6 +160,7 @@ public:
         dirtyThisCycle_.reserve(kDirtySetReserve);
         pendingAcksAll_.reserve(kPendingAcksAllReserve);
         retOverflow_.reserve(kRetOverflowReserve);
+        subs_.reserve(kSubsReserve);
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
 
@@ -212,6 +213,32 @@ public:
     // -----------------------------------------------------------------------
     void setWorkerEgress(WorkerEgress* egress) noexcept { workerEgress_ = egress; }
     [[nodiscard]] WorkerEgress* workerEgress() const noexcept { return workerEgress_; }
+
+    // -----------------------------------------------------------------------
+    // read-rework T3/T4: worker-local subscription cursor (shared-nothing).
+    //
+    // The gateway routes Subscribe/Unsubscribe ops to the owning worker via the
+    // ingress ring; the worker owns the per-subscription push cursor (nextOffset)
+    // and the metadata needed to read + encode + push (I3).  This table is touched
+    // ONLY by the worker thread — no locks, no atomics, no cross-thread mutation.
+    // -----------------------------------------------------------------------
+    struct WorkerSubscription {
+        int64_t subscriptionId       = 0;
+        int64_t sessionId            = 0;
+        int32_t topicId              = 0;
+        int32_t partition            = 0;
+        int64_t nextOffset           = 0;   ///< push cursor (advanced by the worker)
+        rune::storage::Log* logPtr   = nullptr;
+        rune::replication::PartitionReplica* replica = nullptr;
+        uint8_t isolation            = 0;
+        bool    isGroup              = false;
+        bool    groupCarrierReceived = false;
+    };
+
+    /// Test-only: the worker-local subscription table (worker-thread state).
+    [[nodiscard]] const std::vector<WorkerSubscription>& subscriptionsForTest() const noexcept {
+        return subs_;
+    }
 
     // Set acks=all commit-wait timeout.  Default kDefaultAckTimeoutNs (30 s).
     void setAckTimeoutNs(int64_t timeoutNs) noexcept { ackTimeoutNs_ = timeoutNs; }
@@ -682,6 +709,63 @@ private:
         case WorkerOp::Type::AppendControlRecord:
             executeAppendControlRecordWire_(frame, hdr);
             break;
+        // read-rework T3/T4: subscription lifecycle (worker owns the push cursor)
+        case WorkerOp::Type::Subscribe:
+            executeSubscribeWire_(hdr);
+            break;
+        case WorkerOp::Type::Unsubscribe:
+            executeUnsubscribeWire_(hdr);
+            break;
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // read-rework T3/T4: Subscribe — register or update a worker-local
+    // subscription cursor from the wire scalars.  Fire-and-forget (no return).
+    // Idempotent: a repeated Subscribe for the same subscriptionId UPDATES the
+    // existing entry (e.g. cursor rewind / carrier arrival) rather than
+    // duplicating it.  Worker-thread-only mutation of subs_.
+    // -------------------------------------------------------------------
+    void executeSubscribeWire_(const WorkerOpWire* hdr) {
+        for (auto& s : subs_) {
+            if (s.subscriptionId == hdr->subscriptionId) {
+                s.sessionId            = hdr->sessionId;
+                s.topicId              = hdr->topicId;
+                s.partition            = hdr->partition;
+                s.nextOffset           = hdr->nextOffset;
+                s.logPtr               = reinterpret_cast<rune::storage::Log*>(hdr->logPtr);
+                s.replica              = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+                s.isolation            = hdr->isolation;
+                s.isGroup              = hdr->isGroup != 0;
+                s.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+                return;
+            }
+        }
+        WorkerSubscription s;
+        s.subscriptionId       = hdr->subscriptionId;
+        s.sessionId            = hdr->sessionId;
+        s.topicId              = hdr->topicId;
+        s.partition            = hdr->partition;
+        s.nextOffset           = hdr->nextOffset;
+        s.logPtr               = reinterpret_cast<rune::storage::Log*>(hdr->logPtr);
+        s.replica              = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+        s.isolation            = hdr->isolation;
+        s.isGroup              = hdr->isGroup != 0;
+        s.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+        subs_.push_back(s);
+    }
+
+    // -------------------------------------------------------------------
+    // read-rework T3/T4: Unsubscribe — remove a worker-local subscription by id
+    // (swap-and-pop; order does not matter).  No-op if unknown.  Worker-thread-only.
+    // -------------------------------------------------------------------
+    void executeUnsubscribeWire_(const WorkerOpWire* hdr) {
+        for (std::size_t i = 0; i < subs_.size(); ++i) {
+            if (subs_[i].subscriptionId == hdr->subscriptionId) {
+                subs_[i] = subs_.back();
+                subs_.pop_back();
+                return;
+            }
         }
     }
 
@@ -1327,6 +1411,13 @@ private:
     // publication.  Null until setWorkerEgress() is called.  The worker thread is
     // the SOLE writer (shared-nothing); the control thread never touches it.
     WorkerEgress* workerEgress_ = nullptr;
+
+    // read-rework T3/T4: worker-local subscription cursors.  Worker-thread-only;
+    // Subscribe/Unsubscribe ring ops mutate it, the I3 push loop iterates it.
+    // Reserved at construction so the common case never reallocates on the (rare,
+    // control-plane) Subscribe path.
+    static constexpr std::size_t kSubsReserve = 4096;
+    std::vector<WorkerSubscription> subs_;
 
     // E5.1.2d: acks=all commit-wait pending list.
     //

@@ -650,6 +650,18 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_worker_egress_tests
             PROPERTIES TIMEOUT 60
             ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+        # read-rework T3/T4 I2: worker-local subscription table fed by
+        # Subscribe/Unsubscribe WorkerOps (no driver — SPSC ring + doWork only).
+        add_executable(rune_worker_subscribe_tests
+            tests/node/WorkerSubscribeTest.cpp)
+        target_link_libraries(rune_worker_subscribe_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_subscribe_tests
+            PROPERTIES TIMEOUT 60
+            ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     endif()
 
     # ---------------------------------------------------------------------------

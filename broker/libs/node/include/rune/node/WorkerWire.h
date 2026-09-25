@@ -275,6 +275,11 @@ inline std::size_t encodeWorkerOp(const WorkerOp& op,
     case WorkerOp::Type::BecomeFollower:
     case WorkerOp::Type::FetchRequest:
     case WorkerOp::Type::OffsetsForLeaderEpochReq:
+    // read-rework T3/T4: Subscribe/Unsubscribe reuse the scalar wire fields
+    // (subscriptionId/sessionId/topicId/partition/nextOffset/isolation/isGroup/
+    // groupCarrierReceived/logPtr/replica) — no variable tail.
+    case WorkerOp::Type::Subscribe:
+    case WorkerOp::Type::Unsubscribe:
         kind      = TailKind::None;
         tailBytes = 0;
         break;

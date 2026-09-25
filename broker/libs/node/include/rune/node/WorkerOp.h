@@ -70,6 +70,12 @@ struct WorkerOp {
         // synchronously; the worker appends via replica->append(marker, acksAll).
         // Internal partitions (topicId < 0) never use this path.
         AppendControlRecord,      ///< gateway → worker: append txn control marker to user partition
+        // read-rework T3/T4: subscription lifecycle routed to the owning worker so
+        // the worker owns the per-subscription push cursor (shared-nothing).  The
+        // worker's duty cycle (I3) reads + encodes + pushes for its active subs.
+        // Fire-and-forget (no WorkerReturn): registration/removal only.
+        Subscribe,                ///< gateway → worker: register/update a subscription cursor
+        Unsubscribe,              ///< gateway → worker: remove a subscription
     };
 
     Type    type    = Type::Produce;
