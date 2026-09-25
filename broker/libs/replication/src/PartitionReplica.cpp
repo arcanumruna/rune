@@ -1343,6 +1343,22 @@ int PartitionReplica::doWork(int64_t nowNs)
             leaderLagClockNeedsReset_ = false;
         }
 
+        // Task #13 (read-path): advance the served/gateway HW as the local log
+        // grows.  recomputeHw() → setLeaderLogEndOffset(logEndOffset_()) recomputes
+        // HW = min(ISR LEOs): for a single-node ISR this tracks LEO; for a
+        // multi-node ISR it stays correctly bounded by follower fetch offsets.
+        // Previously HW was recomputed ONLY on an ISR change, so a stable-ISR
+        // leader froze the served HW at its becomeLeader value — subscribers
+        // stalled at a stale read bound even though produce had committed far
+        // beyond it, and publishCleanerState() kept re-publishing the stale
+        // snapshot.  Counted as work only when the HW actually moves, so a truly
+        // idle leader still parks.
+        {
+            const Offset servedBefore = leaderState_.highWatermark();
+            recomputeHw();
+            if (leaderState_.highWatermark() != servedBefore) ++work;
+        }
+
         if (nowNs - lastIsrCheckNs_ >= cfg_.isrCheckIntervalNs) {
             lastIsrCheckNs_ = nowNs;
             // NOTE: the bare ISR-check TICK is NOT work — counting it made the

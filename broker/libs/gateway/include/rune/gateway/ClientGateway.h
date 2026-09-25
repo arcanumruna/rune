@@ -1100,7 +1100,7 @@ private:
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription
     // per doWork() cycle.  Prevents one busy subscription from starving others.
-    static constexpr int kMaxBatchesPerSubPerCycle = 8;
+    static constexpr int kMaxBatchesPerSubPerCycle = 1024;
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.
     // Bounded to avoid reading unbounded data from a fast-filling log.

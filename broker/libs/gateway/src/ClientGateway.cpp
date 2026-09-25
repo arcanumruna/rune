@@ -2600,17 +2600,23 @@ void ClientGateway::pushSubscriptions()
                 // No hook: leave pos=-1 → back-pressured (subscription retries next cycle).
             } else {
                 aeron::ExclusivePublication& pub = *session->egress;
-                if (pub.isConnected() && encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
+                auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
+                aeron::concurrent::AtomicBuffer atomicBuf(
+                    mutableBuf, static_cast<aeron::util::index_t>(encoded));
+                if (encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
+                    // Single-fragment fast path.
                     aeron::concurrent::logbuffer::BufferClaim claim;
                     pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
                     if (pos > 0) {
-                        auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
-                        aeron::concurrent::AtomicBuffer atomicBuf(
-                            mutableBuf, static_cast<aeron::util::index_t>(encoded));
                         claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
                                                 static_cast<aeron::util::index_t>(encoded));
                         claim.commit();
                     }
+                } else {
+                    // Batch larger than one MTU fragment: offer() fragments it; the
+                    // client's egress FragmentAssembler reassembles.  (Without this a
+                    // normal RecordBatch was silently skipped on UDP → reads stalled.)
+                    pos = pub.offer(atomicBuf, 0, static_cast<aeron::util::index_t>(encoded));
                 }
             }
 
@@ -2960,23 +2966,28 @@ void ClientGateway::drainWorkerReturns_()
                     }
                 } else {
                     aeron::ExclusivePublication& pub = *session->egress;
-                    if (pub.isConnected() &&
-                        encoded <= static_cast<std::size_t>(pub.maxPayloadLength()))
-                    {
+                    auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
+                    aeron::concurrent::AtomicBuffer atomicBuf(
+                        mutableBuf, static_cast<aeron::util::index_t>(encoded));
+                    if (encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
+                        // Single-fragment fast path.
                         aeron::concurrent::logbuffer::BufferClaim claim;
                         pos = pub.tryClaim(
                             static_cast<aeron::util::index_t>(encoded), claim);
                         if (pos > 0) {
-                            auto* mutableBuf =
-                                const_cast<uint8_t*>(scratch_.data());
-                            aeron::concurrent::AtomicBuffer atomicBuf(
-                                mutableBuf,
-                                static_cast<aeron::util::index_t>(encoded));
                             claim.buffer().putBytes(
                                 claim.offset(), atomicBuf, 0,
                                 static_cast<aeron::util::index_t>(encoded));
                             claim.commit();
                         }
+                    } else {
+                        // Batch larger than one MTU fragment: offer() fragments it
+                        // across the term buffer; the client's egress FragmentAssembler
+                        // reassembles.  WITHOUT this a normal-sized RecordBatch
+                        // (encoded > maxPayloadLength ≈ MTU) was silently skipped on
+                        // UDP and never delivered — real-network reads stalled.
+                        pos = pub.offer(atomicBuf, 0,
+                                        static_cast<aeron::util::index_t>(encoded));
                     }
                 }
 
