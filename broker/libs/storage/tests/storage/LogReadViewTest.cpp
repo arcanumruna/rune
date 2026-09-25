@@ -218,3 +218,174 @@ TEST(LogReadView, SealedSegmentSpanIsStableAlias) {
 
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// Edge cases
+// ---------------------------------------------------------------------------
+
+// Empty log (no bytes written): readView returns an empty view (no mmap(0)).
+TEST(LogReadView, EmptyLogReturnsEmpty) {
+    auto dir = makeTempDir("rune_rv_empty");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 64LL * 1024 * 1024);
+    EXPECT_TRUE(log.readView(0, 1 << 20).empty());
+    EXPECT_TRUE(log.readView(5, 1 << 20).empty());
+    std::filesystem::remove_all(dir);
+}
+
+// maxBytes == 0 must still return at least one whole batch (progress guarantee).
+TEST(LogReadView, MaxBytesZeroStillReturnsOneBatch) {
+    auto dir = makeTempDir("rune_rv_zero");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 64LL * 1024 * 1024);
+    int64_t off = 0;
+    for (int i = 0; i < 3; ++i) {
+        RecordBatchBuilder b(off, 100 + i); b.append("k", "v" + std::to_string(i), 100 + i);
+        off = log.append(b.build(), off);
+    }
+    auto v = log.readView(0, 0);
+    ASSERT_FALSE(v.empty());
+    RecordBatchReader r(v.data, v.len);
+    ASSERT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+    EXPECT_EQ(v.nextOffset, 1) << "maxBytes=0 must yield exactly one batch";
+    std::filesystem::remove_all(dir);
+}
+
+// startOffset INSIDE a multi-record batch (base < start <= lastOffset) must return
+// the whole batch (its baseOffset < start), matching read()'s behavior.
+TEST(LogReadView, StartInsideMultiRecordBatchReturnsWholeBatch) {
+    auto dir = makeTempDir("rune_rv_mid");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 64LL * 1024 * 1024);
+    // One batch spanning offsets 0..4.
+    RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < 5; ++i) b.append("k", "v" + std::to_string(i), 1000 + i);
+    int64_t off = log.append(b.build(), 4); // lastOffset=4, LEO=5
+    ASSERT_EQ(off, 5);
+
+    for (int64_t start : {int64_t{0}, int64_t{2}, int64_t{4}}) {
+        auto v = log.readView(start, 1 << 20);
+        ASSERT_FALSE(v.empty()) << "start=" << start;
+        EXPECT_EQ(v.baseOffset, 0) << "must return the batch containing start (base<=start)";
+        RecordBatchReader r(v.data, v.len);
+        ASSERT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset() + r.lastOffsetDelta(), 4);
+        EXPECT_EQ(v.nextOffset, 5);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// After old-segment deletion, readView below logStartOffset returns empty (the
+// upper_bound trap), and readView(logStartOffset()) returns the oldest survivor —
+// mirrors the read() contract the gateway depends on.
+TEST(LogReadView, BelowLogStartReturnsEmptyAfterDeletion) {
+    auto dir = makeTempDir("rune_rv_logstart");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 256);
+    int64_t off = 0;
+    for (int i = 0; i < 60; ++i) {
+        RecordBatchBuilder b(off, 1000 + i); b.append("k", "val" + std::to_string(i), 1000 + i);
+        off = log.append(b.build(), off);
+    }
+    ASSERT_GT(log.deleteOldSegments(0), 0);
+    const int64_t logStart = log.logStartOffset();
+    ASSERT_GT(logStart, 0);
+    EXPECT_TRUE(log.readView(0, 1 << 20).empty()) << "below logStart must be empty";
+    auto v = log.readView(logStart, 1 << 20);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, logStart);
+    std::filesystem::remove_all(dir);
+}
+
+// After truncateTo (segment shrinks), readView below the boundary works and reads
+// at/above return empty — and the mapping must remain memory-safe (bounded access).
+TEST(LogReadView, TruncateThenReadIsSafeAndCorrect) {
+    auto dir = makeTempDir("rune_rv_trunc");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 64LL * 1024 * 1024);
+    int64_t off = 0;
+    for (int i = 0; i < 10; ++i) {
+        RecordBatchBuilder b(off, 100 + i); b.append("k", "v" + std::to_string(i), 100 + i);
+        off = log.append(b.build(), off);
+    }
+    // Prime the read mmap at the full size, then truncate to shrink the file.
+    ASSERT_FALSE(log.readView(0, 1 << 20).empty());
+    log.truncateTo(5);
+    EXPECT_EQ(log.logEndOffset(), 5);
+
+    auto below = log.readView(0, 1 << 20);
+    ASSERT_FALSE(below.empty());
+    EXPECT_EQ(below.baseOffset, 0);
+    EXPECT_EQ(below.nextOffset, 5) << "readView must not expose truncated bytes";
+    EXPECT_TRUE(log.readView(5, 1 << 20).empty()) << "at/above truncation boundary must be empty";
+
+    // Appendable + readable after truncate.
+    RecordBatchBuilder nb(5, 999); nb.append("k", "new", 999);
+    log.append(nb.build(), 5);
+    auto after = log.readView(5, 1 << 20);
+    ASSERT_FALSE(after.empty());
+    EXPECT_EQ(after.baseOffset, 5);
+    std::filesystem::remove_all(dir);
+}
+
+// Strong parity: for EVERY offset in [0, LEO), readView's first batch baseOffset
+// and nextOffset match read()'s first batch — across segment boundaries.
+TEST(LogReadView, FullOffsetScanParityWithRead) {
+    auto dir = makeTempDir("rune_rv_parity");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 256); // multi-segment
+    int64_t off = 0;
+    for (int i = 0; i < 40; ++i) {
+        RecordBatchBuilder b(off, 7000 + i); b.append("key", "value" + std::to_string(i), 7000 + i);
+        off = log.append(b.build(), off);
+    }
+    const int64_t leo = log.logEndOffset();
+    for (int64_t s = 0; s < leo; ++s) {
+        auto vec = log.read(s, 1 << 20);
+        auto view = log.readView(s, 1 << 20);
+        ASSERT_FALSE(vec.empty()) << "read empty at " << s;
+        ASSERT_FALSE(view.empty()) << "readView empty at " << s;
+        RecordBatchReader rv(vec.data(), vec.size());
+        RecordBatchReader rw(view.data, view.len);
+        ASSERT_TRUE(rv.ensureValid()); ASSERT_TRUE(rw.ensureValid());
+        EXPECT_EQ(rw.baseOffset(), rv.baseOffset()) << "first-batch base mismatch at " << s;
+        EXPECT_EQ(view.baseOffset, rv.baseOffset()) << "view.baseOffset mismatch at " << s;
+        // readView (like read()) only spans the ONE segment containing `s`, so
+        // nextOffset advances past s but need not reach the global LEO.
+        EXPECT_GT(view.nextOffset, s)   << "no progress at " << s;
+        EXPECT_LE(view.nextOffset, leo) << "nextOffset past LEO at " << s;
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// readView must work after reopen + recover (index rebuilt from .log).
+TEST(LogReadView, WorksAfterReopenAndRecover) {
+    auto dir = makeTempDir("rune_rv_recover");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    {
+        Log log(dir.string(), 256);
+        int64_t off = 0;
+        for (int i = 0; i < 30; ++i) {
+            RecordBatchBuilder b(off, 8000 + i); b.append("k", "v" + std::to_string(i), 8000 + i);
+            off = log.append(b.build(), off);
+        }
+    }
+    Log log2(dir.string(), 256);
+    ASSERT_EQ(log2.recover(), 30);
+    auto v = log2.readView(0, 1 << 20);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, 0);
+    // Multi-segment: readView(0) spans only segment 0, so nextOffset lands at that
+    // segment's end (0 < nextOffset <= 30), not necessarily the global LEO.
+    EXPECT_GT(v.nextOffset, 0);
+    EXPECT_LE(v.nextOffset, 30);
+    // The LAST segment reaches the LEO.
+    auto bases = log2.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u);
+    auto vb = log2.readView(bases.back(), 1 << 20);
+    ASSERT_FALSE(vb.empty());
+    EXPECT_EQ(vb.baseOffset, bases.back());
+    EXPECT_EQ(vb.nextOffset, 30) << "last segment must read through to LEO";
+    std::filesystem::remove_all(dir);
+}

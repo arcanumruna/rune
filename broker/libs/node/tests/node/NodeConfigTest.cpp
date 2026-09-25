@@ -143,6 +143,54 @@ TEST(NodeConfigTest, NonIntConsensusStreamIdIsError) {
 }
 
 // ---------------------------------------------------------------------------
+// read-rework T3/T4: per-worker dynamic-MDC egress config (I1b)
+// ---------------------------------------------------------------------------
+
+TEST(NodeConfigTest, WorkerEgressDefaultsWhenUnset) {
+    auto r = parseNodeConfig(fakeEnv(base3node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->workerEgressControlHost,     "127.0.0.1");
+    EXPECT_EQ(r.config->workerEgressControlBasePort,  40300);
+    EXPECT_EQ(r.config->workerEgressBaseStreamId,     0);  // 0 = resolved in buildWorkerPool
+}
+
+TEST(NodeConfigTest, WorkerEgressOverriddenWhenSet) {
+    auto env = base3node();
+    env["RUNE_WORKER_EGRESS_CONTROL_HOST"]      = "10.0.0.5";
+    env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"] = "45000";
+    env["RUNE_WORKER_EGRESS_BASE_STREAM"]       = "99";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->workerEgressControlHost,     "10.0.0.5");
+    EXPECT_EQ(r.config->workerEgressControlBasePort,  45000);
+    EXPECT_EQ(r.config->workerEgressBaseStreamId,     99);
+}
+
+TEST(NodeConfigTest, WorkerEgressEmptyHostFallsBackToDefault) {
+    auto env = base3node();
+    env["RUNE_WORKER_EGRESS_CONTROL_HOST"] = "";  // empty → keep default
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->workerEgressControlHost, "127.0.0.1");
+}
+
+TEST(NodeConfigTest, NonIntWorkerEgressControlBasePortIsError) {
+    auto env = base3node();
+    env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"] = "not-a-port";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+TEST(NodeConfigTest, NonIntWorkerEgressBaseStreamIsError) {
+    auto env = base3node();
+    env["RUNE_WORKER_EGRESS_BASE_STREAM"] = "xyz";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_FALSE(r.config.has_value());
+}
+
+// ---------------------------------------------------------------------------
 // Missing required variables (5 cases)
 // ---------------------------------------------------------------------------
 

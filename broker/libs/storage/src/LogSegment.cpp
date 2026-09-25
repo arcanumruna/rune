@@ -286,7 +286,10 @@ LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) {
     if (firstPos == size) return {};   // offset not present in this segment
 
     // Accumulate WHOLE batches from firstPos up to maxBytes.  Always include the
-    // first batch even if it alone exceeds maxBytes (progress guarantee).
+    // first batch even if it alone exceeds maxBytes (progress guarantee).  A
+    // non-positive maxBytes means "one batch only" (minimal progress), NOT
+    // "unlimited": callers pass a positive chunk cap; 0/negative is a degenerate
+    // request that must still make bounded forward progress.
     const std::size_t cap = maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0;
     std::size_t end = firstPos;
     int64_t nextOff = firstBase;
@@ -294,8 +297,11 @@ LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) {
         RecordBatchReader r(base + end, size - end);
         int32_t total = r.totalLength();
         if (total <= 0 || end + static_cast<std::size_t>(total) > size) break;
-        if (end != firstPos && cap > 0 &&
-            (end - firstPos) + static_cast<std::size_t>(total) > cap) break;
+        if (end != firstPos) {
+            // Past the first batch: only take more if a positive cap has room.
+            if (cap == 0) break;  // maxBytes<=0 → exactly one batch
+            if ((end - firstPos) + static_cast<std::size_t>(total) > cap) break;
+        }
         end += static_cast<std::size_t>(total);
         nextOff = r.baseOffset() + r.lastOffsetDelta() + 1;
     }

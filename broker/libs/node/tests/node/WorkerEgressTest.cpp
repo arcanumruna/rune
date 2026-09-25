@@ -142,4 +142,77 @@ TEST_F(WorkerEgressFixture, NullAeronIsUnresolvedAndSendIsNoop) {
     EXPECT_LE(eg.send(b, sizeof(b)), 0);  // no publication → non-positive result
 }
 
+// Accessors + channel format: dynamic-MDC channel embeds control-mode/control/fc.
+TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
+    WorkerEgress eg(aeron_, "127.0.0.1:24730", 2099);
+    ASSERT_TRUE(eg.resolved());
+    EXPECT_EQ(eg.streamId(), 2099);
+    EXPECT_EQ(eg.controlEndpoint(), "127.0.0.1:24730");
+    const std::string& ch = eg.channel();
+    EXPECT_NE(ch.find("control-mode=dynamic"), std::string::npos) << ch;
+    EXPECT_NE(ch.find("control=127.0.0.1:24730"), std::string::npos) << ch;
+    EXPECT_NE(ch.find("fc=min"), std::string::npos) << ch;
+    EXPECT_GT(eg.maxPayloadLength(), 0);
+}
+
+// send() with NO subscribers connected must not crash and must return <= 0
+// (not-connected / back-pressure) so the caller does not advance its cursor.
+TEST_F(WorkerEgressFixture, SendWithNoSubscribersReturnsNonPositive) {
+    WorkerEgress eg(aeron_, "127.0.0.1:24740", 2098);
+    ASSERT_TRUE(eg.resolved());
+    EXPECT_FALSE(eg.isConnected());  // no subscriber yet
+    uint8_t payload[64];
+    std::memset(payload, 0x11, sizeof(payload));
+    EXPECT_LE(eg.send(payload, sizeof(payload)), 0)
+        << "send with no connected subscriber must not be accepted";
+}
+
+// A frame larger than maxPayloadLength must be fragmented by offer() and
+// reassembled into a single message by the subscriber's FragmentAssembler.
+TEST_F(WorkerEgressFixture, LargeFrameFragmentsAndReassembles) {
+    const char* control = "127.0.0.1:24750";
+    WorkerEgress eg(aeron_, control, 2097);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(std::string("aeron:udp?control=") + control +
+                          "|control-mode=dynamic|endpoint=127.0.0.1:24751", 2097);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    const std::size_t big = static_cast<std::size_t>(eg.maxPayloadLength()) * 3 + 17;
+    std::vector<uint8_t> payload(big, 0x7E);
+    std::atomic<int> msgs{0};
+    std::atomic<std::size_t> lastLen{0};
+    aeron::FragmentAssembler fa([&](aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                                    aeron::util::index_t length, aeron::Header&) {
+        msgs++; lastLen = static_cast<std::size_t>(length);
+    });
+    ASSERT_TRUE(waitFor([&]() { return eg.send(payload.data(), payload.size()) > 0; }, 3s));
+    ASSERT_TRUE(waitFor([&]() { sub->poll(fa.handler(), 10); return msgs.load() >= 1; }))
+        << "fragmented large frame was not reassembled";
+    EXPECT_EQ(lastLen.load(), big) << "reassembled length must equal the sent frame size";
+}
+
+// A subscriber that joins AFTER the publication exists still receives subsequent
+// sends (dynamic-MDC auto-add on connect).
+TEST_F(WorkerEgressFixture, LateSubscriberReceivesSubsequentSends) {
+    const char* control = "127.0.0.1:24760";
+    WorkerEgress eg(aeron_, control, 2096);
+    ASSERT_TRUE(eg.resolved());
+
+    // Late subscriber joins now (after the pub existed).
+    auto sub = resolveSub(std::string("aeron:udp?control=") + control +
+                          "|control-mode=dynamic|endpoint=127.0.0.1:24761", 2096);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    std::atomic<int> got{0};
+    aeron::FragmentAssembler fa([&](aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                                    aeron::util::index_t, aeron::Header&) { got++; });
+    uint8_t payload[96];
+    std::memset(payload, 0x33, sizeof(payload));
+    ASSERT_TRUE(waitFor([&]() { return eg.send(payload, sizeof(payload)) > 0; }, 3s));
+    ASSERT_TRUE(waitFor([&]() { sub->poll(fa.handler(), 10); return got.load() >= 1; }))
+        << "late-joining subscriber did not receive subsequent send";
+}
+
 } // namespace
