@@ -434,7 +434,7 @@ static constexpr uint8_t kProduceKey[] = {0x41, 0x42, 0x43}; // "ABC"
 // ===========================================================================
 TEST(ConformanceGolden, ProduceExplicitPartition) {
     const auto golden = readVector("produce_explicit_partition.bin");
-    ASSERT_EQ(golden.size(), 60u);
+    ASSERT_EQ(golden.size(), 62u);
 
     assertHeader(golden, rpc::Produce::TEMPLATE_ID, rpc::Produce::BODY_FIXED);
 
@@ -460,7 +460,7 @@ TEST(ConformanceGolden, ProduceExplicitPartition) {
 
     std::array<uint8_t, 128> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 60u);
+    ASSERT_EQ(n, 62u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_explicit_partition.bin";
 }
@@ -473,7 +473,7 @@ TEST(ConformanceGolden, ProduceExplicitPartition) {
 // ===========================================================================
 TEST(ConformanceGolden, ProduceKeyOnly) {
     const auto golden = readVector("produce_key_only.bin");
-    ASSERT_EQ(golden.size(), 63u);
+    ASSERT_EQ(golden.size(), 65u);
 
     assertHeader(golden, rpc::Produce::TEMPLATE_ID, rpc::Produce::BODY_FIXED);
 
@@ -500,7 +500,7 @@ TEST(ConformanceGolden, ProduceKeyOnly) {
 
     std::array<uint8_t, 128> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 63u);
+    ASSERT_EQ(n, 65u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_key_only.bin";
 }
@@ -637,7 +637,7 @@ TEST(ConformanceGolden, SubscribeKeyOnly) {
 // ===========================================================================
 TEST(ConformanceGolden, RecordsPush) {
     const auto golden = readVector("records_push.bin");
-    ASSERT_EQ(golden.size(), 58u);
+    ASSERT_EQ(golden.size(), 60u);
 
     assertHeader(golden, rpc::Records::TEMPLATE_ID, rpc::Records::BODY_FIXED);
 
@@ -664,7 +664,7 @@ TEST(ConformanceGolden, RecordsPush) {
 
     std::array<uint8_t, 128> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 58u);
+    ASSERT_EQ(n, 60u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden records_push.bin";
 }

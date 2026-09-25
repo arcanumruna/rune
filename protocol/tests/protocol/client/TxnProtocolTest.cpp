@@ -83,11 +83,11 @@ TEST(DataMessages, ProduceDefaultsAreNonIdempotent) {
 
 TEST(DataMessages, ProduceIdempotentEncodedSizeIncludesNewFields) {
     // BODY_FIXED is now 10 + 8 + 2 + 4 = 24
-    // encodedSize = 24(hdr) + 24(fixed) + 2(key len) + 2(rb len) = 52 with empty fields
+    // encodedSize = 24(hdr) + 24(fixed) + 2(key len) + 4(rb len) = 54 with empty fields
     rpc::Produce msg;
     EXPECT_EQ(rpc::Produce::BODY_FIXED, 24u);
-    // empty key + empty recordBatch: 24 + 24 + 2 + 2 = 52
-    EXPECT_EQ(msg.encodedSize(), 52u);
+    // empty key + empty recordBatch: 24 + 24 + 2 + 4 = 54
+    EXPECT_EQ(msg.encodedSize(), 54u);
 }
 
 // ---------------------------------------------------------------------------

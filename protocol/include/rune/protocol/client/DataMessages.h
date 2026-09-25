@@ -62,12 +62,13 @@ struct Produce {
     static constexpr uint16_t BODY_FIXED_V0 = 9;  // old clients without the acks byte
 
     /// Total encoded size accounting for the two var fields.
-    /// key and recordBatch are each capped at 65535 bytes by the u16 prefix.
+    /// key uses a u16 length prefix (≤65535); recordBatch uses a u32 prefix so a
+    /// single Produce can carry Kafka-scale batches (≫64KB) in one frame.
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE
              + BODY_FIXED
              + 2u + key.size()
-             + 2u + recordBatch.size();
+             + 4u + recordBatch.size();
     }
 
     /// Encode the full frame into buf.  buf must be ≥ encodedSize() bytes.
@@ -98,10 +99,10 @@ struct Produce {
                            key.data(),
                            static_cast<uint16_t>(key.size()));
 
-        // recordBatch var field
-        pos += putVarBytes(buf + pos,
-                           recordBatch.data(),
-                           static_cast<uint16_t>(recordBatch.size()));
+        // recordBatch var field (u32 length prefix — may exceed 64KB)
+        pos += putVarBytes32(buf + pos,
+                             recordBatch.data(),
+                             static_cast<uint32_t>(recordBatch.size()));
 
         return pos;
     }
@@ -150,10 +151,10 @@ struct Produce {
         if (!getVarBytes(buf, avail, pos, keyData, keyLen)) return std::nullopt;
         msg.key = std::span<const uint8_t>(keyData, keyLen);
 
-        // recordBatch var field
+        // recordBatch var field (u32 length prefix — may exceed 64KB)
         const uint8_t* rbData = nullptr;
-        uint16_t       rbLen  = 0;
-        if (!getVarBytes(buf, avail, pos, rbData, rbLen)) return std::nullopt;
+        uint32_t       rbLen  = 0;
+        if (!getVarBytes32(buf, avail, pos, rbData, rbLen)) return std::nullopt;
         msg.recordBatch = std::span<const uint8_t>(rbData, rbLen);
 
         return msg;
@@ -430,10 +431,11 @@ struct Records {
     static constexpr uint16_t BODY_FIXED  = 24; // subscriptionId(8)+topicId(4)+partition(4)+baseOffset(8)
 
     /// Total encoded size accounting for the var field.
+    /// recordBatch uses a u32 length prefix (may exceed 64KB).
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE
              + BODY_FIXED
-             + 2u + recordBatch.size();
+             + 4u + recordBatch.size();
     }
 
     /// Encode the full frame into buf.  buf must be ≥ encodedSize() bytes.
@@ -456,10 +458,10 @@ struct Records {
 
         std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
 
-        // recordBatch var field
-        pos += putVarBytes(buf + pos,
-                           recordBatch.data(),
-                           static_cast<uint16_t>(recordBatch.size()));
+        // recordBatch var field (u32 length prefix — may exceed 64KB)
+        pos += putVarBytes32(buf + pos,
+                             recordBatch.data(),
+                             static_cast<uint32_t>(recordBatch.size()));
         return pos;
     }
 
@@ -487,10 +489,10 @@ struct Records {
 
         std::size_t pos = fixedBase + BODY_FIXED;
 
-        // recordBatch var field
+        // recordBatch var field (u32 length prefix — may exceed 64KB)
         const uint8_t* rbData = nullptr;
-        uint16_t       rbLen  = 0;
-        if (!getVarBytes(buf, avail, pos, rbData, rbLen)) return std::nullopt;
+        uint32_t       rbLen  = 0;
+        if (!getVarBytes32(buf, avail, pos, rbData, rbLen)) return std::nullopt;
         msg.recordBatch = std::span<const uint8_t>(rbData, rbLen);
 
         return msg;

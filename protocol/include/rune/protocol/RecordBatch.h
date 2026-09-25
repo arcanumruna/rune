@@ -101,6 +101,23 @@ public:
     void setProducerEpoch(int16_t ep) noexcept { producerEpoch_ = ep; }
     void setBaseSequence(int32_t seq) noexcept { baseSequence_ = seq; }
 
+    /// Reset to empty for REUSE without freeing records_' capacity — avoids a
+    /// per-batch heap allocation on the produce hot path (the builder is kept
+    /// alive across flushes and re-filled instead of destroyed + recreated).
+    void reset(int64_t baseOffset, int64_t baseTimestamp) noexcept {
+        baseOffset_      = baseOffset;
+        baseTimestamp_   = baseTimestamp;
+        maxTimestamp_    = baseTimestamp;
+        recordCount_     = 0;
+        producerId_      = -1;
+        producerEpoch_   = -1;
+        baseSequence_    = -1;
+        control_         = false;
+        transactional_   = false;
+        deleteHorizonMs_ = -1;
+        records_.clear();   // retains capacity — no realloc on the next batch
+    }
+
     // KIP-534: stamp the delete horizon (epoch-ms) into this batch.
     // When set, build()/buildInto() write horizonMs into the baseTimestamp
     // field and set kAttrDeleteHorizon in attributes.  The wire layout is
@@ -190,6 +207,45 @@ public:
         detail::putLE(out, kLengthOffset, static_cast<uint32_t>(out.size() - 12));
         uint32_t crc = crc32c(out.data() + kAttributesOffset, out.size() - kAttributesOffset);
         detail::putLE(out, kCrcOffset, crc);
+    }
+
+    /// APPEND the serialized batch to `out` WITHOUT clearing it (start-relative
+    /// offsets), returning the batch's byte length.  Lets a caller build the
+    /// RecordBatch directly into a larger frame buffer right after a pre-written
+    /// header — eliminating the extra batch→frame copy on the produce hot path.
+    std::size_t buildAppend(std::vector<uint8_t>& out) {
+        using namespace batch;
+        int16_t attrs = control_
+            ? static_cast<int16_t>(kAttrControl | kAttrTransactional)
+            : (transactional_ ? kAttrTransactional : int16_t{0});
+        const bool hasHorizon = (deleteHorizonMs_ >= 0);
+        if (hasHorizon)
+            attrs = static_cast<int16_t>(attrs | kAttrDeleteHorizon);
+        const int64_t batchBaseTs = hasHorizon ? deleteHorizonMs_ : baseTimestamp_;
+
+        const std::size_t start = out.size();
+        detail::appendLE64(out, baseOffset_);
+        detail::appendLE32(out, 0);                          // length (patched below)
+        detail::appendLE32(out, -1);                         // partitionLeaderEpoch
+        out.push_back(static_cast<uint8_t>(kMagicValue));    // magic = 2
+        detail::appendLE32(out, 0);                          // CRC (patched below)
+        detail::appendLE16(out, attrs);                      // attributes
+        detail::appendLE32(out, recordCount_ - 1);           // lastOffsetDelta
+        detail::appendLE64(out, batchBaseTs);                // baseTimestamp (or horizon)
+        detail::appendLE64(out, maxTimestamp_);              // maxTimestamp
+        detail::appendLE64(out, producerId_);                // producerId
+        detail::appendLE16(out, producerEpoch_);             // producerEpoch
+        detail::appendLE32(out, baseSequence_);              // baseSequence
+        detail::appendLE32(out, recordCount_);               // recordCount
+        out.insert(out.end(), records_.begin(), records_.end());
+
+        const std::size_t len = out.size() - start;
+        detail::putLE(out, static_cast<int>(start) + kLengthOffset,
+                      static_cast<uint32_t>(len - 12));
+        uint32_t crc = crc32c(out.data() + start + kAttributesOffset,
+                              len - static_cast<std::size_t>(kAttributesOffset));
+        detail::putLE(out, static_cast<int>(start) + kCrcOffset, crc);
+        return len;
     }
 
     std::vector<uint8_t> build() {

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string_view>
 #include "MessageHeader.h"   // pulls in detail::putLE16/getLE16/putLE64/getLE64
 
@@ -46,8 +47,9 @@ inline int16_t getLE16s(const uint8_t* buf, int off) noexcept {
 /// Returns bytes written (always 2 + len).
 inline std::size_t putVarBytes(uint8_t* buf, const uint8_t* data, uint16_t len) noexcept {
     detail::putLE16(buf, 0, len);
-    for (uint16_t i = 0; i < len; ++i)
-        buf[2 + i] = data[i];
+    // Bulk copy — memcpy vectorises; the old byte-at-a-time loop capped the
+    // produce encode path at ~300 MB/s (it was ~80% of the client agent thread).
+    if (len) std::memcpy(buf + 2, data, len);
     return static_cast<std::size_t>(2) + len;
 }
 
@@ -61,6 +63,28 @@ inline bool getVarBytes(const uint8_t* buf, std::size_t avail, std::size_t& pos,
     const uint16_t len = detail::getLE16(buf, static_cast<int>(pos));
     pos += 2;
     // Need len more bytes.
+    if (pos + len > avail) return false;
+    outData = buf + pos;
+    outLen  = len;
+    pos    += len;
+    return true;
+}
+
+/// Write a var-bytes field with a 32-bit length prefix (for large blobs like
+/// recordBatch that can exceed 65535 bytes).  buf must have room for 4 + len.
+inline std::size_t putVarBytes32(uint8_t* buf, const uint8_t* data, uint32_t len) noexcept {
+    detail::putLE32(buf, 0, static_cast<int32_t>(len));
+    if (len) std::memcpy(buf + 4, data, len);
+    return static_cast<std::size_t>(4) + len;
+}
+
+/// Read a 32-bit-length var-bytes field from buf[pos..avail-1]; advances pos.
+/// Returns false (no over-read) if truncated.
+inline bool getVarBytes32(const uint8_t* buf, std::size_t avail, std::size_t& pos,
+                          const uint8_t*& outData, uint32_t& outLen) noexcept {
+    if (pos + 4 > avail) return false;
+    const uint32_t len = static_cast<uint32_t>(detail::getLE32(buf, static_cast<int>(pos)));
+    pos += 4;
     if (pos + len > avail) return false;
     outData = buf + pos;
     outLen  = len;
