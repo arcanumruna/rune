@@ -33,6 +33,7 @@
 #include <rune/metadata/ShardRouter.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/InMemoryLog.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
@@ -527,16 +528,31 @@ TEST(WorkerPool, WorkerDoWorkOnlyDrivesOwnedReplicas) {
     ASSERT_EQ(pool.worker(0).ownedCount(), static_cast<std::size_t>(2));
     ASSERT_EQ(pool.worker(1).ownedCount(), static_cast<std::size_t>(0));
 
+    // Give BOTH of worker 0's owned replicas REAL work: append a batch straight to
+    // each log so its LEO advances past the leader's served high-watermark.  On the
+    // next doWork, each owned Leader's recomputeHw() moves the served HW → counts as
+    // work.  (A bare ISR-check tick is intentionally NOT work — the idle strategy
+    // must park a genuinely-idle leader — so the owned-only proof needs actual work
+    // pending, not just a tick.)  logs[0]=r0, logs[1]=r1, both owned by worker 0.
+    {
+        rune::protocol::RecordBatchBuilder b(0, /*baseTs=*/1000);
+        b.append("k", "v", 1000);
+        const auto bytes = b.build();
+        logs[0]->appendNoSync(bytes.data(), bytes.size(), /*lastOffset=*/0);
+        logs[1]->appendNoSync(bytes.data(), bytes.size(), /*lastOffset=*/0);
+    }
+
     // Worker 1 doWork must return 0 — it has no replicas to drive.
     // Use nowNs beyond the 10ms ISR-check interval so Leader ticks fire.
     const int64_t nowNs = 20'000'000LL;  // 20ms > isrCheckIntervalNs default (10ms)
     const int w1Work = pool.worker(1).doWork(nowNs);
     EXPECT_EQ(w1Work, 0) << "empty worker must report 0 work";
 
-    // Worker 0 doWork must return > 0 — two fresh Leader replicas each fire
-    // their first ISR-check cycle (increments work by at least 1 per replica).
+    // Worker 0 doWork must return > 0 — each owned Leader advances its served HW to
+    // the freshly-appended LEO (recomputeHw registers work), proving worker 0 drives
+    // ONLY its owned replicas while worker 1 (owning none) stayed idle.
     const int w0Work = pool.worker(0).doWork(nowNs);
-    EXPECT_GT(w0Work, 0) << "worker owning two Leader replicas must report >0 work on first tick";
+    EXPECT_GT(w0Work, 0) << "worker owning two Leader replicas with pending log growth must report >0 work";
 }
 
 // ---------------------------------------------------------------------------
