@@ -33,6 +33,10 @@ struct Agent {
     virtual ~Agent() = default;
     /// Perform one duty-cycle.  Returns work count (>0 if any work was done).
     virtual int doWork(int64_t nowNs) = 0;
+    /// Thread name for this agent's AgentRunner thread (for `ps -M`/`top -H`/
+    /// profilers).  Keep short: macOS truncates the visible name and Linux
+    /// caps pthread names at 15 chars + NUL.  Default identifies the base.
+    virtual const char* name() const noexcept { return "rune-agent"; }
 };
 
 // ---------------------------------------------------------------------------

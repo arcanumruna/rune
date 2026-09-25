@@ -159,7 +159,13 @@ public:
         dirtyThisCycle_.reserve(kDirtySetReserve);
         pendingAcksAll_.reserve(kPendingAcksAllReserve);
         retOverflow_.reserve(kRetOverflowReserve);
+        threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
+
+    // Thread name for `ps -M`/`top -H`/profilers: "rune-wrk-<id>" (see
+    // AgentRunner::setCurrentThreadName). Cached so name() can hand back a
+    // stable c_str().
+    const char* name() const noexcept override { return threadName_.c_str(); }
 
     // Non-copyable and non-movable (two OneToOneByteRing members are not movable).
     Worker(const Worker&)            = delete;
@@ -1197,6 +1203,7 @@ private:
     }
 
     int32_t workerId_;
+    std::string threadName_; // "rune-wrk-<id>" — stable storage for name()
 
     // R2: ingress ring — agrona OneToOneByteRing (SPSC, flat byte messages).
     // Producer (control thread): tryEnqueueOp encodes into ingressScratch_ then write().

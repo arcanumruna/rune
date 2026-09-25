@@ -1345,7 +1345,10 @@ int PartitionReplica::doWork(int64_t nowNs)
 
         if (nowNs - lastIsrCheckNs_ >= cfg_.isrCheckIntervalNs) {
             lastIsrCheckNs_ = nowNs;
-            ++work; // ISR check cycle itself counts as work
+            // NOTE: the bare ISR-check TICK is NOT work — counting it made the
+            // idle-strategy see work>0 every 10ms and never park (busy-spin on an
+            // idle/no-follower leader).  Only count work when the check ACTUALLY
+            // changes ISR state or emits a reconcile (below).
 
             isrManager_->maybeShrinkIsr(nowNs,
                                          logEndOffset_(),
@@ -1354,11 +1357,13 @@ int PartitionReplica::doWork(int64_t nowNs)
             if (isrManager_->isrChanged()) {
                 syncIsrToLeaderState();
                 recomputeHw();
+                ++work;
             }
 
             isrManager_->maybeExpandIsr(nowNs, leaderState_.highWatermark());
             if (isrManager_->isrChanged()) {
                 syncIsrToLeaderState();
+                ++work;
             }
 
             // DR-BUG-6 completeness gate: re-evaluate each ISR check.  This lets a

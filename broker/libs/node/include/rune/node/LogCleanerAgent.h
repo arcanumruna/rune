@@ -162,6 +162,8 @@ public:
     //
     // Returns 1 if a compaction segment was processed, 0 when idle.
     // -----------------------------------------------------------------------
+    const char* name() const noexcept override { return "rune-cleaner"; }
+
     int doWork(int64_t nowNs) override {
         if (!registry_) return 0;
 

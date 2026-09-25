@@ -58,6 +58,8 @@ public:
     // -----------------------------------------------------------------------
     // Agent::doWork — single-writer duty cycle
     // -----------------------------------------------------------------------
+    const char* name() const noexcept override { return "rune-consensus"; }
+
     int doWork(int64_t nowNs) override {
         // 1. Poll Aeron subscription → fills IngressRing
         int workCount = ingress_.poll(kFragmentLimit);

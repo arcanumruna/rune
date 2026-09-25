@@ -273,6 +273,9 @@ public:
             case NodeConfig::WorkerIdleStrategy::Yielding:  // fallback to Backoff
             case NodeConfig::WorkerIdleStrategy::Sleeping:  // fallback to Backoff
             default:
+                // Agrona defaults (10 spins, 20 yields, 1µs–1ms park): a genuinely
+                // idle worker parks (doWork returns 0 when idle), and the 1ms
+                // maxPark caps first-produce-after-idle wake latency at 1ms.
                 idles_.emplace_back(
                     std::make_unique<rune::consensus::BackoffIdleStrategy>());
                 break;

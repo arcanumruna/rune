@@ -24,7 +24,30 @@
 #include <memory>
 #include <cassert>
 
+#if defined(__APPLE__) || defined(__linux__)
+#  include <pthread.h>
+#endif
+
 namespace rune::consensus {
+
+// Name the CALLING thread so `ps -M`, `top -H`, Instruments, and perf show a
+// human-readable label instead of an anonymous TID.  macOS: pthread_setname_np
+// takes only the name and always targets the current thread.  Linux: caps the
+// name at 15 chars + NUL, so it is truncated here.  No-op elsewhere.
+inline void setCurrentThreadName(const char* name) noexcept {
+    if (!name) return;
+#if defined(__APPLE__)
+    ::pthread_setname_np(name);
+#elif defined(__linux__)
+    char buf[16];
+    std::size_t i = 0;
+    for (; name[i] && i < sizeof(buf) - 1; ++i) buf[i] = name[i];
+    buf[i] = '\0';
+    ::pthread_setname_np(::pthread_self(), buf);
+#else
+    (void)name;
+#endif
+}
 
 // Forward declaration (AgentRunner depends on Agent; Agent is defined in
 // ConsensusAgent.h but the interface itself can be declared here to keep
@@ -92,6 +115,7 @@ public:
 
 private:
     void run() {
+        setCurrentThreadName(agent_.name());
         idle_.reset();
         while (running_.load(std::memory_order_acquire)) {
             const int64_t now = clock_.nowNs();

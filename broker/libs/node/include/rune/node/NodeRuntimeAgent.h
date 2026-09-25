@@ -128,6 +128,8 @@ public:
     // Agent::doWork — single-writer duty cycle.
     // Returns sum of work done by all components.
     // -----------------------------------------------------------------------
+    const char* name() const noexcept override { return "rune-runtime"; }
+
     int doWork(int64_t nowNs) override {
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);

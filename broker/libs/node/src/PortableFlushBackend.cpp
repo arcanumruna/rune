@@ -14,6 +14,7 @@
 //   reap() decrements inFlight_ for each reaped completion (also worker-side only).
 
 #include <rune/node/PortableFlushBackend.h>
+#include <rune/consensus/IdleStrategy.h>
 
 #include <cerrno>
 #include <cstring>
@@ -83,8 +84,19 @@ void PortableFlushBackend::flusherLoop_() {
     // Runs until the dtor sets the atomic stop_ flag (acquire-load below pairs
     // with the dtor's release-store).  No sentinel: submit() is the ring's sole
     // producer, so the dtor never writes to it (Task #12).
+    // Idle strategy for the flusher: when the submit ring is empty, back off
+    // (spin → yield → progressively longer parks) instead of a raw
+    // std::this_thread::yield() spin, which pegged a whole core PER WORKER even
+    // at zero load (one flusher thread per worker → N cores burned idle,
+    // starving the Aeron driver thread of CPU).  Under continuous load drain()
+    // returns >0 every iteration, which resets the strategy — so an fsync
+    // submitted while traffic is flowing is still picked up with no park delay;
+    // parks only accrue during a genuine lull, where latency is irrelevant.
+    // ("always use the backoff aeron idle strategy".)
+    rune::consensus::BackoffIdleStrategy idle;
+
     while (!stop_.load(std::memory_order_acquire)) {
-        submitRing_.drain(
+        const int drained = submitRing_.drain(
             [this](int32_t /*msgTypeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset,
@@ -115,7 +127,7 @@ void PortableFlushBackend::flusherLoop_() {
             /*limit=*/16);
 
         if (!stop_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+            idle.idle(drained); // parks when idle; resets to spin when draining
         }
     }
 
