@@ -279,6 +279,24 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         endif()
     endif()
 
+    # Accumulator engine micro-bench (in-process, no Aeron) — client batching throughput
+    add_executable(rune_producer_accum_bench
+        bench/ProducerAccumBench.cpp
+    )
+    target_include_directories(rune_producer_accum_bench PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_producer_accum_bench PRIVATE
+        rune_client_api
+        rune_client_producer
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_producer_accum_bench PRIVATE ${UUID_LIB})
+        endif()
+    endif()
+
     # CG-7 — GroupConsumer hot-path benchmarks (in-process, no Aeron)
     add_executable(rune_client_group_bench
         bench/GroupConsumerBench.cpp

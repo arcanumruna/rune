@@ -392,10 +392,15 @@ int ProducerImpl::drainRing(int64_t nowNs) {
 
             PartitionState& ps = getOrCreatePartition(topicId, partition);
 
-            // Initialise builder on first record in a batch.
+            // Create the builder ONCE per partition; it is reused (reset in place)
+            // across batches so there is no per-batch heap allocation.
             if (!ps.builder) {
                 ps.builder = std::make_unique<rune::protocol::RecordBatchBuilder>(
                     0, wallNs());
+            }
+            // Start-of-batch bookkeeping fires whenever the builder is empty
+            // (freshly created OR just reset after a flush).
+            if (ps.builder->recordCount() == 0) {
                 ps.builderBytes = 0;
                 ps.batchStartNs = nowNs;
             }
@@ -443,20 +448,14 @@ bool ProducerImpl::encodeAndSend(
     ps.builder->setProducerEpoch(producerEpoch_);
     ps.builder->setBaseSequence(ps.nextBaseSequence);
 
-    // Build the RecordBatch bytes into the reused member scratch buffer
-    // (batchScratch_ is cleared + refilled; capacity is retained across flushes —
-    // zero per-flush heap allocation on the agent produce hot path).
-    ps.builder->buildInto(batchScratch_);
-
     // Stamp the baseSequence advance.
     ps.nextBaseSequence += ps.builder->recordCount();
 
-    // Encode into the Produce wire frame.
-    // The key field on the Produce frame is left empty (partitionKnown=1,
-    // partition is computed client-side; the broker uses the partition field).
-    //
-    // Use the protocol struct directly to get encodedSize() without a cap=0
-    // probe (encodeProduce(nullptr,0,...) always returns 0, not needed size).
+    // Zero-copy encode: build the Produce frame header (with an EMPTY recordBatch)
+    // then append the RecordBatch DIRECTLY after it, into the same wire buffer.
+    // This removes the old two-pass cost — buildInto(batchScratch_) followed by a
+    // full batch memcpy inside Produce::encode — which dominated the agent thread.
+    // The batch's records are now gathered into the frame exactly once.
     namespace rpc = rune::protocol::client;
     rpc::Produce msg;
     msg.sessionId      = sessionId;
@@ -466,17 +465,22 @@ bool ProducerImpl::encodeAndSend(
     msg.partitionKnown = 1;
     msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
     msg.key            = {};
-    msg.recordBatch    = std::span<const uint8_t>(batchScratch_);
+    msg.recordBatch    = {};   // appended directly below (no intermediate copy)
 
-    const std::size_t needed = msg.encodedSize();
-    if (needed == 0) return false;
+    const std::size_t hdrLen = msg.encodedSize();   // header + empty key + empty rb prefix
+    if (hdrLen == 0) return false;
+    encodeScratch_.clear();
+    encodeScratch_.resize(hdrLen);
+    if (msg.encode(encodeScratch_.data()) == 0) return false;
 
-    // Grow scratch if needed (one-time growth; steady-state = no alloc).
-    if (encodeScratch_.size() < needed) {
-        encodeScratch_.resize(needed);
-    }
+    // Append the serialized batch right after the header (single gather copy).
+    const std::size_t batchLen = ps.builder->buildAppend(encodeScratch_);
+    // Patch the recordBatch u32 length prefix (the last 4 bytes of the header).
+    rpc::detail::putLE32(encodeScratch_.data(),
+                         static_cast<int>(hdrLen) - 4,
+                         static_cast<int32_t>(batchLen));
 
-    const std::size_t written = msg.encode(encodeScratch_.data());
+    const std::size_t written = encodeScratch_.size();
     if (written == 0) return false;
 
     // Offer to transport — E5.1: pass per-partition ingressStreamId.
@@ -499,8 +503,9 @@ bool ProducerImpl::encodeAndSend(
         }
     }
 
-    // Reset builder for next batch regardless (the batch bytes are now in flight).
-    ps.builder.reset();
+    // Reset builder IN PLACE for the next batch (keep the object + its records_
+    // capacity — no per-batch heap alloc; drain hot path reuses it).
+    ps.builder->reset(0, wallNs());
     ps.builderBytes  = 0;
     ps.batchStartNs  = 0;
     ps.flushRequested = false;

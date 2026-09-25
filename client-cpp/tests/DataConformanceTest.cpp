@@ -88,7 +88,7 @@ static std::vector<uint8_t> readVector(const char* name) {
 // ===========================================================================
 TEST(DataCodecConformance, ProduceExplicitPartition) {
     const auto golden = readVector("produce_explicit_partition.bin");
-    ASSERT_EQ(golden.size(), 60u);
+    ASSERT_EQ(golden.size(), 62u);
 
     // --- Decode-golden ---
     auto view = cc::decodeProduce(golden.data(), golden.size());
@@ -111,7 +111,7 @@ TEST(DataCodecConformance, ProduceExplicitPartition) {
         std::span<const uint8_t>{},
         std::span<const uint8_t>(kBatchBytes, kBatchLen),
         kSessionId, kCorrelationId);
-    ASSERT_EQ(n, 60u);
+    ASSERT_EQ(n, 62u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_explicit_partition.bin";
 }
@@ -124,7 +124,7 @@ TEST(DataCodecConformance, ProduceExplicitPartition) {
 // ===========================================================================
 TEST(DataCodecConformance, ProduceKeyOnly) {
     const auto golden = readVector("produce_key_only.bin");
-    ASSERT_EQ(golden.size(), 63u);
+    ASSERT_EQ(golden.size(), 65u);
 
     // --- Decode-golden ---
     auto view = cc::decodeProduce(golden.data(), golden.size());
@@ -149,7 +149,7 @@ TEST(DataCodecConformance, ProduceKeyOnly) {
         std::span<const uint8_t>(kKeyBytes, kKeyLen),
         std::span<const uint8_t>(kBatchBytes, kBatchLen),
         kSessionId, kCorrelationId);
-    ASSERT_EQ(n, 63u);
+    ASSERT_EQ(n, 65u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_key_only.bin";
 }
@@ -259,7 +259,7 @@ TEST(DataCodecConformance, SubscribeKeyOnly) {
 // ===========================================================================
 TEST(DataCodecConformance, RecordsPush) {
     const auto golden = readVector("records_push.bin");
-    ASSERT_EQ(golden.size(), 58u);
+    ASSERT_EQ(golden.size(), 60u);
 
     // --- Decode-golden ---
     auto view = cc::decodeRecords(golden.data(), golden.size());
@@ -281,7 +281,7 @@ TEST(DataCodecConformance, RecordsPush) {
         kSubscriptionId, 3001, 5, 100000LL,
         std::span<const uint8_t>(kBatchBytes, kBatchLen),
         kSessionId, kCorrelationId);
-    ASSERT_EQ(n, 58u);
+    ASSERT_EQ(n, 60u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden records_push.bin";
 }
