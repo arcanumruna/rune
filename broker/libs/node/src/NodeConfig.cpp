@@ -317,6 +317,24 @@ ConfigResult parseNodeConfig(
                                    ? (clientStreamId + 1)
                                    : workerIngressBaseStreamId;
 
+    // read-rework T3/T4: per-worker dynamic-MDC egress config (optional overrides;
+    // buildWorkerPool resolves workerEgressBaseStreamId=0 → ingressBase+workerCount).
+    {
+        const char* rawEgHost = getenv_fn("RUNE_WORKER_EGRESS_CONTROL_HOST");
+        if (rawEgHost && !std::string_view(rawEgHost).empty())
+            cfg.workerEgressControlHost = rawEgHost;
+        const char* rawEgPort = getenv_fn("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT");
+        if (rawEgPort && !std::string_view(rawEgPort).empty()) {
+            if (!parseInt32(rawEgPort, cfg.workerEgressControlBasePort))
+                return {{}, std::string("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT is not a valid integer: ") + rawEgPort};
+        }
+        const char* rawEgStream = getenv_fn("RUNE_WORKER_EGRESS_BASE_STREAM");
+        if (rawEgStream && !std::string_view(rawEgStream).empty()) {
+            if (!parseInt32(rawEgStream, cfg.workerEgressBaseStreamId))
+                return {{}, std::string("RUNE_WORKER_EGRESS_BASE_STREAM is not a valid integer: ") + rawEgStream};
+        }
+    }
+
     {
         std::string err;
         err = parseOptionalInt64Ms(getenv_fn, "RUNE_ELECTION_TIMEOUT_MS",

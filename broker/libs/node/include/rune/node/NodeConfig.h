@@ -247,6 +247,28 @@ struct NodeConfig {
     // parseNodeConfig after clientEndpoint.streamId is known.
     int32_t workerIngressBaseStreamId = 0;  // 0 = unset; resolved to clientStreamId+1
 
+    // read-rework T3/T4: per-worker dynamic-MDC egress publication config.
+    //
+    // Each worker owns ONE egress ExclusivePublication on
+    //   channel  = aeron:udp?control-mode=dynamic|control=<host>:<CTRL_BASE+workerId>|fc=min
+    //   streamId = workerEgressBaseStreamId + workerId
+    // Consumers self-register by subscribing to that control address (dynamic MDC),
+    // so the worker never manages the destination list and the control thread never
+    // touches the publication (shared-nothing).
+    //
+    //   - workerEgressControlHost: host the broker binds/advertises for MDC control.
+    //     Default "127.0.0.1" (single-box bench/tests); deployments override via
+    //     RUNE_WORKER_EGRESS_CONTROL_HOST with the broker's reachable address.
+    //   - workerEgressControlBasePort: base UDP control port; worker W uses
+    //     base + W.  RUNE_WORKER_EGRESS_CONTROL_BASE_PORT.  Must not collide with
+    //     client/consensus/replication ports.
+    //   - workerEgressBaseStreamId: 0 = unset; resolved in buildWorkerPool to
+    //     workerIngressBaseStreamId + workerCount (keeps ingress/egress stream
+    //     ranges non-overlapping).  RUNE_WORKER_EGRESS_BASE_STREAM.
+    std::string workerEgressControlHost     = "127.0.0.1";
+    int32_t     workerEgressControlBasePort = 40300;
+    int32_t     workerEgressBaseStreamId    = 0;  // 0 = unset; resolved in buildWorkerPool
+
     // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread
     // communication is via agrona ring buffers; their sizes are tunable per
     // deployment (no hardcoded ring capacities). Powers of two.

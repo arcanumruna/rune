@@ -70,6 +70,7 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerWire.h>
 #include <rune/node/WorkerIngress.h>
+#include <rune/node/WorkerEgress.h>
 #include <rune/node/IoBackend.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
@@ -202,6 +203,15 @@ public:
         workerIngress_          = ingress;
         perWorkerIngressActive_ = active;
     }
+
+    // -----------------------------------------------------------------------
+    // read-rework T3/T4: wire this worker's OWN dynamic-MDC egress publication.
+    // The worker thread becomes the sole writer of `egress` (WorkerEgress::send).
+    // Non-owning: BrokerNode owns the WorkerEgress lifetime.  Must be called
+    // BEFORE the worker's AgentRunner starts (startup / single-threaded).
+    // -----------------------------------------------------------------------
+    void setWorkerEgress(WorkerEgress* egress) noexcept { workerEgress_ = egress; }
+    [[nodiscard]] WorkerEgress* workerEgress() const noexcept { return workerEgress_; }
 
     // Set acks=all commit-wait timeout.  Default kDefaultAckTimeoutNs (30 s).
     void setAckTimeoutNs(int64_t timeoutNs) noexcept { ackTimeoutNs_ = timeoutNs; }
@@ -1312,6 +1322,11 @@ private:
     // Non-owning pointer to this worker's Aeron ingress subscription.
     // Null until setWorkerIngress() is called.  Worker-thread read only (doWork).
     WorkerIngress* workerIngress_ = nullptr;
+
+    // read-rework T3/T4: non-owning pointer to this worker's OWN dynamic-MDC egress
+    // publication.  Null until setWorkerEgress() is called.  The worker thread is
+    // the SOLE writer (shared-nothing); the control thread never touches it.
+    WorkerEgress* workerEgress_ = nullptr;
 
     // E5.1.2d: acks=all commit-wait pending list.
     //

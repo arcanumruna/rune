@@ -32,6 +32,7 @@
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerIngress.h>
+#include <rune/node/WorkerEgress.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -362,6 +363,11 @@ private:
     // Owned here; workers hold non-owning raw pointers (via setWorkerIngress).
     // Empty when perWorkerIngressEnabled is false (default).
     std::vector<std::unique_ptr<WorkerIngress>> workerIngresses_;
+
+    // read-rework T3/T4: per-worker dynamic-MDC egress publications.  One per worker
+    // when perWorkerIngressEnabled && aeron_.  Owned here; workers hold non-owning
+    // raw pointers (via setWorkerEgress).  Empty otherwise.
+    std::vector<std::unique_ptr<WorkerEgress>> workerEgresses_;
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
