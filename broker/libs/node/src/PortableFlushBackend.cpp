@@ -67,14 +67,17 @@ CompletionToken PortableFlushBackend::submit(int fd,
     req.fd            = fd;
     req.flushBoundary = flushBoundary;
     req.token         = tok;
-    uint8_t buf[sizeof(FlushRequest)];
-    std::memcpy(buf, &req, sizeof(FlushRequest));
-    if (!submitRing_.write(buf, sizeof(FlushRequest), /*msgTypeId=*/1)) {
+    // Zero-copy: claim the slot and copy the request straight into the ring
+    // (no intermediate staging buffer).  tryClaim < 0 = back-pressure.
+    const auto idx = submitRing_.tryClaim(/*msgTypeId=*/1, sizeof(FlushRequest));
+    if (idx < 0) {
         // Byte ring is full (shouldn't happen if depth is respected, but guard
         // anyway).  Roll back the token sequence.
         --nextToken_;
         return kNoToken;
     }
+    std::memcpy(submitRing_.base() + idx, &req, sizeof(FlushRequest));
+    submitRing_.commit(idx);
     ++inFlight_;
     return tok;
 }
@@ -114,13 +117,18 @@ void PortableFlushBackend::flusherLoop_() {
                 comp.flushBoundary = req->flushBoundary;
                 comp.errorCode     = (rc == 0) ? 0 : saved_errno;
 
-                // Encode the completion and spin-enqueue it.
-                // The flusher may block (off worker path); the completion ring
-                // will drain on the worker's next reap() call.
-                uint8_t compBuf[sizeof(FlushCompletion)];
-                std::memcpy(compBuf, &comp, sizeof(FlushCompletion));
-                while (!completionRing_.write(compBuf, sizeof(FlushCompletion),
-                                               /*msgTypeId=*/1)) {
+                // Zero-copy: claim the slot + copy the completion straight into the
+                // ring (no staging buffer).  The flusher may block (off worker path);
+                // the completion ring drains on the worker's next reap() call.  Spin
+                // until a slot frees (tryClaim < 0 = full).
+                for (;;) {
+                    const auto idx =
+                        completionRing_.tryClaim(/*msgTypeId=*/1, sizeof(FlushCompletion));
+                    if (idx >= 0) {
+                        std::memcpy(completionRing_.base() + idx, &comp, sizeof(FlushCompletion));
+                        completionRing_.commit(idx);
+                        break;
+                    }
                     std::this_thread::yield();
                 }
             },
