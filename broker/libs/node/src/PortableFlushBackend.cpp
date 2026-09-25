@@ -32,8 +32,8 @@ namespace rune::node {
 
 PortableFlushBackend::PortableFlushBackend(std::size_t submitDepth,
                                            std::size_t completionDepth)
-    : submitRing_(detail::flushRingByteCapacity(submitDepth, sizeof(FlushRequest)))
-    , completionRing_(detail::flushRingByteCapacity(completionDepth, sizeof(FlushCompletion)))
+    : submitRing_(detail::flushRingByteCapacity(submitDepth, kFlushRequestWireLen))
+    , completionRing_(detail::flushRingByteCapacity(completionDepth, kFlushCompletionWireLen))
     , nextToken_(0)
     , submitDepth_(submitDepth)
     , inFlight_(0)
@@ -63,20 +63,20 @@ CompletionToken PortableFlushBackend::submit(int fd,
     }
 
     const CompletionToken tok = ++nextToken_;
-    FlushRequest req{};
-    req.fd            = fd;
-    req.flushBoundary = flushBoundary;
-    req.token         = tok;
-    // Zero-copy: claim the slot and copy the request straight into the ring
-    // (no intermediate staging buffer).  tryClaim < 0 = back-pressure.
-    const auto idx = submitRing_.tryClaim(/*msgTypeId=*/1, sizeof(FlushRequest));
+    // read-rework SBE-C: SBE wrap-in-place encode directly into the claimed slot
+    // (no intermediate struct/memcpy).  tryClaim < 0 = back-pressure.
+    const auto idx = submitRing_.tryClaim(flushsbe::FlushRequest::sbeTemplateId(),
+                                          kFlushRequestWireLen);
     if (idx < 0) {
         // Byte ring is full (shouldn't happen if depth is respected, but guard
         // anyway).  Roll back the token sequence.
         --nextToken_;
         return kNoToken;
     }
-    std::memcpy(submitRing_.base() + idx, &req, sizeof(FlushRequest));
+    flushsbe::FlushRequest enc;
+    enc.wrapAndApplyHeader(reinterpret_cast<char*>(submitRing_.base() + idx), 0,
+                           kFlushRequestWireLen);
+    enc.fd(fd).flushBoundary(flushBoundary).token(static_cast<int64_t>(tok));
     submitRing_.commit(idx);
     ++inFlight_;
     return tok;
@@ -103,29 +103,39 @@ void PortableFlushBackend::flusherLoop_() {
             [this](int32_t /*msgTypeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset,
-                   aeron::util::index_t /*length*/) {
-                // Zero-copy view into the ring.
-                const FlushRequest* req =
-                    reinterpret_cast<const FlushRequest*>(buf.buffer() + offset);
+                   aeron::util::index_t length) {
+                // read-rework SBE-C: SBE-decode the request in place (zero-copy).
+                char* rp = reinterpret_cast<char*>(buf.buffer() + offset);
+                const std::uint64_t rcap = static_cast<std::uint64_t>(length);
+                flushsbe::MessageHeader rhdr;
+                rhdr.wrap(rp, 0, 0, rcap);
+                flushsbe::FlushRequest req;
+                req.wrapForDecode(rp, flushsbe::MessageHeader::encodedLength(),
+                                  rhdr.blockLength(), rhdr.version(), rcap);
+                const int             reqFd    = req.fd();
+                const int64_t         reqBound = req.flushBoundary();
+                const CompletionToken reqTok   = static_cast<CompletionToken>(req.token());
 
                 // Perform the datasync (may block — intentional; off the worker path).
-                int rc = rune_fdatasync(req->fd);
+                int rc = rune_fdatasync(reqFd);
                 int saved_errno = (rc != 0) ? errno : 0;
+                const int32_t ec = (rc == 0) ? 0 : saved_errno;
 
-                FlushCompletion comp{};
-                comp.token         = req->token;
-                comp.flushBoundary = req->flushBoundary;
-                comp.errorCode     = (rc == 0) ? 0 : saved_errno;
-
-                // Zero-copy: claim the slot + copy the completion straight into the
-                // ring (no staging buffer).  The flusher may block (off worker path);
-                // the completion ring drains on the worker's next reap() call.  Spin
-                // until a slot frees (tryClaim < 0 = full).
+                // SBE wrap-in-place encode of the completion into the claimed slot.
+                // The flusher may block (off worker path); the completion ring drains
+                // on the worker's next reap() call.  Spin until a slot frees.
                 for (;;) {
                     const auto idx =
-                        completionRing_.tryClaim(/*msgTypeId=*/1, sizeof(FlushCompletion));
+                        completionRing_.tryClaim(flushsbe::FlushCompletion::sbeTemplateId(),
+                                                 kFlushCompletionWireLen);
                     if (idx >= 0) {
-                        std::memcpy(completionRing_.base() + idx, &comp, sizeof(FlushCompletion));
+                        flushsbe::FlushCompletion cenc;
+                        cenc.wrapAndApplyHeader(
+                            reinterpret_cast<char*>(completionRing_.base() + idx), 0,
+                            kFlushCompletionWireLen);
+                        cenc.token(static_cast<int64_t>(reqTok))
+                            .flushBoundary(reqBound)
+                            .errorCode(ec);
                         completionRing_.commit(idx);
                         break;
                     }

@@ -46,12 +46,23 @@
 //   = capacity/8) while fitting at least `depth` messages byte-wise.
 
 #include <rune/node/OneToOneByteRing.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/FlushRequest.h>
+#include <rune_protocol_internal_sbe/FlushCompletion.h>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <thread>
 
 namespace rune::node {
+
+// read-rework SBE-C: encoded wire sizes of the Flush ring messages (SBE header +
+// fixed block) — used for ring sizing + tryClaim reserves.
+namespace flushsbe = rune::protocol::internal::sbe;
+inline constexpr std::size_t kFlushRequestWireLen =
+    flushsbe::MessageHeader::encodedLength() + flushsbe::FlushRequest::sbeBlockLength();
+inline constexpr std::size_t kFlushCompletionWireLen =
+    flushsbe::MessageHeader::encodedLength() + flushsbe::FlushCompletion::sbeBlockLength();
 
 // ---------------------------------------------------------------------------
 // Shared I/O backend types
@@ -139,14 +150,21 @@ public:
             [&](int32_t /*msgTypeId*/,
                 aeron::concurrent::AtomicBuffer& buf,
                 aeron::util::index_t offset,
-                aeron::util::index_t /*length*/) {
-                // Zero-copy view: reinterpret the bytes in the ring directly.
-                // The handler receives a const reference — valid only for the
-                // duration of this call (agrona ring view lifetime rule).
-                const FlushCompletion* comp =
-                    reinterpret_cast<const FlushCompletion*>(
-                        buf.buffer() + offset);
-                handler(*comp);
+                aeron::util::index_t length) {
+                // read-rework SBE-C: SBE-decode the completion in place (zero-copy
+                // view into the ring) into a FlushCompletion the handler consumes.
+                char* fp = reinterpret_cast<char*>(buf.buffer() + offset);
+                const std::uint64_t cap = static_cast<std::uint64_t>(length);
+                flushsbe::MessageHeader hdr;
+                hdr.wrap(fp, 0, 0, cap);
+                flushsbe::FlushCompletion dec;
+                dec.wrapForDecode(fp, flushsbe::MessageHeader::encodedLength(),
+                                  hdr.blockLength(), hdr.version(), cap);
+                FlushCompletion comp;
+                comp.token         = static_cast<CompletionToken>(dec.token());
+                comp.flushBoundary = dec.flushBoundary();
+                comp.errorCode     = dec.errorCode();
+                handler(comp);
                 ++count;
                 // Decrement in-flight count: this slot is now free.
                 // inFlight_ is worker-only — no synchronisation needed.
