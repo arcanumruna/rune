@@ -440,7 +440,13 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             const std::string_view vv(reinterpret_cast<const char*>(valBytes),
                                       static_cast<std::size_t>(valueLen));
             ps.builder->append(kv, vv, wallNs());
-            ps.builderBytes += static_cast<int32_t>(valueLen);
+            // Track the TRUE encoded WIRE size (fixed batch header + accumulated
+            // record bodies), not just value bytes — so the batch flushes at
+            // batchBytes of WIRE and never overshoots the broker's max produce
+            // batch size (the old value-only count undercounted per-record framing
+            // by ~20B/record, producing ~70KB wire for a "64KB" batch → rejected).
+            ps.builderBytes = static_cast<int32_t>(
+                rune::protocol::batch::kRecordBatchOverhead + ps.builder->bodyBytes());
             ++recordsSent_;
             return ControlledAction::CONTINUE;
         },

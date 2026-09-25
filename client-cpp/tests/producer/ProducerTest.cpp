@@ -412,7 +412,11 @@ TEST(Producer, AutoBatchByteTrigger) {
     auto topic = makeTopic(1, 4);
     Key  key(uint64_t{42});
 
-    // Each value is 100 bytes → 6 sends ≈ 600 bytes > 500 → one batch flush.
+    // Each value is 100 bytes.  builderBytes now tracks the TRUE encoded WIRE size
+    // (61-byte batch header + per-record body incl. framing ≈ 114 B/record), so the
+    // 500-byte trigger fires after ~4 records (61 + 4*114 = 517 ≥ 500) rather than
+    // 5 under the old value-only count.  Point of the test: the byte trigger packs
+    // MULTIPLE records into one batch.
     const std::vector<uint8_t> val(100, 0xAB);
     const std::span<const uint8_t> valSpan(val);
 
@@ -424,7 +428,7 @@ TEST(Producer, AutoBatchByteTrigger) {
         << "Expected 1 batch flushed on batchBytes trigger";
 
     ASSERT_GE(h.gw->batches.size(), 1u);
-    EXPECT_GE(h.gw->batches[0].recCount, 5)
+    EXPECT_GT(h.gw->batches[0].recCount, 1)
         << "Batch must accumulate multiple records before flushing";
     EXPECT_EQ(h.gw->batches[0].topicId, 1);
 }
@@ -1216,6 +1220,12 @@ TEST(Producer, MultiRecordBatch) {
     // baseSequence must be 0 (first batch on this partition).
     EXPECT_EQ(b0.baseSeq, 0)
         << "First batch baseSequence must be 0";
+
+    // builderBytes now tracks true WIRE size (batch header + per-record framing),
+    // so the batchBytes trigger fires earlier and leaves a sub-threshold tail that
+    // the trigger alone will never flush.  Explicitly flush the remainder so the
+    // gap-free-baseSequence invariant can be checked across ALL records.
+    p.flush();
 
     // Wait for all batches to be sent (remaining records after the first flush).
     // Poll until total received records == kRecords (all records flushed).
