@@ -208,6 +208,16 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_gateway_per_partition_routing_tests
                 PROPERTIES TIMEOUT 180)
 
+            # SPIKE (throwaway): per-worker MDC egress mechanic de-risk (T3/T4).
+            add_executable(rune_mdc_egress_spike_tests
+                tests/integration/MdcEgressSpikeTest.cpp)
+            target_link_libraries(rune_mdc_egress_spike_tests PRIVATE
+                rune_gateway
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_mdc_egress_spike_tests
+                PROPERTIES TIMEOUT 90)
+
             # MD1 Task 10: Metadata request/response integration tests.
             add_executable(rune_metadata_request_tests
                 tests/integration/MetadataRequestTest.cpp)
