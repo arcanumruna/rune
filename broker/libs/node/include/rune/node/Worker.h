@@ -68,7 +68,12 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/WorkerOp.h>
-#include <rune/node/WorkerWire.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/WorkerOp.h>
+#include <rune_protocol_internal_sbe/WorkerReturn.h>
+#include <rune_protocol_internal_sbe/OpType.h>
+#include <rune_protocol_internal_sbe/ReturnType.h>
+#include <rune_protocol_internal_sbe/TailKind.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/IoBackend.h>
@@ -97,6 +102,9 @@
 #endif
 
 namespace rune::node {
+
+// read-rework SBE-B: the worker ring codec now uses the SBE-generated flyweights.
+namespace sbe = rune::protocol::internal::sbe;
 
 class Worker : public rune::consensus::Agent {
 public:
@@ -288,14 +296,96 @@ public:
     // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
-        // Zero-copy: reserve the exact ring slot, then encode the op DIRECTLY into
-        // it (no scratch buffer, no scratch→ring copy).  tryClaim() returns < 0 when
-        // the ring is full → explicit back-pressure; the caller must hold and retry.
-        const std::size_t n = encodedWorkerOpSize(op);
+        // SBE wrap-in-place: reserve the exact ring slot (computeLength — no
+        // hand-rolled size), then encode the WorkerOp DIRECTLY into the claimed
+        // buffer via the SBE flyweight (no intermediate struct, no memcpy).
+        // tryClaim() < 0 → ring full → explicit back-pressure (caller holds+retries).
+
+        // Determine the variable tail (src, len, kind) from the op type — the ONE
+        // place tail selection lives (mirrors the former encodeWorkerOp switch).
+        const uint8_t* tailSrc  = nullptr;
+        std::size_t    tailLen  = 0;
+        sbe::TailKind::Value tailKind = sbe::TailKind::Value::NONE;
+        switch (op.type) {
+        case WorkerOp::Type::Produce:
+        case WorkerOp::Type::AppendControlRecord:
+            tailKind = sbe::TailKind::Value::RECORD_BATCH;
+            tailSrc  = op.recordBatchBytes.data();
+            tailLen  = op.recordBatchBytes.size();
+            break;
+        case WorkerOp::Type::ApplyReplicated:
+        case WorkerOp::Type::ReconcileFetchResp:
+            tailKind = sbe::TailKind::Value::REPLICATED_RECORDS;
+            tailSrc  = op.replicatedPayload.records.data();
+            tailLen  = op.replicatedPayload.records.size();
+            break;
+        case WorkerOp::Type::BecomeLeader:
+            tailKind = sbe::TailKind::Value::ISR_LIST;
+            tailSrc  = reinterpret_cast<const uint8_t*>(op.isr.data());
+            tailLen  = op.isr.size() * sizeof(rune::replication::NodeId);
+            break;
+        case WorkerOp::Type::SetOwnership:
+            tailKind = sbe::TailKind::Value::OWNED_SET;
+            tailSrc  = reinterpret_cast<const uint8_t*>(op.ownedSet.data());
+            tailLen  = op.ownedSet.size() * sizeof(uintptr_t);
+            break;
+        default:
+            break;  // NONE tail
+        }
+
+        // Total frame = SBE MessageHeader (8) + block + varData.  computeLength()
+        // covers block+varData only, so add the header explicitly.
+        const std::size_t n =
+            sbe::MessageHeader::encodedLength() + sbe::WorkerOp::computeLength(tailLen);
         const aeron::util::index_t idx =
-            ingress_.tryClaim(workerOpMsgTypeId(op), n);
+            ingress_.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
         if (idx < 0) return false;  // ring full — back-pressure
-        encodeWorkerOp(op, ingress_.base() + idx, n);
+
+        sbe::WorkerOp enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(ingress_.base() + idx), 0, n);
+        enc.opType(static_cast<sbe::OpType::Value>(static_cast<std::uint8_t>(op.type)))
+           .topicId(op.topicId)
+           .partition(op.partition)
+           .replica(reinterpret_cast<std::uint64_t>(op.replica))
+           .logPtr(reinterpret_cast<std::uint64_t>(op.logPtr))
+           .sessionId(op.sessionId)
+           .correlationId(op.correlationId)
+           .acks(op.acks)
+           .producerId(op.producerId)
+           .producerEpoch(op.producerEpoch)
+           .baseSequence(op.baseSequence)
+           .lastOffsetDelta(op.lastOffsetDelta)
+           .recordCount(op.recordCount)
+           .batchAttrs(op.batchAttrs)
+           .deferAck(op.deferAck ? 1 : 0)
+           .durabilityTier(op.durabilityTier)
+           .enqueuedAtNs(op.enqueuedAtNs)
+           .subscriptionId(op.subscriptionId)
+           .nextOffset(op.nextOffset)
+           .hwBound(op.hwBound)
+           .isolation(op.isolation)
+           .isGroup(op.isGroup ? 1 : 0)
+           .groupCarrierReceived(op.groupCarrierReceived ? 1 : 0)
+           .roleEpoch(static_cast<std::int64_t>(op.roleEpoch))
+           .roleLeaderId(static_cast<std::int32_t>(op.roleLeaderId))
+           .replLeaderEpoch(op.replicatedPayload.leaderEpoch)
+           .replPartition(op.replicatedPayload.partition)
+           .replHighWatermark(op.replicatedPayload.highWatermark)
+           .replLogStartOffset(op.replicatedPayload.logStartOffset)
+           .replErrorCode(op.replicatedPayload.errorCode)
+           .replTopicId(op.replicatedPayload.topicId)
+           .frLeaderEpoch(static_cast<std::int64_t>(op.fetchRequestPayload.leaderEpoch))
+           .frFollowerId(static_cast<std::int32_t>(op.fetchRequestPayload.followerId))
+           .frFetchOffset(static_cast<std::int64_t>(op.fetchRequestPayload.fetchOffset))
+           .frMaxBytes(op.fetchRequestPayload.maxBytes)
+           .frNowNs(op.fetchRequestPayload.nowNs)
+           .oleCurrentEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.currentEpoch))
+           .oleFollowerId(static_cast<std::int32_t>(op.offsEpochReqPayload.followerId))
+           .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
+           .oleFollowerLeo(static_cast<std::int64_t>(op.offsEpochReqPayload.followerLeo))
+           .tailKind(tailKind);
+        enc.putTail(reinterpret_cast<const char*>(tailSrc),
+                    static_cast<std::uint32_t>(tailLen));
         ingress_.commit(idx);
         return true;
     }
@@ -321,44 +411,51 @@ public:
                   aeron::util::index_t off,
                   aeron::util::index_t /*len*/)
             {
-                const uint8_t* frame =
-                    reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
-                const WorkerReturnWire* hdr = decodeWorkerReturnHeader(frame);
+                char* frame = reinterpret_cast<char*>(buf.buffer()) + off;
 
-                // Reconstruct WorkerReturn from the wire header.
+                // SBE zero-copy decode: wrap the ring frame, read fields in place.
+                sbe::MessageHeader mh;
+                mh.wrap(frame, 0, 0, static_cast<std::uint64_t>(buf.capacity()) - off);
+                sbe::WorkerReturn dec;
+                dec.wrapForDecode(frame, sbe::MessageHeader::encodedLength(),
+                                  mh.blockLength(), mh.version(),
+                                  static_cast<std::uint64_t>(buf.capacity()) - off);
+
+                // Reconstruct the WorkerReturn struct for the consumer callback.
                 WorkerReturn ret;
-                ret.type                 = static_cast<WorkerReturn::Type>(hdr->type);
-                ret.sessionId            = hdr->sessionId;
-                ret.correlationId        = hdr->correlationId;
-                ret.partition            = hdr->partition;
-                ret.baseOffset           = hdr->baseOffset;
-                ret.lastOffset           = hdr->lastOffset;
-                ret.errorCode            = hdr->errorCode;
-                ret.deferAck             = hdr->deferAck != 0;
+                ret.type                 = static_cast<WorkerReturn::Type>(
+                                               static_cast<std::uint8_t>(dec.returnType()));
+                ret.sessionId            = dec.sessionId();
+                ret.correlationId        = dec.correlationId();
+                ret.partition            = dec.partition();
+                ret.baseOffset           = dec.baseOffset();
+                ret.lastOffset           = dec.lastOffset();
+                ret.errorCode            = dec.errorCode();
+                ret.deferAck             = dec.deferAck() != 0;
                 ret.replica              = reinterpret_cast<
-                    rune::replication::PartitionReplica*>(hdr->replica);
-                ret.producerId           = hdr->producerId;
-                ret.producerEpoch        = hdr->producerEpoch;
-                ret.baseSequence         = hdr->baseSequence;
-                ret.recordCount          = hdr->recordCount;
-                ret.topicId              = hdr->topicId;
-                ret.batchAttrs           = hdr->batchAttrs;
-                ret.enqueuedAtNs         = hdr->enqueuedAtNs;
-                ret.subscriptionId       = hdr->subscriptionId;
-                ret.readTopicId          = hdr->readTopicId;
-                ret.readPartition        = hdr->readPartition;
-                ret.newNextOffset        = hdr->newNextOffset;
-                ret.hwBound              = hdr->hwBound;
-                ret.isolation            = hdr->isolation;
-                ret.isGroup              = hdr->isGroup != 0;
-                ret.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+                    rune::replication::PartitionReplica*>(dec.replica());
+                ret.producerId           = dec.producerId();
+                ret.producerEpoch        = dec.producerEpoch();
+                ret.baseSequence         = dec.baseSequence();
+                ret.recordCount          = dec.recordCount();
+                ret.topicId              = dec.topicId();
+                ret.batchAttrs           = dec.batchAttrs();
+                ret.enqueuedAtNs         = dec.enqueuedAtNs();
+                ret.subscriptionId       = dec.subscriptionId();
+                ret.readTopicId          = dec.readTopicId();
+                ret.readPartition        = dec.readPartition();
+                ret.newNextOffset        = dec.newNextOffset();
+                ret.hwBound              = dec.hwBound();
+                ret.isolation            = dec.isolation();
+                ret.isGroup              = dec.isGroup() != 0;
+                ret.groupCarrierReceived = dec.groupCarrierReceived() != 0;
 
-                // Tail: PushReadResult chunk — copy from ring view (1 copy).
-                // The view is valid only for the duration of this callback; we
-                // copy into ret.chunk so fn can access it safely.
-                const uint8_t* tail = workerReturnTail(frame);
-                if (tail && hdr->tailLen > 0) {
-                    ret.chunk.assign(tail, tail + hdr->tailLen);
+                // Tail: PushReadResult chunk — copy from the ring view (1 copy) so
+                // fn can access it safely after the callback returns.
+                const std::uint32_t chunkLen = dec.chunkLength();
+                if (chunkLen > 0) {
+                    const uint8_t* c = reinterpret_cast<const uint8_t*>(dec.chunk());
+                    ret.chunk.assign(c, c + chunkLen);
                 }
 
                 fn(std::move(ret));
@@ -510,13 +607,48 @@ private:
     //
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
+    // SBE wrap-in-place encode of a WorkerReturn into the claimed ring slot at
+    // ret_.base()+idx (no intermediate struct/memcpy).  Shared by enqueueReturn_
+    // and flushRetOverflow_.
+    void encodeReturnSbe_(const WorkerReturn& ret, aeron::util::index_t idx, std::size_t n) {
+        sbe::WorkerReturn enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(ret_.base() + idx), 0, n);
+        enc.returnType(static_cast<sbe::ReturnType::Value>(static_cast<std::uint8_t>(ret.type)))
+           .sessionId(ret.sessionId)
+           .correlationId(ret.correlationId)
+           .partition(ret.partition)
+           .baseOffset(ret.baseOffset)
+           .lastOffset(ret.lastOffset)
+           .errorCode(ret.errorCode)
+           .deferAck(ret.deferAck ? 1 : 0)
+           .replica(reinterpret_cast<std::uint64_t>(ret.replica))
+           .producerId(ret.producerId)
+           .producerEpoch(ret.producerEpoch)
+           .baseSequence(ret.baseSequence)
+           .recordCount(ret.recordCount)
+           .topicId(ret.topicId)
+           .batchAttrs(ret.batchAttrs)
+           .enqueuedAtNs(ret.enqueuedAtNs)
+           .subscriptionId(ret.subscriptionId)
+           .readTopicId(ret.readTopicId)
+           .readPartition(ret.readPartition)
+           .newNextOffset(ret.newNextOffset)
+           .hwBound(ret.hwBound)
+           .isolation(ret.isolation)
+           .isGroup(ret.isGroup ? 1 : 0)
+           .groupCarrierReceived(ret.groupCarrierReceived ? 1 : 0);
+        enc.putChunk(reinterpret_cast<const char*>(ret.chunk.data()),
+                     static_cast<std::uint32_t>(ret.chunk.size()));
+    }
+
     void enqueueReturn_(const WorkerReturn& ret) {
-        // Zero-copy: reserve the exact ring slot then encode the return DIRECTLY into
-        // it (no returnScratch_ copy).  tryClaim() < 0 = explicit back-pressure.
-        const std::size_t n = encodedWorkerReturnSize(ret);
+        // SBE wrap-in-place: reserve the exact ring slot (computeLength) then encode
+        // the return DIRECTLY into it.  tryClaim() < 0 = explicit back-pressure.
+        const std::size_t n = sbe::MessageHeader::encodedLength() +
+                              sbe::WorkerReturn::computeLength(ret.chunk.size());
         aeron::util::index_t idx;
         try {
-            idx = ret_.tryClaim(workerReturnMsgTypeId(ret), n);
+            idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
         } catch (const std::exception& ex) {
             spdlog::error("Worker {}: enqueueReturn_ tryClaim failed: {}", workerId_, ex.what());
             return;
@@ -534,7 +666,7 @@ private:
             }
             return;
         }
-        encodeWorkerReturn(ret, ret_.base() + idx, n);
+        encodeReturnSbe_(ret, idx, n);
         ret_.commit(idx);
     }
 
@@ -672,10 +804,9 @@ private:
             {
                 // Zero-copy view: frame pointer is valid only inside this callback.
                 // Fully consume the message (executeFromWire_) before returning.
-                (void)len;
                 const uint8_t* frame =
                     reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
-                executeFromWire_(frame);
+                executeFromWire_(frame, static_cast<std::size_t>(len));
             });
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
@@ -685,47 +816,55 @@ private:
     //                    handler.  The frame pointer is a zero-copy view into the
     //                    agrona ring — valid only inside drainIngress_ callback.
     // -----------------------------------------------------------------------
-    void executeFromWire_(const uint8_t* frame) {
-        const WorkerOpWire* hdr = decodeWorkerOpHeader(frame);
-        switch (static_cast<WorkerOp::Type>(hdr->type)) {
+    void executeFromWire_(const uint8_t* frame, std::size_t len) {
+        // SBE zero-copy decode: wrap the ring frame; the flyweight reads fields in
+        // place.  Dispatch on the opType field (the ingress ring carries a single
+        // SBE message type, WorkerOp — templateId is constant).
+        char* cbuf = reinterpret_cast<char*>(const_cast<uint8_t*>(frame));
+        sbe::MessageHeader mh;
+        mh.wrap(cbuf, 0, 0, len);
+        sbe::WorkerOp op;
+        op.wrapForDecode(cbuf, sbe::MessageHeader::encodedLength(),
+                         mh.blockLength(), mh.version(), len);
+        switch (static_cast<WorkerOp::Type>(static_cast<std::uint8_t>(op.opType()))) {
         case WorkerOp::Type::Produce:
-            executeProduceWire_(frame, hdr);
+            executeProduceWire_(op);
             break;
         case WorkerOp::Type::PushRead:
-            executePushReadWire_(frame, hdr);
+            executePushReadWire_(op);
             break;
         case WorkerOp::Type::ApplyReplicated:
-            executeApplyReplicatedWire_(frame, hdr);
+            executeApplyReplicatedWire_(op);
             break;
         case WorkerOp::Type::BecomeLeader:
-            executeBecomeLeaderWire_(frame, hdr);
+            executeBecomeLeaderWire_(op);
             break;
         case WorkerOp::Type::BecomeFollower:
-            executeBecomeFollowerWire_(frame, hdr);
+            executeBecomeFollowerWire_(op);
             break;
         case WorkerOp::Type::SetOwnership:
-            executeSetOwnershipWire_(frame, hdr);
+            executeSetOwnershipWire_(op);
             break;
         // E5.1.2c: leader-side replication state handlers
         case WorkerOp::Type::FetchRequest:
-            executeFetchRequestWire_(frame, hdr);
+            executeFetchRequestWire_(op);
             break;
         case WorkerOp::Type::OffsetsForLeaderEpochReq:
-            executeOffsetsForLeaderEpochReqWire_(frame, hdr);
+            executeOffsetsForLeaderEpochReqWire_(op);
             break;
         case WorkerOp::Type::ReconcileFetchResp:
-            executeReconcileFetchRespWire_(frame, hdr);
+            executeReconcileFetchRespWire_(op);
             break;
         // Task #13: AppendControlRecord — worker appends txn control marker
         case WorkerOp::Type::AppendControlRecord:
-            executeAppendControlRecordWire_(frame, hdr);
+            executeAppendControlRecordWire_(op);
             break;
         // read-rework T3/T4: subscription lifecycle (worker owns the push cursor)
         case WorkerOp::Type::Subscribe:
-            executeSubscribeWire_(hdr);
+            executeSubscribeWire_(op);
             break;
         case WorkerOp::Type::Unsubscribe:
-            executeUnsubscribeWire_(hdr);
+            executeUnsubscribeWire_(op);
             break;
         }
     }
@@ -737,32 +876,33 @@ private:
     // existing entry (e.g. cursor rewind / carrier arrival) rather than
     // duplicating it.  Worker-thread-only mutation of subs_.
     // -------------------------------------------------------------------
-    void executeSubscribeWire_(const WorkerOpWire* hdr) {
+    void executeSubscribeWire_(sbe::WorkerOp& op) {
+        const int64_t subId = op.subscriptionId();
         for (auto& s : subs_) {
-            if (s.subscriptionId == hdr->subscriptionId) {
-                s.sessionId            = hdr->sessionId;
-                s.topicId              = hdr->topicId;
-                s.partition            = hdr->partition;
-                s.nextOffset           = hdr->nextOffset;
-                s.logPtr               = reinterpret_cast<rune::storage::Log*>(hdr->logPtr);
-                s.replica              = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
-                s.isolation            = hdr->isolation;
-                s.isGroup              = hdr->isGroup != 0;
-                s.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+            if (s.subscriptionId == subId) {
+                s.sessionId            = op.sessionId();
+                s.topicId              = op.topicId();
+                s.partition            = op.partition();
+                s.nextOffset           = op.nextOffset();
+                s.logPtr               = reinterpret_cast<rune::storage::Log*>(op.logPtr());
+                s.replica              = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+                s.isolation            = op.isolation();
+                s.isGroup              = op.isGroup() != 0;
+                s.groupCarrierReceived = op.groupCarrierReceived() != 0;
                 return;
             }
         }
         WorkerSubscription s;
-        s.subscriptionId       = hdr->subscriptionId;
-        s.sessionId            = hdr->sessionId;
-        s.topicId              = hdr->topicId;
-        s.partition            = hdr->partition;
-        s.nextOffset           = hdr->nextOffset;
-        s.logPtr               = reinterpret_cast<rune::storage::Log*>(hdr->logPtr);
-        s.replica              = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
-        s.isolation            = hdr->isolation;
-        s.isGroup              = hdr->isGroup != 0;
-        s.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+        s.subscriptionId       = subId;
+        s.sessionId            = op.sessionId();
+        s.topicId              = op.topicId();
+        s.partition            = op.partition();
+        s.nextOffset           = op.nextOffset();
+        s.logPtr               = reinterpret_cast<rune::storage::Log*>(op.logPtr());
+        s.replica              = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        s.isolation            = op.isolation();
+        s.isGroup              = op.isGroup() != 0;
+        s.groupCarrierReceived = op.groupCarrierReceived() != 0;
         subs_.push_back(s);
     }
 
@@ -770,9 +910,10 @@ private:
     // read-rework T3/T4: Unsubscribe — remove a worker-local subscription by id
     // (swap-and-pop; order does not matter).  No-op if unknown.  Worker-thread-only.
     // -------------------------------------------------------------------
-    void executeUnsubscribeWire_(const WorkerOpWire* hdr) {
+    void executeUnsubscribeWire_(sbe::WorkerOp& op) {
+        const int64_t subId = op.subscriptionId();
         for (std::size_t i = 0; i < subs_.size(); ++i) {
-            if (subs_[i].subscriptionId == hdr->subscriptionId) {
+            if (subs_[i].subscriptionId == subId) {
                 subs_[i] = subs_.back();
                 subs_.pop_back();
                 return;
@@ -907,29 +1048,31 @@ private:
     // duration of this callback — it is fully consumed here (appendNoSync
     // copies the bytes into the log's owned buffer).
     // -------------------------------------------------------------------
-    void executeProduceWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
+    void executeProduceWire_(sbe::WorkerOp& op) {
+        const int32_t topicId   = op.topicId();
+        const int32_t partition = op.partition();
         WorkerReturn ret;
         ret.type          = WorkerReturn::Type::ProduceResult;
-        ret.sessionId     = hdr->sessionId;
-        ret.correlationId = hdr->correlationId;
-        ret.partition     = hdr->partition;
-        ret.deferAck      = hdr->deferAck != 0;
-        ret.replica       = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
-        ret.producerId    = hdr->producerId;
-        ret.producerEpoch = hdr->producerEpoch;
-        ret.baseSequence  = hdr->baseSequence;
-        ret.recordCount   = hdr->recordCount;
-        ret.topicId       = hdr->topicId;
-        ret.batchAttrs    = hdr->batchAttrs;
-        ret.enqueuedAtNs  = hdr->enqueuedAtNs;
+        ret.sessionId     = op.sessionId();
+        ret.correlationId = op.correlationId();
+        ret.partition     = partition;
+        ret.deferAck      = op.deferAck() != 0;
+        ret.replica       = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        ret.producerId    = op.producerId();
+        ret.producerEpoch = op.producerEpoch();
+        ret.baseSequence  = op.baseSequence();
+        ret.recordCount   = op.recordCount();
+        ret.topicId       = topicId;
+        ret.batchAttrs    = op.batchAttrs();
+        ret.enqueuedAtNs  = op.enqueuedAtNs();
 
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
-        auto* log     = getLogFromWire_(hdr);
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        auto* log     = getLogFromWire_(op);
 
         if (!log) {
             spdlog::error("Worker {}: executeProduceWire_ — no Log for topicId={} partition={}; "
                           "sending Internal error",
-                          workerId_, hdr->topicId, hdr->partition);
+                          workerId_, topicId, partition);
             ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
             enqueueReturn_(ret);
             return;
@@ -938,16 +1081,16 @@ private:
         // Assign the actual base offset (authoritative — worker is the single writer).
         const int64_t base = log->logEndOffset();
         ret.baseOffset = base;
-        ret.lastOffset = base + static_cast<int64_t>(hdr->lastOffsetDelta);
+        ret.lastOffset = base + static_cast<int64_t>(op.lastOffsetDelta());
 
         // Re-stamp the base offset in the tail view (LE64 at kBaseOffsetOffset=0).
-        // The tail is a mutable view in the ring (AtomicBuffer); the ring frame
-        // is not read by the producer again after write() returned — safe to
-        // mutate in-place here.
-        // CRC region starts at kAttributesOffset=21, AFTER the base-offset field,
-        // so re-stamping does NOT invalidate the CRC.
-        uint8_t* tail = const_cast<uint8_t*>(workerOpTail(frame));
-        const uint32_t tailLen = hdr->tailLen;
+        // op.tail() is a view into the mutable ring frame (we wrapped a mutable
+        // buffer for decode); the frame is not read by the producer again after
+        // commit — safe to mutate in-place here.  CRC region starts at
+        // kAttributesOffset=21, AFTER the base-offset field, so re-stamping does
+        // NOT invalidate the CRC.
+        const uint32_t tailLen = op.tailLength();
+        uint8_t* tail = reinterpret_cast<uint8_t*>(const_cast<char*>(op.tail()));
         if (tail && tailLen >= 8u) {
             const uint64_t u = static_cast<uint64_t>(base);
             for (int i = 0; i < 8; ++i) {
@@ -970,7 +1113,7 @@ private:
             if (appended < 0) {
                 spdlog::warn("Worker {}: appendNoSync refused (back-pressure) for "
                              "topicId={} partition={}; returning Internal",
-                             workerId_, hdr->topicId, hdr->partition);
+                             workerId_, topicId, partition);
                 ret.errorCode = static_cast<int16_t>(6); // Internal
                 enqueueReturn_(ret);
                 return;
@@ -1001,7 +1144,7 @@ private:
         // After ALL this-cycle produces are appended (drainIngress_ returns),
         // submitCoalescedFlushes_() submits ONE io_.submit per dirty log and stamps
         // the resulting token onto every pending entry for that log.
-        if (hdr->durabilityTier == 2 && log->isDiskBacked()) {
+        if (op.durabilityTier() == 2 && log->isDiskBacked()) {
             ret.errorCode = 0; // tentatively OK; updated in submitCoalescedFlushes_ or on completion
             // token=0 means "not yet submitted" — reapDurableCompletions_ will never fire this.
             durablePending_.push_back({kNoToken, ret.lastOffset, log, std::move(ret)});
@@ -1027,20 +1170,24 @@ private:
     // The gateway iterates the chunk, encodes Records frames, and sends them.
     // No tail for PushRead ops.
     // -------------------------------------------------------------------
-    void executePushReadWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
+    void executePushReadWire_(sbe::WorkerOp& op) {
+        const int32_t topicId    = op.topicId();
+        const int32_t partition  = op.partition();
+        const int64_t nextOffset = op.nextOffset();
+        const int64_t hwBound    = op.hwBound();
         WorkerReturn ret;
         ret.type                 = WorkerReturn::Type::PushReadResult;
-        ret.subscriptionId       = hdr->subscriptionId;
-        ret.sessionId            = hdr->sessionId; // gateway needs this to find the session
-        ret.readTopicId          = hdr->topicId;
-        ret.readPartition        = hdr->partition;
-        ret.newNextOffset        = hdr->nextOffset; // will be advanced by gateway on success
-        ret.hwBound              = hdr->hwBound;
-        ret.isolation            = hdr->isolation;
-        ret.isGroup              = hdr->isGroup != 0;
-        ret.groupCarrierReceived = hdr->groupCarrierReceived != 0;
+        ret.subscriptionId       = op.subscriptionId();
+        ret.sessionId            = op.sessionId(); // gateway needs this to find the session
+        ret.readTopicId          = topicId;
+        ret.readPartition        = partition;
+        ret.newNextOffset        = nextOffset; // will be advanced by gateway on success
+        ret.hwBound              = hwBound;
+        ret.isolation            = op.isolation();
+        ret.isGroup              = op.isGroup() != 0;
+        ret.groupCarrierReceived = op.groupCarrierReceived() != 0;
 
-        rune::storage::Log* log = getLogFromWire_(hdr);
+        rune::storage::Log* log = getLogFromWire_(op);
         if (!log) {
             // No log: return empty chunk (gateway will skip this subscription).
             enqueueReturn_(ret);
@@ -1048,16 +1195,16 @@ private:
         }
 
         // Only read if there are records available (within the HW-bound).
-        if (hdr->nextOffset < hdr->hwBound) {
+        if (nextOffset < hwBound) {
             try {
                 // kMaxChunkBytes constant mirrored here; must stay in sync with
                 // ClientGateway.  Gateway sets hwBound before enqueuing.
                 static constexpr int32_t kMaxChunkBytes =
                     static_cast<int32_t>(512 * 1024); // 512 KiB
-                ret.chunk = log->read(hdr->nextOffset, kMaxChunkBytes);
+                ret.chunk = log->read(nextOffset, kMaxChunkBytes);
             } catch (const std::exception& ex) {
                 spdlog::warn("Worker {}: log->read threw for topicId={} partition={}: {}",
-                             workerId_, hdr->topicId, hdr->partition, ex.what());
+                             workerId_, topicId, partition, ex.what());
                 // Return empty chunk — gateway will skip + retry next cycle.
             } catch (...) {
                 spdlog::warn("Worker {}: log->read threw unknown exception", workerId_);
@@ -1075,24 +1222,24 @@ private:
     // records span points into the ring view, then call applyReplicated within
     // this callback — applyReplicated copies into the follower log before we return.
     // -------------------------------------------------------------------
-    void executeApplyReplicatedWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeApplyReplicatedWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeApplyReplicatedWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, op.topicId(), op.partition());
             return;
         }
 
-        const uint8_t* tail    = workerOpTail(frame);
-        const uint32_t tailLen = hdr->tailLen;
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
 
         rune::replication::FetchResponseMsg msg;
-        msg.leaderEpoch    = hdr->replLeaderEpoch;
-        msg.partition      = hdr->replPartition;
-        msg.highWatermark  = hdr->replHighWatermark;
-        msg.logStartOffset = hdr->replLogStartOffset;
-        msg.errorCode      = hdr->replErrorCode;
-        msg.topicId        = hdr->replTopicId;
+        msg.leaderEpoch    = op.replLeaderEpoch();
+        msg.partition      = op.replPartition();
+        msg.highWatermark  = op.replHighWatermark();
+        msg.logStartOffset = op.replLogStartOffset();
+        msg.errorCode      = op.replErrorCode();
+        msg.topicId        = op.replTopicId();
         // Zero-copy span: records view into the ring frame.
         // Valid only inside this callback — applyReplicated copies before we return.
         msg.records = std::span<const uint8_t>(
@@ -1115,17 +1262,19 @@ private:
     // The tail is the ISR list as NodeId[] (int32_t[], native LE).
     // BecomeLeader is a rare path — alloc for the vector is acceptable.
     // -------------------------------------------------------------------
-    void executeBecomeLeaderWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeBecomeLeaderWire_(sbe::WorkerOp& op) {
+        const int32_t topicId   = op.topicId();
+        const int32_t partition = op.partition();
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeBecomeLeaderWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, topicId, partition);
             return;
         }
 
         // Rebuild ISR vector from the tail (rare path, alloc OK).
-        const uint8_t* tail    = workerOpTail(frame);
-        const uint32_t tailLen = hdr->tailLen;
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
         std::vector<rune::replication::NodeId> isr;
         if (tail && tailLen > 0) {
             const std::size_t count = static_cast<std::size_t>(tailLen) /
@@ -1135,13 +1284,13 @@ private:
         }
 
         const rune::replication::Epoch epoch =
-            static_cast<rune::replication::Epoch>(hdr->roleEpoch);
+            static_cast<rune::replication::Epoch>(op.roleEpoch());
 
         try {
             replica->becomeLeader(epoch, std::move(isr));
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeLeader threw for topicId={} partition={}: {}",
-                         workerId_, hdr->topicId, hdr->partition, ex.what());
+                         workerId_, topicId, partition, ex.what());
         } catch (...) {
             spdlog::warn("Worker {}: becomeLeader threw unknown exception", workerId_);
         }
@@ -1185,19 +1334,19 @@ private:
                     hw = log->logEndOffset();
                 }
                 try {
-                    psm_.rebuildFromLog(hdr->topicId, *log, hw, hdr->partition);
+                    psm_.rebuildFromLog(topicId, *log, hw, partition);
                     spdlog::info("Worker {}: PSM rebuilt for topicId={} partition={} "
                                  "hw={} entries={}",
-                                 workerId_, hdr->topicId, hdr->partition, hw,
+                                 workerId_, topicId, partition, hw,
                                  psm_.size());
                 } catch (const std::exception& ex) {
                     spdlog::error("Worker {}: PSM rebuild threw for topicId={} "
                                   "partition={}: {}; idempotency window may be stale",
-                                  workerId_, hdr->topicId, hdr->partition, ex.what());
+                                  workerId_, topicId, partition, ex.what());
                 } catch (...) {
                     spdlog::error("Worker {}: PSM rebuild threw unknown exception for "
                                   "topicId={} partition={}",
-                                  workerId_, hdr->topicId, hdr->partition);
+                                  workerId_, topicId, partition);
                 }
             }
         }
@@ -1209,22 +1358,24 @@ private:
     //
     // Scalars only (no tail for BecomeFollower).
     // -------------------------------------------------------------------
-    void executeBecomeFollowerWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeBecomeFollowerWire_(sbe::WorkerOp& op) {
+        const int32_t topicId   = op.topicId();
+        const int32_t partition = op.partition();
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeBecomeFollowerWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, topicId, partition);
             return;
         }
         const rune::replication::Epoch  epoch    =
-            static_cast<rune::replication::Epoch>(hdr->roleEpoch);
+            static_cast<rune::replication::Epoch>(op.roleEpoch());
         const rune::replication::NodeId leaderId =
-            static_cast<rune::replication::NodeId>(hdr->roleLeaderId);
+            static_cast<rune::replication::NodeId>(op.roleLeaderId());
         try {
             replica->becomeFollower(epoch, leaderId);
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeFollower threw for topicId={} partition={}: {}",
-                         workerId_, hdr->topicId, hdr->partition, ex.what());
+                         workerId_, topicId, partition, ex.what());
         } catch (...) {
             spdlog::warn("Worker {}: becomeFollower threw unknown exception", workerId_);
         }
@@ -1237,9 +1388,9 @@ private:
     // Shared-nothing ([[rune-shared-nothing-law]]): applied on THIS worker
     // thread — no cross-thread write to owned_.
     // -------------------------------------------------------------------
-    void executeSetOwnershipWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
-        const uint8_t* tail    = workerOpTail(frame);
-        const uint32_t tailLen = hdr->tailLen;
+    void executeSetOwnershipWire_(sbe::WorkerOp& op) {
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
 
         owned_.clear();
         if (tail && tailLen > 0) {
@@ -1260,24 +1411,24 @@ private:
     // transport_->sendFetchResponse → enqueueOutbound (MPSC outbound ring).
     // Fire-and-forget: no WorkerReturn needed (FetchResponse goes outbound).
     // -------------------------------------------------------------------
-    void executeFetchRequestWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeFetchRequestWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeFetchRequestWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, op.topicId(), op.partition());
             return;
         }
 
         rune::replication::FetchRequestMsg req;
-        req.leaderEpoch = static_cast<rune::replication::Epoch>(hdr->frLeaderEpoch);
-        req.partition   = static_cast<rune::replication::PartitionId>(hdr->partition);
-        req.followerId  = static_cast<rune::replication::NodeId>(hdr->frFollowerId);
-        req.fetchOffset = static_cast<rune::replication::Offset>(hdr->frFetchOffset);
-        req.maxBytes    = hdr->frMaxBytes;
-        req.topicId     = hdr->topicId;
+        req.leaderEpoch = static_cast<rune::replication::Epoch>(op.frLeaderEpoch());
+        req.partition   = static_cast<rune::replication::PartitionId>(op.partition());
+        req.followerId  = static_cast<rune::replication::NodeId>(op.frFollowerId());
+        req.fetchOffset = static_cast<rune::replication::Offset>(op.frFetchOffset());
+        req.maxBytes    = op.frMaxBytes();
+        req.topicId     = op.topicId();
 
         try {
-            replica->onFetchRequest(req, hdr->frNowNs);
+            replica->onFetchRequest(req, op.frNowNs());
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: onFetchRequest threw: {}", workerId_, ex.what());
         } catch (...) {
@@ -1290,21 +1441,21 @@ private:
     // epoch probe on the worker thread (touches leaderState_/isrManager_).
     // Fire-and-forget: the response is emitted via transport_->sendOffsetsForLeaderEpochResponse.
     // -------------------------------------------------------------------
-    void executeOffsetsForLeaderEpochReqWire_(const uint8_t* /*frame*/, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeOffsetsForLeaderEpochReqWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeOffsetsForLeaderEpochReqWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, op.topicId(), op.partition());
             return;
         }
 
         rune::replication::OffsetsForLeaderEpochReqMsg req;
-        req.currentEpoch   = static_cast<rune::replication::Epoch>(hdr->oleCurrentEpoch);
-        req.partition      = static_cast<rune::replication::PartitionId>(hdr->partition);
-        req.followerId     = static_cast<rune::replication::NodeId>(hdr->oleFollowerId);
-        req.requestedEpoch = static_cast<rune::replication::Epoch>(hdr->oleRequestedEpoch);
-        req.followerLeo    = static_cast<rune::replication::Offset>(hdr->oleFollowerLeo);
-        req.topicId        = hdr->topicId;
+        req.currentEpoch   = static_cast<rune::replication::Epoch>(op.oleCurrentEpoch());
+        req.partition      = static_cast<rune::replication::PartitionId>(op.partition());
+        req.followerId     = static_cast<rune::replication::NodeId>(op.oleFollowerId());
+        req.requestedEpoch = static_cast<rune::replication::Epoch>(op.oleRequestedEpoch());
+        req.followerLeo    = static_cast<rune::replication::Offset>(op.oleFollowerLeo());
+        req.topicId        = op.topicId();
 
         try {
             replica->onOffsetsForLeaderEpochRequest(req);
@@ -1321,24 +1472,24 @@ private:
     // Reuses replicatedPayload scalars + records tail (same layout as ApplyReplicated).
     // Fire-and-forget: no WorkerReturn needed.
     // -------------------------------------------------------------------
-    void executeReconcileFetchRespWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeReconcileFetchRespWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeReconcileFetchRespWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, op.topicId(), op.partition());
             return;
         }
 
-        const uint8_t* tail    = workerOpTail(frame);
-        const uint32_t tailLen = hdr->tailLen;
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
 
         rune::replication::FetchResponseMsg msg;
-        msg.leaderEpoch    = hdr->replLeaderEpoch;
-        msg.partition      = hdr->replPartition;
-        msg.highWatermark  = hdr->replHighWatermark;
-        msg.logStartOffset = hdr->replLogStartOffset;
-        msg.errorCode      = hdr->replErrorCode;
-        msg.topicId        = hdr->replTopicId;
+        msg.leaderEpoch    = op.replLeaderEpoch();
+        msg.partition      = op.replPartition();
+        msg.highWatermark  = op.replHighWatermark();
+        msg.logStartOffset = op.replLogStartOffset();
+        msg.errorCode      = op.replErrorCode();
+        msg.topicId        = op.replTopicId();
         msg.records = std::span<const uint8_t>(
             tail ? tail : static_cast<const uint8_t*>(nullptr),
             static_cast<std::size_t>(tailLen));
@@ -1368,20 +1519,22 @@ private:
     // Fire-and-forget: no WorkerReturn needed (the gateway already has the
     // pre-computed base offset and calls notifyControlMarker synchronously).
     // -------------------------------------------------------------------
-    void executeAppendControlRecordWire_(const uint8_t* frame, const WorkerOpWire* hdr) {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    void executeAppendControlRecordWire_(sbe::WorkerOp& op) {
+        const int32_t topicId   = op.topicId();
+        const int32_t partition = op.partition();
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         if (!replica) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, topicId, partition);
             return;
         }
 
-        const uint8_t* tail    = workerOpTail(frame);
-        const uint32_t tailLen = hdr->tailLen;
+        const uint32_t tailLen = op.tailLength();
+        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
 
         if (!tail || tailLen == 0) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ — empty marker tail for "
-                         "topicId={} partition={}", workerId_, hdr->topicId, hdr->partition);
+                         "topicId={} partition={}", workerId_, topicId, partition);
             return;
         }
 
@@ -1392,7 +1545,7 @@ private:
             if (base < 0) {
                 spdlog::warn("Worker {}: executeAppendControlRecordWire_ — replica->append returned {} "
                              "(minIsr gate?) topicId={} partition={}",
-                             workerId_, base, hdr->topicId, hdr->partition);
+                             workerId_, base, topicId, partition);
             }
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw: {}", workerId_, ex.what());
@@ -1403,20 +1556,19 @@ private:
 
     // -------------------------------------------------------------------
     // getLogFromWire_ — resolve the Log* for the op's (topicId, partition)
-    //                   from the WorkerOpWire scalars.
-    //
-    // Mirrors the old getLog_(const WorkerOp&) but reads from the wire header.
+    //                   from the SBE WorkerOp flyweight.
     // -------------------------------------------------------------------
-    rune::storage::Log* getLogFromWire_(const WorkerOpWire* hdr) const noexcept {
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(hdr->replica);
+    rune::storage::Log* getLogFromWire_(sbe::WorkerOp& op) const noexcept {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         // Prefer replica->log() for disk-backed (avoids separate registry lookup).
         if (replica && replica->isDiskBacked()) {
             return replica->log();
         }
-        // Fall back to direct Log* pointer stored in wire header (set by gateway
-        // at enqueue time to avoid a registry lookup in doWork).
-        if (hdr->logPtr != 0) {
-            return reinterpret_cast<rune::storage::Log*>(hdr->logPtr);
+        // Fall back to direct Log* pointer carried in the op (set by gateway at
+        // enqueue time to avoid a registry lookup in doWork).
+        const std::uint64_t lp = op.logPtr();
+        if (lp != 0) {
+            return reinterpret_cast<rune::storage::Log*>(lp);
         }
         return nullptr;
     }
@@ -1663,10 +1815,11 @@ private:
         // We do this by calling ret_.write() directly here.
         while (!retOverflow_.empty()) {
             const WorkerReturn& ret = retOverflow_.front();
-            const std::size_t n = encodedWorkerReturnSize(ret);
+            const std::size_t n = sbe::MessageHeader::encodedLength() +
+                                  sbe::WorkerReturn::computeLength(ret.chunk.size());
             aeron::util::index_t idx;
             try {
-                idx = ret_.tryClaim(workerReturnMsgTypeId(ret), n);
+                idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
             } catch (...) {
                 // Encode/size error: discard this entry and continue.
                 retOverflow_.erase(retOverflow_.begin());
@@ -1675,7 +1828,7 @@ private:
             if (idx < 0) {
                 break; // ring still full — stop; retry next cycle
             }
-            encodeWorkerReturn(ret, ret_.base() + idx, n);  // zero-copy in place
+            encodeReturnSbe_(ret, idx, n);  // SBE wrap-in-place
             ret_.commit(idx);
             retOverflow_.erase(retOverflow_.begin());
             ++flushed;

@@ -62,7 +62,7 @@ if(BUILD_TESTING)
         tests/node/NodeConfigTest.cpp
         tests/node/PortableFlushBackendTest.cpp
         tests/node/OneToOneByteRingTest.cpp
-        tests/node/WorkerWireTest.cpp)
+        )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
         GTest::gtest_main)

@@ -49,7 +49,6 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerOp.h>
-#include <rune/node/WorkerWire.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
