@@ -3564,6 +3564,15 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     // Track the subscriptionId under this member session for eager revoke.
     groupMemberSubs_[memberSessionId].push_back(subId);
 
+    // read-rework I5: route group subscriptions to the owning worker too (the
+    // worker pushes on its own dynamic-MDC egress).  Without this, pushSubscriptions
+    // skips user partitions under per-worker egress and group reads get nothing.
+    if (perWorkerEgressActive_ && workerPool_ && topicId >= 0) {
+        forwardSubscribeToWorker_(subId, memberSessionId, topicId, partition,
+                                  nextOffset, isolation,
+                                  /*isGroup=*/true, /*groupCarrierReceived=*/!pendingCarrier);
+    }
+
     spdlog::debug("ClientGateway::addGroupSubscription: sessionId={} subId={} "
                   "topic={} partition={} nextOffset={}",
                   memberSessionId, subId, topicId, partition, nextOffset);
@@ -3586,6 +3595,14 @@ void ClientGateway::revokeGroupSubscriptions(int64_t memberSessionId)
     if (it == groupMemberSubs_.end()) return;  // no group subs for this session
 
     for (int64_t subId : it->second) {
+        // read-rework I5: tell the owning worker to drop the cursor too (mirror of
+        // addGroupSubscription's forward), before erasing the gateway record.
+        if (perWorkerEgressActive_ && workerPool_) {
+            auto sIt = subscriptions_.find(subId);
+            if (sIt != subscriptions_.end() && sIt->second.topicId >= 0) {
+                forwardUnsubscribeToWorker_(subId, sIt->second.topicId, sIt->second.partition);
+            }
+        }
         const std::size_t removed = subscriptions_.erase(subId);
         spdlog::debug("ClientGateway::revokeGroupSubscriptions: sessionId={} subId={} removed={}",
                       memberSessionId, subId, removed);
