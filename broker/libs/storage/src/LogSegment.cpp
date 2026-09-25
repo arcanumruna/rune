@@ -2,6 +2,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/uio.h>
 #include <cstdint>
 #include <stdexcept>
 #include <iomanip>
@@ -185,6 +186,57 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     ssize_t written = ::pwrite(fd_, data, len, writePos);
     if (written < 0 || static_cast<std::size_t>(written) != len) {
         throw std::runtime_error("rune: LogSegment::appendNoSync pwrite failed");
+    }
+
+    logSize_ += static_cast<int64_t>(len);
+    bytesSinceIndex_ += static_cast<int64_t>(len);
+    nextOffset_ = lastOffset + 1;
+    return nextOffset_;
+}
+
+int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
+                                        int64_t baseOffset, int64_t lastOffset) {
+    // Zero-copy restamp: identical page-cache write to appendNoSync(), but the
+    // base-offset field [0..7] is patched to the ASSIGNED offset via pwritev()
+    // scatter-gather instead of mutating `data`.  `data` stays read-only (it may
+    // point straight at an Aeron fragment / ring slot), so NO restampScratch_.
+    static_assert(rune::protocol::batch::kBaseOffsetOffset == 0,
+                  "restamp iovec split assumes base-offset field starts at byte 0");
+    if (len < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
+        throw std::runtime_error("rune: batch smaller than record-batch overhead");
+
+    // Sparse index: use the ASSIGNED baseOffset (data still carries the stale
+    // client value, so we must NOT read it via RecordBatchReader::baseOffset()).
+    if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
+        index_->append(baseOffset, logSize_); // C4: OffsetIndex guards 2GiB
+        bytesSinceIndex_ = 0;
+    }
+
+    // pwritev: iov[0] = 8-byte LE64 assigned base offset, iov[1] = the read-only
+    // fragment tail [8 .. len).  Single syscall, zero mutable copy of the batch.
+    uint8_t leBase[8];
+    {
+        uint64_t u = static_cast<uint64_t>(baseOffset);
+        for (int i = 0; i < 8; ++i) leBase[i] = static_cast<uint8_t>(u >> (i * 8));
+    }
+    struct iovec iov[2];
+    iov[0].iov_base = leBase;
+    iov[0].iov_len  = 8;
+    iov[1].iov_base = const_cast<uint8_t*>(data + 8);
+    iov[1].iov_len  = len - 8;
+
+    off_t writePos = static_cast<off_t>(logSize_);
+    ssize_t written = ::pwritev(fd_, iov, 2, writePos);
+    if (written < 0 || static_cast<std::size_t>(written) != len) {
+        throw std::runtime_error("rune: LogSegment::appendNoSyncRestamp pwritev failed");
+    }
+
+    // maxTimestamp lives at kMaxTimestampOffset (outside the base-offset field),
+    // so reading it from the read-only `data` is correct.
+    if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader r(data, len);
+        int64_t ts = r.maxTimestamp();
+        (void)ts; // segment-level maxTs tracked in Log::appendNoSyncRestamp
     }
 
     logSize_ += static_cast<int64_t>(len);

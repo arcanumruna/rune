@@ -53,6 +53,54 @@ TEST(LogSegment, AppendThenReadBack) {
     std::filesystem::remove_all(dir);
 }
 
+// Zero-copy restamp append: the incoming batch carries a STALE base offset
+// (client-supplied), and appendNoSyncRestamp must write it to disk with the
+// ASSIGNED base offset patched into bytes [0..7] WITHOUT any mutable copy of
+// the batch (pwritev scatter-gather: base-offset iovec + fragment[8:]).  The
+// CRC covers [21..end] so the base-offset rewrite is CRC-safe — ensureValid()
+// must still pass after read-back.
+TEST(LogSegment, AppendNoSyncRestampPatchesBaseOffsetZeroCopy) {
+    auto dir = makeTempDir("rune_seg_restamp");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0);
+
+    // Batch built with a WRONG (stale) base offset of 999; 3 records.
+    auto stale = makeBatch(999, 7000, 3);
+    // Assign base offset 0, lastOffset 2 — restamp should overwrite the 999.
+    int64_t next = seg.appendNoSyncRestamp(stale.data(), stale.size(),
+                                           /*baseOffset=*/0, /*lastOffset=*/2);
+    seg.sync();
+    EXPECT_EQ(next, 3);
+    EXPECT_EQ(seg.nextOffset(), 3);
+
+    // Append a second batch (stale base 999 again) assigned base 3, lastOffset 4.
+    auto stale2 = makeBatch(999, 7010, 2);
+    next = seg.appendNoSyncRestamp(stale2.data(), stale2.size(), 3, 4);
+    seg.sync();
+    EXPECT_EQ(next, 5);
+
+    // Read back: first batch base offset must be the ASSIGNED 0, not 999, and
+    // the CRC must still validate (base-offset rewrite is outside the CRC region).
+    {
+        auto buf = seg.read(0, 1 << 20);
+        ASSERT_FALSE(buf.empty());
+        RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+        EXPECT_EQ(r.recordCount(), 3);
+        EXPECT_EQ(r.maxTimestamp(), 7002);  // baseTs 7000 + 2 (record framing intact)
+    }
+    {
+        auto buf = seg.read(3, 1 << 20);
+        ASSERT_FALSE(buf.empty());
+        RecordBatchReader r(buf.data(), buf.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 3);
+        EXPECT_EQ(r.recordCount(), 2);
+    }
+    std::filesystem::remove_all(dir);
+}
+
 // Edge: multiple batches with small indexIntervalBytes so multiple sparse index entries are created;
 // read() from offsets that land on different index entries returns the correct first batch.
 TEST(LogSegment, MultipleSparseIndexEntriesCorrectRead) {

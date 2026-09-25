@@ -77,6 +77,18 @@ public:
     /// offset until sync() has returned for that offset.
     int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset);
 
+    /// Zero-copy restamp append (produce hot path).  Writes [data, data+len) to
+    /// the page cache with the ASSIGNED base offset patched into bytes [0..7],
+    /// WITHOUT any mutable copy of the batch: pwritev() scatter-gathers the
+    /// 8-byte LE64 base offset followed by the read-only fragment tail
+    /// [data+8, data+len).  The record-batch CRC covers [kAttributesOffset=21 ..
+    /// end], so rewriting the base-offset field [0..7] is CRC-safe (identical to
+    /// Kafka's leader restamp).  `data` is never mutated (may point directly at a
+    /// read-only Aeron fragment / ring slot).  Same page-cache durability
+    /// contract as appendNoSync().  Returns nextOffset (= lastOffset + 1).
+    int64_t appendNoSyncRestamp(const uint8_t* data, std::size_t len,
+                                int64_t baseOffset, int64_t lastOffset);
+
     /// Flush libc buffer + fdatasync ".log" + msync ".index".
     /// Called automatically by append() (durable-by-default).
     /// External callers (e.g. group-commit) may call this explicitly after

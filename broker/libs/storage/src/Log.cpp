@@ -436,6 +436,25 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     }
     return logEndOffset_;
 }
+int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
+                                 int32_t lastOffsetDelta, int64_t& outBaseOffset) {
+    // Assign the base offset atomically from the log's current end offset, then
+    // write zero-copy (pwritev restamp): the assigned base offset lands in the
+    // page cache without any mutable copy of `batch`.  maybeRoll() runs first;
+    // the base offset is read AFTER the roll so it matches the segment the batch
+    // actually lands in.
+    maybeRoll();
+    const int64_t base       = logEndOffset_;
+    const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
+    outBaseOffset = base;
+    logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset);
+    if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+        rune::protocol::RecordBatchReader r(batch, len);
+        int64_t batchMaxTs = r.maxTimestamp();
+        if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
+    }
+    return logEndOffset_;
+}
 std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};

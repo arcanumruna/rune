@@ -69,6 +69,18 @@ public:
     /// Callers MUST NOT advance the durable ISR high-watermark past an offset
     /// before sync() has returned for that offset.
     int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset);
+
+    /// Zero-copy restamp append (produce hot path).  Assigns the base offset from
+    /// the current logEndOffset() and writes [batch, batch+len) to the page cache
+    /// with that base offset patched into bytes [0..7] via pwritev scatter-gather
+    /// — `batch` is NEVER mutated (may alias a read-only Aeron fragment / ring
+    /// slot), so callers need no restamp scratch buffer.  `lastOffsetDelta` is the
+    /// LE32 field at kLastOffsetDeltaOffset (recordCount-1).  Sets `outBaseOffset`
+    /// to the assigned base offset and returns nextOffset (= base + delta + 1).
+    /// Same page-cache durability contract as appendNoSync().
+    int64_t appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
+                                int32_t lastOffsetDelta, int64_t& outBaseOffset);
+
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
 
     /// Zero-copy read: locate the segment containing startOffset and return a
