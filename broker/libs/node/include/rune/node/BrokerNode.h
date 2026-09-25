@@ -214,6 +214,14 @@ public:
         return workerPool_ ? workerPool_->ownerWorkerId(topicId, partition) : -1;
     }
 
+    /// read-rework T3/T4 test-only: the per-worker dynamic-MDC egress publications
+    /// created by buildWorkerPool (empty unless perWorkerIngressEnabled && aeron_).
+    /// Lets a test assert per-worker egress creation + stream-id assignment.
+    [[nodiscard]] const std::vector<std::unique_ptr<WorkerEgress>>&
+    workerEgressesForTest() const noexcept {
+        return workerEgresses_;
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers

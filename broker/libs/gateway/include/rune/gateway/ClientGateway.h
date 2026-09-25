@@ -1113,6 +1113,9 @@ public:
     void setMaxBatchesPerSubPerCycleForTest(int n) noexcept {
         if (n > 0) maxBatchesPerSubPerCycle_ = n;
     }
+    [[nodiscard]] int maxBatchesPerSubPerCycleForTest() const noexcept {
+        return maxBatchesPerSubPerCycle_;
+    }
 private:
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.

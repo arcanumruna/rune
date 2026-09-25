@@ -178,5 +178,27 @@ TEST(ClientGatewayHotPath, MinIsrSetGetRoundTrip)
     EXPECT_EQ(gw.minIsr(), 3);
 }
 
+// read-rework T2: per-cycle batch cap setter must default to the production value
+// (1024), accept positive overrides, and IGNORE non-positive values (the BP-gate
+// test relies on the positive-override path; this guards the reject path).
+TEST(ClientGatewayHotPath, MaxBatchesPerSubPerCycleSetterGuardsNonPositive)
+{
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress(), /*sessionId=*/1);
+
+    EXPECT_EQ(gw.maxBatchesPerSubPerCycleForTest(), 1024) << "production default";
+
+    gw.setMaxBatchesPerSubPerCycleForTest(8);
+    EXPECT_EQ(gw.maxBatchesPerSubPerCycleForTest(), 8);
+
+    gw.setMaxBatchesPerSubPerCycleForTest(0);    // non-positive → no-op
+    EXPECT_EQ(gw.maxBatchesPerSubPerCycleForTest(), 8) << "0 must be ignored";
+
+    gw.setMaxBatchesPerSubPerCycleForTest(-5);   // negative → no-op
+    EXPECT_EQ(gw.maxBatchesPerSubPerCycleForTest(), 8) << "negative must be ignored";
+
+    gw.setMaxBatchesPerSubPerCycleForTest(2000);
+    EXPECT_EQ(gw.maxBatchesPerSubPerCycleForTest(), 2000);
+}
+
 } // namespace
 } // namespace rune::gateway

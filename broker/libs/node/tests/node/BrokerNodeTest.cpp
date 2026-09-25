@@ -1005,4 +1005,50 @@ TEST(BrokerNodeTest, DedicatedAeronThreadingMode_BootsAndElects) {
     node.stop();
 }
 
+// ---------------------------------------------------------------------------
+// read-rework T3/T4 I1b: BrokerNode wires one dynamic-MDC WorkerEgress per worker
+// when per-worker ingress is enabled.  Asserts count == workerCount, each resolved,
+// and stream ids are the contiguous range [egressBase, egressBase+W-1] with
+// egressBase = workerIngressBaseStreamId + workerCount (non-overlapping).
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
+    TempDir tmp{"egress_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.workerCount             = 2;
+    cfg.perWorkerIngressEnabled = true;
+    // Distinct control ports/streams to avoid collision with other tests' endpoints.
+    cfg.workerEgressControlHost     = "127.0.0.1";
+    cfg.workerEgressControlBasePort = 40360;
+    // workerIngressBaseStreamId resolves to clientStreamId+1 = 2; egressBase auto =
+    // ingressBase + workerCount = 2 + 2 = 4.
+    cfg.workerIngressBaseStreamId   = 2;
+
+    TopicSpec ts;
+    ts.name           = "egress-topic";
+    ts.partitionCount = 4;      // spread across the 2 workers
+    ts.topicId        = 0;
+    cfg.topics        = {ts};
+
+    BrokerNode node{cfg};
+    ASSERT_NO_THROW(node.start());
+    ASSERT_TRUE(node.awaitLeader(3s));
+
+    const auto& egresses = node.workerEgressesForTest();
+    ASSERT_EQ(egresses.size(), 2u) << "one WorkerEgress per worker";
+
+    const int32_t egressBase = cfg.workerIngressBaseStreamId + cfg.workerCount; // 4
+    for (int32_t i = 0; i < cfg.workerCount; ++i) {
+        ASSERT_NE(egresses[i], nullptr);
+        EXPECT_TRUE(egresses[i]->resolved())
+            << "worker " << i << " egress must resolve on the embedded UDP driver";
+        EXPECT_EQ(egresses[i]->streamId(), egressBase + i)
+            << "worker " << i << " egress stream id must be contiguous from egressBase";
+        EXPECT_EQ(egresses[i]->controlEndpoint(),
+                  std::string("127.0.0.1:") + std::to_string(40360 + i))
+            << "worker " << i << " control endpoint must be host:(basePort+workerId)";
+    }
+
+    node.stop();
+}
+
 } // namespace rune::node
