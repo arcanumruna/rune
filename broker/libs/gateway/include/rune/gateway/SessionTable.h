@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 namespace rune::gateway {
@@ -21,8 +22,17 @@ namespace rune::gateway {
 // ---------------------------------------------------------------------------
 struct Session {
     int64_t                                        sessionId   = 0;
-    std::shared_ptr<aeron::ExclusivePublication>   egress;        // to the client's egress channel
+    std::shared_ptr<aeron::ExclusivePublication>   egress;        // acks/responses (gateway-written)
     int64_t                                        lastSeenNs  = 0;
+
+    // Hybrid egress: the client's egress endpoint (captured at Connect) and a
+    // SECOND publication to it, dedicated to Records pushed by the owning worker
+    // (per-consumer UNICAST → independent per-consumer offsets).  Lazily created
+    // on the first subscribe and written ONLY by the worker thread (the gateway
+    // never touches it — shared-nothing single-writer).  Dropped with the session.
+    std::string                                    egressChannel;
+    int32_t                                        egressStreamId = 0;
+    std::shared_ptr<aeron::ExclusivePublication>   recordEgress;  // Records (worker-written)
 };
 
 // ---------------------------------------------------------------------------
@@ -49,11 +59,15 @@ public:
     // -----------------------------------------------------------------------
     Session& add(int64_t                                      sessionId,
                  std::shared_ptr<aeron::ExclusivePublication> egress,
-                 int64_t                                      nowNs) {
+                 int64_t                                      nowNs,
+                 std::string                                  egressChannel = {},
+                 int32_t                                      egressStreamId = 0) {
         Session s;
-        s.sessionId  = sessionId;
-        s.egress     = std::move(egress);
-        s.lastSeenNs = nowNs;
+        s.sessionId      = sessionId;
+        s.egress         = std::move(egress);
+        s.lastSeenNs     = nowNs;
+        s.egressChannel  = std::move(egressChannel);
+        s.egressStreamId = egressStreamId;
         auto [it, _] = sessions_.emplace(sessionId, std::move(s));
         return it->second;
     }

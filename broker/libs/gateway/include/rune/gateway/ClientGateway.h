@@ -795,6 +795,12 @@ private:
         // ConnectResponse offer while the Aeron UDP link is still warming up.
         // null = publication not yet resolved; non-null = resolved, retrying send.
         std::shared_ptr<aeron::ExclusivePublication> resolvedPub;
+
+        // Hybrid egress: the client's egress endpoint (from the Connect request),
+        // carried to the Session so a per-consumer unicast Records publication can
+        // be created lazily on the first subscribe.
+        std::string egressChannel;
+        int32_t     egressStreamId = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -823,6 +829,35 @@ private:
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
                                    bool isGroup, bool groupCarrierReceived);
     void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
+
+    // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
+    // Records publication resolves (NON-BLOCKING — never sleeps on the control
+    // thread).  Buffered in pendingRecordEgress_ and drained by
+    // pollPendingRecordEgress_ once the pub is ready.
+    struct BufferedSubscribe {
+        int64_t subId              = 0;
+        int64_t sessionId          = 0;
+        int32_t topicId            = 0;
+        int32_t partition          = 0;
+        int64_t nextOffset         = 0;
+        uint8_t isolation          = 0;
+        bool    isGroup            = false;
+        bool    groupCarrierReceived = false;
+    };
+    struct PendingRecordEgress {
+        int64_t regId         = -1;  // addExclusivePublication registration (in flight)
+        int64_t requestedAtNs = 0;   // for the resolve timeout
+        std::vector<BufferedSubscribe> waiters;
+    };
+    // sessionId → in-flight record-egress pub resolve + its buffered subscribes.
+    std::unordered_map<int64_t, PendingRecordEgress> pendingRecordEgress_;
+
+    // Build + route a Subscribe WorkerOp with the resolved egress pub (may be null
+    // → MDC fallback).
+    void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
+    // Resolve in-flight record-egress pubs (non-blocking) + drain buffered
+    // subscribes.  Called from doWork().
+    void pollPendingRecordEgress_(int64_t nowNs);
     // GB-3: Subscribe/Unsubscribe handlers.
     void handleSubscribe    (const uint8_t* buf, std::size_t len);
     void handleUnsubscribe  (const uint8_t* buf, std::size_t len);

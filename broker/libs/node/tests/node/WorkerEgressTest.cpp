@@ -142,7 +142,9 @@ TEST_F(WorkerEgressFixture, NullAeronIsUnresolvedAndSendIsNoop) {
     EXPECT_LE(eg.send(b, sizeof(b)), 0);  // no publication → non-positive result
 }
 
-// Accessors + channel format: dynamic-MDC channel embeds control-mode/control/fc.
+// Accessors + channel format: dynamic-MDC channel embeds control-mode/control.
+// NOTE: fc=min was intentionally REMOVED (min flow control paced the publisher to
+// the slowest/late receiver and stalled the reader); default flow control is used.
 TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
     WorkerEgress eg(aeron_, "127.0.0.1:24730", 2099);
     ASSERT_TRUE(eg.resolved());
@@ -151,7 +153,7 @@ TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
     const std::string& ch = eg.channel();
     EXPECT_NE(ch.find("control-mode=dynamic"), std::string::npos) << ch;
     EXPECT_NE(ch.find("control=127.0.0.1:24730"), std::string::npos) << ch;
-    EXPECT_NE(ch.find("fc=min"), std::string::npos) << ch;
+    EXPECT_EQ(ch.find("fc=min"), std::string::npos) << "fc=min must NOT be present: " << ch;
     EXPECT_GT(eg.maxPayloadLength(), 0);
 }
 

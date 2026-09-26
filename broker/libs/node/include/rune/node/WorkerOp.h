@@ -122,6 +122,12 @@ struct WorkerOp {
     std::span<const uint8_t> recordBatchView;
     std::vector<uint8_t> recordBatchBytes;
 
+    // Hybrid egress (Subscribe op): opaque pointer to the per-consumer UNICAST
+    // egress ExclusivePublication created + lifetime-owned by the gateway, written
+    // only by the owning worker.  Passed through the ring as a uint64 (like
+    // replica/logPtr).  nullptr → worker uses the shared MDC pub (broadcast).
+    void* egressPub = nullptr;
+
     // lastOffsetDelta from the RecordBatch header (kLastOffsetDeltaOffset=23, LE32).
     // The worker computes lastOffset = worker_base + lastOffsetDelta.
     int32_t lastOffsetDelta = 0;

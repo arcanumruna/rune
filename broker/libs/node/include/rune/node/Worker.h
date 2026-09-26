@@ -238,6 +238,12 @@ public:
         uint8_t isolation            = 0;
         bool    isGroup              = false;
         bool    groupCarrierReceived = false;
+        // Hybrid egress: per-consumer UNICAST egress publication for this
+        // subscription's consumer session.  Created + lifetime-owned by the
+        // gateway; written ONLY here on the worker thread (single-writer,
+        // shared-nothing).  nullptr → fall back to the shared MDC pub
+        // (workerEgress_) for broadcast/replication.
+        aeron::ExclusivePublication* egressPub = nullptr;
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -392,6 +398,7 @@ public:
            .oleFollowerId(static_cast<std::int32_t>(op.offsEpochReqPayload.followerId))
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
            .oleFollowerLeo(static_cast<std::int64_t>(op.offsEpochReqPayload.followerLeo))
+           .egressPub(reinterpret_cast<std::uint64_t>(op.egressPub))
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
@@ -898,6 +905,7 @@ private:
                 s.isolation            = op.isolation();
                 s.isGroup              = op.isGroup() != 0;
                 s.groupCarrierReceived = op.groupCarrierReceived() != 0;
+                s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
                 return;
             }
         }
@@ -912,6 +920,7 @@ private:
         s.isolation            = op.isolation();
         s.isGroup              = op.isGroup() != 0;
         s.groupCarrierReceived = op.groupCarrierReceived() != 0;
+        s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
         subs_.push_back(s);
     }
 
@@ -950,14 +959,42 @@ private:
     // Inert until Subscribe ops populate subs_ AND a WorkerEgress is wired, so it
     // is a no-op in the pre-I3b configuration (gateway still owns push).
     // -------------------------------------------------------------------
+    // Send one encoded egress frame to a raw ExclusivePublication (unicast per
+    // consumer OR the shared MDC pub).  Zero-copy: tryClaim for <= maxPayload,
+    // offer() (auto-fragment) otherwise — same policy as WorkerEgress::send.
+    // Returns the Aeron result (>0 accepted; <=0 back-pressure/not-connected).
+    static int64_t sendEncodedToPub_(aeron::ExclusivePublication* pub,
+                                     const uint8_t* data, std::size_t len) {
+        if (!pub) [[unlikely]] return -1;
+        auto* mutableBuf = const_cast<uint8_t*>(data);
+        aeron::concurrent::AtomicBuffer buf(mutableBuf, static_cast<aeron::util::index_t>(len));
+        if (len <= static_cast<std::size_t>(pub->maxPayloadLength())) {
+            aeron::concurrent::logbuffer::BufferClaim claim;
+            const int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos > 0) {
+                claim.buffer().putBytes(claim.offset(), buf, 0,
+                                        static_cast<aeron::util::index_t>(len));
+                claim.commit();
+            }
+            return pos;
+        }
+        return pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+    }
+
     int pushOwnedSubscriptions_(int64_t /*nowNs*/) {
         using namespace rune::protocol::batch;
         namespace pc = rune::protocol::client;
-        if (!workerEgress_ || subs_.empty()) return 0;
+        if (subs_.empty()) return 0;
 
         int work = 0;
         for (auto& s : subs_) {
             if (!s.logPtr) continue;
+
+            // Hybrid egress: prefer this consumer's UNICAST pub (independent
+            // per-consumer offsets); fall back to the shared MDC pub (broadcast).
+            aeron::ExclusivePublication* egressPub = s.egressPub;
+            if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
+            if (!egressPub) continue;  // nowhere to send yet
 
             // HW bound (read_uncommitted).  Worker owns the replica → live HW.
             const int64_t bound = s.replica ? s.replica->highWatermark()
@@ -1030,7 +1067,7 @@ private:
                 }
 
                 const std::size_t encoded = rec.encode(egressScratch_.data());
-                const int64_t r = workerEgress_->send(egressScratch_.data(), encoded);
+                const int64_t r = sendEncodedToPub_(egressPub, egressScratch_.data(), encoded);
                 if (r > 0) {
                     s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                     pos += batchSize;

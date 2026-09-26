@@ -82,6 +82,9 @@ public:
     ~WorkerEgress() = default;
 
     [[nodiscard]] bool     resolved() const noexcept { return pub_ != nullptr; }
+    // Raw pub accessor — used by the worker's push loop to send to the shared MDC
+    // pub via the common sendEncodedToPub_ helper (broadcast/hybrid fallback).
+    [[nodiscard]] aeron::ExclusivePublication* pub() const noexcept { return pub_.get(); }
     [[nodiscard]] int32_t  streamId() const noexcept { return streamId_; }
     [[nodiscard]] const std::string& controlEndpoint() const noexcept { return controlEndpoint_; }
     [[nodiscard]] const std::string& channel() const noexcept { return channel_; }
