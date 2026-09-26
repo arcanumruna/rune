@@ -176,7 +176,7 @@ std::future<void> TransactionalProducerImpl::submitAbort()
 
 int TransactionalProducerImpl::doWork(
     int64_t sessionId,
-    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     if (sessionId == 0) return 0;
 
@@ -386,7 +386,7 @@ int TransactionalProducerImpl::doWork(
 
 void TransactionalProducerImpl::drainPendingSends(
     int64_t sessionId,
-    const std::function<bool(const uint8_t*, std::size_t)>& sendFn,
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn,
     int& work)
 {
     // Process pending sends (auto-AddPartitionsToTxn + Produce).
@@ -479,7 +479,7 @@ void TransactionalProducerImpl::drainPendingSends(
         if (encodeScratch_.size() < needed) encodeScratch_.resize(needed);
         const std::size_t written = msg.encode(encodeScratch_.data());
         if (written > 0) {
-            if (sendFn(encodeScratch_.data(), written)) {
+            if (sendFn(0, encodeScratch_.data(), written)) {
                 // Retain wire frame for idempotent retry: same bytes = same baseSeq.
                 InFlightBatch ib;
                 ib.topicId      = sr.topicId;
@@ -548,7 +548,7 @@ void TransactionalProducerImpl::sweepTimedOut()
 
 void TransactionalProducerImpl::onProduceResponse(
     const uint8_t* buf, std::size_t len,
-    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     auto opt = rpc::ProduceResponse::decode(buf, len);
     if (!opt) return;
@@ -591,7 +591,9 @@ void TransactionalProducerImpl::onProduceResponse(
 
     ++ib.retryCount;
     // Re-send: same bytes, same correlationId in the frame header.
-    sendFn(ib.wireFrame.data(), ib.wireFrame.size());
+    // Stream id 0 = default ingress; Task 1.3 will supply the leader's
+    // stream id here once per-session routing is wired.
+    sendFn(0, ib.wireFrame.data(), ib.wireFrame.size());
 }
 
 void TransactionalProducerImpl::onInitProducerIdResponse(const uint8_t* buf,
@@ -651,7 +653,7 @@ void TransactionalProducerImpl::onAddPartitionsToTxnResponse(const uint8_t* buf,
 void TransactionalProducerImpl::onAddOffsetsToTxnResponse(
     const uint8_t* buf, std::size_t len,
     int64_t sessionId,
-    std::function<bool(const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     auto opt = rpc::AddOffsetsToTxnResponse::decode(buf, len);
     if (!opt) return;
@@ -838,7 +840,7 @@ TxnPartitionState& TransactionalProducerImpl::getOrCreatePartition(
 bool TransactionalProducerImpl::sendInitProducerId(
     int64_t sessionId,
     int64_t corrId,
-    const std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     rpc::InitProducerId msg;
     msg.sessionId            = sessionId;
@@ -853,14 +855,14 @@ bool TransactionalProducerImpl::sendInitProducerId(
     const std::size_t written = msg.encode(encodeScratch_.data());
     if (written == 0) return false;
 
-    return sendFn(encodeScratch_.data(), written);
+    return sendFn(0, encodeScratch_.data(), written);
 }
 
 bool TransactionalProducerImpl::sendAddPartitionsToTxn(
     int64_t sessionId,
     int64_t corrId,
     const std::vector<rpc::TxnTopicPartition>& parts,
-    const std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     rpc::AddPartitionsToTxn msg;
     msg.sessionId     = sessionId;
@@ -878,14 +880,14 @@ bool TransactionalProducerImpl::sendAddPartitionsToTxn(
         msg.encode(encodeScratch_.data(), std::span<const rpc::TxnTopicPartition>(parts));
     if (written == 0) return false;
 
-    return sendFn(encodeScratch_.data(), written);
+    return sendFn(0, encodeScratch_.data(), written);
 }
 
 bool TransactionalProducerImpl::sendEndTxn(
     int64_t sessionId,
     int64_t corrId,
     bool commit,
-    const std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     rpc::EndTxn msg;
     msg.sessionId     = sessionId;
@@ -902,14 +904,14 @@ bool TransactionalProducerImpl::sendEndTxn(
     const std::size_t written = msg.encode(encodeScratch_.data());
     if (written == 0) return false;
 
-    return sendFn(encodeScratch_.data(), written);
+    return sendFn(0, encodeScratch_.data(), written);
 }
 
 bool TransactionalProducerImpl::sendAddOffsetsToTxn(
     int64_t sessionId,
     int64_t corrId,
     std::span<const uint8_t> grpSpan,
-    const std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     rpc::AddOffsetsToTxn msg;
     msg.sessionId     = sessionId;
@@ -926,7 +928,7 @@ bool TransactionalProducerImpl::sendAddOffsetsToTxn(
     const std::size_t written = msg.encode(encodeScratch_.data());
     if (written == 0) return false;
 
-    return sendFn(encodeScratch_.data(), written);
+    return sendFn(0, encodeScratch_.data(), written);
 }
 
 bool TransactionalProducerImpl::sendTxnOffsetCommit(
@@ -934,7 +936,7 @@ bool TransactionalProducerImpl::sendTxnOffsetCommit(
     int64_t corrId,
     std::span<const uint8_t> grpSpan,
     const std::vector<rpc::TxnOffsetCommitEntry>& entries,
-    const std::function<bool(const uint8_t*, std::size_t)>& sendFn)
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     rpc::TxnOffsetCommit msg;
     msg.sessionId     = sessionId;
@@ -953,7 +955,7 @@ bool TransactionalProducerImpl::sendTxnOffsetCommit(
     const std::size_t written = msg.encode(encodeScratch_.data(), entrsSpan);
     if (written == 0) return false;
 
-    return sendFn(encodeScratch_.data(), written);
+    return sendFn(0, encodeScratch_.data(), written);
 }
 
 void TransactionalProducerImpl::handleFencing(int16_t /*errorCode*/)

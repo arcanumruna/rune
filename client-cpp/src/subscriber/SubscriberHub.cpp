@@ -33,7 +33,7 @@ void SubscriberHub::registerSubscribe(
         uint8_t                                       isolation,
         std::span<const uint8_t>                      keyBytes,
         std::chrono::steady_clock::time_point         deadline,
-        const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
+        const SendFn&                                  submitFn)
 {
     // ---- Encode the Subscribe frame -----------------------------------------
     // Max frame size: header(24) + fixed(~30) + key(≤16) = ~70 bytes.
@@ -68,8 +68,10 @@ void SubscriberHub::registerSubscribe(
     // ---- Submit to the agent ring -------------------------------------------
     // If submission fails (ring full), we leave the impl registered; it will
     // be cleaned up by deactivateAll() on close or by a timeout sweep.
+    // Stream id 0 = default ingress stream; Task 1.3 will supply the correct
+    // coordinator/session stream id here once per-session routing is wired.
     if (frameLen > 0) {
-        submitFn(frameBuf, frameLen);
+        submitFn(0, frameBuf, frameLen);
     }
 }
 
@@ -81,7 +83,7 @@ void SubscriberHub::sendUnsubscribe(
         int64_t subscriptionId,
         int64_t sessionId,
         int64_t correlationId,
-        const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
+        const SendFn& submitFn)
 {
     // subscriptionId == 0 means the SubscribeResponse has not arrived yet.
     // Still encode and send — the broker will ignore an Unsubscribe for an
@@ -110,7 +112,7 @@ void SubscriberHub::sendUnsubscribe(
         correlationId);
 
     if (frameLen > 0) {
-        submitFn(frameBuf, frameLen);
+        submitFn(0, frameBuf, frameLen);
     }
 }
 
@@ -122,7 +124,7 @@ void SubscriberHub::onSubscribeResponse(
         const codec::SubscribeResponseView& rsp,
         int64_t                             unsubCorrId,
         int64_t                             sessionId,
-        const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
+        const SendFn&                       submitFn)
 {
     std::shared_ptr<SubscriptionImpl> impl;
     bool needUnsubscribe = false;
@@ -161,7 +163,7 @@ void SubscriberHub::onSubscribeResponse(
             sessionId,
             unsubCorrId);
         if (frameLen > 0) {
-            submitFn(frameBuf, frameLen);
+            submitFn(0, frameBuf, frameLen);
         }
     }
 }
@@ -256,7 +258,7 @@ void SubscriberHub::deactivateAll()
 
 int SubscriberHub::resendPending(
         int64_t newSessionId,
-        const std::function<bool(const uint8_t*, std::size_t)>& submitFn)
+        const SendFn& submitFn)
 {
     // Re-stamp the MessageHeader sessionId (int64 LE at byte offset 8) of every
     // pending Subscribe frame with the leader's freshly assigned sessionId, then
@@ -277,7 +279,7 @@ int SubscriberHub::resendPending(
         for (int i = 0; i < 8; ++i)
             frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
 
-        if (submitFn && submitFn(frame.data(), frame.size())) {
+        if (submitFn && submitFn(0, frame.data(), frame.size())) {
             ++resent;
         }
     }

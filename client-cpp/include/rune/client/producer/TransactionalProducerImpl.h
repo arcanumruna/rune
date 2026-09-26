@@ -142,10 +142,13 @@ public:
     // ---- Agent-thread: duty cycle ------------------------------------------
 
     /// Drain the command ring and process pending frames.
-    /// sendFn: transport send function.
+    /// sendFn: (ingressStreamId, buf, len) -> bool.
+    ///   ingressStreamId=0 = default ingress stream.
+    ///   Matches ClientAgent::SendFn so Task 1.3 can route txn frames to
+    ///   the coordinator session without an adapter at every call site.
     /// Returns work count.
     int doWork(int64_t sessionId,
-               std::function<bool(const uint8_t*, std::size_t)> sendFn);
+               std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// Called when InitProducerIdResponse (templateId 46) arrives.
     void onInitProducerIdResponse(const uint8_t* buf, std::size_t len);
@@ -156,7 +159,7 @@ public:
     /// Called when AddOffsetsToTxnResponse (templateId 50) arrives.
     void onAddOffsetsToTxnResponse(const uint8_t* buf, std::size_t len,
                                     int64_t sessionId,
-                                    std::function<bool(const uint8_t*, std::size_t)> sendFn);
+                                    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// Called when TxnOffsetCommitResponse (templateId 52) arrives.
     void onTxnOffsetCommitResponse(const uint8_t* buf, std::size_t len);
@@ -169,7 +172,7 @@ public:
     /// On retriable error: re-sends the same wire frame (same baseSequence).
     /// On fencing error: calls handleFencing().
     void onProduceResponse(const uint8_t* buf, std::size_t len,
-                           std::function<bool(const uint8_t*, std::size_t)> sendFn);
+                           std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// Fail all pending ops (called on close).
     void failAll(const std::string& reason);
@@ -187,27 +190,27 @@ private:
     // Called from doWork() BEFORE the command queue so data batches always
     // precede an EndTxn on the ordered publication.  Accumulates into `work`.
     void drainPendingSends(int64_t sessionId,
-                           const std::function<bool(const uint8_t*, std::size_t)>& sendFn,
+                           const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn,
                            int& work);
 
     bool sendInitProducerId(int64_t sessionId, int64_t corrId,
-                            const std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                            const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     bool sendAddPartitionsToTxn(int64_t sessionId, int64_t corrId,
                                  const std::vector<rune::protocol::client::TxnTopicPartition>& parts,
-                                 const std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                                 const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     bool sendEndTxn(int64_t sessionId, int64_t corrId, bool commit,
-                    const std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     bool sendAddOffsetsToTxn(int64_t sessionId, int64_t corrId,
                               std::span<const uint8_t> groupIdSpan,
-                              const std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                              const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     bool sendTxnOffsetCommit(int64_t sessionId, int64_t corrId,
                               std::span<const uint8_t> groupIdSpan,
                               const std::vector<rune::protocol::client::TxnOffsetCommitEntry>& entries,
-                              const std::function<bool(const uint8_t*, std::size_t)>& sendFn);
+                              const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     void handleFencing(int16_t errorCode);
 

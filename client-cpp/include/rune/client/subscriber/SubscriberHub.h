@@ -50,8 +50,11 @@ namespace rune::client::subscriber {
 
 class SubscriberHub {
 public:
-    /// SendFn: (frame, len) -> bool.  Provided by the agent as its transport send.
-    using SendFn = std::function<bool(const uint8_t*, std::size_t)>;
+    /// SendFn: (ingressStreamId, frame, len) -> bool.
+    /// ingressStreamId=0 means "use the default ingress stream".
+    /// Matches the ClientAgent::SendFn signature so Task 1.3 can pass the
+    /// stream id through without an adapter at every call site.
+    using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
 
     SubscriberHub() = default;
 
@@ -95,7 +98,7 @@ public:
                            uint8_t                                       isolation,
                            std::span<const uint8_t>                      keyBytes,
                            std::chrono::steady_clock::time_point         deadline,
-                           const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
+                           const SendFn&                                  submitFn);
 
     /// Submit an Unsubscribe frame for a given subscriptionId.
     ///
@@ -105,7 +108,7 @@ public:
     void sendUnsubscribe(int64_t subscriptionId,
                          int64_t sessionId,
                          int64_t correlationId,
-                         const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
+                         const SendFn& submitFn);
 
     // -------------------------------------------------------------------------
     // Agent-thread callbacks (called from ClientAgent's egress observer)
@@ -123,7 +126,7 @@ public:
     void onSubscribeResponse(const codec::SubscribeResponseView& rsp,
                              int64_t                             unsubCorrId,
                              int64_t                             sessionId,
-                             const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
+                             const SendFn&                       submitFn);
 
     /// Called on the agent thread when a Records push arrives.
     ///
@@ -165,7 +168,7 @@ public:
     /// resent so the leader — which just assigned a fresh session — accepts it.
     /// Returns the number of Subscribe frames resent.
     int resendPending(int64_t newSessionId,
-                      const std::function<bool(const uint8_t*, std::size_t)>& submitFn);
+                      const SendFn& submitFn);
 
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;

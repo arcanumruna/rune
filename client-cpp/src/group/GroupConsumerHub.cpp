@@ -113,7 +113,7 @@ void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
                                         std::span<const int32_t>(impl.topicIds));
     if (len == 0) return;
 
-    sendFn(impl.sendBuf.data(), len);
+    sendFn(0, impl.sendBuf.data(), len);
 
     impl.state = GroupConsumerState::Joining;
     impl.joinDeadline = tpNow() + std::chrono::milliseconds(impl.cfg.sessionTimeoutMs);
@@ -148,7 +148,7 @@ void GroupConsumerHub::sendSyncGroup(GroupConsumerImpl& impl,
     const std::size_t len = msg.encode(impl.sendBuf.data());
     if (len == 0) return;
 
-    sendFn(impl.sendBuf.data(), len);
+    sendFn(0, impl.sendBuf.data(), len);
 
     impl.state = GroupConsumerState::Syncing;
 }
@@ -178,7 +178,7 @@ void GroupConsumerHub::sendHeartbeat(GroupConsumerImpl& impl,
     const std::size_t len = msg.encode(impl.sendBuf.data());
     if (len == 0) return;
 
-    sendFn(impl.sendBuf.data(), len);
+    sendFn(0, impl.sendBuf.data(), len);
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +227,7 @@ void GroupConsumerHub::sendOffsetCommit(GroupConsumerImpl& impl,
     const std::size_t len = msg.encode(impl.sendBuf.data(), impl.commitEntriesScratch);
     if (len == 0) return;
 
-    sendFn(impl.sendBuf.data(), len);
+    sendFn(0, impl.sendBuf.data(), len);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +266,7 @@ void GroupConsumerHub::sendOffsetFetch(GroupConsumerImpl& impl,
     const std::size_t len = msg.encode(impl.sendBuf.data(), entries);
     if (len == 0) return;
 
-    sendFn(impl.sendBuf.data(), len);
+    sendFn(0, impl.sendBuf.data(), len);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ void GroupConsumerHub::sendSubscribeForPartitions(GroupConsumerImpl& impl,
             /*correlationId=*/0);
 
         if (len > 0) {
-            sendFn(impl.sendBuf.data(), len);
+            sendFn(0, impl.sendBuf.data(), len);
         }
     }
 }
@@ -769,7 +769,7 @@ void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
             const std::size_t needed = msg.encodedSize();
             ensureBuf(*impl, needed);
             const std::size_t len = msg.encode(impl->sendBuf.data());
-            if (len > 0) sendFn(impl->sendBuf.data(), len);
+            if (len > 0) sendFn(0, impl->sendBuf.data(), len);
         }
 
         impl->active.store(false, std::memory_order_release);

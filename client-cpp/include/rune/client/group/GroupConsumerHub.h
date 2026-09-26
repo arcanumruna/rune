@@ -45,8 +45,11 @@ namespace rune::client::group {
 // Alias for the immutable consumer list (same COW pattern as ProducerHub).
 using ImplList = std::vector<std::shared_ptr<GroupConsumerImpl>>;
 
-// SendFn: (buf, len) -> bool, same as agent_.submitSend.
-using SendFn = std::function<bool(const uint8_t*, std::size_t)>;
+// SendFn: (ingressStreamId, buf, len) -> bool.
+// ingressStreamId=0 means "use the default ingress stream".
+// Matches ClientAgent::SendFn so Task 1.3 can route group frames to the
+// coordinator session without an adapter at every call site.
+using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
 
 class GroupConsumerHub {
 public:

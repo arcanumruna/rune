@@ -112,18 +112,16 @@ Client::Client(ClientConfig cfg)
             }
             int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
             // TX-5: drain all transactional producers (rarely >1; mutex is fine).
-            // Txn producers use the default stream (E5.1 per-worker routing is
-            // regular-producer only); wrap with a legacy adapter.
+            // Txn producers now accept the same (streamId, buf, len) SendFn — pass
+            // sendFn directly; they pass streamId=0 internally on the current path
+            // (Task 1.3 will supply the coordinator session's stream id).
             std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
             {
                 std::lock_guard<std::mutex> lk(txnHubMtx_);
                 txnSnap = txnProducers_;
             }
-            auto txnSendFn = [&sendFn](const uint8_t* buf, std::size_t len) -> bool {
-                return sendFn(0, buf, len);  // 0 = default ingress stream
-            };
             for (auto& tp : txnSnap) {
-                work += tp->doWork(sessionId, txnSendFn);
+                work += tp->doWork(sessionId, sendFn);
             }
             (void)nowNs;
             return work;
@@ -190,7 +188,7 @@ void Client::close() {
     // sendFn here is a best-effort last send (transport may be stopping).
     {
         const auto snap = agent_.stateAndSessionId();
-        const group::SendFn gcSendFn = [this](const uint8_t* fb, std::size_t fl) -> bool {
+        const group::SendFn gcSendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
             return agent_.submitSend(fb, fl);
         };
         groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
@@ -521,7 +519,7 @@ void Client::sweepTimeouts() {
         const auto snap = agent_.stateAndSessionId();
         const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
-        const group::SendFn sendFn = [this](const uint8_t* fb, std::size_t fl) -> bool {
+        const group::SendFn sendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
             return agent_.submitSend(fb, fl);
         };
         groupConsumerHub_.doWork(nowNs, snap.sessionId, sendFn);
@@ -635,17 +633,17 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         return agent_.submitSend(fb, fl);
                     };
                 producerHub_.resendAllRedirected(newSessionId, sendFn);
-                std::function<bool(const uint8_t*, std::size_t)> legacySend =
-                    [this](const uint8_t* fb, std::size_t fl) -> bool {
+                subscriber::SubscriberHub::SendFn subSendFn =
+                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     };
-                subscriberHub_.resendPending(newSessionId, legacySend);
+                subscriberHub_.resendPending(newSessionId, subSendFn);
             }
 
             // CG-5: Trigger group consumers to send JoinGroup on connect.
             if (!groupConsumerHub_.empty()) {
                 const group::SendFn gcSendFn =
-                    [this](const uint8_t* fb, std::size_t fl) -> bool {
+                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     };
                 groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
@@ -720,8 +718,20 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // redirect-reconnect as robust as the initial connect (both now rely
             // on the single SessionMachine fast-retry publication) and removes
             // the pub-swap race — no busy-spin, connect/setup path only.
+            // Task 1.2: include group + txn pending state so that a redirect
+            // arriving while a group join or txn op is in flight is treated as
+            // a genuine data-op redirect rather than dropped as a connect-time
+            // redirect.  All four components are agent-thread reads (no locks).
+            const bool groupActive = !groupConsumerHub_.empty();
+            bool txnPending = false;
+            {
+                // Cold-path lock: only to test for ANY registered txn producer.
+                std::lock_guard<std::mutex> lk(txnHubMtx_);
+                txnPending = !txnProducers_.empty();
+            }
             const bool haveWork =
-                producerHub_.hasInFlight() || subscriberHub_.hasPending();
+                producerHub_.hasInFlight() || subscriberHub_.hasPending()
+                || groupActive || txnPending;
             if (!haveWork) {
                 // Connect-time (or duplicate/late) redirect: let the
                 // SessionMachine handle it; do not churn the transport.
@@ -861,14 +871,26 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // exhausted does retryRedirectedProduce() fail the pending ack — so
         // cbError_ is never fired for a bare NotLeader until retries run out.
         if (ec == rpc::ErrorCode::NotLeader && opt->message.empty()) {
-            const bool haveWork =
-                producerHub_.hasInFlight() || subscriberHub_.hasPending();
-            if (!haveWork) {
-                // No in-flight op to retry (late/duplicate NotLeader for an
-                // already-resolved corrId): arm a background refresh so the map
-                // is reconciled, then drop it.  Do NOT fire cbError_.
-                scheduleMetadataRefresh();
-                break;
+            // Task 1.2: mirror the Redirect haveWork expansion — include
+            // group + txn pending so a bare NotLeader while a group or txn op
+            // is in flight is retried rather than dropped.
+            {
+                bool groupActiveNL = !groupConsumerHub_.empty();
+                bool txnPendingNL  = false;
+                {
+                    std::lock_guard<std::mutex> lk(txnHubMtx_);
+                    txnPendingNL = !txnProducers_.empty();
+                }
+                const bool haveWork =
+                    producerHub_.hasInFlight() || subscriberHub_.hasPending()
+                    || groupActiveNL || txnPendingNL;
+                if (!haveWork) {
+                    // No in-flight op to retry (late/duplicate NotLeader for an
+                    // already-resolved corrId): arm a background refresh so the map
+                    // is reconciled, then drop it.  Do NOT fire cbError_.
+                    scheduleMetadataRefresh();
+                    break;
+                }
             }
 
             // Mark the affected partition (from our own in-flight request
@@ -993,7 +1015,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 *opt,
                 unsubCorrId,
                 snap.sessionId,
-                [this](const uint8_t* fbuf, std::size_t flen) -> bool {
+                [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
                     return agent_.submitSend(fbuf, flen);
                 });
         }
@@ -1017,7 +1039,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!groupConsumerHub_.empty()) {
             const auto snap = agent_.stateAndSessionId();
             const group::SendFn gcSendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             groupConsumerHub_.onJoinGroupResponse(buf, len, snap.sessionId, gcSendFn);
@@ -1029,7 +1051,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!groupConsumerHub_.empty()) {
             const auto snap = agent_.stateAndSessionId();
             const group::SendFn gcSendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             groupConsumerHub_.onSyncGroupResponse(buf, len, snap.sessionId, gcSendFn);
@@ -1041,7 +1063,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!groupConsumerHub_.empty()) {
             const auto snap = agent_.stateAndSessionId();
             const group::SendFn gcSendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             groupConsumerHub_.onHeartbeatResponse(buf, len, snap.sessionId, gcSendFn);
@@ -1067,7 +1089,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!groupConsumerHub_.empty()) {
             const auto snap = agent_.stateAndSessionId();
             const group::SendFn gcSendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             groupConsumerHub_.onAssign(buf, len, snap.sessionId, gcSendFn);
@@ -1087,8 +1109,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             txnSnap = txnProducers_;
         }
         if (!txnSnap.empty()) {
-            std::function<bool(const uint8_t*, std::size_t)> sendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             for (auto& tp : txnSnap) {
@@ -1130,8 +1152,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
         if (!txnSnap.empty()) {
             const auto snap = agent_.stateAndSessionId();
-            std::function<bool(const uint8_t*, std::size_t)> sendFn =
-                [this](const uint8_t* fb, std::size_t fl) -> bool {
+            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             for (auto& tp : txnSnap) {
@@ -1284,7 +1306,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
             subId,
             s.sessionId,
             corrId2,
-            [this](const uint8_t* buf, std::size_t len) -> bool {
+            [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
                 return agent_.submitSend(buf, len);
             });
     };
@@ -1306,7 +1328,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         static_cast<uint8_t>(opts.isolation),
         keyBytes,
         subscribeDL,
-        [this](const uint8_t* buf, std::size_t len) -> bool {
+        [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
             return agent_.submitSend(buf, len);
         });
 
