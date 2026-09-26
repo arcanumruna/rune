@@ -93,7 +93,12 @@ int main() {
     cfg.egressChannel   = egress;
     cfg.egressStreamId  = static_cast<int32_t>(envI64("RUNE_EGRESS_STREAM", 2));
     cfg.dataDir         = dataDir;
-    cfg.idleMode        = IdleMode::LowLatency;
+    {   // RUNE_IDLE_MODE: busyspin | lowlatency (default) | balanced
+        const std::string im = envStr("RUNE_IDLE_MODE", "lowlatency");
+        cfg.idleMode = (im == "busyspin") ? IdleMode::BusySpin
+                     : (im == "balanced") ? IdleMode::Balanced
+                                          : IdleMode::LowLatency;
+    }
     cfg.topics          = parseTopics(topics);
     if (cfg.topics.empty()) { std::cerr << "no topics parsed\n"; return 2; }
 

@@ -441,6 +441,30 @@ void Client::runLoop() {
                              std::chrono::milliseconds(kSweepIntervalMs);
             }
         }
+    } else if (cfg_.idleMode == IdleMode::BusySpin) {
+        // BusySpin: NEVER park or yield — the runner drives both the producer drain
+        // and the egress ack/record poll every cycle with only a cpu_pause() on idle
+        // cycles.  This removes the client-side park from a produce/ack or consume
+        // round-trip (LowLatency's 1–100µs park is the p99 floor otherwise).  Pegs
+        // one core; pin it to a dedicated CPU.
+        while (!stopped_.load(std::memory_order_acquire)) {
+            const int64_t now = nowNs();
+            const int work = agent_.doWork(now);
+            if (work == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+                __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+                __asm__ volatile("yield" ::: "memory");
+#else
+                __asm__ volatile("" ::: "memory");
+#endif
+            }
+            const auto wallNow = std::chrono::steady_clock::now();
+            if (wallNow >= nextSweep_) {
+                sweepTimeouts();
+                nextSweep_ = wallNow + std::chrono::milliseconds(kSweepIntervalMs);
+            }
+        }
     } else {
         // Balanced: Aeron BackoffIdleStrategy: spins → yields → parks (max 1 ms).
         aeron::concurrent::BackoffIdleStrategy idleStrategy(

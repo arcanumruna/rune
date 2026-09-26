@@ -87,8 +87,14 @@ using Bytes = std::vector<uint8_t>;
 // Balanced (default): BackoffIdleStrategy — spins a few cycles → yields →
 //   parks up to 1 ms.  CPU-friendly for idle clients that do not need
 //   sub-millisecond reaction time.
+//
+// BusySpin: NEVER parks or yields — a tight doWork loop with a cpu_pause() on
+//   idle cycles.  Lowest possible reaction time (sub-µs) → the client side never
+//   adds park latency to a produce/ack or consume round-trip (needed for a
+//   sub-100µs p99 target).  Cost: pegs one CPU core continuously; use only on a
+//   dedicated core.  LowLatency still parks 1–100µs, so its p99 floor is ~100µs.
 // ---------------------------------------------------------------------------
-enum class IdleMode { Balanced, LowLatency };
+enum class IdleMode { Balanced, LowLatency, BusySpin };
 
 // ---------------------------------------------------------------------------
 // ClientConfig
