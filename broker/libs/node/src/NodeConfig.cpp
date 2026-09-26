@@ -683,6 +683,14 @@ ConfigResult parseNodeConfig(
         }
     }
     parsePow2(getenv_fn("RUNE_AERON_RCV_WINDOW"), cfg.aeronRcvWindowBytes);
+    // RUNE_AERON_SOCKET_BUFFER_BYTES: OS UDP SO_SNDBUF/SO_RCVBUF (Task 6). Not
+    // required to be a power of two.  0 leaves Aeron's default.
+    if (const char* raw = getenv_fn("RUNE_AERON_SOCKET_BUFFER_BYTES")) {
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v = 0;
+            if (parseInt32(raw, v) && v >= 0) cfg.aeronSocketBufferBytes = v;
+        }
+    }
     // RUNE_GATEWAY_FRAGMENT_LIMIT: not required to be a power of two — use parseInt32.
     if (const char* raw = getenv_fn("RUNE_GATEWAY_FRAGMENT_LIMIT")) {
         if (raw && !std::string_view(raw).empty()) {

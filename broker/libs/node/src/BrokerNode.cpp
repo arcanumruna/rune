@@ -1643,6 +1643,12 @@ void BrokerNode::startEmbeddedDriver() {
         driverCtx_, static_cast<uint64_t>(config_.aeronTermBufferBytes));
     aeron_driver_context_set_mtu_length(driverCtx_, static_cast<size_t>(config_.aeronMtuBytes));
     aeron_driver_context_set_rcv_initial_window_length(driverCtx_, static_cast<size_t>(config_.aeronRcvWindowBytes));
+    // Task 6: larger OS UDP socket buffers absorb produce/ack bursts so the kernel
+    // does not drop datagrams under load (0 = leave Aeron's default).
+    if (config_.aeronSocketBufferBytes > 0) {
+        aeron_driver_context_set_socket_so_sndbuf(driverCtx_, static_cast<size_t>(config_.aeronSocketBufferBytes));
+        aeron_driver_context_set_socket_so_rcvbuf(driverCtx_, static_cast<size_t>(config_.aeronSocketBufferBytes));
+    }
 
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {
         aeron_driver_context_close(driverCtx_);

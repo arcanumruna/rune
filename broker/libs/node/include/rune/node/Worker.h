@@ -2104,9 +2104,13 @@ private:
         const int isrSize = replica ? static_cast<int>(replica->isr().size()) : 0;
         const int minIsr  = replica ? replica->minIsr() : 1;
 
-        // Durability tier — for the WorkerIngress path we use Majority (tier=1)
-        // so the worker's IoBackend group-commit handles fsync.
-        constexpr uint8_t kDurabilityTier = 1;
+        // Durability tier — honor the topic/replica's configured tier so a
+        // tier=strict (D2) topic actually acks after fdatasync (handleProduceBatch
+        // does an inline synchronous log->sync() for tier==2).  Defaults to Majority
+        // (1) when no replica is wired, preserving prior behavior.  (Previously this
+        // was hardcoded to 1, so RUNE_TOPICS tier=strict was silently ignored on the
+        // per-worker ingress path.)
+        const uint8_t durabilityTier = replica ? replica->durabilityTier() : 1;
 
         // Call the shared produce helper.
         rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
@@ -2114,7 +2118,7 @@ private:
             msg.topicId, msg.partition,
             msg.producerId, msg.producerEpoch, msg.baseSequence,
             *log, psm_,
-            acksAll, isrSize, minIsr, kDurabilityTier);
+            acksAll, isrSize, minIsr, durabilityTier);
 
         ret.baseOffset  = outcome.baseOffset;
         ret.lastOffset  = outcome.lastOffset;

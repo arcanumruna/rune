@@ -327,6 +327,14 @@ struct NodeConfig {
     //     avoid receiver window throttling on large batched produces.
     int32_t aeronRcvWindowBytes          = 128 * 1024;
 
+    //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
+    //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.
+    //     Larger socket buffers absorb produce/ack bursts on loopback/LAN so the
+    //     kernel does not drop datagrams under load (which would otherwise force
+    //     Aeron NAK/retransmit or app-level retransmit).  0 = leave Aeron's default.
+    //     Default 2 MiB.  (Task 6: transport reliability hardening.)
+    int32_t aeronSocketBufferBytes       = 2 * 1024 * 1024;
+
     // E5.2: Aeron media-driver threading mode.
     //
     // Controls how the embedded Aeron media driver allocates its internal
