@@ -12,12 +12,14 @@
 // Returns total work count; returns 0 when idle (no busy-spin).
 
 #include <rune/client/agent/ClientAgent.h>
+#include <rune/client/agent/AgentRingMessages.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/MessageHeader.h>  // Task 1.3: re-stamp sessionId (offset 8)
 
 #include <cassert>
 #include <chrono>     // Task 1.3: nowNs for lazy session connect
 #include <cstdlib>    // aligned_alloc / free
+#include <cstdio>     // MNDBG instrumentation
 #include <cstring>    // memcpy
 #include <stdexcept>
 
@@ -155,6 +157,22 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 }
                 break;
 
+            case kMsgRegisterProducer:
+                // Shared-nothing producer registration: decode the SBE
+                // RegisterProducer message and adopt the producer into the
+                // single-owner ProducerHub list ON THIS (runner) thread via the
+                // register hook, which then frees the holder.
+                if (producerRegisterFn_) {
+                    const auto* p = reinterpret_cast<const uint8_t*>(
+                        buf.buffer() + offset);
+                    auto msg = ring_msg::RegisterProducer::decode(
+                        p, static_cast<std::size_t>(len));
+                    if (msg) {
+                        producerRegisterFn_(reinterpret_cast<void*>(msg->handle));
+                    }
+                }
+                break;
+
             default:
                 // Unknown command: drop silently.
                 break;
@@ -194,36 +212,10 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
             [this](int32_t topicId, int32_t partition, int32_t ingressStreamId,
                    const uint8_t* buf, std::size_t len) -> bool {
                 // Task 1.4: partition routing at the flush→sendFn boundary, keyed by
-                // (topicId, partition) — NOT ingressStreamId (which repeats across
-                // nodes and would collide).  Fast path (single-node / no per-worker
-                // routes): the route table is empty ⇒ one empty-map check, then the
-                // byte-identical default offer.  Multi-node: an int64-keyed find
-                // resolves the leader endpoint; we re-stamp the frame's sessionId
-                // (header offset 8) to that leader session's id, then offer directly
-                // to its endpoint on the same per-worker ingress stream.
-                if (!routeByPartition_.empty()) {
-                    const auto it = routeByPartition_.find(routeKey(topicId, partition));
-                    if (it != routeByPartition_.end() && !it->second.empty()) {
-                        Session& leader = sessionForEndpoint(it->second);
-                        const int64_t sid = leader.machine.sessionId();
-                        // Leader session not yet established (async open in flight):
-                        // report a failed offer so the producer retains the batch and
-                        // retries on the next duty cycle (hold-and-refresh, no drop).
-                        if (sid == 0 ||
-                            leader.machine.state() != session::SessionState::Connected) {
-                            return false;
-                        }
-                        // Re-stamp sessionId in place so the leader accepts the frame
-                        // (the producer stamped the seed session id at encode time).
-                        // The buffer is the producer's mutable encodeScratch_/wireFrame.
-                        if (len >= 16) {
-                            ::rune::protocol::client::detail::putLE64(
-                                const_cast<uint8_t*>(buf), 8, sid);
-                        }
-                        return transport_.offerTo(it->second, ingressStreamId, buf, len);
-                    }
-                }
-                return transport_.offer(ingressStreamId, buf, len);
+                // (topicId, partition).  Shared with the redirect resend path — see
+                // offerProduceToLeader_.
+                return offerProduceToLeader_(topicId, partition, ingressStreamId,
+                                             buf, len);
             });
         totalWork += producerWork;
     }
@@ -296,6 +288,17 @@ bool ClientAgent::submitClose() noexcept {
 
 bool ClientAgent::submitSend(const uint8_t* frame, std::size_t len) noexcept {
     return writeCommand(kMsgSend, frame, len);
+}
+
+bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
+    // Encode an SBE RegisterProducer message (MessageHeader + handle) and enqueue
+    // it as the command payload — self-describing/versioned, like every other ring
+    // message, rather than a raw pointer memcpy.
+    ring_msg::RegisterProducer msg;
+    msg.handle = reinterpret_cast<uint64_t>(holder);
+    uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
+    const std::size_t n = msg.encode(buf);
+    return writeCommand(kMsgRegisterProducer, buf, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +391,11 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // channel/streamId), so a ConnectResponse is routed to the session whose
         // in-flight ConnectRequest correlationId matches.  Single-node → the seed.
         Session& s = sessionForConnectCorrId(opt->correlationId);
+        if (std::getenv("RUNE_MN_DEBUG")) {
+            std::fprintf(stderr, "[MNDBG conn] ConnectResponse corrId=%lld code=%d assignedSid=%lld -> session ep='%s' (isSeed=%d)\n",
+                (long long)opt->correlationId, (int)opt->code, (long long)opt->assignedSessionId,
+                s.endpoint.c_str(), (int)(&s == &seedSession()));
+        }
         s.machine.onConnectResponse(
             opt->code,
             opt->leaderMemberId,
@@ -399,6 +407,15 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // via the observer, so a thread returning from connect().get() and
         // immediately calling ping() reads Connected (not the stale snapshot).
         publishSnapshot();
+        // Task 1.4 (redirect convergence): a leader session just (re)connected.
+        // In multi-node mode, re-drive all in-flight produce frames through their
+        // partition routes — held batches whose leader is THIS newly-connected
+        // session now send.  Fires only when a session actually reached Connected
+        // and per-partition routing is active (no cost single-node).
+        if (opt->code == 0 && !routeByPartition_.empty() && produceResendFn_ &&
+            s.machine.state() == session::SessionState::Connected) {
+            produceResendFn_();
+        }
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }
@@ -411,6 +428,12 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // Task 1.3: route to the session whose in-flight connect corrId matches
         // (a Redirect/NotLeader during a session's connect); otherwise the seed.
         Session& s = sessionForConnectCorrId(opt->correlationId);
+        if (std::getenv("RUNE_MN_DEBUG")) {
+            std::fprintf(stderr, "[MNDBG err] ErrorResponse corrId=%lld code=%d msg='%.*s' -> session ep='%s' (isSeed=%d)\n",
+                (long long)opt->correlationId, (int)opt->code,
+                (int)opt->message.size(), opt->message.data(),
+                s.endpoint.c_str(), (int)(&s == &seedSession()));
+        }
         s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
         s.machine.onActivity(nowNs);
         publishSnapshot();  // FIX F1: fresh snapshot before observer
@@ -537,6 +560,11 @@ Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
     s.machine.connect(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     s.connectSubmitted = true;
+    if (std::getenv("RUNE_MN_DEBUG")) {
+        std::fprintf(stderr, "[MNDBG new-session] ep='%s' corrIdBase=%lld nSessions=%zu connectCorrId=%lld\n",
+            endpoint.c_str(), (long long)(static_cast<int64_t>(sessions_.size()-1) * kSessionCorrIdStride),
+            sessions_.size(), (long long)s.machine.correlationId());
+    }
     return s;
 }
 
@@ -569,6 +597,49 @@ std::string ClientAgent::routeEndpointFor(int32_t topicId,
                                           int32_t partition) const noexcept {
     const auto it = routeByPartition_.find(routeKey(topicId, partition));
     return (it != routeByPartition_.end()) ? it->second : std::string{};
+}
+
+bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
+                                        int32_t ingressStreamId,
+                                        const uint8_t* buf, std::size_t len) noexcept {
+    // Fast path (single-node / no per-worker routes): the route table is empty ⇒
+    // one empty-map check, then the byte-identical default offer.  Multi-node: an
+    // int64-keyed find resolves the leader endpoint; we re-stamp the frame's
+    // sessionId (header offset 8) to that leader session's id, then offer directly
+    // to its endpoint on the same per-worker ingress stream.  The (topicId,
+    // partition) key is unique cluster-wide — ingressStreamId REPEATS across nodes
+    // and would collide, so it is only the transport stream, never the routing key.
+    if (!routeByPartition_.empty()) {
+        const auto it = routeByPartition_.find(routeKey(topicId, partition));
+        if (it != routeByPartition_.end() && !it->second.empty()) {
+            Session& leader = sessionForEndpoint(it->second);
+            const int64_t sid = leader.machine.sessionId();
+            if (std::getenv("RUNE_MN_DEBUG")) {
+                static uint64_t dc = 0;
+                if ((dc++ & 0x3FF) == 0)
+                    std::fprintf(stderr, "[MNDBG route] part=%d ep='%s' sid=%lld state=%d %s\n",
+                        partition, it->second.c_str(), (long long)sid, (int)leader.machine.state(),
+                        (sid==0||leader.machine.state()!=session::SessionState::Connected)?"HELD":"offer");
+            }
+            // Leader session not yet established (async open in flight): report a
+            // failed offer so the caller retains the batch and retries later
+            // (hold-and-refresh, no drop).  On multi-node the connect-triggered
+            // produceResendFn_ re-drives held batches once the leader connects.
+            if (sid == 0 ||
+                leader.machine.state() != session::SessionState::Connected) {
+                return false;
+            }
+            // Re-stamp sessionId in place so the leader accepts the frame (the
+            // producer stamped the seed session id at encode time).  The buffer is
+            // the producer's mutable encodeScratch_/wireFrame.
+            if (len >= 16) {
+                ::rune::protocol::client::detail::putLE64(
+                    const_cast<uint8_t*>(buf), 8, sid);
+            }
+            return transport_.offerTo(it->second, ingressStreamId, buf, len);
+        }
+    }
+    return transport_.offer(ingressStreamId, buf, len);
 }
 
 } // namespace rune::client::agent

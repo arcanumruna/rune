@@ -335,6 +335,14 @@ public:
                             std::function<bool(int32_t, int32_t, int32_t,
                                                const uint8_t*, std::size_t)>& sendFn);
 
+    /// Task 1.4 (redirect convergence): re-offer every in-flight frame through its
+    /// partition-leader route (multi-node).  The sendFn re-stamps the correct
+    /// per-leader sessionId itself, so — unlike resendAllRedirected — this does NOT
+    /// re-stamp a global sessionId and does NOT consume the redirect budget (a held
+    /// offer is not a redirect).  Returns the number of frames actually offered.
+    int resendAllViaRoute(std::function<bool(int32_t, int32_t, int32_t,
+                                             const uint8_t*, std::size_t)>& sendFn);
+
     /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
     /// (i.e. a redirect resend would have something to flush).
     [[nodiscard]] bool hasInFlight() const noexcept { return !batchMap_.empty(); }

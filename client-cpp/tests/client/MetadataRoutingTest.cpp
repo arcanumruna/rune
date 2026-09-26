@@ -137,15 +137,19 @@ struct MetaGateway {
 
     // Build + send a MetadataResponse advertising the two brokers + one partition.
     void sendMetadataResponse(int64_t sessionId, int64_t correlationId) {
+        // rp::BrokerEntry::host is a std::string_view (zero-copy into the source).
+        // The backing string MUST outlive msg.encode() below, so keep it in a
+        // function-scope local (an inner-block temporary would dangle — the bug this
+        // fixes: b1.host previously viewed a destroyed substr → garbage host on the
+        // wire → the client's nodeIdForEndpoint never matched the redirect endpoint).
+        const auto colon = leaderEndpoint.rfind(':');
+        const std::string b1Host = leaderEndpoint.substr(0, colon);
         std::vector<rp::BrokerEntry> brokers;
         {
             rp::BrokerEntry b0; b0.nodeId = 0; b0.host = "aeron:ipc"; b0.port = 0;
             rp::BrokerEntry b1;
-            // Split leaderEndpoint "host:port" into host + port for the entry so
-            // the client re-forms exactly "host:port" (what the redirect sends).
-            const auto colon = leaderEndpoint.rfind(':');
             b1.nodeId = 1;
-            b1.host   = leaderEndpoint.substr(0, colon);
+            b1.host   = b1Host;  // view into the function-scope string (valid through encode)
             b1.port   = std::stoi(leaderEndpoint.substr(colon + 1));
             brokers.push_back(std::move(b0));
             brokers.push_back(std::move(b1));

@@ -1126,6 +1126,29 @@ int ProducerImpl::resendAllRedirected(
     return resent;
 }
 
+int ProducerImpl::resendAllViaRoute(
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
+{
+    // Task 1.4 (redirect convergence): re-offer every in-flight batch through its
+    // partition-leader route.  Unlike resendAllRedirected (single-node reconnect),
+    // this does NOT re-stamp a single global sessionId — the multi-node send path
+    // (ClientAgent::offerToPartition) re-stamps the correct per-leader sessionId
+    // itself.  It also does NOT bump redirectCount: a held offer (leader session
+    // still connecting) is not a redirect, so it must not consume the redirect
+    // budget.  Batches that stay unroutable are failed by the deliveryTimeout sweep
+    // (sweepTimedOut), not here.  Fired on every session-connect while multi-node.
+    int resent = 0;
+    for (auto& [corrId, bi] : batchMap_) {
+        (void)corrId;
+        if (bi.wireFrame.empty()) continue;
+        if (sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
+                   bi.wireFrame.data(), bi.wireFrame.size())) {
+            ++resent;
+        }
+    }
+    return resent;
+}
+
 void ProducerImpl::failPending(int64_t corrId, const std::string& reason) {
     std::lock_guard<std::mutex> lock(ackMtx_);
     auto it = pendingAcks_.find(corrId);

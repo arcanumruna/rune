@@ -247,7 +247,7 @@ struct CaptureSink {
     std::vector<CapturedFrame> frames;
 
     SendFn fn() {
-        return [this](const uint8_t* buf, std::size_t len) -> bool {
+        return [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
             CapturedFrame f;
             f.data.assign(buf, buf + len);
             frames.push_back(std::move(f));
@@ -1213,7 +1213,7 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRace) {
     // Uses a local send sink that does nothing (avoids output races).
     std::atomic<int> runnerSent{0};
     std::thread runnerThread([&]() {
-        SendFn noopSend = [&](const uint8_t*, std::size_t) -> bool {
+        SendFn noopSend = [&](int32_t, const uint8_t*, std::size_t) -> bool {
             runnerSent.fetch_add(1, std::memory_order_relaxed);
             return true;
         };

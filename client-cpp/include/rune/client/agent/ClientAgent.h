@@ -238,6 +238,15 @@ public:
     /// reuse immediately after this call returns).
     bool submitSend(const uint8_t* frame, std::size_t len) noexcept;
 
+    /// Shared-nothing producer registration: hand a heap-allocated
+    /// std::shared_ptr<ProducerImpl>* ("holder") to the RUNNER thread via the
+    /// command ring.  The runner drains kMsgRegisterProducer, invokes the register
+    /// hook (which adopts the shared_ptr into the single-owner ProducerHub list and
+    /// deletes the holder), so the producer list is never touched cross-thread.
+    /// Returns false if the ring is momentarily full (caller retries).  The holder
+    /// pointer is only its 8-byte address — no producer bytes cross the ring.
+    bool submitRegisterProducer(void* holder) noexcept;
+
     /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
     /// subscription so the client receives Records pushed by the owning worker.
     /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
@@ -275,6 +284,43 @@ public:
     /// Task 1.4: the resolved leader endpoint for a route (or "" if none). Test hook.
     [[nodiscard]] std::string routeEndpointFor(int32_t topicId,
                                                int32_t partition) const noexcept;
+
+    /// Task 1.4 (redirect convergence): true when per-partition multi-node routing
+    /// is active (at least one route installed).  AGENT-THREAD ONLY.
+    [[nodiscard]] bool multiNodeRouting() const noexcept {
+        return !routeByPartition_.empty();
+    }
+
+    /// Task 1.4 (redirect convergence): route ONE pre-encoded produce frame to its
+    /// partition leader session — the SAME routing the produce drain path uses
+    /// (consult routeByPartition_, lazily open the leader session, re-stamp the
+    /// leader sessionId, offerTo).  Returns false (hold) when the leader session
+    /// is not yet Connected; the caller retains the frame for a later resend.
+    /// Used by the Client-level redirect handler and connect-triggered resend.
+    /// AGENT-THREAD ONLY.
+    bool offerToPartition(int32_t topicId, int32_t partition, int32_t ingressStreamId,
+                          const uint8_t* buf, std::size_t len) noexcept {
+        return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len);
+    }
+
+    /// Task 1.4 (redirect convergence): hook fired on the agent thread whenever a
+    /// (non-seed or seed) session reaches Connected, when multi-node routing is
+    /// active.  The Client wires this to re-offer all in-flight produce frames via
+    /// their (now possibly reachable) partition-leader routes.  Set before start().
+    using ProduceResendFn = std::function<void()>;
+    void setProduceResendFn(ProduceResendFn fn) noexcept {
+        produceResendFn_ = std::move(fn);
+    }
+
+    /// Shared-nothing producer registration hook: invoked on the RUNNER thread
+    /// when a kMsgRegisterProducer command is drained.  The argument is the holder
+    /// pointer passed to submitRegisterProducer (a std::shared_ptr<ProducerImpl>*).
+    /// The Client wires this to adopt the producer into the ProducerHub list and
+    /// delete the holder.  Set before start().
+    using ProducerRegisterFn = std::function<void(void*)>;
+    void setProducerRegisterFn(ProducerRegisterFn fn) noexcept {
+        producerRegisterFn_ = std::move(fn);
+    }
 
     // -------------------------------------------------------------------------
     // Observers
@@ -384,6 +430,7 @@ private:
     static constexpr int32_t kMsgClose      = 3;
     static constexpr int32_t kMsgSend       = 4;
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
+    static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
     // starts its correlationId counter at i*stride so concurrent connects demux
@@ -481,6 +528,13 @@ private:
     bool offerControlTo(const std::string& channel,
                         const uint8_t* buf, std::size_t len) noexcept;
 
+    // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
+    // Consult routeByPartition_, lazily open the leader session, hold if it is not
+    // Connected, else re-stamp the leader sessionId (header offset 8) and offerTo.
+    // Single-writer (agent thread).  Definition mirrors the produce drain send-lambda.
+    bool offerProduceToLeader_(int32_t topicId, int32_t partition, int32_t ingressStreamId,
+                               const uint8_t* buf, std::size_t len) noexcept;
+
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -
     // Buffer size = power-of-two capacity + trailer.
     // Stored as aligned raw bytes; AtomicBuffer wraps it.
@@ -498,6 +552,8 @@ private:
     // ---- CB-2: Producer hooks (agent thread only; set before start()) --------
     ProducerDrainFn    producerDrainFn_;
     ProduceResponseFn  produceResponseFn_;
+    ProduceResendFn    produceResendFn_;    // Task 1.4: fired on session-connect (multi-node)
+    ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
 
     // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
     MetadataResponseFn metadataResponseFn_;

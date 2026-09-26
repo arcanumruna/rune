@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 namespace rune::client {
@@ -147,6 +148,35 @@ Client::Client(ClientConfig cfg)
     agent_.setProduceResponseFn(
         [this](int64_t correlationId, int64_t baseOffset) {
             producerHub_.onProduceResponse(correlationId, baseOffset);
+        });
+
+    // Task 1.4 (multi-node redirect convergence): fired on the agent thread when a
+    // partition-leader session reaches Connected.  Re-offer every in-flight frame
+    // through its partition route — batches held while their leader was connecting
+    // now flush to the correct leader session.  Runs only in multi-node mode (the
+    // agent gates the callback on a non-empty routing table), so single-node pays
+    // nothing.  Same agent thread as the drain path ⇒ no lock on the producer state.
+    agent_.setProduceResendFn(
+        [this]() {
+            std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
+                [this](int32_t t, int32_t p, int32_t sid,
+                       const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.offerToPartition(t, p, sid, fb, fl);
+                };
+            producerHub_.resendAllViaRoute(sendFn);
+        });
+
+    // Shared-nothing producer registration: the runner thread drains a
+    // kMsgRegisterProducer command and lands here (on the runner thread), adopting
+    // the producer into the single-owner ProducerHub list.  `holder` is a
+    // heap std::shared_ptr<ProducerImpl>* created by Client::producer(); we move the
+    // shared_ptr out and free the holder.  No lock, no atomic — the list is only
+    // ever touched by this thread.
+    agent_.setProducerRegisterFn(
+        [this](void* holder) {
+            auto* sp = static_cast<std::shared_ptr<producer::ProducerImpl>*>(holder);
+            producerHub_.add(std::move(*sp));
+            delete sp;
         });
 
     // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
@@ -770,10 +800,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // place so the very next route targets the new node immediately.  A
             // background refresh (with backoff) is also armed so the
             // authoritative {leaderNode,leaderEpoch} is reconciled shortly after.
+            int32_t rTopicId = -1, rPartition = -1;
+            const bool havePart = producerHub_.partitionForCorrId(
+                    opt->correlationId, rTopicId, rPartition);
             {
-                int32_t rTopicId = -1, rPartition = -1;
-                if (producerHub_.partitionForCorrId(
-                        opt->correlationId, rTopicId, rPartition)) {
+                if (havePart) {
                     // Normalise the redirect target to the cache's "host:port"
                     // key: strip an "...endpoint=" prefix if present.
                     std::string cacheEp = newEndpoint;
@@ -802,6 +833,35 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // arm a background metadata refresh with exponential backoff so
                 // the authoritative map is reconciled without storming.
                 scheduleMetadataRefresh();
+            }
+
+            // Task 1.4 (multi-node redirect convergence): when per-partition routing
+            // is active, a per-partition Redirect must update THAT partition's route
+            // to the real leader and resend the redirected frame to the leader's own
+            // session — NOT retarget the shared transport / reconnect the seed (the
+            // single-node model, which churns the seed and thrashes every partition).
+            // The producer stores each in-flight frame; setRoute + offerToPartition
+            // route it to the correct leader (held until that session connects, then
+            // flushed by the connect-triggered produceResendFn_).  This is how the
+            // client converges from the stale bootstrap image to the elected leaders.
+            if (havePart && rTopicId >= 0 && rPartition >= 0 &&
+                agent_.multiNodeRouting() && !newEndpoint.empty()) {
+                const std::string leaderChannel =
+                    (newEndpoint.rfind("aeron:", 0) == 0)
+                        ? newEndpoint
+                        : ("aeron:udp?endpoint=" + newEndpoint);
+                agent_.setRoute(rTopicId, rPartition, leaderChannel);
+                std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> mnSendFn =
+                    [this](int32_t t, int32_t p, int32_t sid,
+                           const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.offerToPartition(t, p, sid, fb, fl);
+                    };
+                // Re-offer the redirected batch to the (new) leader route now; if the
+                // leader session is still connecting it holds and the connect-triggered
+                // resend flushes it.  retryRedirectedProduce enforces the redirect
+                // budget so a genuinely unroutable partition still fails eventually.
+                producerHub_.retryRedirectedProduce(opt->correlationId, mnSendFn);
+                break; // handled per-partition; skip the single-transport retarget.
             }
 
             // Retarget transport to the leader's client endpoint.
@@ -1260,11 +1320,33 @@ Producer Client::producer(ProducerConfig cfg) {
         cfg,
         nextCorrId_);
 
-    // Register with the hub — DR-BUG-1: producer() may legitimately be called
-    // from the app thread at any time, including after start().  ProducerHub::add()
-    // is thread-safe (cold path under addMtx_); the runner thread's hot-path
-    // snapshot load is wait-free and sees the new entry on the next acquire.
-    producerHub_.add(impl);
+    // Shared-nothing registration: producer() may be called from any app thread,
+    // including after start().  Rather than touch the runner-owned ProducerHub list
+    // directly (which would need an atomic snapshot + mutex), hand the ProducerImpl
+    // to the runner thread via the agent command ring.  The runner drains
+    // kMsgRegisterProducer and calls producerHub_.add() itself, so the list stays
+    // single-owner (no atomic, no lock).  `impl` is copied into a heap holder whose
+    // address travels the ring; the runner adopts the shared_ptr and frees the
+    // holder.  Both `impl` (returned to the caller) and the hub's entry keep the
+    // ProducerImpl alive.  Retry on a transiently full ring (off the hot path).
+    auto* holder = new std::shared_ptr<producer::ProducerImpl>(impl);
+    // Cold-path (setup) submit, BOUNDED — not an unbounded busy-spin.  The runner
+    // drains the command ring every duty cycle (microseconds), so the first attempt
+    // essentially always succeeds; a full ring is pathological.  Bounded by a
+    // deadline like the other cold-path setup waits; parks briefly between attempts
+    // and throws (freeing the holder) rather than spinning forever.
+    if (!agent_.submitRegisterProducer(holder)) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!agent_.submitRegisterProducer(holder)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                delete holder;
+                throw std::runtime_error(
+                    "Client::producer(): command ring full — registration timed out");
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds{100});
+        }
+    }
 
     return Producer(std::move(impl));
 }
