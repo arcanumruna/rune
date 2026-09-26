@@ -501,6 +501,21 @@ ConfigResult parseNodeConfig(
                         } else {
                             return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
                         }
+                    } else if (klower == "tier") {
+                        // Async-durability tier (see NodeConfig.h): controls WHEN the
+                        // produce ack fires relative to local fsync.
+                        //   leader=0, majority=1 (default), strict=2 (ack after fdatasync).
+                        std::string vlow(kval);
+                        for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        if (vlow == "leader") {
+                            ts.durabilityTier = 0;
+                        } else if (vlow == "majority") {
+                            ts.durabilityTier = 1;
+                        } else if (vlow == "strict") {
+                            ts.durabilityTier = 2;
+                        } else {
+                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                        }
                     } else {
                         return {{}, std::string("RUNE_TOPICS unknown option '") + std::string(kname) + "' in entry: " + std::string(entry)};
                     }
