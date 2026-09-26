@@ -80,7 +80,9 @@ namespace rune::node { class WorkerPool; }
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <map>
 #include <unordered_map>
+#include <utility>
 #include <unordered_set>
 #include <vector>
 
@@ -849,8 +851,9 @@ private:
         int64_t requestedAtNs = 0;   // for the resolve timeout
         std::vector<BufferedSubscribe> waiters;
     };
-    // sessionId → in-flight record-egress pub resolve + its buffered subscribes.
-    std::unordered_map<int64_t, PendingRecordEgress> pendingRecordEgress_;
+    // (sessionId, ownerWorkerId) → in-flight record-egress pub resolve + its
+    // buffered subscribes.  ONE pub per worker (single-writer ExclusivePublication).
+    std::map<std::pair<int64_t, int32_t>, PendingRecordEgress> pendingRecordEgress_;
 
     // Build + route a Subscribe WorkerOp with the resolved egress pub (may be null
     // → MDC fallback).

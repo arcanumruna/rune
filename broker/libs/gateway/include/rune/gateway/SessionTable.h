@@ -25,14 +25,18 @@ struct Session {
     std::shared_ptr<aeron::ExclusivePublication>   egress;        // acks/responses (gateway-written)
     int64_t                                        lastSeenNs  = 0;
 
-    // Hybrid egress: the client's egress endpoint (captured at Connect) and a
-    // SECOND publication to it, dedicated to Records pushed by the owning worker
-    // (per-consumer UNICAST → independent per-consumer offsets).  Lazily created
-    // on the first subscribe and written ONLY by the worker thread (the gateway
-    // never touches it — shared-nothing single-writer).  Dropped with the session.
+    // Hybrid egress: the client's egress endpoint (captured at Connect) and, per
+    // OWNING WORKER, a dedicated publication to it for Records pushed by that
+    // worker (per-consumer UNICAST → independent per-consumer offsets).  ONE pub
+    // per (session, worker): an ExclusivePublication is single-writer, so a
+    // consumer subscribing to partitions owned by several workers gets one pub per
+    // worker (distinct Aeron images on the client's single egress subscription,
+    // demuxed by its per-session FragmentAssembler).  Lazily created on first
+    // subscribe, written ONLY by the owning worker thread.  Dropped with the session.
     std::string                                    egressChannel;
     int32_t                                        egressStreamId = 0;
-    std::shared_ptr<aeron::ExclusivePublication>   recordEgress;  // Records (worker-written)
+    std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>>
+                                                   recordEgressByWorker;
 };
 
 // ---------------------------------------------------------------------------

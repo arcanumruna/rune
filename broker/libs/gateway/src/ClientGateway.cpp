@@ -535,9 +535,11 @@ void ClientGateway::reapExpired(int64_t nowNs) {
 
     for (int64_t sid : reapScratch_) {
         sessions_.remove(sid);
-        // Hybrid egress: drop any in-flight record-egress resolve for this session
-        // (its buffered subscribes die with the session).
-        pendingRecordEgress_.erase(sid);
+        // Hybrid egress: drop any in-flight record-egress resolves for this session
+        // (all workers — its buffered subscribes die with the session).
+        for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
+            pit = (pit->first.first == sid) ? pendingRecordEgress_.erase(pit) : std::next(pit);
+        }
         // Removing from sessions_ resets the shared_ptr → Aeron releases the
         // ExclusivePublication once no other holder exists.
 
@@ -1939,39 +1941,41 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
 
     rune::gateway::Session* sess = sessions_.find(sessionId);
 
-    // Hybrid egress: forward with this consumer's per-session UNICAST Records pub
-    // (independent per-consumer offsets, not MDC broadcast).
+    // Hybrid egress: forward with this consumer's per-(session,worker) UNICAST
+    // Records pub (independent per-consumer offsets, not MDC broadcast).  ONE pub
+    // per owning worker — an ExclusivePublication is single-writer, so partitions
+    // owned by different workers MUST use different pubs.
     //   - No session / no egress endpoint (test fixtures) → forward with MDC (null).
-    //   - Pub already resolved on the Session → forward immediately.
+    //   - Pub for this worker already resolved on the Session → forward immediately.
     //   - Otherwise → kick off a NON-BLOCKING resolve and DEFER the Subscribe until
     //     the pub is ready (drained by pollPendingRecordEgress_).  Never blocks the
     //     control thread.
-    if (!sess || sess->egressChannel.empty() || !aeron_) {
+    if (!sess || sess->egressChannel.empty() || !aeron_ || !workerPool_) {
         enqueueSubscribeOp_(s, nullptr);
         return;
     }
-    if (sess->recordEgress) {
-        enqueueSubscribeOp_(s, sess->recordEgress.get());
+    const int32_t wid = workerPool_->ownerWorkerId(topicId, partition);
+    if (auto it = sess->recordEgressByWorker.find(wid);
+        it != sess->recordEgressByWorker.end() && it->second) {
+        enqueueSubscribeOp_(s, it->second.get());
         return;
     }
 
-    // Ensure a pending resolve is in flight for this session, then buffer the
-    // subscribe until it resolves.
-    auto& pend = pendingRecordEgress_[sessionId];
+    // Ensure a pending resolve is in flight for (session, worker), then buffer the
+    // subscribe until it resolves.  Each worker gets its OWN ExclusivePublication
+    // to the client's egress endpoint (distinct Aeron session → distinct image;
+    // single-writer preserved).
+    auto& pend = pendingRecordEgress_[{sessionId, wid}];
     if (pend.regId < 0) {
-        // Second ExclusivePublication to the client's egress endpoint, dedicated to
-        // Records and written ONLY by the owning worker (shared-nothing).  The
-        // gateway's acks pub is a distinct Aeron session on the same endpoint; the
-        // client's single egress subscription demuxes both images.
         try {
             pend.regId         = aeron_->addExclusivePublication(sess->egressChannel,
                                                                  sess->egressStreamId);
             pend.requestedAtNs = nowNs_;
         } catch (...) {
             spdlog::warn("ClientGateway: record-egress pub create threw for session {} "
-                         "(channel '{}'); Subscribe uses MDC fallback",
-                         sessionId, sess->egressChannel);
-            pendingRecordEgress_.erase(sessionId);
+                         "worker {} (channel '{}'); Subscribe uses MDC fallback",
+                         sessionId, wid, sess->egressChannel);
+            pendingRecordEgress_.erase({sessionId, wid});
             enqueueSubscribeOp_(s, nullptr);
             return;
         }
@@ -1987,7 +1991,8 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
 {
     if (pendingRecordEgress_.empty()) return;
     for (auto it = pendingRecordEgress_.begin(); it != pendingRecordEgress_.end(); ) {
-        const int64_t sessionId = it->first;
+        const int64_t sessionId = it->first.first;
+        const int32_t workerId  = it->first.second;
         PendingRecordEgress& pend = it->second;
 
         std::shared_ptr<aeron::ExclusivePublication> pub;
@@ -2002,19 +2007,20 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
             (nowNs - pend.requestedAtNs) > connectResolveTimeoutNs_;
 
         if (pub) {
-            // Resolved: cache on the Session (if still present) and drain waiters.
+            // Resolved: cache on the Session under its worker id and drain waiters.
             void* raw = pub.get();
             if (rune::gateway::Session* sess = sessions_.find(sessionId)) {
-                sess->recordEgress = std::move(pub);
-                raw = sess->recordEgress.get();
+                sess->recordEgressByWorker[workerId] = std::move(pub);
+                raw = sess->recordEgressByWorker[workerId].get();
             }
             for (const auto& w : pend.waiters) enqueueSubscribeOp_(w, raw);
             it = pendingRecordEgress_.erase(it);
             continue;
         }
         if (timedOut || pend.regId < 0) {
-            spdlog::warn("ClientGateway: record-egress pub for session {} did not resolve "
-                         "({} waiters) — falling back to MDC", sessionId, pend.waiters.size());
+            spdlog::warn("ClientGateway: record-egress pub for session {} worker {} did not "
+                         "resolve ({} waiters) — falling back to MDC",
+                         sessionId, workerId, pend.waiters.size());
             for (const auto& w : pend.waiters) enqueueSubscribeOp_(w, nullptr);
             it = pendingRecordEgress_.erase(it);
             continue;
