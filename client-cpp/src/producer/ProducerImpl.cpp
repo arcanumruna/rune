@@ -98,14 +98,6 @@ inline int64_t wallNs() noexcept {
 // ZERO-COST on the normal path: only called when frameCapped=true.
 // ---------------------------------------------------------------------------
 
-inline int32_t varintLen(int32_t v) noexcept {
-    // Non-negative inputs only (keyLen, valueLen, bodySize, offsetDelta ≥ 0).
-    auto u = static_cast<uint32_t>(v);
-    int n = 1;
-    while (u >= 0x80u) { u >>= 7; ++n; }
-    return n;
-}
-
 inline int32_t varlongLen(int64_t v) noexcept {
     // Zigzag encoding: matches writeVarlong() in RecordBatch.h.
     const uint64_t u = static_cast<uint64_t>((v << 1) ^ (v >> 63));
@@ -113,6 +105,14 @@ inline int32_t varlongLen(int64_t v) noexcept {
     int n = 1;
     while (tmp >= 0x80u) { tmp >>= 7; ++n; }
     return n;
+}
+
+inline int32_t varintLen(int32_t v) noexcept {
+    // C1 FIX: RecordBatch.h::writeVarint() is ZIGZAG (it delegates to writeVarlong,
+    // see Varint.h).  The pre-flight model MUST match writeVarint exactly, or it
+    // under-counts (e.g. writeVarint(64) = 2 bytes, plain-varint = 1) and emitted
+    // frames overshoot maxFrameBytes.  Delegate to varlongLen for an exact match.
+    return varlongLen(static_cast<int64_t>(v));
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +182,12 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     partitions_.reserve(16);
     batchScratch_.reserve(64 * 1024);  // RecordBatch bytes (reused by buildInto)
     encodeScratch_.reserve(64 * 1024); // Produce wire frame (grown once)
+    // M2: frame-cap threshold computed ONCE (cfg_ is immutable).  With the default
+    // config (maxFrameBytes == batchBytes) frameCapped_ is FALSE, so the per-record
+    // pre-flight collapses out entirely — zero happy-path cost.  It only engages when
+    // a user sets batchBytes larger than maxFrameBytes.
+    frameCapped_ = (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes);
+    effCap_      = frameCapped_ ? cfg_.maxFrameBytes : cfg_.batchBytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,9 +458,9 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             // than batchBytes (i.e. maxFrameBytes > 0 and < batchBytes).  Zero-cost
             // on the normal path (maxFrameBytes >= batchBytes): the min-style compare
             // collapses to batchBytes with no new branch taken.
-            const bool frameCapped =
-                (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes);
-            const int32_t effCap = frameCapped ? cfg_.maxFrameBytes : cfg_.batchBytes;
+            // M2: use the frame-cap values computed once at construction (cfg_ immutable).
+            const bool frameCapped = frameCapped_;
+            const int32_t effCap = effCap_;
 
             // BACKPRESSURE / FRAME-SPLIT: ABORT before appending when accumulating
             // this record would push the frame past effCap.
@@ -517,9 +523,12 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             if (ps.builder->recordCount() == 0) {
                 ps.builderBytes = 0;
                 ps.batchStartNs = nowNs;
-                // Reset base wall time so tsDelta is computed relative to this batch's
-                // first record (mirrors the reset(0, wallNs()) call in encodeAndSend).
-                ps.builderBaseWallNs = wallNs();
+                // I1 FIX: do NOT re-sample wallNs() here.  builderBaseWallNs already
+                // equals the builder's actual baseTimestamp (set at construction above
+                // and at the reset(0, resetWall) in encodeAndSend), so the pre-flight
+                // tsDelta is computed against the SAME base the builder encodes with.
+                // Re-sampling here made the base newer than the builder's, under-counting
+                // tsDelta by up to a varlong byte and compounding the frame-cap overshoot.
             }
 
             // Batch acks (Kafka-style, ZERO-ALLOC): record this ack-wanting record's
@@ -535,6 +544,21 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                 ps.ackRing[ps.ackHead & ps.ackMask] = corrId;
                 ++ps.ackHead;
                 ++ps.batchAckCount;
+            }
+
+            // I2: a single record whose own wire contribution exceeds the frame cap
+            // cannot be split.  It is still emitted (alone) to guarantee progress, but
+            // we surface it loudly so an over-cap frame is never produced silently.
+            if (frameCapped && ps.builder->recordCount() == 0) {
+                const int32_t soloContrib = recordBodyContrib(
+                    static_cast<int32_t>(keyLen), static_cast<int32_t>(valueLen),
+                    /*tsDelta=*/0, /*offsetDelta=*/0);
+                if (soloContrib > effCap) {
+                    std::fprintf(stderr,
+                        "ProducerImpl: single record wire=%d exceeds maxFrameBytes=%d "
+                        "(topic=%d part=%d); emitting oversize frame (broker may reject)\n",
+                        soloContrib, effCap, topicId, partition);
+                }
             }
 
             const std::string_view kv(reinterpret_cast<const char*>(keyBytes),
@@ -646,8 +670,11 @@ bool ProducerImpl::encodeAndSend(
 
     // Reset builder IN PLACE for the next batch (success path only; keep the
     // object + its records_ capacity — no per-batch heap alloc).
-    ps.builder->reset(0, wallNs());
+    const int64_t resetWall = wallNs();
+    ps.builder->reset(0, resetWall);
     ps.builderBytes  = 0;
+    ps.builderBaseWallNs = resetWall;  // I1: keep the pre-flight base in lockstep with
+                                       // the builder's actual baseTimestamp.
     ps.batchStartNs  = 0;
     ps.flushRequested = false;
     ps.pendingCorrId  = 0;
@@ -798,12 +825,10 @@ int ProducerImpl::flushBatches(
 
         if (tier1Pending) {
             const bool lingerExpired  = (nowNs - ps.batchStartNs) >= lingerNs;
-            // Effective per-frame cap: tighter of maxFrameBytes and batchBytes.
-            // Zero-cost on the normal path (maxFrameBytes >= batchBytes): the compare
-            // collapses to batchBytes with no new branch taken.
-            const int32_t effCap =
-                (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes)
-                ? cfg_.maxFrameBytes : cfg_.batchBytes;
+            // M2: effective per-frame cap computed once at construction (effCap_).
+            // Zero-cost on the normal path (maxFrameBytes >= batchBytes): effCap_ ==
+            // batchBytes so sizeFull is identical to the pre-frame-cap behavior.
+            const int32_t effCap = effCap_;
             const bool sizeFull       = (ps.builderBytes >= effCap) ||
                                         (cfg_.batchRecords > 0 &&
                                          ps.builder->recordCount() >= cfg_.batchRecords);

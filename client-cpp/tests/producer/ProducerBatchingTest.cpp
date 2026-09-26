@@ -371,7 +371,9 @@ TEST(ProducerConfigFromEnv, LingerUnsetKeepsDefault) {
 TEST(ProducerConfigFromEnv, FrameCapAndDeliveryTimeoutDefaults) {
     ::unsetenv("RUNE_MAX_FRAME_BYTES"); ::unsetenv("RUNE_DELIVERY_TIMEOUT_MS");
     auto cfg = rune::client::ProducerConfig::fromEnv();
-    EXPECT_EQ(cfg.maxFrameBytes, 61440);
+    // I3: default maxFrameBytes == default batchBytes (65536) → frameCapped_=false
+    // → frame-cap pre-flight collapses to zero cost on the default config.
+    EXPECT_EQ(cfg.maxFrameBytes, 65536);
     EXPECT_EQ(cfg.deliveryTimeoutMs, 30000);
 }
 TEST(ProducerConfigFromEnv, FrameCapOverride) {
@@ -782,6 +784,162 @@ TEST(ProducerFrameCap, FrameAtCapBoundaryEmitsOnePerFrame) {
 
     EXPECT_EQ(h.gw->totalRecords(), kRecords)
         << "All " << kRecords << " records must be preserved";
+}
+
+// ---------------------------------------------------------------------------
+// ByteExactBoundaryNoOvershoot  (M1 regression for C1 — varintLen zigzag fix)
+//
+// Strategy: two-stage.  The 65th record in a batch has offsetDelta=64.
+//
+// The C1 bug: varintLen(64) uses PLAIN unsigned varint (1 byte), but
+// writeVarint(64) in RecordBatch.h uses ZIGZAG (zigzag(64)=128 → 2 bytes).
+// This under-counts offsetDelta by 1 byte.  Additionally, the buggy
+// varintLen(bodySize) is wrong when bodySize crosses a zigzag boundary:
+// if buggy bodySize_buggy=66 (plain 1 byte) but correct bodySize_correct=67
+// (zigzag(67)=134 → 2 bytes), the total under-count is 2 bytes.
+//
+// The pre-flight has a +1 byte slack built in (line: "+1 // wallNs() jitter").
+// The 1-byte slack masks a 1-byte discrepancy, so we need a 2-byte discrepancy
+// to bypass it.  This is achieved by choosing valueLen=57, keyLen=0 (empty key,
+// from Key{}) — at offsetDelta=64, tsDelta≈4 bytes (k*2ms record k=64 → 128ms
+// → zigzag(256M) → 4 bytes):
+//   bodySize_buggy  = 1+4+varintLen_plain(64)+1+0+varintLen_plain(57)+57+1 = 66
+//   bodySize_correct= 1+4+varintLen_zigzag(64)+1+0+varintLen_zigzag(57)+57+1 = 67
+//   contrib_buggy   = varintLen_plain(66)  + 66 = 1+66 = 67
+//   contrib_correct = varintLen_zigzag(67) + 67 = 2+67 = 69
+//   discrepancy = 2 bytes > slack = 1 byte → bug bypasses slack ✓
+//
+// Stage 1: Produce 65 records (kN+1=65) with unlimited cap + batchRecords=65.
+//   Captures single frame rbWireBytes = S65 (actual correct zigzag encoding).
+// Stage 2: cap = S65-1 and batchRecords=65.  Produce 65 records.
+//   Pre-fix (buggy varintLen): builderBytes_64 + (contrib_buggy+1) = S65-1+1-1 = cap-1
+//     → NOT > cap → record ALLOWED → frame has 65 records, rbWireBytes = S65 > cap.
+//     ASSERTION FAILS: rbWireBytes > cap.
+//   Post-fix (correct varintLen): builderBytes_64 + contrib_correct = S65 > cap → ABORT.
+//     2 frames, each ≤ cap.  ASSERTION PASSES.
+//
+// Note: effective check is (builderBytes + contrib + 1 > cap) due to the slack.
+// For buggy code: contrib_buggy=67; 67+1=68. builderBytes_64 = S65-69.
+//   (S65-69)+68 = S65-1 = cap → NOT > cap → allowed ✓ (bug exposed)
+// For correct code: contrib_correct=69. (S65-69)+69 = S65 > cap → ABORT ✓
+//
+// Stream ids: 2059/2060 (Stage 1), 2061/2062 (Stage 2).
+// ---------------------------------------------------------------------------
+TEST(ProducerFrameCap, ByteExactBoundaryNoOvershoot) {
+    static constexpr int kN   = 64;   // target records per frame; 65th has offsetDelta=64
+    static constexpr int kVal = 57;   // valueLen chosen so bodySize_buggy=66 (2-byte discrepancy)
+    // Key{}: empty key (keyLen=0) — required for the bodySize=66/67 computation above.
+
+    // -- Stage 1: measure actual wire size of kN+1=65 records (no cap) ---------
+    int32_t S65 = 0;
+    {
+        static constexpr int32_t kIn1 = 2059, kEg1 = 2060;
+        CapHarness h(kIn1, kEg1);
+        ASSERT_TRUE(h.connect()) << "Stage1: failed to connect";
+
+        ProducerConfig cfg;
+        cfg.acks          = Acks::None;
+        cfg.batchBytes    = 1 << 20;        // 1 MiB — far beyond any frame
+        cfg.maxFrameBytes = 1 << 20;        // same → frameCapped_=false → no pre-flight
+        cfg.lingerUs      = 600'000'000LL;  // 10 min — must NOT fire
+        cfg.batchRecords  = kN + 1;         // flush exactly at 65 records
+        cfg.maxInFlight   = 64;
+
+        auto topic = makeTopic(301, 1);
+        Key  key{};  // empty key: keyLen=0 (required for the 2-byte discrepancy)
+        const std::vector<uint8_t> payload(kVal, 0x42);
+        auto p = h.makeProducer(cfg);
+
+        for (int i = 0; i < kN + 1; ++i)
+            p.send(topic, key, std::span<const uint8_t>(payload));
+        // NO p.flush(): batchRecords=65 is the sole flush trigger.
+
+        ASSERT_TRUE(h.pumpUntilBatches(1))
+            << "Stage1: timed out waiting for 1 frame of " << (kN+1) << " records";
+
+        for (int i = 0; i < 50; ++i) {
+            h.agent->doWork(monoNs());
+            h.gw->poll();
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+
+        ASSERT_EQ(static_cast<int>(h.gw->frames.size()), 1)
+            << "Stage1: expected exactly 1 frame for " << (kN+1) << " records";
+        ASSERT_EQ(h.gw->frames[0].recordCount, kN + 1)
+            << "Stage1: frame must contain exactly " << (kN+1) << " records";
+
+        S65 = h.gw->frames[0].rbWireBytes;
+        ASSERT_GT(S65, 0) << "Stage1: measured wire size must be > 0";
+        std::fprintf(stderr, "[M1] Stage1: S65=%d (wire size of 65 records)\n", S65);
+    }
+
+    // -- Stage 2: cap = S65-1, batchRecords=65 — the C1 regression check -------
+    // Pre-fix:  65th record ALLOWED (2-byte discrepancy exceeds 1-byte slack)
+    //           → 1 frame with rbWireBytes = S65 = cap+1 > cap → FAILS assertion.
+    // Post-fix: 65th record ABORTed → 2 frames, both ≤ cap → PASSES.
+    {
+        static constexpr int32_t kIn2 = 2061, kEg2 = 2062;
+        const int32_t cap = S65 - 1;
+
+        CapHarness h(kIn2, kEg2);
+        ASSERT_TRUE(h.connect()) << "Stage2: failed to connect";
+
+        ProducerConfig cfg;
+        cfg.acks          = Acks::None;
+        cfg.batchBytes    = 1 << 20;
+        cfg.maxFrameBytes = cap;            // exact boundary: S65-1
+        cfg.lingerUs      = 600'000'000LL;  // 10 min — must NOT fire
+        cfg.batchRecords  = kN + 1;         // flush trigger at exactly 65 records
+        cfg.maxInFlight   = 64;
+
+        auto topic = makeTopic(302, 1);
+        Key  key{};  // empty key: keyLen=0
+        const std::vector<uint8_t> payload(kVal, 0x42);
+        auto p = h.makeProducer(cfg);
+
+        for (int i = 0; i < kN + 1; ++i)
+            p.send(topic, key, std::span<const uint8_t>(payload));
+        // NO p.flush().
+
+        // Wait for at least 1 frame (buggy: 1 frame with 65 records; correct: 2 frames).
+        ASSERT_TRUE(h.pumpUntilBatches(1))
+            << "Stage2: timed out (cap=" << cap << ")";
+
+        // With correct code, frame 1 has 64 records and record 65 is queued in a
+        // new builder waiting for batchRecords=65 or linger.  Flush explicitly so
+        // both frames arrive before we assert.  With buggy code, frame 1 already
+        // has 65 records, so this flush is a no-op (empty builder).
+        p.flush();
+        for (int i = 0; i < 50; ++i) {
+            h.agent->doWork(monoNs());
+            h.gw->poll();
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+
+        const auto& frames = h.gw->frames;
+        std::fprintf(stderr, "[M1] Stage2: cap=%d S65=%d frames=%zu total_records=%d\n",
+                     cap, S65, frames.size(), h.gw->totalRecords());
+        for (std::size_t i = 0; i < frames.size(); ++i) {
+            std::fprintf(stderr, "[M1] Stage2 frame[%zu]: rbWireBytes=%d recordCount=%d\n",
+                         i, frames[i].rbWireBytes, frames[i].recordCount);
+        }
+
+        ASSERT_GE(static_cast<int>(frames.size()), 1)
+            << "Stage2: no frames received";
+
+        // C1 regression: if varintLen uses plain (buggy), the 65th record's
+        // contribution is under-estimated by 2 bytes, bypassing the 1-byte slack,
+        // allowing the 65th record into frame 1 → rbWireBytes = S65 = cap+1 > cap.
+        for (std::size_t i = 0; i < frames.size(); ++i) {
+            EXPECT_LE(frames[i].rbWireBytes, cap)
+                << "Stage2 frame " << i << " rbWireBytes=" << frames[i].rbWireBytes
+                << " exceeds cap=" << cap << " (S65=" << S65 << ")"
+                << " — C1 REGRESSION: varintLen must use zigzag (plain under-counts"
+                << " offsetDelta=64 and bodySize by 1 byte each, bypassing +1 slack)";
+        }
+        EXPECT_EQ(h.gw->totalRecords(), kN + 1)
+            << "Stage2: all " << (kN+1) << " records must be preserved";
+    }
 }
 
 // ---------------------------------------------------------------------------

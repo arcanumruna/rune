@@ -430,6 +430,13 @@ private:
 
     ProducerConfig cfg_;
 
+    // M2: frame-cap values derived from cfg_ at construction time.
+    // frameCapped_ = maxFrameBytes is a tighter bound than batchBytes.
+    // effCap_ = the effective per-frame flush threshold.
+    // Both are immutable after construction (cfg_ is immutable).
+    bool    frameCapped_ = false;
+    int32_t effCap_      = 0;
+
     // Shared correlationId counter (also used by Client for ping).
     std::atomic<int64_t>& nextCorrId_;
 

@@ -71,7 +71,7 @@ struct ProducerConfig {
                                           //  hard — 32 batches keeps the pipe full while the
                                           //  idempotent seq window / ackRing bound memory)
     int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
-    int32_t maxFrameBytes    = 61440;   // hard per-FRAME wire cap (≤ this many bytes/frame),
+    int32_t maxFrameBytes    = 65536;   // hard per-FRAME wire cap (≤ this many bytes/frame),
                                          // independent of batchBytes — bounds fragmentation.
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
 
