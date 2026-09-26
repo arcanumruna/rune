@@ -113,6 +113,17 @@ public:
     /// worker stream id decoded from the metadata response.
     bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept;
 
+    /// Task 1.3 (multi-node): publish buf[0..len-1] to the ingress publication for
+    /// an EXPLICIT (channel, ingressStreamId) pair — the per-leader-node routing
+    /// primitive.  Resolves/caches a publication keyed by "channel#streamId" on the
+    /// ONE shared driver (no new driver — reuses the existing multiplexing exactly
+    /// like pubCache_).  This REPLACES the single-transport retarget model: instead
+    /// of swapping ingressPub_ to a leader, each leader session offers directly to
+    /// its own endpoint.  On resolution failure returns false (the caller retries on
+    /// the next duty cycle — no busy-spin, no throw).  Agent-thread only.
+    bool offerTo(const std::string& channel, int32_t ingressStreamId,
+                 const uint8_t* buf, std::size_t len) noexcept;
+
     /// Poll the default egress Subscription AND every per-worker dynamic-MDC egress
     /// Subscription through their FragmentAssemblers.  For each fully reassembled
     /// frame calls handler(buf, len) with a zero-copy view.  Returns the total
@@ -188,6 +199,16 @@ private:
     // Single-writer (agent thread only — same threading contract as offer/poll).
     std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>> pubCache_;
 
+    // ---- Task 1.3: per-(channel,streamId) ingress publication cache ----------
+    // Multi-node routing: a leader is addressed by (channel, ingressStreamId).
+    // Keyed "channel#streamId" so N leader nodes multiplex over the ONE driver
+    // (same pattern as pubCache_/egressSubs_ — no new driver).  Populated lazily
+    // in offerTo(); NOT cleared on retarget() (retarget is the legacy single-node
+    // model; multi-node addresses each node explicitly and never retargets these).
+    // Single-writer (agent thread only).  Cleared in stop() before aeron_ release.
+    std::unordered_map<std::string, std::shared_ptr<aeron::ExclusivePublication>>
+        endpointPubCache_;
+
     // ---- read-rework I4: per-worker dynamic-MDC egress subscription cache -------
     // The client opens one Subscription per owning-worker control endpoint (from
     // the MetadataResponse) and polls them all in poll().  Each Subscription needs
@@ -218,6 +239,11 @@ private:
     /// started).
     std::shared_ptr<aeron::ExclusivePublication>
     resolveWorkerPub(int32_t ingressStreamId) noexcept;
+
+    /// Task 1.3: resolve or retrieve a cached ExclusivePublication for an explicit
+    /// (channel, ingressStreamId) pair.  Returns nullptr on failure.
+    std::shared_ptr<aeron::ExclusivePublication>
+    resolveEndpointPub(const std::string& channel, int32_t ingressStreamId) noexcept;
 
     // ---- Resolution constants ------------------------------------------------
     static constexpr int kResolveMaxMs   = 5'000; // hard cap for pub/sub resolve

@@ -171,8 +171,12 @@ struct CaptureSink {
     std::vector<std::vector<uint8_t>> frames;
     bool returnOk = true;
 
-    std::function<bool(const uint8_t*, std::size_t)> fn() {
-        return [this](const uint8_t* buf, std::size_t len) -> bool {
+    // Task 1.2 unified all hub SendFns to (int32_t ingressStreamId, buf, len).
+    // The stream id is captured but not asserted here (txn produce routing is
+    // Task 3.2); the txn impl passes streamId=0 on the current path.
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> fn() {
+        return [this](int32_t /*ingressStreamId*/, const uint8_t* buf,
+                      std::size_t len) -> bool {
             if (returnOk) frames.emplace_back(buf, buf + len);
             return returnOk;
         };
@@ -807,7 +811,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
 
     // Capture all frames sent by the hub.
     std::vector<std::vector<uint8_t>> capturedFrames;
-    SendFn sendFn = [&capturedFrames](const uint8_t* buf, std::size_t len) -> bool {
+    SendFn sendFn = [&capturedFrames](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
         capturedFrames.emplace_back(buf, buf + len);
         return true;
     };
@@ -891,7 +895,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     hub.add(impl);
 
     std::vector<std::vector<uint8_t>> capturedFrames;
-    SendFn sendFn = [&capturedFrames](const uint8_t* buf, std::size_t len) -> bool {
+    SendFn sendFn = [&capturedFrames](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
         capturedFrames.emplace_back(buf, buf + len);
         return true;
     };

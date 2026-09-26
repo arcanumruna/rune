@@ -484,12 +484,9 @@ private:
     // elapsed and the session is Connected.  Called from sweepTimeouts().
     void tickMetadataRefresh() noexcept;
 
-    // routeProduceToLeader() — IMPORTANT-2: if a pending/in-flight produce
-    // partition's cached leader endpoint differs from the current connection,
-    // retarget the transport to that leader and reconnect so the produce lands
-    // DIRECT on the partition leader.  Returns true if a retarget was initiated.
-    // Called on the agent thread from the produce drain hook.
-    bool routeProduceToLeader() noexcept;
+    // Task 1.3: produce routing moved to the agent's flush→sendFn boundary
+    // (ClientAgent partition routing table + per-leader sessions).  The old
+    // single-transport routeProduceToLeader() retarget model is DELETED.
 
     // onMetadataResponse() — updates the cache from a decoded MetadataResponse.
     // Called on the runner thread via the metadataResponseFn_ hook.

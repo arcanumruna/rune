@@ -149,6 +149,7 @@ void AeronTransport::stop() noexcept {
     ingressPub_.reset();
     egressSub_.reset();
     pubCache_.clear();
+    endpointPubCache_.clear();  // Task 1.3: per-(channel,streamId) leader pubs
 
     // Step 3: Close the Aeron C++ client (joins the conductor thread; the
     //   conductor's onClose() flushes remaining commands into the CnC ring).
@@ -242,6 +243,73 @@ AeronTransport::resolveWorkerPub(int32_t ingressStreamId) noexcept
     } catch (...) {
         return nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.3: resolveEndpointPub — per-(channel,streamId) publication
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<aeron::ExclusivePublication>
+AeronTransport::resolveEndpointPub(const std::string& channel,
+                                   int32_t ingressStreamId) noexcept
+{
+    if (!aeron_ || channel.empty()) return nullptr;
+
+    const std::string key = channel + "#" + std::to_string(ingressStreamId);
+    auto it = endpointPubCache_.find(key);
+    if (it != endpointPubCache_.end()) {
+        return it->second;
+    }
+
+    try {
+        const int64_t regId =
+            aeron_->addExclusivePublication(channel, ingressStreamId);
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds{kResolveMaxMs};
+
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pub = aeron_->findExclusivePublication(regId);
+            if (pub) break;
+            std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
+        }
+
+        if (pub) {
+            endpointPubCache_[key] = pub;
+        }
+        return pub;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.3: offerTo — publish to an explicit (channel, ingressStreamId)
+// ---------------------------------------------------------------------------
+
+bool AeronTransport::offerTo(const std::string& channel,
+                             int32_t ingressStreamId,
+                             const uint8_t* buf,
+                             std::size_t    len) noexcept
+{
+    // An empty channel means "no route yet" — caller should have fallen back to
+    // the default offer path; be defensive and report a failed send.
+    if (channel.empty()) return false;
+
+    // If the target endpoint is the transport's default ingress channel, reuse the
+    // existing default/per-worker pub cache so the single-node hot path is unchanged.
+    if (channel == cfg_.ingressChannel) {
+        return offer(ingressStreamId, buf, len);
+    }
+
+    auto pub = resolveEndpointPub(channel,
+                                  ingressStreamId != 0 ? ingressStreamId
+                                                       : cfg_.ingressStreamId);
+    if (!pub) {
+        return false;  // resolve failed — caller retries next cycle (no busy-spin)
+    }
+    return offerToPub(*pub, buf, len);
 }
 
 // ---------------------------------------------------------------------------

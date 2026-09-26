@@ -41,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -72,7 +73,42 @@ namespace rune::client::agent {
 // pool-of-1 path is byte-identical to the previous single-session flow.  Routing
 // / multi-session-open is Task 1.3.
 // ---------------------------------------------------------------------------
+// Forward declaration — the agent owns the shared transport; a Session's IO
+// adapter targets that transport at the session's own endpoint channel.
+class ClientAgent;
+
+// ---------------------------------------------------------------------------
+// SessionEndpointIo — per-session SessionIo bound to the session's endpoint.
+//
+// Task 1.3: each Session sends its control frames (ConnectRequest / Keepalive /
+// Disconnect) to ITS OWN broker-node endpoint over the SHARED AeronTransport
+// (offerTo(channel, ...)), instead of the legacy single retarget()ed ingress
+// pub.  The seed session's endpoint == the transport's default ingress channel,
+// so its offerTo() fast-paths straight back to the byte-identical default offer.
+// Multi-node: each leader session offers to its own channel.  Retarget on this
+// adapter is a NO-OP (multi-node addresses endpoints explicitly — it never
+// retargets the shared default pub).  Agent-thread only.
+// ---------------------------------------------------------------------------
+struct SessionEndpointIo : session::SessionIo {
+    ClientAgent* agent   = nullptr;    // owner (shared transport lives here)
+    std::string  endpoint;             // this session's ingress channel
+
+    SessionEndpointIo(ClientAgent* a, std::string ep)
+        : agent(a), endpoint(std::move(ep)) {}
+
+    bool sendFrame(const uint8_t* buf, std::size_t len) override;
+    bool retarget(const std::string& newIngressChannel) noexcept override;
+};
+
 struct Session {
+    /// This session's endpoint channel (broker-node ingress).  For the seed this
+    /// equals the transport default ingress channel.
+    std::string endpoint;
+
+    /// Per-session IO adapter — routes control frames to `endpoint`.  Held by
+    /// pointer/value BEFORE `machine` so it outlives the machine's reference.
+    SessionEndpointIo io;
+
     /// The per-node session state machine.  Non-movable (holds a SessionIo&),
     /// so a Session is always held by pointer in the agent's collection.
     session::SessionMachine machine;
@@ -94,10 +130,17 @@ struct Session {
     /// until a REDIRECT teaches us).
     int32_t     currentLeaderNode    = -1;
 
-    Session(session::SessionIo& io, session::SessionConfig cfg,
-            std::string seedChannel)
-        : machine(io, std::move(cfg))
-        , currentLeaderChannel(std::move(seedChannel))
+    /// Task 1.3: has this session's connect been submitted yet?  Lazy multi-node
+    /// sessions are opened async — connect is submitted once; frames for the
+    /// session's partitions park in the producer builders until ConnectResponse{OK}.
+    bool        connectSubmitted     = false;
+
+    Session(ClientAgent* agent, session::SessionConfig cfg,
+            std::string sessionEndpoint)
+        : endpoint(sessionEndpoint)
+        , io(agent, sessionEndpoint)
+        , machine(io, std::move(cfg))
+        , currentLeaderChannel(sessionEndpoint)
     {}
 };
 
@@ -204,6 +247,33 @@ public:
     }
 
     // -------------------------------------------------------------------------
+    // Task 1.3: multi-node session registry + partition routing table
+    // -------------------------------------------------------------------------
+
+    /// Return the Session for `endpoint`, lazily opening a NEW one if absent.
+    /// AGENT-THREAD ONLY.  A new session gets its own SessionMachine bound to a
+    /// per-session IO adapter (offerTo(endpoint,...)) over the SHARED transport —
+    /// its own ConnectRequest → its own sessionId + keepalive on the one driver.
+    /// The open is ASYNC/non-blocking: connect() is submitted here and the session
+    /// transitions Disconnected→Connecting; callers park frames (in the producer
+    /// builders) until this session's ConnectResponse{OK} assigns a sessionId.
+    /// The seed session's endpoint == the transport default ingress channel.
+    Session& sessionForEndpoint(const std::string& endpoint) noexcept;
+
+    /// Task 1.3: (re)build the agent-owned partition routing table entry mapping a
+    /// per-worker ingressStreamId to its leader endpoint channel.  Rebuilt in place
+    /// on metadata change.  ingressStreamId is broker-globally-unique per partition
+    /// (its leader owns it), so it is a sufficient routing key.  endpoint empty ⇒
+    /// remove the route (fall back to the seed/default hot path).  AGENT-THREAD ONLY.
+    void setRoute(int32_t ingressStreamId, const std::string& endpoint) noexcept;
+
+    /// Task 1.3: number of currently open sessions (test/observer helper).
+    [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
+
+    /// Task 1.3: the resolved leader endpoint for a route (or "" if none). Test hook.
+    [[nodiscard]] std::string routeEndpointFor(int32_t ingressStreamId) const noexcept;
+
+    // -------------------------------------------------------------------------
     // Observers
     // -------------------------------------------------------------------------
 
@@ -307,11 +377,23 @@ private:
     static constexpr int32_t kMsgSend       = 4;
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
 
+    // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
+    // starts its correlationId counter at i*stride so concurrent connects demux
+    // unambiguously off the one shared egress subscription.  1e12 is far above any
+    // realistic per-session connect-retry count and stays well within int64.
+    static constexpr int64_t kSessionCorrIdStride = 1'000'000'000'000LL;
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
     bool writeCommand(int32_t msgTypeId, const uint8_t* payload, std::size_t payloadLen) noexcept;
     void dispatchEgressFrame(int64_t nowNs, const uint8_t* buf, std::size_t len) noexcept;
+
+    /// Task 1.3: resolve the Session whose IN-FLIGHT ConnectRequest carries
+    /// `corrId` (its SessionMachine's current correlationId while Connecting).
+    /// Falls back to the seed session when no session matches (single-node, a
+    /// steady-state frame, or an already-established session).  Agent-thread only.
+    Session& sessionForConnectCorrId(int64_t corrId) noexcept;
 
     /// Publish the current (state, sessionId) as ONE packed atomic store
     /// (release).  Called on the agent thread (a) after each frame is fed to the
@@ -351,17 +433,35 @@ private:
     transport::AeronTransport transport_;
 
     // ---- Endpoint-keyed sessions (agent-thread owned, single-writer) ---------
-    // Task 1.1: EXACTLY ONE entry — the seed session.  Held by pointer because
-    // SessionMachine is non-movable (it holds a SessionIo& to *this).  A vector
-    // (not yet a map) keeps the pool-of-1 hot path a single deref with no string
-    // hashing; endpoint keying + lazy-open arrive in Task 1.3.
+    // Held by pointer because SessionMachine is non-movable (it holds a SessionIo&
+    // to the Session's own io adapter).  sessions_[0] is ALWAYS the seed (the
+    // transport default ingress channel); Task 1.3 lazily appends one Session per
+    // additional leader endpoint via sessionForEndpoint().  A plain vector keeps
+    // the pool-of-1 hot path a single deref (no string hashing) while the small N
+    // multi-node case is a short linear scan (N ≤ cluster size).  Agent-thread only.
     std::vector<std::unique_ptr<Session>> sessions_;
 
-    /// The seed (single) session.  Task 1.1 pool-of-1 accessor: identical to the
-    /// previous single-session member for both agent-internal doWork and the
+    /// The seed (single) session — sessions_[0].  Pool-of-1 accessor: identical to
+    /// the previous single-session member for both agent-internal doWork and the
     /// Client-level redirect/dispatch paths.  Agent-thread only.
     Session&       seedSession()       noexcept { return *sessions_.front(); }
     const Session& seedSession() const noexcept { return *sessions_.front(); }
+
+    // ---- Task 1.3: partition routing table (agent-owned plain data) ----------
+    // Maps a per-worker ingressStreamId → its leader endpoint channel.  Rebuilt in
+    // place on metadata change (setRoute).  Read by the produce send lambda on the
+    // hot path: an unordered_map find keyed by an int32_t (no string hashing on the
+    // key).  EMPTY on single-node (no per-worker routes advertised) ⇒ the send
+    // lambda takes the byte-identical default offer path (no lookup cost beyond one
+    // empty-map check).  Single-writer (agent thread).
+    std::unordered_map<int32_t, std::string> routeByStream_;
+
+    // ---- Task 1.3: control-frame offer to a specific endpoint ----------------
+    // Used by SessionEndpointIo::sendFrame — offers a session's control frame to
+    // that session's endpoint over the shared transport (default ingress stream id).
+    friend struct SessionEndpointIo;
+    bool offerControlTo(const std::string& channel,
+                        const uint8_t* buf, std::size_t len) noexcept;
 
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -
     // Buffer size = power-of-two capacity + trailer.

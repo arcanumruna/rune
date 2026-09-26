@@ -84,6 +84,14 @@ struct SessionConfig {
     int maxRedirects     = 5;  // per connect() call
     int maxConnectRetries = 3;  // connect-timeout retries before → Disconnected
     int maxResumeRetries  = 3;  // Resuming → Connecting retries before → Disconnected
+
+    // Task 1.3 (multi-node): starting value for this session's ConnectRequest
+    // correlationId counter.  A client opening N sessions (one per leader node)
+    // over the ONE shared egress subscription demuxes each ConnectResponse by its
+    // correlationId; giving each session a DISJOINT correlationId range guarantees
+    // no cross-session collision while multiple sessions connect concurrently.
+    // Default 0 (first corrId = 1) → single-session behaviour is byte-identical.
+    int64_t correlationIdBase = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +124,7 @@ public:
     explicit SessionMachine(SessionIo& io, SessionConfig cfg = {}) noexcept
         : io_(io)
         , cfg_(std::move(cfg))
+        , correlationIdCounter_(cfg_.correlationIdBase) // Task 1.3: disjoint per-session range
     {}
 
     // Non-copyable, non-movable (holds reference to io_).

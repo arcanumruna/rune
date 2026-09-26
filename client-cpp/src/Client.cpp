@@ -99,16 +99,25 @@ Client::Client(ClientConfig cfg)
     agent_.setProducerDrainFn(
         [this](int64_t nowNs, int64_t sessionId,
                agent::ClientAgent::SendFn sendFn) -> int {
-            // MD1 IMPORTANT-2: before flushing produce frames, consult the
-            // PartitionRouter.  If the pending produce partition's cached leader
-            // endpoint differs from the current connection, retarget+reconnect so
-            // the produce lands DIRECT on the partition leader.  When a retarget
-            // is initiated we skip this drain cycle: drainAndFlush would emit onto
-            // the old (follower) connection with a soon-to-be-stale session.  The
-            // held frames flush on the next ConnectResponse{OK} (redirectPending_
-            // machinery), re-stamped with the leader session — same as a redirect.
-            if (routeProduceToLeader()) {
-                return 1; // did routing work; defer the flush to post-reconnect
+            // Task 1.3: produce routing now happens at the flush→sendFn boundary
+            // inside the agent (ClientAgent's send lambda consults the agent-owned
+            // partition routing table and offers each record to its leader session's
+            // endpoint, re-stamping the leader sessionId).  The old single-transport
+            // routeProduceToLeader() retarget model is DELETED — a single client no
+            // longer thrashes one connection between leaders; each partition's
+            // records land on their leader session directly.
+            //
+            // No-progress backstop (preserved from the old routeProduceToLeader):
+            // if a pending produce partition has NO known leader in the cache, arm
+            // a backoff-gated background metadata refresh so routing self-corrects
+            // without app action.  Pure metadata trigger — no retarget/reconnect.
+            {
+                int32_t topicId = -1, partition = -1;
+                if (producerHub_.firstPendingPartition(topicId, partition) &&
+                    metadataCache_.leaderFor(topicId, partition) ==
+                        metadata::MetadataCache::kNoLeader) {
+                    scheduleMetadataRefresh();
+                }
             }
             int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
             // TX-5: drain all transactional producers (rarely >1; mutex is fine).
@@ -1458,6 +1467,24 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         }
     }
 
+    // Task 1.3: (re)build the agent-owned partition routing table IN PLACE.  For
+    // each partition with a known leader + per-worker ingressStreamId, map the
+    // stream id → the leader node's ingress endpoint channel.  setRoute() drops the
+    // entry when the leader resolves to the seed/default endpoint (single-node =
+    // every partition on the seed ⇒ empty route table ⇒ byte-identical hot path).
+    // The producer's flush→sendFn boundary then routes each record to its leader
+    // session by ingressStreamId — replacing the single-transport retarget model.
+    for (const auto& p : partitions) {
+        if (p.ingressStreamId == 0) continue;
+        const int32_t leaderNode = metadataCache_.leaderFor(p.topicId, p.partition);
+        if (leaderNode == metadata::MetadataCache::kNoLeader) continue;
+        const std::string& ep = metadataCache_.endpointFor(leaderNode);
+        if (ep.empty()) continue;
+        const std::string leaderChannel =
+            (ep.rfind("aeron:", 0) == 0) ? ep : ("aeron:udp?endpoint=" + ep);
+        agent_.setRoute(p.ingressStreamId, leaderChannel);
+    }
+
     // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
     // partition whose owner advertises one (per-worker egress active on the broker).
     // Control host = the leader broker's host; port/stream are per-partition (shared
@@ -1560,75 +1587,6 @@ void Client::tickMetadataRefresh() noexcept {
 
     nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max(); // disarm
     sendMetadataRequest(snap.sessionId);
-}
-
-// ---------------------------------------------------------------------------
-// MD1 IMPORTANT-2: routeProduceToLeader() — proactive per-partition routing
-// ---------------------------------------------------------------------------
-//
-// If there is pending/in-flight produce work whose partition leader (per the
-// cached metadata) lives on a DIFFERENT endpoint than the current connection,
-// retarget the transport to that leader and reconnect so the produce lands
-// DIRECT on the partition leader.  The held produce frames flush on the next
-// ConnectResponse{OK} via the redirectPending_ machinery (re-stamped with the
-// leader session).  Returns true if a retarget was initiated this cycle.
-//
-// PHASE-1 LIMITATION: the client transport maintains a SINGLE session /
-// publication.  True multi-endpoint connection management (N simultaneous
-// leader connections) is a larger change deferred beyond Phase 1.  Here,
-// route-selection drives the target endpoint via cached metadata and reuses the
-// existing connect/redirect machinery to REACH that leader on the one session.
-bool Client::routeProduceToLeader() noexcept {
-    // Only route when a reconnect isn't already in flight (avoid churn).
-    if (redirectPending()) return false;
-
-    int32_t topicId = -1, partition = -1;
-    if (!producerHub_.firstPendingPartition(topicId, partition)) return false;
-
-    // Resolve the partition leader's node from cached metadata.
-    const int32_t leaderNode = metadataCache_.leaderFor(topicId, partition);
-    if (leaderNode == metadata::MetadataCache::kNoLeader) {
-        // Unknown leader for this partition → no-progress: arm a background
-        // metadata refresh (backoff) and stay put; the broker will REDIRECT if
-        // we're on the wrong node.
-        scheduleMetadataRefresh();
-        return false;
-    }
-
-    // Already following this leader (or we haven't yet learned which node the
-    // initial gateway connection is — currentLeaderNode_ == -1)?  Do NOT
-    // proactively churn the working connection.  When we ARE on the wrong node
-    // the broker REDIRECT teaches us currentLeaderNode_ (see the redirect
-    // handler) and the zero-RTT cache update keeps subsequent routes correct.
-    if (currentLeaderNode() < 0 || leaderNode == currentLeaderNode()) {
-        return false;
-    }
-
-    // The cached leader differs from the node we're on → route DIRECT to it.
-    const std::string endpoint = metadataCache_.endpointFor(leaderNode);
-    if (endpoint.empty()) {
-        scheduleMetadataRefresh();
-        return false;
-    }
-    const std::string leaderChannel =
-        (endpoint.rfind("aeron:", 0) == 0)
-            ? endpoint
-            : ("aeron:udp?endpoint=" + endpoint);
-    if (leaderChannel == currentLeaderChannel()) return false;
-
-    // Retarget to the partition leader + reconnect; defer the produce flush to
-    // the next ConnectResponse{OK} (redirectPending) so it carries the leader
-    // session — identical to the redirect-follow contract.
-    if (!agent_.retarget(leaderChannel)) return false;
-    currentLeaderChannel() = leaderChannel;
-    currentLeaderNode()    = leaderNode;
-
-    // Coalesce: single-owner agent thread → plain check-and-set (no CAS).
-    if (!redirectPending()) {
-        redirectPending() = true;
-        agent_.submitReconnect();
-    }
-    return true;
 }
 
 } // namespace rune::client

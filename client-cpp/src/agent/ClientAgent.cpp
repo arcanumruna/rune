@@ -13,8 +13,10 @@
 
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/protocol/client/MessageHeader.h>  // Task 1.3: re-stamp sessionId (offset 8)
 
 #include <cassert>
+#include <chrono>     // Task 1.3: nowNs for lazy session connect
 #include <cstdlib>    // aligned_alloc / free
 #include <cstring>    // memcpy
 #include <stdexcept>
@@ -67,12 +69,13 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
 {
-    // Task 1.1: seed the endpoint-keyed session collection with EXACTLY ONE
-    // entry (the seed session).  The SessionMachine binds to *this as its
-    // SessionIo (single shared transport).  The seed's currentLeaderChannel is
-    // the config ingress channel — the endpoint the transport starts on.
+    // Seed the endpoint-keyed session collection with the seed session
+    // (sessions_[0]).  Its IO adapter targets the transport default ingress
+    // channel, so its control frames fast-path back to the default offer (the
+    // byte-identical single-node path).  Task 1.3 lazily appends one Session per
+    // additional leader endpoint via sessionForEndpoint().
     sessions_.emplace_back(std::make_unique<Session>(
-        *this, cfg_.session, cfg_.transport.ingressChannel));
+        this, cfg_.session, cfg_.transport.ingressChannel));
 }
 
 // ---------------------------------------------------------------------------
@@ -170,12 +173,15 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
 
     totalWork += fragments;
 
-    // ---- Step 3: Tick the session machine -----------------------------------
-    // tick() drives keepalive cadence and timeout handling.  It may emit
-    // frames via sendFrame() → transport_.offer().  We do not count ticks as
-    // work; ring + egress fragments are the sole work-done signals (the
-    // IdleStrategy backs off on 0, which is correct for idle cycles).
-    seedSession().machine.tick(nowNs);
+    // ---- Step 3: Tick every session machine ---------------------------------
+    // tick() drives keepalive cadence and timeout handling.  It may emit frames
+    // via each session's own SessionEndpointIo → transport_.offerTo(endpoint,...).
+    // We do not count ticks as work; ring + egress fragments are the sole
+    // work-done signals (the IdleStrategy backs off on 0 for idle cycles).
+    // Single-node: exactly one session (the seed) — same cost as before.
+    for (auto& s : sessions_) {
+        s->machine.tick(nowNs);
+    }
 
     // ---- Step 4: CB-2 — Producer duty cycle (drain ring + flush batches) -----
     // Runs on the AGENT thread (single-writer); no lock needed.
@@ -186,6 +192,34 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
             nowNs,
             sessId,
             [this](int32_t ingressStreamId, const uint8_t* buf, std::size_t len) -> bool {
+                // Task 1.3: partition routing at the flush→sendFn boundary.
+                // Fast path (single-node / no per-worker routes): the route table
+                // is empty ⇒ one empty-map check, then the byte-identical default
+                // offer.  Multi-node: an int32_t-keyed find resolves the leader
+                // endpoint; we re-stamp the frame's sessionId (header offset 8) to
+                // that leader session's id, then offer directly to its endpoint.
+                if (!routeByStream_.empty() && ingressStreamId != 0) {
+                    const auto it = routeByStream_.find(ingressStreamId);
+                    if (it != routeByStream_.end() && !it->second.empty()) {
+                        Session& leader = sessionForEndpoint(it->second);
+                        const int64_t sid = leader.machine.sessionId();
+                        // Leader session not yet established (async open in flight):
+                        // report a failed offer so the producer retains the batch and
+                        // retries on the next duty cycle (hold-and-refresh, no drop).
+                        if (sid == 0 ||
+                            leader.machine.state() != session::SessionState::Connected) {
+                            return false;
+                        }
+                        // Re-stamp sessionId in place so the leader accepts the frame
+                        // (the producer stamped the seed session id at encode time).
+                        // The buffer is the producer's mutable encodeScratch_/wireFrame.
+                        if (len >= 16) {
+                            ::rune::protocol::client::detail::putLE64(
+                                const_cast<uint8_t*>(buf), 8, sid);
+                        }
+                        return transport_.offerTo(it->second, ingressStreamId, buf, len);
+                    }
+                }
                 return transport_.offer(ingressStreamId, buf, len);
             });
         totalWork += producerWork;
@@ -346,13 +380,18 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     case codec::TemplateId::ConnectResponse: {
         auto opt = codec::decodeConnectResponse(buf, len);
         if (!opt) break;
-        seedSession().machine.onConnectResponse(
+        // Task 1.3: per-session demux by the connect correlationId.  All sessions
+        // share the one egress subscription (every session declares the same egress
+        // channel/streamId), so a ConnectResponse is routed to the session whose
+        // in-flight ConnectRequest correlationId matches.  Single-node → the seed.
+        Session& s = sessionForConnectCorrId(opt->correlationId);
+        s.machine.onConnectResponse(
             opt->code,
             opt->leaderMemberId,
             opt->assignedSessionId,
             opt->correlationId,
             nowNs);
-        seedSession().machine.onActivity(nowNs);
+        s.machine.onActivity(nowNs);
         // FIX F1: publish the fresh (state, sessionId) BEFORE waking any thread
         // via the observer, so a thread returning from connect().get() and
         // immediately calling ping() reads Connected (not the stale snapshot).
@@ -366,8 +405,11 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     case codec::TemplateId::ErrorResponse: {
         auto opt = codec::decodeErrorResponse(buf, len);
         if (!opt) break;
-        seedSession().machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
-        seedSession().machine.onActivity(nowNs);
+        // Task 1.3: route to the session whose in-flight connect corrId matches
+        // (a Redirect/NotLeader during a session's connect); otherwise the seed.
+        Session& s = sessionForConnectCorrId(opt->correlationId);
+        s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
+        s.machine.onActivity(nowNs);
         publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
@@ -436,6 +478,93 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         }
         break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 1.3: multi-node session registry + partition routing table
+// ---------------------------------------------------------------------------
+
+bool SessionEndpointIo::sendFrame(const uint8_t* buf, std::size_t len) {
+    return agent->offerControlTo(endpoint, buf, len);
+}
+
+bool SessionEndpointIo::retarget(const std::string& /*newIngressChannel*/) noexcept {
+    // Multi-node addresses each leader endpoint explicitly (offerTo), so a per-node
+    // session never retargets the shared default pub.  A ConnectResponse-based
+    // redirect on a leader session is a no-op here (the leader endpoint is already
+    // the correct target); the Client-level redirect handler drives re-routing via
+    // the metadata cache + routing table.  Report success so the SessionMachine
+    // proceeds to resend its ConnectRequest on the same (correct) endpoint.
+    return true;
+}
+
+bool ClientAgent::offerControlTo(const std::string& channel,
+                                 const uint8_t* buf, std::size_t len) noexcept {
+    // Seed endpoint == transport default ingress channel → byte-identical default
+    // offer (single-node fast path).  Otherwise route the control frame to the
+    // session's own endpoint over the shared transport (default ingress stream id).
+    if (channel.empty() || channel == cfg_.transport.ingressChannel) {
+        return transport_.offer(buf, len);
+    }
+    return transport_.offerTo(channel, cfg_.transport.ingressStreamId, buf, len);
+}
+
+Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
+    // Empty / seed endpoint → the seed session (single-node hot path, no scan cost
+    // when there is only one session).
+    if (endpoint.empty() || endpoint == seedSession().endpoint) {
+        return seedSession();
+    }
+    for (auto& s : sessions_) {
+        if (s->endpoint == endpoint) return *s;
+    }
+    // Lazily open a NEW session to this endpoint over the SHARED transport.  Its
+    // SessionMachine gets its own IO adapter (offerTo(endpoint,...)) → its own
+    // ConnectRequest → its own sessionId on the one driver.  ASYNC: submit connect
+    // now; the session transitions Disconnected→Connecting.  Frames for its
+    // partitions park in the producer builders until its ConnectResponse{OK}.
+    // Give this session a DISJOINT correlationId range so its ConnectResponse
+    // demuxes unambiguously off the ONE shared egress subscription (per-session
+    // demux by connect corrId — no image identity needed).
+    session::SessionConfig scfg = cfg_.session;
+    scfg.correlationIdBase =
+        static_cast<int64_t>(sessions_.size()) * kSessionCorrIdStride;
+    sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
+    Session& s = *sessions_.back();
+    s.machine.connect(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    s.connectSubmitted = true;
+    return s;
+}
+
+Session& ClientAgent::sessionForConnectCorrId(int64_t corrId) noexcept {
+    for (auto& s : sessions_) {
+        // A session awaiting its ConnectResponse holds the matching correlationId
+        // on its SessionMachine while Connecting.  Match only non-seed or genuinely
+        // in-flight sessions; the seed is the fallback below.
+        if (s->machine.state() == session::SessionState::Connecting &&
+            s->machine.correlationId() == corrId) {
+            return *s;
+        }
+    }
+    return seedSession();
+}
+
+void ClientAgent::setRoute(int32_t ingressStreamId,
+                           const std::string& endpoint) noexcept {
+    if (ingressStreamId == 0) return;  // 0 = legacy/default stream — never routed
+    if (endpoint.empty() || endpoint == seedSession().endpoint) {
+        // Route resolves to the seed/default endpoint → drop the entry so the hot
+        // path stays on the byte-identical default offer.
+        routeByStream_.erase(ingressStreamId);
+        return;
+    }
+    routeByStream_[ingressStreamId] = endpoint;
+}
+
+std::string ClientAgent::routeEndpointFor(int32_t ingressStreamId) const noexcept {
+    const auto it = routeByStream_.find(ingressStreamId);
+    return (it != routeByStream_.end()) ? it->second : std::string{};
 }
 
 } // namespace rune::client::agent

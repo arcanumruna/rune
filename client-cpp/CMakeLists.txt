@@ -418,6 +418,24 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_agent_tests)
     endif()
 
+    # ── Task 1.3: Multi-node partition routing + multi-session registry ───────
+    # Pure unit test: agent routing table (setRoute/routeEndpointFor) + session
+    # registry (sessionForEndpoint/sessionCount) + MetadataCache.  No live driver.
+    if(aeron_FOUND)
+        add_executable(rune_multinode_routing_tests
+            tests/agent/MultiNodeRoutingTest.cpp
+        )
+        target_include_directories(rune_multinode_routing_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_multinode_routing_tests PRIVATE
+            rune_client_agent
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_multinode_routing_tests)
+    endif()
+
     # ── Client API tests (CC-6) — connect/ping futures + ipc gateway ──────────
     if(aeron_FOUND)
         add_executable(rune_client_api_tests
