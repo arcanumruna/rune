@@ -260,18 +260,21 @@ public:
     /// The seed session's endpoint == the transport default ingress channel.
     Session& sessionForEndpoint(const std::string& endpoint) noexcept;
 
-    /// Task 1.3: (re)build the agent-owned partition routing table entry mapping a
-    /// per-worker ingressStreamId to its leader endpoint channel.  Rebuilt in place
-    /// on metadata change.  ingressStreamId is broker-globally-unique per partition
-    /// (its leader owns it), so it is a sufficient routing key.  endpoint empty ⇒
+    /// Task 1.4: (re)build the agent-owned partition routing table entry mapping a
+    /// (topicId, partition) to its leader endpoint channel.  Rebuilt in place on
+    /// metadata change.  (topicId, partition) is unique per partition cluster-wide,
+    /// so it never collides — unlike ingressStreamId, which REPEATS across nodes
+    /// (each node reuses the same small per-worker stream ids).  endpoint empty ⇒
     /// remove the route (fall back to the seed/default hot path).  AGENT-THREAD ONLY.
-    void setRoute(int32_t ingressStreamId, const std::string& endpoint) noexcept;
+    void setRoute(int32_t topicId, int32_t partition,
+                  const std::string& endpoint) noexcept;
 
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
 
-    /// Task 1.3: the resolved leader endpoint for a route (or "" if none). Test hook.
-    [[nodiscard]] std::string routeEndpointFor(int32_t ingressStreamId) const noexcept;
+    /// Task 1.4: the resolved leader endpoint for a route (or "" if none). Test hook.
+    [[nodiscard]] std::string routeEndpointFor(int32_t topicId,
+                                               int32_t partition) const noexcept;
 
     // -------------------------------------------------------------------------
     // Observers
@@ -288,10 +291,15 @@ public:
     // CB-2: Producer duty-cycle hooks (setup-phase only; call before start())
     // -------------------------------------------------------------------------
 
-    /// Send function type: (ingressStreamId, frame, len) -> bool.
+    /// Send function type: (topicId, partition, ingressStreamId, frame, len) -> bool.
     /// ingressStreamId=0 means "use the default ingress stream".
     /// E5.1: carries the per-worker Aeron stream id for per-partition routing.
-    using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
+    /// Task 1.4: (topicId, partition) is the routing key — ingressStreamId is only
+    /// the transport stream to offer on (it REPEATS across nodes, so it cannot be a
+    /// routing key without cross-node collision).
+    using SendFn = std::function<bool(int32_t /*topicId*/, int32_t /*partition*/,
+                                      int32_t /*ingressStreamId*/,
+                                      const uint8_t*, std::size_t)>;
 
     /// Producer drain+flush callback: invoked on the agent thread every doWork
     /// cycle.  Signature: (nowNs, sessionId, sendFn) -> workCount.
@@ -447,14 +455,24 @@ private:
     Session&       seedSession()       noexcept { return *sessions_.front(); }
     const Session& seedSession() const noexcept { return *sessions_.front(); }
 
-    // ---- Task 1.3: partition routing table (agent-owned plain data) ----------
-    // Maps a per-worker ingressStreamId → its leader endpoint channel.  Rebuilt in
-    // place on metadata change (setRoute).  Read by the produce send lambda on the
-    // hot path: an unordered_map find keyed by an int32_t (no string hashing on the
-    // key).  EMPTY on single-node (no per-worker routes advertised) ⇒ the send
-    // lambda takes the byte-identical default offer path (no lookup cost beyond one
-    // empty-map check).  Single-writer (agent thread).
-    std::unordered_map<int32_t, std::string> routeByStream_;
+    // ---- Task 1.4: partition routing table (agent-owned plain data) ----------
+    // Maps a (topicId, partition) → its leader endpoint channel.  Rebuilt in place
+    // on metadata change (setRoute).  Read by the produce send lambda on the hot
+    // path: an unordered_map find keyed by an int64_t packed key (no string hashing
+    // on the key).  The key is ((int64_t)topicId<<32) | (uint32_t)partition — unique
+    // per partition cluster-wide, so it never collides across nodes (ingressStreamId
+    // does — each node reuses the same small per-worker stream ids).  EMPTY on
+    // single-node (no per-worker routes advertised) ⇒ the send lambda takes the
+    // byte-identical default offer path (no lookup cost beyond one empty-map check).
+    // Single-writer (agent thread).
+    std::unordered_map<int64_t, std::string> routeByPartition_;
+
+    // Pack (topicId, partition) into the routing-table key.  partition is masked to
+    // its unsigned 32-bit value so negative partitions (never valid) can't alias.
+    static constexpr int64_t routeKey(int32_t topicId, int32_t partition) noexcept {
+        return (static_cast<int64_t>(topicId) << 32)
+             |  static_cast<int64_t>(static_cast<uint32_t>(partition));
+    }
 
     // ---- Task 1.3: control-frame offer to a specific endpoint ----------------
     // Used by SessionEndpointIo::sendFrame — offers a session's control frame to

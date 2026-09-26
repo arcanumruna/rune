@@ -25,6 +25,8 @@
 
 #include <array>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -121,16 +123,23 @@ Client::Client(ClientConfig cfg)
             }
             int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
             // TX-5: drain all transactional producers (rarely >1; mutex is fine).
-            // Txn producers now accept the same (streamId, buf, len) SendFn — pass
-            // sendFn directly; they pass streamId=0 internally on the current path
-            // (Task 1.3 will supply the coordinator session's stream id).
+            // Task 1.4: the produce SendFn is now (topicId, partition, streamId, buf,
+            // len) — keyed by (topicId, partition) so cross-node stream ids don't
+            // collide.  Txn producers keep their OWN 3-arg SendFn (streamId, buf, len)
+            // and route to the coordinator session (Task 3.2), so adapt: the txn path
+            // passes streamId=0 and has no per-partition leader route, so topicId/
+            // partition default to 0 — the empty/default offer path in the agent.
             std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
             {
                 std::lock_guard<std::mutex> lk(txnHubMtx_);
                 txnSnap = txnProducers_;
             }
+            auto txnSendFn = [&sendFn](int32_t ingressStreamId, const uint8_t* buf,
+                                       std::size_t len) -> bool {
+                return sendFn(/*topicId=*/0, /*partition=*/0, ingressStreamId, buf, len);
+            };
             for (auto& tp : txnSnap) {
-                work += tp->doWork(sessionId, sendFn);
+                work += tp->doWork(sessionId, txnSendFn);
             }
             (void)nowNs;
             return work;
@@ -637,8 +646,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // does not forward streamId.  As a pragmatic safe fallback we use
                 // stream 0 (default) for the resend after redirect; per-worker routing
                 // resumes on the next fresh produce cycle via flushBatches.
-                std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
-                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
+                    [this](int32_t /*topicId*/, int32_t /*partition*/,
+                           int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     };
                 producerHub_.resendAllRedirected(newSessionId, sendFn);
@@ -917,8 +927,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // on exhausting kMaxRedirects, fails the pending ack itself.
             const auto snap = agent_.stateAndSessionId();
             (void)snap;
-            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
-                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+            std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
+                [this](int32_t /*topicId*/, int32_t /*partition*/,
+                       int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                     return agent_.submitSend(fb, fl);
                 };
             producerHub_.retryRedirectedProduce(opt->correlationId, sendFn);
@@ -1474,16 +1485,26 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // every partition on the seed ⇒ empty route table ⇒ byte-identical hot path).
     // The producer's flush→sendFn boundary then routes each record to its leader
     // session by ingressStreamId — replacing the single-transport retarget model.
+    const bool mnDbg = (std::getenv("RUNE_MN_DEBUG") != nullptr);
+    int mnRoutes = 0;
     for (const auto& p : partitions) {
-        if (p.ingressStreamId == 0) continue;
         const int32_t leaderNode = metadataCache_.leaderFor(p.topicId, p.partition);
+        const std::string ep = (leaderNode == metadata::MetadataCache::kNoLeader)
+                                   ? std::string() : metadataCache_.endpointFor(leaderNode);
+        if (mnDbg) {
+            std::fprintf(stderr, "[MNDBG route] topic=%d part=%d ingressStream=%d leaderNode=%d ep='%s'\n",
+                         p.topicId, p.partition, p.ingressStreamId, leaderNode, ep.c_str());
+        }
+        if (p.ingressStreamId == 0) continue;
         if (leaderNode == metadata::MetadataCache::kNoLeader) continue;
-        const std::string& ep = metadataCache_.endpointFor(leaderNode);
         if (ep.empty()) continue;
         const std::string leaderChannel =
             (ep.rfind("aeron:", 0) == 0) ? ep : ("aeron:udp?endpoint=" + ep);
-        agent_.setRoute(p.ingressStreamId, leaderChannel);
+        agent_.setRoute(p.topicId, p.partition, leaderChannel);
+        ++mnRoutes;
     }
+    if (mnDbg) std::fprintf(stderr, "[MNDBG route] built %d routes from %zu partitions\n",
+                            mnRoutes, partitions.size());
 
     // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
     // partition whose owner advertises one (per-worker egress active on the broker).

@@ -290,10 +290,13 @@ public:
 
     /// Flush partition batches that are ready (linger/batchBytes/flush/flushFlag).
     /// Calls encodeAndSend() for each ready batch.
-    /// sendFn: (ingressStreamId, buf, len) → bool (E5.1: per-worker routing).
+    /// sendFn: (topicId, partition, ingressStreamId, buf, len) → bool
+    /// (Task 1.4: route by (topicId,partition); E5.1: ingressStreamId is the
+    /// per-worker transport stream to offer on).
     /// Returns count of batches flushed.
     int flushBatches(int64_t nowNs, int64_t sessionId,
-                     std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
+                     std::function<bool(int32_t, int32_t, int32_t,
+                                        const uint8_t*, std::size_t)> sendFn);
 
     /// Reliability: retransmit in-flight batches whose current attempt is deemed
     /// lost (nowNs >= attemptDeadlineNs), until acked or deliveryTimeoutMs elapses.
@@ -301,7 +304,8 @@ public:
     /// with the same nowNs + sendFn as flushBatches.  O(1) when nothing is stalled
     /// (checks the oldest batch — map front — and returns early). Returns # resent.
     int retransmitStalled(int64_t nowNs,
-                          const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+                          const std::function<bool(int32_t, int32_t, int32_t,
+                                                   const uint8_t*, std::size_t)>& sendFn);
 
     /// Called by the agent when a ProduceResponse arrives.  Resolves the pending
     /// ack (callback/future) by correlationId.
@@ -318,7 +322,8 @@ public:
     /// On failure the pending ack is failed immediately.
     static constexpr int kMaxRedirects = 3;
     bool retryRedirectedProduce(int64_t corrId,
-                                std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+                                std::function<bool(int32_t, int32_t, int32_t,
+                                                   const uint8_t*, std::size_t)>& sendFn);
 
     /// CB-5 B: resend EVERY in-flight (still-unacked) Produce frame after a
     /// leader redirect + reconnect.  Each stored wire frame is re-stamped with
@@ -327,7 +332,8 @@ public:
     /// as unknown-session.  Bounded per-frame by kMaxRedirects; frames that
     /// exceed the budget are failed.  Returns the number of frames resent.
     int resendAllRedirected(int64_t newSessionId,
-                            std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+                            std::function<bool(int32_t, int32_t, int32_t,
+                                               const uint8_t*, std::size_t)>& sendFn);
 
     /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
     /// (i.e. a redirect resend would have something to flush).
@@ -424,7 +430,8 @@ private:
                        int64_t nowNs,
                        int64_t sessionId,
                        int64_t correlationId,
-                       std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+                       std::function<bool(int32_t, int32_t, int32_t,
+                                          const uint8_t*, std::size_t)>& sendFn);
 
     /// Encode + send a Tier-2 pre-built batch (agent thread only).
     /// Patches baseSequence into the provided batch bytes, then encodes a
@@ -432,7 +439,8 @@ private:
     bool encodeAndSendTier2(PartitionState& ps,
                              Tier2Entry& entry,
                              int64_t sessionId,
-                             std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+                             std::function<bool(int32_t, int32_t, int32_t,
+                                                const uint8_t*, std::size_t)>& sendFn);
 
     // ---- Members -------------------------------------------------------------
 

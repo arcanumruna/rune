@@ -99,7 +99,7 @@ public:
     /// Returns total work count (drained + flushed).
     int drainAndFlush(int64_t nowNs,
                       int64_t sessionId,
-                      std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
+                      std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// Route a ProduceResponse to all producers (the one that owns the
     /// correlationId will resolve the ack; others ignore it).
@@ -125,13 +125,13 @@ public:
     /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
     /// Returns true if one producer handled it (resent or failed).
     bool retryRedirectedProduce(int64_t corrId,
-                                std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
+                                std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// CB-5 B: resend every in-flight Produce across all producers after a
     /// leader redirect + reconnect, re-stamped with the new sessionId.
     /// Returns the total number of frames resent.
     int resendAllRedirected(int64_t newSessionId,
-                            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
+                            std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
 
     /// CB-5 B: true if any producer has an in-flight (unacked) batch.
     [[nodiscard]] bool hasInFlight() const noexcept;

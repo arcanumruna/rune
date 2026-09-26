@@ -592,7 +592,7 @@ bool ProducerImpl::encodeAndSend(
     int64_t nowNs,
     int64_t sessionId,
     int64_t correlationId,
-    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     if (!ps.builder || ps.builder->recordCount() == 0) return false;
 
@@ -635,8 +635,10 @@ bool ProducerImpl::encodeAndSend(
     const std::size_t written = encodeScratch_.size();
     if (written == 0) return false;
 
-    // Offer to transport — E5.1: pass per-partition ingressStreamId.
-    const bool ok = sendFn(ps.ingressStreamId, encodeScratch_.data(), written);
+    // Offer to transport — Task 1.4: route by (topicId,partition); E5.1: pass
+    // per-partition ingressStreamId as the transport stream.
+    const bool ok = sendFn(ps.topicId, ps.partition, ps.ingressStreamId,
+                           encodeScratch_.data(), written);
 
     if (!ok) {
         // Aeron ingress back-pressure (term buffer momentarily full / not yet
@@ -701,7 +703,7 @@ bool ProducerImpl::encodeAndSendTier2(
     PartitionState& ps,
     Tier2Entry& entry,
     int64_t sessionId,
-    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     if (entry.batchBytes.empty() || entry.recordCount == 0) return false;
 
@@ -769,8 +771,10 @@ bool ProducerImpl::encodeAndSendTier2(
     const std::size_t written = msg.encode(encodeScratch_.data());
     if (written == 0) return false;
 
-    // E5.1: pass per-partition ingressStreamId for per-worker routing.
-    const bool ok = sendFn(ps.ingressStreamId, encodeScratch_.data(), written);
+    // Task 1.4: route by (topicId,partition); E5.1: pass per-partition
+    // ingressStreamId as the per-worker transport stream.
+    const bool ok = sendFn(ps.topicId, ps.partition, ps.ingressStreamId,
+                           encodeScratch_.data(), written);
 
     if (!ok) {
         // Back-pressure: leave the entry + sequence untouched so the caller can
@@ -801,7 +805,7 @@ bool ProducerImpl::encodeAndSendTier2(
 int ProducerImpl::flushBatches(
     int64_t nowNs,
     int64_t sessionId,
-    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     // M1 FIX [CB-5]: Do NOT emit any frame while the session is not established
     // (sessionId == 0 means Connecting / post-forceReconnect window).  Records
@@ -995,7 +999,7 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
 
 int ProducerImpl::retransmitStalled(
     int64_t nowNs,
-    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
+    const std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     // ZERO happy-path cost: batchMap_ is ordered by corrId == send order == deadline
     // order (all deadlines are sendNs + produceTimeoutMs, monotonic).  So the OLDEST
@@ -1028,7 +1032,8 @@ int ProducerImpl::retransmitStalled(
 
         // Retransmit the SAME wire frame (same pid+seq/corrId → broker dedups and
         // re-acks the original offset).  Reset the per-attempt deadline.
-        if (sendFn(bi.ingressStreamId, bi.wireFrame.data(), bi.wireFrame.size())) {
+        if (sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
+                   bi.wireFrame.data(), bi.wireFrame.size())) {
             ++bi.attempts;
             bi.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
             ++resent;
@@ -1043,7 +1048,7 @@ int ProducerImpl::retransmitStalled(
 
 bool ProducerImpl::retryRedirectedProduce(
     int64_t corrId,
-    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     auto bit = batchMap_.find(corrId);
     if (bit == batchMap_.end()) return false; // unknown corrId
@@ -1064,7 +1069,8 @@ bool ProducerImpl::retryRedirectedProduce(
 
     ++bi.redirectCount;
     // E5.1: pass ingressStreamId so resend goes to the same per-worker stream.
-    return sendFn(bi.ingressStreamId, bi.wireFrame.data(), bi.wireFrame.size());
+    return sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
+                  bi.wireFrame.data(), bi.wireFrame.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,7 +1091,7 @@ inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noe
 
 int ProducerImpl::resendAllRedirected(
     int64_t newSessionId,
-    std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     int resent = 0;
     for (auto it = batchMap_.begin(); it != batchMap_.end(); ) {
@@ -1111,7 +1117,8 @@ int ProducerImpl::resendAllRedirected(
 
         ++bi.redirectCount;
         // E5.1: pass ingressStreamId so resend goes to the per-worker stream.
-        if (sendFn(bi.ingressStreamId, bi.wireFrame.data(), bi.wireFrame.size())) {
+        if (sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
+                   bi.wireFrame.data(), bi.wireFrame.size())) {
             ++resent;
         }
         ++it;

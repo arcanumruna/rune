@@ -54,16 +54,21 @@ using rune::client::Key;
 
 struct FakeSend {
     struct Record {
+        int32_t             topicId;
+        int32_t             partition;
         int32_t             streamId;
         std::vector<uint8_t> frame;
     };
 
     std::vector<Record> calls;
 
-    std::function<bool(int32_t, const uint8_t*, std::size_t)> fn() {
-        return [this](int32_t sid, const uint8_t* buf, std::size_t len) -> bool {
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> fn() {
+        return [this](int32_t topicId, int32_t partition, int32_t sid,
+                      const uint8_t* buf, std::size_t len) -> bool {
             Record r;
-            r.streamId = sid;
+            r.topicId   = topicId;
+            r.partition = partition;
+            r.streamId  = sid;
             r.frame.assign(buf, buf + len);
             calls.push_back(std::move(r));
             return true;  // always accept

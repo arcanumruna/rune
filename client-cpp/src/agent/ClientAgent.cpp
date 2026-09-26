@@ -191,16 +191,19 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
         const int producerWork = producerDrainFn_(
             nowNs,
             sessId,
-            [this](int32_t ingressStreamId, const uint8_t* buf, std::size_t len) -> bool {
-                // Task 1.3: partition routing at the flush→sendFn boundary.
-                // Fast path (single-node / no per-worker routes): the route table
-                // is empty ⇒ one empty-map check, then the byte-identical default
-                // offer.  Multi-node: an int32_t-keyed find resolves the leader
-                // endpoint; we re-stamp the frame's sessionId (header offset 8) to
-                // that leader session's id, then offer directly to its endpoint.
-                if (!routeByStream_.empty() && ingressStreamId != 0) {
-                    const auto it = routeByStream_.find(ingressStreamId);
-                    if (it != routeByStream_.end() && !it->second.empty()) {
+            [this](int32_t topicId, int32_t partition, int32_t ingressStreamId,
+                   const uint8_t* buf, std::size_t len) -> bool {
+                // Task 1.4: partition routing at the flush→sendFn boundary, keyed by
+                // (topicId, partition) — NOT ingressStreamId (which repeats across
+                // nodes and would collide).  Fast path (single-node / no per-worker
+                // routes): the route table is empty ⇒ one empty-map check, then the
+                // byte-identical default offer.  Multi-node: an int64-keyed find
+                // resolves the leader endpoint; we re-stamp the frame's sessionId
+                // (header offset 8) to that leader session's id, then offer directly
+                // to its endpoint on the same per-worker ingress stream.
+                if (!routeByPartition_.empty()) {
+                    const auto it = routeByPartition_.find(routeKey(topicId, partition));
+                    if (it != routeByPartition_.end() && !it->second.empty()) {
                         Session& leader = sessionForEndpoint(it->second);
                         const int64_t sid = leader.machine.sessionId();
                         // Leader session not yet established (async open in flight):
@@ -550,21 +553,22 @@ Session& ClientAgent::sessionForConnectCorrId(int64_t corrId) noexcept {
     return seedSession();
 }
 
-void ClientAgent::setRoute(int32_t ingressStreamId,
+void ClientAgent::setRoute(int32_t topicId, int32_t partition,
                            const std::string& endpoint) noexcept {
-    if (ingressStreamId == 0) return;  // 0 = legacy/default stream — never routed
+    const int64_t key = routeKey(topicId, partition);
     if (endpoint.empty() || endpoint == seedSession().endpoint) {
         // Route resolves to the seed/default endpoint → drop the entry so the hot
         // path stays on the byte-identical default offer.
-        routeByStream_.erase(ingressStreamId);
+        routeByPartition_.erase(key);
         return;
     }
-    routeByStream_[ingressStreamId] = endpoint;
+    routeByPartition_[key] = endpoint;
 }
 
-std::string ClientAgent::routeEndpointFor(int32_t ingressStreamId) const noexcept {
-    const auto it = routeByStream_.find(ingressStreamId);
-    return (it != routeByStream_.end()) ? it->second : std::string{};
+std::string ClientAgent::routeEndpointFor(int32_t topicId,
+                                          int32_t partition) const noexcept {
+    const auto it = routeByPartition_.find(routeKey(topicId, partition));
+    return (it != routeByPartition_.end()) ? it->second : std::string{};
 }
 
 } // namespace rune::client::agent

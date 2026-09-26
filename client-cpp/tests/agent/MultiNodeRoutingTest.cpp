@@ -8,9 +8,11 @@
 //   MN1: RouteTableMapsPartitionsToLeaderEndpoints
 //        Seed a MetadataCache with 8 partitions whose leaders are spread across 3
 //        distinct endpoints, mirror the Client::onMetadataResponse route build, and
-//        assert each partition's per-worker ingressStreamId resolves (via the agent
-//        routing table) to its OWN leader endpoint — i.e. each partition's produce
-//        would be sent on its leader session's stream.
+//        assert each (topicId, partition) resolves (via the agent routing table) to
+//        its OWN leader endpoint — i.e. each partition's produce would be sent to its
+//        leader session.  Task 1.4: per-worker ingressStreamId REPEATS across nodes
+//        (each node reuses the same small stream ids), so the route table is keyed by
+//        (topicId, partition) — NOT ingressStreamId — to avoid cross-node collision.
 //
 //   MN2: MultiSessionOpenPerEndpoint
 //        sessionForEndpoint() opens exactly one NEW session per distinct endpoint
@@ -79,13 +81,17 @@ TEST(MultiNodeRouting, RouteTableMapsPartitionsToLeaderEndpoints) {
         {2, 9002, "hostC"},
     };
 
-    // 8 partitions; leaders spread across the 3 nodes; each partition has a
-    // distinct per-worker ingressStreamId (broker-globally-unique).
+    // 8 partitions; leaders spread across the 3 nodes.  Task 1.4: the per-worker
+    // ingressStreamId REPEATS across nodes — every node reuses the SAME small stream
+    // ids (here streams 2 and 3).  This is the exact collision that broke the old
+    // stream-keyed routing (last-write-wins mapped stream2/3 to one node each), so we
+    // model it here to prove (topicId, partition) keying resolves every partition
+    // correctly despite the shared stream ids.
     // partition -> (leaderNode, ingressStreamId)
     struct P { int32_t part; int32_t leader; int32_t stream; };
     std::vector<P> layout = {
-        {0, 0, 500}, {1, 1, 501}, {2, 2, 502}, {3, 0, 503},
-        {4, 1, 504}, {5, 2, 505}, {6, 0, 506}, {7, 1, 507},
+        {0, 0, 2}, {1, 1, 2}, {2, 2, 2}, {3, 0, 3},
+        {4, 1, 3}, {5, 2, 3}, {6, 0, 2}, {7, 1, 2},
     };
 
     std::vector<mc::PartitionEntry> parts;
@@ -103,27 +109,34 @@ TEST(MultiNodeRouting, RouteTableMapsPartitionsToLeaderEndpoints) {
     // Seed endpoint deliberately NOT equal to any leader endpoint.
     rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
 
-    // Mirror Client::onMetadataResponse's route build.
+    // Mirror Client::onMetadataResponse's route build — keyed by (topicId, partition).
     for (const auto& p : layout) {
         const std::string chan = leaderChannelFor(cache, kTopic, p.part);
         ASSERT_FALSE(chan.empty()) << "partition " << p.part << " has no leader endpoint";
-        agent.setRoute(p.stream, chan);
+        agent.setRoute(kTopic, p.part, chan);
     }
 
-    // Assert each partition's stream routes to ITS leader endpoint, and that the
-    // three leader groups map to three DISTINCT endpoints.
+    // Assert each partition routes to ITS leader endpoint, and that the three leader
+    // groups map to three DISTINCT endpoints.  Crucially: partitions that SHARE a
+    // stream id (e.g. part0 & part1 both use stream 2) still resolve to DIFFERENT
+    // leaders — proving no cross-node stream-id collision.
     const std::string epA = "aeron:udp?endpoint=hostA:9000";
     const std::string epB = "aeron:udp?endpoint=hostB:9001";
     const std::string epC = "aeron:udp?endpoint=hostC:9002";
 
-    EXPECT_EQ(agent.routeEndpointFor(500), epA);
-    EXPECT_EQ(agent.routeEndpointFor(503), epA);
-    EXPECT_EQ(agent.routeEndpointFor(506), epA);
-    EXPECT_EQ(agent.routeEndpointFor(501), epB);
-    EXPECT_EQ(agent.routeEndpointFor(504), epB);
-    EXPECT_EQ(agent.routeEndpointFor(507), epB);
-    EXPECT_EQ(agent.routeEndpointFor(502), epC);
-    EXPECT_EQ(agent.routeEndpointFor(505), epC);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 0), epA);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 3), epA);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 6), epA);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 1), epB);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 4), epB);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 7), epB);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 2), epC);
+    EXPECT_EQ(agent.routeEndpointFor(kTopic, 5), epC);
+
+    // No cross-node collision: part0 (stream 2 → nodeA) and part1 (stream 2 → nodeB)
+    // share a stream id but resolve to different leaders.
+    EXPECT_NE(agent.routeEndpointFor(kTopic, 0), agent.routeEndpointFor(kTopic, 1));
+    EXPECT_NE(agent.routeEndpointFor(kTopic, 3), agent.routeEndpointFor(kTopic, 4));
 
     // Three distinct leader endpoints in play.
     EXPECT_NE(epA, epB);
@@ -191,12 +204,12 @@ TEST(MultiNodeRouting, SingleNodeEmptyRouteTableOneSession) {
     // Build routes; every leader endpoint == the seed → setRoute drops them all.
     for (int32_t p = 0; p < 8; ++p) {
         const std::string chan = leaderChannelFor(cache, kTopic, p);
-        agent.setRoute(600 + p, chan);
+        agent.setRoute(kTopic, p, chan);
     }
 
     // Empty route table → the produce send lambda takes the default offer path.
     for (int32_t p = 0; p < 8; ++p) {
-        EXPECT_TRUE(agent.routeEndpointFor(600 + p).empty())
+        EXPECT_TRUE(agent.routeEndpointFor(kTopic, p).empty())
             << "single-node partition " << p << " must have no per-node route";
     }
     // Only the seed session exists.
