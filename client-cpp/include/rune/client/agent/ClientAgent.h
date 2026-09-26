@@ -41,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // CB-2 forward declaration — allow Client to access ring_ for ProducerImpl.
@@ -48,6 +49,57 @@
 namespace rune::client { class Client; }
 
 namespace rune::client::agent {
+
+// ---------------------------------------------------------------------------
+// Session — endpoint-keyed per-node session state (multi-node Task 1.1).
+//
+// Bundles the state that is specific to ONE broker node/leader:
+//   - the SessionMachine (connect/keepalive/redirect FSM for that node), and
+//   - that node's data-op redirect state (redirectPending / currentLeader*).
+//
+// The single AeronTransport is SHARED across all sessions (it already
+// multiplexes N ingress publications + N egress subscriptions over one embedded
+// media driver); a Session does NOT own a transport — it references the shared
+// one via the owning ClientAgent.  A Session carries its own sessionId (owned by
+// its SessionMachine) and, later, its own stream ids.
+//
+// Shared-nothing: every field here is owned by the AGENT thread only.  The
+// redirect fields are plain data (no atomics) — they are read/written solely on
+// the agent/runner thread (SessionMachine already carries no atomics for the
+// same reason).
+//
+// Task 1.1 scope: the ClientAgent holds EXACTLY ONE Session (the seed).  The
+// pool-of-1 path is byte-identical to the previous single-session flow.  Routing
+// / multi-session-open is Task 1.3.
+// ---------------------------------------------------------------------------
+struct Session {
+    /// The per-node session state machine.  Non-movable (holds a SessionIo&),
+    /// so a Session is always held by pointer in the agent's collection.
+    session::SessionMachine machine;
+
+    // ---- Per-node data-op redirect state (agent-thread-only; plain data) -----
+    // Set when a Produce/Subscribe on THIS node's session is rejected by a
+    // FOLLOWER with ErrorResponse{Redirect,leaderEndpoint}: the transport is
+    // retarget()ed to the leader and a fresh reconnect is submitted; the pending
+    // redirected data ops are re-stamped + resent on the next ConnectResponse{OK}.
+    // Single-owner (runner/agent thread) → NO atomic (shared-nothing law).
+    bool        redirectPending      = false;
+
+    /// The channel URI this session is currently connected to.  Seeded from the
+    /// config gateway channel and updated on every retarget (redirect or route).
+    std::string currentLeaderChannel;
+
+    /// The broker nodeId this session is currently believed to be on, or -1 when
+    /// unknown (the initial gateway connection — we don't know which node it is
+    /// until a REDIRECT teaches us).
+    int32_t     currentLeaderNode    = -1;
+
+    Session(session::SessionIo& io, session::SessionConfig cfg,
+            std::string seedChannel)
+        : machine(io, std::move(cfg))
+        , currentLeaderChannel(std::move(seedChannel))
+    {}
+};
 
 // ---------------------------------------------------------------------------
 // AgentConfig — full configuration for the ClientAgent.
@@ -293,9 +345,23 @@ private:
 
     AgentConfig cfg_;
 
-    // ---- Transport + session (agent-thread owned, single-writer) ------------
+    // ---- Transport (SHARED across all sessions; agent-thread owned) ----------
+    // One embedded media driver multiplexes every session's ingress/egress
+    // streams (Task 1.1: do NOT create per-session transports/drivers).
     transport::AeronTransport transport_;
-    session::SessionMachine   session_;
+
+    // ---- Endpoint-keyed sessions (agent-thread owned, single-writer) ---------
+    // Task 1.1: EXACTLY ONE entry — the seed session.  Held by pointer because
+    // SessionMachine is non-movable (it holds a SessionIo& to *this).  A vector
+    // (not yet a map) keeps the pool-of-1 hot path a single deref with no string
+    // hashing; endpoint keying + lazy-open arrive in Task 1.3.
+    std::vector<std::unique_ptr<Session>> sessions_;
+
+    /// The seed (single) session.  Task 1.1 pool-of-1 accessor: identical to the
+    /// previous single-session member for both agent-internal doWork and the
+    /// Client-level redirect/dispatch paths.  Agent-thread only.
+    Session&       seedSession()       noexcept { return *sessions_.front(); }
+    const Session& seedSession() const noexcept { return *sessions_.front(); }
 
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -
     // Buffer size = power-of-two capacity + trailer.

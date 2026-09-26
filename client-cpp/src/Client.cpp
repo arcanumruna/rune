@@ -81,8 +81,10 @@ Client::Client(ClientConfig cfg)
     , nextSweep_(std::chrono::steady_clock::now() +
                  std::chrono::milliseconds(kSweepIntervalMs))
     , partitionRouter_(metadataCache_)
-    , currentLeaderChannel_(cfg_.gatewayChannel)  // MD1 IMPORTANT-2: seed w/ initial gateway
 {
+    // MD1 IMPORTANT-2: the seed session's currentLeaderChannel is initialised to
+    // the config ingress channel (== gatewayChannel) inside ClientAgent's Session
+    // constructor — Task 1.1 (was Client::currentLeaderChannel_ here).
     // Wire the egress observer BEFORE starting the agent (CC-5 contract).
     agent_.setEgressObserver([this](codec::TemplateId tid,
                                     const uint8_t*    buf,
@@ -217,8 +219,10 @@ void Client::close() {
         }
     }
 
-    // M2 FIX: clear redirectPending_ on close so it does not latch.
-    redirectPending_.store(false, std::memory_order_release);
+    // M2 FIX: clear the seed session's redirect latch on close so it does not
+    // latch.  Safe as a plain write: the runner thread was joined above, so this
+    // runs single-threaded (no concurrent agent-thread access) — Task 1.1.
+    redirectPending() = false;
 
     // Fail any still-pending connect/ping futures.
     failAllPending("Client closed");
@@ -535,16 +539,15 @@ void Client::sweepTimeouts() {
     // redirectPending_ is set → the reconnect to the (possibly dead) leader failed.
     // Promptly fail all pending produces + subscribes and reset redirectPending_
     // so it does not latch into any later connect attempt.
-    if (redirectPending_.load(std::memory_order_acquire)) {
+    if (redirectPending()) {
         const auto snap = agent_.stateAndSessionId();
         if (snap.state == session::SessionState::Disconnected) {
-            if (redirectPending_.exchange(false, std::memory_order_acq_rel)) {
-                producerHub_.failAll("Redirect reconnect failed: endpoint unreachable");
-                subscriberHub_.failPendingSubscribes(
-                    "Redirect reconnect failed: endpoint unreachable");
-                if (cbError_) {
-                    cbError_("Redirect reconnect failed: endpoint unreachable");
-                }
+            redirectPending() = false;
+            producerHub_.failAll("Redirect reconnect failed: endpoint unreachable");
+            subscriberHub_.failPendingSubscribes(
+                "Redirect reconnect failed: endpoint unreachable");
+            if (cbError_) {
+                cbError_("Redirect reconnect failed: endpoint unreachable");
             }
         }
     }
@@ -617,7 +620,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // exactly here (rather than at redirect time) so the resent frames
             // carry the NEW session — the leader drops unknown-session ops.
             // Runs on the agent thread (single-writer): submitSend → agent ring.
-            if (redirectPending_.exchange(false, std::memory_order_acq_rel)) {
+            if (redirectPending()) {
+                redirectPending() = false;
                 const int64_t newSessionId = opt->assignedSessionId;
                 // E5.1: resend uses per-worker streamId stored in BatchInfo.
                 // submitSend goes through the agent ring → transport_.offer(streamId, ...)
@@ -762,7 +766,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         // IMPORTANT-2: we now KNOW which node the session is
                         // following — record it so proactive routing can avoid
                         // re-sending to the wrong node.
-                        currentLeaderNode_ = newNodeId;
+                        currentLeaderNode() = newNodeId;
                     }
                 }
                 // No-progress (unknown corrId / endpoint not in broker set):
@@ -787,7 +791,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (retargeted) {
                 // MD1 IMPORTANT-2: record the connection's new leader channel so
                 // proactive produce routing compares against the right target.
-                currentLeaderChannel_ = newChannel;
+                currentLeaderChannel() = newChannel;
                 // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
                 // rejected by a FOLLOWER.  We must:
                 //   (1) reconnect to the leader with a FRESH session (the leader
@@ -812,9 +816,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // redirected), coalesce — the single deferred resend on the next
                 // ConnectResponse{OK} flushes ALL pending ops.  This prevents
                 // session churn from a burst of redirects.
-                bool expected = false;
-                if (redirectPending_.compare_exchange_strong(
-                        expected, true, std::memory_order_acq_rel)) {
+                // Coalesce: only initiate ONE reconnect per redirect episode.
+                // Single-owner agent thread → a plain check-and-set (no CAS).
+                if (!redirectPending()) {
+                    redirectPending() = true;
                     agent_.submitReconnect();
                 }
             } else {
@@ -831,7 +836,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     "Redirect retarget failed for endpoint: " + newEndpoint;
                 producerHub_.failPending(opt->correlationId, retargetReason);
                 subscriberHub_.failPendingSubscribes("Redirect retarget failed");
-                redirectPending_.store(false, std::memory_order_release);
+                redirectPending() = false;
                 if (cbError_) {
                     cbError_(retargetReason);
                 }
@@ -1444,12 +1449,13 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // control publication binds on that same host.
     std::string fallbackHost;
     {
-        const auto ep = currentLeaderChannel_.find("endpoint=");
+        const std::string& leaderChan = currentLeaderChannel();
+        const auto ep = leaderChan.find("endpoint=");
         if (ep != std::string::npos) {
             const std::size_t hs = ep + 9;
-            const std::size_t colon = currentLeaderChannel_.rfind(':');
+            const std::size_t colon = leaderChan.rfind(':');
             if (colon != std::string::npos && colon > hs)
-                fallbackHost = currentLeaderChannel_.substr(hs, colon - hs);
+                fallbackHost = leaderChan.substr(hs, colon - hs);
         }
     }
     for (const auto& p : resp.partitions) {
@@ -1552,7 +1558,7 @@ void Client::tickMetadataRefresh() noexcept {
 // existing connect/redirect machinery to REACH that leader on the one session.
 bool Client::routeProduceToLeader() noexcept {
     // Only route when a reconnect isn't already in flight (avoid churn).
-    if (redirectPending_.load(std::memory_order_acquire)) return false;
+    if (redirectPending()) return false;
 
     int32_t topicId = -1, partition = -1;
     if (!producerHub_.firstPendingPartition(topicId, partition)) return false;
@@ -1572,7 +1578,7 @@ bool Client::routeProduceToLeader() noexcept {
     // proactively churn the working connection.  When we ARE on the wrong node
     // the broker REDIRECT teaches us currentLeaderNode_ (see the redirect
     // handler) and the zero-RTT cache update keeps subsequent routes correct.
-    if (currentLeaderNode_ < 0 || leaderNode == currentLeaderNode_) {
+    if (currentLeaderNode() < 0 || leaderNode == currentLeaderNode()) {
         return false;
     }
 
@@ -1586,18 +1592,18 @@ bool Client::routeProduceToLeader() noexcept {
         (endpoint.rfind("aeron:", 0) == 0)
             ? endpoint
             : ("aeron:udp?endpoint=" + endpoint);
-    if (leaderChannel == currentLeaderChannel_) return false;
+    if (leaderChannel == currentLeaderChannel()) return false;
 
     // Retarget to the partition leader + reconnect; defer the produce flush to
-    // the next ConnectResponse{OK} (redirectPending_) so it carries the leader
+    // the next ConnectResponse{OK} (redirectPending) so it carries the leader
     // session — identical to the redirect-follow contract.
     if (!agent_.retarget(leaderChannel)) return false;
-    currentLeaderChannel_ = leaderChannel;
-    currentLeaderNode_    = leaderNode;
+    currentLeaderChannel() = leaderChannel;
+    currentLeaderNode()    = leaderNode;
 
-    bool expected = false;
-    if (redirectPending_.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel)) {
+    // Coalesce: single-owner agent thread → plain check-and-set (no CAS).
+    if (!redirectPending()) {
+        redirectPending() = true;
         agent_.submitReconnect();
     }
     return true;

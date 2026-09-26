@@ -61,13 +61,19 @@ int32_t ringTotalBytes(int32_t cap) noexcept {
 ClientAgent::ClientAgent(AgentConfig cfg)
     : cfg_(cfg)
     , transport_(cfg_.transport)
-    , session_(*this, cfg_.session)
     , ringBuf_(makeAlignedBuffer(
           static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)),
           kRingAlignment))
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
-{}
+{
+    // Task 1.1: seed the endpoint-keyed session collection with EXACTLY ONE
+    // entry (the seed session).  The SessionMachine binds to *this as its
+    // SessionIo (single shared transport).  The seed's currentLeaderChannel is
+    // the config ingress channel — the endpoint the transport starts on.
+    sessions_.emplace_back(std::make_unique<Session>(
+        *this, cfg_.session, cfg_.transport.ingressChannel));
+}
 
 // ---------------------------------------------------------------------------
 // Destruction
@@ -119,7 +125,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
         {
             switch (msgTypeId) {
             case kMsgConnect:
-                session_.connect(nowNs);
+                seedSession().machine.connect(nowNs);
                 break;
 
             case kMsgReconnect:
@@ -127,15 +133,15 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 // transport was already retarget()ed to the leader; drop the
                 // stale follower session and connect fresh so the leader
                 // assigns a new sessionId.
-                session_.forceReconnect(nowNs);
+                seedSession().machine.forceReconnect(nowNs);
                 break;
 
             case kMsgDisconnect:
-                session_.disconnect();
+                seedSession().machine.disconnect();
                 break;
 
             case kMsgClose:
-                session_.close();
+                seedSession().machine.close();
                 break;
 
             case kMsgSend:
@@ -169,13 +175,13 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // frames via sendFrame() → transport_.offer().  We do not count ticks as
     // work; ring + egress fragments are the sole work-done signals (the
     // IdleStrategy backs off on 0, which is correct for idle cycles).
-    session_.tick(nowNs);
+    seedSession().machine.tick(nowNs);
 
     // ---- Step 4: CB-2 — Producer duty cycle (drain ring + flush batches) -----
     // Runs on the AGENT thread (single-writer); no lock needed.
     // NanoClock is already sampled as nowNs above — reused here.
     if (producerDrainFn_) {
-        const int64_t sessId = session_.sessionId();
+        const int64_t sessId = seedSession().machine.sessionId();
         const int producerWork = producerDrainFn_(
             nowNs,
             sessId,
@@ -278,10 +284,10 @@ void ClientAgent::setMetadataResponseFn(MetadataResponseFn fn) noexcept {
 void ClientAgent::publishSnapshot() noexcept {
     // Pack (state, sessionId) into ONE atomic value and publish (release).
     // Guard the sessionId range so the packing assumption (48 bits) holds.
-    const int64_t sid = session_.sessionId();
+    const int64_t sid = seedSession().machine.sessionId();
     assert(sid >= 0 && (static_cast<uint64_t>(sid) & ~kSessionIdMask) == 0 &&
            "sessionId does not fit in 48 bits — packing invariant violated");
-    snapshot_.store(packSnapshot(session_.state(), sid),
+    snapshot_.store(packSnapshot(seedSession().machine.state(), sid),
                     std::memory_order_release);
 }
 
@@ -340,13 +346,13 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     case codec::TemplateId::ConnectResponse: {
         auto opt = codec::decodeConnectResponse(buf, len);
         if (!opt) break;
-        session_.onConnectResponse(
+        seedSession().machine.onConnectResponse(
             opt->code,
             opt->leaderMemberId,
             opt->assignedSessionId,
             opt->correlationId,
             nowNs);
-        session_.onActivity(nowNs);
+        seedSession().machine.onActivity(nowNs);
         // FIX F1: publish the fresh (state, sessionId) BEFORE waking any thread
         // via the observer, so a thread returning from connect().get() and
         // immediately calling ping() reads Connected (not the stale snapshot).
@@ -360,8 +366,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     case codec::TemplateId::ErrorResponse: {
         auto opt = codec::decodeErrorResponse(buf, len);
         if (!opt) break;
-        session_.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
-        session_.onActivity(nowNs);
+        seedSession().machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
+        seedSession().machine.onActivity(nowNs);
         publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
@@ -370,7 +376,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     }
 
     case codec::TemplateId::Pong: {
-        session_.onActivity(nowNs);
+        seedSession().machine.onActivity(nowNs);
         publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);

@@ -424,16 +424,24 @@ private:
     group::GroupConsumerHub groupConsumerHub_;
 
     // ---- CB-5 B: data-op leader-redirect state -------------------------------
-    // Set on the runner thread when a Produce/Subscribe is rejected by a
-    // FOLLOWER with ErrorResponse{Redirect,leaderEndpoint}: the transport is
-    // retarget()ed to the leader and a fresh reconnect is submitted.  The
-    // pending redirected data ops are NOT resent immediately (they would race
-    // the new ConnectResponse and carry a stale sessionId) — instead this flag
-    // is consumed on the next ConnectResponse{OK}, at which point every pending
-    // Produce + Subscribe is re-stamped with the NEW sessionId and resent.
-    // Touched only on the runner/agent thread (onEgressFrame); atomic for
-    // publication safety.
-    std::atomic<bool> redirectPending_ {false};
+    // Task 1.1: the redirect latch (redirectPending) and the current-leader
+    // scalars (currentLeaderChannel / currentLeaderNode) MOVED into the agent's
+    // endpoint-keyed Session (agent_.seedSession()).  They are agent-thread-only
+    // plain data (single-owner → no atomic, per the shared-nothing law).  The
+    // Client reaches them through the seed session so that, in Task 1.3, each
+    // node's redirect state lives with its own SessionMachine.
+    //
+    // Accessors (agent/runner-thread only) — thin helpers so the redirect/route
+    // paths read/write the seed session's fields without repeating the deref.
+    [[nodiscard]] bool& redirectPending() noexcept {
+        return agent_.seedSession().redirectPending;
+    }
+    [[nodiscard]] std::string& currentLeaderChannel() noexcept {
+        return agent_.seedSession().currentLeaderChannel;
+    }
+    [[nodiscard]] int32_t& currentLeaderNode() noexcept {
+        return agent_.seedSession().currentLeaderNode;
+    }
 
     // ---- MD1 Task 10: Metadata cache + partition router ----------------------
     // MetadataCache is populated from MetadataResponse frames (on connect and
@@ -445,19 +453,9 @@ private:
     // correlationId for the most recently sent MetadataRequest (0 = none).
     int64_t pendingMetadataCorrId_ {0};
 
-    // ---- MD1 review IMPORTANT-2: proactive per-partition produce routing ------
-    // The channel URI the transport is currently connected to.  Seeded from the
-    // config gateway channel and updated on every retarget (redirect or route).
-    // Agent-thread-only.
-    std::string currentLeaderChannel_;
-
-    // The broker nodeId the session is currently believed to be on, or -1 when
-    // unknown (the initial gateway connection — we don't know which node it is
-    // until a REDIRECT teaches us).  Proactive routing only retargets when the
-    // partition's cached leader node is KNOWN, differs from this, and this is
-    // itself known — so we never churn away from a working initial connection.
-    // Agent-thread-only.
-    int32_t currentLeaderNode_ {-1};
+    // MD1 review IMPORTANT-2 (proactive per-partition produce routing): the
+    // current-leader channel/node scalars now live in agent_.seedSession()
+    // (see currentLeaderChannel()/currentLeaderNode() above) — Task 1.1.
 
     // ---- MD1 review IMPORTANT-3: background metadata refresh w/ backoff -------
     // When no-progress is detected (unknown partition leader / repeated
@@ -515,7 +513,7 @@ public:
         return metadataCache_.epochFor(topicId, partition);
     }
     [[nodiscard]] std::string testCurrentLeaderChannel() const {
-        return currentLeaderChannel_;
+        return agent_.seedSession().currentLeaderChannel;
     }
 };
 
