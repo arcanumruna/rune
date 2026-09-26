@@ -119,7 +119,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(207);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(215);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(1);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(0);
@@ -177,7 +177,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(207);
+        return static_cast<std::uint16_t>(215);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -2830,6 +2830,69 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *egressPubMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t egressPubId() SBE_NOEXCEPT
+    {
+        return 42;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t egressPubSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool egressPubInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t egressPubEncodingOffset() SBE_NOEXCEPT
+    {
+        return 206;
+    }
+
+    static SBE_CONSTEXPR std::uint64_t egressPubNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_UINT64;
+    }
+
+    static SBE_CONSTEXPR std::uint64_t egressPubMinValue() SBE_NOEXCEPT
+    {
+        return UINT64_C(0x0);
+    }
+
+    static SBE_CONSTEXPR std::uint64_t egressPubMaxValue() SBE_NOEXCEPT
+    {
+        return UINT64_C(0xfffffffffffffffe);
+    }
+
+    static SBE_CONSTEXPR std::size_t egressPubEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::uint64_t egressPub() const SBE_NOEXCEPT
+    {
+        std::uint64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 206, sizeof(std::uint64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    WorkerOp &egressPub(const std::uint64_t value) SBE_NOEXCEPT
+    {
+        std::uint64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 206, &val, sizeof(std::uint64_t));
+        return *this;
+    }
+
     SBE_NODISCARD static const char *tailKindMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -2841,7 +2904,7 @@ public:
 
     static SBE_CONSTEXPR std::uint16_t tailKindId() SBE_NOEXCEPT
     {
-        return 41;
+        return 43;
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t tailKindSinceVersion() SBE_NOEXCEPT
@@ -2856,7 +2919,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingOffset() SBE_NOEXCEPT
     {
-        return 206;
+        return 214;
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingLength() SBE_NOEXCEPT
@@ -2867,21 +2930,21 @@ public:
     SBE_NODISCARD std::uint8_t tailKindRaw() const SBE_NOEXCEPT
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 206, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 214, sizeof(std::uint8_t));
         return (val);
     }
 
     SBE_NODISCARD TailKind::Value tailKind() const
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 206, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 214, sizeof(std::uint8_t));
         return TailKind::get((val));
     }
 
     WorkerOp &tailKind(const TailKind::Value value) SBE_NOEXCEPT
     {
         std::uint8_t val = (value);
-        std::memcpy(m_buffer + m_offset + 206, &val, sizeof(std::uint8_t));
+        std::memcpy(m_buffer + m_offset + 214, &val, sizeof(std::uint8_t));
         return *this;
     }
 
@@ -2911,7 +2974,7 @@ public:
 
     static SBE_CONSTEXPR std::uint16_t tailId() SBE_NOEXCEPT
     {
-        return 42;
+        return 44;
     }
 
     static SBE_CONSTEXPR std::uint64_t tailHeaderLength() SBE_NOEXCEPT
@@ -3235,6 +3298,10 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("oleFollowerLeo": )";
     builder << +writer.oleFollowerLeo();
+
+    builder << ", ";
+    builder << R"("egressPub": )";
+    builder << +writer.egressPub();
 
     builder << ", ";
     builder << R"("tailKind": )";

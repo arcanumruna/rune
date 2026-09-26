@@ -119,10 +119,15 @@
     <field name="oleFollowerId"     id="38" type="int32"/>
     <field name="oleRequestedEpoch" id="39" type="int64"/>
     <field name="oleFollowerLeo"    id="40" type="int64"/>
+    <!-- Hybrid egress: per-consumer unicast egress publication pointer for a
+         Subscribe op.  Opaque uint64 (reinterpret of aeron::ExclusivePublication*),
+         created + lifetime-owned by the gateway, written ONLY by the owning worker
+         (shared-nothing single-writer).  0 = none (use MDC broadcast path). -->
+    <field name="egressPub"       id="42" type="uint64"/>
     <!-- which variable field the tail holds -->
-    <field name="tailKind"        id="41" type="TailKind"/>
+    <field name="tailKind"        id="43" type="TailKind"/>
     <!-- variable tail (record batch / replicated records / isr / owned-set) -->
-    <data  name="tail"            id="42" type="varDataEncoding"/>
+    <data  name="tail"            id="44" type="varDataEncoding"/>
   </sbe:message>
 
   <!-- ====================================================================== -->
