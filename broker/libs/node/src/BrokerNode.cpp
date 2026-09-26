@@ -808,12 +808,16 @@ void BrokerNode::buildGateway() {
             std::unordered_map<int32_t, std::string> nodeEndpoints;
             nodeEndpoints.reserve(config_.peers.size());
             for (const auto& peer : config_.peers) {
-                // Self: no self-redirect (empty string).
-                if (peer.id == config_.nodeId) {
-                    nodeEndpoints[peer.id] = "";
-                } else {
-                    nodeEndpoints[peer.id] = peer.clientChannel();
-                }
+                // Advertise EVERY node's real client endpoint — including self.
+                // This map feeds two consumers: (1) the per-partition REDIRECT
+                // path, which never looks up self (both redirect sites guard on
+                // leaderNodeId != thisNodeId_ before the lookup), and (2) the
+                // MetadataResponse broker list, which MUST include self so a
+                // client seeded on this node can route to partitions THIS node
+                // leads.  Blanking self broke (2): the seed node advertised its
+                // own endpoint as "" → clients hit "endpoint unreachable" for
+                // every partition led by the seed.
+                nodeEndpoints[peer.id] = peer.clientChannel();
             }
             gateway_->setNodeEndpointMap(std::move(nodeEndpoints));
             spdlog::info("BrokerNode[{}]: gateway nodeEndpointMap wired ({} entries)",
