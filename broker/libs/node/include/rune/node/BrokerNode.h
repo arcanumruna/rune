@@ -398,7 +398,9 @@ private:
     // Runtime (AgentRunner + clock + idle)
     // -----------------------------------------------------------------------
     rune::consensus::MonotonicNanoClock clock_;
-    rune::consensus::BackoffIdleStrategy idleStrategy_;
+    // Selected from config_.runtimeIdleStrategy (RUNE_RUNTIME_IDLE): Backoff
+    // (default) or BusySpin (sub-100µs produce/ack round-trips; pegs the core).
+    std::unique_ptr<rune::consensus::IdleStrategy> idleStrategy_;
     std::unique_ptr<rune::consensus::AgentRunner> agentRunner_;
 
     // -----------------------------------------------------------------------

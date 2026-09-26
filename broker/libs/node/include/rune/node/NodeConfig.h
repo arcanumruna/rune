@@ -206,6 +206,13 @@ struct NodeConfig {
     };
     WorkerIdleStrategy workerIdleStrategy = WorkerIdleStrategy::Backoff;
 
+    // Idle strategy for the RUNTIME agent thread (consensus + ClientGateway on one
+    // thread).  Parsed from RUNE_RUNTIME_IDLE (same values as RUNE_WORKER_IDLE).
+    // Default Backoff (safe, no core pegging).  Set to "busyspin" for the lowest
+    // produce/ack round-trip latency (the gateway thread never parks) — sub-100µs
+    // territory — at the cost of pegging that core.  Use on a dedicated CPU.
+    WorkerIdleStrategy runtimeIdleStrategy = WorkerIdleStrategy::Backoff;
+
     // E4: per-worker CPU affinity base core (Linux-only; macOS is a no-op).
     //
     // When >= 0, worker i pins its own AgentRunner thread to core

@@ -1260,9 +1260,20 @@ void BrokerNode::buildGateway() {
         metadataService_.get(),   // MD1: metadata service (null-safe if setup failed)
         workerPool_.get());       // E1: shard→worker pool (null-safe if no topics)
 
+    // Select the runtime/gateway idle strategy (RUNE_RUNTIME_IDLE).  BusySpin →
+    // the consensus+gateway thread never parks → sub-100µs produce/ack round-trips
+    // (pegs the core; use on a dedicated CPU).  Default Backoff (safe).
+    if (config_.runtimeIdleStrategy == NodeConfig::WorkerIdleStrategy::BusySpin) {
+        idleStrategy_ = std::make_unique<rune::consensus::BusySpinIdleStrategy>();
+        spdlog::info("BrokerNode[{}]: runtime idle strategy = BusySpin (low latency; core pegged)",
+                     config_.nodeId);
+    } else {
+        idleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>();
+    }
+
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
     agentRunner_ = std::make_unique<rune::consensus::AgentRunner>(
-        *runtimeAgent_, idleStrategy_, clock_);
+        *runtimeAgent_, *idleStrategy_, clock_);
 
     // -----------------------------------------------------------------------
     // CP-6: Wire the LogCleanerAgent on its own AgentRunner thread.

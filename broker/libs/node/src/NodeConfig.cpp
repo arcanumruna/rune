@@ -700,6 +700,23 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (Backoff).
 
+    // --- RUNE_RUNTIME_IDLE (optional) — idle strategy for the runtime/gateway
+    //     thread.  Same values as RUNE_WORKER_IDLE; "busyspin" gives sub-100µs
+    //     produce/ack round-trips (gateway thread never parks). ---
+    if (const char* ri = getenv_fn("RUNE_RUNTIME_IDLE")) {
+        std::string s(ri);
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "busyspin" || s == "busy_spin" || s == "busy-spin") {
+            cfg.runtimeIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
+        } else if (s == "yielding") {
+            cfg.runtimeIdleStrategy = NodeConfig::WorkerIdleStrategy::Yielding;
+        } else if (s == "sleeping") {
+            cfg.runtimeIdleStrategy = NodeConfig::WorkerIdleStrategy::Sleeping;
+        } else {
+            cfg.runtimeIdleStrategy = NodeConfig::WorkerIdleStrategy::Backoff;
+        }
+    }
+
     // --- RUNE_WORKER_CORE_BASE (optional) — E4: CPU affinity base core. ---
     // -1 = disabled (no pinning, default).  >= 0 → worker i pins to core base+i.
     // Values < -1 are clamped to -1 (disabled).
