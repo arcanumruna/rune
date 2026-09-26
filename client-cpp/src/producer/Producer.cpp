@@ -29,6 +29,14 @@ ProducerConfig ProducerConfig::fromEnv() noexcept {
         const long val = std::strtol(v, nullptr, 10);
         if (val > 0) cfg.batchRecords = static_cast<int32_t>(val);
     }
+    if (const char* v = std::getenv("RUNE_MAX_FRAME_BYTES")) {
+        const long val = std::strtol(v, nullptr, 10);
+        if (val > 0) cfg.maxFrameBytes = static_cast<int32_t>(val);
+    }
+    if (const char* v = std::getenv("RUNE_DELIVERY_TIMEOUT_MS")) {
+        const long val = std::strtol(v, nullptr, 10);
+        if (val > 0) cfg.deliveryTimeoutMs = static_cast<int64_t>(val);
+    }
     return cfg;
 }
 

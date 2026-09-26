@@ -365,6 +365,23 @@ TEST(ProducerConfigFromEnv, LingerUnsetKeepsDefault) {
 }
 
 // ===========================================================================
+// ProducerConfigFromEnv — Task 2: maxFrameBytes / deliveryTimeoutMs
+// ===========================================================================
+
+TEST(ProducerConfigFromEnv, FrameCapAndDeliveryTimeoutDefaults) {
+    ::unsetenv("RUNE_MAX_FRAME_BYTES"); ::unsetenv("RUNE_DELIVERY_TIMEOUT_MS");
+    auto cfg = rune::client::ProducerConfig::fromEnv();
+    EXPECT_EQ(cfg.maxFrameBytes, 61440);
+    EXPECT_EQ(cfg.deliveryTimeoutMs, 30000);
+}
+TEST(ProducerConfigFromEnv, FrameCapOverride) {
+    ::setenv("RUNE_MAX_FRAME_BYTES", "16384", 1);
+    auto cfg = rune::client::ProducerConfig::fromEnv();
+    ::unsetenv("RUNE_MAX_FRAME_BYTES");
+    EXPECT_EQ(cfg.maxFrameBytes, 16384);
+}
+
+// ===========================================================================
 // EnvKnobsApplied
 //
 // ProducerConfig::fromEnv() correctly reads RUNE_LINGER_US, RUNE_BATCH_BYTES,

@@ -71,13 +71,18 @@ struct ProducerConfig {
                                           //  hard — 32 batches keeps the pipe full while the
                                           //  idempotent seq window / ackRing bound memory)
     int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
+    int32_t maxFrameBytes    = 61440;   // hard per-FRAME wire cap (≤ this many bytes/frame),
+                                         // independent of batchBytes — bounds fragmentation.
+    int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
 
     /// Build a ProducerConfig from environment variables, falling back to
     /// sane defaults for any variable that is not set.
     ///
-    ///   RUNE_LINGER_US      → lingerUs
-    ///   RUNE_BATCH_BYTES    → batchBytes
-    ///   RUNE_BATCH_RECORDS  → batchRecords
+    ///   RUNE_LINGER_US            → lingerUs
+    ///   RUNE_BATCH_BYTES          → batchBytes
+    ///   RUNE_BATCH_RECORDS        → batchRecords
+    ///   RUNE_MAX_FRAME_BYTES      → maxFrameBytes
+    ///   RUNE_DELIVERY_TIMEOUT_MS  → deliveryTimeoutMs
     static ProducerConfig fromEnv() noexcept;
 };
 
