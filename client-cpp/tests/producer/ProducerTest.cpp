@@ -1080,7 +1080,8 @@ TEST(Producer, ProduceAckTimeout) {
     pcfg.lingerUs         = 1;
     pcfg.batchBytes       = 1;
     pcfg.maxInFlight      = 4;
-    pcfg.produceTimeoutMs = 200; // 200 ms — short enough for unit test
+    pcfg.produceTimeoutMs = 200; // 200 ms per attempt — short enough for unit test
+    pcfg.deliveryTimeoutMs = 400; // retry-then-fail: ~2 attempts then give up (bounds test)
 
     auto p     = h.makeProducer(pcfg);
     auto topic = makeTopic(13, 1);
@@ -1132,7 +1133,8 @@ TEST(Producer, ProduceAckTimeoutCallback) {
     pcfg.lingerUs         = 1;
     pcfg.batchBytes       = 1;
     pcfg.maxInFlight      = 4;
-    pcfg.produceTimeoutMs = 200; // short timeout
+    pcfg.produceTimeoutMs = 200; // short per-attempt timeout
+    pcfg.deliveryTimeoutMs = 400; // retry-then-fail: ~2 attempts then give up (bounds test)
 
     auto p     = h.makeProducer(pcfg);
     auto topic = makeTopic(14, 1);
