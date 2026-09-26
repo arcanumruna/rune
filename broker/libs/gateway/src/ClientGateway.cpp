@@ -1546,13 +1546,31 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // drainWorkerReturns_() at the top of the NEXT doWork() cycle.
     //
     // When no WorkerPool is wired (null), fall through to the inline path below.
-    // E5.1.3 (e): Gate the gateway produce fanout on !perWorkerIngressActive_.
-    // When per-worker ingress is active, workers consume produce directly from
-    // their own Aeron subscriptions — routing through workerPool_ would double-
-    // process the same produce request (once from the gateway, once from the
-    // worker's own ingress poll).  Skipping here prevents the double-processing.
-    // Default: perWorkerIngressActive_=false → gateway fanout is the live path.
-    if (workerPool_ && !perWorkerIngressActive_) {
+    // Route the produce to the OWNING WORKER via the ingress ring whenever a
+    // WorkerPool exists AND either:
+    //   - per-worker ingress is off (legacy: workers own all partitions), OR
+    //   - per-worker ingress is on AND this is a USER partition (topicId >= 0),
+    //     which is worker-owned.
+    //
+    // #13 (HW-visibility race / read tail-stall) FIX: when per-worker ingress is
+    // active, a USER-partition log is worker-owned — the worker is its SOLE
+    // appender AND the sole writer of its replica high-watermark (via
+    // onLeaderLogAppended), AND the sole reader of that HW (pushOwnedSubscriptions_).
+    // The gateway must therefore NEVER inline-append to a worker-owned log: doing so
+    // wrote the HW on the gateway thread while the worker read it on its own thread
+    // with no synchronization — on a weak memory model the worker could read a stale
+    // HW that never included the final produce, so the last records were never pushed
+    // (consumer stalls on the tail).  Routing to the worker keeps append + HW write +
+    // HW read all on the one worker thread — shared-nothing, race-free.
+    //
+    // No double-processing: a single produce reaches EITHER the worker's own Aeron
+    // ingress stream (client routed per-partition) OR the gateway's stream (client
+    // fell back) — never both — so routing gateway-received produce to the worker
+    // appends it exactly once.  Internal partitions (topicId < 0) are gateway-owned
+    // and stay on the inline path below.
+    const bool routeToWorker =
+        workerPool_ && (!perWorkerIngressActive_ || msg.topicId >= 0);
+    if (routeToWorker) {
         // ---------------------------------------------------------------------------
         // WORKER PATH: Parse + validate the batch inline (same logic as before) so
         // that the WorkerOp carries the pre-validated fields (lastOffsetDelta,
