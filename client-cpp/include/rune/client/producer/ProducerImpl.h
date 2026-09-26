@@ -152,6 +152,11 @@ struct PartitionState {
     // Timestamp when first record was appended to the current batch (for linger).
     int64_t batchStartNs = 0; // 0 = empty
 
+    // Wall-clock base timestamp of the current RecordBatchBuilder (wallNs() at
+    // builder creation / last reset).  Used to compute per-record tsDelta for
+    // the frame-cap pre-flight check (task 3).
+    int64_t builderBaseWallNs = 0;
+
     // Force-flush flag (set by flush() call from app thread, read here).
     bool flushRequested = false;
 

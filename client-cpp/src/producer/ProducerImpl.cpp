@@ -92,6 +92,54 @@ inline int64_t wallNs() noexcept {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// ---------------------------------------------------------------------------
+// Varint / varlong length helpers — exact byte count for RecordBatch encoding.
+// Used by recordBodyContrib() to pre-flight the frame-cap check (task 3).
+// ZERO-COST on the normal path: only called when frameCapped=true.
+// ---------------------------------------------------------------------------
+
+inline int32_t varintLen(int32_t v) noexcept {
+    // Non-negative inputs only (keyLen, valueLen, bodySize, offsetDelta ≥ 0).
+    auto u = static_cast<uint32_t>(v);
+    int n = 1;
+    while (u >= 0x80u) { u >>= 7; ++n; }
+    return n;
+}
+
+inline int32_t varlongLen(int64_t v) noexcept {
+    // Zigzag encoding: matches writeVarlong() in RecordBatch.h.
+    const uint64_t u = static_cast<uint64_t>((v << 1) ^ (v >> 63));
+    uint64_t tmp = u;
+    int n = 1;
+    while (tmp >= 0x80u) { tmp >>= 7; ++n; }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// recordBodyContrib — exact bytes that RecordBatchBuilder::append() adds to
+// its internal records_ buffer for one record.
+//
+// Matches RecordBatch.h::append() exactly:
+//   contribution = varint(bodySize) + bodySize
+//   bodySize     = 1(attrs) + varlong(tsDelta) + varint(offsetDelta)
+//               + varint(keyLen) + keyLen
+//               + varint(valueLen) + valueLen
+//               + 1(headerCount=0)
+// ---------------------------------------------------------------------------
+inline int32_t recordBodyContrib(int32_t keyLen, int32_t valueLen,
+                                 int64_t tsDelta, int32_t offsetDelta) noexcept {
+    const int32_t bodySize =
+        1 +                        // attributes byte
+        varlongLen(tsDelta) +      // tsDelta (zigzag varlong)
+        varintLen(offsetDelta) +   // offsetDelta
+        varintLen(keyLen) +        // keyLen varint
+        keyLen +                   // key bytes
+        varintLen(valueLen) +      // valueLen varint
+        valueLen +                 // value bytes
+        1;                         // headerCount = 0 → varint(0) = 1 byte
+    return varintLen(bodySize) + bodySize;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -400,10 +448,59 @@ int ProducerImpl::drainRing(int64_t nowNs) {
 
             PartitionState& ps = getOrCreatePartition(topicId, partition);
 
-            // BACKPRESSURE: if this partition's builder is already at batchBytes and
-            // it cannot flush (at maxInFlight), ABORT — leave the record in the ring
-            // for a later cycle.  Decided BEFORE any state mutation below.
-            if (ps.builderBytes >= cfg_.batchBytes && ps.inFlight >= cfg_.maxInFlight) {
+            // Effective per-frame cap: use maxFrameBytes when it is a tighter bound
+            // than batchBytes (i.e. maxFrameBytes > 0 and < batchBytes).  Zero-cost
+            // on the normal path (maxFrameBytes >= batchBytes): the min-style compare
+            // collapses to batchBytes with no new branch taken.
+            const bool frameCapped =
+                (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes);
+            const int32_t effCap = frameCapped ? cfg_.maxFrameBytes : cfg_.batchBytes;
+
+            // BACKPRESSURE / FRAME-SPLIT: ABORT before appending when accumulating
+            // this record would push the frame past effCap.
+            //
+            // Normal path (frameCapped=false, effCap=batchBytes):
+            //   ABORT only when ALSO at maxInFlight (can't flush; classic backpressure).
+            //   Zero new hot-path branch: frameCapped=false → condition is identical
+            //   to the old `builderBytes >= batchBytes && inFlight >= maxInFlight`.
+            //
+            // Frame-cap path (frameCapped=true, effCap=maxFrameBytes < batchBytes):
+            //   Use an exact pre-flight check: compute the wire contribution of this
+            //   record (recordBodyContrib) and ABORT if appending it would push
+            //   builderBytes past effCap.  The check uses wallNs() for tsDelta, which
+            //   is the same function the builder calls inside append() — so the
+            //   predicted size matches the actual encoded size.  The builder is reset
+            //   to builderBaseWallNs on each frame boundary.
+            //   ABORT even when inFlight has room so the current frame is flushed
+            //   first; this guarantees NO emitted RecordBatch exceeds effCap wire.
+            if (frameCapped && ps.builder && ps.builder->recordCount() > 0) {
+                // Compute exact wire contribution of this next record.
+                // wallNs() here and inside builder->append() may differ by ≤1µs,
+                // which can shift varlongLen(tsDelta) by +1 byte at boundary values.
+                // Adding 1 byte of slack makes the check conservative (splits ≤1 byte
+                // early at boundary values) but guarantees NO overshoot.
+                const int64_t tsDelta = wallNs() - ps.builderBaseWallNs;
+                const int32_t contrib = recordBodyContrib(
+                    static_cast<int32_t>(keyLen),
+                    static_cast<int32_t>(valueLen),
+                    tsDelta,
+                    ps.builder->recordCount() /* offsetDelta = current record count */)
+                    + 1; // +1 byte slack for wallNs() jitter between pre-flight and append
+
+                if (ps.builderBytes + contrib > effCap) {
+                    // Record would overshoot: ABORT.  flushBatches will fire on
+                    // sizeFull (builderBytes >= effCap) or via flushRequested=true
+                    // when builderBytes < effCap but still needs to flush.
+                    if (ps.builderBytes < effCap) {
+                        // sizeFull won't trigger (builder not yet at cap); force flush
+                        // via otherTrigger so the current batch is sent this cycle.
+                        ps.flushRequested = true;
+                    }
+                    return ControlledAction::ABORT;
+                }
+            }
+            // Normal-path backpressure: ABORT when full AND at maxInFlight.
+            if (!frameCapped && ps.builderBytes >= effCap && ps.inFlight >= cfg_.maxInFlight) {
                 return ControlledAction::ABORT;
             }
 
@@ -413,11 +510,16 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             // Create the builder ONCE per partition; reused (reset in place) across
             // batches so there is no per-batch heap allocation.
             if (!ps.builder) {
-                ps.builder = std::make_unique<rune::protocol::RecordBatchBuilder>(0, wallNs());
+                const int64_t baseWall = wallNs();
+                ps.builder = std::make_unique<rune::protocol::RecordBatchBuilder>(0, baseWall);
+                ps.builderBaseWallNs = baseWall;
             }
             if (ps.builder->recordCount() == 0) {
                 ps.builderBytes = 0;
                 ps.batchStartNs = nowNs;
+                // Reset base wall time so tsDelta is computed relative to this batch's
+                // first record (mirrors the reset(0, wallNs()) call in encodeAndSend).
+                ps.builderBaseWallNs = wallNs();
             }
 
             // Batch acks (Kafka-style, ZERO-ALLOC): record this ack-wanting record's
@@ -696,7 +798,13 @@ int ProducerImpl::flushBatches(
 
         if (tier1Pending) {
             const bool lingerExpired  = (nowNs - ps.batchStartNs) >= lingerNs;
-            const bool sizeFull       = (ps.builderBytes >= cfg_.batchBytes) ||
+            // Effective per-frame cap: tighter of maxFrameBytes and batchBytes.
+            // Zero-cost on the normal path (maxFrameBytes >= batchBytes): the compare
+            // collapses to batchBytes with no new branch taken.
+            const int32_t effCap =
+                (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes)
+                ? cfg_.maxFrameBytes : cfg_.batchBytes;
+            const bool sizeFull       = (ps.builderBytes >= effCap) ||
                                         (cfg_.batchRecords > 0 &&
                                          ps.builder->recordCount() >= cfg_.batchRecords);
             const bool otherTrigger   = lingerExpired || ps.flushRequested || globalFlush ||
@@ -705,7 +813,7 @@ int ProducerImpl::flushBatches(
 
             // maxInFlight gates ALL flushes (bounds outstanding un-acked batches —
             // the durability/idempotent window; the MaxInFlightBound contract).
-            // The builder can never grow past batchBytes because drainRing's drain
+            // The builder can never grow past effCap because drainRing's drain
             // gate STOPS draining a partition once it is size-full AND at
             // maxInFlight, so no oversized (unsendable) frame is ever built.
             const bool doFlush        = canFlight && (sizeFull || otherTrigger);

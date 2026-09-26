@@ -418,3 +418,414 @@ TEST(ProducerBatching, EnvKnobsApplied) {
     if (hadRecords) ::setenv("RUNE_BATCH_RECORDS", oldRecords.c_str(), 1);
     else            ::unsetenv("RUNE_BATCH_RECORDS");
 }
+
+// ===========================================================================
+// Task 3: Cap per-frame wire size — split oversize batches
+//
+// Tests:
+//   LargeBatchSplitsIntoCappedFrames
+//     2000 records × 256 bytes ≈ 512 KiB into one partition with
+//     batchBytes=1 MiB and maxFrameBytes=16 KiB. Expects ≥32 frames,
+//     each RecordBatch ≤ 16384 bytes, and total 2000 records preserved.
+//
+//   FrameAtCapBoundaryEmitsOne_PlusOneEmitsTwo
+//     Compute the exact wire size of 64 × 256B records.  Produce exactly
+//     that many records (one frame) then one more (two frames).
+//
+// Gateway design:
+//   CapGateway extends BatchGateway's Aeron setup pattern but captures
+//   per-frame RecordBatch byte counts and record counts for assertions.
+// ===========================================================================
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// CapGateway — like BatchGateway but captures per-frame RecordBatch info.
+// Not thread-safe: gwAsm handler runs on the test thread (via gw->poll()).
+// ---------------------------------------------------------------------------
+
+struct FrameInfo {
+    int32_t rbWireBytes = 0;  // RecordBatch portion of the Produce frame
+    int32_t recordCount  = 0;  // records decoded from the RecordBatch header
+};
+
+struct CapGateway {
+    std::atomic<int>                              batchCount{0};
+    std::vector<FrameInfo>                        frames;   // guarded by test thread
+    std::shared_ptr<aeron::Aeron>                 gwAeron;
+    std::shared_ptr<aeron::Subscription>          gwSub;
+    std::shared_ptr<aeron::ExclusivePublication>  gwPub;
+    std::unique_ptr<aeron::FragmentAssembler>     gwAsm;
+    uint8_t replyBuf[2048]{};
+
+    explicit CapGateway(const std::string& aeronDir,
+                        int32_t ingressStream,
+                        int32_t egressStream)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir);
+        gwAeron = aeron::Aeron::connect(ctx);
+        if (!gwAeron) throw std::runtime_error("CapGateway: connect failed");
+
+        const int64_t subId = gwAeron->addSubscription("aeron:ipc", ingressStream);
+        const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", egressStream);
+
+        const auto dl = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < dl) {
+            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
+            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
+            if (gwSub && gwPub) break;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        if (!gwSub || !gwPub)
+            throw std::runtime_error("CapGateway: sub/pub timed out");
+
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off, aeron::util::index_t len,
+                   aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                        static_cast<std::size_t>(len));
+            });
+    }
+
+    ~CapGateway() {
+        gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset();
+    }
+
+    int poll(int limit = 32) {
+        if (!gwSub || !gwAsm) return 0;
+        return gwSub->poll(gwAsm->handler(), limit);
+    }
+
+    bool gwSend(const uint8_t* buf, std::size_t len) {
+        if (!gwPub) return false;
+        const auto ilen = static_cast<aeron::util::index_t>(len);
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), ilen);
+        for (int i = 0; i < 500; ++i) {
+            if (gwPub->offer(ab, 0, ilen) > 0) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return false;
+    }
+
+    void onFrame(const uint8_t* buf, std::size_t len) {
+        const auto tidOpt = rcc::peekTemplate(buf, len);
+        if (!tidOpt) return;
+
+        const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
+
+        if (tid == rcc::TemplateId::Connect) {
+            const auto opt = rcc::decodeConnectRequest(buf, len);
+            if (!opt) return;
+            const std::size_t n = rcc::encodeConnectResponse(
+                replyBuf, sizeof(replyBuf),
+                static_cast<int16_t>(rcc::ErrorCode::OK),
+                /*leaderMemberId=*/0,
+                /*assignedSessionId=*/42,
+                opt->sessionId,
+                opt->correlationId);
+            if (n > 0) gwSend(replyBuf, n);
+            return;
+        }
+
+        if (tid == rcc::TemplateId::Produce) {
+            batchCount.fetch_add(1, std::memory_order_release);
+            const auto pv = rcc::decodeProduce(buf, len);
+            if (!pv) return;
+
+            FrameInfo fi;
+            fi.rbWireBytes = static_cast<int32_t>(pv->recordBatch.size());
+
+            // Decode record count from the RecordBatch header.
+            if (pv->recordBatch.size() >=
+                    static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+                rune::protocol::RecordBatchReader reader(
+                    pv->recordBatch.data(), pv->recordBatch.size());
+                fi.recordCount = reader.recordCount();
+            }
+            frames.push_back(fi);
+        }
+    }
+
+    int totalRecords() const {
+        int n = 0;
+        for (const auto& f : frames) n += f.recordCount;
+        return n;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// CapHarness — mirrors BatchingHarness but uses CapGateway.
+// ---------------------------------------------------------------------------
+
+struct CapHarness {
+    std::string agentDir;
+    std::string aeronDir;
+
+    std::unique_ptr<rca::ClientAgent> agent;
+    std::unique_ptr<CapGateway>       gw;
+
+    rprod::ProducerHub    hub;
+    std::atomic<int64_t>  nextCorrId_{1};
+
+    explicit CapHarness(int32_t ingressStream, int32_t egressStream,
+                        int32_t ringCap = 4 * 1024 * 1024)
+    {
+        agentDir = uniqueDir("cap_test");
+        aeronDir = agentDir + "/aeron";
+
+        rca::AgentConfig cfg;
+        cfg.transport.ingressChannel  = "aeron:ipc";
+        cfg.transport.ingressStreamId = ingressStream;
+        cfg.transport.egressChannel   = "aeron:ipc";
+        cfg.transport.egressStreamId  = egressStream;
+        cfg.transport.dataDir         = agentDir;
+        cfg.session.egressChannel     = "aeron:ipc";
+        cfg.session.egressStreamId    = egressStream;
+        cfg.session.keepaliveIntervalNs = 10'000'000'000LL;
+        cfg.ringCapacity              = ringCap;
+
+        agent = std::make_unique<rca::ClientAgent>(cfg);
+
+        agent->setProducerDrainFn(
+            [this](int64_t nowNs, int64_t sessionId,
+                   rca::ClientAgent::SendFn sendFn) -> int {
+                return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
+            });
+        agent->setProduceResponseFn(
+            [this](int64_t correlationId, int64_t baseOffset) {
+                hub.onProduceResponse(correlationId, baseOffset);
+            });
+        agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
+
+        agent->start();
+        std::this_thread::sleep_for(150ms);
+
+        gw = std::make_unique<CapGateway>(aeronDir, ingressStream, egressStream);
+    }
+
+    ~CapHarness() {
+        gw.reset();
+        if (agent) agent->stop();
+        try { std::filesystem::remove_all(agentDir); } catch (...) {}
+    }
+
+    Producer makeProducer(ProducerConfig pcfg = {}) {
+        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_);
+        hub.add(impl);
+        return Producer(std::move(impl));
+    }
+
+    bool connect(int limit = kPumpMax) {
+        agent->submitConnect();
+        for (int i = 0; i < limit; ++i) {
+            agent->doWork(monoNs());
+            gw->poll();
+            if (agent->sessionState() == rcs::SessionState::Connected)
+                return true;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        return false;
+    }
+
+    // Pump until gw->batchCount >= target, then drain remaining frames.
+    bool pumpUntilBatches(int target, int limit = kPumpMax) {
+        for (int i = 0; i < limit; ++i) {
+            agent->doWork(monoNs());
+            gw->poll();
+            if (gw->batchCount.load(std::memory_order_acquire) >= target)
+                return true;
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        return false;
+    }
+};
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// LargeBatchSplitsIntoCappedFrames
+//
+// batchBytes=1 MiB, maxFrameBytes=16 KiB.  Produce 2000 × 256B records
+// into 1 partition.  Wire total ≈ 512 KiB.
+//
+// Expected (post-implementation):
+//   - At least 32 frames (512 KiB / 16 KiB).
+//   - Each frame's RecordBatch ≤ 16384 bytes.
+//   - Total records across all frames == 2000.
+//
+// Current (pre-implementation): ONE frame of ≈512 KiB → test fails.
+// ---------------------------------------------------------------------------
+TEST(ProducerFrameCap, LargeBatchSplitsIntoCappedFrames) {
+    static constexpr int32_t kInStr = 2051, kEgStr = 2052;
+    static constexpr int32_t kMaxFrameBytes = 16384;
+    static constexpr int      kRecords      = 2000;
+    static constexpr int      kValBytes     = 256;
+
+    CapHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect to cap-gateway";
+
+    ProducerConfig cfg;
+    cfg.acks          = Acks::None;
+    cfg.batchBytes    = 1 << 20;        // 1 MiB logical — much larger than cap
+    cfg.maxFrameBytes = kMaxFrameBytes; // 16 KiB per-frame cap
+    cfg.lingerUs      = 5'000;          // short linger so size trigger dominates
+    cfg.batchRecords  = 0;
+    cfg.maxInFlight   = 64;
+
+    auto topic = makeTopic(200, 1);
+    Key  key(uint64_t{1});
+
+    const std::vector<uint8_t> payload(kValBytes, 0xAB);
+    auto p = h.makeProducer(cfg);
+
+    for (int i = 0; i < kRecords; ++i) {
+        p.send(topic, key, std::span<const uint8_t>(payload));
+    }
+    p.flush();
+
+    // Rough minimum frame count: total wire / cap.
+    // Each frame overhead = kRecordBatchOverhead = 61 bytes; payload per record ≈ 270B wire.
+    // We expect ≥ 32 frames for 2000 × 256B.
+    const int minFrames = (kRecords * (kValBytes + 20)) / kMaxFrameBytes;
+
+    ASSERT_TRUE(h.pumpUntilBatches(minFrames))
+        << "Timed out waiting for " << minFrames << " frames";
+
+    // Drain any remaining frames.
+    for (int i = 0; i < 200; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    const auto& frames = h.gw->frames;
+    ASSERT_GE(static_cast<int>(frames.size()), minFrames)
+        << "Expected >= " << minFrames << " frames, got " << frames.size();
+
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        EXPECT_LE(frames[i].rbWireBytes, kMaxFrameBytes)
+            << "Frame " << i << " RecordBatch wire bytes " << frames[i].rbWireBytes
+            << " exceeds cap " << kMaxFrameBytes;
+    }
+
+    EXPECT_EQ(h.gw->totalRecords(), kRecords)
+        << "Total records across all frames must equal " << kRecords
+        << " (got " << h.gw->totalRecords() << ")";
+}
+
+// ---------------------------------------------------------------------------
+// FrameAtCapBoundaryEmitsOnePerFrame
+//
+// Set maxFrameBytes to a cap that fits exactly ONE record of 256B value +
+// 8B key (kRecordBatchOverhead + one record body ≈ 335-345 bytes at typical
+// runtime tsDelta).  Use maxFrameBytes=400 which fits 1 record and NOT 2.
+//
+// Send 3 records into 1 partition: expect exactly 3 frames (one record each).
+// Each frame's RecordBatch wire bytes must be ≤ 400.
+//
+// This validates:
+//   1. The frame cap splits correctly at tight boundaries.
+//   2. No record is dropped (total records = 3).
+//   3. Each emitted frame is within the cap.
+// ---------------------------------------------------------------------------
+TEST(ProducerFrameCap, FrameAtCapBoundaryEmitsOnePerFrame) {
+    static constexpr int32_t kInStr    = 2053, kEgStr = 2054;
+    static constexpr int32_t kCap      = 400;   // fits 1 × 256B record, not 2
+    static constexpr int      kValBytes = 256;
+    static constexpr int      kRecords  = 3;
+
+    CapHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect (boundary test)";
+
+    ProducerConfig cfg;
+    cfg.acks          = Acks::None;
+    cfg.batchBytes    = 1 << 20;    // large — size trigger comes from maxFrameBytes
+    cfg.maxFrameBytes = kCap;
+    cfg.lingerUs      = 1'000'000;  // 1 s — linger must NOT fire during test
+    cfg.batchRecords  = 0;
+    cfg.maxInFlight   = 64;
+
+    auto topic = makeTopic(203, 1);
+    Key  key(uint64_t{1});
+    const std::vector<uint8_t> payload(kValBytes, 0xAB);
+    auto p = h.makeProducer(cfg);
+
+    for (int i = 0; i < kRecords; ++i)
+        p.send(topic, key, std::span<const uint8_t>(payload));
+    p.flush();
+
+    ASSERT_TRUE(h.pumpUntilBatches(kRecords))
+        << "Timed out waiting for " << kRecords << " frames";
+
+    // Extra pump to catch any stray frames.
+    for (int i = 0; i < 100; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    const auto& frames = h.gw->frames;
+
+    // Each 256B record + 8B key fits in ~335-345 bytes wire; two would exceed kCap=400.
+    EXPECT_EQ(static_cast<int>(frames.size()), kRecords)
+        << "Each record must be in its own frame (got " << frames.size() << " frames)";
+
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        EXPECT_LE(frames[i].rbWireBytes, kCap)
+            << "Frame " << i << " rbWireBytes=" << frames[i].rbWireBytes
+            << " exceeds cap=" << kCap;
+        EXPECT_EQ(frames[i].recordCount, 1)
+            << "Frame " << i << " should have exactly 1 record";
+    }
+
+    EXPECT_EQ(h.gw->totalRecords(), kRecords)
+        << "All " << kRecords << " records must be preserved";
+}
+
+// ---------------------------------------------------------------------------
+// FrameCapDoesNotSplitWhenBelowCap
+//
+// Verify the normal path: when maxFrameBytes >= batchBytes (or effectively
+// when batchBytes is the tighter constraint), no split occurs and records
+// coalesce normally.  Uses batchRecords=5 to flush every 5 records with
+// maxFrameBytes=1MiB (larger than any real batch).
+// ---------------------------------------------------------------------------
+TEST(ProducerFrameCap, FrameCapDoesNotSplitWhenBelowCap) {
+    static constexpr int32_t kInStr = 2057, kEgStr = 2058;
+
+    CapHarness h(kInStr, kEgStr);
+    ASSERT_TRUE(h.connect()) << "Failed to connect (no-split test)";
+
+    ProducerConfig cfg;
+    cfg.acks          = Acks::None;
+    cfg.batchBytes    = 64 * 1024;
+    cfg.maxFrameBytes = 1 << 20;  // 1 MiB — much larger than batchBytes → no frame split
+    cfg.lingerUs      = 1'000'000;
+    cfg.batchRecords  = 5;        // flush every 5 records
+    cfg.maxInFlight   = 64;
+
+    auto topic = makeTopic(204, 1);
+    Key  key(uint64_t{1});
+    const std::vector<uint8_t> payload(32, 0xCD);  // small payload, 5 easily fit
+    auto p = h.makeProducer(cfg);
+
+    for (int i = 0; i < 15; ++i)  // 3 batches of 5
+        p.send(topic, key, std::span<const uint8_t>(payload));
+
+    ASSERT_TRUE(h.pumpUntilBatches(3))
+        << "Timed out waiting for 3 frames";
+
+    for (int i = 0; i < 50; ++i) {
+        h.agent->doWork(monoNs());
+        h.gw->poll();
+        std::this_thread::sleep_for(kPumpSleep);
+    }
+
+    EXPECT_EQ(static_cast<int>(h.gw->frames.size()), 3)
+        << "With batchRecords=5 and 15 records, expected 3 frames (got "
+        << h.gw->frames.size() << ")";
+    EXPECT_EQ(h.gw->totalRecords(), 15)
+        << "All 15 records must be preserved";
+}
