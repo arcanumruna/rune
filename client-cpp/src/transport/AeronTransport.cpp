@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <thread>
@@ -428,6 +429,20 @@ void AeronTransport::startEmbeddedDriver() {
     aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
     aeron_driver_context_set_term_buffer_length(
         driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
+    // Task 6: larger OS UDP socket buffers so the client kernel does not drop
+    // ack (egress) or produce datagrams under burst.  Overridable via
+    // RUNE_AERON_SOCKET_BUFFER_BYTES (0 = leave Aeron's default).
+    {
+        std::size_t sockBuf = 2u * 1024 * 1024;
+        if (const char* raw = std::getenv("RUNE_AERON_SOCKET_BUFFER_BYTES")) {
+            const long v = std::strtol(raw, nullptr, 10);
+            if (v >= 0) sockBuf = static_cast<std::size_t>(v);
+        }
+        if (sockBuf > 0) {
+            aeron_driver_context_set_socket_so_sndbuf(driverCtx_, sockBuf);
+            aeron_driver_context_set_socket_so_rcvbuf(driverCtx_, sockBuf);
+        }
+    }
 
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {
         aeron_driver_context_close(driverCtx_);
