@@ -301,7 +301,9 @@ int64_t ProducerImpl::registerCallback(std::function<void(int64_t)> cb) {
     pa.kind     = PendingAck::Kind::Callback;
     pa.callback = std::move(cb);
     pa.deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(cfg_.produceTimeoutMs);
+                  std::chrono::milliseconds(cfg_.deliveryTimeoutMs);  // survive retransmits;
+                  // batch-level retransmitStalled resends every produceTimeoutMs until
+                  // this delivery deadline, so a record only fails if delivery truly fails.
     pendingAcks_.emplace(corrId, std::move(pa));
     return corrId;
 }
@@ -312,7 +314,9 @@ std::pair<int64_t, std::future<int64_t>> ProducerImpl::registerFuture() {
     PendingAck pa;
     pa.kind    = PendingAck::Kind::Future;
     pa.deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(cfg_.produceTimeoutMs);
+                  std::chrono::milliseconds(cfg_.deliveryTimeoutMs);  // survive retransmits;
+                  // batch-level retransmitStalled resends every produceTimeoutMs until
+                  // this delivery deadline, so a record only fails if delivery truly fails.
     auto fut = pa.promise.get_future();
     pendingAcks_.emplace(corrId, std::move(pa));
     return {corrId, std::move(fut)};
@@ -665,6 +669,11 @@ bool ProducerImpl::encodeAndSend(
         bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
         bi.ackStart       = ps.batchAckStart; // zero-alloc per-record fan-out slice
         bi.ackCount       = ps.batchAckCount;
+        // Reliability: arm the retransmit clock.  produceTimeoutMs per attempt,
+        // deliveryTimeoutMs total (see retransmitStalled).
+        bi.firstSendNs       = nowNs;
+        bi.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
+        bi.attempts          = 1;
         batchMap_[correlationId] = std::move(bi);
     }
 
@@ -982,6 +991,54 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
             ++it;
         }
     }
+}
+
+int ProducerImpl::retransmitStalled(
+    int64_t nowNs,
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
+{
+    // ZERO happy-path cost: batchMap_ is ordered by corrId == send order == deadline
+    // order (all deadlines are sendNs + produceTimeoutMs, monotonic).  So the OLDEST
+    // batch (map front) has the earliest attemptDeadlineNs.  If it hasn't expired,
+    // nothing has → return immediately without scanning.  On the happy path the front
+    // entry is erased on ack long before its deadline, so this is an O(1) check.
+    if (batchMap_.empty()) return 0;
+    if (nowNs < batchMap_.begin()->second.attemptDeadlineNs) return 0;
+
+    const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
+    int resent = 0;
+    for (auto it = batchMap_.begin(); it != batchMap_.end(); ) {
+        BatchInfo& bi = it->second;
+        if (nowNs < bi.attemptDeadlineNs) { ++it; continue; } // attempt still in flight
+
+        if (bi.wireFrame.empty()) { ++it; continue; }  // nothing to resend (defensive)
+
+        if (nowNs - bi.firstSendNs >= deliveryNs) {
+            // Delivery deadline exhausted.  Stop resending and drop the retry record;
+            // the per-record pendingAcks_ (deadline == deliveryTimeoutMs) fail via
+            // sweepTimedOut, so the caller learns the batch was not delivered.
+            std::fprintf(stderr,
+                "ProducerImpl: batch corrId=%ld undelivered after %d attempts / %ldms "
+                "(topic=%d part=%d); giving up\n",
+                static_cast<long>(it->first), bi.attempts, static_cast<long>(cfg_.deliveryTimeoutMs),
+                bi.topicId, bi.partition);
+            it = batchMap_.erase(it);
+            continue;
+        }
+
+        // Retransmit the SAME wire frame (same pid+seq/corrId → broker dedups and
+        // re-acks the original offset).  Reset the per-attempt deadline.
+        if (sendFn(bi.ingressStreamId, bi.wireFrame.data(), bi.wireFrame.size())) {
+            ++bi.attempts;
+            bi.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
+            ++resent;
+        } else {
+            // Transport back-pressure: leave the deadline in the past and retry next
+            // duty cycle (do NOT advance attemptDeadlineNs — we made no progress).
+        }
+        ++it;
+    }
+    return resent;
 }
 
 bool ProducerImpl::retryRedirectedProduce(

@@ -295,6 +295,14 @@ public:
     int flushBatches(int64_t nowNs, int64_t sessionId,
                      std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
 
+    /// Reliability: retransmit in-flight batches whose current attempt is deemed
+    /// lost (nowNs >= attemptDeadlineNs), until acked or deliveryTimeoutMs elapses.
+    /// Idempotent (same corrId → broker dedups).  Called from the agent duty cycle
+    /// with the same nowNs + sendFn as flushBatches.  O(1) when nothing is stalled
+    /// (checks the oldest batch — map front — and returns early). Returns # resent.
+    int retransmitStalled(int64_t nowNs,
+                          const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+
     /// Called by the agent when a ProduceResponse arrives.  Resolves the pending
     /// ack (callback/future) by correlationId.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset);
@@ -488,6 +496,14 @@ private:
         // ackCount==0 for acks=None batches.
         uint64_t             ackStart = 0;
         int32_t              ackCount = 0;
+        // Reliability (idempotent retransmit): monotonic send bookkeeping.
+        // firstSendNs = when this batch first went on the wire; attemptDeadlineNs =
+        // when the current attempt is deemed lost (→ retransmit, same corrId so the
+        // broker dedups).  Retransmitted until acked or firstSendNs+deliveryTimeoutMs.
+        // Happy path erases the entry on ack before attemptDeadlineNs — zero cost.
+        int64_t              firstSendNs       = 0;
+        int64_t              attemptDeadlineNs = 0;
+        int32_t              attempts          = 0;
     };
     std::map<int64_t, BatchInfo> batchMap_;
 

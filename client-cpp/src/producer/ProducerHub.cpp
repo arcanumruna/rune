@@ -76,6 +76,9 @@ int ProducerHub::drainAndFlush(int64_t nowNs,
             work += drained + flushed;
             if (drained == 0) break; // no more messages in the ring
         }
+        // Reliability: retransmit any in-flight batch whose attempt timed out (O(1)
+        // when nothing is stalled — checks the oldest batch and returns).
+        work += impl->retransmitStalled(nowNs, sendFn);
     }
     return work;
 }
