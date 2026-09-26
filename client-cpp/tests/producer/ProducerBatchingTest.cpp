@@ -349,6 +349,22 @@ TEST(ProducerBatching, CoalescesRecordsIntoFewerFrames) {
 }
 
 // ===========================================================================
+// ProducerConfigFromEnv — Task 1: linger=0 must be honored
+// ===========================================================================
+
+TEST(ProducerConfigFromEnv, LingerZeroIsHonored) {
+    ::setenv("RUNE_LINGER_US", "0", 1);
+    auto cfg = rune::client::ProducerConfig::fromEnv();
+    ::unsetenv("RUNE_LINGER_US");
+    EXPECT_EQ(cfg.lingerUs, 0);   // 0 must be honored, not treated as "unset"
+}
+TEST(ProducerConfigFromEnv, LingerUnsetKeepsDefault) {
+    ::unsetenv("RUNE_LINGER_US");
+    auto cfg = rune::client::ProducerConfig::fromEnv();
+    EXPECT_EQ(cfg.lingerUs, 5000);
+}
+
+// ===========================================================================
 // EnvKnobsApplied
 //
 // ProducerConfig::fromEnv() correctly reads RUNE_LINGER_US, RUNE_BATCH_BYTES,

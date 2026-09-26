@@ -19,7 +19,7 @@ ProducerConfig ProducerConfig::fromEnv() noexcept {
     ProducerConfig cfg{};
     if (const char* v = std::getenv("RUNE_LINGER_US")) {
         const long val = std::strtol(v, nullptr, 10);
-        if (val > 0) cfg.lingerUs = static_cast<int64_t>(val);
+        if (val >= 0) cfg.lingerUs = static_cast<int64_t>(val);
     }
     if (const char* v = std::getenv("RUNE_BATCH_BYTES")) {
         const long val = std::strtol(v, nullptr, 10);
