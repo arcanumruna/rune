@@ -660,6 +660,27 @@ private:
     // Follower HW (leader uses leaderState_.highWatermark())
     Offset followerHw_ = 0;
 
+    // Highest leader HW this follower has ever heard (from FetchResponse.highWatermark).
+    // Used to tell "caught up" (localLeo >= lastKnownLeaderHw_) from "behind": a
+    // caught-up follower fetches only on a slow keepalive cadence and does NOT count
+    // that fetch as work, so the idle backoff parks instead of spinning a 5ms
+    // fetch/empty-response ping-pong.  0 = never heard from a leader yet.
+    Offset lastKnownLeaderHw_ = 0;
+    // False until this follower has received ANY response from the current leader.
+    // Until then it fetches on the FAST cadence (bootstrap / catch-up) — a follower
+    // that has not yet heard the leader's position must not be treated as "caught up"
+    // just because both sit at offset 0.
+    bool   heardFromLeader_ = false;
+    // True when the last response/push from the leader carried NO records — the
+    // robust "caught up" signal (an empty response means the leader had nothing
+    // beyond our fetch offset).  Unlike a HW comparison this is immune to the
+    // min-ISR-gated HW reading 0 while WE are the follower gating it.  A response
+    // that carries records (even one we cannot yet apply due to a gap) means the
+    // leader is ahead → keep fetching fast.
+    bool   lastResponseEmpty_ = false;
+    // (Caught-up keepalive cadence is computed in doWork from replicaLagMaxMs so it
+    //  always keeps the follower in the ISR — see the follower fetch-emit path.)
+
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
     //
     // On becomeFollower(newEpoch) we do NOT truncate eagerly.  Instead we set

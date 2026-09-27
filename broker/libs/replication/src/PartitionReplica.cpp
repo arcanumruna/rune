@@ -327,6 +327,9 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     role_     = Role::Follower;
     leaderId_ = leaderId;
     followerHw_ = 0;
+    lastKnownLeaderHw_ = 0;   // new leader — relearn its HW before "caught up" applies
+    heardFromLeader_ = false;
+    lastResponseEmpty_ = false;
     lastFetchEmitNs_ = 0;
     reconcileTarget_ = -1;
 
@@ -480,6 +483,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         epoch_    = req.leaderEpoch;
         leaderId_ = req.followerId; // best-effort; coordinator will correct
         followerHw_ = committedHw;
+        lastKnownLeaderHw_ = 0;   // relearn the new leader's HW before "caught up" applies
+        heardFromLeader_ = false;
+        lastResponseEmpty_ = false;
         lastFetchEmitNs_ = 0;
 
         // DR-9 m1: arm the KIP-101 epoch probe exactly as becomeFollower() does
@@ -703,6 +709,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         return; // stale-epoch push — deposed leader must not mutate a newer follower's log
     }
 
+    // Adaptive fetch cadence bookkeeping: we have now heard from the current (or a
+    // newer) leader.  Record its advertised HW BEFORE any gap/truncate handling, so a
+    // follower that has a gap (or is otherwise behind) still learns the leader is
+    // ahead and keeps fetching FAST to backfill.  doWork uses this to pick the fetch
+    // cadence: fast while behind, slow keepalive once caught up (no idle spin).
+    heardFromLeader_ = true;
+    if (resp.highWatermark > lastKnownLeaderHw_) lastKnownLeaderHw_ = resp.highWatermark;
+    // Empty response ⟺ caught up (leader had nothing beyond our fetch offset).
+    lastResponseEmpty_ = resp.records.empty();
+
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
@@ -838,6 +854,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (newHw > followerHw_) {
         followerHw_ = newHw;
     }
+    // (lastKnownLeaderHw_ / heardFromLeader_ were recorded at the top of this
+    //  function, before any gap/truncate handling.)
 
     // GR-10: fast-ack — immediately emit a FetchRequest to the leader carrying
     // our new LEO.  This collapses acks=All from fetchInterval+RTT to ~RTT
@@ -1495,11 +1513,35 @@ int PartitionReplica::doWork(int64_t nowNs)
             }
         } else {
             // Follower: emit a fetch on cadence.
-            if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
+            //
+            // CAUGHT UP (our LEO has reached the highest leader HW we have heard):
+            //   the periodic fetch is only an ISR-liveness keepalive + a lost-push
+            //   backstop — new data arrives via GR-10 push + fast-ack, not here.  Use
+            //   the SLOW keepalive cadence and DO NOT count it as work, so the idle
+            //   backoff parks instead of spinning a 5ms fetch/empty-response ping-pong
+            //   (which otherwise pinned both control threads on an idle cluster).
+            // BEHIND (or leader position not yet known): fetch on the FAST cadence and
+            //   count it as work — this is real catch-up.
+            // Caught up ⟺ we have heard the leader's position AND our LEO has reached
+            // the highest leader HW we heard.  A follower that has not yet heard from
+            // the leader (heardFromLeader_ == false) is NOT treated as caught up even
+            // at offset 0, so it bootstraps/backfills on the fast cadence.
+            const bool caughtUp = heardFromLeader_ && lastResponseEmpty_;
+            // Caught-up keepalive: slow, but ALWAYS several fetches per replica-lag
+            // window so the follower is never evicted from the ISR and ISR
+            // re-expansion stays responsive (must stay well under replicaLagMaxMs).
+            // Scales with the lag window: a 20ms window keeps the 5ms fast cadence; a
+            // 1s window gives 250ms; a 10s production window gives 2.5s idle keepalive.
+            // Never faster than the fast cadence.
+            const int64_t keepaliveNs = std::max<int64_t>(
+                cfg_.fetchIntervalNs,
+                (cfg_.replicaLagMaxMs * 1'000'000LL) / 4);
+            const int64_t interval = caughtUp ? keepaliveNs : cfg_.fetchIntervalNs;
+            if (nowNs - lastFetchEmitNs_ >= interval) {
                 lastFetchEmitNs_ = nowNs;
                 FetchRequestMsg req = nextFetch();
                 transport_->sendFetchRequest(req);
-                ++work;
+                if (!caughtUp) ++work;
             }
         }
     }
