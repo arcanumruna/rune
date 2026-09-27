@@ -254,8 +254,6 @@ bool ClientGateway::sendRespReliable_(Session&          session,
                                       int64_t           baseOffset,
                                       int64_t           correlationId)
 {
-    RUNE_FR_SPAN(rune_fr::Site::ProduceAckSend,
-                 static_cast<uint32_t>(correlationId));
     static_assert(pc::ProduceResponse::ENCODED_SIZE <= PendingResp::kMaxBytes,
                   "ProduceResponse::ENCODED_SIZE exceeds PendingResp::kMaxBytes");
     static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
@@ -2875,6 +2873,11 @@ void ClientGateway::drainWorkerReturns_()
         // ProduceResult
         // ===================================================================
         if (ret.type == rune::node::WorkerReturn::Type::ProduceResult) {
+            // Mark the instant the gateway first sees the worker's produce result.
+            // The gap between WorkerAppend (worker thread) and this mark is the
+            // worker→gateway return-ring + duty-cycle latency (same correlationId).
+            RUNE_FR_MARK(rune_fr::Site::WorkerProcessOp,
+                         static_cast<uint32_t>(ret.correlationId));
             Session* session = sessions_.find(ret.sessionId);
             if (!session) {
                 // Session gone — drop result silently.
@@ -2967,7 +2970,9 @@ void ClientGateway::drainWorkerReturns_()
                     "pending-ack sessionId={} partition={} baseOffset={} lastOffset={}",
                     ret.sessionId, ret.partition, ret.baseOffset, ret.lastOffset);
             } else {
-                // Immediate ack.
+                // Immediate ack (acks=Leader/None) — encode + reliable egress send.
+                RUNE_FR_SPAN(rune_fr::Site::ProduceAckSend,
+                             static_cast<uint32_t>(ret.correlationId));
                 pc::ProduceResponse okResp;
                 okResp.sessionId     = ret.sessionId;
                 okResp.correlationId = ret.correlationId;
