@@ -11,6 +11,17 @@ set(RUNE_PROTOCOL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include)
 set(RUNE_NODE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/include)
 
 find_package(aeron)
+# macOS/armv8: the aeron ConanCenter recipe is unsupported there (see conanfile.py),
+# so aeron is skipped and find_package finds nothing.  Provide a stub INTERFACE
+# target so the many `target_link_libraries(... aeron::aeron)` calls still resolve
+# and CMake CONFIGURE succeeds for IDE loading/indexing on a Mac.  The broker is
+# only built/run on Linux, where the real aeron::aeron target is used.
+if(NOT TARGET aeron::aeron)
+    message(WARNING "aeron not found — creating a STUB aeron::aeron INTERFACE target "
+                    "(configure-only; broker build/run requires real aeron on Linux).")
+    add_library(rune_aeron_stub INTERFACE)
+    add_library(aeron::aeron ALIAS rune_aeron_stub)
+endif()
 find_package(spdlog REQUIRED)
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
