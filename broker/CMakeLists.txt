@@ -105,6 +105,9 @@ if(BUILD_BENCHMARKS)
         benchmark/LogSegmentBenchmark.cpp
         benchmark/LogBenchmark.cpp
         benchmark/InMemoryLogBenchmark.cpp
+        benchmark/ThrottlerBenchmark.cpp
+        benchmark/ProducePathBenchmark.cpp
+        benchmark/ProducerIdScanBenchmark.cpp
         benchmark/RetentionBenchmark.cpp
         benchmark/PartitionApiBenchmark.cpp
         benchmark/LeaderEpochCacheBenchmark.cpp
