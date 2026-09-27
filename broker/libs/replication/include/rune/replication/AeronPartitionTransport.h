@@ -65,7 +65,7 @@ namespace rune::node { class WorkerPool; }
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 #include <Subscription.h>
-#include <FragmentAssembler.h>
+#include <ControlledFragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 
@@ -273,12 +273,18 @@ private:
     int drainOutbound();
 
     // -----------------------------------------------------------------------
-    // Fragment callback — called by FragmentAssembler on each reassembled frame.
+    // Fragment callback — called by ControlledFragmentAssembler on each reassembled
+    // frame.  Returns a ControlledPollAction so the ingress can apply END-TO-END
+    // BACK-PRESSURE: when a target worker's SPSC ingress ring is full we return
+    // ABORT, which leaves the fragment UNCONSUMED (position not advanced) so Aeron
+    // re-delivers it on the next controlledPoll — the data stays in the publication,
+    // flow control backs up to the sender, and nothing is dropped.  Malformed /
+    // unroutable frames return CONTINUE (skip + advance).
     // -----------------------------------------------------------------------
-    void onFragment(aeron::concurrent::AtomicBuffer& buffer,
-                    aeron::util::index_t             offset,
-                    aeron::util::index_t             length,
-                    aeron::Header&                   header);
+    aeron::ControlledPollAction onFragment(aeron::concurrent::AtomicBuffer& buffer,
+                                           aeron::util::index_t             offset,
+                                           aeron::util::index_t             length,
+                                           aeron::Header&                   header);
 
     // -----------------------------------------------------------------------
     // Fields
@@ -289,7 +295,7 @@ private:
 
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
-    aeron::FragmentAssembler               assembler_;
+    aeron::ControlledFragmentAssembler     assembler_;
 
     NodeId                                 selfId_;
     int64_t                                nowNs_ = 0; ///< updated at top of poll()
