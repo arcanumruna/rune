@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 using namespace std::chrono_literals;
 
@@ -65,13 +66,19 @@ static void frReport(const std::string& tag) {
     rune_fr::Recorder::instance().drain();
     const char* out = std::getenv("RUNE_FR_OUT");
     const std::string dir = (out && *out) ? out : ".";
+    // Disambiguate per broker so co-located cluster nodes sharing one RUNE_FR_OUT
+    // dir do not overwrite each other's reports: suffix with node id + pid.
+    const char* nid = std::getenv("RUNE_NODE_ID");
+    const std::string sfx = "-n" + std::string(nid ? nid : "x") +
+                            "-p" + std::to_string(static_cast<long>(::getpid())) +
+                            "-" + tag;
     {
-        std::ofstream f(dir + "/fr-hist-" + tag + ".txt");
+        std::ofstream f(dir + "/fr-hist" + sfx + ".txt");
         if (f) rune_fr::dumpHistograms(f);
     }
-    rune_fr::exportChromeTrace(dir + "/fr-trace-" + tag + ".json");
-    rune_fr::writeTape(dir + "/fr-tape-" + tag + ".bin");
-    spdlog::info("rune-fr: report written to {} (tag={})", dir, tag);
+    rune_fr::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
+    rune_fr::writeTape(dir + "/fr-tape" + sfx + ".bin");
+    spdlog::info("rune-fr: report written to {} (suffix={})", dir, sfx);
 }
 
 // ---------------------------------------------------------------------------

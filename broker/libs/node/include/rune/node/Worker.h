@@ -91,6 +91,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -513,6 +514,8 @@ public:
     //      This ensures Aeron term buffer fills → client offer() back-pressures.
     //      NEVER drop an ack.
     int doWork(int64_t nowNs) override {
+        // Per-tick span: inter-tick gap = scheduler handoff/park; duration = tick cost.
+        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, 0);
         int work = 0;
 
         // E4: self-pin this thread to the assigned core on the FIRST doWork call.
@@ -1778,6 +1781,13 @@ private:
     // Worker-thread only — no atomic needed.
     int64_t lastSyncNs_ = 0;
 
+    // Per-log LEO at its last successful sync.  syncOwnedLogs_ skips (and returns
+    // NO work for) any log whose logEndOffset has not advanced since — otherwise a
+    // time-based sync of an idle log reported work>0 every interval, resetting the
+    // worker's backoff idle so it never parked (phantom work → CPU-hogging spin,
+    // starving nothing to do).  Worker-thread only.
+    std::unordered_map<rune::storage::Log*, int64_t> lastSyncedLeo_;
+
     // E5.1.3: desired fragment poll limit for reservation-before-poll.
     // K = min(desiredFragmentLimit_, freeMaxMsgSlots − retOverflow_.size()).
     // Source: NodeConfig::gatewayFragmentLimit (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256).
@@ -1820,8 +1830,15 @@ private:
             if (!replica || !replica->isDiskBacked()) continue;
             rune::storage::Log* log = replica->log();
             if (!log) continue;
+            // Skip logs with no new appends since their last sync — syncing an
+            // unchanged log is a no-op fdatasync that must NOT count as work (else
+            // the backoff idle never parks on an otherwise-idle worker).
+            const int64_t leo = log->logEndOffset();
+            int64_t& lastLeo = lastSyncedLeo_[log];
+            if (leo <= lastLeo) continue;
             try {
                 log->sync();
+                lastLeo = leo;
                 ++synced;
             } catch (const std::exception& ex) {
                 spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw for "
