@@ -31,7 +31,18 @@
 
 #include <rune/replication/Types.h>
 
+// SBE-generated flyweight codecs (schema rune-replication.xml, schemaId 112).
+// The records-carrying messages (FetchRequest/FetchResponse and their reconcile
+// twins) delegate encode/decode/sizing to these so the outbound send path sizes
+// its buffer by the GENERATED computeLength() — no hand-rolled magic constants,
+// no fixed-cap stack buffer, no buffer overflow when a batch is large.
+#include <rune_protocol_replication_sbe/MessageHeader.h>
+#include <rune_protocol_replication_sbe/FetchRequest.h>
+#include <rune_protocol_replication_sbe/FetchResponse.h>
+
 namespace rune::replication {
+
+namespace rsbe = ::rune::protocol::replication::sbe;
 
 // ---------------------------------------------------------------------------
 // Schema constants
@@ -238,13 +249,24 @@ struct FetchResponseMsg {
     int32_t                  topicId;   ///< DR-BUG-5: distinguishes replicas that share a partitionId
     std::span<const uint8_t> records;   ///< Zero-copy view into the decode buf.
 
-    static constexpr uint16_t TEMPLATE_ID        = 2;
-    static constexpr uint16_t BLOCK_LENGTH_FIXED = 36; // fixed fields only (DR-BUG-5: was 30, now 36)
-    static constexpr std::size_t VAR_HEADER_SIZE  = 4;  // int32 length prefix
+    static constexpr uint16_t TEMPLATE_ID = 2;
+    // Layout constants DERIVED from the generated SBE codec (not hand-magic):
+    // the fixed block length and the var-data (records) length-prefix width.
+    static constexpr uint16_t    BLOCK_LENGTH_FIXED = rsbe::FetchResponse::sbeBlockLength();
+    static constexpr std::size_t VAR_HEADER_SIZE    = 4; // varDataEncoding uint32 length prefix
 
-    /// Encode FetchResponse into buf[offset].
-    /// records_ may be empty (size == 0) for high-watermark-only updates.
-    /// Returns total bytes written (header + fixed + length prefix + records).
+    /// Total encoded frame size (SBE header + block + var-header + records),
+    /// computed by the GENERATED codec — the single source of truth the send path
+    /// uses to size its buffer.  No hand-rolled constants; overflow-proof.
+    static std::size_t encodedSize(std::size_t recordsLen) noexcept
+    {
+        return rsbe::MessageHeader::encodedLength()
+             + rsbe::FetchResponse::computeLength(recordsLen);
+    }
+
+    /// Encode via the generated SBE flyweight into buf[offset].  The caller MUST
+    /// provide buf with at least encodedSize(records_.size()) bytes at offset.
+    /// records_ may be empty (high-watermark-only update).  Returns bytes written.
     static std::size_t encode(uint8_t* buf, std::size_t offset,
                               Epoch                    leaderEpoch_,
                               PartitionId              partition_,
@@ -254,78 +276,58 @@ struct FetchResponseMsg {
                               std::span<const uint8_t> records_,
                               int32_t                  topicId_ = 0) noexcept
     {
-        std::size_t pos = offset;
-        pos += ReplicationMessageHeader::encode(buf, pos,
-                                                BLOCK_LENGTH_FIXED, TEMPLATE_ID);
-        uint8_t* p = buf + pos;
-        detail::write_le<int64_t>(p +  0, leaderEpoch_);
-        detail::write_le<int32_t>(p +  8, partition_);
-        detail::write_le<int64_t>(p + 12, highWatermark_);
-        detail::write_le<int64_t>(p + 20, logStartOffset_);
-        detail::write_le<int16_t>(p + 28, errorCode_);
-        detail::write_le<int16_t>(p + 30, 0);         // alignment pad
-        detail::write_le<int32_t>(p + 32, topicId_);
-        pos += BLOCK_LENGTH_FIXED;
-
-        // Variable-length records blob: int32 length + raw bytes
-        auto len = static_cast<int32_t>(records_.size());
-        detail::write_le<int32_t>(buf + pos, len);
-        pos += VAR_HEADER_SIZE;
-        if (len > 0) {
-            std::memcpy(buf + pos, records_.data(), static_cast<std::size_t>(len));
-            pos += static_cast<std::size_t>(len);
-        }
-        return pos - offset;
+        const std::size_t frame = encodedSize(records_.size());
+        rsbe::FetchResponse enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), offset, offset + frame);
+        enc.leaderEpoch(leaderEpoch_)
+           .partition(partition_)
+           .highWatermark(highWatermark_)
+           .logStartOffset(logStartOffset_)
+           .errorCode(errorCode_)
+           .topicId(topicId_);
+        enc.putRecords(reinterpret_cast<const char*>(records_.data()),
+                       static_cast<std::uint32_t>(records_.size()));
+        return frame;
     }
 
-    /// Decode FetchResponse from buf[offset].
-    /// FetchResponseMsg::records is a zero-copy view into buf — caller must
-    /// keep buf alive while using the returned msg.
-    ///
-    /// \param fragmentSize  Total bytes of the frame available starting at
-    ///                      buf[offset].  Pass SIZE_MAX (default) to skip the
-    ///                      bounds check (backward compat).  Pass the actual
-    ///                      fragment length to clamp the records span — prevents
-    ///                      an OOB span read when the records length prefix
-    ///                      claims more bytes than the fragment actually holds
-    ///                      (malformed or truncated frame).
+    /// Decode via the generated SBE flyweight.  records is a zero-copy view into
+    /// buf — caller keeps buf alive while using the returned msg.  fragmentSize is
+    /// the bytes available at buf[offset] (bounds-check); SIZE_MAX = legacy/skip.
     static FetchResponseMsg decode(const uint8_t* buf,
                                    std::size_t offset,
                                    std::size_t fragmentSize = SIZE_MAX) noexcept
     {
-        const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
+        char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
+        const std::uint64_t cap =
+            (fragmentSize == SIZE_MAX) ? (offset + (std::uint64_t{1} << 30))
+                                       : static_cast<std::uint64_t>(fragmentSize);
+        rsbe::MessageHeader mh;
+        mh.wrap(b, offset, 0, cap);
+        rsbe::FetchResponse dec;
+        dec.wrapForDecode(b, offset + rsbe::MessageHeader::encodedLength(),
+                          mh.blockLength(), mh.version(), cap);
         FetchResponseMsg m{};
-        m.leaderEpoch    = detail::read_le<int64_t>(p +  0);
-        m.partition      = detail::read_le<int32_t>(p +  8);
-        m.highWatermark  = detail::read_le<int64_t>(p + 12);
-        m.logStartOffset = detail::read_le<int64_t>(p + 20);
-        m.errorCode      = detail::read_le<int16_t>(p + 28);
-        // p+30: alignment pad (skip)
-        m.topicId        = detail::read_le<int32_t>(p + 32);
-
-        const uint8_t* vp = p + BLOCK_LENGTH_FIXED;
-        int32_t len = detail::read_le<int32_t>(vp);
-
-        // Bound-check: clamp the records span to the actual bytes available in
-        // the fragment.  kFixedEnd = bytes consumed before the records payload.
-        static constexpr std::size_t kFixedEnd =
-            ReplicationMessageHeader::ENCODED_SIZE +
-            BLOCK_LENGTH_FIXED +
-            VAR_HEADER_SIZE;
-        std::size_t maxAvail = (fragmentSize != SIZE_MAX && fragmentSize >= kFixedEnd)
-            ? (fragmentSize - kFixedEnd)
-            : SIZE_MAX;
-
-        std::size_t safeLen;
-        if (len < 0) {
-            safeLen = 0;
-        } else if (maxAvail != SIZE_MAX && static_cast<std::size_t>(len) > maxAvail) {
-            safeLen = maxAvail;
+        m.leaderEpoch    = dec.leaderEpoch();
+        m.partition      = dec.partition();
+        m.highWatermark  = dec.highWatermark();
+        m.logStartOffset = dec.logStartOffset();
+        m.errorCode      = dec.errorCode();
+        m.topicId        = dec.topicId();
+        // Records tail: guard against a malformed/truncated length prefix (a
+        // corrupt frame claiming more bytes than the fragment holds) BEFORE reading
+        // the view — decode is noexcept and must never over-read or let an SBE
+        // bounds-check throw escape.  recordsLength() only reads the 4-byte length
+        // field (within the block), which is always present here.
+        const std::uint32_t rlen = dec.recordsLength();
+        const std::size_t framing = encodedSize(0);          // header + block + len-prefix
+        const std::size_t avail   = (cap >= framing) ? static_cast<std::size_t>(cap - framing) : 0;
+        if (rlen == 0 || rlen > avail) {
+            m.records = {};                                   // empty or malformed → safe empty span
         } else {
-            safeLen = static_cast<std::size_t>(len);
+            const auto sv = dec.getRecordsAsStringView();
+            m.records = std::span<const uint8_t>{
+                reinterpret_cast<const uint8_t*>(sv.data()), sv.size()};
         }
-
-        m.records = std::span<const uint8_t>{vp + VAR_HEADER_SIZE, safeLen};
         return m;
     }
 };

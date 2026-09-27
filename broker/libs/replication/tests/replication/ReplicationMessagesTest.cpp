@@ -57,8 +57,10 @@ TEST(ReplicationMessages, FetchRequestBlockLength) {
 }
 
 TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
-    // DR-BUG-5: int64+int32+int64+int64+int16+int16(pad)+int32 = 8+4+8+8+2+2+4 = 36 (topicId added)
-    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 36u);
+    // SBE tight-packs the block (no alignment pad): int64+int32+int64+int64+int16+int32
+    // = 8+4+8+8+2+4 = 34.  (The pre-SBE hand-rolled layout inserted a 2-byte pad after
+    // errorCode → 36; SBE owns sizing now, and both nodes run the same generated codec.)
+    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 34u);
 }
 
 TEST(ReplicationMessages, FetchRequestTotalSize) {
@@ -213,8 +215,8 @@ TEST(FetchResponse, RoundTripEmptyRecords) {
 
     std::size_t written = FetchResponseMsg::encode(buf, 0,
         epoch, part, hw, logSt, err, empty);
-    // DR-BUG-5: header(8) + fixed(36) + len_prefix(4) + 0 = 48 (was 42 before topicId)
-    EXPECT_EQ(written, 48u);
+    // SBE: header(8) + block(34) + len_prefix(4) + 0 records = 46
+    EXPECT_EQ(written, 46u);
 
     FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
     EXPECT_EQ(m.leaderEpoch,    epoch);

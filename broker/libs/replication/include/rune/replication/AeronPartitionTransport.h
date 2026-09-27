@@ -249,12 +249,15 @@ private:
     // -----------------------------------------------------------------------
     static constexpr int32_t kBroadcast = -1;
 
-    /// Max single wire frame the transport encodes. Kept modest because the
-    /// encode happens in a per-call buffer on WORKER threads, whose stacks are
-    /// small (macOS default ~512 KiB). Bounded by Aeron pub maxMessageLength in
-    /// practice; frames larger than this are dropped+warned. (TODO: make this a
-    /// NodeConfig-configurable max-frame if larger replication terms are needed.)
-    static constexpr std::size_t kMaxWireFrame = 64 * 1024;
+    /// Stack fast-path size for a single encoded wire frame.  A frame that fits is
+    /// encoded/framed on the stack (no heap); a LARGER frame (e.g. a big replicated
+    /// batch) falls back to a heap buffer sized by the generated codec's
+    /// encodedSize() — so there is NO fixed cap that can overflow, and the common
+    /// 64KB-batch case stays allocation-free.  128 KiB comfortably covers a default
+    /// 64KB produce batch + SBE framing on the worker threads' (8 MiB) stacks.
+    /// The outbound ring's maxMessageLength (capacity/8) remains the true upper
+    /// bound; a frame beyond it fails the ring write as back-pressure (retriable).
+    static constexpr std::size_t kMaxWireFrame = 128 * 1024;
 
     /// Routing-header size prepended to each outbound-ring frame: int32 targetNodeId.
     static constexpr std::size_t kOutboundHeaderSize = sizeof(int32_t);

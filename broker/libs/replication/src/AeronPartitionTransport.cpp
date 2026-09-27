@@ -126,17 +126,23 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
 {
     // Shared-nothing: encode into a stack buffer, marshal to control thread via
     // the outbound ring (peers_/pubs are control-owned; drainOutbound offers).
-    uint8_t wire[kMaxWireFrame];
-    const std::size_t len = FetchResponseMsg::encode(
-        wire, 0,
-        resp.leaderEpoch,
-        resp.partition,
-        resp.highWatermark,
-        resp.logStartOffset,
-        resp.errorCode,
-        resp.records,
-        resp.topicId);
-    enqueueOutbound(toFollower, wire, len);
+    // Size the buffer by the GENERATED codec's encodedSize() — stack fast-path for
+    // the common (≤128KB) case, heap fallback for a large replicated batch.  No
+    // fixed-cap overflow (was: fixed uint8_t wire[64KB] → __chk_fail on a 64KB+ batch).
+    const std::size_t frame = FetchResponseMsg::encodedSize(resp.records.size());
+    if (frame <= kMaxWireFrame) {
+        uint8_t wire[kMaxWireFrame];
+        FetchResponseMsg::encode(wire, 0, resp.leaderEpoch, resp.partition,
+                                 resp.highWatermark, resp.logStartOffset,
+                                 resp.errorCode, resp.records, resp.topicId);
+        enqueueOutbound(toFollower, wire, frame);
+    } else {
+        std::vector<uint8_t> wire(frame);
+        FetchResponseMsg::encode(wire.data(), 0, resp.leaderEpoch, resp.partition,
+                                 resp.highWatermark, resp.logStartOffset,
+                                 resp.errorCode, resp.records, resp.topicId);
+        enqueueOutbound(toFollower, wire.data(), frame);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,13 +196,25 @@ void AeronPartitionTransport::sendReconcileRequest(
 void AeronPartitionTransport::sendReconcileResponse(
         NodeId toPeer, const FetchResponseMsg& resp)
 {
-    uint8_t wire[kMaxWireFrame];
-    const std::size_t len = FetchResponseMsg::encode(
-        wire, 0,
-        resp.leaderEpoch, resp.partition, resp.highWatermark,
-        resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
-    stampTemplateId(wire, 0, kReconcileFetchRespTemplateId);
-    enqueueOutbound(toPeer, wire, len);
+    // Reuses the FetchResponse codec, re-stamped with the reconcile templateId.
+    // Same encodedSize()-based sizing (stack fast-path + heap fallback) as
+    // sendFetchResponse so a large reconcile batch cannot overflow a fixed buffer.
+    const std::size_t frame = FetchResponseMsg::encodedSize(resp.records.size());
+    if (frame <= kMaxWireFrame) {
+        uint8_t wire[kMaxWireFrame];
+        FetchResponseMsg::encode(wire, 0, resp.leaderEpoch, resp.partition,
+                                 resp.highWatermark, resp.logStartOffset,
+                                 resp.errorCode, resp.records, resp.topicId);
+        stampTemplateId(wire, 0, kReconcileFetchRespTemplateId);
+        enqueueOutbound(toPeer, wire, frame);
+    } else {
+        std::vector<uint8_t> wire(frame);
+        FetchResponseMsg::encode(wire.data(), 0, resp.leaderEpoch, resp.partition,
+                                 resp.highWatermark, resp.logStartOffset,
+                                 resp.errorCode, resp.records, resp.topicId);
+        stampTemplateId(wire.data(), 0, kReconcileFetchRespTemplateId);
+        enqueueOutbound(toPeer, wire.data(), frame);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,15 +228,39 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
 {
-    if (kOutboundHeaderSize + len > kMaxWireFrame) {
-        spdlog::warn("AeronPartitionTransport: outbound frame too large ({} bytes) — dropped", len);
+    const std::size_t total = kOutboundHeaderSize + len;
+    // Defensive: agrona's ManyToOneRingBuffer::write() THROWS (not returns false)
+    // when a message exceeds maxMsgLength — only insufficient SPACE returns false.
+    // Callers cap the only variable-length payload (the FetchResponse records tail)
+    // below this bound; if an oversized frame still arrives it is a caller bug —
+    // reject it here (retriable: the follower re-fetches and the leader's cap bounds
+    // the re-fetch) rather than letting the throw unwind through the worker duty
+    // cycle and abort the fetch.
+    if (total > outboundRing_.maxMsgLength()) {
+        spdlog::error(
+            "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
+            "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
+            total, outboundRing_.maxMsgLength(), targetNodeId);
+        ++outboundRingFullCount_;
         return false;
     }
-    uint8_t framed[kMaxWireFrame];
-    std::memcpy(framed, &targetNodeId, kOutboundHeaderSize);
-    std::memcpy(framed + kOutboundHeaderSize, wire, len);
-    if (!outboundRing_.write(framed, kOutboundHeaderSize + len)) {
-        ++outboundRingFullCount_;  // back-pressure: skipped (retriable)
+    // Stack fast-path for the common case; heap fallback for a large frame.  A full
+    // ring returns false below and is treated as back-pressure (retriable).
+    if (total <= kMaxWireFrame) {
+        uint8_t framed[kMaxWireFrame];
+        std::memcpy(framed, &targetNodeId, kOutboundHeaderSize);
+        std::memcpy(framed + kOutboundHeaderSize, wire, len);
+        if (!outboundRing_.write(framed, total)) {
+            ++outboundRingFullCount_;  // back-pressure: skipped (retriable)
+            return false;
+        }
+        return true;
+    }
+    std::vector<uint8_t> framed(total);
+    std::memcpy(framed.data(), &targetNodeId, kOutboundHeaderSize);
+    std::memcpy(framed.data() + kOutboundHeaderSize, wire, len);
+    if (!outboundRing_.write(framed.data(), total)) {
+        ++outboundRingFullCount_;  // back-pressure or > ring maxMsgLength (retriable)
         return false;
     }
     return true;
@@ -331,22 +373,37 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // production 64 KiB term this is 8192 bytes; uncapped responses of up to
         // 1 MiB would throw on every send and livelock the follower at LEO=0.
         //
-        // kFetchResponseOverhead = SBE header(8) + fixed block(30) + len-prefix(4) = 42
-        // bytes of framing that are always present; the remaining budget is for records.
-        static constexpr int32_t kFetchResponseOverhead =
-            static_cast<int32_t>(ReplicationMessageHeader::ENCODED_SIZE) +
-            static_cast<int32_t>(FetchResponseMsg::BLOCK_LENGTH_FIXED) +
-            static_cast<int32_t>(FetchResponseMsg::VAR_HEADER_SIZE);
+        // kFetchResponseOverhead = the always-present framing (SBE header + fixed
+        // block + records length-prefix), from the GENERATED codec — the remaining
+        // budget is for records.  encodedSize(0) = the zero-records frame size.
+        const int32_t kFetchResponseOverhead =
+            static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
 
+        // The records tail must survive TWO framing hops without exceeding either
+        // transport bound:
+        //   1. enqueueOutbound writes [int32 targetNodeId][SBE frame] into the
+        //      worker→control outbound ring, whose agrona maxMsgLength (= capacity/8)
+        //      THROWS on an oversized write — it is NOT retriable back-pressure.
+        //   2. drainOutbound offers the SBE frame on the follower publication, whose
+        //      maxMessageLength (= termLength/8) rejects oversized offers.
+        // The outbound-ring bound is ALWAYS known (independent of pub resolution), so
+        // cap to it UNCONDITIONALLY, then tighten with the pub bound once resolved.
+        // Previously the cap was gated on followerPeer->pub AND ignored the ring bound
+        // + the 4-byte outbound header, so an early/large fetch slipped through and
+        // threw inside the worker's onFetchRequest — the fetch was lost.
+        int32_t ceiling =
+            static_cast<int32_t>(outboundRing_.maxMsgLength())
+            - static_cast<int32_t>(kOutboundHeaderSize)
+            - kFetchResponseOverhead;
         auto* followerPeer = findPeer(req.followerId);
         if (followerPeer && followerPeer->pub) {
-            int32_t ceiling = static_cast<int32_t>(followerPeer->pub->maxMessageLength())
-                              - kFetchResponseOverhead;
-            if (ceiling < 0) ceiling = 0;
-            if (req.maxBytes > ceiling) {
-                req.maxBytes = ceiling;
-            }
+            const int32_t pubCeiling =
+                static_cast<int32_t>(followerPeer->pub->maxMessageLength())
+                - kFetchResponseOverhead;
+            if (pubCeiling < ceiling) ceiling = pubCeiling;
         }
+        if (ceiling < 0) ceiling = 0;
+        if (req.maxBytes > ceiling) req.maxBytes = ceiling;
 
         // E5.1.2c: route leader-side FetchRequest to the owning worker so
         // leaderState_/isrManager_ is single-owner (worker thread only).
@@ -376,11 +433,9 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         }
 
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
-        // Minimum fixed size check (header + fixed block + var length prefix).
-        static constexpr std::size_t kMinResponseSize =
-            ReplicationMessageHeader::ENCODED_SIZE +
-            FetchResponseMsg::BLOCK_LENGTH_FIXED +
-            FetchResponseMsg::VAR_HEADER_SIZE;
+        // Minimum valid frame = the zero-records framing (SBE header + block +
+        // records length-prefix), from the generated codec.
+        const std::size_t kMinResponseSize = FetchResponseMsg::encodedSize(0);
         if (len < kMinResponseSize) {
             spdlog::trace("AeronPartitionTransport: FetchResponse truncated ({} bytes)", len);
             return;
@@ -492,25 +547,29 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
         auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
         if (it == replicas_.end() || it->second == nullptr) return;
-        static constexpr int32_t kOverhead =
-            static_cast<int32_t>(ReplicationMessageHeader::ENCODED_SIZE) +
-            static_cast<int32_t>(FetchResponseMsg::BLOCK_LENGTH_FIXED) +
-            static_cast<int32_t>(FetchResponseMsg::VAR_HEADER_SIZE);
+        // Cap to the outbound-ring bound UNCONDITIONALLY (same two-hop framing
+        // rationale as the normal FetchRequest path), tightened by the pub bound when
+        // resolved, minus the outbound header — so the reconcile response never
+        // overflows the outbound ring and throws inside the worker.
+        const int32_t kOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
+        int32_t ceiling =
+            static_cast<int32_t>(outboundRing_.maxMsgLength())
+            - static_cast<int32_t>(kOutboundHeaderSize)
+            - kOverhead;
         auto* peer = findPeer(req.followerId);
         if (peer && peer->pub) {
-            int32_t ceiling = static_cast<int32_t>(peer->pub->maxMessageLength()) - kOverhead;
-            if (ceiling < 0) ceiling = 0;
-            if (req.maxBytes > ceiling) req.maxBytes = ceiling;
+            const int32_t pubCeiling =
+                static_cast<int32_t>(peer->pub->maxMessageLength()) - kOverhead;
+            if (pubCeiling < ceiling) ceiling = pubCeiling;
         }
+        if (ceiling < 0) ceiling = 0;
+        if (req.maxBytes > ceiling) req.maxBytes = ceiling;
         it->second->onReconcileRequest(req);
 
     } else if (tid == kReconcileFetchRespTemplateId) {
         // DR-BUG-6: reverse pull response (survivor → deficient leader).  Reuses
         // the FetchResponse layout.
-        static constexpr std::size_t kMinResp =
-            ReplicationMessageHeader::ENCODED_SIZE +
-            FetchResponseMsg::BLOCK_LENGTH_FIXED +
-            FetchResponseMsg::VAR_HEADER_SIZE;
+        const std::size_t kMinResp = FetchResponseMsg::encodedSize(0);
         if (len < kMinResp) return;
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
         auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});

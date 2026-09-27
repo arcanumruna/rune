@@ -1543,10 +1543,17 @@ TEST_F(TwoReplicaTest, FollowerDoWorkReturnsPosAfterInterval) {
     EXPECT_GT(work, 0);
 }
 
-TEST_F(TwoReplicaTest, LeaderDoWorkReturnsPosAfterIsrCheckInterval) {
-    // Advance past isrCheckIntervalNs (1ms).
+TEST_F(TwoReplicaTest, LeaderIsrCheckTickAloneIsNotWork) {
+    // Idle-doWork contract (task #17): after the ISR-check interval (1ms) elapses,
+    // the leader RUNS the ISR check — but a bare check that changes no ISR state and
+    // moves no HW is NOT counted as work.  Counting the tick made the idle strategy
+    // see work>0 every interval and busy-spin on an idle/no-lag leader.  With a
+    // freshly-registered follower (not yet lagging past replicaLagMaxMs) and no
+    // appends, there is genuinely nothing to do → doWork parks (returns 0).
+    // (ISR-check-produces-work when a follower actually lags is covered by
+    //  IsrShrinkUnblocksHwTest.LaggingFollowerShrunkFromIsrAllowsHwAdvance.)
     int work = leader_->doWork(2'000'000LL);
-    EXPECT_GT(work, 0);
+    EXPECT_EQ(work, 0);
 }
 
 TEST_F(TwoReplicaTest, BoundedDriverNeverExceedsCap) {

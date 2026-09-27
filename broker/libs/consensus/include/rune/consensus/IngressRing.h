@@ -95,6 +95,13 @@ public:
     int64_t producerPosition() const { return ring_.producerPosition(); }
     int64_t consumerPosition() const { return ring_.consumerPosition(); }
 
+    /// Largest single message the ring accepts (agrona: capacity / 8).  write()
+    /// THROWS if a message exceeds this — callers that frame variable-length
+    /// payloads must bound them to this value first.
+    std::size_t maxMsgLength() const {
+        return static_cast<std::size_t>(ring_.maxMsgLength());
+    }
+
 private:
     // Raw storage — owned by IngressRing; zero-initialised so Aeron ring
     // descriptor fields start at 0 (tail=0, head=0, etc.).
