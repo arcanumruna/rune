@@ -702,6 +702,16 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // RUNE_WORKER_ACK_SLOT_BYTES: return-ring reservation slot size for ProduceResult.
+    if (const char* raw = getenv_fn("RUNE_WORKER_ACK_SLOT_BYTES")) {
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (parseInt32(raw, v) && v >= 64) {
+                cfg.workerAckSlotBytes = v;
+            }
+        }
+    }
+
     // --- RUNE_WORKER_IDLE (optional) — Milestone E1/E2: per-worker idle strategy selector. ---
     // E1: parsed + stored here; no per-worker AgentRunner yet (driven cooperatively).
     // E2: will wire this into each worker's AgentRunner.

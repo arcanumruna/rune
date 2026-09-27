@@ -612,9 +612,11 @@ void BrokerNode::buildWorkerPool() {
     // Tests that need the per-worker path construct WorkerIngress directly.
     // -----------------------------------------------------------------------
 
-    // Apply desired fragment limit from NodeConfig to each worker (before runners start).
+    // Apply desired fragment limit + ack-slot reservation size from NodeConfig to
+    // each worker (before runners start).
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
+        workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
     }
 
     if (config_.perWorkerIngressEnabled && aeron_) {

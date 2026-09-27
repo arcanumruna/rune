@@ -321,6 +321,12 @@ struct NodeConfig {
     //     old hard-coded 10 to prevent head-of-line blocking on batched ingress).
     //     Also reused for per-worker ingress poll (Task E5.1.2).
     int32_t gatewayFragmentLimit         = 256;
+    //   - workerAckSlotBytes: expected ProduceResult size used by the worker's
+    //     reservation-before-poll to size return-ring ack slots
+    //     (RUNE_WORKER_ACK_SLOT_BYTES).  Must be >= the framed ProduceResult size
+    //     (~160 B).  Default 256.  The old code reserved 2×maxMsgLength per ack,
+    //     capping produce intake at ~4 frames/cycle on a multi-MB return ring.
+    int32_t workerAckSlotBytes           = 256;
     //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
     //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
     //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to

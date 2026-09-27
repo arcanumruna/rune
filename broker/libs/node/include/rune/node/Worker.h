@@ -269,6 +269,16 @@ public:
         desiredFragmentLimit_ = (limit >= 1) ? limit : 256;
     }
 
+    // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
+    // reservation-before-poll uses this as the expected ProduceResult size to compute
+    // how many produce frames it can safely poll; the OLD code reserved 2×maxMsgLength
+    // per ack (an 8 MB ret_ ring → only ~4 slots → K≤4 → throttled produce intake).
+    // Must be >= the max WorkerReturn ProduceResult size (~160 B framed).
+    // Source: NodeConfig::workerAckSlotBytes (RUNE_WORKER_ACK_SLOT_BYTES, default 256).
+    void setAckSlotBytes(int32_t n) noexcept {
+        ackSlotBytes_ = (n >= 64) ? n : 64;
+    }
+
     // Expose psm_ for tests (worker-thread only; call only from single-threaded tests).
     [[nodiscard]] rune::storage::ProducerStateManager& psmForTest() noexcept { return psm_; }
 
@@ -555,7 +565,7 @@ public:
         if (perWorkerIngressActive_) {
             work += flushRetOverflow_();
             work += flushOwedAcksAll_(nowNs);
-            if (ret_.hasSpaceForMaxMsg() && retOverflow_.empty() && pendingAcksAll_.empty()) {
+            if (ret_.hasSpaceForMsg(ackSlotBytes_) && retOverflow_.empty() && pendingAcksAll_.empty()) {
                 work += pollWorkerIngress_(nowNs);
             }
         }
@@ -1800,6 +1810,11 @@ private:
     // accumulates more than one poll-batch (K entries) of acks.
     int32_t desiredFragmentLimit_ = 256;
 
+    // Expected ProduceResult return size (bytes) for the return-ring reservation.
+    // Configurable (RUNE_WORKER_ACK_SLOT_BYTES); see setAckSlotBytes.  256 comfortably
+    // covers the ~160 B framed ProduceResult.
+    int32_t ackSlotBytes_ = 256;
+
     // -----------------------------------------------------------------------
     // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.
     //
@@ -1934,6 +1949,8 @@ private:
                 } else {
                     entry.ret.errorCode = 0; // OK
                 }
+                RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
+                                         static_cast<uint32_t>(entry.ret.correlationId));
                 enqueueReturn_(entry.ret);
                 // O(1) erase by swap-with-back.
                 pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
@@ -2006,7 +2023,7 @@ private:
         // Reservation-before-poll (E5.1.3 deliverable b):
         //   K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
         // Guard G-A6: never poll more frames than we can ack without dropping.
-        const int64_t freeSlots = ret_.freeMaxMsgSlots();
+        const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
         const int64_t overflow  = static_cast<int64_t>(retOverflow_.size());
         const int64_t available = (freeSlots > overflow) ? (freeSlots - overflow) : 0;
         const int32_t K = static_cast<int32_t>(
@@ -2042,6 +2059,7 @@ private:
     // -----------------------------------------------------------------------
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs) {
+        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
         namespace pc = rune::protocol::client;
 
         // Decode the produce frame.
@@ -2169,6 +2187,8 @@ private:
         // acks=all (non-duplicate): register a pending ack; fire when HW passes.
         // Timeout: nowNs + ackTimeoutNs_ (generous — accounts for fetch-handling
         // latency added by E5.1.2c, where fetch waits a worker cycle).
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckEnqueue,
+                                 static_cast<uint32_t>(ret.correlationId));
         PendingAcksAll pending;
         pending.replica    = replica;
         pending.lastOffset = outcome.lastOffset;

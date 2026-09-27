@@ -12,6 +12,7 @@
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <spdlog/spdlog.h>
 
@@ -442,6 +443,8 @@ void PartitionReplica::onLeaderLogAppended() noexcept
 
 int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t nowNs)
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
+                             static_cast<uint32_t>(req.followerId));
     // Guard: drop silently if this replica is not yet the leader.
     // This can happen during the window between Aeron transport receiving a
     // FetchRequest and the metadata bridge promoting us via becomeLeader().
@@ -688,6 +691,8 @@ std::vector<uint8_t> PartitionReplica::read(Offset fetchOffset,
 
 void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchRespApply,
+                             static_cast<uint32_t>(cfg_.partitionId));
     if (resp.errorCode != kErrNone) {
         // Error response — ignore (control plane handles epoch changes externally).
         return;
@@ -1819,6 +1824,8 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
 // ---------------------------------------------------------------------------
 void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplPushToFollowers,
+                             static_cast<uint32_t>(cfg_.partitionId));
     if (role_ != Role::Leader) return;
     if (!isrManager_) return;
 
