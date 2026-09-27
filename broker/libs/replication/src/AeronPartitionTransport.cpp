@@ -6,6 +6,8 @@
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune_fr/FlightRecorder.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OutboundFrame.h>
 
 // E2 inc2a: WorkerPool + WorkerOp for SPSC ApplyReplicated routing.
 // Included here (not in the header) to avoid pulling consensus/spdlog headers
@@ -22,6 +24,15 @@
 #include <cstring>
 
 namespace rune::replication {
+
+namespace isbe = ::rune::protocol::internal::sbe;
+
+// Fixed overhead of the SBE OutboundFrame envelope (SBE header + targetNodeId block
+// + varData length prefix), from the generated codec — the records tail must be
+// capped so the whole envelope fits the outbound ring's maxMsgLength.
+static constexpr std::size_t kOutboundEnvelopeOverhead =
+    isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::sbeBlockLength() +
+    sizeof(std::uint32_t); // varDataEncoding length field
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -230,41 +241,37 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
 {
-    const std::size_t total = kOutboundHeaderSize + len;
-    // Defensive: agrona's ManyToOneRingBuffer::write() THROWS (not returns false)
-    // when a message exceeds maxMsgLength — only insufficient SPACE returns false.
-    // Callers cap the only variable-length payload (the FetchResponse records tail)
-    // below this bound; if an oversized frame still arrives it is a caller bug —
-    // reject it here (retriable: the follower re-fetches and the leader's cap bounds
-    // the re-fetch) rather than letting the throw unwind through the worker duty
-    // cycle and abort the fetch.
-    if (total > outboundRing_.maxMsgLength()) {
+    // The outbound-ring frame is an SBE OutboundFrame envelope {targetNodeId,
+    // payload=wire}, encoded WRAP-IN-PLACE straight into the claimed ring slot — no
+    // intermediate buffer, no hand-rolled header/offsets, no raw memcpy (the
+    // generated flyweight owns the layout; putPayload copies the already-encoded
+    // replication message once).
+    const std::size_t frameLen =
+        isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::computeLength(len);
+    // Oversized guard: tryClaim rejects a message larger than the ring's maxMsgLength.
+    // Callers cap the variable-length payload (the FetchResponse records tail) below
+    // this bound; an oversized frame here is a caller bug — reject it (retriable).
+    if (frameLen > outboundRing_.maxMsgLength()) {
         spdlog::error(
             "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
-            total, outboundRing_.maxMsgLength(), targetNodeId);
+            frameLen, outboundRing_.maxMsgLength(), targetNodeId);
         ++outboundRingFullCount_;
         return false;
     }
-    // Stack fast-path for the common case; heap fallback for a large frame.  A full
-    // ring returns false below and is treated as back-pressure (retriable).
-    if (total <= kMaxWireFrame) {
-        uint8_t framed[kMaxWireFrame];
-        std::memcpy(framed, &targetNodeId, kOutboundHeaderSize);
-        std::memcpy(framed + kOutboundHeaderSize, wire, len);
-        if (!outboundRing_.write(framed, total)) {
-            ++outboundRingFullCount_;  // back-pressure: skipped (retriable)
-            return false;
-        }
-        return true;
-    }
-    std::vector<uint8_t> framed(total);
-    std::memcpy(framed.data(), &targetNodeId, kOutboundHeaderSize);
-    std::memcpy(framed.data() + kOutboundHeaderSize, wire, len);
-    if (!outboundRing_.write(framed.data(), total)) {
-        ++outboundRingFullCount_;  // back-pressure or > ring maxMsgLength (retriable)
+    // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: bump the
+    // counter and return false WITHOUT committing (nothing claimed, no torn record).
+    // The caller treats the skipped send as retriable (the follower re-fetches).
+    const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
+    if (idx < 0) {
+        ++outboundRingFullCount_;
         return false;
     }
+    isbe::OutboundFrame enc;
+    enc.wrapAndApplyHeader(reinterpret_cast<char*>(outboundRing_.base() + idx), 0, frameLen);
+    enc.targetNodeId(targetNodeId);
+    enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
+    outboundRing_.commit(idx);
     return true;
 }
 
@@ -280,11 +287,19 @@ int AeronPartitionTransport::drainOutbound()
                           aeron::concurrent::AtomicBuffer& buf,
                           aeron::util::index_t offset,
                           aeron::util::index_t length) {
-        const uint8_t* p = buf.buffer() + offset;
-        int32_t target = 0;
-        std::memcpy(&target, p, kOutboundHeaderSize);
-        const uint8_t* wire = p + kOutboundHeaderSize;
-        const std::size_t wlen = static_cast<std::size_t>(length) - kOutboundHeaderSize;
+        // Decode the SBE OutboundFrame envelope: targetNodeId + a ZERO-COPY payload
+        // view into the ring frame (no memcpy, no hand-rolled offsets).
+        char* fbase = reinterpret_cast<char*>(buf.buffer()) + offset;
+        isbe::MessageHeader mh;
+        mh.wrap(fbase, 0, 0, static_cast<std::uint64_t>(length));
+        isbe::OutboundFrame dec;
+        dec.wrapForDecode(fbase, isbe::MessageHeader::encodedLength(),
+                          mh.blockLength(), mh.version(),
+                          static_cast<std::uint64_t>(length));
+        const int32_t target = dec.targetNodeId();
+        const std::string_view pv = dec.getPayloadAsStringView();
+        const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
+        const std::size_t wlen = pv.size();
 
         if (target == kBroadcast) {
             for (auto& [nodeId, peer] : peers_) {
@@ -406,7 +421,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // threw inside the worker's onFetchRequest — the fetch was lost.
         int32_t ceiling =
             static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundHeaderSize)
+            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
             - kFetchResponseOverhead;
         auto* followerPeer = findPeer(req.followerId);
         if (followerPeer && followerPeer->pub) {
@@ -565,7 +580,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         const int32_t kOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
         int32_t ceiling =
             static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundHeaderSize)
+            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
             - kOverhead;
         auto* peer = findPeer(req.followerId);
         if (peer && peer->pub) {
