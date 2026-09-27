@@ -1958,8 +1958,11 @@ private:
                 } else {
                     entry.ret.errorCode = 0; // OK
                 }
+                // Keyed by (partition<<24)|offset — unique across partitions;
+                // correlates across nodes with follower apply/fetch + onFetchRequest.
                 RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
-                                         static_cast<uint32_t>(entry.ret.correlationId));
+                    (static_cast<uint32_t>(entry.ret.partition) << 24) |
+                        (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
                 enqueueReturn_(entry.ret);
                 // O(1) erase by swap-with-back.
                 pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
@@ -2200,8 +2203,10 @@ private:
         // acks=all (non-duplicate): register a pending ack; fire when HW passes.
         // Timeout: nowNs + ackTimeoutNs_ (generous — accounts for fetch-handling
         // latency added by E5.1.2c, where fetch waits a worker cycle).
+        // Keyed by (partition<<24)|offset (see ReplPendingAckFire).
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckEnqueue,
-                                 static_cast<uint32_t>(ret.correlationId));
+            (static_cast<uint32_t>(ret.partition) << 24) |
+                (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
         PendingAcksAll pending;
         pending.replica    = replica;
         pending.lastOffset = outcome.lastOffset;

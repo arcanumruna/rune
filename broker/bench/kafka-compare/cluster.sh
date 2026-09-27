@@ -41,7 +41,10 @@ rune_start_cluster() {
         RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$egbase \
         RUNE_ELECTION_TIMEOUT_MS=300 RUNE_ELECTION_STATUS_INTERVAL_MS=50 \
         RUNE_STARTUP_CANVASS_TIMEOUT_MS=200 \
-        RUNE_WORKER_IDLE=backoff RUNE_RUNTIME_IDLE=backoff RUNE_LOG_LEVEL=info \
+        RUNE_WORKER_IDLE="${RUNE_WORKER_IDLE:-backoff}" \
+        RUNE_RUNTIME_IDLE="${RUNE_RUNTIME_IDLE:-backoff}" \
+        RUNE_AERON_DRIVER_IDLE="${RUNE_AERON_DRIVER_IDLE:-sleep-ns}" \
+        RUNE_LOG_LEVEL="${RUNE_LOG_LEVEL:-info}" \
         $(pin "$CORES_BROKER") "$RUNE_BROKER_BIN" >"$d/broker.log" 2>&1 &
     RUNE_CLUSTER_PIDS+=($!)
   done

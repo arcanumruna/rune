@@ -565,6 +565,11 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
+    // Cross-node offset trace: leader learns follower reached (fetchOffset-1),
+    // so HW can advance to that.  Keyed by (partition<<24)|fetchOffset, arg=followerId.
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
+        (static_cast<uint32_t>(req.partition) << 24) |
+            (static_cast<uint32_t>(req.fetchOffset) & 0xFFFFFFu));
 
     // DR-BUG-6 completeness gate: record this survivor's frontier.  A plain fetch
     // cannot validate lineage (req carries the fetch epoch, not the tail epoch), so
@@ -877,6 +882,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (cfg_.fastAckOnApply && role_ == Role::Follower
         && (postLeo > preLeo || postHw > preHw)) {
         FetchRequestMsg ack = nextFetch();
+        // Follower-clock offset trace: fast-ack reporting LEO, keyed (partition<<24)|LEO.
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplEnqueueOutbound,
+            (static_cast<uint32_t>(cfg_.partitionId) << 24) |
+                (static_cast<uint32_t>(ack.fetchOffset) & 0xFFFFFFu));
         transport_->sendFetchRequest(ack);
     }
 }
