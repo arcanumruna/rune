@@ -7,6 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(RUNE_PROTOCOL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include)
 
 find_package(aeron)
+# macOS/armv8: aeron ConanCenter recipe is unsupported there (see conanfile.py),
+# so it's skipped and find_package finds nothing.  Provide a stub INTERFACE target
+# so `target_link_libraries(... aeron::aeron)` resolve and CMake CONFIGURE succeeds
+# for IDE loading on a Mac.  Real builds/tests run on Linux with the real aeron.
+if(NOT TARGET aeron::aeron)
+    message(WARNING "aeron not found — creating a STUB aeron::aeron INTERFACE target "
+                    "(configure-only; client build/run requires real aeron on Linux).")
+    add_library(rune_aeron_stub INTERFACE)
+    add_library(aeron::aeron ALIAS rune_aeron_stub)
+endif()
 find_package(spdlog REQUIRED)
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)

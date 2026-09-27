@@ -18,5 +18,14 @@ class RuneClientCppConan(ConanFile):
         tc = CMakeToolchain(self); tc.user_presets_path = False; tc.generate()
 
     def requirements(self):
+        # The aeron/1.41.4 ConanCenter recipe raises ConanInvalidConfiguration on
+        # macOS/armv8 (Apple Silicon), breaking `conan install` and the CMake
+        # configure in CLion on a Mac.  The client is built/run on Linux; on macOS
+        # the project is loaded for editing/indexing only, so skip aeron there
+        # (CMakeLists provides a stub aeron::aeron INTERFACE target when absent).
+        skip_aeron = (str(self.settings.os) == "Macos" and
+                      str(self.settings.arch) == "armv8")
         for r in self.conan_data.get("requirements", []):
+            if skip_aeron and r.startswith("aeron/"):
+                continue
             self.requires(r)
