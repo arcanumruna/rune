@@ -104,6 +104,7 @@ if(BUILD_BENCHMARKS)
         benchmark/OffsetIndexBenchmark.cpp
         benchmark/LogSegmentBenchmark.cpp
         benchmark/LogBenchmark.cpp
+        benchmark/InMemoryLogBenchmark.cpp
         benchmark/RetentionBenchmark.cpp
         benchmark/PartitionApiBenchmark.cpp
         benchmark/LeaderEpochCacheBenchmark.cpp
