@@ -46,6 +46,9 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <vector>
 
 namespace rune::node {
@@ -173,42 +176,44 @@ public:
             // committed map forever, so the surviving nodes' replicas never get
             // promoted to Leader (GR-7 / TX-2b failover would hang).
             if (election_) {
-                // FAILOVER liveness window (2026-09-24 bugfix): reassignment must
-                // NOT use the short consensus heartbeat window (max(electionTimeout,
-                // 3*statusInterval) — only ~300ms with the e2e config).  Right after
-                // election a live follower can go >300ms without an AppendPosition,
-                // so the raw consensus eligible set FLAPS ([0,1,2]→[0,1]→[1]) and the
-                // death-edge gate below fires on that jitter — reassigning ALL
-                // leadership to one node, collapsing ISR and timing out produce on
-                // multi-partition topics.  Use a window 3x the heartbeat timeout:
-                // long enough that a live follower's transient post-election gap
-                // (~1 heartbeat) never reads as death, short enough that a genuinely
-                // dead node is reassigned within ~3 heartbeats (fast failover kept).
+                // BIDIRECTIONAL partition-leadership rebalance on eligible-set change.
+                //
+                // Failure detection uses the consensus heartbeat eligible set (the
+                // only real-time "is it dead" signal the metadata leader has; FLP
+                // makes some timeout irreducible for crash detection).  The
+                // TIME-INDEPENDENT part is CONVERGENCE: we run the rebalance on ANY
+                // change of the eligible set — a SHRINK fails a dead leader's
+                // partitions over to a survivor, a GROW restores balance (preferred-
+                // leader elections move leadership back toward the round-robin
+                // assignment when the returned node is in ISR).  So a transient
+                // heartbeat false-positive can no longer permanently collapse
+                // leadership: the moment the node reappears, leadership re-converges,
+                // for ANY window (no tuned grace).  reassign is idempotent, so a
+                // steady eligible set emits nothing.
+                //
+                // ALLOCATION-FREE per cycle: the liveness poll fills a fixed stack
+                // buffer (no std::vector return); a heap vector is built ONLY on an
+                // actual change (rare) to hand to the balancer.
                 const int64_t failoverTimeoutNs =
                     3 * election_->leaderHeartbeatTimeoutNs();
-                const std::vector<rune::metadata::NodeId> eligible =
-                    election_->eligibleNodeIds(nowNs, failoverTimeoutNs);
-                // REASSIGN-GATE (2026-09-24 bugfix): only reassign on an actual
-                // node-DEATH edge — a node that WAS eligible last cycle is no
-                // longer. Running reassignDeadPartitionLeaders() every duty cycle
-                // caused non-convergent churn (63k/run) on a HEALTHY cluster,
-                // collapsing replica sets to RF=1 → ISR stuck at 1 → acks=all
-                // MinIsrViolation. On a stable/growing eligible set we do nothing.
-                bool aNodeDied = false;
-                for (auto id : prevEligible_) {
-                    if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) {
-                        aNodeDied = true;
-                        break;
-                    }
-                }
-                if (aNodeDied) {
-                    std::string es; for (auto id : eligible) es += std::to_string(id) + ",";
-                    std::string ps; for (auto id : prevEligible_) ps += std::to_string(id) + ",";
-                    spdlog::info("REASSIGN-GATE: node-death edge, prevEligible=[{}] eligible=[{}] -> reassigning", ps, es);
+                const std::size_t n = election_->eligibleNodeIds(
+                    nowNs, failoverTimeoutNs, eligBuf_.data(), eligBuf_.size());
+
+                const bool changed =
+                    !prevEligInit_ || n != prevEligLen_ ||
+                    !std::equal(eligBuf_.begin(), eligBuf_.begin() + n,
+                                prevEligBuf_.begin());
+                if (changed && n > 0) {
+                    // Rare path (eligible-set change) — heap vector is acceptable here.
+                    std::vector<rune::metadata::NodeId> eligible(
+                        eligBuf_.begin(), eligBuf_.begin() + n);
                     work += static_cast<int>(
                         metadataService_->reassignDeadPartitionLeaders(eligible));
+                    std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
+                              prevEligBuf_.begin());
+                    prevEligLen_  = n;
+                    prevEligInit_ = true;
                 }
-                prevEligible_ = eligible;
             }
 
             // Rebuild RoutingImage and push to gateway each cycle.
@@ -526,7 +531,14 @@ public:
 private:
     rune::consensus::Agent&                            consensus_;
     rune::consensus::Election*                         election_;   // non-owning; null when no bridge
-    std::vector<rune::metadata::NodeId>                prevEligible_; // REASSIGN-GATE: last cycle's eligible set (death-edge detection)
+    // Allocation-free eligible-set tracking for bidirectional leadership rebalance.
+    // Fixed stack buffers reused every duty cycle (no per-cycle heap); a heap vector
+    // is built only on an actual eligible-set change (rare).  Cap bounds cluster size.
+    static constexpr std::size_t                       kMaxClusterNodes = 64;
+    std::array<rune::metadata::NodeId, kMaxClusterNodes> eligBuf_{};      // this cycle's eligible ids
+    std::array<rune::metadata::NodeId, kMaxClusterNodes> prevEligBuf_{};  // last set that drove a rebalance
+    std::size_t                                       prevEligLen_  = 0;
+    bool                                              prevEligInit_ = false;
     ReplicationMetadataBridge*                         bridge_;     // non-owning; null-safe
     rune::replication::AeronPartitionTransport*        transport_;  // non-owning; null-safe
     ReplicaRegistry*                                   registry_;   // non-owning; null-safe

@@ -35,6 +35,7 @@
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/Types.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <random>
@@ -129,7 +130,14 @@ public:
     // timeoutNs <= 0 means "use the cluster's leaderHeartbeatTimeoutNs" — the
     // same window consensus itself uses to declare a peer dead.  Callers that
     // don't want to hard-code a liveness window should pass 0.
-    std::vector<NodeId> eligibleNodeIds(int64_t nowNs, int64_t timeoutNs = 0) const;
+    // Live cluster members for partition-failover reassignment (a member is live if
+    // it appended a position within timeoutNs; the leader always includes itself).
+    // ALLOCATION-FREE: fills the caller-provided buffer out[0..cap) and returns the
+    // count — no std::vector return, so the per-duty-cycle liveness poll never heap-
+    // allocates.  Result is sorted ascending and de-duplicated.  timeoutNs <= 0 uses
+    // the cluster's own leaderHeartbeatTimeoutNs.
+    [[nodiscard]] std::size_t eligibleNodeIds(int64_t nowNs, int64_t timeoutNs,
+                                              NodeId* out, std::size_t cap) const noexcept;
 
     // The consensus leader-liveness window (max(electionTimeout, 3*statusInterval)).
     // Consensus uses this short window to detect a dead leader quickly.  Partition

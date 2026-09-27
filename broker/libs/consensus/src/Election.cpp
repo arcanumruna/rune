@@ -99,31 +99,30 @@ bool Election::isClosed() const noexcept {
 // eligibleNodeIds — live cluster members for partition-failover reassignment.
 // A member is live if it appended a position within timeoutNs (Aeron liveness).
 // The leader itself is always included when this node is the leader (it never
-// records its own AppendPosition).  Sorted ascending, deduplicated.
-std::vector<NodeId> Election::eligibleNodeIds(int64_t nowNs,
-                                              int64_t timeoutNs) const {
-    // timeoutNs <= 0 → use the cluster's own leader-liveness window.
+// records its own AppendPosition).  ALLOCATION-FREE: fills out[0..cap) and returns
+// the count — the per-duty-cycle liveness poll must not heap-allocate.  Sorted
+// ascending, de-duplicated.
+std::size_t Election::eligibleNodeIds(int64_t nowNs, int64_t timeoutNs,
+                                      NodeId* out, std::size_t cap) const noexcept {
     if (timeoutNs <= 0) {
         timeoutNs = leaderHeartbeatTimeoutNs_;
     }
-
-    std::vector<NodeId> out;
-    out.reserve(clusterMembers_.size());
 
     const NodeId selfId   = thisMemberId_;
     const bool   selfLeads =
         (leaderMember_ != nullptr) && (leaderMember_->id == selfId);
 
+    std::size_t n = 0;
     for (const ClusterMember& m : clusterMembers_) {
         const bool isSelfLeaderEntry = selfLeads && (m.id == selfId);
         if (isSelfLeaderEntry || m.isActive(nowNs, timeoutNs)) {
-            out.push_back(m.id);
+            if (n < cap) out[n++] = m.id;
         }
     }
 
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
+    std::sort(out, out + n);
+    n = static_cast<std::size_t>(std::unique(out, out + n) - out);
+    return n;
 }
 
 // nextDeadlineNs — returns the next clock deadline this state is waiting on.

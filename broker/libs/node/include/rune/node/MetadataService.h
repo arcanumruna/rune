@@ -336,17 +336,22 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // GR-7 / Task-14: Partition-leadership FAILOVER reassignment.
+    // GR-7 / Task-14: Partition-leadership FAILOVER + preferred-leader RESTORE.
     //
-    // Called every duty cycle by NodeRuntimeAgent with the current set of live
-    // cluster members (from consensus liveness — Election::eligibleNodeIds()).
-    // Leader-only, self-gated inside runDynamicRebalanceOnTick():
+    // Called every duty cycle by NodeRuntimeAgent with the FULL, STABLE cluster
+    // membership (Election::allMemberIds()) as the candidate pool — NOT a
+    // heartbeat-timed liveness set.  Leadership health is TIME-INDEPENDENT: it is
+    // decided by ISR (the data-plane in-sync set), so heartbeat jitter can never
+    // shrink the pool or collapse leadership.  Leader-only, self-gated inside
+    // runDynamicRebalanceOnTick():
     //
-    //   For every committed partition whose leaderNode is NOT in eligibleNodes
-    //   (the designated leader died), DynamicBalancer runs FailoverElection over
-    //   the partition's ISR ∩ eligibleNodes and emits a reassignment record
-    //   electing a surviving in-ISR replica.  Partitions whose leader is still
-    //   live are left untouched (min-churn — FailoverElection Rule 1).
+    //   A partition's leader is "dead" only when it is NOT in its own ISR (genuine,
+    //   sustained data failure — see DynamicBalancer leaderDead).  For such a
+    //   partition, DynamicBalancer runs FailoverElection over the partition's ISR
+    //   and elects a surviving in-ISR replica; otherwise it may run a preferred-
+    //   leader election (move to replicas[0] when it is in ISR and improves
+    //   balance) to RESTORE the balanced round-robin distribution.  A healthy
+    //   cluster at the balanced assignment emits nothing (idempotent, no churn).
     //
     // This is what makes a new cluster leader actually take over the partitions
     // owned by a killed node.  Without it, the committed assignment map keeps
