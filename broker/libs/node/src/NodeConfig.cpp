@@ -791,6 +791,17 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default ("sleep-ns").
 
+    // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
+    // Follower periodic-fetch backstop cadence.  Lower = faster acks=all
+    // round-trip when GR-10 push under-delivers; measurement/tuning knob.
+    if (const char* fiv = getenv_fn("RUNE_FETCH_INTERVAL_US")) {
+        if (fiv && !std::string_view(fiv).empty()) {
+            char* end = nullptr;
+            long long us = std::strtoll(fiv, &end, 10);
+            if (end != fiv && us > 0) cfg.fetchIntervalNs = us * 1000LL;
+        }
+    }
+
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the
     // gateway produce fanout is gated off (!perWorkerIngressEnabled).

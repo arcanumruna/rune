@@ -454,7 +454,7 @@ void BrokerNode::buildReplication() {
             pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
             pcfg.replicaLagMaxOffset  = 10'000;
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
-            pcfg.fetchIntervalNs      = 5'000'000LL;
+            pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
             pcfg.maxFetchBytes        = 1 << 20;
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
@@ -885,7 +885,7 @@ void BrokerNode::buildGateway() {
             ocfg.minIsr               = 1;
             ocfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
             ocfg.replicaLagMaxOffset  = 10'000;
-            ocfg.fetchIntervalNs      = 5'000'000LL;
+            ocfg.fetchIntervalNs      = config_.fetchIntervalNs;
             ocfg.isrCheckIntervalNs   = 10'000'000LL;
             ocfg.maxFetchBytes        = 1 << 20;
             // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
@@ -997,7 +997,7 @@ void BrokerNode::buildGateway() {
             tcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
             tcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
             tcfg.replicaLagMaxOffset  = 10'000;
-            tcfg.fetchIntervalNs      = 5'000'000LL;
+            tcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             tcfg.isrCheckIntervalNs   = 10'000'000LL;
             tcfg.maxFetchBytes        = 1 << 20;
             // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
@@ -1123,7 +1123,7 @@ void BrokerNode::buildGateway() {
             mcfg.minIsr               = 1;
             mcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
             mcfg.replicaLagMaxOffset  = 10'000;
-            mcfg.fetchIntervalNs      = 5'000'000LL;
+            mcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             mcfg.isrCheckIntervalNs   = 10'000'000LL;
             mcfg.maxFetchBytes        = 1 << 20;
             // __cluster_metadata: compacted log (keep latest assignment per key).

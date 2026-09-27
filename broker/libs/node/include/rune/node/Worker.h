@@ -1963,6 +1963,9 @@ private:
                 RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
                     (static_cast<uint32_t>(entry.ret.partition) << 24) |
                         (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
+                RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplAckSendOff,
+                    (static_cast<uint32_t>(entry.ret.partition) << 24) |
+                        (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
                 enqueueReturn_(entry.ret);
                 // O(1) erase by swap-with-back.
                 pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
@@ -2188,6 +2191,10 @@ private:
             return 1;
         }
 
+        // Waterfall: leader appended [baseOffset..lastOffset].  Keyed by lastOffset.
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplLeaderAppend,
+            (static_cast<uint32_t>(msg.partition) << 24) |
+                (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
             replica->onLeaderLogAppended();

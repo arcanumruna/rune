@@ -174,6 +174,12 @@ struct NodeConfig {
     // Tests may set a lower value (e.g. 500 ms) for faster ISR shrink in kill scenarios.
     int64_t replicaLagMaxMs = 10'000;
 
+    // Follower periodic-fetch backstop cadence (RUNE_FETCH_INTERVAL_US, default
+    // 5000µs = 5ms).  GR-10 push + fast-ack is meant to drive replication; this
+    // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all
+    // round-trip cadence can be tuned/measured on shared hardware.
+    int64_t fetchIntervalNs = 5'000'000LL;
+
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
     // Set to 1 for single-node deployments (leader-only ISR is the whole cluster).

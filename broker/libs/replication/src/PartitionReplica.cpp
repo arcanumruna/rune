@@ -570,6 +570,10 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
         (static_cast<uint32_t>(req.partition) << 24) |
             (static_cast<uint32_t>(req.fetchOffset) & 0xFFFFFFu));
+    // Waterfall: HW after this follower fetch (keyed by new HW).
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
+        (static_cast<uint32_t>(req.partition) << 24) |
+            (static_cast<uint32_t>(highWatermark()) & 0xFFFFFFu));
 
     // DR-BUG-6 completeness gate: record this survivor's frontier.  A plain fetch
     // cannot validate lineage (req carries the fetch epoch, not the tail epoch), so
@@ -732,6 +736,12 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
+    // Waterfall (follower clock): entered applyReplicated with LEO=preLeo; new
+    // records (up to resp.highWatermark) will be appended below.  Keyed by the
+    // leader HW advertised in this push (what this response can advance us toward).
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFollowerRecv,
+        (static_cast<uint32_t>(cfg_.partitionId) << 24) |
+            (static_cast<uint32_t>(resp.highWatermark) & 0xFFFFFFu));
 
     // Epoch change: truncate divergent tail before applying.
     if (resp.leaderEpoch > epoch_) {
@@ -1862,6 +1872,11 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
         lastPushedOffset_ = currentLeo;
         return;
     }
+    // Offset trace: leader actually pushes new bytes up to currentLeo.  Keyed
+    // (partition<<24)|currentLeo — "push reached X" = first push with key>X.
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPushToFollowers,
+        (static_cast<uint32_t>(cfg_.partitionId) << 24) |
+            (static_cast<uint32_t>(currentLeo) & 0xFFFFFFu));
 
     // Read the bytes from the log — same path as onFetchRequest().
     std::vector<uint8_t> logBytes = onLog([&](auto& L){ return L.read(fromOffset, cfg_.maxFetchBytes); });
