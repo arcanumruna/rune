@@ -27,9 +27,14 @@ find_package(spdlog REQUIRED)
 # ── rune-fr — ultra-low-overhead flight recorder ─────────────────────────────
 # Consumed as a SIBLING source lib (like rune-protocol; no conan publish gate).
 # Header-first + 4 small .cpp; depends only on aeron's header-only AtomicBuffer/
-# RecordDescriptor (already a broker dep).  RUNE_FR defaults to 1 (compiled in,
-# runtime-disabled by default → ~0 cost until rune_fr::enable()).  Set
-# -DRUNE_FR=0 to compile it out entirely.
+# RecordDescriptor (already a broker dep).
+#
+# COMPILE FLAG: -DENABLE_FLIGHT_RECORDER=ON (default) compiles the instrumentation
+# in (runtime-disabled by default → ~0 cost until rune_fr::enable()).  Build with
+# -DENABLE_FLIGHT_RECORDER=OFF to compile EVERY span/mark out to nothing (RUNE_FR=0)
+# — a production build with zero recorder footprint.  At RUN time (ENABLE build),
+# arm with RUNE_FR_ENABLE and choose which paths with RUNE_FR_CATEGORIES.
+option(ENABLE_FLIGHT_RECORDER "Compile in rune-fr flight-recorder instrumentation" ON)
 set(RUNE_FR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-fr" CACHE PATH "Path to the rune-fr sibling repo")
 add_library(rune_fr STATIC
     ${RUNE_FR_DIR}/src/Calibration.cpp
@@ -39,6 +44,12 @@ add_library(rune_fr STATIC
 target_include_directories(rune_fr PUBLIC ${RUNE_FR_DIR}/include)
 target_link_libraries(rune_fr PUBLIC aeron::aeron)
 target_compile_features(rune_fr PUBLIC cxx_std_23)
+# PUBLIC so the RUNE_FR macro reaches every file that includes FlightRecorder.h.
+if(ENABLE_FLIGHT_RECORDER)
+    target_compile_definitions(rune_fr PUBLIC RUNE_FR=1)
+else()
+    target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
+endif()
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)

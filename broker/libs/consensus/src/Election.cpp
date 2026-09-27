@@ -6,6 +6,7 @@
 
 #include <rune/consensus/Election.h>
 #include <rune/consensus/ClusterMember.h>
+#include <rune_fr/FlightRecorder.h>
 #include <algorithm>
 #include <cassert>
 #include <stdexcept>
@@ -196,6 +197,7 @@ int64_t Election::nextDeadlineNs() const noexcept {
 // ---------------------------------------------------------------------------
 int Election::doWork(int64_t nowNs)
 {
+    RUNE_FR_SPAN_CONSENSUS(rune_fr::Site::ElectionStep, 0);
     int workCount = 0;
     switch (state_) {
         case ElectionState::Init:

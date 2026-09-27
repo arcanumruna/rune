@@ -1194,8 +1194,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
     const pc::Produce& msg = *msgOpt;
-    RUNE_FR_SPAN(rune_fr::Site::GatewayHandle,
-                 static_cast<uint32_t>(msg.correlationId));
+    RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle,
+                         static_cast<uint32_t>(msg.correlationId));
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
@@ -2876,8 +2876,8 @@ void ClientGateway::drainWorkerReturns_()
             // Mark the instant the gateway first sees the worker's produce result.
             // The gap between WorkerAppend (worker thread) and this mark is the
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
-            RUNE_FR_MARK(rune_fr::Site::WorkerProcessOp,
-                         static_cast<uint32_t>(ret.correlationId));
+            RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
+                                 static_cast<uint32_t>(ret.correlationId));
             Session* session = sessions_.find(ret.sessionId);
             if (!session) {
                 // Session gone — drop result silently.
@@ -2971,8 +2971,8 @@ void ClientGateway::drainWorkerReturns_()
                     ret.sessionId, ret.partition, ret.baseOffset, ret.lastOffset);
             } else {
                 // Immediate ack (acks=Leader/None) — encode + reliable egress send.
-                RUNE_FR_SPAN(rune_fr::Site::ProduceAckSend,
-                             static_cast<uint32_t>(ret.correlationId));
+                RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend,
+                                     static_cast<uint32_t>(ret.correlationId));
                 pc::ProduceResponse okResp;
                 okResp.sessionId     = ret.sessionId;
                 okResp.correlationId = ret.correlationId;

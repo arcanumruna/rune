@@ -35,6 +35,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
@@ -134,6 +135,7 @@ public:
     const char* name() const noexcept override { return "rune-runtime"; }
 
     int doWork(int64_t nowNs) override {
+        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);
 

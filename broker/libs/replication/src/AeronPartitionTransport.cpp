@@ -5,6 +5,7 @@
 
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune_fr/FlightRecorder.h>
 
 // E2 inc2a: WorkerPool + WorkerOp for SPSC ApplyReplicated routing.
 // Included here (not in the header) to avoid pulling consensus/spdlog headers
@@ -124,6 +125,7 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
                                                  const FetchResponseMsg& resp)
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplSendFetchResp, 0);
     // Shared-nothing: encode into a stack buffer, marshal to control thread via
     // the outbound ring (peers_/pubs are control-owned; drainOutbound offers).
     // Size the buffer by the GENERATED codec's encodedSize() — stack fast-path for
@@ -273,6 +275,7 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::drainOutbound()
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOutboundDrain, 0);
     auto handler = [this](std::int32_t /*msgTypeId*/,
                           aeron::concurrent::AtomicBuffer& buf,
                           aeron::util::index_t offset,
@@ -305,6 +308,7 @@ int AeronPartitionTransport::drainOutbound()
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::poll(int64_t nowNs)
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplIngressPoll, 0);
     nowNs_ = nowNs;
 
     // Non-blocking probe: try to resolve pending publications.
@@ -333,6 +337,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
     aeron::Header&                   /*header*/)
 {
     using Action = aeron::ControlledPollAction;
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
     // CONTINUE = consume this fragment and keep polling (success / skip malformed).
     // ABORT    = leave this fragment UNCONSUMED and stop the poll — Aeron re-delivers
     //            it next cycle.  Returned ONLY when a target worker ring is full, so

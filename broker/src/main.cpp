@@ -50,6 +50,7 @@ static void frConfigure() {
         if (v > 0) ringBytes = v;
     }
     rune_fr::Recorder::instance().configure(static_cast<size_t>(ringBytes));
+
     if (std::getenv("RUNE_FR_ENABLE")) {
         rune_fr::enable();
         spdlog::info("rune-fr: flight recording ENABLED (ring {} MiB/thread)",

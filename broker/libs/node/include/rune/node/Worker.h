@@ -1096,8 +1096,8 @@ private:
     // copies the bytes into the log's owned buffer).
     // -------------------------------------------------------------------
     void executeProduceWire_(sbe::WorkerOp& op) {
-        RUNE_FR_SPAN(rune_fr::Site::WorkerAppend,
-                     static_cast<uint32_t>(op.correlationId()));
+        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend,
+                             static_cast<uint32_t>(op.correlationId()));
         const int32_t topicId   = op.topicId();
         const int32_t partition = op.partition();
         WorkerReturn ret;
@@ -1210,6 +1210,8 @@ private:
     // No tail for PushRead ops.
     // -------------------------------------------------------------------
     void executePushReadWire_(sbe::WorkerOp& op) {
+        RUNE_FR_SPAN_READ(rune_fr::Site::ReadEncodePush,
+                          static_cast<uint32_t>(op.sessionId()));
         const int32_t topicId    = op.topicId();
         const int32_t partition  = op.partition();
         const int64_t nextOffset = op.nextOffset();
