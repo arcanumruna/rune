@@ -24,6 +24,22 @@ if(NOT TARGET aeron::aeron)
 endif()
 find_package(spdlog REQUIRED)
 
+# ── rune-fr — ultra-low-overhead flight recorder ─────────────────────────────
+# Consumed as a SIBLING source lib (like rune-protocol; no conan publish gate).
+# Header-first + 4 small .cpp; depends only on aeron's header-only AtomicBuffer/
+# RecordDescriptor (already a broker dep).  RUNE_FR defaults to 1 (compiled in,
+# runtime-disabled by default → ~0 cost until rune_fr::enable()).  Set
+# -DRUNE_FR=0 to compile it out entirely.
+set(RUNE_FR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-fr" CACHE PATH "Path to the rune-fr sibling repo")
+add_library(rune_fr STATIC
+    ${RUNE_FR_DIR}/src/Calibration.cpp
+    ${RUNE_FR_DIR}/src/Enable.cpp
+    ${RUNE_FR_DIR}/src/Registry.cpp
+    ${RUNE_FR_DIR}/src/Report.cpp)
+target_include_directories(rune_fr PUBLIC ${RUNE_FR_DIR}/include)
+target_link_libraries(rune_fr PUBLIC aeron::aeron)
+target_compile_features(rune_fr PUBLIC cxx_std_23)
+
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
     add_compile_options(--coverage -O0 -g)
@@ -49,8 +65,16 @@ add_subdirectory(libs/transaction)
 add_subdirectory(libs/node)
 add_subdirectory(libs/gateway)
 
+# Flight-recorder instrumentation: link rune_fr PUBLIC into every instrumented
+# lib so the headers propagate to dependents (and their tests).
+target_link_libraries(rune_storage     PUBLIC rune_fr)
+target_link_libraries(rune_consensus   PUBLIC rune_fr)
+target_link_libraries(rune_replication PUBLIC rune_fr)
+target_link_libraries(rune_node        PUBLIC rune_fr)
+target_link_libraries(rune_gateway     PUBLIC rune_fr)
+
 add_executable(rune_broker src/main.cpp)
-target_link_libraries(rune_broker PRIVATE rune_node rune_storage spdlog::spdlog)
+target_link_libraries(rune_broker PRIVATE rune_node rune_storage rune_fr spdlog::spdlog)
 if(aeron_FOUND)
     target_link_libraries(rune_broker PRIVATE aeron::aeron)
     # libuuid (needed by aeron's embedded driver on Linux) is linked PUBLIC on

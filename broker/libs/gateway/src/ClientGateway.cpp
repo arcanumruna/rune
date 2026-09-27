@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
@@ -253,6 +254,8 @@ bool ClientGateway::sendRespReliable_(Session&          session,
                                       int64_t           baseOffset,
                                       int64_t           correlationId)
 {
+    RUNE_FR_SPAN(rune_fr::Site::ProduceAckSend,
+                 static_cast<uint32_t>(correlationId));
     static_assert(pc::ProduceResponse::ENCODED_SIZE <= PendingResp::kMaxBytes,
                   "ProduceResponse::ENCODED_SIZE exceeds PendingResp::kMaxBytes");
     static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
@@ -1193,6 +1196,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
     const pc::Produce& msg = *msgOpt;
+    RUNE_FR_SPAN(rune_fr::Site::GatewayHandle,
+                 static_cast<uint32_t>(msg.correlationId));
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);

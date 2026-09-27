@@ -66,6 +66,7 @@
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/WorkerOp.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
@@ -1095,6 +1096,8 @@ private:
     // copies the bytes into the log's owned buffer).
     // -------------------------------------------------------------------
     void executeProduceWire_(sbe::WorkerOp& op) {
+        RUNE_FR_SPAN(rune_fr::Site::WorkerAppend,
+                     static_cast<uint32_t>(op.correlationId()));
         const int32_t topicId   = op.topicId();
         const int32_t partition = op.partition();
         WorkerReturn ret;
