@@ -371,7 +371,11 @@ BENCHMARK(BM_FetchResponse_Encode_1KiB)->Unit(benchmark::kNanosecond);
 
 static void BM_FetchResponse_Decode_1KiB(benchmark::State& state) {
     static const std::vector<uint8_t> kPayload(1024, 0xBB);
-    std::array<uint8_t, 8 + 30 + 4 + 1024> buf{};
+    // Size the buffer from the codec, NOT a hardcoded overhead: the SBE
+    // FetchResponse block grew past the old `8 + 30 + 4` assumption (e.g. the
+    // topicId field), so encoding into that fixed array overflowed it and
+    // aborted via the stack canary in Release. encodedSize() is authoritative.
+    std::vector<uint8_t> buf(FetchResponseMsg::encodedSize(kPayload.size()));
     FetchResponseMsg::encode(buf.data(), 0, 1, 0, 4096, 0, 0,
                              std::span<const uint8_t>(kPayload));
 
@@ -442,7 +446,9 @@ static void BM_FollowerApplyReplicated(benchmark::State& state) {
 
     // Pre-build a FetchResponse with `batchSize` bytes of records.
     std::vector<uint8_t> payload(batchSize, 0xDD);
-    std::vector<uint8_t> responseBuf(8 + 30 + 4 + batchSize);
+    // Codec-authoritative size (the old `8 + 30 + 4` overhead is stale and
+    // overflowed this heap buffer once the SBE FetchResponse block grew).
+    std::vector<uint8_t> responseBuf(FetchResponseMsg::encodedSize(batchSize));
 
     Offset hw = 0;
     for (auto _ : state) {
