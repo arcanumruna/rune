@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  rune-replication.xml — SBE schema for Rune's cross-node REPLICATION wire messages
+  (leader<->follower fetch, OffsetsForLeaderEpoch exchange, reconcile).
+
+  These travel worker → outbound ring → Aeron publication → peer node (a real wire),
+  so unlike the process-local internal ring schema (rune-internal-ring.xml, id=7),
+  these are genuine wire messages.  schemaId 112 + version 2 preserve the ids the
+  previous hand-rolled ReplicationMessages.h used (ReplicationMessageHeader.schemaId
+  == 112, DR-BUG-5 bumped version to 2 for the topicId fields).
+
+  SBE gives generated encode/decode/encodedLength — so the outbound-ring send path
+  can claim exactly encodedLength() bytes and encode in place (zero-copy, no fixed
+  stack buffer → no buffer-overflow when a replicated batch exceeds a guessed cap).
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="rune.protocol.replication.sbe"
+                   id="112"
+                   version="2"
+                   semanticVersion="1.0"
+                   description="Rune cross-node replication wire messages"
+                   byteOrder="littleEndian">
+
+  <types>
+    <composite name="messageHeader" description="SBE message header (fixed 8 bytes)">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId"  primitiveType="uint16"/>
+      <type name="schemaId"    primitiveType="uint16"/>
+      <type name="version"     primitiveType="uint16"/>
+    </composite>
+
+    <!-- Variable-length raw record-batch bytes (zero-copy view on decode). -->
+    <composite name="varDataEncoding" description="raw variable-length byte block">
+      <type name="length"  primitiveType="uint32" maxValue="1073741824"/>
+      <type name="varData" primitiveType="uint8" length="0"/>
+    </composite>
+  </types>
+
+  <!-- ====================================================================== -->
+  <!-- FetchRequest (follower → leader) : template 1                           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FetchRequest" id="1" description="follower fetch request">
+    <field name="leaderEpoch" id="1" type="int64"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="followerId"  id="3" type="int32"/>
+    <field name="fetchOffset" id="4" type="int64"/>
+    <field name="maxBytes"    id="5" type="int32"/>
+    <field name="topicId"     id="6" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- FetchResponse (leader → follower) : template 2 — carries the records    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="FetchResponse" id="2" description="leader fetch response (records tail)">
+    <field name="leaderEpoch"    id="1" type="int64"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="highWatermark"  id="3" type="int64"/>
+    <field name="logStartOffset" id="4" type="int64"/>
+    <field name="errorCode"      id="5" type="int16"/>
+    <field name="topicId"        id="6" type="int32"/>
+    <data  name="records"        id="7" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- OffsetsForLeaderEpochRequest (DR-BUG-6) : template 3                    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="OffsetsForLeaderEpochRequest" id="3" description="OLE request">
+    <field name="currentEpoch"   id="1" type="int64"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="followerId"     id="3" type="int32"/>
+    <field name="requestedEpoch" id="4" type="int64"/>
+    <field name="followerLeo"    id="5" type="int64"/>
+    <field name="topicId"        id="6" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- OffsetsForLeaderEpochResponse (DR-BUG-6) : template 4                   -->
+  <!-- ====================================================================== -->
+  <sbe:message name="OffsetsForLeaderEpochResponse" id="4" description="OLE response">
+    <field name="leaderEpoch"   id="1" type="int64"/>
+    <field name="partition"     id="2" type="int32"/>
+    <field name="responseEpoch" id="3" type="int64"/>
+    <field name="endOffset"     id="4" type="int64"/>
+    <field name="errorCode"     id="5" type="int16"/>
+    <field name="topicId"       id="6" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- Reconcile fetch req/resp (DR-BUG-6) : templates 5/6 — same shapes as    -->
+  <!-- FetchRequest/FetchResponse but distinct template ids so the receiver     -->
+  <!-- routes them to the reconcile path.                                       -->
+  <!-- ====================================================================== -->
+  <sbe:message name="ReconcileFetchRequest" id="5" description="reconcile fetch request">
+    <field name="leaderEpoch" id="1" type="int64"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="followerId"  id="3" type="int32"/>
+    <field name="fetchOffset" id="4" type="int64"/>
+    <field name="maxBytes"    id="5" type="int32"/>
+    <field name="topicId"     id="6" type="int32"/>
+  </sbe:message>
+
+  <sbe:message name="ReconcileFetchResponse" id="6" description="reconcile fetch response (records tail)">
+    <field name="leaderEpoch"    id="1" type="int64"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="highWatermark"  id="3" type="int64"/>
+    <field name="logStartOffset" id="4" type="int64"/>
+    <field name="errorCode"      id="5" type="int16"/>
+    <field name="topicId"        id="6" type="int32"/>
+    <data  name="records"        id="7" type="varDataEncoding"/>
+  </sbe:message>
+
+</sbe:messageSchema>
