@@ -565,7 +565,16 @@ public:
         if (perWorkerIngressActive_) {
             work += flushRetOverflow_();
             work += flushOwedAcksAll_(nowNs);
-            if (ret_.hasSpaceForMsg(ackSlotBytes_) && retOverflow_.empty() && pendingAcksAll_.empty()) {
+            // Pipelined acks=all: poll new produce as long as the return ring has
+            // space for the acks about to be polled PLUS all already-parked acks
+            // (pendingAcksAll_ fire later, into ret_).  Previously the gate required
+            // pendingAcksAll_.empty(), which SERIALIZED acks=all on the ~172ms
+            // replication round-trip (no new intake while any ack was in flight →
+            // throughput = batch / round-trip).  Now pendingAcksAll_ is bounded by
+            // ret_ capacity (reservation below subtracts its size) instead of 1.
+            if (retOverflow_.empty() &&
+                ret_.freeSlotsForMsgSize(ackSlotBytes_) >
+                    static_cast<int64_t>(pendingAcksAll_.size())) {
                 work += pollWorkerIngress_(nowNs);
             }
         }
@@ -2023,9 +2032,13 @@ private:
         // Reservation-before-poll (E5.1.3 deliverable b):
         //   K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
         // Guard G-A6: never poll more frames than we can ack without dropping.
+        // Reserve return-ring slots for BOTH the acks about to be polled AND the
+        // acks already parked in pendingAcksAll_ (they fire into ret_ later).  This
+        // bounds pendingAcksAll_ by ret_ capacity while allowing acks=all pipelining.
         const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
-        const int64_t overflow  = static_cast<int64_t>(retOverflow_.size());
-        const int64_t available = (freeSlots > overflow) ? (freeSlots - overflow) : 0;
+        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) +
+                                  static_cast<int64_t>(pendingAcksAll_.size());
+        const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
         const int32_t K = static_cast<int32_t>(
             std::min(static_cast<int64_t>(desiredFragmentLimit_), available));
         if (K <= 0) return 0; // no free slots — skip poll (G-A6 preserved)
