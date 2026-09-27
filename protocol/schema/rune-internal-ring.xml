@@ -182,4 +182,17 @@
     <field name="errorCode"     id="3" type="int32"/>
   </sbe:message>
 
+  <!-- ====================================================================== -->
+  <!-- OutboundFrame (worker → control-thread outbound ring)                   -->
+  <!-- Wraps an ALREADY-SBE-encoded replication message (payload) with the      -->
+  <!-- process-local routing target node id.  The worker encodes this straight  -->
+  <!-- into the claimed outbound-ring slot (wrap-in-place); drainOutbound decodes-->
+  <!-- targetNodeId + a zero-copy payload span and offers the payload on that    -->
+  <!-- peer's publication.  targetNodeId == -1 is the broadcast sentinel.        -->
+  <!-- ====================================================================== -->
+  <sbe:message name="OutboundFrame" id="5" description="worker→control outbound ring envelope">
+    <field name="targetNodeId" id="1" type="int32"/>
+    <data  name="payload"      id="2" type="varDataEncoding"/>
+  </sbe:message>
+
 </sbe:messageSchema>
