@@ -115,16 +115,25 @@ public:
         std::vector<uint8_t> out;
         out.reserve(static_cast<std::size_t>(maxBytes));
 
-        // Walk the live entries oldest-first by PHYSICAL index, wrapping with a
-        // predictable compare-and-reset rather than a per-element `% maxRecords_`
-        // (a real division on this non-pow2 capacity — measurably slower on the
-        // read scan).
-        std::size_t phys = entryHead_;
-        for (std::size_t i = 0; i < entryCount_; ++i) {
+        // Entry offsets are strictly increasing with logical index, so binary-search
+        // the FIRST live entry whose lastOffset >= startOffset — O(log n) instead of
+        // an O(n) scan from the oldest entry.  This is the common case where a reader
+        // resumes from a deep offset (e.g. pushSubscriptions on a large ring).
+        std::size_t lo = 0, hi = entryCount_;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (entryAt(mid).lastOffset < startOffset) lo = mid + 1;
+            else hi = mid;
+        }
+
+        // Walk from the located entry by PHYSICAL index, wrapping with a predictable
+        // compare-and-reset rather than a per-element `% maxRecords_` (a real division
+        // on this non-pow2 capacity).
+        std::size_t phys = (entryHead_ + lo) % maxRecords_;
+        for (std::size_t i = lo; i < entryCount_; ++i) {
             const Entry& e = entries_[phys];
             if (++phys == maxRecords_) phys = 0;
-            // Skip batches before startOffset.
-            if (e.lastOffset < startOffset) continue;
+            // All entries from `lo` on have lastOffset >= startOffset (binary search).
             if (e.baseOffset < startOffset) {
                 // Partial batch — skip (InMemoryLog stores whole batches, startOffset
                 // should align to a batch boundary; if not, skip to next).
