@@ -253,7 +253,8 @@ public:
     //
     // Idempotent: if runners_ is already populated this is a no-op.
     void startRunners(NodeConfig::WorkerIdleStrategy strategy,
-                      rune::consensus::NanoClock&    clock) {
+                      rune::consensus::NanoClock&    clock,
+                      int64_t                        maxParkUs = 200) {
         if (!runners_.empty()) return; // idempotent
 
         const std::size_t n = workers_.size();
@@ -273,11 +274,13 @@ public:
             case NodeConfig::WorkerIdleStrategy::Yielding:  // fallback to Backoff
             case NodeConfig::WorkerIdleStrategy::Sleeping:  // fallback to Backoff
             default:
-                // Agrona defaults (10 spins, 20 yields, 1µs–1ms park): a genuinely
-                // idle worker parks (doWork returns 0 when idle), and the 1ms
-                // maxPark caps first-produce-after-idle wake latency at 1ms.
+                // Backoff with a configurable maxPark (default 200µs) — caps the
+                // per-hop wake latency on the replication round-trip (the 1ms Agrona
+                // default was a ~1ms tax at every cross-thread hop under acks=maj).
                 idles_.emplace_back(
-                    std::make_unique<rune::consensus::BackoffIdleStrategy>());
+                    std::make_unique<rune::consensus::BackoffIdleStrategy>(
+                        10, 20, std::chrono::microseconds{1},
+                        std::chrono::microseconds{maxParkUs}));
                 break;
             }
             runners_.emplace_back(

@@ -802,6 +802,17 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // --- RUNE_IDLE_MAX_PARK_US (optional, default 200µs) ---
+    // Backoff idle max park for runtime + worker AgentRunners; caps per-hop wake
+    // latency on the replication round-trip.  Lower = lower latency, more idle CPU.
+    if (const char* imp = getenv_fn("RUNE_IDLE_MAX_PARK_US")) {
+        if (imp && !std::string_view(imp).empty()) {
+            char* end = nullptr;
+            long long us = std::strtoll(imp, &end, 10);
+            if (end != imp && us > 0) cfg.idleMaxParkUs = us;
+        }
+    }
+
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the
     // gateway produce fanout is gated off (!perWorkerIngressEnabled).

@@ -131,7 +131,7 @@ void BrokerNode::start() {
     //     Workers are independent of the control agent but their ingress rings are
     //     fed by the control thread, so the ordering: control first, workers after.
     if (workerPool_) {
-        workerPool_->startRunners(config_.workerIdleStrategy, clock_);
+        workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
         spdlog::info("BrokerNode[{}]: {} worker AgentRunner thread(s) started",
                      config_.nodeId, workerPool_->workerCount());
     }
@@ -1274,7 +1274,12 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: runtime idle strategy = BusySpin (low latency; core pegged)",
                      config_.nodeId);
     } else {
-        idleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>();
+        // Backoff with configurable maxPark (RUNE_IDLE_MAX_PARK_US, default 200µs):
+        // caps per-hop replication-round-trip wake latency without pegging the core
+        // (busyspin here starves consensus heartbeats → re-elections on shared cores).
+        idleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>(
+            10, 20, std::chrono::microseconds{1},
+            std::chrono::microseconds{config_.idleMaxParkUs});
     }
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).

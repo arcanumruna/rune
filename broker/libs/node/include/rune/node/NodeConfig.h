@@ -180,6 +180,14 @@ struct NodeConfig {
     // round-trip cadence can be tuned/measured on shared hardware.
     int64_t fetchIntervalNs = 5'000'000LL;
 
+    // Backoff idle max park (RUNE_IDLE_MAX_PARK_US, default 200µs) for the runtime
+    // + worker AgentRunners.  The default Agrona 1ms max park adds up to ~1ms wake
+    // latency at EACH cross-thread hop of the acks=majority replication round-trip
+    // (worker→control→net→control→worker …); 200µs cuts that 5x without pegging a
+    // core (backoff still sleeps → consensus heartbeats are not starved, unlike
+    // busyspin which triggers re-elections on shared cores).
+    int64_t idleMaxParkUs = 200;
+
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
     // Set to 1 for single-node deployments (leader-only ISR is the whole cluster).

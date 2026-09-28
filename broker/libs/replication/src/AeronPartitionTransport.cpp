@@ -237,6 +237,28 @@ void AeronPartitionTransport::sendReconcileResponse(
 // Back-pressure: on a full ring, bump the counter and return false — the send is
 // skipped (replication is retriable; caller re-drives next cycle). Never blocks.
 // ---------------------------------------------------------------------------
+// FR trace correlation for a replication wire message: (partition<<24)|offset,
+// derived identically at every hop (enqueue/drain/recv) so one corr stitches the
+// full cross-node timeline.  FetchRequest→fetchOffset, FetchResponse→highWatermark.
+static inline uint32_t frCorrOf(const uint8_t* wire, std::size_t len)
+{
+    if (len < ReplicationMessageHeader::ENCODED_SIZE) return 0;
+    const auto hdr = ReplicationMessageHeader::decode(wire, 0);
+    if (hdr.templateId == FetchRequestMsg::TEMPLATE_ID &&
+        len >= FetchRequestMsg::TOTAL_SIZE) {
+        const auto r = FetchRequestMsg::decode(wire, 0);
+        return (static_cast<uint32_t>(static_cast<uint8_t>(r.partition)) << 24) |
+               (static_cast<uint32_t>(r.fetchOffset) & 0xFFFFFFu);
+    }
+    if (hdr.templateId == FetchResponseMsg::TEMPLATE_ID &&
+        len >= FetchResponseMsg::encodedSize(0)) {
+        const auto r = FetchResponseMsg::decode(wire, 0, len);
+        return (static_cast<uint32_t>(static_cast<uint8_t>(r.partition)) << 24) |
+               (static_cast<uint32_t>(r.highWatermark) & 0xFFFFFFu);
+    }
+    return 0;
+}
+
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
@@ -272,6 +294,8 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
     enc.targetNodeId(targetNodeId);
     enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
     outboundRing_.commit(idx);
+    // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, frCorrOf(wire, len));
     return true;
 }
 
@@ -300,6 +324,9 @@ int AeronPartitionTransport::drainOutbound()
         const std::string_view pv = dec.getPayloadAsStringView();
         const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
         const std::size_t wlen = pv.size();
+        // Control-clock: frame drained from the outbound ring + offered to peer(s).
+        // Gap ReplOutEnqueue→ReplOutDrain = worker→control handoff latency.
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, frCorrOf(wire, wlen));
 
         if (target == kBroadcast) {
             for (auto& [nodeId, peer] : peers_) {
@@ -382,6 +409,11 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             return Action::CONTINUE;
         }
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
+        // Control-clock: fetch/ack fragment received from a peer (post-transit).
+        const uint32_t reqCorr =
+            (static_cast<uint32_t>(static_cast<uint8_t>(req.partition)) << 24) |
+            (static_cast<uint32_t>(req.fetchOffset) & 0xFFFFFFu);
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, reqCorr);
 
         // Route to the replica owning (topicId, partition).
         // DR-BUG-5: composite key prevents collision across topics that share
@@ -456,6 +488,10 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
                 // drains).  No drop.
                 return Action::ABORT;
             }
+            // Control-clock: fetch routed to the owning worker (→ onFetchRequest).
+            // Gap ReplFragRecv→ReplRouteToWorker≈0; ReplRouteToWorker→ReplFetchReqHandle
+            // = control→worker handoff latency on the leader.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplRouteToWorker, reqCorr);
         } else {
             it->second->onFetchRequest(req, nowNs_);
         }
@@ -475,6 +511,11 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // Pass `len` so decode() can clamp the records span against the actual
         // fragment size (defence against malformed length prefix).
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
+        // Control-clock: push/response fragment received (post-transit) on follower.
+        const uint32_t respCorr =
+            (static_cast<uint32_t>(static_cast<uint8_t>(resp.partition)) << 24) |
+            (static_cast<uint32_t>(resp.highWatermark) & 0xFFFFFFu);
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, respCorr);
 
         // Route to the replica owning (topicId, partition).
         // DR-BUG-5: composite key prevents collision across topics.
@@ -524,6 +565,8 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
                 // consumed), so the re-delivered fragment re-copies correctly. No drop.
                 return Action::ABORT;
             }
+            // Control-clock: push routed to the owning worker (→ applyReplicated).
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplRouteToWorker, respCorr);
         } else {
             // INLINE path (no WorkerPool): call applyReplicated synchronously.
             it->second->applyReplicated(resp);
