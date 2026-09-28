@@ -228,15 +228,27 @@ rebuilt; a newly-promoted leader already has it (applied as a follower).
 
 Each is independently testable; the registry and validator have no I/O.
 
-## 7. Schema evolution (minimal for step 0)
+## 7. Schema evolution (additive-only in step 0)
 
-- A topic may be re-defined with a **new schema version** (new `irBlob`); the
-  registry keeps the latest and bumps `version`. Records carry `schemaId` +
-  `templateId` + SBE block version, so readers/validators pick the right layout.
-- Step 0 permits **additive** evolution (new trailing optional fields / var-data,
-  per SBE `sinceVersion`) and rejects incompatible redefinition with
-  `IncompatibleSchema`. A full compatibility policy (and multi-version coexistence
-  for in-flight records) is deferred to a later spec; noted in Open Questions.
+- **Additive-only.** A topic's schema may grow — append new fields / var-data /
+  groups, each tagged with SBE `sinceVersion` — but may **not** remove or retype
+  an existing field. Non-additive redefinition is rejected `IncompatibleSchema`.
+  Re-defining bumps the registry `version` and keeps the new IR as the latest.
+- **Keep only the latest IR per topic — sufficient and lossless.** Every record
+  self-describes its version and block length in its SBE header, and additive
+  evolution keeps every existing field at the **same offset** in the newer
+  layout. So the latest IR reads and validates **any** older record: a field
+  added after that record's version has `sinceVersion` greater than the record's
+  version and is returned as absent/default, and the decoder never reads past the
+  record's block length. **No record is ever discarded or rewritten** on a schema
+  change — old events keep flowing, read with their smaller field set.
+- **Version-aware validation.** The validator requires only the fields present in
+  the record's own version, so an older record missing newer fields still passes.
+- A record arriving with a version **newer** than the registered schema is
+  prevented by define-before-produce; if it occurs, its additive known prefix
+  still reads, and it is rejected when validation is on and the version is unknown.
+- Non-additive evolution and storing multiple historical IRs are deferred to a
+  later spec.
 
 ## 8. Error handling
 
@@ -276,14 +288,13 @@ Each is independently testable; the registry and validator have no I/O.
 - The registry is maintained via the **existing replicated compacted-topic
   path** — no new hot-path work on produce.
 
-## 11. Open questions (resolve during planning / later specs)
+## 11. Open questions
 
-**Resolved this pass:** `DefineTopic` **owns topic creation incl. partition
-count/placement**; **clients ship the SBE IR**; **validation runs per-worker**
-(scales with worker count). Remaining:
+**All step-0 design questions are resolved:** `DefineTopic` owns topic creation
+incl. partition count/placement; clients ship the SBE IR; validation runs
+per-worker; schema evolution is additive-only with a single latest IR (§7).
 
-- Validator implementation (a) OTF-driven vs (b) precomputed descriptor table —
-  decide by benchmark; spec targets (b).
-- Multi-version coexistence: do in-flight records of an older block version need
-  the older validator/accessor simultaneously, or is register-before-produce
-  ordering sufficient for step 0?
+One item is settled **at implementation time, not design time**:
+- Validator implementation — precomputed descriptor table (the target) vs.
+  OTF-driven — **decided by benchmark**; both are correct, the choice is purely
+  speed.
