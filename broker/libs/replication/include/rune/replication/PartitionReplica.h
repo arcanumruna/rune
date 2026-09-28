@@ -815,6 +815,19 @@ private:
     // majority committed frontier.  Single-writer (leader thread); bounded by |ISR|.
     std::unordered_map<NodeId, Offset> survivorFrontier_;
 
+    // FETCH CONFLATION: per-follower record of the last (fetchOffset, LEO) served +
+    // when.  The leader SKIPS re-serving an IDENTICAL response within kFetchResendNs.
+    // A behind/stuck follower re-fetches the same range on every apply + every 5ms
+    // periodic tick while its apply is still queued → without this, the leader
+    // re-sends the same data N times → a flood of duplicate (already-applied) apply
+    // ops that head-of-line-block the useful applies in the follower's ingress ring
+    // (measured: 99% useless applies, 47-98ms follower control→worker handoff).
+    // Conflating to ONE response per distinct state removes the flood; the timeout
+    // re-serve preserves lost-push / lost-response recovery.  Cleared on role change.
+    struct ServedFetch { Offset fetchOffset = -1; Offset leo = -1; int64_t timeNs = 0; };
+    std::unordered_map<NodeId, ServedFetch> servedFetch_;
+    static constexpr int64_t kFetchResendNs = 20'000'000;  // 20ms lost-push re-serve window
+
     // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
     // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
     // when the ISR shrinks to a single member (the leader stranded in a

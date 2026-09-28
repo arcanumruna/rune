@@ -258,6 +258,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     completenessFloor_ = committedHw;
     leaderComplete_    = false;
     survivorFrontier_.clear();
+    servedFetch_.clear();   // fetch-conflation state is per-leadership
     survivorFrontier_[cfg_.selfId] = logEndOffset_();
     reconcileTarget_   = -1;   // drop any pull latched under a prior term
     reconcileIssuedNs_ = -1;
@@ -576,6 +577,24 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         survivorFrontier_[req.followerId] =
             std::min<Offset>(req.fetchOffset, logEndOffset_());
         maybeCompleteLeadership();
+    }
+
+    // FETCH CONFLATION: if we already served this follower the IDENTICAL response
+    // (same fetchOffset AND same current LEO) within kFetchResendNs, skip re-serving.
+    // A behind/stuck follower re-fetches the same range on every apply + 5ms tick
+    // while its prior response is still in flight/unapplied — re-sending it floods
+    // the follower's ingress ring with duplicate (already-applied) apply ops that
+    // head-of-line-block the useful ones.  ISR liveness + HW were already updated
+    // above, so skipping the RESPONSE is safe; the timeout re-serve recovers a
+    // genuinely lost push/response.  (Does NOT touch the DR reconcile/ahead-follower
+    // paths handled earlier.)
+    {
+        const Offset curLeo = logEndOffset_();
+        auto& sf = servedFetch_[req.followerId];
+        const bool identical = sf.timeNs != 0 && sf.fetchOffset == req.fetchOffset &&
+                               sf.leo == curLeo && (nowNs - sf.timeNs) < kFetchResendNs;
+        if (identical) return kErrNone;   // conflate: don't re-send the same response
+        sf.fetchOffset = req.fetchOffset; sf.leo = curLeo; sf.timeNs = nowNs;
     }
 
     // Read records from the log.
