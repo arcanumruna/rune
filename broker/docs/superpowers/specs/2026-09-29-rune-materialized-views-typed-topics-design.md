@@ -47,8 +47,9 @@ recorded here so later specs inherit them:
 ## 2. Goals / non-goals
 
 **Goals**
-- A **runtime API** to declare a topic's message type (today topics are defined
-  only via env property; there is no runtime definition path).
+- A **runtime API** to **create a topic** — its **partition count** *and* its
+  message type — replacing the env-property-only path (today there is no runtime
+  create/define path). `DefineTopic` owns topic creation, not just schema.
 - Accept a **serialized SBE schema (IR)** + `schemaId`, deserialize it, link it
   to the topic, and **persist it durably** so it survives restart and reaches
   every node hosting the topic.
@@ -151,8 +152,10 @@ IR — see §4.6) so the client can build correctly-typed records.
    replicated store — reusing the existing compacted-topic + replication
    machinery; no new persistence subsystem. Compaction keeps only the latest
    schema per topic (plus history retained by the log until compacted).
-2b. The topic itself is created/linked (partition assignment) exactly as env-
-    declared topics are today; the only addition is the schema linkage.
+2b. `DefineTopic` **owns topic creation**: it assigns the `topicId`, sets the
+    **partition count**, and drives partition placement (the same assignment the
+    env-declared path used), then links the schema. It is the runtime
+    topic-creation API — not a schema overlay on a pre-existing topic.
 3. On `__topic_schemas` apply (leader and every replica), each node updates its
    in-memory **SchemaRegistry**: `topicId → { IR (parsed), validator?, keyField,
    ... }`. Because it applies via the normal replicated log path, every node
@@ -176,9 +179,11 @@ IR before append:
   or (b) precompute a flat field-descriptor table (offset, type, min/max, enum
   set) and validate with a tight loop. (b) is the target for speed; (a) is the
   fallback. Benchmarked to confirm ~tens of ns for a small record.
-- **Where it runs:** on the produce ingress path *before* the log append. Only
-  topics with `validate` on pay anything; others take a single already-present
-  branch. This preserves write throughput (the explicit constraint).
+- **Where it runs:** **per-worker** — on each worker's own ingress path *before*
+  its log append, never on a shared gateway stage — so validation cost **scales
+  out with worker count** and never serializes on one stage. Only topics with
+  `validate` on pay anything; others take a single already-present branch. This
+  preserves write throughput (the explicit constraint).
 - **Failure:** reject the produce with `SchemaValidationFailed` and a field
   hint; nothing is appended (no partial state).
 
@@ -241,6 +246,7 @@ Each is independently testable; the registry and validator have no I/O.
 | `keyField`/`tsField` missing or wrong type in IR | `InvalidSchema` |
 | Define on existing topic, identical schema | idempotent success (same version) |
 | Define on existing topic, incompatible schema | `IncompatibleSchema` |
+| Define on existing topic, different partition count | `TopicExists` conflict (partition count immutable in step 0) |
 | Produce fails validation (validate on) | `SchemaValidationFailed`, no append |
 | Produce to a validate-on topic with wrong `schemaId`/`templateId` | rejected |
 | Registry miss on produce (schema not yet applied) | reject/retry (define must precede produce) |
@@ -272,17 +278,12 @@ Each is independently testable; the registry and validator have no I/O.
 
 ## 11. Open questions (resolve during planning / later specs)
 
+**Resolved this pass:** `DefineTopic` **owns topic creation incl. partition
+count/placement**; **clients ship the SBE IR**; **validation runs per-worker**
+(scales with worker count). Remaining:
+
 - Validator implementation (a) OTF-driven vs (b) precomputed descriptor table —
   decide by benchmark; spec targets (b).
 - Multi-version coexistence: do in-flight records of an older block version need
   the older validator/accessor simultaneously, or is register-before-produce
   ordering sufficient for step 0?
-- Where exactly validation runs (gateway ingress vs per-worker) given the
-  per-worker ingress scale-out path — pick the point that keeps it off the
-  shared ack path.
-- Does `DefineTopic` also own **partition count / placement**, or only schema on
-  top of the existing topic-creation path? (Leaning: schema-only in step 0;
-  topic creation stays as-is.)
-- Client ergonomics: do clients ship the IR (from their SBE-generated schema) or
-  a higher-level type descriptor the broker compiles to IR? (Leaning: ship IR;
-  it's what SBE already produces.)
