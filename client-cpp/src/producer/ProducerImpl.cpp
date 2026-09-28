@@ -12,6 +12,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <cassert>
 #include <chrono>
@@ -233,6 +234,9 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
         if (valueLen > 0) std::memcpy(dst + kRecValBytesOff, value.data(), valueLen);
 
         ring_.commit(idx);
+        // App-thread: record handed to the app→agent ring (corr=correlationId).
+        RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientAppSend,
+                             static_cast<uint32_t>(correlationId));
         return true;
     } catch (...) {
         return false; // preserve noexcept contract
@@ -452,6 +456,11 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             const uint8_t flags     = p[kRecFlagsOff];
             const int64_t corrId    = readLE64(p, kRecCorrIdOff);
             const uint32_t valueLen = readLE32u(p, kRecValLenOff);
+            // Agent-thread: record dequeued from the ring (gap ClientAppSend→here =
+            // app→agent ring handoff).  corr=correlationId; value=record bytes.
+            RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAgentDrain,
+                                     static_cast<uint32_t>(corrId),
+                                     static_cast<double>(valueLen));
 
             if (sz < static_cast<std::size_t>(kRecHeaderSize) + valueLen)
                 return ControlledAction::CONTINUE;
@@ -657,6 +666,11 @@ bool ProducerImpl::encodeAndSend(
     }
 
     ++framesSent_;                                       // one Aeron frame offered
+    // Agent-thread: batch frame offered to the broker.  corr=batch correlationId;
+    // value=inFlight AFTER this offer (how deep the un-acked pipeline is).
+    RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientBatchOffer,
+                             static_cast<uint32_t>(correlationId),
+                             static_cast<double>(ps.inFlight + 1));
     ps.nextBaseSequence += ps.builder->recordCount();    // advance ONLY on success
     if (correlationId != 0) {
         // Increment in-flight counter (decremented on ProduceResponse).
@@ -949,6 +963,12 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
         auto ait = pendingAcks_.find(corrId);
         if (ait == pendingAcks_.end()) return;
         PendingAck& pa = ait->second;
+        // Agent-thread: ack matched → user callback/promise about to fire.  This is
+        // the END of the broker round-trip as the client sees it (corr=correlationId;
+        // value=committed offset).  Gap ClientBatchOffer→here = offer→ack (broker RTT).
+        RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete,
+                                 static_cast<uint32_t>(corrId),
+                                 static_cast<double>(off));
         if (err) {
             if (pa.kind == PendingAck::Kind::Callback) {
                 if (pa.callback) pa.callback(-1); // -1 signals error to callback

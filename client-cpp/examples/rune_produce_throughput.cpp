@@ -33,18 +33,47 @@
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <csignal>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace rune::client;
+
+// rune-fr lifecycle (mirrors the broker): configure ring + enable on RUNE_FR_ENABLE,
+// dump trace on SIGUSR1 / shutdown so the CLIENT is traced with the same recorder.
+static std::atomic<bool> g_frDump{false};
+static void frdumphandler(int) noexcept { g_frDump.store(true, std::memory_order_release); }
+static void frConfigure() {
+    std::uint64_t ringBytes = 128ull * 1024 * 1024;
+    if (const char* rb = std::getenv("RUNE_FR_RING_BYTES")) {
+        const std::uint64_t v = std::strtoull(rb, nullptr, 10);
+        if (v > 0) ringBytes = v;
+    }
+    rune_fr::Recorder::instance().configure(static_cast<size_t>(ringBytes));
+    if (std::getenv("RUNE_FR_ENABLE")) rune_fr::enable();
+}
+static void frReport(const std::string& tag) {
+    if (!rune_fr::isEnabled()) return;
+    rune_fr::Recorder::instance().drain();
+    const char* out = std::getenv("RUNE_FR_OUT");
+    const std::string dir = (out && *out) ? out : ".";
+    const std::string sfx = "-client-p" + std::to_string(static_cast<long>(::getpid())) + "-" + tag;
+    { std::ofstream f(dir + "/fr-hist" + sfx + ".txt"); if (f) rune_fr::dumpHistograms(f); }
+    rune_fr::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
+    rune_fr::writeTape(dir + "/fr-tape" + sfx + ".bin");
+    std::cerr << "rune-fr: client report written to " << dir << " (suffix=" << sfx << ")\n";
+}
 
 static std::string envStr(const char* n, const std::string& d = {}) {
     const char* v = std::getenv(n); return (v && *v) ? std::string(v) : d;
@@ -73,6 +102,8 @@ static std::vector<TopicSpec> parseTopics(const std::string& s) {
 }
 
 int main() {
+    std::signal(SIGUSR1, frdumphandler);
+    frConfigure();
     const std::string target  = envStr("RUNE_TARGET");
     const std::string egress  = envStr("RUNE_EGRESS");
     const std::string dataDir = envStr("RUNE_DATA_DIR");
@@ -173,11 +204,20 @@ int main() {
             }
             for (int64_t i = 0; i < nRecords; ++i) {
                 // bounded outstanding — backpressure like Kafka buffer.memory
+                const auto submitTs = clk::now();
                 while (static_cast<int64_t>(i - acked.load(std::memory_order_acquire)) >= window)
                     std::this_thread::yield();
                 const auto sendTs = clk::now();
+                // Driver: window cleared → send.  value = µs SPENT waiting on the
+                // MIF window (ack starvation) — the driver's view of pipeline stall.
+                const double windowWaitUs =
+                    std::chrono::duration<double, std::micro>(sendTs - submitTs).count();
+                RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientDrvSend,
+                    static_cast<uint32_t>(i), windowWaitUs);
                 p.send(th, Key(static_cast<uint64_t>(i % keys)), std::span<const uint8_t>(val),
-                       [&acked, &succeeded, &failed, &lat, &sampleGate, sendTs](int64_t offset){
+                       [&acked, &succeeded, &failed, &lat, &sampleGate, sendTs, i](int64_t offset){
+                           RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientDrvAckCb,
+                                                static_cast<uint32_t>(i));
                            acked.fetch_add(1, std::memory_order_release);
                            if (offset >= 0) {
                                succeeded.fetch_add(1, std::memory_order_relaxed);
@@ -255,6 +295,7 @@ int main() {
                       << " records_per_sec=" << (uint64_t)rps
                       << " MB_per_sec=" << (rps * valueBytes / (1024.0*1024.0)) << "\n";
         }
+        frReport("shutdown");   // dump the client-side flight-recorder trace
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "FATAL: " << ex.what() << "\n";

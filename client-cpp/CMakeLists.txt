@@ -35,6 +35,27 @@ if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)
 endif()
 
+# ── rune-fr flight recorder (sibling static lib) ─────────────────────────────
+# Mirrors the broker's wiring so the client can be traced with the SAME rune-fr
+# (compile-in default; runtime-disabled until RUNE_FR_ENABLE=1).
+option(ENABLE_FLIGHT_RECORDER "Compile in rune-fr flight-recorder instrumentation" ON)
+set(RUNE_FR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-fr" CACHE PATH "Path to the rune-fr sibling repo")
+add_library(rune_fr STATIC
+    ${RUNE_FR_DIR}/src/Calibration.cpp
+    ${RUNE_FR_DIR}/src/Enable.cpp
+    ${RUNE_FR_DIR}/src/Registry.cpp
+    ${RUNE_FR_DIR}/src/Report.cpp)
+target_include_directories(rune_fr PUBLIC ${RUNE_FR_DIR}/include)
+if(aeron_FOUND)
+    target_link_libraries(rune_fr PUBLIC aeron::aeron)
+endif()
+target_compile_features(rune_fr PUBLIC cxx_std_23)
+if(ENABLE_FLIGHT_RECORDER)
+    target_compile_definitions(rune_fr PUBLIC RUNE_FR=1)
+else()
+    target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
+endif()
+
 # ── rune_client — trivial header-only/interface library ──────────────────────
 add_library(rune_client INTERFACE)
 target_include_directories(rune_client INTERFACE
@@ -108,6 +129,7 @@ if(aeron_FOUND)
         rune_client_agent
         aeron::aeron
         spdlog::spdlog
+        rune_fr
     )
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
@@ -241,6 +263,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         rune_client_api
         rune_client_producer
         rune_client_subscriber
+        rune_fr
     )
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
