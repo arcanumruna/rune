@@ -678,6 +678,13 @@ private:
     // that carries records (even one we cannot yet apply due to a gap) means the
     // leader is ahead → keep fetching fast.
     bool   lastResponseEmpty_ = false;
+    // Follower LEO at the previous periodic-fetch emit.  If the LEO advanced since
+    // (GR-10 push is delivering), the periodic fetch is a PURE ACK (maxBytes=0) —
+    // requesting data would re-pull the push-delivered lag the follower already has
+    // in its ingress ring, flooding it with useless (already-applied) apply ops that
+    // head-of-line-block the useful ones (measured: 99% useless applies, 47ms handoff).
+    // Only a STUCK LEO (lost push / bootstrap) triggers a bulk data fetch.
+    Offset leoAtLastPeriodicFetch_ = 0;
     // (Caught-up keepalive cadence is computed in doWork from replicaLagMaxMs so it
     //  always keeps the follower in the ISR — see the follower fetch-emit path.)
 

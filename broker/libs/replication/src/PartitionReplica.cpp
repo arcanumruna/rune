@@ -881,8 +881,6 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (cfg_.fastAckOnApply && role_ == Role::Follower
         && (postLeo > preLeo || postHw > preHw)) {
         FetchRequestMsg ack = nextFetch();
-        // (FR: the fast-ack's worker→control send is measured by the transport's
-        //  ReplOutEnqueue→ReplOutDrain seq pair.)
         transport_->sendFetchRequest(ack);
     }
 }
@@ -1547,6 +1545,10 @@ int PartitionReplica::doWork(int64_t nowNs)
             const int64_t keepaliveNs = std::max<int64_t>(
                 cfg_.fetchIntervalNs,
                 (cfg_.replicaLagMaxMs * 1'000'000LL) / 4);
+            // NOTE: a naive "pure-ack while LEO advancing" scheme was tried here and
+            // REGRESSED throughput — it starves the follower's catch-up data-fetches
+            // (the "useless" duplicate applies are partly the follower legitimately
+            // catching up, not pure waste).  Keep the data-fetch when behind.
             const int64_t interval = caughtUp ? keepaliveNs : cfg_.fetchIntervalNs;
             if (nowNs - lastFetchEmitNs_ >= interval) {
                 lastFetchEmitNs_ = nowNs;
