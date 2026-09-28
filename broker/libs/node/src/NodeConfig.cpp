@@ -702,6 +702,20 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // Per-tick drain/poll batch knobs (0 or unparseable → keep default).
+    auto parseLimit = [&](const char* name, int32_t& field) {
+        if (const char* raw = getenv_fn(name)) {
+            if (raw && !std::string_view(raw).empty()) {
+                int32_t v{};
+                if (parseInt32(raw, v) && v > 0) field = v;
+            }
+        }
+    };
+    parseLimit("RUNE_WORKER_INGRESS_DRAIN_LIMIT", cfg.workerIngressDrainLimit);
+    parseLimit("RUNE_WORKER_RETURN_DRAIN_LIMIT",  cfg.workerReturnDrainLimit);
+    parseLimit("RUNE_REPL_FRAGMENT_LIMIT",        cfg.replFragmentLimit);
+    parseLimit("RUNE_CONSENSUS_FRAGMENT_LIMIT",   cfg.consensusFragmentLimit);
+
     // RUNE_WORKER_ACK_SLOT_BYTES: return-ring reservation slot size for ProduceResult.
     if (const char* raw = getenv_fn("RUNE_WORKER_ACK_SLOT_BYTES")) {
         if (raw && !std::string_view(raw).empty()) {

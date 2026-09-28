@@ -290,7 +290,11 @@ private:
     // Fields
     // -----------------------------------------------------------------------
 
-    static constexpr int   kFragmentLimit = 10;
+    // Per-tick fragment cap for the control thread's inbound poll (fast-acks from
+    // peers) AND outbound drain (pushes/acks to peers).  10 was far too small under
+    // the acks=majority fast-ack storm — the HW-advancing fast-ack queued behind the
+    // cap at both stages.  256 lets the control thread clear a burst in one tick.
+    static constexpr int   kFragmentLimit = 256;
     static constexpr std::size_t kScratchSize = 4 * 1024 * 1024; // 4 MiB
 
     std::shared_ptr<aeron::Aeron>          aeron_;

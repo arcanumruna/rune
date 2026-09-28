@@ -268,6 +268,10 @@ public:
     void setDesiredFragmentLimit(int32_t limit) noexcept {
         desiredFragmentLimit_ = (limit >= 1) ? limit : 256;
     }
+    // Per-tick drain batch limits (NodeConfig knobs — see NodeConfig.h).  Call
+    // before the worker's AgentRunner starts (startup, single-threaded).
+    void setIngressDrainLimit(int32_t n) noexcept { ingressDrainLimit_ = (n >= 1) ? n : 1024; }
+    void setReturnDrainLimit(int32_t n)  noexcept { returnDrainLimit_  = (n >= 1) ? n : 1024; }
 
     // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
     // reservation-before-poll uses this as the expected ProduceResult size to compute
@@ -487,7 +491,8 @@ public:
                 }
 
                 fn(std::move(ret));
-            });
+            },
+            returnDrainLimit_);   // configurable (RUNE_WORKER_RETURN_DRAIN_LIMIT); was 16
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
@@ -835,6 +840,10 @@ private:
     // Single-writer invariant: doWork runs on the worker's own thread.
     // -----------------------------------------------------------------------
     std::size_t drainIngress_() {
+        // Drain a LARGE batch per tick: the routed replication ops (fetch/apply —
+        // the HW-advancing fast-acks) must not queue behind a small per-tick cap.
+        // (Default was 16 → under the acks=majority fast-ack storm the ingress ring
+        // backed up multiple ticks; see control→worker handoff p99.)
         int drained = ingress_.drain(
             [this](int32_t /*typeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
@@ -846,7 +855,8 @@ private:
                 const uint8_t* frame =
                     reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
                 executeFromWire_(frame, static_cast<std::size_t>(len));
-            });
+            },
+            ingressDrainLimit_);   // configurable (RUNE_WORKER_INGRESS_DRAIN_LIMIT); was the 16 default
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
@@ -873,6 +883,9 @@ private:
             executePushReadWire_(op);
             break;
         case WorkerOp::Type::ApplyReplicated:
+            // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
+            // with the control thread's ReplFragRecv → EXACT control→worker handoff.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplWorkerOpRun, workerRunSeq_++);
             executeApplyReplicatedWire_(op);
             break;
         case WorkerOp::Type::BecomeLeader:
@@ -886,6 +899,7 @@ private:
             break;
         // E5.1.2c: leader-side replication state handlers
         case WorkerOp::Type::FetchRequest:
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplWorkerOpRun, workerRunSeq_++);
             executeFetchRequestWire_(op);
             break;
         case WorkerOp::Type::OffsetsForLeaderEpochReq:
@@ -1823,6 +1837,14 @@ private:
     // Configurable (RUNE_WORKER_ACK_SLOT_BYTES); see setAckSlotBytes.  256 comfortably
     // covers the ~160 B framed ProduceResult.
     int32_t ackSlotBytes_ = 256;
+    // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
+    // default so routed replication ops / acks don't queue behind a tiny cap).
+    int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
+    int32_t returnDrainLimit_  = 1024;  // RUNE_WORKER_RETURN_DRAIN_LIMIT
+    // FR trace: monotonic count of routed replication ops (fetch/apply) dequeued
+    // from the ingress ring — pairs 1:1 (FIFO) with the control thread's
+    // ReplFragRecv seq to measure the exact control→worker handoff latency.
+    uint32_t workerRunSeq_ = 0;
 
     // -----------------------------------------------------------------------
     // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.

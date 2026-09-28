@@ -565,15 +565,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
-    // Cross-node offset trace: leader learns follower reached (fetchOffset-1),
-    // so HW can advance to that.  Keyed by (partition<<24)|fetchOffset, arg=followerId.
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
-        (static_cast<uint32_t>(req.partition) << 24) |
-            (static_cast<uint32_t>(req.fetchOffset) & 0xFFFFFFu));
-    // Waterfall: HW after this follower fetch (keyed by new HW).
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
-        (static_cast<uint32_t>(req.partition) << 24) |
-            (static_cast<uint32_t>(highWatermark()) & 0xFFFFFFu));
+    // (FR: the onFetchRequest SPAN [ReplFetchReqHandle] measures this handler; the
+    //  control→worker handoff is measured cleanly via ReplFragRecv→ReplWorkerOpRun.)
 
     // DR-BUG-6 completeness gate: record this survivor's frontier.  A plain fetch
     // cannot validate lineage (req carries the fetch epoch, not the tail epoch), so
@@ -736,12 +729,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
-    // Waterfall (follower clock): entered applyReplicated with LEO=preLeo; new
-    // records (up to resp.highWatermark) will be appended below.  Keyed by the
-    // leader HW advertised in this push (what this response can advance us toward).
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFollowerRecv,
-        (static_cast<uint32_t>(cfg_.partitionId) << 24) |
-            (static_cast<uint32_t>(resp.highWatermark) & 0xFFFFFFu));
+    // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
+    //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
     // Epoch change: truncate divergent tail before applying.
     if (resp.leaderEpoch > epoch_) {
@@ -892,10 +881,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (cfg_.fastAckOnApply && role_ == Role::Follower
         && (postLeo > preLeo || postHw > preHw)) {
         FetchRequestMsg ack = nextFetch();
-        // Follower-clock offset trace: fast-ack reporting LEO, keyed (partition<<24)|LEO.
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplEnqueueOutbound,
-            (static_cast<uint32_t>(cfg_.partitionId) << 24) |
-                (static_cast<uint32_t>(ack.fetchOffset) & 0xFFFFFFu));
+        // (FR: the fast-ack's worker→control send is measured by the transport's
+        //  ReplOutEnqueue→ReplOutDrain seq pair.)
         transport_->sendFetchRequest(ack);
     }
 }
@@ -1872,11 +1859,8 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
         lastPushedOffset_ = currentLeo;
         return;
     }
-    // Offset trace: leader actually pushes new bytes up to currentLeo.  Keyed
-    // (partition<<24)|currentLeo — "push reached X" = first push with key>X.
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPushToFollowers,
-        (static_cast<uint32_t>(cfg_.partitionId) << 24) |
-            (static_cast<uint32_t>(currentLeo) & 0xFFFFFFu));
+    // (FR: pushToFollowers duration is the ReplPushToFollowers SPAN; the actual
+    //  send is measured by the transport ReplOutEnqueue→ReplOutDrain seq pair.)
 
     // Read the bytes from the log — same path as onFetchRequest().
     std::vector<uint8_t> logBytes = onLog([&](auto& L){ return L.read(fromOffset, cfg_.maxFetchBytes); });

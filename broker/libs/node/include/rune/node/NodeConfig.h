@@ -335,6 +335,24 @@ struct NodeConfig {
     //     old hard-coded 10 to prevent head-of-line blocking on batched ingress).
     //     Also reused for per-worker ingress poll (Task E5.1.2).
     int32_t gatewayFragmentLimit         = 256;
+    // ── Per-tick drain/poll batch limits (all raised from tiny hard-coded 10/16
+    //    defaults that throttled the acks=majority replication pipeline; each is a
+    //    KNOB so we always know what bounds the per-cycle batch).  A value of 0 is
+    //    coerced to the default.  Env names in NodeConfig.cpp.
+    //   - workerIngressDrainLimit: routed replication ops (FetchRequest/ApplyReplicated
+    //     — the HW-advancing fast-acks) drained per worker duty cycle from the ingress
+    //     ring (RUNE_WORKER_INGRESS_DRAIN_LIMIT; was the OneToOneByteRing default 16).
+    int32_t workerIngressDrainLimit      = 1024;
+    //   - workerReturnDrainLimit: acks drained from a worker's return ring per gateway
+    //     cycle (RUNE_WORKER_RETURN_DRAIN_LIMIT; was 16).
+    int32_t workerReturnDrainLimit       = 1024;
+    //   - replFragmentLimit: control-thread replication transport per-tick cap — BOTH
+    //     the inbound controlledPoll (fast-acks/pushes from peers) AND the outbound
+    //     drain (pushes/acks to peers) (RUNE_REPL_FRAGMENT_LIMIT; was 10).
+    int32_t replFragmentLimit            = 256;
+    //   - consensusFragmentLimit: consensus ingress poll/drain per tick
+    //     (RUNE_CONSENSUS_FRAGMENT_LIMIT; was 10/16).
+    int32_t consensusFragmentLimit       = 64;
     //   - workerAckSlotBytes: expected ProduceResult size used by the worker's
     //     reservation-before-poll to size return-ring ack slots
     //     (RUNE_WORKER_ACK_SLOT_BYTES).  Must be >= the framed ProduceResult size

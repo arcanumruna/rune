@@ -617,6 +617,8 @@ void BrokerNode::buildWorkerPool() {
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
+        workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
+        workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
     }
 
     if (config_.perWorkerIngressEnabled && aeron_) {
