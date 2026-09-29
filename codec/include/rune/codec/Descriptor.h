@@ -16,8 +16,14 @@ struct FieldDescriptor {
     uint32_t     offset       = 0;    // byte offset (fixed fields) or var index (var-len fields)
     uint16_t     sinceVersion = 1;
     bool         isKey        = false;
+    uint16_t     fixedLen     = 0;    // non-zero for FixedStr: per-field byte width in the block
     std::vector<int32_t> enumValues;  // non-empty => Enum whitelist
 };
+
+// Byte width of a field in the fixed block (0 for var-len). FixedStr uses its per-field length.
+inline uint32_t fieldWidth(const FieldDescriptor& f) noexcept {
+    return f.type == PrimType::FixedStr ? f.fixedLen : fixedSize(f.type);
+}
 
 struct Descriptor {
     std::string  name;
@@ -53,6 +59,20 @@ public:
         return *this;
     }
 
+    DescriptorBuilder& addFixedStr(std::string name, uint16_t len,
+                                   uint16_t sinceVersion = 1, bool isKey = false) {
+        FieldDescriptor f;
+        f.name         = std::move(name);
+        f.id           = static_cast<uint16_t>(fields_.size());
+        f.type         = PrimType::FixedStr;
+        f.fixedLen     = len;
+        f.offset       = 0;
+        f.sinceVersion = sinceVersion;
+        f.isKey        = isKey;
+        fields_.push_back(std::move(f));
+        return *this;
+    }
+
     Descriptor build() {
         Descriptor d;
         d.name    = name_;
@@ -62,9 +82,9 @@ public:
         // First pass: assign fixed offsets and compute blockLength
         uint32_t offset = 0;
         for (auto& f : d.fields) {
-            if (!isVarLen(f.type)) {
+            if (!isVarLen(f.type)) {   // FixedStr is not var-len → laid in the block
                 f.offset = offset;
-                offset  += fixedSize(f.type);
+                offset  += fieldWidth(f);   // was fixedSize(f.type)
             }
         }
         d.blockLength = offset;

@@ -43,7 +43,8 @@ add_executable(rune_codec_tests
     tests/RecordReaderTest.cpp
     tests/ValidatorTest.cpp
     tests/GeneratorTest.cpp
-    tests/GeneratedRoundTripTest.cpp)
+    tests/GeneratedRoundTripTest.cpp
+    tests/FixedStrLayoutTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
