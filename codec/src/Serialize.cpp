@@ -21,6 +21,7 @@ static std::string_view primTypeName(PrimType t) noexcept {
         case PrimType::Enum:    return "enum";
         case PrimType::String:  return "string";
         case PrimType::Bytes:   return "bytes";
+        case PrimType::FixedStr: return "string";
     }
     return "unknown";
 }
@@ -147,6 +148,11 @@ std::vector<uint8_t> serialize(const Descriptor& d) {
             // Serialize int32 as its bit-pattern in u32 LE
             push_u32le(buf, static_cast<uint32_t>(ev));
         }
+
+        // FixedStr-only: append fixedLen (u16 LE) so existing blobs are byte-identical
+        if (f.type == PrimType::FixedStr) {
+            push_u16le(buf, f.fixedLen);
+        }
     }
 
     return buf;
@@ -183,7 +189,7 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
         uint16_t enumCount    = read_u16le(blob, pos);
 
         // Validate type byte
-        constexpr uint8_t kMaxType = static_cast<uint8_t>(PrimType::Bytes);
+        constexpr uint8_t kMaxType = static_cast<uint8_t>(PrimType::FixedStr);
         if (typeByte > kMaxType) {
             throw std::runtime_error("deserialize: unknown PrimType value");
         }
@@ -203,8 +209,13 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
             throw std::runtime_error("deserialize: field id out of sequence");
         }
 
-        builder.add(std::move(fieldName), type, sinceVersion,
-                    isKeyByte != 0, std::move(enumValues));
+        if (type == PrimType::FixedStr) {
+            uint16_t fixedLen = read_u16le(blob, pos);
+            builder.addFixedStr(std::move(fieldName), fixedLen, sinceVersion, isKeyByte != 0);
+        } else {
+            builder.add(std::move(fieldName), type, sinceVersion,
+                        isKeyByte != 0, std::move(enumValues));
+        }
     }
 
     return builder.build();
@@ -228,7 +239,11 @@ std::string toText(const Descriptor& d) {
     for (const auto& f : d.fields) {
         out << "  ";
         out << padRight(f.name, kNameWidth);
-        out << padRight(std::string(primTypeName(f.type)), kTypeWidth);
+        if (f.type == PrimType::FixedStr) {
+            out << padRight("string(" + std::to_string(f.fixedLen) + ")", kTypeWidth);
+        } else {
+            out << padRight(std::string(primTypeName(f.type)), kTypeWidth);
+        }
 
         if (isVarLen(f.type)) {
             out << "vardata#" << f.offset;

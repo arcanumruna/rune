@@ -80,6 +80,10 @@ constexpr uint64_t fnv1a_u32le(uint64_t hash, uint32_t v) noexcept {
         for (int32_t ev : fp->enumValues) {
             hash = fnv1a_u32le(hash, static_cast<uint32_t>(ev));
         }
+        // FixedStr-only: absorb fixedLen so existing fingerprints are unchanged
+        if (fp->type == PrimType::FixedStr) {
+            hash = fnv1a_u16le(hash, fp->fixedLen);
+        }
     }
 
     return hash;
