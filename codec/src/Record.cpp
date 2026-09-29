@@ -68,6 +68,10 @@ FieldValue readField(const Descriptor& d, std::span<const uint8_t> record, uint1
         size_t pos = size_t{4} + blockLength;
         if (pos > record.size()) return {};
 
+        // Invariant (additive-only evolution): var fields are appended in
+        // non-decreasing sinceVersion order, so walking var-index order while
+        // gating each by `sinceVersion <= recordVersion` matches the writer's
+        // framing. Out-of-order var-field sinceVersions are unsupported.
         uint32_t varIndex = fd->offset;
         for (uint32_t j = 0; j < varIndex; ++j) {
             if (pos + 4 > record.size()) return {};

@@ -1,6 +1,6 @@
 // src/Validator.cpp
 #include <rune/codec/Validator.h>
-#include <algorithm>
+#include <cstring>
 
 namespace rune::codec {
 
@@ -17,7 +17,6 @@ Validator::Validator(const Descriptor& d)
         e.type         = f.type;
         e.offset       = f.offset;
         e.size         = isVarLen(f.type) ? 0u : fixedSize(f.type);
-        e.varIndex     = isVarLen(f.type) ? f.offset : 0u;
         e.enumValues   = f.enumValues;   // copy whitelist (int32_t, may be negative)
 
         if (isVarLen(f.type))
@@ -77,7 +76,7 @@ ValResult Validator::validate(std::span<const uint8_t> rec) const noexcept {
                        | (uint32_t(rec[off + 2]) << 16)
                        | (uint32_t(rec[off + 3]) << 24);
             // reinterpret bit-pattern as signed
-            __builtin_memcpy(&raw, &u, sizeof(raw));
+            std::memcpy(&raw, &u, sizeof(raw));
 
             bool found = false;
             for (int32_t allowed : e.enumValues) {
@@ -93,10 +92,10 @@ ValResult Validator::validate(std::span<const uint8_t> rec) const noexcept {
     // ----------------------------------------------------------------
     size_t pos = fixedEnd;
 
-    // Var fields are stored in ascending varIndex order (guaranteed by
-    // DescriptorBuilder which assigns varIndex sequentially).
-    // We sorted nothing — varFields_ is already in declaration order
-    // which equals ascending varIndex order.
+    // Invariant (additive-only evolution): var fields are appended in
+    // non-decreasing sinceVersion order, so walking var-index order while
+    // gating each by `sinceVersion <= recordVersion` matches the writer's
+    // framing. Out-of-order var-field sinceVersions are unsupported.
     for (const auto& e : varFields_) {
         if (e.sinceVersion > recVersion)
             continue;

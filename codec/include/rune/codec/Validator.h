@@ -26,7 +26,6 @@ private:
         PrimType             type;
         uint32_t             offset;      // byte offset from start of fixed block (fixed fields)
         uint32_t             size;        // byte size (fixed fields)
-        uint32_t             varIndex;    // position among var fields (var fields)
         std::vector<int32_t> enumValues;  // whitelist for Enum fields; empty = no check
     };
 

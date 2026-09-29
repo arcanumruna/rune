@@ -53,3 +53,34 @@ TEST(Validator, RejectsShortBlock) {
     std::vector<uint8_t> b = {12, 0, 1, 0};
     EXPECT_FALSE(v.validate(b).ok);
 }
+
+// --- Negative enum whitelist ---------------------------------------------
+// Single Enum field (4-byte int32 in fixed block) whose whitelist includes a
+// negative value. blockLength=4, version=1.
+static Descriptor NegEnumD() {
+    return DescriptorBuilder("neg")
+        .add("e", PrimType::Enum, 1, false, {-1, 0, 1})
+        .build();
+}
+
+static std::vector<uint8_t> frameEnum(int32_t e) {
+    std::vector<uint8_t> b;
+    auto le = [&](auto v) {
+        for (size_t i = 0; i < sizeof v; i++)
+            b.push_back(uint8_t(v >> (8 * i)));
+    };
+    uint16_t block = 4, ver = 1;
+    le(block); le(ver);
+    le(e);
+    return b;
+}
+
+TEST(Validator, AcceptsNegativeEnumInWhitelist) {
+    Validator v(NegEnumD());
+    EXPECT_TRUE(v.validate(frameEnum(-1)).ok);
+}
+
+TEST(Validator, RejectsNegativeEnumNotInWhitelist) {
+    Validator v(NegEnumD());
+    EXPECT_FALSE(v.validate(frameEnum(-2)).ok);
+}
