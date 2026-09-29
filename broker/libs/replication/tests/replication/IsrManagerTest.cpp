@@ -394,3 +394,48 @@ TEST(IsrManagerTest, FiveNodePartialEviction) {
     EXPECT_FALSE(mgr.inIsr(5)); // offset lag (gap=120)
     EXPECT_EQ(newIsr.size(), 2u);
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION (bug: acks=all collapse under pipelined produce).
+// A follower that is merely `window`-records behind during normal pipelined
+// produce — but has fetched RECENTLY (well within the time-lag window) — must
+// NOT be shrunk from the ISR.  The old offset-lag gate (replicaLagMaxOffset
+// hardcoded to 10'000) evicted such a follower on every burst deeper than the
+// threshold, collapsing the ISR below minIsr → MinIsrViolation → produce failed.
+// Fix mirrors Kafka's 0.9 removal of `replica.lag.max.messages`: rely on the
+// TIME-based gate and make the offset gate effectively unbounded.
+// Suite name ends in "Regression" so it runs via --gtest_filter='*Regression*'.
+// ---------------------------------------------------------------------------
+TEST(IsrManagerRegression, PipelineDepthLagDoesNotShrinkRecentlyFetchedFollower) {
+    IsrManager mgr = make3();
+    const int64_t now = 1'000'000'000LL;
+    // Leader at 500000; followers are 200000 records behind (a deep but normal
+    // pipeline backlog) yet fetched just now (recent).
+    mgr.onFollowerFetch(kLeader,    500'000, now);
+    mgr.onFollowerFetch(kFollower1, 300'000, now);
+    mgr.onFollowerFetch(kFollower2, 300'000, now);
+
+    // Production settings: time gate 10s, offset gate effectively unbounded.
+    auto newIsr = mgr.maybeShrinkIsr(now, /*leaderLeo=*/500'000,
+                                     /*replicaLagMaxMs=*/10'000,
+                                     /*replicaLagMaxOffset=*/1'000'000'000LL);
+    EXPECT_TRUE(mgr.inIsr(kFollower1))
+        << "a recently-fetched follower merely behind by pipeline depth must stay in ISR";
+    EXPECT_TRUE(mgr.inIsr(kFollower2));
+    EXPECT_EQ(newIsr.size(), 3u) << "ISR must not collapse during normal pipelined produce";
+}
+
+// REGRESSION companion: a genuinely stalled follower (no recent fetch) is STILL
+// shrunk via the time gate — the fix must not disable liveness-based eviction.
+TEST(IsrManagerRegression, StalledFollowerStillShrunkByTimeGate) {
+    IsrManager mgr = make3();
+    const int64_t now = 20'000'000'000LL;
+    mgr.onFollowerFetch(kLeader,    500'000, now);
+    mgr.onFollowerFetch(kFollower1, 300'000, now);                 // recent
+    mgr.onFollowerFetch(kFollower2, 300'000, now - 11'000'000'000LL); // 11s stale
+    auto newIsr = mgr.maybeShrinkIsr(now, 500'000, /*lagMs=*/10'000,
+                                     /*lagOffset=*/1'000'000'000LL);
+    EXPECT_TRUE(mgr.inIsr(kFollower1));
+    EXPECT_FALSE(mgr.inIsr(kFollower2)) << "a follower stalled > lag window is still evicted";
+    EXPECT_EQ(newIsr.size(), 2u);
+}

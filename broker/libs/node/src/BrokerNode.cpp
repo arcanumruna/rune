@@ -131,7 +131,7 @@ void BrokerNode::start() {
     //     Workers are independent of the control agent but their ingress rings are
     //     fed by the control thread, so the ordering: control first, workers after.
     if (workerPool_) {
-        workerPool_->startRunners(config_.workerIdleStrategy, clock_);
+        workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
         spdlog::info("BrokerNode[{}]: {} worker AgentRunner thread(s) started",
                      config_.nodeId, workerPool_->workerCount());
     }
@@ -452,9 +452,9 @@ void BrokerNode::buildReplication() {
             pcfg.partitionId          = static_cast<PartitionId>(part);
             pcfg.selfId               = selfId;
             pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
-            pcfg.replicaLagMaxOffset  = 10'000;
+            pcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
-            pcfg.fetchIntervalNs      = 5'000'000LL;
+            pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
             pcfg.maxFetchBytes        = 1 << 20;
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
@@ -612,9 +612,13 @@ void BrokerNode::buildWorkerPool() {
     // Tests that need the per-worker path construct WorkerIngress directly.
     // -----------------------------------------------------------------------
 
-    // Apply desired fragment limit from NodeConfig to each worker (before runners start).
+    // Apply desired fragment limit + ack-slot reservation size from NodeConfig to
+    // each worker (before runners start).
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
+        workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
+        workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
+        workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
     }
 
     if (config_.perWorkerIngressEnabled && aeron_) {
@@ -882,8 +886,8 @@ void BrokerNode::buildGateway() {
             // the first offset commit succeeds.
             ocfg.minIsr               = 1;
             ocfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            ocfg.replicaLagMaxOffset  = 10'000;
-            ocfg.fetchIntervalNs      = 5'000'000LL;
+            ocfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            ocfg.fetchIntervalNs      = config_.fetchIntervalNs;
             ocfg.isrCheckIntervalNs   = 10'000'000LL;
             ocfg.maxFetchBytes        = 1 << 20;
             // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
@@ -994,8 +998,8 @@ void BrokerNode::buildGateway() {
             tcfg.selfId               = selfId;
             tcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
             tcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            tcfg.replicaLagMaxOffset  = 10'000;
-            tcfg.fetchIntervalNs      = 5'000'000LL;
+            tcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            tcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             tcfg.isrCheckIntervalNs   = 10'000'000LL;
             tcfg.maxFetchBytes        = 1 << 20;
             // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
@@ -1120,8 +1124,8 @@ void BrokerNode::buildGateway() {
             // is wired end-to-end.
             mcfg.minIsr               = 1;
             mcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            mcfg.replicaLagMaxOffset  = 10'000;
-            mcfg.fetchIntervalNs      = 5'000'000LL;
+            mcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
+            mcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             mcfg.isrCheckIntervalNs   = 10'000'000LL;
             mcfg.maxFetchBytes        = 1 << 20;
             // __cluster_metadata: compacted log (keep latest assignment per key).
@@ -1205,10 +1209,17 @@ void BrokerNode::buildGateway() {
                     balancerNodes.push_back(static_cast<rune::metadata::NodeId>(nid));
                 }
                 metadataService_->configure(balancerTopics, balancerNodes);
+                // Commit-quorum failover floor: a partition failover must never
+                // install an ISR below the same minIsr the gateway enforces for
+                // acks=all — otherwise a transiently-isolated controller seizes
+                // leadership with ISR<minIsr and every produce is rejected (startup
+                // collapse).  See DynamicBalancerInputs::minIsr.
+                metadataService_->setMinIsr(config_.gatewayMinIsr);
                 spdlog::info(
                     "BrokerNode[{}]: MetadataService configured for assignment emit "
-                    "({} user topics, {} nodes)",
-                    nodeId, balancerTopics.size(), balancerNodes.size());
+                    "({} user topics, {} nodes, minIsr={})",
+                    nodeId, balancerTopics.size(), balancerNodes.size(),
+                    config_.gatewayMinIsr);
             }
 
             spdlog::info("BrokerNode[{}]: MetadataService wired (__cluster_metadata at {})",
@@ -1272,7 +1283,12 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: runtime idle strategy = BusySpin (low latency; core pegged)",
                      config_.nodeId);
     } else {
-        idleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>();
+        // Backoff with configurable maxPark (RUNE_IDLE_MAX_PARK_US, default 200µs):
+        // caps per-hop replication-round-trip wake latency without pegging the core
+        // (busyspin here starves consensus heartbeats → re-elections on shared cores).
+        idleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>(
+            10, 20, std::chrono::microseconds{1},
+            std::chrono::microseconds{config_.idleMaxParkUs});
     }
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).

@@ -5,6 +5,9 @@
 
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune_fr/FlightRecorder.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OutboundFrame.h>
 
 // E2 inc2a: WorkerPool + WorkerOp for SPSC ApplyReplicated routing.
 // Included here (not in the header) to avoid pulling consensus/spdlog headers
@@ -13,6 +16,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
 
+#include <cstdlib>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -21,6 +25,15 @@
 #include <cstring>
 
 namespace rune::replication {
+
+namespace isbe = ::rune::protocol::internal::sbe;
+
+// Fixed overhead of the SBE OutboundFrame envelope (SBE header + targetNodeId block
+// + varData length prefix), from the generated codec — the records tail must be
+// capped so the whole envelope fits the outbound ring's maxMsgLength.
+static constexpr std::size_t kOutboundEnvelopeOverhead =
+    isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::sbeBlockLength() +
+    sizeof(std::uint32_t); // varDataEncoding length field
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -36,7 +49,7 @@ AeronPartitionTransport::AeronPartitionTransport(
                         aeron::util::index_t             offset,
                         aeron::util::index_t             length,
                         aeron::Header&                   hdr) {
-          onFragment(buf, offset, length, hdr);
+          return onFragment(buf, offset, length, hdr);
       })
     , selfId_(selfId)
     , outboundRing_(outboundRingBytes)  // NodeConfig-configurable ring size
@@ -124,6 +137,7 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
                                                  const FetchResponseMsg& resp)
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplSendFetchResp, 0);
     // Shared-nothing: encode into a stack buffer, marshal to control thread via
     // the outbound ring (peers_/pubs are control-owned; drainOutbound offers).
     // Size the buffer by the GENERATED codec's encodedSize() — stack fast-path for
@@ -224,45 +238,64 @@ void AeronPartitionTransport::sendReconcileResponse(
 // Back-pressure: on a full ring, bump the counter and return false — the send is
 // skipped (replication is retriable; caller re-drives next cycle). Never blocks.
 // ---------------------------------------------------------------------------
+// FR trace correlation via per-endpoint MONOTONIC SEQUENCE (not offset — offsets
+// repeat across fast-acks and collide).  Because each ring is FIFO, the k-th
+// enqueued frame is the k-th drained → ReplOutEnqueue(seq=k) pairs 1:1 with
+// ReplOutDrain(seq=k); likewise ReplFragRecv(recvSeq=k) with ReplWorkerOpRun(k).
+// One transport per node → file-static counters are per-process.
+//   g_outEnqSeq  : atomic (enqueueOutbound may be called from >1 thread).
+//   g_outDrainSeq: control-thread only.   g_inRecvSeq: control-thread only.
+static std::atomic<uint32_t> g_outEnqSeq{0};
+static uint32_t              g_outDrainSeq = 0;
+static uint32_t              g_inRecvSeq   = 0;
+
+// Per-second transport rate diagnostic (control-thread only; RUNE_FS_LOG).
+static bool     g_txRateLog     = [] { const char* e = std::getenv("RUNE_FS_LOG");
+                                       return e == nullptr || e[0] != '0'; }();
+static int64_t  g_txRateLastNs  = 0;
+static int64_t  g_txPolls       = 0;   // poll() calls
+static int64_t  g_txFragsRecv   = 0;   // onFragment invocations (fragments received)
+static int64_t  g_txOutDrained  = 0;   // outbound messages offered to Aeron
+
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
 {
-    const std::size_t total = kOutboundHeaderSize + len;
-    // Defensive: agrona's ManyToOneRingBuffer::write() THROWS (not returns false)
-    // when a message exceeds maxMsgLength — only insufficient SPACE returns false.
-    // Callers cap the only variable-length payload (the FetchResponse records tail)
-    // below this bound; if an oversized frame still arrives it is a caller bug —
-    // reject it here (retriable: the follower re-fetches and the leader's cap bounds
-    // the re-fetch) rather than letting the throw unwind through the worker duty
-    // cycle and abort the fetch.
-    if (total > outboundRing_.maxMsgLength()) {
+    // The outbound-ring frame is an SBE OutboundFrame envelope {targetNodeId,
+    // payload=wire}, encoded WRAP-IN-PLACE straight into the claimed ring slot — no
+    // intermediate buffer, no hand-rolled header/offsets, no raw memcpy (the
+    // generated flyweight owns the layout; putPayload copies the already-encoded
+    // replication message once).
+    const std::size_t frameLen =
+        isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::computeLength(len);
+    // Oversized guard: tryClaim rejects a message larger than the ring's maxMsgLength.
+    // Callers cap the variable-length payload (the FetchResponse records tail) below
+    // this bound; an oversized frame here is a caller bug — reject it (retriable).
+    if (frameLen > outboundRing_.maxMsgLength()) {
         spdlog::error(
             "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
-            total, outboundRing_.maxMsgLength(), targetNodeId);
+            frameLen, outboundRing_.maxMsgLength(), targetNodeId);
         ++outboundRingFullCount_;
         return false;
     }
-    // Stack fast-path for the common case; heap fallback for a large frame.  A full
-    // ring returns false below and is treated as back-pressure (retriable).
-    if (total <= kMaxWireFrame) {
-        uint8_t framed[kMaxWireFrame];
-        std::memcpy(framed, &targetNodeId, kOutboundHeaderSize);
-        std::memcpy(framed + kOutboundHeaderSize, wire, len);
-        if (!outboundRing_.write(framed, total)) {
-            ++outboundRingFullCount_;  // back-pressure: skipped (retriable)
-            return false;
-        }
-        return true;
-    }
-    std::vector<uint8_t> framed(total);
-    std::memcpy(framed.data(), &targetNodeId, kOutboundHeaderSize);
-    std::memcpy(framed.data() + kOutboundHeaderSize, wire, len);
-    if (!outboundRing_.write(framed.data(), total)) {
-        ++outboundRingFullCount_;  // back-pressure or > ring maxMsgLength (retriable)
+    // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: bump the
+    // counter and return false WITHOUT committing (nothing claimed, no torn record).
+    // The caller treats the skipped send as retriable (the follower re-fetches).
+    const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
+    if (idx < 0) {
+        ++outboundRingFullCount_;
         return false;
     }
+    isbe::OutboundFrame enc;
+    enc.wrapAndApplyHeader(reinterpret_cast<char*>(outboundRing_.base() + idx), 0, frameLen);
+    enc.targetNodeId(targetNodeId);
+    enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
+    outboundRing_.commit(idx);
+    // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
+    // corr = monotonic enqueue seq; pairs 1:1 with ReplOutDrain (FIFO ring).
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue,
+                             g_outEnqSeq.fetch_add(1, std::memory_order_relaxed));
     return true;
 }
 
@@ -273,15 +306,29 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::drainOutbound()
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOutboundDrain, 0);
     auto handler = [this](std::int32_t /*msgTypeId*/,
                           aeron::concurrent::AtomicBuffer& buf,
                           aeron::util::index_t offset,
                           aeron::util::index_t length) {
-        const uint8_t* p = buf.buffer() + offset;
-        int32_t target = 0;
-        std::memcpy(&target, p, kOutboundHeaderSize);
-        const uint8_t* wire = p + kOutboundHeaderSize;
-        const std::size_t wlen = static_cast<std::size_t>(length) - kOutboundHeaderSize;
+        // Decode the SBE OutboundFrame envelope: targetNodeId + a ZERO-COPY payload
+        // view into the ring frame (no memcpy, no hand-rolled offsets).
+        char* fbase = reinterpret_cast<char*>(buf.buffer()) + offset;
+        isbe::MessageHeader mh;
+        mh.wrap(fbase, 0, 0, static_cast<std::uint64_t>(length));
+        isbe::OutboundFrame dec;
+        dec.wrapForDecode(fbase, isbe::MessageHeader::encodedLength(),
+                          mh.blockLength(), mh.version(),
+                          static_cast<std::uint64_t>(length));
+        const int32_t target = dec.targetNodeId();
+        const std::string_view pv = dec.getPayloadAsStringView();
+        const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
+        const std::size_t wlen = pv.size();
+        // Control-clock: frame drained from the outbound ring + offered to peer(s).
+        // corr = monotonic drain seq; k-th drain == k-th enqueue (FIFO) → the gap
+        // ReplOutEnqueue(k)→ReplOutDrain(k) is the EXACT worker→control handoff.
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, g_outDrainSeq++);
+        ++g_txOutDrained;
 
         if (target == kBroadcast) {
             for (auto& [nodeId, peer] : peers_) {
@@ -305,6 +352,7 @@ int AeronPartitionTransport::drainOutbound()
 // ---------------------------------------------------------------------------
 int AeronPartitionTransport::poll(int64_t nowNs)
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplIngressPoll, 0);
     nowNs_ = nowNs;
 
     // Non-blocking probe: try to resolve pending publications.
@@ -316,33 +364,54 @@ int AeronPartitionTransport::poll(int64_t nowNs)
     // AgentRunner's IdleStrategy sees outbound activity as work (no idle).
     int work = drainOutbound();
 
-    // Drain ingress subscription.
-    work += sub_->poll(assembler_.handler(), kFragmentLimit);
+    // Drain ingress subscription with a CONTROLLED poll so onFragment can apply
+    // back-pressure: a fragment whose target worker ring is full returns ABORT and
+    // is re-delivered next cycle (not dropped).  See onFragment.
+    const int fragged = sub_->controlledPoll(assembler_.handler(), kFragmentLimit);
+    work += fragged;
+
+    if (g_txRateLog) {
+        ++g_txPolls;
+        if (g_txRateLastNs == 0) g_txRateLastNs = nowNs;
+        else if (nowNs - g_txRateLastNs >= 1'000'000'000LL) {
+            spdlog::info("TXRATE[node={}] polls/s={} fragsRecv/s={} outDrained/s={}",
+                         selfId_, g_txPolls, g_txFragsRecv, g_txOutDrained);
+            g_txRateLastNs = nowNs; g_txPolls = 0; g_txFragsRecv = 0; g_txOutDrained = 0;
+        }
+    }
     return work;
 }
 
 // ---------------------------------------------------------------------------
 // onFragment — called by FragmentAssembler for each reassembled frame.
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer,
-                                          aeron::util::index_t             offset,
-                                          aeron::util::index_t             length,
-                                          aeron::Header&                   /*header*/)
+aeron::ControlledPollAction AeronPartitionTransport::onFragment(
+    aeron::concurrent::AtomicBuffer& buffer,
+    aeron::util::index_t             offset,
+    aeron::util::index_t             length,
+    aeron::Header&                   /*header*/)
 {
+    using Action = aeron::ControlledPollAction;
+    ++g_txFragsRecv;
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
+    // CONTINUE = consume this fragment and keep polling (success / skip malformed).
+    // ABORT    = leave this fragment UNCONSUMED and stop the poll — Aeron re-delivers
+    //            it next cycle.  Returned ONLY when a target worker ring is full, so
+    //            the frame is never dropped: back-pressure propagates to the sender.
     const auto* buf = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
     const auto  len = static_cast<std::size_t>(length);
 
     // Minimum frame: 8-byte SBE header.
     if (len < ReplicationMessageHeader::ENCODED_SIZE) {
         spdlog::trace("AeronPartitionTransport: short frame ({} bytes) dropped", len);
-        return;
+        return Action::CONTINUE;
     }
 
     // Validate schema id.
     const auto hdr = ReplicationMessageHeader::decode(buf, 0);
     if (hdr.schemaId != kSchemaId) {
         spdlog::trace("AeronPartitionTransport: unknown schemaId={} dropped", hdr.schemaId);
-        return;
+        return Action::CONTINUE;
     }
 
     const uint16_t tid = hdr.templateId;
@@ -351,7 +420,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // Minimum size check.
         if (len < FetchRequestMsg::TOTAL_SIZE) {
             spdlog::trace("AeronPartitionTransport: FetchRequest truncated ({} bytes)", len);
-            return;
+            return Action::CONTINUE;
         }
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
 
@@ -362,7 +431,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         if (it == replicas_.end() || it->second == nullptr) {
             spdlog::trace("AeronPartitionTransport: FetchRequest for unknown (topicId={}, partition={})",
                           req.topicId, req.partition);
-            return;
+            return Action::CONTINUE;
         }
 
         // GR-1 fix: cap req.maxBytes to the deliverable ceiling for this follower.
@@ -393,7 +462,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // threw inside the worker's onFetchRequest — the fetch was lost.
         int32_t ceiling =
             static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundHeaderSize)
+            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
             - kFetchResponseOverhead;
         auto* followerPeer = findPeer(req.followerId);
         if (followerPeer && followerPeer->pub) {
@@ -423,11 +492,15 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             op.fetchRequestPayload.topicId       = req.topicId;
             op.fetchRequestPayload.nowNs         = nowNs_;
             if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
-                spdlog::warn(
-                    "AeronPartitionTransport: worker ring full for "
-                    "FetchRequest (topicId={}, partition={}); dropping frame",
-                    req.topicId, req.partition);
+                // Worker ring full → back-pressure: leave the fragment unconsumed and
+                // retry next cycle (the follower's fetch is served once the worker
+                // drains).  No drop.
+                return Action::ABORT;
             }
+            // Control-clock: fetch op enqueued to the worker ring (corr=recvSeq).
+            // Pairs 1:1 (FIFO) with ReplWorkerOpRun when the worker dequeues it →
+            // the gap is the EXACT control→worker handoff latency on this node.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, g_inRecvSeq++);
         } else {
             it->second->onFetchRequest(req, nowNs_);
         }
@@ -438,7 +511,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         const std::size_t kMinResponseSize = FetchResponseMsg::encodedSize(0);
         if (len < kMinResponseSize) {
             spdlog::trace("AeronPartitionTransport: FetchResponse truncated ({} bytes)", len);
-            return;
+            return Action::CONTINUE;
         }
         // Zero-copy decode: FetchResponseMsg::records is a span into `buf`
         // which lives in the Aeron term buffer for the duration of this callback.
@@ -454,7 +527,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         if (it == replicas_.end() || it->second == nullptr) {
             spdlog::trace("AeronPartitionTransport: FetchResponse for unknown (topicId={}, partition={})",
                           resp.topicId, resp.partition);
-            return;
+            return Action::CONTINUE;
         }
         // E2 inc2a: when a WorkerPool is wired, route the applyReplicated call
         // through the owning worker's SPSC ingress ring instead of calling it
@@ -491,11 +564,13 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             }
             if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition,
                                            std::move(op))) {
-                spdlog::warn(
-                    "AeronPartitionTransport: worker ring full for "
-                    "ApplyReplicated (topicId={}, partition={}); dropping frame",
-                    resp.topicId, resp.partition);
+                // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
+                // The records span still lives in the term buffer (fragment not
+                // consumed), so the re-delivered fragment re-copies correctly. No drop.
+                return Action::ABORT;
             }
+            // Control-clock: apply op enqueued to the worker ring (corr=recvSeq).
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, g_inRecvSeq++);
         } else {
             // INLINE path (no WorkerPool): call applyReplicated synchronously.
             it->second->applyReplicated(resp);
@@ -503,10 +578,10 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
 
     } else if (tid == OffsetsForLeaderEpochReqMsg::TEMPLATE_ID) {
         // DR-BUG-6: KIP-101 epoch-boundary query → leader answers.
-        if (len < OffsetsForLeaderEpochReqMsg::TOTAL_SIZE) return;
+        if (len < OffsetsForLeaderEpochReqMsg::TOTAL_SIZE) return Action::CONTINUE;
         auto req = OffsetsForLeaderEpochReqMsg::decode(buf, 0);
         auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
-        if (it == replicas_.end() || it->second == nullptr) return;
+        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
         // E5.1.2c: route to owning worker (touches leaderState_/isrManager_).
         if (workerPool_ && req.topicId >= 0) {
             rune::node::WorkerOp op;
@@ -522,10 +597,8 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
             op.offsEpochReqPayload.followerLeo    = req.followerLeo;
             op.offsEpochReqPayload.topicId        = req.topicId;
             if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
-                spdlog::warn(
-                    "AeronPartitionTransport: worker ring full for "
-                    "OffsetsForLeaderEpochReq (topicId={}, partition={}); dropping frame",
-                    req.topicId, req.partition);
+                // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
+                return Action::ABORT;
             }
         } else {
             it->second->onOffsetsForLeaderEpochRequest(req);
@@ -533,20 +606,20 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
 
     } else if (tid == OffsetsForLeaderEpochRespMsg::TEMPLATE_ID) {
         // DR-BUG-6: KIP-101 epoch-boundary answer → follower truncates.
-        if (len < OffsetsForLeaderEpochRespMsg::TOTAL_SIZE) return;
+        if (len < OffsetsForLeaderEpochRespMsg::TOTAL_SIZE) return Action::CONTINUE;
         auto resp = OffsetsForLeaderEpochRespMsg::decode(buf, 0);
         auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
-        if (it == replicas_.end() || it->second == nullptr) return;
+        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
         it->second->applyOffsetsForLeaderEpochResponse(resp);
 
     } else if (tid == kReconcileFetchReqTemplateId) {
         // DR-BUG-6: reverse pull request (deficient leader → survivor).  Reuses
         // the FetchRequest layout.  Cap maxBytes to the requesting peer's
         // deliverable ceiling (same rationale as the normal FetchRequest path).
-        if (len < FetchRequestMsg::TOTAL_SIZE) return;
+        if (len < FetchRequestMsg::TOTAL_SIZE) return Action::CONTINUE;
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
         auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
-        if (it == replicas_.end() || it->second == nullptr) return;
+        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
         // Cap to the outbound-ring bound UNCONDITIONALLY (same two-hop framing
         // rationale as the normal FetchRequest path), tightened by the pub bound when
         // resolved, minus the outbound header — so the reconcile response never
@@ -554,7 +627,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         const int32_t kOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
         int32_t ceiling =
             static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundHeaderSize)
+            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
             - kOverhead;
         auto* peer = findPeer(req.followerId);
         if (peer && peer->pub) {
@@ -570,10 +643,10 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
         // DR-BUG-6: reverse pull response (survivor → deficient leader).  Reuses
         // the FetchResponse layout.
         const std::size_t kMinResp = FetchResponseMsg::encodedSize(0);
-        if (len < kMinResp) return;
+        if (len < kMinResp) return Action::CONTINUE;
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
         auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
-        if (it == replicas_.end() || it->second == nullptr) return;
+        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
         // E5.1.2c: route to owning worker (applyReconcileResponse touches
         // leaderState_.setLeaderLogEndOffset + recomputeHw).
         // Copy records bytes before returning from the Aeron callback (buffer lifetime).
@@ -596,10 +669,8 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
                     resp.records.data() + resp.records.size());
             }
             if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op))) {
-                spdlog::warn(
-                    "AeronPartitionTransport: worker ring full for "
-                    "ReconcileFetchResp (topicId={}, partition={}); dropping frame",
-                    resp.topicId, resp.partition);
+                // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
+                return Action::ABORT;
             }
         } else {
             it->second->applyReconcileResponse(resp);
@@ -608,6 +679,7 @@ void AeronPartitionTransport::onFragment(aeron::concurrent::AtomicBuffer& buffer
     } else {
         spdlog::trace("AeronPartitionTransport: unknown templateId={} dropped", tid);
     }
+    return Action::CONTINUE;
 }
 
 // ---------------------------------------------------------------------------

@@ -253,6 +253,17 @@ public:
     /// The full replica set (ISR + out-of-sync replicas).
     [[nodiscard]] const std::vector<NodeId>& replicas() const noexcept { return replicas_; }
 
+    /// Diagnostics: the leader's last-seen fetch offset for `node` (-1 if none).
+    [[nodiscard]] Offset debugLastFetchOffset(NodeId node) const noexcept {
+        auto it = followerState_.find(node);
+        return it == followerState_.end() ? -1 : it->second.lastFetchOffset;
+    }
+    /// Diagnostics: ns since `node` last fetched (INT64_MAX if never).
+    [[nodiscard]] int64_t debugFetchAgeNs(NodeId node, int64_t nowNs) const noexcept {
+        auto it = followerState_.find(node);
+        return it == followerState_.end() ? INT64_MAX : (nowNs - it->second.lastFetchTimeNs);
+    }
+
     /// Per-follower fetch state (for inspection / testing).
     [[nodiscard]] const FollowerState* followerState(NodeId node) const noexcept {
         auto it = followerState_.find(node);

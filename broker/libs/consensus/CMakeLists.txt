@@ -24,6 +24,7 @@ if(BUILD_TESTING)
         tests/consensus/ConsensusMessagesTest.cpp
         tests/consensus/ElectionBallotTest.cpp
         tests/consensus/ElectionLogTest.cpp
+        tests/consensus/FollowerLivenessTest.cpp
         tests/consensus/ConsensusPublisherAdapterTest.cpp
         tests/consensus/ConsensusAgentTest.cpp
         tests/consensus/IdleStrategyTest.cpp

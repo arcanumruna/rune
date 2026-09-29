@@ -23,6 +23,7 @@
 #include <rune/consensus/Election.h>
 #include <rune/consensus/ElectionState.h>
 #include <rune/consensus/Types.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <atomic>
 #include <cstdint>
@@ -61,6 +62,7 @@ public:
     const char* name() const noexcept override { return "rune-consensus"; }
 
     int doWork(int64_t nowNs) override {
+        RUNE_FR_SPAN_CONSENSUS(rune_fr::Site::ConsensusDoWork, 0);
         // 1. Poll Aeron subscription → fills IngressRing
         int workCount = ingress_.poll(kFragmentLimit);
 

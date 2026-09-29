@@ -19,6 +19,9 @@ x-broker-build: &broker-build
   additional_contexts:
     # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
     rune-protocol: ../../rune-protocol
+    # rune-fr flight recorder: compiled sibling lib wired by the root CMakeLists
+    # (add_library(rune_fr ...) from ${SRC}/../rune-fr).  Needs src/ AND include/.
+    rune-fr: ../../rune-fr
 
 x-broker-env: &broker-env
   # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
@@ -43,6 +46,10 @@ x-broker-env: &broker-env
   # keeps the E2E output readable.  Set "debug" to surface gateway
   # redirect/accept/subscribe decisions when diagnosing.
   RUNE_LOG_LEVEL: "info"
+  # Diagnostic per-tick FollowerSync/ISR logging (fsLogEnabled) is opt-in; keep it
+  # OFF in e2e so it never floods/starves the data-plane threads (esp. under amd64
+  # emulation on Apple Silicon).  Set to "1" only when debugging replication.
+  RUNE_FS_LOG: "0"
   # GB-1/CB-5: bootstrap the data-plane topics on every node so the leader (and
   # any post-kill leader) can serve produce/subscribe.  Broker assigns topicIds
   # sequentially from 0 in declaration order → "events" = topicId 0.  The client

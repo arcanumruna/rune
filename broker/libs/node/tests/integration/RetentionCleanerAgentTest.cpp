@@ -62,6 +62,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/resource.h>   // getrlimit/setrlimit — fd-limit raise for fd-heavy tests
+
 namespace fs = std::filesystem;
 using namespace rune::replication;
 using namespace rune::storage;
@@ -70,6 +72,38 @@ using namespace rune::protocol;
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+// Fd-heavy stress tests below roll thousands of TINY segments (rollBytes as small
+// as 128) to force retention/compaction churn.  Each live segment consumes an fd,
+// so the churn needs far more descriptors than the default soft RLIMIT_NOFILE
+// (commonly 1024).  When the limit is hit, a segment open() throws mid-run; with a
+// joinable cleaner thread still live, the unwinding destroys it and libstdc++
+// aborts with "terminate called without an active exception" — masking the real
+// cause.  Raise the soft limit to the hard limit ONCE for this test binary so the
+// tests exercise the concurrency they intend, not the ambient fd ceiling.  This is
+// a self-contained test-environment fix (raising soft up to hard needs no
+// privileges); see also the ThreadJoiner guard which makes any future resource
+// failure surface as a clean assertion instead of a terminate.
+static const bool g_cp9_fd_limit_raised = [] {
+    struct ::rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        ::setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    return true;
+}();
+
+// RAII: on scope exit (normal OR exception) signal the worker to stop and join it,
+// so a joinable thread is never destroyed — a resource exception in the writer loop
+// then propagates as a normal gtest failure instead of std::terminate.
+struct ThreadJoiner {
+    std::atomic<bool>& done;
+    std::thread&       t;
+    ~ThreadJoiner() {
+        done.store(true, std::memory_order_relaxed);
+        if (t.joinable()) t.join();
+    }
+};
 
 static std::atomic<uint64_t> g_cp9_seq{0};
 
@@ -735,6 +769,11 @@ TEST(RetentionCleanerAgent, RetentionSingleWriterSafe) {
             std::this_thread::yield();
         }
     });
+    // Exception-safety: if the writer loop below throws (e.g. a resource error),
+    // this guard stops + joins the cleaner so the failure surfaces as a clean gtest
+    // assertion, never a joinable-thread std::terminate.  Normal path still joins
+    // explicitly below (needed before the post-run single-writer drain).
+    ThreadJoiner cleanerJoiner{done, cleanerThread};
 
     // Duty/single-writer thread == this test thread.  Drives the REAL ISR churn
     // (replica->doWork via NodeRuntimeAgent), appends (segments_ mutation), a
@@ -840,6 +879,9 @@ TEST(RetentionCleanerAgent, CompactionSingleWriterSafe) {
             std::this_thread::yield();
         }
     });
+    // Exception-safety guard (see the sibling test): stop + join the cleaner on any
+    // scope exit so a writer-loop throw never becomes a joinable-thread terminate.
+    ThreadJoiner cleanerJoiner{done, cleanerThread};
 
     // Duty/single-writer thread: real ISR churn + keyed appends + drains.
     for (int i = 0; i < 1200; ++i) {

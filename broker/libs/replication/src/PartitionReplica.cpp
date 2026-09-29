@@ -12,11 +12,13 @@
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -54,6 +56,21 @@ const std::vector<uint8_t>& PartitionReplica::makeBatch_(Offset baseOffset,
     batchBuilder_->append(keyView, valView, /*timestamp=*/0);
     batchBuilder_->buildInto(batchScratch_);
     return batchScratch_;
+}
+
+// ---------------------------------------------------------------------------
+// FollowerSync tracing gate.  TEMPORARY high-verbosity diagnostics: logs every
+// follower-sync state change and the factors that drive it (onResponse inputs,
+// decide emits, resets).  On by default; set RUNE_FS_LOG=0 to silence for clean
+// throughput measurement.  Checked once (static-init) so it costs nothing on
+// the hot path when off.
+// ---------------------------------------------------------------------------
+static bool fsLogEnabled() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("RUNE_FS_LOG");
+        return e == nullptr || (e[0] != '0' || e[1] != '\0');
+    }();
+    return on;
 }
 
 
@@ -277,6 +294,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     completenessFloor_ = committedHw;
     leaderComplete_    = false;
     survivorFrontier_.clear();
+    servedFetch_.clear();   // fetch-conflation state is per-leadership
     survivorFrontier_[cfg_.selfId] = logEndOffset_();
     reconcileTarget_   = -1;   // drop any pull latched under a prior term
     reconcileIssuedNs_ = -1;
@@ -347,7 +365,12 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     role_     = Role::Follower;
     leaderId_ = leaderId;
     followerHw_ = 0;
-    lastFetchEmitNs_ = 0;
+    followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
+    if (fsLogEnabled()) {
+        spdlog::info("FollowerSync[node={} part={}] reset (becomeFollower epoch={} leader={})",
+                     cfg_.selfId, cfg_.partitionId, leaderEpoch, leaderId);
+    }
+    lastFetchEmitNs_ = 0;     // (DR epoch-probe cadence; separate from FollowerSync)
     reconcileTarget_ = -1;
 
     // Publish the demotion so the cleaner stops treating this node as Leader
@@ -362,6 +385,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 {
     assert(role_ == Role::Leader && "append() called on follower");
+    ++rtAppends_;
 
     if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
         return -1; // gated by min-ISR
@@ -384,12 +408,16 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // Mirror the advanced HW into the cleaner-visible atomic (release-store).
     publishCleanerState();
 
-    // GR-10: push newly-appended bytes to ISR followers immediately (best-effort).
-    // Collapsed to ~RTT from the follower-poll floor.
+    // GR-10: push newly-appended bytes to ISR followers immediately.  This is the
+    // DIRECT append API (used by tests and internal callers that append one batch
+    // and expect it replicated without a separate doWork tick).  The PRODUCE HOT
+    // PATH does NOT come through here — it uses onLeaderLogAppended(), whose push is
+    // COALESCED in doWork() (that is the throughput fix).  A coalesced doWork push
+    // won't double-send after this one: pushToFollowers advances lastPushedOffset_
+    // to the current LEO, so doWork's `leo > lastPushedOffset_` guard is false.
     if (cfg_.pushOnAppend) {
         pushToFollowers(baseOffset);
     }
-
     return baseOffset;
 }
 
@@ -425,10 +453,10 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
     // Mirror the advanced HW into the cleaner-visible atomic (release-store).
     publishCleanerState();
 
+    // Direct append API → immediate push (see append() note); hot path coalesces.
     if (cfg_.pushOnAppend) {
         pushToFollowers(baseOffset);
     }
-
     return baseOffset;
 }
 
@@ -439,8 +467,6 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
 void PartitionReplica::onLeaderLogAppended() noexcept
 {
     if (role_ != Role::Leader) return;   // follower LEO/HW driven by applyReplicated()
-    // Capture the pre-update LEO so pushToFollowers() knows which bytes are new.
-    Offset prevLeo = lastPushedOffset_;
     // Re-read the log's LEO and recompute HW (leader always in ISR, so with the
     // ISR satisfied the HW advances to cover the newly-appended bytes exactly as
     // it would after append()).
@@ -449,10 +475,14 @@ void PartitionReplica::onLeaderLogAppended() noexcept
     // setLeaderLogEndOffset() recomputes HW eagerly — mirror it to the cleaner.
     publishCleanerState();
 
-    // GR-10: push newly-appended bytes to ISR followers immediately (best-effort).
-    if (cfg_.pushOnAppend) {
-        pushToFollowers(prevLeo);
-    }
+    // THROUGHPUT FIX: do NOT push per produce op here.  This seam is called once
+    // per produce op by the gateway/worker (append-direct-to-Log path); pushing
+    // inline sent one tiny 1-record replication message per record (~383 B), so the
+    // follower applied ~1 record per op and acks=all crawled at ~900 rec/s.  The
+    // replication push is now COALESCED in doWork() (pushToFollowers(lastPushedOffset_)
+    // drains every record appended since the last push in ONE batched message), so a
+    // worker that drains many produce ops in a cycle replicates them as one batch.
+    // Latency is unchanged at low load: doWork runs in the same worker cycle.
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +491,9 @@ void PartitionReplica::onLeaderLogAppended() noexcept
 
 int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t nowNs)
 {
+    if (req.maxBytes == 0) ++rtFastAcks_;   // pure fast-ack (LEO advance only)
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
+                             static_cast<uint32_t>(req.followerId));
     // Guard: drop silently if this replica is not yet the leader.
     // This can happen during the window between Aeron transport receiving a
     // FetchRequest and the metadata bridge promoting us via becomeLeader().
@@ -502,7 +535,13 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         epoch_    = req.leaderEpoch;
         leaderId_ = req.followerId; // best-effort; coordinator will correct
         followerHw_ = committedHw;
-        lastFetchEmitNs_ = 0;
+        followerSync_.reset();    // self-demotion → bootstrap fetch state afresh
+        if (fsLogEnabled()) {
+            spdlog::info("FollowerSync[node={} part={}] reset (self-demote to follower "
+                         "epoch={} newLeaderGuess={})",
+                         cfg_.selfId, cfg_.partitionId, req.leaderEpoch, req.followerId);
+        }
+        lastFetchEmitNs_ = 0;     // (DR epoch-probe cadence; separate from FollowerSync)
 
         // DR-9 m1: arm the KIP-101 epoch probe exactly as becomeFollower() does
         // (lines 213-216).  Self-demotion bumps epoch_ directly, so applyReplicated's
@@ -578,6 +617,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
+    // (FR: the onFetchRequest SPAN [ReplFetchReqHandle] measures this handler; the
+    //  control→worker handoff is measured cleanly via ReplFragRecv→ReplWorkerOpRun.)
 
     // DR-BUG-6 completeness gate: record this survivor's frontier.  A plain fetch
     // cannot validate lineage (req carries the fetch epoch, not the tail epoch), so
@@ -587,6 +628,24 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         survivorFrontier_[req.followerId] =
             std::min<Offset>(req.fetchOffset, logEndOffset_());
         maybeCompleteLeadership();
+    }
+
+    // FETCH CONFLATION: if we already served this follower the IDENTICAL response
+    // (same fetchOffset AND same current LEO) within kFetchResendNs, skip re-serving.
+    // A behind/stuck follower re-fetches the same range on every apply + 5ms tick
+    // while its prior response is still in flight/unapplied — re-sending it floods
+    // the follower's ingress ring with duplicate (already-applied) apply ops that
+    // head-of-line-block the useful ones.  ISR liveness + HW were already updated
+    // above, so skipping the RESPONSE is safe; the timeout re-serve recovers a
+    // genuinely lost push/response.  (Does NOT touch the DR reconcile/ahead-follower
+    // paths handled earlier.)
+    {
+        const Offset curLeo = logEndOffset_();
+        auto& sf = servedFetch_[req.followerId];
+        const bool identical = sf.timeNs != 0 && sf.fetchOffset == req.fetchOffset &&
+                               sf.leo == curLeo && (nowNs - sf.timeNs) < kFetchResendNs;
+        if (identical) return kErrNone;   // conflate: don't re-send the same response
+        sf.fetchOffset = req.fetchOffset; sf.leo = curLeo; sf.timeNs = nowNs;
     }
 
     // Read records from the log.
@@ -704,6 +763,10 @@ std::vector<uint8_t> PartitionReplica::read(Offset fetchOffset,
 
 void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 {
+    ++rtApplies_;
+    rtApplyBytes_ += static_cast<int64_t>(resp.records.size());
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchRespApply,
+                             static_cast<uint32_t>(cfg_.partitionId));
     if (resp.errorCode != kErrNone) {
         // Error response — ignore (control plane handles epoch changes externally).
         return;
@@ -725,9 +788,38 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         return; // stale-epoch push — deposed leader must not mutate a newer follower's log
     }
 
+    // Adaptive fetch cadence bookkeeping: we have now heard from the current (or a
+    // newer) leader.  Record its advertised HW BEFORE any gap/truncate handling, so a
+    // follower that has a gap (or is otherwise behind) still learns the leader is
+    // ahead and keeps fetching FAST to backfill.  doWork uses this to pick the fetch
+    // cadence: fast while behind, slow keepalive once caught up (no idle spin).
+    // FollowerSync: a response from the (current/newer) leader arrived.  Non-empty
+    // ⟺ still behind (keep fetching); empty ⟺ caught up (keepalive only).  This also
+    // clears any outstanding single-outstanding data-fetch (the leader answered).
+    {
+        const FollowerSync::State fsPrev = followerSync_.state();
+        const bool fsWasArmed = followerSync_.fetchArmed();
+        const bool hadRecords = !resp.records.empty();
+        followerSync_.onResponse(hadRecords, resp.highWatermark);
+        // Change-gated: only log a STATE transition (not every applied response — that
+        // floods under load and starves the worker).
+        if (fsLogEnabled() && fsPrev != followerSync_.state()) {
+            spdlog::info(
+                "FollowerSync[node={} part={}] onResponse hadRecords={} nrec={} "
+                "leaderHw={} localLeo={} | {} -> {} armed {}->{}",
+                cfg_.selfId, cfg_.partitionId, hadRecords, resp.records.size(),
+                resp.highWatermark, logEndOffset_(),
+                FollowerSync::toString(fsPrev),
+                FollowerSync::toString(followerSync_.state()),
+                fsWasArmed, followerSync_.fetchArmed());
+        }
+    }
+
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
+    // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
+    //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
     // Epoch change: truncate divergent tail before applying.
     if (resp.leaderEpoch > epoch_) {
@@ -828,14 +920,25 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                 // Append only the strictly-new suffix.
                 std::vector<uint8_t> raw(resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
                                           resp.records.end());
-                onLog([&](auto& L){ L.append(raw, lastOff); });
+                // THROUGHPUT FIX: appendNoSync — do NOT fsync per apply.  The syncing
+                // append() cost ~693µs mean (disk fsync) PER batch on the follower,
+                // capping acks=all at ~1.5k rec/s.  acks=all crash-durability comes
+                // from ISR REPLICATION (multiple page-cache copies), NOT per-record
+                // fsync on each follower (same as Kafka's default + rune's documented
+                // appendNoSync contract).  A single coalesced sync() runs once per
+                // duty cycle below (followerApplyDirty_), amortising the fsync.
+                onLog([&](auto& L){ L.appendNoSync(raw.data(), raw.size(), lastOff); });
+                followerApplyDirty_ = true;
             }
         } else {
             // Fallback: raw user bytes (e.g. injected by unit tests) — wrap in
             // a RecordBatch so the log segment scanner can parse them.
             Offset baseOffset = logEndOffset_();
+            // Merge: keep main's zero-alloc makeBatch_ (reused buffer) + multinode
+            // throughput fix (appendNoSync; coalesced sync via followerApplyDirty_).
             const auto& batch = makeBatch_(baseOffset, resp.records);
-            onLog([&](auto& L){ L.append(batch, baseOffset); });
+            onLog([&](auto& L){ L.appendNoSync(batch.data(), batch.size(), baseOffset); });
+            followerApplyDirty_ = true;
         }
     }
 
@@ -860,6 +963,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (newHw > followerHw_) {
         followerHw_ = newHw;
     }
+    // (followerSync_.onResponse() was recorded at the top of this function,
+    //  before any gap/truncate handling, so a gapped-but-behind follower still
+    //  learns the leader is ahead and keeps fetching FAST.)
 
     // GR-10: fast-ack — immediately emit a FetchRequest to the leader carrying
     // our new LEO.  This collapses acks=All from fetchInterval+RTT to ~RTT
@@ -876,6 +982,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (cfg_.fastAckOnApply && role_ == Role::Follower
         && (postLeo > preLeo || postHw > preHw)) {
         FetchRequestMsg ack = nextFetch();
+        ack.maxBytes = 0;   // PURE ACK: advance leader HW only; NEVER request data
+                            // (data flows via push / the single-outstanding fetch).
         transport_->sendFetchRequest(ack);
     }
 }
@@ -985,6 +1093,16 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         const Offset trackedLeo = std::min<Offset>(req.followerLeo, logEndOffset_());
         if (trackedLeo >= 0) {
             leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
+            // BUG FIX (ISR-tracking divergence): the probe must ALSO advance the
+            // IsrManager's per-follower fetch offset/time, exactly like a normal
+            // fetch (onFetchRequest updates BOTH).  Updating only leaderState_ left
+            // IsrManager's offset stale, so maybeShrinkIsr() evicted a follower that
+            // is in fact caught up (it was reporting its LEO via probes, not normal
+            // fetches, during epoch churn) → ISR collapsed below minIsr → produce
+            // rejected with MinIsrViolation even at 1 partition.  Keeping the two
+            // trackings in lock-step is what the comment above always intended
+            // ("the survivor stays a live ISR member").
+            isrManager_->onFollowerFetch(req.followerId, trackedLeo, lastKnownNowNs_);
         }
     }
 
@@ -1067,6 +1185,12 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
 void PartitionReplica::applyOffsetsForLeaderEpochResponse(
         const OffsetsForLeaderEpochRespMsg& resp)
 {
+    if (fsLogEnabled()) {
+        spdlog::info("EpochProbe[node={} part={}] RESP epoch={} endOffset={} err={} "
+                     "pending={} myLeo={} floor={}",
+                     cfg_.selfId, cfg_.partitionId, resp.leaderEpoch, resp.endOffset,
+                     resp.errorCode, epochProbePending_, logEndOffset_(), epochProbeFloor_);
+    }
     // Only meaningful while a probe is pending for this epoch.
     if (!epochProbePending_) return;
 
@@ -1354,6 +1478,46 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
 int PartitionReplica::doWork(int64_t nowNs)
 {
     int work = 0;
+    lastKnownNowNs_ = nowNs;   // most-recent duty-cycle clock, reused by message
+                               // handlers (e.g. onOffsetsForLeaderEpochRequest) that
+                               // have no nowNs of their own but need a fetch timestamp.
+
+    // TIME-GATED coalesced follower flush: the follower applies via appendNoSync
+    // (no per-apply fsync — that cost ~693µs/batch, capping acks=all at ~1.5k/s).
+    // A fsync EVERY duty cycle instead capped throughput at the cycle rate; here we
+    // fsync at most once per kFollowerFlushIntervalNs, amortising it over the many
+    // applies in that window (Kafka likewise flushes followers on a coarse interval,
+    // not per record — acks=all crash-durability comes from ISR replication).
+    // Disk-backed only (memory-backed sync() is a no-op).  Bounded flush lag =
+    // kFollowerFlushIntervalNs.
+    static constexpr int64_t kFollowerFlushIntervalNs = 20'000'000LL; // 20 ms
+    if (followerApplyDirty_ && !memoryBacked_
+        && nowNs - lastFollowerSyncNs_ >= kFollowerFlushIntervalNs) {
+        followerApplyDirty_ = false;
+        lastFollowerSyncNs_ = nowNs;
+        onLog([&](auto& L){ L.sync(); });
+        ++work;
+    }
+
+    // Per-second rate diagnostic (RUNE_FS_LOG) — localise the acks=all bottleneck.
+    if (fsLogEnabled()) {
+        if (rtLastNs_ == 0) { rtLastNs_ = nowNs; rtLastHw_ = leaderState_.highWatermark(); rtLastLeo_ = logEndOffset_(); }
+        else if (nowNs - rtLastNs_ >= 1'000'000'000LL) {
+            const Offset hw = leaderState_.highWatermark();
+            const Offset leo = logEndOffset_();
+            spdlog::info("RATE[node={} part={} role={}] appends/s={} applies/s={} pushes/s={} "
+                         "fastAcksRecv/s={} hwAdv/s={} leoAdv/s={} recsPerApply={} "
+                         "bytesPerPush={} hw={} leo={}",
+                         cfg_.selfId, cfg_.partitionId, role_ == Role::Leader ? "L" : "F",
+                         rtAppends_, rtApplies_, rtPushes_, rtFastAcks_,
+                         hw - rtLastHw_, leo - rtLastLeo_,
+                         rtApplies_ ? (leo - rtLastLeo_) / rtApplies_ : 0,
+                         rtPushes_ ? rtPushBytes_ / rtPushes_ : 0, hw, leo);
+            rtLastNs_ = nowNs; rtAppends_ = rtApplies_ = rtPushes_ = rtFastAcks_ = 0;
+            rtApplyBytes_ = rtPushBytes_ = 0;
+            rtLastHw_ = hw; rtLastLeo_ = leo;
+        }
+    }
 
     if (role_ == Role::Leader) {
         // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
@@ -1381,6 +1545,37 @@ int PartitionReplica::doWork(int64_t nowNs)
             if (leaderState_.highWatermark() != servedBefore) ++work;
         }
 
+        // GR-10 COALESCED replication push: drain ALL records appended since the
+        // last push into ONE batched push, instead of one tiny push per append.
+        // append()/appendKeyed() no longer push inline (see note there); the worker
+        // drains many produce ops into the log in a single ingress-drain, then this
+        // runs once in the same cycle → the follower applies one large batch instead
+        // of thousands of 1-record messages.  This is the acks=all throughput fix.
+        if (cfg_.pushOnAppend && logEndOffset_() > lastPushedOffset_) {
+            // FLOW CONTROL: never push more than kPushFlowWindow records ahead of the
+            // SLOWEST ISR follower's acked LEO.  Outrunning the follower makes Aeron
+            // back-pressure and DROP the best-effort push → the follower stalls behind
+            // the gap and only recovers via the slow keepalive → the acks=all "push
+            // outran follower" collapse (HW freezes with ISR full).  Capping in-flight
+            // to a window throttles the leader to the follower's apply rate (natural
+            // backpressure to the client) → STABLE.  When the follower is at the window
+            // (behind) we skip the push entirely — no wasted log read/encode this cycle;
+            // the follower's fetch/keepalive drains it and its ack advances the window.
+            Offset minFollowerLeo = logEndOffset_();
+            const auto& fleos = leaderState_.followerLeos();
+            for (NodeId id : isrManager_->isr()) {
+                if (id == cfg_.selfId) continue;
+                const auto it = fleos.find(id);
+                const Offset fl = (it != fleos.end()) ? it->second : 0;
+                if (fl < minFollowerLeo) minFollowerLeo = fl;
+            }
+            const Offset pushCeiling = minFollowerLeo + kPushFlowWindow;
+            if (pushCeiling > lastPushedOffset_) {
+                pushToFollowers(lastPushedOffset_, pushCeiling);
+                ++work;
+            }
+        }
+
         if (nowNs - lastIsrCheckNs_ >= cfg_.isrCheckIntervalNs) {
             lastIsrCheckNs_ = nowNs;
             // NOTE: the bare ISR-check TICK is NOT work — counting it made the
@@ -1398,6 +1593,27 @@ int PartitionReplica::doWork(int64_t nowNs)
                 ++work;
             }
 
+            // Change-gated diagnostic (cheap): only log when the ISR size shrinks
+            // below the full replica set OR recovers — logging every check starves
+            // the worker under load (observed: leo frozen at 0).
+            if (fsLogEnabled()) {
+                const int isrSz = static_cast<int>(isrManager_->isr().size());
+                const int repl  = static_cast<int>(isrManager_->replicas().size());
+                if (isrSz != lastLoggedIsrSize_) {
+                    lastLoggedIsrSize_ = isrSz;
+                    std::string dump;
+                    for (NodeId n : isrManager_->replicas()) {
+                        dump += " n" + std::to_string(n) + "=off"
+                              + std::to_string(isrManager_->debugLastFetchOffset(n))
+                              + "/age" + std::to_string(
+                                    isrManager_->debugFetchAgeNs(n, nowNs) / 1'000'000)
+                              + "ms" + (isrManager_->inIsr(n) ? "(isr)" : "(out)");
+                    }
+                    spdlog::info("ISRChange[node={} part={}] isr {}->{} of {} hw={} leo={}{}",
+                                 cfg_.selfId, cfg_.partitionId, isrSz, isrSz, repl,
+                                 leaderState_.highWatermark(), logEndOffset_(), dump);
+                }
+            }
             isrManager_->maybeExpandIsr(nowNs, leaderState_.highWatermark());
             if (isrManager_->isrChanged()) {
                 syncIsrToLeaderState();
@@ -1512,16 +1728,50 @@ int PartitionReplica::doWork(int64_t nowNs)
                 req.requestedEpoch = epochCache_.latestEpoch();
                 req.followerLeo    = logEndOffset_();
                 req.topicId        = cfg_.topicId;
+                if (fsLogEnabled()) {
+                    spdlog::info("EpochProbe[node={} part={}] SEND to leader={} "
+                                 "requestedEpoch={} followerLeo={} (epoch_={} attempt={})",
+                                 cfg_.selfId, cfg_.partitionId, leaderId_,
+                                 req.requestedEpoch, req.followerLeo, epoch_,
+                                 epochProbeAttempts_);
+                }
                 transport_->sendOffsetsForLeaderEpochRequest(leaderId_, req);
                 ++work;
             }
         } else {
-            // Follower: emit a fetch on cadence.
-            if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
-                lastFetchEmitNs_ = nowNs;
+            // Follower normal fetch — driven ENTIRELY by the FollowerSync state
+            // machine (single source of truth; see FollowerSync in the header).
+            //   InSync → DATA keepalive (pulls any push the follower missed; returns
+            //            empty when genuinely caught up).  Behind → SINGLE-OUTSTANDING
+            //            data-fetch on the fast cadence (kills the redundant-fetch flood
+            //            at its source), with a timeout re-send.
+            // Keepalive cadence: small enough that a LOST push is rediscovered within
+            // ~keepaliveNs (else the follower stalls behind a dropped push until ISR
+            // eviction — the InSync-stall collapse), yet not so fast it spins an idle
+            // follower.  Capped at 20 ms and always << replicaLagMaxMs (ISR-safe).
+            const int64_t keepaliveNs = std::clamp<int64_t>(
+                (cfg_.replicaLagMaxMs * 1'000'000LL) / 4,
+                cfg_.fetchIntervalNs, 20'000'000LL);
+            const FollowerSync::State fsPrev = followerSync_.state();
+            const bool fsWasArmed = followerSync_.fetchArmed();
+            const FollowerSync::Action act = followerSync_.decide(
+                nowNs, cfg_.fetchIntervalNs, keepaliveNs, kFetchResendNs);
+            if (act.emit) {
                 FetchRequestMsg req = nextFetch();
+                if (!act.wantData) req.maxBytes = 0;   // pure-ack keepalive
                 transport_->sendFetchRequest(req);
-                ++work;
+                if (act.wantData) ++work;              // real catch-up counts as work
+                if (fsLogEnabled()) {
+                    spdlog::info(
+                        "FollowerSync[node={} part={}] EMIT state={} wantData={} "
+                        "fetchOffset={} leaderId={} armedBefore={} "
+                        "(fast={}us keep={}us resend={}us)",
+                        cfg_.selfId, cfg_.partitionId,
+                        FollowerSync::toString(fsPrev), act.wantData,
+                        req.fetchOffset, leaderId_, fsWasArmed,
+                        cfg_.fetchIntervalNs / 1000, keepaliveNs / 1000,
+                        kFetchResendNs / 1000);
+                }
             }
         }
     }
@@ -1611,6 +1861,24 @@ void PartitionReplica::publishCleanerState() noexcept
         ? static_cast<int>(isrManager_->isr().size())
         : 0;
     publishedIsrSizeForGateway_.store(isrSize, std::memory_order_release);
+
+    // Controller position snapshot: mirror this replica's view of replica-node LEOs
+    // for the leadership-convergence path (see controllerReplicaLeo() in the header).
+    // Stored as leo+1 so a zero-init slot reads back as "unknown".  Self is always
+    // known; a leader additionally publishes each follower's last-fetched LEO.
+    publishedControllerEpoch_.store(static_cast<int32_t>(epoch_), std::memory_order_release);
+    if (cfg_.selfId >= 0 && cfg_.selfId < kMaxControllerNodes) {
+        publishedReplicaLeo_[static_cast<std::size_t>(cfg_.selfId)].store(
+            logEndOffset_() + 1, std::memory_order_release);
+    }
+    if (role_ == Role::Leader) {
+        for (const auto& [fid, leo] : leaderState_.followerLeos()) {
+            if (fid >= 0 && fid < kMaxControllerNodes) {
+                publishedReplicaLeo_[static_cast<std::size_t>(fid)].store(
+                    leo + 1, std::memory_order_release);
+            }
+        }
+    }
 }
 
 const std::vector<NodeId>& PartitionReplica::isr() const noexcept
@@ -1694,12 +1962,33 @@ void PartitionReplica::maybeCompleteLeadership()
     if (reconcileTarget_ >= 0) return;
 
     // (2) Our LEO covers the on-lineage majority frontier.
-    if (logEndOffset_() < majorityCommittedFrontier()) return;
+    const Offset frontier = majorityCommittedFrontier();
+    if (logEndOffset_() < frontier) return;
 
     // Complete: release the served HW.  The floor was the last majority-committed
     // offset; the raw HW is now >= it (we hold the frontier) so serving resumes
     // without any regression.
     leaderComplete_ = true;
+
+    // DR-BUG-3 × DR-BUG-6 INTERACTION FIX: recover the healthy-committed floor.
+    // A new leader seeds lastHealthyHw_ from its OWN follower-view committed HW at
+    // becomeLeader — which may LAG the true committed point (it had not yet observed
+    // the last commit when the old leader died).  Under AllInSync the post-failover
+    // ISR (survivors) sits below minIsr=RF, so the DR-BUG-3 min-ISR gate clamps the
+    // served HW to lastHealthyHw_ — and if that seed is stale, an already-committed
+    // record stays hidden FOREVER (observed: all-in-sync failover stalls one record
+    // short of committedHw).  Raise the healthy floor to the RAW MAJORITY-OF-ISR HW
+    // (leaderState_.highWatermark()): the offset a MAJORITY of the current ISR
+    // provably holds.  That is genuinely committed (pre-failover AllInSync commits
+    // were held by ALL replicas → held by every survivor → included in the majority
+    // HW), and it can NEVER expose an uncommitted tail held only by this leader —
+    // the majority computation excludes any offset a minority holds (NB1 guard: a
+    // promoted follower with an uncommitted [committed,leo) tail and one peer at 0
+    // yields majority HW == committed, so the floor stays put).  Do NOT use
+    // majorityCommittedFrontier() here — that returns this leader's own LEO (the
+    // ahead-follower reconcile target), which WOULD leak the uncommitted tail.
+    const Offset recoveredHw = leaderState_.highWatermark();
+    if (recoveredHw > lastHealthyHw_) lastHealthyHw_ = recoveredHw;
 }
 
 void PartitionReplica::recomputeHw()
@@ -1797,8 +2086,10 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
 // drop via errorCode path handled above).  Stale-epoch pushes are harmless but
 // wasteful; the follower's fast-ack fetch-response will carry the new epoch.
 // ---------------------------------------------------------------------------
-void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
+void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) noexcept
 {
+    RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplPushToFollowers,
+                             static_cast<uint32_t>(cfg_.partitionId));
     if (role_ != Role::Leader) return;
     if (!isrManager_) return;
 
@@ -1826,11 +2117,21 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
         lastPushedOffset_ = currentLeo;
         return;
     }
+    // (FR: pushToFollowers duration is the ReplPushToFollowers SPAN; the actual
+    //  send is measured by the transport ReplOutEnqueue→ReplOutDrain seq pair.)
 
+    ++rtPushes_;
     // Read the bytes from the log — same path as onFetchRequest().
     std::vector<uint8_t> logBytes = onLog([&](auto& L){ return L.read(fromOffset, cfg_.maxFetchBytes); });
 
-    // Apply whole-batch alignment to avoid partial-batch tails.
+    // Apply whole-batch alignment to avoid partial-batch tails, AND track the
+    // exclusive end offset actually covered so we advance lastPushedOffset_ by ONLY
+    // what we send.  The read is capped at maxFetchBytes; under a large backlog one
+    // push covers a prefix and the next duty cycle pushes the rest.  (The old code
+    // set lastPushedOffset_=currentLeo unconditionally → it marked the un-read tail
+    // as "pushed", so the follower never got it and had to crawl via the slow
+    // single-outstanding fetch backstop → fell behind → ISR collapse under load.)
+    Offset pushedThrough = fromOffset;
     if (!logBytes.empty()) {
         const std::size_t cap = static_cast<std::size_t>(cfg_.maxFetchBytes);
         std::size_t pos = 0;
@@ -1842,14 +2143,19 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
             rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
             int32_t total = r.totalLength();
             if (total <= 0) break;
+            // FLOW CONTROL: stop at the ceiling — do not push a batch that begins at
+            // or beyond it (keeps in-flight ≤ kPushFlowWindow ahead of the follower).
+            if (r.baseOffset() >= pushCeiling) break;
             std::size_t nextEnd = pos + static_cast<std::size_t>(total);
             if (nextEnd > logBytes.size()) break;
             if (nextEnd > cap) break;
+            pushedThrough = r.baseOffset() + r.lastOffsetDelta() + 1;
             committedEnd = nextEnd;
             pos = committedEnd;
         }
         logBytes.resize(committedEnd);
     }
+    if (logBytes.empty()) return;   // nothing deliverable within ceiling/cap this pass
 
     // Encode once into encodeScratch_ — reuse for all followers.
     // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
@@ -1864,6 +2170,7 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
         cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
 
     auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+    rtPushBytes_ += static_cast<int64_t>(logBytes.size());
 
     // Push to each ISR follower (skip self).
     for (NodeId followerId : isrList) {
@@ -1871,7 +2178,9 @@ void PartitionReplica::pushToFollowers(Offset fromOffset) noexcept
         transport_->sendFetchResponse(followerId, resp);
     }
 
-    lastPushedOffset_ = currentLeo;
+    lastPushedOffset_ = pushedThrough;   // advance by what we actually pushed (bounded by
+                                         // ceiling + maxFetchBytes); next cycle pushes the
+                                         // rest once the follower's ack lifts the window.
 }
 
 } // namespace rune::replication

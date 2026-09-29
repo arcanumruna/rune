@@ -66,6 +66,7 @@
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/WorkerOp.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
@@ -90,6 +91,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -265,6 +267,20 @@ public:
     // -----------------------------------------------------------------------
     void setDesiredFragmentLimit(int32_t limit) noexcept {
         desiredFragmentLimit_ = (limit >= 1) ? limit : 256;
+    }
+    // Per-tick drain batch limits (NodeConfig knobs — see NodeConfig.h).  Call
+    // before the worker's AgentRunner starts (startup, single-threaded).
+    void setIngressDrainLimit(int32_t n) noexcept { ingressDrainLimit_ = (n >= 1) ? n : 1024; }
+    void setReturnDrainLimit(int32_t n)  noexcept { returnDrainLimit_  = (n >= 1) ? n : 1024; }
+
+    // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
+    // reservation-before-poll uses this as the expected ProduceResult size to compute
+    // how many produce frames it can safely poll; the OLD code reserved 2×maxMsgLength
+    // per ack (an 8 MB ret_ ring → only ~4 slots → K≤4 → throttled produce intake).
+    // Must be >= the max WorkerReturn ProduceResult size (~160 B framed).
+    // Source: NodeConfig::workerAckSlotBytes (RUNE_WORKER_ACK_SLOT_BYTES, default 256).
+    void setAckSlotBytes(int32_t n) noexcept {
+        ackSlotBytes_ = (n >= 64) ? n : 64;
     }
 
     // Expose psm_ for tests (worker-thread only; call only from single-threaded tests).
@@ -475,7 +491,8 @@ public:
                 }
 
                 fn(std::move(ret));
-            });
+            },
+            returnDrainLimit_);   // configurable (RUNE_WORKER_RETURN_DRAIN_LIMIT); was 16
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
@@ -512,6 +529,8 @@ public:
     //      This ensures Aeron term buffer fills → client offer() back-pressures.
     //      NEVER drop an ack.
     int doWork(int64_t nowNs) override {
+        // Per-tick span: inter-tick gap = scheduler handoff/park; duration = tick cost.
+        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, 0);
         int work = 0;
 
         // E4: self-pin this thread to the assigned core on the FIRST doWork call.
@@ -551,7 +570,16 @@ public:
         if (perWorkerIngressActive_) {
             work += flushRetOverflow_();
             work += flushOwedAcksAll_(nowNs);
-            if (ret_.hasSpaceForMaxMsg() && retOverflow_.empty() && pendingAcksAll_.empty()) {
+            // Pipelined acks=all: poll new produce as long as the return ring has
+            // space for the acks about to be polled PLUS all already-parked acks
+            // (pendingAcksAll_ fire later, into ret_).  Previously the gate required
+            // pendingAcksAll_.empty(), which SERIALIZED acks=all on the ~172ms
+            // replication round-trip (no new intake while any ack was in flight →
+            // throughput = batch / round-trip).  Now pendingAcksAll_ is bounded by
+            // ret_ capacity (reservation below subtracts its size) instead of 1.
+            if (retOverflow_.empty() &&
+                ret_.freeSlotsForMsgSize(ackSlotBytes_) >
+                    static_cast<int64_t>(pendingAcksAll_.size())) {
                 work += pollWorkerIngress_(nowNs);
             }
         }
@@ -812,6 +840,10 @@ private:
     // Single-writer invariant: doWork runs on the worker's own thread.
     // -----------------------------------------------------------------------
     std::size_t drainIngress_() {
+        // Drain a LARGE batch per tick: the routed replication ops (fetch/apply —
+        // the HW-advancing fast-acks) must not queue behind a small per-tick cap.
+        // (Default was 16 → under the acks=majority fast-ack storm the ingress ring
+        // backed up multiple ticks; see control→worker handoff p99.)
         int drained = ingress_.drain(
             [this](int32_t /*typeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
@@ -823,7 +855,8 @@ private:
                 const uint8_t* frame =
                     reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
                 executeFromWire_(frame, static_cast<std::size_t>(len));
-            });
+            },
+            ingressDrainLimit_);   // configurable (RUNE_WORKER_INGRESS_DRAIN_LIMIT); was the 16 default
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
@@ -850,6 +883,9 @@ private:
             executePushReadWire_(op);
             break;
         case WorkerOp::Type::ApplyReplicated:
+            // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
+            // with the control thread's ReplFragRecv → EXACT control→worker handoff.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplWorkerOpRun, workerRunSeq_++);
             executeApplyReplicatedWire_(op);
             break;
         case WorkerOp::Type::BecomeLeader:
@@ -863,6 +899,7 @@ private:
             break;
         // E5.1.2c: leader-side replication state handlers
         case WorkerOp::Type::FetchRequest:
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplWorkerOpRun, workerRunSeq_++);
             executeFetchRequestWire_(op);
             break;
         case WorkerOp::Type::OffsetsForLeaderEpochReq:
@@ -1095,6 +1132,8 @@ private:
     // copies the bytes into the log's owned buffer).
     // -------------------------------------------------------------------
     void executeProduceWire_(sbe::WorkerOp& op) {
+        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend,
+                             static_cast<uint32_t>(op.correlationId()));
         const int32_t topicId   = op.topicId();
         const int32_t partition = op.partition();
         WorkerReturn ret;
@@ -1207,6 +1246,8 @@ private:
     // No tail for PushRead ops.
     // -------------------------------------------------------------------
     void executePushReadWire_(sbe::WorkerOp& op) {
+        RUNE_FR_SPAN_READ(rune_fr::Site::ReadEncodePush,
+                          static_cast<uint32_t>(op.sessionId()));
         const int32_t topicId    = op.topicId();
         const int32_t partition  = op.partition();
         const int64_t nextOffset = op.nextOffset();
@@ -1773,6 +1814,13 @@ private:
     // Worker-thread only — no atomic needed.
     int64_t lastSyncNs_ = 0;
 
+    // Per-log LEO at its last successful sync.  syncOwnedLogs_ skips (and returns
+    // NO work for) any log whose logEndOffset has not advanced since — otherwise a
+    // time-based sync of an idle log reported work>0 every interval, resetting the
+    // worker's backoff idle so it never parked (phantom work → CPU-hogging spin,
+    // starving nothing to do).  Worker-thread only.
+    std::unordered_map<rune::storage::Log*, int64_t> lastSyncedLeo_;
+
     // E5.1.3: desired fragment poll limit for reservation-before-poll.
     // K = min(desiredFragmentLimit_, freeMaxMsgSlots − retOverflow_.size()).
     // Source: NodeConfig::gatewayFragmentLimit (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256).
@@ -1784,6 +1832,19 @@ private:
     // entirely (retOverflow_.empty() is required) — so the overflow vector never
     // accumulates more than one poll-batch (K entries) of acks.
     int32_t desiredFragmentLimit_ = 256;
+
+    // Expected ProduceResult return size (bytes) for the return-ring reservation.
+    // Configurable (RUNE_WORKER_ACK_SLOT_BYTES); see setAckSlotBytes.  256 comfortably
+    // covers the ~160 B framed ProduceResult.
+    int32_t ackSlotBytes_ = 256;
+    // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
+    // default so routed replication ops / acks don't queue behind a tiny cap).
+    int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
+    int32_t returnDrainLimit_  = 1024;  // RUNE_WORKER_RETURN_DRAIN_LIMIT
+    // FR trace: monotonic count of routed replication ops (fetch/apply) dequeued
+    // from the ingress ring — pairs 1:1 (FIFO) with the control thread's
+    // ReplFragRecv seq to measure the exact control→worker handoff latency.
+    uint32_t workerRunSeq_ = 0;
 
     // -----------------------------------------------------------------------
     // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.
@@ -1815,8 +1876,15 @@ private:
             if (!replica || !replica->isDiskBacked()) continue;
             rune::storage::Log* log = replica->log();
             if (!log) continue;
+            // Skip logs with no new appends since their last sync — syncing an
+            // unchanged log is a no-op fdatasync that must NOT count as work (else
+            // the backoff idle never parks on an otherwise-idle worker).
+            const int64_t leo = log->logEndOffset();
+            int64_t& lastLeo = lastSyncedLeo_[log];
+            if (leo <= lastLeo) continue;
             try {
                 log->sync();
+                lastLeo = leo;
                 ++synced;
             } catch (const std::exception& ex) {
                 spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw for "
@@ -1912,6 +1980,14 @@ private:
                 } else {
                     entry.ret.errorCode = 0; // OK
                 }
+                // Keyed by (partition<<24)|offset — unique across partitions;
+                // correlates across nodes with follower apply/fetch + onFetchRequest.
+                RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
+                    (static_cast<uint32_t>(entry.ret.partition) << 24) |
+                        (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
+                RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplAckSendOff,
+                    (static_cast<uint32_t>(entry.ret.partition) << 24) |
+                        (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
                 enqueueReturn_(entry.ret);
                 // O(1) erase by swap-with-back.
                 pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
@@ -1984,9 +2060,13 @@ private:
         // Reservation-before-poll (E5.1.3 deliverable b):
         //   K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
         // Guard G-A6: never poll more frames than we can ack without dropping.
-        const int64_t freeSlots = ret_.freeMaxMsgSlots();
-        const int64_t overflow  = static_cast<int64_t>(retOverflow_.size());
-        const int64_t available = (freeSlots > overflow) ? (freeSlots - overflow) : 0;
+        // Reserve return-ring slots for BOTH the acks about to be polled AND the
+        // acks already parked in pendingAcksAll_ (they fire into ret_ later).  This
+        // bounds pendingAcksAll_ by ret_ capacity while allowing acks=all pipelining.
+        const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
+        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) +
+                                  static_cast<int64_t>(pendingAcksAll_.size());
+        const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
         const int32_t K = static_cast<int32_t>(
             std::min(static_cast<int64_t>(desiredFragmentLimit_), available));
         if (K <= 0) return 0; // no free slots — skip poll (G-A6 preserved)
@@ -2020,6 +2100,7 @@ private:
     // -----------------------------------------------------------------------
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
                                   int64_t nowNs) {
+        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
         namespace pc = rune::protocol::client;
 
         // Decode the produce frame.
@@ -2132,6 +2213,10 @@ private:
             return 1;
         }
 
+        // Waterfall: leader appended [baseOffset..lastOffset].  Keyed by lastOffset.
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplLeaderAppend,
+            (static_cast<uint32_t>(msg.partition) << 24) |
+                (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
             replica->onLeaderLogAppended();
@@ -2147,6 +2232,10 @@ private:
         // acks=all (non-duplicate): register a pending ack; fire when HW passes.
         // Timeout: nowNs + ackTimeoutNs_ (generous — accounts for fetch-handling
         // latency added by E5.1.2c, where fetch waits a worker cycle).
+        // Keyed by (partition<<24)|offset (see ReplPendingAckFire).
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckEnqueue,
+            (static_cast<uint32_t>(ret.partition) << 24) |
+                (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
         PendingAcksAll pending;
         pending.replica    = replica;
         pending.lastOffset = outcome.lastOffset;

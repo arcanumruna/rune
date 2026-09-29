@@ -121,6 +121,26 @@ public:
         return slots > 0 ? slots : 0;
     }
 
+    /// Number of `msgBytes`-sized messages that still fit, accounting for the
+    /// per-record framing (8-byte header, 8-byte aligned).  Use this to reserve
+    /// return-ring space for SMALL fixed acks (ProduceResult ≈ 150 B) — reserving
+    /// by 2×maxMsgLength (freeMaxMsgSlots) drastically over-counts (an 8 MB ring
+    /// reports ~4 slots), throttling produce intake.
+    [[nodiscard]] int64_t freeSlotsForMsgSize(int64_t msgBytes) const noexcept {
+        const int64_t capacity = static_cast<int64_t>(ring_.maxMsgLength()) * 8LL;
+        const int64_t used     = static_cast<int64_t>(const_cast<detail::O2ORingBuffer&>(ring_).size());
+        const int64_t free     = capacity - used;
+        const int64_t slotSize = ((msgBytes + 8 + 7) / 8) * 8; // header + 8-byte align
+        if (slotSize <= 0) return 0;
+        const int64_t slots = free / slotSize;
+        return slots > 0 ? slots : 0;
+    }
+
+    /// True when at least one `msgBytes`-sized (framed) message still fits.
+    [[nodiscard]] bool hasSpaceForMsg(int64_t msgBytes) const noexcept {
+        return freeSlotsForMsgSize(msgBytes) > 0;
+    }
+
 private:
     // Raw storage — zero-initialised so the ring descriptor fields start at 0.
     std::vector<std::byte> bufferStorage_;

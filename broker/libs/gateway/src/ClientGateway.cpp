@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
@@ -1193,6 +1194,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
     const pc::Produce& msg = *msgOpt;
+    RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle,
+                         static_cast<uint32_t>(msg.correlationId));
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
@@ -2870,6 +2873,11 @@ void ClientGateway::drainWorkerReturns_()
         // ProduceResult
         // ===================================================================
         if (ret.type == rune::node::WorkerReturn::Type::ProduceResult) {
+            // Mark the instant the gateway first sees the worker's produce result.
+            // The gap between WorkerAppend (worker thread) and this mark is the
+            // worker→gateway return-ring + duty-cycle latency (same correlationId).
+            RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
+                                 static_cast<uint32_t>(ret.correlationId));
             Session* session = sessions_.find(ret.sessionId);
             if (!session) {
                 // Session gone — drop result silently.
@@ -2962,7 +2970,9 @@ void ClientGateway::drainWorkerReturns_()
                     "pending-ack sessionId={} partition={} baseOffset={} lastOffset={}",
                     ret.sessionId, ret.partition, ret.baseOffset, ret.lastOffset);
             } else {
-                // Immediate ack.
+                // Immediate ack (acks=Leader/None) — encode + reliable egress send.
+                RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend,
+                                     static_cast<uint32_t>(ret.correlationId));
                 pc::ProduceResponse okResp;
                 okResp.sessionId     = ret.sessionId;
                 okResp.correlationId = ret.correlationId;

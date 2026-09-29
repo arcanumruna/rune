@@ -85,6 +85,26 @@ struct DynamicBalancerInputs {
     std::vector<int32_t>    liveNodes;             ///< eligibleNodes() — NOT raw liveNodes.
     std::vector<TopicSpec>  topics;                ///< Topic descriptors with co-partition info.
     ReplicaPositionTable*   positions = nullptr;   ///< Soft position table (may be nullptr).
+    /// Commit quorum (majority) of the replica set.  A FAILOVER must never install
+    /// an ISR below this floor: a partial in-sync set (0 < |ISR∩live| < minIsr)
+    /// means the observing controller is transiently ISOLATED (VM CPU starvation /
+    /// heartbeat jitter), NOT that the peers died.  Seizing leadership there would
+    /// install ISR<minIsr → permanent MinIsrViolation → every acks=all produce
+    /// rejected (the startup-collapse bug).  Below the floor the balancer keeps the
+    /// current leader and re-converges when a majority returns — time-independent,
+    /// for ANY jitter window, no tuned grace.  Default 1 preserves single-survivor
+    /// failover for callers (tests) that don't set it.
+    int                     minIsr = 1;
+    /// Nodes whose currently-led partitions are DEMONSTRABLY ALIVE via the data
+    /// plane — their partition's replication frontier advanced since the last
+    /// cycle, which only a live, serving leader can cause.  Such a leader is NEVER
+    /// failed over even if its consensus heartbeat momentarily lapsed (busy leader
+    /// starving its own control-plane thread under produce load = the acks=all
+    /// leadership-churn bug).  Converge off DATA-PLANE progress, not a heartbeat
+    /// timeout (time-independent; a crashed leader's frontier freezes within a
+    /// cycle → drops out of this set → real failover proceeds).  Empty default
+    /// preserves prior behaviour for callers (tests) that don't populate it.
+    std::vector<int32_t>    dataPlaneAliveLeaders;
     int                     maxPreferredElectionsPerCycle = 1000; ///< Budget cap.
     /// Maximum BalancerRecords returned per rebalance() call.  Excess changes are
     /// deferred to the next cycle so one mass failover cannot stall the metadata log.

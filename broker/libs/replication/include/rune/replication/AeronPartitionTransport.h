@@ -65,7 +65,7 @@ namespace rune::node { class WorkerPool; }
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 #include <Subscription.h>
-#include <FragmentAssembler.h>
+#include <ControlledFragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 
@@ -273,23 +273,33 @@ private:
     int drainOutbound();
 
     // -----------------------------------------------------------------------
-    // Fragment callback — called by FragmentAssembler on each reassembled frame.
+    // Fragment callback — called by ControlledFragmentAssembler on each reassembled
+    // frame.  Returns a ControlledPollAction so the ingress can apply END-TO-END
+    // BACK-PRESSURE: when a target worker's SPSC ingress ring is full we return
+    // ABORT, which leaves the fragment UNCONSUMED (position not advanced) so Aeron
+    // re-delivers it on the next controlledPoll — the data stays in the publication,
+    // flow control backs up to the sender, and nothing is dropped.  Malformed /
+    // unroutable frames return CONTINUE (skip + advance).
     // -----------------------------------------------------------------------
-    void onFragment(aeron::concurrent::AtomicBuffer& buffer,
-                    aeron::util::index_t             offset,
-                    aeron::util::index_t             length,
-                    aeron::Header&                   header);
+    aeron::ControlledPollAction onFragment(aeron::concurrent::AtomicBuffer& buffer,
+                                           aeron::util::index_t             offset,
+                                           aeron::util::index_t             length,
+                                           aeron::Header&                   header);
 
     // -----------------------------------------------------------------------
     // Fields
     // -----------------------------------------------------------------------
 
-    static constexpr int   kFragmentLimit = 10;
+    // Per-tick fragment cap for the control thread's inbound poll (fast-acks from
+    // peers) AND outbound drain (pushes/acks to peers).  10 was far too small under
+    // the acks=majority fast-ack storm — the HW-advancing fast-ack queued behind the
+    // cap at both stages.  256 lets the control thread clear a burst in one tick.
+    static constexpr int   kFragmentLimit = 256;
     static constexpr std::size_t kScratchSize = 4 * 1024 * 1024; // 4 MiB
 
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
-    aeron::FragmentAssembler               assembler_;
+    aeron::ControlledFragmentAssembler     assembler_;
 
     NodeId                                 selfId_;
     int64_t                                nowNs_ = 0; ///< updated at top of poll()

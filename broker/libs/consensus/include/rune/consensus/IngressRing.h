@@ -1,61 +1,65 @@
 #pragma once
-// IngressRing.h — MPSC lock-free ingress ring backed by Aeron's ManyToOneRingBuffer.
+// IngressRing.h — MPSC lock-free ingress ring.
 //
 // Design (§D of phase2-notes):
-//   - Producers (network receiver threads): write() encoded SBE frames → ring.
+//   - Producers (network receiver threads): write()/tryClaim() encoded SBE frames.
 //   - Consumer (single agent thread):        drain() reads up to limit frames.
 //
-// Backed by aeron::concurrent::ringbuffer::ManyToOneRingBuffer which is a
-// battle-tested MPSC ring with correct acquire/release semantics and TRAILER
-// metadata.  All allocation happens at construction; hot path is lock-free.
+// Backed by rune::consensus::detail::M2ORingBuffer — a namespace-isolated copy of
+// common's agrona MULTI-producer/single-consumer ring, retargeted onto Aeron's
+// AtomicBuffer + RecordDescriptor.  Unlike Aeron's stock ManyToOneRingBuffer (which
+// exposes only a scratch→ring write() copy) it adds tryClaim()/commit()/abort() so a
+// producer can encode a message DIRECTLY into the claimed ring slot (ZERO extra copy)
+// and learn immediately when it is back-pressured (claim == INSUFFICIENT_CAPACITY).
+// All allocation happens at construction; the hot path is lock-free.
 //
 // Message type IDs: use 1 (consensus frames) — RecordDescriptor requires
 // typeId >= 1 (0 is reserved for padding).
 
+#include <rune/consensus/detail/M2ORingBuffer.h>
+
 #include <concurrent/AtomicBuffer.h>
-#include <concurrent/ringbuffer/ManyToOneRingBuffer.h>
-#include <concurrent/ringbuffer/RingBufferDescriptor.h>
 
 #include <functional>
-#include <memory>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
-#include <stdexcept>
 
 namespace rune::consensus {
 
-/// Minimum capacity that ManyToOneRingBuffer accepts: power-of-2 payload area.
+/// Minimum capacity accepted: power-of-2 payload area.
 /// Must be a power of two; ring total = capacity + TRAILER_LENGTH.
 inline constexpr int kDefaultIngressCapacity = 64 * 1024; // 64 KiB payload
 
 /// Message type id for consensus SBE frames in the ring.
 inline constexpr int32_t kConsensusMsgTypeId = 1;
 
-/// IngressRing — MPSC lock-free ring for encoded consensus frames.
+/// Sentinel returned by tryClaim() when the ring is full (back-pressure).
+inline constexpr aeron::util::index_t kIngressInsufficientCapacity = -2;
+
+/// IngressRing — MPSC lock-free ring for encoded consensus / outbound frames.
 ///
-/// Thread-safety: write() may be called from multiple producer threads
-/// concurrently.  drain() MUST be called from exactly one consumer thread
-/// (the agent duty-cycle thread).
+/// Thread-safety: write()/tryClaim() may be called from multiple producer threads
+/// concurrently.  drain() MUST be called from exactly one consumer thread.
 class IngressRing {
 public:
-    using DrainHandler = aeron::concurrent::ringbuffer::handler_t;
-    // handler_t signature:
-    //   void(int32_t msgTypeId, AtomicBuffer& buf, index_t offset, index_t length)
+    // (msgTypeId, AtomicBuffer& buf, encodedOffset, length) — same shape as
+    // agrona's handler_t, defined here so we don't depend on the stock ring header.
+    using DrainHandler = std::function<void(std::int32_t,
+                                            aeron::concurrent::AtomicBuffer&,
+                                            aeron::util::index_t,
+                                            aeron::util::index_t)>;
 
     /// Construct with payload capacity in bytes (must be power-of-two; ≥256).
     explicit IngressRing(int payloadCapacity = kDefaultIngressCapacity)
         : bufferStorage_(
               static_cast<std::size_t>(payloadCapacity) +
-              static_cast<std::size_t>(aeron::concurrent::ringbuffer::RingBufferDescriptor::TRAILER_LENGTH),
+              static_cast<std::size_t>(detail::M2ORingBuffer::trailerLength()),
               std::byte{0})
-        , atomicBuffer_(
-              reinterpret_cast<uint8_t*>(bufferStorage_.data()),
-              bufferStorage_.size())
-        , ring_(atomicBuffer_)
+        , ring_(reinterpret_cast<uint8_t*>(bufferStorage_.data()), bufferStorage_.size())
     {}
 
-    // Not copyable or movable (AtomicBuffer is a non-owning view).
+    // Not copyable or movable (the ring holds a view into owned storage).
     IngressRing(const IngressRing&)            = delete;
     IngressRing& operator=(const IngressRing&) = delete;
 
@@ -63,27 +67,34 @@ public:
     // Producer API (multi-threaded, lock-free)
     // -----------------------------------------------------------------------
 
-    /// Write a raw SBE frame into the ring.
-    /// Returns true on success; false if ring is full (producer should retry or drop).
+    /// Write a raw SBE frame into the ring (claim + copy + commit).
+    /// Returns true on success; false if the ring is full (retry or drop).
     /// Thread-safe: may be called from multiple threads concurrently.
     bool write(const uint8_t* data, std::size_t len) {
-        // Wrap caller's buffer as a read-only AtomicBuffer view for ManyToOneRingBuffer.
-        aeron::concurrent::AtomicBuffer srcBuf{
-            const_cast<uint8_t*>(data),
-            len};
-        return ring_.write(
-            kConsensusMsgTypeId,
-            srcBuf,
-            /*srcIndex=*/0,
-            static_cast<aeron::util::index_t>(len));
+        aeron::concurrent::AtomicBuffer srcBuf{const_cast<uint8_t*>(data), len};
+        return ring_.write(kConsensusMsgTypeId, srcBuf, /*srcIndex=*/0,
+                           static_cast<aeron::util::index_t>(len));
     }
+
+    /// Zero-copy claim: reserve `len` bytes and return the encoded-message offset to
+    /// write into (relative to base()), or a NEGATIVE value (kIngressInsufficient-
+    /// Capacity) on back-pressure.  Encode in place at base()+offset, then commit().
+    /// Thread-safe (multi-producer).
+    aeron::util::index_t tryClaim(std::size_t len) {
+        return ring_.tryClaim(kConsensusMsgTypeId, len);
+    }
+    /// Publish a slot previously reserved with tryClaim().
+    void commit(aeron::util::index_t index) { ring_.commit(index); }
+    /// Discard a slot previously reserved with tryClaim() (becomes padding).
+    void abort(aeron::util::index_t index) { ring_.abort(index); }
+    /// Base pointer for zero-copy in-place encoding at a tryClaim() offset.
+    [[nodiscard]] uint8_t* base() noexcept { return ring_.base(); }
 
     // -----------------------------------------------------------------------
     // Consumer API (single-thread: the agent duty-cycle thread)
     // -----------------------------------------------------------------------
 
-    /// Drain up to limit messages, invoking handler for each.
-    /// Returns the count of messages read.
+    /// Drain up to limit messages, invoking handler for each.  Returns count read.
     int drain(const DrainHandler& handler, int limit = 10) {
         return ring_.read(handler, limit);
     }
@@ -95,23 +106,20 @@ public:
     int64_t producerPosition() const { return ring_.producerPosition(); }
     int64_t consumerPosition() const { return ring_.consumerPosition(); }
 
-    /// Largest single message the ring accepts (agrona: capacity / 8).  write()
-    /// THROWS if a message exceeds this — callers that frame variable-length
+    /// Largest single message the ring accepts (agrona: capacity / 8).  write()/
+    /// tryClaim() reject a larger message — callers that frame variable-length
     /// payloads must bound them to this value first.
     std::size_t maxMsgLength() const {
         return static_cast<std::size_t>(ring_.maxMsgLength());
     }
 
 private:
-    // Raw storage — owned by IngressRing; zero-initialised so Aeron ring
-    // descriptor fields start at 0 (tail=0, head=0, etc.).
+    // Raw storage — owned by IngressRing; zero-initialised so ring descriptor
+    // fields start at 0 (tail=0, head=0, etc.).
     std::vector<std::byte> bufferStorage_;
 
-    // Non-owning view used by ManyToOneRingBuffer.
-    aeron::concurrent::AtomicBuffer atomicBuffer_;
-
-    // The ring buffer itself.
-    aeron::concurrent::ringbuffer::ManyToOneRingBuffer ring_;
+    // The ring buffer (holds a non-owning AtomicBuffer view into bufferStorage_).
+    detail::M2ORingBuffer ring_;
 };
 
 } // namespace rune::consensus

@@ -174,6 +174,20 @@ struct NodeConfig {
     // Tests may set a lower value (e.g. 500 ms) for faster ISR shrink in kill scenarios.
     int64_t replicaLagMaxMs = 10'000;
 
+    // Follower periodic-fetch backstop cadence (RUNE_FETCH_INTERVAL_US, default
+    // 5000µs = 5ms).  GR-10 push + fast-ack is meant to drive replication; this
+    // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all
+    // round-trip cadence can be tuned/measured on shared hardware.
+    int64_t fetchIntervalNs = 5'000'000LL;
+
+    // Backoff idle max park (RUNE_IDLE_MAX_PARK_US, default 200µs) for the runtime
+    // + worker AgentRunners.  The default Agrona 1ms max park adds up to ~1ms wake
+    // latency at EACH cross-thread hop of the acks=majority replication round-trip
+    // (worker→control→net→control→worker …); 200µs cuts that 5x without pegging a
+    // core (backoff still sleeps → consensus heartbeats are not starved, unlike
+    // busyspin which triggers re-elections on shared cores).
+    int64_t idleMaxParkUs = 200;
+
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
     // Set to 1 for single-node deployments (leader-only ISR is the whole cluster).
@@ -321,6 +335,30 @@ struct NodeConfig {
     //     old hard-coded 10 to prevent head-of-line blocking on batched ingress).
     //     Also reused for per-worker ingress poll (Task E5.1.2).
     int32_t gatewayFragmentLimit         = 256;
+    // ── Per-tick drain/poll batch limits (all raised from tiny hard-coded 10/16
+    //    defaults that throttled the acks=majority replication pipeline; each is a
+    //    KNOB so we always know what bounds the per-cycle batch).  A value of 0 is
+    //    coerced to the default.  Env names in NodeConfig.cpp.
+    //   - workerIngressDrainLimit: routed replication ops (FetchRequest/ApplyReplicated
+    //     — the HW-advancing fast-acks) drained per worker duty cycle from the ingress
+    //     ring (RUNE_WORKER_INGRESS_DRAIN_LIMIT; was the OneToOneByteRing default 16).
+    int32_t workerIngressDrainLimit      = 1024;
+    //   - workerReturnDrainLimit: acks drained from a worker's return ring per gateway
+    //     cycle (RUNE_WORKER_RETURN_DRAIN_LIMIT; was 16).
+    int32_t workerReturnDrainLimit       = 1024;
+    //   - replFragmentLimit: control-thread replication transport per-tick cap — BOTH
+    //     the inbound controlledPoll (fast-acks/pushes from peers) AND the outbound
+    //     drain (pushes/acks to peers) (RUNE_REPL_FRAGMENT_LIMIT; was 10).
+    int32_t replFragmentLimit            = 256;
+    //   - consensusFragmentLimit: consensus ingress poll/drain per tick
+    //     (RUNE_CONSENSUS_FRAGMENT_LIMIT; was 10/16).
+    int32_t consensusFragmentLimit       = 64;
+    //   - workerAckSlotBytes: expected ProduceResult size used by the worker's
+    //     reservation-before-poll to size return-ring ack slots
+    //     (RUNE_WORKER_ACK_SLOT_BYTES).  Must be >= the framed ProduceResult size
+    //     (~160 B).  Default 256.  The old code reserved 2×maxMsgLength per ack,
+    //     capping produce intake at ~4 frames/cycle on a multi-MB return ring.
+    int32_t workerAckSlotBytes           = 256;
     //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
     //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
     //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to

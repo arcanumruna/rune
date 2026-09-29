@@ -519,8 +519,14 @@ if(BUILD_TESTING)
         rune_replication
         rune_storage
         GTest::gtest_main)
+    # RUN_SERIAL: this binary contains latency assertions (e.g.
+    # AppendP99UnperturbedByCompaction) that measure append p99 while compaction
+    # runs.  Under `ctest -jN` on a small host, concurrent test processes steal CPU
+    # and perturb the p99, causing a false failure (the test passes standalone).
+    # Serialising it guarantees the measurement reflects compaction interference
+    # only, not ambient scheduler contention.
     gtest_discover_tests(rune_compaction_cleaner_agent_tests
-        PROPERTIES TIMEOUT 120)
+        PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
     # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence

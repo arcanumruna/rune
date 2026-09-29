@@ -702,6 +702,30 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // Per-tick drain/poll batch knobs (0 or unparseable → keep default).
+    auto parseLimit = [&](const char* name, int32_t& field) {
+        if (const char* raw = getenv_fn(name)) {
+            if (raw && !std::string_view(raw).empty()) {
+                int32_t v{};
+                if (parseInt32(raw, v) && v > 0) field = v;
+            }
+        }
+    };
+    parseLimit("RUNE_WORKER_INGRESS_DRAIN_LIMIT", cfg.workerIngressDrainLimit);
+    parseLimit("RUNE_WORKER_RETURN_DRAIN_LIMIT",  cfg.workerReturnDrainLimit);
+    parseLimit("RUNE_REPL_FRAGMENT_LIMIT",        cfg.replFragmentLimit);
+    parseLimit("RUNE_CONSENSUS_FRAGMENT_LIMIT",   cfg.consensusFragmentLimit);
+
+    // RUNE_WORKER_ACK_SLOT_BYTES: return-ring reservation slot size for ProduceResult.
+    if (const char* raw = getenv_fn("RUNE_WORKER_ACK_SLOT_BYTES")) {
+        if (raw && !std::string_view(raw).empty()) {
+            int32_t v{};
+            if (parseInt32(raw, v) && v >= 64) {
+                cfg.workerAckSlotBytes = v;
+            }
+        }
+    }
+
     // --- RUNE_WORKER_IDLE (optional) — Milestone E1/E2: per-worker idle strategy selector. ---
     // E1: parsed + stored here; no per-worker AgentRunner yet (driven cooperatively).
     // E2: will wire this into each worker's AgentRunner.
@@ -780,6 +804,28 @@ ConfigResult parseNodeConfig(
         }
     }
     // Absent → keep NodeConfig default ("sleep-ns").
+
+    // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
+    // Follower periodic-fetch backstop cadence.  Lower = faster acks=all
+    // round-trip when GR-10 push under-delivers; measurement/tuning knob.
+    if (const char* fiv = getenv_fn("RUNE_FETCH_INTERVAL_US")) {
+        if (fiv && !std::string_view(fiv).empty()) {
+            char* end = nullptr;
+            long long us = std::strtoll(fiv, &end, 10);
+            if (end != fiv && us > 0) cfg.fetchIntervalNs = us * 1000LL;
+        }
+    }
+
+    // --- RUNE_IDLE_MAX_PARK_US (optional, default 200µs) ---
+    // Backoff idle max park for runtime + worker AgentRunners; caps per-hop wake
+    // latency on the replication round-trip.  Lower = lower latency, more idle CPU.
+    if (const char* imp = getenv_fn("RUNE_IDLE_MAX_PARK_US")) {
+        if (imp && !std::string_view(imp).empty()) {
+            char* end = nullptr;
+            long long us = std::strtoll(imp, &end, 10);
+            if (end != imp && us > 0) cfg.idleMaxParkUs = us;
+        }
+    }
 
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the

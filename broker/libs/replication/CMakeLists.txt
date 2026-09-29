@@ -69,6 +69,19 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_replication_tests)
 
     # ---------------------------------------------------------------------------
+    # FollowerSync state-machine unit tests — STANDALONE.
+    # FollowerSync.h is pure logic (no Aeron / storage / I/O), so this target
+    # links ONLY the header include dir + gtest and builds on ANY platform
+    # (including macOS where aeron is absent and rune_replication cannot link).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_follower_sync_tests
+        tests/replication/FollowerSyncTest.cpp)
+    target_include_directories(rune_follower_sync_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(rune_follower_sync_tests PRIVATE GTest::gtest_main)
+    gtest_discover_tests(rune_follower_sync_tests)
+
+    # ---------------------------------------------------------------------------
     # Task 11: PSM re-rebuild on low-truncation tests (restart-durability trio).
     # ---------------------------------------------------------------------------
     add_executable(rune_psm_rerebuild_tests

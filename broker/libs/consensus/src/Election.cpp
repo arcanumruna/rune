@@ -6,11 +6,22 @@
 
 #include <rune/consensus/Election.h>
 #include <rune/consensus/ClusterMember.h>
+#include <rune_fr/FlightRecorder.h>
 #include <algorithm>
 #include <cassert>
 #include <stdexcept>
+#include <cstdio>
+#include <cstdlib>
 
 namespace rune::consensus {
+
+// TEMP consensus diagnostics (RUNE_CTRL_LOG=1): trace election state transitions
+// and AppendPosition receipt/drops so we can see why the eligible set collapses
+// after a node death.  Remove once the failover-eligibility bug is fixed.
+static bool electLog() noexcept {
+    static const bool on = ::getenv("RUNE_CTRL_LOG") != nullptr;
+    return on;
+}
 
 // ---------------------------------------------------------------------------
 // Construction — Election.java:110-149
@@ -65,6 +76,10 @@ Election::Election(bool             isNodeStartup,
     //   timeout = max(electionTimeoutNs, 3 * electionStatusIntervalNs)
     leaderHeartbeatTimeoutNs_ = std::max<int64_t>(
         electionTimeoutNs_, 3 * electionStatusIntervalNs_);
+
+    // Steady-state follower duties: send our AppendPosition on the status interval;
+    // detect a dead leader after leaderHeartbeatTimeoutNs_.
+    followerLiveness_.configure(electionStatusIntervalNs_, leaderHeartbeatTimeoutNs_);
 
     // Pre-allocate rankedPositions for quorumPosition — no alloc in the hot path.
     const int threshold = ClusterMember::quorumThreshold(
@@ -177,14 +192,14 @@ int64_t Election::nextDeadlineNs() const noexcept {
                 clusterMembers_.size() > 1) {
                 return timeOfLastUpdateNs_ + electionStatusIntervalNs_;
             }
-            // Multi-node FOLLOWER in Closed: wake on the leader-liveness deadline so
-            // a dead leader is detected and re-election is triggered.  Only armed
-            // once a leader heartbeat has actually been observed (sentinel guard).
+            // Multi-node FOLLOWER in Closed: the FollowerLiveness SM owns the
+            // wake-up deadline — min(next AppendPosition send, leader-liveness
+            // expiry).  Keeps the leader's view of us fresh and detects a dead
+            // leader promptly.
             if (clusterMembers_.size() > 1 &&
                 leaderMember_ != nullptr &&
-                leaderMember_->id != thisMemberId_ &&
-                timeOfLastLeaderUpdateNs_ != INT64_MIN) {
-                return timeOfLastLeaderUpdateNs_ + leaderHeartbeatTimeoutNs_;
+                leaderMember_->id != thisMemberId_) {
+                return followerLiveness_.nextDeadlineNs();
             }
             return INT64_MIN;
     }
@@ -196,6 +211,7 @@ int64_t Election::nextDeadlineNs() const noexcept {
 // ---------------------------------------------------------------------------
 int Election::doWork(int64_t nowNs)
 {
+    RUNE_FR_SPAN_CONSENSUS(rune_fr::Site::ElectionStep, 0);
     int workCount = 0;
     switch (state_) {
         case ElectionState::Init:
@@ -805,7 +821,7 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
             } else if (leaderMember_ != nullptr &&
                        leaderMember_->id == leaderMemberIdArg &&
                        leaderMember_->id != thisMemberId_) {
-                timeOfLastLeaderUpdateNs_ = nowNs;
+                followerLiveness_.onLeaderHeartbeat(nowNs);
             }
         }
         return;
@@ -880,7 +896,23 @@ void Election::onAppendPosition(int64_t nowNs,
                                 uint8_t /*flags*/)
 {
     // Election.java:541-543: ignore if wrong leadershipTermId
-    if (leadershipTermIdArg != leadershipTermId_) return;
+    if (leadershipTermIdArg != leadershipTermId_) {
+        if (electLog()) {
+            std::fprintf(stderr,
+                "[APPOS node=%d] DROP from follower=%d: msgTerm=%lld != myTerm=%lld "
+                "(state=%d)\n",
+                (int)thisMemberId_, (int)followerMemberIdArg,
+                (long long)leadershipTermIdArg, (long long)leadershipTermId_,
+                (int)state_);
+        }
+        return;
+    }
+    if (electLog()) {
+        std::fprintf(stderr,
+            "[APPOS node=%d] recv from follower=%d pos=%lld term=%lld (state=%d)\n",
+            (int)thisMemberId_, (int)followerMemberIdArg, (long long)logPositionArg,
+            (long long)leadershipTermIdArg, (int)state_);
+    }
 
     // Election.java:545-549: update the follower's logPosition
     ClusterMember* follower = memberById(followerMemberIdArg);
@@ -928,7 +960,7 @@ void Election::onCommitPosition(int64_t nowNs,
     // spuriously timed out.  Only refresh for a follower that is actually
     // following someone else (the leader must not arm its own timeout).
     if (leaderMember_ != nullptr && leaderMember_->id != thisMemberId_) {
-        timeOfLastLeaderUpdateNs_ = nowNs;
+        followerLiveness_.onLeaderHeartbeat(nowNs);
     }
 
     // Election.java:567: update notifiedCommitPosition
@@ -965,23 +997,34 @@ int Election::closedLeaderHeartbeat(int64_t nowNs)
         // longer than leaderHeartbeatTimeoutNs_, re-enter CANVASS so the surviving
         // nodes elect a new leader.  This does NOT weaken safety: the re-election
         // runs the full canvass/ballot/quorum path with a strictly-higher term.
-        const bool haveLeader   = (leaderMember_ != nullptr);
-        const bool isFollower   = haveLeader && leaderMember_->id != thisMemberId_;
-        const bool multiNode    = clusterMembers_.size() > 1;
-        const bool timeoutArmed = timeOfLastLeaderUpdateNs_ != INT64_MIN;
+        const bool haveLeader = (leaderMember_ != nullptr);
+        const bool isFollower  = haveLeader && leaderMember_->id != thisMemberId_;
+        const bool multiNode   = clusterMembers_.size() > 1;
 
-        if (multiNode && isFollower && timeoutArmed &&
-            nowNs >= (timeOfLastLeaderUpdateNs_ + leaderHeartbeatTimeoutNs_)) {
+        if (!(multiNode && isFollower)) return 0;
+
+        // The FollowerLiveness state machine owns both steady-state duties and
+        // their clocks (see FollowerLiveness.h): (1) republish our AppendPosition
+        // to the leader on the status interval so the leader's per-member liveness
+        // (eligibleNodeIds → partition failover) never goes stale, and (2) detect a
+        // dead leader after leaderHeartbeatTimeoutNs_.
+        const FollowerLiveness::Action act = followerLiveness_.decide(nowNs);
+
+        if (act.triggerReElection) {
             // (Observability: the leadership-change is logged by the caller —
             //  NodeConsensusAgent::updateObservedLeader — when leaderMemberId()
-            //  transitions away from the dead node.  rune_consensus deliberately
-            //  has no spdlog dependency.)
+            //  transitions away from the dead node.  rune_consensus has no spdlog.)
             // Drop the stale leader so leaderMemberId() no longer reports the dead
-            // node while we re-elect (observer mirror will fall back to -1).
+            // node while we re-elect, and disarm until we accept a new leader.
             leaderMember_ = nullptr;
-            // Disarm until we accept a new leader again.
-            timeOfLastLeaderUpdateNs_ = INT64_MIN;
+            followerLiveness_.reset();
             state(ElectionState::Canvass, nowNs, "leader heartbeat timeout → re-election");
+            return 1;
+        }
+
+        if (act.sendAppendPosition) {
+            publisher_.appendPosition(leaderMember_->id, leadershipTermId_,
+                                      logPosition_, thisMemberId_, /*flags=*/0);
             return 1;
         }
         return 0;
@@ -1008,6 +1051,13 @@ int Election::closedLeaderHeartbeat(int64_t nowNs)
 void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
 {
     if (next == state_) return;
+    if (electLog()) {
+        std::fprintf(stderr,
+            "[ELECT node=%d] state %d -> %d term=%lld leader=%d nowNs=%lld\n",
+            (int)thisMemberId_, (int)state_, (int)next,
+            (long long)leadershipTermId_,
+            (int)(leaderMember_ ? leaderMember_->id : -1), (long long)nowNs);
+    }
 
     // Election.java:1389-1391: leaving CANVASS clears isExtendedCanvass
     if (state_ == ElectionState::Canvass) {
@@ -1080,9 +1130,27 @@ void Election::electionComplete(int64_t nowNs)
     // NOT arm the timeout (it never times itself out).  Sentinel INT64_MIN keeps
     // a leader (or a not-yet-following node) from being force-re-canvassed.
     if (leaderMember_ != nullptr && leaderMember_->id != thisMemberId_) {
-        timeOfLastLeaderUpdateNs_ = nowNs;
+        followerLiveness_.onBecomeFollower(nowNs);  // arm liveness + schedule 1st send
     } else {
-        timeOfLastLeaderUpdateNs_ = INT64_MIN;
+        followerLiveness_.reset();                  // leader / not-yet-following: disarm
+    }
+
+    // BECOME-LEADER liveness grace (Aeron ConsensusModuleAgent.becomeLeader):
+    // when THIS node becomes leader, seed every OTHER member's append-position
+    // clock to `nowNs`.  A freshly-elected leader has never received an
+    // AppendPosition from its peers in this term, so their clocks sit at the
+    // INT64_MIN sentinel → isActive()==false → eligibleNodeIds() reports them
+    // dead.  The DynamicBalancer then fails partitions over to the new leader
+    // with the still-alive prior leader wrongly excluded — the acks=all
+    // leadership-churn / throughput-dip bug.  Seeding the clocks gives every
+    // peer one full timeout window to report before it can be judged dead.
+    // Time-INDEPENDENT: correct for ANY window — a live peer always reports
+    // within the window; a genuinely dead one never does, so real failover
+    // still fires.  Mirrors Aeron seeding member liveness at leader handover.
+    if (leaderMember_ != nullptr && leaderMember_->id == thisMemberId_) {
+        for (ClusterMember& m : clusterMembers_) {
+            if (m.id != thisMemberId_) m.timeOfLastAppendPositionNs = nowNs;
+        }
     }
 
     state(ElectionState::Closed, nowNs, "electionComplete");
