@@ -300,10 +300,9 @@ on a shared stage. Off ⇒ one branch; fail ⇒ `SchemaValidationFailed`, no app
 
 - Validator implementation — precomputed descriptor table (target) vs. OTF —
   **decided by benchmark** in 0a.
-- Home for `rune-codec` and Rune QL: a new `rune-codec` package + a `rune-ql`
-  package, vs. folding into rune-protocol / rune-client-cpp. (Leaning: a new
-  `rune-codec` package it can be a build-time tool + runtime lib; QL in the
-  client/CLI.)
+- **Decided:** `rune-codec` is a **new standalone repo/package** (sibling to
+  rune-protocol) — it's a build-time generator *and* a runtime lib consumed by
+  the broker and the CLI. Rune QL (0c) lives in the client/CLI package.
 - `rune schema generate` output ergonomics: emit a single header vs.
   header+source; CMake helper for the codegen build step.
 - Plan-IR opcode set is sketched here but finalized in the query-execution spec.
