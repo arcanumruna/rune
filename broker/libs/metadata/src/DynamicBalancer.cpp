@@ -315,22 +315,22 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     if (groupIsr.empty()) break;
                 }
 
-                // ── minIsr FLOOR (time-independent liveness guard) ──────────────────
-                // A PARTIAL in-sync set — non-empty but below the commit quorum
-                // (0 < |groupIsr| < minIsr) — is the signature of a transiently
-                // ISOLATED observer (VM CPU starvation / heartbeat jitter), NOT proof
-                // that the peers died.  Failing over here would install ISR<minIsr →
-                // permanent MinIsrViolation → every acks=all produce rejected (the
-                // startup collapse: node1 becomeLeader isr.size=1).  Keep the current
-                // leader and re-converge when a majority returns (a later cycle whose
-                // groupIsr ≥ minIsr does the real failover).  Idempotent, converges for
-                // ANY jitter window, no tuned grace.  A FULLY empty groupIsr (total
-                // loss) still falls through to the NO_LEADER safety path below.
-                if (!groupIsr.empty() &&
-                    groupIsr.size() < static_cast<std::size_t>(in.minIsr)) {
-                    continue;  // below commit quorum → do not fail over this partition
-                }
-
+                // NB: NO minIsr floor here.  A single surviving in-ISR replica
+                // (0 < |groupIsr| < minIsr) is a VALID failover target: it holds the
+                // committed prefix (it was in-sync), so promoting it serves committed
+                // data without loss; new acks=all produce correctly blocks at the
+                // gateway until the ISR re-expands to minIsr.  Blocking this failover
+                // instead stalls the partition on the dead leader FOREVER — clients
+                // keep redirecting to the dead endpoint (committed-loss on read).
+                //
+                // The transient-isolation case a floor once guarded (observer sees a
+                // false eligN=1 while peers are alive) is now prevented upstream: the
+                // FollowerLiveness state machine keeps every live follower's
+                // AppendPosition fresh, so eligibleNodeIds() is ACCURATE — a lone
+                // eligible in-ISR member means the others are genuinely gone.  Split
+                // brain is still impossible: this runs on the consensus leader, which
+                // only holds leadership with a majority quorum.  in.minIsr remains the
+                // gateway produce gate (acks=all), not a failover gate.
                 if (groupIsr.empty()) {
                     // No node is in-ISR for all members AND live → NO_LEADER for all.
                     computedLeader = NO_LEADER;

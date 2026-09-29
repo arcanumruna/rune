@@ -399,43 +399,46 @@ TEST(DynamicBalancerRegression, DoesNotRestoreLeadershipToLaggingReplica) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// REGRESSION SUITE — minIsr failover floor (startup-collapse fix).
+// REGRESSION SUITE — failover to surviving in-ISR replicas.
 //
-// Bug (found via e2e on a contended 4-core VM): under transient CPU-starvation
-// heartbeat jitter, the metadata controller's eligible set momentarily shrank to
-// a single node.  A FAILOVER then elected that node with a collapsed ISR of size
-// 1 (< minIsr=2) — a permanent MinIsrViolation, so every acks=all produce was
-// rejected and throughput collapsed (23–1684 rps, p99 ≈ 9 s).  Evidence:
-//   node0 becomeLeader epoch=0 isr.size=3   (clean start)
-//   node1 becomeLeader epoch=1 isr.size=1   (failover installs ISR<minIsr → dead)
+// History: an earlier "minIsr floor" blocked failover whenever the eligible ∩ ISR
+// set fell below minIsr, to stop a transient-CPU-starvation eligible-set collapse
+// from installing a phantom ISR=1 leader.  That floor was REMOVED once the
+// FollowerLiveness state machine made the eligible set ACCURATE (live followers
+// keep publishing AppendPosition every status interval), because the floor then
+// blocked GENUINE single-survivor failover — leaving a partition stuck on a dead
+// leader forever, so subscribers redirect to the dead endpoint (committed-loss on
+// read; the dr-e2e leader-kill failures).
 //
-// Fix: DynamicBalancerInputs::minIsr — a failover never installs an ISR below the
-// commit quorum.  A partial in-sync set (0 < |ISR∩live| < minIsr) is treated as
-// transient isolation of the OBSERVER, not death of the peers: keep the current
-// leader and re-converge when a majority returns (time-independent, any window).
+// Correct behaviour: a lone surviving in-ISR replica IS a valid failover target —
+// it holds the committed prefix (it was in-sync), so promoting it serves committed
+// data without loss; new acks=all produce blocks at the gateway (minIsr) until the
+// ISR re-expands.  Split brain stays impossible: the balancer runs on the
+// consensus leader, which only holds leadership with a majority quorum.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// A single momentarily-eligible node must NOT seize leadership with ISR<minIsr.
-TEST(DynamicBalancerRegression, NoFailoverBelowMinIsrOnTransientIsolation) {
+// A lone surviving in-ISR replica MUST be promoted (accurate eligible set ⇒ the
+// others are genuinely dead).  Previously blocked by the minIsr floor.
+TEST(DynamicBalancerRegression, SingleSurvivorInIsrFailsOver) {
     AssignmentMap m;
-    // part0: healthy 3-node assignment, node 0 leads, ISR = replicas = {0,1,2}.
+    // part0: node 0 leads, ISR = replicas = {0,1,2}.  Nodes 0 and 2 die; only 1 left.
     m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, /*leaderEpoch=*/0,
                                     /*partitionEpoch=*/0});
     ReplicaPositionTable pos;
+    pos.report({7,0,1,0,100});
     DynamicBalancer bal;
     DynamicBalancerInputs in;
     in.cur = &m;
-    in.liveNodes = {1};          // ONLY node 1 eligible this cycle (0 and 2 jittered out)
+    in.liveNodes = {1};          // node 1 is the SOLE survivor (0,2 genuinely gone)
     in.positions = &pos;
-    in.minIsr = 2;               // cluster-majority commit quorum
+    in.minIsr = 2;               // gateway acks=all gate — NOT a failover gate
     in.topics = { TopicSpec{7,1,3,"",""} };
 
     auto recs = bal.rebalance(in);
-    // Old (buggy) behaviour: fail over to node 1 with ISR={1} (size 1 < 2).
-    // Fixed behaviour: below the quorum floor → no reassignment; node 0 kept.
-    EXPECT_TRUE(recs.empty())
-        << "transient single-eligible must NOT install an ISR below minIsr; "
-           "keep current leader and converge when a majority returns";
+    ASSERT_FALSE(recs.empty())
+        << "the sole surviving in-ISR replica must be promoted (it holds committed "
+           "data); blocking this strands the partition on the dead leader";
+    for (auto& r : recs) EXPECT_EQ(r.rec.leaderNode, 1);
 }
 
 // Once a MAJORITY is eligible again, the genuine failover proceeds and installs
