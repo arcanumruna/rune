@@ -161,6 +161,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         auto connectFut = client.connect();
         if (connectFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
             err << "rune: connect timed out to " << broker << "\n";
+            client.close();
             return 1;
         }
         connectFut.get();
@@ -168,6 +169,7 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
         auto schemaFut = client.getTopicSchema(topic);
         if (schemaFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
             err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
+            client.close();
             return 1;
         }
         TopicSchemaResult r = schemaFut.get();
