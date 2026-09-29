@@ -24,7 +24,8 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     enable_testing()
     add_executable(rune_ql_tests
-        tests/AstSmokeTest.cpp)
+        tests/AstSmokeTest.cpp
+        tests/ParserTest.cpp)
     target_link_libraries(rune_ql_tests PRIVATE rune_ql GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_ql_tests)
