@@ -76,8 +76,10 @@ public:
         assert(maxRecords > 0 && "InMemoryLog: maxRecords must be > 0");
         // Allocate the fixed-size circular byte buffer exactly once.
         ring_.resize(maxBytes);
-        // Pre-allocate entry descriptor vector to maxRecords.
-        entries_.reserve(maxRecords);
+        // Allocate the fixed-capacity circular ENTRY ring exactly once.  Unlike a
+        // std::vector, evicting the oldest entry advances a head index in O(1)
+        // (no front-erase memmove of the surviving descriptors).
+        entries_.resize(maxRecords);
     }
 
     ~InMemoryLog() = default;
@@ -106,16 +108,32 @@ public:
     }
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes) {
-        if (startOffset < logStartOffset_ || entries_.empty()) {
+        if (startOffset < logStartOffset_ || entryCount_ == 0) {
             return {};
         }
 
         std::vector<uint8_t> out;
         out.reserve(static_cast<std::size_t>(maxBytes));
 
-        for (const auto& e : entries_) {
-            // Skip batches before startOffset.
-            if (e.lastOffset < startOffset) continue;
+        // Entry offsets are strictly increasing with logical index, so binary-search
+        // the FIRST live entry whose lastOffset >= startOffset — O(log n) instead of
+        // an O(n) scan from the oldest entry.  This is the common case where a reader
+        // resumes from a deep offset (e.g. pushSubscriptions on a large ring).
+        std::size_t lo = 0, hi = entryCount_;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (entryAt(mid).lastOffset < startOffset) lo = mid + 1;
+            else hi = mid;
+        }
+
+        // Walk from the located entry by PHYSICAL index, wrapping with a predictable
+        // compare-and-reset rather than a per-element `% maxRecords_` (a real division
+        // on this non-pow2 capacity).
+        std::size_t phys = (entryHead_ + lo) % maxRecords_;
+        for (std::size_t i = lo; i < entryCount_; ++i) {
+            const Entry& e = entries_[phys];
+            if (++phys == maxRecords_) phys = 0;
+            // All entries from `lo` on have lastOffset >= startOffset (binary search).
             if (e.baseOffset < startOffset) {
                 // Partial batch — skip (InMemoryLog stores whole batches, startOffset
                 // should align to a batch boundary; if not, skip to next).
@@ -146,15 +164,15 @@ public:
 
     void truncateTo(int64_t truncateOffset) {
         // Remove all entries with baseOffset >= truncateOffset from the tail.
-        while (!entries_.empty() &&
-               entries_.back().baseOffset >= truncateOffset) {
-            const Entry& back = entries_.back();
+        while (entryCount_ > 0 &&
+               backEntry().baseOffset >= truncateOffset) {
+            const Entry& back = backEntry();
             // Detect whether this entry was preceded by a wrap-induced padding gap.
             // A wrap happened when the previous entry's end < back.ringOffset (no)
             // OR when back.ringOffset < (prev.ringOffset + prev.length) — i.e. the
             // tail wrapped back to 0 (or near 0) for this entry.
-            if (entries_.size() >= 2) {
-                const Entry& prev = entries_[entries_.size() - 2];
+            if (entryCount_ >= 2) {
+                const Entry& prev = entryAt(entryCount_ - 2);
                 const std::size_t prevEnd = prev.ringOffset + prev.length;
                 if (back.ringOffset < prevEnd) {
                     // This entry was placed after a wrap; there is a padding gap of
@@ -162,7 +180,7 @@ public:
                     const std::size_t paddingGap = maxBytes_ - prevEnd;
                     bytesUsed_ -= paddingGap;
                 }
-            } else if (entries_.size() == 1) {
+            } else if (entryCount_ == 1) {
                 // Only one entry — if tail_ > back.ringOffset + back.length there's
                 // padding at the logical end, but there can be no wrap (head_ == 0).
                 // No action needed.
@@ -170,10 +188,11 @@ public:
             bytesUsed_ -= back.length;
             // Retract tail to free the space this entry occupied.
             tail_ = back.ringOffset;
-            entries_.pop_back();
+            popBackEntry();
         }
-        if (entries_.empty()) {
+        if (entryCount_ == 0) {
             head_ = tail_ = 0;
+            entryHead_ = 0;
         }
         logEndOffset_ = truncateOffset;
     }
@@ -195,7 +214,7 @@ public:
         // Expose a single virtual segment starting at logStartOffset_ so that
         // PSM::rebuildFromLog's CP-3 "start at first live segment" logic works.
         // An empty log returns an empty vector (same as a real Log with no segments).
-        if (entries_.empty()) return {};
+        if (entryCount_ == 0) return {};
         return {logStartOffset_};
     }
 
@@ -211,6 +230,38 @@ private:
         std::size_t ringOffset;  ///< byte index in ring_ where this batch starts (contiguous)
         std::size_t length;      ///< byte length of the batch
     };
+
+    // -----------------------------------------------------------------------
+    // Entry-ring accessors — entries_ is a FIXED-CAPACITY CIRCULAR buffer of
+    // maxRecords_ slots.  `entryHead_` is the physical index of the oldest live
+    // entry; `entryCount_` is the number of live entries.  Logical index i
+    // (0 == oldest) maps to physical slot (entryHead_ + i) % maxRecords_.
+    //
+    // This replaces the former std::vector<Entry> whose erase(begin()) on
+    // eviction shifted every surviving descriptor (O(n) per append in the
+    // steady-state-full hot path).  All operations below are O(1).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] Entry& entryAt(std::size_t i) noexcept {
+        return entries_[(entryHead_ + i) % maxRecords_];
+    }
+    [[nodiscard]] const Entry& entryAt(std::size_t i) const noexcept {
+        return entries_[(entryHead_ + i) % maxRecords_];
+    }
+    [[nodiscard]] Entry&       frontEntry() noexcept { return entries_[entryHead_]; }
+    [[nodiscard]] const Entry& frontEntry() const noexcept { return entries_[entryHead_]; }
+    [[nodiscard]] Entry&       backEntry() noexcept { return entryAt(entryCount_ - 1); }
+    [[nodiscard]] const Entry& backEntry() const noexcept { return entryAt(entryCount_ - 1); }
+
+    void pushBackEntry(const Entry& e) noexcept {
+        // Precondition (guaranteed by callers): entryCount_ < maxRecords_.
+        entries_[(entryHead_ + entryCount_) % maxRecords_] = e;
+        ++entryCount_;
+    }
+    void popFrontEntry() noexcept {
+        entryHead_ = (entryHead_ + 1) % maxRecords_;
+        --entryCount_;
+    }
+    void popBackEntry() noexcept { --entryCount_; }
 
     // -----------------------------------------------------------------------
     // Core append logic
@@ -229,12 +280,12 @@ private:
             // Note: keep at least one remaining entry to guarantee forward
             // progress — a single-entry ring may still evict down to empty,
             // which is fine (tail_ resets to 0 and the new batch goes in fresh).
-            while (!entries_.empty()) {
+            while (entryCount_ > 0) {
                 // Recompute wrap/totalNeed against CURRENT tail_.
                 const std::size_t la = maxBytes_ - tail_;
                 const bool ww = (len > la);
                 const std::size_t need = len + (ww ? la : 0);
-                if (bytesUsed_ + need <= maxBytes_ && entries_.size() < maxRecords_)
+                if (bytesUsed_ + need <= maxBytes_ && entryCount_ < maxRecords_)
                     break; // fits — stop evicting
                 evictOldest();
             }
@@ -243,7 +294,7 @@ private:
             const std::size_t la = maxBytes_ - tail_;
             const bool ww = (len > la);
             const std::size_t need = len + (ww ? la : 0);
-            if (bytesUsed_ + need > maxBytes_ || entries_.size() >= maxRecords_) {
+            if (bytesUsed_ + need > maxBytes_ || entryCount_ >= maxRecords_) {
                 return -1; // sentinel: ring full, caller must retry later
             }
         }
@@ -268,7 +319,7 @@ private:
         tail_       = ringPos + len;
         bytesUsed_ += len;
 
-        entries_.push_back(Entry{baseOffset, lastOffset, ringPos, len});
+        pushBackEntry(Entry{baseOffset, lastOffset, ringPos, len});
         logEndOffset_ = lastOffset + 1;
 
         return baseOffset;
@@ -278,8 +329,8 @@ private:
     // wrap-padding that preceded it), decrements bytesUsed_, advances
     // logStartOffset_.  NO memmove, NO rebase loop.
     void evictOldest() {
-        assert(!entries_.empty());
-        const Entry& oldest = entries_.front();
+        assert(entryCount_ > 0);
+        const Entry& oldest = frontEntry();
 
         // Detect wrap-induced padding: when oldest.ringOffset < head_, the ring
         // wrapped and there is a padding gap at [head_, maxBytes_) that should be
@@ -296,11 +347,14 @@ private:
         bytesUsed_      -= oldest.length;
         logStartOffset_  = oldest.lastOffset + 1;
         head_            = oldest.ringOffset + oldest.length;
-        entries_.erase(entries_.begin());
+        // O(1): advance the entry-ring head past the oldest descriptor — NO
+        // front-erase memmove of the surviving entries.
+        popFrontEntry();
 
-        // If entries_ is now empty, reset head_/tail_ to 0 (clean slate).
-        if (entries_.empty()) {
+        // If the entry ring is now empty, reset head_/tail_ to 0 (clean slate).
+        if (entryCount_ == 0) {
             head_ = tail_ = 0;
+            entryHead_ = 0;
         }
     }
 
@@ -311,7 +365,9 @@ private:
     std::size_t           maxRecords_;
     FullPolicy            policy_;
     std::vector<uint8_t>  ring_;             ///< fixed-capacity circular byte buffer
-    std::vector<Entry>    entries_;          ///< in-order entry descriptors
+    std::vector<Entry>    entries_;          ///< fixed-capacity circular entry ring (size == maxRecords_)
+    std::size_t           entryHead_  = 0;   ///< physical index of oldest live entry in entries_
+    std::size_t           entryCount_ = 0;   ///< number of live entries in the ring
     std::size_t           head_      = 0;    ///< oldest-data index in ring_ (eviction side)
     std::size_t           tail_      = 0;    ///< next-write index in ring_ (append side)
     std::size_t           bytesUsed_ = 0;    ///< logical bytes in use (data + padding gaps)

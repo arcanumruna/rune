@@ -30,16 +30,32 @@ namespace rune::replication {
 // Uses the protocol builder so the batch header is valid (CRC stamped etc).
 // Used by the LEADER path (append from producer).
 // ---------------------------------------------------------------------------
-static std::vector<uint8_t> makeBatch(int64_t baseOffset,
-                                       std::span<const uint8_t> payload)
+// Frame a raw payload as a single-record RecordBatch, REUSING this replica's
+// builder + output buffer so steady-state framing is zero-allocation.  Both the
+// builder's internal records_ vector and batchScratch_ retain capacity across
+// calls (reset()/buildInto() clear without freeing), eliminating the ~12 heap
+// allocations/call the old build()-returns-a-fresh-vector path incurred.
+//
+// The returned reference is valid until the NEXT makeBatch_ call; every caller
+// consumes it synchronously (appends to the log) before any further call, and
+// PartitionReplica is single-writer, so this is safe and non-reentrant.  The
+// framed bytes are byte-identical to the old path.
+const std::vector<uint8_t>& PartitionReplica::makeBatch_(Offset baseOffset,
+                                                         std::span<const uint8_t> payload)
 {
-    rune::protocol::RecordBatchBuilder builder(baseOffset, /*baseTimestamp=*/0);
+    // Lazily create the reused builder on first framing use (avoids touching the
+    // two constructors / initReplica); the branch is predictable after warm-up.
+    if (!batchBuilder_) {
+        batchBuilder_ = std::make_unique<rune::protocol::RecordBatchBuilder>(0, 0);
+    }
+    batchBuilder_->reset(baseOffset, /*baseTimestamp=*/0);
     // Wrap the raw payload as a single record (key=empty, value=payload).
     std::string_view keyView{};
     std::string_view valView(reinterpret_cast<const char*>(payload.data()),
                               payload.size());
-    builder.append(keyView, valView, /*timestamp=*/0);
-    return builder.build();
+    batchBuilder_->append(keyView, valView, /*timestamp=*/0);
+    batchBuilder_->buildInto(batchScratch_);
+    return batchScratch_;
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +121,10 @@ PartitionReplica::PartitionReplica(PartitionConfig            cfg,
     assert(transport_ != nullptr && "transport must not be null");
     initReplica(std::move(replicas), std::move(isr));
 }
+
+// Defined here (not defaulted in the header) so the unique_ptr<RecordBatchBuilder>
+// member destroys a COMPLETE type — RecordBatch.h is included in this TU.
+PartitionReplica::~PartitionReplica() = default;
 
 // Shared construction logic for both backend overloads (de-virtualized seam).
 void PartitionReplica::initReplica(std::vector<NodeId> replicas,
@@ -374,7 +394,9 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     Offset baseOffset = logEndOffset_();
 
     // Build a proper RecordBatch so the Log segment scanner works correctly.
-    auto batch = makeBatch(baseOffset, records);
+    // Bind by const& — makeBatch returns a reused thread-local buffer; consumed
+    // synchronously by the append below before any further makeBatch call.
+    const auto& batch = makeBatch_(baseOffset, records);
     // lastOffset = baseOffset + 0 (one record per batch = lastOffsetDelta=0).
     onLog([&](auto& L){ L.append(batch, baseOffset); });
 
@@ -912,7 +934,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             // Fallback: raw user bytes (e.g. injected by unit tests) — wrap in
             // a RecordBatch so the log segment scanner can parse them.
             Offset baseOffset = logEndOffset_();
-            auto batch = makeBatch(baseOffset, resp.records);
+            // Merge: keep main's zero-alloc makeBatch_ (reused buffer) + multinode
+            // throughput fix (appendNoSync; coalesced sync via followerApplyDirty_).
+            const auto& batch = makeBatch_(baseOffset, resp.records);
             onLog([&](auto& L){ L.appendNoSync(batch.data(), batch.size(), baseOffset); });
             followerApplyDirty_ = true;
         }

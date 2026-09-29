@@ -60,6 +60,10 @@
 #include <rune/storage/LeaderEpochCache.h>
 #include <rune/storage/ProducerStateManager.h>
 
+// Forward-declared so this public header does not pull in the rune-protocol
+// include path; the builder is held by unique_ptr and only completed in the .cpp.
+namespace rune::protocol { class RecordBatchBuilder; }
+
 namespace rune::replication {
 
 // ---------------------------------------------------------------------------
@@ -224,6 +228,10 @@ public:
                      std::vector<NodeId>                    isr,
                      rune::storage::InMemoryLog*            log,
                      PartitionTransport*                    transport);
+
+    /// Declared (defaulted in the .cpp) so the unique_ptr<RecordBatchBuilder>
+    /// member can hold a forward-declared type — dtor runs where it is complete.
+    ~PartitionReplica();
 
     // -----------------------------------------------------------------------
     // Role transitions (called by control plane on leader election / demotion)
@@ -695,6 +703,19 @@ private:
     // Pre-allocated scratch buffers (no hot-path alloc)
     static constexpr std::size_t kScratchSize = 4 * 1024 * 1024; // 4 MiB
     std::vector<uint8_t> encodeScratch_;   ///< for FetchResponse encoding
+
+    // Reused batch-framing state (control-plane append(span)/applyReplicated
+    // paths).  Held across calls so RecordBatchBuilder::reset()/buildInto()
+    // retain capacity → zero steady-state heap allocations per framed batch.
+    // Single-writer per replica, so no synchronisation is needed.
+    std::unique_ptr<rune::protocol::RecordBatchBuilder> batchBuilder_;
+    std::vector<uint8_t>                                batchScratch_;
+
+    /// Frame `payload` as a single-record RecordBatch into batchScratch_ (reusing
+    /// batchBuilder_).  Returns a reference valid until the next call; consume it
+    /// synchronously.  See the definition in PartitionReplica.cpp.
+    const std::vector<uint8_t>& makeBatch_(Offset baseOffset,
+                                           std::span<const uint8_t> payload);
 
     // Follower HW (leader uses leaderState_.highWatermark())
     Offset followerHw_ = 0;
