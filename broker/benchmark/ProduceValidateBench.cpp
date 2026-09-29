@@ -9,10 +9,11 @@
 // in executeProduceWire_ (Worker.h) immediately before appendNoSyncRestamp.
 //
 // Methodology:
-//   - ABAB interleaving: each measurement alternates OFF/ON pairs so ambient
-//     CPU/cache effects cancel (Google Benchmark interleaves them via separate
-//     BM_* functions registered in pairs by the same fixture run).
-//   - n >= 15 repetitions (--benchmark_repetitions=15 in BENCHMARK call).
+//   - Sequential A/B (n=15 each): Google Benchmark runs all 15 repetitions of
+//     BM_ProduceValidate_Off THEN all 15 of BM_ProduceValidate_On (AABB, not
+//     ABAB).  True per-iteration interleaving is not achievable with separately
+//     registered BM_* functions in Google Benchmark.  The sequential ordering
+//     is sufficient to measure the per-produce cost delta between the two paths.
 //   - SetItemsProcessed() → Google Benchmark reports throughput + ns/item.
 //   - DoNotOptimize on the acked boolean prevents DCE of the timed section.
 //
@@ -301,16 +302,14 @@ static void BM_ProduceValidate_On(benchmark::State& state) {
 }
 
 // ---------------------------------------------------------------------------
-// ABAB registration (n=15 repetitions each).
+// Sequential A/B registration (n=15 repetitions each).
 //
-// Google Benchmark runs BM_ProduceValidate_Off then BM_ProduceValidate_On,
-// each with 15 repetitions.  Report the mean_time (ns/op) delta:
+// Google Benchmark runs all 15 repetitions of BM_ProduceValidate_Off, then
+// all 15 of BM_ProduceValidate_On (sequential AABB — not interleaved ABAB).
+// True ABAB interleaving is not achievable with separately registered BM_*
+// functions.  Report the mean_time (ns/op) delta:
 //   delta_ns = mean(On) − mean(Off)
 // is the cost of the Task 7 validation hook per produce.
-//
-// The ABAB pattern cancels CPU/cache warm-up: the second benchmark sees the
-// same cache state as the first because the same Log+Worker fixture is
-// used (SetupOn creates a fresh fixture, matching SetupOff's starting state).
 // ---------------------------------------------------------------------------
 BENCHMARK(BM_ProduceValidate_Off)
     ->Setup(SetupOff)

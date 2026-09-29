@@ -170,6 +170,7 @@ public:
         pendingAcksAll_.reserve(kPendingAcksAllReserve);
         retOverflow_.reserve(kRetOverflowReserve);
         subs_.reserve(kSubsReserve);
+        validators_.reserve(kValidatorsReserve);
         egressScratch_.resize(kEgressScratchSize);
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
@@ -1238,8 +1239,7 @@ private:
         // ── Task 7: per-worker schema validation hook ──────────────────────
         // Immediately before append: if a local Validator is installed for this
         // topic (installed off-hot-path via SchemaUpdate ring op), validate each
-        // record's value in the batch.  Single branch when no validator is set
-        // (most-common case; validators_ lookup is O(1) unordered_map).
+        // record's value in the batch.
         //
         // HARD RULE 4 (zero hot-path alloc): validators_ was built by
         // executeSchemaUpdateWire_ off-hot-path.  The validate() call operates
@@ -1248,13 +1248,28 @@ private:
         // HARD RULE 5 (no virtual calls): Validator::validate is a concrete call.
         // HARD RULE 1 (shared-nothing): validators_ is ONLY touched by this worker
         // thread — never shared, never locked.
-        {
+        //
+        // I1 fast-out (ultra-low-latency default path, HARD RULE #4): when no
+        // validator has ever been installed (validators_ empty — the common case
+        // for topics without a schema), skip the hash lookup entirely.  This
+        // reduces the default produce path to one integer load + one
+        // well-predicted branch; the hash+bucket+pointer-chase is paid only when
+        // at least one schema has been pushed to this worker.
+        if (!validators_.empty()) [[unlikely]] {
             auto it = validators_.find(topicId);
             if (it != validators_.end()) [[unlikely]] {
                 const rune::codec::Validator& v = it->second;
                 bool validationFailed = false;
                 if (tailLen >= static_cast<uint32_t>(rune::protocol::batch::kRecordBatchOverhead)) {
                     rune::protocol::RecordBatchReader rdr(tail, static_cast<std::size_t>(tailLen));
+                    // M2 (HARD RULE #4 — zero hot-path alloc): the capturing lambda
+                    // passed to forEach must fit in std::function's small-object
+                    // buffer.  It captures: &v (pointer, 8 B), &validationFailed
+                    // (pointer, 8 B) — 16 bytes total, well within the typical 24–32 B
+                    // SOB limit.  If future changes add captures, re-verify this; a
+                    // larger capture list WILL cause a per-produce heap allocation.
+                    // static_assert cannot gate std::function SOB at compile time
+                    // (it's implementation-defined), so this comment is the pin.
                     rdr.forEach([&](std::string_view /*key*/,
                                     std::string_view val,
                                     int64_t /*offset*/,
@@ -1273,11 +1288,11 @@ private:
                     validationFailed = true;
                 }
                 if (validationFailed) {
-                    static constexpr int16_t kSchemaValidationFailed = 24;
                     spdlog::debug("Worker {}: schema validation FAILED for "
                                   "topicId={} partition={}; rejecting produce",
                                   workerId_, topicId, partition);
-                    ret.errorCode = kSchemaValidationFailed;
+                    ret.errorCode = static_cast<int16_t>(
+                        rune::protocol::client::ErrorCode::SchemaValidationFailed);
                     enqueueReturn_(ret);
                     return;
                 }
