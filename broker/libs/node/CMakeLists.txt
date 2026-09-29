@@ -57,14 +57,16 @@ if(BUILD_TESTING)
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
-    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + WorkerWire)
+    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
         tests/node/PortableFlushBackendTest.cpp
         tests/node/OneToOneByteRingTest.cpp
+        tests/node/SchemaCodecSmokeTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
+        rune_codec
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)

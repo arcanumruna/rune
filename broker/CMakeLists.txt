@@ -4,7 +4,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # rune-protocol is header-only; consumed via the sibling source include path in Phase 1.
-set(RUNE_PROTOCOL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include)
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include"
+    CACHE PATH "rune-protocol include dir")
 
 # rune_node include path — exposed as a CMake variable so gateway (which rune_node links)
 # can include NodeConfig.h / TopicSpec without creating a circular target dependency.
@@ -51,6 +52,17 @@ else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
 
+# ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
+set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
+    CACHE PATH "Path to the rune-codec sibling repo")
+add_library(rune_codec STATIC
+    ${RUNE_CODEC_ROOT}/src/Serialize.cpp
+    ${RUNE_CODEC_ROOT}/src/Record.cpp
+    ${RUNE_CODEC_ROOT}/src/Validator.cpp
+    ${RUNE_CODEC_ROOT}/src/Generator.cpp)
+target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
+target_compile_features(rune_codec PUBLIC cxx_std_23)
+
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
     add_compile_options(--coverage -O0 -g)
@@ -81,7 +93,7 @@ add_subdirectory(libs/gateway)
 target_link_libraries(rune_storage     PUBLIC rune_fr)
 target_link_libraries(rune_consensus   PUBLIC rune_fr)
 target_link_libraries(rune_replication PUBLIC rune_fr)
-target_link_libraries(rune_node        PUBLIC rune_fr)
+target_link_libraries(rune_node        PUBLIC rune_fr rune_codec)
 target_link_libraries(rune_gateway     PUBLIC rune_fr)
 
 add_executable(rune_broker src/main.cpp)
