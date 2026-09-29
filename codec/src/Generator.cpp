@@ -3,7 +3,7 @@
 #include <rune/codec/Serialize.h>
 #include <sstream>
 #include <cctype>
-#include <format>
+#include <algorithm>
 
 namespace rune::codec {
 
@@ -44,21 +44,6 @@ static std::string_view cppType(PrimType t) noexcept {
         case PrimType::Bytes:   return "std::string_view";
     }
     return "/* unknown */";
-}
-
-/// Map a PrimType to its byte size expression (for encode/decode).
-static std::string_view primSizeExpr(PrimType t) noexcept {
-    switch (t) {
-        case PrimType::Int32:   return "4";
-        case PrimType::Int64:   return "8";
-        case PrimType::UInt16:  return "2";
-        case PrimType::UInt32:  return "8";
-        case PrimType::UInt64:  return "8";
-        case PrimType::Float64: return "8";
-        case PrimType::Bool:    return "1";
-        case PrimType::Enum:    return "4";
-        default:                return "0";
-    }
 }
 
 // ─── generateHeader ───────────────────────────────────────────────────────────
@@ -114,6 +99,7 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
 
     // ── Constants ───────────────────────────────────────────────────────────
     o << "    static constexpr uint16_t     kBlockLength = " << d.blockLength << "u;\n";
+    o << "    static constexpr uint16_t     kVersion     = " << d.version << "u;\n";
     o << "    static constexpr uint64_t     kFingerprint = " << fp << "ull;\n";
     o << "    static constexpr std::string_view kSchemaName = \"" << d.name << "\";\n";
     o << "\n";
@@ -153,7 +139,7 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "        auto wr32 = [&](uint32_t v) { *p++ = uint8_t(v); *p++ = uint8_t(v>>8); *p++ = uint8_t(v>>16); *p++ = uint8_t(v>>24); };\n";
     o << "        auto wr64 = [&](uint64_t v) { for(int i=0;i<8;i++) *p++=uint8_t(v>>(8*i)); };\n";
     o << "        wr16(kBlockLength);\n";
-    o << "        wr16(uint16_t(1)); // version\n";
+    o << "        wr16(kVersion);\n";
     o << "        // Fixed block\n";
 
     // Emit fixed fields in offset order (they are already in declaration order by the builder)
@@ -223,6 +209,13 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     o << "    }\n\n";
 
     // ── decode() ─────────────────────────────────────────────────────────────
+    o << "    // PRECONDITION: `record` is assumed to be a pre-validated, well-formed\n";
+    o << "    // record. decode() trusts the record's declared blockLength to locate the\n";
+    o << "    // var-data section and does NOT reject a blockLength that disagrees with\n";
+    o << "    // the descriptor — it is the zero-copy hot path and stays branch-lean.\n";
+    o << "    // For untrusted input, call rune::codec::Validator::validate first; the\n";
+    o << "    // Validator is the gate. All accesses here are still bounds-checked, so a\n";
+    o << "    // hostile record can never read out of bounds.\n";
     o << "    void decode(std::span<const uint8_t> record) noexcept {\n";
     o << "        if (record.size() < 4) return;\n";
     o << "        const uint8_t* p = record.data();\n";

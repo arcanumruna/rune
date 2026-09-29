@@ -38,7 +38,11 @@ constexpr uint64_t fnv1a_u32le(uint64_t hash, uint32_t v) noexcept {
 /// Fields are processed in canonical order (sorted by id), so field declaration
 /// order does not affect the result. The fingerprint covers:
 ///   schema name, then per field: id (LE16), type (uint8_t), sinceVersion (LE16),
-///   isKey (uint8_t), name bytes, each enumValue (LE32).
+///   isKey (uint8_t), name length (LE16) + name bytes, enum count (LE16) +
+///   each enumValue (LE32).
+///
+/// The name length and enum count are hashed as delimiters so the name/enum
+/// byte boundary cannot be slid between structurally distinct descriptors.
 ///
 /// offset and blockLength are intentionally excluded (they are derived values).
 [[nodiscard]] inline uint64_t fingerprint(const Descriptor& d) noexcept {
@@ -68,9 +72,11 @@ constexpr uint64_t fnv1a_u32le(uint64_t hash, uint32_t v) noexcept {
         hash = fnv1a_byte(hash, static_cast<uint8_t>(fp->type));
         hash = fnv1a_u16le(hash, fp->sinceVersion);
         hash = fnv1a_byte(hash, fp->isKey ? uint8_t{1} : uint8_t{0});
+        hash = fnv1a_u16le(hash, static_cast<uint16_t>(fp->name.size()));
         for (unsigned char c : fp->name) {
             hash = fnv1a_byte(hash, c);
         }
+        hash = fnv1a_u16le(hash, static_cast<uint16_t>(fp->enumValues.size()));
         for (int32_t ev : fp->enumValues) {
             hash = fnv1a_u32le(hash, static_cast<uint32_t>(ev));
         }

@@ -1,8 +1,8 @@
 // src/Serialize.cpp
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Fingerprint.h>
-#include <format>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 
 namespace rune::codec {

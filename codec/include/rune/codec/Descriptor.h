@@ -1,6 +1,7 @@
 // include/rune/codec/Descriptor.h
 #pragma once
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -73,6 +74,23 @@ public:
         for (auto& f : d.fields) {
             if (isVarLen(f.type)) {
                 f.offset = varIndex++;
+            }
+        }
+
+        // Enforce the additive-only invariant: iterating var fields in
+        // var-index order must yield non-decreasing sinceVersion. This is the
+        // load-bearing assumption both readField and Validator rely on when
+        // walking the var-data section; a violation would mis-parse across
+        // versions. deserialize() and the generator both funnel through
+        // build(), so this single check covers every consumer.
+        uint16_t prevSince = 0;
+        for (const auto& f : d.fields) {
+            if (isVarLen(f.type)) {
+                if (f.sinceVersion < prevSince) {
+                    throw std::invalid_argument(
+                        "var-field sinceVersion must be non-decreasing in var-index order");
+                }
+                prevSince = f.sinceVersion;
             }
         }
 
