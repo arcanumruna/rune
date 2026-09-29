@@ -76,6 +76,11 @@ struct WorkerOp {
         // Fire-and-forget (no WorkerReturn): registration/removal only.
         Subscribe,                ///< gateway → worker: register/update a subscription cursor
         Unsubscribe,              ///< gateway → worker: remove a subscription
+        // Task 7: admin → worker schema validator push.
+        // Carries topicId (existing scalar) + descriptor blob (tail, TailKind=DESCRIPTOR_BLOB).
+        // Worker builds a local rune::codec::Validator from the blob on its own thread
+        // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
+        SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
     };
 
     Type    type    = Type::Produce;
@@ -211,6 +216,16 @@ struct WorkerOp {
     // worker moves it into its own (non-atomic, worker-thread-only) owned_.
     // -----------------------------------------------------------------------
     std::vector<rune::replication::PartitionReplica*> ownedSet;
+
+    // Task 7: SchemaUpdate payload — descriptor blob for a single topic.
+    //
+    // Lifetime: the blob is COPIED into the ring slot at enqueue time
+    // (tryEnqueueOp, via putTail).  The worker reads it zero-copy from the
+    // ring view inside executeSchemaUpdateWire_ on ITS OWN thread.
+    //
+    // topicId is carried in the existing common scalar field (WorkerOp::topicId).
+    // The blob is carried as the variable tail (TailKind = DESCRIPTOR_BLOB).
+    std::vector<uint8_t> schemaUpdateBlob;
 
     // -----------------------------------------------------------------------
     // E5.1.2c: FetchRequest-specific fields (leader handles follower fetch).

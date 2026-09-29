@@ -5,6 +5,8 @@ add_library(rune_node
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
     src/PortableFlushBackend.cpp
+    src/SchemaRegistry.cpp
+    src/AdminWorker.cpp
     # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
     src/UringFlushBackend.cpp)
 # E5.1.2d: ProducePath.cpp was moved from libs/gateway/src/ to libs/storage/src/
@@ -57,14 +59,18 @@ if(BUILD_TESTING)
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
-    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + WorkerWire)
+    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
         tests/node/PortableFlushBackendTest.cpp
         tests/node/OneToOneByteRingTest.cpp
+        tests/node/SchemaCodecSmokeTest.cpp
+        tests/node/SchemaRegistryTest.cpp
+        tests/node/AdminWorkerTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
+        rune_codec
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
@@ -308,6 +314,74 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 6: SchemaPersistenceTest — __topic_schemas log + AdminWorker wiring.
+    #
+    # Tests (on-host, no Aeron / media driver):
+    #   1. SchemaRecord_LandsInLog
+    #   2. RebuildFromLog_RecoveryAfterRestart
+    #   3. DuplicateDefineTopic_IdempotentOnLog
+    #   4. ValidateTrue_PushValidatorsCalled
+    #   5. Regression_RULING1_TopicIdIsReturnedByCreateTopic
+    #
+    # NOT tested here (Docker-gated / Task 8):
+    #   - majority-durable commit (Aeron follower replicas required)
+    #   - full client DDL e2e (gateway required)
+    # ---------------------------------------------------------------------------
+    add_executable(rune_schema_persistence_tests
+        tests/integration/SchemaPersistenceTest.cpp)
+    target_include_directories(rune_schema_persistence_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_schema_persistence_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_schema_persistence_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Task 8a: SchemaGatewayTest — gateway → admin ring → replica → response
+    # DDL round-trip (RULING-2 E/F), plus SchemaGatewayRegression.DdlDoesNotBlockProduce.
+    # On-host (no Aeron); real-Aeron majority-durable + failover deferred to 8b.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_schema_gateway_tests
+        tests/integration/SchemaGatewayTest.cpp)
+    target_include_directories(rune_schema_gateway_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_schema_gateway_tests PRIVATE
+        rune_node
+        rune_gateway
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_schema_gateway_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Task 7: ProduceValidationTest — per-worker schema validation hook.
+    #
+    # Tests (on-host, no Aeron / media driver):
+    #   1. SchemaUpdate_Regression_ValidatorInstalledOnWorkerThread
+    #   2. SchemaUpdate_Regression_WellFormedRecord_AppendProceeds
+    #   3. SchemaUpdate_Regression_MalformedRecord_ValidationFailed
+    #   4. SchemaUpdate_Regression_BadEnumRecord_ValidationFailed
+    #   5. SchemaUpdate_Regression_NoValidator_FallsThrough
+    #
+    # Uses InMemoryLog + Worker directly (no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_produce_validation_tests
+        tests/integration/ProduceValidationTest.cpp)
+    target_include_directories(rune_produce_validation_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_produce_validation_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_produce_validation_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
     # tests — 5 test cases:
     #   1. SingleNode: HW-gated visibility.
@@ -373,6 +447,29 @@ if(BUILD_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_static_assignment_emit_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Task 8b (RULING-4, SINGLE-NODE): RuntimeTopicReplica integration test — a
+    # RUNTIME-defined topic (DefineTopic → AdminWorker → control-hook createTopic)
+    # becomes produce/consume-capable because the control thread creates +
+    # registers its user PartitionReplica and emits its assignment so the bridge
+    # promotes it to Leader.  Proves: register replica (bumps generation) →
+    # addRuntimeTopic emits assignment → bridge promotes to Leader → produce
+    # appends (LEO advances) → consume reads back.  Uses InMemoryTransport (no
+    # Aeron); the full real-Aeron socket e2e is Task 13 (Docker).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_runtime_topic_replica_tests
+        tests/integration/RuntimeTopicReplicaTest.cpp)
+    target_include_directories(rune_runtime_topic_replica_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_runtime_topic_replica_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_runtime_topic_replica_tests
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------

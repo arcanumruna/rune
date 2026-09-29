@@ -23,6 +23,10 @@ target_include_directories(rune_gateway PUBLIC
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
 target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
+# rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
+# includes rune/codec/Validator.h for the Task 7 per-worker schema validation
+# hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
+target_link_libraries(rune_gateway PUBLIC rune_codec)
 
 if(aeron_FOUND)
     target_link_libraries(rune_gateway PUBLIC aeron::aeron)
@@ -56,6 +60,17 @@ if(BUILD_TESTING)
         rune_gateway
         GTest::gtest_main)
     gtest_discover_tests(rune_gateway_topic_registry_tests)
+
+    # -------------------------------------------------------------------------
+    # TopicRegistry runtime tests (Task 5) — createTopic + regression guards.
+    # No Aeron, real filesystem + rune_storage.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_topic_registry_runtime_tests
+        tests/gateway/TopicRegistryRuntimeTest.cpp)
+    target_link_libraries(rune_gateway_topic_registry_runtime_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_topic_registry_runtime_tests)
 
     # -------------------------------------------------------------------------
     # G0.1: ClientGateway egress retry queue unit tests — no Aeron, no driver.

@@ -124,6 +124,12 @@ struct TopicSpec {
     //   2 = Strict  — ack only after local fsync completion AND (if acks=All) HW advance.
     // Default Majority (1) so all existing tests are parity-unchanged.
     uint8_t         durabilityTier = 1;  // 0=Leader, 1=Majority, 2=Strict
+
+    // Task 5 (0b): schema validation flag.
+    // When true, the AdminWorker validates incoming produce records against the
+    // registered schema for this topic before appending.  Default false (no validation)
+    // so all existing topics are parity-unchanged until the caller opts in.
+    bool            validate = false;
 };
 
 struct PeerConfig {

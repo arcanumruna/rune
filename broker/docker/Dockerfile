@@ -66,6 +66,16 @@ COPY --from=rune-protocol include /rune-protocol/include
 COPY --from=rune-fr src     /rune-fr/src
 COPY --from=rune-fr include /rune-fr/include
 
+# ── rune-codec (0a) sibling (compiled: src + include) ─────────────────────────
+# The root CMakeLists wires add_library(rune_codec ...) from ${RUNE_CODEC_ROOT}
+# (default ${SRC}/../rune-codec → /rune-codec here) and links it into rune_node.
+# rune-codec is COMPILED (Serialize/Record/Validator/Generator), so copy BOTH its
+# sources and headers.  Supplied via the BuildKit named build context `rune-codec`
+# (see docker-compose additional_contexts).  The CMake configure below passes
+# -DRUNE_CODEC_ROOT=/rune-codec so the sibling path resolves inside the image.
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
+
 # ── Application sources (copied last so edits don't bust the conan cache) ─────
 COPY . .
 
@@ -75,6 +85,8 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
     && cmake --build build --target rune_broker rune_role
 
 # gcc-13's libstdc++ is newer than bookworm-slim's; stage it for the runtime.

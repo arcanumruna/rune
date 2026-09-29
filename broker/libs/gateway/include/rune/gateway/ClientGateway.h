@@ -48,6 +48,7 @@
 #include <rune/gateway/SessionTable.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
+#include <rune/gateway/IAdminRequestSink.h>
 
 // Forward-declared to avoid pulling the full WorkerPool header (and its heavy
 // chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
@@ -248,6 +249,23 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] rune::gateway::ITxnRequestHandler* txnService() const noexcept {
         return txnService_;
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8a: setAdminSink — wire in the schema DDL request sink (RULING-2 F).
+    // Accepts any IAdminRequestSink (e.g. the AdminWorkerAgent ring adapter).
+    // On DefineTopic (64) / GetTopicSchema (66), the gateway validates the frame,
+    // requires a known session, decodes, copies the fields into the sink, and
+    // RETURNS immediately — never blocks the produce hot path on DDL.
+    // May be null (DDL messages are dropped).  Non-owning; must outlive the
+    // gateway.  Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setAdminSink(rune::gateway::IAdminRequestSink* sink) noexcept {
+        adminSink_ = sink;
+    }
+
+    [[nodiscard]] rune::gateway::IAdminRequestSink* adminSink() const noexcept {
+        return adminSink_;
     }
 
     // -----------------------------------------------------------------------
@@ -677,6 +695,18 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // Task 8a: DDL test seams — feed a raw DefineTopic (64) / GetTopicSchema (66)
+    // frame through the real handler path (route to the admin sink).
+    // Single-writer: call only on the duty-cycle thread or before doWork().
+    // -----------------------------------------------------------------------
+    void applyDefineTopicForTest(const uint8_t* buf, std::size_t len) {
+        handleDefineTopic(buf, len);
+    }
+    void applyGetTopicSchemaForTest(const uint8_t* buf, std::size_t len) {
+        handleGetTopicSchema(buf, len);
+    }
+
+    // -----------------------------------------------------------------------
     // subscriptionIsolationForTest — return the isolation level (0/1) of the
     // subscription matching (sessionId, topicId, partition), or -1 if none.
     // For tests to assert the carrier merge updated the group sub in place.
@@ -879,6 +909,11 @@ private:
     // TX-3: Transaction coordination handler — routes templateIds 45,47,49,51,53
     // to TransactionCoordinationService.
     void handleTxnMessage   (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
+    // Task 8a: schema DDL handlers — route DefineTopic (64) / GetTopicSchema (66)
+    // to the admin sink (ring hand-off).  Validate frame + require known session,
+    // decode, copy fields into the sink, RETURN immediately (no hot-path blocking).
+    void handleDefineTopic  (const uint8_t* buf, std::size_t len);
+    void handleGetTopicSchema(const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
@@ -1105,6 +1140,10 @@ private:
     // (TransactionCoordinationService) lives in rune_node — no circular dependency.
     // Single-writer: only accessed on the duty-cycle thread.
     rune::gateway::ITxnRequestHandler* txnService_ = nullptr;
+
+    // Task 8a: schema DDL request sink (RULING-2 F) — non-owning; set via
+    // setAdminSink().  Null → DefineTopic/GetTopicSchema are dropped.
+    rune::gateway::IAdminRequestSink* adminSink_ = nullptr;
 
     // MD1 Task 9: Per-partition RoutingImage (capture-once per duty cycle).
     //

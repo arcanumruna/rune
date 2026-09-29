@@ -1,0 +1,70 @@
+# docker-compose.single.yml — SINGLE-NODE rune-broker (Task 13 typed e2e)
+#
+# One broker node that self-elects (RUNE_PEERS lists only itself), over real
+# Aeron (default config), for the headline typed round-trip probe
+# (docker/schema-e2e.sh + the rune-client-cpp schema-probe).
+#
+# WHY A SEPARATE COMPOSE (vs docker-compose.yml's 3-node cluster):
+#   1. Task 13 is the SINGLE-NODE typed round-trip; one self-electing node is
+#      the minimal real broker↔client Aeron path.
+#   2. The 0b schema messages (DefineTopic/GetTopicSchema/…) live in the 0b
+#      protocol worktree, and the broker links rune-codec (0a).  The stock
+#      docker-compose.yml points the `rune-protocol` build context at
+#      ../../rune-protocol (the MAIN worktree, which lacks SchemaMessages.h)
+#      and supplies NO rune-codec context.  This file wires BOTH correctly:
+#        rune-protocol → ../../rune-protocol-0b   (has SchemaMessages.h)
+#        rune-codec    → ../../rune-codec         (0a codec sibling)
+#      and the Dockerfile passes -DRUNE_CODEC_ROOT=/rune-codec.
+#
+# Platform: linux/amd64 (Docker Desktop / Rosetta on Apple Silicon).
+# Image tag: rune-broker-node:${RUNE_IMAGE_TAG:-single} — set to the commit SHA
+# by the harness so layers never collide with other commits.
+
+name: rune-broker-single
+
+services:
+  rune-1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        # relative to this compose file's dir (docker/):
+        #   ../../rune-protocol-0b = the 0b protocol worktree (has SchemaMessages.h)
+        rune-protocol: ../../rune-protocol-0b
+        # rune-fr flight recorder: compiled sibling lib (src/ + include/)
+        rune-fr: ../../rune-fr
+        # rune-codec (0a): compiled sibling lib (src/ + include/) linked into rune_node
+        rune-codec: ../../rune-codec
+    image: rune-broker-node:${RUNE_IMAGE_TAG:-single}
+    platform: linux/amd64
+    hostname: rune-1
+    shm_size: "256m"
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      # Single-node cluster: RUNE_PEERS lists ONLY this node → self-elect.
+      # Format: id@host:consensusPort:clientPort:replicationPort.
+      RUNE_PEERS: "0@rune-1:40111:40200:40222"
+      RUNE_NODE_ID: "0"
+      RUNE_DATA_DIR: /var/lib/rune
+      RUNE_CLIENT_ENDPOINT: "0.0.0.0:40200"
+      RUNE_ELECTION_TIMEOUT_MS: "300"
+      RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
+      RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
+      RUNE_LOG_LEVEL: "info"
+      RUNE_FS_LOG: "0"
+      # NOTE: NO RUNE_TOPICS here — the typed topic "characters" is created at
+      # RUNTIME by the probe via defineTopic() (the whole point of Task 13).
+      # io_uring portability under Rosetta amd64 emulation (see docker-compose.yml).
+      RUNE_IO_BACKEND: "portable"
+    volumes:
+      - rune-data-1:/var/lib/rune
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "rune_broker"]
+      interval: 5s
+      timeout: 3s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  rune-data-1:

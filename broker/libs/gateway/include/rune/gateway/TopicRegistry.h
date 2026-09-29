@@ -88,6 +88,27 @@ public:
     partitionForKey(int32_t topicId, std::span<const uint8_t> key) const noexcept;
 
     // -----------------------------------------------------------------------
+    // createTopic — runtime topic creation (post-boot).
+    //
+    // Creates partition directories + Log objects for the given spec, runs
+    // Log::recover() on each partition, and registers the topic in the
+    // internal name/id indexes.
+    //
+    // The assigned topicId is the next sequential index (topics_.size() at
+    // the time of insertion) and is stored back into the entry's spec.
+    // The spec.topicId field is IGNORED for placement; the registry owns
+    // the assignment so that topics_[id] lookups remain valid.
+    //
+    // Idempotent: if a topic with the same name already exists, returns
+    // its existing topicId without recreating any directories or logs.
+    //
+    // Returns the assigned topicId (>= 0).
+    // Throws std::runtime_error if a directory cannot be created.
+    // SINGLE-WRITER: must only be called on the gateway duty-cycle thread.
+    // -----------------------------------------------------------------------
+    int32_t createTopic(const rune::node::TopicSpec& spec);
+
+    // -----------------------------------------------------------------------
     // CP-1: per-topic retention + compaction config accessors.
     // All return a default/safe value when topicId is out of range.
     // -----------------------------------------------------------------------
@@ -119,6 +140,7 @@ private:
         std::vector<PartitionEntry>       partitions; // size == spec.partitionCount
     };
 
+    std::string                            dataDir_;       // root data directory (for createTopic)
     std::vector<TopicEntry>               topics_;        // indexed by topicId
     std::unordered_map<std::string, int32_t> nameIndex_;  // name → topicId
 };

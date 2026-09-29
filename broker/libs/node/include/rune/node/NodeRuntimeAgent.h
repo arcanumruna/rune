@@ -45,6 +45,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <algorithm>
@@ -127,6 +128,24 @@ public:
 
     NodeRuntimeAgent(const NodeRuntimeAgent&)            = delete;
     NodeRuntimeAgent& operator=(const NodeRuntimeAgent&) = delete;
+
+    // -----------------------------------------------------------------------
+    // Task 8a: admin control-plane servicing hook (RULING-2 B).
+    //
+    // The schema DDL control plane hands off to the CONTROL thread via rings:
+    //   - createReqRing (admin → control): create physical topic + add a user
+    //     PartitionReplica (topic visibility via the ReplicaRegistry generation
+    //     → WorkerPool::reconcile mechanism); reply the authoritative id.
+    //   - egressRing (admin → control): send DDL response frames on the session
+    //     egress via gateway->sendControlFrame.
+    //   - roleRing (control → admin): posted here on leadership change.
+    //
+    // BrokerNode wires this lambda; it runs on THIS (control) thread every cycle.
+    // Non-owning; single-writer (control thread).  Null when no admin plane.
+    // -----------------------------------------------------------------------
+    void setAdminControlHook(std::function<int(int64_t)> hook) noexcept {
+        adminControlHook_ = std::move(hook);
+    }
 
     // -----------------------------------------------------------------------
     // Agent::doWork — single-writer duty cycle.
@@ -410,6 +429,15 @@ public:
             }
         }
 
+        // 5.9. Task 8a: service the schema DDL control plane (RULING-2 B).
+        //      Drains admin→control rings (createTopic requests + response egress)
+        //      and posts leadership role events to the admin thread.  Runs BEFORE
+        //      gateway_->doWork so any DDL response frame enqueued via
+        //      sendControlFrame is flushed on the egress this same cycle.
+        if (adminControlHook_) {
+            work += adminControlHook_(nowNs);
+        }
+
         // 6. Gateway.
         if (gateway_) {
             work += gateway_->doWork(nowNs);
@@ -633,6 +661,8 @@ private:
     TransactionCoordinationService*                    txnService_;      // non-owning; null-safe (TX-3)
     MetadataService*                                   metadataService_; // non-owning; null-safe (MD1)
     WorkerPool*                                        workerPool_;      // non-owning; null = pre-E1 path
+    // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
+    std::function<int(int64_t)>                        adminControlHook_;
 };
 
 } // namespace rune::node

@@ -23,6 +23,14 @@
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 // MD1 Task 4: MetadataService for __cluster_metadata.
 #include <rune/node/MetadataService.h>
+// Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
+#include <rune/node/AdminWorker.h>
+#include <rune/node/SchemaRegistry.h>
+// Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
+#include <rune/protocol/RecordBatch.h>
+// Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
+#include <rune/protocol/client/SchemaMessages.h>
+#include <cstring>
 
 namespace fs = std::filesystem;
 using namespace rune::consensus;
@@ -134,6 +142,15 @@ void BrokerNode::start() {
         workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
         spdlog::info("BrokerNode[{}]: {} worker AgentRunner thread(s) started",
                      config_.nodeId, workerPool_->workerCount());
+    }
+
+    // 7c. Task 6: start the AdminWorker AgentRunner thread.
+    //     Must start AFTER agentRunner_ (control thread drives replication for
+    //     __topic_schemas log; admin thread calls appendDurable which uses the
+    //     replica).  Separate thread — never blocks the gateway duty cycle.
+    if (adminWorkerRunner_) {
+        adminWorkerRunner_->start();
+        spdlog::info("BrokerNode[{}]: AdminWorker thread started", config_.nodeId);
     }
 
     // 8. Start the LogCleanerAgent on its own thread (CP-6).
@@ -536,6 +553,132 @@ void BrokerNode::buildReplication() {
                  config_.nodeId,
                  replicaRegistry_->replicaCount(),
                  replTransport_ ? "aeron:udp" : "none");
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::createRuntimeUserReplicas — Task 8b (RULING-4, SINGLE-NODE).
+//
+// Create + register the user PartitionReplica(s) for a RUNTIME-defined topic
+// so it becomes produce/consume-capable.  Called on the CONTROL thread from the
+// admin create-topic hook AFTER TopicRegistry::createTopic() has assigned the
+// authoritative id and created the dirs/logs.  This is a faithful, single-topic
+// replay of the boot buildReplication() user-topic loop — same PartitionConfig
+// threading, same InMemoryTransport fallback, same registry + transport
+// registration.  Adding to replicaRegistry_ bumps its generation, so the next
+// NodeRuntimeAgent::doWork cycle's WorkerPool::reconcile() assigns the replica to
+// a worker; addRuntimeTopic() on the MetadataService emits the assignment so the
+// bridge promotes the replica to Leader (single-node this node is the leader).
+// ---------------------------------------------------------------------------
+int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
+    using namespace rune::replication;
+
+    if (spec.topicId < 0) return 0;             // internal topics not handled here
+    if (!replicaRegistry_ || !topicRegistry_) return 0;
+
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+    std::vector<NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers)
+        allNodeIds.push_back(static_cast<NodeId>(peer.id));
+    if (allNodeIds.empty()) allNodeIds.push_back(selfId);  // single-node safety
+
+    const int32_t topicId = spec.topicId;
+    int32_t registered = 0;
+
+    for (int32_t part = 0; part < spec.partitionCount; ++part) {
+        // Skip if this partition replica already exists (idempotent re-invoke).
+        if (replicaRegistry_->lookup(topicId, part) != nullptr) continue;
+
+        rune::storage::Log*         diskLogPtr = nullptr;
+        rune::storage::InMemoryLog* memLogPtr  = nullptr;
+        const bool isMemory =
+            (spec.persistence == rune::node::PersistenceMode::Memory);
+
+        if (isMemory) {
+            const std::size_t kMemLogMaxBytes =
+                static_cast<std::size_t>(config_.memoryLogRingBytes);
+            constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
+            memoryLogs_.push_back(std::make_unique<rune::storage::InMemoryLog>(
+                kMemLogMaxBytes, kMemLogMaxRecords,
+                rune::storage::FullPolicy::DropOldest));
+            memLogPtr = memoryLogs_.back().get();
+        } else {
+            // Reuse the Log created + recovered by TopicRegistry::createTopic (Task 5).
+            diskLogPtr = topicRegistry_->log(topicId, part);
+            if (!diskLogPtr) {
+                spdlog::warn("BrokerNode[{}]: runtime topic '{}' partition {} has no log; "
+                             "skipping replica", config_.nodeId, spec.name, part);
+                continue;
+            }
+        }
+
+        // Mirror buildReplication()'s PartitionConfig threading exactly.
+        PartitionConfig pcfg;
+        pcfg.topicId              = topicId;
+        pcfg.partitionId          = static_cast<PartitionId>(part);
+        pcfg.selfId               = selfId;
+        pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+        pcfg.replicaLagMaxOffset  = 1'000'000'000;
+        pcfg.minIsr               = config_.gatewayMinIsr;
+        pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+        pcfg.isrCheckIntervalNs   = 10'000'000LL;
+        pcfg.maxFetchBytes        = 1 << 20;
+        pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
+            static_cast<uint8_t>(spec.cleanupPolicy));
+        pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
+        pcfg.deleteRetentionMs      = spec.deleteRetentionMs;
+        pcfg.retentionBytes         = spec.retentionBytes;
+        pcfg.retentionMs            = spec.retentionMs;
+        pcfg.minCompactionLagMs     = spec.minCompactionLagMs;
+        pcfg.maxCompactionLagMs     = spec.maxCompactionLagMs;
+        pcfg.segmentRollBytes       = spec.segmentRollBytes;
+        pcfg.retentionCheckMs       = spec.retentionCheckMs;
+        pcfg.fileDeleteDelayMs      = spec.fileDeleteDelayMs;
+        pcfg.logStartOffset         = spec.logStartOffset;
+        pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
+        pcfg.durabilityTier = spec.durabilityTier;
+
+        PartitionTransport* transport = replTransport_.get();
+        if (!transport) {
+            nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+            transport = nullTransports_.back().get();
+        }
+
+        auto replica = isMemory
+            ? std::make_unique<PartitionReplica>(
+                  pcfg, Role::Follower, /*epoch=*/0,
+                  allNodeIds, allNodeIds, memLogPtr, transport)
+            : std::make_unique<PartitionReplica>(
+                  pcfg, Role::Follower, /*epoch=*/0,
+                  allNodeIds, allNodeIds, diskLogPtr, transport);
+
+        if (replTransport_)
+            replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
+
+        // add() bumps ReplicaRegistry::generation() → WorkerPool::reconcile()
+        // picks it up on the next control cycle and assigns it to a worker.
+        replicaRegistry_->add(topicId, part, std::move(replica));
+        ++registered;
+    }
+
+    // Register the runtime topic with the MetadataService so its assignment is
+    // emitted (leader-only) and the bridge promotes the replica to Leader.
+    // buildStaticRoutingImage() / future rebalances also pick it up.
+    if (metadataService_) {
+        rune::metadata::TopicSpec bs;
+        bs.topicId          = topicId;
+        bs.partitionCount   = spec.partitionCount;
+        bs.rf               = static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size()));
+        bs.coPartitionGroup = spec.coPartitionGroup;
+        bs.partitionKey     = spec.partitionKey;
+        metadataService_->addRuntimeTopic(bs);
+    }
+
+    spdlog::info("BrokerNode[{}]: runtime topic '{}' (id={}) → {} user replica(s) registered "
+                 "(single-node); assignment emitted via MetadataService={}",
+                 config_.nodeId, spec.name, topicId, registered,
+                 metadataService_ ? "yes" : "no");
+    return registered;
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1399,20 @@ void BrokerNode::buildGateway() {
         replBridge_->setWorkerPool(workerPool_.get());
     }
 
+    // -----------------------------------------------------------------------
+    // Task 6: Build __topic_schemas log/replica + AdminWorker thread.
+    // Must run AFTER buildWorkerPool() so AdminDeps.pushValidators can enqueue
+    // SchemaUpdate ops to the worker pool.
+    // -----------------------------------------------------------------------
+    buildAdminWorker();
+
+    // Task 8a (RULING-2 F): wire the gateway → admin request sink so DefineTopic
+    // (64) / GetTopicSchema (66) frames are handed off to the AdminWorker ring
+    // (no registry access on the gateway hot path).
+    if (gateway_ && adminWorkerAgent_) {
+        gateway_->setAdminSink(adminWorkerAgent_.get());
+    }
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
@@ -1274,6 +1431,109 @@ void BrokerNode::buildGateway() {
         txnCoordService_.get(),   // TX-3: txn coordinator (null-safe if setup failed)
         metadataService_.get(),   // MD1: metadata service (null-safe if setup failed)
         workerPool_.get());       // E1: shard→worker pool (null-safe if no topics)
+
+    // -----------------------------------------------------------------------
+    // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.
+    //
+    // Runs on the CONTROL (duty-cycle) thread every cycle.  It owns the three
+    // control-side ring endpoints for the schema DDL plane:
+    //   1. Post a role event to the admin thread whenever cluster leadership for
+    //      this node changes (Follower↔Leader) — the admin thread applies
+    //      becomeLeader/becomeFollower on the schema replica ON ITS OWN THREAD.
+    //   2. Drain createReqRing (admin → control): create the physical topic via
+    //      the control-thread-owned TopicRegistry (the SAME mechanism the broker
+    //      uses to make topics visible to the produce path) and reply the id.
+    //   3. Drain egressRing (admin → control): send DDL response frames on the
+    //      originating session's egress via gateway_->sendControlFrame.
+    // No cross-thread mutation: TopicRegistry + gateway egress are touched ONLY
+    // here on the control thread; the admin thread touches ONLY its replica.
+    if (adminWorkerAgent_) {
+        runtimeAgent_->setAdminControlHook(
+            [this](int64_t /*nowNs*/) -> int {
+                int work = 0;
+                auto* agent = adminWorkerAgent_.get();
+                if (!agent) return 0;
+
+                // (1) Post a role event on a leadership-state change.
+                const bool leaderNow = this->isLeader();
+                const int32_t epochNow = static_cast<int32_t>(this->leadershipTermId());
+                if (leaderNow != adminLastLeader_ || epochNow != adminLastEpoch_) {
+                    AdminRoleMsg rm;
+                    rm.leader   = leaderNow;
+                    rm.epoch    = epochNow;
+                    rm.leaderId = static_cast<int32_t>(this->leaderId());
+                    if (encodeAdminRole(agent->roleRing(), rm)) {
+                        adminLastLeader_ = leaderNow;
+                        adminLastEpoch_  = epochNow;
+                        ++work;
+                    }
+                    // else: ring full (impossible for 1-deep role churn) → retry next cycle
+                }
+
+                // (2) Drain create-topic requests (admin → control).
+                work += agent->createReqRing().drain(
+                    [this, agent](int32_t /*tid*/,
+                                  aeron::concurrent::AtomicBuffer& b,
+                                  aeron::util::index_t off,
+                                  aeron::util::index_t len) {
+                        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                        CreateTopicReqMsg req =
+                            decodeCreateTopicReq(p, static_cast<std::size_t>(len));
+                        int32_t id = -1;
+                        if (topicRegistry_) {
+                            rune::node::TopicSpec spec;
+                            spec.name           = req.name;
+                            spec.partitionCount = req.partitionCount;
+                            spec.topicId        = -1;  // registry assigns
+                            try {
+                                id = topicRegistry_->createTopic(spec);
+                                // Task 8b (SINGLE-NODE): make the runtime topic
+                                // produce/consume-capable by creating its user
+                                // PartitionReplica(s) NOW, on this same control
+                                // thread that owns TopicRegistry / replicaRegistry_
+                                // / replTransport_ / MetadataService (no new
+                                // cross-thread mutation).  The authoritative spec
+                                // (assigned id + all fields, dirs/logs already
+                                // created by createTopic) is read back from the
+                                // registry and replayed through the boot path.
+                                if (id >= 0) {
+                                    const rune::node::TopicSpec* authSpec =
+                                        topicRegistry_->topic(id);
+                                    if (authSpec) {
+                                        (void)createRuntimeUserReplicas(*authSpec);
+                                    }
+                                }
+                            } catch (const std::exception& ex) {
+                                spdlog::error("BrokerNode: admin createTopic('{}') failed: {}",
+                                              req.name, ex.what());
+                                id = -1;
+                            }
+                        }
+                        CreateTopicReplyMsg reply;
+                        reply.ticket  = req.ticket;
+                        reply.topicId = id;
+                        // Reply ring is 1-deep in flight (one DDL at a time) → never full.
+                        (void)encodeCreateTopicReply(agent->replyRing(), reply);
+                    }, 8);
+
+                // (3) Drain response frames (admin → control) → session egress.
+                work += agent->egressRing().drain(
+                    [this](int32_t /*tid*/,
+                           aeron::concurrent::AtomicBuffer& b,
+                           aeron::util::index_t off,
+                           aeron::util::index_t len) {
+                        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                        const auto n = static_cast<std::size_t>(len);
+                        if (n < 8) return;
+                        int64_t session;
+                        std::memcpy(&session, p, 8);
+                        if (gateway_)
+                            (void)gateway_->sendControlFrame(session, p + 8, n - 8);
+                    }, 16);
+
+                return work;
+            });
+    }
 
     // Select the runtime/gateway idle strategy (RUNE_RUNTIME_IDLE).  BusySpin →
     // the consensus+gateway thread never parks → sub-100µs produce/ack round-trips
@@ -1491,6 +1751,300 @@ std::string BrokerNode::leaderClientEndpoint() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::buildAdminWorker — Task 6
+//
+// Mirrors the __transaction_state block (TX-3) at ~lines 975-1069:
+//   1. Open + recover a Log under dataDir/"__topic_schemas".
+//   2. Build a PartitionConfig with topicId=-4 (kSchemaTopicId) and
+//      cleanupPolicy=Compact (same as __transaction_state / __cluster_metadata).
+//   3. Build a PartitionReplica, register in replicaRegistry_ + replTransport_.
+//   4. Rebuild SchemaRegistry from the compacted log (rebuildFromLog).
+//   5. Construct AdminDeps with real effects wired:
+//        createTopic     → TopicRegistry::createTopic(spec)
+//        appendDurable   → appendKeyed to schemaReplica_ (majority-durable, minIsr=2)
+//        pushValidators  → enqueue SchemaUpdate WorkerOp to each worker via workerPool_
+//        respondDefine / respondGet → stored in BrokerNode response callbacks
+//          (seam for Task 8 gateway routing; for Task 6: no-op / discarded)
+//   6. Construct AdminWorkerAgent + AdminWorkerRunner (dedicated thread).
+// ---------------------------------------------------------------------------
+void BrokerNode::buildAdminWorker() {
+    const int32_t nodeId = config_.nodeId;
+    try {
+        const fs::path schemaDir = fs::path{config_.dataDir} / "__topic_schemas";
+        fs::create_directories(schemaDir);
+
+        schemaLog_ = std::make_unique<rune::storage::Log>(schemaDir.string());
+        schemaLog_->recover();
+
+        const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+
+        std::vector<NodeId> allNodeIds;
+        allNodeIds.reserve(config_.peers.size());
+        for (const auto& peer : config_.peers) {
+            allNodeIds.push_back(static_cast<NodeId>(peer.id));
+        }
+
+        rune::replication::PartitionConfig scfg;
+        scfg.topicId              = kSchemaTopicId;  // -4: sentinel for __topic_schemas
+        scfg.partitionId          = 0;
+        scfg.selfId               = selfId;
+        // Majority-durable (same as __transaction_state): schema records must
+        // survive leader failover without data loss.
+        scfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
+        scfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+        scfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only
+        scfg.fetchIntervalNs      = config_.fetchIntervalNs;
+        scfg.isrCheckIntervalNs   = 10'000'000LL;
+        scfg.maxFetchBytes        = 1 << 20;
+        // Compacted: keep latest schema record per topicId (key = topicId bytes).
+        scfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+        scfg.minCleanableDirtyRatio = 0.5;
+        scfg.deleteRetentionMs      = 86'400'000LL;  // 1 day tombstone retention
+        scfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
+
+        // RULING-2 A: the schema replica is SOLELY owned + driven by the admin
+        // thread.  It is therefore NOT registered with replTransport_ and NOT
+        // added to replicaRegistry_ — this keeps it out of BOTH the control
+        // thread's allReplicas() doWork loop AND the bridge's role-flip loop
+        // (which iterates allReplicas() and would call becomeLeader/Follower on
+        // the admin-owned replica from the control thread — the RULING-2 race).
+        //
+        // A dedicated InMemoryTransport backs it so no cross-thread transport
+        // poll (AeronPartitionTransport::poll → replica->applyReplicated on the
+        // control thread) ever touches it.  Real multi-node follower fetch
+        // routing on an admin-thread-owned transport is Docker-gated (Task 8b).
+        nullTransports_.push_back(
+            std::make_unique<rune::replication::InMemoryTransport>());
+        rune::replication::PartitionTransport* schemaTransport =
+            nullTransports_.back().get();
+
+        schemaReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+            scfg,
+            rune::replication::Role::Follower,
+            /*epoch=*/0,
+            allNodeIds,
+            allNodeIds,
+            schemaLog_.get(),
+            schemaTransport);
+
+        // schemaReplica_ stays owned HERE (never handed to replicaRegistry_).
+        rune::replication::PartitionReplica* schemaReplicaRaw = schemaReplica_.get();
+
+        // Build the replica-set vector for the AdminWorker's becomeLeader ISR seed.
+        std::vector<int32_t> replicaSetIds;
+        replicaSetIds.reserve(allNodeIds.size());
+        for (auto id : allNodeIds) replicaSetIds.push_back(static_cast<int32_t>(id));
+
+        // Build the in-memory schema registry.
+        schemaRegistry_ = std::make_unique<SchemaRegistry>();
+
+        // ── rebuildFromLog ───────────────────────────────────────────────────
+        // Replay the compacted __topic_schemas log [0, HW) and reconstruct the
+        // in-memory SchemaRegistry.  Mirrors ReplicatedTxnStateStore::rebuildFromLog.
+        // Each record outer batch contains a single record with:
+        //   key   = topicId bytes (4 bytes, LE int32, used by the compactor)
+        //   value = TopicSchema::serialize() payload
+        // ────────────────────────────────────────────────────────────────────
+        if (schemaReplicaRaw) {
+            const rune::replication::Offset hw = schemaReplicaRaw->highWatermark();
+            if (hw > 0) {
+                static constexpr int32_t kChunkBytes = 64 * 1024 * 1024;
+                rune::replication::Offset fetchOffset = 0;
+                while (fetchOffset < hw) {
+                    std::vector<uint8_t> data = schemaReplicaRaw->read(fetchOffset, kChunkBytes);
+                    if (data.empty()) break;
+
+                    std::size_t pos = 0;
+                    rune::replication::Offset lastBatchEnd = fetchOffset;
+
+                    while (pos < data.size()) {
+                        const uint8_t*    batchStart = data.data() + pos;
+                        const std::size_t remaining  = data.size() - pos;
+
+                        if (remaining < static_cast<std::size_t>(
+                                rune::protocol::batch::kRecordBatchOverhead))
+                            break;
+
+                        rune::protocol::RecordBatchReader reader(batchStart, remaining);
+                        if (!reader.ensureValid()) break;
+
+                        const int32_t tl = reader.totalLength();
+                        if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+
+                        // Each record: key=topicId(4 bytes LE), value=TopicSchema payload.
+                        reader.forEach([this](std::string_view /*key*/,
+                                              std::string_view val,
+                                              int64_t /*offset*/,
+                                              int64_t /*ts*/) {
+                            auto ts = TopicSchema::deserialize(
+                                std::span<const uint8_t>(
+                                    reinterpret_cast<const uint8_t*>(val.data()),
+                                    val.size()));
+                            if (ts) {
+                                schemaRegistry_->applyRecord(*ts);
+                            }
+                        });
+
+                        const rune::replication::Offset batchNextOffset =
+                            reader.baseOffset() + reader.lastOffsetDelta() + 1;
+                        if (batchNextOffset > lastBatchEnd)
+                            lastBatchEnd = batchNextOffset;
+
+                        pos += static_cast<std::size_t>(tl);
+                    }
+
+                    if (lastBatchEnd <= fetchOffset) break;
+                    fetchOffset = lastBatchEnd;
+                }
+                spdlog::info(
+                    "BrokerNode[{}]: __topic_schemas rebuilt from log ({} entries, hw={})",
+                    nodeId, schemaRegistry_->runtimeIdHighWater(), hw);
+            }
+        }
+
+        (void)schemaReplicaRaw;  // replica handed to the AdminWorker below
+
+        // ── Wire AdminDeps ───────────────────────────────────────────────────
+        // RULING-2 B: createTopic is NOT called on the admin thread.  Instead the
+        // admin thread posts a CreateTopicRequest on createReqRing_ (admin →
+        // control); the control thread (NodeRuntimeAgent) owns TopicRegistry +
+        // ReplicaRegistry, performs createTopic + registers a user PartitionReplica
+        // (which makes the topic visible to the produce path via the SAME
+        // ReplicaRegistry generation → WorkerPool::reconcile mechanism the broker
+        // already uses), and posts the authoritative id back on replyRing_.
+        AdminDeps deps;
+
+        deps.requestCreateTopic = [this](int64_t ticket, int32_t partitionCount,
+                                         const std::string& name) -> bool {
+            if (!adminWorkerAgent_) return false;
+            CreateTopicReqMsg m;
+            m.ticket         = ticket;
+            m.partitionCount = partitionCount;
+            m.name           = name;
+            return encodeCreateTopicReq(adminWorkerAgent_->createReqRing(), m);
+        };
+
+        // Task 7: pushValidators — enqueue a SchemaUpdate WorkerOp to EVERY
+        // produce worker's ingress ring.
+        //
+        // Admin→worker hand-off: this lambda is called on the AdminWorker thread
+        // after a DefineTopic DDL commit (validate=true).  It fans out a
+        // SchemaUpdate op to each worker in the pool by calling
+        // worker.tryEnqueueOp().  Each worker builds a local rune::codec::Validator
+        // from the blob on ITS OWN thread (shared-nothing — single-writer per
+        // validators_ map entry).
+        //
+        // Back-pressure: if a worker's ingress ring is full, we log a warning and
+        // skip that worker for this cycle.  The validator will be retried when a
+        // later DefineTopic DDL commit fires (rare admin path — not a problem in
+        // practice, and a full ring means the worker is processing under load).
+        // A TODO(T8) can add a retry queue if needed.
+        //
+        // No blocking: the lambda enqueues and returns.  The worker thread applies
+        // the op the next time it drains its ingress ring.
+        deps.pushValidators = [this](const RegistryEntry& entry, int32_t topicId) {
+            if (!workerPool_) {
+                spdlog::warn(
+                    "BrokerNode: pushValidators — no WorkerPool; "
+                    "validator for topicId={} not pushed", topicId);
+                return;
+            }
+            const int32_t nWorkers = workerPool_->workerCount();
+            for (int32_t i = 0; i < nWorkers; ++i) {
+                WorkerOp op;
+                op.type              = WorkerOp::Type::SchemaUpdate;
+                op.topicId           = topicId;
+                op.schemaUpdateBlob  = entry.descriptorBlob; // copy (admin-path, not hot)
+                if (!workerPool_->worker(i).tryEnqueueOp(std::move(op))) {
+                    spdlog::warn(
+                        "BrokerNode: pushValidators — worker {} ingress ring full; "
+                        "SchemaUpdate for topicId={} dropped (back-pressure)",
+                        i, topicId);
+                }
+            }
+            spdlog::info(
+                "BrokerNode: pushValidators — SchemaUpdate for topicId={} "
+                "enqueued to {} workers", topicId, nWorkers);
+        };
+
+        // respondDefine / respondGet (RULING-2 F): encode the protocol response
+        // frame and push it on egressRing_ (admin → control) as
+        // [sessionId:i64][encoded frame].  The control thread drains egressRing_
+        // in NodeRuntimeAgent and sends each frame on the originating session's
+        // egress via gateway_->sendControlFrame (single-writer — no cross-thread
+        // egress publication access from the admin thread).
+        deps.respondDefine = [this](int64_t session, int64_t corr, int32_t topicId,
+                                    uint16_t version, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::DefineTopicResponse resp;
+            resp.sessionId     = session;
+            resp.correlationId = corr;
+            resp.topicId       = topicId;
+            resp.version       = version;
+            resp.errorCode     = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            auto& ring = adminWorkerAgent_->egressRing();
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
+            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
+            uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &session, 8);
+            std::memcpy(p + 8, frame, n);
+            ring.commit(idx);
+        };
+        deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
+                                 uint16_t version, const std::vector<uint8_t>& blob,
+                                 uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::TopicSchemaResponse resp;
+            resp.sessionId      = session;
+            resp.correlationId  = corr;
+            resp.topicId        = topicId;
+            resp.version        = version;
+            resp.errorCode      = errorCode;
+            resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
+            resp.descriptorLen  = static_cast<uint32_t>(blob.size());
+            const std::size_t sz = resp.encodedSize();
+            std::vector<uint8_t> frame(sz);
+            const std::size_t n = resp.encode(frame.data());
+            auto& ring = adminWorkerAgent_->egressRing();
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
+            if (idx < 0) return;
+            uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &session, 8);
+            std::memcpy(p + 8, frame.data(), n);
+            ring.commit(idx);
+        };
+
+        // Construct AdminWorkerAgent (owns AdminWorker + the __topic_schemas
+        // replica by raw ptr; the replica stays owned by BrokerNode::schemaReplica_).
+        adminWorkerAgent_ = std::make_unique<AdminWorkerAgent>(
+            *schemaRegistry_, schemaReplica_.get(), config_.nodeId,
+            std::move(replicaSetIds), std::move(deps));
+
+        // Dedicated thread (separate from gateway and produce workers).
+        adminWorkerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+            *adminWorkerAgent_, adminWorkerIdleStrategy_, adminWorkerClock_);
+
+        spdlog::info(
+            "BrokerNode[{}]: __topic_schemas persistence + AdminWorker wired (dir={})",
+            nodeId, schemaDir.string());
+
+    } catch (const std::exception& ex) {
+        spdlog::error(
+            "BrokerNode[{}]: AdminWorker setup failed: {}; schema DDL will not work",
+            nodeId, ex.what());
+        adminWorkerRunner_.reset();
+        adminWorkerAgent_.reset();
+        schemaRegistry_.reset();
+        schemaReplica_.reset();
+        schemaLog_.reset();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::stop
 // ---------------------------------------------------------------------------
 void BrokerNode::stop() {
@@ -1509,6 +2063,20 @@ void BrokerNode::stop() {
         spdlog::info("BrokerNode[{}]: worker AgentRunner threads stopped", config_.nodeId);
     }
 
+    // 1b-admin. Task 6: stop AdminWorker thread BEFORE the main agent runner.
+    //     The AdminWorker calls appendDurable which uses the schema replica.
+    //     The main agent drives the replica's doWork, so the admin thread must
+    //     be quiesced before the main agent stops.
+    if (adminWorkerRunner_) {
+        adminWorkerRunner_->stopAndJoin();
+        spdlog::info("BrokerNode[{}]: AdminWorker thread stopped", config_.nodeId);
+    }
+    // NOTE (Task 8a): do NOT reset adminWorkerAgent_ here.  The gateway holds it
+    // as adminSink_ and the NodeRuntimeAgent's admin control hook captures it;
+    // both run on the MAIN agent runner, which is still live at this point.  We
+    // reset it only AFTER agentRunner_->stopAndJoin() below (the main duty cycle
+    // is quiesced then), preventing a use-after-free of adminSink_ / the hook.
+
     // 1b. Stop the LogCleanerAgent BEFORE the main agent runner.
     //     This ensures the cleaner thread stops enqueuing swaps before the
     //     duty cycle stops draining them (avoids a lost-swap scenario where
@@ -1522,6 +2090,11 @@ void BrokerNode::stop() {
     if (agentRunner_) {
         agentRunner_->stopAndJoin();
     }
+
+    // Task 8a: main duty cycle is now quiesced — safe to drop the admin agent.
+    // Clear the gateway's admin sink first (defensive; gateway is torn down below).
+    if (gateway_) gateway_->setAdminSink(nullptr);
+    adminWorkerAgent_.reset();
 
     // 2. Release the runtime agent and gateway FIRST — in this order:
     //      a. runtimeAgent_ (holds refs to nodeAgent_/agent_ + gateway_ + replication)
@@ -1542,6 +2115,11 @@ void BrokerNode::stop() {
     metadataService_.reset(); // MetadataService (holds raw ptr to metadata replica in registry)
     metadataReplica_.reset(); // no-op: ownership transferred to replicaRegistry_ in buildGateway
     metadataLog_.reset();     // Log for __cluster_metadata (file flush on dtor)
+    // Task 6: destroy schema registry before replicaRegistry_ (schema replica in registry).
+    // adminWorkerAgent_ is already reset above (in the runner stop block).
+    schemaRegistry_.reset();  // SchemaRegistry (no raw ptrs to replicas — safe to reset here)
+    schemaReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildAdminWorker
+    schemaLog_.reset();       // Log for __topic_schemas (file flush on dtor)
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
     txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
     txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway
