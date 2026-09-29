@@ -4,7 +4,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # rune-protocol is header-only; consumed via the sibling source include path.
-set(RUNE_PROTOCOL_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include)
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include"
+    CACHE PATH "rune-protocol include dir")
 
 find_package(aeron)
 # macOS/armv8: aeron ConanCenter recipe is unsupported there (see conanfile.py),
@@ -56,6 +57,17 @@ else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
 
+# ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
+set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
+    CACHE PATH "Path to the rune-codec sibling repo")
+add_library(rune_codec STATIC
+    ${RUNE_CODEC_ROOT}/src/Serialize.cpp
+    ${RUNE_CODEC_ROOT}/src/Record.cpp
+    ${RUNE_CODEC_ROOT}/src/Validator.cpp
+    ${RUNE_CODEC_ROOT}/src/Generator.cpp)
+target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
+target_compile_features(rune_codec PUBLIC cxx_std_23)
+
 # ── rune_client — trivial header-only/interface library ──────────────────────
 add_library(rune_client INTERFACE)
 target_include_directories(rune_client INTERFACE
@@ -101,6 +113,7 @@ if(aeron_FOUND)
         rune_client_transport
         aeron::aeron
         spdlog::spdlog
+        rune_codec
     )
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
@@ -175,6 +188,7 @@ target_include_directories(rune_client_group PUBLIC
 )
 target_link_libraries(rune_client_group PUBLIC
     spdlog::spdlog
+    rune_codec
 )
 if(aeron_FOUND)
     target_link_libraries(rune_client_group PUBLIC aeron::aeron)
@@ -412,6 +426,13 @@ if(BUILD_TESTING)
     )
 
     gtest_discover_tests(rune_client_tests)
+
+    # ── Schema codec smoke test (0b Task 9) — no Aeron dependency ───────────────
+    add_executable(rune_schema_codec_smoke_tests
+        tests/SchemaCodecSmokeTest.cpp
+    )
+    target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec GTest::gtest_main)
+    gtest_discover_tests(rune_schema_codec_smoke_tests)
 
     # ── Session state machine tests (CC-4) — no Aeron dependency ──────────────
     add_executable(rune_session_tests
