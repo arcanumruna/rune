@@ -252,20 +252,26 @@ TEST(MetadataResponseIngressStreamId, SingleWorkerAllIngressStreamIdsEqualBase)
 }
 
 // ===========================================================================
-// MRID-5: Per-worker ingress INACTIVE (default) → ingressStreamId == 0.
+// MRID-5 (REGRESSION): Per-worker ingress INACTIVE → ingressStreamId ==
+// clientStreamId_ (the gateway's OWN client ingress stream), NOT 0.
 //
-// The gated contract (ClientGateway.cpp): when perWorkerIngressActive_ is
-// false, the broker has NO per-worker Aeron subscription bound, so the
-// metadata MUST advertise ingressStreamId=0 — the sentinel telling the
-// client to use the default gateway ingress stream. Advertising a
-// per-worker stream id with no subscriber behind it is the NOT_CONNECTED
-// bug this gate fixes. A WorkerPool being wired does NOT flip the gate;
-// only setPerWorkerIngressActive(true) does.
+// Regression for the dr3 rolling-leader-kill ping-pong (produced 44/50):
+// advertising the disabling sentinel 0 when per-worker ingress is inactive
+// stopped the client from building ANY per-partition routes (its route
+// builder skips ingressStreamId==0).  Once partition leadership legitimately
+// SPREADS across nodes after failover, the client was forced onto a single
+// shared transport that ping-ponged between two partition leaders on
+// consecutive records and exhausted its redirect budget.  Every node's
+// gateway subscribes on clientStreamId_, so advertising it is always a safe,
+// consistent routing target that lets the client reach each partition's true
+// leader directly (no redirect loop).  A WorkerPool being wired does NOT flip
+// the gate; only setPerWorkerIngressActive(true) selects per-worker streams.
 // ===========================================================================
-TEST(MetadataResponseIngressStreamId, InactiveAdvertisesZero)
+TEST(MetadataResponseIngressStreamIdRegression, InactiveAdvertisesClientStream)
 {
-    constexpr int32_t kBase    = 77;
-    constexpr int32_t kWorkers = 3;
+    constexpr int32_t kBase         = 77;
+    constexpr int32_t kWorkers      = 3;
+    constexpr int32_t kClientStream = 1;   // the gateway's client ingress stream
     const std::vector<std::pair<int32_t,int32_t>> kParts = {
         {10, 0}, {10, 1}, {10, 2}, {20, 0}, {20, 1},
     };
@@ -277,6 +283,7 @@ TEST(MetadataResponseIngressStreamId, InactiveAdvertisesZero)
     ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, /*sessionId=*/1);
     gw.setRoutingImageSnapshot(makeImage(kParts));
     gw.setWorkerIngressBaseStreamId(kBase);
+    gw.setClientStreamIdForTest(kClientStream);
     gw.setCommittedMetadataReady(true);
     gw.setWorkerPool(pool.get());
     // NOTE: setPerWorkerIngressActive NOT called → remains false (default).
@@ -295,9 +302,10 @@ TEST(MetadataResponseIngressStreamId, InactiveAdvertisesZero)
     ASSERT_EQ(captured->partitions.size(), kParts.size());
 
     for (const auto& p : captured->partitions) {
-        EXPECT_EQ(p.ingressStreamId, 0)
-            << "per-worker ingress inactive → must advertise 0 (default gateway "
-               "stream); topic=" << p.topicId << " part=" << p.partition;
+        EXPECT_EQ(p.ingressStreamId, kClientStream)
+            << "per-worker ingress inactive → must advertise clientStreamId_ so the "
+               "client can route per-partition to the true leader (NOT the disabling "
+               "sentinel 0); topic=" << p.topicId << " part=" << p.partition;
     }
 }
 

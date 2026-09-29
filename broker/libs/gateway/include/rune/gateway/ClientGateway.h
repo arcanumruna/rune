@@ -399,6 +399,15 @@ public:
         return workerIngressBaseStreamId_;
     }
 
+    // Test-only: override the client ingress stream id (normally set via the
+    // production constructor).  Used to verify that, with per-worker ingress
+    // INACTIVE, the MetadataResponse advertises this stream (so the client can
+    // route per-partition to the true leader on the shared gateway stream)
+    // rather than the disabling sentinel 0.
+    void setClientStreamIdForTest(int32_t streamId) noexcept {
+        clientStreamId_ = streamId;
+    }
+
     // read-rework T3/T4 (I4): configure the per-worker dynamic-MDC egress params so
     // handleMetadata can advertise each partition's egress control port + stream id
     // (control port = base + ownerWorker; stream id = base + ownerWorker).  Only

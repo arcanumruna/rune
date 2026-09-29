@@ -41,6 +41,36 @@ TEST(FailoverElection, NoIsrSurvivorGoesNoLeader) {
     auto next = mergeChange(cur, out.change);
     EXPECT_EQ(next.replicas.size(), 3u);
     EXPECT_GT(next.leaderEpoch, cur.leaderEpoch) << "NO_LEADER bumps leaderEpoch";
+    // RECOVERY FIX: the ISR lineage must be RETAINED (not cleared) so a returning
+    // in-sync replica can restore leadership without unclean election.
+    ASSERT_EQ(next.isr.size(), 1u) << "NO_LEADER retains the last ISR lineage";
+    EXPECT_EQ(next.isr[0], 1);
+}
+
+// REGRESSION (dr3 rolling leader-kill: partition permanently NO_LEADER):
+// A partition whose sole ISR survivor died goes NO_LEADER but RETAINS its ISR
+// lineage.  When that former-ISR member rejoins (returns to liveNodes) it must be
+// elected cleanly on the very next pass — proving the empty-ISR deadlock is gone.
+TEST(FailoverElectionRegression, NoLeaderRecoversWhenIsrMemberRejoins) {
+    ReplicaPositionTable pos;
+    // Partition led by node 3 with ISR collapsed to {3}; node 3 then dies.
+    auto cur = mk(3, {3}, {1,2,3}, 5, 9);
+    ElectionInputs down{cur, {1,2}, &pos, false};   // 3 dead, only 1,2 live (not in ISR)
+    auto gone = FailoverElection::elect(1, 2, down);
+    ASSERT_TRUE(gone.wentNoLeader);
+    auto offline = mergeChange(cur, gone.change);
+    ASSERT_EQ(offline.leaderNode, NO_LEADER);
+    ASSERT_EQ(offline.isr.size(), 1u) << "ISR lineage retained while offline";
+    EXPECT_EQ(offline.isr[0], 3);
+
+    // Node 3 rejoins (back in liveNodes, caught up). Next election must elect it.
+    ElectionInputs back{offline, {1,2,3}, &pos, false};
+    auto recovered = FailoverElection::elect(1, 2, back);
+    EXPECT_TRUE(recovered.leaderChanged);
+    EXPECT_FALSE(recovered.wentNoLeader);
+    EXPECT_EQ(recovered.change.newLeader, 3) << "returning former-ISR member is re-elected (clean)";
+    auto online = mergeChange(offline, recovered.change);
+    EXPECT_EQ(online.leaderNode, 3);
 }
 
 TEST(FailoverElection, ReRunsOverProposedIsrHigherEpochWins) {

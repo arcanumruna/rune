@@ -423,19 +423,32 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 chg.newLeader = computedLeader;
 
                 if (groupAction == Action::Failover) {
-                    // New ISR = cur.isr ∩ liveNodes ∩ groupIsr-winner neighbourhood,
-                    // with elected leader first.  For the NO_LEADER case the new ISR
-                    // is empty (no live in-sync replica for this member).
-                    std::vector<int32_t> newIsr;
-                    newIsr.reserve(cur->isr.size());
                     if (computedLeader != NO_LEADER) {
+                        // New ISR = cur.isr ∩ liveNodes with the elected leader first.
+                        std::vector<int32_t> newIsr;
+                        newIsr.reserve(cur->isr.size());
                         newIsr.push_back(computedLeader);
                         for (int32_t node : cur->isr) {
                             if (node != computedLeader && isIn(node, in.liveNodes))
                                 newIsr.push_back(node);
                         }
+                        chg.newIsr = std::move(newIsr);
+                    } else {
+                        // NO_LEADER (no live in-sync survivor): RETAIN the ISR lineage
+                        // — do NOT clear it.  cur.isr is the set of replicas that held
+                        // the committed prefix when the last survivor died.  Clearing
+                        // it to {} made the partition PERMANENTLY offline: every later
+                        // tick recomputed proposedIsr = {} ∩ liveNodes = {} → NO_LEADER
+                        // forever, even after a former-ISR replica rejoined caught-up
+                        // (dr3 rolling leader-kill: partitions stuck NO_LEADER, produce
+                        // 44/50).  Retaining cur.isr lets a returning in-sync replica be
+                        // cleanly re-elected on a later tick (FailoverElection then finds
+                        // a non-empty proposed ISR).  Kafka parity: an offline partition
+                        // keeps its ISR lineage; recovery is a clean election, never
+                        // unclean.  newIsr == cur.isr → mergeChange applies only the
+                        // leader→NO_LEADER flip, no spurious ISR churn.
+                        chg.newIsr = cur->isr;
                     }
-                    chg.newIsr      = std::move(newIsr);
                     chg.newReplicas = {};  // replica set unchanged
                 } else {
                     // Preferred-leader.

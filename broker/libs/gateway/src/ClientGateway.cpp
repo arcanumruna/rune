@@ -4117,14 +4117,25 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // ACTUALLY ACTIVE (perWorkerIngressActive_). Otherwise the broker has NO
             // subscriber on the per-worker stream (only the gateway on clientStreamId),
             // so a client routing there hits NOT_CONNECTED and can't send consistently.
-            // ingressStreamId == 0 tells the client to use its default (gateway) ingress
-            // stream — the correct target when the gateway fanout is the live path.
+            //
+            // When per-worker ingress is INACTIVE (gateway-fanout mode), advertise the
+            // gateway's OWN client ingress stream (clientStreamId_) — NOT 0.  Every
+            // node's gateway subscribes on clientStreamId_, so a client that opens a
+            // per-partition session to the true leader endpoint on this stream lands
+            // directly on that leader's gateway.  Advertising 0 here disabled client
+            // per-partition routing entirely (the client's route builder skips
+            // ingressStreamId==0), which — once partition leadership legitimately
+            // SPREADS across nodes after failover — forced the client onto a single
+            // shared transport that ping-ponged between two partition leaders on
+            // consecutive records and exhausted its redirect budget (dr3 rolling
+            // leader-kill: produced 44/50).  clientStreamId_ has a live subscriber on
+            // every node, so it is always a safe, consistent routing target.
             p.ingressStreamId = perWorkerIngressActive_
                               ? (workerIngressBaseStreamId_
                                  + (workerPool_
                                     ? workerPool_->ownerWorkerId(topicId, partition)
                                     : 0))
-                              : 0;
+                              : clientStreamId_;
             // read-rework T3/T4 (I4): advertise the per-worker dynamic-MDC egress
             // endpoint so the client subscribes to the OWNING worker's control
             // address + stream to receive this partition's pushed Records.  Control

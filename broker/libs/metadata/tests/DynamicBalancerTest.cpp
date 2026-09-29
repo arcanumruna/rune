@@ -537,3 +537,55 @@ TEST(DynamicBalancerRegression, DefaultMinIsrOnePreservesSingleSurvivorFailover)
     for (auto& r : recs)
         EXPECT_EQ(r.rec.leaderNode, 2);
 }
+
+// REGRESSION (dr3 rolling leader-kill: partition permanently NO_LEADER):
+// When a partition's sole ISR survivor dies (no live in-sync replica), the
+// balancer must take it NO_LEADER but RETAIN the ISR lineage — NOT clear it —
+// so the partition can recover cleanly once a former-ISR replica rejoins.
+// Clearing the ISR left partitions permanently offline (empty ISR ∩ liveNodes
+// = ∅ → NO_LEADER forever), which manifested as the client producing 44/50
+// (records for the stuck partition failed with NotLeader / redirect-exhausted).
+TEST(DynamicBalancerRegression, NoLeaderRetainsIsrAndRecoversOnRejoin) {
+    // ── Step 1: leader (node 3) with ISR collapsed to {3} dies → NO_LEADER ────
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{3, {3}, {1,2,3}, 5, 9});
+
+    ReplicaPositionTable pos;
+    pos.report({7,0,3,5,100});
+
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur       = &m;
+    in.liveNodes = {1, 2};        // node 3 (sole ISR member) is dead
+    in.positions = &pos;
+    in.topics    = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    ASSERT_FALSE(recs.empty()) << "partition must transition to NO_LEADER";
+    const BalancerRecord* offline = nullptr;
+    for (auto& r : recs) if (r.rec.topicId == 7 && r.rec.partition == 0) offline = &r;
+    ASSERT_TRUE(offline != nullptr);
+    EXPECT_EQ(offline->rec.leaderNode, NO_LEADER) << "no live in-sync survivor → NO_LEADER";
+    // CRITICAL: the ISR lineage is RETAINED, not cleared.
+    ASSERT_EQ(offline->isr.size(), 1u) << "NO_LEADER must retain the ISR lineage {3}";
+    EXPECT_EQ(offline->isr[0], 3);
+
+    // ── Step 2: apply the offline record, then node 3 rejoins → recovers ──────
+    AssignmentMap m2;
+    m2.put(7, 0, PartitionAssignment{NO_LEADER, {3}, {1,2,3},
+                                     offline->rec.leaderEpoch,
+                                     offline->rec.partitionEpoch});
+    DynamicBalancerInputs in2;
+    in2.cur       = &m2;
+    in2.liveNodes = {1, 2, 3};    // node 3 back online (caught up)
+    in2.positions = &pos;
+    in2.topics    = { TopicSpec{7,1,3,"",""} };
+
+    auto recs2 = bal.rebalance(in2);
+    ASSERT_FALSE(recs2.empty()) << "returning former-ISR member must restore leadership";
+    const BalancerRecord* recovered = nullptr;
+    for (auto& r : recs2) if (r.rec.topicId == 7 && r.rec.partition == 0) recovered = &r;
+    ASSERT_TRUE(recovered != nullptr);
+    EXPECT_EQ(recovered->rec.leaderNode, 3)
+        << "clean election: the retained-ISR replica (node 3) is re-elected leader";
+}
