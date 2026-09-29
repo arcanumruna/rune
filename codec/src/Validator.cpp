@@ -16,7 +16,7 @@ Validator::Validator(const Descriptor& d)
         e.sinceVersion = f.sinceVersion;
         e.type         = f.type;
         e.offset       = f.offset;
-        e.size         = isVarLen(f.type) ? 0u : fixedSize(f.type);
+        e.size         = isVarLen(f.type) ? 0u : fieldWidth(f);
         e.enumValues   = f.enumValues;   // copy whitelist (int32_t, may be negative)
 
         if (isVarLen(f.type))

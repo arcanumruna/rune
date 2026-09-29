@@ -20,7 +20,7 @@ FieldValue readField(const Descriptor& d, std::span<const uint8_t> record, uint1
 
     if (!isVarLen(fd->type)) {
         size_t off = size_t{4} + fd->offset;
-        size_t sz  = fixedSize(fd->type);
+        size_t sz  = fieldWidth(*fd);
         if (off + sz > record.size()) return {};
 
         FieldValue fv;
@@ -59,6 +59,9 @@ FieldValue readField(const Descriptor& d, std::span<const uint8_t> record, uint1
             case PrimType::Bool:
                 fv.b = record[off] != 0;
                 fv.i = record[off];
+                break;
+            case PrimType::FixedStr:
+                fv.bytes = std::string_view(reinterpret_cast<const char*>(record.data() + off), sz);
                 break;
             default:
                 return {};
