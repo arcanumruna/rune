@@ -68,8 +68,12 @@ if [ "$FR" = "1" ]; then
   # NB: rune_start_cluster ran under $(...) command substitution (subshell), so the
   # RUNE_CLUSTER_PIDS array is EMPTY in this scope — signal by process name instead.
   pkill -USR1 -x rune_broker 2>/dev/null
-  sleep 4
+  sleep "${REPL_FR_DUMP_WAIT:-12}"   # let exportChromeTrace finish (large JSON) before kill -9
   echo "--- FR reports in $FROUT ---"; ls -la "$FROUT" 2>/dev/null | grep fr-hist
 fi
 rune_stop_cluster
+if [ "$FR" = "1" ] && command -v python3 >/dev/null 2>&1; then
+  echo "=== REPLICATION LATENCY BREAKDOWN (frwaterfall.py) ==="
+  python3 "$(dirname "$0")/frwaterfall.py" "$FROUT/fr-trace-n*.json" 2>/dev/null || true
+fi
 echo "=== DONE ==="
