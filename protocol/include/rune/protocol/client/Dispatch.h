@@ -91,6 +91,11 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::EndTxnResponse)) {
         return true;
     }
+    // 0b schema range: 64..67
+    if (tid >= static_cast<uint16_t>(TemplateId::DefineTopic) &&
+        tid <= static_cast<uint16_t>(TemplateId::TopicSchemaResponse)) {
+        return true;
+    }
     return false;
 }
 

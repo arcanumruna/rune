@@ -38,6 +38,8 @@ if(BUILD_TESTING)
             tests/protocol/client/DispatchTest.cpp
             tests/protocol/client/TxnProtocolTest.cpp
             tests/protocol/client/MetadataMessagesTest.cpp
+            tests/protocol/client/SchemaMessagesTest.cpp
+            tests/protocol/client/SchemaConformanceTest.cpp
             tests/protocol/internal/RingSbeTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(rune_protocol_tests PRIVATE

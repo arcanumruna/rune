@@ -48,6 +48,11 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     TxnOffsetCommitResponse     = 52,
     EndTxn                      = 53,
     EndTxnResponse              = 54,
+    // schema/view range (64-95) — 0b schema registry
+    DefineTopic          = 64,
+    DefineTopicResponse  = 65,
+    GetTopicSchema       = 66,
+    TopicSchemaResponse  = 67,
 };
 
 enum class ErrorCode : uint16_t {
@@ -77,6 +82,10 @@ enum class ErrorCode : uint16_t {
     DuplicateSequence    = 21,
     // produce error codes
     MessageTooLarge      = 22,  // produce batch exceeds the broker's max batch size
+    // schema-registry error codes (0b)
+    InvalidSchema          = 23,  // descriptor blob malformed / invariant-violating
+    SchemaValidationFailed = 24,  // produced record failed validation
+    TopicExists            = 25,  // DefineTopic on an existing topic name
 };
 
 } // namespace rune::protocol::client
