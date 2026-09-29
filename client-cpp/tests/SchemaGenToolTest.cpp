@@ -79,7 +79,7 @@ TEST(SchemaGenToolRegression, OutputFilenameMatchesSchemaName) {
 // Regression: missing blob file must throw, not crash silently.
 TEST(SchemaGenToolRegression, MissingBlobThrows) {
     EXPECT_THROW(
-        rune::tools::generateFromFile("/nonexistent/path/blob.bin", "/tmp"),
+        (void)rune::tools::generateFromFile("/nonexistent/path/blob.bin", "/tmp"),
         std::runtime_error);
 }
 
@@ -97,6 +97,6 @@ TEST(SchemaGenToolRegression, MalformedBlobThrows) {
     }
 
     EXPECT_THROW(
-        rune::tools::generateFromFile(blobPath.string(), dir.string()),
+        (void)rune::tools::generateFromFile(blobPath.string(), dir.string()),
         std::runtime_error);
 }

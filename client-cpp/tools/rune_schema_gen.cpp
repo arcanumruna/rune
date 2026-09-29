@@ -65,13 +65,6 @@ std::string flagValue(int argc, char** argv, std::string_view flag) {
     return {};
 }
 
-bool hasFlag(int argc, char** argv, std::string_view flag) {
-    for (int i = 1; i < argc; ++i) {
-        if (argv[i] == flag) return true;
-    }
-    return false;
-}
-
 // ---------------------------------------------------------------------------
 // Offline (--from-file) entry point
 // ---------------------------------------------------------------------------
@@ -139,9 +132,16 @@ int runLive(const std::string& topic,
         std::ofstream out(outPath, std::ios::out | std::ios::trunc);
         if (!out) {
             std::cerr << "rune_schema_gen: cannot write: " << outPath << "\n";
+            client.close();
             return 1;
         }
         out << hdr;
+        out.flush();
+        if (!out) {
+            std::cerr << "rune_schema_gen: write failed for: " << outPath << "\n";
+            client.close();
+            return 1;
+        }
 
         std::cout << "rune_schema_gen: wrote " << outPath.string() << "\n";
         client.close();
