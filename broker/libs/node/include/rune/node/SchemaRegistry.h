@@ -48,6 +48,9 @@ struct RegistryEntry {
 class SchemaRegistry {
 public:
     /// Apply (leader-commit or replica-apply) one schema record.
+    /// Precondition: ts.descriptorBlob is a valid, pre-validated descriptor blob.
+    /// May throw std::runtime_error (propagated from rune::codec::deserialize) if
+    /// the blob is malformed or truncated.
     void applyRecord(const TopicSchema& ts);
 
     /// Look up by numeric topic id. Returns nullptr if absent.

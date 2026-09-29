@@ -50,3 +50,17 @@ TEST(SchemaRegistry, RuntimeIdHighWaterAdvancesAndRecovers) {
     SchemaRegistry reg2; reg2.rebuildFromRecords(recs);
     EXPECT_EQ(reg2.allocateRuntimeId(), 0x40000006);
 }
+
+// Regression: a negative internal id (e.g. kSchemaTopicId = -4) must NOT advance
+// the runtime-id high-water. Prior to the M1 fix, uint32_t(-4) = 0xFFFFFFFC would
+// satisfy the >= RUNTIME_TOPIC_ID_BASE guard and corrupt the water mark.
+TEST(SchemaRegistryRegression, NegativeInternalIdDoesNotAdvanceHighWater) {
+    SchemaRegistry reg;
+    reg.applyRecord(makeSchema(kSchemaTopicId, "__topic_schemas", false));
+    EXPECT_EQ(reg.runtimeIdHighWater(), RUNTIME_TOPIC_ID_BASE);
+    EXPECT_EQ(reg.allocateRuntimeId(), static_cast<int32_t>(RUNTIME_TOPIC_ID_BASE));
+    // The internal record is still indexed and retrievable by its negative id.
+    const auto* e = reg.byId(kSchemaTopicId);
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->topicId, kSchemaTopicId);
+}

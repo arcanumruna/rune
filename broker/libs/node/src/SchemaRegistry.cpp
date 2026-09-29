@@ -129,7 +129,6 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
     if (!readU32LE(buf, pos, descLen))         return std::nullopt;
     if (pos + descLen > buf.size())            return std::nullopt;
     ts.descriptorBlob.assign(buf.data() + pos, buf.data() + pos + descLen);
-    pos += descLen;
 
     return ts;
 }
@@ -154,7 +153,11 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     nameToId_[schemaName]  = ts.topicId;
     byId_[ts.topicId]      = std::move(e);
 
-    if (static_cast<uint32_t>(ts.topicId) >= RUNTIME_TOPIC_ID_BASE) {
+    // Only genuine runtime ids advance the water mark. The `>= 0` guard keeps
+    // negative internal ids (e.g. kSchemaTopicId = -4) from casting to a huge
+    // unsigned (0xFFFFFFFC) and corrupting the water mark.
+    if (ts.topicId >= 0 &&
+        static_cast<uint32_t>(ts.topicId) >= RUNTIME_TOPIC_ID_BASE) {
         runtimeIdHighWater_ = std::max(runtimeIdHighWater_,
                                        static_cast<uint32_t>(ts.topicId) + 1u);
     }
