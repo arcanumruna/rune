@@ -631,8 +631,20 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // Pass the REAL nowNs so time-lag eviction uses the actual fetch time,
     // not the stale last-ISR-check timestamp.
     isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
+    const Offset prevHwOnFetch = leaderState_.highWatermark();
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
+    // FR: acks=all COMMIT point — this follower position update just lifted the
+    //     majority high-watermark. Keyed by (partition<<24)|committedOffset so it
+    //     pairs 1:1 with the leader's ReplLeaderAppend (round-trip commit latency).
+    {
+        const Offset newHwOnFetch = leaderState_.highWatermark();
+        if (newHwOnFetch > prevHwOnFetch) {
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
+                (static_cast<uint32_t>(cfg_.partitionId) << 24) |
+                    (static_cast<uint32_t>(newHwOnFetch - 1) & 0xFFFFFFu));
+        }
+    }
     // (FR: the onFetchRequest SPAN [ReplFetchReqHandle] measures this handler; the
     //  control→worker handoff is measured cleanly via ReplFragRecv→ReplWorkerOpRun.)
 
@@ -995,6 +1007,15 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // HW-only push with no actual new data does not warrant an extra round-trip.
     const Offset postLeo = logEndOffset_();
     const Offset postHw  = followerHw_;
+    // FR: the follower has now appended up to postLeo-1 — the "last replica received
+    //     offset X" marker. Keyed by (partition<<24)|lastOffset to pair with the
+    //     leader's ReplLeaderAppend / ReplHwAdvance for end-to-end (cross-node)
+    //     replication latency.
+    if (postLeo > preLeo) {
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFollowerRecv,
+            (static_cast<uint32_t>(cfg_.partitionId) << 24) |
+                (static_cast<uint32_t>(postLeo - 1) & 0xFFFFFFu));
+    }
     if (cfg_.fastAckOnApply && role_ == Role::Follower
         && (postLeo > preLeo || postHw > preHw)) {
         FetchRequestMsg ack = nextFetch();
@@ -2013,7 +2034,17 @@ void PartitionReplica::recomputeHw()
     // so a single call is sufficient.  We no longer call
     // updateFollowerFetchOffset(selfId, ...) — that was an incorrect hack that
     // polluted the follower LEO map with the leader's own entry.
+    const Offset prevHwRecompute = leaderState_.highWatermark();
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
+    // FR: HW may advance on the leader here (append-time / acks=leader / single-node).
+    //     The follower-driven acks=all commit advance is marked in onFetchRequest.
+    //     Keyed by (partition<<24)|committedOffset to pair with ReplLeaderAppend.
+    const Offset newHwRecompute = leaderState_.highWatermark();
+    if (newHwRecompute > prevHwRecompute) {
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
+            (static_cast<uint32_t>(cfg_.partitionId) << 24) |
+                (static_cast<uint32_t>(newHwRecompute - 1) & 0xFFFFFFu));
+    }
 }
 
 void PartitionReplica::syncIsrToLeaderState()
