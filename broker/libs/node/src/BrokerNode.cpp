@@ -556,6 +556,132 @@ void BrokerNode::buildReplication() {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::createRuntimeUserReplicas — Task 8b (RULING-4, SINGLE-NODE).
+//
+// Create + register the user PartitionReplica(s) for a RUNTIME-defined topic
+// so it becomes produce/consume-capable.  Called on the CONTROL thread from the
+// admin create-topic hook AFTER TopicRegistry::createTopic() has assigned the
+// authoritative id and created the dirs/logs.  This is a faithful, single-topic
+// replay of the boot buildReplication() user-topic loop — same PartitionConfig
+// threading, same InMemoryTransport fallback, same registry + transport
+// registration.  Adding to replicaRegistry_ bumps its generation, so the next
+// NodeRuntimeAgent::doWork cycle's WorkerPool::reconcile() assigns the replica to
+// a worker; addRuntimeTopic() on the MetadataService emits the assignment so the
+// bridge promotes the replica to Leader (single-node this node is the leader).
+// ---------------------------------------------------------------------------
+int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
+    using namespace rune::replication;
+
+    if (spec.topicId < 0) return 0;             // internal topics not handled here
+    if (!replicaRegistry_ || !topicRegistry_) return 0;
+
+    const NodeId selfId = static_cast<NodeId>(config_.nodeId);
+    std::vector<NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers)
+        allNodeIds.push_back(static_cast<NodeId>(peer.id));
+    if (allNodeIds.empty()) allNodeIds.push_back(selfId);  // single-node safety
+
+    const int32_t topicId = spec.topicId;
+    int32_t registered = 0;
+
+    for (int32_t part = 0; part < spec.partitionCount; ++part) {
+        // Skip if this partition replica already exists (idempotent re-invoke).
+        if (replicaRegistry_->lookup(topicId, part) != nullptr) continue;
+
+        rune::storage::Log*         diskLogPtr = nullptr;
+        rune::storage::InMemoryLog* memLogPtr  = nullptr;
+        const bool isMemory =
+            (spec.persistence == rune::node::PersistenceMode::Memory);
+
+        if (isMemory) {
+            const std::size_t kMemLogMaxBytes =
+                static_cast<std::size_t>(config_.memoryLogRingBytes);
+            constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
+            memoryLogs_.push_back(std::make_unique<rune::storage::InMemoryLog>(
+                kMemLogMaxBytes, kMemLogMaxRecords,
+                rune::storage::FullPolicy::DropOldest));
+            memLogPtr = memoryLogs_.back().get();
+        } else {
+            // Reuse the Log created + recovered by TopicRegistry::createTopic (Task 5).
+            diskLogPtr = topicRegistry_->log(topicId, part);
+            if (!diskLogPtr) {
+                spdlog::warn("BrokerNode[{}]: runtime topic '{}' partition {} has no log; "
+                             "skipping replica", config_.nodeId, spec.name, part);
+                continue;
+            }
+        }
+
+        // Mirror buildReplication()'s PartitionConfig threading exactly.
+        PartitionConfig pcfg;
+        pcfg.topicId              = topicId;
+        pcfg.partitionId          = static_cast<PartitionId>(part);
+        pcfg.selfId               = selfId;
+        pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+        pcfg.replicaLagMaxOffset  = 1'000'000'000;
+        pcfg.minIsr               = config_.gatewayMinIsr;
+        pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+        pcfg.isrCheckIntervalNs   = 10'000'000LL;
+        pcfg.maxFetchBytes        = 1 << 20;
+        pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
+            static_cast<uint8_t>(spec.cleanupPolicy));
+        pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
+        pcfg.deleteRetentionMs      = spec.deleteRetentionMs;
+        pcfg.retentionBytes         = spec.retentionBytes;
+        pcfg.retentionMs            = spec.retentionMs;
+        pcfg.minCompactionLagMs     = spec.minCompactionLagMs;
+        pcfg.maxCompactionLagMs     = spec.maxCompactionLagMs;
+        pcfg.segmentRollBytes       = spec.segmentRollBytes;
+        pcfg.retentionCheckMs       = spec.retentionCheckMs;
+        pcfg.fileDeleteDelayMs      = spec.fileDeleteDelayMs;
+        pcfg.logStartOffset         = spec.logStartOffset;
+        pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
+        pcfg.durabilityTier = spec.durabilityTier;
+
+        PartitionTransport* transport = replTransport_.get();
+        if (!transport) {
+            nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+            transport = nullTransports_.back().get();
+        }
+
+        auto replica = isMemory
+            ? std::make_unique<PartitionReplica>(
+                  pcfg, Role::Follower, /*epoch=*/0,
+                  allNodeIds, allNodeIds, memLogPtr, transport)
+            : std::make_unique<PartitionReplica>(
+                  pcfg, Role::Follower, /*epoch=*/0,
+                  allNodeIds, allNodeIds, diskLogPtr, transport);
+
+        if (replTransport_)
+            replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
+
+        // add() bumps ReplicaRegistry::generation() → WorkerPool::reconcile()
+        // picks it up on the next control cycle and assigns it to a worker.
+        replicaRegistry_->add(topicId, part, std::move(replica));
+        ++registered;
+    }
+
+    // Register the runtime topic with the MetadataService so its assignment is
+    // emitted (leader-only) and the bridge promotes the replica to Leader.
+    // buildStaticRoutingImage() / future rebalances also pick it up.
+    if (metadataService_) {
+        rune::metadata::TopicSpec bs;
+        bs.topicId          = topicId;
+        bs.partitionCount   = spec.partitionCount;
+        bs.rf               = static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size()));
+        bs.coPartitionGroup = spec.coPartitionGroup;
+        bs.partitionKey     = spec.partitionKey;
+        metadataService_->addRuntimeTopic(bs);
+    }
+
+    spdlog::info("BrokerNode[{}]: runtime topic '{}' (id={}) → {} user replica(s) registered "
+                 "(single-node); assignment emitted via MetadataService={}",
+                 config_.nodeId, spec.name, topicId, registered,
+                 metadataService_ ? "yes" : "no");
+    return registered;
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::buildWorkerPool — E1: create WorkerPool and assign replicas.
 //
 // Must be called AFTER replicaRegistry_ is fully populated (i.e. AFTER
@@ -1361,6 +1487,22 @@ void BrokerNode::buildGateway() {
                             spec.topicId        = -1;  // registry assigns
                             try {
                                 id = topicRegistry_->createTopic(spec);
+                                // Task 8b (SINGLE-NODE): make the runtime topic
+                                // produce/consume-capable by creating its user
+                                // PartitionReplica(s) NOW, on this same control
+                                // thread that owns TopicRegistry / replicaRegistry_
+                                // / replTransport_ / MetadataService (no new
+                                // cross-thread mutation).  The authoritative spec
+                                // (assigned id + all fields, dirs/logs already
+                                // created by createTopic) is read back from the
+                                // registry and replayed through the boot path.
+                                if (id >= 0) {
+                                    const rune::node::TopicSpec* authSpec =
+                                        topicRegistry_->topic(id);
+                                    if (authSpec) {
+                                        (void)createRuntimeUserReplicas(*authSpec);
+                                    }
+                                }
                             } catch (const std::exception& ex) {
                                 spdlog::error("BrokerNode: admin createTopic('{}') failed: {}",
                                               req.name, ex.what());

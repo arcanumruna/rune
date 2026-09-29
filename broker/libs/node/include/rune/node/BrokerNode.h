@@ -383,6 +383,20 @@ private:
     void buildWorkerPool();    // E1: shard→worker assignment (must call after replicaRegistry_ is fully built)
     void buildAdminWorker();   // Task 6: __topic_schemas log/replica + AdminWorker thread
 
+    // Task 8b (RULING-4, SINGLE-NODE): create + register the user
+    // PartitionReplica(s) for a RUNTIME-defined topic (created via
+    // DefineTopic→AdminWorker→control-hook createTopic).  Mirrors the boot
+    // buildReplication() user-topic path: reuses the dirs/log created by
+    // TopicRegistry::createTopic (Task 5), constructs one PartitionReplica per
+    // partition (Follower / epoch 0), registers each in replicaRegistry_ +
+    // replTransport_ (which bumps the registry generation → WorkerPool::reconcile
+    // assigns it next control cycle), and registers the topic with the
+    // MetadataService so its assignment is emitted and the bridge promotes the
+    // replica to Leader.  Control-thread only (same thread that owns these
+    // registries — no cross-thread mutation).  Returns the number of partitions
+    // registered.  Multi-node partition placement is OUT OF SCOPE (deferred).
+    int32_t createRuntimeUserReplicas(const TopicSpec& spec);
+
     // -----------------------------------------------------------------------
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------

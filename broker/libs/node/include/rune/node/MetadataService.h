@@ -132,6 +132,80 @@ public:
     /// gatewayMinIsr (cluster majority).
     void setMinIsr(int minIsr) noexcept { minIsr_ = minIsr > 0 ? minIsr : 1; }
 
+    // -----------------------------------------------------------------------
+    // Task 8b (RULING-4, SINGLE-NODE): register a RUNTIME-defined topic and
+    // emit its initial static assignment.
+    //
+    // Called by the CONTROL thread's create-topic hook AFTER
+    // TopicRegistry::createTopic() returns an authoritative id and the user
+    // PartitionReplica(s) have been created + registered.  It mirrors the boot
+    // assignment path (emitStaticAssignmentIfNeeded), scoped to the ONE new
+    // topic:
+    //   1. Appends `spec` to configuredTopics_ so the runtime topic participates
+    //      in the RoutingImage build (buildStaticRoutingImage) AND future
+    //      dynamic rebalances, and so msmAlreadyHasAllAssignments() accounts for
+    //      it after a restart-rebuild.
+    //   2. If this node is the metadata Leader, runs StaticBalancer::assign()
+    //      for JUST this topic and appends one record per (topic, partition) to
+    //      the replicated __cluster_metadata log (one-record-per-append).  The
+    //      committed records flow through doWork()→MSM→committedMap(), which the
+    //      ReplicationMetadataBridge then uses (applyUserPartitionRoles) to
+    //      promote the runtime replica to Leader — exactly like a boot topic.
+    //
+    // Does NOT touch the assigned_ latch (that guards the boot one-shot emit).
+    // Idempotent per topic: if the MSM already has an assignment for every
+    // partition of this topic (restart / re-invocation), emission is skipped.
+    //
+    // No-op emission (still records the topic in configuredTopics_) if:
+    //   - This replica is not the Leader (single-node this node is the leader).
+    //   - liveNodes_ is empty (not yet configured).
+    //   - StaticBalancer throws (misconfigured — should not occur single-node).
+    //
+    // Single-writer: must be called on the duty-cycle / control thread.
+    void addRuntimeTopic(const rune::metadata::TopicSpec& spec) {
+        if (spec.topicId < 0) return;  // internal topics are not assigned
+
+        // (1) Record the topic in the configured set (idempotent by topicId) so
+        // it participates in routing-image builds + future rebalances.
+        bool present = false;
+        for (const auto& ts : configuredTopics_) {
+            if (ts.topicId == spec.topicId) { present = true; break; }
+        }
+        if (!present) configuredTopics_.push_back(spec);
+
+        // (2) Emit the initial assignment for this topic (leader-only).
+        if (!replica_) return;
+        if (replica_->role() != rune::replication::Role::Leader) return;
+        if (liveNodes_.empty()) return;
+
+        // Per-topic idempotency: skip if the MSM already has every partition
+        // assigned (e.g. re-invocation after a restart-rebuild replayed it).
+        bool allAssigned = spec.partitionCount > 0;
+        for (int32_t p = 0; p < spec.partitionCount; ++p) {
+            if (msm_.assignment(spec.topicId, p) == nullptr) { allAssigned = false; break; }
+        }
+        if (allAssigned) return;
+
+        std::vector<rune::metadata::TopicSpec> one{spec};
+        std::vector<rune::metadata::BalancerRecord> records;
+        try {
+            records = rune::metadata::StaticBalancer::assign(one, liveNodes_);
+        } catch (const rune::metadata::BalancerError&) {
+            ++balancerErrors_;
+            return;
+        }
+        if (records.empty()) return;
+
+        // One-record-per-append (see emitStaticAssignmentIfNeeded rationale).
+        static constexpr std::size_t kEncBufSize = 16 * 1024;
+        uint8_t encBuf[kEncBufSize];
+        for (const auto& br : records) {
+            const std::size_t n = br.rec.encode(encBuf, kEncBufSize);
+            if (n == 0) continue;
+            replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false);
+        }
+    }
+
     /// Emit static assignment records to the metadata log if needed.
     ///
     /// This is the leader-claim action.  It:

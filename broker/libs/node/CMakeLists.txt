@@ -450,6 +450,29 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 8b (RULING-4, SINGLE-NODE): RuntimeTopicReplica integration test — a
+    # RUNTIME-defined topic (DefineTopic → AdminWorker → control-hook createTopic)
+    # becomes produce/consume-capable because the control thread creates +
+    # registers its user PartitionReplica and emits its assignment so the bridge
+    # promotes it to Leader.  Proves: register replica (bumps generation) →
+    # addRuntimeTopic emits assignment → bridge promotes to Leader → produce
+    # appends (LEO advances) → consume reads back.  Uses InMemoryTransport (no
+    # Aeron); the full real-Aeron socket e2e is Task 13 (Docker).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_runtime_topic_replica_tests
+        tests/integration/RuntimeTopicReplicaTest.cpp)
+    target_include_directories(rune_runtime_topic_replica_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_runtime_topic_replica_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_runtime_topic_replica_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # MD1-13 Round-2: BootstrapRoutingImage tests.
     #
     # Tests 1-3 (no Aeron): buildStaticRoutingImage() correctness when
