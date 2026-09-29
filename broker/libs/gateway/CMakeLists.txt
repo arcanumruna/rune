@@ -58,6 +58,17 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_topic_registry_tests)
 
     # -------------------------------------------------------------------------
+    # TopicRegistry runtime tests (Task 5) — createTopic + regression guards.
+    # No Aeron, real filesystem + rune_storage.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_topic_registry_runtime_tests
+        tests/gateway/TopicRegistryRuntimeTest.cpp)
+    target_link_libraries(rune_gateway_topic_registry_runtime_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_topic_registry_runtime_tests)
+
+    # -------------------------------------------------------------------------
     # G0.1: ClientGateway egress retry queue unit tests — no Aeron, no driver.
     # Uses the test-only makeForTest() factory + FakePublication seam.
     # -------------------------------------------------------------------------
