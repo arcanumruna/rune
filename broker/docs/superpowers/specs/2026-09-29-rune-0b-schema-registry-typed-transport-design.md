@@ -19,10 +19,10 @@ validated on ingress, and open it type-safely with a generated struct.
 **In scope (0b):**
 - Wire API in `rune-protocol`: `DefineTopic` / `DefineTopicResponse` /
   `GetTopicSchema` / `TopicSchemaResponse` (templateIds 64–67).
-- Broker: `__topic_schemas` compacted+replicated internal topic, in-memory
-  `SchemaRegistry` rebuilt from it, a `DefineTopic` gateway handler that
-  **creates topics at runtime**, and **opt-in per-worker validation** on the
-  produce hot path.
+- Broker: `__topic_schemas` compacted+replicated internal topic, a dedicated
+  **AdminWorker** thread that owns the in-memory `SchemaRegistry` (rebuilt from
+  the topic) and **creates topics at runtime** off the hot path, and **opt-in
+  per-worker validation** on the produce hot path.
 - Client (`rune-client-cpp`): `openTopic<T>()` → `TypedTopic<T>` with a
   **client-side exact-fingerprint** gate, `MetadataCache` schema fields.
 - A minimal `rune schema generate` tool (fetch descriptor → rune-codec
@@ -61,7 +61,8 @@ validated on ingress, and open it type-safely with a generated struct.
 | D3 | **Exact fingerprint match** at open. | 0b has one version per topic, so additive-compat is behaviorally identical but far more code; deferred to the evolution spec where it is testable. |
 | D4 | **Open folds into `GetTopicSchema`** with a **client-side** fingerprint check. | One fewer message; broker stays stateless about client types; client already needs `topicId`/routing from the response. |
 | D5 | **Validation off by default**; opt-in per topic via `DefineTopic.validate`. | Matches "opt-in, per-worker, fast validation" goal; zero hot-path cost by default. |
-| D6 | **Workers receive validators via their ingress ring** as immutable per-worker handles. | Shared-nothing + ring-buffer-only cross-thread passing (HARD RULES 1–2); no shared registry read on the hot path. |
+| D6 | **Workers receive validators via their ingress ring** as immutable per-worker handles (pushed by the AdminWorker). | Shared-nothing + ring-buffer-only cross-thread passing (HARD RULES 1–2); no shared registry read on the hot path. |
+| D10 | **DDL runs on a dedicated AdminWorker thread**, not on the gateway or produce workers; the gateway only *routes* 64/66 to it. The AdminWorker owns the `SchemaRegistry` and does all blocking work (topic-creation I/O, durable-commit waits). | User priority: DDL "blocks nothing" hot. Full isolation while staying shared-nothing + ring-only; produce/queries stay hot. |
 | D7 | **`TypedTopic<T>` reuses the existing producer path**, keyed by `topicId`. | Inherits batching/routing/acks; typed layer only adds `encode()` + fingerprint gating. |
 | D8 | **rune-codec consumed as sibling source static lib** (the `rune-fr` template), compiled under each consumer's toolchain via an overridable `RUNE_CODEC_ROOT`. | Dissolves the arm64/x86_64 question (rune-codec's native-arm64 was only for its own tests). |
 | D9 | **3 worktrees + branches `feature/0b-schema-registry`** forked from **main** in rune-protocol, rune-broker, rune-client-cpp, created at execution time. rune-codec is **not** worktreed (read-only from its `main`). | Isolated multi-repo execution; design docs stay on the program's `feature/materialized-views` lineage. |
@@ -76,11 +77,13 @@ rune-protocol (header-only, sibling include)
   conformance/             + vectors for the 4 new messages
 
 rune-broker (consumes rune-codec + rune-protocol as siblings)
-  node/SchemaRegistry.h/.cpp   NEW: in-memory topicId→entry + name→id index
+  node/AdminWorker.h/.cpp      NEW: dedicated DDL/admin thread; owns SchemaRegistry
+  node/SchemaRegistry.h/.cpp   NEW: in-memory topicId→entry + name→id index (admin-owned)
   node/BrokerNode.cpp          + __topic_schemas log/replica wiring (~like __transaction_state)
+                               + spawn AdminWorker + its ingress ring
   node/NodeConfig.h            TopicSpec += {keyField, validate}
-  gateway/ClientGateway.cpp    + handleDefineTopic / handleGetTopicSchema in onFragment
-  gateway/TopicRegistry.h/.cpp + runtime createTopic(...) entry point
+  gateway/ClientGateway.cpp    + onFragment routes 64/66 to AdminWorker ring (no inline work)
+  gateway/TopicRegistry.h/.cpp + runtime createTopic(...) entry point (called on AdminWorker)
   node/Worker.h                + validation hook in executeProduceWire_ (pre-append)
   CMakeLists.txt               + RUNE_CODEC_ROOT (overridable), compile rune-codec src
 
@@ -137,6 +140,37 @@ descriptor blob; `uint16` length prefix for strings).
 
 ## 6. Broker
 
+### 6.0 Control-plane placement (AdminWorker — D10)
+
+DDL is fully isolated from the hot path on a **dedicated AdminWorker thread**
+(one per node, spawned by `BrokerNode` at startup with its own SPSC/MPSC ingress
+ring). Cross-thread passing is **ring-buffer-only** and the AdminWorker owns its
+state outright — pure shared-nothing (HARD RULES 1–2).
+
+Responsibilities (all off the gateway and produce workers):
+- Owns the node's **`SchemaRegistry`** (sole reader/writer — no other thread
+  touches it).
+- Processes `DefineTopic`/`GetTopicSchema` ops the gateway routes to it.
+- Runs the **blocking** work: descriptor deserialize/validate, topicId
+  allocation, partition **log/replica creation I/O**, and the wait for the
+  `__topic_schemas` **majority-durable commit**.
+- Applies `__topic_schemas` entries to the registry on **both** the leader
+  (post-commit) and **replica** (`applyReplicated`) paths, so the registry is
+  single-owner and identical on every node.
+- On commit: pushes immutable `ValidatorHandle`s to each produce worker's ring
+  (D6) and routes the response to the client via the gateway's egress ring.
+
+The gateway's `onFragment` does **no** DDL work: for templateIds 64 and 66 it
+decodes only enough to enqueue an `AdminOp` (raw message + session/correlation
+context) onto the AdminWorker ring, then returns immediately — the hot routing
+path is never blocked by DDL.
+
+State machine (AdminWorker, per `DefineTopic` op) — each state holds exactly its
+data (HARD RULE 3):
+`IDLE → PARSING(blob) → CREATING(topicId, spec) → AWAITING_COMMIT(topicId,
+appendFuture, session, corr) → PUBLISHING(handles) → DONE` (respond); any step's
+failure → `REJECT(errorCode, session, corr)` (respond, no side effects kept).
+
 ### 6.1 `__topic_schemas` persistence (mirror `__transaction_state`)
 
 Model exactly on `BrokerNode.cpp` TX wiring (`~:975–1069`): a `storage::Log`
@@ -146,11 +180,13 @@ under `dataDir/__topic_schemas`, `PartitionConfig.topicId = -4`,
 `(-4, 0)`; entries replicate over the same `AeronPartitionTransport` as user
 partitions. Records are keyed by `topicId` (compaction keeps latest per topic);
 value = serialized `TopicSchema { topicId:i32, version:u16, keyField:str,
-validate:u8, descriptorBlob:bytes }`.
+validate:u8, descriptorBlob:bytes }`. The AdminWorker owns the append/apply side
+of this replica.
 
-### 6.2 `SchemaRegistry` (in-memory, per node)
+### 6.2 `SchemaRegistry` (in-memory, AdminWorker-owned per node)
 
-`node/SchemaRegistry.{h,cpp}`:
+`node/SchemaRegistry.{h,cpp}` — mutated and read **only** on the AdminWorker
+thread:
 - `topicId → RegistryEntry { Descriptor descriptor; uint64_t fingerprint;
   std::optional<Validator> validator; std::string keyField; uint16_t version;
   int32_t partitionCount; }`
@@ -166,42 +202,51 @@ validate:u8, descriptorBlob:bytes }`.
   replica converge to identical state, and the id counter is recovered.
 
 `NodeConfig.h` `TopicSpec` gains `keyField` and `validate` so env-declared
-topics can also opt into a key field / validation (registered into the same
-`SchemaRegistry` at boot when they carry a descriptor; env topics without a
-descriptor remain untyped/unvalidated).
+topics can also opt into a key field / validation. At boot the AdminWorker
+registers any env topics that carry a descriptor into the `SchemaRegistry`
+(env topics without a descriptor remain untyped/unvalidated).
 
-### 6.3 `DefineTopic` handler (`ClientGateway::onFragment`)
+### 6.3 `DefineTopic` flow (gateway → AdminWorker)
 
-New `case` in the 64–67 range (structure mirrors `handleProduce`, `:1188`):
-1. Decode; require a known/authenticated session.
-2. `rune-codec::deserialize(descriptorBlob)` → on failure or a rejected
-   `build()` invariant (e.g. var-index ordering) respond `InvalidSchema`.
-3. **Name lookup.** If `topicName` already exists (env or runtime), respond
-   `TopicExists` with the existing `topicId`/`version` (0b has no alter path;
-   a differing blob on an existing name is still `TopicExists`).
-4. **Runtime topic creation (the new capability).** Allocate `topicId` from
+Gateway `onFragment` (structure mirrors the `handleProduce` route at `:1188`,
+but enqueue-only): validate frame, require a known/authenticated session,
+enqueue an `AdminOp{DefineTopic, msgBytes, session, correlationId}` on the
+AdminWorker ring, return. No decode of the descriptor, no registry access.
+
+AdminWorker processing the op (the state machine above):
+1. `rune-codec::deserialize(descriptorBlob)` → on failure or a rejected
+   `build()` invariant (e.g. var-index ordering) → `REJECT(InvalidSchema)`.
+2. **Name lookup** in its own `SchemaRegistry`. If `topicName` exists (env or
+   runtime) → respond `TopicExists` with the existing `topicId`/`version`
+   (0b has no alter path; a differing blob on an existing name is still
+   `TopicExists`).
+3. **Runtime topic creation (the new capability).** Allocate `topicId` from
    `runtimeIdHighWater++`, set `partitionCount`, and create the partition
    log(s)/replica set via a new `TopicRegistry::createTopic(spec)` entry point
    — the runtime analogue of what `parseNodeConfig` + `TopicRegistry`
    construction do at boot (create dirs, `Log::recover()`, register with the
-   balancer/placement). Reuses existing placement; only the *timing* (post-boot)
-   is new.
-5. Append the `TopicSchema` to `__topic_schemas`. On majority-durable commit,
-   `SchemaRegistry::applyRecord` runs (locally and on replicas via
-   `applyReplicated`), then respond `DefineTopicResponse { topicId, version:1,
-   errorCode:Ok }`.
+   balancer/placement). **This blocking I/O runs on the AdminWorker**, so it
+   never stalls the gateway or produce workers. Reuses existing placement; only
+   the *timing* (post-boot) and *thread* are new.
+4. Append the `TopicSchema` to `__topic_schemas`; **await majority-durable
+   commit** on the AdminWorker. On commit, `applyRecord` updates the registry;
+   push `ValidatorHandle`s to produce-worker rings; route
+   `DefineTopicResponse { topicId, version:1, errorCode:Ok }` to the client via
+   the gateway egress.
 
-`GetTopicSchema` handler: look up by name in `SchemaRegistry`; respond with
-`{ topicId, version, descriptorBlob }` or `UnknownTopic`.
+`GetTopicSchema` op: the gateway routes 66 to the AdminWorker, which looks up by
+name in its `SchemaRegistry` and routes back `{ topicId, version,
+descriptorBlob }` or `UnknownTopic`. (Not hot-path — used at client
+`openTopic`/`generate` time — so the extra ring hop is immaterial.)
 
 ### 6.4 Per-worker validation (`Worker::executeProduceWire_`)
 
 **Handle distribution (D6, HARD RULES 1–2):** when `DefineTopic` commits with
-`validate=1`, the gateway enqueues a `SchemaUpdate` op onto **each worker's
-existing ingress ring**, carrying an **immutable per-worker `ValidatorHandle`**
-(each worker builds/owns its own `Validator` from the descriptor bytes — no
-shared object, no cross-thread pointer to shared state). Workers keep a local
-`topicId → ValidatorHandle` map they mutate only from their own thread.
+`validate=1`, the **AdminWorker** enqueues a `SchemaUpdate` op onto **each
+produce worker's existing ingress ring**, carrying the descriptor bytes; each
+worker builds/owns its own `Validator` locally (no shared object, no cross-thread
+pointer to shared state). Workers keep a local `topicId → ValidatorHandle` map
+they mutate only from their own thread.
 
 **Hot path:** in `executeProduceWire_`, immediately **before**
 `appendNoSyncRestamp` (`Worker.h:~1176`): if the topic has a local validator,
@@ -272,11 +317,17 @@ one conformance vector each (repo already ships conformance vectors).
 **rune-broker:**
 - `SchemaRegistry` unit tests: rebuild-from-log, runtime-id high-water
   recovery, name→id index, validator built iff `validate`.
+- `AdminWorker` unit tests: the op state machine (`PARSING→CREATING→
+  AWAITING_COMMIT→PUBLISHING→DONE`, and each `REJECT` path) driven over its
+  ring with a fake durable-commit + fake worker rings; assert responses,
+  registry mutations, and pushed `SchemaUpdate`s. **Gateway-non-blocking test:**
+  a slow/stalled AdminWorker (or slow createTopic I/O) does **not** delay
+  produce routing on the gateway (the gateway only enqueues).
 - Integration: `DefineTopic` a topic; with `validate=on`, produce a valid and
   an invalid record; assert `SchemaValidationFailed` + no append for the bad
   one and a durable append for the good one.
-- Replication integration: a follower rebuilds an **identical** registry from
-  `__topic_schemas`.
+- Replication integration: a follower's AdminWorker rebuilds an **identical**
+  registry from `__topic_schemas`.
 - Restart: registry (and runtime-id counter) survives a restart.
 - Benchmark: produce hot path validate-off vs validate-on delta.
 
@@ -295,9 +346,12 @@ execution; run first, before all other tests.
 
 ## 10. Module boundaries (isolation check)
 
+- `AdminWorker` — owns the DDL op state machine + `SchemaRegistry`; communicates
+  only via rings (gateway → admin ingress, admin → worker rings, admin → gateway
+  egress). No shared state; testable by driving its ring with fakes.
 - `SchemaRegistry` — owns registry state + rebuild; depends only on rune-codec
   (`Descriptor`, `fingerprint`, `Validator`) + the `TopicSchema` record.
-  Testable with no networking.
+  Single-threaded (AdminWorker-owned); testable with no networking.
 - `SchemaMessages.h` — pure (de)serialization; testable in isolation.
 - `TypedTopic<T>` — depends only on the producer interface + `T::encode`.
 - `rune_schema_gen` — depends on the client fetch + rune-codec codegen;
@@ -309,8 +363,15 @@ execution; run first, before all other tests.
 
 - Exact reuse points in `TopicRegistry`/placement for runtime `createTopic`
   (the plan pins the function signatures after reading the current code).
-- The `SchemaUpdate` op encoding on the worker ingress ring (reuse the existing
-  `WorkerOp` framing).
+- The `AdminOp` (gateway→admin) and `SchemaUpdate` (admin→worker) op encodings
+  on the rings (reuse the existing `WorkerOp`/ring framing). Ring cardinality:
+  gateway→admin is MPSC if the ingress-scaleout design runs multiple gateway
+  threads (pin against the current ingress topology); admin→worker is one ring
+  per worker (SPSC), same as produce dispatch.
+- AdminWorker thread provisioning: a brand-new dedicated thread vs. reusing an
+  existing control/background thread in `BrokerNode` (pin after reading the
+  current threading model; requirement is only that it is off the gateway and
+  produce-worker threads).
 - Whether env-declared topics with a descriptor are registered eagerly at boot
-  or lazily on first access (default: eagerly, alongside `TopicRegistry`
-  construction).
+  or lazily on first access (default: eagerly, by the AdminWorker alongside
+  `TopicRegistry` construction).
