@@ -43,3 +43,36 @@ TEST(Parser, ErrorHasLocation) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().line, 2u);
 }
+
+// ── Regression suite ─────────────────────────────────────────────────────────
+// Guards against silent uint16_t truncation of string(N) width (review Important #1).
+TEST(ParserRegression, RejectsStringWidthAbove65535) {
+    // 65536 truncates to 0 under naive static_cast<uint16_t> — must be rejected.
+    auto r0 = parse("topic t { a string(65536) } partitions 1 key a;");
+    ASSERT_FALSE(r0.has_value());
+    EXPECT_NE(r0.error().message.find("string"), std::string::npos);
+    // 65537 truncates to 1 — must be rejected.
+    auto r1 = parse("topic t { a string(65537) } partitions 1 key a;");
+    ASSERT_FALSE(r1.has_value());
+    // 65535 is the maximum valid width.
+    auto rMax = parse("topic t { a string(65535) } partitions 1 key a;");
+    ASSERT_TRUE(rMax.has_value());
+    EXPECT_EQ(rMax->fields[0].type, rune::codec::PrimType::FixedStr);
+    EXPECT_EQ(rMax->fields[0].fixedLen, 65535u);
+}
+
+// Guards against uint32_t truncation of partitions (review Important #1, applied to partitions).
+TEST(ParserRegression, RejectsPartitionsAboveUint32Max) {
+    auto r = parse("topic t { a int32 } partitions 4294967296 key a;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("partitions"), std::string::npos);
+}
+
+// Guards against the "one token too far" location bug for partitions < 1 (review Minor #2).
+TEST(ParserRegression, ZeroPartitionsErrorPointsAtZero) {
+    // 'partitions 0' on line 2 — the '0' token is at line 2, col 12.
+    auto r = parse("topic t { a int32 }\npartitions 0 key a;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().line, 2u);
+    EXPECT_EQ(r.error().col, 12u);  // points at '0', not the following 'key'
+}

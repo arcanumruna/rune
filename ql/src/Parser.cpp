@@ -184,6 +184,10 @@ struct Parser {
                     return std::unexpected(ParseError{tk.line, tk.col,
                         "string(N) width must be >= 1"});
                 }
+                if (*nval > 0xFFFFu) {
+                    return std::unexpected(ParseError{tk.line, tk.col,
+                        "string(N) width must be <= 65535"});
+                }
                 auto rparen = expect(TK::RParen, ")");
                 if (!rparen) return std::unexpected(std::move(rparen.error()));
                 uint16_t width = static_cast<uint16_t>(*nval);
@@ -265,11 +269,16 @@ struct Parser {
         }
         advance();
 
+        Token partTok = cur;  // save location before parseInt advances past it
         auto partVal = parseInt();
         if (!partVal) return std::unexpected(std::move(partVal.error()));
         if (*partVal < 1) {
-            return std::unexpected(ParseError{cur.line, cur.col,
+            return std::unexpected(ParseError{partTok.line, partTok.col,
                 "partitions must be >= 1"});
+        }
+        if (*partVal > 0xFFFFFFFFu) {
+            return std::unexpected(ParseError{partTok.line, partTok.col,
+                "partitions must be <= 4294967295"});
         }
         td.partitions = static_cast<uint32_t>(*partVal);
 
