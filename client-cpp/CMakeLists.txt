@@ -323,6 +323,52 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             target_link_libraries(dr_client PRIVATE ${UUID_LIB})
         endif()
     endif()
+
+    # ── Task 13 — headline typed round-trip probe (define→open→send→consume) ──
+    #
+    # Build-time schema codegen (mirrors rune-codec's generate_characters_header):
+    #   rune_codec_gen <blob> <out.h>  reads the CHECKED-IN descriptor blob
+    #   tests/generated/characters.blob and emits characters.gen.h into the build
+    #   tree.  The SAME blob is used by the probe at runtime to defineTopic(), so
+    #   the generated struct's fingerprint matches the broker's stored schema by
+    #   construction and openTopic<Characters>'s exact-fingerprint gate passes.
+    #
+    # The rune_codec_gen CLI source lives in the rune-codec sibling (0a, frozen);
+    # we compile it here against the rune_codec static lib already wired above.
+    add_executable(rune_codec_gen "${RUNE_CODEC_ROOT}/tools/rune_codec_gen_main.cpp")
+    target_link_libraries(rune_codec_gen PRIVATE rune_codec)
+
+    set(CHARACTERS_BLOB  "${CMAKE_CURRENT_SOURCE_DIR}/tests/generated/characters.blob")
+    set(CHARACTERS_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/gen/characters.gen.h")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/gen")
+    add_custom_command(
+        OUTPUT  "${CHARACTERS_GEN_H}"
+        COMMAND rune_codec_gen "${CHARACTERS_BLOB}" "${CHARACTERS_GEN_H}"
+        DEPENDS rune_codec_gen "${CHARACTERS_BLOB}"
+        COMMENT "Task 13: generating characters.gen.h from characters.blob"
+    )
+    add_custom_target(generate_characters_header DEPENDS "${CHARACTERS_GEN_H}")
+
+    add_executable(rune_schema_probe
+        examples/rune_schema_probe.cpp
+    )
+    add_dependencies(rune_schema_probe generate_characters_header)
+    target_include_directories(rune_schema_probe PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        "${CMAKE_CURRENT_BINARY_DIR}/gen"   # for characters.gen.h
+    )
+    target_link_libraries(rune_schema_probe PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+        rune_codec
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_PROBE uuid)
+        if(UUID_LIB_PROBE)
+            target_link_libraries(rune_schema_probe PRIVATE ${UUID_LIB_PROBE})
+        endif()
+    endif()
 endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────

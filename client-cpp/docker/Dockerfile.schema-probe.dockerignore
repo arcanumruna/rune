@@ -1,0 +1,43 @@
+# Per-Dockerfile ignore for Dockerfile.schema-probe (Task 13).
+# Keep the build context small, but KEEP tests/generated/characters.blob — the
+# build-time codegen (rune_codec_gen) and the probe's runtime defineTopic() both
+# need it.
+
+# Build outputs (large; do NOT send to the daemon)
+build/
+cov/
+cmake-build-debug/
+cmake-build-release/
+conan-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Benchmarks (not built in the probe image)
+benchmark/
+bench/
+
+# Tests — exclude everything EXCEPT the checked-in descriptor blob.
+tests/*
+!tests/generated
+tests/generated/*
+!tests/generated/characters.blob
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md
