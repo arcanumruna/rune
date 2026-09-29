@@ -188,39 +188,21 @@ protected:
 
         registry_ = std::make_unique<SchemaRegistry>();
 
-        // --- Wire AdminDeps ---
-        // createTopic (RULING-1): returns a sequential id from a fake registry counter.
+        // --- Wire AdminDeps (Task 8a async model) ---
+        // requestCreateTopic (RULING-2 B): the admin worker posts a create-topic
+        // request; the SIMULATED control thread (below) replies with a sequential
+        // id via onCreateTopicReply.  The AdminWorker itself owns the replica and
+        // performs appendDurable + HW-gated commit internally (RULING-2 D).
         AdminDeps deps;
-        deps.createTopic = [this](int32_t /*partitionCount*/,
-                                  const std::string& /*name*/) -> int32_t {
-            return nextTopicId_++;
+        deps.requestCreateTopic = [this](int64_t ticket, int32_t /*partitionCount*/,
+                                         const std::string& /*name*/) -> bool {
+            pendingTicket_ = ticket;
+            return true;
         };
-
-        // appendDurable: append TopicSchema to the __topic_schemas replica
-        // (single-node, minIsr=1 — succeeds immediately).
-        deps.appendDurable = [this](const TopicSchema& ts) -> bool {
-            const std::vector<uint8_t> payload = ts.serialize();
-            // Key = topicId as 4-byte LE (for log compaction).
-            uint8_t key[4];
-            const uint32_t u = static_cast<uint32_t>(ts.topicId);
-            key[0] = static_cast<uint8_t>(u & 0xff);
-            key[1] = static_cast<uint8_t>((u >> 8) & 0xff);
-            key[2] = static_cast<uint8_t>((u >> 16) & 0xff);
-            key[3] = static_cast<uint8_t>((u >> 24) & 0xff);
-            const Offset base = replica_->appendKeyed(
-                std::span<const uint8_t>(key, 4),
-                std::span<const uint8_t>(payload.data(), payload.size()),
-                /*acksAll=*/true);
-            return base >= 0;
-        };
-
-        // pushValidators: stub for Task 6 (T7 adds real worker ring enqueue).
         deps.pushValidators = [this](const RegistryEntry& /*entry*/, int32_t tid) {
             ++pushValidatorCallCount_;
             lastPushedTopicId_ = tid;
         };
-
-        // respondDefine/respondGet: capture for assertions.
         deps.respondDefine = [this](int64_t /*session*/, int64_t /*corr*/,
                                     int32_t topicId, uint16_t /*version*/,
                                     uint16_t errorCode) {
@@ -235,7 +217,31 @@ protected:
             lastGetError_   = errorCode;
         };
 
-        adminWorker_ = std::make_unique<AdminWorker>(*registry_, std::move(deps));
+        adminWorker_ = std::make_unique<AdminWorker>(
+            *registry_, replica_.get(), /*selfId=*/1,
+            std::vector<int32_t>{1}, std::move(deps));
+        // Promote to leader (single-node) so DDL is served.
+        adminWorker_->onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
+    }
+
+    // Drive one DefineTopic through the async state machine to completion:
+    // submit → doWork loop, answering the createTopic request via the reply ring,
+    // ticking until the HW-gated commit resolves.
+    void driveDefine(const DefineTopicMsg& msg) {
+        adminWorker_->submitDefineTopic(msg);
+        pendingTicket_ = -1;
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) {
+            nowNs += 1'000'000LL;
+            adminWorker_->doWork(nowNs);
+            if (pendingTicket_ >= 0) {
+                CreateTopicReplyMsg reply;
+                reply.ticket  = pendingTicket_;
+                reply.topicId = nextTopicId_++;
+                pendingTicket_ = -1;
+                adminWorker_->onCreateTopicReply(reply);
+            }
+        }
     }
 
     // Drive one "doWork" tick on the replica (advances HW on single-node leader).
@@ -255,6 +261,7 @@ protected:
     std::unique_ptr<AdminWorker>            adminWorker_;
 
     int32_t nextTopicId_ = 0;
+    int64_t pendingTicket_ = -1;   // set by requestCreateTopic; consumed by driveDefine
 
     // Captured response state
     int32_t  lastDefineTopicId_ = -1;
@@ -274,7 +281,7 @@ protected:
 //   - __topic_schemas log LEO >= 1 (at least one record written)
 // ---------------------------------------------------------------------------
 TEST_F(SchemaPersistenceTest, SchemaRecord_LandsInLog) {
-    DefineTopicArgs args;
+    DefineTopicMsg args;
     args.session        = 1;
     args.corr           = 2;
     args.name           = "characters";
@@ -283,7 +290,7 @@ TEST_F(SchemaPersistenceTest, SchemaRecord_LandsInLog) {
     args.validate       = false;
     args.blob           = charsBlob();
 
-    adminWorker_->onDefineTopic(args);
+    driveDefine(args);
 
     // respondDefine should have been called with OK=0.
     EXPECT_EQ(lastDefineError_, 0u) << "DefineTopic must succeed (OK=0)";
@@ -310,7 +317,7 @@ TEST_F(SchemaPersistenceTest, SchemaRecord_LandsInLog) {
 // ---------------------------------------------------------------------------
 TEST_F(SchemaPersistenceTest, RebuildFromLog_RecoveryAfterRestart) {
     // 1. Write a schema record.
-    DefineTopicArgs args;
+    DefineTopicMsg args;
     args.session        = 10;
     args.corr           = 20;
     args.name           = "characters";
@@ -319,7 +326,7 @@ TEST_F(SchemaPersistenceTest, RebuildFromLog_RecoveryAfterRestart) {
     args.validate       = false;
     args.blob           = charsBlob();
 
-    adminWorker_->onDefineTopic(args);
+    driveDefine(args);
     ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic must succeed";
 
     const int32_t savedTopicId = lastDefineTopicId_;
@@ -355,7 +362,7 @@ TEST_F(SchemaPersistenceTest, RebuildFromLog_RecoveryAfterRestart) {
 //   - Must NOT append a second record to the log.
 // ---------------------------------------------------------------------------
 TEST_F(SchemaPersistenceTest, DuplicateDefineTopic_IdempotentOnLog) {
-    DefineTopicArgs args;
+    DefineTopicMsg args;
     args.session        = 1;
     args.corr           = 2;
     args.name           = "characters";
@@ -365,7 +372,7 @@ TEST_F(SchemaPersistenceTest, DuplicateDefineTopic_IdempotentOnLog) {
     args.blob           = charsBlob();
 
     // First define — should succeed.
-    adminWorker_->onDefineTopic(args);
+    driveDefine(args);
     ASSERT_EQ(lastDefineError_, 0u) << "First DefineTopic must succeed";
 
     const Offset leoAfterFirst = log_.logEndOffset();
@@ -373,7 +380,7 @@ TEST_F(SchemaPersistenceTest, DuplicateDefineTopic_IdempotentOnLog) {
 
     // Second define — same name, should return TopicExists=25.
     args.corr = 3;
-    adminWorker_->onDefineTopic(args);
+    driveDefine(args);
     EXPECT_EQ(lastDefineError_, 25u) << "Duplicate DefineTopic must return TopicExists=25";
 
     // Log must NOT have grown (no second record appended).
@@ -388,7 +395,7 @@ TEST_F(SchemaPersistenceTest, DuplicateDefineTopic_IdempotentOnLog) {
 // (Stub in Task 6; Task 7 will replace with real worker ring enqueue.)
 // ---------------------------------------------------------------------------
 TEST_F(SchemaPersistenceTest, ValidateTrue_PushValidatorsCalled) {
-    DefineTopicArgs args;
+    DefineTopicMsg args;
     args.session        = 1;
     args.corr           = 2;
     args.name           = "orders";
@@ -397,7 +404,7 @@ TEST_F(SchemaPersistenceTest, ValidateTrue_PushValidatorsCalled) {
     args.validate       = true;
     args.blob           = charsBlob();  // valid blob (name in blob is "characters" but that's OK for this test)
 
-    adminWorker_->onDefineTopic(args);
+    driveDefine(args);
     ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic must succeed";
 
     EXPECT_EQ(pushValidatorCallCount_, 1)
@@ -414,26 +421,16 @@ TEST_F(SchemaPersistenceTest, ValidateTrue_PushValidatorsCalled) {
 // uses the returned id, not any stale RUNTIME_TOPIC_ID_BASE-based value.
 // ---------------------------------------------------------------------------
 TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic) {
-    // createTopic fake returns 42 (not RUNTIME_TOPIC_ID_BASE).
-    // We wire a fresh AdminWorker with a different fake that returns 42.
+    // The authoritative id is the one the control thread REPLIES (RULING-1/B).
+    // Here the simulated control thread replies topicId=42 for the pending ticket;
+    // the registry entry + response must carry 42.
     SchemaRegistry reg2;
     int32_t returnedId = -1;
+    int64_t ticket = -1;
 
     AdminDeps deps;
-    deps.createTopic = [](int32_t, const std::string&) -> int32_t { return 42; };
-    deps.appendDurable = [this](const TopicSchema& ts) -> bool {
-        const std::vector<uint8_t> payload = ts.serialize();
-        uint8_t key[4];
-        const uint32_t u = static_cast<uint32_t>(ts.topicId);
-        key[0] = static_cast<uint8_t>(u & 0xff);
-        key[1] = static_cast<uint8_t>((u >> 8) & 0xff);
-        key[2] = static_cast<uint8_t>((u >> 16) & 0xff);
-        key[3] = static_cast<uint8_t>((u >> 24) & 0xff);
-        const Offset base = replica_->appendKeyed(
-            std::span<const uint8_t>(key, 4),
-            std::span<const uint8_t>(payload.data(), payload.size()),
-            /*acksAll=*/true);
-        return base >= 0;
+    deps.requestCreateTopic = [&ticket](int64_t t, int32_t, const std::string&) -> bool {
+        ticket = t; return true;
     };
     deps.pushValidators = [](const RegistryEntry&, int32_t) {};
     deps.respondDefine = [&returnedId](int64_t, int64_t, int32_t tid,
@@ -441,9 +438,11 @@ TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic)
     deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t,
                           const std::vector<uint8_t>&, uint16_t) {};
 
-    AdminWorker w(reg2, std::move(deps));
+    AdminWorker w(reg2, replica_.get(), /*selfId=*/1,
+                  std::vector<int32_t>{1}, std::move(deps));
+    w.onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
 
-    DefineTopicArgs args;
+    DefineTopicMsg args;
     args.session        = 1;
     args.corr           = 2;
     args.name           = "items";
@@ -451,14 +450,22 @@ TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic)
     args.partitionCount = 1;
     args.validate       = false;
     args.blob           = charsBlob();
+    w.submitDefineTopic(args);
 
-    w.onDefineTopic(args);
+    int64_t nowNs = 0;
+    for (int i = 0; i < 50; ++i) {
+        nowNs += 1'000'000LL;
+        w.doWork(nowNs);
+        if (ticket >= 0) {
+            w.onCreateTopicReply(CreateTopicReplyMsg{ticket, 42});
+            ticket = -1;
+        }
+    }
 
     EXPECT_EQ(returnedId, 42)
-        << "RULING-1 regression: topicId must be the value RETURNED by createTopic (42), "
-           "not RUNTIME_TOPIC_ID_BASE or any pre-allocated SchemaRegistry id";
+        << "RULING-1 regression: topicId must be the value the control thread REPLIED (42)";
     const RegistryEntry* e = reg2.byName("characters");  // blob encodes "characters"
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->topicId, 42)
-        << "Registry entry topicId must match the createTopic return value (42)";
+        << "Registry entry topicId must match the replied create-topic id (42)";
 }

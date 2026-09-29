@@ -1,9 +1,14 @@
 #pragma once
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 #include "rune/node/SchemaRegistry.h"
+#include "rune/node/AdminChannels.h"
+
+namespace rune::replication { class PartitionReplica; }
 
 namespace rune::node {
 
@@ -16,62 +21,147 @@ namespace rune::node {
 //   SchemaValidationFailed= 24  (not used in this task)
 //   TopicExists           = 25
 
+// ---------------------------------------------------------------------------
+// AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.
+//
+// RULING-2: the AdminWorker SOLELY owns the __topic_schemas replica.  It does
+// NOT reach into TopicRegistry (control-thread-owned) or the WorkerPool
+// directly across threads — every cross-thread effect is a ring hand-off:
+//
+//   requestCreateTopic — post a CreateTopicRequest to the CONTROL thread (which
+//                        owns TopicRegistry + ReplicaRegistry) and returns a
+//                        ticket; the authoritative id arrives later on the
+//                        create-topic reply ring, drained in doWork().
+//   pushValidators     — enqueue SchemaUpdate WorkerOps to each worker via their
+//                        SPSC ingress (still a ring hand-off; workers apply on
+//                        their own thread).
+//   respondDefine/Get  — encode a response frame + send on the originating
+//                        session's egress (via the gateway's control-frame path).
+// ---------------------------------------------------------------------------
 struct AdminDeps {
-    // CREATING: create the physical topic partitions (blocking I/O in real impl).
-    // RULING-1: createTopic does NOT take a pre-allocated id; it returns the
-    // authoritative sequential topicId assigned by the registry.
-    std::function<int32_t(int32_t partitionCount,
-                          const std::string& name)> createTopic;
+    // CREATING: post a create-topic request to the control thread.  Returns true
+    // if the request was enqueued on the ring (false = ring full / no channel).
+    // The authoritative topicId arrives later via CreateTopicReplyMsg.
+    std::function<bool(int64_t ticket, int32_t partitionCount,
+                       const std::string& name)> requestCreateTopic;
 
-    // AWAITING_COMMIT: append a durable TopicSchema record; returns true = committed.
-    std::function<bool(const TopicSchema&)> appendDurable;
-
-    // PUBLISHING: push validators to the validator registry after commit (only when
-    // validate=true).
+    // PUBLISHING: push validators to each produce worker after commit (validate=true).
     std::function<void(const RegistryEntry&, int32_t topicId)> pushValidators;
 
-    // Send the DefineTopic response back to the client.
+    // Send the DefineTopic response back to the client (encode + egress).
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
                        uint16_t version, uint16_t errorCode)> respondDefine;
 
-    // Send the GetTopicSchema response back to the client.
+    // Send the GetTopicSchema response back to the client (encode + egress).
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
                        uint16_t version, const std::vector<uint8_t>& blob,
                        uint16_t errorCode)> respondGet;
 };
 
-struct DefineTopicArgs {
-    int64_t              session;
-    int64_t              corr;
-    std::string          name;
-    std::string          keyField;
-    int32_t              partitionCount;
-    bool                 validate;
-    std::vector<uint8_t> blob;
-};
-
-struct GetSchemaArgs {
-    int64_t     session;
-    int64_t     corr;
-    std::string name;
-};
-
-/// Single-threaded, AdminWorker-owned DDL state machine.
-/// No locks, no atomics — caller owns the thread (shared-nothing, rule #1).
+/// Single-threaded, AdminWorker-owned DDL state machine (RULING-2).
+///
+/// SOLE owner of the __topic_schemas PartitionReplica: the admin thread is the
+/// ONLY thread that calls schemaReplica_->doWork()/appendKeyed()/becomeLeader().
+/// No locks, no atomics — the caller owns the thread (shared-nothing, rule #1).
+///
+/// The DDL path is ASYNC because createTopic is a ring round-trip to the control
+/// thread (which owns TopicRegistry).  At most one DefineTopic is in flight; the
+/// rest queue.  Each state holds exactly the variables it needs (rule #3).
 class AdminWorker {
 public:
-    AdminWorker(SchemaRegistry& reg, AdminDeps deps);
+    /// \param reg           in-memory schema registry (admin-thread-owned).
+    /// \param replica       the __topic_schemas PartitionReplica (may be null in
+    ///                      pure-unit tests that stub appendDurable; when null,
+    ///                      appendDurable/rebuild are no-ops).
+    /// \param selfId        this node's id (for becomeLeader ISR seeding).
+    /// \param replicaSet    the full replica set (for becomeLeader ISR seeding).
+    /// \param deps          effects.
+    AdminWorker(SchemaRegistry& reg,
+                rune::replication::PartitionReplica* replica,
+                int32_t selfId,
+                std::vector<int32_t> replicaSet,
+                AdminDeps deps);
 
-    /// Run the DefineTopic DDL state machine synchronously.
-    /// States: PARSING → name-lookup → CREATING → AWAITING_COMMIT → on-commit.
-    void onDefineTopic(const DefineTopicArgs& args);
+    // -----------------------------------------------------------------------
+    // Ingress — enqueue an op (called on the ADMIN thread by AdminWorkerAgent
+    // after draining the request ring).
+    // -----------------------------------------------------------------------
+    void submitDefineTopic(DefineTopicMsg msg);
+    void submitGetSchema(const GetSchemaMsg& msg);
 
-    /// Run the GetTopicSchema lookup.
-    void onGetTopicSchema(const GetSchemaArgs& args);
+    // -----------------------------------------------------------------------
+    // control → admin: create-topic reply.  Matches the ticket of the in-flight
+    // DefineTopic and advances the state machine (AWAITING_ID → AWAITING_COMMIT).
+    // -----------------------------------------------------------------------
+    void onCreateTopicReply(const CreateTopicReplyMsg& reply);
+
+    // -----------------------------------------------------------------------
+    // control → admin: role transition for the schema replica.  Applied on the
+    // admin thread (becomeLeader/becomeFollower) — no cross-thread role_ write.
+    // C: on a Follower→Leader edge, rebuild the SchemaRegistry from the log.
+    // -----------------------------------------------------------------------
+    void onRole(const AdminRoleMsg& role);
+
+    // -----------------------------------------------------------------------
+    // doWork — drive the replica + advance the in-flight DDL state machine.
+    // Returns a work count (>0 if progress made).  Called every admin-thread tick.
+    // -----------------------------------------------------------------------
+    int doWork(int64_t nowNs);
+
+    // -----------------------------------------------------------------------
+    // Test / introspection.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] bool isLeader() const noexcept { return leader_; }
+    [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
 
 private:
-    SchemaRegistry& reg_;
-    AdminDeps       deps_;
+    // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
+    void rebuildFromLog_();
+
+    // Advance the in-flight DDL if possible.  Returns true if work was done.
+    bool advance_(int64_t nowNs);
+
+    // Start the next queued DefineTopic (if idle).
+    void startNext_(int64_t nowNs);
+
+    enum class DdlState {
+        Idle,             // nothing in flight
+        AwaitingId,       // requested createTopic; waiting for reply ring
+        AwaitingCommit,   // appended durable record; waiting for HW to cover it
+    };
+
+    // One queued/in-flight DefineTopic.  Each state uses exactly its own fields.
+    struct DdlOp {
+        DefineTopicMsg msg;
+        int64_t        ticket        = 0;
+        int32_t        topicId       = -1;   // set on AwaitingId → AwaitingCommit
+        int64_t        appendedBase  = -1;   // set on AwaitingCommit (HW must reach it)
+        int64_t        appendedLast  = -1;
+        int64_t        startedNs     = 0;    // for timeout
+    };
+
+    SchemaRegistry&                       reg_;
+    rune::replication::PartitionReplica*  replica_;
+    int32_t                               selfId_;
+    std::vector<int32_t>                  replicaSet_;
+    AdminDeps                             deps_;
+
+    // Leadership (admin-thread-owned; driven only by onRole()).
+    bool     leader_      = false;
+    int32_t  epoch_       = 0;
+    bool     wasLeader_   = false;   // C: Follower→Leader edge detection
+
+    // In-flight DDL state machine.
+    DdlState        state_ = DdlState::Idle;
+    std::optional<DdlOp> inFlight_;
+    std::deque<DefineTopicMsg> pending_;   // queued DefineTopics (>1 in flight rare)
+    int64_t         nextTicket_ = 1;
+
+    // Timeout for a stuck in-flight op (createTopic reply lost, or HW never
+    // advances because leadership was lost) — respond Internal and move on.
+    // Time-independent CORRECTNESS is preserved: this is an ERROR path bound, not
+    // a convergence gate (we never sleep to "let things settle").
+    static constexpr int64_t kDdlTimeoutNs = 30LL * 1'000'000'000LL;
 };
 
 } // namespace rune::node

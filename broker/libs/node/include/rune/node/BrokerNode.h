@@ -35,6 +35,7 @@
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/AdminWorker.h>
+#include <rune/node/AdminChannels.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -84,99 +85,125 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// AdminOp — thin envelope for the admin ring (SPSC: gateway → AdminWorker).
+// AdminWorkerAgent — wraps AdminWorker + its cross-thread SPSC rings into an
+// Agent so it can be driven by an AgentRunner on a dedicated thread.
 //
-// The ring carries serialised AdminOp messages.  Two op types:
-//   DefineTopic  (opType=0) — DefineTopicArgs
-//   GetSchema    (opType=1) — GetSchemaArgs
+// Shared-nothing (Rule #1): AdminWorkerAgent owns the AdminWorker (which SOLELY
+// owns the __topic_schemas replica).  Every cross-thread hop is an SPSC ring
+// (Rule #2, Aeron-style):
 //
-// On-host (Task 6) only the ring-enqueue path is wired; ring drain + dispatch
-// are exercised in SchemaPersistenceTest via direct AdminWorker calls.
-// ---------------------------------------------------------------------------
-struct AdminOp {
-    enum class OpType : uint8_t { DefineTopic = 0, GetSchema = 1 };
-    OpType opType = OpType::DefineTopic;
-    // Union-style: only one of these is valid per message.
-    DefineTopicArgs  defineArgs;
-    GetSchemaArgs    getArgs;
-};
-
-// ---------------------------------------------------------------------------
-// AdminWorkerAgent — wraps AdminWorker + its ingress ring into an Agent so it
-// can be driven by an AgentRunner on a dedicated thread.
+//   requestRing_ (gateway/control → admin) : DefineTopic / GetSchema ops.
+//   replyRing_   (control → admin)          : authoritative topicId back.
+//   roleRing_    (control → admin)           : Follower/Leader role events.
+//   createReqRing_ (admin → control)         : "create this physical topic".
 //
-// Shared-nothing (Rule #1): AdminWorkerAgent owns the SchemaRegistry and
-// AdminWorker.  The only cross-thread communication is the adminRing_ (SPSC
-// from the gateway thread to this agent's thread — Rule #2).
+// The dead unsynchronized linked-list enqueue path (Task 6) is REMOVED.
 // ---------------------------------------------------------------------------
-class AdminWorkerAgent final : public rune::consensus::Agent {
+class AdminWorkerAgent final : public rune::consensus::Agent,
+                               public rune::gateway::IAdminRequestSink {
 public:
-    explicit AdminWorkerAgent(SchemaRegistry& reg, AdminDeps deps)
-        : worker_(reg, std::move(deps)) {}
+    AdminWorkerAgent(SchemaRegistry& reg,
+                     rune::replication::PartitionReplica* replica,
+                     int32_t selfId,
+                     std::vector<int32_t> replicaSet,
+                     AdminDeps deps)
+        : worker_(reg, replica, selfId, std::move(replicaSet), std::move(deps))
+        , requestRing_(kAdminRequestRingBytes)
+        , replyRing_(kCreateTopicRingBytes)
+        , roleRing_(kAdminRoleRingBytes) {}
 
     const char* name() const noexcept override { return "rune-admin"; }
 
-    int doWork(int64_t /*nowNs*/) noexcept override {
-        // Drain pending ops from the ring (fed by gateway / test harness).
+    // ── IAdminRequestSink (gateway → admin ring adapter; RULING-2 F) ──────────
+    // Called on the gateway/control thread; encodes onto requestRing_ (SPSC).
+    bool submitDefineTopic(int64_t sessionId, int64_t correlationId,
+                           std::string_view name, uint32_t partitionCount,
+                           std::string_view keyField, bool validate,
+                           const uint8_t* descriptorBlob,
+                           uint32_t descriptorLen) override {
+        DefineTopicMsg m;
+        m.session        = sessionId;
+        m.corr           = correlationId;
+        m.partitionCount = static_cast<int32_t>(partitionCount);
+        m.validate       = validate;
+        m.name.assign(name);
+        m.keyField.assign(keyField);
+        if (descriptorBlob && descriptorLen)
+            m.blob.assign(descriptorBlob, descriptorBlob + descriptorLen);
+        return encodeDefineTopic(requestRing_, m);
+    }
+
+    bool submitGetSchema(int64_t sessionId, int64_t correlationId,
+                         std::string_view name) override {
+        GetSchemaMsg m;
+        m.session = sessionId;
+        m.corr    = correlationId;
+        m.name.assign(name);
+        return encodeGetSchema(requestRing_, m);
+    }
+
+    int doWork(int64_t nowNs) noexcept override {
         int work = 0;
-        for (auto* op = pendingFront_; op != nullptr; ) {
-            auto* next = op->next;
-            if (op->opType == AdminOp::OpType::DefineTopic) {
-                worker_.onDefineTopic(op->defineArgs);
-            } else {
-                worker_.onGetTopicSchema(op->getArgs);
+
+        // 1. Drain role events (control → admin) FIRST so leadership is current
+        //    before any DDL runs this tick.
+        work += roleRing_.drain([this](int32_t /*tid*/,
+                                       aeron::concurrent::AtomicBuffer& b,
+                                       aeron::util::index_t off,
+                                       aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            worker_.onRole(decodeAdminRole(p, static_cast<std::size_t>(len)));
+        }, 16);
+
+        // 2. Drain create-topic replies (control → admin).
+        work += replyRing_.drain([this](int32_t /*tid*/,
+                                        aeron::concurrent::AtomicBuffer& b,
+                                        aeron::util::index_t off,
+                                        aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            worker_.onCreateTopicReply(decodeCreateTopicReply(p, static_cast<std::size_t>(len)));
+        }, 16);
+
+        // 3. Drain gateway requests (DefineTopic / GetSchema).
+        work += requestRing_.drain([this](int32_t tid,
+                                          aeron::concurrent::AtomicBuffer& b,
+                                          aeron::util::index_t off,
+                                          aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto  n = static_cast<std::size_t>(len);
+            if (tid == kMsgDefineTopic) {
+                worker_.submitDefineTopic(decodeDefineTopic(p, n));
+            } else if (tid == kMsgGetSchema) {
+                worker_.submitGetSchema(decodeGetSchema(p, n));
             }
-            delete op;
-            op = next;
-            ++work;
-        }
-        pendingFront_ = nullptr;
-        pendingBack_  = nullptr;
+        }, 16);
+
+        // 4. Advance the DDL state machine + drive the replica.
+        work += worker_.doWork(nowNs);
         return work;
     }
 
-    // Enqueue a DefineTopic op (called from the gateway/test on any thread;
-    // safe because the linked list is only read in doWork on the admin thread
-    // and is written here before the AdminWorkerAgent thread calls doWork).
-    // NOTE: for Task 6 this is a simple heap-allocated linked list —
-    // Task 8 will replace this with a proper SPSC ring.  The linked list is
-    // safe here because: (a) tests call onDefineTopic directly, and (b) the
-    // BrokerNode wiring (Task 8) will replace this seam.
-    void enqueueDefineTopic(DefineTopicArgs args) {
-        auto* node = new PendingNode{AdminOp::OpType::DefineTopic,
-                                     std::move(args), {}, nullptr};
-        appendNode(node);
-    }
+    // -----------------------------------------------------------------------
+    // Producer-side accessors — the gateway/control thread enqueues here.
+    // requestRing_ producer = gateway/control duty-cycle thread.
+    // replyRing_ / roleRing_ producer = control thread.
+    // createReqRing_ consumer = control thread; producer = admin (via deps).
+    // -----------------------------------------------------------------------
+    OneToOneByteRing& requestRing()   noexcept { return requestRing_; }
+    OneToOneByteRing& replyRing()     noexcept { return replyRing_;   }
+    OneToOneByteRing& roleRing()      noexcept { return roleRing_;    }
+    OneToOneByteRing& createReqRing() noexcept { return createReqRing_; }
+    OneToOneByteRing& egressRing()    noexcept { return egressRing_;   } // admin → control (response frames)
 
-    void enqueueGetSchema(GetSchemaArgs args) {
-        auto* node = new PendingNode{AdminOp::OpType::GetSchema,
-                                     {}, std::move(args), nullptr};
-        appendNode(node);
-    }
-
-    // Direct dispatch (used by tests and the BrokerNode single-threaded path).
     AdminWorker& worker() noexcept { return worker_; }
 
 private:
-    struct PendingNode {
-        AdminOp::OpType opType;
-        DefineTopicArgs defineArgs;
-        GetSchemaArgs   getArgs;
-        PendingNode*    next = nullptr;
-    };
-
-    void appendNode(PendingNode* node) {
-        if (pendingBack_) {
-            pendingBack_->next = node;
-        } else {
-            pendingFront_ = node;
-        }
-        pendingBack_ = node;
-    }
-
-    AdminWorker   worker_;
-    PendingNode*  pendingFront_ = nullptr;
-    PendingNode*  pendingBack_  = nullptr;
+    AdminWorker      worker_;
+    OneToOneByteRing requestRing_;     // gateway/control → admin (DefineTopic/GetSchema)
+    OneToOneByteRing replyRing_;       // control → admin (createTopic reply)
+    OneToOneByteRing roleRing_;        // control → admin (role events)
+    OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
+    OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
 };
 
 // ---------------------------------------------------------------------------
@@ -498,6 +525,9 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>  schemaReplica_;
     std::unique_ptr<SchemaRegistry>                       schemaRegistry_;
     std::unique_ptr<AdminWorkerAgent>                     adminWorkerAgent_;
+    // Task 8a: last leadership state posted to the admin role ring (control thread).
+    bool                                                  adminLastLeader_ = false;
+    int32_t                                               adminLastEpoch_  = -1;
     rune::consensus::BackoffIdleStrategy                  adminWorkerIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;

@@ -340,6 +340,24 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 8a: SchemaGatewayTest — gateway → admin ring → replica → response
+    # DDL round-trip (RULING-2 E/F), plus SchemaGatewayRegression.DdlDoesNotBlockProduce.
+    # On-host (no Aeron); real-Aeron majority-durable + failover deferred to 8b.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_schema_gateway_tests
+        tests/integration/SchemaGatewayTest.cpp)
+    target_include_directories(rune_schema_gateway_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_schema_gateway_tests PRIVATE
+        rune_node
+        rune_gateway
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_schema_gateway_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # Task 7: ProduceValidationTest — per-worker schema validation hook.
     #
     # Tests (on-host, no Aeron / media driver):

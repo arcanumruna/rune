@@ -28,6 +28,7 @@
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <spdlog/spdlog.h>
@@ -626,6 +627,13 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
         case pc::TemplateId::TxnOffsetCommit:
         case pc::TemplateId::EndTxn:
             handleTxnMessage(buf, len, nowNs_, fc.templateId);
+            break;
+        // Task 8a: schema DDL — route to the admin sink (ring hand-off).
+        case pc::TemplateId::DefineTopic:
+            handleDefineTopic(buf, len);
+            break;
+        case pc::TemplateId::GetTopicSchema:
+            handleGetTopicSchema(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -3616,6 +3624,67 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
     }
 
     sendTo(*session, scratch_.data(), encoded);
+}
+
+// ---------------------------------------------------------------------------
+// Task 8a: handleDefineTopic (RULING-2 F) — route DefineTopic (64) to the admin
+// sink via a ring hand-off.  Validate + require known session + decode, then
+// copy the fields into the sink and RETURN immediately.  NO registry access, NO
+// blocking on the gateway hot path — a stalled AdminWorker never delays produce.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
+{
+    if (!adminSink_) {
+        spdlog::debug("ClientGateway: DefineTopic received but adminSink_ not set — dropped");
+        return;
+    }
+    auto msgOpt = pc::DefineTopic::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: DefineTopic decode failed — dropped");
+        return;
+    }
+    const pc::DefineTopic& m = *msgOpt;
+
+    // Require a known session (mirror handleProduce).
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: DefineTopic for unknown sessionId={} — dropped", m.sessionId);
+        return;
+    }
+
+    // Copy-and-return: the sink OWNS the copied bytes (name/keyField/blob views
+    // point into the ingress buffer and are copied by the sink before return).
+    (void)adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
+                                        m.topicName, m.partitionCount,
+                                        m.keyField, m.validate,
+                                        m.descriptorBlob, m.descriptorLen);
+    // Return immediately — the AdminWorker produces the DefineTopicResponse
+    // asynchronously on the session egress (via the admin→control egress ring).
+}
+
+// ---------------------------------------------------------------------------
+// Task 8a: handleGetTopicSchema (RULING-2 F) — route GetTopicSchema (66) to the
+// admin sink via a ring hand-off (same discipline as handleDefineTopic).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
+{
+    if (!adminSink_) {
+        spdlog::debug("ClientGateway: GetTopicSchema received but adminSink_ not set — dropped");
+        return;
+    }
+    auto msgOpt = pc::GetTopicSchema::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: GetTopicSchema decode failed — dropped");
+        return;
+    }
+    const pc::GetTopicSchema& m = *msgOpt;
+
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: GetTopicSchema for unknown sessionId={} — dropped", m.sessionId);
+        return;
+    }
+    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName);
 }
 
 // ---------------------------------------------------------------------------
