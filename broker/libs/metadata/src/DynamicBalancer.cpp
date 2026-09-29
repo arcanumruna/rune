@@ -225,6 +225,11 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
             enum class Action { None, Failover, Preferred };
             Action groupAction = Action::None;
             int32_t computedLeader = NO_LEADER_CHANGE;
+            // Set when computedLeader was chosen by the position-proven survivor
+            // election (a live replica proven to hold the committed prefix, but not in
+            // the stale committed ISR) — the ISR-membership safety assert is satisfied
+            // by position proof instead of committed-ISR membership.
+            bool positionProven = false;
 
             const TopicSpec* driver = nullptr;
 
@@ -332,8 +337,61 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 // only holds leadership with a majority quorum.  in.minIsr remains the
                 // gateway produce gate (acks=all), not a failover gate.
                 if (groupIsr.empty()) {
-                    // No node is in-ISR for all members AND live → NO_LEADER for all.
+                    // ── Position-proven clean survivor election ────────────────────
+                    // The committed ISR (intersected over the group) has NO live
+                    // member — it went stale, shrinking to nodes that are now dead
+                    // while the live survivors were never re-admitted (data-plane ISR
+                    // expand not yet propagated to the committed map).  Going NO_LEADER
+                    // here strands the partition forever even though live survivors
+                    // hold the committed prefix (dr5_leader_isolation committed-loss).
+                    //
+                    // SAFETY (no committed loss): a committed record under acks=all was
+                    // durable on >= minIsr replicas.  If MORE than (RF - minIsr)
+                    // replicas survive, at least one record-holder survives; the
+                    // highest-(leaderEpoch,leo) live survivor holds a superset of every
+                    // live replica's log, hence the full committed prefix.  Electing it
+                    // is a CLEAN election (becomeLeader caps the committed floor at the
+                    // new leader's HW view, so no uncommitted tail is exposed).  Gate on
+                    // the survivor count so a genuine minority still (correctly) stays
+                    // NO_LEADER.  Time-independent: decided off positions, not timing.
                     computedLeader = NO_LEADER;
+                    positionProven = false;
+                    for (const TopicSpec* ts : members) {
+                        const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
+                        if (!mc || mc->replicas.empty() || !in.positions) {
+                            computedLeader = NO_LEADER; positionProven = false; break;
+                        }
+                        const int rf = static_cast<int>(mc->replicas.size());
+                        int liveInReplicas = 0;
+                        for (int32_t r : mc->replicas)
+                            if (isIn(r, in.liveNodes)) ++liveInReplicas;
+                        // Need strictly more than (RF - minIsr) survivors for the
+                        // pigeonhole completeness guarantee to hold.
+                        if (liveInReplicas < (rf - in.minIsr + 1)) {
+                            computedLeader = NO_LEADER; positionProven = false; break;
+                        }
+                        // Highest-(epoch,leo) live replica WITH a position report.
+                        int32_t best = NO_LEADER;
+                        rune::consensus::Term bestEp = -1; int64_t bestLeo = -1;
+                        for (int32_t r : mc->replicas) {
+                            if (!isIn(r, in.liveNodes)) continue;
+                            auto opt = in.positions->get(ts->topicId, p, r);
+                            if (!opt.has_value()) continue; // no proof → not a candidate
+                            const auto ep  = static_cast<rune::consensus::Term>(opt->leaderEpoch);
+                            const auto leo = opt->logEndPosition;
+                            const int cmp = (best == NO_LEADER) ? 1
+                                : rune::consensus::ClusterMember::compareLog(ep, leo, bestEp, bestLeo);
+                            if (cmp > 0 || (cmp == 0 && r < best)) {
+                                best = r; bestEp = ep; bestLeo = leo;
+                            }
+                        }
+                        if (best == NO_LEADER) { computedLeader = NO_LEADER; positionProven = false; break; }
+                        // All members of a co-partition group must agree on one leader:
+                        // require the SAME survivor across members (they co-partition).
+                        if (computedLeader == NO_LEADER) computedLeader = best;
+                        else if (computedLeader != best) { computedLeader = NO_LEADER; positionProven = false; break; }
+                        positionProven = true;
+                    }
                 } else {
                     // Run FailoverElection with the intersected ISR to pick a winner.
                     // We synthesise a proxy PartitionAssignment whose ISR is the group
@@ -365,7 +423,13 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 // Per-member safety assert: computedLeader must be in member.isr ∧ live,
                 // OR computedLeader == NO_LEADER (intersection was empty).
                 // If intersection logic is correct this always holds; assert defensively.
-                if (computedLeader != NO_LEADER) {
+                // EXCEPTION: a position-proven survivor election (positionProven) elects
+                // a live replica that is NOT in the stale committed ISR but is proven by
+                // the ReplicaPositionTable to hold the committed prefix — its safety comes
+                // from position proof + the survivor-count gate, not ISR membership, so we
+                // only require it to be live (never let it be outside the replica set,
+                // which the election above already guarantees).
+                if (computedLeader != NO_LEADER && !positionProven) {
                     for (const TopicSpec* ts : members) {
                         const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
                         if (!mc) continue;
@@ -376,6 +440,9 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                             break;
                         }
                     }
+                } else if (computedLeader != NO_LEADER && positionProven) {
+                    // Position-proven: only require liveness (defence-in-depth).
+                    if (!isIn(computedLeader, in.liveNodes)) computedLeader = NO_LEADER;
                 }
             } else {
                 // Preferred-leader: use replicas[0] of the driver.

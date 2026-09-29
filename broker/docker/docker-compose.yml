@@ -22,6 +22,8 @@ x-broker-build: &broker-build
     # rune-fr flight recorder: compiled sibling lib wired by the root CMakeLists
     # (add_library(rune_fr ...) from ${SRC}/../rune-fr).  Needs src/ AND include/.
     rune-fr: ../../rune-fr
+    # rune-codec (0a): compiled sibling codec lib; Dockerfile COPYs --from=rune-codec.
+    rune-codec: ../../rune-codec
 
 x-broker-env: &broker-env
   # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane

@@ -342,10 +342,26 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     if (leaderEpoch > epoch_) {
         Offset committedHw = highWatermark();
 
-        epochProbePending_  = true;
-        epochProbeEpoch_    = leaderEpoch;   // epoch we are transitioning INTO
-        epochProbeFloor_    = committedHw;    // never truncate below this
-        epochProbeAttempts_ = 0;
+        // DR-BUG-6 deadlock fix: only arm the epoch probe when we actually have an
+        // UNCOMMITTED TAIL (localLeo > committedHw) that could diverge from the new
+        // leader and thus needs KIP-101 truncation.  A follower that is merely BEHIND
+        // (localLeo <= committedHw — no records past its committed point) has NOTHING
+        // to truncate; arming the probe there only DEFERS its normal fetching until an
+        // answer that may never come (leader slow to promote / packet loss), leaving
+        // the follower frozen at a stale LEO → it never catches up → never re-admitted
+        // to the ISR → acks=all stalls at minIsr forever (dr5_leader_isolation post-heal
+        // hang: survivor stuck lastFetchOffset=8 while leader HW=23).  With no tail there
+        // is no divergence risk (the committed prefix is identical across the lineage),
+        // so we skip the probe and fetch normally to pull forward to the leader's HW.
+        if (logEndOffset_() > committedHw) {
+            epochProbePending_  = true;
+            epochProbeEpoch_    = leaderEpoch;   // epoch we are transitioning INTO
+            epochProbeFloor_    = committedHw;    // never truncate below this
+            epochProbeAttempts_ = 0;
+        } else {
+            // No uncommitted tail → nothing to reconcile → fetch normally.
+            epochProbePending_ = false;
+        }
     } else if (leaderEpoch == epoch_ && epochProbePending_
                && epochProbeEpoch_ == leaderEpoch) {
         // Re-assertion of the SAME epoch we are already probing (e.g. a node

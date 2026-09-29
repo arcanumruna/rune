@@ -778,8 +778,28 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
                                    bool    /*isStartup*/,
                                    int64_t commitPositionArg)
 {
-    // Election.java:430: if CLOSED ignore
-    if (state_ == ElectionState::Closed) return;
+    // Election.java:430: if CLOSED ignore — EXCEPT a same-term NLT from the leader
+    // we already follow is a LIVENESS HEARTBEAT, not an election message.  The
+    // leader's periodic Closed-state broadcast is publishNewLeadershipTermToAll()
+    // (an NLT), so a Closed follower that blindly dropped it would never refresh
+    // its follower-liveness clock from the leader's heartbeats, falsely time out a
+    // LIVE leader after leaderHeartbeatTimeoutNs, and flap Canvass↔Closed.  That
+    // flapping collapses eligibleNodeIds() to just the leader (a live survivor is
+    // never credited), which stalls partition failover forever → committed records
+    // become unreadable after a leader partition (dr5_leader_isolation committed-loss).
+    // Refresh liveness on the heartbeat, then still ignore it for election purposes.
+    if (state_ == ElectionState::Closed) {
+        if (leaderMember_ != nullptr &&
+            leaderMemberIdArg == leaderMember_->id &&
+            leaderMemberIdArg != thisMemberId_ &&
+            leadershipTermIdArg == leadershipTermId_) {
+            followerLiveness_.onLeaderHeartbeat(nowNs);
+            if (commitPositionArg > notifiedCommitPosition_) {
+                notifiedCommitPosition_ = commitPositionArg;
+            }
+        }
+        return;
+    }
 
     // Election.java:440-450: state gate — only accept from ballot/canvass states
     bool inAcceptingState =
