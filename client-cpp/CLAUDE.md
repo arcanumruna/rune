@@ -159,3 +159,18 @@ the `rune-live` server). **Every session must keep it updated.**
    ```
    Override `RUNE_PUSH_TOKEN` / `RUNE_LIVE_URL` as needed; formats in
    `rune-live/README.md`.
+
+---
+
+## Engineering Philosophy (HARD RULES — apply everywhere, always)
+
+These are non-negotiable across every Rune repo. Check every design and every fix against all eight:
+
+1. **Shared-nothing.** No shared mutable state, no locks, no atomics-as-coordination, no `thread_local`. Each thread/component owns its data outright.
+2. **Ring buffers are the ONLY cross-thread event passing.** All inter-thread / inter-component communication goes through ring buffers (Aeron-style) — never shared memory or cross-thread callbacks.
+3. **State machines where each STATE holds exactly the variables that state needs** — not scattered booleans. e.g. `PUBLISHED(buffer, destination, publisher, counter)`, `BEHIND(...)`, `INSYNC(...)`. Every edge case = one explicit state with one code path.
+4. **Zero allocations.** No heap allocation on hot paths or in steady state — preallocate, reuse buffers (capacity persists), fixed stack buffers; no per-cycle `std::vector` returns / `std::function` / dynamic containers on the fast path.
+5. **Test everything, benchmark everything.** Prove features via real e2e/integration + benchmarks. No hand-waving; no "done" without the real path green.
+6. **Regression test on EVERY fix**, marked as a regression suite (e.g. `*Regression*`) so they run together.
+7. **On every fix/implementation, run the FULL regression suite FIRST (priority)** — then all other tests. The regression suite is the gate before anything else.
+8. **Fix-on-sight.** If while reading any file you find code that violates this philosophy (shared state, cross-thread callback, scattered flags, hot-path allocation, untested/un-regressed fix), you FIX it — don't just note it.
