@@ -71,6 +71,7 @@
 #include <cstdint>
 #include <deque>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::node {
@@ -124,6 +125,12 @@ public:
         liveNodes_ = liveNodes;
         assigned_  = false;
     }
+
+    /// Set the commit-quorum failover floor handed to the DynamicBalancer.  A
+    /// failover never installs an ISR below this (prevents the ISR<minIsr startup
+    /// collapse under transient heartbeat isolation).  BrokerNode passes
+    /// gatewayMinIsr (cluster majority).
+    void setMinIsr(int minIsr) noexcept { minIsr_ = minIsr > 0 ? minIsr : 1; }
 
     /// Emit static assignment records to the metadata log if needed.
     ///
@@ -327,6 +334,40 @@ public:
         in.positions = positions;
         in.maxPreferredElectionsPerCycle = maxPreferredElectionsPerCycle;
         in.maxRecordsPerCycle            = maxRecordsPerCycle;
+        in.minIsr                        = minIsr_;   // commit-quorum failover floor
+
+        // DATA-PLANE LIVENESS: mark every leader whose partition frontier ADVANCED
+        // since the last cycle as alive.  The frontier = max reported LEO across the
+        // partition's replicas (from `positions`); only a live, serving leader can
+        // drive it forward (a follower's LEO advances only by replicating from a
+        // live leader).  Such a leader is never failed over even if its consensus
+        // heartbeat lapsed under produce load — the acks=all leadership-churn fix.
+        // First observation seeds a baseline AND grants benefit-of-the-doubt (mark
+        // alive) so we never fail over before a baseline exists.  A crashed leader's
+        // frontier freezes → not marked next cycle → real failover proceeds (≤1
+        // cycle delay).  Control-plane duty cycle; scratch reused across calls.
+        dataPlaneAliveScratch_.clear();
+        if (positions != nullptr) {
+            in.cur->forEach([&](int32_t topicId, int32_t partition,
+                                const rune::metadata::PartitionAssignment& pa) {
+                if (pa.leaderNode == rune::metadata::NO_LEADER) return;
+                int64_t frontier = -1;
+                for (int32_t node : pa.replicas) {
+                    auto rep = positions->get(topicId, partition, node);
+                    if (rep && rep->logEndPosition > frontier)
+                        frontier = rep->logEndPosition;
+                }
+                if (frontier < 0) return;  // no positions yet → leave to heartbeat
+                const int64_t k = (static_cast<int64_t>(topicId) << 32)
+                                | static_cast<uint32_t>(partition);
+                auto it = lastFrontier_.find(k);
+                const bool advanced =
+                    (it == lastFrontier_.end()) || (frontier > it->second);
+                lastFrontier_[k] = frontier;
+                if (advanced) dataPlaneAliveScratch_.push_back(pa.leaderNode);
+            });
+        }
+        in.dataPlaneAliveLeaders = dataPlaneAliveScratch_;
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
@@ -368,13 +409,27 @@ public:
     // \returns number of reassignment records emitted this call (0 = steady state).
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
+    /// Ingest a soft replica-position report into the controller's position table.
+    /// Called on the control/duty thread (NodeRuntimeAgent) each cycle from the
+    /// worker-published, race-free controller position snapshots.  Latest-wins per
+    /// (topicId, partition, nodeId).  This is what activates the DynamicBalancer's
+    /// position-gated leadership restoration after a transient-liveness ISR collapse.
+    void reportReplicaPosition(int32_t topicId, int32_t partition, int32_t nodeId,
+                               int32_t leaderEpoch, int64_t logEndPosition)
+    {
+        positions_.report(rune::replication::ReplicaPositionReport{
+            topicId, partition, nodeId, leaderEpoch, logEndPosition});
+    }
+
     std::size_t reassignDeadPartitionLeaders(
-        const std::vector<rune::metadata::NodeId>& eligibleNodes)
+        const std::vector<rune::metadata::NodeId>& eligibleNodes,
+        int maxPreferredElectionsPerCycle = 1000)
     {
         if (!replica_) return 0;
         if (replica_->role() != rune::replication::Role::Leader) return 0;
         if (eligibleNodes.empty()) return 0;
-        return runDynamicRebalanceOnTick(eligibleNodes, &positions_);
+        return runDynamicRebalanceOnTick(eligibleNodes, &positions_,
+                                         maxPreferredElectionsPerCycle);
     }
 
     /// Diagnostics: the tickSeq of the most-recently appended ControlTickRecord
@@ -725,6 +780,16 @@ private:
     std::vector<rune::metadata::TopicSpec>  configuredTopics_;
     /// Live node IDs for the balancer.
     std::vector<rune::metadata::NodeId>     liveNodes_;
+    /// Commit-quorum failover floor handed to the DynamicBalancer (see
+    /// DynamicBalancerInputs::minIsr).  Set by BrokerNode from gatewayMinIsr.
+    int                                     minIsr_ = 1;
+    /// Data-plane liveness state (duty-thread only): last-observed replication
+    /// frontier per (topicId<<32|partition), used to detect whether a leader's
+    /// partition is still advancing → the leader is alive despite heartbeat lapse.
+    std::unordered_map<int64_t, int64_t>    lastFrontier_;
+    /// Reused scratch for the per-cycle data-plane-alive leader set (capacity
+    /// persists after warmup → no steady-state heap alloc on the control plane).
+    std::vector<int32_t>                    dataPlaneAliveScratch_;
     /// Idempotency latch: true after the first successful emit.
     bool assigned_ = false;
     /// Error counter: incremented when BalancerError is caught.

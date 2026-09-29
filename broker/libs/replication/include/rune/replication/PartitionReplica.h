@@ -38,6 +38,7 @@
 // log buffers.
 // ---------------------------------------------------------------------------
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -49,6 +50,7 @@
 #include <string>
 
 #include <rune/replication/Types.h>
+#include <rune/replication/FollowerSync.h>
 #include <rune/replication/HighWatermark.h>
 #include <rune/replication/IsrManager.h>
 #include <rune/replication/EpochFencing.h>
@@ -432,6 +434,33 @@ public:
     [[nodiscard]] int gatewayIsrSize() const noexcept {
         return publishedIsrSizeForGateway_.load(std::memory_order_acquire);
     }
+
+    // ── CONTROLLER POSITION SNAPSHOT (leadership-convergence path) ─────────────
+    // The duty thread publishes (in publishCleanerState()) this replica's view of
+    // every replica-node's LEO for THIS partition: a leader publishes its own LEO
+    // plus each follower's last-fetched LEO (from leaderState_.followerLeos()); a
+    // follower publishes only its own LEO.  The control thread (NodeRuntimeAgent)
+    // acquire-loads these and feeds the controller's ReplicaPositionTable so the
+    // DynamicBalancer can decide, off POSITIONS (not a heartbeat timeout race),
+    // whether a returned replica is caught up enough to reclaim leadership after a
+    // transient-liveness ISR collapse.  Same TSan-clean release/acquire idiom as
+    // the cleaner/gateway HW snapshots above.  Node ids beyond kMaxControllerNodes
+    // are simply not snapshotted (safe: they just won't be restoration candidates).
+    static constexpr int kMaxControllerNodes = 32;
+    /// leaderEpoch as of the last publication (-1 = never published).
+    [[nodiscard]] int32_t controllerLeaderEpoch() const noexcept {
+        return publishedControllerEpoch_.load(std::memory_order_acquire);
+    }
+    /// This replica's published LEO for `nodeId` (self or a follower it leads);
+    /// -1 if unknown / out of range.  (Stored as leo+1 so a zero-init slot reads
+    /// as "unknown" while a genuine LEO of 0 is representable.)
+    [[nodiscard]] Offset controllerReplicaLeo(NodeId nodeId) const noexcept {
+        if (nodeId < 0 || nodeId >= kMaxControllerNodes) return -1;
+        const Offset raw = publishedReplicaLeo_[static_cast<std::size_t>(nodeId)]
+                               .load(std::memory_order_acquire);
+        return raw == 0 ? -1 : raw - 1;
+    }
+
     [[nodiscard]] int32_t     topicId()        const noexcept { return cfg_.topicId; }
     [[nodiscard]] PartitionId partitionId()    const noexcept { return cfg_.partitionId; }
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
@@ -579,7 +608,17 @@ private:
     /// via unsolicited FetchResponse.  Non-blocking (tryClaim/offer); a dropped
     /// push is fine — the fetch backstop recovers it.  Uses encodeScratch_ (no
     /// per-call alloc).  Only called when cfg_.pushOnAppend is true.
-    void pushToFollowers(Offset fromOffset) noexcept;
+    // Flow control: the leader never pushes more than kPushFlowWindow records ahead
+    // of the slowest ISR follower's acked LEO.  Outrunning the follower makes Aeron
+    // back-pressure and DROP best-effort pushes → the follower stalls behind the gap
+    // (the acks=all "push outran follower" collapse).  Bounded in-flight throttles the
+    // leader to the follower's apply rate instead → stable.  Well under an Aeron term
+    // buffer's record capacity so a full window never overflows the publication.
+    static constexpr Offset kPushFlowWindow  = 16384;
+    static constexpr Offset kNoPushCeiling   = (1LL << 62);
+    /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
+    /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
+    void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
 
     // -----------------------------------------------------------------------
     // Fields
@@ -660,33 +699,28 @@ private:
     // Follower HW (leader uses leaderState_.highWatermark())
     Offset followerHw_ = 0;
 
-    // Highest leader HW this follower has ever heard (from FetchResponse.highWatermark).
-    // Used to tell "caught up" (localLeo >= lastKnownLeaderHw_) from "behind": a
-    // caught-up follower fetches only on a slow keepalive cadence and does NOT count
-    // that fetch as work, so the idle backoff parks instead of spinning a 5ms
-    // fetch/empty-response ping-pong.  0 = never heard from a leader yet.
-    Offset lastKnownLeaderHw_ = 0;
-    // False until this follower has received ANY response from the current leader.
-    // Until then it fetches on the FAST cadence (bootstrap / catch-up) — a follower
-    // that has not yet heard the leader's position must not be treated as "caught up"
-    // just because both sit at offset 0.
-    bool   heardFromLeader_ = false;
-    // True when the last response/push from the leader carried NO records — the
-    // robust "caught up" signal (an empty response means the leader had nothing
-    // beyond our fetch offset).  Unlike a HW comparison this is immune to the
-    // min-ISR-gated HW reading 0 while WE are the follower gating it.  A response
-    // that carries records (even one we cannot yet apply due to a gap) means the
-    // leader is ahead → keep fetching fast.
-    bool   lastResponseEmpty_ = false;
-    // Follower LEO at the previous periodic-fetch emit.  If the LEO advanced since
-    // (GR-10 push is delivering), the periodic fetch is a PURE ACK (maxBytes=0) —
-    // requesting data would re-pull the push-delivered lag the follower already has
-    // in its ingress ring, flooding it with useless (already-applied) apply ops that
-    // head-of-line-block the useful ones (measured: 99% useless applies, 47ms handoff).
-    // Only a STUCK LEO (lost push / bootstrap) triggers a bulk data fetch.
-    Offset leoAtLastPeriodicFetch_ = 0;
+    // ── Follower replication sync — SINGLE SOURCE OF TRUTH ──────────────────────
+    // One explicit state machine (see FollowerSync.h) replaces the former scattered
+    // flags (heardFromLeader_ / lastResponseEmpty_ / lastKnownLeaderHw_ /
+    // leoAtLastPeriodicFetch_ / dataFetchInFlight_ / dataFetchSentNs_).  Governs ONLY
+    // the normal follower fetch path; the DR epoch-probe / reconcile path pre-empts it
+    // (and keeps its own lastFetchEmitNs_ cadence).  Fast-acks (on apply) are pure
+    // (maxBytes=0) and independent of this machine — they advance the leader's
+    // follower-offset → HW for acks=majority.
+    FollowerSync followerSync_;
     // (Caught-up keepalive cadence is computed in doWork from replicaLagMaxMs so it
     //  always keeps the follower in the ISR — see the follower fetch-emit path.)
+    int lastLoggedIsrSize_ = -1;   ///< change-gated ISR diagnostic (RUNE_FS_LOG)
+    int64_t lastKnownNowNs_ = 0;   ///< most-recent doWork() clock, for message handlers
+    bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
+    int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
+    // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
+    // throughput bottleneck: appends (LEO growth), applies (follower push-apply),
+    // pushes sent, fast-acks received, HW advance.
+    int64_t rtLastNs_ = 0;
+    int64_t rtAppends_ = 0, rtApplies_ = 0, rtPushes_ = 0, rtFastAcks_ = 0;
+    int64_t rtApplyBytes_ = 0, rtPushBytes_ = 0;
+    Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
 
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
     //
@@ -866,6 +900,12 @@ private:
     std::atomic<Offset> publishedHwForCleaner_{0};
     std::atomic<int>    publishedRoleForCleaner_{static_cast<int>(Role::Follower)};
     std::atomic<int>    publishedIsrSizeForGateway_{0};
+
+    // Controller position snapshot (see controllerReplicaLeo()/controllerLeaderEpoch()).
+    // Per-node published LEO (stored as leo+1; 0 = unknown), indexed by nodeId.
+    // Zero-initialised → every slot starts "unknown" with no constructor work.
+    std::atomic<int32_t>                              publishedControllerEpoch_{-1};
+    std::array<std::atomic<Offset>, kMaxControllerNodes> publishedReplicaLeo_{};
 };
 
 // ---------------------------------------------------------------------------

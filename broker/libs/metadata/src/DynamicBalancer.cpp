@@ -164,6 +164,31 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
     // reflect already-decided swaps within this rebalance cycle.
     // (Mutable copy; we adjust when we emit a leadership change.)
 
+    // ── Restorability check (time-independent convergence) ────────────────────
+    // A live replica is "restorable" — safe to re-admit to the ISR / re-elect as
+    // preferred leader after a transient-liveness collapse dropped it from the ISR —
+    // ONLY when we have POSITIVE proof it still holds the committed prefix: its
+    // reported logEndPosition >= the reference leader's, from the ReplicaPositionTable.
+    //
+    // Absent that proof (no position report for the node or the leader) we must NOT
+    // restore: a node outside the ISR is by-definition not in-sync, and electing it
+    // without proof of catch-up would risk committed-data loss.  This keeps the old
+    // "preferred-leader only if in ISR" safety while ADDING position-proven
+    // restoration — the mechanism that lets a transient heartbeat false-positive
+    // stop permanently collapsing leadership, for ANY window (no tuned grace).
+    //
+    // NOTE: this activates only once replica position reports are plumbed into the
+    // controller's ReplicaPositionTable; until then it is a safe no-op (see the
+    // position-report wiring in NodeRuntimeAgent / MetadataService).
+    auto restorable = [&](int32_t topicId, int32_t part,
+                          int32_t node, int32_t refLeader) -> bool {
+        if (!in.positions) return false;
+        const auto np = in.positions->get(topicId, part, node);
+        const auto lp = in.positions->get(topicId, part, refLeader);
+        if (!np || !lp) return false;   // no proof of catch-up → not restorable (safety)
+        return np->logEndPosition >= lp->logEndPosition;
+    };
+
     // ── 3. Group topics by coPartitionGroup ──────────────────────────────────
     std::map<std::string, std::vector<const TopicSpec*>> namedGroups;
     std::vector<const TopicSpec*> singletons;
@@ -207,8 +232,17 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 const PartitionAssignment* cur = in.cur->get(ts->topicId, p);
                 if (!cur) continue;
 
-                const bool leaderDead = (cur->leaderNode == NO_LEADER)
-                                     || !isIn(cur->leaderNode, in.liveNodes);
+                // A leader is dead only if it is neither heartbeat-eligible NOR
+                // demonstrably alive via the data plane (its partition frontier is
+                // advancing — see DynamicBalancerInputs::dataPlaneAliveLeaders).
+                // This stops a busy leader whose consensus heartbeat is starved
+                // under produce load from being falsely failed over (churn bug),
+                // while a genuinely crashed leader (frozen frontier) still fails
+                // over.  Time-independent: converges off data-plane progress.
+                const bool leaderDead =
+                    (cur->leaderNode == NO_LEADER)
+                    || (!isIn(cur->leaderNode, in.liveNodes)
+                        && !isIn(cur->leaderNode, in.dataPlaneAliveLeaders));
 
                 if (leaderDead) {
                     groupAction = Action::Failover;
@@ -225,10 +259,19 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     const int32_t preferred = cur->replicas[0];
                     if (preferred == cur->leaderNode) continue;  // already preferred
 
-                    // CARRY-FORWARD: preferred only valid if in ISR
-                    const bool prefInIsr  = isIn(preferred, cur->isr);
                     const bool prefIsLive = isIn(preferred, in.liveNodes);
-                    if (!prefInIsr || !prefIsLive) continue;
+                    if (!prefIsLive) continue;
+                    // Preferred is valid if it is in the ISR, OR — after a transient
+                    // liveness collapse dropped it from the ISR — if it is restorable
+                    // (caught up per positions / RF==N).  Restoring from outside the
+                    // stale ISR is what breaks the "collapsed to survivor forever"
+                    // deadlock; the emit path below re-seeds a healthy ISR so the new
+                    // leader is in its own ISR and acks=majority can commit again.
+                    const bool prefInIsr = isIn(preferred, cur->isr);
+                    if (!prefInIsr &&
+                        !restorable(ts->topicId, p, preferred, cur->leaderNode)) {
+                        continue;
+                    }
 
                     // Only trigger if it improves balance (preferred leads fewer than current).
                     const int32_t prefLoad    = leaderLoad.count(preferred)
@@ -270,6 +313,22 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                         groupIsr.end());
 
                     if (groupIsr.empty()) break;
+                }
+
+                // ── minIsr FLOOR (time-independent liveness guard) ──────────────────
+                // A PARTIAL in-sync set — non-empty but below the commit quorum
+                // (0 < |groupIsr| < minIsr) — is the signature of a transiently
+                // ISOLATED observer (VM CPU starvation / heartbeat jitter), NOT proof
+                // that the peers died.  Failing over here would install ISR<minIsr →
+                // permanent MinIsrViolation → every acks=all produce rejected (the
+                // startup collapse: node1 becomeLeader isr.size=1).  Keep the current
+                // leader and re-converge when a majority returns (a later cycle whose
+                // groupIsr ≥ minIsr does the real failover).  Idempotent, converges for
+                // ANY jitter window, no tuned grace.  A FULLY empty groupIsr (total
+                // loss) still falls through to the NO_LEADER safety path below.
+                if (!groupIsr.empty() &&
+                    groupIsr.size() < static_cast<std::size_t>(in.minIsr)) {
+                    continue;  // below commit quorum → do not fail over this partition
                 }
 
                 if (groupIsr.empty()) {
@@ -324,17 +383,23 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 if (!driverCur || driverCur->replicas.empty()) continue;
                 const int32_t candidate = driverCur->replicas[0];
 
-                // ── Safety: the candidate must be in EVERY member's ISR ∩ liveNodes.
+                // ── Safety: the candidate must be safe leader for EVERY member.
                 //
                 // Preferred-leader is a best-effort optimisation, not a safety op.
-                // If the group can't move as a unit safely (candidate missing from any
-                // member's ISR or not live), skip the whole group — don't move it.
+                // "Safe" = live AND holds the committed prefix for that member —
+                // either already in the member's ISR, OR restorable (caught up per
+                // positions / RF==N) after a transient-liveness collapse dropped it
+                // from the ISR.  Restoration re-seeds the ISR in the emit path below.
+                // If it can't move as a unit safely, skip the whole group.
                 // ─────────────────────────────────────────────────────────────────────
                 bool safeForAll = isIn(candidate, in.liveNodes);
                 if (safeForAll) {
                     for (const TopicSpec* ts : members) {
                         const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
-                        if (!mc || !isIn(candidate, mc->isr)) {
+                        if (!mc) { safeForAll = false; break; }
+                        const bool inIsr = isIn(candidate, mc->isr);
+                        if (!inIsr &&
+                            !restorable(ts->topicId, p, candidate, mc->leaderNode)) {
                             safeForAll = false;
                             break;
                         }
@@ -373,8 +438,32 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     chg.newIsr      = std::move(newIsr);
                     chg.newReplicas = {};  // replica set unchanged
                 } else {
-                    // Preferred-leader: ISR unchanged (leader is already in ISR).
-                    chg.newIsr      = {};
+                    // Preferred-leader.
+                    if (isIn(computedLeader, cur->isr)) {
+                        // Normal case: elected leader already in ISR → ISR unchanged.
+                        chg.newIsr      = {};
+                    } else {
+                        // Restoration from a collapsed ISR (transient-liveness recovery):
+                        // the elected leader was dropped from the ISR during the earlier
+                        // failover shrink.  Re-seed a healthy ISR = {newLeader} ∪ the live
+                        // restorable replicas (caught up per positions / RF==N), so the
+                        // leader is in its own ISR and the set reaches minIsr again.  The
+                        // data-plane IsrManager maintains it from here.
+                        std::vector<int32_t> newIsr;
+                        newIsr.push_back(computedLeader);
+                        for (int32_t node : cur->replicas) {
+                            if (node == computedLeader) continue;
+                            if (isIn(node, in.liveNodes) &&
+                                restorable(ts->topicId, p, node, cur->leaderNode))
+                                newIsr.push_back(node);
+                        }
+                        // Retain any current ISR members still live but not already added
+                        // (e.g. the survivor that has been leading).
+                        for (int32_t node : cur->isr)
+                            if (!isIn(node, newIsr) && isIn(node, in.liveNodes))
+                                newIsr.push_back(node);
+                        chg.newIsr = std::move(newIsr);
+                    }
                     chg.newReplicas = {};
                 }
 

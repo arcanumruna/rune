@@ -58,6 +58,14 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 #   docker build --build-context rune-protocol=../rune-protocol ...
 COPY --from=rune-protocol include /rune-protocol/include
 
+# ── rune-fr flight recorder sibling (compiled: src + include) ─────────────────
+# The root CMakeLists wires add_library(rune_fr ...) from ${SRC}/../rune-fr, which
+# from WORKDIR /build resolves to /rune-fr.  Unlike rune-protocol (headers only),
+# rune-fr is COMPILED, so copy BOTH its sources and headers.  Supplied via the
+# BuildKit named build context `rune-fr` (see docker-compose additional_contexts).
+COPY --from=rune-fr src     /rune-fr/src
+COPY --from=rune-fr include /rune-fr/include
+
 # ── Application sources (copied last so edits don't bust the conan cache) ─────
 COPY . .
 

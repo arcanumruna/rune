@@ -182,6 +182,13 @@ public:
         return highWatermark();
     }
 
+    /// The leader's latest known LEO per follower (from updateFollowerFetchOffset).
+    /// Read on the DUTY thread only (used by publishCleanerState() to mirror the
+    /// leader's view of follower positions into the controller position snapshot).
+    [[nodiscard]] const std::unordered_map<NodeId, Offset>& followerLeos() const noexcept {
+        return followerLeo_;
+    }
+
     /// Return the leader's current logEndOffset.
     Offset leaderLogEndOffset() const noexcept { return leaderLeo_; }
 

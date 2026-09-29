@@ -31,6 +31,7 @@
 #include <rune/consensus/ClusterMember.h>
 #include <rune/consensus/ConsensusPublisher.h>
 #include <rune/consensus/ElectionState.h>
+#include <rune/consensus/FollowerLiveness.h>
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/Types.h>
@@ -322,9 +323,17 @@ private:
     // INT64_MIN sentinel = "no leader heartbeat observed yet" — the timeout is
     // only armed once a follower has actually accepted a leader, so a node that
     // has never had a leader (still canvassing) is not force-re-canvassed.
-    int64_t timeOfLastLeaderUpdateNs_ = INT64_MIN;
-    // Derived in the constructor from the election timing parameters.
+    // Derived in the constructor from the election timing parameters.  Kept as a
+    // field because the PUBLIC leaderHeartbeatTimeoutNs() accessor exposes it (the
+    // failover eligible-set window is 3× this) and the ctor feeds it to
+    // followerLiveness_.configure().
     int64_t leaderHeartbeatTimeoutNs_ = 0;
+
+    // Steady-state (CLOSED) follower duties as ONE state machine that OWNS its
+    // clocks — the periodic AppendPosition-to-leader send AND dead-leader
+    // detection.  Replaces the former scattered timeOfLastLeaderUpdateNs_ /
+    // timeOfLastAppendPositionSentNs_ fields.  See FollowerLiveness.h.
+    FollowerLiveness followerLiveness_;
 
     // Log position fields — Election.java:85-87
     int64_t logPosition_             = 0;

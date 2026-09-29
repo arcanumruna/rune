@@ -194,23 +194,100 @@ public:
                 // steady eligible set emits nothing.
                 //
                 // ALLOCATION-FREE per cycle: the liveness poll fills a fixed stack
-                // buffer (no std::vector return); a heap vector is built ONLY on an
-                // actual change (rare) to hand to the balancer.
+                // buffer (no std::vector return); the eligible vector handed to the
+                // balancer is a REUSED member (capacity persists → no steady-state
+                // heap alloc).
                 const int64_t failoverTimeoutNs =
                     3 * election_->leaderHeartbeatTimeoutNs();
                 const std::size_t n = election_->eligibleNodeIds(
                     nowNs, failoverTimeoutNs, eligBuf_.data(), eligBuf_.size());
 
+                // Track eligible-set changes (kept for diagnostics / future gating).
                 const bool changed =
                     !prevEligInit_ || n != prevEligLen_ ||
                     !std::equal(eligBuf_.begin(), eligBuf_.begin() + n,
                                 prevEligBuf_.begin());
-                if (changed && n > 0) {
-                    // Rare path (eligible-set change) — heap vector is acceptable here.
-                    std::vector<rune::metadata::NodeId> eligible(
-                        eligBuf_.begin(), eligBuf_.begin() + n);
-                    work += static_cast<int>(
-                        metadataService_->reassignDeadPartitionLeaders(eligible));
+                // TEMP control-plane churn diagnostic (RUNE_CTRL_LOG=1).
+                static const bool kCtrlLog = ::getenv("RUNE_CTRL_LOG") != nullptr;
+                if (kCtrlLog) {
+                    const int32_t curLeader = election_->leaderMemberId();
+                    const int64_t curTerm   = (int64_t)election_->leadershipTermId();
+                    if (changed || curLeader != dbgLastLeader_ || curTerm != dbgLastTerm_) {
+                        char eb[256]; int off = 0;
+                        for (std::size_t i = 0; i < n && off < 240; ++i)
+                            off += std::snprintf(eb + off, sizeof(eb) - off, "%d ",
+                                                 (int)eligBuf_[i]);
+                        eb[off] = '\0';
+                        std::fprintf(stderr,
+                            "[CTRL] t=%lldms consensusLeader=%d term=%lld eligN=%zu elig=[%s] "
+                            "(prevLeader=%d prevTerm=%lld changed=%d)\n",
+                            (long long)(nowNs / 1'000'000), (int)curLeader,
+                            (long long)curTerm, n, eb, (int)dbgLastLeader_,
+                            (long long)dbgLastTerm_, (int)changed);
+                        dbgLastLeader_ = curLeader;
+                        dbgLastTerm_   = curTerm;
+                    }
+                }
+                if (n > 0) {
+                    // Refresh the controller's ReplicaPositionTable from the worker-
+                    // published, race-free controller position snapshots BEFORE the
+                    // rebalance runs, so the DynamicBalancer decides leadership
+                    // restoration off POSITIONS (a returned replica caught up to the
+                    // leader's LEO) rather than a heartbeat-timeout race.  Acquire-load
+                    // only — no access to live worker-owned state.
+                    //
+                    // CONVERGENCE (time-independent): we run the refresh + idempotent
+                    // reassign EVERY duty cycle, not only on an eligible-set change.
+                    // A returned replica's position becomes visible some cycles AFTER
+                    // it re-enters the eligible set (the leader must observe its next
+                    // fetch), so a one-shot on-change reassign would miss the
+                    // restoration and leave the ISR permanently collapsed for those
+                    // partitions.  reassign is idempotent (emits nothing once every
+                    // partition has a live, in-ISR leader), so re-running each cycle
+                    // costs an O(partitions) no-op at steady state and converges for
+                    // ANY position-arrival ordering, with no tuned grace window.
+                    if (registry_ && metadataService_) {
+                        for (auto* replica : registry_->allReplicas()) {
+                            if (!replica) continue;
+                            const int32_t ep = replica->controllerLeaderEpoch();
+                            if (ep < 0) continue;  // never published yet
+                            const int32_t tid  = replica->topicId();
+                            const int32_t part = replica->partitionId();
+                            for (int32_t node = 0;
+                                 node < rune::replication::PartitionReplica::kMaxControllerNodes;
+                                 ++node) {
+                                const auto leo = replica->controllerReplicaLeo(node);
+                                if (leo < 0) continue;  // unknown for this node
+                                metadataService_->reportReplicaPosition(
+                                    tid, part, node, ep, leo);
+                            }
+                        }
+                    }
+                    eligibleScratch_.assign(eligBuf_.begin(), eligBuf_.begin() + n);
+                    // Two-speed convergence:
+                    //   • EVERY cycle → FAILOVER-ONLY (maxPreferred=0): fail a
+                    //     genuinely-unavailable leader over to a survivor and re-seed/
+                    //     expand the ISR.  Idempotent, no churn.
+                    //   • On an eligible-set CHANGE (rare) → also allow the PREFERRED-
+                    //     LEADER BALANCE pass (maxPreferred>0) so leadership SPREADS
+                    //     back off the survivor once nodes return — otherwise all
+                    //     partitions stay collapsed on the single consensus leader and
+                    //     that one node's followers can't sustain the produce rate
+                    //     (throughput bottleneck).  Gating balance to on-change (not
+                    //     every cycle) keeps it from oscillating against a heartbeat-
+                    //     flapping node while still re-spreading load when the set is
+                    //     stable.  restorable()/position-gating keeps every move safe.
+                    const int maxPref = changed ? 1024 : 0;
+                    const std::size_t emitted =
+                        metadataService_->reassignDeadPartitionLeaders(
+                            eligibleScratch_, maxPref);
+                    if (kCtrlLog && emitted > 0)
+                        std::fprintf(stderr,
+                            "[CTRL] t=%lldms REASSIGN emitted=%zu records "
+                            "(maxPref=%d eligN=%zu) — a partition leader was deemed "
+                            "dead/rebalanced\n",
+                            (long long)(nowNs / 1'000'000), emitted, maxPref, n);
+                    work += static_cast<int>(emitted);
                     std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
                               prevEligBuf_.begin());
                     prevEligLen_  = n;
@@ -541,6 +618,13 @@ private:
     std::array<rune::metadata::NodeId, kMaxClusterNodes> prevEligBuf_{};  // last set that drove a rebalance
     std::size_t                                       prevEligLen_  = 0;
     bool                                              prevEligInit_ = false;
+    // TEMP control-plane diagnostics (RUNE_CTRL_LOG): last-seen consensus
+    // leader/term so we log only on change.  Remove once churn is fixed.
+    int32_t                                           dbgLastLeader_ = -2;
+    int64_t                                           dbgLastTerm_   = -2;
+    // Reused every cycle for the idempotent convergence reassign (capacity persists
+    // after warmup → no steady-state heap alloc).
+    std::vector<rune::metadata::NodeId>               eligibleScratch_{};
     ReplicationMetadataBridge*                         bridge_;     // non-owning; null-safe
     rune::replication::AeronPartitionTransport*        transport_;  // non-owning; null-safe
     ReplicaRegistry*                                   registry_;   // non-owning; null-safe

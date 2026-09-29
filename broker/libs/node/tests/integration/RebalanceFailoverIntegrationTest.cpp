@@ -365,6 +365,20 @@ TEST(RebalanceFailover, NodeDeath_NoCommittedLoss_AllInSync) {
     runNoCommittedLossFailover(DurabilityMode::AllInSync, /*minIsr=*/3, "all-in-sync");
 }
 
+// REGRESSION (DR-BUG-3 × DR-BUG-6 interaction): after an AllInSync leader death,
+// the new leader seeds lastHealthyHw_ from its OWN follower-view committed HW,
+// which may LAG the true committed point (it had not observed the last commit when
+// the old leader died).  Post-failover the survivor ISR (2) sits below minIsr=RF
+// (3), so the DR-BUG-3 min-ISR gate clamps the served HW to that stale floor —
+// leaving an already-committed record hidden FOREVER (HW stuck one short of
+// committedHw, drive() stalls after 4000 iters).  Fixed by raising lastHealthyHw_
+// to the recovered majorityCommittedFrontier when leadership completes.  This test
+// is the AllInSync failover path that reproduced the stall.
+TEST(RebalanceFailoverRegression, AllInSyncFailoverRecoversStaleHealthyFloor) {
+    runNoCommittedLossFailover(DurabilityMode::AllInSync, /*minIsr=*/3,
+                               "all-in-sync-regression");
+}
+
 // ---------------------------------------------------------------------------
 // Apply-determinism: the SAME encoded ControlTickRecord bytes applied on all 3
 // nodes' MSMs yield IDENTICAL resulting assignment state, and tickSeq is

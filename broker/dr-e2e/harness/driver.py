@@ -26,6 +26,7 @@ output, and returns a `GroupResults` the group-invariant assertions consume.
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import re
 import time
 import uuid
@@ -34,7 +35,9 @@ from typing import Optional
 
 from .dockerutil import run
 
-DR_IMAGE = "rune-dr-client:dev"
+# Client image tag is overridable so each work-context uses a UNIQUE tag (never a
+# generic :dev/:latest that silently overwrites a baseline).  Set DR_CLIENT_IMAGE.
+DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", "rune-dr-client:dev")
 
 _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")

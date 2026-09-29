@@ -56,10 +56,27 @@
 #include <unistd.h>
 #include <vector>
 
+#include <sys/resource.h>   // getrlimit/setrlimit — fd-limit raise for fd-heavy tests
+
 namespace fs = std::filesystem;
 using namespace rune::replication;
 using namespace rune::storage;
 using namespace rune::protocol;
+
+// Fd-heavy stress tests here roll thousands of tiny segments across many partitions;
+// each live segment consumes an fd, exceeding the default soft RLIMIT_NOFILE
+// (commonly 1024) → an open() throws mid-run ("open failed: ...index").  Raise the
+// soft limit to the hard limit once for this test binary so the stress exercises the
+// churn it intends, not the ambient fd ceiling (raising soft up to hard is
+// unprivileged; as root the hard limit is already high).
+static const bool g_compaction_stress_fd_limit_raised = [] {
+    struct ::rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        ::setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    return true;
+}();
 using namespace std::chrono_literals;
 
 // ---------------------------------------------------------------------------

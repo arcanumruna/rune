@@ -317,3 +317,220 @@ TEST(DynamicBalancer, SkipNoOpForAlreadyOptimalPartition) {
     auto recs = bal.rebalance(in);
     EXPECT_TRUE(recs.empty()) << "node 1 still live+in ISR → min-churn → no records";
 }
+
+// ---------------------------------------------------------------------------
+// REPRO (bug): transient multi-node heartbeat expiry on the 3-node bench VM
+// collapses every partition onto the sole surviving eligible node with the ISR
+// shrunk to {survivor}.  When the expired nodes return AND have fully caught up,
+// leadership must RE-CONVERGE (spread back toward the preferred replicas) so
+// acks=majority can commit again.  It does not today: preferred-leader
+// restoration is gated on stale-ISR membership (the returned nodes were dropped
+// from the ISR during the failover shrink), so leadership stays pinned on the
+// survivor forever and HW is stuck below minIsr.  The fix converges off the
+// ReplicaPositionTable (a caught-up live replica is restorable) — time-independent,
+// ISR/position-based, idempotent.  See [[rune-followersync-state-machine]].
+// ---------------------------------------------------------------------------
+// NOTE: suite name ends in "Regression" so the whole growing regression set is
+// runnable via --gtest_filter='*Regression*'.  See [[mark-regression-tests-as-suite]].
+TEST(DynamicBalancerRegression, RestoresLeadershipAfterIsrCollapseWhenReplicaCaughtUp) {
+    AssignmentMap m;
+    // Post-collapse state: 3 partitions all pinned on the survivor (node 1) with
+    // ISR shrunk to {1}.  Preferred replica (replicas[0]) is 0, 1, 2 respectively.
+    for (int p = 0; p < 3; ++p) {
+        PartitionAssignment a;
+        a.leaderNode    = 1;
+        a.isr           = {1};                          // collapsed
+        a.replicas      = {p, (p + 1) % 3, (p + 2) % 3}; // preferred = p
+        a.leaderEpoch   = 5;
+        a.partitionEpoch = 9;
+        m.put(7, p, a);
+    }
+    // All three replicas have returned and fully caught up to the SAME frontier.
+    ReplicaPositionTable pos;
+    for (int p = 0; p < 3; ++p)
+        for (int n = 0; n < 3; ++n)
+            pos.report({/*topic=*/7, /*part=*/p, /*node=*/n, /*epoch=*/5, /*leo=*/1000});
+
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {0, 1, 2}; in.positions = &pos;
+    in.topics = { TopicSpec{7, 3, 3, "", ""} };
+
+    auto recs = bal.rebalance(in);
+
+    // Partitions 0 and 2 are led by the wrong node (1); their caught-up preferred
+    // replicas (0 and 2) must be restored → at least 2 leadership records off node 1.
+    int restoredOffSurvivor = 0;
+    for (auto& r : recs) if (r.rec.leaderNode != 1) ++restoredOffSurvivor;
+    EXPECT_GE(restoredOffSurvivor, 2)
+        << "leadership must re-converge to caught-up preferred replicas after an ISR "
+           "collapse; emitted " << recs.size() << " records";
+}
+
+// SAFETY GUARD for the fix above: a returned replica that is NOT caught up (its
+// reported position lags the leader's frontier) must NEVER be elected leader —
+// electing outside the committed frontier would lose acknowledged data.  This
+// keeps the position-based restoration honest (it must gate on real catch-up, not
+// blindly restore any live preferred replica).
+TEST(DynamicBalancerRegression, DoesNotRestoreLeadershipToLaggingReplica) {
+    AssignmentMap m;
+    PartitionAssignment a;
+    a.leaderNode    = 1;
+    a.isr           = {1};                 // collapsed onto survivor
+    a.replicas      = {0, 1, 2};           // preferred = 0
+    a.leaderEpoch   = 5;
+    a.partitionEpoch = 9;
+    m.put(7, 0, a);
+
+    ReplicaPositionTable pos;
+    pos.report({7, 0, 1, 5, 1000});        // survivor/leader frontier = 1000
+    pos.report({7, 0, 0, 5,  400});        // preferred node 0 is BEHIND (not caught up)
+    pos.report({7, 0, 2, 5, 1000});        // node 2 caught up
+
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {0, 1, 2}; in.positions = &pos;
+    in.topics = { TopicSpec{7, 1, 3, "", ""} };
+
+    auto recs = bal.rebalance(in);
+    for (auto& r : recs)
+        EXPECT_NE(r.rec.leaderNode, 0)
+            << "a lagging replica (node 0, leo=400 < 1000) must not be elected leader";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REGRESSION SUITE — minIsr failover floor (startup-collapse fix).
+//
+// Bug (found via e2e on a contended 4-core VM): under transient CPU-starvation
+// heartbeat jitter, the metadata controller's eligible set momentarily shrank to
+// a single node.  A FAILOVER then elected that node with a collapsed ISR of size
+// 1 (< minIsr=2) — a permanent MinIsrViolation, so every acks=all produce was
+// rejected and throughput collapsed (23–1684 rps, p99 ≈ 9 s).  Evidence:
+//   node0 becomeLeader epoch=0 isr.size=3   (clean start)
+//   node1 becomeLeader epoch=1 isr.size=1   (failover installs ISR<minIsr → dead)
+//
+// Fix: DynamicBalancerInputs::minIsr — a failover never installs an ISR below the
+// commit quorum.  A partial in-sync set (0 < |ISR∩live| < minIsr) is treated as
+// transient isolation of the OBSERVER, not death of the peers: keep the current
+// leader and re-converge when a majority returns (time-independent, any window).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A single momentarily-eligible node must NOT seize leadership with ISR<minIsr.
+TEST(DynamicBalancerRegression, NoFailoverBelowMinIsrOnTransientIsolation) {
+    AssignmentMap m;
+    // part0: healthy 3-node assignment, node 0 leads, ISR = replicas = {0,1,2}.
+    m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, /*leaderEpoch=*/0,
+                                    /*partitionEpoch=*/0});
+    ReplicaPositionTable pos;
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m;
+    in.liveNodes = {1};          // ONLY node 1 eligible this cycle (0 and 2 jittered out)
+    in.positions = &pos;
+    in.minIsr = 2;               // cluster-majority commit quorum
+    in.topics = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    // Old (buggy) behaviour: fail over to node 1 with ISR={1} (size 1 < 2).
+    // Fixed behaviour: below the quorum floor → no reassignment; node 0 kept.
+    EXPECT_TRUE(recs.empty())
+        << "transient single-eligible must NOT install an ISR below minIsr; "
+           "keep current leader and converge when a majority returns";
+}
+
+// Once a MAJORITY is eligible again, the genuine failover proceeds and installs
+// an ISR at or above the quorum floor — availability is preserved for real death.
+TEST(DynamicBalancerRegression, FailoverProceedsWhenQuorumEligible) {
+    AssignmentMap m;
+    // part0: node 0 is the (dead) leader; nodes 1,2 survive in ISR.
+    m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, 0, 0});
+    ReplicaPositionTable pos;
+    pos.report({7,0,1,0,100});
+    pos.report({7,0,2,0,100});
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m;
+    in.liveNodes = {1,2};        // node 0 genuinely gone; a majority remains
+    in.positions = &pos;
+    in.minIsr = 2;
+    in.topics = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    ASSERT_FALSE(recs.empty()) << "a real crash with quorum live MUST fail over";
+    for (auto& r : recs) {
+        EXPECT_NE(r.rec.leaderNode, NO_LEADER);
+        EXPECT_NE(r.rec.leaderNode, 0) << "dead node must not be re-elected";
+        EXPECT_GE(r.isr.size(), static_cast<std::size_t>(in.minIsr))
+            << "failover ISR must meet the commit-quorum floor";
+    }
+}
+
+// A leader that lost consensus eligibility (heartbeat starved under load) but is
+// DEMONSTRABLY ALIVE via the data plane (its partition frontier advanced → listed
+// in dataPlaneAliveLeaders) must NOT be failed over — the acks=all churn fix.
+TEST(DynamicBalancerRegression, NoFailoverOfDataPlaneAliveLeaderDespiteHeartbeatLapse) {
+    AssignmentMap m;
+    // part0: node 0 leads, healthy 3-node ISR.
+    m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, 0, 0});
+    ReplicaPositionTable pos;
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m;
+    in.liveNodes = {1,2};                 // node 0 dropped from heartbeat-eligible set
+    in.positions = &pos;
+    in.minIsr = 2;
+    in.dataPlaneAliveLeaders = {0};       // ...but node 0's partition is still advancing
+    in.topics = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    EXPECT_TRUE(recs.empty())
+        << "a data-plane-alive leader (frontier advancing) must not be failed over "
+           "on a transient heartbeat lapse — that is the leadership-churn bug";
+}
+
+// Control: the SAME heartbeat lapse WITHOUT data-plane liveness (leader genuinely
+// silent, not in dataPlaneAliveLeaders) DOES fail over — real crash still handled.
+TEST(DynamicBalancerRegression, FailoverWhenLeaderNeitherEligibleNorDataPlaneAlive) {
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, 0, 0});
+    ReplicaPositionTable pos;
+    pos.report({7,0,1,0,100});
+    pos.report({7,0,2,0,100});
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m;
+    in.liveNodes = {1,2};
+    in.positions = &pos;
+    in.minIsr = 2;
+    // dataPlaneAliveLeaders left empty → node 0 is genuinely gone
+    in.topics = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    ASSERT_FALSE(recs.empty()) << "a truly-dead leader (frozen frontier) MUST fail over";
+    for (auto& r : recs) {
+        EXPECT_NE(r.rec.leaderNode, 0);
+        EXPECT_GE(r.isr.size(), static_cast<std::size_t>(in.minIsr));
+    }
+}
+
+// Default minIsr (1) preserves single-survivor failover for callers that don't
+// set it — guards against the floor accidentally blocking legitimate last-node
+// promotion (RF==N total-loss-but-one recovery).
+TEST(DynamicBalancerRegression, DefaultMinIsrOnePreservesSingleSurvivorFailover) {
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, 0, 0});
+    ReplicaPositionTable pos;
+    pos.report({7,0,2,0,100});
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m;
+    in.liveNodes = {2};          // only node 2 survives
+    in.positions = &pos;
+    // in.minIsr left at its default (1)
+    in.topics = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    ASSERT_FALSE(recs.empty()) << "default minIsr=1 must still fail over to lone survivor";
+    for (auto& r : recs)
+        EXPECT_EQ(r.rec.leaderNode, 2);
+}

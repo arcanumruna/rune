@@ -1798,23 +1798,35 @@ TEST(ElectionLog, ClosedFollower_NoHeartbeatBroadcast_ButLivenessRearmed) {
 
     pub.clear();
 
-    // The follower now arms the leader-liveness deadline (it accepted leader 1).
-    EXPECT_NE(e.nextDeadlineNs(), INT64_MIN)
-        << "follower in CLOSED must arm a leader-liveness deadline";
+    // The follower is now armed.  Its FIRST duty is an immediate AppendPosition
+    // send (nextDeadlineNs()==INT64_MIN means "act now"); after the first send the
+    // next deadline becomes a real future time (min of next-send / leader-expiry).
+    e.doWork(nowNs);   // perform the immediate first AppendPosition send
+    EXPECT_FALSE(pub.appendPositionCalls.empty())
+        << "follower in CLOSED must send its AppendPosition to the leader";
+    EXPECT_GT(e.nextDeadlineNs(), nowNs)
+        << "after the first send the follower schedules a future send/liveness deadline";
+    pub.clear();
 
-    // While the leader keeps sending CommitPosition heartbeats, the follower
-    // stays in CLOSED and emits NO NLT of its own.
+    // While the leader keeps sending CommitPosition heartbeats, the follower stays
+    // in CLOSED and emits NO NLT of its own — BUT it MUST periodically publish its
+    // OWN AppendPosition back to the leader so the leader's per-member liveness
+    // (eligibleNodeIds → partition failover) never goes stale.  Omitting this
+    // collapsed the eligible set and broke failover + churned throughput; the
+    // FollowerLiveness SM now drives one send per status interval.
     for (int i = 0; i < 5; ++i) {
         nowNs += kStatusIntervalNs + 1;
         e.onCommitPosition(nowNs, /*leadershipTermId=*/1, 0, /*leaderMemberId=*/1);
-        int work = e.doWork(nowNs);
-        EXPECT_EQ(work, 0)
-            << "live-leader follower CLOSED doWork must return 0 at step " << i;
+        e.doWork(nowNs);
         EXPECT_EQ(e.state(), ElectionState::Closed)
             << "follower must stay CLOSED while leader heartbeats arrive";
     }
     EXPECT_TRUE(pub.nltCalls.empty())
         << "follower in CLOSED must never emit NLT (only the leader broadcasts)";
+    EXPECT_FALSE(pub.appendPositionCalls.empty())
+        << "REGRESSION: follower in CLOSED MUST periodically publish its "
+           "AppendPosition to the leader (keeps leader liveness / eligibleNodeIds "
+           "fresh — the failover-eligibility + throughput-churn fix)";
 }
 
 // CB-5: dead-leader detection — a follower in CLOSED whose leader goes silent
@@ -1836,11 +1848,10 @@ TEST(ElectionLog, ClosedFollower_DeadLeader_ReCanvasses) {
     ASSERT_EQ(e.state(), ElectionState::Closed);
     ASSERT_EQ(e.leaderMemberId(), 1);
 
-    // Leader dies: no more heartbeats.  Advance past the liveness timeout
-    // (max(electionTimeout, 3*statusInterval) = 150ms in this test config).
-    const int64_t deadline = e.nextDeadlineNs();
-    ASSERT_NE(deadline, INT64_MIN);
-    nowNs = deadline + 1;
+    // Leader dies: no more heartbeats.  nextDeadlineNs() is now the sooner of the
+    // periodic AppendPosition-send deadline and the leader-liveness expiry, so
+    // advance WELL past the leader-heartbeat timeout explicitly to force detection.
+    nowNs += 10 * e.leaderHeartbeatTimeoutNs();
     int work = e.doWork(nowNs);
 
     EXPECT_GT(work, 0) << "silent-leader timeout must produce work (re-canvass)";
@@ -1878,4 +1889,61 @@ TEST(ElectionLog, PartB8b_C5_PassthroughGuard_LeaderReplay_PositivePath) {
     EXPECT_NE(e.state(), ElectionState::LeaderLogReplication)
         << "B-8b/C5: leaderReplay pass-through (logPos==appendPos) must advance past "
            "LeaderLogReplication without triggering the PHASE-2-DEFERRED assert";
+}
+
+// ===========================================================================
+// REGRESSION: become-leader liveness grace (acks=all leadership-churn fix).
+//
+// Bug (found via e2e on the 4-core VM): a busy single-partition leader (node0)
+// starved its own consensus heartbeat and lost leadership.  The new leader
+// (node1) closed its election on quorum = {self, node2} WITHOUT node0 ever
+// sending an AppendPosition for the new term, so node0's clock stayed at the
+// INT64_MIN sentinel → isActive()==false → eligibleNodeIds() reported node0
+// dead → the DynamicBalancer failed node0's partition over to node1 while the
+// still-alive node0 was wrongly excluded (leadership churn / throughput dip).
+//
+// Fix: electionComplete() seeds every OTHER member's timeOfLastAppendPositionNs
+// to `nowNs` when THIS node becomes leader — one full timeout window of grace
+// for a peer to report before it can be judged dead.  Time-independent: any
+// window converges; a live peer reports within it, a dead one never does.
+// ===========================================================================
+TEST(ElectionLogRegression, BecomeLeaderGrantsLivenessGraceToSilentPeer) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+
+    // Node 0 is self.  Win the election via canvass+votes from BOTH peers (votes
+    // do NOT set the append-position liveness clock — only onAppendPosition does),
+    // then close the leader phase on an AppendPosition quorum of {self, node2}
+    // ONLY.  node1 (the busy/lagging peer) votes but NEVER sends an AppendPosition
+    // for this term → its liveness clock stays at the INT64_MIN sentinel, exactly
+    // reproducing the production scenario.
+    auto e = makeElection(makeMembers3(0), /*self=*/0, pub, nsf, tl);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+    ASSERT_TRUE(driveLeaderToClosed(e, nowNs, pub, /*followerIds=*/{2}))
+        << "leader must close on self+node2 majority without node1's AppendPosition";
+    ASSERT_EQ(e.leaderMemberId(), 0) << "node 0 must be the leader";
+
+    // Immediately after becoming leader, node1 has sent nothing this term.  With
+    // the grace seed it must STILL be eligible (benefit of the doubt for one
+    // window); without the fix it would be excluded → false failover.
+    NodeId out[8];
+    std::size_t n = e.eligibleNodeIds(nowNs, kElectionTimeoutNs, out, 8);
+    std::vector<NodeId> elig(out, out + n);
+    EXPECT_NE(std::find(elig.begin(), elig.end(), 1), elig.end())
+        << "silent peer node1 must be granted liveness grace at leader handover, "
+           "not immediately declared dead (the churn bug)";
+    EXPECT_EQ(n, 3u) << "all three members eligible within the grace window";
+
+    // The grace is a WINDOW, not permanent: after the timeout elapses with no
+    // report from node1, it drops out — real crash-failover is preserved.
+    int64_t later = nowNs + 2 * kElectionTimeoutNs;
+    std::size_t n2 = e.eligibleNodeIds(later, kElectionTimeoutNs, out, 8);
+    std::vector<NodeId> elig2(out, out + n2);
+    EXPECT_EQ(std::find(elig2.begin(), elig2.end(), 1), elig2.end())
+        << "after the grace window with no heartbeat, a genuinely silent peer "
+           "MUST expire so real failover still fires";
 }

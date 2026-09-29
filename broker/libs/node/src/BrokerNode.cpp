@@ -452,7 +452,7 @@ void BrokerNode::buildReplication() {
             pcfg.partitionId          = static_cast<PartitionId>(part);
             pcfg.selfId               = selfId;
             pcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;  // GR-5: configurable
-            pcfg.replicaLagMaxOffset  = 10'000;
+            pcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
             pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
@@ -886,7 +886,7 @@ void BrokerNode::buildGateway() {
             // the first offset commit succeeds.
             ocfg.minIsr               = 1;
             ocfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            ocfg.replicaLagMaxOffset  = 10'000;
+            ocfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             ocfg.fetchIntervalNs      = config_.fetchIntervalNs;
             ocfg.isrCheckIntervalNs   = 10'000'000LL;
             ocfg.maxFetchBytes        = 1 << 20;
@@ -998,7 +998,7 @@ void BrokerNode::buildGateway() {
             tcfg.selfId               = selfId;
             tcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
             tcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            tcfg.replicaLagMaxOffset  = 10'000;
+            tcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             tcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             tcfg.isrCheckIntervalNs   = 10'000'000LL;
             tcfg.maxFetchBytes        = 1 << 20;
@@ -1124,7 +1124,7 @@ void BrokerNode::buildGateway() {
             // is wired end-to-end.
             mcfg.minIsr               = 1;
             mcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
-            mcfg.replicaLagMaxOffset  = 10'000;
+            mcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             mcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             mcfg.isrCheckIntervalNs   = 10'000'000LL;
             mcfg.maxFetchBytes        = 1 << 20;
@@ -1209,10 +1209,17 @@ void BrokerNode::buildGateway() {
                     balancerNodes.push_back(static_cast<rune::metadata::NodeId>(nid));
                 }
                 metadataService_->configure(balancerTopics, balancerNodes);
+                // Commit-quorum failover floor: a partition failover must never
+                // install an ISR below the same minIsr the gateway enforces for
+                // acks=all — otherwise a transiently-isolated controller seizes
+                // leadership with ISR<minIsr and every produce is rejected (startup
+                // collapse).  See DynamicBalancerInputs::minIsr.
+                metadataService_->setMinIsr(config_.gatewayMinIsr);
                 spdlog::info(
                     "BrokerNode[{}]: MetadataService configured for assignment emit "
-                    "({} user topics, {} nodes)",
-                    nodeId, balancerTopics.size(), balancerNodes.size());
+                    "({} user topics, {} nodes, minIsr={})",
+                    nodeId, balancerTopics.size(), balancerNodes.size(),
+                    config_.gatewayMinIsr);
             }
 
             spdlog::info("BrokerNode[{}]: MetadataService wired (__cluster_metadata at {})",

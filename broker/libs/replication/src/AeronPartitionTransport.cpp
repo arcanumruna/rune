@@ -16,6 +16,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
 
+#include <cstdlib>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -248,6 +249,14 @@ static std::atomic<uint32_t> g_outEnqSeq{0};
 static uint32_t              g_outDrainSeq = 0;
 static uint32_t              g_inRecvSeq   = 0;
 
+// Per-second transport rate diagnostic (control-thread only; RUNE_FS_LOG).
+static bool     g_txRateLog     = [] { const char* e = std::getenv("RUNE_FS_LOG");
+                                       return e == nullptr || e[0] != '0'; }();
+static int64_t  g_txRateLastNs  = 0;
+static int64_t  g_txPolls       = 0;   // poll() calls
+static int64_t  g_txFragsRecv   = 0;   // onFragment invocations (fragments received)
+static int64_t  g_txOutDrained  = 0;   // outbound messages offered to Aeron
+
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
@@ -319,6 +328,7 @@ int AeronPartitionTransport::drainOutbound()
         // corr = monotonic drain seq; k-th drain == k-th enqueue (FIFO) → the gap
         // ReplOutEnqueue(k)→ReplOutDrain(k) is the EXACT worker→control handoff.
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, g_outDrainSeq++);
+        ++g_txOutDrained;
 
         if (target == kBroadcast) {
             for (auto& [nodeId, peer] : peers_) {
@@ -357,7 +367,18 @@ int AeronPartitionTransport::poll(int64_t nowNs)
     // Drain ingress subscription with a CONTROLLED poll so onFragment can apply
     // back-pressure: a fragment whose target worker ring is full returns ABORT and
     // is re-delivered next cycle (not dropped).  See onFragment.
-    work += sub_->controlledPoll(assembler_.handler(), kFragmentLimit);
+    const int fragged = sub_->controlledPoll(assembler_.handler(), kFragmentLimit);
+    work += fragged;
+
+    if (g_txRateLog) {
+        ++g_txPolls;
+        if (g_txRateLastNs == 0) g_txRateLastNs = nowNs;
+        else if (nowNs - g_txRateLastNs >= 1'000'000'000LL) {
+            spdlog::info("TXRATE[node={}] polls/s={} fragsRecv/s={} outDrained/s={}",
+                         selfId_, g_txPolls, g_txFragsRecv, g_txOutDrained);
+            g_txRateLastNs = nowNs; g_txPolls = 0; g_txFragsRecv = 0; g_txOutDrained = 0;
+        }
+    }
     return work;
 }
 
@@ -371,6 +392,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
     aeron::Header&                   /*header*/)
 {
     using Action = aeron::ControlledPollAction;
+    ++g_txFragsRecv;
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
     // CONTINUE = consume this fragment and keep polling (success / skip malformed).
     // ABORT    = leave this fragment UNCONSUMED and stop the poll — Aeron re-delivers
