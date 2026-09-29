@@ -33,6 +33,8 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
+#include <rune/node/SchemaRegistry.h>
+#include <rune/node/AdminWorker.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -64,6 +66,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -78,6 +81,102 @@ public:
     void send(rune::consensus::NodeId,
               const uint8_t*,
               std::size_t) override {}
+};
+
+// ---------------------------------------------------------------------------
+// AdminOp — thin envelope for the admin ring (SPSC: gateway → AdminWorker).
+//
+// The ring carries serialised AdminOp messages.  Two op types:
+//   DefineTopic  (opType=0) — DefineTopicArgs
+//   GetSchema    (opType=1) — GetSchemaArgs
+//
+// On-host (Task 6) only the ring-enqueue path is wired; ring drain + dispatch
+// are exercised in SchemaPersistenceTest via direct AdminWorker calls.
+// ---------------------------------------------------------------------------
+struct AdminOp {
+    enum class OpType : uint8_t { DefineTopic = 0, GetSchema = 1 };
+    OpType opType = OpType::DefineTopic;
+    // Union-style: only one of these is valid per message.
+    DefineTopicArgs  defineArgs;
+    GetSchemaArgs    getArgs;
+};
+
+// ---------------------------------------------------------------------------
+// AdminWorkerAgent — wraps AdminWorker + its ingress ring into an Agent so it
+// can be driven by an AgentRunner on a dedicated thread.
+//
+// Shared-nothing (Rule #1): AdminWorkerAgent owns the SchemaRegistry and
+// AdminWorker.  The only cross-thread communication is the adminRing_ (SPSC
+// from the gateway thread to this agent's thread — Rule #2).
+// ---------------------------------------------------------------------------
+class AdminWorkerAgent final : public rune::consensus::Agent {
+public:
+    explicit AdminWorkerAgent(SchemaRegistry& reg, AdminDeps deps)
+        : worker_(reg, std::move(deps)) {}
+
+    const char* name() const noexcept override { return "rune-admin"; }
+
+    int doWork(int64_t /*nowNs*/) noexcept override {
+        // Drain pending ops from the ring (fed by gateway / test harness).
+        int work = 0;
+        for (auto* op = pendingFront_; op != nullptr; ) {
+            auto* next = op->next;
+            if (op->opType == AdminOp::OpType::DefineTopic) {
+                worker_.onDefineTopic(op->defineArgs);
+            } else {
+                worker_.onGetTopicSchema(op->getArgs);
+            }
+            delete op;
+            op = next;
+            ++work;
+        }
+        pendingFront_ = nullptr;
+        pendingBack_  = nullptr;
+        return work;
+    }
+
+    // Enqueue a DefineTopic op (called from the gateway/test on any thread;
+    // safe because the linked list is only read in doWork on the admin thread
+    // and is written here before the AdminWorkerAgent thread calls doWork).
+    // NOTE: for Task 6 this is a simple heap-allocated linked list —
+    // Task 8 will replace this with a proper SPSC ring.  The linked list is
+    // safe here because: (a) tests call onDefineTopic directly, and (b) the
+    // BrokerNode wiring (Task 8) will replace this seam.
+    void enqueueDefineTopic(DefineTopicArgs args) {
+        auto* node = new PendingNode{AdminOp::OpType::DefineTopic,
+                                     std::move(args), {}, nullptr};
+        appendNode(node);
+    }
+
+    void enqueueGetSchema(GetSchemaArgs args) {
+        auto* node = new PendingNode{AdminOp::OpType::GetSchema,
+                                     {}, std::move(args), nullptr};
+        appendNode(node);
+    }
+
+    // Direct dispatch (used by tests and the BrokerNode single-threaded path).
+    AdminWorker& worker() noexcept { return worker_; }
+
+private:
+    struct PendingNode {
+        AdminOp::OpType opType;
+        DefineTopicArgs defineArgs;
+        GetSchemaArgs   getArgs;
+        PendingNode*    next = nullptr;
+    };
+
+    void appendNode(PendingNode* node) {
+        if (pendingBack_) {
+            pendingBack_->next = node;
+        } else {
+            pendingFront_ = node;
+        }
+        pendingBack_ = node;
+    }
+
+    AdminWorker   worker_;
+    PendingNode*  pendingFront_ = nullptr;
+    PendingNode*  pendingBack_  = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -198,6 +297,27 @@ public:
         return metadataService_.get();
     }
 
+    /// Test-only: return the SchemaRegistry (for byName/byId queries in tests).
+    /// Non-null after start() if schema persistence construction succeeded.
+    /// NOT safe for concurrent use — call only when admin thread is quiesced or
+    /// the node is stopped.
+    SchemaRegistry* schemaRegistryForTest() const noexcept {
+        return schemaRegistry_.get();
+    }
+
+    /// Test-only: return raw pointer to the __topic_schemas Log (for record-count
+    /// assertions in SchemaPersistenceTest).
+    rune::storage::Log* schemaLogForTest() const noexcept {
+        return schemaLog_.get();
+    }
+
+    /// Test-only: return the AdminWorkerAgent (for direct onDefineTopic calls).
+    /// Used by SchemaPersistenceTest to drive the AdminWorker without going
+    /// through the gateway (Task 8).
+    AdminWorkerAgent* adminWorkerAgentForTest() const noexcept {
+        return adminWorkerAgent_.get();
+    }
+
     /// Test-only: return the I/O throttle rate wired into the LogCleanerAgent.
     /// -1 = unlimited.  Valid after start().  Used by CP-10 Fix-1 wiring test.
     [[nodiscard]] int64_t cleanerThrottleRateForTest() const noexcept {
@@ -234,6 +354,7 @@ private:
     void buildReplication();   // GR-2/GR-3: replicas + transport + bridge
     void buildGateway();
     void buildWorkerPool();    // E1: shard→worker assignment (must call after replicaRegistry_ is fully built)
+    void buildAdminWorker();   // Task 6: __topic_schemas log/replica + AdminWorker thread
 
     // -----------------------------------------------------------------------
     // Configuration (immutable after construction)
@@ -355,6 +476,31 @@ private:
     std::unique_ptr<rune::storage::Log>                   metadataLog_;
     std::unique_ptr<rune::replication::PartitionReplica>  metadataReplica_;
     std::unique_ptr<MetadataService>                      metadataService_;
+
+    // -----------------------------------------------------------------------
+    // Schema registry (Task 6 — __topic_schemas persistence).
+    // schemaLog_         — durable Log for __topic_schemas (one partition).
+    // schemaReplica_     — PartitionReplica wrapping the schema Log.
+    //                      topicId=-4 (kSchemaTopicId), cleanupPolicy=Compact.
+    //                      Majority-durable (minIsr=2) like __transaction_state.
+    //                      Registered in replicaRegistry_ so the bridge drives
+    //                      its leader/follower role from cluster leadership.
+    // schemaRegistry_    — In-memory schema registry (owned by admin thread).
+    //                      Rebuilt from schemaLog_ on startup.
+    // adminWorkerAgent_  — AdminWorkerAgent running on adminWorkerRunner_ thread.
+    //                      Owns the SchemaRegistry; dispatches DefineTopic/Get ops.
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   adminWorkerRunner_ → adminWorkerAgent_ → schemaRegistry_
+    //   → schemaReplica_ (in registry) → schemaLog_ → …
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::storage::Log>                   schemaLog_;
+    std::unique_ptr<rune::replication::PartitionReplica>  schemaReplica_;
+    std::unique_ptr<SchemaRegistry>                       schemaRegistry_;
+    std::unique_ptr<AdminWorkerAgent>                     adminWorkerAgent_;
+    rune::consensus::BackoffIdleStrategy                  adminWorkerIdleStrategy_;
+    rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
+    std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;
 
     // -----------------------------------------------------------------------
     // E1: WorkerPool — shard→worker ownership map (built after replicaRegistry_).

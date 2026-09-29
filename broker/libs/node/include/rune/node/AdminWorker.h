@@ -18,7 +18,9 @@ namespace rune::node {
 
 struct AdminDeps {
     // CREATING: create the physical topic partitions (blocking I/O in real impl).
-    std::function<int32_t(int32_t topicId, int32_t partitionCount,
+    // RULING-1: createTopic does NOT take a pre-allocated id; it returns the
+    // authoritative sequential topicId assigned by the registry.
+    std::function<int32_t(int32_t partitionCount,
                           const std::string& name)> createTopic;
 
     // AWAITING_COMMIT: append a durable TopicSchema record; returns true = committed.

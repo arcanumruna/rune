@@ -13,9 +13,13 @@ std::vector<uint8_t> charsBlob() {
 struct Recorder {
     int creates=0, appends=0, pushes=0;
     int32_t lastTopicId=-1; uint16_t lastErr=0xffff;
+    // RULING-1: createTopic no longer receives a pre-allocated id — it returns
+    // the authoritative sequential id from the registry (simulated here as a
+    // monotone counter starting at 0).
+    int32_t nextTopicId = 0;
     AdminDeps make(bool commit=true) {
         AdminDeps d;
-        d.createTopic=[this](int32_t id,int32_t,const std::string&){ ++creates; return id; };
+        d.createTopic=[this](int32_t,const std::string&){ ++creates; return nextTopicId++; };
         d.appendDurable=[this,commit](const TopicSchema&){ ++appends; return commit; };
         d.pushValidators=[this](const RegistryEntry&,int32_t){ ++pushes; };
         d.respondDefine=[this](int64_t,int64_t,int32_t tid,uint16_t,uint16_t e){ lastTopicId=tid; lastErr=e; };
@@ -32,7 +36,8 @@ TEST(AdminWorker, DefineTopicHappyPath) {
     EXPECT_EQ(r.appends,1);
     EXPECT_EQ(r.pushes,1);                       // validate=true → validators pushed
     EXPECT_EQ(r.lastErr,0);                      // OK
-    EXPECT_GE(r.lastTopicId, static_cast<int32_t>(RUNTIME_TOPIC_ID_BASE));
+    // RULING-1: id is the sequential value returned by createTopic (0 for first topic).
+    EXPECT_EQ(r.lastTopicId, 0);
     ASSERT_NE(reg.byName("characters"), nullptr); // registry updated on commit
 }
 

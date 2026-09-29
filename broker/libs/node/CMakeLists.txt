@@ -314,6 +314,32 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 6: SchemaPersistenceTest — __topic_schemas log + AdminWorker wiring.
+    #
+    # Tests (on-host, no Aeron / media driver):
+    #   1. SchemaRecord_LandsInLog
+    #   2. RebuildFromLog_RecoveryAfterRestart
+    #   3. DuplicateDefineTopic_IdempotentOnLog
+    #   4. ValidateTrue_PushValidatorsCalled
+    #   5. Regression_RULING1_TopicIdIsReturnedByCreateTopic
+    #
+    # NOT tested here (Docker-gated / Task 8):
+    #   - majority-durable commit (Aeron follower replicas required)
+    #   - full client DDL e2e (gateway required)
+    # ---------------------------------------------------------------------------
+    add_executable(rune_schema_persistence_tests
+        tests/integration/SchemaPersistenceTest.cpp)
+    target_include_directories(rune_schema_persistence_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_schema_persistence_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_schema_persistence_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
     # tests — 5 test cases:
     #   1. SingleNode: HW-gated visibility.

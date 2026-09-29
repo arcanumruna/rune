@@ -45,8 +45,9 @@ void AdminWorker::onDefineTopic(const DefineTopicArgs& args) {
     }
 
     // ── CREATING ─────────────────────────────────────────────────────────────
-    const int32_t id = reg_.allocateRuntimeId();
-    deps_.createTopic(id, args.partitionCount, args.name);
+    // RULING-1: createTopic returns the authoritative topicId from the registry.
+    // We do NOT pre-allocate via SchemaRegistry::allocateRuntimeId().
+    const int32_t id = deps_.createTopic(args.partitionCount, args.name);
 
     // ── AWAITING_COMMIT ──────────────────────────────────────────────────────
     TopicSchema ts;

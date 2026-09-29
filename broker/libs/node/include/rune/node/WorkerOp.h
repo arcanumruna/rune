@@ -76,6 +76,11 @@ struct WorkerOp {
         // Fire-and-forget (no WorkerReturn): registration/removal only.
         Subscribe,                ///< gateway → worker: register/update a subscription cursor
         Unsubscribe,              ///< gateway → worker: remove a subscription
+        // Task 6 NOTE: SchemaUpdate (admin → worker) is intentionally NOT added to this
+        // SBE-encoded ring enum.  The SBE OpType schema (rune-protocol, frozen) only
+        // defines values 0-11.  Extending the SBE schema is Task 7's responsibility
+        // (T7 adds worker-side consumption of schema validator blobs).  For Task 6,
+        // pushValidators is a stub that logs the intent without enqueueing via the ring.
     };
 
     Type    type    = Type::Produce;
@@ -211,6 +216,10 @@ struct WorkerOp {
     // worker moves it into its own (non-atomic, worker-thread-only) owned_.
     // -----------------------------------------------------------------------
     std::vector<rune::replication::PartitionReplica*> ownedSet;
+
+    // Task 6 NOTE: SchemaUpdatePayload is NOT included here because the SBE
+    // ring encoding (rune-protocol OpType) does not yet have a SchemaUpdate
+    // value.  T7 will extend the SBE schema and add SchemaUpdatePayload here.
 
     // -----------------------------------------------------------------------
     // E5.1.2c: FetchRequest-specific fields (leader handles follower fetch).
