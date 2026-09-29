@@ -76,11 +76,11 @@ struct WorkerOp {
         // Fire-and-forget (no WorkerReturn): registration/removal only.
         Subscribe,                ///< gateway → worker: register/update a subscription cursor
         Unsubscribe,              ///< gateway → worker: remove a subscription
-        // Task 6 NOTE: SchemaUpdate (admin → worker) is intentionally NOT added to this
-        // SBE-encoded ring enum.  The SBE OpType schema (rune-protocol, frozen) only
-        // defines values 0-11.  Extending the SBE schema is Task 7's responsibility
-        // (T7 adds worker-side consumption of schema validator blobs).  For Task 6,
-        // pushValidators is a stub that logs the intent without enqueueing via the ring.
+        // Task 7: admin → worker schema validator push.
+        // Carries topicId (existing scalar) + descriptor blob (tail, TailKind=DESCRIPTOR_BLOB).
+        // Worker builds a local rune::codec::Validator from the blob on its own thread
+        // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
+        SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
     };
 
     Type    type    = Type::Produce;
@@ -217,9 +217,15 @@ struct WorkerOp {
     // -----------------------------------------------------------------------
     std::vector<rune::replication::PartitionReplica*> ownedSet;
 
-    // Task 6 NOTE: SchemaUpdatePayload is NOT included here because the SBE
-    // ring encoding (rune-protocol OpType) does not yet have a SchemaUpdate
-    // value.  T7 will extend the SBE schema and add SchemaUpdatePayload here.
+    // Task 7: SchemaUpdate payload — descriptor blob for a single topic.
+    //
+    // Lifetime: the blob is COPIED into the ring slot at enqueue time
+    // (tryEnqueueOp, via putTail).  The worker reads it zero-copy from the
+    // ring view inside executeSchemaUpdateWire_ on ITS OWN thread.
+    //
+    // topicId is carried in the existing common scalar field (WorkerOp::topicId).
+    // The blob is carried as the variable tail (TailKind = DESCRIPTOR_BLOB).
+    std::vector<uint8_t> schemaUpdateBlob;
 
     // -----------------------------------------------------------------------
     // E5.1.2c: FetchRequest-specific fields (leader handles follower fetch).

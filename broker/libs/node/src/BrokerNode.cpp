@@ -1699,21 +1699,47 @@ void BrokerNode::buildAdminWorker() {
             return base >= 0;
         };
 
-        // pushValidators: Task 6 STUB — logs intent only.
+        // Task 7: pushValidators — enqueue a SchemaUpdate WorkerOp to EVERY
+        // produce worker's ingress ring.
         //
-        // The SBE-encoded worker ring (rune-protocol OpType) does not yet have a
-        // SchemaUpdate opType value (it defines 0-11, PRODUCE..UNSUBSCRIBE).
-        // Extending the SBE schema and adding worker-side consumption is Task 7.
-        // For Task 6, we define the seam: pushValidators records that a schema
-        // validator should be pushed to workers but does not enqueue it.
-        // Task 7 will: (a) extend OpType.sbe with SchemaUpdate=12, (b) add
-        // SchemaUpdatePayload to WorkerOp, (c) add executeSchemaUpdateWire_() to
-        // Worker.h, and (d) replace this stub with the real enqueue path.
-        deps.pushValidators = [](const RegistryEntry& /*entry*/, int32_t topicId) {
+        // Admin→worker hand-off: this lambda is called on the AdminWorker thread
+        // after a DefineTopic DDL commit (validate=true).  It fans out a
+        // SchemaUpdate op to each worker in the pool by calling
+        // worker.tryEnqueueOp().  Each worker builds a local rune::codec::Validator
+        // from the blob on ITS OWN thread (shared-nothing — single-writer per
+        // validators_ map entry).
+        //
+        // Back-pressure: if a worker's ingress ring is full, we log a warning and
+        // skip that worker for this cycle.  The validator will be retried when a
+        // later DefineTopic DDL commit fires (rare admin path — not a problem in
+        // practice, and a full ring means the worker is processing under load).
+        // A TODO(T8) can add a retry queue if needed.
+        //
+        // No blocking: the lambda enqueues and returns.  The worker thread applies
+        // the op the next time it drains its ingress ring.
+        deps.pushValidators = [this](const RegistryEntry& entry, int32_t topicId) {
+            if (!workerPool_) {
+                spdlog::warn(
+                    "BrokerNode: pushValidators — no WorkerPool; "
+                    "validator for topicId={} not pushed", topicId);
+                return;
+            }
+            const int32_t nWorkers = workerPool_->workerCount();
+            for (int32_t i = 0; i < nWorkers; ++i) {
+                WorkerOp op;
+                op.type              = WorkerOp::Type::SchemaUpdate;
+                op.topicId           = topicId;
+                op.schemaUpdateBlob  = entry.descriptorBlob; // copy (admin-path, not hot)
+                if (!workerPool_->worker(i).tryEnqueueOp(std::move(op))) {
+                    spdlog::warn(
+                        "BrokerNode: pushValidators — worker {} ingress ring full; "
+                        "SchemaUpdate for topicId={} dropped (back-pressure)",
+                        i, topicId);
+                }
+            }
             spdlog::info(
-                "BrokerNode: pushValidators stub — topicId={} "
-                "(SchemaUpdate ring op deferred to Task 7: SBE schema extension needed)",
-                topicId);
+                "BrokerNode: pushValidators — SchemaUpdate for topicId={} "
+                "enqueued to {} workers", topicId, nWorkers);
         };
 
         // respondDefine / respondGet: seam for Task 8 (gateway routing).

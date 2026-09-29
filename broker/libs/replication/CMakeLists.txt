@@ -29,6 +29,11 @@ if(aeron_FOUND)
     # spdlog PUBLIC because AeronPartitionTransport.h includes WorkerPool.h→Worker.h
     # which uses spdlog inline methods; consumers must see spdlog headers.
     target_link_libraries(rune_replication_aeron PUBLIC spdlog::spdlog)
+    # rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
+    # includes rune/codec/Validator.h + rune/codec/Serialize.h for the Task 7
+    # per-worker schema validation hook.  Any consumer of rune_replication_aeron
+    # that includes Worker.h (directly or transitively) needs rune_codec headers.
+    target_link_libraries(rune_replication_aeron PUBLIC rune_codec)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING

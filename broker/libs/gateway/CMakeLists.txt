@@ -23,6 +23,10 @@ target_include_directories(rune_gateway PUBLIC
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
 target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
+# rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
+# includes rune/codec/Validator.h for the Task 7 per-worker schema validation
+# hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
+target_link_libraries(rune_gateway PUBLIC rune_codec)
 
 if(aeron_FOUND)
     target_link_libraries(rune_gateway PUBLIC aeron::aeron)

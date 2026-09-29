@@ -340,6 +340,30 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 7: ProduceValidationTest — per-worker schema validation hook.
+    #
+    # Tests (on-host, no Aeron / media driver):
+    #   1. SchemaUpdate_Regression_ValidatorInstalledOnWorkerThread
+    #   2. SchemaUpdate_Regression_WellFormedRecord_AppendProceeds
+    #   3. SchemaUpdate_Regression_MalformedRecord_ValidationFailed
+    #   4. SchemaUpdate_Regression_BadEnumRecord_ValidationFailed
+    #   5. SchemaUpdate_Regression_NoValidator_FallsThrough
+    #
+    # Uses InMemoryLog + Worker directly (no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_produce_validation_tests
+        tests/integration/ProduceValidationTest.cpp)
+    target_include_directories(rune_produce_validation_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_produce_validation_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_produce_validation_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
     # tests — 5 test cases:
     #   1. SingleNode: HW-gated visibility.
