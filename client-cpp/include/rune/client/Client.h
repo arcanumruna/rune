@@ -75,6 +75,22 @@ namespace rune::client {
 using Bytes = std::vector<uint8_t>;
 
 // ---------------------------------------------------------------------------
+// Schema DDL result types (Task 10)
+// ---------------------------------------------------------------------------
+struct DefineTopicResult {
+    int32_t  topicId   = -1;
+    uint16_t version   = 0;
+    uint16_t errorCode = 0;
+};
+
+struct TopicSchemaResult {
+    int32_t              topicId   = -1;
+    uint16_t             version   = 0;
+    std::vector<uint8_t> descriptorBlob;
+    uint16_t             errorCode = 0;
+};
+
+// ---------------------------------------------------------------------------
 // IdleMode — controls the runner-thread idle strategy.
 //
 // LowLatency: YieldingIdleStrategy — on each idle cycle the runner calls
@@ -227,6 +243,35 @@ public:
     /// Rejected with a timeout error if pingTimeoutMs elapses without a Pong.
     std::future<Bytes> ping(Bytes payload);
 
+    // ---- Task 10: Schema DDL round-trips ------------------------------------
+
+    /// Submit a DefineTopic request and return a future for the result.
+    ///
+    /// Requires an established session (state() == Connected).  If the session
+    /// is not Connected the future is rejected immediately.
+    ///
+    /// The future resolves when DefineTopicResponse arrives with a matching
+    /// correlationId.  errorCode==0 means success; non-zero carries an ErrorCode.
+    ///
+    /// Rejected with a timeout error if pingTimeoutMs elapses without a response.
+    std::future<DefineTopicResult> defineTopic(std::string            name,
+                                               uint32_t               partitions,
+                                               std::string            keyField,
+                                               bool                   validate,
+                                               std::span<const uint8_t> descriptorBlob);
+
+    /// Submit a GetTopicSchema request and return a future for the result.
+    ///
+    /// Requires an established session (state() == Connected).  Rejected
+    /// immediately if the session is not Connected.
+    ///
+    /// The future resolves when TopicSchemaResponse arrives; descriptorBlob is
+    /// owned (copied from the Aeron buffer).  errorCode==UnknownTopic(7) if the
+    /// topic does not exist.
+    ///
+    /// Rejected with a timeout error if pingTimeoutMs elapses without a response.
+    std::future<TopicSchemaResult> getTopicSchema(std::string name);
+
     // ---- CB-4: Subscribe API -------------------------------------------------
 
     /// Subscribe to a topic partition using a Key (partition resolved via FNV-1a).
@@ -319,6 +364,17 @@ private:
         std::chrono::steady_clock::time_point       deadline;
     };
 
+    // Task 10: schema DDL pending ops (guarded by mtx_, same as pendingPings_).
+    struct PendingDefine {
+        std::promise<DefineTopicResult>             promise;
+        std::chrono::steady_clock::time_point       deadline;
+    };
+
+    struct PendingGet {
+        std::promise<TopicSchemaResult>             promise;
+        std::chrono::steady_clock::time_point       deadline;
+    };
+
     // -------------------------------------------------------------------------
     // Runner
     // -------------------------------------------------------------------------
@@ -384,9 +440,13 @@ private:
     // ---- Cross-thread promise maps (guarded by mtx_) -------------------------
     // pendingConnect_: at most one in-flight connect at a time.
     // pendingPings_:   map from correlationId → PendingPing.
+    // pendingDefine_:  map from correlationId → PendingDefine (Task 10).
+    // pendingGet_:     map from correlationId → PendingGet    (Task 10).
     std::mutex                              mtx_;
     std::unique_ptr<PendingConnect>         pendingConnect_;
     std::map<int64_t, PendingPing>          pendingPings_;
+    std::map<int64_t, PendingDefine>        pendingDefine_;
+    std::map<int64_t, PendingGet>           pendingGet_;
 
     // ---- Monotonic correlationId counter (atomic; incremented by app thread) -
     std::atomic<int64_t> nextCorrId_ {1};

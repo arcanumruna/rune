@@ -19,6 +19,7 @@
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
+#include <rune/protocol/client/SchemaMessages.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
@@ -450,6 +451,150 @@ std::future<Bytes> Client::ping(Bytes payload) {
 }
 
 // ---------------------------------------------------------------------------
+// defineTopic() — app thread (Task 10)
+// ---------------------------------------------------------------------------
+
+std::future<DefineTopicResult> Client::defineTopic(std::string              name,
+                                                    uint32_t                 partitions,
+                                                    std::string              keyField,
+                                                    bool                     validate,
+                                                    std::span<const uint8_t> descriptorBlob)
+{
+    namespace rpc = rune::protocol::client;
+
+    std::promise<DefineTopicResult> prom;
+    auto fut = prom.get_future();
+
+    // Require an established session (mirror ping() semantics).
+    const auto snap   = agent_.stateAndSessionId();
+    const auto st     = snap.state;
+    const auto sessId = snap.sessionId;
+
+    if (st != session::SessionState::Connected) {
+        prom.set_exception(std::make_exception_ptr(
+            std::runtime_error("defineTopic(): not connected (state != Connected)")));
+        return fut;
+    }
+
+    // Allocate a fresh correlationId.
+    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+
+    // Encode the DefineTopic request.
+    rpc::DefineTopic msg;
+    msg.sessionId      = sessId;
+    msg.correlationId  = corrId;
+    msg.topicName      = name;
+    msg.partitionCount = partitions;
+    msg.keyField       = keyField;
+    msg.validate       = validate;
+    msg.descriptorBlob = descriptorBlob.data();
+    msg.descriptorLen  = static_cast<uint32_t>(descriptorBlob.size());
+
+    const std::size_t neededCap = msg.encodedSize() + 32u; // 32 bytes headroom
+    std::vector<uint8_t> scratch(neededCap);
+    const std::size_t frameLen = msg.encode(scratch.data());
+
+    if (frameLen == 0) {
+        prom.set_exception(std::make_exception_ptr(
+            std::runtime_error("defineTopic(): failed to encode DefineTopic frame")));
+        return fut;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(cfg_.pingTimeoutMs);
+
+    // Insert into pending map BEFORE submitting (prevents a race where the
+    // response arrives before we insert the promise — mirrors ping()).
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        pendingDefine_.emplace(corrId,
+            PendingDefine{std::move(prom), deadline});
+    }
+
+    // Submit the encoded frame to the agent ring.
+    if (!agent_.submitSend(scratch.data(), frameLen)) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = pendingDefine_.find(corrId);
+        if (it != pendingDefine_.end()) {
+            try {
+                it->second.promise.set_exception(
+                    std::make_exception_ptr(
+                        std::runtime_error("defineTopic(): ring full, could not submit")));
+            } catch (...) {}
+            pendingDefine_.erase(it);
+        }
+    }
+
+    return fut;
+}
+
+// ---------------------------------------------------------------------------
+// getTopicSchema() — app thread (Task 10)
+// ---------------------------------------------------------------------------
+
+std::future<TopicSchemaResult> Client::getTopicSchema(std::string name)
+{
+    namespace rpc = rune::protocol::client;
+
+    std::promise<TopicSchemaResult> prom;
+    auto fut = prom.get_future();
+
+    // Require an established session.
+    const auto snap   = agent_.stateAndSessionId();
+    const auto st     = snap.state;
+    const auto sessId = snap.sessionId;
+
+    if (st != session::SessionState::Connected) {
+        prom.set_exception(std::make_exception_ptr(
+            std::runtime_error("getTopicSchema(): not connected (state != Connected)")));
+        return fut;
+    }
+
+    // Allocate a fresh correlationId.
+    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+
+    // Encode the GetTopicSchema request.
+    rpc::GetTopicSchema msg;
+    msg.sessionId     = sessId;
+    msg.correlationId = corrId;
+    msg.topicName     = name;
+
+    const std::size_t neededCap = msg.encodedSize() + 32u;
+    std::vector<uint8_t> scratch(neededCap);
+    const std::size_t frameLen = msg.encode(scratch.data());
+
+    if (frameLen == 0) {
+        prom.set_exception(std::make_exception_ptr(
+            std::runtime_error("getTopicSchema(): failed to encode GetTopicSchema frame")));
+        return fut;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(cfg_.pingTimeoutMs);
+
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        pendingGet_.emplace(corrId,
+            PendingGet{std::move(prom), deadline});
+    }
+
+    if (!agent_.submitSend(scratch.data(), frameLen)) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = pendingGet_.find(corrId);
+        if (it != pendingGet_.end()) {
+            try {
+                it->second.promise.set_exception(
+                    std::make_exception_ptr(
+                        std::runtime_error("getTopicSchema(): ring full, could not submit")));
+            } catch (...) {}
+            pendingGet_.erase(it);
+        }
+    }
+
+    return fut;
+}
+
+// ---------------------------------------------------------------------------
 // runLoop() — background runner thread
 // ---------------------------------------------------------------------------
 
@@ -624,6 +769,34 @@ void Client::sweepTimeouts() {
                         std::runtime_error("ping() timed out (no Pong received)")));
             } catch (...) {}
             it = pendingPings_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // --- Task 10: Pending defineTopic timeouts ---
+    for (auto it = pendingDefine_.begin(); it != pendingDefine_.end(); ) {
+        if (now >= it->second.deadline) {
+            try {
+                it->second.promise.set_exception(
+                    std::make_exception_ptr(
+                        std::runtime_error("defineTopic() timed out (no DefineTopicResponse received)")));
+            } catch (...) {}
+            it = pendingDefine_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // --- Task 10: Pending getTopicSchema timeouts ---
+    for (auto it = pendingGet_.begin(); it != pendingGet_.end(); ) {
+        if (now >= it->second.deadline) {
+            try {
+                it->second.promise.set_exception(
+                    std::make_exception_ptr(
+                        std::runtime_error("getTopicSchema() timed out (no TopicSchemaResponse received)")));
+            } catch (...) {}
+            it = pendingGet_.erase(it);
         } else {
             ++it;
         }
@@ -1267,6 +1440,67 @@ void Client::onEgressFrame(codec::TemplateId tid,
         break;
     }
 
+    // ---- Task 10: DefineTopicResponse (65) ----
+    case codec::TemplateId::DefineTopicResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::DefineTopicResponse::decode(buf, len);
+        if (!opt) break;
+
+        std::promise<DefineTopicResult> prom;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = pendingDefine_.find(opt->correlationId);
+            if (it != pendingDefine_.end()) {
+                prom  = std::move(it->second.promise);
+                pendingDefine_.erase(it);
+                found = true;
+            }
+        }
+        if (found) {
+            DefineTopicResult result;
+            result.topicId   = opt->topicId;
+            result.version   = opt->version;
+            result.errorCode = opt->errorCode;
+            try { prom.set_value(result); } catch (...) {}
+        }
+        break;
+    }
+
+    // ---- Task 10: TopicSchemaResponse (67) ----
+    case codec::TemplateId::TopicSchemaResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::TopicSchemaResponse::decode(buf, len);
+        if (!opt) break;
+
+        std::promise<TopicSchemaResult> prom;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            auto it = pendingGet_.find(opt->correlationId);
+            if (it != pendingGet_.end()) {
+                prom  = std::move(it->second.promise);
+                pendingGet_.erase(it);
+                found = true;
+            }
+        }
+        if (found) {
+            TopicSchemaResult result;
+            result.topicId   = opt->topicId;
+            result.version   = opt->version;
+            result.errorCode = opt->errorCode;
+            // Copy descriptorBlob out of the Aeron buffer (view is only valid
+            // for the duration of this callback — same discipline as Pong echo).
+            if (opt->descriptorBlob && opt->descriptorLen > 0) {
+                result.descriptorBlob.assign(
+                    opt->descriptorBlob,
+                    opt->descriptorBlob + opt->descriptorLen);
+            }
+            try { prom.set_value(std::move(result)); } catch (...) {}
+        }
+        break;
+    }
+
     default:
         // Unknown template — ignore (never crash).
         break;
@@ -1295,6 +1529,23 @@ void Client::failAllPending(const std::string& reason) {
         } catch (...) {}
     }
     pendingPings_.clear();
+
+    // Task 10: fail any in-flight schema ops.
+    for (auto& [corrId, pd] : pendingDefine_) {
+        try {
+            pd.promise.set_exception(
+                std::make_exception_ptr(std::runtime_error(reason)));
+        } catch (...) {}
+    }
+    pendingDefine_.clear();
+
+    for (auto& [corrId, pg] : pendingGet_) {
+        try {
+            pg.promise.set_exception(
+                std::make_exception_ptr(std::runtime_error(reason)));
+        } catch (...) {}
+    }
+    pendingGet_.clear();
 }
 
 // ---------------------------------------------------------------------------

@@ -506,6 +506,23 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_client_api_tests)
     endif()
 
+    # ── Task 10: Schema DDL round-trip tests (defineTopic / getTopicSchema) ─────
+    # Uses the embedded Aeron IPC loopback gateway (same pattern as ClientTest).
+    if(aeron_FOUND)
+        add_executable(rune_schema_client_tests
+            tests/client/ClientSchemaTest.cpp
+        )
+        target_include_directories(rune_schema_client_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_schema_client_tests PRIVATE
+            rune_client_api
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_schema_client_tests)
+    endif()
+
     # ── Redirect-follow tests (CB-5 B) — data-op redirect follow ──────────────
     if(aeron_FOUND)
         add_executable(rune_redirect_tests
