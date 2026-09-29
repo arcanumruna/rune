@@ -25,7 +25,8 @@ if(BUILD_TESTING)
     enable_testing()
     add_executable(rune_ql_tests
         tests/AstSmokeTest.cpp
-        tests/ParserTest.cpp)
+        tests/ParserTest.cpp
+        tests/BackendsTest.cpp)
     target_link_libraries(rune_ql_tests PRIVATE rune_ql GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_ql_tests)
@@ -34,6 +35,8 @@ endif()
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 find_package(benchmark QUIET)
 if(benchmark_FOUND)
-    add_executable(rune_ql_bench benchmark/QlBenchmark.cpp)
+    add_executable(rune_ql_bench
+        benchmark/QlBenchmark.cpp
+        benchmark/ParseBench.cpp)
     target_link_libraries(rune_ql_bench PRIVATE rune_ql benchmark::benchmark)
 endif()
