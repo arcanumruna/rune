@@ -781,4 +781,47 @@ if(BUILD_TESTING)
 
         gtest_discover_tests(rune_group_tsan_tests)
     endif()
+
+    # ── Task 12: rune_schema_gen tool unit tests (--from-file, no Aeron) ─────
+    add_executable(rune_schema_gen_tests
+        tests/SchemaGenToolTest.cpp
+    )
+    target_include_directories(rune_schema_gen_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_CODEC_ROOT}/include
+    )
+    target_link_libraries(rune_schema_gen_tests PRIVATE rune_codec GTest::gtest_main)
+    gtest_discover_tests(rune_schema_gen_tests)
+endif()
+
+# ── Task 12: rune_schema_gen executable ───────────────────────────────────────
+# The offline (--from-file) path links only rune_codec + filesystem.
+# The live (generate <topic>) path requires Aeron and is gated by
+# RUNE_SCHEMA_GEN_LIVE_ENABLED.  For Task 13 e2e the live path is enabled;
+# for local/on-host builds only the offline path is compiled in.
+add_executable(rune_schema_gen
+    tools/rune_schema_gen.cpp
+)
+target_include_directories(rune_schema_gen PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${RUNE_CODEC_ROOT}/include
+)
+target_link_libraries(rune_schema_gen PRIVATE rune_codec)
+target_compile_features(rune_schema_gen PRIVATE cxx_std_23)
+
+# Enable the live broker path when Aeron is available.
+if(aeron_FOUND)
+    target_compile_definitions(rune_schema_gen PRIVATE RUNE_SCHEMA_GEN_LIVE_ENABLED=1)
+    target_include_directories(rune_schema_gen PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_schema_gen PRIVATE
+        rune_client_api
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_SCHEMAGEN uuid)
+        if(UUID_LIB_SCHEMAGEN)
+            target_link_libraries(rune_schema_gen PRIVATE ${UUID_LIB_SCHEMAGEN})
+        endif()
+    endif()
 endif()
