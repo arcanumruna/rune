@@ -246,7 +246,8 @@ struct TopicSchemaEntry {
 };
 
 // ---------------------------------------------------------------------------
-// TopicSchemaCache — maps topicId → TopicSchemaEntry (agent-thread-only)
+// TopicSchemaCache — maps topicId → TopicSchemaEntry
+// Guarded by Client::mtx_; written by openTopic<T> async continuations (app threads).
 // ---------------------------------------------------------------------------
 class TopicSchemaCache {
 public:

@@ -371,8 +371,8 @@ public:
 
     /// Create a Producer with the given config.
     /// The producer uses the same underlying agent ring and session as the Client.
-    /// MUST be called before connect() — producers are registered in the hub
-    /// during the setup phase.  (Calling after start() is a data race on the hub.)
+    /// May be called before or after connect(); registration is submitted through
+    /// the agent command ring and is thread-safe.
     Producer producer(ProducerConfig cfg = {});
 
     // ---- TX-5: Transactional Producer API -----------------------------------
