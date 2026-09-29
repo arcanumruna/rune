@@ -11,7 +11,8 @@ add_executable(rune_codec_tests
     tests/PrimTypeTest.cpp
     tests/DescriptorTest.cpp
     tests/FingerprintTest.cpp
-    tests/SerializeTest.cpp)
+    tests/SerializeTest.cpp
+    tests/ToTextTest.cpp)
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
 include(GoogleTest)
 gtest_discover_tests(rune_codec_tests)

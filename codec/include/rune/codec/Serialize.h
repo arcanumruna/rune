@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #include <rune/codec/Descriptor.h>
 
@@ -30,5 +31,14 @@ namespace rune::codec {
 /// so offsets and blockLength are recomputed from scratch (not trusted from
 /// the blob). Throws std::runtime_error on any malformed or truncated input.
 [[nodiscard]] Descriptor deserialize(std::span<const uint8_t> blob);
+
+/// Render a Descriptor as a human-readable text representation.
+///
+/// Format (spec §3.1):
+///   schema <name> fp=0x<hex16> block=<N> version=<V> {
+///     <name padded to 10> <type padded to 8> @<offset>    [key] [sinceVersion=N] [enum(v,...)]
+///     <name padded to 10> <type padded to 8> vardata#<i>  [key] [sinceVersion=N]
+///   }
+[[nodiscard]] std::string toText(const Descriptor& d);
 
 } // namespace rune::codec

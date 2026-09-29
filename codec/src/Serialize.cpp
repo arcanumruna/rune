@@ -1,7 +1,39 @@
 // src/Serialize.cpp
 #include <rune/codec/Serialize.h>
+#include <rune/codec/Fingerprint.h>
+#include <format>
+#include <sstream>
+#include <string_view>
 
 namespace rune::codec {
+
+// ─── toText helpers ───────────────────────────────────────────────────────────
+
+static std::string_view primTypeName(PrimType t) noexcept {
+    switch (t) {
+        case PrimType::Int32:   return "int32";
+        case PrimType::Int64:   return "int64";
+        case PrimType::UInt16:  return "uint16";
+        case PrimType::UInt32:  return "uint32";
+        case PrimType::UInt64:  return "uint64";
+        case PrimType::Float64: return "float64";
+        case PrimType::Bool:    return "bool";
+        case PrimType::Enum:    return "enum";
+        case PrimType::String:  return "string";
+        case PrimType::Bytes:   return "bytes";
+    }
+    return "unknown";
+}
+
+// Pad s with trailing spaces to reach at least width characters.
+static std::string padRight(std::string_view s, size_t width) {
+    std::string out(s);
+    if (out.size() < width)
+        out.append(width - out.size(), ' ');
+    return out;
+}
+
+
 
 // ─── Magic ────────────────────────────────────────────────────────────────────
 // "RCD1" as a little-endian u32: 'R'=0x52, 'C'=0x43, 'D'=0x44, '1'=0x31
@@ -176,6 +208,54 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
     }
 
     return builder.build();
+}
+
+std::string toText(const Descriptor& d) {
+    std::ostringstream out;
+
+    // Header line: schema <name> fp=0x<hex16> block=<N> version=<V> {
+    uint64_t fp = fingerprint(d);
+    out << "schema " << d.name
+        << " fp=0x" << std::hex << std::uppercase << fp << std::dec
+        << " block=" << d.blockLength
+        << " version=" << d.version
+        << " {\n";
+
+    // Field lines
+    constexpr size_t kNameWidth = 10;
+    constexpr size_t kTypeWidth = 8;
+
+    for (const auto& f : d.fields) {
+        out << "  ";
+        out << padRight(f.name, kNameWidth);
+        out << padRight(std::string(primTypeName(f.type)), kTypeWidth);
+
+        if (isVarLen(f.type)) {
+            out << "vardata#" << f.offset;
+        } else {
+            out << "@" << f.offset;
+        }
+
+        if (f.isKey) {
+            out << "    key";
+        }
+        if (f.sinceVersion > 1) {
+            out << "    sinceVersion=" << f.sinceVersion;
+        }
+        if (!f.enumValues.empty()) {
+            out << "    enum(";
+            for (size_t i = 0; i < f.enumValues.size(); ++i) {
+                if (i > 0) out << ",";
+                out << f.enumValues[i];
+            }
+            out << ")";
+        }
+
+        out << "\n";
+    }
+
+    out << "}\n";
+    return out.str();
 }
 
 } // namespace rune::codec
