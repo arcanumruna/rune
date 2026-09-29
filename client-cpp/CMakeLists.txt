@@ -68,6 +68,18 @@ add_library(rune_codec STATIC
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 
+# ── rune-ql — DDL parser + code-gen backends (sibling source static lib) ──────
+# Mirrors the rune-codec wiring above.  rune-ql's sources include rune-codec
+# headers, so we reuse the rune_codec target (already defined above) rather
+# than re-defining it, avoiding duplicate-target errors.
+set(RUNE_QL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-ql"
+    CACHE PATH "Path to the rune-ql sibling repo")
+file(GLOB RUNE_QL_SRCS "${RUNE_QL_ROOT}/src/*.cpp")
+add_library(rune_ql STATIC ${RUNE_QL_SRCS})
+target_include_directories(rune_ql PUBLIC ${RUNE_QL_ROOT}/include)
+target_link_libraries(rune_ql PUBLIC rune_codec)
+target_compile_features(rune_ql PUBLIC cxx_std_23)
+
 # ── rune_client — trivial header-only/interface library ──────────────────────
 add_library(rune_client INTERFACE)
 target_include_directories(rune_client INTERFACE
@@ -870,4 +882,53 @@ if(aeron_FOUND)
             target_link_libraries(rune_schema_gen PRIVATE ${UUID_LIB_SCHEMAGEN})
         endif()
     endif()
+endif()
+
+# ── Task 8: rune CLI shared implementation library ────────────────────────────
+# src/cli/Cli.cpp contains rune::cli::run() with no main().
+# Compiled into a static lib so both the `rune` executable and the offline
+# tests can link it without a duplicate-main conflict with gtest_main.
+add_library(rune_cli_lib STATIC
+    src/cli/Cli.cpp
+)
+target_include_directories(rune_cli_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${RUNE_QL_ROOT}/include
+    ${RUNE_CODEC_ROOT}/include
+)
+target_link_libraries(rune_cli_lib PUBLIC rune_ql rune_codec)
+target_compile_features(rune_cli_lib PUBLIC cxx_std_23)
+
+# Enable the live broker path when Aeron is available.
+if(aeron_FOUND)
+    target_compile_definitions(rune_cli_lib PUBLIC RUNE_CLI_LIVE_ENABLED=1)
+    target_include_directories(rune_cli_lib PUBLIC
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_cli_lib PUBLIC rune_client_api)
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_RUNE uuid)
+        if(UUID_LIB_RUNE)
+            target_link_libraries(rune_cli_lib PUBLIC ${UUID_LIB_RUNE})
+        endif()
+    endif()
+endif()
+
+# ── Task 8: rune CLI executable ───────────────────────────────────────────────
+# tools/rune_cli.cpp is just main() — all logic is in rune_cli_lib.
+add_executable(rune
+    tools/rune_cli.cpp
+)
+target_link_libraries(rune PRIVATE rune_cli_lib)
+target_compile_features(rune PRIVATE cxx_std_23)
+
+# ── Task 8: rune CLI offline tests ────────────────────────────────────────────
+# Tests schema apply --dry-run (and generate --from-file) without Aeron.
+if(BUILD_TESTING)
+    add_executable(rune_cli_offline_tests
+        tests/RuneCliOfflineTest.cpp
+    )
+    target_link_libraries(rune_cli_offline_tests PRIVATE rune_cli_lib GTest::gtest_main)
+    target_compile_features(rune_cli_offline_tests PRIVATE cxx_std_23)
+    gtest_discover_tests(rune_cli_offline_tests)
 endif()
