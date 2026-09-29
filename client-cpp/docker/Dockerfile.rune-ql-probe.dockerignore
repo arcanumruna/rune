@@ -1,0 +1,43 @@
+# Per-Dockerfile ignore for Dockerfile.rune-ql-probe (Task 10, 0c #11 gate).
+# Keep the build context small, but KEEP tests/e2e/ (characters.rql + the probe
+# source rune_ql_probe.cpp) — the runtime CLI-driven compile needs both.
+
+# Build outputs (large; do NOT send to the daemon)
+build/
+cov/
+cmake-build-debug/
+cmake-build-release/
+conan-release/
+
+# Version control
+.git/
+.gitignore
+
+# Superpowers / internal docs
+.superpowers/
+
+# Benchmarks (not built in this image)
+benchmark/
+bench/
+
+# Tests — exclude everything EXCEPT the e2e probe + schema.
+tests/*
+!tests/e2e
+tests/e2e/*
+!tests/e2e/rune_ql_probe.cpp
+!tests/e2e/characters.rql
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# CI
+.woodpecker/
+
+# Docs
+docs/
+README.md
+CLAUDE.md

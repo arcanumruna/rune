@@ -381,6 +381,45 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             target_link_libraries(rune_schema_probe PRIVATE ${UUID_LIB_PROBE})
         endif()
     endif()
+
+    # ── Task 10 (0c #11 gate) — CLI-driven rune-ql typed probe ────────────────
+    #
+    # tests/e2e/rune_ql_probe.cpp is the 0c single-node real-Aeron probe.  Unlike
+    # the 0b schema-probe above (build-time codegen from a checked-in blob), this
+    # probe's header comes from `rune schema generate` at RUNTIME.  The e2e script
+    # (docker/rune-ql-e2e.sh) runs, inside the client container:
+    #     rune schema apply    tests/e2e/characters.rql --broker <node> --validate
+    #     rune schema generate characters --out ${RUNE_GEN_DIR} --broker <node>
+    #     cmake --build . --target rune_ql_probe    (compiles THIS against the header)
+    #     ./rune_ql_probe
+    #
+    # RUNE_GEN_DIR is where `rune schema generate` writes characters.gen.h; the
+    # probe includes it from there.  Default: ${CMAKE_BINARY_DIR}/e2e-gen.  The
+    # probe target is configured at cmake time but only COMPILES once the header
+    # exists (post-generate), so it is NOT part of the default `all` build.
+    set(RUNE_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/e2e-gen"
+        CACHE PATH "Directory where `rune schema generate` writes characters.gen.h for rune_ql_probe")
+    file(MAKE_DIRECTORY "${RUNE_GEN_DIR}")
+
+    add_executable(rune_ql_probe EXCLUDE_FROM_ALL
+        tests/e2e/rune_ql_probe.cpp
+    )
+    target_include_directories(rune_ql_probe PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        "${RUNE_GEN_DIR}"   # for the runtime-generated characters.gen.h
+    )
+    target_link_libraries(rune_ql_probe PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+        rune_codec
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_QL_PROBE uuid)
+        if(UUID_LIB_QL_PROBE)
+            target_link_libraries(rune_ql_probe PRIVATE ${UUID_LIB_QL_PROBE})
+        endif()
+    endif()
 endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────

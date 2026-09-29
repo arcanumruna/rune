@@ -76,6 +76,12 @@ void printUsage(std::ostream& err) {
 //   --cli-stream-in  <n>   override gatewayStreamId  (default 1)
 //   --cli-stream-out <n>   override egressStreamId   (default 2)
 //   --cli-data-dir   <p>   override dataDir          (default "")
+//   --cli-egress     <ch>  override egressChannel    (default "aeron:ipc")
+//                          Required for a real UDP broker: the broker publishes
+//                          responses back to this channel, so with a UDP gateway
+//                          it must be a client-reachable UDP endpoint, e.g.
+//                          "aeron:udp?endpoint=rune-ql-probe:40500".  Also read
+//                          from RUNE_EGRESS if the flag is absent.
 //
 #ifdef RUNE_CLI_LIVE_ENABLED
 rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& args) {
@@ -87,6 +93,16 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
         if (const char* env = std::getenv("RUNE_BROKER"); env) cfg.gatewayChannel = env;
     }
     if (cfg.gatewayChannel.empty()) cfg.gatewayChannel = "aeron:ipc";
+
+    // Egress channel: --cli-egress <ch> or RUNE_EGRESS env.  For a UDP gateway
+    // this MUST be a client-reachable UDP endpoint so the broker can route
+    // responses (define/getSchema/produce) back to this client; the default
+    // aeron:ipc only works for a loopback/same-host gateway.
+    std::string egress = flagValue(args, "--cli-egress");
+    if (egress.empty()) {
+        if (const char* env = std::getenv("RUNE_EGRESS"); env) egress = env;
+    }
+    if (!egress.empty()) cfg.egressChannel = egress;
 
     // Stream IDs: hidden test overrides.
     const std::string sIn  = flagValue(args, "--cli-stream-in");
