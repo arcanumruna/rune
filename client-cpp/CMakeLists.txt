@@ -932,3 +932,31 @@ if(BUILD_TESTING)
     target_compile_features(rune_cli_offline_tests PRIVATE cxx_std_23)
     gtest_discover_tests(rune_cli_offline_tests)
 endif()
+
+# ── Task 9: rune CLI live tests (schema apply/get/list via loopback Aeron) ─────
+# Requires Aeron (embedded driver + ipc loopback gateway).
+if(BUILD_TESTING AND aeron_FOUND)
+    add_executable(rune_cli_live_tests
+        tests/RuneCliLiveTest.cpp
+    )
+    target_include_directories(rune_cli_live_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${RUNE_CODEC_ROOT}/include
+        ${RUNE_QL_ROOT}/include
+    )
+    target_link_libraries(rune_cli_live_tests PRIVATE
+        rune_cli_lib
+        rune_client_api
+        rune_codec
+        rune_ql
+        GTest::gtest_main
+    )
+    target_compile_features(rune_cli_live_tests PRIVATE cxx_std_23)
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_CLI_LIVE uuid)
+        if(UUID_LIB_CLI_LIVE)
+            target_link_libraries(rune_cli_live_tests PRIVATE ${UUID_LIB_CLI_LIVE})
+        endif()
+    endif()
+    gtest_discover_tests(rune_cli_live_tests)
+endif()

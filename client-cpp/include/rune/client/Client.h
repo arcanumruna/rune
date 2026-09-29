@@ -273,6 +273,15 @@ public:
     /// Rejected with a timeout error if pingTimeoutMs elapses without a response.
     std::future<TopicSchemaResult> getTopicSchema(std::string name);
 
+    // ---- Task 9 (CLI): list topics known to this client ----------------------
+
+    /// Return a snapshot of all topics that were successfully defined through
+    /// this client instance (errorCode==0 DefineTopicResponse).
+    ///
+    /// Returns a vector of (name, topicId) pairs in insertion order.
+    /// Thread-safe: takes a lock-guarded snapshot.
+    [[nodiscard]] std::vector<std::pair<std::string, int32_t>> listTopics();
+
     // ---- Task 11: Typed topic API --------------------------------------------
 
     /// Open a typed topic, verifying the broker's schema fingerprint matches T.
@@ -427,6 +436,7 @@ private:
     struct PendingDefine {
         std::promise<DefineTopicResult>             promise;
         std::chrono::steady_clock::time_point       deadline;
+        std::string                                 topicName;  // saved for the knownTopics registry
     };
 
     struct PendingGet {
@@ -573,6 +583,11 @@ private:
     // Guarded by mtx_ (the openTopic async continuation writes it from an app
     // thread; any future reader must also hold mtx_).
     metadata::TopicSchemaCache topicSchemaCache_;
+
+    // ---- Task 9 (CLI): names of topics successfully defined via defineTopic() -
+    // Populated in onEgressFrame when DefineTopicResponse{OK} resolves a pending
+    // define op.  Guarded by mtx_.  Ordered by insertion to preserve apply order.
+    std::vector<std::pair<std::string, int32_t>> knownTopics_;
 
     // correlationId for the most recently sent MetadataRequest (0 = none).
     int64_t pendingMetadataCorrId_ {0};

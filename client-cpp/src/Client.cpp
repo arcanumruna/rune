@@ -508,7 +508,7 @@ std::future<DefineTopicResult> Client::defineTopic(std::string              name
     {
         std::lock_guard<std::mutex> lk(mtx_);
         pendingDefine_.emplace(corrId,
-            PendingDefine{std::move(prom), deadline});
+            PendingDefine{std::move(prom), deadline, name});
     }
 
     // Submit the encoded frame to the agent ring.
@@ -592,6 +592,16 @@ std::future<TopicSchemaResult> Client::getTopicSchema(std::string name)
     }
 
     return fut;
+}
+
+// ---------------------------------------------------------------------------
+// listTopics() — app thread (Task 9 CLI)
+// ---------------------------------------------------------------------------
+
+std::vector<std::pair<std::string, int32_t>> Client::listTopics()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    return knownTopics_;
 }
 
 // ---------------------------------------------------------------------------
@@ -1447,12 +1457,14 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!opt) break;
 
         std::promise<DefineTopicResult> prom;
+        std::string savedName;
         bool found = false;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             auto it = pendingDefine_.find(opt->correlationId);
             if (it != pendingDefine_.end()) {
-                prom  = std::move(it->second.promise);
+                prom      = std::move(it->second.promise);
+                savedName = std::move(it->second.topicName);
                 pendingDefine_.erase(it);
                 found = true;
             }
@@ -1462,6 +1474,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
             result.topicId   = opt->topicId;
             result.version   = opt->version;
             result.errorCode = opt->errorCode;
+
+            // Task 9 (CLI): on success, register (name, topicId) so listTopics()
+            // can enumerate topics that were applied via this client.
+            if (result.errorCode == 0 && !savedName.empty() && result.topicId >= 0) {
+                std::lock_guard<std::mutex> lk(mtx_);
+                // Avoid duplicates (idempotent re-apply would re-register).
+                bool already = false;
+                for (const auto& [n, id] : knownTopics_) {
+                    if (n == savedName) { already = true; break; }
+                }
+                if (!already) {
+                    knownTopics_.emplace_back(savedName, result.topicId);
+                }
+            }
+
             try { prom.set_value(result); } catch (...) {}
         }
         break;
