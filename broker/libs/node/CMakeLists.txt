@@ -6,6 +6,7 @@ add_library(rune_node
     src/TransactionCoordinationService.cpp
     src/PortableFlushBackend.cpp
     src/SchemaRegistry.cpp
+    src/AdminWorker.cpp
     # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
     src/UringFlushBackend.cpp)
 # E5.1.2d: ProducePath.cpp was moved from libs/gateway/src/ to libs/storage/src/
@@ -58,13 +59,14 @@ if(BUILD_TESTING)
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
-    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry)
+    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
         tests/node/PortableFlushBackendTest.cpp
         tests/node/OneToOneByteRingTest.cpp
         tests/node/SchemaCodecSmokeTest.cpp
         tests/node/SchemaRegistryTest.cpp
+        tests/node/AdminWorkerTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
