@@ -45,6 +45,8 @@ public:
         APPEND_CONTROL_RECORD = static_cast<std::uint8_t>(9),
         SUBSCRIBE = static_cast<std::uint8_t>(10),
         UNSUBSCRIBE = static_cast<std::uint8_t>(11),
+        // Task 7: admin → worker schema validator push (descriptor blob in tail).
+        SCHEMA_UPDATE = static_cast<std::uint8_t>(12),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -64,6 +66,7 @@ public:
             case static_cast<std::uint8_t>(9): return APPEND_CONTROL_RECORD;
             case static_cast<std::uint8_t>(10): return SUBSCRIBE;
             case static_cast<std::uint8_t>(11): return UNSUBSCRIBE;
+            case static_cast<std::uint8_t>(12): return SCHEMA_UPDATE;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -86,6 +89,7 @@ public:
             case APPEND_CONTROL_RECORD: return "APPEND_CONTROL_RECORD";
             case SUBSCRIBE: return "SUBSCRIBE";
             case UNSUBSCRIBE: return "UNSUBSCRIBE";
+            case SCHEMA_UPDATE: return "SCHEMA_UPDATE";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

@@ -49,6 +49,11 @@
       <validValue name="APPEND_CONTROL_RECORD">9</validValue>
       <validValue name="SUBSCRIBE">10</validValue>
       <validValue name="UNSUBSCRIBE">11</validValue>
+      <!-- Task 7: admin → worker schema validator push (SchemaUpdate = 12).
+           Carries topicId (existing scalar field) + descriptor blob (tail,
+           TailKind = DESCRIPTOR_BLOB).  Worker builds a local rune::codec::Validator
+           from the blob on its own thread (shared-nothing). -->
+      <validValue name="SCHEMA_UPDATE">12</validValue>
     </enum>
 
     <!-- Which variable field the tail holds (matches TailKind in WorkerWire.h). -->
@@ -59,6 +64,8 @@
       <validValue name="ISR_LIST">3</validValue>
       <validValue name="OWNED_SET">4</validValue>
       <validValue name="CHUNK">5</validValue>
+      <!-- Task 7: raw descriptor blob bytes for a SchemaUpdate op. -->
+      <validValue name="DESCRIPTOR_BLOB">6</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->
