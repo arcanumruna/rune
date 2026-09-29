@@ -24,5 +24,8 @@ conan_provider.cmake
 *.swp
 *.swo
 
+# SDD scratch
+.superpowers/
+
 # macOS
 .DS_Store

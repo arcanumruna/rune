@@ -14,7 +14,7 @@ add_library(rune_codec_dep STATIC
 target_include_directories(rune_codec_dep PUBLIC ${RUNE_CODEC_ROOT}/include)
 
 # ── rune_ql library ──────────────────────────────────────────────────────────
-file(GLOB RUNE_QL_SOURCES src/*.cpp)
+file(GLOB RUNE_QL_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(rune_ql STATIC ${RUNE_QL_SOURCES})
 target_include_directories(rune_ql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(rune_ql PUBLIC rune_codec_dep)
