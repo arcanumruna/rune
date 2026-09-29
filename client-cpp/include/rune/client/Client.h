@@ -52,6 +52,7 @@
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/client/group/GroupConsumer.h>
 #include <rune/client/group/GroupConsumerHub.h>
+#include <rune/client/TypedTopic.h>
 
 #include <atomic>
 #include <chrono>
@@ -271,6 +272,64 @@ public:
     ///
     /// Rejected with a timeout error if pingTimeoutMs elapses without a response.
     std::future<TopicSchemaResult> getTopicSchema(std::string name);
+
+    // ---- Task 11: Typed topic API --------------------------------------------
+
+    /// Open a typed topic, verifying the broker's schema fingerprint matches T.
+    ///
+    /// Chains on getTopicSchema(name):
+    ///   - If errorCode != OK: the returned future is rejected.
+    ///   - If schemaMatches(T::kFingerprint, blob) is false: rejected with
+    ///     "generated type is stale — rerun rune schema generate".
+    ///   - Otherwise: populates TopicSchemaCache and resolves with
+    ///     TypedTopic<T>(producer(topicId), topicId).
+    ///
+    /// The fingerprint check is the EXACT-fingerprint gate: the generated struct
+    /// and the broker's stored descriptor must be byte-identical in structure.
+    ///
+    /// Requires an established session (same as getTopicSchema).
+    /// The continuation runs on a detached thread (std::async(std::launch::async)).
+    template <class T>
+    [[nodiscard]] std::future<TypedTopic<T>> openTopic(std::string name) {
+        // Obtain the schema from the broker.
+        auto schemaFut = getTopicSchema(name);
+
+        // Chain a continuation: runs on a separate thread, awaits schemaFut.
+        // RULE #1 (shared-nothing): no shared mutable state is introduced here.
+        // `this` is accessed only to call producer() which uses the agent ring
+        // (thread-safe) and to call topicSchemaCacheStore() (mutex-guarded below).
+        return std::async(std::launch::async,
+            [this, schemaFut = std::move(schemaFut)]() mutable -> TypedTopic<T> {
+                // Wait for the schema response (may throw on error/timeout).
+                TopicSchemaResult r = schemaFut.get();  // throws if rejected
+
+                // Check broker-side error code.
+                if (r.errorCode != 0) {
+                    throw std::runtime_error(
+                        "openTopic: broker returned errorCode " +
+                        std::to_string(r.errorCode));
+                }
+
+                // Exact-fingerprint gate.
+                if (!schemaMatches(T::kFingerprint,
+                                   std::span<const uint8_t>(r.descriptorBlob))) {
+                    throw std::runtime_error(
+                        "openTopic: generated type is stale — rerun rune schema generate");
+                }
+
+                // Populate the per-topic schema metadata cache (guarded by mtx_
+                // so it is safe to call from this async thread).
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    topicSchemaCache_.put(r.topicId,
+                        metadata::TopicSchemaEntry{r.version, /*validate=*/false, /*keyField=*/""});
+                }
+
+                // Create a Producer for this typed topic.
+                Producer p = producer();
+                return TypedTopic<T>(std::move(p), r.topicId);
+            });
+    }
 
     // ---- CB-4: Subscribe API -------------------------------------------------
 
@@ -509,6 +568,11 @@ private:
     // Both are agent-thread-only (runner thread); no mutex required.
     metadata::MetadataCache  metadataCache_;
     metadata::PartitionRouter partitionRouter_;
+
+    // ---- Task 11: per-topic schema metadata (populated by openTopic<T>) ------
+    // Guarded by mtx_ (the openTopic async continuation writes it from an app
+    // thread; any future reader must also hold mtx_).
+    metadata::TopicSchemaCache topicSchemaCache_;
 
     // correlationId for the most recently sent MetadataRequest (0 = none).
     int64_t pendingMetadataCorrId_ {0};

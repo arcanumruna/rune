@@ -434,6 +434,35 @@ if(BUILD_TESTING)
     target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec GTest::gtest_main)
     gtest_discover_tests(rune_schema_codec_smoke_tests)
 
+    # ── Task 11: TypedTopic unit tests (schemaMatches) — no Aeron dependency ───
+    # Tests schemaMatches() / fingerprint gate logic without a live broker.
+    add_executable(rune_open_topic_tests
+        tests/client/OpenTopicTest.cpp
+    )
+    target_include_directories(rune_open_topic_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_CODEC_ROOT}/include
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_open_topic_tests PRIVATE rune_codec GTest::gtest_main)
+    gtest_discover_tests(rune_open_topic_tests)
+
+    # ── Task 11: openTopic<T> gate tests (loopback Aeron gateway) ────────────
+    if(aeron_FOUND)
+        add_executable(rune_open_topic_gate_tests
+            tests/client/OpenTopicGateTest.cpp
+        )
+        target_include_directories(rune_open_topic_gate_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_open_topic_gate_tests PRIVATE
+            rune_client_api
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_open_topic_gate_tests)
+    endif()
+
     # ── Session state machine tests (CC-4) — no Aeron dependency ──────────────
     add_executable(rune_session_tests
         tests/session/SessionMachineTest.cpp

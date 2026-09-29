@@ -236,4 +236,42 @@ private:
     std::unordered_map<int32_t, std::string> endpoints_;
 };
 
+// ---------------------------------------------------------------------------
+// TopicSchemaEntry — per-topic schema metadata populated by openTopic<T>
+// ---------------------------------------------------------------------------
+struct TopicSchemaEntry {
+    uint16_t    schemaVersion = 0;
+    bool        validate      = false;
+    std::string keyField;
+};
+
+// ---------------------------------------------------------------------------
+// TopicSchemaCache — maps topicId → TopicSchemaEntry (agent-thread-only)
+// ---------------------------------------------------------------------------
+class TopicSchemaCache {
+public:
+    TopicSchemaCache()  = default;
+    ~TopicSchemaCache() = default;
+
+    TopicSchemaCache(const TopicSchemaCache&)            = delete;
+    TopicSchemaCache& operator=(const TopicSchemaCache&) = delete;
+    TopicSchemaCache(TopicSchemaCache&&)                 = default;
+    TopicSchemaCache& operator=(TopicSchemaCache&&)      = default;
+
+    void put(int32_t topicId, TopicSchemaEntry entry) noexcept {
+        entries_[topicId] = std::move(entry);
+    }
+
+    [[nodiscard]] const TopicSchemaEntry* get(int32_t topicId) const noexcept {
+        const auto it = entries_.find(topicId);
+        if (it == entries_.end()) return nullptr;
+        return &it->second;
+    }
+
+    void clear() noexcept { entries_.clear(); }
+
+private:
+    std::unordered_map<int32_t, TopicSchemaEntry> entries_;
+};
+
 } // namespace rune::client::metadata
