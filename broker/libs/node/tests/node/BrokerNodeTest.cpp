@@ -14,6 +14,8 @@
 // Unique temp paths use getpid() + atomic counter.
 
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
+#include <utility>
 #include <rune/node/NodeConfig.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
@@ -25,6 +27,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <map>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <thread>
@@ -917,10 +922,12 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
 
     ASSERT_TRUE(node.awaitLeader(2s)) << "single-node must self-elect within 2 s";
 
-    auto* replica = node.replicaForTest(0, 0);
-    ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
+    ASSERT_TRUE(rune::node::test::hasReplica(node)) << "replica must exist for topic 0 partition 0";
 
-    EXPECT_EQ(replica->durability(), rune::replication::DurabilityMode::AllInSync)
+    // F1: read on the replica's OWNING thread (no raw cross-thread replica access).
+    EXPECT_EQ(node.onOwnerThreadForTest(0, 0,
+                  [](rune::replication::PartitionReplica& r) { return r.durability(); }),
+              rune::replication::DurabilityMode::AllInSync)
         << "Task M1 precondition #1: durability=1 in TopicSpec must produce AllInSync "
            "PartitionReplica — durability field was not threaded through to PartitionConfig";
 
@@ -963,13 +970,17 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
     // Give the cleaner time to run (it must NOT crash on the memory-backed replica).
     std::this_thread::sleep_for(std::chrono::milliseconds{500});
 
-    auto* replica = node.replicaForTest(0, 0);
-    ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
+    ASSERT_TRUE(rune::node::test::hasReplica(node)) << "replica must exist for topic 0 partition 0";
 
     // Verify the log is memory-backed (de-virtualized seam: isMemoryBacked()).
-    EXPECT_TRUE(replica->isMemoryBacked())
+    // F1: read on the replica's OWNING thread.
+    const auto [memBacked, diskBacked] = node.onOwnerThreadForTest(0, 0,
+        [](rune::replication::PartitionReplica& r) {
+            return std::pair{r.isMemoryBacked(), r.isDiskBacked()};
+        });
+    EXPECT_TRUE(memBacked)
         << "Task M1: persistence=Memory must produce a memory-backed replica (InMemoryLog)";
-    EXPECT_FALSE(replica->isDiskBacked())
+    EXPECT_FALSE(diskBacked)
         << "Task M1: persistence=Memory replica must not be disk-backed";
 
     // If we reach here without a crash/assertion, the cleaner correctly skipped
@@ -1047,6 +1058,141 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
                   std::string("127.0.0.1:") + std::to_string(40360 + i))
             << "worker " << i << " control endpoint must be host:(basePort+workerId)";
     }
+
+    node.stop();
+}
+
+// ===========================================================================
+// F1 REGRESSION: owner-thread test hook runs on the replica's TRUE owner.
+//
+// The old replicaForTest() raw accessor let tests append()/read LEO/HW from the
+// TEST thread while a WORKER owned the replica (append pushes inline on the
+// worker's single-writer ExclusivePublication → corrupted/lost replication
+// frames under load).  onOwnerThreadForTest must execute:
+//   - user partitions (WorkerPool present) → on the OWNING worker thread
+//     (never the test thread, never the control thread; stable per partition;
+//     distinct threads for partitions owned by distinct workers);
+//   - internal partitions (topicId < 0)    → on the CONTROL thread;
+// and fail loudly on misuse (not running, admin-owned __topic_schemas, missing
+// replica for the reference form) while propagating the callable's exceptions.
+// ===========================================================================
+TEST(BrokerNodeTest, OwnerThreadHookRunsOnTrueOwnerThreadRegression) {
+    using rune::replication::PartitionReplica;
+    TempDir tmp{"f1_owner_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.workerCount = 2;
+
+    TopicSpec ts;
+    ts.name           = "f1";
+    ts.partitionCount = 8;
+    ts.topicId        = 0;
+    cfg.topics = {ts};
+
+    BrokerNode node{cfg};
+    auto threadOf = [](PartitionReplica&) { return std::this_thread::get_id(); };
+
+    // Not started → no owner thread → loud failure (never a silent test-thread run).
+    EXPECT_THROW(node.onOwnerThreadForTest(0, 0, threadOf), std::logic_error);
+
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s));
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s));
+
+    const auto testTid    = std::this_thread::get_id();
+    const auto controlTid = node.onControlThreadForTest([] { return std::this_thread::get_id(); });
+    EXPECT_NE(controlTid, testTid) << "control-thread task ran on the test thread";
+
+    // User partitions → the owning WORKER thread.
+    std::map<int32_t, std::thread::id> tidByWorker;
+    for (int32_t p = 0; p < static_cast<int32_t>(ts.partitionCount); ++p) {
+        const auto tid = node.onOwnerThreadForTest(0, p, threadOf);
+        EXPECT_NE(tid, testTid)    << "partition " << p << " ran on the test thread";
+        EXPECT_NE(tid, controlTid) << "partition " << p << " (worker-owned) ran on the control thread";
+        EXPECT_EQ(tid, node.onOwnerThreadForTest(0, p, threadOf))
+            << "partition " << p << " owner thread must be stable";
+        const int32_t wid = node.workerForPartitionForTest(0, p);
+        ASSERT_GE(wid, 0);
+        auto [it, inserted] = tidByWorker.emplace(wid, tid);
+        if (!inserted) {
+            EXPECT_EQ(it->second, tid) << "partitions of worker " << wid << " ran on different threads";
+        }
+    }
+    for (auto a = tidByWorker.begin(); a != tidByWorker.end(); ++a) {
+        for (auto b = std::next(a); b != tidByWorker.end(); ++b) {
+            EXPECT_NE(a->second, b->second)
+                << "workers " << a->first << " and " << b->first << " share a thread";
+        }
+    }
+
+    // Internal partitions (topicId < 0) → the CONTROL thread.
+    int internalSeen = 0;
+    for (int32_t t : {-1, -2, -3}) {
+        if (!rune::node::test::hasReplica(node, t, 0)) continue;
+        ++internalSeen;
+        EXPECT_EQ(node.onOwnerThreadForTest(t, 0, threadOf), controlTid)
+            << "internal partition topicId=" << t << " must run on the control thread";
+    }
+    EXPECT_GE(internalSeen, 1) << "expected at least one internal partition replica";
+
+    // Mutation on the owner: append advances LEO by exactly one record.
+    const auto leo0 = rune::node::test::leoOnOwner(node);
+    const std::vector<uint8_t> payload(16, 0x5A);
+    EXPECT_GE(rune::node::test::appendOnOwner(node, payload, /*acksAll=*/false), 0);
+    EXPECT_EQ(rune::node::test::leoOnOwner(node), leo0 + 1);
+
+    // Misuse fails loudly; the callable's own exceptions propagate.
+    EXPECT_FALSE(rune::node::test::hasReplica(node, 0, 99));            // pointer form: nullptr
+    EXPECT_THROW(rune::node::test::leoOnOwner(node, 0, 99), std::runtime_error);  // ref form
+    EXPECT_THROW(node.onOwnerThreadForTest(kSchemaTopicId, 0, threadOf), std::invalid_argument);
+    EXPECT_THROW(node.onOwnerThreadForTest(0, 0,
+                     [](PartitionReplica&) -> int { throw std::domain_error("boom"); }),
+                 std::domain_error);
+
+    node.stop();
+    EXPECT_THROW(node.onOwnerThreadForTest(0, 0, threadOf), std::logic_error);
+}
+
+// ===========================================================================
+// F1 REGRESSION: a task the owner has not STARTED by the deadline is cancelled
+// and NEVER runs afterwards (its callable captures test locals by reference —
+// running it after the test frame unwinds would be a use-after-free).
+// ===========================================================================
+TEST(BrokerNodeTest, OwnerThreadHookTimeoutCancelsTaskRegression) {
+    TempDir tmp{"f1_cancel_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    TopicSpec ts;
+    ts.name           = "f1c";
+    ts.partitionCount = 1;
+    ts.topicId        = 0;
+    cfg.topics = {ts};
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s));
+
+    // Occupy the control thread with a task that blocks until released (hard cap).
+    std::promise<void> started, release;
+    auto releaseFut = release.get_future().share();
+    auto blocker = std::async(std::launch::async, [&] {
+        return node.onControlThreadForTest([&started, releaseFut] {
+            started.set_value();
+            return releaseFut.wait_for(10s) == std::future_status::ready;
+        }, 15s);
+    });
+    ASSERT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+
+    // Queued behind the blocker → cannot start within 100ms → cancelled + throws.
+    bool ran = false;
+    EXPECT_THROW(node.onControlThreadForTest([&ran] { ran = true; return 0; },
+                                             std::chrono::milliseconds{100}),
+                 std::runtime_error);
+
+    release.set_value();
+    EXPECT_TRUE(blocker.get()) << "blocker task must have been released, not timed out";
+
+    // FIFO round-trip AFTER the cancelled task: it has been drained by now.
+    EXPECT_EQ(node.onControlThreadForTest([] { return 7; }), 7);
+    EXPECT_FALSE(ran) << "a cancelled (timed-out) task must never run";
 
     node.stop();
 }

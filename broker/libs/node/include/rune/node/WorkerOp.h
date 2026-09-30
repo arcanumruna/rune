@@ -81,6 +81,13 @@ struct WorkerOp {
         // Worker builds a local rune::codec::Validator from the blob on its own thread
         // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
         SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
+        // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
+        // control → owning worker: run a test-owned OwnerThreadTestTask against
+        // `replica` on the worker's OWN thread.  The opaque task ref travels in the
+        // `egressPub` pointer slot (no new wire field, no hot-path encode branch).
+        // Never enqueued by production code; the worker's handler is a cold branch.
+        // Value 200 matches the schema's TEST_TASK (outside the dense prod range).
+        TestTask = 200,           ///< control → worker: run a test task (test-only)
     };
 
     Type    type    = Type::Produce;

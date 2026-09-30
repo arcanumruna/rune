@@ -37,6 +37,7 @@
 
 // Node / replication
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -69,6 +70,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -78,6 +80,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 
 // ===========================================================================
@@ -349,7 +352,8 @@ TEST(GR4_Unit, NonLeaderProduceRejected_ReplicaRoleCheck) {
 //   - The test opens a real Aeron:udp client connection to the elected leader's
 //     client endpoint.
 //   - Sends N Produce messages; asserts ProduceResponse{OK} for each.
-//   - Waits (bounded) for all followers' replicaForTest(0,0)->logEndOffset()
+//   - Waits (bounded) for all followers' LEO (read on the owning thread via
+//     leoOrMinusOne / onOwnerThreadForTest)
 //     to converge to N and leader highWatermark() >= N.
 //
 // NO Docker.  NO mocks.  Real aeron:udp on loopback.
@@ -643,15 +647,14 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     // -----------------------------------------------------------------------
     // 5. Verify leader replica LEO == kNumRecords.
     // -----------------------------------------------------------------------
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr) << "leader must have a replica for topic=0 partition=0";
-    EXPECT_EQ(leaderReplica->logEndOffset(), static_cast<Offset>(kNumRecords))
+    ASSERT_TRUE(hasReplica(*leaderNode)) << "leader must have a replica for topic=0 partition=0";
+    EXPECT_EQ(leoOnOwner(*leaderNode), static_cast<Offset>(kNumRecords))
         << "leader replica LEO must equal kNumRecords after produce";
 
     // -----------------------------------------------------------------------
     // 6. Wait for followers to replicate and HW to advance.
     // -----------------------------------------------------------------------
-    const Offset targetLeo = leaderReplica->logEndOffset();
+    const Offset targetLeo = leoOnOwner(*leaderNode);
     ASSERT_GT(targetLeo, 0) << "leader LEO must be > 0 after produce";
 
     bool converged = false;
@@ -661,13 +664,13 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
             bool allFollowersHaveLeo = true;
             for (int i = 0; i < 3; ++i) {
                 if (allNodes[i] == leaderNode) continue;
-                PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-                if (!fr || fr->logEndOffset() < targetLeo) {
+                // -1 when the follower has no replica (== the old !fr case).
+                if (leoOrMinusOne(*allNodes[i]) < targetLeo) {
                     allFollowersHaveLeo = false;
                     break;
                 }
             }
-            if (allFollowersHaveLeo && leaderReplica->highWatermark() >= targetLeo) {
+            if (allFollowersHaveLeo && hwOnOwner(*leaderNode) >= targetLeo) {
                 converged = true;
                 break;
             }
@@ -678,17 +681,16 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(converged)
         << "Replication did not converge within 12 s after gateway produce. "
         << "Leader LEO=" << targetLeo
-        << " HW=" << leaderReplica->highWatermark();
+        << " HW=" << hwOnOwner(*leaderNode);
 
-    EXPECT_GE(leaderReplica->highWatermark(), targetLeo)
+    EXPECT_GE(hwOnOwner(*leaderNode), targetLeo)
         << "Leader HW must advance to >= targetLeo after follower acks";
 
     // Verify at least one follower converged.
     bool anyFollowerConverged = false;
     for (int i = 0; i < 3; ++i) {
         if (allNodes[i] == leaderNode) continue;
-        PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-        if (fr && fr->logEndOffset() >= targetLeo) {
+        if (leoOrMinusOne(*allNodes[i]) >= targetLeo) {
             anyFollowerConverged = true;
         }
     }

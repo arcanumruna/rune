@@ -38,6 +38,7 @@
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
+#include <rune/node/OwnerThreadTestTask.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -71,7 +72,10 @@ extern "C" {
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace rune::node {
@@ -269,23 +273,52 @@ public:
     std::string leaderClientEndpoint() const noexcept;
 
     // -----------------------------------------------------------------------
-    // Test-only accessors (GR-2/GR-3 integration tests).
-    // NOTE: these reach into duty-cycle-owned state; call only when the node
-    // is stopped OR from a synchronized test context that knows the duty cycle
-    // is between doWork calls.  NOT safe for general concurrent use.
+    // F1: TEST-ONLY owner-thread hook.
+    //
+    // Replica / Log state is owned by exactly one thread (a worker for user
+    // partitions when a WorkerPool exists; the control thread for internal
+    // partitions and for pool-less nodes).  Tests MUST NOT touch it from the
+    // test thread — the former replicaForTest()/topicRegistryForTest() raw
+    // accessors were REMOVED because tests used them to append()/read LEO/HW/ISR
+    // cross-thread (append() offers on the owner's single-writer
+    // ExclusivePublication → corrupted/lost replication frames).
+    //
+    // onOwnerThreadForTest(topicId, partition, f) runs `f` on the replica's TRUE
+    // owner thread for this node's configuration and returns its result (or
+    // rethrows its exception) to the test thread:
+    //   f(PartitionReplica&)  — missing replica = std::runtime_error.
+    //   f(PartitionReplica*)  — nullptr passed through (tolerant polling).
+    // Routing: test thread → control thread (SPSC test-task ring) → [user
+    // partition + WorkerPool] owning worker via the existing control→worker
+    // ingress ring (WorkerOp::TestTask).  See OwnerThreadTestTask.h.
+    //
+    // Timeout: if the owner has not STARTED the task within `timeout`, it is
+    // cancelled (never runs) and std::runtime_error is thrown.
+    // Preconditions (fail loudly with std::logic_error / invalid_argument):
+    //   node started and not stopped; topicId != kSchemaTopicId (-4, the
+    //   __topic_schemas replica is AdminWorker-owned — not routable here).
+    // Callers may be on any test thread; test-side producers are serialised by
+    // testHookMu_ (touched ONLY by test threads — never by a node thread).
     // -----------------------------------------------------------------------
-
-    /// Return the PartitionReplica for (topicId, partition), or nullptr.
-    rune::replication::PartitionReplica*
-    replicaForTest(int32_t topicId, int32_t partition) const noexcept {
-        if (!replicaRegistry_) return nullptr;
-        return replicaRegistry_->lookup(topicId, partition);
+    template <class F>
+    auto onOwnerThreadForTest(int32_t topicId, int32_t partition, F&& f,
+                              std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        if (topicId == kSchemaTopicId) {
+            throw std::invalid_argument(
+                "onOwnerThreadForTest: __topic_schemas (topicId=-4) is AdminWorker-owned; "
+                "not routable via the owner-thread hook");
+        }
+        return submitOwnerThreadTestTask_<OwnerThreadTestTask::Target::Replica>(
+            topicId, partition, std::forward<F>(f), timeout);
     }
 
-    /// Return the TopicRegistry (for direct Log* access in tests).
-    rune::gateway::TopicRegistry*
-    topicRegistryForTest() const noexcept {
-        return topicRegistry_.get();
+    /// F1: run `f()` on the CONTROL (NodeRuntimeAgent) thread — for test reads of
+    /// control-thread-owned state (e.g. ClientGateway::pendingAckCount()).
+    template <class F>
+    auto onControlThreadForTest(F&& f,
+                                std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        return submitOwnerThreadTestTask_<OwnerThreadTestTask::Target::ControlThread>(
+            -1, -1, std::forward<F>(f), timeout);
     }
 
     /// Observer-thread-safe: true if the replication metadata bridge has
@@ -378,6 +411,35 @@ public:
     }
 
 private:
+    // F1: test-side submit + await (see onOwnerThreadForTest).  Runs on the TEST
+    // thread only; the node's threads only ever see the ring-carried ref.
+    template <OwnerThreadTestTask::Target T, class F>
+    auto submitOwnerThreadTestTask_(int32_t topicId, int32_t partition, F&& f,
+                                    std::chrono::milliseconds timeout) {
+        using Impl = detail::OwnerThreadTestTaskImpl<std::decay_t<F>, T>;
+        if (!started_.load(std::memory_order_acquire) ||
+            stopped_.load(std::memory_order_acquire) || !runtimeAgent_) {
+            throw std::logic_error(
+                "onOwnerThreadForTest: node is not running (start() not called, or "
+                "already stopped) — no owner thread to run the task on");
+        }
+        auto task = std::make_shared<Impl>(topicId, partition, std::forward<F>(f));
+        auto fut  = task->future();
+        auto* ref = new OwnerThreadTestTaskRef(task);   // the ring's reference
+        {
+            std::lock_guard<std::mutex> lk(testHookMu_);
+            if (!runtimeAgent_->offerOwnerThreadTestTask(ref)) {
+                delete ref;
+                throw std::runtime_error("onOwnerThreadForTest: control test-task ring full");
+            }
+        }
+        return awaitOwnerThreadTestTask(*task, fut, timeout);
+    }
+
+    // F1: serialises TEST-thread producers onto the SPSC test-task ring.  Never
+    // touched by any node thread (not on any production path).
+    std::mutex testHookMu_;
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------

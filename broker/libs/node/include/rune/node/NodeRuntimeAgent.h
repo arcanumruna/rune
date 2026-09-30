@@ -33,6 +33,8 @@
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/OneToOneByteRing.h>
+#include <rune/node/OwnerThreadTestTask.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
@@ -51,6 +53,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <vector>
 
 namespace rune::node {
@@ -483,7 +486,24 @@ public:
             }
         }
 
+        // F1: TEST-ONLY owner-thread hook.  One empty-ring poll per CONTROL cycle
+        // (never on the worker hot path); the dispatch body is out-of-line + cold.
+        work += drainOwnerThreadTestTasks_();
+
         return work;
+    }
+
+    // -----------------------------------------------------------------------
+    // F1: TEST-ONLY owner-thread hook — producer side (TEST thread).
+    //
+    // Offer a ring-carried OwnerThreadTestTask ref (see OwnerThreadTestTask.h)
+    // to the CONTROL thread over testTaskRing_ (SPSC: single producer = the test
+    // thread, serialised by BrokerNode; single consumer = this control thread).
+    // Returns false if the ring is full (caller fails loudly).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] bool offerOwnerThreadTestTask(void* ref) {
+        return testTaskRing_.write(reinterpret_cast<const uint8_t*>(&ref),
+                                   sizeof(ref), kTestTaskMsgTypeId);
     }
 
     // -----------------------------------------------------------------------
@@ -636,6 +656,77 @@ public:
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // F1: TEST-ONLY owner-thread hook — consumer side (THIS control thread).
+    //
+    // For each ring-carried task ref, resolve the replica in THIS thread's
+    // ReplicaRegistry (the registry is control-thread-owned) and route to the
+    // replica's TRUE owner, mirroring the ownership split in doWork above:
+    //   - ControlThread target, internal partition (topicId < 0), or no
+    //     WorkerPool (pre-E1: control drives every replica)  → run inline HERE.
+    //   - user partition with a WorkerPool → WorkerOp::TestTask over the
+    //     EXISTING control→worker ingress ring (this thread is its sole
+    //     producer); the owning worker runs it in its duty cycle.  Ring full →
+    //     hold in pendingTestTasks_ (FIFO) and retry next cycle; never drop.
+    // Missing replica → run inline with nullptr (the task reports the error).
+    // -----------------------------------------------------------------------
+    int drainOwnerThreadTestTasks_() {
+        int work = 0;
+        if (!pendingTestTasks_.empty()) work += retryPendingOwnerThreadTestTasks_();
+        work += testTaskRing_.drain(
+            [this](int32_t /*typeId*/, aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t off, aeron::util::index_t /*len*/) {
+                void* ref = nullptr;
+                std::memcpy(&ref, buf.buffer() + off, sizeof(ref));
+                // Keep FIFO behind held ones; hold (never drop) on a full ingress.
+                if (!pendingTestTasks_.empty() || !dispatchOwnerThreadTestTask_(ref)) {
+                    pendingTestTasks_.push_back(ref);
+                }
+            }, 16);
+        return work;
+    }
+
+    [[gnu::cold]] [[gnu::noinline]] int retryPendingOwnerThreadTestTasks_() {
+        std::size_t i = 0;
+        for (; i < pendingTestTasks_.size(); ++i) {
+            if (!dispatchOwnerThreadTestTask_(pendingTestTasks_[i])) break;
+        }
+        pendingTestTasks_.erase(pendingTestTasks_.begin(),
+                                pendingTestTasks_.begin() + static_cast<std::ptrdiff_t>(i));
+        return static_cast<int>(i);
+    }
+
+    // Returns false only when the owning worker's ingress ring is full (the ref
+    // is then still owned by the caller, who holds it for retry).
+    [[gnu::cold]] [[gnu::noinline]] bool dispatchOwnerThreadTestTask_(void* ref) {
+        const OwnerThreadTestTask& task = ownerThreadTestTaskOf(ref);
+        if (task.target() == OwnerThreadTestTask::Target::ControlThread) {
+            runOwnerThreadTestTask(ref, nullptr);
+            return true;
+        }
+        const int32_t tid = task.topicId();
+        const int32_t pid = task.partition();
+        rune::replication::PartitionReplica* replica =
+            registry_ ? registry_->lookup(tid, pid) : nullptr;
+        if (workerPool_ && tid >= 0 && replica) {
+            WorkerOp op;
+            op.type      = WorkerOp::Type::TestTask;
+            op.topicId   = tid;
+            op.partition = pid;
+            op.replica   = replica;
+            op.egressPub = ref;   // opaque task ref (WorkerOp::TestTask contract)
+            return workerPool_->tryEnqueueOp(tid, pid, std::move(op));
+        }
+        runOwnerThreadTestTask(ref, replica);   // control-thread-owned (or missing)
+        return true;
+    }
+
+    static constexpr int32_t kTestTaskMsgTypeId = 0x7E57;  // F1 test-task ring msg
+    // test thread → control thread (SPSC).  Small: tests enqueue one task at a time.
+    OneToOneByteRing                                   testTaskRing_{4096};
+    // Control-thread-only: refs whose owning worker's ingress was full.
+    std::vector<void*>                                 pendingTestTasks_;
+
     rune::consensus::Agent&                            consensus_;
     rune::consensus::Election*                         election_;   // non-owning; null when no bridge
     // Allocation-free eligible-set tracking for bidirectional leadership rebalance.

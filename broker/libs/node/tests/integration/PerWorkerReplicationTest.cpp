@@ -89,6 +89,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -108,6 +109,7 @@ extern "C" {
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <array>
 #include <algorithm>
@@ -119,6 +121,15 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+// F1: every replica/log probe runs on the replica's OWNING thread.
+using rune::node::test::leoOnOwner;
+using rune::node::test::leoOrMinusOne;
+using rune::node::test::hwOnOwner;
+using rune::node::test::roleOnOwner;
+using rune::node::test::gatewayIsrSizeOnOwner;
+using rune::node::test::hasReplica;
+using rune::node::test::appendOnOwner;
+using rune::node::test::readLogOnOwner;
 
 // ===========================================================================
 // Shared helpers
@@ -361,20 +372,19 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest())
         << "Leader's replication bridge must report isLeader after election";
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr) << "Leader must have a partition replica for (topicId=0, partition=0)";
-    ASSERT_EQ(leaderReplica->role(), Role::Leader);
+    ASSERT_TRUE(hasReplica(*leaderNode)) << "Leader must have a partition replica for (topicId=0, partition=0)";
+    ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
-    // Produce N=6 records via the leader replica directly.
+    // Produce N=6 records via the leader replica directly (on its OWNING thread).
     // Each record has a distinct fill byte 0xA0+i so we can verify content.
     constexpr int kN = 6;
     for (int i = 0; i < kN; ++i) {
         auto payload = makePwPayload(static_cast<uint8_t>(0xA0 + i), 16);
-        Offset off = leaderReplica->append(
+        Offset off = appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
         ASSERT_GE(off, 0) << "Leader must accept record " << i;
     }
-    const Offset leaderLeo = leaderReplica->logEndOffset();
+    const Offset leaderLeo = leoOnOwner(*leaderNode);
     ASSERT_GE(leaderLeo, kN) << "Leader LEO must be at least N after append";
 
     // Wait for the leader's HW to advance (majority-committed).
@@ -382,38 +392,36 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool hwAdvanced = false;
         while (std::chrono::steady_clock::now() < deadline && !hwAdvanced) {
-            hwAdvanced = (leaderReplica->highWatermark() >= leaderLeo);
+            hwAdvanced = (hwOnOwner(*leaderNode) >= leaderLeo);
             if (!hwAdvanced) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(hwAdvanced)
             << "Leader HW must advance to " << leaderLeo
             << " via per-worker replication; actual HW="
-            << leaderReplica->highWatermark();
+            << hwOnOwner(*leaderNode);
     }
-    const Offset committedHw = leaderReplica->highWatermark();
+    const Offset committedHw = hwOnOwner(*leaderNode);
     ASSERT_GE(committedHw, leaderLeo)
         << "committedHw must equal leaderLeo (all records committed)";
 
     // Wait for both followers' LEO to reach committedHw.
-    PartitionReplica* f1Replica = follower1->replicaForTest(0, 0);
-    PartitionReplica* f2Replica = follower2->replicaForTest(0, 0);
-    ASSERT_NE(f1Replica, nullptr) << "Follower1 must have a partition replica";
-    ASSERT_NE(f2Replica, nullptr) << "Follower2 must have a partition replica";
+    ASSERT_TRUE(hasReplica(*follower1)) << "Follower1 must have a partition replica";
+    ASSERT_TRUE(hasReplica(*follower2)) << "Follower2 must have a partition replica";
 
     {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool f1ok = false, f2ok = false;
         while (std::chrono::steady_clock::now() < deadline && (!f1ok || !f2ok)) {
-            f1ok = (f1Replica->logEndOffset() >= committedHw);
-            f2ok = (f2Replica->logEndOffset() >= committedHw);
+            f1ok = (leoOnOwner(*follower1) >= committedHw);
+            f2ok = (leoOnOwner(*follower2) >= committedHw);
             if (!f1ok || !f2ok) std::this_thread::sleep_for(20ms);
         }
         EXPECT_TRUE(f1ok)
             << "Follower1 LEO must reach committedHw=" << committedHw
-            << " via per-worker replication; actual LEO=" << f1Replica->logEndOffset();
+            << " via per-worker replication; actual LEO=" << leoOnOwner(*follower1);
         EXPECT_TRUE(f2ok)
             << "Follower2 LEO must reach committedHw=" << committedHw
-            << " via per-worker replication; actual LEO=" << f2Replica->logEndOffset();
+            << " via per-worker replication; actual LEO=" << leoOnOwner(*follower2);
     }
 
     // HW must be N on the leader (all records committed).
@@ -423,11 +431,7 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     // Content check on leader log: read raw bytes and scan RecordBatches.
     // Verify all N payloads are present with their distinct fill bytes.
     {
-        rune::gateway::TopicRegistry* reg = leaderNode->topicRegistryForTest();
-        ASSERT_NE(reg, nullptr);
-        rune::storage::Log* log = reg->log(0, 0);
-        ASSERT_NE(log, nullptr);
-        auto rawBytes = log->read(0, 1 << 20);
+        auto rawBytes = readLogOnOwner(*leaderNode, 0, 1 << 20);
         ASSERT_FALSE(rawBytes.empty()) << "Leader log must contain committed data";
 
         auto payloads = scanCommittedRecordPayloads(rawBytes, kN);
@@ -522,9 +526,8 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     }
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
-    ASSERT_EQ(leaderReplica->role(), Role::Leader);
+    ASSERT_TRUE(hasReplica(*leaderNode));
+    ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Produce K=5 records with DISTINCT known payloads (fill byte 0xB0+i).
     // This is the key setup for [Critical-1]: known payloads let us verify
@@ -532,36 +535,35 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     constexpr int kK = 5;
     for (int i = 0; i < kK; ++i) {
         auto payload = makePwPayload(static_cast<uint8_t>(0xB0 + i), 16);
-        Offset off = leaderReplica->append(
+        Offset off = appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
         ASSERT_GE(off, 0) << "Leader must accept record " << i;
     }
-    const Offset leaderLeo = leaderReplica->logEndOffset();
+    const Offset leaderLeo = leoOnOwner(*leaderNode);
 
     // Wait for HW to advance (majority-committed).
     {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool hwOk = false;
         while (std::chrono::steady_clock::now() < deadline && !hwOk) {
-            hwOk = (leaderReplica->highWatermark() >= leaderLeo);
+            hwOk = (hwOnOwner(*leaderNode) >= leaderLeo);
             if (!hwOk) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(hwOk)
             << "Leader HW must advance to " << leaderLeo
             << " via per-worker replication before killing the leader";
     }
-    const Offset committedHw = leaderReplica->highWatermark();
+    const Offset committedHw = hwOnOwner(*leaderNode);
     ASSERT_GE(committedHw, leaderLeo);
 
     // Also verify the followers have caught up (all K records replicated).
     {
-        PartitionReplica* f1r = follower1->replicaForTest(0, 0);
-        PartitionReplica* f2r = follower2->replicaForTest(0, 0);
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
-            ok = (f1r && f1r->logEndOffset() >= committedHw) &&
-                 (f2r && f2r->logEndOffset() >= committedHw);
+            // leoOrMinusOne: -1 when a follower has no replica (never >= committedHw).
+            ok = (leoOrMinusOne(*follower1) >= committedHw) &&
+                 (leoOrMinusOne(*follower2) >= committedHw);
             if (!ok) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(ok) << "Both followers must have replicated all K committed records before kill";
@@ -605,14 +607,13 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
         << "New leader's replication bridge must report isLeader";
 
-    PartitionReplica* newLeaderReplica = newLeaderNode->replicaForTest(0, 0);
-    ASSERT_NE(newLeaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*newLeaderNode));
 
     // Poll for Leader role on new leader's partition replica.
     {
         const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline &&
-               newLeaderReplica->role() != Role::Leader) {
+               roleOnOwner(*newLeaderNode) != Role::Leader) {
             std::this_thread::sleep_for(20ms);
         }
     }
@@ -623,27 +624,27 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     // and log non-empty" checks, which are necessary but not sufficient.
 
     // (c) Structural bound: LEO >= committedHw.
-    EXPECT_GE(newLeaderReplica->logEndOffset(), committedHw)
+    const Offset newLeaderLeo = leoOnOwner(*newLeaderNode);
+    EXPECT_GE(newLeaderLeo, committedHw)
         << "REGRESSION: new leader lost committed records!"
-        << " LEO=" << newLeaderReplica->logEndOffset()
+        << " LEO=" << newLeaderLeo
         << " committedHw=" << committedHw;
 
-    // (d) No phantom-committed record.
-    EXPECT_LE(newLeaderReplica->highWatermark(), newLeaderReplica->logEndOffset())
-        << "HW must never exceed LEO after failover";
+    // (d) No phantom-committed record.  HW + LEO read in ONE owner-thread task so
+    // the pair is a consistent snapshot (the owner cannot advance between them).
+    {
+        const auto [hw, leo] = newLeaderNode->onOwnerThreadForTest(0, 0,
+            [](PartitionReplica& r) { return std::pair{r.highWatermark(), r.logEndOffset()}; });
+        EXPECT_LE(hw, leo) << "HW must never exceed LEO after failover";
+    }
 
     // Role must be Leader.
-    EXPECT_EQ(newLeaderReplica->role(), Role::Leader)
+    EXPECT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
         << "New leader's partition replica must be in Leader role";
 
     // (a)(b) [Critical-1] Read back and verify record COUNT and CONTENT.
     {
-        rune::gateway::TopicRegistry* reg = newLeaderNode->topicRegistryForTest();
-        ASSERT_NE(reg, nullptr);
-        rune::storage::Log* log = reg->log(0, 0);
-        ASSERT_NE(log, nullptr);
-
-        auto rawBytes = log->read(0, 1 << 20);
+        auto rawBytes = readLogOnOwner(*newLeaderNode, 0, 1 << 20);
         ASSERT_FALSE(rawBytes.empty())
             << "New leader's log must contain committed data from offset 0";
 
@@ -676,13 +677,12 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool isrOk = false;
         while (std::chrono::steady_clock::now() < deadline && !isrOk) {
-            // gatewayIsrSize() is an atomic acquire-load — safe from test thread.
-            isrOk = (newLeaderReplica->gatewayIsrSize() >= 2);
+            isrOk = (gatewayIsrSizeOnOwner(*newLeaderNode) >= 2);
             if (!isrOk) std::this_thread::sleep_for(50ms);
         }
         EXPECT_TRUE(isrOk)
             << "[Important-1] ISR must re-expand to at least 2 after re-election + follower rejoin; "
-            << "actual gatewayIsrSize=" << newLeaderReplica->gatewayIsrSize()
+            << "actual gatewayIsrSize=" << gatewayIsrSizeOnOwner(*newLeaderNode)
             << " — surviving follower never joined the new leader's ISR";
     }
 
@@ -692,13 +692,13 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     // Also verify the surviving follower replicates it (its LEO advances).
     {
         auto postPayload = makePwPayload(0xBF, 16);
-        const Offset leoBeforePost = newLeaderReplica->logEndOffset();
-        Offset postOff = newLeaderReplica->append(
+        const Offset leoBeforePost = leoOnOwner(*newLeaderNode);
+        Offset postOff = appendOnOwner(*newLeaderNode,
             std::span<const uint8_t>(postPayload.data(), postPayload.size()), false);
         EXPECT_GE(postOff, 0)
             << "[Important-2] New leader must accept a post-failover append";
 
-        const Offset leoAfterPost = newLeaderReplica->logEndOffset();
+        const Offset leoAfterPost = leoOnOwner(*newLeaderNode);
         EXPECT_GT(leoAfterPost, leoBeforePost)
             << "[Important-2] New leader LEO must advance after post-failover produce";
 
@@ -708,27 +708,26 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
             const auto deadline = std::chrono::steady_clock::now() + 45s;
             bool hwOk = false;
             while (std::chrono::steady_clock::now() < deadline && !hwOk) {
-                hwOk = (newLeaderReplica->highWatermark() >= hwFloor);
+                hwOk = (hwOnOwner(*newLeaderNode) >= hwFloor);
                 if (!hwOk) std::this_thread::sleep_for(20ms);
             }
             EXPECT_TRUE(hwOk)
                 << "[Important-2] Post-failover produce must COMMIT on the new leader; "
-                << "HW=" << newLeaderReplica->highWatermark() << " expected >= " << hwFloor
+                << "HW=" << hwOnOwner(*newLeaderNode) << " expected >= " << hwFloor
                 << " — new leader cannot advance HW after failover (OLE/reconcile broken?)";
         }
 
         // Wait for the surviving follower to replicate the post-failover record.
-        PartitionReplica* sfReplica = survivingFollowerNode->replicaForTest(0, 0);
-        if (sfReplica) {
+        if (hasReplica(*survivingFollowerNode)) {
             const auto deadline = std::chrono::steady_clock::now() + 45s;
             bool replOk = false;
             while (std::chrono::steady_clock::now() < deadline && !replOk) {
-                replOk = (sfReplica->logEndOffset() >= leoAfterPost);
+                replOk = (leoOnOwner(*survivingFollowerNode) >= leoAfterPost);
                 if (!replOk) std::this_thread::sleep_for(20ms);
             }
             EXPECT_TRUE(replOk)
                 << "[Important-2] Surviving follower must replicate post-failover record; "
-                << "sfLEO=" << sfReplica->logEndOffset() << " expected >= " << leoAfterPost
+                << "sfLEO=" << leoOnOwner(*survivingFollowerNode) << " expected >= " << leoAfterPost
                 << " — per-worker replication plane broken after failover";
         }
     }
@@ -861,43 +860,41 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     }
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
-    ASSERT_EQ(leaderReplica->role(), Role::Leader);
+    ASSERT_TRUE(hasReplica(*leaderNode));
+    ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Phase 1: produce N=4 records on the 3-node cluster with distinct fill bytes.
     constexpr int kN = 4;
     for (int i = 0; i < kN; ++i) {
         auto payload = makePwPayload(static_cast<uint8_t>(0xC0 + i), 16);
-        Offset off = leaderReplica->append(
+        Offset off = appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
         ASSERT_GE(off, 0) << "Leader must accept N-phase record " << i;
     }
-    const Offset leoN = leaderReplica->logEndOffset();
+    const Offset leoN = leoOnOwner(*leaderNode);
 
     // Wait for HW to advance to leoN (3-node majority committed).
     {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
-            ok = (leaderReplica->highWatermark() >= leoN);
+            ok = (hwOnOwner(*leaderNode) >= leoN);
             if (!ok) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(ok) << "N records must commit on the 3-node cluster";
     }
-    const Offset hwAfterN = leaderReplica->highWatermark();
+    const Offset hwAfterN = hwOnOwner(*leaderNode);
     ASSERT_GE(hwAfterN, leoN) << "hwAfterN must cover all N records";
 
     // Wait for both followers to replicate all N records (need F1 to actually
     // have them before we stop it — avoids a trivially non-divergent scenario).
     {
-        PartitionReplica* f1r = f1Node->replicaForTest(0, 0);
-        PartitionReplica* f2r = f2Node->replicaForTest(0, 0);
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
-            ok = (f1r && f1r->logEndOffset() >= hwAfterN) &&
-                 (f2r && f2r->logEndOffset() >= hwAfterN);
+            // leoOrMinusOne: -1 when a follower has no replica (never >= hwAfterN).
+            ok = (leoOrMinusOne(*f1Node) >= hwAfterN) &&
+                 (leoOrMinusOne(*f2Node) >= hwAfterN);
             if (!ok) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(ok) << "Both followers must have N records before F1 is stopped";
@@ -915,12 +912,12 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool isrShrunk = false;
         while (std::chrono::steady_clock::now() < deadline && !isrShrunk) {
-            isrShrunk = (leaderReplica->gatewayIsrSize() == 2);
+            isrShrunk = (gatewayIsrSizeOnOwner(*leaderNode) == 2);
             if (!isrShrunk) std::this_thread::sleep_for(50ms);
         }
         ASSERT_TRUE(isrShrunk)
             << "[Critical-2] ISR must shrink to 2 after F1 stops before we can produce "
-            << "the uncommitted tail; actual ISR size=" << leaderReplica->gatewayIsrSize()
+            << "the uncommitted tail; actual ISR size=" << gatewayIsrSizeOnOwner(*leaderNode)
             << " — F1 was not evicted from ISR within the deadline";
     }
 
@@ -931,34 +928,33 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     constexpr int kM = 2;
     for (int i = 0; i < kM; ++i) {
         auto payload = makePwPayload(static_cast<uint8_t>(0xD0 + i), 16);
-        leaderReplica->append(
+        appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
     }
-    const Offset leoNM = leaderReplica->logEndOffset();
+    const Offset leoNM = leoOnOwner(*leaderNode);
     ASSERT_GT(leoNM, leoN) << "M records must have been appended to the leader's log";
 
     // [Critical-2] HARD PRECONDITION 1: F2 MUST receive the M uncommitted records.
     // The fetch loop is not HW-bounded; followers pull up to the leader's LEO.
     // This assertion converts the divergent tail from "maybe" to a guaranteed fact.
     {
-        PartitionReplica* f2r = f2Node->replicaForTest(0, 0);
-        ASSERT_NE(f2r, nullptr) << "F2 must have a replica";
+        ASSERT_TRUE(hasReplica(*f2Node)) << "F2 must have a replica";
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
-            ok = (f2r->logEndOffset() >= leoNM);
+            ok = (leoOnOwner(*f2Node) >= leoNM);
             if (!ok) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(ok)
             << "[Critical-2] F2 must replicate the M uncommitted records (LEO must reach "
-            << leoNM << "); actual F2 LEO=" << f2r->logEndOffset()
+            << leoNM << "); actual F2 LEO=" << leoOnOwner(*f2Node)
             << " — divergent tail on F2 is a HARD PRECONDITION for this test";
     }
 
     // [Critical-2] HARD PRECONDITION 2: HW must still equal hwAfterN (M records
     // did NOT commit because ISR={leader,F2} < minIsr=3).
     {
-        const Offset hwAfterM = leaderReplica->highWatermark();
+        const Offset hwAfterM = hwOnOwner(*leaderNode);
         ASSERT_EQ(hwAfterM, hwAfterN)
             << "[Critical-2] HW must remain frozen at hwAfterN=" << hwAfterN
             << " while ISR has only 2 members (minIsr=3); actual HW=" << hwAfterM
@@ -1004,33 +1000,39 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
         << "New leader's replication bridge must report isLeader";
 
-    PartitionReplica* newLeaderReplica = newLeaderNode->replicaForTest(0, 0);
-    ASSERT_NE(newLeaderReplica, nullptr);
-    PartitionReplica* newFollowerReplica = newFollowerNode->replicaForTest(0, 0);
-    ASSERT_NE(newFollowerReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*newLeaderNode));
+    ASSERT_TRUE(hasReplica(*newFollowerNode));
 
     // Poll for Leader role on new leader's partition replica.
     {
         const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline &&
-               newLeaderReplica->role() != Role::Leader) {
+               roleOnOwner(*newLeaderNode) != Role::Leader) {
             std::this_thread::sleep_for(20ms);
         }
     }
-    EXPECT_EQ(newLeaderReplica->role(), Role::Leader)
+    EXPECT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
         << "New leader's partition replica must be in Leader role";
 
     // --- Phase 7: invariant checks ---
 
     // 7a. The leoN baseline (fully committed before F1 was stopped) must be
     //     preserved on the new leader — NOT truncated by the epoch change.
-    EXPECT_GE(newLeaderReplica->logEndOffset(), hwAfterN)
-        << "Committed records up to hwAfterN=" << hwAfterN
-        << " must NOT be truncated; new leader LEO=" << newLeaderReplica->logEndOffset();
+    {
+        const Offset leo = leoOnOwner(*newLeaderNode);
+        EXPECT_GE(leo, hwAfterN)
+            << "Committed records up to hwAfterN=" << hwAfterN
+            << " must NOT be truncated; new leader LEO=" << leo;
+    }
 
-    // 7b. No phantom-committed record: HW <= LEO at all times.
-    EXPECT_LE(newLeaderReplica->highWatermark(), newLeaderReplica->logEndOffset())
-        << "HW must never exceed LEO after failover (no phantom-committed records)";
+    // 7b. No phantom-committed record: HW <= LEO at all times (one consistent
+    //     owner-thread snapshot of the pair).
+    {
+        const auto [hw, leo] = newLeaderNode->onOwnerThreadForTest(0, 0,
+            [](PartitionReplica& r) { return std::pair{r.highWatermark(), r.logEndOffset()}; });
+        EXPECT_LE(hw, leo)
+            << "HW must never exceed LEO after failover (no phantom-committed records)";
+    }
 
     // 7c. [Critical-2] CONVERGENCE WITH DIRECTION CHECK.
     //
@@ -1047,28 +1049,28 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     //
     // NOTE: election winner is non-deterministic in-process (see the large comment
     // above the test).  Both branches are correct; the test is complete either way.
-    const Offset followerLeoBeforeConverge = newFollowerReplica->logEndOffset();
-    const Offset leaderLeoAtElection       = newLeaderReplica->logEndOffset();
+    const Offset followerLeoBeforeConverge = leoOnOwner(*newFollowerNode);
+    const Offset leaderLeoAtElection       = leoOnOwner(*newLeaderNode);
 
     // Wait for the follower to converge to the leader's log.
     {
         const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool converged = false;
         while (std::chrono::steady_clock::now() < deadline && !converged) {
-            converged = (newFollowerReplica->logEndOffset() == newLeaderReplica->logEndOffset());
+            converged = (leoOnOwner(*newFollowerNode) == leoOnOwner(*newLeaderNode));
             if (!converged) std::this_thread::sleep_for(50ms);
         }
         EXPECT_TRUE(converged)
             << "[Critical-2] Both surviving nodes must converge to the same LEO after "
             << "epoch exchange + reconcile; "
-            << "leader LEO=" << newLeaderReplica->logEndOffset()
-            << " follower LEO=" << newFollowerReplica->logEndOffset()
+            << "leader LEO=" << leoOnOwner(*newLeaderNode)
+            << " follower LEO=" << leoOnOwner(*newFollowerNode)
             << " (follower was " << followerLeoBeforeConverge << " before converge; "
             << "leader was " << leaderLeoAtElection << " at election)";
     }
 
-    const Offset followerLeoAfterConverge  = newFollowerReplica->logEndOffset();
-    const Offset leaderLeoAfterConverge    = newLeaderReplica->logEndOffset();
+    const Offset followerLeoAfterConverge  = leoOnOwner(*newFollowerNode);
+    const Offset leaderLeoAfterConverge    = leoOnOwner(*newLeaderNode);
 
     // Assert direction of convergence:
     //   F2 lost (divergent follower) → truncation must have happened.
@@ -1100,11 +1102,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     // With minIsr=3: if F2 won, it has N+M — first N must be the committed fill bytes.
     //               if F1 won, it has N (M was never committed) — all N present.
     {
-        rune::gateway::TopicRegistry* reg = newLeaderNode->topicRegistryForTest();
-        ASSERT_NE(reg, nullptr);
-        rune::storage::Log* log = reg->log(0, 0);
-        ASSERT_NE(log, nullptr);
-        auto rawBytes = log->read(0, 1 << 20);
+        auto rawBytes = readLogOnOwner(*newLeaderNode, 0, 1 << 20);
         ASSERT_FALSE(rawBytes.empty())
             << "New leader's log must contain committed data readable from offset 0";
 
@@ -1147,13 +1145,13 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     // the record (LEO-level, not HW-level):
     {
         auto postPayload = makePwPayload(0xCF, 16);
-        const Offset leoBeforePost = newLeaderReplica->logEndOffset();
-        Offset postOff = newLeaderReplica->append(
+        const Offset leoBeforePost = leoOnOwner(*newLeaderNode);
+        Offset postOff = appendOnOwner(*newLeaderNode,
             std::span<const uint8_t>(postPayload.data(), postPayload.size()), false);
         EXPECT_GE(postOff, leoBeforePost)
             << "New leader must accept post-failover append (LEO-level, not commit-gated)";
 
-        const Offset leoAfterPost = newLeaderReplica->logEndOffset();
+        const Offset leoAfterPost = leoOnOwner(*newLeaderNode);
         EXPECT_GT(leoAfterPost, leoBeforePost)
             << "New leader LEO must advance after post-failover append";
 
@@ -1163,12 +1161,12 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
             const auto deadline = std::chrono::steady_clock::now() + 45s;
             bool replOk = false;
             while (std::chrono::steady_clock::now() < deadline && !replOk) {
-                replOk = (newFollowerReplica->logEndOffset() >= leoAfterPost);
+                replOk = (leoOnOwner(*newFollowerNode) >= leoAfterPost);
                 if (!replOk) std::this_thread::sleep_for(20ms);
             }
             EXPECT_TRUE(replOk)
                 << "Surviving follower must replicate post-failover record (LEO >= "
-                << leoAfterPost << "); sfLEO=" << newFollowerReplica->logEndOffset()
+                << leoAfterPost << "); sfLEO=" << leoOnOwner(*newFollowerNode)
                 << " — per-worker replication plane broken after epoch change";
         }
     }

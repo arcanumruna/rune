@@ -57,6 +57,7 @@
 
 // Node / replication
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -89,6 +90,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -98,6 +100,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 
 // ===========================================================================
@@ -935,8 +938,7 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     ASSERT_GT(conn.assignedSessionId, 0) << "failed to connect to leader gateway";
 
     // Get leader replica for HW inspection.
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
 
     // --- Send acks=All produce ---
     constexpr int kNumRecords = 5;
@@ -989,9 +991,10 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     // (GR-9: HW is EXCLUSIVE — the response only fires when HW > lastOffset in
     // drainPendingAcks, i.e. HW >= lastOffset + 1 == kNumRecords.)
     const Offset lastOffset = static_cast<Offset>(kNumRecords - 1);
-    EXPECT_GT(leaderReplica->highWatermark(), lastOffset)
+    const Offset hwAtResponse = hwOnOwner(*leaderNode);
+    EXPECT_GT(hwAtResponse, lastOffset)
         << "acks=All ProduceResponse must not fire before HW > lastOffset; "
-        << "HW=" << leaderReplica->highWatermark()
+        << "HW=" << hwAtResponse
         << " lastOffset=" << lastOffset;
 
     conn.ingressPub.reset();
@@ -1074,18 +1077,17 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     // Set minIsr=2 on the leader gateway (requires both followers in ISR for acks=All).
     leaderNode->setGatewayMinIsr(2);
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
 
     // Verify ISR starts at 3 (all nodes in sync).
     {
         const auto isrDeadline = std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < isrDeadline) {
-            if (static_cast<int>(leaderReplica->isr().size()) >= 2) break;
+            if (isrSizeOnOwner(*leaderNode) >= 2) break;
             std::this_thread::sleep_for(20ms);
         }
     }
-    EXPECT_GE(static_cast<int>(leaderReplica->isr().size()), 2)
+    EXPECT_GE(isrSizeOnOwner(*leaderNode), 2)
         << "ISR must start with at least 2 nodes before killing a follower";
 
     // --- Start client driver ---
@@ -1168,7 +1170,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
 
             // Wait for ProduceResponse (any response for this produce).
             const int64_t thisCorrId = prodN.correlationId;
-            const Offset leoBeforeThis = leaderReplica->logEndOffset();
+            const Offset leoBeforeThis = leoOnOwner(*leaderNode);
             std::optional<pc::ProduceResponse> thisResp;
             {
                 aeron::FragmentAssembler pollAsm([&](aeron::concurrent::AtomicBuffer& buf,
@@ -1198,7 +1200,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
                 static_cast<int16_t>(pc::ErrorCode::MinIsrViolation)) {
                 // Got the rejection we're looking for.
                 // Verify no data was appended for this specific rejected produce.
-                EXPECT_EQ(leaderReplica->logEndOffset(), leoBeforeThis)
+                EXPECT_EQ(leoOnOwner(*leaderNode), leoBeforeThis)
                     << "MinIsrViolation must not advance LEO "
                     << "(leoBeforeThis=" << leoBeforeThis << ")";
                 rejResp = thisResp;
@@ -1212,7 +1214,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     ASSERT_TRUE(rejResp.has_value())
         << "No MinIsrViolation received within 10s (ISR never dropped below minIsr=3 "
         << "after follower kill?). Current ISR size="
-        << leaderReplica->isr().size();
+        << isrSizeOnOwner(*leaderNode);
     EXPECT_EQ(rejResp->errorCode, static_cast<int16_t>(pc::ErrorCode::MinIsrViolation))
         << "Expected MinIsrViolation";
 
@@ -1301,8 +1303,7 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
     // requires a MAJORITY (2 of 3) LEO>=1 for HW to advance past 0.
     leaderNode->setGatewayMinIsr(2);
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
     rune::gateway::ClientGateway* leaderGw = leaderNode->gatewayForTest();
     ASSERT_NE(leaderGw, nullptr);
 
@@ -1371,16 +1372,19 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
         EXPECT_NE(anyResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
             << "GR-9 REGRESSION: single-record acks=All was acked OK while it "
                "cannot be majority-committed (both followers dead). HW="
-            << leaderReplica->highWatermark();
+            << hwOnOwner(*leaderNode);
     }
 
     // The leader's HW must be pinned at 0 (nothing majority-committed).
-    EXPECT_EQ(leaderReplica->highWatermark(), static_cast<Offset>(0))
+    EXPECT_EQ(hwOnOwner(*leaderNode), static_cast<Offset>(0))
         << "leader HW must stay 0 with no follower replication";
 
     // The record was appended to the leader log (LEO advanced) but the ack is
     // still deferred: the pending-ack entry must remain enqueued.
-    EXPECT_GE(leaderGw->pendingAckCount(), static_cast<std::size_t>(1))
+    // pendingAcks_ is CONTROL-thread-owned (gateway duty cycle) → read it there.
+    EXPECT_GE(leaderNode->onControlThreadForTest(
+                  [leaderGw] { return leaderGw->pendingAckCount(); }),
+              static_cast<std::size_t>(1))
         << "acks=All entry for the single record must remain deferred "
            "(HW=0 does NOT satisfy HW > lastOffset=0)";
 
