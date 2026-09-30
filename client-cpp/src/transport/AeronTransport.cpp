@@ -530,6 +530,23 @@ void AeronTransport::startEmbeddedDriver() {
             aeron_errmsg());
     }
 
+    // aeron_driver_init already created AND signalled the CnC file
+    // (aeron_driver.c:864 create_cnc_file, :912 signal_cnc_ready), so prime the
+    // conductor from THIS thread before any driver thread exists.  From here on
+    // exactly one thread drives the driver (spec §3.6).
+    const std::string cncPath = aeronDir + "/cnc.dat";
+    if (!fs::exists(cncPath)) {
+        aeron_driver_close(driver_);
+        aeron_driver_context_close(driverCtx_);
+        driver_    = nullptr;
+        driverCtx_ = nullptr;
+        throw std::runtime_error(
+            "AeronTransport: Aeron CnC file missing after aeron_driver_init: " + cncPath);
+    }
+    pumpDriverFromCaller_();
+    pumpDriverFromCaller_();
+    pumpDriverFromCaller_();
+
     driverRunning_.store(true, std::memory_order_release);
     driverThread_ = std::thread([this]() {
         while (driverRunning_.load(std::memory_order_acquire)) {
@@ -538,24 +555,13 @@ void AeronTransport::startEmbeddedDriver() {
                 aeron_driver_main_do_work(driver_));
         }
     });
+}
 
-    // Wait for cnc.dat (bounded) — mirrors BrokerNode::startEmbeddedDriver.
-    const std::string cncPath = aeronDir + "/cnc.dat";
-    const auto readyDeadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{200};
-    while (std::chrono::steady_clock::now() < readyDeadline) {
-        aeron_driver_main_do_work(driver_);
-        if (fs::exists(cncPath)) {
-            aeron_driver_main_do_work(driver_);
-            aeron_driver_main_do_work(driver_);
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+int AeronTransport::pumpDriverFromCaller_() noexcept {
+    if (driverRunning_.load(std::memory_order_acquire)) {
+        ++callerPumpViolations_;
     }
-    if (!fs::exists(cncPath)) {
-        throw std::runtime_error(
-            "AeronTransport: Aeron CnC file not created within timeout: " + cncPath);
-    }
+    return aeron_driver_main_do_work(driver_);
 }
 
 // ---------------------------------------------------------------------------
@@ -579,9 +585,9 @@ void AeronTransport::stopEmbeddedDriver() noexcept {
             std::chrono::steady_clock::now() +
             std::chrono::milliseconds{kDrainMaxMs};
         while (std::chrono::steady_clock::now() < drainDeadline) {
-            const int work = aeron_driver_main_do_work(driver_);
+            const int work = pumpDriverFromCaller_();
             if (work == 0) {
-                aeron_driver_main_do_work(driver_);
+                pumpDriverFromCaller_();
                 break;
             }
             std::this_thread::sleep_for(std::chrono::microseconds{kDrainSliceUs});

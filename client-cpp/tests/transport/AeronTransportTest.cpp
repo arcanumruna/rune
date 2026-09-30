@@ -222,3 +222,19 @@ TEST(AeronTransport, DtorAfterStartWithoutStop) {
         // dtor called here without explicit stop().
     });
 }
+
+// ---------------------------------------------------------------------------
+// Regression (spec §3.6): a driver is driven by exactly one thread.  start()
+// used to pump aeron_driver_main_do_work() from the caller thread while the
+// driver thread was already running the same duty cycle.
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, StartupPumpsDriverFromOneThreadOnlyRegression) {
+    Transport t{makeLoopbackConfig(1010)};
+    t.start();
+    EXPECT_EQ(t.callerPumpViolations(), 0)
+        << "start() pumped the driver from the caller thread while driverThread_ ran";
+    awaitConnected(t);
+    t.stop();
+    EXPECT_EQ(t.callerPumpViolations(), 0)
+        << "stop() may drain the driver only after joining driverThread_";
+}

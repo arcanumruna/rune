@@ -153,6 +153,11 @@ public:
     /// connected).  Safe to call before start() (returns false).
     [[nodiscard]] bool egressConnected() const noexcept;
 
+    /// Regression hook (spec §3.6): number of times the CALLER thread pumped
+    /// aeron_driver_main_do_work() while driverThread_ was running.  A driver
+    /// must be driven by exactly one thread, so this must always be 0.
+    [[nodiscard]] int callerPumpViolations() const noexcept { return callerPumpViolations_; }
+
     // -------------------------------------------------------------------------
     // retarget — single-writer, agent-thread only
     // -------------------------------------------------------------------------
@@ -185,6 +190,11 @@ private:
 
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;
+
+    /// Every caller-thread duty cycle of the driver goes through here.  Counts a
+    /// violation when driverThread_ is concurrently driving the same driver.
+    int pumpDriverFromCaller_() noexcept;
+    int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
 
     // ---- Aeron C++ client + pub/sub -----------------------------------------
     std::shared_ptr<aeron::Aeron>                aeron_;
