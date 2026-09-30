@@ -37,7 +37,8 @@ Consensus and metadata replicas are control-thread-driven and must not move onto
 ### 3.4 Symmetric-worker-count invariant (enforced, not assumed)
 Per-worker planes are correct only when all nodes share `workerCount`. Today `RUNE_WORKERS` is per-node with no cross-node awareness. This design:
 - Publishes each node's `workerCount` in the consensus/metadata membership it already exchanges.
-- At plane construction (and on membership change), **validates every peer's `workerCount == self.workerCount`**. On mismatch: **do not enable per-worker planes** — fall back to the legacy shared-drain transport for user partitions and emit a fatal-level log naming the offending node. Never silently mis-route.
+- At membership resolution (startup, and when a new peer joins), **validates every peer's `workerCount == self.workerCount`**. On mismatch (when `RUNE_PER_WORKER_REPLICATION` is on): **hard-refuse** — the mismatched node fails startup with a fatal error naming the offending node and both counts (a joining node aborts rather than disrupt an established cluster; established nodes reject a peer advertising a mismatched count).
+- **Why hard-refuse, not per-node fallback:** a per-node fallback to the legacy shared-stream transport would put that node on a *different* streamId scheme than its per-worker-plane peers, so they could not communicate at all — mixed transports are a split cluster, not a graceful degrade. A worker-count mismatch is a misconfiguration in a homogeneous cluster; fail loud and force the fix. (Correct cluster-wide coordinated fallback is possible but complex and unwarranted — YAGNI.)
 - Asymmetric worker counts (propagate + route to each peer's own `workerForPartition`) are explicitly **out of scope** (YAGNI); homogeneous clusters are the norm.
 
 ### 3.5 Config flag & rollback (also the A/B test harness)
@@ -92,7 +93,7 @@ Per `perf-ab-never-blame-server`, `never-hardware-to-mask-bad-software`, and the
 ## 7. Risks & mitigations
 - **Aeron resource/memory blowup:** W subs + W×(N-1) pubs per node, each with term buffers. At W=4/N=3 that's 4 subs + 8 pubs. Term-buffer sizing must fit the box (64 MiB × that count thrashes 8 GB) → size per-plane term buffers modestly (e.g. 16 MiB) and document. Mitigation validated in 6.4/6.5.
 - **OLE / reconcile / epoch paths on worker threads:** these must be verified worker-safe on plane `w` (6.2). Internal partitions staying on the control thread (3.2) limits blast radius to user-partition replication.
-- **Symmetric-worker-count invariant violated in the field:** enforced validation + fallback (3.4) prevents silent mis-routing.
+- **Symmetric-worker-count invariant violated in the field:** enforced validation with **hard-refuse** at membership resolution (3.4) prevents both silent mis-routing and a split cluster from mixed transports.
 - **Regression in DR:** flag gives instant rollback; full DR matrix gates merge (6.3).
 
 ## 8. Out of scope
