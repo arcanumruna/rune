@@ -1614,4 +1614,116 @@ TEST(NodeConfig, ParsesAeronDriverIdleOverride) {
     EXPECT_EQ(res.config->driverIdleStrategy, "noop");
 }
 
+// ===========================================================================
+// Task 1 (per-worker replication transport): perWorkerReplication flag,
+// replBaseStreamId, PeerConfig::workerCount, validateStreamRanges()
+// ===========================================================================
+
+// Step 1 — TDD: write the test first, confirm it fails, then implement.
+
+TEST(NodeConfig, ParsesPerWorkerReplicationFlagDefaultFalse) {
+    // RUNE_PER_WORKER_REPLICATION absent → default false.
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_FALSE(res.config->perWorkerReplication)
+        << "default perWorkerReplication must be false";
+}
+
+TEST(NodeConfig, ParsesPerWorkerReplicationFlagTrue) {
+    // "1", "true", "TRUE" → true.
+    for (const char* v : {"1", "true", "TRUE"}) {
+        auto base = base1node();
+        base["RUNE_PER_WORKER_REPLICATION"] = v;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_TRUE(res.config->perWorkerReplication)
+            << "RUNE_PER_WORKER_REPLICATION=" << v << " must set flag true";
+    }
+}
+
+TEST(NodeConfig, ParsesPerWorkerReplicationFlagFalseForOtherValues) {
+    // Non-truthy value → false.
+    auto base = base1node();
+    base["RUNE_PER_WORKER_REPLICATION"] = "no";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_FALSE(res.config->perWorkerReplication);
+}
+
+TEST(NodeConfig, ParsesReplBaseStreamIdDefault) {
+    // RUNE_REPL_BASE_STREAM_ID absent → default 2000.
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->replBaseStreamId, 2000)
+        << "default replBaseStreamId must be 2000";
+}
+
+TEST(NodeConfig, ParsesReplBaseStreamIdOverride) {
+    auto base = base1node();
+    base["RUNE_REPL_BASE_STREAM_ID"] = "3000";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->replBaseStreamId, 3000);
+}
+
+TEST(NodeConfig, ParsesReplBaseStreamIdInvalidIsError) {
+    auto base = base1node();
+    base["RUNE_REPL_BASE_STREAM_ID"] = "notanumber";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    EXPECT_FALSE(res.config.has_value())
+        << "non-integer RUNE_REPL_BASE_STREAM_ID must be rejected";
+    EXPECT_NE(res.error.find("RUNE_REPL_BASE_STREAM_ID"), std::string::npos);
+}
+
+TEST(NodeConfig, PeerWorkerCountDefaultsToZero) {
+    // PeerConfig::workerCount defaults to 0 (unknown) for peers parsed from RUNE_PEERS.
+    auto res = rune::node::parseNodeConfig(fakeEnv(base3node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    for (const auto& p : res.config->peers) {
+        EXPECT_EQ(p.workerCount, 0)
+            << "PeerConfig::workerCount must default to 0 for peer id=" << p.id;
+    }
+}
+
+TEST(NodeConfig, SelfPeerWorkerCountReflectsWorkerCount) {
+    // The peer entry for self.id must have workerCount == NodeConfig::workerCount.
+    auto base = base3node();
+    base["RUNE_WORKERS"] = "4";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->self().workerCount, 4)
+        << "self peer workerCount must match NodeConfig::workerCount";
+    // Other peers must still be 0.
+    for (const auto& p : res.config->peers) {
+        if (p.id != res.config->nodeId)
+            EXPECT_EQ(p.workerCount, 0)
+                << "non-self peer workerCount must be 0, peer id=" << p.id;
+    }
+}
+
+// Regression test: validateStreamRanges returns std::nullopt for valid default config.
+TEST(NodeConfig, ValidateStreamRanges_CleanDefaultConfig) {
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    auto err = res.config->validateStreamRanges();
+    EXPECT_FALSE(err.has_value())
+        << "default config must pass validateStreamRanges(), got: "
+        << (err ? *err : "");
+}
+
+// validateStreamRanges detects overlap of replBase range with clientStreamId.
+TEST(NodeConfig, ValidateStreamRanges_OverlapWithClientStreamId_ReturnsError) {
+    // clientStreamId defaults to 1; replBaseStreamId=1 with workerCount=4
+    // means [1,4] overlaps stream 1.
+    auto base = base1node();
+    base["RUNE_REPL_BASE_STREAM_ID"] = "1";  // collides with clientStreamId=1
+    base["RUNE_WORKERS"] = "4";
+    base["RUNE_PER_WORKER_REPLICATION"] = "true";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;  // parse still succeeds
+    auto err = res.config->validateStreamRanges();
+    EXPECT_TRUE(err.has_value())
+        << "replBase overlapping clientStreamId must fail validateStreamRanges()";
+}
+
 } // namespace rune::node

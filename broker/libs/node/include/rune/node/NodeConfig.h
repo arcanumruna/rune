@@ -139,6 +139,12 @@ struct PeerConfig {
     uint16_t clientPort       = 0;  // 0 = no known client endpoint (GB-4, backward-compatible)
     uint16_t replicationPort  = 0;  // 0 = no replication endpoint (GR-3, backward-compatible)
 
+    // Task 1 (per-worker replication transport): advertised per-worker replication
+    // stream count for this peer.  0 = unknown / feature disabled (default).
+    // Self's entry is populated from NodeConfig::workerCount during parseNodeConfig.
+    // Remote peers' entries are populated from membership descriptors when received.
+    int32_t  workerCount      = 0;  // 0 = unknown
+
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
 
@@ -161,6 +167,23 @@ struct NodeConfig {
     std::string         dataDir;
     int32_t             consensusStreamId    = 0;
     int32_t             replicationStreamId  = 20;  // GR-3: stream for per-partition replication
+
+    // Task 1 (per-worker replication transport):
+    //
+    // perWorkerReplication: when true, each worker opens its own dedicated
+    //   replication transport on stream replBaseStreamId + workerId, replacing
+    //   the shared control-thread replication path.  Default false.
+    //   Overridable via RUNE_PER_WORKER_REPLICATION ("1" or "true" → true).
+    //
+    // replBaseStreamId: base Aeron stream id for the per-worker replication
+    //   streams.  Worker W uses stream replBaseStreamId + W.
+    //   The range [replBaseStreamId, replBaseStreamId + workerCount - 1] must
+    //   not overlap clientStreamId, workerIngress/egress base ranges, or the
+    //   consensus/replication stream ids (enforced by validateStreamRanges()).
+    //   Default 2000 — chosen to be disjoint from all existing defaults.
+    //   Overridable via RUNE_REPL_BASE_STREAM_ID (parseInt32).
+    bool    perWorkerReplication = false;
+    int32_t replBaseStreamId     = 2000;
 
     // Topics declared via RUNE_TOPICS (GB-1).
     // Empty when RUNE_TOPICS is absent or empty — valid state (no topics).
@@ -465,6 +488,23 @@ struct NodeConfig {
     const PeerConfig& self() const;
 
     bool isSingleNode() const { return peers.size() == 1; }
+
+    /// Task 1 (per-worker replication transport): validate that the per-worker
+    /// replication stream range [replBaseStreamId, replBaseStreamId+workerCount-1]
+    /// does not overlap any other configured stream id or range:
+    ///   - clientStreamId (clientEndpoint.streamId)
+    ///   - workerIngress range [workerIngressBaseStreamId, +workerCount-1]
+    ///   - workerEgress range [workerEgressBaseStreamId, +workerCount-1]  (if set)
+    ///   - consensusStreamId
+    ///   - replicationStreamId
+    ///
+    /// Returns std::nullopt when the configuration is valid.
+    /// Returns an error string describing the first detected overlap when invalid.
+    ///
+    /// Called automatically at the end of parseNodeConfig when
+    /// perWorkerReplication is true and workerCount > 0.  May also be called
+    /// directly by callers that modify replBaseStreamId programmatically.
+    std::optional<std::string> validateStreamRanges() const;
 };
 
 struct ConfigResult {

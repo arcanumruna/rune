@@ -184,6 +184,69 @@ const PeerConfig& NodeConfig::self() const {
 }
 
 // ---------------------------------------------------------------------------
+// NodeConfig::validateStreamRanges  (Task 1 — per-worker replication transport)
+// ---------------------------------------------------------------------------
+
+std::optional<std::string> NodeConfig::validateStreamRanges() const {
+    if (workerCount <= 0) return std::nullopt;  // empty range — nothing to check
+
+    // Helper: does the range [base, base+count-1] contain the single stream id?
+    auto rangeContains = [](int32_t base, int32_t count, int32_t id) -> bool {
+        return id >= base && id < base + count;
+    };
+
+    // Helper: do two ranges [a, a+ac-1] and [b, b+bc-1] overlap?
+    auto rangesOverlap = [](int32_t a, int32_t ac, int32_t b, int32_t bc) -> bool {
+        return a < b + bc && b < a + ac;
+    };
+
+    const int32_t base  = replBaseStreamId;
+    const int32_t count = workerCount;
+
+    // Check vs. clientStreamId (single stream).
+    if (rangeContains(base, count, clientEndpoint.streamId)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps clientStreamId=" +
+               std::to_string(clientEndpoint.streamId);
+    }
+
+    // Check vs. consensusStreamId (single stream).
+    if (rangeContains(base, count, consensusStreamId)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps consensusStreamId=" +
+               std::to_string(consensusStreamId);
+    }
+
+    // Check vs. replicationStreamId (single stream).
+    if (rangeContains(base, count, replicationStreamId)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps replicationStreamId=" +
+               std::to_string(replicationStreamId);
+    }
+
+    // Check vs. workerIngress range [workerIngressBaseStreamId, +workerCount-1].
+    if (workerIngressBaseStreamId > 0 &&
+        rangesOverlap(base, count, workerIngressBaseStreamId, workerCount)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps workerIngress range [" +
+               std::to_string(workerIngressBaseStreamId) + ", " +
+               std::to_string(workerIngressBaseStreamId + workerCount - 1) + "]";
+    }
+
+    // Check vs. workerEgress range [workerEgressBaseStreamId, +workerCount-1]
+    // (only when explicitly set — 0 means unresolved).
+    if (workerEgressBaseStreamId > 0 &&
+        rangesOverlap(base, count, workerEgressBaseStreamId, workerCount)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps workerEgress range [" +
+               std::to_string(workerEgressBaseStreamId) + ", " +
+               std::to_string(workerEgressBaseStreamId + workerCount - 1) + "]";
+    }
+
+    return std::nullopt;  // no overlap detected
+}
+
+// ---------------------------------------------------------------------------
 // parseNodeConfig
 // ---------------------------------------------------------------------------
 
@@ -300,6 +363,17 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_REPLICATION_STREAM_ID is not a valid integer: ") + rawReplStream};
     }
 
+    // --- RUNE_REPL_BASE_STREAM_ID (optional, default 2000) — Task 1 ---
+    // Base Aeron stream id for per-worker replication streams.
+    // Worker W uses stream replBaseStreamId + W.
+    // Default 2000 is disjoint from all existing default stream ids/ranges.
+    int32_t replBaseStreamId = 2000;
+    const char* rawReplBase = getenv_fn("RUNE_REPL_BASE_STREAM_ID");
+    if (rawReplBase && !std::string_view(rawReplBase).empty()) {
+        if (!parseInt32(rawReplBase, replBaseStreamId))
+            return {{}, std::string("RUNE_REPL_BASE_STREAM_ID is not a valid integer: ") + rawReplBase};
+    }
+
     // --- Election timing (optional, positive ms, env-overridable) ---
     // Defaults set in NodeConfig field initializers; only override if env var present.
     NodeConfig cfg;
@@ -311,6 +385,7 @@ ConfigResult parseNodeConfig(
 
     cfg.clientEndpoint.channel  = std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
+    cfg.replBaseStreamId        = replBaseStreamId;
 
     // E5.1: resolve workerIngressBaseStreamId — default to clientStreamId+1 when unset.
     cfg.workerIngressBaseStreamId = (workerIngressBaseStreamId == 0)
@@ -847,6 +922,32 @@ ConfigResult parseNodeConfig(
         if (pwe && !std::string_view(pwe).empty()) {
             std::string_view sv(pwe);
             cfg.perWorkerEgressEnabled = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+
+    // --- RUNE_PER_WORKER_REPLICATION (optional, default false) — Task 1 ---
+    // When "1" or "true", each worker opens its own dedicated replication transport
+    // on stream replBaseStreamId + workerId, replacing the shared control-thread
+    // replication path.  Default false: shared path remains live.
+    if (const char* pwr = getenv_fn("RUNE_PER_WORKER_REPLICATION")) {
+        if (pwr && !std::string_view(pwr).empty()) {
+            std::string_view sv(pwr);
+            cfg.perWorkerReplication = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+    // Absent → keep NodeConfig default (false).
+
+    // Task 1: populate self peer's workerCount from cfg.workerCount so that
+    // membership descriptors advertise the correct per-worker replication capacity.
+    // Only set when workerCount > 1 (explicitly configured for multi-worker mode);
+    // leave at 0 (unknown) for the default single-worker configuration so that
+    // the default-on field is distinguishable from an explicit deployment choice.
+    if (cfg.workerCount > 1) {
+        for (auto& p : cfg.peers) {
+            if (p.id == cfg.nodeId) {
+                p.workerCount = cfg.workerCount;
+                break;
+            }
         }
     }
 
