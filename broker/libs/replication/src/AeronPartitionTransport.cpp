@@ -138,25 +138,12 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
                                                  const FetchResponseMsg& resp)
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplSendFetchResp, 0);
-    // Shared-nothing: encode into a stack buffer, marshal to control thread via
-    // the outbound ring (peers_/pubs are control-owned; drainOutbound offers).
-    // Size the buffer by the GENERATED codec's encodedSize() — stack fast-path for
-    // the common (≤128KB) case, heap fallback for a large replicated batch.  No
-    // fixed-cap overflow (was: fixed uint8_t wire[64KB] → __chk_fail on a 64KB+ batch).
-    const std::size_t frame = FetchResponseMsg::encodedSize(resp.records.size());
-    if (frame <= kMaxWireFrame) {
-        uint8_t wire[kMaxWireFrame];
-        FetchResponseMsg::encode(wire, 0, resp.leaderEpoch, resp.partition,
-                                 resp.highWatermark, resp.logStartOffset,
-                                 resp.errorCode, resp.records, resp.topicId);
-        enqueueOutbound(toFollower, wire, frame);
-    } else {
-        std::vector<uint8_t> wire(frame);
-        FetchResponseMsg::encode(wire.data(), 0, resp.leaderEpoch, resp.partition,
-                                 resp.highWatermark, resp.logStartOffset,
-                                 resp.errorCode, resp.records, resp.topicId);
-        enqueueOutbound(toFollower, wire.data(), frame);
-    }
+    // #2b zero-copy: encode the FetchResponse straight into the claimed outbound-ring
+    // slot's OutboundFrame payload — one copy (records: log mmap → ring) instead of
+    // the old encode-into-`wire` + putPayload-into-ring double copy.  Shared-nothing:
+    // the worker only writes the ring; peers_/pubs stay control-owned (drainOutbound
+    // offers).  Back-pressure (full ring) → false; the follower re-fetches.
+    enqueueFetchResponse(toFollower, resp, /*reconcile=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,25 +197,80 @@ void AeronPartitionTransport::sendReconcileRequest(
 void AeronPartitionTransport::sendReconcileResponse(
         NodeId toPeer, const FetchResponseMsg& resp)
 {
-    // Reuses the FetchResponse codec, re-stamped with the reconcile templateId.
-    // Same encodedSize()-based sizing (stack fast-path + heap fallback) as
-    // sendFetchResponse so a large reconcile batch cannot overflow a fixed buffer.
-    const std::size_t frame = FetchResponseMsg::encodedSize(resp.records.size());
-    if (frame <= kMaxWireFrame) {
-        uint8_t wire[kMaxWireFrame];
-        FetchResponseMsg::encode(wire, 0, resp.leaderEpoch, resp.partition,
-                                 resp.highWatermark, resp.logStartOffset,
-                                 resp.errorCode, resp.records, resp.topicId);
-        stampTemplateId(wire, 0, kReconcileFetchRespTemplateId);
-        enqueueOutbound(toPeer, wire, frame);
-    } else {
-        std::vector<uint8_t> wire(frame);
-        FetchResponseMsg::encode(wire.data(), 0, resp.leaderEpoch, resp.partition,
-                                 resp.highWatermark, resp.logStartOffset,
-                                 resp.errorCode, resp.records, resp.topicId);
-        stampTemplateId(wire.data(), 0, kReconcileFetchRespTemplateId);
-        enqueueOutbound(toPeer, wire.data(), frame);
+    // #2b zero-copy: encode the FetchResponse straight into the outbound-ring slot,
+    // then re-stamp the reconcile templateId in place (see enqueueFetchResponse).
+    enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
+}
+
+// FR trace correlation via per-endpoint MONOTONIC SEQUENCE (not offset — offsets
+// repeat across fast-acks and collide).  Because each ring is FIFO, the k-th
+// enqueued frame is the k-th drained → ReplOutEnqueue(seq=k) pairs 1:1 with
+// ReplOutDrain(seq=k); likewise ReplFragRecv(recvSeq=k) with ReplWorkerOpRun(k).
+// One transport per node → file-static counters are per-process.
+//   g_outEnqSeq  : atomic (enqueue* may be called from >1 worker thread).
+//   g_outDrainSeq: control-thread only.   g_inRecvSeq: control-thread only.
+static std::atomic<uint32_t> g_outEnqSeq{0};
+static uint32_t              g_outDrainSeq = 0;
+static uint32_t              g_inRecvSeq   = 0;
+
+// ---------------------------------------------------------------------------
+// enqueueFetchResponse — WORKER-thread side, ZERO-COPY (#2b).
+// Claims the outbound-ring slot, then encodes the FetchResponse SBE message
+// DIRECTLY into the OutboundFrame's var-data payload region — records are copied
+// exactly once (log mmap → ring, via FetchResponse::putRecords), eliminating the
+// intermediate `wire` buffer + the putPayload memcpy of enqueueOutbound(wire,len).
+//
+// Var-data layout is [uint32 LE length][payload bytes]; we write the length prefix
+// exactly as OutboundFrame::putPayload would (same LE encoding), then hand the
+// payload pointer to FetchResponseMsg::encode.  Uses only the codec's public
+// buffer()/sbePosition() API + the documented 4-byte varDataEncoding header.
+// ---------------------------------------------------------------------------
+bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targetNodeId,
+                                                    const FetchResponseMsg& resp,
+                                                    bool                    reconcile)
+{
+    const std::size_t payloadLen = FetchResponseMsg::encodedSize(resp.records.size());
+    const std::size_t frameLen =
+        isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::computeLength(payloadLen);
+    // Oversized guard (identical policy to enqueueOutbound): a frame beyond the
+    // ring's maxMsgLength is a caller cap bug — reject as retriable back-pressure.
+    if (frameLen > outboundRing_.maxMsgLength()) {
+        spdlog::error(
+            "AeronPartitionTransport::enqueueFetchResponse: framed message {} B exceeds "
+            "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
+            frameLen, outboundRing_.maxMsgLength(), targetNodeId);
+        ++outboundRingFullCount_;
+        return false;
     }
+    const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
+    if (idx < 0) {                          // full ring → back-pressure, nothing committed
+        ++outboundRingFullCount_;
+        return false;
+    }
+    char* slot = reinterpret_cast<char*>(outboundRing_.base() + idx);
+    isbe::OutboundFrame enc;
+    enc.wrapAndApplyHeader(slot, 0, frameLen);
+    enc.targetNodeId(targetNodeId);
+    // Var-data payload header + in-place FetchResponse encode.  sbePosition() sits at
+    // the var-data length field once the fixed block is written.
+    const std::uint64_t lenPos = enc.sbePosition();
+    detail::write_le<std::uint32_t>(reinterpret_cast<uint8_t*>(slot) + lenPos,
+                                    static_cast<std::uint32_t>(payloadLen));
+    uint8_t* payload = reinterpret_cast<uint8_t*>(slot) + lenPos + isbe::OutboundFrame::payloadHeaderLength();
+    FetchResponseMsg::encode(payload, 0,
+                             resp.leaderEpoch, resp.partition, resp.highWatermark,
+                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
+    if (reconcile) {
+        // DR reverse-catch-up: re-stamp the FetchResponse templateId in place so it
+        // routes to the reconcile handlers (matches sendReconcileResponse's wire).
+        stampTemplateId(payload, 0, kReconcileFetchRespTemplateId);
+    }
+    // Advance the flyweight position so the frame is well-formed (commit uses frameLen).
+    enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
+    outboundRing_.commit(idx);
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue,
+                             g_outEnqSeq.fetch_add(1, std::memory_order_relaxed));
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,16 +280,6 @@ void AeronPartitionTransport::sendReconcileResponse(
 // Back-pressure: on a full ring, bump the counter and return false — the send is
 // skipped (replication is retriable; caller re-drives next cycle). Never blocks.
 // ---------------------------------------------------------------------------
-// FR trace correlation via per-endpoint MONOTONIC SEQUENCE (not offset — offsets
-// repeat across fast-acks and collide).  Because each ring is FIFO, the k-th
-// enqueued frame is the k-th drained → ReplOutEnqueue(seq=k) pairs 1:1 with
-// ReplOutDrain(seq=k); likewise ReplFragRecv(recvSeq=k) with ReplWorkerOpRun(k).
-// One transport per node → file-static counters are per-process.
-//   g_outEnqSeq  : atomic (enqueueOutbound may be called from >1 thread).
-//   g_outDrainSeq: control-thread only.   g_inRecvSeq: control-thread only.
-static std::atomic<uint32_t> g_outEnqSeq{0};
-static uint32_t              g_outDrainSeq = 0;
-static uint32_t              g_inRecvSeq   = 0;
 
 // Per-second transport rate diagnostic (control-thread only; RUNE_FS_LOG).
 static bool     g_txRateLog     = [] { const char* e = std::getenv("RUNE_FS_LOG");

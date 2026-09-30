@@ -266,6 +266,16 @@ private:
     /// Returns false on full ring (back-pressure; caller's op is retriable).
     bool enqueueOutbound(int32_t targetNodeId, const uint8_t* wire, std::size_t len);
 
+    /// WORKER-thread side, ZERO-COPY FetchResponse: encode the FetchResponse SBE
+    /// message DIRECTLY into the claimed OutboundFrame payload region of the ring
+    /// slot — one copy (records: log mmap → ring), skipping the intermediate
+    /// `wire` buffer + its memcpy that enqueueOutbound(wire,len) would incur.
+    /// \param reconcile  when true, re-stamp the FetchResponse templateId to the
+    ///        reconcile id (DR reverse-catch-up) after encoding, matching
+    ///        sendReconcileResponse's wire.  Returns false on full ring.
+    bool enqueueFetchResponse(int32_t targetNodeId, const FetchResponseMsg& resp,
+                              bool reconcile = false);
+
     /// CONTROL-thread side: drain the outbound ring and do the real peer offers.
     /// Called from poll().  Only this path touches peers_/pubs on send.
     /// Returns the count of ring messages drained (folded into poll()'s work
