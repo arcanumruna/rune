@@ -30,6 +30,25 @@ using namespace std::chrono_literals;
 
 namespace rune::client::transport {
 
+namespace {
+struct PubRegistry {
+    aeron::Aeron&      aeron;
+    const std::string& channel;
+    int32_t            streamId;
+    int64_t add() { return aeron.addExclusivePublication(channel, streamId); }
+    std::shared_ptr<aeron::ExclusivePublication> find(int64_t id) {
+        return aeron.findExclusivePublication(id);
+    }
+};
+struct SubRegistry {
+    aeron::Aeron&      aeron;
+    const std::string& channel;
+    int32_t            streamId;
+    int64_t add() { return aeron.addSubscription(channel, streamId); }
+    std::shared_ptr<aeron::Subscription> find(int64_t id) { return aeron.findSubscription(id); }
+};
+} // namespace
+
 int64_t AeronTransport::monoNs_() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -119,30 +138,30 @@ void AeronTransport::start() {
         }
     }
 
-    // 4. Register ingress ExclusivePublication + egress Subscription.
-    int64_t pubRegId = aeron_->addExclusivePublication(cfg_.ingressChannel,
-                                                        cfg_.ingressStreamId);
-    int64_t subRegId = aeron_->addSubscription(cfg_.egressChannel,
-                                                cfg_.egressStreamId);
-
-    // 5. Resolve both within kResolveMaxMs (bounded — no busy-spin).
-    const bool resolved = pumpUntil_([&] {
-        if (!ingressPub_) ingressPub_ = aeron_->findExclusivePublication(pubRegId);
-        if (!egressSub_)  egressSub_  = aeron_->findSubscription(subRegId);
-        return ingressPub_ && egressSub_;
-    }, static_cast<int64_t>(kResolveMaxMs) * 1'000'000LL);
-    (void)resolved;  // the !ingressPub_ || !egressSub_ check below reports failure
-
-    if (!ingressPub_ || !egressSub_) {
-        // Release partially-resolved resources before tearing down.
-        ingressPub_.reset();
-        egressSub_.reset();
+    // 4-5. Register + resolve the ingress ExclusivePublication and egress
+    //      Subscription, pumping THIS transport's driver + conductor (invoker) or
+    //      letting the background agents run (thread).  Bounded by kResolveMaxMs.
+    Resolution<aeron::ExclusivePublication> pubRes{kResolveTimeoutNs, kResolveRetryNs};
+    Resolution<aeron::Subscription>         subRes{kResolveTimeoutNs, kResolveRetryNs};
+    PubRegistry preg{*aeron_, cfg_.ingressChannel, cfg_.ingressStreamId};
+    SubRegistry sreg{*aeron_, cfg_.egressChannel, cfg_.egressStreamId};
+    pumpUntil_([&] {
+        const int64_t now = monoNs_();
+        const bool pubOk = pubRes.poll(preg, now) == ResolveStatus::Ready;
+        const bool subOk = subRes.poll(sreg, now) == ResolveStatus::Ready;
+        return (pubOk && subOk) || pubRes.rejected() || subRes.rejected();
+    }, kResolveTimeoutNs);
+    if (pubRes.ready() == nullptr || subRes.ready() == nullptr) {
+        const std::string why = pubRes.rejected() || subRes.rejected() ? "rejected by the driver"
+                                                                        : "timed out";
         aeron_.reset();
         stopEmbeddedDriver();
-        throw std::runtime_error(
-            "AeronTransport: timed out resolving ExclusivePublication/Subscription "
-            "(ingressChannel=" + cfg_.ingressChannel + " egressChannel=" + cfg_.egressChannel + ")");
+        throw std::runtime_error("AeronTransport: resolving ExclusivePublication/Subscription " + why +
+                                 " (ingressChannel=" + cfg_.ingressChannel +
+                                 " egressChannel=" + cfg_.egressChannel + ")");
     }
+    ingressPub_ = *pubRes.readyShared();
+    egressSub_  = *subRes.readyShared();
 
     // 6. Build the FragmentAssembler (installed fresh each start; owns a lambda
     //    that captures nothing — the handler is passed in at poll() time).
@@ -177,12 +196,12 @@ void AeronTransport::stop() noexcept {
     assembler_.reset();
     // read-rework I4: release per-worker egress subscriptions + their assemblers
     // BEFORE closing the aeron client (same recursive_mutex teardown reason as
-    // pubCache_ below — Subscription dtors deregister via the conductor).
-    egressSubs_.clear();
+    // the publication slots below — Subscription dtors deregister via the conductor).
+    subSlots_.clear();                  // assemblers + subscriptions (conductor dereg)
 
     // Step 2: Release pub/sub BEFORE closing the aeron client.
     //   Resetting shared_ptrs triggers deregistration commands into the conductor.
-    //   pubCache_ (per-worker ingress ExclusivePublications) MUST be released here
+    //   pubSlots_ (per-stream / per-endpoint ExclusivePublications) MUST be released here
     //   too.  Each ExclusivePublication's destructor calls
     //   ClientConductor::releaseExclusivePublication(), which locks the conductor's
     //   admin mutex.  If left to member-teardown they outlive aeron_.reset() below
@@ -190,8 +209,8 @@ void AeronTransport::stop() noexcept {
     //   client shutdown whenever per-worker ingress had populated the cache).
     ingressPub_.reset();
     egressSub_.reset();
-    pubCache_.clear();
-    endpointPubCache_.clear();  // Task 1.3: per-(channel,streamId) leader pubs
+    pubSlots_.clear();                  // every per-stream / per-endpoint publication
+    streamPub_ = detail::FlatIndexMap{};
 
     // Step 3: Close the Aeron C++ client (joins the conductor thread; the
     //   conductor's onClose() flushes remaining commands into the CnC ring).
@@ -249,131 +268,73 @@ bool AeronTransport::offer(const uint8_t* buf, std::size_t len) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// resolveWorkerPub — resolve or retrieve a per-worker publication
+// Publication handles — resolved asynchronously, never sleep (spec §3.6)
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<aeron::ExclusivePublication>
-AeronTransport::resolveWorkerPub(int32_t ingressStreamId) noexcept
-{
-    if (!aeron_) return nullptr;
-
-    // Check the cache first.
-    auto it = pubCache_.find(ingressStreamId);
-    if (it != pubCache_.end()) {
-        return it->second;
-    }
-
-    // Resolve a new publication (bounded, same timeout as start()).
-    try {
-        const int64_t regId =
-            aeron_->addExclusivePublication(cfg_.ingressChannel, ingressStreamId);
-
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds{kResolveMaxMs};
-
-        std::shared_ptr<aeron::ExclusivePublication> pub;
-        while (std::chrono::steady_clock::now() < deadline) {
-            pub = aeron_->findExclusivePublication(regId);
-            if (pub) break;
-            std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
+AeronTransport::PubHandle AeronTransport::publicationHandle(const std::string& channel,
+                                                            int32_t streamId) {
+    for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
+        if (pubSlots_[i].streamId == streamId && pubSlots_[i].channel == channel) {
+            return static_cast<PubHandle>(i);
         }
-
-        if (pub) {
-            pubCache_[ingressStreamId] = pub;
-        }
-        return pub;
-    } catch (...) {
-        return nullptr;
     }
+    pubSlots_.push_back(PubSlot{channel, streamId,
+                                Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs,
+                                                                        kResolveRetryNs}});
+    return static_cast<PubHandle>(pubSlots_.size() - 1);
 }
 
-// ---------------------------------------------------------------------------
-// Task 1.3: resolveEndpointPub — per-(channel,streamId) publication
-// ---------------------------------------------------------------------------
-
-std::shared_ptr<aeron::ExclusivePublication>
-AeronTransport::resolveEndpointPub(const std::string& channel,
-                                   int32_t ingressStreamId) noexcept
-{
-    if (!aeron_ || channel.empty()) return nullptr;
-
-    const std::string key = channel + "#" + std::to_string(ingressStreamId);
-    auto it = endpointPubCache_.find(key);
-    if (it != endpointPubCache_.end()) {
-        return it->second;
-    }
-
-    try {
-        const int64_t regId =
-            aeron_->addExclusivePublication(channel, ingressStreamId);
-
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds{kResolveMaxMs};
-
-        std::shared_ptr<aeron::ExclusivePublication> pub;
-        while (std::chrono::steady_clock::now() < deadline) {
-            pub = aeron_->findExclusivePublication(regId);
-            if (pub) break;
-            std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
-        }
-
-        if (pub) {
-            endpointPubCache_[key] = pub;
-        }
-        return pub;
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Task 1.3: offerTo — publish to an explicit (channel, ingressStreamId)
-// ---------------------------------------------------------------------------
-
-bool AeronTransport::offerTo(const std::string& channel,
-                             int32_t ingressStreamId,
-                             const uint8_t* buf,
-                             std::size_t    len) noexcept
-{
-    // An empty channel means "no route yet" — caller should have fallen back to
-    // the default offer path; be defensive and report a failed send.
-    if (channel.empty()) return false;
-
-    // If the target endpoint is the transport's default ingress channel, reuse the
-    // existing default/per-worker pub cache so the single-node hot path is unchanged.
-    if (channel == cfg_.ingressChannel) {
-        return offer(ingressStreamId, buf, len);
-    }
-
-    auto pub = resolveEndpointPub(channel,
-                                  ingressStreamId != 0 ? ingressStreamId
-                                                       : cfg_.ingressStreamId);
-    if (!pub) {
-        return false;  // resolve failed — caller retries next cycle (no busy-spin)
-    }
-    return offerToPub(*pub, buf, len);
+bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len) noexcept {
+    if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
+    PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
+    if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len);
+    if (!aeron_) return false;
+    PubRegistry reg{*aeron_, s.channel, s.streamId};
+    if (s.res.poll(reg, monoNs_()) != ResolveStatus::Ready) return false;
+    return offerToPub(*s.res.ready(), buf, len);
 }
 
 // ---------------------------------------------------------------------------
 // offer (per-worker stream)
 // ---------------------------------------------------------------------------
 
-bool AeronTransport::offer(int32_t ingressStreamId,
-                            const uint8_t* buf,
-                            std::size_t    len) noexcept
-{
+bool AeronTransport::offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept {
     // 0 means "legacy / no per-worker stream" — fall back to default.
-    if (ingressStreamId == 0 || ingressStreamId == cfg_.ingressStreamId) {
-        return offer(buf, len);
+    if (ingressStreamId == 0 || ingressStreamId == cfg_.ingressStreamId) return offer(buf, len);
+    uint32_t h = streamPub_.find(ingressStreamId);
+    if (h == detail::FlatIndexMap::kNone) {
+        try {
+            h = static_cast<uint32_t>(publicationHandle(cfg_.ingressChannel, ingressStreamId));
+            streamPub_.insert(ingressStreamId, h);
+        } catch (...) {
+            return offer(buf, len);
+        }
     }
+    const auto ph = static_cast<PubHandle>(h);
+    if (offerOn(ph, buf, len)) return true;
+    // Unresolved: keep the historical fallback to the default publication (the
+    // runtime routes it).  Resolved but back-pressured: report it (retry).
+    return publicationReady(ph) ? false : offer(buf, len);
+}
 
-    auto pub = resolveWorkerPub(ingressStreamId);
-    if (!pub) {
-        // Resolution failed — fall back to the default publication.
-        return offer(buf, len);
+// ---------------------------------------------------------------------------
+// Task 1.3: offerTo — publish to an explicit (channel, ingressStreamId)
+// ---------------------------------------------------------------------------
+
+bool AeronTransport::offerTo(const std::string& channel, int32_t ingressStreamId,
+                             const uint8_t* buf, std::size_t len) noexcept {
+    // An empty channel means "no route yet" — report a failed send.
+    if (channel.empty()) return false;
+    // The default ingress channel keeps the single-node per-worker path.
+    if (channel == cfg_.ingressChannel) return offer(ingressStreamId, buf, len);
+    PubHandle h = kNoPub;
+    try {
+        h = publicationHandle(channel,
+                              ingressStreamId != 0 ? ingressStreamId : cfg_.ingressStreamId);
+    } catch (...) {
+        return false;
     }
-
-    return offerToPub(*pub, buf, len);
+    return offerOn(h, buf, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -391,10 +352,24 @@ int AeronTransport::poll(const Handler& handler, int fragmentLimit) {
     }
     // read-rework I4: per-worker dynamic-MDC egress subscriptions (pushed Records
     // for user partitions when per-worker egress is active on the broker).
-    for (auto& [key, es] : egressSubs_) {
-        if (es.sub && es.assembler) {
-            frags += es.sub->poll(es.assembler->handler(), fragmentLimit);
+    // Each resolves here, on the owner thread, without ever sleeping.
+    for (SubSlot& s : subSlots_) {
+        aeron::Subscription* sub = s.res.ready();
+        if (sub == nullptr) {
+            if (!aeron_) continue;
+            SubRegistry reg{*aeron_, s.channel, s.streamId};
+            if (s.res.poll(reg, monoNs_()) != ResolveStatus::Ready) continue;
+            sub = s.res.ready();
+            s.assembler = std::make_unique<aeron::FragmentAssembler>(
+                [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                       aeron::util::index_t len, aeron::Header&) {
+                    if (pollHandler_) {
+                        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                        (*pollHandler_)(p, static_cast<std::size_t>(len));
+                    }
+                });
         }
+        frags += sub->poll(s.assembler->handler(), fragmentLimit);
     }
     pollHandler_ = nullptr;
     return frags;
@@ -407,38 +382,16 @@ int AeronTransport::poll(const Handler& handler, int fragmentLimit) {
 void AeronTransport::addEgressSubscription(const std::string& controlChannel,
                                            int32_t streamId) noexcept {
     if (!aeron_ || streamId == 0 || controlChannel.empty()) return;
-    const std::string key = controlChannel + "#" + std::to_string(streamId);
-    if (egressSubs_.find(key) != egressSubs_.end()) return;  // already open
-
-    int64_t regId = -1;
+    for (const SubSlot& s : subSlots_) {
+        if (s.streamId == streamId && s.channel == controlChannel) return;  // idempotent
+    }
     try {
-        regId = aeron_->addSubscription(controlChannel, streamId);
+        subSlots_.push_back(SubSlot{controlChannel, streamId,
+                                    Resolution<aeron::Subscription>{kResolveTimeoutNs,
+                                                                    kResolveRetryNs},
+                                    nullptr});
     } catch (...) {
-        return;  // bad channel — skip (never throw on the agent thread)
     }
-
-    std::shared_ptr<aeron::Subscription> sub;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-    while (std::chrono::steady_clock::now() < deadline) {
-        try { sub = aeron_->findSubscription(regId); } catch (...) { break; }
-        if (sub) break;
-        std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
-    }
-    if (!sub) return;  // resolve timeout — skip; a later metadata cycle retries
-
-    EgressSubscription es;
-    es.sub = std::move(sub);
-    es.assembler = std::make_unique<aeron::FragmentAssembler>(
-        [this](aeron::concurrent::AtomicBuffer& buf,
-               aeron::util::index_t offset, aeron::util::index_t len,
-               aeron::Header&) {
-            if (pollHandler_) {
-                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
-                (*pollHandler_)(p, static_cast<std::size_t>(len));
-            }
-        });
-    egressSubs_.emplace(key, std::move(es));
 }
 
 // ---------------------------------------------------------------------------
@@ -463,38 +416,23 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
     // contain it so nothing escapes into the agent's noexcept dispatch path
     // (→ std::terminate).  On ANY failure we leave the OLD ingressPub_ intact.
     try {
-        if (!aeron_) {
-            return false;  // not started — cannot retarget, old state untouched
-        }
-
+        if (!aeron_) return false;  // not started — cannot retarget, old state untouched
         // Resolve the NEW default publication BEFORE releasing the old one, so a
         // failed resolve leaves the old pub usable (offer() keeps working).
-        const int64_t pubRegId =
-            aeron_->addExclusivePublication(newIngressChannel, cfg_.ingressStreamId);
-
-        // Bounded resolution (kResolveMaxMs hard cap — no busy-spin).
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds{kResolveMaxMs};
-
-        std::shared_ptr<aeron::ExclusivePublication> newPub;
-        while (std::chrono::steady_clock::now() < deadline) {
-            newPub = aeron_->findExclusivePublication(pubRegId);
-            if (newPub) break;
-            std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
+        Resolution<aeron::ExclusivePublication> res{kResolveTimeoutNs, kResolveRetryNs};
+        PubRegistry reg{*aeron_, newIngressChannel, cfg_.ingressStreamId};
+        pumpUntil_([&] {
+            return res.poll(reg, monoNs_()) == ResolveStatus::Ready || res.rejected();
+        }, kResolveTimeoutNs);
+        if (res.ready() == nullptr) return false;  // old publication stays intact
+        // Per-stream publications on the OLD default channel are released and
+        // lazily re-resolved on the new channel (stream ids preserved).
+        for (PubSlot& s : pubSlots_) {
+            if (s.channel == cfg_.ingressChannel) s.res.reset();
         }
-
-        if (!newPub) {
-            // Resolve timed out — keep the old pub; report failure.
-            return false;
-        }
-
-        // Success: update channel, swap default pub, clear per-worker pub cache.
-        // E5.1: REDIRECT changes channel — per-worker publications are on the new
-        // channel.  Clear the cache so they are lazily re-resolved with the new
-        // channel on next use (stream ids are PRESERVED — only the channel changes).
+        streamPub_ = detail::FlatIndexMap{};
         cfg_.ingressChannel = newIngressChannel;
-        ingressPub_ = std::move(newPub);
-        pubCache_.clear();  // E5.1: lazy re-resolve with new channel on next offer
+        ingressPub_ = *res.readyShared();
         return true;
     } catch (...) {
         // Any Aeron exception → treat as a failed retarget; old pub intact.

@@ -29,6 +29,8 @@ extern "C" {
 #include <aeronmd/aeronmd.h>
 }
 
+#include <rune/client/detail/FlatIndexMap.h>
+#include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
 
 #include <atomic>
@@ -38,7 +40,7 @@ extern "C" {
 #include <memory>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <vector>
 
 namespace rune::client::transport {
 
@@ -99,23 +101,39 @@ public:
     bool offer(const uint8_t* buf, std::size_t len) noexcept;
 
     /// Publish buf[0..len-1] to the per-worker ingress ExclusivePublication
-    /// for the given ingressStreamId.  Resolves / caches a publication for the
-    /// pair (currentChannel, ingressStreamId) on first use.  Falls back to the
-    /// default publication if ingressStreamId == 0 or resolution fails.
+    /// for the given ingressStreamId.  The (currentChannel, ingressStreamId)
+    /// publication resolves asynchronously (never sleeps); while it is not Ready
+    /// (or if ingressStreamId == 0) the frame goes to the default publication.
     /// E5.1: called from the ProducerImpl flush path with the per-partition
     /// worker stream id decoded from the metadata response.
     bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept;
 
     /// Task 1.3 (multi-node): publish buf[0..len-1] to the ingress publication for
     /// an EXPLICIT (channel, ingressStreamId) pair — the per-leader-node routing
-    /// primitive.  Resolves/caches a publication keyed by "channel#streamId" on the
-    /// ONE shared driver (no new driver — reuses the existing multiplexing exactly
-    /// like pubCache_).  This REPLACES the single-transport retarget model: instead
-    /// of swapping ingressPub_ to a leader, each leader session offers directly to
-    /// its own endpoint.  On resolution failure returns false (the caller retries on
-    /// the next duty cycle — no busy-spin, no throw).  Agent-thread only.
+    /// primitive.  Uses publicationHandle(channel, streamId) on the ONE shared
+    /// driver.  This REPLACES the single-transport retarget model: instead of
+    /// swapping ingressPub_ to a leader, each leader session offers directly to
+    /// its own endpoint.  Returns false while the publication resolves (never
+    /// sleeps) or is back-pressured — the caller retries on the next duty cycle.
+    /// Agent-thread only.
     bool offerTo(const std::string& channel, int32_t ingressStreamId,
                  const uint8_t* buf, std::size_t len) noexcept;
+
+    /// Stable handle of the publication for (channel, streamId).  Cold path: the
+    /// first call creates the slot; resolution then advances inside offerOn() /
+    /// dutyCycle() without ever blocking.
+    using PubHandle = int32_t;
+    static constexpr PubHandle kNoPub = -1;
+    PubHandle publicationHandle(const std::string& channel, int32_t streamId);
+
+    /// Hot path: one bounds check + one variant check + tryClaim.  Returns false
+    /// while the publication resolves or is back-pressured (retry next cycle).
+    bool offerOn(PubHandle h, const uint8_t* buf, std::size_t len) noexcept;
+
+    [[nodiscard]] bool publicationReady(PubHandle h) const noexcept {
+        return h >= 0 && static_cast<std::size_t>(h) < pubSlots_.size() &&
+               pubSlots_[static_cast<std::size_t>(h)].res.ready() != nullptr;
+    }
 
     /// Poll the default egress Subscription AND every per-worker dynamic-MDC egress
     /// Subscription through their FragmentAssemblers.  For each fully reassembled
@@ -128,7 +146,8 @@ public:
     /// pushed by the OWNING worker's egress publication.  Learned from the
     /// MetadataResponse (control host = leader broker host; port/stream per
     /// partition).  Agent-thread only (single-writer, same contract as poll()).
-    /// Bounded resolve; on failure it logs nothing and skips (no throw) — the
+    /// Returns immediately: the subscription resolves inside poll() (never
+    /// sleeps; a timed-out registration is retried after kResolveRetryNs) — the
     /// worker's cursor only advances on a successful send, so a delayed/absent
     /// subscription delays but never loses records.  Records route by
     /// subscriptionId in the SubscriberHub regardless of which sub delivered them.
@@ -163,10 +182,11 @@ public:
 
     /// Create a new ingress ExclusivePublication on newIngressChannel (same
     /// stream id as the original config) and swap it in for the current one.
-    /// All per-worker publications in pubCache_ are also re-resolved on the new
-    /// channel; the stream ids are PRESERVED (E5.1: REDIRECT changes channel,
+    /// Per-stream publications of offer(streamId) are lazily re-resolved on the
+    /// new channel; the stream ids are PRESERVED (E5.1: REDIRECT changes channel,
     /// keeps per-partition worker stream ids).
-    /// Bounded resolution (kResolveMaxMs hard cap + no busy-spin).
+    /// Bounded resolution (kResolveMaxMs hard cap); pumps this transport's own
+    /// driver + conductor in invoker mode (never waits on another thread).
     /// Called only from the agent thread (single-writer contract).
     ///
     /// FIX F8: noexcept + non-throwing.  Resolves the NEW publication BEFORE
@@ -208,35 +228,6 @@ private:
     std::shared_ptr<aeron::Subscription>         egressSub_;
     std::unique_ptr<aeron::FragmentAssembler>    assembler_;
 
-    // ---- E5.1: per-worker ingress publication cache -------------------------
-    // Maps ingressStreamId → ExclusivePublication on cfg_.ingressChannel.
-    // Populated on first use in offer(streamId, buf, len); entries are rebuilt
-    // on retarget() so the channel change is transparent to the caller.
-    // Single-writer (agent thread only — same threading contract as offer/poll).
-    std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>> pubCache_;
-
-    // ---- Task 1.3: per-(channel,streamId) ingress publication cache ----------
-    // Multi-node routing: a leader is addressed by (channel, ingressStreamId).
-    // Keyed "channel#streamId" so N leader nodes multiplex over the ONE driver
-    // (same pattern as pubCache_/egressSubs_ — no new driver).  Populated lazily
-    // in offerTo(); NOT cleared on retarget() (retarget is the legacy single-node
-    // model; multi-node addresses each node explicitly and never retargets these).
-    // Single-writer (agent thread only).  Cleared in stop() before aeron_ release.
-    std::unordered_map<std::string, std::shared_ptr<aeron::ExclusivePublication>>
-        endpointPubCache_;
-
-    // ---- read-rework I4: per-worker dynamic-MDC egress subscription cache -------
-    // The client opens one Subscription per owning-worker control endpoint (from
-    // the MetadataResponse) and polls them all in poll().  Each Subscription needs
-    // its OWN FragmentAssembler — per-image reassembly state must not be shared
-    // across subscriptions.  Keyed by "channel#streamId".  Single-writer (agent
-    // thread only).  Cleared in stop() before the aeron client is released.
-    struct EgressSubscription {
-        std::shared_ptr<aeron::Subscription>      sub;
-        std::unique_ptr<aeron::FragmentAssembler> assembler;
-    };
-    std::unordered_map<std::string, EgressSubscription> egressSubs_;
-
     // ---- Lifecycle CAS flags (idempotent stop) --------------------------------
     std::atomic<bool> started_ {false};
     std::atomic<bool> stopped_ {false};
@@ -250,20 +241,29 @@ private:
     bool offerToPub(aeron::ExclusivePublication& pub,
                     const uint8_t* buf, std::size_t len) noexcept;
 
-    /// Resolve or retrieve a cached ExclusivePublication for ingressStreamId on
-    /// cfg_.ingressChannel.  Returns nullptr on failure (resolve timeout / not
-    /// started).
-    std::shared_ptr<aeron::ExclusivePublication>
-    resolveWorkerPub(int32_t ingressStreamId) noexcept;
-
-    /// Task 1.3: resolve or retrieve a cached ExclusivePublication for an explicit
-    /// (channel, ingressStreamId) pair.  Returns nullptr on failure.
-    std::shared_ptr<aeron::ExclusivePublication>
-    resolveEndpointPub(const std::string& channel, int32_t ingressStreamId) noexcept;
-
     // ---- Resolution constants ------------------------------------------------
-    static constexpr int kResolveMaxMs   = 5'000; // hard cap for pub/sub resolve
-    static constexpr int kResolveSliceUs = 1'000; // sleep between polls (1 ms)
+    static constexpr int kResolveMaxMs = 5'000; // hard cap for pub/sub resolve
+
+    // ---- Resolved-on-demand publications / subscriptions (spec §3.6) ---------
+    // Single-writer (owner thread only).  Cleared in stop() before aeron_ release
+    // (their dtors deregister through the client conductor).
+    struct PubSlot {
+        std::string channel;
+        int32_t     streamId;
+        Resolution<aeron::ExclusivePublication> res;
+    };
+    struct SubSlot {
+        std::string channel;
+        int32_t     streamId;
+        Resolution<aeron::Subscription> res;
+        std::unique_ptr<aeron::FragmentAssembler> assembler;  // built on Ready
+    };
+    std::vector<PubSlot>  pubSlots_;   // index == PubHandle (stable, never erased)
+    detail::FlatIndexMap  streamPub_;  // default-channel streamId -> PubHandle
+    std::vector<SubSlot>  subSlots_;   // per-worker dynamic-MDC egress subscriptions
+
+    static constexpr int64_t kResolveTimeoutNs = static_cast<int64_t>(kResolveMaxMs) * 1'000'000LL;
+    static constexpr int64_t kResolveRetryNs   = 100'000'000LL;  // 100 ms before re-registering
 };
 
 } // namespace rune::client::transport

@@ -147,3 +147,68 @@ TEST(InvokerTransport, MinimumAcceptedLivenessStartsDriverRegression) {
     EXPECT_FALSE(t.closed());
     t.stop();
 }
+
+// Regression: offer(streamId) used to add a per-worker publication and SLEEP up to
+// 5 s for the conductor.  In invoker mode nobody else runs the conductor, so the
+// caller blocked for the full timeout.  It must return at once (falling back to
+// the default publication while the per-worker one resolves) and the handle must
+// resolve through the owner's duty cycle.
+TEST(InvokerTransport, PerStreamPublicationResolvesWithoutBlockingRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3200)};
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected(); }));
+    const uint8_t b[] = {9};
+    EXPECT_TRUE(t.offer(3201, b, 1)) << "unresolved per-worker stream falls back to default";
+    const Transport::PubHandle h = t.publicationHandle("aeron:ipc", 3201);
+    EXPECT_FALSE(t.publicationReady(h)) << "offer() must not have blocked until resolution";
+    ASSERT_TRUE(pumpUntil(t, [&] { t.offerOn(h, b, 1); return t.publicationReady(h); }));
+    EXPECT_EQ(t.publicationHandle("aeron:ipc", 3201), h) << "handles are stable and deduplicated";
+    t.stop();
+}
+
+TEST(InvokerTransport, EgressSubscriptionResolvesAsynchronouslyAndDelivers) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3300)};
+    t.start();
+    t.addEgressSubscription("aeron:ipc", 3301);  // returns immediately
+    const Transport::PubHandle h = t.publicationHandle("aeron:ipc", 3301);
+    const uint8_t payload[] = {0xAB, 0xCD};
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        t.offerOn(h, payload, sizeof payload);
+        t.poll([&](const uint8_t* p, std::size_t n) {
+            if (n == sizeof payload) got.assign(p, p + n);
+        }, 10);
+        return !got.empty();
+    }));
+    EXPECT_EQ(got, std::vector<uint8_t>(std::begin(payload), std::end(payload)));
+    t.stop();
+}
+
+TEST(InvokerTransport, OfferToUnknownEndpointNeverBlocks) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3400)};
+    t.start();
+    const uint8_t b[] = {1};
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(t.offerTo("aeron:udp?endpoint=127.0.0.1:24741", 3401, b, 1));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::milliseconds(500))
+        << "offerTo must return while the publication resolves (was a 5 s sleep loop)";
+    t.stop();
+}
+
+// Regression (Task 6 review carry-over): Aeron::connect() runs Aeron's own
+// mapCncFile sleep loops (wait for cnc.dat, CnC-ready version, driver heartbeat;
+// 10 s media-driver timeout).  In invoker mode nothing else can make the driver
+// progress, so start() must bring the driver up — aeron_driver_init writes the
+// CnC, signals it ready and stamps the to-driver heartbeat synchronously
+// (aeron_driver.c:911-912) — BEFORE connect.  If that ordering ever regressed,
+// connect would wait out the media-driver timeout and throw.
+TEST(InvokerTransport, StartBringsDriverUpBeforeClientConnectRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3500)};
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_NO_THROW(t.start());
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2))
+        << "connect waited on a driver nobody was driving";
+    EXPECT_FALSE(t.usesDriverThread());
+    EXPECT_FALSE(t.closed());
+    t.stop();
+}
