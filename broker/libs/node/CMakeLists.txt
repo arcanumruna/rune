@@ -87,6 +87,42 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_worker_replication_validator_tests)
 
     # ---------------------------------------------------------------------------
+    # E5 Task 3: WorkerReplicationTransport unit tests — send path (per-worker
+    # sub + per-peer pubs, direct-claim encode).
+    #
+    # Tests (no Aeron driver required):
+    #   1. SendFetchResponseSelectsPeerPubAndEncodesFrame — exact peer routing +
+    #      byte-identical SBE frame (round-trip decode).
+    #   2. SendFetchRequestBroadcastsToAllPeers — sendFetchRequest hits ALL peers.
+    #   3. SendOleRequestRoutesToLeader — OLE request to single target peer.
+    #   4. SendOleResponseRoutesToFollower — OLE response to single target peer.
+    #   5. SendReconcileRequestStampsReconcileTemplateId — FetchRequest +
+    #      ReconcileFetchReq templateId in place.
+    #   6. SendReconcileResponseStampsReconcileTemplateId — FetchResponse +
+    #      ReconcileFetchResp templateId in place.
+    #   7. ResolvedTrueWhenFakeRegistryHasPeers — resolved() gate.
+    #   8. SendFetchResponseEmptyRecords — HW-only update (zero records).
+    #   9. SendFetchRequestBroadcastsToThreePeers — 3-peer broadcast regression.
+    #  10. WorkerIdAccessor — workerId() returns configured id.
+    #
+    # Test seam: FakePubRegistry (SharedFakePubRegistry) injected via the
+    # WorkerReplicationTransportImpl<PubRegistry> template — no Aeron driver.
+    # The WorkerReplicationTransport.h header includes Aeron headers (tryClaim
+    # etc.) so the target must link aeron::aeron for include-path resolution.
+    # Gated behind aeron_FOUND (not BUILD_BROKER_NODE_TESTS: no driver started).
+    # ---------------------------------------------------------------------------
+    if(aeron_FOUND)
+        add_executable(rune_worker_replication_transport_tests
+            tests/node/WorkerReplicationTransportTest.cpp)
+        target_link_libraries(rune_worker_replication_transport_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_replication_transport_tests)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # E5.1.2b: ProducePathTest — unit tests for the shared handleProduceBatch
     # helper (ProducePath.h/.cpp).  Tests the core batch produce semantics
     # (restamp, CRC, idempotent dedup, min-ISR gate, append, PSM update) against
