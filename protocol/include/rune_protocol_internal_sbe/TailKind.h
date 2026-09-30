@@ -39,8 +39,8 @@ public:
         ISR_LIST = static_cast<std::uint8_t>(3),
         OWNED_SET = static_cast<std::uint8_t>(4),
         CHUNK = static_cast<std::uint8_t>(5),
-        // Task 7: raw descriptor blob bytes for a SchemaUpdate op.
         DESCRIPTOR_BLOB = static_cast<std::uint8_t>(6),
+        EGRESS_CHANNEL = static_cast<std::uint8_t>(7),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -55,6 +55,7 @@ public:
             case static_cast<std::uint8_t>(4): return OWNED_SET;
             case static_cast<std::uint8_t>(5): return CHUNK;
             case static_cast<std::uint8_t>(6): return DESCRIPTOR_BLOB;
+            case static_cast<std::uint8_t>(7): return EGRESS_CHANNEL;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -72,6 +73,7 @@ public:
             case OWNED_SET: return "OWNED_SET";
             case CHUNK: return "CHUNK";
             case DESCRIPTOR_BLOB: return "DESCRIPTOR_BLOB";
+            case EGRESS_CHANNEL: return "EGRESS_CHANNEL";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

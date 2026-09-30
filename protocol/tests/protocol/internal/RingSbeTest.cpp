@@ -161,4 +161,47 @@ TEST(RingSbe, FlushRequestAndCompletionRoundTrip) {
     }
 }
 
+TEST(RingSbe, SessionAnnounceCarriesEgressChannelAndStream) {
+    std::array<char, 1024> buf{};
+    const std::string ch = "aeron:udp?endpoint=10.0.0.9:40900";
+    sbe::WorkerOp enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.opType(sbe::OpType::Value::SESSION_ANNOUNCE)
+       .sessionId(77)
+       .egressStreamId(9)
+       .tailKind(sbe::TailKind::Value::EGRESS_CHANNEL);
+    enc.putTail(ch);
+    EXPECT_EQ(enc.encodedLength(), sbe::WorkerOp::computeLength(ch.size()));
+
+    auto dec = decodeAt<sbe::WorkerOp>(buf.data(), buf.size());
+    EXPECT_EQ(dec.opType(), sbe::OpType::Value::SESSION_ANNOUNCE);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SESSION_ANNOUNCE), 13);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SESSION_CLOSE), 14);
+    EXPECT_EQ(dec.sessionId(), 77);
+    EXPECT_EQ(dec.egressStreamId(), 9);
+    EXPECT_EQ(dec.tailKind(), sbe::TailKind::Value::EGRESS_CHANNEL);
+    const std::uint32_t len = dec.tailLength();
+    const char* p = dec.tail();
+    EXPECT_EQ(std::string(p, len), ch);
+}
+
+TEST(RingSbe, ProduceNotifyReturnTypeRoundTrips) {
+    std::array<char, 512> buf{};
+    sbe::WorkerReturn enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.returnType(sbe::ReturnType::Value::PRODUCE_NOTIFY)
+       .sessionId(0).correlationId(0).partition(3).baseOffset(1234).lastOffset(1240)
+       .errorCode(0).deferAck(0).replica(0).producerId(55).producerEpoch(1)
+       .baseSequence(10).recordCount(7).topicId(2).batchAttrs(0x10).enqueuedAtNs(0)
+       .subscriptionId(0).readTopicId(0).readPartition(0).newNextOffset(0).hwBound(0)
+       .isolation(0).isGroup(0).groupCarrierReceived(0);
+    enc.putChunk(nullptr, 0);
+    auto dec = decodeAt<sbe::WorkerReturn>(buf.data(), buf.size());
+    EXPECT_EQ(dec.returnType(), sbe::ReturnType::Value::PRODUCE_NOTIFY);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::PRODUCE_NOTIFY), 2);
+    EXPECT_EQ(dec.producerId(), 55);
+    EXPECT_EQ(dec.baseOffset(), 1234);
+    EXPECT_EQ(dec.batchAttrs(), 0x10);
+}
+
 } // namespace

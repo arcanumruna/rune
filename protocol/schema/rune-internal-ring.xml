@@ -54,6 +54,12 @@
            TailKind = DESCRIPTOR_BLOB).  Worker builds a local rune::codec::Validator
            from the blob on its own thread (shared-nothing). -->
       <validValue name="SCHEMA_UPDATE">12</validValue>
+      <!-- Self-contained worker shards (spec §3.4): runtime → every worker.
+           SESSION_ANNOUNCE: sessionId + egressStreamId + egress channel (tail,
+           TailKind = EGRESS_CHANNEL); the worker opens its OWN exclusive publication.
+           SESSION_CLOSE: sessionId; the worker drops the session and its queued acks. -->
+      <validValue name="SESSION_ANNOUNCE">13</validValue>
+      <validValue name="SESSION_CLOSE">14</validValue>
     </enum>
 
     <!-- Which variable field the tail holds (matches TailKind in WorkerWire.h). -->
@@ -66,12 +72,16 @@
       <validValue name="CHUNK">5</validValue>
       <!-- Task 7: raw descriptor blob bytes for a SchemaUpdate op. -->
       <validValue name="DESCRIPTOR_BLOB">6</validValue>
+      <validValue name="EGRESS_CHANNEL">7</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->
     <enum name="ReturnType" encodingType="uint8">
       <validValue name="PRODUCE_RESULT">0</validValue>
       <validValue name="PUSH_READ_RESULT">1</validValue>
+      <!-- Post-ack, fire-and-forget worker → runtime notification (spec §3.4):
+           PSM mirror + transaction LSO bookkeeping; never on the ack path. -->
+      <validValue name="PRODUCE_NOTIFY">2</validValue>
     </enum>
   </types>
 
@@ -131,6 +141,8 @@
          created + lifetime-owned by the gateway, written ONLY by the owning worker
          (shared-nothing single-writer).  0 = none (use MDC broadcast path). -->
     <field name="egressPub"       id="42" type="uint64"/>
+    <!-- SESSION_ANNOUNCE: the client session's egress stream id (channel in the tail). -->
+    <field name="egressStreamId"  id="45" type="int32"/>
     <!-- which variable field the tail holds -->
     <field name="tailKind"        id="43" type="TailKind"/>
     <!-- variable tail (record batch / replicated records / isr / owned-set) -->
