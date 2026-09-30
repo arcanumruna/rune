@@ -13,6 +13,23 @@ Rune is an ultra-low-latency durable log. It must beat Kafka on latency and at l
 
 Out of scope: fsync-before-ack (Strict tier) latency (bounded by the disk, ~2 ms p50 here); more than one shard worker per node on this 4-core box; consumer/read path.
 
+## 1a. Binding principles (apply to every task, broker and client)
+
+These are standing laws for all Rune work; any task, review or plan step that violates one is defective.
+
+1. **Shared-nothing.** Every piece of mutable state is owned by exactly one thread. No shared mutable state, no locks/mutex/condvar, no atomics as cross-thread coordination (atomics only inside ring-buffer primitives), no `thread_local` on hot paths.
+2. **Ring buffers are the only cross-thread channel.** Aeron/Agrona rings (OneToOne where single-producer, ManyToOne only where genuinely multi-producer) — never shared reads or cross-thread callbacks.
+3. **Aeron is the bible.** Mirror Aeron's patterns exactly: single-writer agents with `doWork(nowNs)` under an `IdleStrategy`, invoker modes, `tryClaim`/`BufferClaim` zero-copy, flat SBE messages with reused encoders, correct release/acquire ordering, one injected clock sampled once per cycle. Busy-spin only on a dedicated pinned core; an agent with no work never burns a shared core.
+4. **Rich-state state machines.** Each state holds exactly the variables it needs (e.g. `Resolving(pubRegId, deadlineNs)`, `Ready(pub)`); every edge case is one explicit state with one code path — no scattered booleans. Reference: `FollowerSync`.
+5. **Zero allocation, no virtual calls on hot paths.** No heap allocation, `std::function`, node-based containers (`std::map`/`unordered_map`/`std::string`) or vtable dispatch on the per-record/per-batch/per-duty-cycle path. Polymorphism via concrete types + a construction-time branch, templates, or tagged unions.
+6. **Cache-friendly, compact data structures;** every optimisation proven by a before/after benchmark with no correctness or p99 regression — no speculative optimisation.
+7. **Test everything; regression test on every fix** (failing repro test first, marked `*Regression*`, regression suite run first). "Done" means the real end-to-end path is green (real client ↔ real broker over real transport) **in the default configuration as well as flag-on**; shortcut/in-process tests alone never count.
+8. **Tests never spin to pass time:** advance an injected clock to the next deadline; every drive loop has a hard iteration cap and fails instead of hanging.
+9. **Time-independent liveness:** control-plane convergence never depends on a tuned timeout out-racing jitter.
+10. **Benchmark gate:** any p99 > 100 µs is a stop-and-fix, not a result. Perf claims are proven with interleaved A/B on a verified-idle box, citing the exact code path; measurements are validated (same binary, complete captures, run succeeded, feature actually active) before any explanation is drawn from them.
+11. **Never hardware to mask software:** a bad number on this box is a software bug to root-cause and fix.
+12. **Fix on sight:** code found violating these while doing the work is fixed as part of the work, not noted.
+
 ## 2. Why the current design cannot meet it (measured 2026-09-30)
 
 - Unloaded (1 record in flight) latency is **p50 4.2 ms / p99 9.8 ms**; leader append→commit alone is p50 3.0 ms.
@@ -76,6 +93,13 @@ Every per-worker port is explicit configuration, validated for collisions at sta
 
 1. **No re-send of pushed data.** The follower's `FollowerSync` keeps a single-outstanding data fetch whenever its LEO < leader LEO (always under load) and the conflation guard (same fetchOffset **and** same leader LEO) never fires, so leaders sent each follower ~2× its ingest. New rule, per follower, progress-based: while that follower's fetch offset keeps advancing and the requested offset is below `lastPushedOffset_`, answer ack-only (HW, no data); once it has asked for the same offset for ≥ `kFetchResendNs` (20 ms), serve data (lost-push recovery). Measured (env-gated experiment): +10%, no stall; a global-recency variant stalled (p99 3.3 s) and is rejected.
 2. **Fast-acks unicast to the leader.** `WorkerReplicationTransport::sendFetchRequest` currently broadcasts to every peer; the replica knows its leader — send to it only.
+3. The per-follower progress tracker for rule 1 is a fixed-size flat array indexed by the follower's replica-set slot (no `unordered_map`; the env-gated experiment's map is replaced).
+
+### 3.5a Fix-on-sight items found while designing (principles §1a.5)
+
+1. **Virtual call on the hot path:** `PartitionReplica` calls `transport_->sendFetchResponse(...)` / `sendFetchRequest(...)` through the virtual `PartitionTransport` interface on every push/ack; #4's `WorkerReplicationTransport` overrides it. De-virtualise: the replica holds concrete transport pointers (per-worker vs legacy) chosen at construction and branches on a construction-time tag (both inlinable, branch perfectly predicted).
+2. **Allocation + copy on every push and data fetch:** `pushToFollowers` and `onFetchRequest` build `std::vector<uint8_t> logBytes = L.read(...)` per call. Replace with a zero-copy read view over the log (`Log::readView`, already used by the read path) encoded straight into the publication claim.
+3. **Worker-shard startup, route resolution, session announcement and ack overflow** are designed as rich-state state machines (e.g. publication `Resolving(regId, deadlineNs) → Ready(pub) → Failed(reason)`), not flag combinations.
 
 ### 3.6 Invoker-mode correctness rules
 
