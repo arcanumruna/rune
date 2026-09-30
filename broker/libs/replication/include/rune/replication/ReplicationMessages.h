@@ -222,23 +222,22 @@ struct FetchRequestMsg {
 // consumers), the logStartOffset (earliest offset available in this epoch),
 // an error code, and a variable-length records blob.
 //
-// Fixed block (34 bytes):  [schema version 2: DR-BUG-5 adds topicId]
+// Fixed block (34 bytes, sbeBlockLength=34):  [schema version 2: DR-BUG-5 adds topicId]
 //   leaderEpoch    : Epoch       (int64)  @ +0
 //   partition      : PartitionId (int32)  @ +8
 //   highWatermark  : Offset      (int64)  @ +12
 //   logStartOffset : Offset      (int64)  @ +20
 //   errorCode      : int16       @ +28
-//   _pad           : int16       @ +30   (alignment padding; must be 0)
-//   topicId        : int32       @ +32   (DR-BUG-5: multi-topic routing)
-// Total fixed: 8 + 4 + 8 + 8 + 2 + 2 + 4 = 36 bytes... wait:
-//   leaderEpoch(8) + partition(4) + highWatermark(8) + logStartOffset(8) +
-//   errorCode(2) + _pad(2) + topicId(4) = 36 bytes
+//   topicId        : int32       @ +30   (DR-BUG-5: multi-topic routing; NO alignment pad)
+// Total fixed: leaderEpoch(8) + partition(4) + highWatermark(8) + logStartOffset(8) +
+//   errorCode(2) + topicId(4) = 34 bytes  (matches generated SBE sbeBlockLength=34;
+//   topicIdEncodingOffset()=30, errorCodeEncodingOffset()=28)
 //
 // Followed by variable-length records blob:
-//   recordsLength  : int32       @ +36  (can be 0 for HW-only updates)
-//   recordsData    : uint8[]     @ +40  (recordsLength bytes)
+//   recordsLength  : uint32      @ +34  (can be 0 for HW-only updates)
+//   recordsData    : uint8[]     @ +38  (recordsLength bytes)
 //
-// Total on-wire = 8 (header) + 36 (fixed) + 4 (length prefix) + recordsLength
+// Total on-wire = 8 (header) + 34 (fixed) + 4 (length prefix) + recordsLength
 // ===========================================================================
 struct FetchResponseMsg {
     Epoch                    leaderEpoch;

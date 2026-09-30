@@ -81,6 +81,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -388,13 +389,28 @@ public:
         using D = std::remove_reference_t<Dispatch>;
 
         if (testMode_) {
-            // Test-mode: drain the in-process inbound queue (no real Aeron sub).
-            // Each entry is a fully-encoded SBE frame.  Honour fragmentLimit.
+            // Test-mode: drain the in-process inbound queues (no real Aeron sub).
+            // Two queues are drained in FIFO order across both:
+            //   inboundQueue_ — frames stored as owned heap vectors (copy-inject path).
+            //   viewQueue_    — frames stored as raw (ptr, len) views into caller-owned
+            //                   backing buffers (zero-copy-inject path, mirrors Aeron
+            //                   term-buffer dispatch for aliasing regression tests).
+            // Honour fragmentLimit across both queues combined.
             int count = 0;
-            while (count < fragmentLimit && !inboundQueue_.empty()) {
-                std::vector<uint8_t> frame = std::move(inboundQueue_.front());
-                inboundQueue_.pop_front();
-                dispatchFrame_(frame.data(), frame.size(), dispatch);
+            while (count < fragmentLimit &&
+                   (!inboundQueue_.empty() || !viewQueue_.empty())) {
+                if (!inboundQueue_.empty()) {
+                    std::vector<uint8_t> frame = std::move(inboundQueue_.front());
+                    inboundQueue_.pop_front();
+                    dispatchFrame_(frame.data(), frame.size(), dispatch);
+                } else {
+                    const auto [ptr, len] = viewQueue_.front();
+                    viewQueue_.pop_front();
+                    // dispatch ptr DIRECTLY (zero-copy: pointer into caller's buffer).
+                    // Valid ONLY for the duration of this dispatchFrame_ call, exactly
+                    // as the production path is valid only inside the Aeron callback.
+                    dispatchFrame_(ptr, len, dispatch);
+                }
                 ++count;
             }
             return count;
@@ -432,10 +448,46 @@ public:
     // queue.  Must only be called when testMode_ is true (i.e. the test-seam
     // constructor was used).  poll() drains this queue instead of the real
     // Aeron subscription.
+    //
+    // This COPIES the bytes into a private heap vector (one vector per injected
+    // frame) — safe for all tests that do not need to verify term-buffer aliasing
+    // behaviour.
     // -----------------------------------------------------------------------
     void injectFrameForTest(const uint8_t* buf, std::size_t len)
     {
         inboundQueue_.emplace_back(buf, buf + len);
+    }
+
+    // -----------------------------------------------------------------------
+    // injectFrameViewForTest — inject a ZERO-COPY view into a caller-owned
+    // backing buffer without copying bytes.
+    //
+    // The transport stores ONLY the raw pointer and length; it does NOT take
+    // ownership of the memory.  poll() dispatches the raw pointer directly,
+    // exactly as the production Aeron path dispatches a pointer into the term
+    // buffer.
+    //
+    // This is the test seam for aliasing / lifetime regression tests:
+    //   1. Caller fills `backingBuf` with frame1.
+    //   2. `injectFrameViewForTest(backingBuf.data(), backingBuf.size())`
+    //   3. poll(1, cb) — cb receives a pointer INTO backingBuf.  The contract:
+    //      all data must be consumed INSIDE cb; the pointer is invalid after
+    //      poll() returns.
+    //   4. Caller overwrites `backingBuf` with frame2 bytes.
+    //   5. `injectFrameViewForTest(backingBuf.data(), backingBuf.size())`
+    //   6. poll(1, cb) — pointer still points to backingBuf (now frame2).
+    //
+    // IF a broken dispatch implementation had stored the raw pointer from step 3
+    // and deferred reading it until after step 4, it would observe frame2 bytes
+    // instead of frame1 bytes — causing the assertion on the captured value to
+    // FAIL.  This is the real regression guard.
+    //
+    // The caller MUST keep the backing buffer alive and unmodified for the
+    // duration of the poll() call that consumes the view.
+    // -----------------------------------------------------------------------
+    void injectFrameViewForTest(const uint8_t* buf, std::size_t len)
+    {
+        viewQueue_.emplace_back(buf, len);
     }
 
     // -----------------------------------------------------------------------
@@ -746,7 +798,14 @@ private:
 
     // Test-mode inbound queue: feed frames via injectFrameForTest().
     // poll() drains this instead of the real Aeron subscription in testMode_.
+    // Each entry is an OWNED copy of the encoded frame bytes.
     std::deque<std::vector<uint8_t>> inboundQueue_;
+
+    // Test-mode zero-copy view queue: feed raw pointer views via
+    // injectFrameViewForTest().  Entries are (ptr, len) pairs into
+    // caller-owned backing buffers — NOT owned by this queue.
+    // Simulates the Aeron term-buffer dispatch for aliasing regression tests.
+    std::deque<std::pair<const uint8_t*, std::size_t>> viewQueue_;
 
     // True when constructed via the test-seam constructor (no real Aeron sub).
     bool testMode_ = false;

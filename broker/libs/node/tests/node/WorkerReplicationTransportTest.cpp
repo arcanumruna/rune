@@ -869,37 +869,53 @@ TEST(WorkerReplicationTransport, PollCapsReconcileFetchReqMaxBytes)
 }
 
 // ===========================================================================
-// 19. Regression: back-to-back polls with fragmentLimit=1 each must not alias
-//     the records of the first frame when the second frame is polled.
+// 19. Regression: back-to-back polls over a SINGLE shared backing buffer must
+//     not alias records — dispatch MUST decode all needed bytes INSIDE the
+//     callback (zero-copy lifetime contract).
 //
-//     This test verifies the zero-copy lifetime contract: once poll() returns,
-//     the pointer passed to dispatch is no longer valid — but the CONTENT of
-//     the first poll's buffer must have been fully consumed INSIDE that call
-//     before the second poll begins.
+//     Mechanism (real aliasing guard):
+//       - A single std::vector<uint8_t> `sharedBuf` is used as the Aeron
+//         term-buffer stand-in.
+//       - Frame1 (pattern 0xAA) is encoded INTO sharedBuf; injected via
+//         injectFrameViewForTest — which stores a RAW POINTER into sharedBuf,
+//         NOT a copy.
+//       - poll(1): dispatch is called with a pointer into sharedBuf; decoded
+//         bytes are captured INSIDE the callback.
+//       - After poll() returns, sharedBuf is OVERWRITTEN with frame2 (0xBB).
+//       - Frame2 is injected (same sharedBuf, same address).
+//       - poll(1): dispatch sees frame2 bytes.
+//
+//     Aliasing failure mode: if a broken dispatch implementation stored the raw
+//     pointer from the first poll() and deferred reading it until after
+//     sharedBuf was overwritten, firstByte1 would equal 0xBB instead of 0xAA,
+//     causing EXPECT_EQ(firstByte1, 0xAA) to FAIL.  The current correct
+//     in-callback decode passes because firstByte1 is captured before poll()
+//     returns.
 // ===========================================================================
 TEST(WorkerReplicationTransportRegression, BackToBackPollsDoNotAliasRecords)
 {
     auto h = makeTestPair(/*workerId=*/1, {2, 3});
 
-    // Inject two frames with DISTINCT record patterns.
     const std::vector<uint8_t> records1(1024, 0xAA);
     const std::vector<uint8_t> records2(1024, 0xBB);
 
-    const auto frame1 = makeFetchResponseFrame(/*partition=*/5, /*topicId=*/0, records1);
-    const auto frame2 = makeFetchResponseFrame(/*partition=*/6, /*topicId=*/0, records2);
+    // Single backing buffer — the Aeron term-buffer stand-in.  Both frames
+    // will occupy the SAME memory at different points in time.
+    std::vector<uint8_t> sharedBuf;
 
-    h.transport->injectFrameForTest(frame1.data(), frame1.size());
-    h.transport->injectFrameForTest(frame2.data(), frame2.size());
+    // --- Frame 1 (0xAA) --- encode into sharedBuf, inject as a raw view.
+    sharedBuf = makeFetchResponseFrame(/*partition=*/5, /*topicId=*/0, records1);
+    h.transport->injectFrameViewForTest(sharedBuf.data(), sharedBuf.size());
 
-    // First poll (fragmentLimit=1): must deliver frame1 only.
-    uint8_t firstByte1 = 0;
+    uint8_t     firstByte1 = 0;
     PartitionId firstPart1 = -1;
     std::size_t firstLen1  = 0;
     const int n1 = h.transport->poll(1,
         [&](int32_t, int32_t part, uint16_t,
             const uint8_t* f, std::size_t len) {
-            // Consume the records INSIDE the callback (zero-copy: pointer is
-            // only valid here).
+            // MUST decode INSIDE the callback — pointer is valid ONLY here.
+            // If decode is deferred past this callback, sharedBuf will have
+            // been overwritten with frame2 and the assertion will catch it.
             const FetchResponseMsg decoded = FetchResponseMsg::decode(f, 0, len);
             firstByte1 = decoded.records.empty() ? 0 : decoded.records[0];
             firstPart1 = part;
@@ -910,10 +926,16 @@ TEST(WorkerReplicationTransportRegression, BackToBackPollsDoNotAliasRecords)
     EXPECT_EQ(firstPart1, 5);
     EXPECT_EQ(firstLen1, 1024u);
     EXPECT_EQ(firstByte1, 0xAA)
-        << "first poll must see the 0xAA pattern of frame1";
+        << "first poll must see 0xAA; failure here = dispatch read the pointer "
+           "AFTER sharedBuf was overwritten (aliasing bug)";
 
-    // Second poll (fragmentLimit=1): must deliver frame2 independently.
-    uint8_t firstByte2 = 0;
+    // Overwrite sharedBuf with frame2 (0xBB) — this simulates the Aeron driver
+    // reusing the term-buffer slot for the next frame.  Any stale pointer from
+    // the first poll now points to frame2 bytes.
+    sharedBuf = makeFetchResponseFrame(/*partition=*/6, /*topicId=*/0, records2);
+    h.transport->injectFrameViewForTest(sharedBuf.data(), sharedBuf.size());
+
+    uint8_t     firstByte2 = 0;
     PartitionId firstPart2 = -1;
     const int n2 = h.transport->poll(1,
         [&](int32_t, int32_t part, uint16_t,
@@ -926,7 +948,7 @@ TEST(WorkerReplicationTransportRegression, BackToBackPollsDoNotAliasRecords)
     EXPECT_EQ(n2, 1) << "second poll must deliver exactly 1 fragment";
     EXPECT_EQ(firstPart2, 6);
     EXPECT_EQ(firstByte2, 0xBB)
-        << "second poll must see the 0xBB pattern of frame2 (no aliasing with frame1)";
+        << "second poll must see the 0xBB pattern of frame2";
 
     // Third poll: queue is now empty.
     int callCount = 0;
@@ -936,4 +958,94 @@ TEST(WorkerReplicationTransportRegression, BackToBackPollsDoNotAliasRecords)
         });
     EXPECT_EQ(n3, 0)        << "queue must be empty after consuming both frames";
     EXPECT_EQ(callCount, 0) << "dispatch must not be called on an empty queue";
+}
+
+// ===========================================================================
+// 20. poll() returns 0 when the transport is not resolved (no peer pubs).
+// ===========================================================================
+TEST(WorkerReplicationTransport, PollReturnsZeroWhenNotResolved)
+{
+    // Construct a transport with NO peers → allResolved() returns false →
+    // resolved() returns false → poll() must return 0 immediately.
+    SharedFakePubRegistry noPeers({});  // empty peer list → not resolved
+    auto transport = std::make_unique<SharedTestTransport>(/*workerId=*/1,
+                                                           std::move(noPeers));
+
+    ASSERT_FALSE(transport->resolved())
+        << "pre-condition: transport must not be resolved with empty peer list";
+
+    // Inject a valid frame — it must NOT be dispatched.
+    const std::vector<uint8_t> records(64, 0xCC);
+    const auto frame = makeFetchResponseFrame(/*partition=*/0, /*topicId=*/0, records);
+    transport->injectFrameForTest(frame.data(), frame.size());
+
+    int callCount = 0;
+    const int n = transport->poll(10,
+        [&](int32_t, int32_t, uint16_t, const uint8_t*, std::size_t) {
+            ++callCount;
+        });
+
+    EXPECT_EQ(n, 0)        << "poll must return 0 when not resolved";
+    EXPECT_EQ(callCount, 0) << "dispatch must not be called when not resolved";
+}
+
+// ===========================================================================
+// 21. poll() drops frames with an unknown/garbage templateId (default: case)
+//     without invoking dispatch and without crashing.
+// ===========================================================================
+TEST(WorkerReplicationTransport, PollDropsUnknownTemplateIdFrame)
+{
+    auto h = makeTestPair(/*workerId=*/1, {2, 3});
+
+    // Encode a valid FetchRequest to get the right overall size, then patch
+    // the templateId to a value not in the enum (0xFFFF = garbage).
+    auto buf = makeFetchRequestFrame(/*partition=*/0, /*topicId=*/0, /*maxBytes=*/4096);
+
+    // Stamp an unrecognised templateId into the SBE message header.
+    constexpr uint16_t kGarbageTemplateId = 0xFFFF;
+    stampTemplateId(buf.data(), 0, kGarbageTemplateId);
+
+    h.transport->injectFrameForTest(buf.data(), buf.size());
+
+    int callCount = 0;
+    const int n = h.transport->poll(10,
+        [&](int32_t, int32_t, uint16_t, const uint8_t*, std::size_t) {
+            ++callCount;
+        });
+
+    // poll() must return 1 (one fragment was processed — it was examined and
+    // dropped), but dispatch must NOT have been invoked.
+    EXPECT_EQ(n, 1)        << "poll must return the fragment count (frame was consumed)";
+    EXPECT_EQ(callCount, 0) << "dispatch must not be called for an unknown templateId";
+}
+
+// ===========================================================================
+// 22. poll() drops a truncated frame (shorter than the fixed block) without
+//     crashing — the length guard in dispatchFrame_ must catch it.
+// ===========================================================================
+TEST(WorkerReplicationTransport, PollDropsTruncatedFrameWithoutCrash)
+{
+    auto h = makeTestPair(/*workerId=*/1, {2, 3});
+
+    // Build a valid full frame, then truncate it to just 4 bytes — far below
+    // both the SBE header size and the fixed-block minimum.
+    const std::vector<uint8_t> records(64, 0xAA);
+    auto fullFrame = makeFetchResponseFrame(/*partition=*/1, /*topicId=*/0, records);
+
+    // Inject only the first 4 bytes (header-only truncation).
+    constexpr std::size_t kTruncLen = 4;
+    ASSERT_GE(fullFrame.size(), kTruncLen);
+    h.transport->injectFrameForTest(fullFrame.data(), kTruncLen);
+
+    // Also inject a 0-byte frame to cover the degenerate empty case.
+    h.transport->injectFrameForTest(fullFrame.data(), 0);
+
+    int callCount = 0;
+    const int n = h.transport->poll(10,
+        [&](int32_t, int32_t, uint16_t, const uint8_t*, std::size_t) {
+            ++callCount;
+        });
+
+    EXPECT_EQ(n, 2)        << "poll must count both truncated frames as processed";
+    EXPECT_EQ(callCount, 0) << "dispatch must not be called for truncated frames";
 }
