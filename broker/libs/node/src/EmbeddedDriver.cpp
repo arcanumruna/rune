@@ -125,6 +125,19 @@ int EmbeddedDriver::doWork() noexcept {
     return callerPump_();
 }
 
+int EmbeddedDriver::pumpTrampoline_(void* self) noexcept {
+    auto* d = static_cast<EmbeddedDriver*>(self);
+    if (d->mode_ == DriverMode::Threaded ||
+        std::this_thread::get_id() != d->pumpOwner_.load(std::memory_order_relaxed)) {
+        d->foreignPumpAttempts_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("EmbeddedDriver: AeronPump refused — not this driver's pump thread "
+                      "(dir={}, mode={}); resolve fails fast", d->cfg_.dir,
+                      d->mode_ == DriverMode::Invoker ? "invoker" : "threaded");
+        return rune::aeronutil::AeronPump::kRefused;
+    }
+    return d->callerPump_();
+}
+
 void EmbeddedDriver::close() noexcept {
     if (mode_ == DriverMode::Invoker && driver_ &&
         std::this_thread::get_id() != pumpOwner_.load(std::memory_order_relaxed)) {

@@ -138,21 +138,37 @@ public:
         std::vector<Pending> pending;
         pending.reserve(peerChannels.size());
 
+        // Peers whose registration failed (add or find threw): absent from pubs_
+        // (sends to them are no-ops) and they keep allResolved() false.
+        std::size_t failedPeers = 0;
         for (const auto& [peerId, channel] : peerChannels) {
             try {
                 int64_t regId = aeron->addExclusivePublication(channel, peerStreamId);
                 pending.push_back({peerId, regId});
-            } catch (...) {
-                // Failed to register — leave this peer absent; sends to it are no-ops.
+            } catch (const std::exception& e) {
+                spdlog::error("AeronPubRegistry: peer {} addExclusivePublication {} failed: {}",
+                              peerId, channel, e.what());
+                ++failedPeers;
             }
         }
 
         // Bounded resolve (spec §3.6): default pump sleeps 1 ms between probes
         // (legacy WorkerEgress behaviour); an invoker pump drives this shard's
         // own driver + conductor instead.
+        // A peer whose registration ERRORED (find throws: bad channel, ...) is
+        // dropped from `pending` and counted in `failedPeers` — the others keep
+        // resolving; the ctor is noexcept so nothing may escape.
         (void)pump.resolve([&] {
             for (auto it = pending.begin(); it != pending.end(); ) {
-                auto pub = aeron->findExclusivePublication(it->regId);
+                std::shared_ptr<aeron::ExclusivePublication> pub;
+                try {
+                    pub = aeron->findExclusivePublication(it->regId);
+                } catch (const std::exception& e) {
+                    spdlog::error("AeronPubRegistry: peer {} publication failed: {}", it->peerId, e.what());
+                    ++failedPeers;
+                    it = pending.erase(it);
+                    continue;
+                }
                 if (pub) {
                     if (pubCount_ < kMaxPeers) pubs_[pubCount_++] = PeerPub{it->peerId, std::move(pub)};
                     it = pending.erase(it);
@@ -164,7 +180,8 @@ public:
         }, std::chrono::milliseconds{kResolveMaxMs});
         // Any still-pending entries were not resolved within the window;
         // they remain absent from pubs_ → sends to them are no-ops.
-        allResolved_ = pending.empty() && pubCount_ > 0 && peerChannels.size() <= kMaxPeers;
+        allResolved_ = pending.empty() && failedPeers == 0 && pubCount_ > 0 &&
+                       peerChannels.size() <= kMaxPeers;
     }
 
     // Non-copyable, non-movable.
@@ -370,8 +387,25 @@ public:
         // Resolve inbound subscription — mirrors WorkerIngress ctor exactly.
         // The registry got its own copy of `pump`; this copy drives the
         // subscription resolve (default: 1 ms sleep; invoker: pump, no sleep).
-        const int64_t regId = aeron->addSubscription(inboundChannel_, inboundStreamId_);
-        sub_ = pump.resolve([&] { return aeron->findSubscription(regId); }, std::chrono::milliseconds{5000});
+        // Registration errors (bad channel, ...) throw from add/find; the ctor is
+        // noexcept, so they become a logged resolve failure (resolved()==false).
+        bool failed = false;
+        try {
+            const int64_t regId = aeron->addSubscription(inboundChannel_, inboundStreamId_);
+            sub_ = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
+                try {
+                    return aeron->findSubscription(regId);
+                } catch (const std::exception& e) {
+                    spdlog::error("WorkerReplicationTransport[{}]: inbound {} stream {} failed: {}",
+                                  workerId_, inboundChannel_, inboundStreamId_, e.what());
+                    failed = true;
+                    return nullptr;
+                }
+            }, std::chrono::milliseconds{AeronPubRegistry::kResolveMaxMs}, &failed);
+        } catch (const std::exception& e) {
+            spdlog::error("WorkerReplicationTransport[{}]: addSubscription {} stream {} failed: {}",
+                          workerId_, inboundChannel_, inboundStreamId_, e.what());
+        }
         // sub_ == nullptr → resolved() returns false.
     }
 

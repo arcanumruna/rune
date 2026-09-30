@@ -56,8 +56,14 @@ public:
     /// untouched) because draining would make it a second pumper.
     void close() noexcept;
 
-    /// A pump that drives THIS driver (via doWork's single-thread check) + `client`'s conductor.
+    /// A pump for startup resolves against THIS driver.
+    ///  - Threaded: the default pump (driver thread makes progress; resolve sleeps 1 ms).
+    ///  - Invoker:  pumps this driver + `client`'s conductor.  Only the bound pump
+    ///    thread may use it: a pump from any other thread is REFUSED loudly
+    ///    (logged, foreignPumpAttempts()++) and the resolve fails fast — never a
+    ///    silent spin for the whole budget.
     [[nodiscard]] rune::aeronutil::AeronPump pumpWith(aeron::Aeron* client) noexcept {
+        if (mode_ == DriverMode::Threaded) return {};
         return rune::aeronutil::AeronPump(&EmbeddedDriver::pumpTrampoline_, this, client);
     }
 
@@ -68,7 +74,7 @@ public:
     [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { return callerPumpsWhileThreadRunning_.load(std::memory_order_relaxed); }
 
 private:
-    static int pumpTrampoline_(void* self) noexcept { return static_cast<EmbeddedDriver*>(self)->doWork(); }
+    static int pumpTrampoline_(void* self) noexcept;   // AeronPump::kRefused off the pump thread
     int callerPump_() noexcept;   // any pump NOT made by the driver thread
 
     EmbeddedDriverConfig    cfg_;

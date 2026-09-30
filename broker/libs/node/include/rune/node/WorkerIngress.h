@@ -37,6 +37,7 @@
 #include <rune/aeronutil/AeronPump.h>
 
 #include <Aeron.h>
+#include <spdlog/spdlog.h>
 #include <Subscription.h>
 #include <FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
@@ -90,8 +91,23 @@ public:
         // Add, then resolve (spec §3.6): the default pump sleeps 1 ms between
         // probes (legacy ClientGateway.cpp:85-99 behaviour); an invoker pump
         // drives this shard's own driver + conductor instead of sleeping.
-        const int64_t regId = aeron_->addSubscription(channel_, streamId_);
-        sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, budget);
+        // A driver registration error (bad channel, ...) makes add/find THROW;
+        // this ctor is noexcept, so it becomes a logged resolve failure.
+        bool failed = false;
+        try {
+            const int64_t regId = aeron_->addSubscription(channel_, streamId_);
+            sub_ = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
+                try {
+                    return aeron_->findSubscription(regId);
+                } catch (const std::exception& e) {
+                    spdlog::error("WorkerIngress: subscription {} stream {} failed: {}", channel_, streamId_, e.what());
+                    failed = true;
+                    return nullptr;
+                }
+            }, budget, &failed);
+        } catch (const std::exception& e) {
+            spdlog::error("WorkerIngress: addSubscription {} stream {} failed: {}", channel_, streamId_, e.what());
+        }
         // sub_ == nullptr → resolved() returns false; caller handles.
     }
 

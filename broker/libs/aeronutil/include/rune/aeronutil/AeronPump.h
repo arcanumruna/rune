@@ -6,6 +6,12 @@
 //     1 ms between attempts — exactly the legacy behaviour;
 //   invoker (driver + client conductor owned by the resolving thread): resolve()
 //     pumps both between attempts and never sleeps.
+// Fail-fast (never a silent spin):
+//   - a driver pump fn that returns kRefused (< 0) — e.g. an invoker driver
+//     pumped from a thread that is not its bound pumper — stops resolve()
+//     immediately (the conductor is not invoked either); refused() latches;
+//   - a caller-owned `failed` flag (set by the find lambda when the driver
+//     reported a registration error) stops resolve() on the next check.
 #include <Aeron.h>
 
 #include <chrono>
@@ -17,6 +23,8 @@ namespace rune::aeronutil {
 class AeronPump {
 public:
     using DriverPumpFn = int (*)(void*) noexcept;
+    /// Returned by a DriverPumpFn that refuses to pump (not this thread's driver).
+    static constexpr int kRefused = -1;
 
     AeronPump() noexcept = default;
     AeronPump(DriverPumpFn fn, void* driverCtx, aeron::Aeron* client) noexcept
@@ -28,29 +36,40 @@ public:
         if (!fn_) return 0;
         ++pumps_;
         int w = fn_(ctx_);
+        if (w < 0) { refused_ = true; return kRefused; }   // not ours to pump: stop
         if (client_) w += client_->conductorAgentInvoker().invoke();
         return w;
     }
 
+    /// Probe `find` until it yields a truthy value, `budget` elapses, `*failed`
+    /// becomes true (find saw a hard registration error), or the driver refuses
+    /// to be pumped by this thread.  Returns find()'s last result.
     template <class Find>
-    auto resolve(Find&& find, std::chrono::milliseconds budget) -> decltype(find()) {
+    auto resolve(Find&& find, std::chrono::milliseconds budget,
+                 const bool* failed = nullptr) -> decltype(find()) {
         using clock = std::chrono::steady_clock;
         const auto deadline = clock::now() + budget;
         for (;;) {
             auto r = find();
-            if (r || clock::now() >= deadline) return r;
-            if (invoker()) pump();
-            else           std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            if (r || (failed && *failed) || clock::now() >= deadline) return r;
+            if (invoker()) {
+                if (pump() < 0) return r;                      // refused: fail fast
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
         }
     }
 
     [[nodiscard]] uint64_t pumps() const noexcept { return pumps_; }
+    /// True once the driver refused a pump from this thread (resolve failed fast).
+    [[nodiscard]] bool refused() const noexcept { return refused_; }
 
 private:
     DriverPumpFn  fn_     = nullptr;
     void*         ctx_    = nullptr;
     aeron::Aeron* client_ = nullptr;
     uint64_t      pumps_  = 0;
+    bool          refused_ = false;
 };
 
 } // namespace rune::aeronutil

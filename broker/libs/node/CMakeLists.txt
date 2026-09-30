@@ -24,9 +24,9 @@ target_include_directories(rune_node PUBLIC
 # rune_metadata_msm: MetadataStateMachine (MD1 Task 4)
 # rune_dynamic_balancer: DynamicBalancer + FailoverElection (GR-7 dead-leader reassign,
 #   now ODR-used via MetadataService::reassignDeadPartitionLeaders from NodeRuntimeAgent)
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer rune_aeron_util)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer)
 if(aeron_FOUND)
-    target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
+    target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron rune_aeron_util)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
     # macOS provides it in system libs and the ConanCenter aeron recipe doesn't
     # propagate it. Link it PUBLIC so every driver-embedding consumer (rune_broker

@@ -33,6 +33,7 @@
 #include <rune/aeronutil/AeronPump.h>
 
 #include <Aeron.h>
+#include <spdlog/spdlog.h>
 #include <ExclusivePublication.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
@@ -68,8 +69,23 @@ public:
 
         channel_ = "aeron:udp?control-mode=dynamic|control=" + controlEndpoint_;
 
-        const int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
-        pub_ = pump.resolve([&] { return aeron_->findExclusivePublication(regId); }, budget);
+        // A driver registration error (bad channel, ...) makes add/find THROW;
+        // this ctor is noexcept, so it becomes a logged resolve failure.
+        bool failed = false;
+        try {
+            const int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
+            pub_ = pump.resolve([&]() -> std::shared_ptr<aeron::ExclusivePublication> {
+                try {
+                    return aeron_->findExclusivePublication(regId);
+                } catch (const std::exception& e) {
+                    spdlog::error("WorkerEgress: publication {} stream {} failed: {}", channel_, streamId_, e.what());
+                    failed = true;
+                    return nullptr;
+                }
+            }, budget, &failed);
+        } catch (const std::exception& e) {
+            spdlog::error("WorkerEgress: addExclusivePublication {} stream {} failed: {}", channel_, streamId_, e.what());
+        }
         // pub_ == nullptr → resolved() returns false; caller handles.
     }
 
