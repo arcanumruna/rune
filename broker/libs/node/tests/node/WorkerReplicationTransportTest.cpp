@@ -81,6 +81,11 @@ public:
 
     [[nodiscard]] bool allResolved() const noexcept { return !state_->peers.empty(); }
 
+    [[nodiscard]] bool hasPeer(NodeId peer) const noexcept
+    {
+        return std::find(state_->peers.begin(), state_->peers.end(), peer) != state_->peers.end();
+    }
+
     // maxMessageLength — returns a fixed large value (simulates a generous Aeron
     // term; override via state_->fakeMaxMessageLength for cap tests).
     [[nodiscard]] int32_t maxMessageLength() const noexcept
@@ -1068,4 +1073,23 @@ TEST(WorkerReplicationTransport, PollDropsTruncatedFrameWithoutCrash)
 
     EXPECT_EQ(n, 2)        << "poll must count both truncated frames as processed";
     EXPECT_EQ(callCount, 0) << "dispatch must not be called for truncated frames";
+}
+
+TEST(WorkerReplicationTransportRegression, SendFetchRequestToUnicastsToLeaderOnly)
+{
+    auto h = makeTestPair(/*workerId=*/0, {2, 3});
+    FetchRequestMsg req{4, 1, 7, 100, 0, 3};
+    h.transport->sendFetchRequestTo(/*leader=*/2, req);
+    ASSERT_EQ(h.pubs.offersTo(2).size(), 1u);
+    EXPECT_TRUE(h.pubs.offersTo(3).empty()) << "fast-ack must not be broadcast";
+    EXPECT_EQ(h.pubs.offersTo(2)[0], encodeExpectedFetchRequest(req));
+}
+
+TEST(WorkerReplicationTransport, SendFetchRequestToUnknownLeaderFallsBackToBroadcast)
+{
+    auto h = makeTestPair(/*workerId=*/0, {2, 3});
+    FetchRequestMsg req{4, 1, 7, 100, 0, 3};
+    h.transport->sendFetchRequestTo(/*leader=*/9, req);
+    EXPECT_EQ(h.pubs.offersTo(2).size(), 1u);
+    EXPECT_EQ(h.pubs.offersTo(3).size(), 1u);
 }

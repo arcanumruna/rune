@@ -326,6 +326,7 @@ public:
 
     [[nodiscard]] bool    allResolved()      const noexcept { return state_->allResolved; }
     [[nodiscard]] int32_t maxMessageLength() const noexcept { return state_->maxMsgLen; }
+    [[nodiscard]] bool    hasPeer(rune::replication::NodeId) const noexcept { return true; }
 
     // No real sends needed for receive-path tests.
     int64_t sendToPeer(rune::replication::NodeId, const uint8_t*, std::size_t) noexcept { return 1; }

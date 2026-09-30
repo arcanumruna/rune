@@ -3597,6 +3597,10 @@ TEST(PartitionReplicaTest, OnFetchRequest_WholeBatchAlignment) {
     cfg.fetchIntervalNs     = 5'000'000LL;
     cfg.isrCheckIntervalNs  = 10'000'000LL;
     cfg.maxFetchBytes       = 1 << 20;
+    // This test exercises the FETCH-serve path's whole-batch alignment.  With push
+    // on, append() pushes [0,10) to follower 2 and the no-dup-fetch gate (spec §3.5)
+    // correctly answers the fetch at offset 0 ack-only — so disable push here.
+    cfg.pushOnAppend        = false;
 
     PartitionReplica leader(cfg, Role::Leader, 1,
                             {1, 2}, {1, 2}, &log, &transport);

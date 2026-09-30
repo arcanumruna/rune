@@ -63,6 +63,8 @@ if(BUILD_TESTING)
         tests/replication/IsrManagerTest.cpp
         tests/replication/EpochFencingTest.cpp
         tests/replication/PartitionReplicaTest.cpp
+        tests/replication/FollowerSlotsTest.cpp
+        tests/replication/NoDupFetchGateTest.cpp
         tests/replication/PartitionRecorderTest.cpp
         tests/replication/PartitionReplayTest.cpp
         tests/replication/PartitionFailoverTest.cpp

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <string>
 
 namespace rune::replication {
 
@@ -132,6 +133,11 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
     // follower-first replica can rebuild a correct IsrManager on a later
     // becomeLeader() instead of collapsing replicas == isr (see header note).
     configuredReplicas_ = replicas;
+    if (!followerSlots_.init(configuredReplicas_)) {
+        throw std::invalid_argument(
+            "PartitionReplica: replica set size " + std::to_string(configuredReplicas_.size()) +
+            " exceeds FollowerSlots::kMaxReplicas=" + std::to_string(FollowerSlots::kMaxReplicas));
+    }
 
     // Task 9: restore the LeaderEpochCache from the durable checkpoint BEFORE any
     // assign() calls below.  Disk-backed only — memory-backed partitions have no
@@ -292,7 +298,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     completenessFloor_ = committedHw;
     leaderComplete_    = false;
     survivorFrontier_.clear();
-    servedFetch_.clear();   // fetch-conflation state is per-leadership
+    followerSlots_.resetLeadership();   // conflation + push coverage are per-leadership
     survivorFrontier_[cfg_.selfId] = logEndOffset_();
     reconcileTarget_   = -1;   // drop any pull latched under a prior term
     reconcileIssuedNs_ = -1;
@@ -386,6 +392,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     }
     lastFetchEmitNs_ = 0;     // (DR epoch-probe cadence; separate from FollowerSync)
     reconcileTarget_ = -1;
+    followerSlots_.resetLeadership();
 
     // Publish the demotion so the cleaner stops treating this node as Leader
     // (cleanerRole() flips to Follower) — no live-state read on the cleaner.
@@ -542,6 +549,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         leaderId_ = req.followerId; // best-effort; coordinator will correct
         followerHw_ = committedHw;
         followerSync_.reset();    // self-demotion → bootstrap fetch state afresh
+        followerSlots_.resetLeadership();
         if (fsLogEnabled()) {
             spdlog::info("FollowerSync[node={} part={}] reset (self-demote to follower "
                          "epoch={} newLeaderGuess={})",
@@ -650,18 +658,18 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // above, so skipping the RESPONSE is safe; the timeout re-serve recovers a
     // genuinely lost push/response.  (Does NOT touch the DR reconcile/ahead-follower
     // paths handled earlier.)
-    {
-        const Offset curLeo = logEndOffset_();
-        auto& sf = servedFetch_[req.followerId];
-        const bool identical = sf.timeNs != 0 && sf.fetchOffset == req.fetchOffset &&
-                               sf.leo == curLeo && (nowNs - sf.timeNs) < kFetchResendNs;
-        if (identical) return kErrNone;   // conflate: don't re-send the same response
-        sf.fetchOffset = req.fetchOffset; sf.leo = curLeo; sf.timeNs = nowNs;
-    }
+    // FETCH CONFLATION + NO-DUP-FETCH (spec §3.5) — FollowerSlots.h.  ISR liveness
+    // and HW were updated above, so answering ack-only or nothing is safe.
+    FollowerSlot* const slot = followerSlots_.find(req.followerId);
+    const FetchServe serve = slot
+        ? decideFetchServe(*slot, req.fetchOffset, req.maxBytes, logEndOffset_(),
+                           cfg_.pushOnAppend, nowNs, kFetchResendNs)
+        : (req.maxBytes > 0 ? FetchServe::Data : FetchServe::AckOnly);
+    if (serve == FetchServe::Conflate) return kErrNone;
 
-    // Read records from the log.
+    // Read records from the log (Data only; AckOnly answers the HW with no records).
     std::vector<uint8_t> logBytes;
-    if (req.maxBytes > 0 && req.fetchOffset < logEndOffset_()) {
+    if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
         logBytes = onLog([&](auto& L){ return L.read(req.fetchOffset, req.maxBytes); });
 
         // GR-1 fix: whole-batch alignment.
@@ -996,8 +1004,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         FetchRequestMsg ack = nextFetch();
         ack.maxBytes = 0;   // PURE ACK: advance leader HW only; NEVER request data
                             // (data flows via push / the single-outstanding fetch).
-        transport_->sendFetchRequest(ack);
+        sendFetchToLeader_(ack);
     }
+}
+
+// Spec §3.5.2: the follower knows its leader — unicast.  Before the leader is
+// known (leaderId_ < 0) fall back to the transport's broadcast.
+void PartitionReplica::sendFetchToLeader_(const FetchRequestMsg& req)
+{
+    if (leaderId_ >= 0 && leaderId_ != cfg_.selfId) transport_->sendFetchRequestTo(leaderId_, req);
+    else                                            transport_->sendFetchRequest(req);
 }
 
 // ---------------------------------------------------------------------------
@@ -1266,7 +1282,7 @@ void PartitionReplica::applyOffsetsForLeaderEpochResponse(
 
     // Kick a fetch right now so convergence does not wait a full interval.
     FetchRequestMsg req = nextFetch();
-    transport_->sendFetchRequest(req);
+    sendFetchToLeader_(req);
 }
 
 // (Any role) Serve a reconcile pull from an ahead survivor's log.
@@ -1722,7 +1738,7 @@ int PartitionReplica::doWork(int64_t nowNs)
                 if (epochProbeAttempts_ >= kEpochProbeMaxAttempts) {
                     epochProbeAttempts_ = 0;   // keep probing; never give up destructively
                     FetchRequestMsg fr = nextFetch();
-                    transport_->sendFetchRequest(fr);
+                    sendFetchToLeader_(fr);
                     ++work;
                     // fall through to re-issue the probe this cycle too.
                 }
@@ -1767,7 +1783,7 @@ int PartitionReplica::doWork(int64_t nowNs)
             if (act.emit) {
                 FetchRequestMsg req = nextFetch();
                 if (!act.wantData) req.maxBytes = 0;   // pure-ack keepalive
-                transport_->sendFetchRequest(req);
+                sendFetchToLeader_(req);
                 if (act.wantData) ++work;              // real catch-up counts as work
                 if (fsLogEnabled()) {
                     spdlog::info(
@@ -2187,6 +2203,9 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     for (NodeId followerId : isrList) {
         if (followerId == cfg_.selfId) continue;
         transport_->sendFetchResponse(followerId, resp);
+        if (FollowerSlot* s = followerSlots_.find(followerId)) {
+            if (pushedThrough > s->pushedThrough) s->pushedThrough = pushedThrough;
+        }
     }
 
     lastPushedOffset_ = pushedThrough;   // advance by what we actually pushed (bounded by

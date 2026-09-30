@@ -55,6 +55,7 @@ struct FakePubRegistry {
 
     [[nodiscard]] bool allResolved() const noexcept { return peerCount > 0; }
     [[nodiscard]] int32_t maxMessageLength() const noexcept { return 1 << 20; }
+    [[nodiscard]] bool hasPeer(NodeId) const noexcept { return peerCount > 0; }
 
     int64_t sendToPeer(NodeId, const uint8_t*, std::size_t) noexcept { return 1; }
     void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}

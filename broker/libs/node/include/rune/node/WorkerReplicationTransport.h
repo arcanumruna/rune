@@ -38,6 +38,9 @@
 //     Rationale: sendFetchRequest has no target on the wire; only the current
 //     leader responds; non-leaders drop it via their role guard.  Mirrors
 //     AeronPartitionTransport::sendFetchRequest → kBroadcast.
+//   sendFetchRequestTo(leader, req)     → single peer pub (spec §3.5.2: the
+//     follower's fetches / fast-acks go to its KNOWN leader only); falls back to
+//     the broadcast when the leader is not a registered peer.
 //
 // ## Shared-nothing
 //   This object is OWNED by one worker thread and NEVER touched by another.
@@ -166,6 +169,11 @@ public:
     // allResolved — true when every peer pub resolved AND there is ≥1 peer.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool allResolved() const noexcept { return allResolved_; }
+
+    [[nodiscard]] bool hasPeer(rune::replication::NodeId peer) const noexcept
+    {
+        return pubs_.find(peer) != pubs_.end();
+    }
 
     // -----------------------------------------------------------------------
     // maxMessageLength — minimum maxMessageLength across all resolved peer
@@ -543,6 +551,24 @@ public:
             req.leaderEpoch, req.partition, req.followerId,
             req.fetchOffset, req.maxBytes, req.topicId);
         pubReg_.broadcastToPeers(claimBuf, kSize);
+    }
+
+    // -----------------------------------------------------------------------
+    // sendFetchRequestTo — spec §3.5.2: UNICAST to the replica's known leader.
+    // A leader that is not (yet) a registered peer falls back to the broadcast.
+    // -----------------------------------------------------------------------
+    void sendFetchRequestTo(rune::replication::NodeId leader,
+                            const rune::replication::FetchRequestMsg& req) override
+    {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerFetchReqSend,
+                                 static_cast<uint32_t>(req.partition));
+        constexpr std::size_t kSize = rune::replication::FetchRequestMsg::TOTAL_SIZE;
+        alignas(8) uint8_t claimBuf[kSize];
+        rune::replication::FetchRequestMsg::encode(
+            claimBuf, 0, req.leaderEpoch, req.partition, req.followerId,
+            req.fetchOffset, req.maxBytes, req.topicId);
+        if (pubReg_.hasPeer(leader)) pubReg_.sendToPeer(leader, claimBuf, kSize);
+        else                         pubReg_.broadcastToPeers(claimBuf, kSize);
     }
 
     // -----------------------------------------------------------------------

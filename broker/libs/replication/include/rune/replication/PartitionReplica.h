@@ -50,6 +50,7 @@
 #include <string>
 
 #include <rune/replication/Types.h>
+#include <rune/replication/FollowerSlots.h>
 #include <rune/replication/FollowerSync.h>
 #include <rune/replication/HighWatermark.h>
 #include <rune/replication/IsrManager.h>
@@ -152,6 +153,12 @@ public:
 
     /// (Follower → Leader) send a FetchRequest.
     virtual void sendFetchRequest(const FetchRequestMsg& req) = 0;
+
+    /// (Follower → its KNOWN leader) spec §3.5.2: unicast.  Default keeps the old
+    /// behaviour for transports that cannot address a peer (tests, legacy ring).
+    virtual void sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) {
+        sendFetchRequest(req);
+    }
 
     /// (Leader → Follower) send a FetchResponse.
     virtual void sendFetchResponse(NodeId toFollower,
@@ -628,6 +635,8 @@ private:
     /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
     /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
     void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+    // Spec §3.5.2: follower FetchRequests are unicast to the known leader.
+    void sendFetchToLeader_(const FetchRequestMsg& req);
 
     /// Build a FetchResponseMsg stamped with this partition's identity
     /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
@@ -899,9 +908,8 @@ private:
     // (measured: 99% useless applies, 47-98ms follower control→worker handoff).
     // Conflating to ONE response per distinct state removes the flood; the timeout
     // re-serve preserves lost-push / lost-response recovery.  Cleared on role change.
-    struct ServedFetch { Offset fetchOffset = -1; Offset leo = -1; int64_t timeNs = 0; };
-    std::unordered_map<NodeId, ServedFetch> servedFetch_;
-    static constexpr int64_t kFetchResendNs = 20'000'000;  // 20ms lost-push re-serve window
+    // Per-follower conflation + no-dup-fetch state (spec §3.5) — flat, slot-indexed.
+    FollowerSlots followerSlots_;
 
     // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
     // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
