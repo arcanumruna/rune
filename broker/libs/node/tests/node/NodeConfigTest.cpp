@@ -1,5 +1,7 @@
 #include <rune/node/NodeConfig.h>
 
+#include <filesystem>
+
 #include <gtest/gtest.h>
 #include <map>
 #include <string>
@@ -1673,6 +1675,27 @@ TEST(NodeConfig, ParsesReplBaseStreamIdInvalidIsError) {
     EXPECT_FALSE(res.config.has_value())
         << "non-integer RUNE_REPL_BASE_STREAM_ID must be rejected";
     EXPECT_NE(res.error.find("RUNE_REPL_BASE_STREAM_ID"), std::string::npos);
+}
+
+// Regression: the broker ignored RUNE_AERON_DIR and always put the Aeron dir
+// (CnC + every mmapped term buffer) under dataDir/aeron — on a disk-backed data
+// dir that puts Aeron's log buffers on ext4 (page-cache writeback + fault-on-
+// sparse-file for every message; ~2x throughput loss measured on the 4-core VM).
+TEST(NodeConfigRegression, AeronDirDefaultsUnderDataDir) {
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_TRUE(res.config->aeronDir.empty());
+    EXPECT_EQ(res.config->effectiveAeronDir(),
+              (std::filesystem::path{res.config->dataDir} / "aeron").string());
+}
+
+TEST(NodeConfigRegression, AeronDirHonorsRuneAeronDirEnv) {
+    auto base = base1node();
+    base["RUNE_AERON_DIR"] = "/dev/shm/rune-node-0-aeron";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->aeronDir, "/dev/shm/rune-node-0-aeron");
+    EXPECT_EQ(res.config->effectiveAeronDir(), "/dev/shm/rune-node-0-aeron");
 }
 
 TEST(NodeConfig, PeerWorkerCountDefaultsToZero) {

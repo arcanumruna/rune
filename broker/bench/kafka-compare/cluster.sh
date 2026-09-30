@@ -10,10 +10,11 @@ RUNE_CLUSTER_PIDS=()
 rune_cluster_peers() {
   echo "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"
 }
-# The embedded Aeron driver places its CnC file under RUNE_DATA_DIR/aeron (NOT
-# RUNE_AERON_DIR), so rune_role must read there.
+# The broker honours RUNE_AERON_DIR (set to $WORK/rune-c$i/a below, on tmpfs):
+# Aeron's CnC + term buffers must NOT live on the disk-backed data dir, and
+# rune_role reads the role counter from that same dir.
 CLUSTER_PERSISTENCE="nvme"
-_rune_node_aeron() { echo "$(data_root "${CLUSTER_PERSISTENCE:-nvme}" rune-log-$1)/aeron"; }
+_rune_node_aeron() { echo "$WORK/rune-c$1/a"; }
 
 # rune_start_cluster <workers> <topics_spec> [io] [persistence]
 rune_start_cluster() {

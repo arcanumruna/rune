@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -165,6 +166,15 @@ struct NodeConfig {
     std::vector<PeerConfig> peers;       // includes self; sorted by id
     ClientEndpoint      clientEndpoint;
     std::string         dataDir;
+    // Aeron directory (CnC + every mmapped term buffer) — RUNE_AERON_DIR.
+    // Empty → dataDir/aeron (legacy default).  Aeron's log buffers MUST live on
+    // tmpfs (/dev/shm) for performance: on a disk-backed dataDir the default puts
+    // every message's term-buffer writes through ext4 page-cache writeback.
+    std::string         aeronDir;
+    [[nodiscard]] std::string effectiveAeronDir() const {
+        return aeronDir.empty() ? (std::filesystem::path{dataDir} / "aeron").string()
+                                : aeronDir;
+    }
     int32_t             consensusStreamId    = 0;
     int32_t             replicationStreamId  = 20;  // GR-3: stream for per-partition replication
 

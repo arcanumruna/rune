@@ -93,7 +93,7 @@ void BrokerNode::start() {
     // 4. Connect Aeron client — must point at the same dir as the driver.
     {
         const std::string aeronDir =
-            (fs::path{config_.dataDir} / "aeron").string();
+            config_.effectiveAeronDir();
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         aeron_ = aeron::Aeron::connect(ctx);
@@ -1760,9 +1760,7 @@ void BrokerNode::buildGateway() {
         // Backoff with configurable maxPark (RUNE_IDLE_MAX_PARK_US, default 200µs):
         // caps per-hop replication-round-trip wake latency without pegging the core
         // (busyspin here starves consensus heartbeats → re-elections on shared cores).
-        idleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>(
-            10, 20, std::chrono::microseconds{1},
-            std::chrono::microseconds{config_.idleMaxParkUs});
+        idleStrategy_ = makeBackoffIdle(config_.idleMaxParkUs);
     }
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
@@ -2407,7 +2405,7 @@ void BrokerNode::startEmbeddedDriver() {
 
     // Use a node-specific aeron dir to avoid collisions in tests.
     const std::string aeronDir =
-        (fs::path{config_.dataDir} / "aeron").string();
+        config_.effectiveAeronDir();
 
     // Silent-failure guard: if an ACTIVE media driver already holds this aeron
     // dir, dir_delete_on_start cannot wipe it and start degrades into a cryptic
@@ -2516,7 +2514,7 @@ void BrokerNode::startEmbeddedDriver() {
     static constexpr int kDriverReadySliceUs  = 500; // poll granularity (0.5 ms)
 
     const std::string aeronDirStr =
-        (fs::path{config_.dataDir} / "aeron").string();
+        config_.effectiveAeronDir();
 
     const auto readyDeadline =
         std::chrono::steady_clock::now() +

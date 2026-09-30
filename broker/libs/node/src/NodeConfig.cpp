@@ -386,6 +386,8 @@ ConfigResult parseNodeConfig(
     cfg.clientEndpoint.channel  = std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
     cfg.replBaseStreamId        = replBaseStreamId;
+    // RUNE_AERON_DIR (optional): Aeron dir override (empty → dataDir/aeron).
+    if (const char* ad = getenv_fn("RUNE_AERON_DIR")) cfg.aeronDir = ad;
 
     // E5.1: resolve workerIngressBaseStreamId — default to clientStreamId+1 when unset.
     cfg.workerIngressBaseStreamId = (workerIngressBaseStreamId == 0)
