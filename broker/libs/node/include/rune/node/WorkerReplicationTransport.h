@@ -71,6 +71,8 @@
 #include <rune/replication/PartitionReplica.h>   // PartitionTransport base
 #include <rune/replication/ReplicationMessages.h> // SBE codecs + stampTemplateId
 
+#include <spdlog/spdlog.h>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -181,10 +183,20 @@ public:
 
 private:
     // Zero-copy tryClaim for ≤ maxPayloadLength; offer() for larger frames.
-    // Mirrors Worker::sendEncodedToPub_ (Worker.h:1064-1085).
+    // Mirrors Worker::sendEncodedToPub_ (Worker.h:1064-1085) plus the
+    // defence-in-depth maxMessageLength guard from AeronPartitionTransport::sendOnPub.
     static int64_t sendOnPub_(aeron::ExclusivePublication& pub,
                               const uint8_t* buf, std::size_t len) noexcept
     {
+        // Guard: offer() THROWS IllegalArgumentException if len > maxMessageLength.
+        // Drop and log — the follower will retry on the next fetch cycle.
+        if (len > static_cast<std::size_t>(pub.maxMessageLength())) {
+            spdlog::error("WorkerReplicationTransport::sendOnPub_: drop oversized frame "
+                          "len={} maxMessageLength={} — replication term too small",
+                          len, pub.maxMessageLength());
+            return -1;
+        }
+
         auto* mutableBuf = const_cast<uint8_t*>(buf);
         aeron::concurrent::AtomicBuffer atomicBuf(
             mutableBuf, static_cast<aeron::util::index_t>(len));
@@ -427,7 +439,7 @@ private:
     // -----------------------------------------------------------------------
     void sendFetchResponseImpl_(rune::replication::NodeId peer,
                                 const rune::replication::FetchResponseMsg& resp,
-                                bool reconcile) noexcept
+                                bool reconcile)
     {
         const std::size_t frameLen =
             rune::replication::FetchResponseMsg::encodedSize(resp.records.size());

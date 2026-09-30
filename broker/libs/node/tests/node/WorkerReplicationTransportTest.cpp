@@ -3,9 +3,10 @@
 //                                      send path (Task 3, E5 per-worker replication).
 //
 // Test strategy (Aeron-free seam):
-//   We inject a FakePubRegistry instead of AeronPubRegistry.  FakePubRegistry
-//   records every sendToPeer / broadcastToPeers call (NodeId + encoded bytes).
-//   WorkerReplicationTransportImpl<FakePubRegistry> is alias TestTransport.
+//   We inject a SharedFakePubRegistry instead of AeronPubRegistry.
+//   SharedFakePubRegistry records every sendToPeer / broadcastToPeers call
+//   (NodeId + encoded bytes) via a shared_ptr<SharedState> so the observation
+//   handle and the transport's internal copy share the same state.
 //
 //   Tests assert:
 //     (a) Each targeted send goes to the correct peer NodeId only.
@@ -13,9 +14,11 @@
 //     (c) Encoded bytes are SBE-correct (round-trip decode matches input).
 //     (d) Reconcile variants carry the reconcile templateId (not the fetch one).
 //     (e) resolved() reflects whether allResolved() on the registry is true.
+//     (f) Back-pressure (sendToPeer ≤ 0) — nothing recorded, no crash.
+//     (g) Unknown-peer send — nothing recorded to any peer, no crash.
 //
-// No Aeron driver required — FakePubRegistry::allResolved() always returns
-// true once constructed with ≥1 peer.  No network, no file-system I/O.
+// No Aeron driver required — SharedFakePubRegistry::allResolved() returns true
+// once constructed with ≥1 peer.  No network, no file-system I/O.
 // ---------------------------------------------------------------------------
 
 #include <rune/node/WorkerReplicationTransport.h>
@@ -35,229 +38,37 @@ using namespace rune::replication;
 using namespace rune::node;
 
 // ===========================================================================
-// FakePubRegistry — test-only PubRegistry policy.
+// SharedState — backing state shared between the observation handle and the
+// registry copy stored inside the transport.
+// ===========================================================================
+struct SharedState {
+    std::vector<NodeId>                                           peers;
+    std::unordered_map<NodeId, std::vector<std::vector<uint8_t>>> offersTo;
+
+    // When backPressurePeer is set, sendToPeer returns -1 for that peer (no record).
+    NodeId backPressurePeer = static_cast<NodeId>(-1);
+
+    explicit SharedState(std::vector<NodeId> p) : peers(std::move(p)) {
+        for (NodeId id : peers) offersTo[id];  // ensure entry exists even if nothing sent
+    }
+};
+
+// ===========================================================================
+// SharedFakePubRegistry — test PubRegistry policy backed by a shared_ptr so
+// the observation handle and the moved-into-transport copy see the same state.
 //
-// Records all sendToPeer / broadcastToPeers calls so tests can inspect what
-// the transport would have sent.  Satisfies the PubRegistry concept:
+// Satisfies the PubRegistry concept:
 //   int64_t sendToPeer(NodeId, const uint8_t*, size_t)
 //   void    broadcastToPeers(const uint8_t*, size_t)
 //   bool    allResolved()
 // ===========================================================================
-class FakePubRegistry {
-public:
-    struct Offer {
-        std::vector<uint8_t> bytes;
-    };
-
-    // Construct with known peer NodeIds (determines allResolved and broadcast targets).
-    explicit FakePubRegistry(std::vector<NodeId> peers) noexcept
-        : peers_(std::move(peers))
-    {
-        for (NodeId id : peers_) {
-            offers_[id]; // ensure entry exists even if nothing sent yet
-        }
-    }
-
-    // FakePubRegistry is move-constructible so it can be passed to the test ctor.
-    FakePubRegistry(FakePubRegistry&&)                 = default;
-    FakePubRegistry& operator=(FakePubRegistry&&)      = default;
-    FakePubRegistry(const FakePubRegistry&)            = delete;
-    FakePubRegistry& operator=(const FakePubRegistry&) = delete;
-
-    [[nodiscard]] bool allResolved() const noexcept { return !peers_.empty(); }
-
-    int64_t sendToPeer(NodeId peer, const uint8_t* buf, std::size_t len) noexcept
-    {
-        offers_[peer].push_back({std::vector<uint8_t>(buf, buf + len)});
-        return 1;  // simulate accepted
-    }
-
-    void broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
-    {
-        for (NodeId id : peers_) {
-            sendToPeer(id, buf, len);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Test accessors
-    // -----------------------------------------------------------------------
-    [[nodiscard]] const std::vector<Offer>& offersTo(NodeId peer) const
-    {
-        static const std::vector<Offer> empty;
-        auto it = offers_.find(peer);
-        return (it != offers_.end()) ? it->second : empty;
-    }
-
-    [[nodiscard]] std::size_t totalOffersTo(NodeId peer) const
-    {
-        return offersTo(peer).size();
-    }
-
-    [[nodiscard]] const std::vector<NodeId>& peers() const noexcept { return peers_; }
-
-    void clear() {
-        for (auto& [id, v] : offers_) v.clear();
-    }
-
-private:
-    std::vector<NodeId>                              peers_;
-    std::unordered_map<NodeId, std::vector<Offer>>   offers_;
-};
-
-// ---------------------------------------------------------------------------
-// Alias for a test-mode transport.
-// ---------------------------------------------------------------------------
-using TestTransport = WorkerReplicationTransportImpl<FakePubRegistry>;
-
-// ---------------------------------------------------------------------------
-// Factory: construct a TestTransport with workerId=1, peers={2, 3}.
-// Returns the transport AND a reference to the embedded FakePubRegistry.
-// Because FakePubRegistry is stored by value inside the template and we need
-// to observe it after construction, we capture a pointer by accessing it from
-// a wrapper that exposes the registry.
-//
-// Simpler: build the FakePubRegistry separately, move it into the transport,
-// and expose what was recorded after.
-// ---------------------------------------------------------------------------
-
-// Helper to build a FetchResponseMsg with a records blob.
-static FetchResponseMsg makeResp(PartitionId partition,
-                                  std::vector<uint8_t> recordData = {})
-{
-    FetchResponseMsg resp{};
-    resp.leaderEpoch    = 10;
-    resp.partition      = partition;
-    resp.highWatermark  = 100;
-    resp.logStartOffset = 0;
-    resp.errorCode      = 0;
-    resp.topicId        = 0;
-    // Store the data so the span is valid for the test's lifetime.
-    // resp.records is a non-owning span — caller must keep data alive.
-    // We return the raw msg; caller assigns records after storing the data.
-    (void)recordData;
-    return resp;
-}
-
-// Helper: encode expected FetchResponse bytes (for round-trip comparison).
-static std::vector<uint8_t> encodeExpectedFetchResponse(const FetchResponseMsg& resp)
-{
-    const std::size_t sz = FetchResponseMsg::encodedSize(resp.records.size());
-    std::vector<uint8_t> buf(sz, 0);
-    FetchResponseMsg::encode(buf.data(), 0,
-                             resp.leaderEpoch, resp.partition, resp.highWatermark,
-                             resp.logStartOffset, resp.errorCode, resp.records,
-                             resp.topicId);
-    return buf;
-}
-
-// Helper: encode expected FetchRequest bytes.
-static std::vector<uint8_t> encodeExpectedFetchRequest(const FetchRequestMsg& req)
-{
-    std::vector<uint8_t> buf(FetchRequestMsg::TOTAL_SIZE, 0);
-    FetchRequestMsg::encode(buf.data(), 0,
-                            req.leaderEpoch, req.partition, req.followerId,
-                            req.fetchOffset, req.maxBytes, req.topicId);
-    return buf;
-}
-
-// Helper: encode expected OLE req bytes.
-static std::vector<uint8_t> encodeExpectedOleReq(const OffsetsForLeaderEpochReqMsg& req)
-{
-    std::vector<uint8_t> buf(OffsetsForLeaderEpochReqMsg::TOTAL_SIZE, 0);
-    OffsetsForLeaderEpochReqMsg::encode(buf.data(), 0,
-                                        req.currentEpoch, req.partition,
-                                        req.followerId, req.requestedEpoch,
-                                        req.followerLeo, req.topicId);
-    return buf;
-}
-
-// Helper: encode expected OLE resp bytes.
-static std::vector<uint8_t> encodeExpectedOleResp(const OffsetsForLeaderEpochRespMsg& resp)
-{
-    std::vector<uint8_t> buf(OffsetsForLeaderEpochRespMsg::TOTAL_SIZE, 0);
-    OffsetsForLeaderEpochRespMsg::encode(buf.data(), 0,
-                                         resp.leaderEpoch, resp.partition,
-                                         resp.responseEpoch, resp.endOffset,
-                                         resp.errorCode, resp.topicId);
-    return buf;
-}
-
-// ===========================================================================
-// Test fixture
-// ===========================================================================
-class WorkerReplicationTransportTest : public ::testing::Test {
-protected:
-    // Peers: nodes 2 and 3.
-    static constexpr NodeId kPeer2 = 2;
-    static constexpr NodeId kPeer3 = 3;
-
-    // Build a transport + extract a separate registry for observation.
-    // Because the registry is moved into the transport, we build a second
-    // identical registry for expected-state comparison.  Alternatively, we
-    // expose the registry via a method.
-    //
-    // To avoid this complexity, we use a wrapper that holds both:
-    struct Harness {
-        // The second registry is used ONLY for verifying which peers exist.
-        TestTransport transport;
-        FakePubRegistry& reg;  // reference into transport's internal PubRegistry
-
-        // We can't easily get a reference into the moved-from registry.
-        // Instead: use a pointer trick by constructing with a factory that
-        // returns both.
-    };
-
-    // Because we can't hold a reference into a moved PubRegistry easily,
-    // we wrap via a helper that provides access via transport.pubReg().
-    // Alternatively: expose pubReg_ as a public member in the test
-    // template specialisation.
-    //
-    // SIMPLEST approach: build the transport, then call the send methods,
-    // and observe via a shared pointer to the FakePubRegistry.
-    //
-    // Use std::shared_ptr<FakePubRegistry> so it outlives the transport.
-    // But FakePubRegistry is stored by VALUE in the template; moving a
-    // shared_ptr doesn't help.
-    //
-    // RESOLUTION: subclass TestTransport to expose the reg_ for testing.
-    // Or: wrap FakePubRegistry in a ref-counted shell.  The cleanest approach
-    // for a test is:
-    //
-    //   FakePubRegistry reg({2, 3});
-    //   TestTransport t(workerId, std::move(reg));
-    //   // After move, reg is in moved-from state.
-    //
-    // Instead, capture the results via a "proxy FakePubRegistry" that wraps
-    // a shared captures vector:
-
-    // FINAL approach: since the brief shows `pubs.offersTo(3)` being checked
-    // AFTER `t.sendFetchResponse(3, resp)`, and pubs is separate from t,
-    // we model this as: pubs is a wrapper whose internal state is shared.
-    // We implement this via a SharedFakePubRegistry.
-    void SetUp() override {}
-};
-
-// ===========================================================================
-// SharedFakePubRegistry — wraps FakePubRegistry via shared_ptr so the
-// observation handle (pubs) and the registry inside the transport share state.
-// ===========================================================================
-struct SharedState {
-    std::vector<NodeId>                              peers;
-    std::unordered_map<NodeId, std::vector<std::vector<uint8_t>>> offersTo;
-
-    explicit SharedState(std::vector<NodeId> p) : peers(std::move(p)) {
-        for (NodeId id : peers) offersTo[id];  // ensure entries exist
-    }
-};
-
 class SharedFakePubRegistry {
 public:
     explicit SharedFakePubRegistry(std::vector<NodeId> peers)
         : state_(std::make_shared<SharedState>(std::move(peers)))
     {}
 
-    // Allow move construction so it can be passed to the transport ctor.
+    // Allow copy+move (shared_ptr semantics — all copies share the same state).
     SharedFakePubRegistry(SharedFakePubRegistry&&)            = default;
     SharedFakePubRegistry& operator=(SharedFakePubRegistry&&) = default;
     SharedFakePubRegistry(const SharedFakePubRegistry&)        = default;
@@ -267,6 +78,12 @@ public:
 
     int64_t sendToPeer(NodeId peer, const uint8_t* buf, std::size_t len) noexcept
     {
+        // Simulate back-pressure for a chosen peer — return ≤ 0, record nothing.
+        if (peer == state_->backPressurePeer) return -1;
+
+        // Unknown peer (not in the registered set) — return -1, record nothing.
+        if (state_->offersTo.find(peer) == state_->offersTo.end()) return -1;
+
         state_->offersTo[peer].emplace_back(buf, buf + len);
         return 1;
     }
@@ -276,7 +93,9 @@ public:
         for (NodeId id : state_->peers) sendToPeer(id, buf, len);
     }
 
-    // Observation interface (same as FakePubRegistry).
+    // -----------------------------------------------------------------------
+    // Observation interface
+    // -----------------------------------------------------------------------
     [[nodiscard]] const std::vector<std::vector<uint8_t>>& offersTo(NodeId peer) const
     {
         static const std::vector<std::vector<uint8_t>> empty;
@@ -288,6 +107,10 @@ public:
 
     void clear() { for (auto& [id, v] : state_->offersTo) v.clear(); }
 
+    // Configure back-pressure on a peer (subsequent sendToPeer to that peer returns -1).
+    void setBackPressurePeer(NodeId peer) noexcept { state_->backPressurePeer = peer; }
+    void clearBackPressure()              noexcept { state_->backPressurePeer = static_cast<NodeId>(-1); }
+
 private:
     std::shared_ptr<SharedState> state_;
 };
@@ -295,18 +118,61 @@ private:
 using SharedTestTransport = WorkerReplicationTransportImpl<SharedFakePubRegistry>;
 
 // Helper: make a SharedFakePubRegistry + SharedTestTransport sharing state.
-// Returns pubs (for observation) and a heap-allocated transport (non-movable).
 struct TestHarness {
-    SharedFakePubRegistry          pubs;
+    SharedFakePubRegistry               pubs;
     std::unique_ptr<SharedTestTransport> transport;
 };
 
 static TestHarness makeTestPair(int32_t workerId, std::vector<NodeId> peers)
 {
     SharedFakePubRegistry pubs(peers);
-    SharedFakePubRegistry pubsCopy = pubs;  // shared_ptr copy, same underlying state
+    SharedFakePubRegistry pubsCopy = pubs;  // shared_ptr copy — same underlying state
     auto transport = std::make_unique<SharedTestTransport>(workerId, std::move(pubsCopy));
     return TestHarness{std::move(pubs), std::move(transport)};
+}
+
+// ---------------------------------------------------------------------------
+// Encode helpers (reference encodings for byte-identity checks).
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t> encodeExpectedFetchResponse(const FetchResponseMsg& resp)
+{
+    const std::size_t sz = FetchResponseMsg::encodedSize(resp.records.size());
+    std::vector<uint8_t> buf(sz, 0);
+    FetchResponseMsg::encode(buf.data(), 0,
+                             resp.leaderEpoch, resp.partition, resp.highWatermark,
+                             resp.logStartOffset, resp.errorCode, resp.records,
+                             resp.topicId);
+    return buf;
+}
+
+static std::vector<uint8_t> encodeExpectedFetchRequest(const FetchRequestMsg& req)
+{
+    std::vector<uint8_t> buf(FetchRequestMsg::TOTAL_SIZE, 0);
+    FetchRequestMsg::encode(buf.data(), 0,
+                            req.leaderEpoch, req.partition, req.followerId,
+                            req.fetchOffset, req.maxBytes, req.topicId);
+    return buf;
+}
+
+static std::vector<uint8_t> encodeExpectedOleReq(const OffsetsForLeaderEpochReqMsg& req)
+{
+    std::vector<uint8_t> buf(OffsetsForLeaderEpochReqMsg::TOTAL_SIZE, 0);
+    OffsetsForLeaderEpochReqMsg::encode(buf.data(), 0,
+                                        req.currentEpoch, req.partition,
+                                        req.followerId, req.requestedEpoch,
+                                        req.followerLeo, req.topicId);
+    return buf;
+}
+
+static std::vector<uint8_t> encodeExpectedOleResp(const OffsetsForLeaderEpochRespMsg& resp)
+{
+    std::vector<uint8_t> buf(OffsetsForLeaderEpochRespMsg::TOTAL_SIZE, 0);
+    OffsetsForLeaderEpochRespMsg::encode(buf.data(), 0,
+                                         resp.leaderEpoch, resp.partition,
+                                         resp.responseEpoch, resp.endOffset,
+                                         resp.errorCode, resp.topicId);
+    return buf;
 }
 
 // ===========================================================================
@@ -316,7 +182,6 @@ TEST(WorkerReplicationTransport, SendFetchResponseSelectsPeerPubAndEncodesFrame)
 {
     auto h = makeTestPair(/*workerId=*/1, {2, 3});
 
-    // Build a resp with a non-empty records blob.
     const std::vector<uint8_t> recordData(1024, 0xAB);
     FetchResponseMsg resp{};
     resp.leaderEpoch    = 7;
@@ -329,14 +194,11 @@ TEST(WorkerReplicationTransport, SendFetchResponseSelectsPeerPubAndEncodesFrame)
 
     h.transport->sendFetchResponse(/*toFollower=*/3, resp);
 
-    // Exactly one offer to peer 3.
     ASSERT_EQ(h.pubs.offersTo(3).size(), 1u)
         << "sendFetchResponse should send exactly one frame to the target follower";
-    // No offer to peer 2.
     EXPECT_TRUE(h.pubs.offersTo(2).empty())
         << "sendFetchResponse must NOT send to non-target peer";
 
-    // Verify the frame bytes by round-trip decode.
     const auto& frame = h.pubs.offersTo(3)[0];
     const FetchResponseMsg decoded = FetchResponseMsg::decode(frame.data(), 0, frame.size());
     EXPECT_EQ(decoded.leaderEpoch,    resp.leaderEpoch);
@@ -348,11 +210,9 @@ TEST(WorkerReplicationTransport, SendFetchResponseSelectsPeerPubAndEncodesFrame)
     ASSERT_EQ(decoded.records.size(), recordData.size());
     EXPECT_EQ(0, std::memcmp(decoded.records.data(), recordData.data(), recordData.size()));
 
-    // The frame templateId must be FetchResponse (not reconcile).
     EXPECT_EQ(peekTemplateId(frame.data(), 0),
               static_cast<uint16_t>(FetchResponseMsg::TEMPLATE_ID));
 
-    // The encoded bytes must be identical to the reference encoding.
     const auto expected = encodeExpectedFetchResponse(resp);
     ASSERT_EQ(frame.size(), expected.size());
     EXPECT_EQ(0, std::memcmp(frame.data(), expected.data(), expected.size()))
@@ -376,11 +236,9 @@ TEST(WorkerReplicationTransport, SendFetchRequestBroadcastsToAllPeers)
 
     h.transport->sendFetchRequest(req);
 
-    // Must be delivered to BOTH peers.
     ASSERT_EQ(h.pubs.offersTo(2).size(), 1u) << "sendFetchRequest must broadcast to peer 2";
     ASSERT_EQ(h.pubs.offersTo(3).size(), 1u) << "sendFetchRequest must broadcast to peer 3";
 
-    // Verify encoding of peer 2's frame (peer 3 is identical by construction).
     const auto& frame2 = h.pubs.offersTo(2)[0];
     const FetchRequestMsg decoded = FetchRequestMsg::decode(frame2.data(), 0);
     EXPECT_EQ(decoded.leaderEpoch, req.leaderEpoch);
@@ -390,16 +248,13 @@ TEST(WorkerReplicationTransport, SendFetchRequestBroadcastsToAllPeers)
     EXPECT_EQ(decoded.maxBytes,    req.maxBytes);
     EXPECT_EQ(decoded.topicId,     req.topicId);
 
-    // templateId = FetchRequest.
     EXPECT_EQ(peekTemplateId(frame2.data(), 0),
               static_cast<uint16_t>(FetchRequestMsg::TEMPLATE_ID));
 
-    // Bytes identical to reference encoding.
     const auto expected = encodeExpectedFetchRequest(req);
     ASSERT_EQ(frame2.size(), expected.size());
     EXPECT_EQ(0, std::memcmp(frame2.data(), expected.data(), expected.size()));
 
-    // Both peers received the same bytes.
     const auto& frame3 = h.pubs.offersTo(3)[0];
     ASSERT_EQ(frame2.size(), frame3.size());
     EXPECT_EQ(0, std::memcmp(frame2.data(), frame3.data(), frame2.size()))
@@ -504,13 +359,11 @@ TEST(WorkerReplicationTransport, SendReconcileRequestStampsReconcileTemplateId)
 
     const auto& frame = h.pubs.offersTo(2)[0];
 
-    // templateId MUST be kReconcileFetchReqTemplateId, NOT FetchRequest::TEMPLATE_ID.
     EXPECT_EQ(peekTemplateId(frame.data(), 0), kReconcileFetchReqTemplateId)
         << "sendReconcileRequest must re-stamp the templateId to ReconcileFetchReq";
     EXPECT_NE(peekTemplateId(frame.data(), 0),
               static_cast<uint16_t>(FetchRequestMsg::TEMPLATE_ID));
 
-    // Body decodes correctly (re-use FetchRequest decoder, the layout is identical).
     const FetchRequestMsg decoded = FetchRequestMsg::decode(frame.data(), 0);
     EXPECT_EQ(decoded.leaderEpoch, req.leaderEpoch);
     EXPECT_EQ(decoded.partition,   req.partition);
@@ -544,13 +397,11 @@ TEST(WorkerReplicationTransport, SendReconcileResponseStampsReconcileTemplateId)
 
     const auto& frame = h.pubs.offersTo(3)[0];
 
-    // templateId MUST be kReconcileFetchRespTemplateId.
     EXPECT_EQ(peekTemplateId(frame.data(), 0), kReconcileFetchRespTemplateId)
         << "sendReconcileResponse must re-stamp the templateId to ReconcileFetchResp";
     EXPECT_NE(peekTemplateId(frame.data(), 0),
               static_cast<uint16_t>(FetchResponseMsg::TEMPLATE_ID));
 
-    // Body decodes correctly.
     const FetchResponseMsg decoded = FetchResponseMsg::decode(frame.data(), 0, frame.size());
     EXPECT_EQ(decoded.leaderEpoch,    resp.leaderEpoch);
     EXPECT_EQ(decoded.partition,      resp.partition);
@@ -568,7 +419,6 @@ TEST(WorkerReplicationTransport, SendReconcileResponseStampsReconcileTemplateId)
 TEST(WorkerReplicationTransport, ResolvedTrueWhenFakeRegistryHasPeers)
 {
     auto h = makeTestPair(/*workerId=*/1, {2, 3});
-    // testMode_ = true, sub_ = null; resolved() delegates to pubReg_.allResolved()
     EXPECT_TRUE(h.transport->resolved());
 }
 
@@ -586,7 +436,7 @@ TEST(WorkerReplicationTransport, SendFetchResponseEmptyRecords)
     resp.logStartOffset = 0;
     resp.errorCode      = 0;
     resp.topicId        = 0;
-    resp.records        = {};  // empty — HW-only update
+    resp.records        = {};
 
     h.transport->sendFetchResponse(/*toFollower=*/2, resp);
 
@@ -633,4 +483,94 @@ TEST(WorkerReplicationTransport, WorkerIdAccessor)
 {
     auto h = makeTestPair(/*workerId=*/7, {2, 3});
     EXPECT_EQ(h.transport->workerId(), 7);
+}
+
+// ===========================================================================
+// 11. Back-pressure: when sendToPeer returns ≤ 0 nothing is recorded and no
+//     partial/corrupt state remains (the send is simply dropped).
+// ===========================================================================
+TEST(WorkerReplicationTransport, SendDroppedOnBackPressureNothingRecorded)
+{
+    auto h = makeTestPair(/*workerId=*/1, {2, 3});
+
+    // Arm back-pressure on peer 3.
+    h.pubs.setBackPressurePeer(3);
+
+    const std::vector<uint8_t> recordData(128, 0x55);
+    FetchResponseMsg resp{};
+    resp.leaderEpoch    = 2;
+    resp.partition      = 1;
+    resp.highWatermark  = 50;
+    resp.logStartOffset = 0;
+    resp.errorCode      = 0;
+    resp.topicId        = 0;
+    resp.records        = std::span<const uint8_t>(recordData);
+
+    // Send to the back-pressured peer — must not crash and must record nothing.
+    h.transport->sendFetchResponse(/*toFollower=*/3, resp);
+
+    EXPECT_TRUE(h.pubs.offersTo(3).empty())
+        << "Back-pressured send must not record any frame";
+    EXPECT_TRUE(h.pubs.offersTo(2).empty())
+        << "Non-target peer must also have no frame";
+
+    // Also verify with a targeted fixed-size message (sendOffsetsForLeaderEpochRequest).
+    OffsetsForLeaderEpochReqMsg req{};
+    req.currentEpoch   = 1;
+    req.partition      = 0;
+    req.followerId     = 1;
+    req.requestedEpoch = 0;
+    req.followerLeo    = 0;
+    req.topicId        = 0;
+    h.transport->sendOffsetsForLeaderEpochRequest(/*toLeader=*/3, req);
+
+    EXPECT_TRUE(h.pubs.offersTo(3).empty())
+        << "Back-pressured OLE request must also be dropped without recording";
+
+    // Clear back-pressure — next send to peer 3 should succeed.
+    h.pubs.clearBackPressure();
+    h.transport->sendFetchResponse(/*toFollower=*/3, resp);
+    EXPECT_EQ(h.pubs.offersTo(3).size(), 1u)
+        << "After clearing back-pressure, send to peer 3 should be recorded";
+}
+
+// ===========================================================================
+// 12. Unknown-peer: a targeted send to a NodeId NOT registered → nothing is
+//     recorded to any peer and there is no crash.
+// ===========================================================================
+TEST(WorkerReplicationTransport, SendToUnknownPeerNothingRecordedNoCrash)
+{
+    // Register only peers 2 and 3.
+    auto h = makeTestPair(/*workerId=*/1, {2, 3});
+
+    constexpr NodeId kUnknown = 99;
+
+    // sendFetchResponse to an unregistered peer.
+    const std::vector<uint8_t> recordData(64, 0xAA);
+    FetchResponseMsg resp{};
+    resp.leaderEpoch    = 5;
+    resp.partition      = 0;
+    resp.highWatermark  = 10;
+    resp.logStartOffset = 0;
+    resp.errorCode      = 0;
+    resp.topicId        = 0;
+    resp.records        = std::span<const uint8_t>(recordData);
+
+    h.transport->sendFetchResponse(/*toFollower=*/kUnknown, resp);
+
+    // No crash; nothing recorded to any registered peer.
+    EXPECT_TRUE(h.pubs.offersTo(2).empty())
+        << "Unknown-peer send must not bleed into peer 2";
+    EXPECT_TRUE(h.pubs.offersTo(3).empty())
+        << "Unknown-peer send must not bleed into peer 3";
+
+    // Also verify with a reconcile response.
+    h.transport->sendReconcileResponse(/*toPeer=*/kUnknown, resp);
+    EXPECT_TRUE(h.pubs.offersTo(2).empty());
+    EXPECT_TRUE(h.pubs.offersTo(3).empty());
+
+    // Confirm registered peers still work after the unknown-peer calls.
+    h.transport->sendFetchResponse(/*toFollower=*/2, resp);
+    EXPECT_EQ(h.pubs.offersTo(2).size(), 1u)
+        << "Registered peer must still receive frames after unknown-peer calls";
 }
