@@ -116,6 +116,32 @@ void LogSegment::sync() {
     index_->sync();
 }
 
+void LogSegment::preallocate(int64_t bytes) noexcept {
+    // #5 non-blocking append: reserve disk blocks up front so O_APPEND pwrite()s
+    // never block on block allocation.  Keep the file SIZE unchanged (0 for a fresh
+    // segment) so O_APPEND still writes at the true end-of-data — we only pre-reserve
+    // the extents.  Best-effort: any failure (unsupported fs, ENOSPC) is a no-op; the
+    // append path still works, just without the preallocation benefit.
+    if (fd_ < 0 || bytes <= 0) return;
+#if defined(__linux__)
+    // FALLOC_FL_KEEP_SIZE: allocate blocks in [0, bytes) but do NOT grow st_size.
+    (void)::fallocate(fd_, FALLOC_FL_KEEP_SIZE, 0, static_cast<off_t>(bytes));
+#elif defined(__APPLE__)
+    // F_PREALLOCATE reserves blocks past the current EOF without changing st_size.
+    fstore_t fst{};
+    fst.fst_flags   = F_ALLOCATECONTIG;      // try contiguous first
+    fst.fst_posmode = F_PEOFPOSMODE;         // allocate `bytes` beyond current EOF
+    fst.fst_offset  = 0;
+    fst.fst_length  = static_cast<off_t>(bytes);
+    if (::fcntl(fd_, F_PREALLOCATE, &fst) == -1) {
+        fst.fst_flags = F_ALLOCATEALL;       // fall back to non-contiguous
+        (void)::fcntl(fd_, F_PREALLOCATE, &fst);
+    }
+#else
+    (void)bytes;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // writeAndUpdateState — shared core: update index + write bytes + advance LEO.
 // Writes via fstream (buffered, write-only path) for the durable append() path.

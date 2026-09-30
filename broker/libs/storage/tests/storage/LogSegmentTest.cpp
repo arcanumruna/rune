@@ -33,6 +33,50 @@ static std::vector<uint8_t> makeBatch(int64_t baseOffset, int64_t baseTs, int nR
     return b.build();
 }
 
+// #5 non-blocking append: preallocate() must reserve disk blocks WITHOUT changing
+// st_size (so O_APPEND still writes at the true end-of-data) and must not disturb
+// append/read semantics. Idempotent + safe on unsupported filesystems.
+TEST(LogSegmentRegression, PreallocateReservesBlocksKeepsAppendSemantics) {
+    auto dir = makeTempDir("rune_seg_prealloc");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0);
+    const std::string logPath = seg.logPath();
+
+    struct stat st0{}; ASSERT_EQ(::stat(logPath.c_str(), &st0), 0);
+    EXPECT_EQ(st0.st_size, 0) << "fresh segment .log should be empty";
+
+    const int64_t kPre = 4 * 1024 * 1024;   // 4 MiB
+    seg.preallocate(kPre);
+
+    struct stat st1{}; ASSERT_EQ(::stat(logPath.c_str(), &st1), 0);
+    // CRITICAL correctness: preallocate reserves blocks but MUST NOT grow st_size —
+    // else O_APPEND would write past the reserved region and corrupt offsets.
+    EXPECT_EQ(st1.st_size, 0) << "preallocate must keep st_size unchanged (KEEP_SIZE/F_PREALLOCATE)";
+    // Best-effort (informational): blocks should be reserved on ext4/APFS; some
+    // filesystems (tmpfs/overlay) may not reflect it — never REDUCE blocks though.
+    EXPECT_GE(st1.st_blocks, st0.st_blocks);
+    RecordProperty("reserved_bytes", std::to_string((long long)st1.st_blocks * 512));
+
+    // Functional: append still lands at offset 0 and reads back correctly.
+    RecordBatchBuilder b(0, 1000); b.append("k", "v0", 1000);
+    ASSERT_EQ(seg.append(b.build(), 0), 1);
+    auto bytes = seg.read(0, 1 << 20);
+    RecordBatchReader r(bytes.data(), bytes.size());
+    ASSERT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+
+    // Idempotent: a second preallocate is safe and the on-disk data is intact.
+    seg.preallocate(kPre);
+    auto bytes2 = seg.read(0, 1 << 20);
+    RecordBatchReader r2(bytes2.data(), bytes2.size());
+    ASSERT_TRUE(r2.ensureValid());
+    EXPECT_EQ(r2.baseOffset(), 0);
+
+    // Zero/negative + no-op are safe.
+    seg.preallocate(0); seg.preallocate(-1);
+    std::filesystem::remove_all(dir);
+}
+
 TEST(LogSegment, AppendThenReadBack) {
     auto dir = makeTempDir("rune_seg");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);

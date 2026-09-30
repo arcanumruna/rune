@@ -117,6 +117,13 @@ public:
     /// hot path without the worker calling sync() directly.
     int logFd() const noexcept { return fd_; }
 
+    /// #5 non-blocking append: preallocate `bytes` of disk blocks for the .log
+    /// WITHOUT changing the file size, so subsequent O_APPEND pwrite()s never stall
+    /// on block allocation (the append-p99 tail).  Linux: fallocate(FALLOC_FL_KEEP_SIZE);
+    /// macOS: fcntl(F_PREALLOCATE).  Best-effort + idempotent (no-op on failure or
+    /// unsupported fs).  Call on the ACTIVE (appended) segment only.
+    void preallocate(int64_t bytes) noexcept;
+
     // -----------------------------------------------------------------------
     // Background segment pre-provisioning (append-p99 fix).
     //

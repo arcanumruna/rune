@@ -58,6 +58,9 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     for (int64_t b : bases)
         segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
     logEndOffset_ = activeSegment().nextOffset();
+    // #5 non-blocking append: preallocate the active segment's blocks so hot-path
+    // O_APPEND pwrite()s never stall on block allocation (append-p99 tail).
+    activeSegment().preallocate(rollBytes_);
 }
 Log::~Log() {
     // The background thread has been stopped by the owner before Log destruction,
@@ -107,6 +110,10 @@ void Log::maybeRoll() {
         // synchronous create.  The seal fsync above is unchanged and fully
         // synchronous (durability preserved).
         installNextSegment(base);
+        // #5 non-blocking append: preallocate the freshly-installed active segment's
+        // blocks (negligible vs the seal fsync above) so its hot-path appends don't
+        // stall on block allocation.
+        activeSegment().preallocate(rollBytes_);
         // CP-8 FIX (incremental largestTimestamp): capture the running max we
         // tracked for the about-to-be-sealed segment, then reset for the new
         // active segment.  publishSealedSnapshot will use this captured value
