@@ -46,7 +46,7 @@ echo "=== replbench: parts=$PARTS workers=$WORKERS recs=$RECS win=$WIN vbytes=$V
 pkill -9 -x rune_broker 2>/dev/null; sleep 1
 rm -rf /dev/shm/kbench/rune-c* /root/kbench-disk/rune-log* /tmp/rune_bn_egress_* /dev/shm/aeron* 2>/dev/null
 
-LEADER="$(rune_start_cluster "$WORKERS" "bench:${PARTS}:tier=majority:durability=all-in-sync" uring nvme)"
+LEADER="$(rune_start_cluster "$WORKERS" "bench:${PARTS}:tier=${REPL_TIER:-majority:durability=all-in-sync}" uring nvme)"
 [ -z "$LEADER" ] && { echo "NO-LEADER"; exit 1; }
 echo "leader=node$LEADER workers=$WORKERS"
 sleep 6   # let startup churn settle to ISR=3
@@ -55,7 +55,7 @@ port=$((40200+LEADER)); d=/dev/shm/kbench/cP; rm -rf "$d"; mkdir -p "$d"
 echo -n "RESULT: "
 env RUNE_TARGET="aeron:udp?endpoint=127.0.0.1:${port}" RUNE_EGRESS="aeron:udp?endpoint=127.0.0.1:40900" \
   RUNE_DATA_DIR="$d" RUNE_TOPICS="bench:0:${PARTS}" RUNE_BENCH_RECORDS="$RECS" RUNE_BENCH_VALUE_BYTES="$VBYTES" \
-  RUNE_BENCH_WARMUP="$WARMUP_N" RUNE_BENCH_MODE=acked RUNE_BENCH_ACKS=all \
+  RUNE_BENCH_WARMUP="$WARMUP_N" RUNE_BENCH_MODE=acked RUNE_BENCH_ACKS=${REPL_ACKS:-all} \
   RUNE_BENCH_WINDOW="$WIN" RUNE_BENCH_MAX_IN_FLIGHT="$WIN" \
   RUNE_LINGER_US="$LINGER_US" RUNE_BATCH_BYTES="$BATCH_BYTES" RUNE_IDLE_MODE=backoff \
   timeout 120 "$RUNE_PROD_BIN" 2>&1 | grep -E "^RESULT" | \
