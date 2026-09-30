@@ -110,6 +110,14 @@ public:
         for (NodeId id : state_->peers) sendToPeer(id, buf, len);
     }
 
+    int64_t sendGatherToPeer(NodeId peer, const uint8_t* prefix, std::size_t prefixLen,
+                             std::span<const uint8_t> body) noexcept
+    {
+        std::vector<uint8_t> frame(prefix, prefix + prefixLen);
+        frame.insert(frame.end(), body.begin(), body.end());
+        return sendToPeer(peer, frame.data(), frame.size());
+    }
+
     // -----------------------------------------------------------------------
     // Observation interface
     // -----------------------------------------------------------------------
@@ -1092,4 +1100,20 @@ TEST(WorkerReplicationTransport, SendFetchRequestToUnknownLeaderFallsBackToBroad
     h.transport->sendFetchRequestTo(/*leader=*/9, req);
     EXPECT_EQ(h.pubs.offersTo(2).size(), 1u);
     EXPECT_EQ(h.pubs.offersTo(3).size(), 1u);
+}
+
+TEST(WorkerReplicationTransportRegression, GatherSendIsByteIdenticalForLargeRecords)
+{
+    auto h = makeTestPair(/*workerId=*/0, {2});
+    const std::vector<uint8_t> big(64 * 1024, 0xC3);
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 3; resp.partition = 1; resp.highWatermark = 9;
+    resp.errorCode = 0; resp.topicId = 4; resp.records = std::span<const uint8_t>(big);
+    h.transport->sendFetchResponse(2, resp);
+    ASSERT_EQ(h.pubs.offersTo(2).size(), 1u);
+    EXPECT_EQ(h.pubs.offersTo(2)[0], encodeExpectedFetchResponse(resp));
+    h.pubs.clear();
+    h.transport->sendReconcileResponse(2, resp);
+    ASSERT_EQ(h.pubs.offersTo(2).size(), 1u);
+    EXPECT_EQ(peekTemplateId(h.pubs.offersTo(2)[0].data(), 0), kReconcileFetchRespTemplateId);
 }

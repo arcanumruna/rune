@@ -77,10 +77,18 @@ if(BUILD_TESTING)
         tests/replication/PartitionFailoverTest.cpp
         tests/replication/AeronPartitionTransportTest.cpp
         tests/replication/DurabilityQuorumTest.cpp
-        tests/replication/LeaderEpochCacheRestartTest.cpp)
+        tests/replication/LeaderEpochCacheRestartTest.cpp
+        tests/replication/BatchPrefixTest.cpp)
     target_link_libraries(rune_replication_tests PRIVATE rune_replication GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_replication_tests)
+
+    # Zero-allocation proof for the leader's push/fetch paths (spec §1a.5, §3.5a.2).
+    # Own executable: it replaces global operator new to count allocations.
+    add_executable(rune_replication_zero_alloc_tests
+        tests/replication/ZeroAllocReplicaTest.cpp)
+    target_link_libraries(rune_replication_zero_alloc_tests PRIVATE rune_replication GTest::gtest_main)
+    gtest_discover_tests(rune_replication_zero_alloc_tests)
 
     # ---------------------------------------------------------------------------
     # FollowerSync state-machine unit tests — STANDALONE.

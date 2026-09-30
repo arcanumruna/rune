@@ -41,6 +41,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <span>
 #include <vector>
 
 using namespace rune::node;
@@ -59,6 +60,8 @@ struct FakePubRegistry {
 
     int64_t sendToPeer(NodeId, const uint8_t*, std::size_t) noexcept { return 1; }
     void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}
+    int64_t sendGatherToPeer(NodeId, const uint8_t*, std::size_t,
+                             std::span<const uint8_t>) noexcept { return 1; }
 };
 
 using FakeTransport = WorkerReplicationTransportImpl<FakePubRegistry>;

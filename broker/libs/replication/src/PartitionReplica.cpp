@@ -11,6 +11,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/BatchPrefix.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
 #if RUNE_REPLICATION_HAS_AERON
@@ -692,55 +693,32 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         : (req.maxBytes > 0 ? FetchServe::Data : FetchServe::AckOnly);
     if (serve == FetchServe::Conflate) return kErrNone;
 
-    // Read records from the log (Data only; AckOnly answers the HW with no records).
-    std::vector<uint8_t> logBytes;
+    // Read records (Data only; AckOnly answers the HW with no records).
+    // Zero-copy: a view into the log (disk mmap / memory ring).  The transport
+    // copies the bytes ONCE, straight into the publication term.
+    std::span<const uint8_t> records{};
     if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
-        logBytes = onLog([&](auto& L){ return L.read(req.fetchOffset, req.maxBytes); });
-
-        // GR-1 fix: whole-batch alignment.
-        //
-        // Walk the returned bytes with RecordBatchReader and truncate to the
-        // largest whole-batch prefix that does NOT exceed req.maxBytes.
-        // This ensures the encoded FetchResponse fits within the Aeron
-        // publication's maxMessageLength (callers cap req.maxBytes to
-        // pub.maxMessageLength() - kFetchResponseOverhead before calling us).
-        // Without this, a partial-batch tail could push the encoded response
-        // over the transport ceiling, causing offer() to throw.
-        if (!logBytes.empty()) {
-            const std::size_t cap = static_cast<std::size_t>(req.maxBytes);
-            std::size_t pos = 0;
-            std::size_t committedEnd = 0;
-            while (pos < logBytes.size()) {
-                std::size_t rem = logBytes.size() - pos;
-                if (rem < static_cast<std::size_t>(
-                        rune::protocol::batch::kRecordBatchOverhead)) break;
-                rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
-                int32_t total = r.totalLength();
-                if (total <= 0) break;
-                std::size_t nextEnd = pos + static_cast<std::size_t>(total);
-                if (nextEnd > logBytes.size()) break;
-                // Stop before a batch that would push the byte count over cap.
-                if (nextEnd > cap) break;
-                committedEnd = nextEnd;
-                pos = committedEnd;
-            }
-            logBytes.resize(committedEnd);
-        }
+        const rune::storage::LogReadView v =
+            onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
+        // GR-1: whole batches only and never above req.maxBytes (the transport's
+        // frame ceiling); a first batch larger than the cap is not sent (as before).
+        const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
+                                                 static_cast<std::size_t>(req.maxBytes),
+                                                 kNoPushCeiling);
+        records = std::span<const uint8_t>(v.data, pre.bytes);
     }
 
     // DR-BUG-3: advertise the min-ISR-GATED committed HW to followers via the
     // gated accessor.  followerHw_ = min(localLeo, resp.highWatermark), so a
     // rejoining follower never treats a minority leader's uncommitted tail as
-    // committed.  Note this does NOT bound catch-up: log_->read() above is
+    // committed.  Note this does NOT bound catch-up: the log read above is
     // intentionally NOT HW-bounded, so the follower still fetches (and applies)
     // the uncommitted tail and advances its own LEO — which is exactly what
     // lets the leader's real (majority) HW advance and the ISR re-expand.  Only
     // the follower's *committed view* (followerHw_) is held at the majority floor
     // until the ISR heals.
     const Offset advertiseHw = highWatermark();
-    auto resp = makeFetchResponse(
-        advertiseHw, kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
+    auto resp = makeFetchResponse(advertiseHw, kErrNone, records);
     onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
 
     return kErrNone;
@@ -2134,9 +2112,9 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
 // push is recovered by the follower's periodic fetch backstop.
 //
 // Design:
-//   1. Read log bytes from [fromOffset, LEO) using the existing log_.read() path.
-//   2. Apply the same whole-batch alignment as onFetchRequest() to ensure the
-//      encoded FetchResponse fits within transport limits.
+//   1. Take a ZERO-COPY view of [fromOffset, LEO) via readView() (spec §3.5a.2).
+//   2. Trim it with the shared whole-batch walk (wholeBatchPrefix, same as
+//      onFetchRequest()) so the encoded FetchResponse fits within transport limits.
 //   3. Build a FetchResponse via makeFetchResponse() (zero-copy records view).
 //   4. Call sendFetchResponse(followerId, resp) for each ISR follower != selfId.
 //   5. Update lastPushedOffset_ so onLeaderLogAppended() does not re-push.
@@ -2182,51 +2160,27 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     //  send is measured by the transport ReplOutEnqueue→ReplOutDrain seq pair.)
 
     ++rtPushes_;
-    // Read the bytes from the log — same path as onFetchRequest().
-    std::vector<uint8_t> logBytes = onLog([&](auto& L){ return L.read(fromOffset, cfg_.maxFetchBytes); });
+    // Zero-copy: a view into the log (same path as onFetchRequest()); the
+    // transport copies the bytes once, straight into each follower's term buffer.
+    const rune::storage::LogReadView v =
+        onLog([&](auto& L) { return L.readView(fromOffset, cfg_.maxFetchBytes); });
+    // Advance lastPushedOffset_ by ONLY what is actually pushed (ceiling + cap bound).
+    // The read is capped at maxFetchBytes; under a large backlog one push covers a
+    // prefix and the next duty cycle pushes the rest.  FLOW CONTROL: no batch that
+    // begins at or beyond pushCeiling is pushed (in-flight <= kPushFlowWindow).
+    const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
+                                             static_cast<std::size_t>(cfg_.maxFetchBytes),
+                                             pushCeiling);
+    if (pre.bytes == 0) return;   // nothing deliverable within ceiling/cap this pass
+    const Offset pushedThrough = pre.endOffset;
 
-    // Apply whole-batch alignment to avoid partial-batch tails, AND track the
-    // exclusive end offset actually covered so we advance lastPushedOffset_ by ONLY
-    // what we send.  The read is capped at maxFetchBytes; under a large backlog one
-    // push covers a prefix and the next duty cycle pushes the rest.  (The old code
-    // set lastPushedOffset_=currentLeo unconditionally → it marked the un-read tail
-    // as "pushed", so the follower never got it and had to crawl via the slow
-    // single-outstanding fetch backstop → fell behind → ISR collapse under load.)
-    Offset pushedThrough = fromOffset;
-    if (!logBytes.empty()) {
-        const std::size_t cap = static_cast<std::size_t>(cfg_.maxFetchBytes);
-        std::size_t pos = 0;
-        std::size_t committedEnd = 0;
-        while (pos < logBytes.size()) {
-            std::size_t rem = logBytes.size() - pos;
-            if (rem < static_cast<std::size_t>(
-                    rune::protocol::batch::kRecordBatchOverhead)) break;
-            rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
-            int32_t total = r.totalLength();
-            if (total <= 0) break;
-            // FLOW CONTROL: stop at the ceiling — do not push a batch that begins at
-            // or beyond it (keeps in-flight ≤ kPushFlowWindow ahead of the follower).
-            if (r.baseOffset() >= pushCeiling) break;
-            std::size_t nextEnd = pos + static_cast<std::size_t>(total);
-            if (nextEnd > logBytes.size()) break;
-            if (nextEnd > cap) break;
-            pushedThrough = r.baseOffset() + r.lastOffsetDelta() + 1;
-            committedEnd = nextEnd;
-            pos = committedEnd;
-        }
-        logBytes.resize(committedEnd);
-    }
-    if (logBytes.empty()) return;   // nothing deliverable within ceiling/cap this pass
-
-    // Build once — reuse (re-encoded per follower) for all ISR followers.
-    // logBytes (the zero-copy records view) stays alive for the whole loop below.
+    // Build once — reused for all ISR followers; the view stays valid for the loop
+    // (no append/truncate on this thread in between).
     // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
-    auto resp = makeFetchResponse(
-        highWatermark(), kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
-    rtPushBytes_ += static_cast<int64_t>(logBytes.size());
+    auto resp = makeFetchResponse(highWatermark(), kErrNone,
+                                  std::span<const uint8_t>(v.data, pre.bytes));
+    rtPushBytes_ += static_cast<int64_t>(pre.bytes);
 
-    // Push to each ISR follower (skip self).
     for (NodeId followerId : isrList) {
         if (followerId == cfg_.selfId) continue;
         onTransport([&](auto& t) { t.sendFetchResponse(followerId, resp); });
@@ -2234,10 +2188,8 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
             if (pushedThrough > s->pushedThrough) s->pushedThrough = pushedThrough;
         }
     }
-
-    lastPushedOffset_ = pushedThrough;   // advance by what we actually pushed (bounded by
-                                         // ceiling + maxFetchBytes); next cycle pushes the
-                                         // rest once the follower's ack lifts the window.
+    lastPushedOffset_ = pushedThrough;   // next cycle pushes the rest once the
+                                         // follower's ack lifts the window.
 }
 
 } // namespace rune::replication
