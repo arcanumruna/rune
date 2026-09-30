@@ -41,6 +41,7 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <rune/client/detail/FlatIndexMap.h>
+#include <rune/client/producer/InFlightRing.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
 #include <atomic>
@@ -143,8 +144,9 @@ struct PartitionState {
     // Idempotence sequence: monotonically increasing baseSequence.
     int32_t nextBaseSequence = 0;
 
-    // In-flight count: batches sent but not yet acked.
-    int32_t inFlight = 0;
+    // Fixed ring of in-flight (sent, un-acked) batches; capacity = maxInFlight
+    // rounded up to a power of two (spec §4.3).
+    InFlightRing inflight;
 
     // RecordBatchBuilder (reused; reset after each flush).
     // Lazy-initialised on first append.
@@ -162,12 +164,6 @@ struct PartitionState {
     // Force-flush flag (set by flush() call from app thread, read here).
     bool flushRequested = false;
 
-    // Pending correlationId for the current batch (0 = acks::None or not set).
-    // This is the WIRE corrId the Produce frame carries — the FIRST ack-wanting
-    // record's corrId in the current batch.  The broker echoes it on the
-    // ProduceResponse, which the client uses to look up the batch and fan out.
-    int64_t pendingCorrId = 0;
-
     // Per-record ack fan-out, ZERO-ALLOC ring.  corrIds are NOT contiguous within
     // a partition (a producer spread across N partitions strides corrIds), so we
     // cannot use a (base,count) pair — we must remember each record's corrId.
@@ -175,8 +171,9 @@ struct PartitionState {
     // preallocated ONCE (never per-batch); each flushed batch owns the contiguous
     // slice [batchAckStart, batchAckStart+batchAckCount).  On ProduceResponse the
     // slice is walked: corrId = ackRing[(start+i) & ackMask] resolves at
-    // baseOffset + i.  ackTail advances as batches ack (FIFO per partition), so
-    // (ackHead - ackTail) is the outstanding count for overflow backpressure.
+    // baseOffset + i.  ackTail = start of the oldest un-acked slice (oldest live
+    // in-flight batch, else the current builder), so out-of-order acks never
+    // reclaim a live slice; (ackHead - ackTail) is the outstanding count.
     std::vector<int64_t> ackRing;        // preallocated corrId ring (agent-thread only)
     uint32_t             ackMask       = 0; // ackRing.size() - 1 (size is pow2)
     uint64_t             ackHead       = 0; // next write index (monotonic)
@@ -320,8 +317,7 @@ public:
     /// On failure the pending ack is failed immediately.
     static constexpr int kMaxRedirects = 3;
     bool retryRedirectedProduce(int64_t corrId,
-                                std::function<bool(int32_t, int32_t, int32_t,
-                                                   const uint8_t*, std::size_t)>& sendFn);
+                                SendFn& sendFn);
 
     /// CB-5 B: resend EVERY in-flight (still-unacked) Produce frame after a
     /// leader redirect + reconnect.  Each stored wire frame is re-stamped with
@@ -330,39 +326,41 @@ public:
     /// as unknown-session.  Bounded per-frame by kMaxRedirects; frames that
     /// exceed the budget are failed.  Returns the number of frames resent.
     int resendAllRedirected(int64_t newSessionId,
-                            std::function<bool(int32_t, int32_t, int32_t,
-                                               const uint8_t*, std::size_t)>& sendFn);
+                            SendFn& sendFn);
 
     /// Task 1.4 (redirect convergence): re-offer every in-flight frame through its
     /// partition-leader route (multi-node).  The sendFn re-stamps the correct
     /// per-leader sessionId itself, so — unlike resendAllRedirected — this does NOT
     /// re-stamp a global sessionId and does NOT consume the redirect budget (a held
     /// offer is not a redirect).  Returns the number of frames actually offered.
-    int resendAllViaRoute(std::function<bool(int32_t, int32_t, int32_t,
-                                             const uint8_t*, std::size_t)>& sendFn);
+    int resendAllViaRoute(SendFn& sendFn);
 
     /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
     /// (i.e. a redirect resend would have something to flush).
-    [[nodiscard]] bool hasInFlight() const noexcept { return !batchMap_.empty(); }
+    [[nodiscard]] bool hasInFlight() const noexcept {
+        for (const auto& up : partitions_) if (!up->inflight.empty()) return true;
+        return false;
+    }
 
     /// MD1 review IMPORTANT-1: look up the (topicId, partition) for an in-flight
-    /// corrId.  Returns true and sets topicId+partition if found; false if the
-    /// corrId is not in batchMap_.  Called on the agent thread from the redirect
-    /// handler so the MetadataCache can be updated with the affected partition.
-    [[nodiscard]] bool partitionForCorrId(int64_t corrId,
-                                          int32_t& topicIdOut,
-                                          int32_t& partitionOut) const noexcept {
-        const auto it = batchMap_.find(corrId);
-        if (it == batchMap_.end()) return false;
-        topicIdOut   = it->second.topicId;
-        partitionOut = it->second.partition;
+    /// batch corrId (O(1): the id addresses its partition slot directly).  Returns
+    /// true and sets topicId+partition if a live batch has exactly this id.
+    /// Called on the agent thread from the redirect handler so the MetadataCache
+    /// can be updated with the affected partition.
+    [[nodiscard]] bool partitionForCorrId(int64_t corrId, int32_t& topicIdOut,
+                                          int32_t& partitionOut) noexcept {
+        if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return false;
+        const uint32_t s = batchcorr::slot(corrId);
+        if (s >= partitions_.size() || partitions_[s]->inflight.find(corrId) == nullptr) return false;
+        topicIdOut   = partitions_[s]->topicId;
+        partitionOut = partitions_[s]->partition;
         return true;
     }
 
     /// MD1 review IMPORTANT-2: return the (topicId, partition) of the first
     /// partition that currently has produce work — either accumulated in a
     /// PartitionState (records appended / Tier-2 queued) or already in-flight
-    /// (batchMap_).  Returns true and sets the out params if any such partition
+    /// (its InFlightRing).  Returns true and sets the out params if any such partition
     /// exists; false otherwise.  Called on the agent thread so the produce path
     /// can resolve the partition leader's endpoint via the PartitionRouter and
     /// route the produce DIRECT to that leader using cached metadata.
@@ -381,11 +379,12 @@ public:
             }
         }
         // Fall back to an in-flight batch (already sent, awaiting ack).
-        if (!batchMap_.empty()) {
-            const auto& bi = batchMap_.begin()->second;
-            topicIdOut   = bi.topicId;
-            partitionOut = bi.partition;
-            return true;
+        for (const auto& up : partitions_) {
+            if (!up->inflight.empty()) {
+                topicIdOut   = up->topicId;
+                partitionOut = up->partition;
+                return true;
+            }
         }
         return false;
     }
@@ -406,6 +405,10 @@ public:
     // ---- Accessors -----------------------------------------------------------
 
     const ProducerConfig& config() const noexcept { return cfg_; }
+
+    /// Ordinal inside the owning ProducerHub; encoded into batch correlation ids.
+    void setOrdinal(uint32_t o) noexcept { ordinal_ = o; }
+    [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
 
     /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
     uint64_t framesSent()  const noexcept { return framesSent_; }
@@ -445,9 +448,21 @@ private:
     /// Produce wire frame and offers it to transport.
     template <class Sink>
     bool encodeAndSendTier2(PartitionState& ps,
-                             Tier2Entry& entry,
-                             int64_t sessionId,
-                             const Sink& sink);
+                            Tier2Entry& entry,
+                            int64_t nowNs,
+                            int64_t sessionId,
+                            const Sink& sink);
+
+    [[nodiscard]] bool canFlight_(const PartitionState& ps) const noexcept {
+        return static_cast<int32_t>(ps.inflight.live()) < cfg_.maxInFlight && !ps.inflight.full();
+    }
+    /// ackTail = start of the oldest un-acked slice (in-flight or current builder).
+    void reclaimAckRing_(PartitionState& ps) noexcept;
+    /// Resolves the per-record acks of a batch slice (record i -> baseOffset + i;
+    /// baseOffset < 0 = error sentinel -errorCode).
+    void resolveSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset);
+    /// Fails a live batch's records and releases its slot.
+    void failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason);
 
     // ---- Members -------------------------------------------------------------
 
@@ -501,28 +516,12 @@ private:
     int16_t producerEpoch_ = 0;
 
     // ---- In-flight batch tracking (agent-thread only; no mutex needed) -------
-    struct BatchInfo {
-        int32_t              topicId;
-        int32_t              partition;
-        int32_t              ingressStreamId = 0; // E5.1: per-worker stream for redirect resend
-        std::vector<uint8_t> wireFrame;   // CB-5 B: encoded Produce bytes for redirect resend
-        int32_t              redirectCount = 0; // bounded redirect attempts
-        // Per-record ack fan-out (zero-alloc): this batch owns the ackRing slice
-        // [ackStart, ackStart+ackCount).  onProduceResponse resolves
-        // corrId = ackRing[(ackStart+i) & ackMask] with (baseOffset+i).
-        // ackCount==0 for acks=None batches.
-        uint64_t             ackStart = 0;
-        int32_t              ackCount = 0;
-        // Reliability (idempotent retransmit): monotonic send bookkeeping.
-        // firstSendNs = when this batch first went on the wire; attemptDeadlineNs =
-        // when the current attempt is deemed lost (→ retransmit, same corrId so the
-        // broker dedups).  Retransmitted until acked or firstSendNs+deliveryTimeoutMs.
-        // Happy path erases the entry on ack before attemptDeadlineNs — zero cost.
-        int64_t              firstSendNs       = 0;
-        int64_t              attemptDeadlineNs = 0;
-        int32_t              attempts          = 0;
-    };
-    std::map<int64_t, BatchInfo> batchMap_;
+    // In-flight batches live in each PartitionState::inflight ring; a batch
+    // correlation id encodes (ordinal_, partition slot, ring sequence).
+    uint32_t ordinal_ = 0;
+    // Lower bound of every live batch's attemptDeadlineNs: retransmitStalled()
+    // returns in O(1) until it passes (spec §1a.5; replaces the ordered map front).
+    int64_t earliestAttemptDeadlineNs_ = INT64_MAX;
 
     // ---- Tier-2 batch queue (mutex-guarded — app threads push, agent pops) ----
     // The ring carries a small kMsgTier2Batch token; the actual batch bytes live

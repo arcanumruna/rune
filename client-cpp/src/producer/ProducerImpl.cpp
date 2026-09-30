@@ -380,6 +380,10 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     ps->slotIndex = static_cast<uint32_t>(partitions_.size());
     ps->ackRing.assign(kAckRingCapacity, 0);  // preallocated ONCE (zero per-batch alloc)
     ps->ackMask = kAckRingCapacity - 1;
+    ps->inflight = InFlightRing(static_cast<uint32_t>(cfg_.maxInFlight > 0 ? cfg_.maxInFlight : 1));
+    if (partitions_.size() > batchcorr::kMaxSlot) {
+        throw std::length_error("ProducerImpl: more than 262144 partitions");
+    }
     partitions_.push_back(std::move(ps));
     partitionIndex_.insert(k, partitions_.back()->slotIndex);
     return *partitions_.back();
@@ -519,7 +523,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                 }
             }
             // Normal-path backpressure: ABORT when full AND at maxInFlight.
-            if (!frameCapped && ps.builderBytes >= effCap && ps.inFlight >= cfg_.maxInFlight) {
+            if (!frameCapped && ps.builderBytes >= effCap && !canFlight_(ps)) {
                 return ControlledAction::ABORT;
             }
 
@@ -550,10 +554,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             // (a producer spread over N partitions strides them).
             if ((flags & kFlagWantAck) && corrId != 0) {
                 if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
-                if (ps.batchAckCount == 0) {
-                    ps.batchAckStart = ps.ackHead;
-                    ps.pendingCorrId = corrId; // wire corrId = first ack record in batch
-                }
+                if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
                 ps.ackRing[ps.ackHead & ps.ackMask] = corrId;
                 ++ps.ackHead;
                 ++ps.batchAckCount;
@@ -668,30 +669,30 @@ bool ProducerImpl::encodeAndSend(
 
     ++framesSent_;                                       // one Aeron frame offered
     // Agent-thread: batch frame offered to the broker.  corr=batch correlationId;
-    // value=inFlight AFTER this offer (how deep the un-acked pipeline is).
+    // value=in-flight depth AFTER this offer (how deep the un-acked pipeline is).
     RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientBatchOffer,
                              static_cast<uint32_t>(correlationId),
-                             static_cast<double>(ps.inFlight + 1));
-    ps.nextBaseSequence += ps.builder->recordCount();    // advance ONLY on success
+                             static_cast<double>(ps.inflight.live() + 1));
+    const int32_t batchSeq     = ps.nextBaseSequence;
+    const int32_t batchRecords = ps.builder->recordCount();
+    ps.nextBaseSequence += batchRecords;                 // advance ONLY on success
     if (correlationId != 0) {
-        // Increment in-flight counter (decremented on ProduceResponse).
-        // Only track ack-expecting batches; acks=None (corrId==0) are
-        // fire-and-forget and must NOT consume inFlight slots.
-        ++ps.inFlight;
-        // CB-5 B: store wire frame bytes for redirect resend + ack fan-out slice.
-        BatchInfo bi;
-        bi.topicId        = ps.topicId;
-        bi.partition      = ps.partition;
-        bi.ingressStreamId = ps.ingressStreamId;  // E5.1: preserve stream for resend
-        bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
-        bi.ackStart       = ps.batchAckStart; // zero-alloc per-record fan-out slice
-        bi.ackCount       = ps.batchAckCount;
-        // Reliability: arm the retransmit clock.  produceTimeoutMs per attempt,
-        // deliveryTimeoutMs total (see retransmitStalled).
-        bi.firstSendNs       = nowNs;
-        bi.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
-        bi.attempts          = 1;
-        batchMap_[correlationId] = std::move(bi);
+        // Only ack-expecting batches occupy the in-flight window (acks=None: corrId 0).
+        InFlightBatch& b = ps.inflight.claim(ordinal_, ps.slotIndex);
+        assert(b.corrId == correlationId && "frame corrId must equal the claimed slot id");
+        b.firstSendNs       = nowNs;
+        b.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
+        b.attempts          = 1;
+        b.redirectCount     = 0;
+        b.ackStart          = (ps.batchAckCount > 0) ? ps.batchAckStart : ps.ackHead;
+        b.ackCount          = ps.batchAckCount;
+        b.recordCount       = batchRecords;
+        b.baseSequence      = batchSeq;
+        b.ingressStreamId   = ps.ingressStreamId;
+        b.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);  // reuses capacity
+        if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
+            earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
+        }
     }
 
     // Reset builder IN PLACE for the next batch (success path only; keep the
@@ -703,7 +704,6 @@ bool ProducerImpl::encodeAndSend(
                                        // the builder's actual baseTimestamp.
     ps.batchStartNs  = 0;
     ps.flushRequested = false;
-    ps.pendingCorrId  = 0;
     ps.batchAckCount  = 0; // ackHead/ackTail persist; only the current-batch slice resets
     // batchAckStart is set afresh when the next ack-wanting record arrives.
 
@@ -718,6 +718,7 @@ template <class Sink>
 bool ProducerImpl::encodeAndSendTier2(
     PartitionState& ps,
     Tier2Entry& entry,
+    int64_t nowNs,
     int64_t sessionId,
     const Sink& sink)
 {
@@ -769,7 +770,11 @@ bool ProducerImpl::encodeAndSendTier2(
     namespace rpc = rune::protocol::client;
     rpc::Produce msg;
     msg.sessionId      = sessionId;
-    msg.correlationId  = entry.corrId;
+    // Wire id = the in-flight slot this batch will claim; the Tier-2 future's own
+    // id goes into the ack slice (record 0) below.
+    msg.correlationId  = (entry.corrId != 0)
+                             ? batchcorr::make(ordinal_, ps.slotIndex, ps.inflight.nextSeq())
+                             : 0;
     msg.topicId        = entry.topicId;
     msg.partition      = entry.partition;
     msg.partitionKnown = 1;
@@ -799,16 +804,30 @@ bool ProducerImpl::encodeAndSendTier2(
     }
 
     ++framesSent_; // one Aeron frame offered to transport (Tier-2)
-    ps.nextBaseSequence += entry.recordCount; // advance ONLY on success
+    const int32_t batchSeq = ps.nextBaseSequence;
+    ps.nextBaseSequence += entry.recordCount;  // advance ONLY on success
     if (entry.corrId != 0) {
-        ++ps.inFlight;
-        // CB-5 B: store wire frame bytes for redirect resend.
-        BatchInfo bi;
-        bi.topicId        = entry.topicId;
-        bi.partition      = entry.partition;
-        bi.ingressStreamId = ps.ingressStreamId;  // E5.1: preserve stream for resend
-        bi.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
-        batchMap_[entry.corrId] = std::move(bi);
+        if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
+        const uint64_t slice = ps.ackHead;
+        ps.ackRing[ps.ackHead & ps.ackMask] = entry.corrId;  // record 0 -> the batch future
+        ++ps.ackHead;
+        InFlightBatch& ib = ps.inflight.claim(ordinal_, ps.slotIndex);
+        // Tier-2 gets the same retransmit/delivery clock as Tier-1 (fixed on sight:
+        // the old BatchInfo left firstSendNs = 0, so the first retransmit scan gave
+        // it up immediately).
+        ib.firstSendNs       = nowNs;
+        ib.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
+        if (ib.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
+            earliestAttemptDeadlineNs_ = ib.attemptDeadlineNs;
+        }
+        ib.attempts          = 1;
+        ib.redirectCount     = 0;
+        ib.ackStart          = slice;
+        ib.ackCount          = 1;
+        ib.recordCount       = entry.recordCount;
+        ib.baseSequence      = batchSeq;
+        ib.ingressStreamId   = ps.ingressStreamId;
+        ib.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
     }
 
     return true;
@@ -865,7 +884,7 @@ int ProducerImpl::flushBatches(
                                          ps.builder->recordCount() >= cfg_.batchRecords);
             const bool otherTrigger   = lingerExpired || ps.flushRequested || globalFlush ||
                                         !ps.pendingTier2Entries.empty();
-            const bool canFlight      = (ps.inFlight < cfg_.maxInFlight);
+            const bool canFlight      = canFlight_(ps);
 
             // maxInFlight gates ALL flushes (bounds outstanding un-acked batches —
             // the durability/idempotent window; the MaxInFlightBound contract).
@@ -875,15 +894,11 @@ int ProducerImpl::flushBatches(
             const bool doFlush        = canFlight && (sizeFull || otherTrigger);
 
             if (doFlush) {
-                int64_t corrId = 0;
-                if (cfg_.acks != Acks::None) {
-                    corrId = (ps.pendingCorrId != 0)
-                                 ? ps.pendingCorrId
-                                 : nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-                }
+                const int64_t corrId = (cfg_.acks != Acks::None)
+                    ? batchcorr::make(ordinal_, ps.slotIndex, ps.inflight.nextSeq())
+                    : 0;
                 if (encodeAndSend(ps, nowNs, sessionId, corrId, sink)) {
                     ++flushed;
-                    ps.pendingCorrId = 0;
                     tier1Pending = false;
                 }
                 // encodeAndSend false (transport back-pressure): batch kept intact,
@@ -905,11 +920,11 @@ int ProducerImpl::flushBatches(
 
         while (!ps.pendingTier2Entries.empty()) {
             // maxInFlight guard (shared with Tier-1 for this partition).
-            if (ps.inFlight >= cfg_.maxInFlight) break;
+            if (!canFlight_(ps)) break;
 
             Tier2Entry& entry = ps.pendingTier2Entries.front();
 
-            if (!encodeAndSendTier2(ps, entry, sessionId, sink)) {
+            if (!encodeAndSendTier2(ps, entry, nowNs, sessionId, sink)) {
                 break; // back-pressure: keep the entry, retry next cycle (no drop)
             }
             ++flushed;
@@ -926,77 +941,70 @@ int ProducerImpl::flushBatches(
 
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
 {
-    if (correlationId == 0) return;
+    if (!batchcorr::isBatch(correlationId) || batchcorr::ordinal(correlationId) != ordinal_) return;
+    const uint32_t s = batchcorr::slot(correlationId);
+    if (s >= partitions_.size()) return;
+    PartitionState& ps = *partitions_[s];
+    InFlightBatch* b = ps.inflight.find(correlationId);
+    if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
+    resolveSlice_(ps, b->ackStart, b->ackCount, baseOffset);
+    ps.inflight.release(*b);
+    reclaimAckRing_(ps);
+}
 
-    // Look up the batch (agent-thread only; no mutex).  The wire correlationId is
-    // the batch's FIRST ack-wanting record corrId.  The batch owns the ack-ring
-    // slice [ackStart, ackStart+ackCount); record i landed at offset baseOffset+i.
-    PartitionState* ps       = nullptr;
-    uint64_t        ackStart = 0;
-    int32_t         ackCount = 0;
-    auto bit = batchMap_.find(correlationId);
-    if (bit != batchMap_.end()) {
-        ackStart = bit->second.ackStart;
-        ackCount = bit->second.ackCount;
-        const uint32_t pidx = partitionIndex_.find(partKey(bit->second.topicId, bit->second.partition));
-        if (pidx != detail::FlatIndexMap::kNone) {
-            ps = partitions_[pidx].get();
-            if (ps->inFlight > 0) --ps->inFlight;    // one batch, one in-flight slot
-            ps->ackTail += static_cast<uint64_t>(ackCount); // FIFO reclaim of ring slots
-        }
-        batchMap_.erase(bit);
+void ProducerImpl::reclaimAckRing_(PartitionState& ps) noexcept {
+    if (const InFlightBatch* o = ps.inflight.oldestLive()) {
+        ps.ackTail = o->ackStart;
+    } else {
+        ps.ackTail = (ps.batchAckCount > 0) ? ps.batchAckStart : ps.ackHead;
     }
-    if (!ps || ackCount == 0) {
-        // Fallback (should not happen): resolve just the wire corrId.
-        ps = nullptr; ackStart = 0; ackCount = 0;
-    }
+}
 
-    // Fan out to every record's callback/future (under mutex).
-    //
-    // DR-BUG-5: a negative baseOffset is a sentinel from ClientAgent indicating a
-    // broker-side non-OK errorCode (e.g. MinIsrViolation) for the whole batch —
-    // reject every record's future/callback rather than resolving with garbage.
-    std::lock_guard<std::mutex> lock(ackMtx_);
+void ProducerImpl::resolveSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount,
+                                 int64_t baseOffset) {
+    if (ackCount <= 0) return;
+    // DR-BUG-5: a negative baseOffset is the -errorCode sentinel for the whole batch.
     const bool err = (baseOffset < 0);
-    const std::string msg = err
-        ? ("produce rejected by broker (errorCode=" + std::to_string(-baseOffset) + ")")
-        : std::string();
-
-    auto resolveOne = [&](int64_t corrId, int64_t off) {
+    std::lock_guard<std::mutex> lock(ackMtx_);
+    for (int32_t i = 0; i < ackCount; ++i) {
+        const int64_t corrId = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
         auto ait = pendingAcks_.find(corrId);
-        if (ait == pendingAcks_.end()) return;
+        if (ait == pendingAcks_.end()) continue;
         PendingAck& pa = ait->second;
-        // Agent-thread: ack matched → user callback/promise about to fire.  This is
-        // the END of the broker round-trip as the client sees it (corr=correlationId;
-        // value=committed offset).  Gap ClientBatchOffer→here = offer→ack (broker RTT).
+        const int64_t off = baseOffset + i;
         RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete,
-                                 static_cast<uint32_t>(corrId),
-                                 static_cast<double>(off));
-        if (err) {
-            if (pa.kind == PendingAck::Kind::Callback) {
-                if (pa.callback) pa.callback(-1); // -1 signals error to callback
-            } else {
-                try { pa.promise.set_exception(
-                    std::make_exception_ptr(std::runtime_error(msg))); } catch (...) {}
-            }
+                                 static_cast<uint32_t>(corrId), static_cast<double>(off));
+        if (pa.kind == PendingAck::Kind::Callback) {
+            if (pa.callback) pa.callback(err ? -1 : off);
+        } else if (err) {
+            try {
+                pa.promise.set_exception(std::make_exception_ptr(std::runtime_error(
+                    "produce rejected by broker (errorCode=" + std::to_string(-baseOffset) + ")")));
+            } catch (...) {}
         } else {
-            if (pa.kind == PendingAck::Kind::Callback) {
-                if (pa.callback) pa.callback(off);
-            } else {
-                try { pa.promise.set_value(off); } catch (...) {}
-            }
+            try { pa.promise.set_value(off); } catch (...) {}
         }
         pendingAcks_.erase(ait);
-    };
-
-    if (ps && ackCount > 0) {
-        for (int32_t i = 0; i < ackCount; ++i) {
-            const int64_t corrId = ps->ackRing[(ackStart + static_cast<uint64_t>(i)) & ps->ackMask];
-            resolveOne(corrId, baseOffset + i);
-        }
-    } else {
-        resolveOne(correlationId, baseOffset); // degenerate fallback
     }
+}
+
+void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> lock(ackMtx_);
+        for (int32_t i = 0; i < b.ackCount; ++i) {
+            const int64_t corrId = ps.ackRing[(b.ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
+            auto it = pendingAcks_.find(corrId);
+            if (it == pendingAcks_.end()) continue;
+            if (it->second.kind == PendingAck::Kind::Future) {
+                try { it->second.promise.set_exception(std::make_exception_ptr(std::runtime_error(reason))); } catch (...) {}
+            } else if (it->second.callback) {
+                it->second.callback(-1);
+            }
+            pendingAcks_.erase(it);
+        }
+    }
+    ps.inflight.release(b);
+    reclaimAckRing_(ps);
 }
 
 void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
@@ -1021,80 +1029,37 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
 }
 
 template <class Sink>
-int ProducerImpl::retransmitStalled(
-    int64_t nowNs,
-    const Sink& sink)
+int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
 {
-    // ZERO happy-path cost: batchMap_ is ordered by corrId == send order == deadline
-    // order (all deadlines are sendNs + produceTimeoutMs, monotonic).  So the OLDEST
-    // batch (map front) has the earliest attemptDeadlineNs.  If it hasn't expired,
-    // nothing has → return immediately without scanning.  On the happy path the front
-    // entry is erased on ack long before its deadline, so this is an O(1) check.
-    if (batchMap_.empty()) return 0;
-    if (nowNs < batchMap_.begin()->second.attemptDeadlineNs) return 0;
-
+    if (nowNs < earliestAttemptDeadlineNs_) return 0;  // O(1) on the happy path
     const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
+    const int64_t attemptNs  = cfg_.produceTimeoutMs * 1'000'000LL;
+    int64_t nextEarliest = INT64_MAX;
     int resent = 0;
-    for (auto it = batchMap_.begin(); it != batchMap_.end(); ) {
-        BatchInfo& bi = it->second;
-        if (nowNs < bi.attemptDeadlineNs) { ++it; continue; } // attempt still in flight
-
-        if (bi.wireFrame.empty()) { ++it; continue; }  // nothing to resend (defensive)
-
-        if (nowNs - bi.firstSendNs >= deliveryNs) {
-            // Delivery deadline exhausted.  Stop resending and drop the retry record;
-            // the per-record pendingAcks_ (deadline == deliveryTimeoutMs) fail via
-            // sweepTimedOut, so the caller learns the batch was not delivered.
-            std::fprintf(stderr,
-                "ProducerImpl: batch corrId=%ld undelivered after %d attempts / %ldms "
-                "(topic=%d part=%d); giving up\n",
-                static_cast<long>(it->first), bi.attempts, static_cast<long>(cfg_.deliveryTimeoutMs),
-                bi.topicId, bi.partition);
-            it = batchMap_.erase(it);
-            continue;
-        }
-
-        // Retransmit the SAME wire frame (same pid+seq/corrId → broker dedups and
-        // re-acks the original offset).  Reset the per-attempt deadline.
-        if (sink(bi.topicId, bi.partition, bi.ingressStreamId,
-                bi.wireFrame.data(), bi.wireFrame.size())) {
-            ++bi.attempts;
-            bi.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
-            ++resent;
-        } else {
-            // Transport back-pressure: leave the deadline in the past and retry next
-            // duty cycle (do NOT advance attemptDeadlineNs — we made no progress).
-        }
-        ++it;
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            if (nowNs - b.firstSendNs >= deliveryNs) {
+                std::fprintf(stderr,
+                    "ProducerImpl: batch corrId=%lld undelivered after %d attempts / %lldms "
+                    "(topic=%d part=%d); giving up\n",
+                    static_cast<long long>(b.corrId), b.attempts,
+                    static_cast<long long>(cfg_.deliveryTimeoutMs), ps.topicId, ps.partition);
+                failBatch_(ps, b, "produce delivery timed out (no ProduceResponse)");
+                return;
+            }
+            if (nowNs >= b.attemptDeadlineNs &&
+                sink(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
+                     b.wireFrame.size())) {
+                ++b.attempts;
+                b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, same corrId: broker dedups
+                ++resent;
+            }
+            if (b.attemptDeadlineNs < nextEarliest) nextEarliest = b.attemptDeadlineNs;
+        });
     }
+    earliestAttemptDeadlineNs_ = nextEarliest;
     return resent;
-}
-
-bool ProducerImpl::retryRedirectedProduce(
-    int64_t corrId,
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
-{
-    auto bit = batchMap_.find(corrId);
-    if (bit == batchMap_.end()) return false; // unknown corrId
-
-    BatchInfo& bi = bit->second;
-    if (bi.redirectCount >= kMaxRedirects) {
-        // Exhausted redirect budget — fail the promise.
-        failPending(corrId, "Redirect exhausted: max redirect attempts reached");
-        batchMap_.erase(bit);
-        return false;
-    }
-
-    if (bi.wireFrame.empty()) {
-        failPending(corrId, "Redirect: wire frame not available for resend");
-        batchMap_.erase(bit);
-        return false;
-    }
-
-    ++bi.redirectCount;
-    // E5.1: pass ingressStreamId so resend goes to the same per-worker stream.
-    return sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
-                  bi.wireFrame.data(), bi.wireFrame.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,77 +1078,74 @@ inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noe
 }
 } // anonymous namespace
 
-int ProducerImpl::resendAllRedirected(
-    int64_t newSessionId,
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
+bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
+{
+    if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return false;
+    const uint32_t s = batchcorr::slot(corrId);
+    if (s >= partitions_.size()) return false;
+    PartitionState& ps = *partitions_[s];
+    InFlightBatch* b = ps.inflight.find(corrId);
+    if (b == nullptr) return false;
+    if (b->redirectCount >= kMaxRedirects) {
+        failBatch_(ps, *b, "Redirect exhausted: max redirect attempts reached");
+        return false;
+    }
+    ++b->redirectCount;
+    return sendFn(ps.topicId, ps.partition, b->ingressStreamId, b->wireFrame.data(),
+                  b->wireFrame.size());
+}
+
+int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
 {
     int resent = 0;
-    for (auto it = batchMap_.begin(); it != batchMap_.end(); ) {
-        BatchInfo& bi = it->second;
-
-        if (bi.wireFrame.empty()) {
-            const int64_t corrId = it->first;
-            it = batchMap_.erase(it);
-            failPending(corrId, "Redirect: wire frame not available for resend");
-            continue;
-        }
-
-        if (bi.redirectCount >= kMaxRedirects) {
-            const int64_t corrId = it->first;
-            it = batchMap_.erase(it);
-            failPending(corrId, "Redirect exhausted: max redirect attempts reached");
-            continue;
-        }
-
-        // Re-stamp the frame header with the leader's freshly assigned sessionId
-        // so the leader accepts the resend (unknown-session would be dropped).
-        restampSessionId(bi.wireFrame, newSessionId);
-
-        ++bi.redirectCount;
-        // E5.1: pass ingressStreamId so resend goes to the per-worker stream.
-        if (sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
-                   bi.wireFrame.data(), bi.wireFrame.size())) {
-            ++resent;
-        }
-        ++it;
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            if (b.redirectCount >= kMaxRedirects) {
+                failBatch_(ps, b, "Redirect exhausted: max redirect attempts reached");
+                return;
+            }
+            restampSessionId(b.wireFrame, newSessionId);
+            ++b.redirectCount;
+            if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
+                       b.wireFrame.size())) {
+                ++resent;
+            }
+        });
     }
     return resent;
 }
 
-int ProducerImpl::resendAllViaRoute(
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
+int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
 {
-    // Task 1.4 (redirect convergence): re-offer every in-flight batch through its
-    // partition-leader route.  Unlike resendAllRedirected (single-node reconnect),
-    // this does NOT re-stamp a single global sessionId — the multi-node send path
-    // (ClientAgent::offerToPartition) re-stamps the correct per-leader sessionId
-    // itself.  It also does NOT bump redirectCount: a held offer (leader session
-    // still connecting) is not a redirect, so it must not consume the redirect
-    // budget.  Batches that stay unroutable are failed by the deliveryTimeout sweep
-    // (sweepTimedOut), not here.  Fired on every session-connect while multi-node.
     int resent = 0;
-    for (auto& [corrId, bi] : batchMap_) {
-        (void)corrId;
-        if (bi.wireFrame.empty()) continue;
-        if (sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
-                   bi.wireFrame.data(), bi.wireFrame.size())) {
-            ++resent;
-        }
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
+                       b.wireFrame.size())) {
+                ++resent;
+            }
+        });
     }
     return resent;
 }
 
 void ProducerImpl::failPending(int64_t corrId, const std::string& reason) {
-    std::lock_guard<std::mutex> lock(ackMtx_);
+    if (batchcorr::isBatch(corrId)) {  // a wire (batch) id: fail every record of that batch
+        if (batchcorr::ordinal(corrId) != ordinal_) return;
+        const uint32_t s = batchcorr::slot(corrId);
+        if (s >= partitions_.size()) return;
+        if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) failBatch_(*partitions_[s], *b, reason);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ackMtx_);  // an app-registered per-record id
     auto it = pendingAcks_.find(corrId);
     if (it == pendingAcks_.end()) return;
     PendingAck& pa = it->second;
     if (pa.kind == PendingAck::Kind::Future) {
-        try {
-            pa.promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(reason)));
-        } catch (...) {}
-    } else if (pa.kind == PendingAck::Kind::Callback && pa.callback) {
+        try { pa.promise.set_exception(std::make_exception_ptr(std::runtime_error(reason))); } catch (...) {}
+    } else if (pa.callback) {
         pa.callback(-1);
     }
     pendingAcks_.erase(it);

@@ -11,15 +11,22 @@
 
 #include <rune/client/producer/ProducerHub.h>
 
+#include <stdexcept>
+
 namespace rune::client::producer {
 
 // ---------------------------------------------------------------------------
 // add() — RUNNER-THREAD ONLY (invoked from the kMsgRegisterProducer drain).
-// A plain push_back on the single-owner vector.
+// A plain push_back on the single-owner vector; the producer's position is its
+// ordinal, encoded into every batch correlation id it emits.
 // ---------------------------------------------------------------------------
 
 void ProducerHub::add(std::shared_ptr<ProducerImpl> impl)
 {
+    if (producers_.size() > batchcorr::kMaxOrdinal) {
+        throw std::length_error("ProducerHub: at most 4096 producers per client");
+    }
+    impl->setOrdinal(static_cast<uint32_t>(producers_.size()));
     producers_.push_back(std::move(impl));
 }
 
@@ -28,9 +35,11 @@ void ProducerHub::add(std::shared_ptr<ProducerImpl> impl)
 // ---------------------------------------------------------------------------
 
 void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset) {
-    for (auto& impl : producers_) {
-        impl->onProduceResponse(correlationId, baseOffset);
-    }
+    // O(1): the batch id names its producer.  Matching is by correlation id only,
+    // never by the publisher the response arrived on.
+    if (!batchcorr::isBatch(correlationId)) return;       // txn / non-producer id
+    const uint32_t o = batchcorr::ordinal(correlationId);
+    if (o < producers_.size()) producers_[o]->onProduceResponse(correlationId, baseOffset);
 }
 
 void ProducerHub::failAll(const std::string& reason) {
@@ -93,9 +102,9 @@ void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now
 
 bool ProducerHub::partitionForCorrId(int64_t corrId,
                                      int32_t& topicId,
-                                     int32_t& partition) const noexcept
+                                     int32_t& partition) noexcept
 {
-    for (const auto& impl : producers_) {
+    for (auto& impl : producers_) {
         if (impl->partitionForCorrId(corrId, topicId, partition)) {
             return true;
         }

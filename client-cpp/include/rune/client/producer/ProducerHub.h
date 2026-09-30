@@ -8,7 +8,7 @@
 //   On each doWork cycle the agent calls:
 //     hub.drainAndFlush(nowNs, sessionId, sendFn)
 //   When a ProduceResponse arrives (dispatchEgressFrame), the agent calls:
-//     hub.onProduceResponse(correlationId, baseOffset, topicId, partition)
+//     hub.onProduceResponse(correlationId, baseOffset)  (O(1) by batch-id ordinal)
 //
 // Threading model (shared-nothing, single-owner — NO atomics, NO locks):
 //   The producer list is owned SOLELY by the runner (agent) thread.  Every
@@ -62,7 +62,9 @@ public:
     //
     // Called by the runner thread when it drains a kMsgRegisterProducer command
     // from the agent ring (Client::producer() submits it from the app thread).
-    // A plain push_back on the single-owner vector — no lock, no atomic.
+    // A plain push_back on the single-owner vector — no lock, no atomic.  Assigns
+    // the producer's ordinal (its index; encoded into its batch correlation ids).
+    // Throws std::length_error past batchcorr::kMaxOrdinal + 1 producers.
 
     void add(std::shared_ptr<ProducerImpl> impl);
 
@@ -88,8 +90,8 @@ public:
         return work;
     }
 
-    /// Route a ProduceResponse to all producers (the one that owns the
-    /// correlationId will resolve the ack; others ignore it).
+    /// Route a ProduceResponse to the ONE producer named by the batch id's
+    /// ordinal (O(1)); non-batch ids (transactional / control) are ignored.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset);
 
     /// Fail all pending acks on close.
@@ -134,7 +136,7 @@ public:
     /// found; false if unknown.  Agent-thread only (redirect handler).
     [[nodiscard]] bool partitionForCorrId(int64_t corrId,
                                           int32_t& topicId,
-                                          int32_t& partition) const noexcept;
+                                          int32_t& partition) noexcept;
 
     /// MD1 review IMPORTANT-2: return the (topicId, partition) of the first
     /// partition with pending or in-flight produce work across all producers.

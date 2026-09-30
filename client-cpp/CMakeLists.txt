@@ -895,6 +895,7 @@ if(BUILD_TESTING)
         tests/transport/TransportConfigTest.cpp
         tests/transport/ResolutionTest.cpp
         tests/detail/FlatIndexMapTest.cpp
+        tests/producer/InFlightRingTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -908,6 +909,9 @@ if(BUILD_TESTING)
         add_executable(rune_invoker_tests
             tests/transport/InvokerTransportTest.cpp
             tests/producer/ProducerSinkTest.cpp
+            tests/producer/ProducerAllocRegressionTest.cpp
+            tests/producer/ProducerAckPathTest.cpp
+            tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_invoker_tests PRIVATE rune_client_api GTest::gtest_main)
