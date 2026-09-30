@@ -30,10 +30,15 @@ struct FollowerSlot {
     Offset  askOffset         = -1;
     int64_t askSinceNs        = 0;
     Offset  pushedThrough     = 0;
+    // CATCH-UP (review I1): once a gapped/stuck follower is served Data by a
+    // FETCH, keep serving Data until its fetch offset reaches this target (the
+    // pushedThrough at the last catch-up serve).  Data served by a fetch is not a
+    // push, so it must never re-arm the ack-only gate.  -1 = not catching up.
+    Offset  catchUpTarget     = -1;
 
     void resetLeadership() noexcept {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
-        askOffset = -1; askSinceNs = 0; pushedThrough = 0;
+        askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
     }
 };
 
@@ -81,11 +86,24 @@ private:
     s.servedLeo         = curLeo;
     s.servedTimeNs      = nowNs;
     if (maxBytes <= 0) return FetchServe::AckOnly;              // pure fast-ack: HW only
+    // A fetch BELOW the previous ask means the follower lost data (restart/truncate):
+    // it is not inside the push stream, so it enters catch-up at once.
+    const bool wentBack = s.askOffset >= 0 && fetchOffset < s.askOffset;
     if (fetchOffset != s.askOffset) { s.askOffset = fetchOffset; s.askSinceNs = nowNs; }
-    if (pushOnAppend && fetchOffset < s.pushedThrough && (nowNs - s.askSinceNs) < resendNs) {
-        return FetchServe::AckOnly;                             // covered by a push, still advancing
+    if (s.catchUpTarget >= 0) {
+        if (fetchOffset < s.catchUpTarget) {                    // still catching up:
+            s.catchUpTarget = s.pushedThrough;                  // pushes it dropped meanwhile
+            return FetchServe::Data;                            // extend the target
+        }
+        s.catchUpTarget = -1;                                   // reached the push frontier
     }
-    return FetchServe::Data;                                    // never pushed, or stuck (lost push)
+    if (pushOnAppend && fetchOffset < s.pushedThrough) {
+        if (!wentBack && (nowNs - s.askSinceNs) < resendNs) {
+            return FetchServe::AckOnly;                         // covered by a push, still advancing
+        }
+        s.catchUpTarget = s.pushedThrough;                      // stuck (lost push) or went back
+    }
+    return FetchServe::Data;                                    // never pushed, stuck, or catching up
 }
 
 } // namespace rune::replication

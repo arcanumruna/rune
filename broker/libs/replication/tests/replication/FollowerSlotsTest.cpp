@@ -69,3 +69,44 @@ TEST(FollowerSlots, ResetLeadershipClearsCoverageKeepsIds) {
     EXPECT_EQ(s.find(2)->askOffset, -1);
     EXPECT_EQ(s.find(2)->id, 2);
 }
+
+// Review I1: Data served by a FETCH is not a push and must not re-arm the gate.
+TEST(FollowerSlotsRegression, AfterStuckReserveCatchUpIsServedDataWithoutFurtherWaits) {
+    FollowerSlot f; f.id = 3; f.pushedThrough = 100;
+    EXPECT_EQ(decideFetchServe(f, 0, 256, 100, true, 1 * kMs, kFetchResendNs), FetchServe::AckOnly);
+    EXPECT_EQ(decideFetchServe(f, 0, 256, 100, true, 1 * kMs + kFetchResendNs, kFetchResendNs),
+              FetchServe::Data);
+    f.pushedThrough = 120;   // pushes keep flowing (and are rejected by the gapped follower)
+    // Every advancing fetch below the catch-up target is served Data at once.
+    Offset off = 2;
+    int64_t t = 1 * kMs + kFetchResendNs;
+    for (int round = 0; round < 200 && off < 120; ++round) {
+        t += 1 * kMs;
+        ASSERT_EQ(decideFetchServe(f, off, 256, 120, true, t, kFetchResendNs), FetchServe::Data)
+            << "catch-up fetch at " << off << " was gated";
+        off += 2;
+    }
+    EXPECT_GE(off, 120);
+    // At the push frontier catch-up ends; the gate is armed again.
+    EXPECT_EQ(decideFetchServe(f, 120, 256, 130, true, t + kMs, kFetchResendNs), FetchServe::Data)
+        << "not covered (== pushedThrough) → Data";
+    f.pushedThrough = 130;
+    EXPECT_EQ(decideFetchServe(f, 125, 256, 130, true, t + 2 * kMs, kFetchResendNs),
+              FetchServe::AckOnly) << "caught-up follower is gated again";
+}
+
+TEST(FollowerSlotsRegression, BackwardFetchJumpEntersCatchUpImmediately) {
+    FollowerSlot f; f.id = 3; f.pushedThrough = 100;
+    EXPECT_EQ(decideFetchServe(f, 90, 256, 100, true, 1 * kMs, kFetchResendNs), FetchServe::AckOnly);
+    // Restarted follower: its LEO went backwards below pushedThrough.
+    EXPECT_EQ(decideFetchServe(f, 5, 256, 100, true, 2 * kMs, kFetchResendNs), FetchServe::Data);
+    EXPECT_EQ(decideFetchServe(f, 7, 256, 100, true, 3 * kMs, kFetchResendNs), FetchServe::Data);
+}
+
+TEST(FollowerSlots, ResetLeadershipClearsCatchUp) {
+    FollowerSlot f; f.id = 3; f.pushedThrough = 100;
+    decideFetchServe(f, 90, 256, 100, true, 1 * kMs, kFetchResendNs);
+    ASSERT_EQ(decideFetchServe(f, 5, 256, 100, true, 2 * kMs, kFetchResendNs), FetchServe::Data);
+    f.resetLeadership();
+    EXPECT_EQ(f.catchUpTarget, -1);
+}

@@ -197,3 +197,93 @@ TEST(FastAckUnicastRegression, FollowerFastAckTargetsItsLeader) {
     EXPECT_EQ(ack.to, kLeader);
     EXPECT_EQ(ack.msg.maxBytes, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Review I1: bounded catch-up after a lost push / restart.  F3 models the real
+// follower: it applies a batch only if it is contiguous with its LEO (a gapped
+// push is dropped); overlapping batches advance it past the overlap.
+// ---------------------------------------------------------------------------
+namespace {
+
+Offset applyContiguous(const std::vector<uint8_t>& recs, Offset leo) {
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= recs.size()) {
+        rune::protocol::RecordBatchReader r(recs.data() + pos, recs.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0) break;
+        const Offset base = r.baseOffset();
+        const Offset last = base + r.lastOffsetDelta();
+        if (base > leo) break;             // gap → dropped
+        if (last >= leo) leo = last + 1;
+        pos += static_cast<std::size_t>(total);
+    }
+    return leo;
+}
+
+void appendOne(LeaderFixture& f) {
+    const Offset o = f.leader->logEndOffset();
+    rune::protocol::RecordBatchBuilder b(o, 1000);
+    b.append("k", std::string(64, 'x'), 1000);
+    f.log.append(b.build(), o);
+    f.leader->onLeaderLogAppended();
+}
+
+constexpr int32_t kSmallFetch = 300;   // ~2 batches per fetch — far smaller than the gap
+constexpr int     kRoundCap   = 200;   // hard iteration cap
+
+struct CatchUpResult { int rounds = 0; int gatedBelowTarget = 0; bool caughtUp = false; };
+
+// Drive F3 from `f3Leo`; the leader appends+pushes one batch per round for the
+// first `growRounds` rounds.  From `armedAtNs` on, every F3 fetch below the
+// leader's LEO must be served Data (counted in gatedBelowTarget otherwise).
+CatchUpResult driveF3(LeaderFixture& f, Offset& f3Leo, int64_t& t, int growRounds,
+                      int64_t armedAtNs) {
+    CatchUpResult res;
+    for (int round = 0; round < kRoundCap; ++round) {
+        res.rounds = round + 1;
+        t += 1 * kMs;
+        if (round < growRounds) { appendOne(f); f.leader->doWork(t); }
+        for (auto& p : f.t.takeFor(kF3)) f3Leo = applyContiguous(p.records, f3Leo);  // pushes
+        const Offset leoBefore = f.leader->logEndOffset();
+        f.leader->onFetchRequest(fetch(kF3, f3Leo, kSmallFetch), t);
+        auto resp = f.t.takeFor(kF3);
+        const bool data = !resp.empty() && !resp[0].records.empty();
+        if (t >= armedAtNs && f3Leo < leoBefore && !data) ++res.gatedBelowTarget;
+        for (auto& r : resp) f3Leo = applyContiguous(r.records, f3Leo);
+        if (round >= growRounds && f3Leo == f.leader->logEndOffset()) { res.caughtUp = true; break; }
+    }
+    return res;
+}
+
+} // namespace
+
+TEST(NoDupFetchGateRegression, LostPushCatchUpIsNotThrottledPerHop) {
+    LeaderFixture f;          // push 1 ([0,10)) to F3 is lost
+    Offset  f3Leo = 0;
+    int64_t t = 1 * kMs;
+    // Pushes 2,3,... continue to F2+F3 (F3 drops them: gapped).  The first stuck
+    // re-serve happens kFetchResendNs after F3 first asked for 0 (at t=2ms).
+    const int64_t firstReserve = 2 * kMs + kFetchResendNs;
+    const CatchUpResult r = driveF3(f, f3Leo, t, /*growRounds=*/60, firstReserve);
+    EXPECT_EQ(r.gatedBelowTarget, 0) << "a catch-up fetch waited another kFetchResendNs";
+    EXPECT_TRUE(r.caughtUp) << "F3 LEO " << f3Leo << " never reached leader LEO "
+                            << f.leader->logEndOffset() << " within " << kRoundCap << " rounds";
+    EXPECT_EQ(f3Leo, f.leader->logEndOffset());
+}
+
+TEST(NoDupFetchGateRegression, RestartedFollowerBackwardJumpCatchesUpBounded) {
+    LeaderFixture f;
+    // F3 is caught up with the push (fetch at 10, covered → ack-only)…
+    f.leader->onFetchRequest(fetch(kF3, 10, kSmallFetch), 2 * kMs);
+    ASSERT_TRUE(f.t.takeFor(kF3).at(0).records.empty());
+    for (int i = 0; i < 20; ++i) appendOne(f);
+    f.leader->doWork(3 * kMs);   // push [10,30) to F2+F3
+    f.t.responses.clear();
+    // …then restarts with a truncated log: LEO jumps back to 3 (< pushedThrough).
+    Offset  f3Leo = 3;
+    int64_t t = 3 * kMs;
+    const CatchUpResult r = driveF3(f, f3Leo, t, /*growRounds=*/30, /*armedAtNs=*/0);
+    EXPECT_EQ(r.gatedBelowTarget, 0) << "restarted follower was gated below pushedThrough";
+    EXPECT_TRUE(r.caughtUp);
+    EXPECT_EQ(f3Leo, f.leader->logEndOffset());
+}
