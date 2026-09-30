@@ -614,8 +614,9 @@ private:
 
     /// (Leader) GR-10: push records starting at fromOffset to all ISR followers
     /// via unsolicited FetchResponse.  Non-blocking (tryClaim/offer); a dropped
-    /// push is fine — the fetch backstop recovers it.  Uses encodeScratch_ (no
-    /// per-call alloc).  Only called when cfg_.pushOnAppend is true.
+    /// push is fine — the fetch backstop recovers it.  Builds the FetchResponse
+    /// via makeFetchResponse() (zero-copy records view).  Only called when
+    /// cfg_.pushOnAppend is true.
     // Flow control: the leader never pushes more than kPushFlowWindow records ahead
     // of the slowest ISR follower's acked LEO.  Outrunning the follower makes Aeron
     // back-pressure and DROP best-effort pushes → the follower stalls behind the gap
@@ -627,6 +628,28 @@ private:
     /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
     /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
     void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+
+    /// Build a FetchResponseMsg stamped with this partition's identity
+    /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
+    /// errorCode and records.  ZERO-COPY: `records` is a view (into the log's
+    /// read mmap, or an empty span for an error/HW-only reply) that the caller
+    /// MUST keep alive until transport_->sendFetchResponse()/sendReconcileResponse()
+    /// returns — both encode synchronously into the outbound ring before
+    /// returning.  Replaces the old encode-into-encodeScratch_ → decode →
+    /// re-encode round-trip (one full record-bytes copy + a decode parse per
+    /// replication frame).
+    FetchResponseMsg makeFetchResponse(Offset highWatermark, int16_t errorCode,
+                                       std::span<const uint8_t> records) const noexcept {
+        FetchResponseMsg r{};
+        r.leaderEpoch    = epoch_;
+        r.partition      = cfg_.partitionId;
+        r.highWatermark  = highWatermark;
+        r.logStartOffset = 0;
+        r.errorCode      = errorCode;
+        r.topicId        = cfg_.topicId;
+        r.records        = records;
+        return r;
+    }
 
     // -----------------------------------------------------------------------
     // Fields
@@ -700,9 +723,6 @@ private:
     int64_t lastIsrCheckNs_  = 0;   ///< last ISR shrink/expand timestamp
     int64_t lastFetchEmitNs_ = 0;   ///< last follower fetch emission timestamp
 
-    // Pre-allocated scratch buffers (no hot-path alloc)
-    static constexpr std::size_t kScratchSize = 4 * 1024 * 1024; // 4 MiB
-    std::vector<uint8_t> encodeScratch_;   ///< for FetchResponse encoding
 
     // Reused batch-framing state (control-plane append(span)/applyReplicated
     // paths).  Held across calls so RecordBatchBuilder::reset()/buildInto()

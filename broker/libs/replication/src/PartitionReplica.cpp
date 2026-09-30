@@ -93,7 +93,6 @@ PartitionReplica::PartitionReplica(PartitionConfig          cfg,
     , memLog_(nullptr)
     , memoryBacked_(false)
     , transport_(transport)
-    , encodeScratch_(kScratchSize, uint8_t{0})
 {
     assert(diskLog_   != nullptr && "log must not be null");
     assert(transport_ != nullptr && "transport must not be null");
@@ -115,7 +114,6 @@ PartitionReplica::PartitionReplica(PartitionConfig            cfg,
     , memLog_(log)
     , memoryBacked_(true)
     , transport_(transport)
-    , encodeScratch_(kScratchSize, uint8_t{0})
 {
     assert(memLog_    != nullptr && "log must not be null");
     assert(transport_ != nullptr && "transport must not be null");
@@ -520,15 +518,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
 
     // Epoch fence: reject stale leader epochs.
     if (isStaleEpoch(req.leaderEpoch, epoch_)) {
-        FetchResponseMsg::encode(
-            encodeScratch_.data(), 0,
-            epoch_, cfg_.partitionId,
-            leaderState_.highWatermark(),
-            /*logStartOffset=*/0,
-            kErrStaleEpoch,
-            {},
-            cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
-        auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+        auto resp = makeFetchResponse(leaderState_.highWatermark(), kErrStaleEpoch, {});
         transport_->sendFetchResponse(req.followerId, resp);
         return kErrStaleEpoch;
     }
@@ -574,15 +564,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         // this node as Leader (no live-state read on the cleaner thread).
         publishCleanerState();
 
-        FetchResponseMsg::encode(
-            encodeScratch_.data(), 0,
-            epoch_, cfg_.partitionId,
-            committedHw,
-            /*logStartOffset=*/0,
-            kErrNotLeader,  // A-NEW-5: correct error code (follower is ahead)
-            {},
-            cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
-        auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+        // A-NEW-5: kErrNotLeader — the follower is ahead of this stale leader.
+        auto resp = makeFetchResponse(committedHw, kErrNotLeader, {});
         transport_->sendFetchResponse(req.followerId, resp);
         return kErrNotLeader;
     }
@@ -722,17 +705,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // the follower's *committed view* (followerHw_) is held at the majority floor
     // until the ISR heals.
     const Offset advertiseHw = highWatermark();
-    FetchResponseMsg::encode(
-        encodeScratch_.data(), 0,
-        epoch_,
-        cfg_.partitionId,
-        advertiseHw,
-        /*logStartOffset=*/0,
-        kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()),
-        cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
-
-    auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+    auto resp = makeFetchResponse(
+        advertiseHw, kErrNone,
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
     transport_->sendFetchResponse(req.followerId, resp);
 
     return kErrNone;
@@ -1355,16 +1330,10 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
 
     // Reply carrying the records and our LEO as the highWatermark hint (the
     // deficient leader uses byte content, not this HW, to advance its own).
-    FetchResponseMsg::encode(
-        encodeScratch_.data(), 0,
-        epoch_,                          // our epoch (>= leader's; fences stale)
-        cfg_.partitionId,
-        leo,                             // survivor LEO
-        /*logStartOffset=*/0,
-        kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()),
-        cfg_.topicId);
-    auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+    // survivor LEO as the HW hint; our epoch (>= leader's) fences stale.
+    auto resp = makeFetchResponse(
+        leo, kErrNone,
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
     transport_->sendReconcileResponse(req.followerId, resp);
 }
 
@@ -2123,7 +2092,7 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
 //   1. Read log bytes from [fromOffset, LEO) using the existing log_.read() path.
 //   2. Apply the same whole-batch alignment as onFetchRequest() to ensure the
 //      encoded FetchResponse fits within transport limits.
-//   3. Encode a FetchResponse into encodeScratch_ (pre-allocated, zero per-call alloc).
+//   3. Build a FetchResponse via makeFetchResponse() (zero-copy records view).
 //   4. Call sendFetchResponse(followerId, resp) for each ISR follower != selfId.
 //   5. Update lastPushedOffset_ so onLeaderLogAppended() does not re-push.
 //
@@ -2204,19 +2173,12 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     }
     if (logBytes.empty()) return;   // nothing deliverable within ceiling/cap this pass
 
-    // Encode once into encodeScratch_ — reuse for all followers.
+    // Build once — reuse (re-encoded per follower) for all ISR followers.
+    // logBytes (the zero-copy records view) stays alive for the whole loop below.
     // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
-    FetchResponseMsg::encode(
-        encodeScratch_.data(), 0,
-        epoch_,
-        cfg_.partitionId,
-        highWatermark(),
-        /*logStartOffset=*/0,
-        kErrNone,
-        std::span<const uint8_t>(logBytes.data(), logBytes.size()),
-        cfg_.topicId);   // DR-BUG-5: stamp topicId for transport routing
-
-    auto resp = FetchResponseMsg::decode(encodeScratch_.data(), 0);
+    auto resp = makeFetchResponse(
+        highWatermark(), kErrNone,
+        std::span<const uint8_t>(logBytes.data(), logBytes.size()));
     rtPushBytes_ += static_cast<int64_t>(logBytes.size());
 
     // Push to each ISR follower (skip self).
