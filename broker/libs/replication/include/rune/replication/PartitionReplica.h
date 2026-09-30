@@ -147,9 +147,18 @@ struct PartitionConfig {
 // The fake pumps responses back into the leader via its onFetchRequest() and
 // pumps requests back into the follower via its applyReplicated().
 // ---------------------------------------------------------------------------
+enum class TransportKind : uint8_t {
+    Generic   = 0,  ///< virtual dispatch (legacy control-thread transport, test fakes)
+    PerWorker = 1,  ///< concrete final WorkerReplicationTransport — direct calls
+};
+
 class PartitionTransport {
 public:
     virtual ~PartitionTransport() = default;
+
+    /// Construction-time classification (spec §3.5a.1): PartitionReplica reads
+    /// this ONCE and dispatches the PerWorker arm through a direct call.
+    [[nodiscard]] virtual TransportKind kind() const noexcept { return TransportKind::Generic; }
 
     /// (Follower → Leader) send a FetchRequest.
     virtual void sendFetchRequest(const FetchRequestMsg& req) = 0;
@@ -197,11 +206,17 @@ public:
             NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) {}
 };
 
+class AeronPubRegistry;
+template <typename PubRegistry> class WorkerReplicationTransportImpl;
+
 // ---------------------------------------------------------------------------
 // PartitionReplica
 // ---------------------------------------------------------------------------
 class PartitionReplica {
 public:
+    /// Transport arm chosen at construction (spec §3.5a.1).
+    [[nodiscard]] TransportKind transportKindForTest() const noexcept { return tkind_; }
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
@@ -678,6 +693,12 @@ private:
     rune::storage::InMemoryLog* memLog_  = nullptr;  ///< non-null iff  memoryBacked_
     bool                        memoryBacked_ = false;
     PartitionTransport*         transport_;   ///< non-owning
+    using PerWorkerTransport = WorkerReplicationTransportImpl<AeronPubRegistry>;
+    TransportKind       tkind_     = TransportKind::Generic;  ///< fixed at construction
+    PerWorkerTransport* perWorker_ = nullptr;                 ///< non-null iff tkind_ == PerWorker
+    /// Apply f to the concrete transport: one predicted branch, direct call on the
+    /// PerWorker arm.  Defined in PartitionReplica.cpp (its only user).
+    template <class F> void onTransport(F&& f);
 
     // -----------------------------------------------------------------------
     // De-virtualized hot-path log dispatch.

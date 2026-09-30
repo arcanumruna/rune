@@ -10,6 +10,13 @@ target_include_directories(rune_replication PUBLIC
 # consumers of rune_replication also get rune_storage headers transitively.
 target_link_libraries(rune_replication PUBLIC rune_storage)
 
+# Task 4 (de-virtualised replica transport): the per-worker transport is
+# header-only Aeron code the replica calls concretely.
+if(aeron_FOUND)
+    target_link_libraries(rune_replication PUBLIC aeron::aeron spdlog::spdlog)
+    target_compile_definitions(rune_replication PUBLIC RUNE_REPLICATION_HAS_AERON=1)
+endif()
+
 # ---------------------------------------------------------------------------
 # AeronPartitionTransport — compiled separately only when aeron is available.
 # Consumers that want the real transport link rune_replication_aeron.

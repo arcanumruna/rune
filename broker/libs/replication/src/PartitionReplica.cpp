@@ -13,6 +13,9 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
+#if RUNE_REPLICATION_HAS_AERON
+#include <rune/replication/WorkerReplicationTransport.h>
+#endif
 
 #include <spdlog/spdlog.h>
 
@@ -76,6 +79,20 @@ static bool fsLogEnabled() noexcept {
 
 
 // ---------------------------------------------------------------------------
+// Transport dispatch (spec §3.5a.1): the kind is fixed at construction, so this
+// is one perfectly-predicted branch; the PerWorker arm is a direct call on the
+// final WorkerReplicationTransport (inlinable), everything else goes virtual.
+// ---------------------------------------------------------------------------
+template <class F>
+[[gnu::always_inline]] inline void PartitionReplica::onTransport(F&& f)
+{
+#if RUNE_REPLICATION_HAS_AERON
+    if (tkind_ == TransportKind::PerWorker) { f(*perWorker_); return; }
+#endif
+    f(*transport_);
+}
+
+// ---------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------
 
@@ -129,6 +146,14 @@ PartitionReplica::~PartitionReplica() = default;
 void PartitionReplica::initReplica(std::vector<NodeId> replicas,
                                    std::vector<NodeId> isr)
 {
+    // Construction-time transport classification (never re-evaluated on the hot path).
+    tkind_ = transport_->kind();
+#if RUNE_REPLICATION_HAS_AERON
+    if (tkind_ == TransportKind::PerWorker) perWorker_ = static_cast<PerWorkerTransport*>(transport_);
+#else
+    tkind_ = TransportKind::Generic;
+#endif
+
     // Retain the full replica set (RF) for the lifetime of this replica so a
     // follower-first replica can rebuild a correct IsrManager on a later
     // becomeLeader() instead of collapsing replicas == isr (see header note).
@@ -526,7 +551,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // Epoch fence: reject stale leader epochs.
     if (isStaleEpoch(req.leaderEpoch, epoch_)) {
         auto resp = makeFetchResponse(leaderState_.highWatermark(), kErrStaleEpoch, {});
-        transport_->sendFetchResponse(req.followerId, resp);
+        onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
         return kErrStaleEpoch;
     }
 
@@ -574,7 +599,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
 
         // A-NEW-5: kErrNotLeader — the follower is ahead of this stale leader.
         auto resp = makeFetchResponse(committedHw, kErrNotLeader, {});
-        transport_->sendFetchResponse(req.followerId, resp);
+        onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
         return kErrNotLeader;
     }
 
@@ -610,7 +635,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
             pull.fetchOffset = logEndOffset_();      // from our LEO
             pull.maxBytes    = cfg_.maxFetchBytes;
             pull.topicId     = cfg_.topicId;
-            transport_->sendReconcileRequest(req.followerId, pull);
+            onTransport([&](auto& t) { t.sendReconcileRequest(req.followerId, pull); });
         }
         // Serve nothing forward to an ahead follower: forward-serving under the
         // new epoch could stamp divergent bytes.  The follower keeps its tail
@@ -716,7 +741,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     auto resp = makeFetchResponse(
         advertiseHw, kErrNone,
         std::span<const uint8_t>(logBytes.data(), logBytes.size()));
-    transport_->sendFetchResponse(req.followerId, resp);
+    onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
 
     return kErrNone;
 }
@@ -1012,8 +1037,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 // known (leaderId_ < 0) fall back to the transport's broadcast.
 void PartitionReplica::sendFetchToLeader_(const FetchRequestMsg& req)
 {
-    if (leaderId_ >= 0 && leaderId_ != cfg_.selfId) transport_->sendFetchRequestTo(leaderId_, req);
-    else                                            transport_->sendFetchRequest(req);
+    if (leaderId_ >= 0 && leaderId_ != cfg_.selfId)
+        onTransport([&](auto& t) { t.sendFetchRequestTo(leaderId_, req); });
+    else
+        onTransport([&](auto& t) { t.sendFetchRequest(req); });
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1129,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         resp.endOffset     = 0;
         resp.errorCode     = kErrNotLeader;
         resp.topicId       = cfg_.topicId;
-        transport_->sendOffsetsForLeaderEpochResponse(req.followerId, resp);
+        onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochResponse(req.followerId, resp); });
         return;
     }
 
@@ -1176,7 +1203,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
             pull.fetchOffset = logEndOffset_();      // from our LEO
             pull.maxBytes    = cfg_.maxFetchBytes;
             pull.topicId     = cfg_.topicId;
-            transport_->sendReconcileRequest(req.followerId, pull);
+            onTransport([&](auto& t) { t.sendReconcileRequest(req.followerId, pull); });
         }
         // Fallback-race hardening (the Major): send an EXPLICIT defer keep-alive
         // instead of silently dropping the answer.  Silence lets the follower's
@@ -1191,7 +1218,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         defer.endOffset     = req.followerLeo;   // "keep everything up to your LEO"
         defer.errorCode     = kErrReconcileDeferred;
         defer.topicId       = cfg_.topicId;
-        transport_->sendOffsetsForLeaderEpochResponse(req.followerId, defer);
+        onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochResponse(req.followerId, defer); });
         return;
     }
 
@@ -1206,7 +1233,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
     resp.endOffset     = r.second;
     resp.errorCode     = kErrNone;
     resp.topicId       = cfg_.topicId;
-    transport_->sendOffsetsForLeaderEpochResponse(req.followerId, resp);
+    onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochResponse(req.followerId, resp); });
 }
 
 // (Follower) Apply the leader's answer: the DEFERRED, epoch-correct truncation.
@@ -1350,7 +1377,7 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
     auto resp = makeFetchResponse(
         leo, kErrNone,
         std::span<const uint8_t>(logBytes.data(), logBytes.size()));
-    transport_->sendReconcileResponse(req.followerId, resp);
+    onTransport([&](auto& t) { t.sendReconcileResponse(req.followerId, resp); });
 }
 
 // (Leader) Apply reconcile records pulled from an ahead survivor.
@@ -1694,7 +1721,7 @@ int PartitionReplica::doWork(int64_t nowNs)
                         pull.fetchOffset = myLeo;                // from our LEO
                         pull.maxBytes    = cfg_.maxFetchBytes;
                         pull.topicId     = cfg_.topicId;
-                        transport_->sendReconcileRequest(aheadPeer, pull);
+                        onTransport([&](auto& t) { t.sendReconcileRequest(aheadPeer, pull); });
                         ++work;
                     }
                 }
@@ -1759,7 +1786,7 @@ int PartitionReplica::doWork(int64_t nowNs)
                                  req.requestedEpoch, req.followerLeo, epoch_,
                                  epochProbeAttempts_);
                 }
-                transport_->sendOffsetsForLeaderEpochRequest(leaderId_, req);
+                onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochRequest(leaderId_, req); });
                 ++work;
             }
         } else {
@@ -2202,7 +2229,7 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     // Push to each ISR follower (skip self).
     for (NodeId followerId : isrList) {
         if (followerId == cfg_.selfId) continue;
-        transport_->sendFetchResponse(followerId, resp);
+        onTransport([&](auto& t) { t.sendFetchResponse(followerId, resp); });
         if (FollowerSlot* s = followerSlots_.find(followerId)) {
             if (pushedThrough > s->pushedThrough) s->pushedThrough = pushedThrough;
         }
