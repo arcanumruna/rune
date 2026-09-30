@@ -67,3 +67,32 @@ TEST(ProducerAllocRegression, SteadyStateAckedFlushAllocatesNothingRegression) {
     EXPECT_EQ(allocs, 0L) << "acked produce steady state must not allocate";
     EXPECT_FALSE(impl.hasInFlight());
 }
+
+// Regression: the in-flight slot kept its wire frame with vector::assign, whose
+// capacity is the EXACT size of the first frame; a frame a few bytes larger (a
+// wider timestamp-delta varint as the wall clock moves, or a slightly longer
+// value) reallocated in steady state — the intermittent 1-allocation failure of
+// SteadyStateAckedFlushAllocatesNothingRegression.  Deterministic here: sizes jitter by 2 bytes.
+TEST(ProducerAllocRegression, FrameSizeJitterDoesNotReallocateSlotRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(1), corr);  // one slot: every frame reuses it
+    int64_t lastCorr = 0;
+    const ProducerImpl::SendFn sink = [&lastCorr](int32_t, int32_t, int32_t, const uint8_t* b,
+                                                  std::size_t n) {
+        const auto v = rcc::decodeProduce(b, n);
+        lastCorr = v ? v->correlationId : 0;
+        return true;
+    };
+    const std::vector<uint8_t> small(16, 0x11), large(18, 0x22);
+    auto cycle = [&](uint64_t k, const std::vector<uint8_t>& v) {
+        (void)impl.submitSendRecord(1, 0, Key(k), v, false, 0);
+        pump(impl, sink);
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k));
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k, small);  // warm-up at the SMALL size only
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k, (k & 1) ? large : small);
+    const long allocs = alloc_counter::stop();
+    EXPECT_EQ(allocs, 0L) << "a slightly larger frame must not reallocate the slot's frame";
+    EXPECT_FALSE(impl.hasInFlight());
+}

@@ -257,7 +257,7 @@ void Client::close() {
     // producerHub_.failAll() calls ProducerImpl::failAllPending on every registered
     // producer — this resolves every pending future/callback with an error so they
     // never hang.  MUST be called after agent_.stop() so the agent thread is no
-    // longer in drainAndFlush / onProduceResponse (no concurrent access to pendingAcks_).
+    // longer in drainAndFlush / onProduceResponse (no concurrent access to the ack rings).
     producerHub_.failAll("Client closed");
 
     // TX-5: fail all pending txn producer ops.
@@ -705,7 +705,7 @@ void Client::runLoop() {
 void Client::sweepTimeouts() {
     const auto now = std::chrono::steady_clock::now();
 
-    // --- Pending producer ack timeouts (no mtx_ — ProducerImpl has its own ackMtx_) ---
+    // --- Producer delivery timeouts (duty-cycle thread; no lock — ack rings are single-owner) ---
     // Mirror the connect/ping sweep: any pending ProduceResponse ack older than
     // produceTimeoutMs is failed so futures/callbacks never hang.
     producerHub_.sweepTimedOut(now);

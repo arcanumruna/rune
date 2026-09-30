@@ -1107,6 +1107,10 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
             key, std::span<const uint8_t>(val),
             /*wantAck=*/false, /*corrId=*/0);
     }
+    // The Tier-2 token is only 8 bytes (a Tier2Entry* travels the ring), so it can
+    // still fit in the tail the 80-byte records leave; top the ring off with the
+    // smallest messages (8-byte flush tokens) so it is truly full.
+    for (int i = 0; i < 1'000; ++i) impl->submitFlush();
 
     // Now try a Tier-2 batch — ring should be full → fail immediately.
     auto bb = p.batch(topic, key);

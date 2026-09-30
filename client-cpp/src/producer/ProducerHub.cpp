@@ -50,7 +50,7 @@ void ProducerHub::failAll(const std::string& reason) {
 
 void ProducerHub::failPending(int64_t corrId, const std::string& reason) {
     for (auto& impl : producers_) {
-        impl->failPending(corrId, reason);
+        impl->failBatch(corrId, reason);
     }
 }
 

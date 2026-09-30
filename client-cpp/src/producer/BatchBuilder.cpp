@@ -77,7 +77,7 @@ std::future<int64_t> BatchBuilder::send() {
     sent_ = true;
 
     // Register a future for the ack (Tier-2 always returns a future).
-    auto [corrId, fut] = impl_->registerFuture();
+    auto [ackHandle, fut] = impl_->registerFuture();
 
     const int32_t recordCount = builder_->recordCount();
 
@@ -90,18 +90,18 @@ std::future<int64_t> BatchBuilder::send() {
     builder_->buildInto(batchBytes);
     builder_.reset(); // release memory; builder is single-use
 
-    // Submit to ProducerImpl: pushes batchBytes to tier2Queue_ and writes a
-    // ring token (kMsgTier2Batch) so the agent processes it in submission order
+    // Submit to ProducerImpl: the heap Tier2Entry's address travels through the
+    // ring (kMsgTier2Batch token) so the agent processes it in submission order
     // relative to Tier-1 records on the same partition.
     const bool ok = impl_->submitTier2Batch(
-        topicId_, partition_, corrId, recordCount, std::move(batchBytes));
+        topicId_, partition_, ackHandle, recordCount, std::move(batchBytes));
 
     if (!ok) {
         // CB-5 A3: ring full — fail the specific promise immediately.
         // The ring token was never written so the agent will never see this
         // batch; the future would otherwise hang until produceTimeoutMs.
         // Fail it now so the caller gets an error without waiting.
-        impl_->failPending(corrId, "Tier-2 batch ring full — batch dropped");
+        impl_->failUnsubmitted(ackHandle, "Tier-2 batch ring full — batch dropped");
     }
 
     return std::move(fut);

@@ -8,12 +8,13 @@
 // App threads:
 //   submitSendRecord() — lock-free ring write (the zero-alloc handoff).
 //   submitFlush()      — lock-free ring write (zero bytes, flushFlag).
-//   registerCallback() / registerFuture() — control-plane only (mutex-guarded).
+//   registerCallback() / registerFuture() — opt-in: allocate a PendingAck whose
+//     address (the "ack handle") travels to the agent inside the SEND_RECORD.
 //
 // Agent thread (doWork / drainAndFlush):
 //   drainRing()    — reads SEND_RECORD ring entries, appends to builders.
 //   flushBatches() — encodes + offers batches that hit linger/size/flush triggers.
-//   onProduceResponse() — resolves pending acks by correlationId.
+//   onProduceResponse() — completes the batch's ack-ring slice (no lookup, no lock).
 //   NanoClock is sampled once per doWork cycle and passed in (never per-send).
 //
 // Ring message format (kMsgSendRecord payload):
@@ -22,7 +23,8 @@
 //   [8]      keyLen    : uint8  (≤16)
 //   [9..24]  keyBytes  : uint8[keyLen] (inline)
 //   [25]     flags     : uint8  (bit0=wantAck)
-//   [26..33] corrId    : int64 LE (only meaningful when wantAck)
+//   [26..33] ackHandle : int64 LE PendingAck* (only meaningful when wantAck;
+//                        ownership passes to the agent on ring commit)
 //   [34..37] valueLen  : uint32 LE
 //   [38..]   valueBytes
 //
@@ -52,10 +54,10 @@
 #include <deque>
 #include <functional>
 #include <future>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -81,19 +83,9 @@ inline constexpr int kRecValLenOff   = 34;  // uint32 LE
 inline constexpr int kRecValBytesOff = 38;  // value bytes
 inline constexpr int kRecHeaderSize  = 38;  // bytes before value
 
-// kMsgTier2Batch token layout constants (21 bytes total)
-// ---------------------------------------------------------------------------
-// [0..3]   topicId     : int32 LE
-// [4..7]   partition   : int32 LE
-// [8]      flags       : uint8 (bit0=wantAck — always set for Tier-2)
-// [9..16]  corrId      : int64 LE
-// [17..20] recordCount : int32 LE (number of records in the pre-built batch)
-inline constexpr int kT2TopicIdOff    = 0;   // int32 LE
-inline constexpr int kT2PartOff       = 4;   // int32 LE
-inline constexpr int kT2FlagsOff      = 8;   // uint8
-inline constexpr int kT2CorrIdOff     = 9;   // int64 LE
-inline constexpr int kT2RecCountOff   = 17;  // int32 LE
-inline constexpr int kT2TokenSize     = 21;  // total bytes
+// kMsgTier2Batch token: 8 bytes = a heap Tier2Entry* (int64 LE).  The entry's
+// ownership travels through the ring (spec §1a.2) — no side queue, no mutex.
+inline constexpr int kT2TokenSize = 8;
 
 // Flags bits
 inline constexpr uint8_t kFlagWantAck = 0x01;
@@ -106,26 +98,27 @@ inline constexpr uint8_t kFlagWantAck = 0x01;
 inline constexpr int32_t kDefaultProducerRingCap = 32 * 1024 * 1024; // 32 MiB
 
 // Per-partition ack-ring capacity (entries; MUST be a power of two).  Holds the
-// corrIds of outstanding (sent, not-yet-acked) records for one partition so
-// ProduceResponse can fan out baseOffset+i to each.  Sized to comfortably exceed
+// PendingAck handles of outstanding (sent, not-yet-acked) records for one
+// partition at their record index so ProduceResponse can fan out baseOffset+i.  Sized to comfortably exceed
 // the in-flight record count for a partition (maxInFlight batches × batch size);
 // if it ever fills, drainRing force-flushes + stops draining so the producer ring
-// applies backpressure (no corrId is ever dropped).  8 bytes/entry.
+// applies backpressure (no handle is ever dropped).  8 bytes/entry.
 inline constexpr uint32_t kAckRingCapacity = 16384; // 128 KiB/partition
 
 // ---------------------------------------------------------------------------
 // Tier2Entry — pre-built RecordBatch bytes waiting for agent-thread processing.
 //
-// The app thread builds the batch bytes (without baseSequence — left 0) and
-// stores them here.  The ring carries only a small token (kMsgTier2Batch);
-// the agent pops from this queue in FIFO order when it processes the token,
-// stamps the correct baseSequence from PartitionState, then encodes+sends.
+// The app thread builds the batch bytes (without baseSequence — left 0) into a
+// heap entry and writes its address into the ring (kMsgTier2Batch); the agent
+// takes ownership when it drains the token, stamps the correct baseSequence
+// from PartitionState, then encodes+sends.
 // ---------------------------------------------------------------------------
 struct Tier2Entry {
-    int32_t topicId     = 0;
-    int32_t partition   = 0;
-    int64_t corrId      = 0;
-    int32_t recordCount = 0;
+    int32_t  topicId     = 0;
+    int32_t  partition   = 0;
+    uint64_t ackHandle   = 0;  // PendingAck* of the batch future (0 = none)
+    int32_t  recordCount = 0;
+    int64_t  enqueuedNs  = 0;  // agent clock when drained (delivery deadline if never sent)
     std::vector<uint8_t> batchBytes; // pre-built RecordBatch (baseSequence=0, patched by agent)
 };
 
@@ -164,22 +157,20 @@ struct PartitionState {
     // Force-flush flag (set by flush() call from app thread, read here).
     bool flushRequested = false;
 
-    // Per-record ack fan-out, ZERO-ALLOC ring.  corrIds are NOT contiguous within
-    // a partition (a producer spread across N partitions strides corrIds), so we
-    // cannot use a (base,count) pair — we must remember each record's corrId.
-    // ackRing is a per-partition ring of corrIds in batch-append order,
-    // preallocated ONCE (never per-batch); each flushed batch owns the contiguous
-    // slice [batchAckStart, batchAckStart+batchAckCount).  On ProduceResponse the
-    // slice is walked: corrId = ackRing[(start+i) & ackMask] resolves at
-    // baseOffset + i.  ackTail = start of the oldest un-acked slice (oldest live
-    // in-flight batch, else the current builder), so out-of-order acks never
-    // reclaim a live slice; (ackHead - ackTail) is the outstanding count.
-    std::vector<int64_t> ackRing;        // preallocated corrId ring (agent-thread only)
+    // Per-record ack fan-out, ZERO-ALLOC ring (spec §4.3).  ackRing holds
+    // PendingAck handles at their record's OWN index within the batch (void
+    // records hold 0; zeros are back-filled lazily, trailing void records take no
+    // slot), preallocated ONCE (never per-batch).  Each flushed batch owns the
+    // contiguous slice [batchAckStart, batchAckStart+batchAckCount): on
+    // ProduceResponse ackRing[(start+i) & ackMask] completes at baseOffset + i.
+    // ackTail = start of the oldest un-acked slice (oldest live in-flight batch,
+    // else the current builder), so out-of-order acks never reclaim a live slice.
+    std::vector<uint64_t> ackRing;       // PendingAck* handles at record index (0 = void record)
     uint32_t             ackMask       = 0; // ackRing.size() - 1 (size is pow2)
     uint64_t             ackHead       = 0; // next write index (monotonic)
     uint64_t             ackTail       = 0; // oldest unacked index (monotonic)
     uint64_t             batchAckStart = 0; // ackHead at start of current batch
-    int32_t              batchAckCount = 0; // ack-wanting records in current batch
+    int32_t              batchAckCount = 0; // slice length of current batch (incl. back-filled 0s)
 
     // Tier-2 batches queued for this partition (agent-thread only, no mutex).
     // Populated by drainRing() when kMsgTier2Batch token is processed.
@@ -198,20 +189,20 @@ struct PartitionState {
 };
 
 // ---------------------------------------------------------------------------
-// PendingAck — pending ack entry keyed by correlationId.
+// PendingAck — heap object created on the opt-in ack paths.  Owned by the app
+// thread until the SEND_RECORD carrying its address is committed to the ring,
+// by the duty-cycle thread afterwards.  complete() fires it exactly once and
+// deletes it.
 // ---------------------------------------------------------------------------
 struct PendingAck {
-    enum class Kind { Callback, Future };
-    Kind kind = Kind::Callback;
-
-    // Callback path.
+    enum class Kind : uint8_t { Callback, Future };
+    Kind                         kind = Kind::Callback;
     std::function<void(int64_t)> callback;
+    std::promise<int64_t>        promise;
 
-    // Future path.
-    std::promise<int64_t> promise;
-
-    // Deadline for timeout sweep (steady_clock).
-    std::chrono::steady_clock::time_point deadline;
+    /// error empty = success (callback gets offset, future gets value);
+    /// otherwise callback(-1) / future exception(error).
+    static void complete(uint64_t handle, int64_t offset, std::string_view error) noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -229,7 +220,8 @@ public:
                           std::atomic<int64_t>& nextCorrId,
                           int32_t ringCap = kDefaultProducerRingCap);
 
-    ~ProducerImpl() = default;
+    /// Frees (without firing) every ack handle still owned by this producer.
+    ~ProducerImpl();
 
     // Non-copyable, non-movable (owns the ring buffer).
     ProducerImpl(const ProducerImpl&) = delete;
@@ -255,11 +247,12 @@ public:
 
     /// Submit a pre-built Tier-2 batch (from BatchBuilder::send()).
     ///
-    /// Pushes the batch bytes to tier2Queue_ (mutex-guarded) and writes a
-    /// kMsgTier2Batch token into the ring.  The agent thread processes the
-    /// token in order with Tier-1 records, stamping baseSequence at that point.
+    /// Moves the batch into a heap Tier2Entry and writes its address into the
+    /// ring (kMsgTier2Batch); ownership passes to the agent on commit.  The agent
+    /// processes the token in order with Tier-1 records, stamping baseSequence.
     ///
-    /// corrId: 0 = acks::None; non-zero = pending ack already registered.
+    /// ackHandle: PendingAck handle from registerFuture() (0 = none).  On false
+    /// the caller still owns it and must failUnsubmitted() it.
     /// recordCount: number of records in the pre-built batch.
     /// batchBytes: pre-built RecordBatch bytes (baseSequence field = 0; will be
     ///             patched by the agent).
@@ -267,18 +260,38 @@ public:
     /// Returns false if the ring is full (caller should handle as an error).
     bool submitTier2Batch(int32_t topicId,
                           int32_t partition,
-                          int64_t corrId,
+                          int64_t ackHandle,
                           int32_t recordCount,
                           std::vector<uint8_t> batchBytes);
 
     // ---- App-thread API (opt-in ack — may allocate) --------------------------
 
-    /// Allocate a correlationId + register a callback.  Returns the correlationId
-    /// to stamp on the SEND_RECORD.
+    /// Allocate a callback PendingAck.  Returns the owning ack handle to stamp on
+    /// the SEND_RECORD (ownership passes on a successful submit; otherwise the
+    /// caller must failUnsubmitted() it).
     int64_t registerCallback(std::function<void(int64_t)> cb);
 
-    /// Allocate a correlationId + register a promise.  Returns (correlationId, future).
+    /// Allocate a future PendingAck.  Returns (owning ack handle, future).
     std::pair<int64_t, std::future<int64_t>> registerFuture();
+
+    /// App thread: fail an ack handle that never reached the ring (ring full).
+    void failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept;
+
+    /// Per-batch acknowledgements (setup-phase; see Producer::onBatchAck).
+    void onBatchAck(std::function<void(const BatchAck&)> cb) { batchAckCb_ = std::move(cb); }
+    /// Invoker mode: buffer BatchAcks for drainBatchAcks() instead of (or as well
+    /// as) calling the callback.
+    void collectBatchAcks(bool on) noexcept {
+        collectBatchAcks_ = on;
+        if (on && completedAcks_.capacity() < 4096) completedAcks_.reserve(4096);
+    }
+    template <class H>
+    int drainBatchAcks(H&& h) {
+        const int n = static_cast<int>(completedAcks_.size());
+        for (const BatchAck& a : completedAcks_) h(a);
+        completedAcks_.clear();  // keeps capacity
+        return n;
+    }
 
     // ---- Agent-thread API (single-writer) ------------------------------------
 
@@ -302,15 +315,18 @@ public:
     template <class Sink>
     int retransmitStalled(int64_t nowNs, const Sink& sink);
 
-    /// Called by the agent when a ProduceResponse arrives.  Resolves the pending
-    /// ack (callback/future) by correlationId.
+    /// Called by the agent when a ProduceResponse arrives.  Completes the batch's
+    /// ack-ring slice (record i -> baseOffset + i) and reports its BatchAck.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset);
 
-    /// Called on agent close/stop: fail all pending acks.
+    /// Called on close / redirect-reconnect failure (duty-cycle thread, or after
+    /// it stopped): fails AND drops every accepted record — still in the app ring,
+    /// in a builder, queued Tier-2, or in flight.
     void failAllPending(const std::string& reason);
 
-    /// Fail a single pending ack by correlationId (CB-5 A3: ring-full fast-fail).
-    void failPending(int64_t corrId, const std::string& reason);
+    /// Duty-cycle thread: fail every record of an in-flight batch (wire id).
+    /// Non-batch ids are ignored (they can come from any ErrorResponse).
+    void failBatch(int64_t batchCorrId, const std::string& reason);
 
     /// CB-5 B: attempt to resend the wire frame for a redirected Produce.
     /// Returns true if resent, false if corrId unknown / max redirects exceeded.
@@ -399,7 +415,8 @@ public:
     void updateIngressRoute(int32_t topicId, int32_t partition,
                             int32_t ingressStreamId) noexcept;
 
-    /// Called from Client::sweepTimeouts(): fail acks older than the deadline.
+    /// Called from Client::sweepTimeouts(): fail in-flight batches past the
+    /// delivery timeout, and fail + drop never-sent records past it.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
     // ---- Accessors -----------------------------------------------------------
@@ -463,9 +480,20 @@ private:
     }
     /// ackTail = start of the oldest un-acked slice (in-flight or current builder).
     void reclaimAckRing_(PartitionState& ps) noexcept;
-    /// Resolves the per-record acks of a batch slice (record i -> baseOffset + i;
-    /// baseOffset < 0 = error sentinel -errorCode).
-    void resolveSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset);
+    /// Consumes every message left in the app->agent ring, handing each ack
+    /// handle it carries (SEND_RECORD wantAck / Tier-2 entry) to onHandle.
+    template <class OnHandle>
+    void drainAppRingHandles_(OnHandle&& onHandle);
+    void pushAck_(PartitionState& ps, uint64_t handle);
+    /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
+    /// baseOffset + i, or error.  Zeroes each slot so nothing completes twice.
+    void completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount,
+                        int64_t baseOffset, std::string_view error) noexcept;
+    /// acks=None: completes the just-sent builder slice with -1 ("sent, offset
+    /// unknown") and reclaims it — nothing waits for a response.
+    void completeSentUnacked_(PartitionState& ps) noexcept;
+    void emitBatchAck_(const PartitionState& ps, int32_t baseSequence, int32_t recordCount,
+                       int64_t baseOffset, int16_t errorCode);
     /// Fails a live batch's records and releases its slot.
     void failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason);
     /// Always-on invariant check: the id encoded into the sent frame must be the
@@ -531,15 +559,10 @@ private:
     // returns in O(1) until it passes (spec §1a.5; replaces the ordered map front).
     int64_t earliestAttemptDeadlineNs_ = INT64_MAX;
 
-    // ---- Tier-2 batch queue (mutex-guarded — app threads push, agent pops) ----
-    // The ring carries a small kMsgTier2Batch token; the actual batch bytes live
-    // here.  Agent pops in FIFO order when it processes the ring token.
-    std::mutex               tier2Mtx_;
-    std::deque<Tier2Entry>   tier2Queue_;
-
-    // ---- Pending acks (mutex-guarded — control-plane only) -------------------
-    std::mutex               ackMtx_;
-    std::map<int64_t, PendingAck> pendingAcks_;
+    // ---- Per-batch acks (duty-cycle thread only) ------------------------------
+    std::function<void(const BatchAck&)> batchAckCb_;   // set before the first send
+    bool                                 collectBatchAcks_ = false;
+    std::vector<BatchAck>                completedAcks_;
 };
 
 } // namespace rune::client::producer

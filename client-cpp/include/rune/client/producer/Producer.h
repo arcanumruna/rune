@@ -93,6 +93,24 @@ struct want_future_t {};
 inline constexpr want_future_t want_future{};
 
 // ---------------------------------------------------------------------------
+// BatchAck — one acknowledged (or failed) produce batch (spec §4.3).  Records of
+// the batch are baseSequence .. baseSequence+recordCount-1 of this producer's
+// per-partition idempotent sequence and landed at baseOffset .. +recordCount-1.
+//
+// acks=None: no response is awaited; a BatchAck{errorCode=0, baseOffset=-1} is
+// reported when the batch is handed to the transport ("sent, offset unknown").
+// ---------------------------------------------------------------------------
+struct BatchAck {
+    static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
+    int32_t topicId      = 0;
+    int32_t partition    = 0;
+    int64_t baseOffset   = -1;  ///< -1 unless errorCode == 0
+    int32_t baseSequence = 0;
+    int32_t recordCount  = 0;
+    int16_t errorCode    = 0;   ///< 0 OK; >0 broker ErrorCode; kClientFailure
+};
+
+// ---------------------------------------------------------------------------
 // Producer
 //
 // Returned by Client::producer(config).  Owns a shared_ptr to ProducerImpl so
@@ -146,7 +164,9 @@ public:
 
     /// Send with callback.  The callback fires on the agent thread with the
     /// broker's baseOffset when the ProduceResponse arrives.
-    /// Allocates a correlationId entry in the promise map (control-plane).
+    /// acks=None: fires with -1 once the record's batch is handed to the transport.
+    /// Allocates one PendingAck whose ownership travels to the duty-cycle thread
+    /// inside the SEND_RECORD (no map, no lock).
     void send(TopicHandle              topic,
               const Key&               key,
               std::span<const uint8_t> value,
@@ -154,11 +174,17 @@ public:
 
     /// Send with future.  Returns a future that resolves with the broker's
     /// baseOffset (or throws on error / timeout).
-    /// Allocates a std::promise entry in the promise map (control-plane).
+    /// acks=None: resolves with -1 once the record's batch is handed to the
+    /// transport.  Allocates one PendingAck (ownership travels through the ring).
     std::future<int64_t> send(TopicHandle              topic,
                                const Key&               key,
                                std::span<const uint8_t> value,
                                want_future_t);
+
+    /// Per-batch acknowledgement callback (one call per batch, not per record).
+    /// Setup-phase: call before the first send(); fires on the duty-cycle thread
+    /// (the runner in thread mode, the app thread inside doWork() in invoker mode).
+    void onBatchAck(std::function<void(const BatchAck&)> cb);
 
     // ---- Tier-2: explicit atomic batch ---------------------------------------
 

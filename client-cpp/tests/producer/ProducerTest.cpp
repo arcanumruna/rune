@@ -1026,42 +1026,22 @@ TEST(Producer, TopicLookup) {
 TEST(Producer, CloseWithPendingFuture) {
     static constexpr int32_t kInStr = 2025, kEgStr = 2026;
     AgentHarness h(kInStr, kEgStr);
-
-    // Disable gateway acks so the ProduceResponse never arrives.
-    // (We want to close while a future is pending.)
-    // We DON'T connect — just set up the producer and call close() immediately.
-
     ProducerConfig pcfg;
-    pcfg.acks            = Acks::Leader;
-    pcfg.lingerUs        = 1;
-    pcfg.batchBytes      = 1;
-    pcfg.maxInFlight     = 4;
-    pcfg.produceTimeoutMs = 30'000; // long timeout — we close before it fires
-
-    // Register a future BEFORE connecting or connecting at all.
-    // The future is registered in pendingAcks_ immediately.
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, h.nextCorrId_);
-    h.hub.add(impl);
-
-    // Register a future directly (without submitting to the ring — this puts
-    // the corrId into pendingAcks_ immediately, simulating an in-flight ack).
-    auto [corrId, fut] = impl->registerFuture();
-
-    // Verify the future is pending (not yet resolved).
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::timeout)
-        << "Future must be pending before failAll";
-
-    // Now call failAll (as Client::close() would do).
+    pcfg.acks             = Acks::Leader;
+    pcfg.lingerUs         = 1;
+    pcfg.batchBytes       = 1;
+    pcfg.maxInFlight      = 4;
+    pcfg.produceTimeoutMs = 30'000;
+    auto p     = h.makeProducer(pcfg);
+    auto topic = makeTopic(15, 1);
+    const std::vector<uint8_t> val = {0x01};
+    // Submitted but never drained (no doWork): the record sits in the producer ring.
+    auto fut = p.send(topic, Key(uint64_t{0}), std::span<const uint8_t>(val), want_future);
+    ASSERT_EQ(fut.wait_for(0s), std::future_status::timeout);
     h.hub.failAll("Client closed");
-
-    // Future must now be immediately resolvable with an exception (not hang).
     ASSERT_EQ(fut.wait_for(0s), std::future_status::ready)
-        << "Future must be resolved by failAll (close)";
-
-    // Confirm it throws with the expected message.
-    EXPECT_THROW({
-        fut.get();
-    }, std::runtime_error) << "Future must throw std::runtime_error on close";
+        << "close must fail futures whose records are still in the ring";
+    EXPECT_THROW({ fut.get(); }, std::runtime_error);
 }
 
 // ===========================================================================

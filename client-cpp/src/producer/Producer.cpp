@@ -71,13 +71,13 @@ void Producer::send(TopicHandle              topic,
 {
     if (!impl_ || !topic.valid()) return;
     const int32_t part   = key.partition(topic.partitionCount);
-    const int64_t corrId = impl_->registerCallback(std::move(callback));
+    const int64_t ackHandle = impl_->registerCallback(std::move(callback));
     // Back-pressure: if the send ring is full the record never reaches the agent,
     // so the ack would never arrive — fail the pending callback immediately
     // (callback fires with offset=-1) rather than stranding it forever.
     if (!impl_->submitSendRecord(topic.topicId, part, key, value,
-                                 /*wantAck=*/true, corrId)) {
-        impl_->failPending(corrId, "producer send ring full — back-pressure (retry)");
+                                 /*wantAck=*/true, ackHandle)) {
+        impl_->failUnsubmitted(ackHandle, "producer send ring full — back-pressure (retry)");
     }
 }
 
@@ -93,15 +93,19 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
         return p.get_future();
     }
     const int32_t part = key.partition(topic.partitionCount);
-    auto [corrId, fut] = impl_->registerFuture();
+    auto [ackHandle, fut] = impl_->registerFuture();
     // Back-pressure: if the send ring is full the record never reaches the agent,
     // so the ack would never arrive and future.get() would hang forever. Reject
     // the future immediately with a retriable error instead of stranding it.
     if (!impl_->submitSendRecord(topic.topicId, part, key, value,
-                                 /*wantAck=*/true, corrId)) {
-        impl_->failPending(corrId, "producer send ring full — back-pressure (retry)");
+                                 /*wantAck=*/true, ackHandle)) {
+        impl_->failUnsubmitted(ackHandle, "producer send ring full — back-pressure (retry)");
     }
     return std::move(fut);
+}
+
+void Producer::onBatchAck(std::function<void(const BatchAck&)> cb) {
+    if (impl_) impl_->onBatchAck(std::move(cb));
 }
 
 // ---------------------------------------------------------------------------

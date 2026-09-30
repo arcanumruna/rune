@@ -16,7 +16,9 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
 
+#include <bit>
 #include <cassert>
+#include <climits>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -143,6 +145,15 @@ inline int32_t recordBodyContrib(int32_t keyLen, int32_t valueLen,
     return varintLen(bodySize) + bodySize;
 }
 
+// Copies a sent frame into an in-flight slot's reusable buffer.  Capacity grows
+// to the next power of two, so frames that differ by a few bytes (timestamp-delta
+// varint width, value length) reuse it instead of reallocating in steady state
+// (vector::assign would size it to the exact first frame).
+inline void keepFrame(std::vector<uint8_t>& dst, const uint8_t* src, std::size_t n) {
+    if (dst.capacity() < n) dst.reserve(std::bit_ceil(n));
+    dst.assign(src, src + n);
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -257,75 +268,61 @@ void ProducerImpl::submitFlush() noexcept {
 
 bool ProducerImpl::submitTier2Batch(int32_t topicId,
                                      int32_t partition,
-                                     int64_t corrId,
+                                     int64_t ackHandle,
                                      int32_t recordCount,
                                      std::vector<uint8_t> batchBytes)
 {
-    // Push the batch bytes to the side queue BEFORE writing the ring token.
-    // The agent pops from this queue when it processes the token.  The mutex
-    // ensures correct ordering between app thread(s) and the agent thread.
-    {
-        std::lock_guard<std::mutex> lock(tier2Mtx_);
-        Tier2Entry entry;
-        entry.topicId     = topicId;
-        entry.partition   = partition;
-        entry.corrId      = corrId;
-        entry.recordCount = recordCount;
-        entry.batchBytes  = std::move(batchBytes);
-        tier2Queue_.push_back(std::move(entry));
-    }
-
-    // Build the ring token (21 bytes).
+    auto entry = std::make_unique<Tier2Entry>();
+    entry->topicId     = topicId;
+    entry->partition   = partition;
+    entry->ackHandle   = static_cast<uint64_t>(ackHandle);
+    entry->recordCount = recordCount;
+    entry->batchBytes  = std::move(batchBytes);
     uint8_t tok[kT2TokenSize];
-    writeLE32(tok, kT2TopicIdOff,   topicId);
-    writeLE32(tok, kT2PartOff,      partition);
-    tok[kT2FlagsOff] = kFlagWantAck; // Tier-2 always expects an ack
-    writeLE64(tok, kT2CorrIdOff,    corrId);
-    writeLE32(tok, kT2RecCountOff,  recordCount);
-
-    const bool ok = writeToRing(kMsgTier2Batch, tok, kT2TokenSize);
-
-    if (!ok) {
-        // Ring full: remove the entry we just pushed to keep the queue/ring in sync.
-        std::lock_guard<std::mutex> lock(tier2Mtx_);
-        if (!tier2Queue_.empty()) {
-            tier2Queue_.pop_back();
-        }
-    }
-
-    return ok;
+    writeLE64(tok, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.get())));
+    if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) return false;  // caller fails the handle
+    entry.release();  // ownership now travels through the ring
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// App-thread: opt-in ack registration (may allocate)
+// App-thread: opt-in ack registration (allocates one PendingAck; its address is
+// the ack handle whose ownership travels through the ring — no map, no lock)
 // ---------------------------------------------------------------------------
 
+void PendingAck::complete(uint64_t handle, int64_t offset, std::string_view error) noexcept {
+    std::unique_ptr<PendingAck> pa(reinterpret_cast<PendingAck*>(static_cast<uintptr_t>(handle)));
+    if (!pa) return;
+    try {
+        if (pa->kind == Kind::Callback) {
+            if (pa->callback) pa->callback(error.empty() ? offset : -1);
+        } else if (error.empty()) {
+            pa->promise.set_value(offset);
+        } else {
+            pa->promise.set_exception(
+                std::make_exception_ptr(std::runtime_error(std::string(error))));
+        }
+    } catch (...) {
+        // A throwing user callback must not escape the duty cycle.
+    }
+}
+
 int64_t ProducerImpl::registerCallback(std::function<void(int64_t)> cb) {
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(ackMtx_);
-    PendingAck pa;
-    pa.kind     = PendingAck::Kind::Callback;
-    pa.callback = std::move(cb);
-    pa.deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(cfg_.deliveryTimeoutMs);  // survive retransmits;
-                  // batch-level retransmitStalled resends every produceTimeoutMs until
-                  // this delivery deadline, so a record only fails if delivery truly fails.
-    pendingAcks_.emplace(corrId, std::move(pa));
-    return corrId;
+    auto* pa = new PendingAck{};
+    pa->kind = PendingAck::Kind::Callback;
+    pa->callback = std::move(cb);
+    return static_cast<int64_t>(reinterpret_cast<uintptr_t>(pa));
 }
 
 std::pair<int64_t, std::future<int64_t>> ProducerImpl::registerFuture() {
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(ackMtx_);
-    PendingAck pa;
-    pa.kind    = PendingAck::Kind::Future;
-    pa.deadline = std::chrono::steady_clock::now() +
-                  std::chrono::milliseconds(cfg_.deliveryTimeoutMs);  // survive retransmits;
-                  // batch-level retransmitStalled resends every produceTimeoutMs until
-                  // this delivery deadline, so a record only fails if delivery truly fails.
-    auto fut = pa.promise.get_future();
-    pendingAcks_.emplace(corrId, std::move(pa));
-    return {corrId, std::move(fut)};
+    auto* pa = new PendingAck{};
+    pa->kind = PendingAck::Kind::Future;
+    auto fut = pa->promise.get_future();
+    return {static_cast<int64_t>(reinterpret_cast<uintptr_t>(pa)), std::move(fut)};
+}
+
+void ProducerImpl::failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept {
+    PendingAck::complete(static_cast<uint64_t>(ackHandle), -1, reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +397,7 @@ void ProducerImpl::growAckRing(PartitionState& ps) {
     const uint32_t newCap = oldCap << 1; // stays a power of two
     const uint32_t oldMask = ps.ackMask;
     const uint32_t newMask = newCap - 1;
-    std::vector<int64_t> next(newCap, 0);
+    std::vector<uint64_t> next(newCap, 0);
     // Re-place the live window [ackTail, ackHead) at its new masked slots.  head/
     // tail/batchAckStart are absolute monotonic indices, so they remain valid.
     for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
@@ -433,6 +430,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             aeron::util::index_t                 offset,
             aeron::util::index_t                 len) -> ControlledAction
         {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
             if (msgTypeId == kMsgFlush) {
                 for (auto& up : partitions_) up->flushRequested = true;
                 globalFlushPending_.store(false, std::memory_order_relaxed);
@@ -440,23 +438,20 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             }
 
             if (msgTypeId == kMsgTier2Batch) {
-                Tier2Entry entry;
-                {
-                    std::lock_guard<std::mutex> lock(tier2Mtx_);
-                    if (tier2Queue_.empty()) return ControlledAction::CONTINUE; // ring/queue race
-                    entry = std::move(tier2Queue_.front());
-                    tier2Queue_.pop_front();
-                }
-                PartitionState& ps = getOrCreatePartition(entry.topicId, entry.partition);
+                if (len < kT2TokenSize) return ControlledAction::CONTINUE;
+                // Take ownership of the heap entry whose address travelled the ring.
+                std::unique_ptr<Tier2Entry> entry(
+                    reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
+                PartitionState& ps = getOrCreatePartition(entry->topicId, entry->partition);
                 if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
-                recordsSent_ += static_cast<uint64_t>(entry.recordCount);
-                ps.pendingTier2Entries.push_back(std::move(entry));
+                recordsSent_ += static_cast<uint64_t>(entry->recordCount);
+                entry->enqueuedNs = nowNs;
+                ps.pendingTier2Entries.push_back(std::move(*entry));
                 return ControlledAction::CONTINUE;
             }
 
             if (msgTypeId != kMsgSendRecord) return ControlledAction::CONTINUE;
 
-            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
             const std::size_t sz = static_cast<std::size_t>(len);
             if (sz < static_cast<std::size_t>(kRecHeaderSize)) return ControlledAction::CONTINUE;
 
@@ -464,12 +459,12 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             const int32_t partition = readLE32(p, kRecPartOff);
             const uint8_t keyLen    = p[kRecKeyLenOff];
             const uint8_t flags     = p[kRecFlagsOff];
-            const int64_t corrId    = readLE64(p, kRecCorrIdOff);
+            const uint64_t ackHandle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
             const uint32_t valueLen = readLE32u(p, kRecValLenOff);
             // Agent-thread: record dequeued from the ring (gap ClientAppSend→here =
-            // app→agent ring handoff).  corr=correlationId; value=record bytes.
+            // app→agent ring handoff).  corr=ack handle (low bits); value=record bytes.
             RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAgentDrain,
-                                     static_cast<uint32_t>(corrId),
+                                     static_cast<uint32_t>(ackHandle),
                                      static_cast<double>(valueLen));
 
             if (sz < static_cast<std::size_t>(kRecHeaderSize) + valueLen)
@@ -554,16 +549,15 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                 // tsDelta by up to a varlong byte and compounding the frame-cap overshoot.
             }
 
-            // Batch acks (Kafka-style, ZERO-ALLOC): record this ack-wanting record's
-            // corrId in the per-partition ack-ring so onProduceResponse can fan out
-            // baseOffset+i to every callback/future.  corrIds need NOT be contiguous
-            // (a producer spread over N partitions strides them).
-            if ((flags & kFlagWantAck) && corrId != 0) {
-                if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
+            // Per-record acks at the record's OWN index (spec §4.3): the slice of a
+            // batch is aligned with its records, void records hold 0.  Zeros are
+            // back-filled lazily so batches without callbacks cost nothing.  The
+            // handle's ownership passed to this thread with the ring commit.
+            if ((flags & kFlagWantAck) && ackHandle != 0) {
+                const int32_t index = ps.builder->recordCount();  // this record's offsetDelta
                 if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
-                ps.ackRing[ps.ackHead & ps.ackMask] = corrId;
-                ++ps.ackHead;
-                ++ps.batchAckCount;
+                while (ps.batchAckCount < index) pushAck_(ps, 0);
+                pushAck_(ps, ackHandle);
             }
 
             // I2: a single record whose own wire contribution exceeds the frame cap
@@ -668,7 +662,7 @@ bool ProducerImpl::encodeAndSend(
         // This is the fix for the intermittent 5s tail: the old code reset the
         // builder + advanced nextBaseSequence UNCONDITIONALLY, so a single
         // back-pressured offer silently dropped the batch's records while their
-        // callbacks waited in pendingAcks_ → produceTimeout (5s), and also opened
+        // callbacks waited for an ack → produceTimeout (5s), and also opened
         // an idempotent-sequence gap.
         return false;
     }
@@ -694,11 +688,17 @@ bool ProducerImpl::encodeAndSend(
         b.recordCount       = batchRecords;
         b.baseSequence      = batchSeq;
         b.ingressStreamId   = ps.ingressStreamId;
-        b.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);  // reuses capacity
+        keepFrame(b.wireFrame, encodeScratch_.data(), written);
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
             earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
         }
         verifyClaimedCorrId_(ps, b, correlationId);  // always on (not an assert)
+    } else {
+        // acks=None: no response is awaited (the wire id is 0 — see onProduceResponse),
+        // so the batch's acks complete now, "sent, offset unknown" (-1), and its
+        // ack-ring slice is reclaimed immediately — nothing is retained.
+        emitBatchAck_(ps, batchSeq, batchRecords, -1, 0);
+        completeSentUnacked_(ps);
     }
 
     // Reset builder IN PLACE for the next batch (success path only; keep the
@@ -776,9 +776,11 @@ bool ProducerImpl::encodeAndSendTier2(
     namespace rpc = rune::protocol::client;
     rpc::Produce msg;
     msg.sessionId      = sessionId;
-    // Wire id = the in-flight slot this batch will claim; the Tier-2 future's own
-    // id goes into the ack slice (record 0) below.
-    const int64_t wireCorrId = (entry.corrId != 0)
+    // Wire id = the in-flight slot this batch will claim (the Tier-2 future's
+    // handle goes into the ack slice, record 0, below).  acks=None: id 0 and no
+    // slot, exactly like Tier-1 — no response is awaited.
+    const bool    awaitAck   = (cfg_.acks != Acks::None);
+    const int64_t wireCorrId = awaitAck
                              ? batchcorr::make(ordinal_, ps.slotIndex, ps.inflight.nextSeq())
                              : 0;
     msg.correlationId  = wireCorrId;
@@ -813,11 +815,17 @@ bool ProducerImpl::encodeAndSendTier2(
     ++framesSent_; // one Aeron frame offered to transport (Tier-2)
     const int32_t batchSeq = ps.nextBaseSequence;
     ps.nextBaseSequence += entry.recordCount;  // advance ONLY on success
-    if (entry.corrId != 0) {
+    if (!awaitAck) {
+        emitBatchAck_(ps, batchSeq, entry.recordCount, -1, 0);
+        const uint64_t h = entry.ackHandle;
+        entry.ackHandle = 0;
+        PendingAck::complete(h, -1, {});  // "sent, offset unknown"
+    } else {
         if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
         const uint64_t slice = ps.ackHead;
-        ps.ackRing[ps.ackHead & ps.ackMask] = entry.corrId;  // record 0 -> the batch future
+        ps.ackRing[ps.ackHead & ps.ackMask] = entry.ackHandle;  // record 0 -> the batch future
         ++ps.ackHead;
+        entry.ackHandle = 0;  // ownership moved to the ack ring
         InFlightBatch& ib = ps.inflight.claim(ordinal_, ps.slotIndex);
         // Tier-2 gets the same retransmit/delivery clock as Tier-1 (fixed on sight:
         // the old BatchInfo left firstSendNs = 0, so the first retransmit scan gave
@@ -834,7 +842,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.recordCount       = entry.recordCount;
         ib.baseSequence      = batchSeq;
         ib.ingressStreamId   = ps.ingressStreamId;
-        ib.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+        keepFrame(ib.wireFrame, encodeScratch_.data(), written);
         verifyClaimedCorrId_(ps, ib, wireCorrId);  // always on (not an assert)
     }
 
@@ -955,7 +963,15 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
     PartitionState& ps = *partitions_[s];
     InFlightBatch* b = ps.inflight.find(correlationId);
     if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
-    resolveSlice_(ps, b->ackStart, b->ackCount, baseOffset);
+    // DR-BUG-5: a negative baseOffset is the -errorCode sentinel for the whole batch.
+    const int16_t ec = baseOffset < 0 ? static_cast<int16_t>(-baseOffset) : int16_t{0};
+    emitBatchAck_(ps, b->baseSequence, b->recordCount, baseOffset, ec);
+    if (ec == 0) {
+        completeSlice_(ps, b->ackStart, b->ackCount, baseOffset, {});
+    } else {
+        const std::string err = "produce rejected by broker (errorCode=" + std::to_string(ec) + ")";
+        completeSlice_(ps, b->ackStart, b->ackCount, -1, err);
+    }
     ps.inflight.release(*b);
     reclaimAckRing_(ps);
 }
@@ -981,70 +997,103 @@ void ProducerImpl::reclaimAckRing_(PartitionState& ps) noexcept {
     }
 }
 
-void ProducerImpl::resolveSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount,
-                                 int64_t baseOffset) {
-    if (ackCount <= 0) return;
-    // DR-BUG-5: a negative baseOffset is the -errorCode sentinel for the whole batch.
-    const bool err = (baseOffset < 0);
-    std::lock_guard<std::mutex> lock(ackMtx_);
+void ProducerImpl::pushAck_(PartitionState& ps, uint64_t handle) {
+    if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
+    ps.ackRing[ps.ackHead & ps.ackMask] = handle;
+    ++ps.ackHead;
+    ++ps.batchAckCount;
+}
+
+void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount,
+                                  int64_t baseOffset, std::string_view error) noexcept {
     for (int32_t i = 0; i < ackCount; ++i) {
-        const int64_t corrId = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
-        auto ait = pendingAcks_.find(corrId);
-        if (ait == pendingAcks_.end()) continue;
-        PendingAck& pa = ait->second;
-        const int64_t off = baseOffset + i;
-        RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete,
-                                 static_cast<uint32_t>(corrId), static_cast<double>(off));
-        if (pa.kind == PendingAck::Kind::Callback) {
-            if (pa.callback) pa.callback(err ? -1 : off);
-        } else if (err) {
-            try {
-                pa.promise.set_exception(std::make_exception_ptr(std::runtime_error(
-                    "produce rejected by broker (errorCode=" + std::to_string(-baseOffset) + ")")));
-            } catch (...) {}
-        } else {
-            try { pa.promise.set_value(off); } catch (...) {}
-        }
-        pendingAcks_.erase(ait);
+        uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
+        const uint64_t h = slot;
+        slot = 0;
+        if (h == 0) continue;
+        RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete, static_cast<uint32_t>(h),
+                                 static_cast<double>(baseOffset + i));
+        PendingAck::complete(h, baseOffset + i, error);
     }
 }
 
-void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason) {
-    {
-        std::lock_guard<std::mutex> lock(ackMtx_);
-        for (int32_t i = 0; i < b.ackCount; ++i) {
-            const int64_t corrId = ps.ackRing[(b.ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
-            auto it = pendingAcks_.find(corrId);
-            if (it == pendingAcks_.end()) continue;
-            if (it->second.kind == PendingAck::Kind::Future) {
-                try { it->second.promise.set_exception(std::make_exception_ptr(std::runtime_error(reason))); } catch (...) {}
-            } else if (it->second.callback) {
-                it->second.callback(-1);
-            }
-            pendingAcks_.erase(it);
-        }
+void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
+    if (ps.batchAckCount <= 0) return;
+    for (int32_t i = 0; i < ps.batchAckCount; ++i) {
+        uint64_t& slot = ps.ackRing[(ps.batchAckStart + static_cast<uint64_t>(i)) & ps.ackMask];
+        const uint64_t h = slot;
+        slot = 0;
+        if (h != 0) PendingAck::complete(h, -1, {});
     }
+    // The builder slice is always the newest one and acks=None never has an
+    // in-flight slice, so the slice is reclaimed by rewinding the head.
+    ps.ackHead       = ps.batchAckStart;
+    ps.batchAckCount = 0;
+    reclaimAckRing_(ps);
+}
+
+void ProducerImpl::emitBatchAck_(const PartitionState& ps, int32_t baseSequence,
+                                 int32_t recordCount, int64_t baseOffset, int16_t errorCode) {
+    if (!batchAckCb_ && !collectBatchAcks_) return;
+    const BatchAck a{ps.topicId, ps.partition, errorCode == 0 ? baseOffset : -1,
+                     baseSequence, recordCount, errorCode};
+    if (batchAckCb_) {
+        try { batchAckCb_(a); } catch (...) {}  // a throwing user callback must not escape
+    }
+    if (collectBatchAcks_) completedAcks_.push_back(a);
+}
+
+void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason) {
+    emitBatchAck_(ps, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure);
+    completeSlice_(ps, b.ackStart, b.ackCount, -1, reason);
     ps.inflight.release(b);
     reclaimAckRing_(ps);
 }
 
+void ProducerImpl::failBatch(int64_t corrId, const std::string& reason) {
+    if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return;
+    const uint32_t s = batchcorr::slot(corrId);
+    if (s >= partitions_.size()) return;
+    if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) failBatch_(*partitions_[s], *b, reason);
+}
+
 void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
-    std::lock_guard<std::mutex> lock(ackMtx_);
-    for (auto it = pendingAcks_.begin(); it != pendingAcks_.end(); ) {
-        if (now >= it->second.deadline) {
-            PendingAck& pa = it->second;
-            if (pa.kind == PendingAck::Kind::Future) {
-                try {
-                    pa.promise.set_exception(
-                        std::make_exception_ptr(
-                            std::runtime_error("produce ack timed out (no ProduceResponse)")));
-                } catch (...) {}
-            } else if (pa.kind == PendingAck::Kind::Callback && pa.callback) {
-                pa.callback(-1); // -1 signals error to callback
+    const int64_t nowNs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            if (nowNs - b.firstSendNs >= deliveryNs) {
+                failBatch_(ps, b, "produce delivery timed out (no ProduceResponse)");
             }
-            it = pendingAcks_.erase(it);
-        } else {
-            ++it;
+        });
+        // Records never sent (no session / no route) past the delivery deadline are
+        // failed AND dropped — an ack is never reported failed for a record that
+        // could still be written later.
+        if (ps.builder && ps.builder->recordCount() > 0 && ps.batchStartNs != 0 &&
+            nowNs - ps.batchStartNs >= deliveryNs) {
+            if (ps.batchAckCount > 0) {
+                completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1,
+                               "produce delivery timed out (never sent)");
+                ps.ackHead = ps.batchAckStart;  // reclaim the unsent (newest) slice
+            }
+            ps.batchAckCount = 0;
+            const int64_t resetWall = wallNs();
+            ps.builder->reset(0, resetWall);
+            ps.builderBaseWallNs = resetWall;
+            ps.builderBytes      = 0;
+            ps.batchStartNs      = 0;
+            ps.flushRequested    = false;
+            reclaimAckRing_(ps);
+        }
+        // Tier-2 batches never sent past the deadline: same rule (FIFO, so the
+        // expired ones are at the front).
+        while (!ps.pendingTier2Entries.empty() &&
+               nowNs - ps.pendingTier2Entries.front().enqueuedNs >= deliveryNs) {
+            PendingAck::complete(ps.pendingTier2Entries.front().ackHandle, -1,
+                                 "produce delivery timed out (never sent)");
+            ps.pendingTier2Entries.pop_front();
         }
     }
 }
@@ -1152,41 +1201,78 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     return resent;
 }
 
-void ProducerImpl::failPending(int64_t corrId, const std::string& reason) {
-    if (batchcorr::isBatch(corrId)) {  // a wire (batch) id: fail every record of that batch
-        if (batchcorr::ordinal(corrId) != ordinal_) return;
-        const uint32_t s = batchcorr::slot(corrId);
-        if (s >= partitions_.size()) return;
-        if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) failBatch_(*partitions_[s], *b, reason);
-        return;
+template <class OnHandle>
+void ProducerImpl::drainAppRingHandles_(OnHandle&& onHandle) {
+    // Records still in the app->agent ring (single consumer: we are it).  A
+    // padding record at the wrap reads as 0 messages, so stop after two empty
+    // passes; hard-capped so concurrent writers cannot keep us here.
+    auto h = [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                 aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+        if (type == kMsgSendRecord && len >= kRecHeaderSize && (p[kRecFlagsOff] & kFlagWantAck)) {
+            onHandle(static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)));
+        } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
+            std::unique_ptr<Tier2Entry> e(
+                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
+            if (e) onHandle(e->ackHandle);
+        }
+    };
+    int empty = 0;
+    for (int pass = 0; pass < 64 && empty < 2; ++pass) {
+        empty = (ring_.read(h, INT_MAX) == 0) ? empty + 1 : 0;
     }
-    std::lock_guard<std::mutex> lock(ackMtx_);  // an app-registered per-record id
-    auto it = pendingAcks_.find(corrId);
-    if (it == pendingAcks_.end()) return;
-    PendingAck& pa = it->second;
-    if (pa.kind == PendingAck::Kind::Future) {
-        try { pa.promise.set_exception(std::make_exception_ptr(std::runtime_error(reason))); } catch (...) {}
-    } else if (pa.callback) {
-        pa.callback(-1);
-    }
-    pendingAcks_.erase(it);
 }
 
 void ProducerImpl::failAllPending(const std::string& reason) {
-    std::lock_guard<std::mutex> lock(ackMtx_);
-    for (auto& [corrId, pa] : pendingAcks_) {
-        if (pa.kind == PendingAck::Kind::Future) {
-            try {
-                pa.promise.set_exception(
-                    std::make_exception_ptr(std::runtime_error(reason)));
-            } catch (...) {}
+    drainAppRingHandles_([&](uint64_t handle) { PendingAck::complete(handle, -1, reason); });
+    // Everything the producer accepted: in-flight slices + the current builder slice.
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            emitBatchAck_(ps, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure);
+            ps.inflight.release(b);
+        });
+        for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
+            uint64_t& h = ps.ackRing[i & ps.ackMask];
+            if (h != 0) {
+                PendingAck::complete(h, -1, reason);
+                h = 0;
+            }
         }
-        // Callbacks: fire with offset=-1 to signal error (best-effort).
-        if (pa.kind == PendingAck::Kind::Callback && pa.callback) {
-            pa.callback(-1);
+        ps.ackTail = ps.ackHead;
+        ps.batchAckCount = 0;
+        for (Tier2Entry& e : ps.pendingTier2Entries) PendingAck::complete(e.ackHandle, -1, reason);
+        ps.pendingTier2Entries.clear();
+        if (ps.builder) {
+            const int64_t resetWall = wallNs();
+            ps.builder->reset(0, resetWall);
+            ps.builderBaseWallNs = resetWall;
         }
+        ps.builderBytes   = 0;
+        ps.batchStartNs   = 0;
+        ps.flushRequested = false;
     }
-    pendingAcks_.clear();
+}
+
+ProducerImpl::~ProducerImpl() {
+    // Last owner gone (no other thread can reach this producer): free every
+    // handle still owned here WITHOUT invoking user callbacks (their captures may
+    // already be dead) — a future's promise is destroyed, so its get() throws
+    // broken_promise, exactly as when the old ack map was destroyed.
+    auto discard = [](uint64_t h) {
+        delete reinterpret_cast<PendingAck*>(static_cast<uintptr_t>(h));
+    };
+    try {
+        drainAppRingHandles_(discard);
+    } catch (...) {}
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
+            uint64_t& h = ps.ackRing[i & ps.ackMask];
+            if (h != 0) { discard(h); h = 0; }
+        }
+        for (Tier2Entry& e : ps.pendingTier2Entries) discard(e.ackHandle);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -97,7 +97,8 @@ public:
     /// Fail all pending acks on close.
     void failAll(const std::string& reason);
 
-    /// Fail a single pending ack identified by correlationId.
+    /// Fail every record of the in-flight batch with this wire correlationId
+    /// (forwards to ProducerImpl::failBatch; non-batch ids are ignored).
     /// Used by the Redirect retarget-failure path to fail ONLY the produce that
     /// triggered the redirect, leaving all other pending produces intact so the
     /// client session can continue serving other partitions.
