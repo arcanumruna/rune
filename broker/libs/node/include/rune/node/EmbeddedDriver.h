@@ -10,6 +10,7 @@
 extern "C" {
 #include <aeronmd/aeronmd.h>
 }
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/node/NodeConfig.h>
 
 #include <atomic>
@@ -55,6 +56,11 @@ public:
     /// untouched) because draining would make it a second pumper.
     void close() noexcept;
 
+    /// A pump that drives THIS driver (via doWork's single-thread check) + `client`'s conductor.
+    [[nodiscard]] rune::aeronutil::AeronPump pumpWith(aeron::Aeron* client) noexcept {
+        return rune::aeronutil::AeronPump(&EmbeddedDriver::pumpTrampoline_, this, client);
+    }
+
     [[nodiscard]] DriverMode         mode() const noexcept { return mode_; }
     [[nodiscard]] const std::string& dir() const noexcept { return cfg_.dir; }
     [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { return foreignPumpAttempts_.load(std::memory_order_relaxed); }
@@ -62,6 +68,7 @@ public:
     [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { return callerPumpsWhileThreadRunning_.load(std::memory_order_relaxed); }
 
 private:
+    static int pumpTrampoline_(void* self) noexcept { return static_cast<EmbeddedDriver*>(self)->doWork(); }
     int callerPump_() noexcept;   // any pump NOT made by the driver thread
 
     EmbeddedDriverConfig    cfg_;

@@ -79,6 +79,7 @@
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
 
+#include <rune/aeronutil/AeronPump.h>          // spec §3.6 invoker-aware resolve
 #include <rune/replication/FollowerSlots.h>      // kMaxReplicas (flat peer array bound)
 #include <rune/replication/PartitionReplica.h>   // PartitionTransport base
 #include <rune/replication/ReplicationMessages.h> // SBE codecs + stampTemplateId
@@ -110,14 +111,14 @@ namespace rune::replication {
 // Owns a FLAT array of (NodeId, shared_ptr<ExclusivePublication>) — at most
 // FollowerSlots::kMaxReplicas peers; a linear scan beats unordered_map::find on
 // every send (spec §3.5a.2 fix on sight).
-// Resolves publications via bounded addExclusivePublication / findExclusive-
-// Publication loops (kResolveMaxMs=5000 / kResolveSliceMs=1), same as
+// Resolves publications via bounded addExclusivePublication + findExclusive-
+// Publication resolve via AeronPump (kResolveMaxMs=5000; 1 ms sleep with the
+// default pump, invoker pumping otherwise), same as
 // WorkerEgress.  Single-owner / single-thread.
 // ===========================================================================
 class AeronPubRegistry {
 public:
     static constexpr int kResolveMaxMs   = 5000;
-    static constexpr int kResolveSliceMs = 1;
 
     // -----------------------------------------------------------------------
     // Construction: for each (peerId, peerChannel) pair, register an
@@ -125,11 +126,10 @@ public:
     // -----------------------------------------------------------------------
     AeronPubRegistry(std::shared_ptr<aeron::Aeron>                                       aeron,
                      const std::vector<std::pair<rune::replication::NodeId, std::string>>& peerChannels,
-                     int32_t peerStreamId) noexcept
+                     int32_t peerStreamId,
+                     rune::aeronutil::AeronPump pump = {}) noexcept
     {
         if (!aeron) return;  // no driver → all unresolved
-
-        using clock = std::chrono::steady_clock;
 
         struct Pending {
             rune::replication::NodeId peerId;
@@ -147,9 +147,10 @@ public:
             }
         }
 
-        // Bounded resolve loop: mirror WorkerEgress exactly.
-        auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-        while (!pending.empty() && clock::now() < deadline) {
+        // Bounded resolve (spec §3.6): default pump sleeps 1 ms between probes
+        // (legacy WorkerEgress behaviour); an invoker pump drives this shard's
+        // own driver + conductor instead.
+        (void)pump.resolve([&] {
             for (auto it = pending.begin(); it != pending.end(); ) {
                 auto pub = aeron->findExclusivePublication(it->regId);
                 if (pub) {
@@ -159,10 +160,8 @@ public:
                     ++it;
                 }
             }
-            if (!pending.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-            }
-        }
+            return pending.empty();
+        }, std::chrono::milliseconds{kResolveMaxMs});
         // Any still-pending entries were not resolved within the window;
         // they remain absent from pubs_ → sends to them are no-ops.
         allResolved_ = pending.empty() && pubCount_ > 0 && peerChannels.size() <= kMaxPeers;
@@ -350,7 +349,8 @@ public:
             std::string                                                              inboundChannel,
             int32_t                                                                  inboundStreamId,
             std::vector<std::pair<rune::replication::NodeId, std::string>>           peerChannels,
-            int32_t                                                                  peerStreamId) noexcept
+            int32_t                                                                  peerStreamId,
+            rune::aeronutil::AeronPump                                               pump = {}) noexcept
         : workerId_(workerId)
         , inboundChannel_(std::move(inboundChannel))
         , inboundStreamId_(inboundStreamId)
@@ -363,23 +363,15 @@ public:
                           static_cast<std::size_t>(length),
                           header);
           })
-        , pubReg_(aeron, peerChannels, peerStreamId)
+        , pubReg_(aeron, peerChannels, peerStreamId, pump)
     {
         if (!aeron) return;  // null aeron → unresolved (test or misconfiguration)
 
         // Resolve inbound subscription — mirrors WorkerIngress ctor exactly.
-        static constexpr int kResolveMaxMs   = 5000;
-        static constexpr int kResolveSliceMs = 1;
-
+        // The registry got its own copy of `pump`; this copy drives the
+        // subscription resolve (default: 1 ms sleep; invoker: pump, no sleep).
         const int64_t regId = aeron->addSubscription(inboundChannel_, inboundStreamId_);
-
-        using clock = std::chrono::steady_clock;
-        auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-        while (clock::now() < deadline) {
-            sub_ = aeron->findSubscription(regId);
-            if (sub_) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-        }
+        sub_ = pump.resolve([&] { return aeron->findSubscription(regId); }, std::chrono::milliseconds{5000});
         // sub_ == nullptr → resolved() returns false.
     }
 

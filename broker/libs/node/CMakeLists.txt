@@ -24,7 +24,7 @@ target_include_directories(rune_node PUBLIC
 # rune_metadata_msm: MetadataStateMachine (MD1 Task 4)
 # rune_dynamic_balancer: DynamicBalancer + FailoverElection (GR-7 dead-leader reassign,
 #   now ODR-used via MetadataService::reassignDeadPartitionLeaders from NodeRuntimeAgent)
-target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer)
+target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer rune_aeron_util)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -746,6 +746,10 @@ if(BUILD_TESTING)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_embedded_driver_tests
                 PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp)
+            target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the

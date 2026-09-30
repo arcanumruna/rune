@@ -42,6 +42,8 @@
 #include <rune/consensus/MessageSink.h>
 #include <rune/consensus/Types.h>
 
+#include <rune/aeronutil/AeronPump.h>
+
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 #include <concurrent/logbuffer/BufferClaim.h>
@@ -68,7 +70,8 @@ public:
     // @param peerEndpoints  Map NodeId → {channel, streamId} for each peer (not self).
     UdpMessageSink(std::shared_ptr<aeron::Aeron>                            aeron,
                    const std::unordered_map<rune::consensus::NodeId,
-                                             PeerEndpoint>&                 peerEndpoints)
+                                             PeerEndpoint>&                 peerEndpoints,
+                   rune::aeronutil::AeronPump                               pump = {})
         : aeron_(std::move(aeron))
     {
         // Register all peer slots.  addExclusivePublication is async — it never
@@ -86,17 +89,17 @@ public:
         // yet resolvable (e.g. a co-restarting node whose DNS entry is not up)
         // are left pending and retried lazily from send().  This is the DR-BUG-4
         // fix: a temporarily-unresolvable peer must not abort node startup.
-        using namespace std::chrono;
-        auto deadline = steady_clock::now() + seconds{5};
-        while (steady_clock::now() < deadline) {
-            if (resolvePending() == 0) return; // all resolved
-            std::this_thread::sleep_for(milliseconds{1});
-        }
+        // Default pump: 1 ms sleep between probes (legacy); invoker pump: drive
+        // this shard's own driver + conductor between probes (spec §3.6).
+        (void)pump.resolve([&] { return resolvePending() == 0; }, std::chrono::seconds{5});
         // Partial (or zero) resolution is OK — resolvePending() runs on every
         // send() until the remaining peers come up.
     }
 
     ~UdpMessageSink() override = default;
+
+    /// Test-only: number of peer publications still unresolved (runs one resolve probe).
+    [[nodiscard]] int unresolvedForTest() noexcept { return resolvePending(); }
 
     UdpMessageSink(const UdpMessageSink&)            = delete;
     UdpMessageSink& operator=(const UdpMessageSink&) = delete;

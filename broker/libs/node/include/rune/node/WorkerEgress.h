@@ -19,7 +19,8 @@
 //
 // ## Design (mirrors WorkerIngress)
 //   - Resolves the publication via a bounded addExclusivePublication +
-//     findExclusivePublication loop (kResolveMaxMs=5000 / kResolveSliceMs=1),
+//     findExclusivePublication resolve via AeronPump (kResolveMaxMs=5000; 1 ms
+//     sleep with the default pump, invoker pumping otherwise),
 //     the same pattern used across the gateway/ingress.
 //   - Non-throwing construction; check resolved() after construction.
 //   - SINGLE-OWNER / SINGLE-THREAD: one WorkerEgress per worker, written only on
@@ -28,6 +29,8 @@
 //     term buffer), offer() (auto-fragmented) for larger frames — same policy as
 //     the gateway egress path.
 // ---------------------------------------------------------------------------
+
+#include <rune/aeronutil/AeronPump.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -54,7 +57,9 @@ public:
     // -----------------------------------------------------------------------
     WorkerEgress(std::shared_ptr<aeron::Aeron> aeron,
                  std::string                   controlEndpoint,
-                 int32_t                       streamId) noexcept
+                 int32_t                       streamId,
+                 rune::aeronutil::AeronPump    pump   = {},
+                 std::chrono::milliseconds     budget = std::chrono::milliseconds{kResolveMaxMs}) noexcept
         : aeron_(std::move(aeron))
         , controlEndpoint_(std::move(controlEndpoint))
         , streamId_(streamId)
@@ -63,14 +68,8 @@ public:
 
         channel_ = "aeron:udp?control-mode=dynamic|control=" + controlEndpoint_;
 
-        int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
-        using clock = std::chrono::steady_clock;
-        auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-        while (clock::now() < deadline) {
-            pub_ = aeron_->findExclusivePublication(regId);
-            if (pub_) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-        }
+        const int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
+        pub_ = pump.resolve([&] { return aeron_->findExclusivePublication(regId); }, budget);
         // pub_ == nullptr → resolved() returns false; caller handles.
     }
 
@@ -129,7 +128,6 @@ public:
 
 private:
     static constexpr int kResolveMaxMs   = 5000;
-    static constexpr int kResolveSliceMs = 1;
 
     std::shared_ptr<aeron::Aeron>                aeron_;
     std::string                                  controlEndpoint_;

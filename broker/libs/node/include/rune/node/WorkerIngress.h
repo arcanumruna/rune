@@ -8,7 +8,8 @@
 // ## Design
 //   - Subscribes to (channel, streamId) via a bounded resolve loop that mirrors
 //     ClientGateway.cpp:85-99 exactly: addSubscription + findSubscription loop,
-//     kResolveMaxMs=5000 ms / kResolveSliceMs=1 ms slices.
+//     kResolveMaxMs=5000 ms; via AeronPump (1 ms sleep with the default pump,
+//     invoker pumping of the shard's own driver + conductor otherwise, §3.6).
 //   - Wraps an aeron::FragmentAssembler (member) to reassemble multi-fragment
 //     messages (produces can exceed a single Aeron MTU) — same as the gateway.
 //   - poll<Handler>(fragmentLimit, handler) is TEMPLATED on Handler so OUR
@@ -32,6 +33,8 @@
 //   the bounded window, resolved() returns false and poll() is a no-op.
 //   The caller must check resolved() after construction.
 // ---------------------------------------------------------------------------
+
+#include <rune/aeronutil/AeronPump.h>
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -62,7 +65,9 @@ public:
     // -----------------------------------------------------------------------
     WorkerIngress(std::shared_ptr<aeron::Aeron> aeron,
                   std::string                   channel,
-                  int32_t                       streamId) noexcept
+                  int32_t                       streamId,
+                  rune::aeronutil::AeronPump    pump   = {},
+                  std::chrono::milliseconds     budget = std::chrono::milliseconds{kResolveMaxMs}) noexcept
         : aeron_(std::move(aeron))
         , channel_(std::move(channel))
         , streamId_(streamId)
@@ -82,16 +87,11 @@ public:
     {
         if (!aeron_) return;  // null aeron_ → unresolved
 
-        // Mirror ClientGateway.cpp:85-99 EXACTLY.
-        int64_t regId = aeron_->addSubscription(channel_, streamId_);
-
-        using clock = std::chrono::steady_clock;
-        auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-        while (clock::now() < deadline) {
-            sub_ = aeron_->findSubscription(regId);
-            if (sub_) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-        }
+        // Add, then resolve (spec §3.6): the default pump sleeps 1 ms between
+        // probes (legacy ClientGateway.cpp:85-99 behaviour); an invoker pump
+        // drives this shard's own driver + conductor instead of sleeping.
+        const int64_t regId = aeron_->addSubscription(channel_, streamId_);
+        sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, budget);
         // sub_ == nullptr → resolved() returns false; caller handles.
     }
 
@@ -156,7 +156,6 @@ public:
 private:
     // Mirror the exact constants from ClientGateway.cpp:49-50.
     static constexpr int kResolveMaxMs   = 5000;  // 5 s
-    static constexpr int kResolveSliceMs = 1;
 
     // Raw-pointer trampoline: set for the duration of each poll() call.
     // No std::function, no heap allocation, no virtual call of our own.

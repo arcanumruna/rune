@@ -14,6 +14,7 @@ target_link_libraries(rune_replication PUBLIC rune_storage)
 # header-only Aeron code the replica calls concretely.
 if(aeron_FOUND)
     target_link_libraries(rune_replication PUBLIC aeron::aeron spdlog::spdlog)
+    target_link_libraries(rune_replication PUBLIC rune_aeron_util)
     target_compile_definitions(rune_replication PUBLIC RUNE_REPLICATION_HAS_AERON=1)
 endif()
 
