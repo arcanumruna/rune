@@ -907,6 +907,7 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_invoker_tests
             tests/transport/InvokerTransportTest.cpp
+            tests/producer/ProducerSinkTest.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_invoker_tests PRIVATE rune_client_api GTest::gtest_main)

@@ -68,12 +68,25 @@ public:
 
     // ---- Agent-thread duty cycle (implemented in ProducerHub.cpp) -----------
 
-    /// Drain all producer rings and flush ready batches.
-    /// sendFn: the agent's transport send function (E5.1: carries ingressStreamId).
-    /// Returns total work count (drained + flushed).
-    int drainAndFlush(int64_t nowNs,
-                      int64_t sessionId,
-                      std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
+    /// Drain all producer rings and flush ready batches through `sink` (a plain
+    /// call; see ProducerImpl::flushBatches for the Sink concept).
+    template <class Sink>
+    int drainAndFlush(int64_t nowNs, int64_t sessionId, const Sink& sink) {
+        int work = 0;
+        for (auto& impl : producers_) {
+            // Drain ONE message then flush, so flush() boundaries between sends are
+            // honoured; bounded at 256 records per producer per cycle.
+            static constexpr int kMaxInnerIters = 256;
+            for (int iter = 0; iter < kMaxInnerIters; ++iter) {
+                const int drained = impl->drainRing(nowNs);
+                const int flushed = impl->flushBatches(nowNs, sessionId, sink);
+                work += drained + flushed;
+                if (drained == 0) break;
+            }
+            work += impl->retransmitStalled(nowNs, sink);
+        }
+        return work;
+    }
 
     /// Route a ProduceResponse to all producers (the one that owns the
     /// correlationId will resolve the ack; others ignore it).

@@ -20,6 +20,7 @@
 
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/producer/CountingSink.h>
 #include <rune/client/Key.h>
 
 #include <atomic>
@@ -67,13 +68,15 @@ int main() {
     std::atomic<int64_t> corr{1};
     ProducerImpl impl(cfg, corr, ringCap);
 
+    const bool concrete = std::getenv("ACCUM_SINK") == nullptr ||
+                          std::string(std::getenv("ACCUM_SINK")) != "function";
     uint64_t frames = 0, bytes = 0;   // agent-thread only; read after join()
-    const std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sink =
-        [&frames, &bytes](int32_t, int32_t, int32_t, const uint8_t*, std::size_t len) -> bool {
-            ++frames;
-            bytes += len;
-            return true;  // always accept (counting sink)
-        };
+    const rune::client::producer::CountingSink csink{&frames, &bytes};
+    const ProducerImpl::SendFn fsink = csink;  // ACCUM_SINK=function: same work via std::function
+    auto flush = [&](int64_t nowNs) {
+        return concrete ? impl.flushBatches(nowNs, /*sessionId=*/1, csink)
+                        : impl.flushBatches(nowNs, /*sessionId=*/1, fsink);
+    };
 
     const std::vector<uint8_t> val((std::size_t)valueBytes, uint8_t{0xAB});
     std::atomic<bool> appDone{false};
@@ -92,12 +95,12 @@ int main() {
             for (int it = 0; it < 256; ++it) {
                 const int64_t nowNs = wallNs();
                 const int d = impl.drainRing(nowNs);
-                const int f = impl.flushBatches(nowNs, /*sessionId=*/1, sink);
+                const int f = flush(nowNs);
                 work += d + f;
                 if (d == 0) break;
             }
             // idle flush so linger-based flushes still fire when the ring is empty
-            impl.flushBatches(wallNs(), 1, sink);
+            flush(wallNs());
             if (appDone.load(std::memory_order_acquire) &&
                 impl.recordsSent() >= (uint64_t)N && work == 0)
                 break;

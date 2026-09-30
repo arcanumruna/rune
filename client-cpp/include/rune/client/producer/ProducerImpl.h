@@ -40,6 +40,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <concurrent/AtomicBuffer.h>
+#include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
 #include <atomic>
@@ -133,6 +134,7 @@ struct Tier2Entry {
 struct PartitionState {
     int32_t topicId        = 0;
     int32_t partition      = 0;
+    uint32_t slotIndex = 0;  ///< dense index inside the owning producer (stable)
 
     /// E5.1: per-worker Aeron ingress stream id from metadata.
     /// 0 = legacy / not yet known — falls back to the default ingress stream.
@@ -220,6 +222,10 @@ struct PendingAck {
 // ---------------------------------------------------------------------------
 class ProducerImpl {
 public:
+    /// Sink concept: `bool operator()(int32_t topicId, int32_t partition,
+    /// int32_t ingressStreamId, const uint8_t* buf, std::size_t len) const`.
+    using SendFn = std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>;
+
     /// Construct a ProducerImpl with its own ring buffer.
     /// ringCap: power-of-two usable capacity in bytes (default 256 KiB).
     explicit ProducerImpl(ProducerConfig cfg,
@@ -288,24 +294,16 @@ public:
     /// Returns count of records drained.
     int drainRing(int64_t nowNs);
 
-    /// Flush partition batches that are ready (linger/batchBytes/flush/flushFlag).
-    /// Calls encodeAndSend() for each ready batch.
-    /// sendFn: (topicId, partition, ingressStreamId, buf, len) → bool
-    /// (Task 1.4: route by (topicId,partition); E5.1: ingressStreamId is the
-    /// per-worker transport stream to offer on).
-    /// Returns count of batches flushed.
-    int flushBatches(int64_t nowNs, int64_t sessionId,
-                     std::function<bool(int32_t, int32_t, int32_t,
-                                        const uint8_t*, std::size_t)> sendFn);
+    /// Sink concept: `bool operator()(int32_t topicId, int32_t partition,
+    /// int32_t ingressStreamId, const uint8_t* buf, std::size_t len) const`.
+    /// Explicitly instantiated in ProducerImpl.cpp for SendFn (tests, cold
+    /// paths), agent::AgentProduceSink (production) and CountingSink (benches);
+    /// no std::function is built or called on the production flush path.
+    template <class Sink>
+    int flushBatches(int64_t nowNs, int64_t sessionId, const Sink& sink);
 
-    /// Reliability: retransmit in-flight batches whose current attempt is deemed
-    /// lost (nowNs >= attemptDeadlineNs), until acked or deliveryTimeoutMs elapses.
-    /// Idempotent (same corrId → broker dedups).  Called from the agent duty cycle
-    /// with the same nowNs + sendFn as flushBatches.  O(1) when nothing is stalled
-    /// (checks the oldest batch — map front — and returns early). Returns # resent.
-    int retransmitStalled(int64_t nowNs,
-                          const std::function<bool(int32_t, int32_t, int32_t,
-                                                   const uint8_t*, std::size_t)>& sendFn);
+    template <class Sink>
+    int retransmitStalled(int64_t nowNs, const Sink& sink);
 
     /// Called by the agent when a ProduceResponse arrives.  Resolves the pending
     /// ack (callback/future) by correlationId.
@@ -372,7 +370,8 @@ public:
                                              int32_t& partitionOut) const noexcept {
         // Prefer an accumulated (not-yet-sent) partition: routing it BEFORE the
         // frame goes out is the zero-extra-hop path.
-        for (const auto& [key, ps] : partitions_) {
+        for (const auto& up : partitions_) {
+            const PartitionState& ps = *up;
             const bool hasTier1 = (ps.batchStartNs != 0) || ps.flushRequested;
             const bool hasTier2 = !ps.pendingTier2Entries.empty();
             if (hasTier1 || hasTier2) {
@@ -434,21 +433,21 @@ private:
     /// never reallocs.
     void growAckRing(PartitionState& ps);
 
+    template <class Sink>
     bool encodeAndSend(PartitionState& ps,
                        int64_t nowNs,
                        int64_t sessionId,
                        int64_t correlationId,
-                       std::function<bool(int32_t, int32_t, int32_t,
-                                          const uint8_t*, std::size_t)>& sendFn);
+                       const Sink& sink);
 
     /// Encode + send a Tier-2 pre-built batch (agent thread only).
     /// Patches baseSequence into the provided batch bytes, then encodes a
     /// Produce wire frame and offers it to transport.
+    template <class Sink>
     bool encodeAndSendTier2(PartitionState& ps,
                              Tier2Entry& entry,
                              int64_t sessionId,
-                             std::function<bool(int32_t, int32_t, int32_t,
-                                                const uint8_t*, std::size_t)>& sendFn);
+                             const Sink& sink);
 
     // ---- Members -------------------------------------------------------------
 
@@ -478,8 +477,10 @@ private:
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 
-    // Per-((int64_t(topicId)<<32)|uint32_t(partition)) → PartitionState (collision-free).
-    std::unordered_map<int64_t, PartitionState> partitions_;
+    // Flat partition table (spec §1a.5): FlatIndexMap key -> dense slot, slots own
+    // their PartitionState (stable address; slotIndex == position).
+    detail::FlatIndexMap                          partitionIndex_;
+    std::vector<std::unique_ptr<PartitionState>>  partitions_;
 
     // Encode scratch buffers (reused per batch — zero per-flush heap allocation).
     // batchScratch_: RecordBatch bytes (cleared + refilled by buildInto()).

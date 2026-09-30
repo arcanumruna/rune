@@ -8,7 +8,9 @@
 //   All batching, encoding, and ack routing happen on the agent thread.
 
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/producer/CountingSink.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
@@ -370,19 +372,17 @@ void ProducerImpl::updateIngressRoute(int32_t topicId, int32_t partition,
 // Agent-thread: drain ring
 // ---------------------------------------------------------------------------
 
-PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId,
-                                                    int32_t partition) {
+PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t partition) {
     const int64_t k = partKey(topicId, partition);
-    auto it = partitions_.find(k);
-    if (it == partitions_.end()) {
-        auto [ins, ok] = partitions_.emplace(k, PartitionState(topicId, partition));
-        PartitionState& ps = ins->second;
-        // Preallocate the per-partition ack-ring ONCE (zero per-batch alloc).
-        ps.ackRing.assign(kAckRingCapacity, 0);
-        ps.ackMask = kAckRingCapacity - 1;
-        return ps;
-    }
-    return it->second;
+    const uint32_t idx = partitionIndex_.find(k);
+    if (idx != detail::FlatIndexMap::kNone) return *partitions_[idx];
+    auto ps = std::make_unique<PartitionState>(topicId, partition);
+    ps->slotIndex = static_cast<uint32_t>(partitions_.size());
+    ps->ackRing.assign(kAckRingCapacity, 0);  // preallocated ONCE (zero per-batch alloc)
+    ps->ackMask = kAckRingCapacity - 1;
+    partitions_.push_back(std::move(ps));
+    partitionIndex_.insert(k, partitions_.back()->slotIndex);
+    return *partitions_.back();
 }
 
 void ProducerImpl::growAckRing(PartitionState& ps) {
@@ -424,7 +424,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             aeron::util::index_t                 len) -> ControlledAction
         {
             if (msgTypeId == kMsgFlush) {
-                for (auto& [k, ps] : partitions_) ps.flushRequested = true;
+                for (auto& up : partitions_) up->flushRequested = true;
                 globalFlushPending_.store(false, std::memory_order_relaxed);
                 return ControlledAction::CONTINUE;
             }
@@ -596,12 +596,13 @@ int ProducerImpl::drainRing(int64_t nowNs) {
 // Agent-thread: encode and offer one batch
 // ---------------------------------------------------------------------------
 
+template <class Sink>
 bool ProducerImpl::encodeAndSend(
     PartitionState& ps,
     int64_t nowNs,
     int64_t sessionId,
     int64_t correlationId,
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
+    const Sink& sink)
 {
     if (!ps.builder || ps.builder->recordCount() == 0) return false;
 
@@ -646,8 +647,8 @@ bool ProducerImpl::encodeAndSend(
 
     // Offer to transport — Task 1.4: route by (topicId,partition); E5.1: pass
     // per-partition ingressStreamId as the transport stream.
-    const bool ok = sendFn(ps.topicId, ps.partition, ps.ingressStreamId,
-                           encodeScratch_.data(), written);
+    const bool ok = sink(ps.topicId, ps.partition, ps.ingressStreamId,
+                        encodeScratch_.data(), written);
 
     if (!ok) {
         // Aeron ingress back-pressure (term buffer momentarily full / not yet
@@ -713,11 +714,12 @@ bool ProducerImpl::encodeAndSend(
 // Agent-thread: encode and send a Tier-2 pre-built batch
 // ---------------------------------------------------------------------------
 
+template <class Sink>
 bool ProducerImpl::encodeAndSendTier2(
     PartitionState& ps,
     Tier2Entry& entry,
     int64_t sessionId,
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
+    const Sink& sink)
 {
     if (entry.batchBytes.empty() || entry.recordCount == 0) return false;
 
@@ -787,8 +789,8 @@ bool ProducerImpl::encodeAndSendTier2(
 
     // Task 1.4: route by (topicId,partition); E5.1: pass per-partition
     // ingressStreamId as the per-worker transport stream.
-    const bool ok = sendFn(ps.topicId, ps.partition, ps.ingressStreamId,
-                           encodeScratch_.data(), written);
+    const bool ok = sink(ps.topicId, ps.partition, ps.ingressStreamId,
+                        encodeScratch_.data(), written);
 
     if (!ok) {
         // Back-pressure: leave the entry + sequence untouched so the caller can
@@ -816,10 +818,11 @@ bool ProducerImpl::encodeAndSendTier2(
 // Agent-thread: flush batches
 // ---------------------------------------------------------------------------
 
+template <class Sink>
 int ProducerImpl::flushBatches(
     int64_t nowNs,
     int64_t sessionId,
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
+    const Sink& sink)
 {
     // M1 FIX [CB-5]: Do NOT emit any frame while the session is not established
     // (sessionId == 0 means Connecting / post-forceReconnect window).  Records
@@ -839,7 +842,8 @@ int ProducerImpl::flushBatches(
 
     int flushed = 0;
 
-    for (auto& [k, ps] : partitions_) {
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
         //
         // CB-5 A1 FIX: Tier-2 entries must NEVER be dispatched while a
@@ -877,7 +881,7 @@ int ProducerImpl::flushBatches(
                                  ? ps.pendingCorrId
                                  : nextCorrId_.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (encodeAndSend(ps, nowNs, sessionId, corrId, sendFn)) {
+                if (encodeAndSend(ps, nowNs, sessionId, corrId, sink)) {
                     ++flushed;
                     ps.pendingCorrId = 0;
                     tier1Pending = false;
@@ -905,7 +909,7 @@ int ProducerImpl::flushBatches(
 
             Tier2Entry& entry = ps.pendingTier2Entries.front();
 
-            if (!encodeAndSendTier2(ps, entry, sessionId, sendFn)) {
+            if (!encodeAndSendTier2(ps, entry, sessionId, sink)) {
                 break; // back-pressure: keep the entry, retry next cycle (no drop)
             }
             ++flushed;
@@ -934,10 +938,9 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
     if (bit != batchMap_.end()) {
         ackStart = bit->second.ackStart;
         ackCount = bit->second.ackCount;
-        const int64_t k = partKey(bit->second.topicId, bit->second.partition);
-        auto pit = partitions_.find(k);
-        if (pit != partitions_.end()) {
-            ps = &pit->second;
+        const uint32_t pidx = partitionIndex_.find(partKey(bit->second.topicId, bit->second.partition));
+        if (pidx != detail::FlatIndexMap::kNone) {
+            ps = partitions_[pidx].get();
             if (ps->inFlight > 0) --ps->inFlight;    // one batch, one in-flight slot
             ps->ackTail += static_cast<uint64_t>(ackCount); // FIFO reclaim of ring slots
         }
@@ -1017,9 +1020,10 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
     }
 }
 
+template <class Sink>
 int ProducerImpl::retransmitStalled(
     int64_t nowNs,
-    const std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)>& sendFn)
+    const Sink& sink)
 {
     // ZERO happy-path cost: batchMap_ is ordered by corrId == send order == deadline
     // order (all deadlines are sendNs + produceTimeoutMs, monotonic).  So the OLDEST
@@ -1052,8 +1056,8 @@ int ProducerImpl::retransmitStalled(
 
         // Retransmit the SAME wire frame (same pid+seq/corrId → broker dedups and
         // re-acks the original offset).  Reset the per-attempt deadline.
-        if (sendFn(bi.topicId, bi.partition, bi.ingressStreamId,
-                   bi.wireFrame.data(), bi.wireFrame.size())) {
+        if (sink(bi.topicId, bi.partition, bi.ingressStreamId,
+                bi.wireFrame.data(), bi.wireFrame.size())) {
             ++bi.attempts;
             bi.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
             ++resent;
@@ -1201,5 +1205,19 @@ void ProducerImpl::failAllPending(const std::string& reason) {
     }
     pendingAcks_.clear();
 }
+
+// ---------------------------------------------------------------------------
+// Explicit instantiations — the only sink types the producer is built for.
+// ---------------------------------------------------------------------------
+template int ProducerImpl::flushBatches<ProducerImpl::SendFn>(int64_t, int64_t,
+                                                             const ProducerImpl::SendFn&);
+template int ProducerImpl::flushBatches<agent::AgentProduceSink>(
+    int64_t, int64_t, const agent::AgentProduceSink&);
+template int ProducerImpl::flushBatches<CountingSink>(int64_t, int64_t, const CountingSink&);
+template int ProducerImpl::retransmitStalled<ProducerImpl::SendFn>(int64_t,
+                                                                  const ProducerImpl::SendFn&);
+template int ProducerImpl::retransmitStalled<agent::AgentProduceSink>(
+    int64_t, const agent::AgentProduceSink&);
+template int ProducerImpl::retransmitStalled<CountingSink>(int64_t, const CountingSink&);
 
 } // namespace rune::client::producer
