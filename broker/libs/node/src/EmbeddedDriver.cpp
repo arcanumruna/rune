@@ -28,8 +28,15 @@ std::optional<std::string> checkAeronSpace(uint64_t freeBytes, int32_t drivers, 
            "fewer RUNE_WORKERS, or a larger tmpfs";
 }
 
+// The ONE primitive for every pump not made by thread_ (Invoker doWork, close
+// drain).  Kept deliberately: callerPumpsWhileThreadRunning() is only meaningful
+// if all non-thread pumps go through here.  It guards against someone
+// reintroducing a caller-side pump while thread_ runs, such as the old startup
+// readiness loop (the two-thread race, spec §3.6).
+// EmbeddedDriverRegression.ThreadedStartNeverPumpsFromCaller pins it at 0.
 int EmbeddedDriver::callerPump_() noexcept {
-    if (running_.load(std::memory_order_acquire)) ++callerPumpsWhileThreadRunning_;
+    if (running_.load(std::memory_order_acquire))
+        callerPumpsWhileThreadRunning_.fetch_add(1, std::memory_order_relaxed);
     return aeron_driver_main_do_work(driver_);
 }
 
@@ -88,28 +95,48 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     }
     if (mode_ == DriverMode::Threaded) {
         running_.store(true, std::memory_order_release);
-        thread_ = std::thread([this] {
-            while (running_.load(std::memory_order_acquire))
-                aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
-        });
+        try {
+            thread_ = std::thread([this] {
+                while (running_.load(std::memory_order_acquire))
+                    aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+            });
+        } catch (...) {
+            // No thread was started: clear the flag so close() does not join,
+            // then drain and close the initialised driver/context (no leak).
+            running_.store(false, std::memory_order_release);
+            close();
+            throw;
+        }
         // No caller-side readiness pumping: aeron_driver_init already wrote cnc.dat
         // (aeron_driver.c:864) and stamped the heartbeat (:911); only thread_ drives.
     } else {
-        pumpOwner_ = std::this_thread::get_id();
+        pumpOwner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
     }
     spdlog::info("EmbeddedDriver: started (dir={}, mode={})", cfg_.dir,
                  mode_ == DriverMode::Invoker ? "invoker" : "threaded");
 }
 
 int EmbeddedDriver::doWork() noexcept {
-    if (mode_ == DriverMode::Threaded || std::this_thread::get_id() != pumpOwner_) {
-        ++foreignPumpAttempts_;          // a driver is driven by exactly one thread
+    if (mode_ == DriverMode::Threaded ||
+        std::this_thread::get_id() != pumpOwner_.load(std::memory_order_relaxed)) {
+        foreignPumpAttempts_.fetch_add(1, std::memory_order_relaxed);   // exactly one pumper
         return 0;
     }
-    return aeron_driver_main_do_work(driver_);
+    return callerPump_();
 }
 
 void EmbeddedDriver::close() noexcept {
+    if (mode_ == DriverMode::Invoker && driver_ &&
+        std::this_thread::get_id() != pumpOwner_.load(std::memory_order_relaxed)) {
+        // Draining here would make this thread a SECOND pumper while the bound
+        // owner may still be running.  Refuse loudly and leave the driver intact.
+        // The owner closes it, or a closer takes over via bindPumpThread() after
+        // joining the owner.
+        foreignCloseAttempts_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("EmbeddedDriver: close() refused from non-pumper thread (dir={}); "
+                      "the bound pump thread must close, or bindPumpThread() first", cfg_.dir);
+        return;
+    }
     if (mode_ == DriverMode::Threaded && running_.exchange(false, std::memory_order_acq_rel)) {
         if (thread_.joinable()) thread_.join();
     }
@@ -120,7 +147,7 @@ void EmbeddedDriver::close() noexcept {
         constexpr int kMaxDrainPumps = 10'000;
         int idle = 0;
         for (int i = 0; i < kMaxDrainPumps && idle < 2; ++i)
-            idle = (aeron_driver_main_do_work(driver_) == 0) ? idle + 1 : 0;
+            idle = (callerPump_() == 0) ? idle + 1 : 0;
         if (aeron_driver_close(driver_) < 0)
             spdlog::warn("EmbeddedDriver: aeron_driver_close error (dir={}): {}", cfg_.dir, aeron_errmsg());
         driver_ = nullptr;

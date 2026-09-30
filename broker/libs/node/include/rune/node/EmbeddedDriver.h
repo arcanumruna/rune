@@ -46,13 +46,20 @@ public:
     EmbeddedDriver& operator=(const EmbeddedDriver&) = delete;
 
     int  doWork() noexcept;
-    void bindPumpThread() noexcept { pumpOwner_ = std::this_thread::get_id(); }
+    /// The calling thread becomes the only pumper (Invoker).  Calling it also
+    /// asserts that the previous pumper has stopped, e.g. a closer takes ownership
+    /// after joining the worker thread and before close().
+    void bindPumpThread() noexcept { pumpOwner_.store(std::this_thread::get_id(), std::memory_order_relaxed); }
+    /// Idempotent.  Invoker: only the bound pumper may close.  A close from any other
+    /// thread is REFUSED (logged, counted in foreignCloseAttempts(), driver left
+    /// untouched) because draining would make it a second pumper.
     void close() noexcept;
 
     [[nodiscard]] DriverMode         mode() const noexcept { return mode_; }
     [[nodiscard]] const std::string& dir() const noexcept { return cfg_.dir; }
-    [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { return foreignPumpAttempts_; }
-    [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { return callerPumpsWhileThreadRunning_; }
+    [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { return foreignPumpAttempts_.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t foreignCloseAttempts() const noexcept { return foreignCloseAttempts_.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { return callerPumpsWhileThreadRunning_.load(std::memory_order_relaxed); }
 
 private:
     int callerPump_() noexcept;   // any pump NOT made by the driver thread
@@ -63,9 +70,12 @@ private:
     aeron_driver_t*         driver_ = nullptr;
     std::atomic<bool>       running_{false};   // Threaded: stop flag for the driver thread
     std::thread             thread_;
-    std::thread::id         pumpOwner_{};
-    uint64_t                foreignPumpAttempts_           = 0;
-    uint64_t                callerPumpsWhileThreadRunning_ = 0;
+    // Diagnostics only (never used for coordination): relaxed atomics because
+    // foreign threads touch them by definition (spec §3.6 one-pumper contract).
+    std::atomic<std::thread::id> pumpOwner_{};
+    std::atomic<uint64_t>        foreignPumpAttempts_{0};
+    std::atomic<uint64_t>        foreignCloseAttempts_{0};
+    std::atomic<uint64_t>        callerPumpsWhileThreadRunning_{0};
 };
 
 } // namespace rune::node

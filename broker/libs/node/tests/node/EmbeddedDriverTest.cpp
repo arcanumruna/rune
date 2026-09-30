@@ -117,3 +117,35 @@ TEST(EmbeddedDriverRegression, AeronSpaceCheck) {
     ASSERT_TRUE(e.has_value());
     EXPECT_NE(e->find("RUNE_AERON_TERM_BUFFER_BYTES"), std::string::npos);
 }
+
+// Fix round 1: close() drains, which pumps the driver.  In Invoker mode a close
+// from a thread that is not the bound pumper would make it a second pumper, so
+// it must be refused and leave the driver untouched.
+TEST(EmbeddedDriverRegression, InvokerForeignThreadCloseIsRefused) {
+    TmpDir d;
+    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
+    std::thread t([&] { drv.close(); });
+    t.join();
+    EXPECT_EQ(drv.foreignCloseAttempts(), 1u);
+    ASSERT_TRUE(fs::exists(d.path / "cnc.dat")) << "a refused close must not tear the driver down";
+    EXPECT_GE(drv.doWork(), 0) << "the owner still pumps after a refused foreign close";
+    EXPECT_EQ(drv.foreignPumpAttempts(), 0u);
+    drv.close();                                   // owner close succeeds
+    EXPECT_EQ(drv.foreignCloseAttempts(), 1u);
+}
+
+// The documented hand-off: the worker pumps, is joined, then the closer binds
+// itself as the pumper and closes.  This is not a foreign close.
+TEST(EmbeddedDriverRegression, InvokerHandOffThenCloseByNewOwner) {
+    TmpDir d;
+    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
+    std::thread worker([&] {
+        drv.bindPumpThread();
+        for (int i = 0; i < 4; ++i) drv.doWork();
+    });
+    worker.join();
+    drv.bindPumpThread();
+    drv.close();
+    EXPECT_EQ(drv.foreignCloseAttempts(), 0u);
+    EXPECT_EQ(drv.foreignPumpAttempts(), 0u);
+}
