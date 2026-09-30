@@ -501,9 +501,8 @@ struct NodeConfig {
     /// Returns std::nullopt when the configuration is valid.
     /// Returns an error string describing the first detected overlap when invalid.
     ///
-    /// Called automatically at the end of parseNodeConfig when
-    /// perWorkerReplication is true and workerCount > 0.  May also be called
-    /// directly by callers that modify replBaseStreamId programmatically.
+    /// NOT called during parseNodeConfig.  Callers (e.g. BrokerNode startup)
+    /// must invoke this after parsing and refuse to start if it returns an error.
     std::optional<std::string> validateStreamRanges() const;
 };
 

@@ -1726,4 +1726,74 @@ TEST(NodeConfig, ValidateStreamRanges_OverlapWithClientStreamId_ReturnsError) {
         << "replBase overlapping clientStreamId must fail validateStreamRanges()";
 }
 
+// validateStreamRanges detects overlap of replBase range with consensusStreamId.
+TEST(NodeConfig, ValidateStreamRanges_OverlapWithConsensusStreamId_ReturnsError) {
+    // consensusStreamId defaults to 10; replBaseStreamId=9 with workerCount=4
+    // means range [9,12] contains stream 10.
+    auto base = base1node();
+    base["RUNE_REPL_BASE_STREAM_ID"] = "9";
+    base["RUNE_WORKERS"] = "4";
+    base["RUNE_PER_WORKER_REPLICATION"] = "true";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;  // parse still succeeds
+    auto err = res.config->validateStreamRanges();
+    ASSERT_TRUE(err.has_value())
+        << "replBase range overlapping consensusStreamId must fail validateStreamRanges()";
+    EXPECT_NE(err->find("consensusStreamId"), std::string::npos)
+        << "error message must name 'consensusStreamId', got: " << *err;
+}
+
+// validateStreamRanges detects overlap of replBase range with replicationStreamId.
+TEST(NodeConfig, ValidateStreamRanges_OverlapWithReplicationStreamId_ReturnsError) {
+    // replicationStreamId defaults to 20; replBaseStreamId=20 with workerCount=4
+    // means range [20,23] contains stream 20.
+    auto base = base1node();
+    base["RUNE_REPL_BASE_STREAM_ID"] = "20";
+    base["RUNE_WORKERS"] = "4";
+    base["RUNE_PER_WORKER_REPLICATION"] = "true";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;  // parse still succeeds
+    auto err = res.config->validateStreamRanges();
+    ASSERT_TRUE(err.has_value())
+        << "replBase range overlapping replicationStreamId must fail validateStreamRanges()";
+    EXPECT_NE(err->find("replicationStreamId"), std::string::npos)
+        << "error message must name 'replicationStreamId', got: " << *err;
+}
+
+// validateStreamRanges detects overlap of replBase range with workerIngress base range.
+TEST(NodeConfig, ValidateStreamRanges_OverlapWithWorkerIngressRange_ReturnsError) {
+    // workerIngressBaseStreamId resolves to clientStreamId+1 = 2 (default).
+    // replBaseStreamId=2 with workerCount=4 → range [2,5] overlaps [2,5].
+    // clientStreamId=1 is not in [2,5] so clientStreamId check does not fire first.
+    auto base = base1node();
+    base["RUNE_REPL_BASE_STREAM_ID"] = "2";
+    base["RUNE_WORKERS"] = "4";
+    base["RUNE_PER_WORKER_REPLICATION"] = "true";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;  // parse still succeeds
+    auto err = res.config->validateStreamRanges();
+    ASSERT_TRUE(err.has_value())
+        << "replBase range overlapping workerIngress range must fail validateStreamRanges()";
+    EXPECT_NE(err->find("workerIngress"), std::string::npos)
+        << "error message must name 'workerIngress', got: " << *err;
+}
+
+// validateStreamRanges detects overlap of replBase range with workerEgress base range.
+TEST(NodeConfig, ValidateStreamRanges_OverlapWithWorkerEgressRange_ReturnsError) {
+    // Set workerEgressBaseStreamId=500 explicitly; replBaseStreamId=500
+    // with workerCount=4 → range [500,503] overlaps [500,503].
+    auto base = base1node();
+    base["RUNE_WORKER_EGRESS_BASE_STREAM"] = "500";
+    base["RUNE_REPL_BASE_STREAM_ID"] = "500";
+    base["RUNE_WORKERS"] = "4";
+    base["RUNE_PER_WORKER_REPLICATION"] = "true";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;  // parse still succeeds
+    auto err = res.config->validateStreamRanges();
+    ASSERT_TRUE(err.has_value())
+        << "replBase range overlapping workerEgress range must fail validateStreamRanges()";
+    EXPECT_NE(err->find("workerEgress"), std::string::npos)
+        << "error message must name 'workerEgress', got: " << *err;
+}
+
 } // namespace rune::node
