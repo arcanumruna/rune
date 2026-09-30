@@ -35,6 +35,7 @@ struct Frame {
     int64_t corrId;
     int32_t records;
     int32_t baseSequence;
+    int64_t producerId; // F5
 };
 
 struct Capture {
@@ -46,7 +47,8 @@ struct Capture {
             const auto v = rcc::decodeProduce(b, n);
             if (!v) return false;
             rune::protocol::RecordBatchReader r(v->recordBatch.data(), v->recordBatch.size());
-            frames.push_back({t, p, v->correlationId, r.recordCount(), r.baseSequence()});
+            frames.push_back({t, p, v->correlationId, r.recordCount(), r.baseSequence(),
+                              r.producerId()});
             return true;
         };
     }
@@ -296,7 +298,9 @@ TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
     EXPECT_FALSE(impl->hasInFlight());
     for (int i = 0; i < kBatches; ++i) {
         EXPECT_EQ(cap.frames[i].corrId, 0);
-        EXPECT_EQ(cap.frames[i].baseSequence, 2 * i);
+        // F5: acks=None batches are non-idempotent — baseSequence is always the
+        // "unset" sentinel -1, never a real (tracked) partition sequence.
+        EXPECT_EQ(cap.frames[i].baseSequence, -1);
         ASSERT_EQ(futs[i].wait_for(std::chrono::seconds(0)), std::future_status::ready) << i;
         EXPECT_EQ(futs[i].get(), -1);
     }
@@ -307,6 +311,103 @@ TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
     const PartitionState* ps = impl->partitionState(1, 0);
     ASSERT_NE(ps, nullptr);
     EXPECT_EQ(ps->ackTail, ps->ackHead);
+}
+
+// ---------------------------------------------------------------------------
+// F5 — producerId uniqueness + acks=None non-idempotence.
+//
+// Bug: producerId_ was one hardcoded magic-stub constant shared by EVERY
+// ProducerImpl instance.  The broker dedups idempotent batches by
+// (producerId, partition, baseSequence), so two producers writing the same
+// partition with the same producerId silently deduplicated each other's
+// records.  acks=None batches also carried a stamped-but-untracked sequence,
+// so a lost frame opened a permanent gap nothing could ever detect or heal.
+// ---------------------------------------------------------------------------
+
+// (a) Two ProducerImpl instances must draw different, non-negative producerIds
+// — neither may be the old shared magic-stub value.
+TEST(ProducerSequence, TwoInstancesGetUniqueProducerIdsRegression) {
+    std::atomic<int64_t> corr1{1};
+    std::atomic<int64_t> corr2{1};
+    ProducerImpl p1(ackCfg(8), corr1);
+    ProducerImpl p2(ackCfg(8), corr2);
+
+    constexpr int64_t kLegacyStubProducerId =
+        static_cast<int64_t>(0x4352554E'4543422DULL); // old "RUNECB-" magic stub
+
+    EXPECT_GE(p1.producerId(), 0) << "producerId must be non-negative (idempotent)";
+    EXPECT_GE(p2.producerId(), 0) << "producerId must be non-negative (idempotent)";
+    EXPECT_NE(p1.producerId(), kLegacyStubProducerId)
+        << "must never reissue the old shared stub";
+    EXPECT_NE(p2.producerId(), kLegacyStubProducerId)
+        << "must never reissue the old shared stub";
+    EXPECT_NE(p1.producerId(), p2.producerId())
+        << "two live instances must not share a producerId (broker dedup collision)";
+}
+
+// (b) Epoch overflow (INT16_MAX) — see below, after the SeqCapture/sendOne
+// helpers are declared (TwoInstancesGetUniqueProducerIdsRegression is (a);
+// the overflow test EpochOverflowRotatesToFreshProducerIdRegression follows
+// CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegression et al.).
+
+// (c) acks=None: every batch is encoded producerId=-1 (non-idempotent) and the
+// partition's real idempotent sequence is never touched — it stays exactly
+// where it was across many batches, so nothing is ever stamped/tracked that a
+// lost frame could turn into an undetectable gap.
+TEST(ProducerAcks, AcksNoneAlwaysNonIdempotentSequenceNeverAdvancesRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(noneCfg(8), corr);
+    Capture cap;
+    const auto sink = cap.fn();
+
+    constexpr int kBatches = 500;
+    for (int i = 0; i < kBatches; ++i) {
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, false, 0));
+        pump(impl, sink);
+    }
+    ASSERT_EQ(cap.frames.size(), static_cast<std::size_t>(kBatches));
+
+    const PartitionState* ps = impl.partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    EXPECT_EQ(ps->nextBaseSequence, 0)
+        << "acks=None must never advance the partition's idempotent sequence";
+
+    for (int i = 0; i < kBatches; ++i) {
+        EXPECT_EQ(cap.frames[i].producerId, -1)
+            << "acks=None batch " << i << " must carry the non-idempotent producerId sentinel";
+        EXPECT_EQ(cap.frames[i].baseSequence, -1)
+            << "acks=None batch " << i << " must carry the non-idempotent baseSequence sentinel";
+    }
+}
+
+// (d) Guard: acks=Leader/All must still stamp THIS instance's real producerId
+// and advance the partition's idempotent sequence normally (i.e. the acks=None
+// fix above must not regress the idempotent path).
+TEST(ProducerAcks, AcksLeaderStampsInstanceIdAndAdvancesSequenceGuard) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(8), corr);
+    Capture cap;
+    const auto sink = cap.fn();
+
+    constexpr int kBatches = 5;
+    for (int i = 0; i < kBatches; ++i) {
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, false, 0));
+        pump(impl, sink);
+    }
+    ASSERT_EQ(cap.frames.size(), static_cast<std::size_t>(kBatches));
+
+    const PartitionState* ps = impl.partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    EXPECT_EQ(ps->nextBaseSequence, kBatches)
+        << "acks=Leader must advance the idempotent sequence by 1 per single-record batch";
+
+    for (int i = 0; i < kBatches; ++i) {
+        EXPECT_EQ(cap.frames[i].producerId, impl.producerId())
+            << "acks=Leader batch " << i << " must carry this instance's real producerId";
+        EXPECT_GE(cap.frames[i].producerId, 0);
+        EXPECT_EQ(cap.frames[i].baseSequence, i)
+            << "acks=Leader batch " << i << " must carry the real, advancing sequence";
+    }
 }
 
 namespace {
@@ -487,6 +588,43 @@ void sendOne(ProducerImpl& impl, const ProducerImpl::SendFn& sink, int32_t parti
     pump(impl, sink, now);
 }
 } // namespace
+
+// (b) Epoch overflow (INT16_MAX) must rotate to a FRESH unique producerId —
+// never producerId_+1 — and restart epoch at 0 with every partition's sequence
+// back at 0.  Uses the debugSetEpochForTest() seam to reach INT16_MAX without
+// actually sending 32767 batches, then drives the SAME delivery-timeout path
+// as DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression below.
+TEST(ProducerSequence, EpochOverflowRotatesToFreshProducerIdRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(8), corr);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+
+    const int64_t oldId = impl.producerId();
+    impl.debugSetEpochForTest(INT16_MAX);
+
+    sendOne(impl, sink, 0); // batch is stamped with the current (INT16_MAX) epoch
+    ASSERT_EQ(cap.frames.size(), 1u);
+    EXPECT_EQ(cap.frames[0].epoch, INT16_MAX);
+
+    // Past deliveryTimeoutMs (10s in ackCfg): retransmitStalled fails the
+    // unresolved batch, triggering the epoch-overflow rotation.
+    const int64_t late = kNow + 10'000LL * 1'000'000LL;
+    impl.retransmitStalled(late, sink);
+    EXPECT_FALSE(impl.hasInFlight());
+
+    EXPECT_EQ(impl.producerEpoch(), 0) << "epoch must restart at 0 after overflow";
+    EXPECT_GE(impl.producerId(), 0) << "the rotated id must still be non-negative";
+    EXPECT_NE(impl.producerId(), oldId) << "overflow must draw a NEW id";
+    EXPECT_NE(impl.producerId(), oldId + 1)
+        << "must NOT rotate via +1 (as likely to collide as the original id)";
+
+    // The next batch on this (now-reset) partition must start at sequence 0.
+    sendOne(impl, sink, 0, late);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    EXPECT_EQ(cap.frames[1].epoch, 0);
+    EXPECT_EQ(cap.frames[1].baseSequence, 0);
+}
 
 TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegression) {
     std::atomic<int64_t> corr{1};

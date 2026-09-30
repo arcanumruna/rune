@@ -114,12 +114,13 @@ int64_t monoNs() {
 
 struct ProduceGateway {
     struct BatchRecord {
-        int32_t topicId   = 0;
-        int32_t partition = 0;
-        int64_t corrId    = 0;
-        int32_t baseSeq   = -1; // from RecordBatch header offset 53
-        int32_t recCount  = 0;
-        uint8_t acks      = 0xff; // captured from wire frame (0=Leader/None, 1=All)
+        int32_t topicId    = 0;
+        int32_t partition  = 0;
+        int64_t corrId     = 0;
+        int64_t producerId = -1; // from RecordBatch header offset 43 (F5)
+        int32_t baseSeq    = -1; // from RecordBatch header offset 53
+        int32_t recCount   = 0;
+        uint8_t acks       = 0xff; // captured from wire frame (0=Leader/None, 1=All)
         std::vector<std::string> values; // decoded record values
     };
 
@@ -227,25 +228,16 @@ struct ProduceGateway {
         rec.corrId    = opt->correlationId;
         rec.acks      = opt->acks;  // B2: capture wire acks field
 
-        // Decode RecordBatch header: baseSequence at offset 53, recordCount at 57.
+        // Decode RecordBatch header via the reader (producerId, baseSequence,
+        // recordCount — F5 adds producerId to what this test harness captures).
         const auto& rb = opt->recordBatch;
         if (rb.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-            const uint8_t* d = rb.data();
-            // baseSequence (int32 LE at offset 53).
-            rec.baseSeq = static_cast<int32_t>(
-                static_cast<uint32_t>(d[53])        |
-               (static_cast<uint32_t>(d[54]) <<  8) |
-               (static_cast<uint32_t>(d[55]) << 16) |
-               (static_cast<uint32_t>(d[56]) << 24));
-            // recordCount (int32 LE at offset 57).
-            rec.recCount = static_cast<int32_t>(
-                static_cast<uint32_t>(d[57])        |
-               (static_cast<uint32_t>(d[58]) <<  8) |
-               (static_cast<uint32_t>(d[59]) << 16) |
-               (static_cast<uint32_t>(d[60]) << 24));
+            rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
+            rec.producerId = reader.producerId();
+            rec.baseSeq    = reader.baseSequence();
+            rec.recCount   = reader.recordCount();
 
             // Decode values.
-            rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
             reader.forEach([&](std::string_view /*key*/, std::string_view val,
                                int64_t /*off*/, int64_t /*ts*/) {
                 rec.values.emplace_back(val.data(), val.size());
@@ -1199,9 +1191,15 @@ TEST(Producer, MultiRecordBatch) {
     EXPECT_GT(b0.recCount, 1)
         << "First batch must pack multiple records (batchBytes trigger)";
 
-    // baseSequence must be 0 (first batch on this partition).
-    EXPECT_EQ(b0.baseSeq, 0)
-        << "First batch baseSequence must be 0";
+    // F5: acks=None batches are ALWAYS encoded non-idempotent — producerId=-1
+    // (the wire sentinel telling the broker to skip sequence validation) and
+    // baseSequence left at the RecordBatchBuilder's own "unset" default (-1).
+    // Nothing tracks or retransmits an acks=None batch, so stamping a real
+    // sequence that nothing can recover on loss is exactly the bug this fixes.
+    EXPECT_EQ(b0.producerId, -1)
+        << "acks=None batch must carry the non-idempotent producerId sentinel (-1)";
+    EXPECT_EQ(b0.baseSeq, -1)
+        << "acks=None batch must carry the non-idempotent baseSequence sentinel (-1)";
 
     // builderBytes now tracks true WIRE size (batch header + per-record framing),
     // so the batchBytes trigger fires earlier and leaves a sub-threshold tail that
@@ -1220,21 +1218,22 @@ TEST(Producer, MultiRecordBatch) {
         std::this_thread::sleep_for(kPumpSleep);
     }
 
-    // Compute total records sent so far across all received batches.
-    int32_t totalRecsSoFar = 0;
-    for (const auto& b : h.gw->batches) totalRecsSoFar += b.recCount;
-
-    // Verify monotonic gap-free baseSequence across all batches.
-    int32_t nextExpected = 0;
+    // F5: every acks=None batch must carry the non-idempotent sentinel (-1) for
+    // BOTH producerId and baseSequence — none of them occupy a slot in the
+    // partition's real idempotent sequence.  The correctness signal for "no
+    // records lost or duplicated" is now the total record count, not
+    // sequence continuity (acks=None sequences are intentionally untracked).
+    int32_t totalRecs = 0;
     for (std::size_t i = 0; i < h.gw->batches.size(); ++i) {
         const auto& b = h.gw->batches[i];
-        EXPECT_EQ(b.baseSeq, nextExpected)
-            << "Gap-free baseSequence required at batch " << i;
-        nextExpected = b.baseSeq + b.recCount;
+        EXPECT_EQ(b.producerId, -1)
+            << "acks=None batch " << i << " must carry producerId sentinel -1";
+        EXPECT_EQ(b.baseSeq, -1)
+            << "acks=None batch " << i << " must carry baseSequence sentinel -1";
+        totalRecs += b.recCount;
     }
-    // nextExpected == total records = kRecords (gap-free).
-    EXPECT_EQ(nextExpected, kRecords)
-        << "baseSequence must advance by exactly kRecords across all batches";
+    EXPECT_EQ(totalRecs, kRecords)
+        << "All records must be delivered exactly once across batches (none lost/duplicated)";
 }
 
 // ===========================================================================
@@ -1248,8 +1247,11 @@ TEST(Producer, MultiPartitionInterleave) {
     AgentHarness h(kInStr, kEgStr);
     ASSERT_TRUE(h.connect()) << "Failed to connect";
 
+    // F5: acks=None batches are now always non-idempotent (baseSequence=-1,
+    // untracked — see MultiRecordBatch above), so per-partition sequence
+    // tracking — what this test actually verifies — requires acks=Leader/All.
     ProducerConfig pcfg;
-    pcfg.acks        = Acks::None;
+    pcfg.acks        = Acks::Leader;
     pcfg.lingerUs    = 1;   // flush fast
     pcfg.batchBytes  = 1;   // flush every record
     pcfg.maxInFlight = 32;

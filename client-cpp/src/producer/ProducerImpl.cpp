@@ -23,7 +23,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <random>
 #include <stdexcept>
+
+#if defined(_WIN32)
+#include <process.h> // _getpid
+#else
+#include <unistd.h>  // getpid
+#endif
 
 namespace rune::client::producer {
 
@@ -154,6 +161,73 @@ inline void keepFrame(std::vector<uint8_t>& dst, const uint8_t* src, std::size_t
     dst.assign(src, src + n);
 }
 
+// ---------------------------------------------------------------------------
+// producerId generation (F5 fix) — see ProducerImpl.h's producerId_ comment.
+//
+// The old code shared one hardcoded magic-stub constant across every
+// ProducerImpl instance; the broker dedups idempotent batches by
+// (producerId, partition, baseSequence), so two producers on the same
+// partition collided and silently deduplicated each other's records.  This
+// generator draws a fresh, effectively-unique, non-negative 64-bit id per
+// instance (and per epoch-overflow rotation) instead.
+//
+// TODO(milestone-c): a client-guessed id is only a stopgap. The durable fix
+// is a broker-allocated InitProducerId RPC with zombie-fencing (a monotonic
+// epoch the broker itself hands out and validates), which this local
+// generator cannot provide (no protection against two processes drawing the
+// same id, however astronomically unlikely).
+// ---------------------------------------------------------------------------
+
+// SplitMix64 — fast, well-distributed 64-bit mixer (public-domain algorithm;
+// used here purely to combine entropy sources, not as a CSPRNG).
+inline uint64_t splitmix64(uint64_t x) noexcept {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// The old shared magic-stub producerId — the generator below must never
+// reissue it (that would silently resurrect the collision bug this fix
+// removes).
+inline constexpr int64_t kLegacyStubProducerId =
+    static_cast<int64_t>(0x4352554E'4543422DULL); // "RUNECB-"
+
+// Draws a fresh, non-negative 64-bit producerId by mixing three independent,
+// cheap entropy sources: std::random_device (OS entropy), steady_clock (a
+// monotonic per-call timestamp), and the process id (separates concurrent
+// processes started at the same instant). The result is masked to 63 bits
+// (always >= 0 — the wire protocol reserves -1 for "non-idempotent"); on the
+// vanishingly unlikely chance it comes out as 0 or the old stub, it redraws.
+int64_t generateProducerId() noexcept {
+    for (;;) {
+        std::random_device rd;
+        const uint64_t rdBits = (static_cast<uint64_t>(rd()) << 32) ^
+                                 static_cast<uint64_t>(rd());
+        const uint64_t clockBits = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const uint64_t pidBits = static_cast<uint64_t>(
+#if defined(_WIN32)
+            ::_getpid()
+#else
+            ::getpid()
+#endif
+        );
+
+        uint64_t mixed = splitmix64(rdBits);
+        mixed = splitmix64(mixed ^ splitmix64(clockBits));
+        mixed = splitmix64(mixed ^ splitmix64(pidBits));
+
+        const int64_t candidate =
+            static_cast<int64_t>(mixed & 0x7FFFFFFFFFFFFFFFULL); // mask to non-negative
+        if (candidate != 0 && candidate != kLegacyStubProducerId) {
+            return candidate;
+        }
+        // 0 or an exact collision with the retired stub: redraw (astronomically
+        // unlikely — loop rather than special-case it).
+    }
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -191,6 +265,7 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , ringBuf_(makeRingBuffer(static_cast<std::size_t>(ringTotalBytes(ringCap)),
                               kRingAlignment))
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(ringCap)))
+    , producerId_(generateProducerId())  // F5: unique per instance, never the old shared stub
 {
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
@@ -607,12 +682,22 @@ bool ProducerImpl::encodeAndSend(
 {
     if (!ps.builder || ps.builder->recordCount() == 0) return false;
 
-    // Stamp idempotent header fields.  baseSequence is stamped but NOT advanced
-    // yet — the advance happens only after a successful offer (below), so a
-    // back-pressured retry re-sends the SAME sequence rather than opening a gap.
-    ps.builder->setProducerId(producerId_);
-    ps.builder->setProducerEpoch(producerEpoch_);
-    ps.builder->setBaseSequence(ps.nextBaseSequence);
+    // acks=None: nothing waits for a response, so nothing can detect (or ever
+    // retransmit) a lost frame — sequencing a batch nobody tracks just leaves a
+    // permanent, silent gap in the idempotent stream the moment one is dropped.
+    // Encode these batches as NON-idempotent instead: producerId=-1 (the wire
+    // sentinel the broker uses to skip all sequence validation) and leave
+    // producerEpoch/baseSequence at the builder's reset() defaults (-1/-1) —
+    // see Producer.h's "acks=None" note for the documented convention.
+    // acks=Leader/All: stamp this instance's real id and the next sequence.
+    // baseSequence is stamped but NOT advanced yet — the advance happens only
+    // after a successful offer (below), so a back-pressured retry re-sends the
+    // SAME sequence rather than opening a gap.
+    if (cfg_.acks != Acks::None) {
+        ps.builder->setProducerId(producerId_);
+        ps.builder->setProducerEpoch(producerEpoch_);
+        ps.builder->setBaseSequence(ps.nextBaseSequence);
+    }
 
     // Zero-copy encode: build the Produce frame header (with an EMPTY recordBatch)
     // then append the RecordBatch DIRECTLY after it, into the same wire buffer.
@@ -673,9 +758,15 @@ bool ProducerImpl::encodeAndSend(
     RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientBatchOffer,
                              static_cast<uint32_t>(correlationId),
                              static_cast<double>(ps.inflight.live() + 1));
-    const int32_t batchSeq     = ps.nextBaseSequence;
     const int32_t batchRecords = ps.builder->recordCount();
-    ps.nextBaseSequence += batchRecords;                 // advance ONLY on success
+    // acks=None batches are non-idempotent (producerId=-1, above) and nothing
+    // tracks their sequence, so nextBaseSequence is never stamped, read, or
+    // advanced for them — it stays exactly where the last idempotent batch (if
+    // any) left it, ready to resume cleanly if acks is ever changed back.
+    const int32_t batchSeq = (cfg_.acks != Acks::None) ? ps.nextBaseSequence : -1;
+    if (cfg_.acks != Acks::None) {
+        ps.nextBaseSequence += batchRecords;             // advance ONLY on success
+    }
     if (correlationId != 0) {
         // Only ack-expecting batches occupy the in-flight window (acks=None: corrId 0).
         InFlightBatch& b = ps.inflight.claim(ordinal_, ps.slotIndex);
@@ -731,37 +822,52 @@ bool ProducerImpl::encodeAndSendTier2(
 {
     if (entry.batchBytes.empty() || entry.recordCount == 0) return false;
 
-    // Patch the baseSequence, producerId, and producerEpoch into the pre-built
-    // RecordBatch bytes.  Use the named constants from rune::protocol::batch
-    // (RecordBatch.h) so a layout change on the C++ server side causes a
-    // compile-time break rather than silent CRC/seq corruption.
     namespace rb = rune::protocol::batch;
     auto& b = entry.batchBytes;
     if (b.size() < static_cast<std::size_t>(rb::kRecordBatchOverhead)) {
         return false; // truncated batch — should not happen
     }
 
-    // Patch producerId (int64 LE at kProducerIdOffset).
-    const uint64_t pid = static_cast<uint64_t>(producerId_);
-    for (int i = 0; i < 8; ++i)
-        b[rb::kProducerIdOffset + i] = static_cast<uint8_t>(pid >> (i * 8));
+    // acks=None: nothing waits for a response, so a lost frame can never be
+    // detected or retransmitted — sequencing (and tracking) a batch nobody
+    // tracks just leaves a permanent gap the moment one is dropped.  Encode
+    // these as NON-idempotent instead: producerId=-1 (the wire sentinel that
+    // tells the broker to skip sequence validation entirely).  BatchBuilder
+    // never stamps a pre-built Tier-2 batch (RecordBatchBuilder defaults
+    // producerId_/producerEpoch_/baseSequence_ to -1 — see RecordBatch.h), so
+    // entry.batchBytes is ALREADY -1/-1/-1 with a CRC computed over exactly
+    // those values: nothing to patch, and ps.nextBaseSequence is left
+    // untouched (see the Tier-1 path in encodeAndSend for the same rule).
+    //
+    // acks=Leader/All: patch this instance's real id and the next sequence
+    // into the pre-built RecordBatch bytes.  Use the named constants from
+    // rune::protocol::batch (RecordBatch.h) so a layout change on the C++
+    // server side causes a compile-time break rather than silent CRC/seq
+    // corruption.
+    const bool idempotent = (cfg_.acks != Acks::None);
+    if (idempotent) {
+        // Patch producerId (int64 LE at kProducerIdOffset).
+        const uint64_t pid = static_cast<uint64_t>(producerId_);
+        for (int i = 0; i < 8; ++i)
+            b[rb::kProducerIdOffset + i] = static_cast<uint8_t>(pid >> (i * 8));
 
-    // Patch producerEpoch (int16 LE at kProducerEpochOffset).
-    const uint16_t ep = static_cast<uint16_t>(producerEpoch_);
-    b[rb::kProducerEpochOffset]     = static_cast<uint8_t>(ep);
-    b[rb::kProducerEpochOffset + 1] = static_cast<uint8_t>(ep >> 8);
+        // Patch producerEpoch (int16 LE at kProducerEpochOffset).
+        const uint16_t ep = static_cast<uint16_t>(producerEpoch_);
+        b[rb::kProducerEpochOffset]     = static_cast<uint8_t>(ep);
+        b[rb::kProducerEpochOffset + 1] = static_cast<uint8_t>(ep >> 8);
 
-    // Patch baseSequence (int32 LE at kBaseSequenceOffset).
-    const uint32_t seq = static_cast<uint32_t>(ps.nextBaseSequence);
-    b[rb::kBaseSequenceOffset]     = static_cast<uint8_t>(seq);
-    b[rb::kBaseSequenceOffset + 1] = static_cast<uint8_t>(seq >> 8);
-    b[rb::kBaseSequenceOffset + 2] = static_cast<uint8_t>(seq >> 16);
-    b[rb::kBaseSequenceOffset + 3] = static_cast<uint8_t>(seq >> 24);
+        // Patch baseSequence (int32 LE at kBaseSequenceOffset).  NOT advanced
+        // until the offer succeeds (below) — a back-pressured retry must
+        // re-send the SAME sequence.
+        const uint32_t seq = static_cast<uint32_t>(ps.nextBaseSequence);
+        b[rb::kBaseSequenceOffset]     = static_cast<uint8_t>(seq);
+        b[rb::kBaseSequenceOffset + 1] = static_cast<uint8_t>(seq >> 8);
+        b[rb::kBaseSequenceOffset + 2] = static_cast<uint8_t>(seq >> 16);
+        b[rb::kBaseSequenceOffset + 3] = static_cast<uint8_t>(seq >> 24);
 
-    // Recompute the CRC-32C over the CRC-covered region
-    // [kAttributesOffset .. end], stored as uint32 LE at kCrcOffset.
-    // Must be recomputed after patching producerId/epoch/baseSequence.
-    {
+        // Recompute the CRC-32C over the CRC-covered region
+        // [kAttributesOffset .. end], stored as uint32 LE at kCrcOffset.
+        // Must be recomputed after patching producerId/epoch/baseSequence.
         const uint32_t crc = rune::protocol::crc32c(
             b.data() + rb::kAttributesOffset, b.size() - rb::kAttributesOffset);
         b[rb::kCrcOffset]     = static_cast<uint8_t>(crc);
@@ -770,9 +876,6 @@ bool ProducerImpl::encodeAndSendTier2(
         b[rb::kCrcOffset + 3] = static_cast<uint8_t>(crc >> 24);
     }
 
-    // NOTE: baseSequence is patched above but NOT advanced until the offer
-    // succeeds (below) — a back-pressured retry must re-send the SAME sequence.
-
     // Encode the Produce wire frame.
     namespace rpc = rune::protocol::client;
     rpc::Produce msg;
@@ -780,7 +883,7 @@ bool ProducerImpl::encodeAndSendTier2(
     // Wire id = the in-flight slot this batch will claim (the Tier-2 future's
     // handle goes into the ack slice, record 0, below).  acks=None: id 0 and no
     // slot, exactly like Tier-1 — no response is awaited.
-    const bool    awaitAck   = (cfg_.acks != Acks::None);
+    const bool    awaitAck   = idempotent;
     const int64_t wireCorrId = awaitAck
                              ? batchcorr::make(ordinal_, ps.slotIndex, ps.inflight.nextSeq())
                              : 0;
@@ -814,8 +917,12 @@ bool ProducerImpl::encodeAndSendTier2(
     }
 
     ++framesSent_; // one Aeron frame offered to transport (Tier-2)
-    const int32_t batchSeq = ps.nextBaseSequence;
-    ps.nextBaseSequence += entry.recordCount;  // advance ONLY on success
+    // acks=None: non-idempotent (see above) — sequence stays untouched, matching
+    // the Tier-1 rule in encodeAndSend.
+    const int32_t batchSeq = idempotent ? ps.nextBaseSequence : -1;
+    if (idempotent) {
+        ps.nextBaseSequence += entry.recordCount;  // advance ONLY on success
+    }
     if (!awaitAck) {
         emitBatchAck_(ps, batchSeq, entry.recordCount, -1, 0);
         const uint64_t h = entry.ackHandle;
@@ -1057,7 +1164,12 @@ void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, const std::s
 void ProducerImpl::onUnresolvedSequence_(int16_t batchEpoch) noexcept {
     if (batchEpoch != producerEpoch_) return;  // gap already resolved by an earlier bump
     if (producerEpoch_ == INT16_MAX) {
-        ++producerId_;
+        // Epoch space exhausted: rotate to a FRESH unique id (never producerId_+1 —
+        // an incremented id is just as likely to collide with another live
+        // producer's id as the original was, and gives the broker no reason to
+        // believe this is a distinct producer).  Fresh id + epoch 0 is the same
+        // trust-on-first-use the broker already grants any never-seen producerId.
+        producerId_ = generateProducerId();
         producerEpoch_ = 0;
     } else {
         ++producerEpoch_;

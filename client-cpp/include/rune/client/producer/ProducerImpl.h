@@ -438,6 +438,18 @@ public:
     /// Total records accepted via drainRing (agent-thread only; plain uint64_t).
     uint64_t recordsSent() const noexcept { return recordsSent_; }
 
+    /// This instance's current producerId / epoch (diagnostics + tests; F5).
+    /// Both are agent-thread state but only ever change on the agent thread
+    /// (construction and the epoch-overflow path), so a racy read from another
+    /// thread is stale-but-safe for test assertions taken after a pump.
+    [[nodiscard]] int64_t producerId() const noexcept { return producerId_; }
+    [[nodiscard]] int16_t producerEpoch() const noexcept { return producerEpoch_; }
+
+    /// Test-only seam (F5 regression coverage): force the current epoch so a
+    /// test can drive the INT16_MAX overflow path without sending 32767 real
+    /// batches to get there. Never called from production code.
+    void debugSetEpochForTest(int16_t epoch) noexcept { producerEpoch_ = epoch; }
+
     // ---- Global flush flag (written by app thread, read by agent) -------------
     // Set by submitFlush(); cleared by flushBatches() after processing.
     std::atomic<bool> globalFlushPending_ {false};
@@ -498,7 +510,8 @@ private:
     /// reject forever.  Bumps producerEpoch_ and restarts every partition at
     /// baseSequence 0 (the broker accepts a higher epoch only at 0 and resets its
     /// state).  Batches of an older epoch do not bump again (one bump per gap
-    /// event).  Epoch overflow: at INT16_MAX the producerId is rotated (+1) and
+    /// event).  Epoch overflow: at INT16_MAX a FRESH unique producerId is drawn
+    /// (never the old id+1 — see generateProducerId() in ProducerImpl.cpp) and
     /// the epoch restarts at 0 — the broker treats it as a new producer
     /// (trust-on-first-use at baseSequence 0).
     void onUnresolvedSequence_(int16_t batchEpoch) noexcept;
@@ -549,16 +562,19 @@ private:
     std::vector<uint8_t> batchScratch_;
     std::vector<uint8_t> encodeScratch_;
 
-    // Stub producerId for M-B: local random-ish value.
-    // TODO(milestone-c): real InitProducerId + zombie-fencing.
-    // NOTE: every ProducerImpl instance (and every Client instance) shares
-    // this same (producerId, epoch) pair.  On the broker, the idempotent-dedup
-    // key is (producerId, partition, baseSequence).  Two concurrent producers
-    // writing to the SAME partition with the same producerId WILL collide and
-    // deduplicate incorrectly.  M-B assumes a single producer per broker
-    // partition at a time; multi-producer safety requires per-producer unique
-    // producerIds via InitProducerId (Milestone-C TODO).
-    int64_t producerId_  = 0x4352554E'4543422DULL; // "RUNECB-" magic stub
+    // Per-instance producerId (F5 fix): drawn fresh at construction by
+    // generateProducerId() (ProducerImpl.cpp) — 63 random bits mixed from
+    // std::random_device, std::chrono::steady_clock, and the process id, never
+    // the old shared magic-stub value.  On the broker, the idempotent-dedup key
+    // is (producerId, partition, baseSequence); two concurrent producers on the
+    // SAME partition with the SAME producerId would collide and deduplicate
+    // incorrectly, which is exactly what the old hardcoded stub caused.
+    // producerId == -1 is reserved by the wire protocol for "non-idempotent"
+    // (see acks=None handling in ProducerImpl.cpp) and is never assigned here.
+    // TODO(milestone-c): the durable fix is a broker-allocated InitProducerId
+    // with zombie-fencing; this client-drawn random id only makes an
+    // accidental collision between two live instances astronomically unlikely.
+    int64_t producerId_;
     int16_t producerEpoch_ = 0;
 
     // ---- In-flight batch tracking (agent-thread only; no mutex needed) -------

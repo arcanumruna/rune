@@ -19,10 +19,22 @@
 //
 // Idempotence:
 //   Each partition carries a monotonic baseSequence stamped into the batch header.
-//   producerId is a local stub for M-B (TODO(milestone-c): real InitProducerId).
+//   producerId is a per-instance client-drawn random id for M-B (F5 fix — see
+//   ProducerImpl.h/.cpp's generateProducerId()); TODO(milestone-c): real
+//   broker-allocated InitProducerId + zombie-fencing.
 //
 // acks=None: the batch is sent without requesting a ProduceResponse.  The void
-//   send fast path with acks=None is fully alloc-free end-to-end.
+//   send fast path with acks=None is fully alloc-free end-to-end.  Nothing
+//   tracks or retransmits an acks=None batch, so it is ALWAYS encoded as
+//   NON-idempotent: producerId=-1 (the wire sentinel that tells the broker to
+//   skip all sequence validation for this batch) with producerEpoch and
+//   baseSequence left at -1 too (RecordBatchBuilder's own "unset" defaults —
+//   see RecordBatch.h).  This is the documented convention for "no
+//   idempotence" throughout this client: -1/-1/-1.  A partition's real
+//   (producerId_, producerEpoch_, nextBaseSequence) idempotent state is never
+//   read, stamped, or advanced for an acks=None batch, so switching acks back
+//   to Leader/All later resumes cleanly from wherever the idempotent sequence
+//   last left off.
 //
 // Usage:
 //   auto topic = client.topic("orders");          // returns TopicHandle
@@ -97,8 +109,11 @@ inline constexpr want_future_t want_future{};
 // the batch are baseSequence .. baseSequence+recordCount-1 of this producer's
 // per-partition idempotent sequence and landed at baseOffset .. +recordCount-1.
 //
-// acks=None: no response is awaited; a BatchAck{errorCode=0, baseOffset=-1} is
-// reported when the batch is handed to the transport ("sent, offset unknown").
+// acks=None: no response is awaited; a BatchAck{errorCode=0, baseOffset=-1,
+// baseSequence=-1} is reported when the batch is handed to the transport
+// ("sent, offset unknown") — baseSequence=-1 reflects that the batch was
+// encoded non-idempotent (see the "acks=None" note above) and never occupied
+// a slot in the partition's real idempotent sequence.
 //
 // Failure of a sequenced batch (delivery timeout, redirect exhausted, close,
 // broker rejection) bumps the producer epoch and restarts every partition's
