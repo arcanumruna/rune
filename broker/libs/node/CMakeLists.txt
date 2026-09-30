@@ -76,6 +76,17 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_node_tests)
 
     # ---------------------------------------------------------------------------
+    # E5 Task 2: WorkerReplicationValidator unit tests — pure symmetric-worker-count
+    # validator (header-only, no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_worker_replication_validator_tests
+        tests/node/WorkerReplicationValidatorTest.cpp)
+    target_link_libraries(rune_worker_replication_validator_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_worker_replication_validator_tests)
+
+    # ---------------------------------------------------------------------------
     # E5.1.2b: ProducePathTest — unit tests for the shared handleProduceBatch
     # helper (ProducePath.h/.cpp).  Tests the core batch produce semantics
     # (restamp, CRC, idempotent dedup, min-ISR gate, append, PSM update) against
