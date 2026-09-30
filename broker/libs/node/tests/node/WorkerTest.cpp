@@ -21,6 +21,15 @@
 //      that the doWork return-value includes the polled fragment count.
 //   6. DoWorkReplTransportNullWhenFlagOff — no transport wired → doWork() does
 //      not crash (flag-off path unchanged, workerReplTransport_ == nullptr).
+//   7. DoWorkReplTransportRoutesFetchRequestToLeader (Task 6 review) — leader
+//      worker owning a partition; inject a FetchRequest frame via the transport's
+//      test-inject seam; call doWork(); assert the leader called sendFetchResponse
+//      on its RecordingTransport (proves templateId 1 → onFetchRequest routing
+//      end-to-end at the Worker layer).
+//   8. DoWorkReplTransportNullReplicaGuard (Task 6 review) — inject a frame
+//      whose (topicId, partition) is NOT owned by this worker; call doWork();
+//      assert no crash and no side-effect on any owned replica.
+//      (OLE + reconcile routing covered by Task 7 failover integration.)
 // ---------------------------------------------------------------------------
 
 #include <rune/node/Worker.h>
@@ -387,8 +396,6 @@ TEST(Worker, DoWorkPollsReplicationTransportAndAppliesInline)
 
     const rune::replication::Offset leoAtStart = follower->logEndOffset();
 
-    // Build a minimal RecordBatch and encode a FetchResponse carrying it.
-    const std::vector<uint8_t> batchBytes = makeMinimalRecordBatch(128);
     // Use raw bytes (not magic=2 pattern) so applyReplicated uses the
     // unit-test fallback path (makeBatch_) — simpler, equally valid for LEO check.
     std::vector<uint8_t> rawRecords(32, 0xAB); // 32 bytes of raw payload
@@ -448,4 +455,164 @@ TEST(Worker, DoWorkReplTransportNullWhenFlagOff)
     // No setReplicationTransport call — transport remains null.
     const int work = w.doWork(/*nowNs=*/1'000'000LL);
     EXPECT_GE(work, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 Review Test 1: DoWorkReplTransportRoutesFetchRequestToLeader
+//
+// Scenario:
+//   - 2-node LEADER (selfId=1, ISR=[1,2], minIsr=1, epoch=1),
+//     topicId=3, partition=4, with RecordingTransport as the replica's
+//     PartitionTransport (captures sendFetchResponse calls).
+//   - Encode a FetchRequest (templateId=1) from follower 2 (fetchOffset=0,
+//     epoch=1) into a wire buffer.
+//   - Inject the frame via transport.injectFrameForTest() into the
+//     TestWorkerTransport (the per-worker replication poll path).
+//   - Call worker.doWork() once — must poll the transport and call
+//     pollReplTransportDispatch_(templateId=1) → replica->onFetchRequest()
+//     → recording transport's sendFetchResponse is invoked.
+//   - Assert: fetchResponseCount == 1 (proves templateId 1 routing end-to-end).
+//   - Assert: lastToFollower == 2 (correct target).
+//
+// This test fails if pollReplTransportDispatch_ mis-routes templateId 1
+// (e.g. falls through to default/no-op), because no sendFetchResponse
+// would be recorded.
+// ---------------------------------------------------------------------------
+TEST(Worker, DoWorkReplTransportRoutesFetchRequestToLeader)
+{
+    const int32_t kTopicId   = 3;
+    const int32_t kPartition = 4;
+    const int64_t kEpoch     = 1;
+
+    // RecordingTransport captures sendFetchResponse calls from onFetchRequest.
+    RecordingTransport recordingTransport;
+
+    InMemoryLog leaderLog(/*maxBytes=*/4 * 1024 * 1024, /*maxRecords=*/10000);
+    PartitionConfig cfg{};
+    cfg.topicId             = kTopicId;
+    cfg.partitionId         = static_cast<rune::replication::PartitionId>(kPartition);
+    cfg.selfId              = 1;   // this node is the leader
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 10'000;
+    cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs     = 1'000'000LL;
+    cfg.isrCheckIntervalNs  = 1'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;
+    cfg.pushOnAppend        = false;
+    auto leader = std::make_unique<PartitionReplica>(
+        cfg,
+        rune::replication::Role::Leader, kEpoch,
+        std::vector<NodeId>{1, 2},   // ISR: leader=1, follower=2
+        std::vector<NodeId>{1, 2},   // full replica set
+        &leaderLog, &recordingTransport);
+
+    // Encode a FetchRequest (templateId=1) from follower 2, fetchOffset=0.
+    alignas(8) uint8_t fetchReqBuf[rune::replication::FetchRequestMsg::TOTAL_SIZE];
+    rune::replication::FetchRequestMsg::encode(
+        fetchReqBuf, /*offset=*/0,
+        /*leaderEpoch=*/kEpoch,
+        /*partition=*/static_cast<rune::replication::PartitionId>(kPartition),
+        /*followerId=*/2,
+        /*fetchOffset=*/0,
+        /*maxBytes=*/1 << 20,
+        /*topicId=*/kTopicId);
+
+    // Wire the worker as the leader's owner.
+    TestWorkerTransport workerTransport(/*workerId=*/11, SharedFakePubRegistry{});
+    workerTransport.injectFrameForTest(fetchReqBuf, sizeof(fetchReqBuf));
+
+    Worker w(/*workerId=*/11);
+    w.setOwnedDirect(Worker::OwnedSet{leader.get()});
+    w.setReplicationTransportForTest(&workerTransport);
+
+    // Drive the worker once — must poll transport + route FetchRequest inline
+    // → leader->onFetchRequest() → recordingTransport.sendFetchResponse().
+    const int work = w.doWork(/*nowNs=*/1'000'000LL);
+    EXPECT_GE(work, 0);
+
+    // The leader must have responded to follower 2.
+    EXPECT_EQ(recordingTransport.fetchResponseCount.load(), 1)
+        << "pollReplTransportDispatch_(templateId=1) must route to onFetchRequest "
+           "which calls sendFetchResponse; count was "
+        << recordingTransport.fetchResponseCount.load();
+    EXPECT_EQ(recordingTransport.lastToFollower, 2)
+        << "FetchResponse must be addressed to follower 2";
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 Review Test 2: DoWorkReplTransportNullReplicaGuard
+//
+// Scenario:
+//   - Worker owns a follower replica for (topicId=5, partition=7).
+//   - Inject a FetchResponse frame for (topicId=99, partition=88) — NOT owned
+//     by this worker.
+//   - Call doWork() once.
+//   - Assert: no crash, no LEO change on the owned replica
+//     (pollReplTransportDispatch_'s null-replica guard fires, frame is dropped).
+//
+// OLE + reconcile routing (templateIds 3/4/5/6) is covered by Task 7
+// failover integration tests, not constructed artificially here.
+// ---------------------------------------------------------------------------
+TEST(Worker, DoWorkReplTransportNullReplicaGuard)
+{
+    const int32_t kOwnedTopicId   = 5;
+    const int32_t kOwnedPartition = 7;
+    const int64_t kEpoch          = 1;
+
+    // Build a follower replica for (topicId=5, partition=7).
+    NullTransport nullTransport;
+    InMemoryLog followerLog(/*maxBytes=*/4 * 1024 * 1024, /*maxRecords=*/10000);
+    PartitionConfig cfg{};
+    cfg.topicId             = kOwnedTopicId;
+    cfg.partitionId         = static_cast<rune::replication::PartitionId>(kOwnedPartition);
+    cfg.selfId              = 2;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 10'000;
+    cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs     = 1'000'000LL;
+    cfg.isrCheckIntervalNs  = 1'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;
+    cfg.pushOnAppend        = false;
+    auto follower = std::make_unique<PartitionReplica>(
+        cfg,
+        rune::replication::Role::Follower, kEpoch,
+        std::vector<NodeId>{1, 2},
+        std::vector<NodeId>{1, 2},
+        &followerLog, &nullTransport);
+
+    const rune::replication::Offset leoAtStart = follower->logEndOffset();
+
+    // Encode a FetchResponse for (topicId=99, partition=88) — NOT owned by this worker.
+    const int32_t kWrongTopicId   = 99;
+    const int32_t kWrongPartition = 88;
+    std::vector<uint8_t> rawRecords(32, 0xCD); // 32 arbitrary bytes
+    const std::size_t frameLen =
+        rune::replication::FetchResponseMsg::encodedSize(rawRecords.size());
+    std::vector<uint8_t> frameBuf(frameLen, 0);
+    rune::replication::FetchResponseMsg::encode(
+        frameBuf.data(), /*offset=*/0,
+        /*leaderEpoch=*/kEpoch,
+        /*partition=*/kWrongPartition,
+        /*highWatermark=*/1,
+        /*logStartOffset=*/0,
+        /*errorCode=*/0,
+        std::span<const uint8_t>(rawRecords.data(), rawRecords.size()),
+        /*topicId=*/kWrongTopicId);
+
+    // Inject into the per-worker transport.
+    TestWorkerTransport workerTransport(/*workerId=*/12, SharedFakePubRegistry{});
+    workerTransport.injectFrameForTest(frameBuf.data(), frameBuf.size());
+
+    // Wire the worker — it ONLY owns (topicId=5, partition=7).
+    Worker w(/*workerId=*/12);
+    w.setOwnedDirect(Worker::OwnedSet{follower.get()});
+    w.setReplicationTransportForTest(&workerTransport);
+
+    // doWork() must not crash; the null-replica guard must silently drop the frame.
+    EXPECT_NO_FATAL_FAILURE(w.doWork(/*nowNs=*/1'000'000LL));
+
+    // The owned follower's LEO must be unchanged — the frame was dropped.
+    EXPECT_EQ(follower->logEndOffset(), leoAtStart)
+        << "Null-replica guard must drop frames for unowned (topicId=99, partition=88); "
+           "LEO of the owned replica (5,7) must be unchanged";
 }
