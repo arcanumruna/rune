@@ -406,6 +406,11 @@ public:
 
     const ProducerConfig& config() const noexcept { return cfg_; }
 
+    /// Diagnostics / tests (agent thread only): the accumulator of
+    /// (topicId, partition), or nullptr if never seen.  Read-only; no allocation.
+    [[nodiscard]] const PartitionState* partitionState(int32_t topicId,
+                                                       int32_t partition) const noexcept;
+
     /// Ordinal inside the owning ProducerHub; encoded into batch correlation ids.
     void setOrdinal(uint32_t o) noexcept { ordinal_ = o; }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
@@ -463,6 +468,9 @@ private:
     void resolveSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset);
     /// Fails a live batch's records and releases its slot.
     void failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason);
+    /// Always-on invariant check: the id encoded into the sent frame must be the
+    /// id of the slot just claimed; on mismatch logs loudly and fails the batch.
+    void verifyClaimedCorrId_(PartitionState& ps, InFlightBatch& b, int64_t wireCorrId);
 
     // ---- Members -------------------------------------------------------------
 

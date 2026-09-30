@@ -389,6 +389,12 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     return *partitions_.back();
 }
 
+const PartitionState* ProducerImpl::partitionState(int32_t topicId,
+                                                   int32_t partition) const noexcept {
+    const uint32_t i = partitionIndex_.find(partKey(topicId, partition));
+    return (i == detail::FlatIndexMap::kNone) ? nullptr : partitions_[i].get();
+}
+
 void ProducerImpl::growAckRing(PartitionState& ps) {
     const uint32_t oldCap = static_cast<uint32_t>(ps.ackRing.size());
     const uint32_t newCap = oldCap << 1; // stays a power of two
@@ -679,7 +685,6 @@ bool ProducerImpl::encodeAndSend(
     if (correlationId != 0) {
         // Only ack-expecting batches occupy the in-flight window (acks=None: corrId 0).
         InFlightBatch& b = ps.inflight.claim(ordinal_, ps.slotIndex);
-        assert(b.corrId == correlationId && "frame corrId must equal the claimed slot id");
         b.firstSendNs       = nowNs;
         b.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
         b.attempts          = 1;
@@ -693,6 +698,7 @@ bool ProducerImpl::encodeAndSend(
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
             earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
         }
+        verifyClaimedCorrId_(ps, b, correlationId);  // always on (not an assert)
     }
 
     // Reset builder IN PLACE for the next batch (success path only; keep the
@@ -772,9 +778,10 @@ bool ProducerImpl::encodeAndSendTier2(
     msg.sessionId      = sessionId;
     // Wire id = the in-flight slot this batch will claim; the Tier-2 future's own
     // id goes into the ack slice (record 0) below.
-    msg.correlationId  = (entry.corrId != 0)
+    const int64_t wireCorrId = (entry.corrId != 0)
                              ? batchcorr::make(ordinal_, ps.slotIndex, ps.inflight.nextSeq())
                              : 0;
+    msg.correlationId  = wireCorrId;
     msg.topicId        = entry.topicId;
     msg.partition      = entry.partition;
     msg.partitionKnown = 1;
@@ -828,6 +835,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.baseSequence      = batchSeq;
         ib.ingressStreamId   = ps.ingressStreamId;
         ib.wireFrame.assign(encodeScratch_.data(), encodeScratch_.data() + written);
+        verifyClaimedCorrId_(ps, ib, wireCorrId);  // always on (not an assert)
     }
 
     return true;
@@ -950,6 +958,19 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
     resolveSlice_(ps, b->ackStart, b->ackCount, baseOffset);
     ps.inflight.release(*b);
     reclaimAckRing_(ps);
+}
+
+void ProducerImpl::verifyClaimedCorrId_(PartitionState& ps, InFlightBatch& b, int64_t wireCorrId) {
+    if (b.corrId == wireCorrId) return;
+    // Invariant broken: the frame on the wire carries an id no live slot answers
+    // to, so its ack could never resolve these records.  Fail them loudly now
+    // rather than let them hang until the delivery timeout (release builds too).
+    std::fprintf(stderr,
+                 "ProducerImpl: BUG wire corrId=%lld != claimed slot corrId=%lld "
+                 "(topic=%d part=%d); failing the batch\n",
+                 static_cast<long long>(wireCorrId), static_cast<long long>(b.corrId),
+                 ps.topicId, ps.partition);
+    failBatch_(ps, b, "internal error: batch correlation id mismatch");
 }
 
 void ProducerImpl::reclaimAckRing_(PartitionState& ps) noexcept {

@@ -132,3 +132,96 @@ TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {
     hub.onProduceResponse(cap.frames[0].corrId, 5);
     EXPECT_FALSE(b->hasInFlight());
 }
+
+// Regression (fixed in this task): a batch that passes its delivery timeout is
+// failed immediately and its slot released; a LATE OK ProduceResponse for that
+// id must not complete anything (the old path dropped the retry record without
+// failing it, then resolved the wire corrId OK on a late ack).  Each record
+// completes exactly once, with the failure.
+TEST(ProducerInFlight, TimedOutBatchLateOkAckCompletesNothingRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(4, /*lingerUs=*/1'000'000), corr);
+    Capture cap;
+    const auto sink = cap.fn();
+    std::vector<int64_t> results[2];
+    for (int r = 0; r < 2; ++r) {
+        const int64_t id = impl.registerCallback([&results, r](int64_t off) {
+            results[r].push_back(off);
+        });
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(r)), kVal, true, id));
+    }
+    // One batch holding both ack-wanting records (linger holds, then flush).
+    pump(impl, sink);
+    impl.submitFlush();
+    pump(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    ASSERT_EQ(cap.frames[0].records, 2);
+    const int64_t wire = cap.frames[0].corrId;
+
+    // Past deliveryTimeoutMs (10 s) on the injected clock: batch given up.
+    const int64_t late = kNow + 10'000LL * 1'000'000LL;
+    impl.retransmitStalled(late, sink);
+    EXPECT_FALSE(impl.hasInFlight());
+    for (int r = 0; r < 2; ++r) {
+        ASSERT_EQ(results[r].size(), 1u) << "record " << r << " must fail exactly once";
+        EXPECT_EQ(results[r][0], -1);
+    }
+
+    // The broker's late OK ack for the given-up batch arrives.
+    impl.onProduceResponse(wire, 100);
+    for (int r = 0; r < 2; ++r) {
+        EXPECT_EQ(results[r].size(), 1u) << "late OK ack must not complete record " << r;
+        EXPECT_EQ(results[r][0], -1);
+    }
+}
+
+// Regression (fixed in this task): ackTail used to advance FIFO by the acked
+// batch's count, so an out-of-order ack moved it into a LIVE slice.  It must
+// stay at the oldest live batch's slice start, and the ack ring must never grow
+// over many out-of-order cycles (> kAckRingCapacity total ack entries).
+TEST(ProducerInFlight, OutOfOrderAcksKeepAckTailAtOldestLiveRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(2, /*lingerUs=*/1'000'000), corr);
+    Capture cap;
+    const auto sink = cap.fn();
+    long completed = 0;
+    auto sendBatch = [&](int records) {
+        for (int i = 0; i < records; ++i) {
+            const int64_t id = impl.registerCallback([&completed](int64_t off) {
+                if (off >= 0) ++completed;
+            });
+            ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(i)), kVal, true, id));
+        }
+        pump(impl, sink);            // linger holds the records in one builder
+        impl.submitFlush();
+        pump(impl, sink);            // one frame for all of them
+    };
+
+    // Seed the partition so its state exists.
+    sendBatch(1);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    impl.onProduceResponse(cap.frames[0].corrId, 0);
+    const PartitionState* ps = impl.partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    const std::size_t ringCap = ps->ackRing.size();
+    ASSERT_EQ(ringCap, kAckRingCapacity);
+
+    constexpr int kCycles = 6'000;   // 3 ack entries/cycle -> 18'000 > 16'384
+    for (int c = 0; c < kCycles; ++c) {
+        const uint64_t aStart = ps->ackHead;
+        const std::size_t f0 = cap.frames.size();
+        sendBatch(1);                // A: slice [aStart, aStart+1)
+        sendBatch(2);                // B: slice [aStart+1, aStart+3)
+        ASSERT_EQ(cap.frames.size(), f0 + 2) << "cycle " << c;
+        ASSERT_EQ(cap.frames[f0 + 1].records, 2);
+        ASSERT_EQ(ps->ackHead, aStart + 3);
+
+        impl.onProduceResponse(cap.frames[f0 + 1].corrId, 10);   // B acks first
+        ASSERT_EQ(ps->ackTail, aStart) << "ackTail must stay at live A's slice, cycle " << c;
+        impl.onProduceResponse(cap.frames[f0].corrId, 5);        // then A
+        ASSERT_EQ(ps->ackTail, ps->ackHead) << "cycle " << c;
+        ASSERT_EQ(ps->ackRing.size(), ringCap) << "ack ring grew at cycle " << c;
+    }
+    EXPECT_EQ(completed, 1 + 3L * kCycles);
+    EXPECT_FALSE(impl.hasInFlight());
+}
