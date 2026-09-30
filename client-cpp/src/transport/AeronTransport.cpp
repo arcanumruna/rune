@@ -51,6 +51,10 @@ void AeronTransport::start() {
         return; // already started
     }
 
+    if (auto err = validate(cfg_)) {
+        throw std::invalid_argument("AeronTransport: invalid TransportConfig: " + *err);
+    }
+
     // 1. Create dataDir (and the aeron sub-dir will be created by the driver).
     std::error_code ec;
     fs::create_directories(cfg_.dataDir, ec);
@@ -493,23 +497,18 @@ void AeronTransport::startEmbeddedDriver() {
     aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
     aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-    aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
+    aeron_driver_context_set_shared_idle_strategy(driverCtx_, cfg_.driverIdleStrategy.c_str());
     aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
     aeron_driver_context_set_term_buffer_length(
         driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
-    // Task 6: larger OS UDP socket buffers so the client kernel does not drop
-    // ack (egress) or produce datagrams under burst.  Overridable via
-    // RUNE_AERON_SOCKET_BUFFER_BYTES (0 = leave Aeron's default).
-    {
-        std::size_t sockBuf = 2u * 1024 * 1024;
-        if (const char* raw = std::getenv("RUNE_AERON_SOCKET_BUFFER_BYTES")) {
-            const long v = std::strtol(raw, nullptr, 10);
-            if (v >= 0) sockBuf = static_cast<std::size_t>(v);
-        }
-        if (sockBuf > 0) {
-            aeron_driver_context_set_socket_so_sndbuf(driverCtx_, sockBuf);
-            aeron_driver_context_set_socket_so_rcvbuf(driverCtx_, sockBuf);
-        }
+    aeron_driver_context_set_mtu_length(driverCtx_, cfg_.mtuLength);
+    aeron_driver_context_set_client_liveness_timeout_ns(
+        driverCtx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
+    if (cfg_.socketSndBufBytes > 0) {
+        aeron_driver_context_set_socket_so_sndbuf(driverCtx_, cfg_.socketSndBufBytes);
+    }
+    if (cfg_.socketRcvBufBytes > 0) {
+        aeron_driver_context_set_socket_so_rcvbuf(driverCtx_, cfg_.socketRcvBufBytes);
     }
 
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {

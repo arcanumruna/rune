@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -237,4 +238,32 @@ TEST(AeronTransportRegression, StartupPumpsDriverFromOneThreadOnlyRegression) {
     t.stop();
     EXPECT_EQ(t.callerPumpViolations(), 0)
         << "stop() may drain the driver only after joining driverThread_";
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: explicit transport configuration — MTU reaches the driver.
+// ---------------------------------------------------------------------------
+
+// The configured MTU reaches the driver: a UDP publication's max payload is
+// mtuLength - DATA_HEADER_LENGTH (32).  Aeron's default would give 1408 - 32.
+TEST(AeronTransport, UdpPublicationHonoursConfiguredMtu) {
+    Config cfg = makeLoopbackConfig(1020);
+    cfg.ingressChannel = "aeron:udp?endpoint=127.0.0.1:24711";  // no subscriber needed
+    cfg.mtuLength      = 8192;
+    Transport t{cfg};
+    t.start();
+    EXPECT_EQ(t.ingressMaxPayloadLength(), 8192 - 32);
+    t.stop();
+}
+
+TEST(AeronTransport, InvalidMtuFailsStartWithClearError) {
+    Config cfg = makeLoopbackConfig(1021);
+    cfg.mtuLength = 1000;  // not a multiple of 32
+    Transport t{cfg};
+    try {
+        t.start();
+        FAIL() << "start() must reject an invalid MTU";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("multiple of 32"), std::string::npos);
+    }
 }

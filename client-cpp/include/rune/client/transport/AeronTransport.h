@@ -29,6 +29,8 @@ extern "C" {
 #include <aeronmd/aeronmd.h>
 }
 
+#include <rune/client/transport/TransportConfig.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -39,28 +41,6 @@ extern "C" {
 #include <unordered_map>
 
 namespace rune::client::transport {
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-/// Configuration for AeronTransport.
-/// dataDir is the root directory for the embedded media driver.
-/// The driver's aeron dir will be dataDir/aeron (the aeronDir gotcha:
-/// the aeron::Context aeronDir MUST equal the driver's aeron dir).
-struct TransportConfig {
-    std::string ingressChannel;   ///< Channel the client publishes to (→ gateway)
-    int32_t     ingressStreamId;  ///< Stream id for ingress publication
-    std::string egressChannel;    ///< Channel the client subscribes on (← gateway)
-    int32_t     egressStreamId;   ///< Stream id for egress subscription
-    std::string dataDir;          ///< Root dir; driver lives at dataDir/aeron
-    /// Aeron term buffer length (bytes) for the embedded driver — sizes every
-    /// publication/subscription log buffer on this driver.  Must be a power of
-    /// two in [64 KiB, 1 GiB].  Default 4 MiB (deployments raise it via env, e.g.
-    /// 32 MiB, for deep in-flight on high-throughput small-record producing;
-    /// a 64 KiB buffer caps in-flight to ~50 × 1 KiB).
-    std::size_t termBufferLength = 4u * 1024 * 1024;
-};
 
 // ---------------------------------------------------------------------------
 // AeronTransport
@@ -157,6 +137,12 @@ public:
     /// aeron_driver_main_do_work() while driverThread_ was running.  A driver
     /// must be driven by exactly one thread, so this must always be 0.
     [[nodiscard]] int callerPumpViolations() const noexcept { return callerPumpViolations_; }
+
+    /// Max single-frame payload of the default ingress publication
+    /// (= mtuLength - 32 for UDP).  0 before start().
+    [[nodiscard]] int32_t ingressMaxPayloadLength() const noexcept {
+        return ingressPub_ ? ingressPub_->maxPayloadLength() : 0;
+    }
 
     // -------------------------------------------------------------------------
     // retarget — single-writer, agent-thread only

@@ -889,6 +889,17 @@ if(BUILD_TESTING)
     )
     target_link_libraries(rune_schema_gen_tests PRIVATE rune_codec GTest::gtest_main)
     gtest_discover_tests(rune_schema_gen_tests)
+
+    # ── Sharded invoker client: pure (Aeron-free) unit tests ─────────────────
+    add_executable(rune_pure_tests
+        tests/transport/TransportConfigTest.cpp
+    )
+    target_include_directories(rune_pure_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_pure_tests PRIVATE GTest::gtest_main)
+    gtest_discover_tests(rune_pure_tests)
 endif()
 
 # ── Task 12: rune_schema_gen executable ───────────────────────────────────────

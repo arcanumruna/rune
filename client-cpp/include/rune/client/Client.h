@@ -132,6 +132,12 @@ struct ClientConfig {
     // Power of two in [64 KiB, 1 GiB].  Default 4 MiB; raise (e.g. 32 MiB) for
     // deep in-flight on high-throughput small-record producing.
     std::size_t termBufferBytes = 4u * 1024 * 1024;
+
+    // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
+    // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win.
+    std::size_t mtuBytes          = 8192;
+    std::size_t socketBufferBytes = 2u * 1024 * 1024;  // SO_SNDBUF and SO_RCVBUF
+
     // M2 FIX [CB-5]: subscribe-request timeout — if a SubscribeResponse does
     // not arrive within this window the pending subscribe is failed (active
     // cleared) so the app is not left polling subscriptionId() forever.
@@ -150,6 +156,9 @@ struct ClientConfig {
     // TODO(dynamic): fetch topic metadata from the broker on connect.
     std::vector<TopicSpec> topics;
 };
+
+/// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
+[[nodiscard]] agent::AgentConfig toAgentConfig(const ClientConfig& c);
 
 // ---------------------------------------------------------------------------
 // Client

@@ -39,9 +39,7 @@ namespace rune::client {
 // Helper: build AgentConfig from ClientConfig
 // ---------------------------------------------------------------------------
 
-namespace {
-
-agent::AgentConfig makeAgentConfig(const ClientConfig& c) {
+agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     agent::AgentConfig acfg;
     acfg.transport.ingressChannel  = c.gatewayChannel;
     acfg.transport.ingressStreamId = c.gatewayStreamId;
@@ -70,10 +68,14 @@ agent::AgentConfig makeAgentConfig(const ClientConfig& c) {
             static_cast<int64_t>(c.connectTimeoutMs) * 1'000'000LL;
     }
 
+    // Task 3: explicit Aeron knobs (spec §4.1/§4.3).  Env overrides win.
+    acfg.transport.mtuLength         = c.mtuBytes;
+    acfg.transport.socketSndBufBytes = c.socketBufferBytes;
+    acfg.transport.socketRcvBufBytes = c.socketBufferBytes;
+    transport::applyEnvOverrides(acfg.transport);
+
     return acfg;
 }
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -81,7 +83,7 @@ agent::AgentConfig makeAgentConfig(const ClientConfig& c) {
 
 Client::Client(ClientConfig cfg)
     : cfg_(std::move(cfg))
-    , agent_(makeAgentConfig(cfg_))
+    , agent_(toAgentConfig(cfg_))
     , nextSweep_(std::chrono::steady_clock::now() +
                  std::chrono::milliseconds(kSweepIntervalMs))
     , partitionRouter_(metadataCache_)
