@@ -36,6 +36,8 @@ extern "C" {
 
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationMessages.h>
+#include <rune/replication/WorkerReplicationTransport.h>
 #include <rune/storage/Log.h>
 
 #include <atomic>
@@ -45,6 +47,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 // UDP port discovery
@@ -481,4 +484,93 @@ TEST(AeronPartitionTransportInteg, FetchLoop_LargeBacklog) {
         << "Follower LEO did not reach leader LEO";
     EXPECT_GE(leaderReplica.highWatermark(), targetLeo)
         << "Leader HW did not advance to LEO";
+}
+
+// ===========================================================================
+// TEST: per-worker transport gather send over REAL aeron:udp (spec §3.5a.2).
+//
+// The FetchResponse records body is handed to AeronPubRegistry::sendGatherToPeer
+// as a separate buffer: tryClaim for frames <= maxPayloadLength, a 2-buffer
+// gather offer() (Aeron fragments it) above.  Both must arrive byte-identical to
+// a single contiguous SBE encode — including the reconcile re-stamp.  Frames
+// larger than maxMessageLength are dropped (no throw).  Bounded: 10 s deadline.
+// ===========================================================================
+TEST(WorkerReplicationTransportInteg, GatherSendArrivesByteIdenticalRegression) {
+    TempDir driverTd("rune_wrt_driver_");
+    const uint16_t portA = discoverFreeUdpPort();
+    const uint16_t portB = discoverFreeUdpPort();
+    ASSERT_NE(portA, portB) << "Port collision — retry";
+    constexpr int32_t kStream = 700;
+
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    // Node 1 (sender) and node 2 (receiver), one worker each.
+    WorkerReplicationTransport a(aeronClient, 0, udpChannel(portA), kStream,
+                                 {{2, udpChannel(portB)}}, kStream);
+    WorkerReplicationTransport b(aeronClient, 0, udpChannel(portB), kStream,
+                                 {{1, udpChannel(portA)}}, kStream);
+    ASSERT_TRUE(a.resolved());
+    ASSERT_TRUE(b.resolved());
+
+    const int32_t maxRecords = a.maxFetchResponseBytes();   // 64 KiB term → 8 KiB msg
+    ASSERT_GT(maxRecords, 4096) << "need room for a multi-fragment frame";
+
+    auto encodeExpected = [](const FetchResponseMsg& r, bool reconcile) {
+        std::vector<uint8_t> out(FetchResponseMsg::encodedSize(r.records.size()));
+        FetchResponseMsg::encode(out.data(), 0, r.leaderEpoch, r.partition, r.highWatermark,
+                                 r.logStartOffset, r.errorCode, r.records, r.topicId);
+        if (reconcile) stampTemplateId(out.data(), 0, kReconcileFetchRespTemplateId);
+        return out;
+    };
+
+    // Send (re-sending until the image connects) and return the first frame B sees
+    // of the SAME kind + length (a late duplicate of an earlier step is skipped).
+    auto roundTrip = [&](const FetchResponseMsg& r, bool reconcile) {
+        const uint16_t wantTid = reconcile
+            ? kReconcileFetchRespTemplateId
+            : static_cast<uint16_t>(ReplicationTemplateId::FetchResponse);
+        const std::size_t wantLen = FetchResponseMsg::encodedSize(r.records.size());
+        std::vector<uint8_t> got;
+        const auto deadline = steady_clock::now() + seconds(10);
+        auto lastSend = steady_clock::now() - seconds(1);
+        while (got.empty() && steady_clock::now() < deadline) {
+            if (steady_clock::now() - lastSend >= milliseconds(50)) {
+                if (reconcile) a.sendReconcileResponse(2, r);
+                else           a.sendFetchResponse(2, r);
+                lastSend = steady_clock::now();
+            }
+            b.poll(10, [&](int32_t, int32_t, uint16_t tid, const uint8_t* f, std::size_t len) {
+                if (got.empty() && tid == wantTid && len == wantLen) got.assign(f, f + len);
+            });
+            if (got.empty()) std::this_thread::sleep_for(milliseconds(1));
+        }
+        return got;
+    };
+
+    auto mk = [](std::span<const uint8_t> recs) {
+        FetchResponseMsg r{};
+        r.leaderEpoch = 3; r.partition = 1; r.highWatermark = 9; r.logStartOffset = 0;
+        r.errorCode = 0; r.topicId = 4; r.records = recs;
+        return r;
+    };
+
+    // (1) small frame → tryClaim path.
+    const std::vector<uint8_t> small(200, 0x11);
+    const auto rs = mk(small);
+    EXPECT_EQ(roundTrip(rs, false), encodeExpected(rs, false));
+
+    // (2) multi-fragment frame (> maxPayloadLength) → 2-buffer gather offer().
+    std::vector<uint8_t> big(static_cast<std::size_t>(maxRecords) - 16);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i * 131u + 7u);
+    const auto rb = mk(big);
+    EXPECT_EQ(roundTrip(rb, false), encodeExpected(rb, false));
+    EXPECT_EQ(roundTrip(rb, true), encodeExpected(rb, true))
+        << "reconcile re-stamp must survive the gather path";
+
+    // (3) oversized frame is dropped, never thrown.
+    const std::vector<uint8_t> huge(static_cast<std::size_t>(maxRecords) + 1, 0x22);
+    EXPECT_NO_THROW(a.sendFetchResponse(2, mk(huge)));
 }

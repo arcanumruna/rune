@@ -43,6 +43,7 @@
 #include <memory>
 #include <atomic>
 #include <cstdint>
+#include <span>
 #include <vector>
 #include <unordered_map>
 
@@ -331,6 +332,8 @@ public:
     // No real sends needed for receive-path tests.
     int64_t sendToPeer(rune::replication::NodeId, const uint8_t*, std::size_t) noexcept { return 1; }
     void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}
+    int64_t sendGatherToPeer(rune::replication::NodeId, const uint8_t*, std::size_t,
+                             std::span<const uint8_t>) noexcept { return 1; }
 
 private:
     std::shared_ptr<SharedFakePubState> state_;

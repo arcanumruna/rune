@@ -24,6 +24,13 @@ public:
     [[nodiscard]] bool    hasPeer(NodeId) const noexcept { return true; }
     int64_t sendToPeer(NodeId, const uint8_t*, std::size_t) noexcept { ++sends; return 1; }
     void    broadcastToPeers(const uint8_t*, std::size_t) noexcept { ++sends; }
+    int64_t sendGatherToPeer(NodeId peer, const uint8_t* prefix, std::size_t prefixLen,
+                             std::span<const uint8_t> body) noexcept
+    {
+        std::vector<uint8_t> frame(prefix, prefix + prefixLen);
+        frame.insert(frame.end(), body.begin(), body.end());
+        return sendToPeer(peer, frame.data(), frame.size());
+    }
     int sends = 0;
 };
 

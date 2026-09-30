@@ -24,9 +24,11 @@
 //     - tryClaim the Aeron term buffer slot
 //     - encode the SBE message DIRECTLY into the claimed buffer (zero-copy)
 //     - commit
-//   For frames > pub.maxPayloadLength() (large FetchResponse record tails):
-//     - encode into a per-instance scratch buffer
-//     - pub.offer() (auto-fragments large batches)
+//   FetchResponse (spec §3.5a.2): only the 46-byte SBE prefix is encoded (on the
+//   stack); the records body is a zero-copy log view handed to sendGatherToPeer,
+//   which copies it ONCE, log → term buffer:
+//     - len <= pub.maxPayloadLength(): tryClaim + two memcpys + commit
+//     - larger: 2-buffer gather pub.offer() (Aeron fragments it) — no scratch copy
 //
 // ## Routing
 //   sendFetchResponse(toFollower, ...)  → single peer pub (by NodeId)
@@ -56,6 +58,8 @@
 //   pub handles and provides:
 //     int64_t sendToPeer(NodeId, const uint8_t* buf, std::size_t len)
 //     void    broadcastToPeers(const uint8_t* buf, std::size_t len)
+//     int64_t sendGatherToPeer(NodeId, const uint8_t* prefix, std::size_t prefixLen,
+//                              std::span<const uint8_t> body)
 //   The default AeronPubRegistry resolves real ExclusivePublications and calls
 //   tryClaim/offer.  Tests inject FakePubRegistry (records offers per NodeId,
 //   no Aeron driver needed).  No virtual calls on any path.
@@ -75,6 +79,7 @@
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
 
+#include <rune/replication/FollowerSlots.h>      // kMaxReplicas (flat peer array bound)
 #include <rune/replication/PartitionReplica.h>   // PartitionTransport base
 #include <rune/replication/ReplicationMessages.h> // SBE codecs + stampTemplateId
 #include <rune_fr/FlightRecorder.h>                // #4 deep instrumentation
@@ -82,6 +87,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -89,10 +95,10 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -101,7 +107,9 @@ namespace rune::replication {
 // ===========================================================================
 // AeronPubRegistry — production PubRegistry policy.
 //
-// Owns an unordered_map<NodeId, shared_ptr<ExclusivePublication>>.
+// Owns a FLAT array of (NodeId, shared_ptr<ExclusivePublication>) — at most
+// FollowerSlots::kMaxReplicas peers; a linear scan beats unordered_map::find on
+// every send (spec §3.5a.2 fix on sight).
 // Resolves publications via bounded addExclusivePublication / findExclusive-
 // Publication loops (kResolveMaxMs=5000 / kResolveSliceMs=1), same as
 // WorkerEgress.  Single-owner / single-thread.
@@ -145,7 +153,7 @@ public:
             for (auto it = pending.begin(); it != pending.end(); ) {
                 auto pub = aeron->findExclusivePublication(it->regId);
                 if (pub) {
-                    pubs_.emplace(it->peerId, std::move(pub));
+                    if (pubCount_ < kMaxPeers) pubs_[pubCount_++] = PeerPub{it->peerId, std::move(pub)};
                     it = pending.erase(it);
                 } else {
                     ++it;
@@ -157,7 +165,7 @@ public:
         }
         // Any still-pending entries were not resolved within the window;
         // they remain absent from pubs_ → sends to them are no-ops.
-        allResolved_ = pending.empty() && !pubs_.empty();
+        allResolved_ = pending.empty() && pubCount_ > 0 && peerChannels.size() <= kMaxPeers;
     }
 
     // Non-copyable, non-movable.
@@ -173,7 +181,7 @@ public:
 
     [[nodiscard]] bool hasPeer(rune::replication::NodeId peer) const noexcept
     {
-        return pubs_.find(peer) != pubs_.end();
+        return findPub_(peer) != nullptr;
     }
 
     // -----------------------------------------------------------------------
@@ -186,8 +194,8 @@ public:
     [[nodiscard]] int32_t maxMessageLength() const noexcept
     {
         int32_t minLen = std::numeric_limits<int32_t>::max();
-        for (const auto& [id, pub] : pubs_) {
-            if (pub) {
+        for (std::size_t i = 0; i < pubCount_; ++i) {
+            if (const auto& pub = pubs_[i].pub) {
                 const int32_t ml = static_cast<int32_t>(pub->maxMessageLength());
                 if (ml < minLen) minLen = ml;
             }
@@ -202,9 +210,9 @@ public:
     int64_t sendToPeer(rune::replication::NodeId peer,
                        const uint8_t* buf, std::size_t len) noexcept
     {
-        auto it = pubs_.find(peer);
-        if (it == pubs_.end() || !it->second) return -1;
-        return sendOnPub_(*it->second, buf, len);
+        aeron::ExclusivePublication* pub = findPub_(peer);
+        if (!pub) return -1;
+        return sendOnPub_(*pub, buf, len);
     }
 
     // -----------------------------------------------------------------------
@@ -214,9 +222,48 @@ public:
     void broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerBroadcast, 0);
-        for (auto& [id, pub] : pubs_) {
-            if (pub) sendOnPub_(*pub, buf, len);
+        for (std::size_t i = 0; i < pubCount_; ++i) {
+            if (pubs_[i].pub) sendOnPub_(*pubs_[i].pub, buf, len);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // sendGatherToPeer — zero-copy send of [prefix | body]: body bytes are
+    // copied exactly once, from the log view into the term buffer.  tryClaim
+    // for <= maxPayloadLength, else a 2-buffer gather offer() (Aeron fragments
+    // it) — no intermediate scratch copy.
+    // -----------------------------------------------------------------------
+    int64_t sendGatherToPeer(rune::replication::NodeId peer,
+                             const uint8_t* prefix, std::size_t prefixLen,
+                             std::span<const uint8_t> body) noexcept
+    {
+        aeron::ExclusivePublication* pub = findPub_(peer);
+        if (!pub) return -1;
+        const std::size_t len = prefixLen + body.size();
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSendOnPub,
+                                 static_cast<uint32_t>(len));
+        if (len > static_cast<std::size_t>(pub->maxMessageLength())) {
+            spdlog::error("WorkerReplicationTransport: drop oversized frame len={} max={}",
+                          len, pub->maxMessageLength());
+            return -1;
+        }
+        if (len <= static_cast<std::size_t>(pub->maxPayloadLength())) {
+            aeron::concurrent::logbuffer::BufferClaim claim;
+            const int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos > 0) {
+                uint8_t* dst = claim.buffer().buffer() + claim.offset();
+                std::memcpy(dst, prefix, prefixLen);
+                if (!body.empty()) std::memcpy(dst + prefixLen, body.data(), body.size());
+                claim.commit();
+            }
+            return pos;
+        }
+        const std::array<aeron::concurrent::AtomicBuffer, 2> parts{
+            aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(prefix),
+                                            static_cast<aeron::util::index_t>(prefixLen)),
+            aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(body.data()),
+                                            static_cast<aeron::util::index_t>(body.size()))};
+        return pub->offer(parts);
     }
 
 private:
@@ -256,9 +303,21 @@ private:
         return pub.offer(atomicBuf, 0, static_cast<aeron::util::index_t>(len));
     }
 
-    bool allResolved_  = false;
-    std::unordered_map<rune::replication::NodeId,
-                       std::shared_ptr<aeron::ExclusivePublication>> pubs_;
+    struct PeerPub {
+        rune::replication::NodeId                    id = -1;
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+    };
+    static constexpr std::size_t kMaxPeers = FollowerSlots::kMaxReplicas;
+
+    [[nodiscard]] aeron::ExclusivePublication* findPub_(rune::replication::NodeId id) const noexcept
+    {
+        for (std::size_t i = 0; i < pubCount_; ++i) if (pubs_[i].id == id) return pubs_[i].pub.get();
+        return nullptr;
+    }
+
+    bool                           allResolved_ = false;
+    std::array<PeerPub, kMaxPeers> pubs_{};
+    std::size_t                    pubCount_    = 0;
 };
 
 // ===========================================================================
@@ -534,14 +593,11 @@ public:
     // =======================================================================
     // PartitionTransport virtuals — SEND PATH
     //
-    // Each method:
-    //   1. Computes encodedSize.
-    //   2. If size <= maxPayloadLength: encode DIRECTLY into the tryClaim
-    //      BufferClaim buffer (true zero-copy, no intermediate copy).
-    //      This is the fast path: the SBE encode writes into the term buffer.
-    //   3. Else: encode into scratchBuf_ and offer() (handles large record
-    //      tails that span multiple Aeron MTU fragments).
-    //   4. On back-pressure (tryClaim ≤ 0 / peer not found): drop.
+    // Fixed-size messages encode on the stack and go out via sendToPeer /
+    // broadcastToPeers (tryClaim).  FetchResponse / ReconcileResponse encode only
+    // their SBE prefix on the stack and gather-send the records view
+    // (sendGatherToPeer: tryClaim <= maxPayloadLength, else 2-buffer offer()).
+    // On back-pressure (tryClaim/offer <= 0 / peer not found): drop.
     //      Replication is retriable; the follower re-issues its fetch.
     // =======================================================================
 
@@ -772,42 +828,32 @@ private:
     // sendFetchResponseImpl_ — shared implementation for sendFetchResponse and
     // sendReconcileResponse (reconcile=true re-stamps the templateId).
     //
-    // Fast path (frame ≤ maxPayloadLength for a dummy/default query of 64KiB
-    // Aeron term):
-    //   The encoded frame fits in a single Aeron fragment; encode into a
-    //   stack/scratch buffer and let the PubRegistry's sendToPeer use
-    //   tryClaim for zero-copy placement into the term buffer.
-    //
-    // Large path (frame > maxPayloadLength):
-    //   Encode into scratchBuf_ and offer() (auto-fragments by Aeron driver).
-    //
-    // NOTE: The "direct in-claim encode" that the brief describes (#2b) is
-    // best realised here by encoding into a buffer whose pointer is passed to
-    // sendToPeer; for the tryClaim fast path the PubRegistry copies from that
-    // buffer into the claimed slot — this is ONE copy (same as the #2b
-    // enqueueFetchResponse zero-copy claim, minus the outbound-ring indirection
-    // the legacy transport needs).  The only allocation is the scratch vector
-    // for the large-frame path.
+    // Zero-copy (spec §3.5a.2): only the fixed SBE prefix (header + fixed block +
+    // records length) is encoded, on the stack; resp.records (a view into the
+    // log) is handed to sendGatherToPeer, which copies it ONCE into the term
+    // buffer.  No scratch buffer, no allocation.
     // -----------------------------------------------------------------------
+    static constexpr std::size_t kFetchResponsePrefixMax = 64;   // encodedSize(0) == 46
+
     void sendFetchResponseImpl_(rune::replication::NodeId peer,
                                 const rune::replication::FetchResponseMsg& resp,
-                                bool reconcile)
+                                bool reconcile) noexcept
     {
-        const std::size_t frameLen =
-            rune::replication::FetchResponseMsg::encodedSize(resp.records.size());
-
-        // Encode into scratch buffer (grown on demand, never shrunk).
-        if (scratchBuf_.size() < frameLen) scratchBuf_.resize(frameLen);
-        rune::replication::FetchResponseMsg::encode(
-            scratchBuf_.data(), 0,
-            resp.leaderEpoch, resp.partition, resp.highWatermark,
-            resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
-        if (reconcile) {
-            rune::replication::stampTemplateId(
-                scratchBuf_.data(), 0,
-                rune::replication::kReconcileFetchRespTemplateId);
-        }
-        pubReg_.sendToPeer(peer, scratchBuf_.data(), frameLen);
+        namespace rr = rune::replication;
+        static const uint8_t kNoRecords = 0;
+        alignas(8) uint8_t prefix[kFetchResponsePrefixMax];
+        const std::size_t prefixLen = rr::FetchResponseMsg::encodedSize(0);
+        // Encode header + fixed block + a zero-length records prefix, then patch the
+        // real length: the body is handed over separately (never copied here).
+        rr::FetchResponseMsg::encode(prefix, 0, resp.leaderEpoch, resp.partition,
+                                     resp.highWatermark, resp.logStartOffset,
+                                     resp.errorCode,
+                                     std::span<const uint8_t>(&kNoRecords, 0),
+                                     resp.topicId);
+        rr::detail::write_le<uint32_t>(prefix + prefixLen - rr::FetchResponseMsg::VAR_HEADER_SIZE,
+                                       static_cast<uint32_t>(resp.records.size()));
+        if (reconcile) rr::stampTemplateId(prefix, 0, rr::kReconcileFetchRespTemplateId);
+        pubReg_.sendGatherToPeer(peer, prefix, prefixLen, resp.records);
     }
 
     // -----------------------------------------------------------------------
@@ -838,10 +884,6 @@ private:
     aeron::FragmentAssembler assembler_;
 
     PubRegistry pubReg_;  // per-peer pub management + send policy
-
-    // Reusable scratch buffer for FetchResponse large-frame encode path.
-    // Per-instance (not shared): this class is single-thread owned.
-    std::vector<uint8_t> scratchBuf_;
 
     // Test-mode inbound queue: feed frames via injectFrameForTest().
     // poll() drains this instead of the real Aeron subscription in testMode_.

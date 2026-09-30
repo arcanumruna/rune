@@ -1,4 +1,5 @@
 #pragma once
+#include <rune/storage/LogReadView.h>
 #include <rune/storage/OffsetIndex.h>
 #include <cstddef>
 #include <cstdint>
@@ -8,22 +9,6 @@
 #include <fstream>
 #include <unistd.h>
 namespace rune::storage {
-
-/// Zero-copy read result: a span into a segment's read-only mmap covering one or
-/// more WHOLE record batches (never a partial trailing batch).  No heap
-/// allocation, no copy — the bytes are the OS page-cache pages shared with the
-/// writer's fd.
-///
-/// Lifetime: valid until the next readView() on the SAME segment triggers a
-/// remap-on-grow, or the segment is destroyed/reloaded.  A caller must consume
-/// (encode/push) the span before issuing the next readView() on that segment.
-struct LogReadView {
-    const uint8_t* data       = nullptr; // pointer into the segment's read mmap
-    std::size_t    len        = 0;       // bytes spanned (whole record batches)
-    int64_t        baseOffset = 0;       // baseOffset of the FIRST batch in the view
-    int64_t        nextOffset = 0;       // lastOffset of the LAST batch + 1 (cursor advance)
-    bool empty() const noexcept { return data == nullptr || len == 0; }
-};
 
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.
 ///
@@ -188,11 +173,13 @@ private:
     int64_t writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset);
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
-    /// readView() can return a span into the OS page cache.  Grow-remap when the
-    /// active segment has grown past the current mapping.  No-op for logSize_==0
+    /// readView() can return a span into the OS page cache.  Maps with geometric
+    /// headroom past EOF, so the active segment only remaps when it outgrows it.  No-op for logSize_==0
     /// (mmap of length 0 is EINVAL).  The read mmap shares the page cache with the
     /// writer's fd, so appendNoSync()/flushed append() bytes are visible at once.
     void ensureReadMap();
+    /// Eagerly create the read mapping at segment construction (off the hot path).
+    void openReadMap() noexcept;
     int64_t baseOffset_; int32_t indexIntervalBytes_;
     int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
     std::string logPath_; std::fstream log_;
@@ -202,11 +189,12 @@ private:
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 
-    // Lazy read-only mmap of the .log for zero-copy readView().  Created on the
-    // first readView() call (never for a write-only segment), grow-remapped when
-    // the active segment grows.  Separate O_RDONLY fd from the writer's fd_, but
+    // Read-only mmap of the .log for zero-copy readView().  Created WITH the
+    // segment (openReadMap; lazily only if that failed) with headroom past EOF,
+    // grow-remapped (geometrically) only when the active segment outgrows it.  Separate O_RDONLY fd from the writer's fd_, but
     // the same inode → shared page cache, so it observes committed appends.
     std::unique_ptr<MappedFile> readMap_;
-    std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_
+    std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_ (>= logSize_ headroom)
+    static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
 };
 } // namespace rune::storage

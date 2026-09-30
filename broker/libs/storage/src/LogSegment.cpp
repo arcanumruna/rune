@@ -1,5 +1,6 @@
 #include <rune/storage/LogSegment.h>
 #include <rune/protocol/RecordBatch.h>
+#include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/uio.h>
@@ -57,6 +58,7 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
     seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
                                                 /*prefault*/true);
+    seg->openReadMap();   // background thread: the read mapping is ready at adopt
     return seg;
 }
 
@@ -101,6 +103,22 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // append/roll hot path never faults them.
     index_ = std::make_unique<OffsetIndex>(fname(dir, baseOffset, ".index"), baseOffset,
                                            indexMaxBytes_, prefaultIndex);
+    openReadMap();
+}
+
+void LogSegment::openReadMap() noexcept {
+    // Create the read-only .log mapping WITH the segment (spec §1a.5): the first
+    // readView() after a roll must not allocate a MappedFile + mmap on the
+    // push/fetch hot path.  kReadMapMinBytes of headroom past EOF (never touched:
+    // readView reads only [0, logSize_)).  Failure is non-fatal — ensureReadMap()
+    // falls back to creating it lazily.
+    try {
+        readMap_     = std::make_unique<MappedFile>(logPath_, kReadMapMinBytes, /*writable*/false);
+        readMapSize_ = readMap_->size();
+    } catch (...) {
+        readMap_.reset();
+        readMapSize_ = 0;
+    }
 }
 
 LogSegment::~LogSegment() {
@@ -320,25 +338,33 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
 void LogSegment::ensureReadMap() {
     if (logSize_ <= 0) return;                       // mmap(len=0) is EINVAL
     const std::size_t want = static_cast<std::size_t>(logSize_);
+    if (readMap_ && readMapSize_ >= want) return;    // steady state: no syscall
+    // Map with GEOMETRIC HEADROOM past EOF (read-only, so the file is never
+    // extended; the pages beyond EOF are never touched — readView reads only
+    // [0, logSize_)).  The active segment then grows inside one mapping instead of
+    // munmap+mmap on every append: views keep a stable address and a push/fetch
+    // costs no syscalls.  A remap happens only O(log(segment/kMin)) times.
+    std::size_t cap = readMapSize_ > 0 ? readMapSize_ : kReadMapMinBytes;
+    while (cap < want) cap *= 2;
     if (!readMap_) {
         // Read-only mapping (writable=false → no ftruncate; never mutates .log).
-        readMap_ = std::make_unique<MappedFile>(logPath_, want, /*writable*/false);
-        readMapSize_ = want;
-    } else if (readMapSize_ < want) {
-        // Active segment grew — remap to expose the newly-committed bytes.  For a
-        // read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate.
-        readMap_->resize(want);
-        readMapSize_ = want;
+        readMap_ = std::make_unique<MappedFile>(logPath_, cap, /*writable*/false);
+    } else {
+        // For a read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate.
+        readMap_->resize(cap);
     }
-    // readMapSize_ > want (post-truncate) is memory-safe: readView() only accesses
-    // bytes in [0, logSize_), which are still backed by the file/page cache.
+    readMapSize_ = readMap_->size();
+    // readMapSize_ > logSize_ (headroom / post-truncate) is memory-safe: readView()
+    // only accesses bytes in [0, logSize_), which are backed by the file.
 }
 
 LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) {
     if (logSize_ <= 0) return {};
     ensureReadMap();
     const uint8_t* base = readMap_ ? readMap_->data() : nullptr;
-    const std::size_t size = static_cast<std::size_t>(logSize_);
+    // Never read past the mapping: bound by the size the map was built for.
+    const std::size_t size =
+        std::min(static_cast<std::size_t>(logSize_), readMapSize_);
     if (!base || size == 0) return {};
 
     using rune::protocol::RecordBatchReader;
