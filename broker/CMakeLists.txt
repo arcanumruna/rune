@@ -72,6 +72,23 @@ endif()
 option(BUILD_TESTING "Build tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
+
+    # F4 regression guard: a media driver is driven by exactly ONE thread
+    # (spec Sec 3.6). This statically re-detects the "caller thread pumps
+    # aeron_driver_main_do_work() in a wait-for-cnc.dat loop while a dedicated
+    # thread ALSO pumps it" two-pumper race across every source file (test
+    # harnesses, benchmarks, tools) outside libs/node/src/EmbeddedDriver.cpp,
+    # so the bug class fixed in F4 cannot silently come back in a new/copied
+    # harness. See scripts/check_single_driver_pumper.py for the exact rule.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME NoCallerSideDriverPumpingRegression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
+                ${CMAKE_CURRENT_SOURCE_DIR})
+    else()
+        message(WARNING "Python3 interpreter not found; NoCallerSideDriverPumpingRegression ctest disabled")
+    endif()
 endif()
 
 # gtest_discover_tests() defaults to running each test binary with

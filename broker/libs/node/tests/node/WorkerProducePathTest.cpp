@@ -32,6 +32,7 @@
 // Mirrors the WorkerIngressFixture pattern from WorkerIngressTest.cpp.
 // ---------------------------------------------------------------------------
 
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/replication/PartitionReplica.h>
@@ -272,58 +273,18 @@ private:
     void startDriver() {
         const std::string aeronDir = (tmpDir_->path / "aeron").string();
 
-        aeron_driver_context_init(&driverCtx_);
-        aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx_,
-                                                AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
+        // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+        // readiness pumping — aeron_driver_init already wrote cnc.dat and stamped
+        // the heartbeat synchronously before the driver thread even starts.
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir;
         // Use a small term length so back-pressure fills quickly in test 3.
-        aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
-
-        ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0)
-            << "aeron_driver_init: " << aeron_errmsg();
-        ASSERT_EQ(aeron_driver_start(driver_, /*manual_main_loop=*/true), 0)
-            << "aeron_driver_start: " << aeron_errmsg();
-
-        driverRunning_.store(true, std::memory_order_release);
-        driverThread_ = std::thread([this]() {
-            while (driverRunning_.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(driver_,
-                    aeron_driver_main_do_work(driver_));
-            }
-        });
-
-        const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
-        }
-        ASSERT_TRUE(fs::exists(cncPath)) << "Aeron cnc.dat not created";
+        cfg.termBufferBytes = 64 * 1024;
+        driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
     }
 
     void stopDriver() {
-        if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
-            if (driverThread_.joinable()) driverThread_.join();
-        }
-        if (driver_) {
-            const auto dl = std::chrono::steady_clock::now() + 50ms;
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver_) == 0) {
-                    aeron_driver_main_do_work(driver_); break;
-                }
-                std::this_thread::sleep_for(200us);
-            }
-            aeron_driver_close(driver_);
-            driver_ = nullptr;
-        }
-        if (driverCtx_) {
-            aeron_driver_context_close(driverCtx_);
-            driverCtx_ = nullptr;
-        }
+        driver_.reset();
     }
 
     void connectAeron() {
@@ -335,10 +296,7 @@ private:
     }
 
     std::unique_ptr<TempDir>   tmpDir_;
-    aeron_driver_context_t*    driverCtx_   = nullptr;
-    aeron_driver_t*            driver_      = nullptr;
-    std::atomic<bool>          driverRunning_{false};
-    std::thread                driverThread_;
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
 };
 
 // ===========================================================================
