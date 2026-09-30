@@ -12,6 +12,9 @@
 
 ## Global Constraints
 
+- **Where things run (user, 2026-09-30):** the dockerized DR matrix (every DR e2e run) and **every benchmark** run on **k3s-node-01** (`root@178.104.16.102`, repos under `/root/rune-e5`), never on the Mac. Local runs are for unit/integration tests only.
+- **Mandatory VM cleanup before EVERY benchmark and EVERY DR run:** `bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh` (created in Task 16 Step 0). It kills all Rune/Kafka/bench/client processes and Rune DR containers, removes stale `/tmp/frout*`, waits for load1 < 1, refuses (exit 1) if any stray process remains, root disk < 3 GiB free, or `/dev/shm` < 1 GiB free. A run that did not start from a passing `vm-clean.sh` is not a valid measurement. Never kill processes with a `pkill -f` pattern that can match the calling ssh command line.
+- k3s on k3s-node-01 stays stopped while benchmarking/DR (it is a repurposed UAT box); restart it with `systemctl start k3s` when the plan is finished.
 - Pass criterion (verbatim, spec §1): on the 4-core k3s-node-01 box, 3 brokers + 1 client co-located, 1 KB records, 3-node acks=all with the **replicated, no-fsync-before-ack** guarantee (Rune `tier=majority`, `durability=all-in-sync`), an **open-loop producer offering 100,000 rec/s for 60 s achieves ≥ 100,000 rec/s and p99 end-to-end ≤ 100 µs** (every record measured, coordinated-omission-safe).
 - Out of scope (spec §1): fsync-before-ack (Strict tier) latency; more than one shard worker per node on the 4-core box; consumer/read path.
 - §1a.1 **Shared-nothing.** Every piece of mutable state is owned by exactly one thread. No shared mutable state, no locks/mutex/condvar, no atomics as cross-thread coordination (atomics only inside ring-buffer primitives), no `thread_local` on hot paths.
@@ -6448,26 +6451,89 @@ ctest --test-dir build-tsan -R 'Shard|EmbeddedDriver|AeronPump|PerWorkerReplicat
 ```
 Expected: PASS with zero `ThreadSanitizer: data race` reports outside `cmake/tsan-aeron.supp` (every rune-side race is a stop-and-fix).
 
-- [ ] **Step 4: Rung 4 — real e2e with the real client (rune-client-cpp, after its shard/invoker tasks land)**
+- [ ] **Step 3b: VM prep — cleanup script + Docker on k3s-node-01 (DR and benchmarks run there)**
+
+Create `bench/kafka-compare/vm-clean.sh`:
 
 ```bash
-cd /Users/vradu/Projects/rune-broker && export RUNE_IMAGE_TAG="$(git rev-parse --short HEAD)"
-docker compose -f docker/docker-compose.yml build
-cd /Users/vradu/Projects/rune-client-cpp && docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol \
-    -f docker/Dockerfile.dr -t "rune-dr-client:${RUNE_IMAGE_TAG}" .
-export DR_CLIENT_IMAGE="rune-dr-client:${RUNE_IMAGE_TAG}"   # dr-e2e/harness/driver.py:40 — never :dev/:latest
-cd /Users/vradu/Projects/rune-broker/dr-e2e
-python3 -m pytest tests/test_dr1_baseline.py -x -q                                   # default config
-RUNE_DR_COMPOSE_OVERRIDES=$PWD/../docker/docker-compose.shard.yml python3 -m pytest tests/test_dr1_baseline.py -x -q
+#!/bin/bash
+# vm-clean.sh — make k3s-node-01 a verified-idle box before ANY benchmark or DR run.
+# Kills by exact process NAME / anchored pattern only, so it can never kill the ssh
+# session that invoked it (a `pkill -f replbench` matches `bash -c '... replbench ...'`).
+set -u
+pkill -9 -x rune_broker 2>/dev/null
+pkill -9 -x rune_produce_th 2>/dev/null
+pkill -9 -x aeronmd 2>/dev/null
+pkill -9 -x yes 2>/dev/null
+pkill -9 -f '^bash (replbench|cluster|run-rune|run-kafka)' 2>/dev/null
+pkill -9 -f '^timeout [0-9]+ bash replbench' 2>/dev/null
+pkill -9 -f 'kafka\.Kafka' 2>/dev/null
+if command -v docker >/dev/null 2>&1; then
+  docker ps -aq --filter 'name=rune' | xargs -r docker rm -f >/dev/null 2>&1
+fi
+rm -rf /tmp/frout* /dev/shm/kbench-data 2>/dev/null
+for i in $(seq 1 60); do
+  awk '{exit !($1 < 1.0)}' /proc/loadavg && break
+  sleep 2
+done
+stray=$(pgrep -c -x 'rune_broker|rune_produce_th|aeronmd' 2>/dev/null || true)
+load=$(cut -d' ' -f1 /proc/loadavg)
+rootfree=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+shmfree=$(df -BM --output=avail /dev/shm | tail -1 | tr -dc 0-9)
+echo "vm-clean: stray=${stray:-0} load1=$load rootFreeG=$rootfree shmFreeM=$shmfree"
+ps -eo pcpu,comm --sort=-pcpu | head -6
+[ "${stray:-0}" = 0 ] || { echo "vm-clean: FAIL stray processes"; exit 1; }
+awk -v l="$load" 'BEGIN{exit !(l < 1.0)}' || { echo "vm-clean: FAIL busy box"; exit 1; }
+[ "$rootfree" -ge 3 ] || { echo "vm-clean: FAIL root disk < 3G free"; exit 1; }
+[ "$shmfree" -ge 1024 ] || { echo "vm-clean: FAIL /dev/shm < 1G free"; exit 1; }
+echo "vm-clean: OK"
 ```
-Expected: both PASS (no loss, ordering, single leader). If Docker is down, `open -a Docker` and wait for `docker info` to succeed.
+
+Sync and prove it on the VM (it must exit 0 on an idle box, and exit 1 while a broker runs):
+
+```bash
+chmod +x bench/kafka-compare/vm-clean.sh
+rsync -az bench/kafka-compare/vm-clean.sh root@178.104.16.102:/root/rune-e5/rune-broker/bench/kafka-compare/
+ssh root@178.104.16.102 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh; echo rc=$?'
+```
+Expected: `vm-clean: OK` and `rc=0`.
+
+Install Docker on k3s-node-01 for the DR matrix (the box has none; root disk is ~92 % used, so check space first and keep only SHA-tagged images of the current run):
+
+```bash
+ssh root@178.104.16.102 'df -BG --output=avail / | tail -1;   DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io docker-compose-v2 python3-pip >/tmp/apt-docker.log 2>&1; echo apt=$?;   systemctl enable --now docker; docker info --format "{{.ServerVersion}}"; docker compose version;   pip3 install -q -r /root/rune-e5/rune-broker/dr-e2e/requirements.txt; df -BG --output=avail / | tail -1'
+```
+Expected: `apt=0`, a Docker server version, a compose version, and ≥ 3 GiB still free. If free space drops below 3 GiB, prune only Rune images older than the current SHA (`docker images 'rune-*' --format '{{.Repository}}:{{.Tag}}' | grep -v "$RUNE_IMAGE_TAG" | xargs -r docker rmi`) — never touch k3s/containerd data.
+
+- [ ] **Step 4: Rung 4 — real e2e with the real client (rune-client-cpp, after its shard/invoker tasks land)**
+
+Runs on k3s-node-01 (Global Constraints). Sync all four repos first, then build SHA-tagged images there:
+
+```bash
+TAG="$(cd /Users/vradu/Projects/rune-broker && git rev-parse --short HEAD)"
+for r in rune-broker rune-protocol rune-fr rune-client-cpp; do
+  rsync -az --delete --exclude 'build*' --exclude '.git' /Users/vradu/Projects/$r/ root@178.104.16.102:/root/rune-e5/$r/
+done
+ssh root@178.104.16.102 "bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && \
+  cd /root/rune-e5/rune-broker && export RUNE_IMAGE_TAG=$TAG && docker compose -f docker/docker-compose.yml build && \
+  cd /root/rune-e5/rune-client-cpp && docker build --build-context rune-protocol=../rune-protocol \
+     -f docker/Dockerfile.dr -t rune-dr-client:$TAG . && \
+  export DR_CLIENT_IMAGE=rune-dr-client:$TAG && cd /root/rune-e5/rune-broker/dr-e2e && \
+  python3 -m pytest tests/test_dr1_baseline.py -x -q && \
+  bash ../bench/kafka-compare/vm-clean.sh && \
+  RUNE_DR_COMPOSE_OVERRIDES=\$PWD/../docker/docker-compose.shard.yml python3 -m pytest tests/test_dr1_baseline.py -x -q"
+```
+Expected: both PASS (no loss, ordering, single leader); images tagged `:$TAG`, never `:dev`/`:latest`.
 
 - [ ] **Step 5: Rung 5 — dockerized DR matrix, default and shard**
 
+Runs on k3s-node-01, each matrix preceded by `vm-clean.sh`:
+
 ```bash
-cd /Users/vradu/Projects/rune-broker/dr-e2e
-python3 -m pytest tests -q                                                            # default
-RUNE_DR_COMPOSE_OVERRIDES=$PWD/../docker/docker-compose.shard.yml python3 -m pytest tests -q   # shard + fused
+ssh root@178.104.16.102 "cd /root/rune-e5/rune-broker/dr-e2e && export RUNE_IMAGE_TAG=$TAG DR_CLIENT_IMAGE=rune-dr-client:$TAG && \
+  bash ../bench/kafka-compare/vm-clean.sh && python3 -m pytest tests -q && \
+  bash ../bench/kafka-compare/vm-clean.sh && \
+  RUNE_DR_COMPOSE_OVERRIDES=\$PWD/../docker/docker-compose.shard.yml python3 -m pytest tests -q"
 ```
 Expected: the matrix that is green on the default config is green in shard mode (zero committed loss, time-independent ISR/epoch convergence). Any shard-only failure: reproduce in `ShardFailoverTest` first, fix, add the `*Regression*` test, re-run.
 
@@ -6479,15 +6545,16 @@ for r in rune-broker rune-protocol rune-fr; do
 done
 ssh root@178.104.16.102 'cd /root/rune-e5/rune-broker && cmake --build build-linux -j4 \
   && ctest --test-dir build-linux -R "Regression|Uring|Shard|AsyncDurability" --output-on-failure'
-ssh root@178.104.16.102 'pkill -9 -x rune_broker; pkill -9 -f rune_produce_throughput; pkill -9 -f kafka.Kafka; \
-  sleep 5; uptime; top -bn1 | head -15'
+ssh root@178.104.16.102 'bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh'
 ```
 Expected: suites PASS on Linux (the `UringFlushBackend` path of Task 10 runs for real here); `uptime` load1 < 1 and top ≥ 90 % idle — otherwise find and kill the CPU consumer and re-check (never measure a busy box). Then, same binary, interleaved ABAB n = 15, 1 KB records, 1 worker per node:
 
 ```bash
 ssh root@178.104.16.102 'cd /root/rune-e5/rune-broker/bench/kafka-compare && : > /tmp/abab.txt; \
   for i in $(seq 1 15); do \
+    bash vm-clean.sh >/dev/null || exit 1; \
     RUNE_SHARD=0 REPL_WORKERS=1 REPL_VBYTES=1024 REPL_FR=0 bash replbench.sh 4 1000000 8000 | grep -E "RESULT|BUSY" | sed "s/^/A $i /" >> /tmp/abab.txt; \
+    bash vm-clean.sh >/dev/null || exit 1; \
     RUNE_SHARD=1 REPL_WORKERS=1 REPL_VBYTES=1024 REPL_FR=0 bash replbench.sh 4 1000000 8000 | grep -E "RESULT|BUSY" | sed "s/^/B $i /" >> /tmp/abab.txt; \
   done; cat /tmp/abab.txt'
 ```
@@ -6495,13 +6562,13 @@ Expected: 30 `RESULT` lines, no `BUSY-BOX`. Validate before interpreting (spec �
 
 - [ ] **Step 7: Rung 7 — the pass criterion (spec §1), verified-idle box**
 
-With the rune-client-cpp open-loop producer (spec §5, `--rate 100000`, 60 s, every record in an HdrHistogram measured from its scheduled send time), client shard pinned to core 0, brokers `RUNE_SHARD=1 RUNE_RUNTIME_PLACEMENT=fused`, topic `bench:4:tier=majority:durability=all-in-sync`, 1 KB records: **≥ 100,000 rec/s achieved and p99 ≤ 100 µs**, same run. A p99 > 100 µs is a stop-and-fix: arm the flight recorder (`REPL_FR=1`) and localise with the `ShardPass`, `ReplWorker*`, `WorkerDrainIngress`, `ReplHwAdvance`, `ReplAckSendOff` spans and `ShardAgent::slowPassesForTest`-equivalent counters; the next lever if loopback UDP cost dominates is per-peer multiplexing (spec §8), never hardware.
+Immediately after a passing `vm-clean.sh` on k3s-node-01, with the rune-client-cpp open-loop producer (spec §5, `--rate 100000`, 60 s, every record in an HdrHistogram measured from its scheduled send time), client shard pinned to core 0, brokers `RUNE_SHARD=1 RUNE_RUNTIME_PLACEMENT=fused`, topic `bench:4:tier=majority:durability=all-in-sync`, 1 KB records: **≥ 100,000 rec/s achieved and p99 ≤ 100 µs**, same run. A p99 > 100 µs is a stop-and-fix: arm the flight recorder (`REPL_FR=1`) and localise with the `ShardPass`, `ReplWorker*`, `WorkerDrainIngress`, `ReplHwAdvance`, `ReplAckSendOff` spans and `ShardAgent::slowPassesForTest`-equivalent counters; the next lever if loopback UDP cost dominates is per-peer multiplexing (spec §8), never hardware.
 
 - [ ] **Step 8: Commit the suite (and any regression tests added while climbing the ladder)**
 
 ```bash
 cd /Users/vradu/Projects/rune-broker
-git add libs/node/tests/integration/ShardFailoverTest.cpp libs/node/CMakeLists.txt
+git add libs/node/tests/integration/ShardFailoverTest.cpp libs/node/CMakeLists.txt bench/kafka-compare/vm-clean.sh
 git commit -m "test(node): shard-mode failover suite (leader kill, rolling restart, reconnect) + validation ladder
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
