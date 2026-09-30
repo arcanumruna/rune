@@ -174,9 +174,9 @@ void AeronTransport::start() {
                aeron::util::index_t            offset,
                aeron::util::index_t            len,
                aeron::Header&) {
-            if (pollHandler_) {
-                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
-                (*pollHandler_)(p, static_cast<std::size_t>(len));
+            if (pollThunk_) {
+                pollThunk_(pollCtx_, reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                           static_cast<std::size_t>(len));
             }
         });
 }
@@ -340,38 +340,24 @@ bool AeronTransport::offerTo(const std::string& channel, int32_t ingressStreamId
 // poll
 // ---------------------------------------------------------------------------
 
-int AeronTransport::poll(const Handler& handler, int fragmentLimit) {
-    // Store handler pointer for this poll cycle.  Every FragmentAssembler lambda
-    // (default + per-worker) reads pollHandler_ during its callback.
-    pollHandler_ = &handler;
-    int frags = 0;
-    // Default egress subscription (control responses + internal-partition Records).
-    if (egressSub_ && assembler_) {
-        frags += egressSub_->poll(assembler_->handler(), fragmentLimit);
+aeron::Subscription* AeronTransport::resolveSubSlot_(SubSlot& s) noexcept {
+    if (!aeron_) return nullptr;
+    SubRegistry reg{*aeron_, s.channel, s.streamId};
+    if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) return nullptr;
+    try {
+        s.assembler = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                   aeron::util::index_t len, aeron::Header&) {
+                if (pollThunk_) {
+                    pollThunk_(pollCtx_, reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                               static_cast<std::size_t>(len));
+                }
+            });
+    } catch (...) {
+        s.res.reset();
+        return nullptr;
     }
-    // read-rework I4: per-worker dynamic-MDC egress subscriptions (pushed Records
-    // for user partitions when per-worker egress is active on the broker).
-    // Each resolves here, on the owner thread, without ever sleeping.
-    for (SubSlot& s : subSlots_) {
-        aeron::Subscription* sub = s.res.ready();
-        if (sub == nullptr) {
-            if (!aeron_) continue;
-            SubRegistry reg{*aeron_, s.channel, s.streamId};
-            if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) continue;
-            sub = s.res.ready();
-            s.assembler = std::make_unique<aeron::FragmentAssembler>(
-                [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
-                       aeron::util::index_t len, aeron::Header&) {
-                    if (pollHandler_) {
-                        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
-                        (*pollHandler_)(p, static_cast<std::size_t>(len));
-                    }
-                });
-        }
-        frags += sub->poll(s.assembler->handler(), fragmentLimit);
-    }
-    pollHandler_ = nullptr;
-    return frags;
+    return s.res.ready();
 }
 
 // ---------------------------------------------------------------------------

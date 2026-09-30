@@ -40,6 +40,7 @@ extern "C" {
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace rune::client::transport {
@@ -148,11 +149,41 @@ public:
                pubSlots_[static_cast<std::size_t>(h)].res.ready() != nullptr;
     }
 
-    /// Poll the default egress Subscription AND every per-worker dynamic-MDC egress
-    /// Subscription through their FragmentAssemblers.  For each fully reassembled
-    /// frame calls handler(buf, len) with a zero-copy view.  Returns the total
-    /// number of fragments processed across all egress subscriptions.
-    int poll(const Handler& handler, int fragmentLimit);
+    /// Polls the default egress subscription and every resolved per-worker egress
+    /// subscription.  Unfragmented messages (every control frame / ProduceResponse)
+    /// go straight to `handler` — an inlined template call, no std::function; only
+    /// multi-fragment messages pass through Aeron's FragmentAssembler (the same
+    /// UNFRAGMENTED test Aeron uses, FragmentAssembler.h:92).  handler:
+    /// void(const uint8_t* buf, std::size_t len); buf valid only during the call.
+    template <class H>
+    int poll(H&& handler, int fragmentLimit) {
+        using HT = std::remove_reference_t<H>;
+        pollCtx_   = const_cast<void*>(static_cast<const void*>(&handler));
+        pollThunk_ = [](void* ctx, const uint8_t* b, std::size_t n) { (*static_cast<HT*>(ctx))(b, n); };
+        auto onFragment = [&handler](aeron::FragmentAssembler& assembler) {
+            return [&handler, &assembler](aeron::concurrent::AtomicBuffer& buf,
+                                          aeron::util::index_t offset, aeron::util::index_t length,
+                                          aeron::Header& header) {
+                namespace FrameDescriptor = aeron::FrameDescriptor;
+                if ((header.flags() & FrameDescriptor::UNFRAGMENTED) == FrameDescriptor::UNFRAGMENTED) {
+                    handler(reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                            static_cast<std::size_t>(length));
+                } else {
+                    assembler.handler()(buf, offset, length, header);
+                }
+            };
+        };
+        int frags = 0;
+        if (egressSub_ && assembler_) frags += egressSub_->poll(onFragment(*assembler_), fragmentLimit);
+        for (SubSlot& s : subSlots_) {
+            aeron::Subscription* sub = s.res.ready();
+            if (sub == nullptr) sub = resolveSubSlot_(s);
+            if (sub != nullptr) frags += sub->poll(onFragment(*s.assembler), fragmentLimit);
+        }
+        pollCtx_   = nullptr;
+        pollThunk_ = nullptr;
+        return frags;
+    }
 
     /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
     /// Subscription on controlChannel + streamId so the client receives Records
@@ -246,9 +277,12 @@ private:
     std::atomic<bool> started_ {false};
     std::atomic<bool> stopped_ {false};
 
-    // ---- Poll handler pointer (set during poll(), cleared after) -------------
+    // ---- Poll handler thunk (set during poll(), cleared after) ---------------
     // Single-writer: only one thread calls poll() so this is never concurrent.
-    const Handler* pollHandler_ = nullptr;
+    // Reassembled (multi-fragment) messages reach the current poll() handler via
+    // this thunk; set only for the duration of poll().
+    void* pollCtx_ = nullptr;
+    void (*pollThunk_)(void*, const uint8_t*, std::size_t) = nullptr;
 
     // ---- Internal helpers ----------------------------------------------------
     /// Offer buf to a specific ExclusivePublication (shared implementation).
@@ -275,6 +309,8 @@ private:
     std::vector<PubSlot>  pubSlots_;   // index == PubHandle (stable, never erased)
     detail::FlatIndexMap  streamPub_;  // default-channel streamId -> PubHandle
     std::vector<SubSlot>  subSlots_;   // per-worker dynamic-MDC egress subscriptions
+    /// Advances a pending egress SubSlot; on Ready builds its assembler.
+    aeron::Subscription* resolveSubSlot_(SubSlot& s) noexcept;
 
     static constexpr int64_t kResolveTimeoutNs = static_cast<int64_t>(kResolveMaxMs) * 1'000'000LL;
     static constexpr int64_t kResolveRetryNs   = 100'000'000LL;  // 100 ms before re-registering

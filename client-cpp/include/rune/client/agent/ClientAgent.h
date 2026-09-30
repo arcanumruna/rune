@@ -33,6 +33,7 @@
 #include <rune/client/codec/Codec.h>
 
 #include <concurrent/AtomicBuffer.h>
+#include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
 #include <atomic>
@@ -40,6 +41,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -269,31 +271,45 @@ public:
     /// The seed session's endpoint == the transport default ingress channel.
     Session& sessionForEndpoint(const std::string& endpoint) noexcept;
 
-    /// Task 1.4: (re)build the agent-owned partition routing table entry mapping a
-    /// (topicId, partition) to its leader endpoint channel.  Rebuilt in place on
-    /// metadata change.  (topicId, partition) is unique per partition cluster-wide,
-    /// so it never collides — unlike ingressStreamId, which REPEATS across nodes
-    /// (each node reuses the same small per-worker stream ids).  endpoint empty ⇒
-    /// remove the route (fall back to the seed/default hot path).  AGENT-THREAD ONLY.
-    void setRoute(int32_t topicId, int32_t partition,
-                  const std::string& endpoint) noexcept;
+    /// Task-1.3 form: session and produce data share `endpoint`.
+    void setRoute(int32_t topicId, int32_t partition, const std::string& endpoint) noexcept {
+        (void)setRoute(topicId, partition, endpoint, endpoint);
+    }
+    /// Routes (topicId, partition): Connect / session id on `sessionEndpoint` (the
+    /// node), Produce frames on `dataChannel` (the owning worker's ingress, or the
+    /// node).  Both equal to the seed endpoint (or empty) removes the route so the
+    /// partition takes the byte-identical default path.  Cold path (metadata).
+    /// Returns true when the route changed.
+    bool setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
+                  const std::string& dataChannel) noexcept;
 
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
 
-    /// Task 1.4: the resolved leader endpoint for a route (or "" if none). Test hook.
-    [[nodiscard]] std::string routeEndpointFor(int32_t topicId,
-                                               int32_t partition) const noexcept;
+    [[nodiscard]] std::string routeEndpointFor(int32_t topicId, int32_t partition) const noexcept;
+    [[nodiscard]] std::string dataChannelFor(int32_t topicId, int32_t partition) const noexcept;
+    [[nodiscard]] bool multiNodeRouting() const noexcept { return routeIndex_.size() != 0; }
 
-    /// Task 1.4 (redirect convergence): true when per-partition multi-node routing
-    /// is active (at least one route installed).  AGENT-THREAD ONLY.
-    [[nodiscard]] bool multiNodeRouting() const noexcept {
-        return !routeByPartition_.empty();
+    /// ProduceResponses decoded this duty cycle, for the owner to route with plain
+    /// calls (buffered only when no produceResponseFn_ test hook is installed).
+    struct ProduceAck {
+        int64_t correlationId;
+        int64_t baseOffsetOrError;  ///< < 0 = -ErrorCode
+    };
+    [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
+        return {produceAcks_.data(), produceAcks_.size()};
     }
+    void clearProduceAcks() noexcept { produceAcks_.clear(); }
+
+    /// Forward ProduceResponse frames to the egress observer (transactional
+    /// producers need them).  Default true (historical behaviour).
+    void setForwardProduceResponses(bool on) noexcept { forwardProduceResponses_ = on; }
+
+    [[nodiscard]] bool transportClosed() const noexcept { return transport_.closed(); }
 
     /// Task 1.4 (redirect convergence): route ONE pre-encoded produce frame to its
     /// partition leader session — the SAME routing the produce drain path uses
-    /// (consult routeByPartition_, lazily open the leader session, re-stamp the
+    /// (consult the route slots, lazily open the leader session, re-stamp the
     /// leader sessionId, offerTo).  Returns false (hold) when the leader session
     /// is not yet Connected; the caller retains the frame for a later resend.
     /// Used by the Client-level redirect handler and connect-triggered resend.
@@ -505,14 +521,30 @@ private:
     // ---- Task 1.4: partition routing table (agent-owned plain data) ----------
     // Maps a (topicId, partition) → its leader endpoint channel.  Rebuilt in place
     // on metadata change (setRoute).  Read by the produce send lambda on the hot
-    // path: an unordered_map find keyed by an int64_t packed key (no string hashing
+    // path: a FlatIndexMap probe keyed by an int64_t packed key (no string hashing
     // on the key).  The key is ((int64_t)topicId<<32) | (uint32_t)partition — unique
     // per partition cluster-wide, so it never collides across nodes (ingressStreamId
     // does — each node reuses the same small per-worker stream ids).  EMPTY on
     // single-node (no per-worker routes advertised) ⇒ the send lambda takes the
-    // byte-identical default offer path (no lookup cost beyond one empty-map check).
+    // byte-identical default offer path (no lookup cost beyond one size check).
     // Single-writer (agent thread).
-    std::unordered_map<int64_t, std::string> routeByPartition_;
+    static constexpr uint32_t kNoSession = 0xFFFFFFFFu;
+    // One slot per routed partition: strings are cold (setRoute / first offer);
+    // the hot path touches only sessionIndex / streamId / pub.
+    struct PartitionRoute {
+        std::string sessionEndpoint;
+        std::string dataChannel;
+        uint32_t    sessionIndex = kNoSession;  // resolved on first offer
+        int32_t     streamId     = -1;          // stream `pub` was built for
+        transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
+    };
+    detail::FlatIndexMap        routeIndex_;   // routeKey(t,p) -> routes_ index
+    std::vector<PartitionRoute> routes_;
+    std::vector<uint32_t>       freeRoutes_;
+    std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
+    bool                        forwardProduceResponses_ = true;
+    bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
+    uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
 
     // Pack (topicId, partition) into the routing-table key.  partition is masked to
     // its unsigned 32-bit value so negative partitions (never valid) can't alias.
@@ -529,8 +561,8 @@ private:
                         const uint8_t* buf, std::size_t len) noexcept;
 
     // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
-    // Consult routeByPartition_, lazily open the leader session, hold if it is not
-    // Connected, else re-stamp the leader sessionId (header offset 8) and offerTo.
+    // Probe the route slot, resolve its session / pub once, hold if the session is not
+    // Connected, else re-stamp the leader sessionId (header offset 8) and offerOn.
     // Single-writer (agent thread).  Definition mirrors the produce drain send-lambda.
     bool offerProduceToLeader_(int32_t topicId, int32_t partition, int32_t ingressStreamId,
                                const uint8_t* buf, std::size_t len) noexcept;

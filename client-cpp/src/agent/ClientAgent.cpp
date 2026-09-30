@@ -71,6 +71,8 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(cfg_.ringCapacity)))
     , egressObserver_(nullptr)
 {
+    mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
+    produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
     // Seed the endpoint-keyed session collection with the seed session
     // (sessions_[0]).  Its IO adapter targets the transport default ingress
     // channel, so its control frames fast-path back to the default offer (the
@@ -118,7 +120,7 @@ void ClientAgent::stop() noexcept {
 // ---------------------------------------------------------------------------
 
 int ClientAgent::doWork(int64_t nowNs) noexcept {
-    int totalWork = 0;
+    int totalWork = transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
 
     // ---- Step 1: Drain the command ring (bounded) ---------------------------
     int ringWork = ring_.read(
@@ -391,7 +393,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // channel/streamId), so a ConnectResponse is routed to the session whose
         // in-flight ConnectRequest correlationId matches.  Single-node → the seed.
         Session& s = sessionForConnectCorrId(opt->correlationId);
-        if (std::getenv("RUNE_MN_DEBUG")) {
+        if (mnDebug_) {
             std::fprintf(stderr, "[MNDBG conn] ConnectResponse corrId=%lld code=%d assignedSid=%lld -> session ep='%s' (isSeed=%d)\n",
                 (long long)opt->correlationId, (int)opt->code, (long long)opt->assignedSessionId,
                 s.endpoint.c_str(), (int)(&s == &seedSession()));
@@ -412,7 +414,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // partition routes — held batches whose leader is THIS newly-connected
         // session now send.  Fires only when a session actually reached Connected
         // and per-partition routing is active (no cost single-node).
-        if (opt->code == 0 && !routeByPartition_.empty() && produceResendFn_ &&
+        if (opt->code == 0 && routeIndex_.size() != 0 && produceResendFn_ &&
             s.machine.state() == session::SessionState::Connected) {
             produceResendFn_();
         }
@@ -428,7 +430,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // Task 1.3: route to the session whose in-flight connect corrId matches
         // (a Redirect/NotLeader during a session's connect); otherwise the seed.
         Session& s = sessionForConnectCorrId(opt->correlationId);
-        if (std::getenv("RUNE_MN_DEBUG")) {
+        if (mnDebug_) {
             std::fprintf(stderr, "[MNDBG err] ErrorResponse corrId=%lld code=%d msg='%.*s' -> session ep='%s' (isSeed=%d)\n",
                 (long long)opt->correlationId, (int)opt->code,
                 (int)opt->message.size(), opt->message.data(),
@@ -468,28 +470,19 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     }
 
     case codec::TemplateId::ProduceResponse: {
-        // Route to the producer response hook so pending acks are resolved.
-        //
-        // DR-BUG-5 client fix: always check errorCode before resolving.  A
-        // non-zero errorCode (e.g. MinIsrViolation=10) means the broker
-        // rejected the produce — the record was NOT written.  Pass a
-        // negative sentinel (-errorCode) so ProducerImpl::onProduceResponse
-        // can distinguish an error response from a genuine baseOffset=0.
-        // Valid committed baseOffsets are always >= 0, so negative is unambiguous.
-        if (produceResponseFn_) {
-            auto opt = codec::decodeProduceResponse(buf, len);
-            if (opt) {
-                const int64_t sentinel =
-                    (opt->errorCode != 0)
-                        ? -static_cast<int64_t>(static_cast<uint16_t>(opt->errorCode))
-                        : opt->baseOffset;
-                produceResponseFn_(opt->correlationId, sentinel);
+        // DR-BUG-5: a non-zero errorCode is passed as the negative sentinel -errorCode.
+        if (auto opt = codec::decodeProduceResponse(buf, len)) {
+            const int64_t sentinel =
+                (opt->errorCode != 0)
+                    ? -static_cast<int64_t>(static_cast<uint16_t>(opt->errorCode))
+                    : opt->baseOffset;
+            if (produceResponseFn_) {
+                produceResponseFn_(opt->correlationId, sentinel);  // test-harness hook
+            } else {
+                produceAcks_.push_back(ProduceAck{opt->correlationId, sentinel});
             }
         }
-        // Also forward to egress observer so Client can chain-observe if needed.
-        if (egressObserver_) {
-            egressObserver_(tid, buf, len);
-        }
+        if (forwardProduceResponses_ && egressObserver_) egressObserver_(tid, buf, len);
         break;
     }
 
@@ -560,7 +553,7 @@ Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
     s.machine.connect(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     s.connectSubmitted = true;
-    if (std::getenv("RUNE_MN_DEBUG")) {
+    if (mnDebug_) {
         std::fprintf(stderr, "[MNDBG new-session] ep='%s' corrIdBase=%lld nSessions=%zu connectCorrId=%lld\n",
             endpoint.c_str(), (long long)(static_cast<int64_t>(sessions_.size()-1) * kSessionCorrIdStride),
             sessions_.size(), (long long)s.machine.correlationId());
@@ -581,62 +574,90 @@ Session& ClientAgent::sessionForConnectCorrId(int64_t corrId) noexcept {
     return seedSession();
 }
 
-void ClientAgent::setRoute(int32_t topicId, int32_t partition,
-                           const std::string& endpoint) noexcept {
-    const int64_t key = routeKey(topicId, partition);
-    if (endpoint.empty() || endpoint == seedSession().endpoint) {
-        // Route resolves to the seed/default endpoint → drop the entry so the hot
-        // path stays on the byte-identical default offer.
-        routeByPartition_.erase(key);
-        return;
+uint32_t ClientAgent::sessionIndexFor_(const std::string& endpoint) noexcept {
+    Session& s = sessionForEndpoint(endpoint);
+    for (uint32_t i = 0; i < sessions_.size(); ++i) {
+        if (sessions_[i].get() == &s) return i;
     }
-    routeByPartition_[key] = endpoint;
+    return 0;  // unreachable: sessionForEndpoint always returns a member
 }
 
-std::string ClientAgent::routeEndpointFor(int32_t topicId,
-                                          int32_t partition) const noexcept {
-    const auto it = routeByPartition_.find(routeKey(topicId, partition));
-    return (it != routeByPartition_.end()) ? it->second : std::string{};
+bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
+                           const std::string& dataChannel) noexcept {
+    const int64_t  key  = routeKey(topicId, partition);
+    const uint32_t idx  = routeIndex_.find(key);
+    const std::string& seed = seedSession().endpoint;
+    const bool isDefault = (sessionEndpoint.empty() || sessionEndpoint == seed) &&
+                           (dataChannel.empty() || dataChannel == seed);
+    if (isDefault) {
+        if (idx == detail::FlatIndexMap::kNone) return false;
+        routeIndex_.erase(key);
+        routes_[idx] = PartitionRoute{};
+        freeRoutes_.push_back(idx);
+        return true;
+    }
+    try {
+        const std::string& data = dataChannel.empty() ? sessionEndpoint : dataChannel;
+        if (idx != detail::FlatIndexMap::kNone) {
+            PartitionRoute& r = routes_[idx];
+            if (r.sessionEndpoint == sessionEndpoint && r.dataChannel == data) return false;
+            r = PartitionRoute{sessionEndpoint, data};
+            return true;
+        }
+        uint32_t slot;
+        if (!freeRoutes_.empty()) {
+            slot = freeRoutes_.back();
+            freeRoutes_.pop_back();
+            routes_[slot] = PartitionRoute{sessionEndpoint, data};
+        } else {
+            slot = static_cast<uint32_t>(routes_.size());
+            routes_.push_back(PartitionRoute{sessionEndpoint, data});
+        }
+        routeIndex_.insert(key, slot);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string ClientAgent::routeEndpointFor(int32_t topicId, int32_t partition) const noexcept {
+    const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+    return idx == detail::FlatIndexMap::kNone ? std::string{} : routes_[idx].sessionEndpoint;
+}
+
+std::string ClientAgent::dataChannelFor(int32_t topicId, int32_t partition) const noexcept {
+    const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+    return idx == detail::FlatIndexMap::kNone ? std::string{} : routes_[idx].dataChannel;
 }
 
 bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                                         int32_t ingressStreamId,
                                         const uint8_t* buf, std::size_t len) noexcept {
-    // Fast path (single-node / no per-worker routes): the route table is empty ⇒
-    // one empty-map check, then the byte-identical default offer.  Multi-node: an
-    // int64-keyed find resolves the leader endpoint; we re-stamp the frame's
-    // sessionId (header offset 8) to that leader session's id, then offer directly
-    // to its endpoint on the same per-worker ingress stream.  The (topicId,
-    // partition) key is unique cluster-wide — ingressStreamId REPEATS across nodes
-    // and would collide, so it is only the transport stream, never the routing key.
-    if (!routeByPartition_.empty()) {
-        const auto it = routeByPartition_.find(routeKey(topicId, partition));
-        if (it != routeByPartition_.end() && !it->second.empty()) {
-            Session& leader = sessionForEndpoint(it->second);
+    // Single-node / no routes: one size check, then the default offer.
+    if (routeIndex_.size() != 0) {
+        const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+        if (idx != detail::FlatIndexMap::kNone) {
+            PartitionRoute& r = routes_[idx];
+            if (r.sessionIndex == kNoSession) r.sessionIndex = sessionIndexFor_(r.sessionEndpoint);  // once
+            Session& leader = *sessions_[r.sessionIndex];
             const int64_t sid = leader.machine.sessionId();
-            if (std::getenv("RUNE_MN_DEBUG")) {
-                static uint64_t dc = 0;
-                if ((dc++ & 0x3FF) == 0)
-                    std::fprintf(stderr, "[MNDBG route] part=%d ep='%s' sid=%lld state=%d %s\n",
-                        partition, it->second.c_str(), (long long)sid, (int)leader.machine.state(),
-                        (sid==0||leader.machine.state()!=session::SessionState::Connected)?"HELD":"offer");
+            // Leader session still connecting: hold the batch (retried next cycle;
+            // produceResendFn_ re-drives it on connect).
+            if (sid == 0 || leader.machine.state() != session::SessionState::Connected) return false;
+            if (r.streamId != ingressStreamId) {  // once per route / stream change
+                const int32_t stream = ingressStreamId != 0 ? ingressStreamId
+                                                            : cfg_.transport.ingressStreamId;
+                try {
+                    r.pub = transport_.publicationHandle(r.dataChannel, stream);
+                } catch (...) {
+                    return false;
+                }
+                r.streamId = ingressStreamId;
             }
-            // Leader session not yet established (async open in flight): report a
-            // failed offer so the caller retains the batch and retries later
-            // (hold-and-refresh, no drop).  On multi-node the connect-triggered
-            // produceResendFn_ re-drives held batches once the leader connects.
-            if (sid == 0 ||
-                leader.machine.state() != session::SessionState::Connected) {
-                return false;
-            }
-            // Re-stamp sessionId in place so the leader accepts the frame (the
-            // producer stamped the seed session id at encode time).  The buffer is
-            // the producer's mutable encodeScratch_/wireFrame.
             if (len >= 16) {
-                ::rune::protocol::client::detail::putLE64(
-                    const_cast<uint8_t*>(buf), 8, sid);
+                ::rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, sid);
             }
-            return transport_.offerTo(it->second, ingressStreamId, buf, len);
+            return transport_.offerOn(r.pub, buf, len);
         }
     }
     return transport_.offer(ingressStreamId, buf, len);

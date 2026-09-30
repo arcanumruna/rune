@@ -215,3 +215,40 @@ TEST(MultiNodeRouting, SingleNodeEmptyRouteTableOneSession) {
     // Only the seed session exists.
     EXPECT_EQ(agent.sessionCount(), 1u);
 }
+
+// A worker data channel distinct from the session (node) endpoint keeps the route
+// even when the session endpoint IS the seed (single-node shard broker).
+TEST(MultiNodeRouting, SeparateDataChannelKeepsSessionOnSeed) {
+    const std::string seed = "aeron:udp?endpoint=seed:1";
+    rca::ClientAgent agent(makeAgentConfig(seed));
+    EXPECT_TRUE(agent.setRoute(5, 0, seed, "aeron:udp?endpoint=seed:40500"));
+    EXPECT_EQ(agent.routeEndpointFor(5, 0), seed);
+    EXPECT_EQ(agent.dataChannelFor(5, 0), "aeron:udp?endpoint=seed:40500");
+    EXPECT_TRUE(agent.multiNodeRouting());
+    EXPECT_EQ(agent.sessionCount(), 1u);
+}
+
+TEST(MultiNodeRouting, SetRouteReportsChanges) {
+    const std::string seed = "aeron:udp?endpoint=seed:1";
+    rca::ClientAgent agent(makeAgentConfig(seed));
+    EXPECT_TRUE(agent.setRoute(5, 1, "aeron:udp?endpoint=hostA:9000", "aeron:udp?endpoint=hostA:40500"));
+    EXPECT_FALSE(agent.setRoute(5, 1, "aeron:udp?endpoint=hostA:9000", "aeron:udp?endpoint=hostA:40500"));
+    EXPECT_TRUE(agent.setRoute(5, 1, "aeron:udp?endpoint=hostA:9000", "aeron:udp?endpoint=hostA:40501"));
+    EXPECT_TRUE(agent.setRoute(5, 1, seed, seed));   // back to the default path: route removed
+    EXPECT_TRUE(agent.routeEndpointFor(5, 1).empty());
+    EXPECT_FALSE(agent.setRoute(5, 1, seed, seed));
+    EXPECT_FALSE(agent.multiNodeRouting());
+}
+
+// Regression: getenv("RUNE_MN_DEBUG") ran on every routed offer / session open.
+// It is read once, at construction.
+TEST(MultiNodeRouting, MnDebugIsReadOnceAtConstructionRegression) {
+    ::unsetenv("RUNE_MN_DEBUG");
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    ::setenv("RUNE_MN_DEBUG", "1", 1);
+    testing::internal::CaptureStderr();
+    agent.sessionForEndpoint("aeron:udp?endpoint=hostZ:9");
+    const std::string err = testing::internal::GetCapturedStderr();
+    ::unsetenv("RUNE_MN_DEBUG");
+    EXPECT_EQ(err.find("MNDBG"), std::string::npos);
+}

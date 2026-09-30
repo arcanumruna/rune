@@ -908,6 +908,7 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_invoker_tests
             tests/transport/InvokerTransportTest.cpp
+            tests/agent/InvokerAgentTest.cpp
             tests/producer/ProducerSinkTest.cpp
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp

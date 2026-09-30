@@ -352,3 +352,20 @@ TEST(InvokerTransport, EgressSubscriptionRecoversFromTransientRejectionRegressio
     t.setResolveClock(nullptr);
     t.stop();
 }
+
+// The template poll keeps multi-fragment reassembly (IPC MTU 1408 → 20 KiB = 15 fragments).
+TEST(InvokerTransport, FragmentedMessageStillReassemblesThroughTemplatePoll) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3600)};
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    std::vector<uint8_t> big(20 * 1024);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i * 31);
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(big.data(), big.size()); }));
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        t.poll([&](const uint8_t* b, std::size_t n) { got.assign(b, b + n); }, 32);
+        return !got.empty();
+    }));
+    EXPECT_EQ(got, big);
+    t.stop();
+}
