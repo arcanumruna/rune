@@ -1067,6 +1067,31 @@ if(BUILD_TESTING)
     endif()
 
     # ---------------------------------------------------------------------------
+    # E5 Task 7: PerWorkerReplicationTest — in-process per-worker replication
+    # integration + failover suite (perWorkerReplication flag ON).
+    #
+    # 3 BrokerNodes with perWorkerReplication=true, workerCount=2, replBaseStreamId=200.
+    # Real aeron:udp — no Docker, no InMemoryTransport.
+    #
+    # Tests:
+    #   AcksAllThreeNodeReplicatesAndCommits — FetchRequest(1)/FetchResponse(2) E2E.
+    #   RollingLeaderKillNoCommittedLossRegression (*Regression*) — OLE+reconcile(3-6).
+    #   EpochChangeTruncatesDivergentTailOnly — divergent-tail truncation path.
+    #
+    # RESOURCE_LOCK rune_udp_ports: same ephemeral-port TOCTOU concern as GR-7.
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_per_worker_replication_integration_tests
+            tests/integration/PerWorkerReplicationTest.cpp)
+        target_link_libraries(rune_per_worker_replication_integration_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_per_worker_replication_integration_tests
+            PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # TX-2b fix round 1 (A): HW-bound unit test — no Aeron required.
     #
     # DivergentTail_HWBoundRebuild_NoFalseDuplicate:
