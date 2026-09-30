@@ -902,6 +902,22 @@ if(BUILD_TESTING)
     )
     target_link_libraries(rune_pure_tests PRIVATE GTest::gtest_main)
     gtest_discover_tests(rune_pure_tests)
+
+    # ── Sharded invoker client: Aeron-backed tests (single-threaded where possible) ──
+    if(aeron_FOUND)
+        add_executable(rune_invoker_tests
+            tests/transport/InvokerTransportTest.cpp
+        )
+        target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_invoker_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_INVOKER uuid)
+            if(UUID_LIB_INVOKER)
+                target_link_libraries(rune_invoker_tests PRIVATE ${UUID_LIB_INVOKER})
+            endif()
+        endif()
+        gtest_discover_tests(rune_invoker_tests)
+    endif()
 endif()
 
 # ── Task 12: rune_schema_gen executable ───────────────────────────────────────

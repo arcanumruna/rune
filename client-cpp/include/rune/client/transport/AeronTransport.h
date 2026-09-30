@@ -75,6 +75,19 @@ public:
     /// Teardown order follows BrokerNode BR-3b to prevent use-after-free.
     void stop() noexcept;
 
+    /// Invoker mode: one pass of this transport's OWN embedded driver duty cycle
+    /// (conductor + sender + receiver, aeron_driver.c:712-722) followed by the Aeron
+    /// client conductor (useConductorAgentInvoker).  Thread mode: returns 0 — the
+    /// driver thread and conductor thread own those duty cycles.
+    int dutyCycle() noexcept;
+
+    /// True once the Aeron client closed itself (inter-service timeout, driver
+    /// timeout).  Offers then fail; the owner decides whether to rebuild.
+    [[nodiscard]] bool closed() const noexcept { return aeron_ && aeron_->isClosed(); }
+
+    /// True when a background driver thread exists (Thread mode after start()).
+    [[nodiscard]] bool usesDriverThread() const noexcept { return driverThread_.joinable(); }
+
     // -------------------------------------------------------------------------
     // I/O — single-writer, called from ONE thread only
     // -------------------------------------------------------------------------
@@ -181,6 +194,13 @@ private:
     /// violation when driverThread_ is concurrently driving the same driver.
     int pumpDriverFromCaller_() noexcept;
     int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
+
+    /// Pumps THIS transport's driver + conductor (Invoker) or backs off while the
+    /// background agents work (Thread) until ready() or timeoutNs elapses.  Never
+    /// waits on another component of the calling thread (spec §3.6).
+    template <class Ready>
+    bool pumpUntil_(Ready&& ready, int64_t timeoutNs);
+    static int64_t monoNs_() noexcept;
 
     // ---- Aeron C++ client + pub/sub -----------------------------------------
     std::shared_ptr<aeron::Aeron>                aeron_;

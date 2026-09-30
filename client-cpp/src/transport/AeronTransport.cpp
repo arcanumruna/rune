@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -27,6 +28,39 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 namespace rune::client::transport {
+
+int64_t AeronTransport::monoNs_() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+template <class Ready>
+bool AeronTransport::pumpUntil_(Ready&& ready, int64_t timeoutNs) {
+    const int64_t deadline = monoNs_() + timeoutNs;
+    for (;;) {
+        dutyCycle();
+        if (ready()) return true;
+        if (monoNs_() >= deadline) return false;
+        if (cfg_.driverMode == DriverMode::Thread) {
+            // Background driver/conductor threads do the work; back off briefly.
+            std::this_thread::sleep_for(std::chrono::microseconds{50});
+        }
+    }
+}
+
+int AeronTransport::dutyCycle() noexcept {
+    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) return 0;
+    int work = pumpDriverFromCaller_();  // spec §3.1 order: driver, then client conductor
+    if (aeron_) {
+        try {
+            work += aeron_->conductorAgentInvoker().invoke();
+        } catch (...) {
+            // AgentInvoker routes SourcedException to the error handler; anything
+            // else is contained here — dutyCycle() is noexcept.
+        }
+    }
+    return work;
+}
 
 // ---------------------------------------------------------------------------
 // Construction / destruction
@@ -71,6 +105,12 @@ void AeronTransport::start() {
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
+        ctx.useConductorAgentInvoker(cfg_.driverMode == DriverMode::Invoker);
+        // Aeron's default handler calls ::exit(-1) (Context.h:145-161).  A client
+        // library must never exit its host: log, and let closed() report it.
+        ctx.errorHandler([](const std::exception& e) {
+            std::fprintf(stderr, "rune-client: aeron client error: %s\n", e.what());
+        });
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) {
             stopEmbeddedDriver();
@@ -85,15 +125,12 @@ void AeronTransport::start() {
                                                 cfg_.egressStreamId);
 
     // 5. Resolve both within kResolveMaxMs (bounded — no busy-spin).
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds{kResolveMaxMs};
-
-    while (std::chrono::steady_clock::now() < deadline) {
+    const bool resolved = pumpUntil_([&] {
         if (!ingressPub_) ingressPub_ = aeron_->findExclusivePublication(pubRegId);
         if (!egressSub_)  egressSub_  = aeron_->findSubscription(subRegId);
-        if (ingressPub_ && egressSub_) break;
-        std::this_thread::sleep_for(std::chrono::microseconds{kResolveSliceUs});
-    }
+        return ingressPub_ && egressSub_;
+    }, static_cast<int64_t>(kResolveMaxMs) * 1'000'000LL);
+    (void)resolved;  // the !ingressPub_ || !egressSub_ check below reports failure
 
     if (!ingressPub_ || !egressSub_) {
         // Release partially-resolved resources before tearing down.
@@ -494,7 +531,11 @@ void AeronTransport::startEmbeddedDriver() {
     }
 
     aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
-    aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
+    // INVOKER: one runner (conductor+sender+receiver), no threads, refuses a
+    // non-manual start (aeron_driver.c:939-957, :1054-1087).
+    aeron_driver_context_set_threading_mode(
+        driverCtx_, cfg_.driverMode == DriverMode::Invoker ? AERON_THREADING_MODE_INVOKER
+                                                           : AERON_THREADING_MODE_SHARED);
     aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
     aeron_driver_context_set_shared_idle_strategy(driverCtx_, cfg_.driverIdleStrategy.c_str());
@@ -502,8 +543,19 @@ void AeronTransport::startEmbeddedDriver() {
     aeron_driver_context_set_term_buffer_length(
         driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
     aeron_driver_context_set_mtu_length(driverCtx_, cfg_.mtuLength);
-    aeron_driver_context_set_client_liveness_timeout_ns(
-        driverCtx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
+    // Aeron requires timer_interval < client_liveness < publication_unblock
+    // (aeron_driver_context.c:1322-1344).  validate() accepts any liveness > 0, so
+    // derive the two driver timers from it instead of failing driver init.
+    const auto livenessNs = static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs);
+    aeron_driver_context_set_client_liveness_timeout_ns(driverCtx_, livenessNs);
+    if (aeron_driver_context_get_timer_interval_ns(driverCtx_) >= livenessNs) {
+        aeron_driver_context_set_timer_interval_ns(driverCtx_,
+                                                   livenessNs / 10 > 0 ? livenessNs / 10 : 1);
+    }
+    if (aeron_driver_context_get_publication_unblock_timeout_ns(driverCtx_) <= livenessNs) {
+        aeron_driver_context_set_publication_unblock_timeout_ns(driverCtx_,
+                                                                livenessNs + livenessNs / 2);
+    }
     if (cfg_.socketSndBufBytes > 0) {
         aeron_driver_context_set_socket_so_sndbuf(driverCtx_, cfg_.socketSndBufBytes);
     }
@@ -546,14 +598,14 @@ void AeronTransport::startEmbeddedDriver() {
     pumpDriverFromCaller_();
     pumpDriverFromCaller_();
 
-    driverRunning_.store(true, std::memory_order_release);
-    driverThread_ = std::thread([this]() {
-        while (driverRunning_.load(std::memory_order_acquire)) {
-            aeron_driver_main_idle_strategy(
-                driver_,
-                aeron_driver_main_do_work(driver_));
-        }
-    });
+    if (cfg_.driverMode == DriverMode::Thread) {
+        driverRunning_.store(true, std::memory_order_release);
+        driverThread_ = std::thread([this]() {
+            while (driverRunning_.load(std::memory_order_acquire)) {
+                aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+            }
+        });
+    }
 }
 
 int AeronTransport::pumpDriverFromCaller_() noexcept {
