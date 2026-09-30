@@ -81,14 +81,26 @@ if(BUILD_TESTING)
     # so the bug class fixed in F4 cannot silently come back in a new/copied
     # harness. See scripts/check_single_driver_pumper.py for the exact rule.
     find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME NoCallerSideDriverPumpingRegression
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
-                ${CMAKE_CURRENT_SOURCE_DIR})
-    else()
-        message(WARNING "Python3 interpreter not found; NoCallerSideDriverPumpingRegression ctest disabled")
+    if(NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR
+            "Python3 interpreter not found, but BUILD_TESTING=ON requires it for "
+            "the DriverPumpGuardSelfTestRegression / NoCallerSideDriverPumpingRegression "
+            "ctests (scripts/check_single_driver_pumper.py). Silently dropping this guard "
+            "is how the F4 two-pumper race regresses unnoticed; install Python3 or "
+            "configure with -DBUILD_TESTING=OFF.")
     endif()
+    # Self-test first: pins that the detector itself still catches every known
+    # antipattern shape (braced, braceless, pump-in-condition/increment) and
+    # stays false-positive-free on every known legitimate shape, independent
+    # of what the current tree looks like.
+    add_test(NAME DriverPumpGuardSelfTestRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
+            --selftest)
+    add_test(NAME NoCallerSideDriverPumpingRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # gtest_discover_tests() defaults to running each test binary with

@@ -56,7 +56,11 @@ protected:
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir_;
         cfg.termBufferBytes = 64 * 1024;
-        driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        try {
+            driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception& e) {
+            FAIL() << "EmbeddedDriver failed to start: " << e.what();
+        }
     }
     void stopDriver() {
         driver_.reset();
