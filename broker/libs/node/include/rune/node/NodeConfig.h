@@ -206,8 +206,8 @@ struct NodeConfig {
     enum class RuntimePlacement : uint8_t { Thread = 0, Fused = 1 };    // RUNE_RUNTIME_PLACEMENT
     WorkerMode       workerMode       = WorkerMode::Legacy;
     RuntimePlacement runtimePlacement = RuntimePlacement::Thread;
-    int32_t workerIngressBasePort = 0;   // RUNE_WORKER_INGRESS_BASE_PORT (0 = unset)
-    int32_t workerReplBasePort    = 0;   // RUNE_WORKER_REPL_BASE_PORT    (0 = unset)
+    std::optional<int32_t> workerIngressBasePort;   // RUNE_WORKER_INGRESS_BASE_PORT (nullopt = unset)
+    std::optional<int32_t> workerReplBasePort;      // RUNE_WORKER_REPL_BASE_PORT    (nullopt = unset)
     static constexpr int32_t kMaxShardWorkers = 64;   // runtime→worker announce mask width
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
@@ -338,16 +338,22 @@ struct NodeConfig {
     //     RUNE_WORKER_EGRESS_CONTROL_HOST with the broker's reachable address.
     //   - workerEgressControlBasePort: base UDP control port; worker W uses
     //     base + W.  RUNE_WORKER_EGRESS_CONTROL_BASE_PORT.  Must not collide with
-    //     client/consensus/replication ports.
+    //     client/consensus/replication ports.  nullopt = not configured: legacy
+    //     mode binds kDefaultWorkerEgressControlBasePort (via
+    //     effectiveWorkerEgressControlBasePort()); shard mode refuses to start
+    //     (spec §3.3: every per-worker port explicit — a shared default would let
+    //     co-located shard nodes silently collide).
     //   - workerEgressBaseStreamId: 0 = unset; resolved in buildWorkerPool to
     //     workerIngressBaseStreamId + workerCount (keeps ingress/egress stream
     //     ranges non-overlapping).  RUNE_WORKER_EGRESS_BASE_STREAM.
     std::string workerEgressControlHost     = "127.0.0.1";
-    int32_t     workerEgressControlBasePort = 40300;
-    // True iff RUNE_WORKER_EGRESS_CONTROL_BASE_PORT was explicitly configured.  Shard
-    // mode refuses to start without it (spec §3.3: every per-worker port explicit;
-    // the 40300 default would let co-located shard nodes silently collide).
-    bool        workerEgressControlBasePortExplicit = false;
+    static constexpr int32_t kDefaultWorkerEgressControlBasePort = 40300;
+    std::optional<int32_t> workerEgressControlBasePort;
+    /// The egress-control base port actually bound: the configured value, else the
+    /// legacy default.  The ONLY way readers obtain the port.
+    [[nodiscard]] int32_t effectiveWorkerEgressControlBasePort() const noexcept {
+        return workerEgressControlBasePort.value_or(kDefaultWorkerEgressControlBasePort);
+    }
     int32_t     workerEgressBaseStreamId    = 0;  // 0 = unset; resolved in buildWorkerPool
 
     // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread

@@ -238,10 +238,10 @@ std::string NodeConfig::clientBindHost() const {
     return std::string(colon == std::string_view::npos ? hp : hp.substr(0, colon));
 }
 std::string NodeConfig::shardIngressBindChannel(int32_t w) const {
-    return "aeron:udp?endpoint=" + clientBindHost() + ":" + std::to_string(workerIngressBasePort + w);
+    return "aeron:udp?endpoint=" + clientBindHost() + ":" + std::to_string(workerIngressBasePort.value() + w);
 }
 std::string NodeConfig::shardReplBindChannel(int32_t w) const {
-    return "aeron:udp?endpoint=" + self().host + ":" + std::to_string(workerReplBasePort + w);
+    return "aeron:udp?endpoint=" + self().host + ":" + std::to_string(workerReplBasePort.value() + w);
 }
 std::string NodeConfig::shardPeerReplChannel(const PeerConfig& p, int32_t w) {
     return "aeron:udp?endpoint=" + p.host + ":" + std::to_string(static_cast<int32_t>(p.replBasePort) + w);
@@ -259,19 +259,22 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
     if (W > kMaxShardWorkers)
         return "shard mode supports at most " + std::to_string(kMaxShardWorkers) +
                " workers per node, got RUNE_WORKERS=" + std::to_string(W);
-    auto baseOk = [W](int32_t base) { return base >= 1 && base + W - 1 <= 65535; };
-    if (!baseOk(workerIngressBasePort))
-        return "shard mode requires RUNE_WORKER_INGRESS_BASE_PORT in [1, " + std::to_string(65536 - W) +
-               "], got " + std::to_string(workerIngressBasePort);
-    if (!baseOk(workerReplBasePort))
-        return "shard mode requires RUNE_WORKER_REPL_BASE_PORT in [1, " + std::to_string(65536 - W) +
-               "], got " + std::to_string(workerReplBasePort);
-    if (!workerEgressControlBasePortExplicit)
-        return std::string("shard mode requires RUNE_WORKER_EGRESS_CONTROL_BASE_PORT to be set explicitly "
-                           "(the legacy default would silently collide between co-located shard nodes)");
-    if (!baseOk(workerEgressControlBasePort))
-        return "shard mode requires RUNE_WORKER_EGRESS_CONTROL_BASE_PORT in [1, " + std::to_string(65536 - W) +
-               "], got " + std::to_string(workerEgressControlBasePort);
+    // Every per-worker base port must be explicit and its whole range [base, base+W-1]
+    // must be a valid port range (no silent default in shard mode).
+    auto checkBase = [W](const std::optional<int32_t>& base, const char* env) -> std::optional<std::string> {
+        if (!base.has_value())
+            return std::string("shard mode requires ") + env + " to be set explicitly";
+        if (*base < 1 || *base + W - 1 > 65535)
+            return std::string("shard mode requires ") + env + " in [1, " + std::to_string(65536 - W) +
+                   "], got " + std::to_string(*base);
+        return std::nullopt;
+    };
+    if (auto e = checkBase(workerIngressBasePort, "RUNE_WORKER_INGRESS_BASE_PORT")) return e;
+    if (auto e = checkBase(workerReplBasePort, "RUNE_WORKER_REPL_BASE_PORT")) return e;
+    if (auto e = checkBase(workerEgressControlBasePort, "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT")) return e;
+    const int32_t ingressBase = *workerIngressBasePort;
+    const int32_t replBase    = *workerReplBasePort;
+    const int32_t egressBase  = effectiveWorkerEgressControlBasePort();
 
     for (const auto& p : peers) {
         if (p.replBasePort == 0)
@@ -285,11 +288,11 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
                    " advertises " + std::to_string(p.workerCount) + ", self has " + std::to_string(W);
     }
     const PeerConfig& me = self();
-    if (me.replBasePort != workerReplBasePort)
-        return "RUNE_WORKER_REPL_BASE_PORT=" + std::to_string(workerReplBasePort) +
+    if (me.replBasePort != replBase)
+        return "RUNE_WORKER_REPL_BASE_PORT=" + std::to_string(replBase) +
                " disagrees with self RUNE_PEERS replBasePort=" + std::to_string(me.replBasePort);
-    if (me.ingressBasePort != workerIngressBasePort)
-        return "RUNE_WORKER_INGRESS_BASE_PORT=" + std::to_string(workerIngressBasePort) +
+    if (me.ingressBasePort != ingressBase)
+        return "RUNE_WORKER_INGRESS_BASE_PORT=" + std::to_string(ingressBase) +
                " disagrees with self RUNE_PEERS ingressBasePort=" + std::to_string(me.ingressBasePort);
 
     struct Bind { int32_t port; std::string what; };
@@ -299,9 +302,9 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
     if (me.replicationPort != 0) binds.push_back({me.replicationPort, "replicationPort"});
     for (int32_t w = 0; w < W; ++w) {
         const std::string tag = "[w" + std::to_string(w) + "]";
-        binds.push_back({workerIngressBasePort + w, "workerIngress" + tag});
-        binds.push_back({workerReplBasePort + w, "workerRepl" + tag});
-        binds.push_back({workerEgressControlBasePort + w, "workerEgressControl" + tag});
+        binds.push_back({ingressBase + w, "workerIngress" + tag});
+        binds.push_back({replBase + w, "workerRepl" + tag});
+        binds.push_back({egressBase + w, "workerEgressControl" + tag});
     }
     for (std::size_t i = 0; i < binds.size(); ++i)
         for (std::size_t j = i + 1; j < binds.size(); ++j)
@@ -484,9 +487,10 @@ ConfigResult parseNodeConfig(
             cfg.workerEgressControlHost = rawEgHost;
         const char* rawEgPort = getenv_fn("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT");
         if (rawEgPort && !std::string_view(rawEgPort).empty()) {
-            if (!parseInt32(rawEgPort, cfg.workerEgressControlBasePort))
+            int32_t port{};
+            if (!parseInt32(rawEgPort, port))
                 return {{}, std::string("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT is not a valid integer: ") + rawEgPort};
-            cfg.workerEgressControlBasePortExplicit = true;
+            cfg.workerEgressControlBasePort = port;
         }
         const char* rawEgStream = getenv_fn("RUNE_WORKER_EGRESS_BASE_STREAM");
         if (rawEgStream && !std::string_view(rawEgStream).empty()) {
@@ -1040,16 +1044,20 @@ ConfigResult parseNodeConfig(
         else return {{}, std::string("RUNE_RUNTIME_PLACEMENT must be 'thread' or 'fused', got: ") + raw};
     }
     if (const char* raw = getenv_fn("RUNE_WORKER_INGRESS_BASE_PORT"); raw && *raw) {
-        if (!parseInt32(raw, cfg.workerIngressBasePort))
+        int32_t port{};
+        if (!parseInt32(raw, port))
             return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT is not a valid integer: ") + raw};
-        if (cfg.workerIngressBasePort < 1 || cfg.workerIngressBasePort > 65535)   // rejected in every mode (no silent fallback)
+        if (port < 1 || port > 65535)   // rejected in every mode (no silent fallback)
             return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT must be a port in [1, 65535], got: ") + raw};
+        cfg.workerIngressBasePort = port;
     }
     if (const char* raw = getenv_fn("RUNE_WORKER_REPL_BASE_PORT"); raw && *raw) {
-        if (!parseInt32(raw, cfg.workerReplBasePort))
+        int32_t port{};
+        if (!parseInt32(raw, port))
             return {{}, std::string("RUNE_WORKER_REPL_BASE_PORT is not a valid integer: ") + raw};
-        if (cfg.workerReplBasePort < 1 || cfg.workerReplBasePort > 65535)   // rejected in every mode (no silent fallback)
+        if (port < 1 || port > 65535)   // rejected in every mode (no silent fallback)
             return {{}, std::string("RUNE_WORKER_REPL_BASE_PORT must be a port in [1, 65535], got: ") + raw};
+        cfg.workerReplBasePort = port;
     }
     if (cfg.shardMode()) {
         // A shard IS per-worker ingress + replication + egress on the worker's own driver.

@@ -153,7 +153,8 @@ TEST(NodeConfigTest, WorkerEgressDefaultsWhenUnset) {
     auto r = parseNodeConfig(fakeEnv(base3node()));
     ASSERT_TRUE(r.error.empty()) << r.error;
     EXPECT_EQ(r.config->workerEgressControlHost,     "127.0.0.1");
-    EXPECT_EQ(r.config->workerEgressControlBasePort,  40300);
+    EXPECT_FALSE(r.config->workerEgressControlBasePort.has_value());
+    EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 40300);
     EXPECT_EQ(r.config->workerEgressBaseStreamId,     0);  // 0 = resolved in buildWorkerPool
 }
 
@@ -165,7 +166,8 @@ TEST(NodeConfigTest, WorkerEgressOverriddenWhenSet) {
     auto r = parseNodeConfig(fakeEnv(env));
     ASSERT_TRUE(r.error.empty()) << r.error;
     EXPECT_EQ(r.config->workerEgressControlHost,     "10.0.0.5");
-    EXPECT_EQ(r.config->workerEgressControlBasePort,  45000);
+    EXPECT_EQ(r.config->workerEgressControlBasePort, std::optional<int32_t>{45000});
+    EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 45000);
     EXPECT_EQ(r.config->workerEgressBaseStreamId,     99);
 }
 
@@ -1844,8 +1846,8 @@ TEST(NodeConfig, DefaultsAreLegacyThreadAndValid) {
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->workerMode, NodeConfig::WorkerMode::Legacy);
     EXPECT_EQ(r.config->runtimePlacement, NodeConfig::RuntimePlacement::Thread);
-    EXPECT_EQ(r.config->workerIngressBasePort, 0);
-    EXPECT_EQ(r.config->workerReplBasePort, 0);
+    EXPECT_FALSE(r.config->workerIngressBasePort.has_value());
+    EXPECT_FALSE(r.config->workerReplBasePort.has_value());
     EXPECT_FALSE(r.config->validateShardConfig().has_value());
 }
 
@@ -1857,8 +1859,8 @@ TEST(NodeConfig, ParsesShardModePlacementPortsAndPeerBases) {
     const auto& c = *r.config;
     EXPECT_TRUE(c.shardMode());
     EXPECT_TRUE(c.fused());
-    EXPECT_EQ(c.workerIngressBasePort, 40520);
-    EXPECT_EQ(c.workerReplBasePort, 40620);
+    EXPECT_EQ(c.workerIngressBasePort, std::optional<int32_t>{40520});
+    EXPECT_EQ(c.workerReplBasePort, std::optional<int32_t>{40620});
     EXPECT_TRUE(c.perWorkerIngressEnabled);
     EXPECT_TRUE(c.perWorkerReplication);
     EXPECT_TRUE(c.perWorkerEgressEnabled);
@@ -1990,7 +1992,7 @@ TEST(ShardConfigRegression, MissingEgressControlBasePortRefused) {
 TEST(NodeConfigRegression, LegacyModeKeepsDefaultEgressControlBasePort) {
     auto r = parseNodeConfig(fakeEnv(base1node()));
     ASSERT_TRUE(r.config.has_value()) << r.error;
-    EXPECT_EQ(r.config->workerEgressControlBasePort, 40300);
+    EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 40300);
     EXPECT_FALSE(r.config->validateShardConfig().has_value());
 }
 
@@ -2052,6 +2054,28 @@ TEST(ShardConfigRegression, SixtyFourShardWorkersAcceptedSixtyFiveRefused) {
     auto e = shardErr(env);
     ASSERT_TRUE(e.has_value());
     EXPECT_NE(e->find("64"), std::string::npos) << *e;
+}
+
+
+// --- Task 6 fix round 2: egress-control base port is optional<int32_t> (no side flag) ---
+TEST(ShardConfigRegression, ProgrammaticShardConfigWithEgressPortValidatesWithoutSideFlag) {
+    // A shard config built in code: setting the port alone must be enough.
+    auto env = shard3node(); env.erase("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT");
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    auto c = *r.config;
+    ASSERT_TRUE(c.validateShardConfig().has_value()) << "unset must be refused";
+    c.workerEgressControlBasePort = 40400;
+    auto e = c.validateShardConfig();
+    EXPECT_FALSE(e.has_value()) << *e;
+    EXPECT_EQ(c.effectiveWorkerEgressControlBasePort(), 40400);
+}
+
+TEST(NodeConfigRegression, EgressControlBasePortUnsetResolvesLegacyDefault) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_FALSE(r.config->workerEgressControlBasePort.has_value());
+    EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 40300);
 }
 
 } // namespace rune::node
