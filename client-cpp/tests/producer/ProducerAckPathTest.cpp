@@ -435,7 +435,7 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentRecordsAndDropsThem) {
 // Tier-2 counterpart: a Tier-2 batch that never left the partition queue (no
 // session) past the delivery deadline is failed AND dropped (the per-record map
 // deadline that used to time it out no longer exists).
-TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThem) {
+TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThemRegression) {
     std::atomic<int64_t> corr{1};
     auto impl = std::make_shared<ProducerImpl>(ackCfg(8), corr);
     Capture cap;
@@ -452,4 +452,118 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThem) {
     EXPECT_THROW(fut.get(), std::runtime_error);
     impl->flushBatches(kNow + 10'000'000'001LL, 42, sink);
     EXPECT_TRUE(cap.frames.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Unresolved sequences (Kafka semantics): failing a SEQUENCED batch to the user
+// while its broker outcome is unknown (or known-rejected) leaves a same-epoch
+// sequence gap the broker rejects forever (ProducerStateManager: same epoch ->
+// baseSequence must equal lastSequence+1).  The producer bumps its epoch and
+// restarts every partition at baseSequence 0 (a higher epoch must start at 0 and
+// resets the broker's state).
+// ---------------------------------------------------------------------------
+namespace {
+struct SeqFrame {
+    int64_t corrId;
+    int16_t epoch;
+    int32_t baseSequence;
+    int32_t partition;
+};
+struct SeqCapture {
+    std::vector<SeqFrame> frames;
+    ProducerImpl::SendFn fn() {
+        return [this](int32_t, int32_t p, int32_t, const uint8_t* b, std::size_t n) {
+            const auto v = rcc::decodeProduce(b, n);
+            if (!v) return false;
+            rune::protocol::RecordBatchReader r(v->recordBatch.data(), v->recordBatch.size());
+            frames.push_back({v->correlationId, r.producerEpoch(), r.baseSequence(), p});
+            return true;
+        };
+    }
+};
+void sendOne(ProducerImpl& impl, const ProducerImpl::SendFn& sink, int32_t partition,
+             int64_t now = kNow) {
+    ASSERT_TRUE(impl.submitSendRecord(1, partition, Key(uint64_t{1}), kVal, false, 0));
+    pump(impl, sink, now);
+}
+} // namespace
+
+TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(8), corr);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    sendOne(impl, sink, 0);
+    sendOne(impl, sink, 1);
+    ASSERT_EQ(cap.frames.size(), 3u);
+    const int16_t e0 = cap.frames[0].epoch;
+    EXPECT_EQ(cap.frames[1].baseSequence, 1);
+    impl.failAllPending("Redirect reconnect failed");  // releases 3 in-flight batches
+    sendOne(impl, sink, 0);
+    sendOne(impl, sink, 1);
+    ASSERT_EQ(cap.frames.size(), 5u);
+    EXPECT_EQ(cap.frames[3].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[3].baseSequence, 0);
+    EXPECT_EQ(cap.frames[4].epoch, static_cast<int16_t>(e0 + 1)) << "one bump for the whole close";
+    EXPECT_EQ(cap.frames[4].baseSequence, 0);
+}
+
+TEST(ProducerSequence, DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(8), corr);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    sendOne(impl, sink, 0);   // two batches, both time out
+    sendOne(impl, sink, 1);   // other partition, acked fine
+    ASSERT_EQ(cap.frames.size(), 3u);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[2].corrId, 7);
+    const int64_t late = kNow + 10'000LL * 1'000'000LL;  // deliveryTimeoutMs = 10 s
+    impl.retransmitStalled(late, sink);
+    EXPECT_FALSE(impl.hasInFlight());
+    sendOne(impl, sink, 0, late);
+    sendOne(impl, sink, 1, late);
+    ASSERT_EQ(cap.frames.size(), 5u);
+    EXPECT_EQ(cap.frames[3].epoch, static_cast<int16_t>(e0 + 1)) << "two timeouts, one bump";
+    EXPECT_EQ(cap.frames[3].baseSequence, 0);
+    EXPECT_EQ(cap.frames[4].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[4].baseSequence, 0) << "every partition restarts at 0";
+}
+
+TEST(ProducerSequence, AckedBatchesKeepEpochAndSequenceRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(8), corr);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    for (int i = 0; i < 4; ++i) {
+        sendOne(impl, sink, 0);
+        impl.onProduceResponse(cap.frames.back().corrId, i);
+        impl.onProduceResponse(cap.frames.back().corrId, i);  // duplicate ack: ignored
+    }
+    ASSERT_EQ(cap.frames.size(), 4u);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_EQ(cap.frames[i].epoch, cap.frames[0].epoch);
+        EXPECT_EQ(cap.frames[i].baseSequence, i);
+    }
+}
+
+// A broker-rejected batch also consumed sequences it never wrote: bump once;
+// the later same-epoch batches it strands (rejected out-of-sequence) must not
+// bump again.
+TEST(ProducerSequence, BrokerRejectionBumpsEpochOnceRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl impl(ackCfg(8), corr);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    sendOne(impl, sink, 0);
+    sendOne(impl, sink, 0);
+    const int16_t e0 = cap.frames[0].epoch;
+    impl.onProduceResponse(cap.frames[0].corrId, /*-MinIsrViolation*/ -10);
+    impl.onProduceResponse(cap.frames[1].corrId, /*-OutOfOrderSequence (any)*/ -9);
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(cap.frames[2].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[2].baseSequence, 0);
 }

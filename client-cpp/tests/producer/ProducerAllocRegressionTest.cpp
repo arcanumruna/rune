@@ -96,3 +96,25 @@ TEST(ProducerAllocRegression, FrameSizeJitterDoesNotReallocateSlotRegression) {
     EXPECT_EQ(allocs, 0L) << "a slightly larger frame must not reallocate the slot's frame";
     EXPECT_FALSE(impl.hasInFlight());
 }
+
+// Regression guard: acks=None void sends (no ack handle, no in-flight slot) must
+// not allocate in steady state either.
+TEST(ProducerAllocRegression, AcksNoneVoidSteadyStateAllocatesNothingRegression) {
+    std::atomic<int64_t> corr{1};
+    ProducerConfig cfg = ackCfg(4);
+    cfg.acks = Acks::None;
+    ProducerImpl impl(cfg, corr);
+    const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        (void)impl.submitSendRecord(1, 0, Key(k), kVal, false, 0);
+        pump(impl, sink);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    const long allocs = alloc_counter::stop();
+    EXPECT_EQ(allocs, 0L) << "acks=None void steady state must not allocate";
+    EXPECT_FALSE(impl.hasInFlight());
+}

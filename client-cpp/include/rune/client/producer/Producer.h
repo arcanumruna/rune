@@ -99,6 +99,10 @@ inline constexpr want_future_t want_future{};
 //
 // acks=None: no response is awaited; a BatchAck{errorCode=0, baseOffset=-1} is
 // reported when the batch is handed to the transport ("sent, offset unknown").
+//
+// Failure of a sequenced batch (delivery timeout, redirect exhausted, close,
+// broker rejection) bumps the producer epoch and restarts every partition's
+// sequence at 0, so the failed batch never leaves a permanent sequence gap.
 // ---------------------------------------------------------------------------
 struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
@@ -165,6 +169,8 @@ public:
     /// Send with callback.  The callback fires on the agent thread with the
     /// broker's baseOffset when the ProduceResponse arrives.
     /// acks=None: fires with -1 once the record's batch is handed to the transport.
+    /// Under acks=None that -1 carries NO success/failure information (nothing is
+    /// acknowledged); use onBatchAck() and its errorCode for per-batch outcome.
     /// Allocates one PendingAck whose ownership travels to the duty-cycle thread
     /// inside the SEND_RECORD (no map, no lock).
     void send(TopicHandle              topic,
@@ -175,7 +181,7 @@ public:
     /// Send with future.  Returns a future that resolves with the broker's
     /// baseOffset (or throws on error / timeout).
     /// acks=None: resolves with -1 once the record's batch is handed to the
-    /// transport.  Allocates one PendingAck (ownership travels through the ring).
+    /// transport — no success/failure information (see onBatchAck()'s errorCode).  Allocates one PendingAck (ownership travels through the ring).
     std::future<int64_t> send(TopicHandle              topic,
                                const Key&               key,
                                std::span<const uint8_t> value,

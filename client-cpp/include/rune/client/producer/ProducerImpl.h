@@ -492,6 +492,16 @@ private:
     /// acks=None: completes the just-sent builder slice with -1 ("sent, offset
     /// unknown") and reclaims it — nothing waits for a response.
     void completeSentUnacked_(PartitionState& ps) noexcept;
+    /// Unresolved sequence (Kafka semantics): a sequenced batch stamped with the
+    /// CURRENT epoch was failed to the user while its broker outcome is unknown or
+    /// it was rejected, so its sequences are a same-epoch gap the broker would
+    /// reject forever.  Bumps producerEpoch_ and restarts every partition at
+    /// baseSequence 0 (the broker accepts a higher epoch only at 0 and resets its
+    /// state).  Batches of an older epoch do not bump again (one bump per gap
+    /// event).  Epoch overflow: at INT16_MAX the producerId is rotated (+1) and
+    /// the epoch restarts at 0 — the broker treats it as a new producer
+    /// (trust-on-first-use at baseSequence 0).
+    void onUnresolvedSequence_(int16_t batchEpoch) noexcept;
     void emitBatchAck_(const PartitionState& ps, int32_t baseSequence, int32_t recordCount,
                        int64_t baseOffset, int16_t errorCode);
     /// Fails a live batch's records and releases its slot.

@@ -687,6 +687,7 @@ bool ProducerImpl::encodeAndSend(
         b.ackCount          = ps.batchAckCount;
         b.recordCount       = batchRecords;
         b.baseSequence      = batchSeq;
+        b.producerEpoch     = producerEpoch_;
         b.ingressStreamId   = ps.ingressStreamId;
         keepFrame(b.wireFrame, encodeScratch_.data(), written);
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
@@ -841,6 +842,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.ackCount          = 1;
         ib.recordCount       = entry.recordCount;
         ib.baseSequence      = batchSeq;
+        ib.producerEpoch     = producerEpoch_;
         ib.ingressStreamId   = ps.ingressStreamId;
         keepFrame(ib.wireFrame, encodeScratch_.data(), written);
         verifyClaimedCorrId_(ps, ib, wireCorrId);  // always on (not an assert)
@@ -971,6 +973,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
     } else {
         const std::string err = "produce rejected by broker (errorCode=" + std::to_string(ec) + ")";
         completeSlice_(ps, b->ackStart, b->ackCount, -1, err);
+        onUnresolvedSequence_(b->producerEpoch);  // rejected: its sequences were never written
     }
     ps.inflight.release(*b);
     reclaimAckRing_(ps);
@@ -1046,8 +1049,24 @@ void ProducerImpl::emitBatchAck_(const PartitionState& ps, int32_t baseSequence,
 void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason) {
     emitBatchAck_(ps, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure);
     completeSlice_(ps, b.ackStart, b.ackCount, -1, reason);
+    onUnresolvedSequence_(b.producerEpoch);  // outcome at the broker unknown
     ps.inflight.release(b);
     reclaimAckRing_(ps);
+}
+
+void ProducerImpl::onUnresolvedSequence_(int16_t batchEpoch) noexcept {
+    if (batchEpoch != producerEpoch_) return;  // gap already resolved by an earlier bump
+    if (producerEpoch_ == INT16_MAX) {
+        ++producerId_;
+        producerEpoch_ = 0;
+    } else {
+        ++producerEpoch_;
+    }
+    for (auto& up : partitions_) up->nextBaseSequence = 0;
+    std::fprintf(stderr,
+                 "ProducerImpl: unresolved sequence -> producerId=%lld epoch=%d, sequences "
+                 "restart at 0\n",
+                 static_cast<long long>(producerId_), static_cast<int>(producerEpoch_));
 }
 
 void ProducerImpl::failBatch(int64_t corrId, const std::string& reason) {
@@ -1230,6 +1249,7 @@ void ProducerImpl::failAllPending(const std::string& reason) {
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             emitBatchAck_(ps, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure);
+            onUnresolvedSequence_(b.producerEpoch);  // released with an unknown outcome
             ps.inflight.release(b);
         });
         for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
