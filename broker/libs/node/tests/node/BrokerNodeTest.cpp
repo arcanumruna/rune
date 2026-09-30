@@ -1062,4 +1062,16 @@ TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
+
+TEST(BrokerNodeRegression, StartNeverPumpsNodeDriverFromCallerThread) {
+    const fs::path dir = makeTempDataDir("drvrace_");
+    BrokerNode node{makeSingleNodeConfig(dir)};
+    node.start();
+    ASSERT_NE(node.driverForTest(), nullptr);
+    EXPECT_EQ(node.driverForTest()->callerPumpsWhileThreadRunning(), 0u);
+    EXPECT_EQ(node.driverForTest()->foreignPumpAttempts(), 0u);
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 } // namespace rune::node

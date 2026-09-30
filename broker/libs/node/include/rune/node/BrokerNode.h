@@ -21,6 +21,7 @@
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
 #include <rune/node/NodeConfig.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
@@ -318,6 +319,9 @@ public:
         return gateway_.get();
     }
 
+    /// Test-only: the node-level embedded driver (spec §3.6 one-pumper counters).
+    EmbeddedDriver* driverForTest() const noexcept { return nodeDriver_.get(); }
+
     /// Test-only: return the MetadataService (for assignment() queries in tests).
     /// Non-null after start() if metadata service construction succeeded.
     /// NOT safe for concurrent use — call only when duty cycle is between
@@ -612,10 +616,7 @@ private:
     // -----------------------------------------------------------------------
     // Aeron embedded driver + client
     // -----------------------------------------------------------------------
-    aeron_driver_context_t* driverCtx_  = nullptr;
-    aeron_driver_t*         driver_     = nullptr;
-    std::atomic<bool>       driverRunning_{false};
-    std::thread             driverThread_;
+    std::unique_ptr<EmbeddedDriver> nodeDriver_;   // node-level driver (runtime / legacy workers)
 
     std::shared_ptr<aeron::Aeron> aeron_;
 

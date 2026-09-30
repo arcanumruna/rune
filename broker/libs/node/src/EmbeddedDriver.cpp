@@ -1,0 +1,137 @@
+#include <rune/node/EmbeddedDriver.h>
+
+#include <spdlog/spdlog.h>
+
+#include <stdexcept>
+
+namespace rune::node {
+
+EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::string dir) {
+    EmbeddedDriverConfig e;
+    e.dir               = std::move(dir);
+    e.termBufferBytes   = c.aeronTermBufferBytes;
+    e.mtuBytes          = c.aeronMtuBytes;
+    e.rcvWindowBytes    = c.aeronRcvWindowBytes;
+    e.socketBufferBytes = c.aeronSocketBufferBytes;
+    e.threadingMode     = c.aeronThreadingMode;
+    e.idleStrategy      = c.driverIdleStrategy;
+    return e;
+}
+
+std::optional<std::string> checkAeronSpace(uint64_t freeBytes, int32_t drivers, int32_t termBufferBytes) {
+    const uint64_t perDriver = 3ULL * static_cast<uint64_t>(termBufferBytes) + 64ULL * 1024;
+    const uint64_t need      = perDriver * static_cast<uint64_t>(drivers);
+    if (freeBytes >= need) return std::nullopt;
+    return "aeron dir has " + std::to_string(freeBytes) + " bytes free but " + std::to_string(drivers) +
+           " driver(s) need at least " + std::to_string(need) +
+           " (3 x RUNE_AERON_TERM_BUFFER_BYTES + 64 KiB each) — lower RUNE_AERON_TERM_BUFFER_BYTES, "
+           "fewer RUNE_WORKERS, or a larger tmpfs";
+}
+
+int EmbeddedDriver::callerPump_() noexcept {
+    if (running_.load(std::memory_order_acquire)) ++callerPumpsWhileThreadRunning_;
+    return aeron_driver_main_do_work(driver_);
+}
+
+EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
+    : cfg_(std::move(cfg)), mode_(mode)
+{
+    if (aeron_driver_context_init(&ctx_) < 0)
+        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
+                                 aeron_errmsg());
+    if (aeron_is_driver_active(cfg_.dir.c_str(), /*timeout_ms=*/1000, +[](const char*) {})) {
+        aeron_driver_context_close(ctx_);
+        ctx_ = nullptr;
+        throw std::runtime_error(
+            "EmbeddedDriver: aeron dir '" + cfg_.dir + "' is already in use by an ACTIVE media "
+            "driver (a prior broker instance may still be running, or was killed without clean "
+            "shutdown). Use a distinct RUNE_AERON_DIR/RUNE_DATA_DIR, or ensure the previous "
+            "instance exited.");
+    }
+    aeron_driver_context_set_dir(ctx_, cfg_.dir.c_str());
+    const char* idle = cfg_.idleStrategy.c_str();
+    if (mode_ == DriverMode::Invoker) {
+        // INVOKER: SHARED runner layout, manual main loop REQUIRED, no agent thread
+        // (aeron_driver.c:939-956, 1046-1082).  DEDICATED / SHARED_NETWORK would still
+        // spawn sender/receiver threads under a manual main loop.
+        aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_INVOKER);
+    } else if (cfg_.threadingMode == NodeConfig::AeronThreadingMode::Dedicated) {
+        aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_DEDICATED);
+        aeron_driver_context_set_conductor_idle_strategy(ctx_, idle);
+        aeron_driver_context_set_sender_idle_strategy(ctx_, idle);
+        aeron_driver_context_set_receiver_idle_strategy(ctx_, idle);
+    } else {
+        aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
+        aeron_driver_context_set_shared_idle_strategy(ctx_, idle);
+    }
+    aeron_driver_context_set_dir_delete_on_start(ctx_, true);
+    aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
+    aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);
+    aeron_driver_context_set_term_buffer_length(ctx_, static_cast<uint64_t>(cfg_.termBufferBytes));
+    aeron_driver_context_set_mtu_length(ctx_, static_cast<size_t>(cfg_.mtuBytes));
+    aeron_driver_context_set_rcv_initial_window_length(ctx_, static_cast<size_t>(cfg_.rcvWindowBytes));
+    if (cfg_.socketBufferBytes > 0) {
+        aeron_driver_context_set_socket_so_sndbuf(ctx_, static_cast<size_t>(cfg_.socketBufferBytes));
+        aeron_driver_context_set_socket_so_rcvbuf(ctx_, static_cast<size_t>(cfg_.socketBufferBytes));
+    }
+    if (aeron_driver_init(&driver_, ctx_) < 0) {
+        aeron_driver_context_close(ctx_);
+        ctx_ = nullptr;
+        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_init failed: ") + aeron_errmsg());
+    }
+    if (aeron_driver_start(driver_, /*manual_main_loop=*/true) < 0) {
+        aeron_driver_close(driver_);
+        aeron_driver_context_close(ctx_);
+        driver_ = nullptr;
+        ctx_    = nullptr;
+        throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_start failed: ") + aeron_errmsg());
+    }
+    if (mode_ == DriverMode::Threaded) {
+        running_.store(true, std::memory_order_release);
+        thread_ = std::thread([this] {
+            while (running_.load(std::memory_order_acquire))
+                aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+        });
+        // No caller-side readiness pumping: aeron_driver_init already wrote cnc.dat
+        // (aeron_driver.c:864) and stamped the heartbeat (:911); only thread_ drives.
+    } else {
+        pumpOwner_ = std::this_thread::get_id();
+    }
+    spdlog::info("EmbeddedDriver: started (dir={}, mode={})", cfg_.dir,
+                 mode_ == DriverMode::Invoker ? "invoker" : "threaded");
+}
+
+int EmbeddedDriver::doWork() noexcept {
+    if (mode_ == DriverMode::Threaded || std::this_thread::get_id() != pumpOwner_) {
+        ++foreignPumpAttempts_;          // a driver is driven by exactly one thread
+        return 0;
+    }
+    return aeron_driver_main_do_work(driver_);
+}
+
+void EmbeddedDriver::close() noexcept {
+    if (mode_ == DriverMode::Threaded && running_.exchange(false, std::memory_order_acq_rel)) {
+        if (thread_.joinable()) thread_.join();
+    }
+    // The driver thread (if any) has exited: the closing thread is now the ONLY
+    // pumper.  Drain the client-close commands still queued in the CnC ring before
+    // aeron_driver_close (prevents the conductor on_close use-after-free).
+    if (driver_) {
+        constexpr int kMaxDrainPumps = 10'000;
+        int idle = 0;
+        for (int i = 0; i < kMaxDrainPumps && idle < 2; ++i)
+            idle = (aeron_driver_main_do_work(driver_) == 0) ? idle + 1 : 0;
+        if (aeron_driver_close(driver_) < 0)
+            spdlog::warn("EmbeddedDriver: aeron_driver_close error (dir={}): {}", cfg_.dir, aeron_errmsg());
+        driver_ = nullptr;
+    }
+    if (ctx_) {
+        if (aeron_driver_context_close(ctx_) < 0)
+            spdlog::warn("EmbeddedDriver: aeron_driver_context_close error (dir={}): {}", cfg_.dir, aeron_errmsg());
+        ctx_ = nullptr;
+    }
+}
+
+EmbeddedDriver::~EmbeddedDriver() { close(); }
+
+} // namespace rune::node

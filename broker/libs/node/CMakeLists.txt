@@ -1,6 +1,7 @@
 add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
+    src/EmbeddedDriver.cpp
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
@@ -739,6 +740,12 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_broker_node_tests
                 PROPERTIES TIMEOUT 60
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
+            add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp)
+            target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_embedded_driver_tests
+                PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the
