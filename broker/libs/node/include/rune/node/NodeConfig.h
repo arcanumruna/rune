@@ -146,6 +146,12 @@ struct PeerConfig {
     // Remote peers' entries are populated from membership descriptors when received.
     int32_t  workerCount      = 0;  // 0 = unknown
 
+    // Self-contained worker shards (spec §3.3): this peer's explicit per-worker base
+    // ports.  Worker w listens on replBasePort + w (replication) and
+    // ingressBasePort + w (client produce).  0 = not advertised (legacy peers).
+    uint16_t replBasePort    = 0;
+    uint16_t ingressBasePort = 0;
+
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
 
@@ -194,6 +200,17 @@ struct NodeConfig {
     //   Overridable via RUNE_REPL_BASE_STREAM_ID (parseInt32).
     bool    perWorkerReplication = false;
     int32_t replBaseStreamId     = 2000;
+
+    // Self-contained worker shards (spec §3.1-§3.3).  Defaults = today's behaviour.
+    enum class WorkerMode : uint8_t { Legacy = 0, Shard = 1 };          // RUNE_WORKER_MODE
+    enum class RuntimePlacement : uint8_t { Thread = 0, Fused = 1 };    // RUNE_RUNTIME_PLACEMENT
+    WorkerMode       workerMode       = WorkerMode::Legacy;
+    RuntimePlacement runtimePlacement = RuntimePlacement::Thread;
+    int32_t workerIngressBasePort = 0;   // RUNE_WORKER_INGRESS_BASE_PORT (0 = unset)
+    int32_t workerReplBasePort    = 0;   // RUNE_WORKER_REPL_BASE_PORT    (0 = unset)
+    static constexpr int32_t kMaxShardWorkers = 64;   // runtime→worker announce mask width
+    [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
+    [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
 
     // Topics declared via RUNE_TOPICS (GB-1).
     // Empty when RUNE_TOPICS is absent or empty — valid state (no topics).
@@ -514,6 +531,19 @@ struct NodeConfig {
     /// NOT called during parseNodeConfig.  Callers (e.g. BrokerNode startup)
     /// must invoke this after parsing and refuse to start if it returns an error.
     std::optional<std::string> validateStreamRanges() const;
+
+    /// Shard mode: every port this node binds + co-located peers' advertised
+    /// ranges, peer base ports, symmetric worker count, stream ranges.  nullopt =
+    /// valid (always nullopt in legacy mode unless placement=fused).  BrokerNode
+    /// refuses to start on an error (no silent fallback).
+    std::optional<std::string> validateShardConfig() const;
+
+    /// Host part of clientEndpoint.channel (the client-facing bind host).
+    std::string clientBindHost() const;
+    std::string shardIngressBindChannel(int32_t w) const;  // aeron:udp?endpoint=<clientBindHost>:<ingressBase+w>
+    std::string shardReplBindChannel(int32_t w) const;     // aeron:udp?endpoint=<self.host>:<replBase+w>
+    static std::string shardPeerReplChannel(const PeerConfig& p, int32_t w);  // <p.host>:<p.replBasePort+w>
+    static std::string shardIngressEndpoint(const PeerConfig& p, int32_t w);  // "<p.host>:<p.ingressBasePort+w>"
 };
 
 struct ConfigResult {

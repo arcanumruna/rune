@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 #include <map>
+#include <optional>
 #include <string>
 
 namespace rune::node {
@@ -1817,6 +1818,164 @@ TEST(NodeConfig, ValidateStreamRanges_OverlapWithWorkerEgressRange_ReturnsError)
         << "replBase range overlapping workerEgress range must fail validateStreamRanges()";
     EXPECT_NE(err->find("workerEgress"), std::string::npos)
         << "error message must name 'workerEgress', got: " << *err;
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained worker shards (spec §3.3): config + validation + refusal.
+// ---------------------------------------------------------------------------
+static std::map<std::string, std::string> shard3node(int self = 0) {
+    return {
+        {"RUNE_NODE_ID",          std::to_string(self)},
+        {"RUNE_PEERS",            "0@127.0.0.1:40110:40200:40220:40600:40500,"
+                                  "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                                  "2@127.0.0.1:40112:40202:40222:40640:40540"},
+        {"RUNE_CLIENT_ENDPOINT",  "0.0.0.0:" + std::to_string(40200 + self)},
+        {"RUNE_DATA_DIR",         "/data/rune"},
+        {"RUNE_WORKERS",          "1"},
+        {"RUNE_WORKER_MODE",      "shard"},
+        {"RUNE_WORKER_INGRESS_BASE_PORT", std::to_string(40500 + 20 * self)},
+        {"RUNE_WORKER_REPL_BASE_PORT",    std::to_string(40600 + 20 * self)},
+        {"RUNE_WORKER_EGRESS_CONTROL_BASE_PORT", std::to_string(40400 + 20 * self)},
+    };
+}
+
+TEST(NodeConfig, DefaultsAreLegacyThreadAndValid) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->workerMode, NodeConfig::WorkerMode::Legacy);
+    EXPECT_EQ(r.config->runtimePlacement, NodeConfig::RuntimePlacement::Thread);
+    EXPECT_EQ(r.config->workerIngressBasePort, 0);
+    EXPECT_EQ(r.config->workerReplBasePort, 0);
+    EXPECT_FALSE(r.config->validateShardConfig().has_value());
+}
+
+TEST(NodeConfig, ParsesShardModePlacementPortsAndPeerBases) {
+    auto env = shard3node(1);
+    env["RUNE_RUNTIME_PLACEMENT"] = "fused";
+    auto r = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto& c = *r.config;
+    EXPECT_TRUE(c.shardMode());
+    EXPECT_TRUE(c.fused());
+    EXPECT_EQ(c.workerIngressBasePort, 40520);
+    EXPECT_EQ(c.workerReplBasePort, 40620);
+    EXPECT_TRUE(c.perWorkerIngressEnabled);
+    EXPECT_TRUE(c.perWorkerReplication);
+    EXPECT_TRUE(c.perWorkerEgressEnabled);
+    EXPECT_EQ(c.peers[2].replBasePort, 40640);
+    EXPECT_EQ(c.peers[2].ingressBasePort, 40540);
+    EXPECT_EQ(c.shardIngressBindChannel(0), "aeron:udp?endpoint=0.0.0.0:40520");
+    EXPECT_EQ(c.shardReplBindChannel(0), "aeron:udp?endpoint=127.0.0.1:40620");
+    EXPECT_EQ(NodeConfig::shardPeerReplChannel(c.peers[2], 0), "aeron:udp?endpoint=127.0.0.1:40640");
+    EXPECT_EQ(NodeConfig::shardIngressEndpoint(c.peers[0], 0), "127.0.0.1:40500");
+    EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
+}
+
+TEST(NodeConfigRegression, UnknownWorkerModeIsParseError) {
+    auto env = shard3node(); env["RUNE_WORKER_MODE"] = "shards";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("RUNE_WORKER_MODE"), std::string::npos);
+}
+
+TEST(NodeConfigRegression, UnknownRuntimePlacementIsParseError) {
+    auto env = shard3node(); env["RUNE_RUNTIME_PLACEMENT"] = "fuse";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("RUNE_RUNTIME_PLACEMENT"), std::string::npos);
+}
+
+TEST(NodeConfigRegression, PeerEntryWithSixPortsRejected) {
+    auto env = base3node();
+    env["RUNE_PEERS"] = "0@h:1:2:3:4:5:6,1@h:11,2@h:12";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+}
+
+static std::optional<std::string> shardErr(std::map<std::string, std::string> env) {
+    auto r = parseNodeConfig(fakeEnv(std::move(env)));
+    if (!r.config) return r.error;
+    return r.config->validateShardConfig();
+}
+
+TEST(ShardConfigRegression, MissingIngressBasePortRefused) {
+    auto env = shard3node(); env.erase("RUNE_WORKER_INGRESS_BASE_PORT");
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("RUNE_WORKER_INGRESS_BASE_PORT"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, MissingPeerReplBasePortRefused) {
+    auto env = shard3node();
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("peer 2"), std::string::npos);
+    EXPECT_NE(e->find("replBasePort"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, SelfPeerEntryDisagreeingWithEnvRefused) {
+    auto env = shard3node(); env["RUNE_WORKER_REPL_BASE_PORT"] = "40700";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("RUNE_WORKER_REPL_BASE_PORT"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, OwnPortCollisionRefusedNamingBothPorts) {
+    auto env = shard3node(); env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"] = "40500";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("40500"), std::string::npos);
+    EXPECT_NE(e->find("workerIngress"), std::string::npos);
+    EXPECT_NE(e->find("workerEgressControl"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, CoLocatedPeerRangeOverlapRefused) {
+    auto env = shard3node(0);
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:40500,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40500,"   // same ingress base as node 0
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("co-located peer 1"), std::string::npos);
+    EXPECT_NE(e->find("40500"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, AsymmetricWorkerCountRefused) {
+    auto r = parseNodeConfig(fakeEnv(shard3node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    auto c = *r.config;
+    c.peers[1].workerCount = 2;               // peer advertises 2, self runs 1
+    auto e = c.validateShardConfig();
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("worker count"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, PortRangeOverflowRefused) {
+    auto env = shard3node(); env["RUNE_WORKERS"] = "2";
+    env["RUNE_WORKER_INGRESS_BASE_PORT"] = "65535";
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:40600:65535,"
+                        "1@127.0.0.1:40111:40201:40221:40620:40520,"
+                        "2@127.0.0.1:40112:40202:40222:40640:40540";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("RUNE_WORKER_INGRESS_BASE_PORT"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, FusedRequiresShard) {
+    auto env = base1node(); env["RUNE_RUNTIME_PLACEMENT"] = "fused";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("fused requires"), std::string::npos);
+}
+
+TEST(ShardConfigRegression, MoreThanSixtyFourShardWorkersRefused) {
+    auto env = shard3node(); env["RUNE_WORKERS"] = "65";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("64"), std::string::npos);
 }
 
 } // namespace rune::node

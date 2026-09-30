@@ -25,6 +25,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <thread>
@@ -1049,6 +1050,16 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     }
 
     node.stop();
+}
+
+TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
+    const fs::path dir = makeTempDataDir("shardbad_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;     // no per-worker ports configured
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 } // namespace rune::node

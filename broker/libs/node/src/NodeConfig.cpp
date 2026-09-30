@@ -1,9 +1,11 @@
 #include <rune/node/NodeConfig.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <optional>
 #include <cstdlib>
 #include <sstream>
 #include <string_view>
@@ -71,83 +73,59 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
     return true;
 }
 
-/// Parse one peer entry of the form "id@host:consensusPort[:clientPort[:replPort]]".
-/// Optional segments (backward-compatible):
-///   - "1@host:40111"               → consensusPort=40111, clientPort=0, replPort=0
-///   - "1@host:40111:40200"         → consensusPort=40111, clientPort=40200, replPort=0
-///   - "1@host:40111:40200:40300"   → consensusPort=40111, clientPort=40200, replPort=40300
+/// Parse one peer entry of the form
+///   "id@host:consensusPort[:clientPort[:replPort[:replBasePort[:ingressBasePort]]]]".
+/// Optional segments (backward-compatible; absent → 0):
+///   - "1@host:40111"                         → consensusPort=40111
+///   - "1@host:40111:40200"                   → + clientPort=40200
+///   - "1@host:40111:40200:40300"             → + replPort=40300
+///   - "1@host:40111:40200:40300:40600:40500" → + replBasePort=40600, ingressBasePort=40500
+///     (self-contained worker shards, spec §3.3: worker w uses base + w)
+/// More than 5 port segments is an error.
 /// Returns an error string on failure or an empty string on success.
 static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     auto at = entry.find('@');
     if (at == std::string_view::npos)
         return std::string("malformed peer entry (missing '@'): ") + std::string(entry);
-
     std::string_view idPart   = trim(entry.substr(0, at));
     std::string_view hostPort = trim(entry.substr(at + 1));
-
     int32_t id{};
     if (!parseInt32(idPart, id))
         return std::string("peer id is not a valid integer in entry: ") + std::string(entry);
-
-    // Split on the FIRST colon for host.
     auto firstColon = hostPort.find(':');
     if (firstColon == std::string_view::npos)
         return std::string("malformed peer entry (missing ':' in host:port): ") + std::string(entry);
-
-    std::string_view host        = trim(hostPort.substr(0, firstColon));
-    std::string_view remainder   = trim(hostPort.substr(firstColon + 1));
-
+    std::string_view host = trim(hostPort.substr(0, firstColon));
     if (host.empty())
         return std::string("peer host is empty in entry: ") + std::string(entry);
 
-    // remainder may be: "consensusPort" | "consensusPort:clientPort" | "consensusPort:clientPort:replPort"
-    auto secondColon = remainder.find(':');
-
-    std::string_view consensusPortPart;
-    std::string_view clientPortPart;
-    std::string_view replPortPart;
-    bool hasClientPort = false;
-    bool hasReplPort   = false;
-
-    if (secondColon == std::string_view::npos) {
-        // Two-segment: no clientPort.
-        consensusPortPart = remainder;
-    } else {
-        // Three-or-four-segment: consensusPort:clientPort[:replPort].
-        consensusPortPart = trim(remainder.substr(0, secondColon));
-        std::string_view rest2 = trim(remainder.substr(secondColon + 1));
-        auto thirdColon = rest2.find(':');
-        if (thirdColon == std::string_view::npos) {
-            clientPortPart = rest2;
-        } else {
-            clientPortPart = trim(rest2.substr(0, thirdColon));
-            replPortPart   = trim(rest2.substr(thirdColon + 1));
-            hasReplPort    = true;
-        }
-        hasClientPort = true;
+    // consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort]]]]
+    static constexpr const char* kNames[5] = {
+        "consensusPort", "clientPort", "replicationPort", "replBasePort", "ingressBasePort"};
+    std::array<std::string_view, 5> parts{};
+    std::size_t n = 0;
+    std::string_view rem = trim(hostPort.substr(firstColon + 1));
+    for (;;) {
+        if (n == parts.size())
+            return std::string("too many ':' port segments (max 5) in peer entry: ") + std::string(entry);
+        const auto c = rem.find(':');
+        parts[n++] = trim(c == std::string_view::npos ? rem : rem.substr(0, c));
+        if (c == std::string_view::npos) break;
+        rem = rem.substr(c + 1);
     }
-
-    uint16_t consensusPort{};
-    if (!parsePort(consensusPortPart, consensusPort))
-        return std::string("peer consensusPort is invalid or out of range in entry: ") + std::string(entry);
-
-    uint16_t clientPort = 0;
-    if (hasClientPort) {
-        if (!parsePort(clientPortPart, clientPort))
-            return std::string("peer clientPort is invalid or out of range in entry: ") + std::string(entry);
+    std::array<uint16_t, 5> ports{};
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!parsePort(parts[i], ports[i]))
+            return std::string("peer ") + kNames[i] + " is invalid or out of range in entry: " +
+                   std::string(entry);
     }
-
-    uint16_t replPort = 0;
-    if (hasReplPort) {
-        if (!parsePort(replPortPart, replPort))
-            return std::string("peer replicationPort is invalid or out of range in entry: ") + std::string(entry);
-    }
-
-    out.id               = id;
-    out.host             = std::string(host);
-    out.consensusPort    = consensusPort;
-    out.clientPort       = clientPort;
-    out.replicationPort  = replPort;
+    out.id              = id;
+    out.host            = std::string(host);
+    out.consensusPort   = ports[0];
+    out.clientPort      = ports[1];
+    out.replicationPort = ports[2];
+    out.replBasePort    = ports[3];
+    out.ingressBasePort = ports[4];
     return {};
 }
 
@@ -244,6 +222,104 @@ std::optional<std::string> NodeConfig::validateStreamRanges() const {
     }
 
     return std::nullopt;  // no overlap detected
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained worker shards (spec §3.3): per-worker channels + validation
+// ---------------------------------------------------------------------------
+
+std::string NodeConfig::clientBindHost() const {
+    const std::string_view ch = clientEndpoint.channel;
+    const auto ep = ch.find("endpoint=");
+    if (ep == std::string_view::npos) return "0.0.0.0";
+    std::string_view hp = ch.substr(ep + 9);
+    if (const auto bar = hp.find('|'); bar != std::string_view::npos) hp = hp.substr(0, bar);
+    const auto colon = hp.rfind(':');
+    return std::string(colon == std::string_view::npos ? hp : hp.substr(0, colon));
+}
+std::string NodeConfig::shardIngressBindChannel(int32_t w) const {
+    return "aeron:udp?endpoint=" + clientBindHost() + ":" + std::to_string(workerIngressBasePort + w);
+}
+std::string NodeConfig::shardReplBindChannel(int32_t w) const {
+    return "aeron:udp?endpoint=" + self().host + ":" + std::to_string(workerReplBasePort + w);
+}
+std::string NodeConfig::shardPeerReplChannel(const PeerConfig& p, int32_t w) {
+    return "aeron:udp?endpoint=" + p.host + ":" + std::to_string(static_cast<int32_t>(p.replBasePort) + w);
+}
+std::string NodeConfig::shardIngressEndpoint(const PeerConfig& p, int32_t w) {
+    return p.host + ":" + std::to_string(static_cast<int32_t>(p.ingressBasePort) + w);
+}
+
+std::optional<std::string> NodeConfig::validateShardConfig() const {
+    if (fused() && !shardMode())
+        return std::string("RUNE_RUNTIME_PLACEMENT=fused requires RUNE_WORKER_MODE=shard");
+    if (!shardMode()) return std::nullopt;
+
+    const int32_t W = workerCount >= 1 ? workerCount : 1;
+    if (W > kMaxShardWorkers)
+        return "shard mode supports at most " + std::to_string(kMaxShardWorkers) +
+               " workers per node, got RUNE_WORKERS=" + std::to_string(W);
+    auto baseOk = [W](int32_t base) { return base >= 1 && base + W - 1 <= 65535; };
+    if (!baseOk(workerIngressBasePort))
+        return "shard mode requires RUNE_WORKER_INGRESS_BASE_PORT in [1, " + std::to_string(65536 - W) +
+               "], got " + std::to_string(workerIngressBasePort);
+    if (!baseOk(workerReplBasePort))
+        return "shard mode requires RUNE_WORKER_REPL_BASE_PORT in [1, " + std::to_string(65536 - W) +
+               "], got " + std::to_string(workerReplBasePort);
+
+    for (const auto& p : peers) {
+        if (p.replBasePort == 0)
+            return "shard mode requires replBasePort for peer " + std::to_string(p.id) +
+                   " in RUNE_PEERS (id@host:consensus:client:repl:replBase:ingressBase)";
+        if (p.ingressBasePort == 0)
+            return "shard mode requires ingressBasePort for peer " + std::to_string(p.id) +
+                   " in RUNE_PEERS (id@host:consensus:client:repl:replBase:ingressBase)";
+        if (p.id != nodeId && p.workerCount != 0 && p.workerCount != W)
+            return "shard mode requires a symmetric worker count: peer " + std::to_string(p.id) +
+                   " advertises " + std::to_string(p.workerCount) + ", self has " + std::to_string(W);
+    }
+    const PeerConfig& me = self();
+    if (me.replBasePort != workerReplBasePort)
+        return "RUNE_WORKER_REPL_BASE_PORT=" + std::to_string(workerReplBasePort) +
+               " disagrees with self RUNE_PEERS replBasePort=" + std::to_string(me.replBasePort);
+    if (me.ingressBasePort != workerIngressBasePort)
+        return "RUNE_WORKER_INGRESS_BASE_PORT=" + std::to_string(workerIngressBasePort) +
+               " disagrees with self RUNE_PEERS ingressBasePort=" + std::to_string(me.ingressBasePort);
+
+    struct Bind { int32_t port; std::string what; };
+    std::vector<Bind> binds;
+    binds.push_back({me.consensusPort, "consensusPort"});
+    if (me.clientPort != 0)      binds.push_back({me.clientPort, "clientPort"});
+    if (me.replicationPort != 0) binds.push_back({me.replicationPort, "replicationPort"});
+    for (int32_t w = 0; w < W; ++w) {
+        const std::string tag = "[w" + std::to_string(w) + "]";
+        binds.push_back({workerIngressBasePort + w, "workerIngress" + tag});
+        binds.push_back({workerReplBasePort + w, "workerRepl" + tag});
+        binds.push_back({workerEgressControlBasePort + w, "workerEgressControl" + tag});
+    }
+    for (std::size_t i = 0; i < binds.size(); ++i)
+        for (std::size_t j = i + 1; j < binds.size(); ++j)
+            if (binds[i].port == binds[j].port)
+                return "port collision: " + binds[i].what + " and " + binds[j].what +
+                       " both bind " + std::to_string(binds[i].port);
+
+    for (const auto& p : peers) {
+        if (p.id == nodeId || p.host != me.host) continue;       // only co-located peers can collide
+        std::vector<Bind> theirs{{p.consensusPort, "consensusPort"}};
+        if (p.clientPort != 0)      theirs.push_back({p.clientPort, "clientPort"});
+        if (p.replicationPort != 0) theirs.push_back({p.replicationPort, "replicationPort"});
+        for (int32_t w = 0; w < W; ++w) {
+            theirs.push_back({p.ingressBasePort + w, "workerIngress[w" + std::to_string(w) + "]"});
+            theirs.push_back({p.replBasePort + w, "workerRepl[w" + std::to_string(w) + "]"});
+        }
+        for (const auto& a : binds)
+            for (const auto& b : theirs)
+                if (a.port == b.port)
+                    return "port collision with co-located peer " + std::to_string(p.id) + " (" +
+                           p.host + "): our " + a.what + " and its " + b.what + " both use " +
+                           std::to_string(a.port);
+    }
+    return validateStreamRanges();
 }
 
 // ---------------------------------------------------------------------------
@@ -939,12 +1015,45 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (false).
 
+    // --- Self-contained worker shards (spec §3.1-§3.3) ---
+    auto lower = [](std::string s) {
+        for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return s;
+    };
+    if (const char* raw = getenv_fn("RUNE_WORKER_MODE"); raw && *raw) {
+        const std::string s = lower(std::string(trim(raw)));
+        if (s == "legacy")     cfg.workerMode = NodeConfig::WorkerMode::Legacy;
+        else if (s == "shard") cfg.workerMode = NodeConfig::WorkerMode::Shard;
+        else return {{}, std::string("RUNE_WORKER_MODE must be 'legacy' or 'shard', got: ") + raw};
+    }
+    if (const char* raw = getenv_fn("RUNE_RUNTIME_PLACEMENT"); raw && *raw) {
+        const std::string s = lower(std::string(trim(raw)));
+        if (s == "thread")     cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+        else if (s == "fused") cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+        else return {{}, std::string("RUNE_RUNTIME_PLACEMENT must be 'thread' or 'fused', got: ") + raw};
+    }
+    if (const char* raw = getenv_fn("RUNE_WORKER_INGRESS_BASE_PORT"); raw && *raw) {
+        if (!parseInt32(raw, cfg.workerIngressBasePort))
+            return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT is not a valid integer: ") + raw};
+    }
+    if (const char* raw = getenv_fn("RUNE_WORKER_REPL_BASE_PORT"); raw && *raw) {
+        if (!parseInt32(raw, cfg.workerReplBasePort))
+            return {{}, std::string("RUNE_WORKER_REPL_BASE_PORT is not a valid integer: ") + raw};
+    }
+    if (cfg.shardMode()) {
+        // A shard IS per-worker ingress + replication + egress on the worker's own driver.
+        cfg.perWorkerIngressEnabled = true;
+        cfg.perWorkerReplication    = true;
+        cfg.perWorkerEgressEnabled  = true;
+    }
+
     // Task 1: populate self peer's workerCount from cfg.workerCount so that
     // membership descriptors advertise the correct per-worker replication capacity.
     // Only set when workerCount > 1 (explicitly configured for multi-worker mode);
     // leave at 0 (unknown) for the default single-worker configuration so that
     // the default-on field is distinguishable from an explicit deployment choice.
-    if (cfg.workerCount > 1) {
+    // Shard mode always stamps (even W=1): symmetric-worker-count validation needs it.
+    if (cfg.workerCount > 1 || cfg.shardMode()) {
         for (auto& p : cfg.peers) {
             if (p.id == cfg.nodeId) {
                 p.workerCount = cfg.workerCount;

@@ -68,6 +68,13 @@ void BrokerNode::start() {
         return; // idempotent
     }
 
+    // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
+    // side effect (no dataDir, no driver, no ports).
+    if (auto err = config_.validateShardConfig(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
 
