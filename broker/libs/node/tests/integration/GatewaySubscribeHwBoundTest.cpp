@@ -54,6 +54,7 @@
 
 // Node / replication
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -86,6 +87,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -95,6 +97,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 
 // ===========================================================================
@@ -852,17 +855,16 @@ TEST(GR6_Integration, SubscriberBoundedByHW_FullyReplicated) {
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
 
     // Wait for full ISR (all 3 nodes).
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
 
     {
         const auto deadline = std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < deadline) {
-            if (static_cast<int>(leaderReplica->isr().size()) >= 2) break;
+            if (isrSizeOnOwner(*leaderNode) >= 2) break;
             std::this_thread::sleep_for(20ms);
         }
     }
-    EXPECT_GE(static_cast<int>(leaderReplica->isr().size()), 2)
+    EXPECT_GE(isrSizeOnOwner(*leaderNode), 2)
         << "ISR must have at least 2 members before produce";
 
     // Set minIsr=2 so acks=All requires majority.
@@ -977,7 +979,7 @@ TEST(GR6_Integration, SubscriberBoundedByHW_FullyReplicated) {
         << "acks=All produce must succeed; errorCode=" << prodResp->errorCode;
 
     // At this point HW >= kNumRecords (ProduceResponse only fires when HW covers lastOffset).
-    const Offset hwAfterProduce = leaderReplica->highWatermark();
+    const Offset hwAfterProduce = hwOnOwner(*leaderNode);
     ASSERT_GE(hwAfterProduce, static_cast<Offset>(kNumRecords))
         << "HW must be >= " << kNumRecords << " after acks=All ProduceResponse";
 
@@ -1044,7 +1046,7 @@ TEST(GR6_Integration, SubscriberBoundedByHW_FullyReplicated) {
     }
 
     // GR-6 INVARIANT: every received record's baseOffset must be <= HW.
-    const Offset hwAtCheck = leaderReplica->highWatermark();
+    const Offset hwAtCheck = hwOnOwner(*leaderNode);
     ASSERT_FALSE(receivedOffsets.empty())
         << "Subscriber must receive at least one batch; HW=" << hwAtCheck;
 

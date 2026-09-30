@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -64,6 +65,7 @@ extern "C" {
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -73,6 +75,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 
 // ---------------------------------------------------------------------------
 // Helpers (mirrors UdpClusterElectionTest)
@@ -326,8 +329,7 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     ASSERT_NE(leaderNode, nullptr);
 
     // Get the leader's PartitionReplica (topicId=0, partition=0).
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr) << "leader has no replica for topic=0 partition=0";
+    ASSERT_TRUE(hasReplica(*leaderNode)) << "leader has no replica for topic=0 partition=0";
 
     // Wait for the metadata bridge to transition the replica to Leader role.
     // Uses the atomic mirror in ReplicationMetadataBridge — safe from the test thread.
@@ -344,7 +346,7 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
 
     // Produce N records via the leader's gateway over real aeron:udp.
     //
-    // IMPORTANT: we do NOT call leaderReplica->append() from the test thread.
+    // IMPORTANT: we do NOT call PartitionReplica::append() from the test thread.
     // PartitionReplica is single-writer (duty-cycle-thread-only); a test-thread
     // append() races the leader's duty cycle (onFetchRequest → recomputeHw,
     // pushToFollowers → Aeron publish), which TSan correctly flags. Driving the
@@ -490,11 +492,10 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     // the ISR, which simultaneously proves the leader committed AND the followers
     // replicated (HW only advances past an offset the ISR has acknowledged).
     auto leaderCommittedHw = [&]() -> Offset {
-        return leaderReplica->cleanerHighWatermark();
+        return cleanerHwOrMinusOne(*leaderNode);
     };
     auto followerCommittedHw = [&](int i) -> Offset {
-        PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-        return fr ? fr->cleanerHighWatermark() : -1;
+        return cleanerHwOrMinusOne(*allNodes[i]);   // -1 when no replica
     };
 
     while (Wall::now() < deadline) {

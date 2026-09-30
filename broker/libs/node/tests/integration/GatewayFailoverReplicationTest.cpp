@@ -82,6 +82,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -110,6 +111,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <algorithm>
 #include <unistd.h>
@@ -120,6 +122,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 
 // ===========================================================================
@@ -969,32 +972,31 @@ TEST(GR7_Integration, LeaderFailover_NoCommittedLoss_GroupCommitReconcile) {
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest())
         << "Leader's replication bridge must report isLeader";
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr) << "Leader must have a partition replica";
-    ASSERT_EQ(leaderReplica->role(), Role::Leader);
+    ASSERT_TRUE(hasReplica(*leaderNode)) << "Leader must have a partition replica";
+    ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
-    // Produce N=5 records via the leader replica directly.
+    // Produce N=5 records via the leader replica directly (on its OWNING thread).
     constexpr int kN = 5;
     for (int i = 0; i < kN; ++i) {
         auto payload = makeGr7Payload(static_cast<uint8_t>(0x10 + i), 16);
-        Offset off = leaderReplica->append(
+        Offset off = appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
         ASSERT_GE(off, 0) << "Leader must accept record " << i;
     }
-    const Offset leaderLeo = leaderReplica->logEndOffset();
+    const Offset leaderLeo = leoOnOwner(*leaderNode);
 
     // Wait for the leader's HW to advance (majority of followers replicated).
     {
         const auto deadline = std::chrono::steady_clock::now() + 10s;
         bool hwAdvanced = false;
         while (std::chrono::steady_clock::now() < deadline && !hwAdvanced) {
-            hwAdvanced = (leaderReplica->highWatermark() >= leaderLeo);
+            hwAdvanced = (hwOnOwner(*leaderNode) >= leaderLeo);
             if (!hwAdvanced) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(hwAdvanced)
             << "Leader HW must advance after replication";
     }
-    const Offset committedHw = leaderReplica->highWatermark();
+    const Offset committedHw = hwOnOwner(*leaderNode);
     ASSERT_GE(committedHw, leaderLeo);
 
     // Stop the leader — simulates leader kill.
@@ -1034,8 +1036,7 @@ TEST(GR7_Integration, LeaderFailover_NoCommittedLoss_GroupCommitReconcile) {
     ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
         << "New leader's replication bridge must report isLeader";
 
-    PartitionReplica* newLeaderReplica = newLeaderNode->replicaForTest(0, 0);
-    ASSERT_NE(newLeaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*newLeaderNode));
 
     // Partition failover (metadata reassignment of the dead leader's partitions)
     // is ASYNCHRONOUS and completes shortly AFTER consensus re-election — the
@@ -1045,30 +1046,33 @@ TEST(GR7_Integration, LeaderFailover_NoCommittedLoss_GroupCommitReconcile) {
     {
         const auto deadline = std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < deadline &&
-               newLeaderReplica->role() != Role::Leader) {
+               roleOnOwner(*newLeaderNode) != Role::Leader) {
             std::this_thread::sleep_for(20ms);
         }
     }
 
     // Assert: new leader has all committed records (no committed loss).
-    EXPECT_GE(newLeaderReplica->logEndOffset(), committedHw)
-        << "New leader must hold all committed records: LEO="
-        << newLeaderReplica->logEndOffset() << " committedHw=" << committedHw;
+    {
+        const Offset leo = leoOnOwner(*newLeaderNode);
+        EXPECT_GE(leo, committedHw)
+            << "New leader must hold all committed records: LEO="
+            << leo << " committedHw=" << committedHw;
+    }
 
-    // Assert: no phantom-committed record (HW <= LEO).
-    EXPECT_LE(newLeaderReplica->highWatermark(), newLeaderReplica->logEndOffset())
-        << "HW must never exceed LEO (no phantom-committed records)";
+    // Assert: no phantom-committed record (HW <= LEO) — one consistent
+    // owner-thread snapshot of the pair.
+    {
+        const auto [hw, leo] = newLeaderNode->onOwnerThreadForTest(0, 0,
+            [](PartitionReplica& r) { return std::pair{r.highWatermark(), r.logEndOffset()}; });
+        EXPECT_LE(hw, leo) << "HW must never exceed LEO (no phantom-committed records)";
+    }
 
     // Assert: committed data readable from 0.
-    rune::gateway::TopicRegistry* reg = newLeaderNode->topicRegistryForTest();
-    ASSERT_NE(reg, nullptr);
-    rune::storage::Log* newLeaderLog = reg->log(0, 0);
-    ASSERT_NE(newLeaderLog, nullptr);
-    auto bytes = newLeaderLog->read(0, 1 << 20);
+    auto bytes = readLogOnOwner(*newLeaderNode, 0, 1 << 20);
     EXPECT_FALSE(bytes.empty()) << "New leader's log must contain committed data";
 
     // Assert: per-partition role is correct.
-    EXPECT_EQ(newLeaderReplica->role(), Role::Leader);
+    EXPECT_EQ(roleOnOwner(*newLeaderNode), Role::Leader);
 
     node0->stop();
     node1->stop();
@@ -1136,25 +1140,24 @@ TEST(GR7_Integration, Rejoin_CatchesUp_NoGap) {
     }
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
 
-    // Produce N=4 records → majority-committed.
+    // Produce N=4 records → majority-committed (appended on the OWNING thread).
     constexpr int kN = 4;
     for (int i = 0; i < kN; ++i) {
         auto payload = makeGr7Payload(static_cast<uint8_t>(0x20 + i), 16);
-        Offset off = leaderReplica->append(
+        Offset off = appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
         ASSERT_GE(off, 0);
     }
-    const Offset leoN = leaderReplica->logEndOffset();
+    const Offset leoN = leoOnOwner(*leaderNode);
 
     // Wait for HW to advance.
     {
         const auto deadline = std::chrono::steady_clock::now() + 10s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
-            ok = (leaderReplica->highWatermark() >= leoN);
+            ok = (hwOnOwner(*leaderNode) >= leoN);
             if (!ok) std::this_thread::sleep_for(20ms);
         }
         ASSERT_TRUE(ok) << "N records must commit";
@@ -1171,7 +1174,7 @@ TEST(GR7_Integration, Rejoin_CatchesUp_NoGap) {
     constexpr int kM = 2;
     for (int i = 0; i < kM; ++i) {
         auto payload = makeGr7Payload(static_cast<uint8_t>(0x30 + i), 16);
-        leaderReplica->append(
+        appendOnOwner(*leaderNode,
             std::span<const uint8_t>(payload.data(), payload.size()), false);
     }
     // (HW may or may not advance depending on ISR — not critical for this test.)
@@ -1190,28 +1193,23 @@ TEST(GR7_Integration, Rejoin_CatchesUp_NoGap) {
 
     std::this_thread::sleep_for(500ms);
 
-    PartitionReplica* restartedReplica = restartedNode->replicaForTest(0, 0);
-    ASSERT_NE(restartedReplica, nullptr) << "Restarted node must have a partition replica";
+    ASSERT_TRUE(hasReplica(*restartedNode)) << "Restarted node must have a partition replica";
 
     // Wait for the restarted follower to catch up to at least leoN.
     {
         const auto deadline = std::chrono::steady_clock::now() + 15s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
-            ok = (restartedReplica->logEndOffset() >= leoN);
+            ok = (leoOnOwner(*restartedNode) >= leoN);
             if (!ok) std::this_thread::sleep_for(50ms);
         }
         ASSERT_TRUE(ok)
             << "Restarted follower must catch up to at least leoN=" << leoN
-            << "; actual=" << restartedReplica->logEndOffset();
+            << "; actual=" << leoOnOwner(*restartedNode);
     }
 
     // No gap: the restarted follower's log must be readable from 0.
-    rune::gateway::TopicRegistry* reg = restartedNode->topicRegistryForTest();
-    ASSERT_NE(reg, nullptr);
-    rune::storage::Log* restartedLog = reg->log(0, 0);
-    ASSERT_NE(restartedLog, nullptr);
-    auto bytes = restartedLog->read(0, 1 << 20);
+    auto bytes = readLogOnOwner(*restartedNode, 0, 1 << 20);
     EXPECT_FALSE(bytes.empty())
         << "Restarted follower's log must be readable from 0 (no gap)";
 

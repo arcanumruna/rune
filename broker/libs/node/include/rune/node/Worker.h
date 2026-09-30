@@ -68,6 +68,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/WorkerOp.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/WorkerOp.h>
@@ -1014,7 +1015,25 @@ private:
         case WorkerOp::Type::SchemaUpdate:
             executeSchemaUpdateWire_(op);
             break;
+        // F1: TEST-ONLY owner-thread hook — cold branch, never sent by production.
+        case WorkerOp::Type::TestTask:
+            executeTestTaskWire_(op);
+            break;
         }
+    }
+
+    // -------------------------------------------------------------------
+    // F1: executeTestTaskWire_ — run a test-owned OwnerThreadTestTask on THIS
+    // (owning) worker thread against the replica the control thread resolved.
+    // The opaque task ref rides in the egressPub slot (see WorkerOp::TestTask).
+    // Production code only moves the pointer; all completion synchronisation is
+    // inside the test-owned task object.  Out-of-line + cold so the hot dispatch
+    // switch is unaffected.
+    // -------------------------------------------------------------------
+    [[gnu::cold]] [[gnu::noinline]] void executeTestTaskWire_(sbe::WorkerOp& op) noexcept {
+        runOwnerThreadTestTask(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(op.egressPub())),
+            reinterpret_cast<rune::replication::PartitionReplica*>(op.replica()));
     }
 
     // -------------------------------------------------------------------

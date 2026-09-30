@@ -47,6 +47,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/storage/Log.h>
@@ -64,6 +65,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -1063,14 +1065,17 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
             << "Smoke7 Phase 1: replication bridge must propagate within 2 s";
 
         // HW advanced by becomeLeader() on duty-cycle thread.
-        // lastCleanOffset_ is std::atomic → safe to poll from test thread.
-        auto* replica = node.replicaForTest(0, 0);
-        ASSERT_NE(replica, nullptr);
+        // F1: lastCleanOffset() is read on the replica's OWNING thread.
+        auto lastClean = [&node] {
+            return node.onOwnerThreadForTest(0, 0,
+                [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); });
+        };
+        ASSERT_TRUE(rune::node::test::hasReplica(node));
 
         std::this_thread::sleep_for(1500ms);
 
-        waitFor([&] { return replica->lastCleanOffset() > 0; }, 2s);
-        watermarkAfterFirst = replica->lastCleanOffset();
+        waitFor([&] { return lastClean() > 0; }, 2s);
+        watermarkAfterFirst = lastClean();
         node.stop();
     }
 
@@ -1091,15 +1096,18 @@ TEST(CompactionRetentionSmoke, RestartResume_Checkpoint) {
             << "Smoke7 Phase 2: replication bridge must propagate within 2 s";
 
         // HW advanced by becomeLeader() on duty-cycle thread.
-        // lastCleanOffset_ is std::atomic → safe to poll from test thread.
-        auto* replica2 = node2.replicaForTest(0, 0);
-        ASSERT_NE(replica2, nullptr);
+        // F1: lastCleanOffset() is read on the replica's OWNING thread.
+        auto lastClean2 = [&node2] {
+            return node2.onOwnerThreadForTest(0, 0,
+                [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); });
+        };
+        ASSERT_TRUE(rune::node::test::hasReplica(node2));
 
         std::this_thread::sleep_for(1500ms);
 
-        waitFor([&] { return replica2->lastCleanOffset() >= watermarkAfterFirst; }, 2s);
+        waitFor([&] { return lastClean2() >= watermarkAfterFirst; }, 2s);
 
-        const int64_t watermarkAfterSecond = replica2->lastCleanOffset();
+        const int64_t watermarkAfterSecond = lastClean2();
         EXPECT_GE(watermarkAfterSecond, watermarkAfterFirst)
             << "Smoke7 Phase 2: cleaner resumed from checkpoint → watermark must be "
                ">= watermark after first node; expected>=" << watermarkAfterFirst

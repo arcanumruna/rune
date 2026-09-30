@@ -61,6 +61,7 @@
 // Integration-only headers (require Aeron)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/BrokerNode.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -87,6 +88,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -95,6 +97,7 @@ using namespace std::chrono_literals;
 using namespace rune::storage;
 #ifndef TX2B_UNIT_ONLY
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 #endif // TX2B_UNIT_ONLY
 
@@ -588,9 +591,8 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         }
     }
     ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
-    ASSERT_EQ(leaderReplica->role(), Role::Leader);
+    ASSERT_TRUE(hasReplica(*leaderNode));
+    ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Start the test-client Aeron driver.
     Tx2bClientDriver clientDrv(clientDir.path / "aeron");
@@ -632,18 +634,18 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     }
 
     // Wait for majority HW to cover all kN batches.
-    const Offset targetLeo = leaderReplica->logEndOffset();
+    const Offset targetLeo = leoOnOwner(*leaderNode);
     ASSERT_GT(targetLeo, 0) << "leader LEO must be > 0 after produces";
     {
         const auto dl = std::chrono::steady_clock::now() + 10s;
         while (std::chrono::steady_clock::now() < dl) {
-            if (leaderReplica->highWatermark() >= targetLeo) break;
+            if (hwOnOwner(*leaderNode) >= targetLeo) break;
             std::this_thread::sleep_for(20ms);
         }
     }
-    ASSERT_GE(leaderReplica->highWatermark(), targetLeo)
+    ASSERT_GE(hwOnOwner(*leaderNode), targetLeo)
         << "leader HW must reach " << targetLeo << " before failover";
-    const Offset committedHw = leaderReplica->highWatermark();
+    const Offset committedHw = hwOnOwner(*leaderNode);
 
     // Disconnect from old leader before killing it.
     conn1.ingressPub.reset();
@@ -699,8 +701,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
         << "New leader's replication bridge must report isLeader (PSM rebuild fires)";
 
-    PartitionReplica* newReplica = newLeaderNode->replicaForTest(0, 0);
-    ASSERT_NE(newReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*newLeaderNode));
 
     // Partition failover (metadata reassignment of the dead leader's partitions)
     // is ASYNCHRONOUS and completes shortly AFTER consensus re-election — the
@@ -710,13 +711,13 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     {
         const auto dl = std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < dl &&
-               newReplica->role() != Role::Leader) {
+               roleOnOwner(*newLeaderNode) != Role::Leader) {
             std::this_thread::sleep_for(20ms);
         }
     }
-    ASSERT_EQ(newReplica->role(), Role::Leader)
+    ASSERT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
         << "New leader's partition replica must be promoted (async failover)";
-    ASSERT_GE(newReplica->logEndOffset(), committedHw)
+    ASSERT_GE(leoOnOwner(*newLeaderNode), committedHw)
         << "New leader must hold all committed records (LEO >= committedHw="
         << committedHw << ")";
 
@@ -729,7 +730,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         clientDrv, newLeaderCh, kClientStreamId, egressPort2);
     ASSERT_GT(conn2.assignedSessionId, 0) << "failed to connect to new leader gateway";
 
-    const Offset logEndBeforeRetry = newReplica->logEndOffset();
+    const Offset logEndBeforeRetry = leoOnOwner(*newLeaderNode);
 
     // -----------------------------------------------------------------------
     // KEY ASSERTION 1: Re-send seq=kN-1 (last committed) → Duplicate.
@@ -750,7 +751,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
             << baseOffsets[static_cast<std::size_t>(lastSeq)]
             << ". A different baseOffset means the gateway re-appended "
                "(TX-2b PSM rebuild bug: stale window caused Accept of a Duplicate).";
-        EXPECT_EQ(newReplica->logEndOffset(), logEndBeforeRetry)
+        EXPECT_EQ(leoOnOwner(*newLeaderNode), logEndBeforeRetry)
             << "logEndOffset must NOT advance on a Duplicate — re-append detected! "
                "Pre-fix: fresh PSM = empty map → Accept → re-append → data corruption.";
     }
@@ -764,7 +765,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
         EXPECT_EQ(resp->baseOffset, baseOffsets[0])
             << "Dup seq=0 must return original baseOffset=" << baseOffsets[0];
-        EXPECT_EQ(newReplica->logEndOffset(), logEndBeforeRetry)
+        EXPECT_EQ(leoOnOwner(*newLeaderNode), logEndBeforeRetry)
             << "log must not advance on dup seq=0";
     }
 
@@ -780,7 +781,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         EXPECT_GT(resp->baseOffset, baseOffsets[kN - 1])
             << "New seq=" << kN
             << " must have a baseOffset strictly above the last committed batch";
-        EXPECT_GT(newReplica->logEndOffset(), logEndBeforeRetry)
+        EXPECT_GT(leoOnOwner(*newLeaderNode), logEndBeforeRetry)
             << "log MUST advance for a genuinely new sequence (seq=" << kN << ")";
     }
 
