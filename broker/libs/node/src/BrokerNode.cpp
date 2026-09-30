@@ -742,6 +742,29 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
     const int32_t topicId = spec.topicId;
     int32_t registered = 0;
 
+    // MUST-FIX (final review, item a): route runtime-created USER topics
+    // (topicId>=0) to the per-worker replication plane when planes are live —
+    // mirrors buildReplication().  Without this a runtime topic would land on the
+    // legacy transport (a different stream) while peers place it on a per-worker
+    // plane → it would silently fail to replicate on a multi-node cluster.
+    // Internal (topicId<0) always stays on legacy.  (ShardRouter build mirrors
+    // buildReplication + buildWorkerPool; tech-debt: extract a shared helper.)
+    std::optional<rune::metadata::ShardRouter> rtReplRouter;
+    if (!perWorkerReplTransports_.empty()) {
+        const int32_t wc = static_cast<int32_t>(perWorkerReplTransports_.size());
+        std::set<std::string> groups;
+        for (const auto& ts : config_.topics)
+            if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
+        std::unordered_map<std::string, int32_t> groupKey;
+        int32_t nextGk = -1;
+        for (const auto& g : groups) groupKey[g] = nextGk--;
+        rune::metadata::ShardRouter sr(wc);
+        for (const auto& ts : config_.topics)
+            if (!ts.coPartitionGroup.empty())
+                sr.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
+        rtReplRouter = std::move(sr);
+    }
+
     for (int32_t part = 0; part < spec.partitionCount; ++part) {
         // Skip if this partition replica already exists (idempotent re-invoke).
         if (replicaRegistry_->lookup(topicId, part) != nullptr) continue;
@@ -795,10 +818,18 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
         pcfg.durabilityTier = spec.durabilityTier;
 
-        PartitionTransport* transport = replTransport_.get();
-        if (!transport) {
-            nullTransports_.push_back(std::make_unique<InMemoryTransport>());
-            transport = nullTransports_.back().get();
+        const bool onPerWorkerPlane =
+            (topicId >= 0 && !perWorkerReplTransports_.empty() && rtReplRouter);
+        PartitionTransport* transport = nullptr;
+        if (onPerWorkerPlane) {
+            const int32_t workerIdx = rtReplRouter->workerForPartition(topicId, part);
+            transport = perWorkerReplTransports_[static_cast<std::size_t>(workerIdx)].get();
+        } else {
+            transport = replTransport_.get();
+            if (!transport) {
+                nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+                transport = nullTransports_.back().get();
+            }
         }
 
         auto replica = isMemory
@@ -809,7 +840,10 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
 
-        if (replTransport_)
+        // User replicas on a per-worker plane are polled by their owning worker —
+        // do NOT register them in the legacy transport's routing table (that would
+        // double-dispatch via the control thread). Internal/legacy replicas: register.
+        if (replTransport_ && !onPerWorkerPlane)
             replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
 
         // add() bumps ReplicaRegistry::generation() → WorkerPool::reconcile()
