@@ -86,7 +86,7 @@ public:
         const aeron::util::index_t recordIndex = claimCapacity(recordLength);
         if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
 
-        m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
         std::atomic_thread_fence(std::memory_order_release);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex), msgTypeId);
         return RD::RecordDescriptor::encodedMsgOffset(recordIndex);
@@ -97,7 +97,7 @@ public:
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
-        m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 
     /// Discard a message previously reserved with tryClaim() (becomes padding).
@@ -107,7 +107,7 @@ public:
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                           RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
-        m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 
     /// Convenience: claim + copy + commit in one call (matches Aeron's write()).
@@ -143,14 +143,14 @@ public:
         ScopeExit cleanup([&]() {
             if (bytesRead != 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
-                m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                storeRelease64_(headPositionIndex, head + bytesRead);
             }
         });
 
         while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
             const aeron::util::index_t recordIndex = headIndex + bytesRead;
             const std::int32_t recordLength =
-                m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
+                loadAcquire32_(RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
 
             bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
@@ -187,14 +187,14 @@ public:
         ScopeExit cleanup([&]() {
             if (bytesRead > 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
-                m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                storeRelease64_(headPositionIndex, head + bytesRead);
             }
         });
 
         while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
             const aeron::util::index_t recordIndex = headIndex + bytesRead;
             const std::int32_t recordLength =
-                m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
+                loadAcquire32_(RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
 
             const aeron::util::index_t alignedLength =
@@ -215,7 +215,7 @@ public:
             if (action == ControlledAction::BREAK) break;
             if (action == ControlledAction::COMMIT) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
-                m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                storeRelease64_(headPositionIndex, head + bytesRead);
                 headIndex += bytesRead;
                 head      += bytesRead;
                 bytesRead = 0;
@@ -246,6 +246,37 @@ private:
     private:
         F f_;
     };
+
+    // Synchronisation words (record length, head, head cache, tail) use C++
+    // __atomic builtins rather than Aeron's x86-64 accessors (plain volatile +
+    // asm compiler barriers).  Same machine code on x86-64 (a release store and
+    // an acquire load are plain MOVs; the CAS is LOCK CMPXCHG), correct on weakly
+    // ordered CPUs by construction, and visible to ThreadSanitizer — which could
+    // not see the publication edge, so every message handed through this ring
+    // (and everything it points to) was reported as a data race.
+    [[nodiscard]] std::int32_t* word32_(aeron::util::index_t off) noexcept {
+        return reinterpret_cast<std::int32_t*>(m_buffer.buffer() + off);
+    }
+    [[nodiscard]] std::int64_t* word64_(aeron::util::index_t off) noexcept {
+        return reinterpret_cast<std::int64_t*>(m_buffer.buffer() + off);
+    }
+    [[nodiscard]] std::int32_t loadAcquire32_(aeron::util::index_t off) noexcept {
+        return __atomic_load_n(word32_(off), __ATOMIC_ACQUIRE);
+    }
+    void storeRelease32_(aeron::util::index_t off, std::int32_t v) noexcept {
+        __atomic_store_n(word32_(off), v, __ATOMIC_RELEASE);
+    }
+    [[nodiscard]] std::int64_t loadAcquire64_(aeron::util::index_t off) noexcept {
+        return __atomic_load_n(word64_(off), __ATOMIC_ACQUIRE);
+    }
+    void storeRelease64_(aeron::util::index_t off, std::int64_t v) noexcept {
+        __atomic_store_n(word64_(off), v, __ATOMIC_RELEASE);
+    }
+    bool compareAndSet64_(aeron::util::index_t off, std::int64_t expected,
+                          std::int64_t desired) noexcept {
+        return __atomic_compare_exchange_n(word64_(off), &expected, desired, /*weak=*/false,
+                                           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
 
     static void checkCapacity(aeron::util::index_t capacity) {
         if (!aeron::util::BitUtil::isPowerOfTwo(capacity)) {
@@ -295,21 +326,21 @@ private:
         const aeron::util::index_t headCachePositionIndex = m_headCachePositionIndex;
         const aeron::util::index_t mask = capacity - 1;
 
-        std::int64_t head = m_buffer.getInt64Volatile(headCachePositionIndex);
+        std::int64_t head = loadAcquire64_(headCachePositionIndex);
         std::int64_t tail, newTail;
         aeron::util::index_t tailIndex, padding, writeIndex;
 
         do {
-            tail = m_buffer.getInt64Volatile(tailPositionIndex);
+            tail = loadAcquire64_(tailPositionIndex);
             const aeron::util::index_t availableCapacity =
                 capacity - static_cast<aeron::util::index_t>(tail - head);
 
             if (requiredCapacity > availableCapacity) {
-                head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                head = loadAcquire64_(m_headPositionIndex);
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
                     return INSUFFICIENT_CAPACITY;
                 }
-                m_buffer.putInt64Ordered(headCachePositionIndex, head);
+                storeRelease64_(headCachePositionIndex, head);
             }
 
             newTail   = tail + requiredCapacity;
@@ -322,25 +353,25 @@ private:
                 aeron::util::index_t headIndex = static_cast<aeron::util::index_t>(head) & mask;
                 writeIndex = 0;
                 if (requiredCapacity > headIndex) {
-                    head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                    head = loadAcquire64_(m_headPositionIndex);
                     headIndex = static_cast<aeron::util::index_t>(head) & mask;
                     if (requiredCapacity > headIndex) {
                         writeIndex = INSUFFICIENT_CAPACITY;
                         newTail = tail; // only pad to the buffer end; claim no space
                     }
-                    m_buffer.putInt64Ordered(headCachePositionIndex, head);
+                    storeRelease64_(headCachePositionIndex, head);
                 }
                 padding = toBufferEndLength;
                 newTail += padding;
             }
-        } while (!m_buffer.compareAndSetInt64(tailPositionIndex, tail, newTail));
+        } while (!compareAndSet64_(tailPositionIndex, tail, newTail));
 
         if (0 != padding) {
-            m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), -padding);
+            storeRelease32_(RD::RecordDescriptor::lengthOffset(tailIndex), -padding);
             std::atomic_thread_fence(std::memory_order_release);
             m_buffer.putInt32(RD::RecordDescriptor::typeOffset(tailIndex),
                               RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
-            m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), padding);
+            storeRelease32_(RD::RecordDescriptor::lengthOffset(tailIndex), padding);
         }
         return writeIndex;
     }
