@@ -57,13 +57,17 @@
 //   tryClaim/offer.  Tests inject FakePubRegistry (records offers per NodeId,
 //   no Aeron driver needed).  No virtual calls on any path.
 //
-// ## Task 4
-//   poll() is added in Task 4.  A stub is provided so the class is usable
-//   before that task lands.
+// ## Receive path (Task 4)
+//   poll(fragmentLimit, dispatch) drains up to fragmentLimit reassembled SBE
+//   frames from the inbound subscription and invokes dispatch zero-copy inside
+//   each fragment callback.  In test mode it drains the in-process inbound
+//   queue fed by injectFrameForTest().  FetchRequest.maxBytes is capped to
+//   maxFetchResponseBytes() before dispatch (GR-1 carry-forward).
 // ---------------------------------------------------------------------------
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
+#include <FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
@@ -73,9 +77,12 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -157,6 +164,25 @@ public:
     // allResolved — true when every peer pub resolved AND there is ≥1 peer.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool allResolved() const noexcept { return allResolved_; }
+
+    // -----------------------------------------------------------------------
+    // maxMessageLength — minimum maxMessageLength across all resolved peer
+    // publications.  Used to cap FetchRequest.maxBytes so the leader never
+    // builds a FetchResponse that exceeds the Aeron frame limit.
+    // Returns 0 if no pubs are resolved yet (safe: ceiling computation will
+    // clamp to 0 which disables non-empty fetches until pubs resolve).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int32_t maxMessageLength() const noexcept
+    {
+        int32_t minLen = std::numeric_limits<int32_t>::max();
+        for (const auto& [id, pub] : pubs_) {
+            if (pub) {
+                const int32_t ml = static_cast<int32_t>(pub->maxMessageLength());
+                if (ml < minLen) minLen = ml;
+            }
+        }
+        return (minLen == std::numeric_limits<int32_t>::max()) ? 0 : minLen;
+    }
 
     // -----------------------------------------------------------------------
     // sendToPeer — look up the peer pub by NodeId and send (tryClaim / offer).
@@ -255,6 +281,15 @@ public:
         : workerId_(workerId)
         , inboundChannel_(std::move(inboundChannel))
         , inboundStreamId_(inboundStreamId)
+        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
+                            aeron::util::index_t             offset,
+                            aeron::util::index_t             length,
+                            aeron::Header&                   header) {
+              trampoline_(ctx_,
+                          reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                          static_cast<std::size_t>(length),
+                          header);
+          })
         , pubReg_(aeron, peerChannels, peerStreamId)
     {
         if (!aeron) return;  // null aeron → unresolved (test or misconfiguration)
@@ -284,6 +319,15 @@ public:
     explicit WorkerReplicationTransportImpl(int32_t workerId, PubRegistry pubReg) noexcept
         : workerId_(workerId)
         , inboundStreamId_(0)
+        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
+                            aeron::util::index_t             offset,
+                            aeron::util::index_t             length,
+                            aeron::Header&                   header) {
+              trampoline_(ctx_,
+                          reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                          static_cast<std::size_t>(length),
+                          header);
+          })
         , pubReg_(std::move(pubReg))
         , testMode_(true)
     {}
@@ -311,10 +355,106 @@ public:
     [[nodiscard]] int32_t workerId() const noexcept { return workerId_; }
 
     // -----------------------------------------------------------------------
-    // poll — TODO(Task 4): implement inbound fragment dispatch.
-    // Stub returns 0 so the class is usable before Task 4 lands.
+    // poll — inbound fragment dispatch (Task 4).
+    //
+    // Drain up to fragmentLimit reassembled replication frames from the inbound
+    // subscription (or the test-mode inbound queue) and invoke dispatch for each.
+    //
+    // dispatch is called INSIDE the Aeron fragment callback (or inline in test
+    // mode) with a zero-copy view into the term buffer (valid ONLY for the
+    // duration of the call).  The caller MUST NOT store the frame pointer.
+    //
+    // dispatch signature:
+    //   void(int32_t topicId, int32_t partition, uint16_t templateId,
+    //        const uint8_t* frame, std::size_t len)
+    //
+    // For FetchRequest (templateId 1) and ReconcileFetchReq (templateId 5):
+    //   req.maxBytes is capped to maxFetchResponseBytes() BEFORE dispatch so
+    //   the leader never builds a FetchResponse that exceeds the Aeron frame
+    //   limit on the send side.  The dispatch callback receives the capped
+    //   value.  A local copy of the decoded fields is built for this.
+    //
+    // Returns the number of fragments handled; 0 if not resolved().
+    //
+    // No std::function of our own — the only type-erasure is Aeron's own
+    // fragment_handler_t at the Subscription::poll boundary (mirrors
+    // WorkerIngress::poll exactly).
     // -----------------------------------------------------------------------
-    int poll(int /*fragmentLimit*/ = 10) { return 0; }
+    template <class Dispatch>
+    int poll(int fragmentLimit, Dispatch&& dispatch)
+    {
+        if (!resolved()) [[unlikely]] return 0;
+
+        using D = std::remove_reference_t<Dispatch>;
+
+        if (testMode_) {
+            // Test-mode: drain the in-process inbound queue (no real Aeron sub).
+            // Each entry is a fully-encoded SBE frame.  Honour fragmentLimit.
+            int count = 0;
+            while (count < fragmentLimit && !inboundQueue_.empty()) {
+                std::vector<uint8_t> frame = std::move(inboundQueue_.front());
+                inboundQueue_.pop_front();
+                dispatchFrame_(frame.data(), frame.size(), dispatch);
+                ++count;
+            }
+            return count;
+        }
+
+        // Production path: FragmentAssembler + trampoline, mirroring
+        // WorkerIngress::poll exactly.
+        //
+        // ctx_ points to a PollCtx on this call's stack frame — valid for the
+        // synchronous duration of sub_->poll() (single-threaded, no reentry).
+        // The trampoline is a plain function pointer (no capture, no heap).
+        struct PollCtx {
+            WorkerReplicationTransportImpl* self;
+            D*                              dispatch;
+        };
+        PollCtx pctx{ this, std::addressof(dispatch) };
+        ctx_ = static_cast<void*>(&pctx);
+        trampoline_ = [](void*          ctx,
+                         const uint8_t* data,
+                         std::size_t    len,
+                         aeron::Header& /*hdr*/) {
+            auto* pc = static_cast<PollCtx*>(ctx);
+            pc->self->dispatchFrame_(data, len, *pc->dispatch);
+        };
+
+        int result = sub_->poll(assembler_.handler(), fragmentLimit);
+
+        ctx_        = nullptr;
+        trampoline_ = nullptr;
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // injectFrameForTest — feed an encoded SBE frame into the test-mode inbound
+    // queue.  Must only be called when testMode_ is true (i.e. the test-seam
+    // constructor was used).  poll() drains this queue instead of the real
+    // Aeron subscription.
+    // -----------------------------------------------------------------------
+    void injectFrameForTest(const uint8_t* buf, std::size_t len)
+    {
+        inboundQueue_.emplace_back(buf, buf + len);
+    }
+
+    // -----------------------------------------------------------------------
+    // maxFetchResponseBytes — the maximum records payload that a FetchResponse
+    // may carry without exceeding the Aeron frame limit on this transport's
+    // publications.
+    //
+    // = pubReg_.maxMessageLength() - kFetchResponseOverhead
+    //
+    // The poll path caps FetchRequest.maxBytes to this value before dispatching
+    // to onFetchRequest so the leader never builds an oversized response.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept
+    {
+        const int32_t kOverhead =
+            static_cast<int32_t>(rune::replication::FetchResponseMsg::encodedSize(0));
+        const int32_t ml = pubReg_.maxMessageLength();
+        return (ml > kOverhead) ? (ml - kOverhead) : 0;
+    }
 
     // =======================================================================
     // PartitionTransport virtuals — SEND PATH
@@ -417,6 +557,119 @@ public:
 
 private:
     // -----------------------------------------------------------------------
+    // dispatchFrame_ — decode the SBE header and fixed fields, apply maxBytes
+    // cap for FetchRequest variants, then invoke dispatch.
+    //
+    // Called from both the production trampoline (term-buffer pointer, valid
+    // only for the call) and the test-mode queue drain (heap buffer, but same
+    // zero-copy contract enforced: dispatch MUST NOT store the pointer).
+    //
+    // Template on Dispatch to keep the call inlined and avoid an extra virtual.
+    // -----------------------------------------------------------------------
+    template <class Dispatch>
+    void dispatchFrame_(const uint8_t* frame, std::size_t len, Dispatch& dispatch)
+    {
+        if (len < rune::replication::ReplicationMessageHeader::ENCODED_SIZE)
+            [[unlikely]] return;  // too short to have a valid header
+
+        const uint16_t templateId =
+            rune::replication::peekTemplateId(frame, 0);
+
+        // Extract (topicId, partition) from the fixed block (all message types
+        // carry both fields at the same offsets relative to the block start):
+        //
+        //   FetchRequest (1) / ReconcileFetchReq (5): TOTAL_SIZE=40
+        //     partition @ hdr+8, topicId @ hdr+28
+        //   FetchResponse (2) / ReconcileFetchResp (6): variable
+        //     partition @ hdr+8, topicId @ hdr+32
+        //   OffsetsForLeaderEpochReq (3): TOTAL_SIZE=44
+        //     partition @ hdr+8, topicId @ hdr+32
+        //   OffsetsForLeaderEpochResp (4): TOTAL_SIZE=44
+        //     partition @ hdr+8, topicId @ hdr+32
+        //
+        // We always read partition from hdr+8 (offset 10 in frame).
+        // topicId location depends on the message type (28 vs 32 into block).
+
+        namespace rr = rune::replication;
+        constexpr std::size_t kHdrSize = rr::ReplicationMessageHeader::ENCODED_SIZE;
+
+        // Minimum frame size check (need at least the header + partition field).
+        if (len < kHdrSize + 12) [[unlikely]] return;
+
+        const int32_t partition =
+            rr::detail::read_le<int32_t>(frame + kHdrSize + 8);
+
+        int32_t topicId = 0;
+
+        switch (templateId) {
+            case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest):
+            case rr::kReconcileFetchReqTemplateId:
+            {
+                if (len < rr::FetchRequestMsg::TOTAL_SIZE) [[unlikely]] return;
+                topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 28);
+
+                // GR-1 carry-forward: cap maxBytes to the deliverable ceiling so the
+                // leader never builds a FetchResponse that exceeds this transport's
+                // Aeron frame limit.  Mirror AeronPartitionTransport::onFragment.
+                //
+                // We decode the full FetchRequest into a local copy, apply the cap,
+                // then re-encode the capped frame into a scratch buffer and dispatch
+                // the scratch pointer.  This keeps the zero-copy contract on the
+                // OUTBOUND records path (the records span in the FetchResponse is the
+                // zero-copy object; the capped FetchRequest is fixed-size and cheap).
+                const int32_t ceiling = maxFetchResponseBytes();
+                const int32_t rawMaxBytes =
+                    rr::detail::read_le<int32_t>(frame + kHdrSize + 24);
+                if (ceiling > 0 && rawMaxBytes > ceiling) {
+                    // Build a capped copy and dispatch it instead of the original.
+                    alignas(8) uint8_t cappedBuf[rr::FetchRequestMsg::TOTAL_SIZE];
+                    std::memcpy(cappedBuf, frame, rr::FetchRequestMsg::TOTAL_SIZE);
+                    rr::detail::write_le<int32_t>(
+                        cappedBuf + kHdrSize + 24, ceiling);
+                    dispatch(topicId, partition, templateId,
+                             cappedBuf, rr::FetchRequestMsg::TOTAL_SIZE);
+                    return;
+                }
+                break;
+            }
+            case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchResponse):
+            case rr::kReconcileFetchRespTemplateId:
+            {
+                if (len < rr::FetchResponseMsg::encodedSize(0)) [[unlikely]] return;
+                // Generated SBE: topicId @ m_offset+30 (errorCode+2=@28, topicId@30;
+                // no padding; sbeBlockLength=34).
+                topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 30);
+                break;
+            }
+            case static_cast<uint16_t>(rr::ReplicationTemplateId::OffsetsForLeaderEpochReq):
+            {
+                if (len < rr::OffsetsForLeaderEpochReqMsg::TOTAL_SIZE) [[unlikely]] return;
+                // Generated SBE: topicId @ m_offset+32 (followerLeo@24+8=32).
+                topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 32);
+                break;
+            }
+            case static_cast<uint16_t>(rr::ReplicationTemplateId::OffsetsForLeaderEpochResp):
+            {
+                if (len < rr::OffsetsForLeaderEpochRespMsg::TOTAL_SIZE) [[unlikely]] return;
+                // Hand-rolled encode (ReplicationMessages.h): errorCode@+28 (2 bytes),
+                // alignment pad@+30 (2 bytes), topicId@+32 (4 bytes).
+                // Note: the generated SBE places topicId@+30 (no pad), but the
+                // wire frames are produced by the hand-rolled encode which inserts
+                // a 2-byte pad, so we must read from +32 to match the actual wire layout.
+                topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 32);
+                break;
+            }
+            default:
+                // Unknown templateId — log and drop.
+                spdlog::trace("WorkerReplicationTransport worker={}: unknown templateId={} len={}",
+                              workerId_, templateId, len);
+                return;
+        }
+
+        dispatch(topicId, partition, templateId, frame, len);
+    }
+
+    // -----------------------------------------------------------------------
     // sendFetchResponseImpl_ — shared implementation for sendFetchResponse and
     // sendReconcileResponse (reconcile=true re-stamps the templateId).
     //
@@ -467,11 +720,33 @@ private:
 
     std::shared_ptr<aeron::Subscription> sub_;  // inbound (resolved by ctor)
 
+    // -----------------------------------------------------------------------
+    // Fragment assembler + trampoline — mirrors WorkerIngress EXACTLY.
+    //
+    // assembler_ is a member (lambda captures `this`) so it outlives any
+    // poll() call.  trampoline_/ctx_ are set for the duration of each poll()
+    // call and cleared immediately after.  No std::function of our own on the
+    // hot path — Aeron's fragment_handler_t is the ONLY type-erasure boundary.
+    // -----------------------------------------------------------------------
+    using TrampolineFn = void(*)(void*              ctx,
+                                 const uint8_t*     data,
+                                 std::size_t        len,
+                                 aeron::Header&     hdr);
+
+    void*          ctx_        = nullptr;
+    TrampolineFn   trampoline_ = nullptr;
+
+    aeron::FragmentAssembler assembler_;
+
     PubRegistry pubReg_;  // per-peer pub management + send policy
 
     // Reusable scratch buffer for FetchResponse large-frame encode path.
     // Per-instance (not shared): this class is single-thread owned.
     std::vector<uint8_t> scratchBuf_;
+
+    // Test-mode inbound queue: feed frames via injectFrameForTest().
+    // poll() drains this instead of the real Aeron subscription in testMode_.
+    std::deque<std::vector<uint8_t>> inboundQueue_;
 
     // True when constructed via the test-seam constructor (no real Aeron sub).
     bool testMode_ = false;
