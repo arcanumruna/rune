@@ -34,8 +34,12 @@
 //   [after brokers]
 //             partitionCount : uint16
 //   [after count]
-//             partitions[]:  (each entry = fixed 20 bytes)
-//               topicId(4) + partition(4) + leaderId(4) + leaderEpoch(4) + ingressStreamId(4)
+//             partitions[]:  (each entry = fixed 28 bytes)
+//               topicId(4) + partition(4) + leaderId(4) + leaderEpoch(4) +
+//               ingressStreamId(4) + egressControlPort(4) + egressStreamId(4)
+//               ingressStreamId: E5.1 per-worker ingress Aeron stream id.
+//               egressControlPort/egressStreamId: read-rework per-worker dynamic-
+//                 MDC egress (control port + stream id); both 0 when inactive.
 //   [after partitions] optional trailer: uint16 endpointCount; endpointCount ×
 //               (uint16 len + host:port bytes).  Present only when at least one
 //               partition's ingressEndpoint is non-empty (2026-09-30 self-contained
