@@ -1501,6 +1501,8 @@ int PartitionReplica::doWork(int64_t nowNs)
         && nowNs - lastFollowerSyncNs_ >= kFollowerFlushIntervalNs) {
         followerApplyDirty_ = false;
         lastFollowerSyncNs_ = nowNs;
+        RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
+                             static_cast<uint32_t>(cfg_.partitionId));
         onLog([&](auto& L){ L.sync(); });
         ++work;
     }

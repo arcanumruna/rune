@@ -646,7 +646,10 @@ public:
         // Step 0: drain ingress ring (E2 inc2a / R2). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         // Strict-tier produces record their log in dirtyThisCycle_ (token=0).
-        work += static_cast<int>(drainIngress_());
+        {
+            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDrainIngress, 0);
+            work += static_cast<int>(drainIngress_());
+        }
 
         // Step E3 coalesce: after all this-cycle produces are appended, submit
         // ONE fsync per dirty log and stamp the completion token onto every pending
@@ -655,9 +658,12 @@ public:
 
         // Shared-nothing: owned_ is a plain member touched only by this thread.
         // Step 5: per-replica ISR checks / follower fetch emission.
-        for (auto* replica : owned_) {
-            if (!replica) continue;
-            work += replica->doWork(nowNs);
+        {
+            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, 0);
+            for (auto* replica : owned_) {
+                if (!replica) continue;
+                work += replica->doWork(nowNs);
+            }
         }
 
         // Task 6: per-worker replication transport poll — inline dispatch.
@@ -678,6 +684,7 @@ public:
         // → the poll is never called (flag-off path unchanged).  The dispatch lambda
         // passed to poll() is a non-capturing function pointer (zero overhead).
         if (replTransportCtx_) {
+            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplPollDrive, 0);
             work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit,
                                         this, nowNs);
         }
@@ -686,7 +693,10 @@ public:
         // Records directly on this worker's egress.  Runs after replica doWork so
         // the HW bound is fresh.  No-op unless subs_ is populated (Subscribe ops)
         // AND a WorkerEgress is wired (pre-I3b: gateway still owns push → inert).
-        work += pushOwnedSubscriptions_(nowNs);
+        {
+            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerEgressPushStage, 0);
+            work += pushOwnedSubscriptions_(nowNs);
+        }
 
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
         for (auto* replica : owned_) {

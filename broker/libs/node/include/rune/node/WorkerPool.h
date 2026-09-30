@@ -49,6 +49,16 @@
 
 namespace rune::node {
 
+// Backoff idle shared by the worker + runtime loops.  Fixed shape (10 spins,
+// 20 yields, 1 µs → maxParkUs park) — identical to the two former inline
+// constructions; this helper only de-duplicates them.
+inline std::unique_ptr<rune::consensus::BackoffIdleStrategy>
+makeBackoffIdle(int64_t maxParkUs) {
+    return std::make_unique<rune::consensus::BackoffIdleStrategy>(
+        10, 20, std::chrono::microseconds{1},
+        std::chrono::microseconds{maxParkUs});
+}
+
 class WorkerPool {
 public:
 
@@ -277,10 +287,7 @@ public:
                 // Backoff with a configurable maxPark (default 200µs) — caps the
                 // per-hop wake latency on the replication round-trip (the 1ms Agrona
                 // default was a ~1ms tax at every cross-thread hop under acks=maj).
-                idles_.emplace_back(
-                    std::make_unique<rune::consensus::BackoffIdleStrategy>(
-                        10, 20, std::chrono::microseconds{1},
-                        std::chrono::microseconds{maxParkUs}));
+                idles_.emplace_back(makeBackoffIdle(maxParkUs));
                 break;
             }
             runners_.emplace_back(

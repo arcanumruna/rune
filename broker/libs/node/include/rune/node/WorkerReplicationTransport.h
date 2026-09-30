@@ -74,6 +74,7 @@
 
 #include <rune/replication/PartitionReplica.h>   // PartitionTransport base
 #include <rune/replication/ReplicationMessages.h> // SBE codecs + stampTemplateId
+#include <rune_fr/FlightRecorder.h>                // #4 deep instrumentation
 
 #include <spdlog/spdlog.h>
 
@@ -203,6 +204,7 @@ public:
     // -----------------------------------------------------------------------
     void broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
     {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerBroadcast, 0);
         for (auto& [id, pub] : pubs_) {
             if (pub) sendOnPub_(*pub, buf, len);
         }
@@ -215,6 +217,8 @@ private:
     static int64_t sendOnPub_(aeron::ExclusivePublication& pub,
                               const uint8_t* buf, std::size_t len) noexcept
     {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSendOnPub,
+                                 static_cast<uint32_t>(len));
         // Guard: offer() THROWS IllegalArgumentException if len > maxMessageLength.
         // Drop and log — the follower will retry on the next fetch cycle.
         if (len > static_cast<std::size_t>(pub.maxMessageLength())) {
@@ -384,6 +388,7 @@ public:
     template <class Dispatch>
     int poll(int fragmentLimit, Dispatch&& dispatch)
     {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerPoll, 0);
         if (!resolved()) [[unlikely]] return 0;
 
         using D = std::remove_reference_t<Dispatch>;
@@ -529,6 +534,8 @@ public:
     // -----------------------------------------------------------------------
     void sendFetchRequest(const rune::replication::FetchRequestMsg& req) override
     {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerFetchReqSend,
+                                 static_cast<uint32_t>(req.partition));
         constexpr std::size_t kSize = rune::replication::FetchRequestMsg::TOTAL_SIZE;
         alignas(8) uint8_t claimBuf[kSize];
         rune::replication::FetchRequestMsg::encode(
@@ -546,6 +553,8 @@ public:
     void sendFetchResponse(rune::replication::NodeId toFollower,
                            const rune::replication::FetchResponseMsg& resp) override
     {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSend,
+                                 static_cast<uint32_t>(resp.records.size()));
         sendFetchResponseImpl_(toFollower, resp, /*reconcile=*/false);
     }
 
@@ -621,6 +630,8 @@ private:
     template <class Dispatch>
     void dispatchFrame_(const uint8_t* frame, std::size_t len, Dispatch& dispatch)
     {
+        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerDispatch,
+                                 static_cast<uint32_t>(len));
         if (len < rune::replication::ReplicationMessageHeader::ENCODED_SIZE)
             [[unlikely]] return;  // too short to have a valid header
 
