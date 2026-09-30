@@ -69,7 +69,11 @@ class Cluster:
         # containerd snapshot store has stale layers from a previous build).
         # _git_sha falls back to "local" in bare-binary CI environments.
         _sha = _git_sha(BROKER_REPO)
-        self.compose = Compose(COMPOSE_FILE, project, override_files=override_files,
+        # RUNE_DR_COMPOSE_OVERRIDES: extra overlays (e.g. docker/docker-compose.shard.yml)
+        # appended after explicit override_files — runs the whole matrix in shard mode.
+        extra = [p for p in os.environ.get("RUNE_DR_COMPOSE_OVERRIDES", "").split(os.pathsep) if p]
+        self.compose = Compose(COMPOSE_FILE, project,
+                               override_files=list(override_files or []) + extra,
                                image_tag=_sha)
         self._up = False
         self._serving_cache: str | None = None

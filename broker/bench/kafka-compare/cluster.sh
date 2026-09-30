@@ -7,8 +7,21 @@
 # ---- Rune 3-node -----------------------------------------------------------
 # node i (0,1,2): consensus=40110+i client=40200+i repl=40220+i wker-egress-base=40400+i*20
 RUNE_CLUSTER_PIDS=()
+# Shard mode (RUNE_SHARD=1, spec §3.3): node i gets explicit, distinct per-worker
+# ranges — ingress 40500+20i, replication 40600+20i — advertised in RUNE_PEERS
+# (id@host:consensus:client:repl:replBase:ingressBase).  <= 20 workers per node.
 rune_cluster_peers() {
-  echo "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"
+  if [ "${RUNE_SHARD:-0}" = "1" ]; then
+    echo "0@127.0.0.1:40110:40200:40220:40600:40500,1@127.0.0.1:40111:40201:40221:40620:40520,2@127.0.0.1:40112:40202:40222:40640:40540"
+  else
+    echo "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"
+  fi
+}
+# rune_shard_env <i> -> extra env for node i (empty unless RUNE_SHARD=1).  Broker i's
+# shard worker 0 (runtime fused) is pinned to core RUNE_SHARD_CORE0+i (client: core 0).
+rune_shard_env() {
+  [ "${RUNE_SHARD:-0}" = "1" ] || return 0
+  echo "RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=${RUNE_RUNTIME_PLACEMENT:-fused} RUNE_WORKER_INGRESS_BASE_PORT=$((40500+20*$1)) RUNE_WORKER_REPL_BASE_PORT=$((40600+20*$1)) RUNE_WORKER_CORE_BASE=$(( ${RUNE_SHARD_CORE0:-1} + $1 ))"
 }
 # The broker honours RUNE_AERON_DIR (set to $WORK/rune-c$i/a below, on tmpfs):
 # Aeron's CnC + term buffers must NOT live on the disk-backed data dir, and
@@ -33,6 +46,8 @@ rune_start_cluster() {
     local cport=$((40200+i)) egbase=$((40400+i*20))
     local logdir; logdir="$(data_root "$persistence" rune-log-$i)"
     local d="$WORK/rune-c$i"; rm -rf "$d" "$logdir"; mkdir -p "$d/a" "$logdir"
+    local pinprefix; pinprefix="$(pin "$CORES_BROKER")"
+    [ "${RUNE_SHARD:-0}" = "1" ] && pinprefix=""
     # shellcheck disable=SC2086
     env RUNE_NODE_ID=$i RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="0.0.0.0:$cport" \
         RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_WORKERS="$workers" \
@@ -40,6 +55,7 @@ rune_start_cluster() {
         RUNE_IO_BACKEND="$io" RUNE_AERON_TERM_BUFFER_BYTES="$termb" \
         RUNE_WORKER_INGRESS_RING_BYTES="$iring" RUNE_WORKER_RETURN_RING_BYTES="$rring" \
         RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$egbase \
+        $(rune_shard_env "$i") \
         RUNE_ELECTION_TIMEOUT_MS="${RUNE_ELECTION_TIMEOUT_MS:-300}" \
         RUNE_ELECTION_STATUS_INTERVAL_MS="${RUNE_ELECTION_STATUS_INTERVAL_MS:-50}" \
         RUNE_STARTUP_CANVASS_TIMEOUT_MS="${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-200}" \
@@ -47,7 +63,7 @@ rune_start_cluster() {
         RUNE_RUNTIME_IDLE="${RUNE_RUNTIME_IDLE:-backoff}" \
         RUNE_AERON_DRIVER_IDLE="${RUNE_AERON_DRIVER_IDLE:-sleep-ns}" \
         RUNE_LOG_LEVEL="${RUNE_LOG_LEVEL:-info}" \
-        $(pin "$CORES_BROKER") "$RUNE_BROKER_BIN" >"$d/broker.log" 2>&1 &
+        $pinprefix "$RUNE_BROKER_BIN" >"$d/broker.log" 2>&1 &
     RUNE_CLUSTER_PIDS+=($!)
   done
   # Wait for a leader via rune_role (reliable — reads the Aeron role counter).

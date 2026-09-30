@@ -15,6 +15,13 @@ set -uo pipefail
 cd /root/rune-e5/rune-broker/bench/kafka-compare
 set +u; source env.sh; source run-rune.sh; source cluster.sh
 
+# ── verified-idle box (spec §1a.10 / §5): refuse to measure on a busy box ────────
+load1="$(cut -d' ' -f1 /proc/loadavg)"
+if [ "${REPL_ALLOW_BUSY:-0}" != "1" ] && awk -v l="$load1" 'BEGIN{exit !(l >= 1.0)}'; then
+  echo "BUSY-BOX: load1=$load1 >= 1.0 — kill stray CPU processes first (REPL_ALLOW_BUSY=1 overrides)"; exit 2
+fi
+echo "=== box: load1=$load1 cores=$(nproc) shard=${RUNE_SHARD:-0} placement=${RUNE_RUNTIME_PLACEMENT:-fused} ==="
+
 # ── tunables (env-overridable) ───────────────────────────────────────────────
 PARTS="${1:-${REPL_PARTS:-4}}"
 RECS="${2:-${REPL_RECS:-1000000}}"
@@ -28,7 +35,12 @@ WARMUP_N="${REPL_WARMUP:-50000}"
 export RUNE_AERON_TERM_BUFFER_BYTES="${RUNE_AERON_TERM_BUFFER_BYTES:-67108864}"    # 64 MiB
 export RUNE_WORKER_INGRESS_RING_BYTES="${RUNE_WORKER_INGRESS_RING_BYTES:-67108864}"
 export RUNE_WORKER_RETURN_RING_BYTES="${RUNE_WORKER_RETURN_RING_BYTES:-67108864}"
-export RUNE_WORKER_IDLE=backoff RUNE_RUNTIME_IDLE=backoff RUNE_FS_LOG=0
+export RUNE_FS_LOG=0
+if [ "${RUNE_SHARD:-0}" = "1" ]; then
+  export RUNE_SHARD RUNE_RUNTIME_PLACEMENT="${RUNE_RUNTIME_PLACEMENT:-fused}"
+else
+  export RUNE_WORKER_IDLE=backoff RUNE_RUNTIME_IDLE=backoff
+fi
 export RUNE_BROKER_BIN=/root/rune-e5/rune-broker/build-linux/rune_broker
 export RUNE_ROLE_BIN=/root/rune-e5/rune-broker/build-linux/rune_role
 export CELL_CORES="${CELL_CORES:-0}"
@@ -71,6 +83,8 @@ if [ "$FR" = "1" ]; then
   sleep "${REPL_FR_DUMP_WAIT:-12}"   # let exportChromeTrace finish (large JSON) before kill -9
   echo "--- FR reports in $FROUT ---"; ls -la "$FROUT" 2>/dev/null | grep fr-hist
 fi
+echo "=== per-thread CPU (broker threads) ==="
+for p in $(pgrep -x rune_broker); do ps -L -o pid,tid,psr,pcpu,comm -p "$p"; done
 rune_stop_cluster
 if [ "$FR" = "1" ] && command -v python3 >/dev/null 2>&1; then
   echo "=== REPLICATION LATENCY BREAKDOWN (frwaterfall.py) ==="

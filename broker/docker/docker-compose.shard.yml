@@ -1,0 +1,18 @@
+# Shard-mode overlay for the dockerized DR matrix (Task 15).  Each container is its
+# own host, so every node uses the same per-worker base ports; RUNE_PEERS advertises
+# them explicitly (id@host:consensus:client:repl:replBase:ingressBase).
+# Use: RUNE_DR_COMPOSE_OVERRIDES=$PWD/docker/docker-compose.shard.yml pytest ...
+x-shard-env: &shard-env
+  RUNE_WORKER_MODE: "shard"
+  RUNE_RUNTIME_PLACEMENT: "fused"
+  RUNE_WORKER_INGRESS_BASE_PORT: "40500"
+  RUNE_WORKER_REPL_BASE_PORT: "40600"
+  RUNE_PEERS: "0@rune-1:40111:40200:40222:40600:40500,1@rune-2:40111:40200:40222:40600:40500,2@rune-3:40111:40200:40222:40600:40500"
+
+services:
+  rune-1:
+    environment: *shard-env
+  rune-2:
+    environment: *shard-env
+  rune-3:
+    environment: *shard-env
