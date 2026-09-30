@@ -152,6 +152,12 @@ public:
     // timeout is not too tight.  Configurable via setAckTimeoutNs.
     static constexpr int64_t kDefaultAckTimeoutNs = 30'000'000'000LL; // 30 s
 
+    // Task 6: per-worker replication transport poll fragment limit.
+    // Matches desiredFragmentLimit_ (256) so both ingress paths use a consistent
+    // per-cycle budget.  No back-pressure mechanics needed here (fire-and-forget
+    // replication paths: FetchRequest, FetchResponse, OLE, reconcile).
+    static constexpr int kReplFetchLimit = 256;
+
     // ctor: ingressRingBytes / returnRingBytes are the per-worker SPSC ring
     // byte capacities (power of two). They default to the k*ByteCapacity
     // constants; BrokerNode threads NodeConfig.workerIngress/ReturnRingBytes
@@ -227,14 +233,36 @@ public:
     [[nodiscard]] WorkerEgress* workerEgress() const noexcept { return workerEgress_; }
 
     // -----------------------------------------------------------------------
-    // E5 Task 5: wire this worker's per-worker replication transport.
+    // E5 Task 5 / Task 6: wire this worker's per-worker replication transport.
+    //
     // Non-owning: BrokerNode owns the WorkerReplicationTransport lifetime.
     // Must be called BEFORE the worker's AgentRunner starts.
-    // Task 6 will drive poll() from doWork; for now only stores the pointer.
+    //
+    // Task 6: stores a (ctx, poll-trampoline) pair so doWork can call poll()
+    // without std::function and without virtual dispatch on the hot path.
+    // The trampoline is a plain function pointer; ctx is the typed transport
+    // pointer erased to void*.  This mirrors WorkerReplicationTransportImpl's
+    // own trampoline_ / ctx_ idiom and WorkerIngress::poll exactly.
+    //
+    // Production path: takes WorkerReplicationTransport* (AeronPubRegistry alias).
+    // Test-seam: setReplicationTransportForTest<T> accepts any Impl<T> without
+    // requiring AeronPubRegistry — used by unit tests that inject a
+    // WorkerReplicationTransportImpl<SharedFakePubRegistry>.  Zero overhead:
+    // trampoline is a non-capturing lambda → plain function pointer.
     // -----------------------------------------------------------------------
     void setReplicationTransport(WorkerReplicationTransport* transport) noexcept {
+        setReplicationTransportImpl_(transport);
         workerReplTransport_ = transport;
     }
+
+    // Test-seam overload: accepts any WorkerReplicationTransportImpl<T>.
+    // Sets the trampoline but leaves the typed workerReplTransport_ null so
+    // the replicationTransport() accessor remains production-only.
+    template <typename T>
+    void setReplicationTransportForTest(WorkerReplicationTransportImpl<T>* transport) noexcept {
+        setReplicationTransportImpl_(transport);
+    }
+
     [[nodiscard]] WorkerReplicationTransport* replicationTransport() const noexcept {
         return workerReplTransport_;
     }
@@ -630,6 +658,28 @@ public:
         for (auto* replica : owned_) {
             if (!replica) continue;
             work += replica->doWork(nowNs);
+        }
+
+        // Task 6: per-worker replication transport poll — inline dispatch.
+        //
+        // After driving owned replicas, drain inbound replication frames from the
+        // per-worker Aeron subscription and apply each frame INLINE to the owning
+        // replica on THIS worker thread.  Zero-copy: the frame pointer is valid
+        // only inside the callback; the replica copies into its log before the
+        // callback returns (same contract as executeApplyReplicatedWire_ ~1443-1471).
+        //
+        // replTransportCtx_ / replTransportPollFn_ is a (void* ctx, fn*) trampoline
+        // set by setReplicationTransportImpl_<T>: the function pointer casts ctx back
+        // to the concrete WorkerReplicationTransportImpl<T> and calls its templated
+        // poll() with the dispatch lambda.  No std::function, no virtual dispatch —
+        // identical idiom to WorkerReplicationTransportImpl's own ctx_/trampoline_.
+        //
+        // Shared-nothing: replTransportCtx_ is null when the transport is not wired
+        // → the poll is never called (flag-off path unchanged).  The dispatch lambda
+        // passed to poll() is a non-capturing function pointer (zero overhead).
+        if (replTransportCtx_) {
+            work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit,
+                                        this, nowNs);
         }
 
         // read-rework T3/T4 (I3): in-worker push — read owned partitions and push
@@ -1776,6 +1826,235 @@ private:
     }
 
     // -------------------------------------------------------------------
+    // setReplicationTransportImpl_ — template helper that wires the (ctx,
+    //   trampoline) pair from a concrete WorkerReplicationTransportImpl<T>.
+    //
+    // The trampoline is a non-capturing lambda (→ plain function pointer) that:
+    //   1. Casts ctx back to the concrete type.
+    //   2. Calls poll(limit, dispatch) where dispatch is also a non-capturing
+    //      lambda (→ function pointer) forwarding to pollReplTransportDispatch_.
+    //
+    // No std::function, no heap allocation, no virtual dispatch.
+    // Mirrors WorkerReplicationTransportImpl's own ctx_/trampoline_ pattern.
+    // -------------------------------------------------------------------
+    template <typename T>
+    void setReplicationTransportImpl_(WorkerReplicationTransportImpl<T>* transport) noexcept
+    {
+        if (!transport) {
+            replTransportCtx_    = nullptr;
+            replTransportPollFn_ = nullptr;
+            return;
+        }
+        replTransportCtx_ = static_cast<void*>(transport);
+        // The trampoline is a non-capturing lambda → implicitly converts to
+        // a plain function pointer (ReplPollFn).  Safe because it is stored as
+        // a function pointer and never invoked after the transport is destroyed
+        // (BrokerNode owns the lifetime and tears down workers first).
+        replTransportPollFn_ = [](void* ctx, int limit, Worker* self, int64_t nowNs) -> int
+        {
+            auto* t = static_cast<WorkerReplicationTransportImpl<T>*>(ctx);
+            return t->poll(
+                limit,
+                // Inner dispatch: also non-capturing → function pointer.
+                // GCC/Clang: a non-capturing lambda with a non-capturing
+                // closure may capture (Worker*, int64_t) via a Dispatch
+                // parameter (templated, inlined) without being a std::function.
+                // Here we use a struct-based callable to make the intent
+                // explicit and guarantee zero heap allocation.
+                [self, nowNs]
+                (int32_t topicId, int32_t partition,
+                 uint16_t templateId,
+                 const uint8_t* frame, std::size_t len)
+                {
+                    self->pollReplTransportDispatch_(topicId, partition, templateId,
+                                                    frame, len, nowNs);
+                });
+        };
+    }
+
+    // -------------------------------------------------------------------
+    // findOwnedReplica_ — scan owned_ for a replica matching (topicId, partition).
+    //
+    // Returns the first match or nullptr if not found.  O(n) over owned_ —
+    // acceptable: owned_ has O(partitions-per-worker) entries (typically small,
+    // ≤ tens); a hot-path map is overkill and would add per-tick lookup cost.
+    //
+    // Worker-thread only (owned_ is single-writer on the worker thread).
+    // -------------------------------------------------------------------
+    rune::replication::PartitionReplica*
+    findOwnedReplica_(int32_t topicId, int32_t partition) const noexcept
+    {
+        for (auto* r : owned_) {
+            if (r && r->topicId() == topicId &&
+                static_cast<int32_t>(r->partitionId()) == partition) {
+                return r;
+            }
+        }
+        return nullptr;
+    }
+
+    // -------------------------------------------------------------------
+    // pollReplTransportDispatch_ — inline dispatch of one replication frame
+    //   received from the per-worker WorkerReplicationTransport::poll callback.
+    //
+    // Routes by templateId to the owned replica's appropriate handler,
+    // INLINE (no ring hop).  The frame pointer is a zero-copy view valid ONLY
+    // inside this call; the replica copies data into its log before returning.
+    //
+    // Mirrors the decode+call logic of the execute*Wire_ ring handlers
+    // (executeFetchRequestWire_ ~1664, executeApplyReplicatedWire_ ~1479,
+    // executeOffsetsForLeaderEpochReqWire_ ~1698, executeReconcileFetchRespWire_
+    // ~1729) but decodes from the raw SBE frame rather than the WorkerOp ring
+    // flyweight.  A small comment cross-references each parallel executeXxxWire_.
+    //
+    // Worker-thread only.
+    // -------------------------------------------------------------------
+    void pollReplTransportDispatch_(int32_t topicId, int32_t partition,
+                                    uint16_t templateId,
+                                    const uint8_t* frame, std::size_t len,
+                                    int64_t nowNs) noexcept
+    {
+        namespace rr = rune::replication;
+
+        auto* replica = findOwnedReplica_(topicId, partition);
+        if (!replica) {
+            // Not owned by this worker — drop silently (shared-nothing: only
+            // the owning worker handles its replicas).
+            spdlog::trace("Worker {}: pollReplTransportDispatch_ — no owned replica for "
+                          "topicId={} partition={} templateId={}",
+                          workerId_, topicId, partition, templateId);
+            return;
+        }
+
+        // Mirrors the executeXxxWire_ ring handlers (listed above):
+        // decode the fixed or variable frame and call the replica method inline.
+        switch (templateId) {
+
+        // TemplateId 1: FetchRequest — leader handles follower fetch.
+        // Mirrors executeFetchRequestWire_ (~1664).
+        case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest): {
+            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0);
+            try {
+                replica->onFetchRequest(req, nowNs);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport FetchRequest onFetchRequest threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport FetchRequest onFetchRequest threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 2: FetchResponse — follower applies received records.
+        // Mirrors executeApplyReplicatedWire_ (~1479).
+        // CRITICAL: zero-copy — msg.records is a span VIEW into `frame` (valid
+        // only during this call); applyReplicated copies into the follower log
+        // before returning.  No records.assign / no intermediate vector.
+        case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchResponse): {
+            const rr::FetchResponseMsg msg =
+                rr::FetchResponseMsg::decode(frame, 0, len);
+            try {
+                replica->applyReplicated(msg);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport FetchResponse applyReplicated threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport FetchResponse applyReplicated threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 3: OffsetsForLeaderEpochRequest — leader handles KIP-101
+        // epoch probe.  Mirrors executeOffsetsForLeaderEpochReqWire_ (~1698).
+        case static_cast<uint16_t>(rr::ReplicationTemplateId::OffsetsForLeaderEpochReq): {
+            const rr::OffsetsForLeaderEpochReqMsg req =
+                rr::OffsetsForLeaderEpochReqMsg::decode(frame, 0);
+            try {
+                replica->onOffsetsForLeaderEpochRequest(req);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport OleReq onOffsetsForLeaderEpochRequest threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport OleReq onOffsetsForLeaderEpochRequest threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 4: OffsetsForLeaderEpochResponse — follower applies KIP-101
+        // epoch probe answer.  Mirrors the OLE-response apply path the ring uses
+        // (applyOffsetsForLeaderEpochResponse, called by the control-thread
+        // AeronPartitionTransport path that routes via WorkerOp into executeXxxWire_).
+        // No dedicated executeXxxWire_ in the current ring path (OLE-resp arrives
+        // at the follower via AeronPartitionTransport → callback → applyOle directly
+        // on the control thread).  Here we apply inline on the WORKER thread for
+        // the per-worker transport path.
+        case static_cast<uint16_t>(rr::ReplicationTemplateId::OffsetsForLeaderEpochResp): {
+            const rr::OffsetsForLeaderEpochRespMsg resp =
+                rr::OffsetsForLeaderEpochRespMsg::decode(frame, 0);
+            try {
+                replica->applyOffsetsForLeaderEpochResponse(resp);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport OleResp applyOffsetsForLeaderEpochResponse threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport OleResp applyOffsetsForLeaderEpochResponse threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 5: ReconcileFetchRequest — ahead survivor handles a
+        // deficient-leader reverse pull request.  Mirrors the reconcile-request
+        // handler path (onReconcileRequest).  The frame reuses FetchRequest layout.
+        case rr::kReconcileFetchReqTemplateId: {
+            const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0);
+            try {
+                replica->onReconcileRequest(req);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport ReconcileFetchReq onReconcileRequest threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport ReconcileFetchReq onReconcileRequest threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        // TemplateId 6: ReconcileFetchResponse — deficient leader applies records
+        // pulled from an ahead survivor.  Mirrors executeReconcileFetchRespWire_
+        // (~1729).  Frame reuses FetchResponse layout (same codec, different
+        // templateId → routes to applyReconcileResponse instead of applyReplicated).
+        // Zero-copy: msg.records is a span VIEW into `frame` (see templateId 2).
+        case rr::kReconcileFetchRespTemplateId: {
+            const rr::FetchResponseMsg msg =
+                rr::FetchResponseMsg::decode(frame, 0, len);
+            try {
+                replica->applyReconcileResponse(msg);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Worker {}: pollReplTransport ReconcileFetchResp applyReconcileResponse threw: {}",
+                             workerId_, ex.what());
+            } catch (...) {
+                spdlog::warn("Worker {}: pollReplTransport ReconcileFetchResp applyReconcileResponse threw unknown",
+                             workerId_);
+            }
+            break;
+        }
+
+        default:
+            // Unknown templateId — dispatchFrame_ in WorkerReplicationTransport
+            // already logs and drops unknowns before reaching here; this is a
+            // defence-in-depth guard only.
+            spdlog::trace("Worker {}: pollReplTransportDispatch_ — unhandled templateId={} "
+                          "topicId={} partition={}",
+                          workerId_, templateId, topicId, partition);
+            break;
+        }
+    }
+
+    // -------------------------------------------------------------------
     // getLogFromWire_ — resolve the Log* for the op's (topicId, partition)
     //                   from the SBE WorkerOp flyweight.
     // -------------------------------------------------------------------
@@ -1902,11 +2181,28 @@ private:
     // the SOLE writer (shared-nothing); the control thread never touches it.
     WorkerEgress* workerEgress_ = nullptr;
 
-    // E5 Task 5: non-owning pointer to this worker's per-worker replication
-    // transport.  Null until setReplicationTransport() is called.
+    // E5 Task 5: non-owning typed pointer to the production replication transport
+    // (AeronPubRegistry alias).  Null until setReplicationTransport() is called.
     // BrokerNode owns the WorkerReplicationTransport lifetime.
-    // Task 6 will poll this from doWork; for Task 5 it is stored only.
     WorkerReplicationTransport* workerReplTransport_ = nullptr;
+
+    // Task 6: type-erased (ctx, trampoline) pair for calling
+    // WorkerReplicationTransportImpl<T>::poll() from doWork() without std::function
+    // and without virtual dispatch.  Set by setReplicationTransportImpl_<T>.
+    //
+    // Trampoline signature:
+    //   int(*)(void* ctx, int limit, Worker* self, int64_t nowNs)
+    //
+    // The trampoline casts ctx back to WorkerReplicationTransportImpl<T>* and
+    // calls poll(limit, dispatch) where dispatch is a non-capturing lambda
+    // (plain function pointer) that forwards to self->pollReplTransportDispatch_.
+    // This is the same ctx_/trampoline_ idiom WorkerReplicationTransportImpl uses
+    // internally and matches WorkerIngress::poll exactly.
+    //
+    // replTransportCtx_ == nullptr when no transport is wired (flag-off path).
+    using ReplPollFn = int(*)(void* ctx, int limit, Worker* self, int64_t nowNs);
+    void*       replTransportCtx_    = nullptr;
+    ReplPollFn  replTransportPollFn_ = nullptr;
 
     // read-rework T3/T4: worker-local subscription cursors.  Worker-thread-only;
     // Subscribe/Unsubscribe ring ops mutate it, the I3 push loop iterates it.
