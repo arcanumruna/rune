@@ -2313,6 +2313,13 @@ void BrokerNode::stop() {
     replicaRegistry_.reset(); // PartitionReplicas + offsetReplica (destroyed before transport)
     memoryLogs_.clear();      // InMemoryLogs outlive replicas — clear after replicaRegistry_ on stop() path
     replTransport_.reset();   // AeronPartitionTransport: deregisters replication Subscription + ExclusivePubs
+    // Task 5 teardown fix: perWorkerReplTransports_ holds per-worker inbound Subscriptions +
+    // per-peer ExclusivePublications.  Must be cleared AFTER replicaRegistry_ (no replica
+    // must dereference a freed transport) and BEFORE aeron_.reset() / stopEmbeddedDriver()
+    // so the Subscription/Publication dtors deregister from the conductor while it is
+    // still alive.  Without this clear(), those dtors run in ~BrokerNode which fires
+    // after stop() has already torn down the Aeron client → use-after-close on restart.
+    perWorkerReplTransports_.clear(); // WorkerReplicationTransports: deregisters per-worker Subscription + ExclusivePubs
     nullTransports_.clear();  // Per-replica no-op transports (no Aeron resources)
     topicRegistry_.reset();   // TopicRegistry: Logs are files (flushed/synced by Log dtor)
 
