@@ -1,5 +1,7 @@
 #include <rune/node/NodeConfig.h>
 
+#include <stdexcept>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -237,16 +239,44 @@ std::string NodeConfig::clientBindHost() const {
     const auto colon = hp.rfind(':');
     return std::string(colon == std::string_view::npos ? hp : hp.substr(0, colon));
 }
+// Shard channel helpers are only meaningful after validateShardConfig() passed
+// (shard mode, explicit base ports, w in [0, W)).  Called on anything else they
+// refuse loudly (logic_error) instead of dereferencing an unset optional or
+// building a port-0 channel.
+namespace {
+void requireShardWorker(int32_t w, int32_t workerCount, const char* what) {
+    const int32_t W = workerCount >= 1 ? workerCount : 1;
+    if (w < 0 || w >= W)
+        throw std::logic_error(std::string(what) + ": worker " + std::to_string(w) +
+                               " out of range [0, " + std::to_string(W) + ")");
+}
+} // namespace
+
 std::string NodeConfig::shardIngressBindChannel(int32_t w) const {
-    return "aeron:udp?endpoint=" + clientBindHost() + ":" + std::to_string(workerIngressBasePort.value() + w);
+    if (!workerIngressBasePort)
+        throw std::logic_error("shardIngressBindChannel: RUNE_WORKER_INGRESS_BASE_PORT unset "
+                               "(only valid after validateShardConfig)");
+    requireShardWorker(w, workerCount, "shardIngressBindChannel");
+    return "aeron:udp?endpoint=" + clientBindHost() + ":" + std::to_string(*workerIngressBasePort + w);
 }
 std::string NodeConfig::shardReplBindChannel(int32_t w) const {
-    return "aeron:udp?endpoint=" + self().host + ":" + std::to_string(workerReplBasePort.value() + w);
+    if (!workerReplBasePort)
+        throw std::logic_error("shardReplBindChannel: RUNE_WORKER_REPL_BASE_PORT unset "
+                               "(only valid after validateShardConfig)");
+    requireShardWorker(w, workerCount, "shardReplBindChannel");
+    return "aeron:udp?endpoint=" + self().host + ":" + std::to_string(*workerReplBasePort + w);
 }
 std::string NodeConfig::shardPeerReplChannel(const PeerConfig& p, int32_t w) {
+    if (p.replBasePort == 0 || w < 0)
+        throw std::logic_error("shardPeerReplChannel: peer " + std::to_string(p.id) +
+                               " has no replBasePort / bad worker " + std::to_string(w) +
+                               " (only valid after validateShardConfig)");
     return "aeron:udp?endpoint=" + p.host + ":" + std::to_string(static_cast<int32_t>(p.replBasePort) + w);
 }
 std::string NodeConfig::shardIngressEndpoint(const PeerConfig& p, int32_t w) {
+    if (p.ingressBasePort == 0 || w < 0)
+        throw std::logic_error("shardIngressEndpoint: peer " + std::to_string(p.id) +
+                               " has no ingressBasePort / bad worker " + std::to_string(w));
     return p.host + ":" + std::to_string(static_cast<int32_t>(p.ingressBasePort) + w);
 }
 

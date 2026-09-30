@@ -1873,6 +1873,27 @@ TEST(NodeConfig, ParsesShardModePlacementPortsAndPeerBases) {
     EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
 }
 
+// Task 9 carry (T6 minor): the shard channel helpers are only valid after
+// validateShardConfig(); on an unvalidated config they refuse loudly instead of
+// dereferencing an unset optional or building a port-0 / out-of-range channel.
+TEST(ShardConfigRegression, ChannelHelpersRefuseUnvalidatedConfig) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));     // legacy: no shard base ports
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    const auto& legacy = *r.config;
+    EXPECT_THROW((void)legacy.shardIngressBindChannel(0), std::logic_error);
+    EXPECT_THROW((void)legacy.shardReplBindChannel(0), std::logic_error);
+    PeerConfig noBase; noBase.id = 7; noBase.host = "127.0.0.1";
+    EXPECT_THROW((void)NodeConfig::shardPeerReplChannel(noBase, 0), std::logic_error);
+    EXPECT_THROW((void)NodeConfig::shardIngressEndpoint(noBase, 0), std::logic_error);
+
+    auto s = parseNodeConfig(fakeEnv(shard3node(1)));
+    ASSERT_TRUE(s.config.has_value()) << s.error;
+    const int32_t W = s.config->workerCount;
+    EXPECT_THROW((void)s.config->shardIngressBindChannel(W), std::logic_error);
+    EXPECT_THROW((void)s.config->shardReplBindChannel(-1), std::logic_error);
+    EXPECT_NO_THROW((void)s.config->shardReplBindChannel(W - 1));
+}
+
 TEST(NodeConfigRegression, UnknownWorkerModeIsParseError) {
     auto env = shard3node(); env["RUNE_WORKER_MODE"] = "shards";
     auto r = parseNodeConfig(fakeEnv(env));

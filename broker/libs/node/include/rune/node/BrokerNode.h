@@ -32,6 +32,7 @@
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/ShardAgent.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/WorkerReplicationTransport.h>
@@ -414,6 +415,18 @@ public:
         return perWorkerReplTransports_.size();
     }
 
+    /// Self-contained worker shards (spec §3.1): number of per-worker invoker
+    /// drivers built (0 in legacy mode).  Startup/stop-time state (no worker access).
+    [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept { return shardDrivers_.size(); }
+
+    /// Test-only: worker w's replication plane (nullptr if none).  The vector is
+    /// startup-immutable; the transport's STATE is worker-owned — read it only
+    /// inside onOwnerThreadForTest on that worker.
+    [[nodiscard]] WorkerReplicationTransport* perWorkerPlaneForTest(int32_t w) const noexcept {
+        return (w >= 0 && static_cast<std::size_t>(w) < perWorkerReplTransports_.size())
+                   ? perWorkerReplTransports_[static_cast<std::size_t>(w)].get() : nullptr;
+    }
+
 private:
     // F1: test-side submit + await (see onOwnerThreadForTest).  Runs on the TEST
     // thread only; the node's threads only ever see the ring-carried ref.
@@ -627,6 +640,18 @@ private:
     // Declaration order enforces this via reverse-destruction in the destructor.
     // -----------------------------------------------------------------------
     std::unique_ptr<WorkerPool> workerPool_;  // E1: shard->worker ownership
+
+    // Self-contained worker shards (spec §3.1).  Index = worker id.  Declared
+    // BEFORE the per-worker Aeron resources below so that, even on a destructor
+    // path, pubs/subs die before their clients and clients before their drivers.
+    // Normally torn down explicitly in stop() (teardownShardRuntimes_) after the
+    // worker runners are joined and each invoker driver is handed to the closing
+    // thread (join → bindPumpThread → close), before the node driver.
+    std::vector<std::unique_ptr<EmbeddedDriver>> shardDrivers_;
+    std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
+    std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
+    void buildShardRuntimes_();
+    void teardownShardRuntimes_() noexcept;
 
     // E5.1.3: per-worker Aeron ingress subscriptions.
     // One WorkerIngress per worker, allocated in buildWorkerPool() when

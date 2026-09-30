@@ -42,6 +42,8 @@ checkAeronSpace(uint64_t freeBytes, int32_t drivers, int32_t termBufferBytes);
 class EmbeddedDriver {
 public:
     EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode);
+    /// Closes the driver.  An Invoker driver destroyed off its pump thread (no
+    /// hand-off) cannot close: logged critical, and debug builds abort.
     ~EmbeddedDriver();
     EmbeddedDriver(const EmbeddedDriver&)            = delete;
     EmbeddedDriver& operator=(const EmbeddedDriver&) = delete;
@@ -67,6 +69,9 @@ public:
         return rune::aeronutil::AeronPump(&EmbeddedDriver::pumpTrampoline_, this, client);
     }
 
+    /// True until close() has actually released the driver (a refused close
+    /// leaves it open).  Read on the closing / pump thread only.
+    [[nodiscard]] bool               isOpen() const noexcept { return driver_ != nullptr; }
     [[nodiscard]] DriverMode         mode() const noexcept { return mode_; }
     [[nodiscard]] const std::string& dir() const noexcept { return cfg_.dir; }
     [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { return foreignPumpAttempts_.load(std::memory_order_relaxed); }

@@ -2,6 +2,7 @@ add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
     src/EmbeddedDriver.cpp
+    src/ShardAgent.cpp
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
@@ -751,6 +752,10 @@ if(BUILD_TESTING)
             target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            add_executable(rune_shard_agent_tests tests/node/ShardAgentTest.cpp)
+            target_link_libraries(rune_shard_agent_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_shard_agent_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the
             # rune_role path).  Embeds the media driver → gated with the others.
@@ -1101,6 +1106,13 @@ if(BUILD_TESTING)
             GTest::gtest_main)
         gtest_discover_tests(rune_per_worker_replication_integration_tests
             PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Self-contained worker shards (spec §3.1): per-worker invoker driver +
+        # client, ShardAgent pass, shard replication planes over real UDP.
+        add_executable(rune_shard_mode_tests tests/integration/ShardModeTest.cpp)
+        target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
     endif()
 
     # ---------------------------------------------------------------------------

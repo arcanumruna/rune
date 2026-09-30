@@ -31,6 +31,7 @@
 #include <rune/protocol/RecordBatch.h>
 // Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
 #include <rune/protocol/client/SchemaMessages.h>
+#include <cstdlib>
 #include <cstring>
 
 namespace fs = std::filesystem;
@@ -95,6 +96,11 @@ void BrokerNode::start() {
 
     // 3. Start embedded Aeron media driver.
     startEmbeddedDriver();
+    // 3b. Self-contained worker shards (spec §3.1): one invoker driver + invoker
+    //     client per worker under <aeronDir>/w<w>.  Built (and pumped for every
+    //     startup resolve) on THIS thread; each ShardAgent takes ownership on its
+    //     worker thread's first pass (bindPumpThread).
+    if (config_.shardMode()) buildShardRuntimes_();
     const auto t1 = sclock::now();
 
     // 4. Connect Aeron client — must point at the same dir as the driver.
@@ -147,9 +153,17 @@ void BrokerNode::start() {
     //     Workers are independent of the control agent but their ingress rings are
     //     fed by the control thread, so the ordering: control first, workers after.
     if (workerPool_) {
-        workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
-        spdlog::info("BrokerNode[{}]: {} worker AgentRunner thread(s) started",
-                     config_.nodeId, workerPool_->workerCount());
+        if (config_.shardMode()) {
+            // Busy-spin ONLY when pinned to a dedicated core (principle §1a.3);
+            // unpinned shard workers use the backoff idle.
+            workerPool_->startShardRunners(shardAgents_, clock_,
+                                           /*busySpin=*/config_.workerCoreBase >= 0,
+                                           config_.idleMaxParkUs);
+        } else {
+            workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
+        }
+        spdlog::info("BrokerNode[{}]: {} worker thread(s) started (shard={})",
+                     config_.nodeId, workerPool_->workerCount(), config_.shardMode());
     }
 
     // 7c. Task 6: start the AdminWorker AgentRunner thread.
@@ -472,7 +486,41 @@ void BrokerNode::buildReplication() {
     // Hard-refuse if any transport fails to resolve: a half-wired replication
     // plane silently drops messages for the partitions assigned to that worker.
     // -----------------------------------------------------------------------
-    if (config_.perWorkerReplication && aeron_) {
+    if (config_.shardMode()) {
+        // Self-contained worker shards (spec §3.1/§3.3): worker w's plane binds
+        // shardReplBindChannel(w) on ITS OWN client and sends to each peer's
+        // explicit replBasePort + w; resolved by pumping the worker's own driver
+        // on this (startup) thread.  Any unresolved plane is a hard refusal.
+        const int32_t wc = static_cast<int32_t>(shardClients_.size());
+        for (int32_t w = 0; w < wc; ++w) {
+            const auto idx = static_cast<std::size_t>(w);
+            std::vector<std::pair<rune::replication::NodeId, std::string>> peersW;
+            std::vector<rune::replication::NodeId> peerIds;
+            for (const auto& peer : config_.peers) {
+                if (peer.id == config_.nodeId) continue;
+                peersW.push_back({static_cast<rune::replication::NodeId>(peer.id),
+                                  NodeConfig::shardPeerReplChannel(peer, w)});
+                peerIds.push_back(static_cast<rune::replication::NodeId>(peer.id));
+            }
+            if (peersW.empty()) break;                           // single node: no planes
+            const int32_t streamId = config_.replBaseStreamId + w;
+            auto t = std::make_unique<WorkerReplicationTransport>(
+                shardClients_[idx], w, config_.shardReplBindChannel(w),
+                streamId, peersW, streamId,
+                shardDrivers_[idx]->pumpWith(shardClients_[idx].get()));
+            if (!t->resolved())
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                         "]: shard " + std::to_string(w) +
+                                         " replication plane did not resolve — refusing to start");
+            // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
+            // are unknown at parse time, so each plane verifies them in-band.
+            t->enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds);
+            perWorkerReplTransports_.push_back(std::move(t));
+        }
+        if (!perWorkerReplTransports_.empty())
+            spdlog::info("BrokerNode[{}]: {} shard replication plane(s) built (replBaseStreamId={})",
+                         config_.nodeId, perWorkerReplTransports_.size(), config_.replBaseStreamId);
+    } else if (config_.perWorkerReplication && aeron_) {
         // Collect (peerId, peerChannel) pairs for all peers with a replication port.
         std::vector<std::pair<rune::replication::NodeId, std::string>> replPeers;
         replPeers.reserve(config_.peers.size());
@@ -962,101 +1010,142 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
     }
 
-    if (config_.perWorkerIngressEnabled && aeron_) {
-        const std::string& channel  = config_.clientEndpoint.channel;
-        const int32_t      baseStream = config_.workerIngressBaseStreamId;
-
-        workerIngresses_.reserve(static_cast<std::size_t>(wc));
-        for (int32_t i = 0; i < wc; ++i) {
-            const int32_t streamId = baseStream + i;
-            auto ing = std::make_unique<WorkerIngress>(aeron_, channel, streamId);
-            if (!ing->resolved()) {
-                spdlog::warn("BrokerNode[{}]: WorkerIngress for worker {} on stream {} "
-                             "did not resolve within 5s — per-worker ingress disabled for this worker",
-                             config_.nodeId, i, streamId);
-            } else {
-                spdlog::info("BrokerNode[{}]: WorkerIngress for worker {} wired on stream {} (channel={})",
-                             config_.nodeId, i, streamId, channel);
-            }
-            workerPool_->worker(i).setWorkerIngress(ing.get(), /*active=*/ing->resolved());
-            workerIngresses_.push_back(std::move(ing));
-        }
-        // Gate the gateway produce fanout: when per-worker ingress is active,
-        // produce arrives on each worker's dedicated stream — gateway must NOT also
-        // enqueue to workerPool_ (that would double-process the same produce).
-        if (gateway_) {
-            gateway_->setPerWorkerIngressActive(true);
-            spdlog::info("BrokerNode[{}]: gateway produce fanout GATED (perWorkerIngressActive=true)",
-                         config_.nodeId);
-
-            // E5.1.3 (d) R7 fix: register all user-partition logs as worker-owned
-            // so flushDirtyLogs() skips them (the worker calls log->sync on its
-            // own thread — the only thread appending to these logs).
-            if (replicaRegistry_ && topicRegistry_) {
-                for (const auto& ts : config_.topics) {
-                    for (int32_t p = 0; p < ts.partitionCount; ++p) {
-                        rune::storage::Log* log = topicRegistry_->log(ts.topicId, p);
-                        if (log) {
-                            gateway_->addWorkerOwnedLog(log);
-                        }
-                    }
-                }
-                spdlog::info("BrokerNode[{}]: {} user-partition logs marked worker-owned (R7 fix)",
-                             config_.nodeId, config_.topics.size());
-            }
-        }
-        spdlog::info("BrokerNode[{}]: per-worker ingress ACTIVE ({} subscriptions on base stream {})",
-                     config_.nodeId, wc, baseStream);
-    } else if (config_.perWorkerIngressEnabled && !aeron_) {
-        spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_INGRESS=true but aeron_ is null — "
-                     "per-worker ingress NOT activated (no embedded driver)",
-                     config_.nodeId);
-    }
-
-    // -----------------------------------------------------------------------
-    // read-rework T3/T4 (I1b/I3b): per-worker dynamic-MDC EGRESS publications.
-    //
-    // Independent of per-worker ingress.  Each worker owns ONE ExclusivePublication
-    // it alone writes; consumers self-register via control-mode=dynamic.  Control
-    // address = host:(basePort+W), streamId = egressBase + W.  egressBase defaults
-    // to workerIngressBaseStreamId + workerCount so the ingress/egress stream ranges
-    // never overlap.  When active, the gateway routes Subscribe/Unsubscribe to the
-    // owning worker and stops pushing user partitions itself (I3b).
-    // -----------------------------------------------------------------------
-    if (config_.perWorkerEgressEnabled && aeron_) {
+    if (config_.shardMode()) {
+        // Self-contained worker shards (spec §3.1): worker i's client ingress,
+        // record egress and (buildReplication) plane live on ITS OWN client and are
+        // resolved by pumping ITS OWN invoker driver on this (startup) thread.
+        // Any unresolved per-worker resource is a hard refusal — no fallback.
         int32_t egressBase = config_.workerEgressBaseStreamId;
         if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
-        workerEgresses_.reserve(static_cast<std::size_t>(wc));
+        const int32_t egressControlBase = config_.effectiveWorkerEgressControlBasePort();
+        shardAgents_.reserve(static_cast<std::size_t>(wc));
         for (int32_t i = 0; i < wc; ++i) {
-            const int32_t     egStream = egressBase + i;
-            const std::string control  = config_.workerEgressControlHost + ":" +
-                std::to_string(config_.effectiveWorkerEgressControlBasePort() + i);
-            auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
-            if (!eg->resolved()) {
-                spdlog::warn("BrokerNode[{}]: WorkerEgress for worker {} on stream {} "
-                             "control {} did not resolve within 5s — per-worker egress "
-                             "disabled for this worker",
-                             config_.nodeId, i, egStream, control);
-            } else {
-                spdlog::info("BrokerNode[{}]: WorkerEgress for worker {} wired on stream {} "
-                             "(dynamic-MDC control={})",
-                             config_.nodeId, i, egStream, control);
-            }
-            workerPool_->worker(i).setWorkerEgress(eg.get());
+            const auto idx = static_cast<std::size_t>(i);
+            auto pump = shardDrivers_[idx]->pumpWith(shardClients_[idx].get());
+            auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(i),
+                                                       config_.workerIngressBaseStreamId + i, pump);
+            const std::string control = config_.workerEgressControlHost + ":" +
+                                        std::to_string(egressControlBase + i);
+            auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + i, pump);
+            if (!ing->resolved() || !eg->resolved())
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                         std::to_string(i) + " ingress/egress did not resolve — refusing to start");
+            Worker& wk = workerPool_->worker(i);
+            wk.setWorkerIngress(ing.get(), /*active=*/true);
+            wk.setWorkerEgress(eg.get());
+            wk.setShardMode(true);
+            workerIngresses_.push_back(std::move(ing));
             workerEgresses_.push_back(std::move(eg));
+            shardAgents_.push_back(std::make_unique<ShardAgent>(wk, *shardDrivers_[idx], *shardClients_[idx]));
         }
         if (gateway_) {
+            gateway_->setPerWorkerIngressActive(true);
             gateway_->setPerWorkerEgressActive(true);
-            gateway_->setWorkerEgressParams(config_.effectiveWorkerEgressControlBasePort(), egressBase);
-            spdlog::info("BrokerNode[{}]: per-worker EGRESS ACTIVE — gateway routes "
-                         "Subscribe/Unsubscribe to owning workers (base stream {}, "
-                         "control base port {})",
-                         config_.nodeId, egressBase, config_.effectiveWorkerEgressControlBasePort());
+            gateway_->setWorkerEgressParams(egressControlBase, egressBase);
+            if (topicRegistry_)
+                for (const auto& ts : config_.topics)
+                    for (int32_t p = 0; p < ts.partitionCount; ++p)
+                        if (auto* log = topicRegistry_->log(ts.topicId, p)) gateway_->addWorkerOwnedLog(log);
         }
-    } else if (config_.perWorkerEgressEnabled && !aeron_) {
-        spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_EGRESS=true but aeron_ is null — "
-                     "per-worker egress NOT activated (no embedded driver)",
-                     config_.nodeId);
+        spdlog::info("BrokerNode[{}]: {} worker shard(s) wired (own driver + client + ingress + egress)",
+                     config_.nodeId, wc);
+    } else {
+        if (config_.perWorkerIngressEnabled && aeron_) {
+            const std::string& channel  = config_.clientEndpoint.channel;
+            const int32_t      baseStream = config_.workerIngressBaseStreamId;
+
+            workerIngresses_.reserve(static_cast<std::size_t>(wc));
+            for (int32_t i = 0; i < wc; ++i) {
+                const int32_t streamId = baseStream + i;
+                auto ing = std::make_unique<WorkerIngress>(aeron_, channel, streamId);
+                if (!ing->resolved()) {
+                    spdlog::warn("BrokerNode[{}]: WorkerIngress for worker {} on stream {} "
+                                 "did not resolve within 5s — per-worker ingress disabled for this worker",
+                                 config_.nodeId, i, streamId);
+                } else {
+                    spdlog::info("BrokerNode[{}]: WorkerIngress for worker {} wired on stream {} (channel={})",
+                                 config_.nodeId, i, streamId, channel);
+                }
+                workerPool_->worker(i).setWorkerIngress(ing.get(), /*active=*/ing->resolved());
+                workerIngresses_.push_back(std::move(ing));
+            }
+            // Gate the gateway produce fanout: when per-worker ingress is active,
+            // produce arrives on each worker's dedicated stream — gateway must NOT also
+            // enqueue to workerPool_ (that would double-process the same produce).
+            if (gateway_) {
+                gateway_->setPerWorkerIngressActive(true);
+                spdlog::info("BrokerNode[{}]: gateway produce fanout GATED (perWorkerIngressActive=true)",
+                             config_.nodeId);
+
+                // E5.1.3 (d) R7 fix: register all user-partition logs as worker-owned
+                // so flushDirtyLogs() skips them (the worker calls log->sync on its
+                // own thread — the only thread appending to these logs).
+                if (replicaRegistry_ && topicRegistry_) {
+                    for (const auto& ts : config_.topics) {
+                        for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                            rune::storage::Log* log = topicRegistry_->log(ts.topicId, p);
+                            if (log) {
+                                gateway_->addWorkerOwnedLog(log);
+                            }
+                        }
+                    }
+                    spdlog::info("BrokerNode[{}]: {} user-partition logs marked worker-owned (R7 fix)",
+                                 config_.nodeId, config_.topics.size());
+                }
+            }
+            spdlog::info("BrokerNode[{}]: per-worker ingress ACTIVE ({} subscriptions on base stream {})",
+                         config_.nodeId, wc, baseStream);
+        } else if (config_.perWorkerIngressEnabled && !aeron_) {
+            spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_INGRESS=true but aeron_ is null — "
+                         "per-worker ingress NOT activated (no embedded driver)",
+                         config_.nodeId);
+        }
+
+        // -----------------------------------------------------------------------
+        // read-rework T3/T4 (I1b/I3b): per-worker dynamic-MDC EGRESS publications.
+        //
+        // Independent of per-worker ingress.  Each worker owns ONE ExclusivePublication
+        // it alone writes; consumers self-register via control-mode=dynamic.  Control
+        // address = host:(basePort+W), streamId = egressBase + W.  egressBase defaults
+        // to workerIngressBaseStreamId + workerCount so the ingress/egress stream ranges
+        // never overlap.  When active, the gateway routes Subscribe/Unsubscribe to the
+        // owning worker and stops pushing user partitions itself (I3b).
+        // -----------------------------------------------------------------------
+        if (config_.perWorkerEgressEnabled && aeron_) {
+            int32_t egressBase = config_.workerEgressBaseStreamId;
+            if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
+            workerEgresses_.reserve(static_cast<std::size_t>(wc));
+            for (int32_t i = 0; i < wc; ++i) {
+                const int32_t     egStream = egressBase + i;
+                const std::string control  = config_.workerEgressControlHost + ":" +
+                    std::to_string(config_.effectiveWorkerEgressControlBasePort() + i);
+                auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
+                if (!eg->resolved()) {
+                    spdlog::warn("BrokerNode[{}]: WorkerEgress for worker {} on stream {} "
+                                 "control {} did not resolve within 5s — per-worker egress "
+                                 "disabled for this worker",
+                                 config_.nodeId, i, egStream, control);
+                } else {
+                    spdlog::info("BrokerNode[{}]: WorkerEgress for worker {} wired on stream {} "
+                                 "(dynamic-MDC control={})",
+                                 config_.nodeId, i, egStream, control);
+                }
+                workerPool_->worker(i).setWorkerEgress(eg.get());
+                workerEgresses_.push_back(std::move(eg));
+            }
+            if (gateway_) {
+                gateway_->setPerWorkerEgressActive(true);
+                gateway_->setWorkerEgressParams(config_.effectiveWorkerEgressControlBasePort(), egressBase);
+                spdlog::info("BrokerNode[{}]: per-worker EGRESS ACTIVE — gateway routes "
+                             "Subscribe/Unsubscribe to owning workers (base stream {}, "
+                             "control base port {})",
+                             config_.nodeId, egressBase, config_.effectiveWorkerEgressControlBasePort());
+            }
+        } else if (config_.perWorkerEgressEnabled && !aeron_) {
+            spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_EGRESS=true but aeron_ is null — "
+                         "per-worker egress NOT activated (no embedded driver)",
+                         config_.nodeId);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2281,6 +2370,9 @@ void BrokerNode::stop() {
         workerPool_->stopAndJoinRunners();
         spdlog::info("BrokerNode[{}]: worker AgentRunner threads stopped", config_.nodeId);
     }
+    // Shard agents reference workers + their drivers/clients; the runners that
+    // drove them are joined, so nothing pumps a shard driver any more.
+    shardAgents_.clear();
 
     // 1b-admin. Task 6: stop AdminWorker thread BEFORE the main agent runner.
     //     The AdminWorker calls appendDurable which uses the schema replica.
@@ -2359,6 +2451,14 @@ void BrokerNode::stop() {
     // still alive.  Without this clear(), those dtors run in ~BrokerNode which fires
     // after stop() has already torn down the Aeron client → use-after-close on restart.
     perWorkerReplTransports_.clear(); // WorkerReplicationTransports: deregisters per-worker Subscription + ExclusivePubs
+    // Per-worker ingress/egress deregister from their client while it is alive
+    // (legacy: the node client; shard: the worker's own client).
+    workerIngresses_.clear();
+    workerEgresses_.clear();
+    // Shard teardown: clients before their drivers, each driver handed to THIS
+    // thread (its pumping worker is joined) before it closes.  Before the node
+    // driver, which owns the parent aeron dir.
+    teardownShardRuntimes_();
     nullTransports_.clear();  // Per-replica no-op transports (no Aeron resources)
     topicRegistry_.reset();   // TopicRegistry: Logs are files (flushed/synced by Log dtor)
 
@@ -2414,6 +2514,66 @@ void BrokerNode::startEmbeddedDriver() {
 // ---------------------------------------------------------------------------
 void BrokerNode::stopEmbeddedDriver() noexcept {
     nodeDriver_.reset();   // joins the driver thread, drains, closes (EmbeddedDriver::close)
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::buildShardRuntimes_ — spec §3.1: per worker, an invoker driver
+// (<aeronDir>/w<w>) + an Aeron client with useConductorAgentInvoker(true).
+// Refuses (throws) when the aeron dir cannot hold one log per driver.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildShardRuntimes_() {
+    const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+    std::error_code ec;
+    const auto space = fs::space(config_.effectiveAeronDir(), ec);
+    if (!ec) {
+        if (auto err = checkAeronSpace(space.available, wc, config_.aeronTermBufferBytes)) {
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                     "]: refusing shard mode — " + *err);
+        }
+    }
+    shardDrivers_.reserve(static_cast<std::size_t>(wc));
+    shardClients_.reserve(static_cast<std::size_t>(wc));
+    for (int32_t w = 0; w < wc; ++w) {
+        const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
+        shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(
+            EmbeddedDriverConfig::fromNode(config_, dir), DriverMode::Invoker));
+        aeron::Context ctx;
+        ctx.aeronDir(dir);
+        ctx.useConductorAgentInvoker(true);
+        auto client = aeron::Aeron::connect(ctx);
+        if (!client)
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                     std::to_string(w) + " Aeron client connect failed");
+        shardClients_.push_back(std::move(client));
+    }
+    spdlog::info("BrokerNode[{}]: {} shard runtime(s) (invoker driver + invoker client) under {}/w*",
+                 config_.nodeId, wc, config_.effectiveAeronDir());
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::teardownShardRuntimes_ — precondition: every shard runner joined.
+// Hand-off (EmbeddedDriver one-pumper contract): the closing thread binds itself
+// as each invoker driver's pumper, clients close (their close commands queue in
+// the CnC ring), then each driver drains + closes on this thread.  A driver that
+// still refuses to close is a leak: logged critical, debug builds abort.
+// ---------------------------------------------------------------------------
+void BrokerNode::teardownShardRuntimes_() noexcept {
+    if (shardDrivers_.empty() && shardClients_.empty()) return;
+    shardAgents_.clear();
+    for (auto& d : shardDrivers_) if (d) d->bindPumpThread();
+    shardClients_.clear();
+    for (auto& d : shardDrivers_) {
+        if (!d) continue;
+        d->close();
+        if (d->isOpen()) {
+            spdlog::critical("BrokerNode[{}]: shard driver {} did not close on the stopping thread — LEAK",
+                             config_.nodeId, d->dir());
+#ifndef NDEBUG
+            std::abort();
+#endif
+        }
+    }
+    shardDrivers_.clear();
 }
 
 } // namespace rune::node

@@ -45,6 +45,7 @@ using namespace rune::node;
 struct SharedState {
     std::vector<NodeId>                                           peers;
     std::unordered_map<NodeId, std::vector<std::vector<uint8_t>>> offersTo;
+    std::vector<NodeId>                                           dropped;   // dropPeer() calls
 
     // When backPressurePeer is set, sendToPeer returns -1 for that peer (no record).
     NodeId backPressurePeer = static_cast<NodeId>(-1);
@@ -110,6 +111,15 @@ public:
         for (NodeId id : state_->peers) sendToPeer(id, buf, len);
     }
 
+    // Shard plane refusal: forget the peer (subsequent sends are no-ops).
+    void dropPeer(NodeId peer) noexcept
+    {
+        state_->peers.erase(std::remove(state_->peers.begin(), state_->peers.end(), peer),
+                            state_->peers.end());
+        state_->offersTo.erase(peer);
+        state_->dropped.push_back(peer);
+    }
+
     int64_t sendGatherToPeer(NodeId peer, const uint8_t* prefix, std::size_t prefixLen,
                              std::span<const uint8_t> body) noexcept
     {
@@ -129,6 +139,7 @@ public:
     }
 
     [[nodiscard]] const std::vector<NodeId>& peers() const noexcept { return state_->peers; }
+    [[nodiscard]] const std::vector<NodeId>& dropped() const noexcept { return state_->dropped; }
 
     void clear() { for (auto& [id, v] : state_->offersTo) v.clear(); }
 
@@ -1116,4 +1127,109 @@ TEST(WorkerReplicationTransportRegression, GatherSendIsByteIdenticalForLargeReco
     h.transport->sendReconcileResponse(2, resp);
     ASSERT_EQ(h.pubs.offersTo(2).size(), 1u);
     EXPECT_EQ(peekTemplateId(h.pubs.offersTo(2)[0].data(), 0), kReconcileFetchRespTemplateId);
+}
+
+
+// ===========================================================================
+// Shard plane handshake (Task 6 ruling I2, Task 9): runtime worker-count
+// symmetry.  Injected clock only; no Aeron.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> helloFrame(int32_t nodeId, int32_t workerId, int32_t workerCount, int32_t flags) {
+    PlaneHelloMsg m; m.nodeId = nodeId; m.workerId = workerId; m.workerCount = workerCount; m.flags = flags;
+    std::vector<uint8_t> f(PlaneHelloMsg::TOTAL_SIZE);
+    PlaneHelloMsg::encode(f.data(), m);
+    return f;
+}
+PlaneHelloMsg decodeHello(const std::vector<uint8_t>& f) {
+    PlaneHelloMsg m; EXPECT_TRUE(PlaneHelloMsg::decode(f.data(), f.size(), m)); return m;
+}
+std::vector<uint8_t> fetchReqFrame(int32_t topicId, int32_t partition) {
+    std::vector<uint8_t> f(FetchRequestMsg::TOTAL_SIZE);
+    FetchRequestMsg::encode(f.data(), 0, /*epoch*/1, partition, /*follower*/1, /*offset*/0, /*maxBytes*/1024, topicId);
+    return f;
+}
+struct CountingDispatch {
+    int* n;
+    void operator()(int32_t, int32_t, uint16_t, const uint8_t*, std::size_t) const { ++*n; }
+};
+} // namespace
+
+TEST(WorkerReplicationTransport, PlaneHandshakeDisabledByDefaultSendsNothing)
+{
+    auto h = makeTestPair(/*workerId=*/0, {1, 2});
+    EXPECT_FALSE(h.transport->planeHandshakeEnabled());
+    EXPECT_EQ(h.transport->driveHandshake(1'000), 0);
+    EXPECT_TRUE(h.pubs.offersTo(1).empty());
+    EXPECT_TRUE(h.pubs.offersTo(2).empty());
+}
+
+TEST(WorkerReplicationTransport, PlaneHandshakeRetriesOnInjectedClockUntilVerified)
+{
+    auto h = makeTestPair(/*workerId=*/1, {1, 2});
+    h.transport->enablePlaneHandshake(/*self=*/0, /*workers=*/2, {1, 2});
+    EXPECT_EQ(h.transport->driveHandshake(1'000), 2);                 // first pass: both peers
+    ASSERT_EQ(h.pubs.offersTo(1).size(), 1u);
+    const auto m = decodeHello(h.pubs.offersTo(1)[0]);
+    EXPECT_EQ(m.nodeId, 0); EXPECT_EQ(m.workerId, 1); EXPECT_EQ(m.workerCount, 2);
+    EXPECT_EQ(m.flags & PlaneHelloMsg::kReplyRequested, PlaneHelloMsg::kReplyRequested);
+    EXPECT_EQ(h.transport->driveHandshake(1'000 + SharedTestTransport::kHelloRetryNs - 1), 0);  // not due
+    // Peer 1 answers (matching): verified, and its reply-requested hello is answered.
+    auto f = helloFrame(1, 1, 2, PlaneHelloMsg::kReplyRequested);
+    h.transport->injectFrameForTest(f.data(), f.size(), /*sessionId=*/11);
+    int n = 0;
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_EQ(n, 0) << "a hello is never dispatched to a replica";
+    EXPECT_EQ(h.transport->peerPlaneState(1), SharedTestTransport::PeerPlaneState::Verified);
+    ASSERT_EQ(h.pubs.offersTo(1).size(), 2u);
+    EXPECT_EQ(decodeHello(h.pubs.offersTo(1)[1]).flags, 0) << "reply does not request a reply";
+    // Next due pass retries ONLY the still-unverified peer 2.
+    EXPECT_EQ(h.transport->driveHandshake(1'000 + SharedTestTransport::kHelloRetryNs), 1);
+    EXPECT_EQ(h.pubs.offersTo(1).size(), 2u);
+    EXPECT_EQ(h.pubs.offersTo(2).size(), 2u);
+    auto f2 = helloFrame(2, 1, 2, 0);
+    h.transport->injectFrameForTest(f2.data(), f2.size(), /*sessionId=*/22);
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_EQ(h.transport->peerPlaneState(2), SharedTestTransport::PeerPlaneState::Verified);
+    EXPECT_EQ(h.transport->driveHandshake(INT64_MAX / 2), 0) << "all verified: no more hellos";
+    EXPECT_FALSE(h.transport->planeRefused());
+}
+
+TEST(ShardPlaneRegression, AsymmetricWorkerCountRefusedAtRuntime)
+{
+    auto h = makeTestPair(/*workerId=*/0, {1, 2});
+    h.transport->enablePlaneHandshake(/*self=*/0, /*workers=*/1, {1, 2});
+    // Peer 1 runs 2 workers (unknown at config-parse time): its hello on plane 0.
+    auto bad = helloFrame(1, 0, 2, PlaneHelloMsg::kReplyRequested);
+    h.transport->injectFrameForTest(bad.data(), bad.size(), /*sessionId=*/77);
+    int n = 0;
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_TRUE(h.transport->planeRefused());
+    EXPECT_EQ(h.transport->planeRefusals(), 1u);
+    EXPECT_EQ(h.transport->peerPlaneState(1), SharedTestTransport::PeerPlaneState::Refused);
+    ASSERT_EQ(h.pubs.dropped().size(), 1u);
+    EXPECT_EQ(h.pubs.dropped()[0], 1) << "nothing more is sent to the mismatched peer";
+    // Frames from the refused peer's image are discarded; others still dispatch.
+    auto fr = fetchReqFrame(0, 0);
+    h.transport->injectFrameForTest(fr.data(), fr.size(), /*sessionId=*/77);
+    h.transport->injectFrameForTest(fr.data(), fr.size(), /*sessionId=*/22);
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_EQ(n, 1) << "only the healthy peer's frame is applied";
+    // Refusal is terminal: a later matching hello from the same peer does not re-admit it.
+    auto good = helloFrame(1, 0, 1, 0);
+    h.transport->injectFrameForTest(good.data(), good.size(), /*sessionId=*/78);
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_EQ(h.transport->peerPlaneState(1), SharedTestTransport::PeerPlaneState::Refused);
+    EXPECT_EQ(h.transport->planeRefusals(), 1u);
+}
+
+TEST(ShardPlaneRegression, PlaneIndexMismatchRefused)
+{
+    auto h = makeTestPair(/*workerId=*/0, {1});
+    h.transport->enablePlaneHandshake(/*self=*/0, /*workers=*/2, {1});
+    auto wrongPlane = helloFrame(1, /*workerId=*/1, 2, 0);   // same count, crossed ports
+    h.transport->injectFrameForTest(wrongPlane.data(), wrongPlane.size(), 5);
+    int n = 0;
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_TRUE(h.transport->planeRefused());
 }

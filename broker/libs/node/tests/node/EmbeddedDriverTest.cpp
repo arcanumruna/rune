@@ -149,3 +149,26 @@ TEST(EmbeddedDriverRegression, InvokerHandOffThenCloseByNewOwner) {
     EXPECT_EQ(drv.foreignCloseAttempts(), 0u);
     EXPECT_EQ(drv.foreignPumpAttempts(), 0u);
 }
+
+// Task 9 carry (T7 minor): an Invoker driver destroyed off its pump thread with
+// no hand-off cannot close — it would leak the driver + dir silently.  The leak
+// is logged critical and debug builds abort, so a wrong-thread shard teardown
+// can never go unnoticed.
+TEST(EmbeddedDriverRegression, InvokerDestroyedOffPumpThreadWithoutHandOffAbortsInDebug) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    TmpDir d;
+    EXPECT_DEBUG_DEATH({
+        auto drv = std::make_unique<EmbeddedDriver>(cfgAt(d.path), DriverMode::Invoker);
+        std::thread t([&] { drv.reset(); });   // no join-then-bindPumpThread hand-off
+        t.join();
+    }, "");
+}
+
+// The same destruction WITH the hand-off closes cleanly (dir released).
+TEST(EmbeddedDriverRegression, InvokerDestroyedAfterHandOffClosesCleanly) {
+    TmpDir d;
+    auto drv = std::make_unique<EmbeddedDriver>(cfgAt(d.path), DriverMode::Invoker);
+    std::thread t([&] { drv->bindPumpThread(); drv.reset(); });
+    t.join();
+    EXPECT_FALSE(fs::exists(d.path / "cnc.dat")) << "hand-off close must release the driver dir";
+}

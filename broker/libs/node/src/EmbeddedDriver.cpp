@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace rune::node {
@@ -172,6 +173,20 @@ void EmbeddedDriver::close() noexcept {
     }
 }
 
-EmbeddedDriver::~EmbeddedDriver() { close(); }
+EmbeddedDriver::~EmbeddedDriver() {
+    close();
+    if (driver_) {
+        // close() was refused (Invoker destroyed off its pump thread): the driver,
+        // its context and its dir are leaked.  Never silent: shard teardown must
+        // hand the driver to the closing thread first (join the pumper, then
+        // bindPumpThread(), then close()).  Debug builds abort on the spot.
+        spdlog::critical("EmbeddedDriver: destroyed off its pump thread without a hand-off — "
+                         "driver LEAKED (dir={}); join the pumper and bindPumpThread() before close()",
+                         cfg_.dir);
+#ifndef NDEBUG
+        std::abort();
+#endif
+    }
+}
 
 } // namespace rune::node

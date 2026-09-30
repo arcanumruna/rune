@@ -334,6 +334,7 @@ public:
     void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}
     int64_t sendGatherToPeer(rune::replication::NodeId, const uint8_t*, std::size_t,
                              std::span<const uint8_t>) noexcept { return 1; }
+    void    dropPeer(rune::replication::NodeId) noexcept {}
 
 private:
     std::shared_ptr<SharedFakePubState> state_;

@@ -1,0 +1,231 @@
+#pragma once
+// ShardTestClient.h — a minimal REAL wire client for shard-mode integration
+// tests: its own (threaded) embedded driver + Aeron client, raw Rune protocol
+// frames over UDP.  Every wait is a bounded poll of a real condition (hard
+// iteration cap), never a sleep-for-correctness.
+#include <rune/node/EmbeddedDriver.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/Protocol.h>
+
+#include <Aeron.h>
+#include <FragmentAssembler.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace rune::node::test {
+
+namespace pc = rune::protocol::client;
+
+inline bool udpPortFree(uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+    ::close(fd);
+    return ok;
+}
+
+inline uint16_t freeUdpPort() {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+    socklen_t len = sizeof(a);
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+    ::close(fd);
+    return ntohs(a.sin_port);
+}
+
+/// n disjoint blocks of `width` consecutive free UDP ports (per-worker base ranges).
+inline std::vector<uint16_t> freeUdpPortBlocks(int n, int width) {
+    std::vector<uint16_t> out;
+    for (int attempt = 0; attempt < 2000 && static_cast<int>(out.size()) < n; ++attempt) {
+        const uint16_t p = freeUdpPort();
+        if (p == 0 || static_cast<int>(p) + width > 65535) continue;
+        bool ok = true;
+        for (int k = 0; k < width && ok; ++k) ok = udpPortFree(static_cast<uint16_t>(p + k));
+        for (uint16_t q : out) if (p < q + width && q < p + width) ok = false;
+        if (ok) out.push_back(p);
+    }
+    return out;
+}
+
+struct PartitionInfo {
+    int32_t topicId = 0, partition = 0, leaderId = -1, ingressStreamId = 0;
+    std::string ingressEndpoint;
+};
+
+inline std::vector<uint8_t> makeBatch(int records) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < records; ++i) b.append("k", "v", 1000 + i);
+    return b.build();
+}
+
+class ShardTestClient {
+public:
+    static constexpr int32_t kEgressStream = 4242;
+    static constexpr int     kMaxIters     = 50'000;   // × 100 µs ⇒ 5 s hard cap per wait
+
+    explicit ShardTestClient(const std::filesystem::path& aeronDir)
+        : driver_(cfgFor(aeronDir), DriverMode::Threaded)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir.string());
+        aeron_ = aeron::Aeron::connect(ctx);
+        egressChannel_ = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
+        const int64_t reg = aeron_->addSubscription(egressChannel_, kEgressStream);
+        for (int i = 0; i < kMaxIters && !egress_; ++i) { egress_ = aeron_->findSubscription(reg); pause_(); }
+    }
+    ~ShardTestClient() { pubs_.clear(); egress_.reset(); aeron_.reset(); }
+
+    const std::string& egressChannel() const noexcept { return egressChannel_; }
+
+    int64_t connect(const std::string& gatewayChannel, int32_t stream) {
+        connect_.reset();                                  // each connect waits for ITS response
+        pc::ConnectRequest req;
+        req.correlationId  = ++corr_;
+        req.egressStreamId = kEgressStream;
+        req.clientVersion  = 1;
+        req.egressChannel  = egressChannel_;
+        std::vector<uint8_t> buf(pc::MessageHeader::ENCODED_SIZE + pc::ConnectRequest::BODY_FIXED + 2 +
+                                 req.egressChannel.size());
+        const std::size_t len = req.encode(buf.data());
+        if (!send(gatewayChannel, stream, buf.data(), len)) return -1;
+        for (int i = 0; i < kMaxIters && !connect_; ++i) { poll_(); pause_(); }
+        return connect_ && connect_->code == 0 ? connect_->assignedSessionId : -1;
+    }
+
+    bool produce(const std::string& channel, int32_t stream, int64_t sessionId, int64_t corr,
+                 int32_t topicId, int32_t partition, uint8_t acks, const std::vector<uint8_t>& batch) {
+        pc::Produce msg;
+        msg.sessionId = sessionId; msg.correlationId = corr;
+        msg.topicId = topicId; msg.partition = partition; msg.partitionKnown = 1;
+        msg.acks = acks; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
+        msg.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> buf(msg.encodedSize());
+        msg.encode(buf.data());
+        return send(channel, stream, buf.data(), buf.size());
+    }
+
+    std::optional<pc::ProduceResponse> awaitProduceResponse(int64_t corr) {
+        for (int i = 0; i < kMaxIters; ++i) {
+            poll_();
+            if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    /// Produce until an OK ack (retries NotLeader while leadership settles).  Returns the ack.
+    std::optional<pc::ProduceResponse> produceUntilOk(const std::string& channel, int32_t stream,
+                                                      int64_t sessionId, int32_t topicId,
+                                                      int32_t partition, uint8_t acks,
+                                                      const std::vector<uint8_t>& batch,
+                                                      int maxAttempts = 100) {
+        for (int a = 0; a < maxAttempts; ++a) {
+            const int64_t c = ++corr_;
+            if (!produce(channel, stream, sessionId, c, topicId, partition, acks, batch)) continue;
+            auto ack = awaitProduceResponse(c);
+            if (ack && ack->errorCode == 0) return ack;
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});   // leadership settling
+        }
+        return std::nullopt;
+    }
+
+    std::vector<PartitionInfo> metadata(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
+        pc::MetadataRequest req;
+        req.sessionId = sessionId; req.correlationId = ++corr_;
+        std::vector<uint8_t> buf(req.encodedSize());
+        req.encode(buf.data());
+        metadata_.reset();
+        if (!send(gatewayChannel, stream, buf.data(), buf.size())) return {};
+        for (int i = 0; i < kMaxIters && !metadata_; ++i) { poll_(); pause_(); }
+        return metadata_.value_or(std::vector<PartitionInfo>{});
+    }
+
+    bool disconnect(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
+        pc::Disconnect d; d.sessionId = sessionId; d.correlationId = ++corr_;
+        std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
+        const std::size_t len = d.encode(buf.data());
+        return send(gatewayChannel, stream, buf.data(), len);
+    }
+
+    bool send(const std::string& channel, int32_t stream, const uint8_t* buf, std::size_t len) {
+        auto& pub = pubs_[{channel, stream}];
+        if (!pub) {
+            const int64_t reg = aeron_->addPublication(channel, stream);
+            for (int i = 0; i < kMaxIters && !pub; ++i) { pub = aeron_->findPublication(reg); pause_(); }
+            if (!pub) return false;
+        }
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), static_cast<aeron::util::index_t>(len));
+        for (int i = 0; i < kMaxIters; ++i) {
+            if (pub->offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) return true;
+            pause_();
+        }
+        return false;
+    }
+
+private:
+    static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d) {
+        EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = 1 << 20; return c;
+    }
+    static void pause_() { std::this_thread::sleep_for(std::chrono::microseconds{100}); }
+
+    void poll_() {
+        if (!egress_) return;
+        egress_->poll(assembler_.handler(), 64);
+    }
+    void onFrame_(const uint8_t* p, std::size_t n) {
+        auto hdr = pc::MessageHeader::decode(p, n);
+        if (!hdr) return;
+        switch (static_cast<pc::TemplateId>(hdr->templateId)) {
+            case pc::TemplateId::ConnectResponse:
+                if (auto r = pc::ConnectResponse::decode(p, n)) connect_ = *r;
+                break;
+            case pc::TemplateId::ProduceResponse:
+                if (auto r = pc::ProduceResponse::decode(p, n)) acks_[r->correlationId] = *r;
+                break;
+            case pc::TemplateId::MetadataResponse:
+                if (auto r = pc::MetadataResponse::decode(p, n)) {
+                    std::vector<PartitionInfo> v;
+                    for (const auto& e : r->partitions)
+                        v.push_back({e.topicId, e.partition, e.leaderId, e.ingressStreamId,
+                                     std::string(e.ingressEndpoint)});
+                    metadata_ = std::move(v);
+                }
+                break;
+            default: break;
+        }
+    }
+
+    EmbeddedDriver                                   driver_;
+    std::shared_ptr<aeron::Aeron>                    aeron_;
+    std::string                                      egressChannel_;
+    std::shared_ptr<aeron::Subscription>             egress_;
+    std::map<std::pair<std::string, int32_t>, std::shared_ptr<aeron::Publication>> pubs_;
+    aeron::FragmentAssembler assembler_{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                               aeron::util::index_t len, aeron::Header&) {
+        onFrame_(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
+    }};
+    std::optional<pc::ConnectResponse>              connect_;
+    std::map<int64_t, pc::ProduceResponse>          acks_;
+    std::optional<std::vector<PartitionInfo>>       metadata_;
+    int64_t                                         corr_ = 0;
+};
+
+} // namespace rune::node::test

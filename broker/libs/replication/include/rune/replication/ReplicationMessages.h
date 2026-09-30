@@ -465,4 +465,53 @@ struct OffsetsForLeaderEpochRespMsg {
     }
 };
 
+// ===========================================================================
+// PlaneHello (templateId = 90) — shard-mode replication-plane handshake.
+//
+// Self-contained worker shards (spec §3.3): worker w of every node exchanges a
+// hello on its replication plane w carrying the sender's node id, plane index
+// and worker count.  A receiver whose worker count (or plane index) differs
+// refuses the peer loudly instead of silently splitting replication planes
+// (partition P owned by worker a here, by worker b there).  Hand-rolled, fixed
+// 24 bytes, never sent in legacy mode.  Pre-handshake receivers drop the unknown
+// templateId (WorkerReplicationTransport::dispatchFrame_ default branch).
+//    nodeId      : int32 @ +0
+//    workerId    : int32 @ +4   (sender's plane index)
+//    workerCount : int32 @ +8   (sender's RUNE_WORKERS)
+//    flags       : int32 @ +12  (bit0 = reply requested)
+// ===========================================================================
+inline constexpr uint16_t kPlaneHelloTemplateId = 90;
+
+struct PlaneHelloMsg {
+    int32_t nodeId      = -1;
+    int32_t workerId    = -1;
+    int32_t workerCount = 0;
+    int32_t flags       = 0;
+
+    static constexpr int32_t     kReplyRequested = 1;
+    static constexpr uint16_t    BLOCK_LENGTH    = 16;
+    static constexpr std::size_t TOTAL_SIZE      = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, const PlaneHelloMsg& m) noexcept {
+        ReplicationMessageHeader::encode(buf, 0, BLOCK_LENGTH, kPlaneHelloTemplateId);
+        uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        detail::write_le<int32_t>(p + 0,  m.nodeId);
+        detail::write_le<int32_t>(p + 4,  m.workerId);
+        detail::write_le<int32_t>(p + 8,  m.workerCount);
+        detail::write_le<int32_t>(p + 12, m.flags);
+        return TOTAL_SIZE;
+    }
+
+    /// nullopt-free decode: returns false if the frame is too short.
+    static bool decode(const uint8_t* buf, std::size_t len, PlaneHelloMsg& out) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        const uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        out.nodeId      = detail::read_le<int32_t>(p + 0);
+        out.workerId    = detail::read_le<int32_t>(p + 4);
+        out.workerCount = detail::read_le<int32_t>(p + 8);
+        out.flags       = detail::read_le<int32_t>(p + 12);
+        return true;
+    }
+};
+
 } // namespace rune::replication

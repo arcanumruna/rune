@@ -36,6 +36,7 @@
 #include <rune/consensus/NanoClock.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/ShardAgent.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/metadata/ShardRouter.h>
@@ -297,6 +298,25 @@ public:
         }
         // From now on, ownership changes must go via SetOwnership ring ops
         // (workers are live on their own threads — no direct owned_ writes).
+        runnersStarted_ = true;
+    }
+
+    // Shard mode (spec §3.1): one runner per ShardAgent.  Busy-spin ONLY when the
+    // worker is pinned to its own core; otherwise the backoff idle (§1a.3).
+    // Idempotent (no-op if runners are already started).
+    void startShardRunners(std::vector<std::unique_ptr<ShardAgent>>& agents,
+                           rune::consensus::NanoClock& clock,
+                           bool busySpin, int64_t maxParkUs) {
+        if (!runners_.empty()) return;
+        assert(agents.size() == workers_.size() && "one ShardAgent per worker");
+        idles_.reserve(agents.size());
+        runners_.reserve(agents.size());
+        for (auto& a : agents) {
+            if (busySpin) idles_.emplace_back(std::make_unique<rune::consensus::BusySpinIdleStrategy>());
+            else          idles_.emplace_back(makeBackoffIdle(maxParkUs));
+            runners_.emplace_back(std::make_unique<rune::consensus::AgentRunner>(*a, *idles_.back(), clock));
+            runners_.back()->start();
+        }
         runnersStarted_ = true;
     }
 

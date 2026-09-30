@@ -113,7 +113,7 @@ namespace rune::node {
 // read-rework SBE-B: the worker ring codec now uses the SBE-generated flyweights.
 namespace sbe = rune::protocol::internal::sbe;
 
-class Worker : public rune::consensus::Agent {
+class Worker final : public rune::consensus::Agent {
 public:
     // Non-owning pointer set published as an immutable snapshot.
     using OwnedSet = std::vector<rune::replication::PartitionReplica*>;
@@ -206,6 +206,10 @@ public:
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
+
+    // Self-contained worker shard (spec §3.1).  Set before the runner starts.
+    void setShardMode(bool on) noexcept { shardMode_ = on; }
+    [[nodiscard]] bool shardMode() const noexcept { return shardMode_; }
 
     // -----------------------------------------------------------------------
     // E5.1.2d: per-worker ingress produce path.
@@ -609,6 +613,8 @@ public:
             }
         }
 
+        if (shardMode_) return doWorkShard_(nowNs);
+
         // Step E3: reap async-durability completions from the IoBackend FIRST so
         // that completions from the previous cycle fire before the next produce
         // cycle's ops are processed.  Per-worker, no shared state.
@@ -726,6 +732,46 @@ public:
     }
 
 private:
+    // Shard pass order (spec §3.1 steps 3-6).  The ShardAgent already ran the
+    // driver (1) and client conductor (2).  Never blocks; never waits on another
+    // component (a full return ring is a non-blocking intake skip, spec §3.6).
+    int doWorkShard_(int64_t nowNs) {
+        int work = 0;
+        // 2b. runtime→worker ring first: ownership / role changes (and, Task 13,
+        //     session announcements) must be applied before the intake they govern.
+        work += static_cast<int>(drainIngress_());
+        // 3. client ingress → append (G-A6 gate unchanged).  A plane that refused a
+        //    mismatched peer (asymmetric worker count) stops serving new produce:
+        //    never accept records a split replication plane cannot replicate.
+        work += flushRetOverflow_();
+        if (!replPlaneRefused_ && retOverflow_.empty() &&
+            ret_.freeSlotsForMsgSize(ackSlotBytes_) > static_cast<int64_t>(pendingAcksAll_.size())) {
+            work += pollWorkerIngress_(nowNs);
+        }
+        work += submitCoalescedFlushes_();
+        // 4. replication on this worker's plane: apply inbound (inline, fast-acks),
+        //    then push / ISR / HW per owned replica.
+        if (replTransportCtx_) work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);
+        for (auto* replica : owned_) {
+            if (replica) work += replica->doWork(nowNs);
+        }
+        // 5. fire due produce acks.
+        work += flushOwedAcksAll_(nowNs);
+        // 6. reap durability completions.
+        work += reapDurableCompletions_();
+        // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
+        work += pushOwnedSubscriptions_(nowNs);
+        for (auto* replica : owned_) {
+            if (replica && replica->isDiskBacked()) {
+                work += replica->log()->drainCleanerSwaps();
+                work += replica->log()->drainRetentionDeletes();
+                work += replica->log()->drainStagingRenamesDone();
+            }
+        }
+        work += syncOwnedLogs_(nowNs);   // made asynchronous in Task 10
+        return work;
+    }
+
     // -----------------------------------------------------------------------
     // enqueueReturn_ — R3: encode a WorkerReturn into returnScratch_ and
     //                  write it to the ret_ OneToOneByteRing.
@@ -1882,7 +1928,11 @@ private:
         replTransportPollFn_ = [](void* ctx, int limit, Worker* self, int64_t nowNs) -> int
         {
             auto* t = static_cast<WorkerReplicationTransportImpl<T>*>(ctx);
-            return t->poll(
+            // Shard plane handshake (spec §3.3): one predicted branch unless a
+            // peer is still unverified; a refused peer stops this shard's intake.
+            int hs = t->driveHandshake(nowNs);
+            self->replPlaneRefused_ = t->planeRefused();
+            return hs + t->poll(
                 limit,
                 // Inner dispatch: also non-capturing → function pointer.
                 // GCC/Clang: a non-capturing lambda with a non-capturing
@@ -2163,6 +2213,8 @@ private:
     // -1 = disabled (default, no pinning).  Set via setCoreId() at startup,
     // before the AgentRunner starts.  Read-only at runtime (single writer).
     int  coreId_ = -1;
+    bool shardMode_ = false;   // spec §3.1: set before the runner starts, then read-only
+    bool replPlaneRefused_ = false;   // shard plane handshake refused a peer (worker-thread only)
 
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.
