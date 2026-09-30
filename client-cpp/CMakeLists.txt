@@ -355,7 +355,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/gen")
     add_custom_command(
         OUTPUT  "${CHARACTERS_GEN_H}"
-        COMMAND rune_codec_gen "${CHARACTERS_BLOB}" "${CHARACTERS_GEN_H}"
+        COMMAND $<TARGET_FILE:rune_codec_gen> "${CHARACTERS_BLOB}" "${CHARACTERS_GEN_H}"
         DEPENDS rune_codec_gen "${CHARACTERS_BLOB}"
         COMMENT "Task 13: generating characters.gen.h from characters.blob"
     )

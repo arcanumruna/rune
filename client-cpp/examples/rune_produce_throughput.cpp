@@ -202,11 +202,22 @@ int main() {
                     }
                 });
             }
+            // Window wait with a BACKOFF (spin → yield → short sleep), not a bare
+            // yield loop: on a shared box a yield-spinning load generator holds a
+            // scheduler slot the whole time the window is full, stealing CPU from the
+            // brokers it measures (strace: ~14k sched_yield/s).  A 20µs sleep is
+            // negligible against ms-scale ack round-trips.
+            auto waitUntil = [](auto&& ready) {
+                for (int n = 0; !ready(); ++n) {
+                    if (n < 64)      { /* spin */ }
+                    else if (n < 72) std::this_thread::yield();
+                    else             std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
+            };
             for (int64_t i = 0; i < nRecords; ++i) {
                 // bounded outstanding — backpressure like Kafka buffer.memory
                 const auto submitTs = clk::now();
-                while (static_cast<int64_t>(i - acked.load(std::memory_order_acquire)) >= window)
-                    std::this_thread::yield();
+                waitUntil([&]{ return static_cast<int64_t>(i - acked.load(std::memory_order_acquire)) < window; });
                 const auto sendTs = clk::now();
                 // Driver: window cleared → send.  value = µs SPENT waiting on the
                 // MIF window (ack starvation) — the driver's view of pipeline stall.
@@ -232,8 +243,7 @@ int main() {
                 sent.fetch_add(1, std::memory_order_release);
             }
             p.flush();
-            while (acked.load(std::memory_order_acquire) < static_cast<uint64_t>(nRecords))
-                std::this_thread::yield();
+            waitUntil([&]{ return acked.load(std::memory_order_acquire) >= static_cast<uint64_t>(nRecords); });
             progDone.store(true, std::memory_order_release);
             if (prog.joinable()) prog.join();
             const auto t1 = clk::now();
