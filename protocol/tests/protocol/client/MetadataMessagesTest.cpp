@@ -450,3 +450,75 @@ TEST(MetadataMessages, IsKnownTemplateBoundaries)
     EXPECT_FALSE(rpc::isKnownTemplate(10)) << "10 is still unassigned";
     EXPECT_FALSE(rpc::isKnownTemplate(15)) << "15 is still unassigned";
 }
+
+// ===========================================================================
+// 2026-09-30 self-contained worker shards: per-partition ingressEndpoint trailer.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> encodeResp(const std::vector<rpc::BrokerEntry>& brokers,
+                                const std::vector<rpc::PartitionEntry>& parts) {
+    rpc::MetadataResponse resp;
+    resp.sessionId = 5; resp.correlationId = 6;
+    resp.brokers    = std::span<const rpc::BrokerEntry>(brokers.data(), brokers.size());
+    resp.partitions = std::span<const rpc::PartitionEntry>(parts.data(), parts.size());
+    std::vector<uint8_t> buf(resp.encodedSize());
+    EXPECT_EQ(resp.encode(buf.data()), buf.size());
+    return buf;
+}
+} // namespace
+
+TEST(MetadataMessagesIngressEndpoint, RoundTripsPerPartitionEndpoints) {
+    rpc::BrokerEntry b; b.nodeId = 1; b.port = 40200; b.host = "10.0.0.1";
+    rpc::PartitionEntry p0; p0.topicId = 3; p0.partition = 0; p0.leaderId = 1; p0.ingressEndpoint = "10.0.0.1:40500";
+    rpc::PartitionEntry p1; p1.topicId = 3; p1.partition = 1; p1.leaderId = 1; p1.ingressEndpoint = "10.0.0.1:40501";
+    auto buf = encodeResp({b}, {p0, p1});
+    auto dec = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(dec.has_value());
+    ASSERT_EQ(dec->partitions.size(), 2u);
+    EXPECT_EQ(dec->partitions[0].ingressEndpoint, "10.0.0.1:40500");
+    EXPECT_EQ(dec->partitions[1].ingressEndpoint, "10.0.0.1:40501");
+    EXPECT_EQ(dec->partitions[1].partition, 1);
+}
+
+TEST(MetadataMessagesIngressEndpoint, EmptyEndpointsAreByteIdenticalToLegacyLayout) {
+    rpc::BrokerEntry b; b.nodeId = 1; b.port = 40200; b.host = "h";
+    rpc::PartitionEntry p; p.topicId = 1; p.leaderId = 1;
+    auto buf = encodeResp({b}, {p, p});
+    // header + brokerCount + (nodeId+port+hostLen+1) + partitionCount + 2*28, no trailer.
+    EXPECT_EQ(buf.size(), rpc::MessageHeader::ENCODED_SIZE + 2u + (4u + 4u + 2u + 1u) + 2u + 2u * 28u);
+    auto dec = rpc::MetadataResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(dec.has_value());
+    EXPECT_TRUE(dec->partitions[0].ingressEndpoint.empty());
+}
+
+TEST(MetadataMessagesIngressEndpoint, OlderDecoderIgnoresTrailer) {
+    rpc::PartitionEntry p; p.topicId = 9; p.partition = 2; p.leaderId = 4; p.ingressEndpoint = "h:1";
+    auto buf = encodeResp({}, {p});
+    // A pre-trailer decoder consumes exactly header + 2 + 2 + 28 bytes; decoding that
+    // prefix alone must succeed and yield identical fixed fields.
+    const std::size_t legacyLen = rpc::MessageHeader::ENCODED_SIZE + 2u + 2u + 28u;
+    ASSERT_GT(buf.size(), legacyLen);
+    auto dec = rpc::MetadataResponse::decode(buf.data(), legacyLen);
+    ASSERT_TRUE(dec.has_value());
+    EXPECT_EQ(dec->partitions[0].topicId, 9);
+    EXPECT_EQ(dec->partitions[0].partition, 2);
+    EXPECT_EQ(dec->partitions[0].leaderId, 4);
+    EXPECT_TRUE(dec->partitions[0].ingressEndpoint.empty());
+}
+
+TEST(MetadataMessagesIngressEndpointRegression, TornTrailerRejected) {
+    rpc::PartitionEntry p; p.ingressEndpoint = "host:40500";
+    auto buf = encodeResp({}, {p});
+    for (std::size_t cut = 1; cut <= 12; ++cut) {
+        EXPECT_FALSE(rpc::MetadataResponse::decode(buf.data(), buf.size() - cut).has_value())
+            << "cut=" << cut;
+    }
+}
+
+TEST(MetadataMessagesIngressEndpointRegression, TrailerCountMismatchRejected) {
+    rpc::PartitionEntry p; p.ingressEndpoint = "host:1";
+    auto buf = encodeResp({}, {p});
+    const std::size_t trailerPos = rpc::MessageHeader::ENCODED_SIZE + 2u + 2u + 28u;
+    buf[trailerPos] = 2;   // claims 2 endpoints for 1 partition
+    EXPECT_FALSE(rpc::MetadataResponse::decode(buf.data(), buf.size()).has_value());
+}

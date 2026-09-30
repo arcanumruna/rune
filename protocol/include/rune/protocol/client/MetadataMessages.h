@@ -36,6 +36,11 @@
 //   [after count]
 //             partitions[]:  (each entry = fixed 20 bytes)
 //               topicId(4) + partition(4) + leaderId(4) + leaderEpoch(4) + ingressStreamId(4)
+//   [after partitions] optional trailer: uint16 endpointCount; endpointCount ×
+//               (uint16 len + host:port bytes).  Present only when at least one
+//               partition's ingressEndpoint is non-empty (2026-09-30 self-contained
+//               worker shards); absent for default-config frames, and ignored by
+//               older decoders that stop reading after partitions[].
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
@@ -172,6 +177,12 @@ struct PartitionEntry {
     int32_t ingressStreamId  = 0;  ///< E5.1: Aeron stream id for per-worker ingress.
     int32_t egressControlPort = 0; ///< per-worker dynamic-MDC control port (0=off).
     int32_t egressStreamId   = 0;  ///< per-worker egress stream id (0=off).
+
+    /// 2026-09-30 (self-contained worker shards): "host:port" of the owning worker's
+    /// client-ingress endpoint on the leader.  EMPTY = use the node endpoint
+    /// (BrokerEntry host + port).  Carried in an additive trailer after partitions[];
+    /// on decode a zero-copy view into the frame buffer.
+    std::string_view ingressEndpoint;
 };
 
 // ---------------------------------------------------------------------------
@@ -190,6 +201,14 @@ struct MetadataResponse {
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::MetadataResponse); // 9
     static constexpr uint16_t BODY_FIXED  = 0;
+
+    /// True when at least one partition carries a non-empty ingressEndpoint.
+    /// Gates whether encode()/encodedSize() emit the additive trailer, so
+    /// default-config frames (no per-worker ingress) stay byte-identical.
+    [[nodiscard]] bool hasIngressEndpoints() const noexcept {
+        for (const auto& p : partitions) if (!p.ingressEndpoint.empty()) return true;
+        return false;
+    }
 
     // ---- Encode into buf.
     //
@@ -247,6 +266,14 @@ struct MetadataResponse {
             detail::putLE32(buf, static_cast<int>(pos) + 24, p.egressStreamId);    // read-rework
             pos += 28;
         }
+
+        // Additive trailer: uint16 count (== partitions.size()) + var-str per entry.
+        // Written only when some endpoint is non-empty → default frames unchanged.
+        if (hasIngressEndpoints()) {
+            detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
+            pos += 2;
+            for (const auto& p : partitions) pos += putVarStr(buf + pos, p.ingressEndpoint);
+        }
         return pos;
     }
 
@@ -259,6 +286,10 @@ struct MetadataResponse {
         }
         sz += 2u;              // partitionCount
         sz += partitions.size() * 28u;  // read-rework: 28 bytes/entry (E5.1 was 20)
+        if (hasIngressEndpoints()) {
+            sz += 2u;
+            for (const auto& p : partitions) sz += 2u + p.ingressEndpoint.size();
+        }
         return sz;
     }
 
@@ -323,6 +354,17 @@ struct MetadataResponse {
             p.egressStreamId   = detail::getLE32(buf, static_cast<int>(pos) + 24);  // read-rework
             pos += 28;
             result.partitions.push_back(p);
+        }
+
+        // Optional trailer (brokers that advertise per-worker ingress endpoints).
+        if (pos == avail) return result;                 // absent: older broker / default config
+        if (pos + 2u > avail) return std::nullopt;       // torn trailer header
+        const uint16_t epCount = detail::getLE16(buf, static_cast<int>(pos));
+        pos += 2;
+        if (epCount != partCount) return std::nullopt;   // must parallel partitions[]
+        for (uint16_t i = 0; i < epCount; ++i) {
+            if (!getVarStr(buf, avail, pos, result.partitions[i].ingressEndpoint))
+                return std::nullopt;
         }
         return result;
     }
