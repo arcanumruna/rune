@@ -204,4 +204,27 @@ TEST(RingSbe, ProduceNotifyReturnTypeRoundTrips) {
     EXPECT_EQ(dec.batchAttrs(), 0x10);
 }
 
+TEST(RingSbe, TestTaskOpCarriesOpaquePointersRegression) {
+    // F1: test-only owner-thread hook.  TEST_TASK must round-trip through the
+    // generated enum decoder (an unknown value would throw E103) and carry the
+    // replica + task pointers in the replica / egressPub uint64 slots.
+    std::array<char, 512> buf{};
+    sbe::WorkerOp enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.opType(sbe::OpType::Value::TEST_TASK)
+       .topicId(3)
+       .partition(1)
+       .replica(0x1122334455667788ULL)
+       .egressPub(0x0102030405060708ULL)
+       .tailKind(sbe::TailKind::Value::NONE);
+    enc.putTail(nullptr, 0);
+    auto dec = decodeAt<sbe::WorkerOp>(buf.data(), buf.size());
+    EXPECT_EQ(dec.opType(), sbe::OpType::Value::TEST_TASK);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::TEST_TASK), 200);
+    EXPECT_EQ(dec.topicId(), 3);
+    EXPECT_EQ(dec.partition(), 1);
+    EXPECT_EQ(dec.replica(), 0x1122334455667788ULL);
+    EXPECT_EQ(dec.egressPub(), 0x0102030405060708ULL);
+}
+
 } // namespace

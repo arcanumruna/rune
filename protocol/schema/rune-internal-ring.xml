@@ -60,6 +60,13 @@
            SESSION_CLOSE: sessionId; the worker drops the session and its queued acks. -->
       <validValue name="SESSION_ANNOUNCE">13</validValue>
       <validValue name="SESSION_CLOSE">14</validValue>
+      <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
+           runtime -> owning worker: run a test-owned task (opaque in-process
+           pointer carried in the egressPub uint64 slot) against the replica
+           (replica field) on the worker's OWN thread.  Cold branch; never sent
+           by production code.  Value 200 = out of the production op range so
+           future production ops keep the dense 0..N numbering. -->
+      <validValue name="TEST_TASK">200</validValue>
     </enum>
 
     <!-- Which variable field the tail holds (matches TailKind in WorkerWire.h). -->
