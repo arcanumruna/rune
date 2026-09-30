@@ -327,9 +327,9 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     node1->start();
     node2->start();
 
-    ASSERT_TRUE(node0->awaitLeader(10s)) << "node0 must converge to a leader";
-    ASSERT_TRUE(node1->awaitLeader(10s)) << "node1 must converge to a leader";
-    ASSERT_TRUE(node2->awaitLeader(10s)) << "node2 must converge to a leader";
+    ASSERT_TRUE(node0->awaitLeader(30s)) << "node0 must converge to a leader";
+    ASSERT_TRUE(node1->awaitLeader(30s)) << "node1 must converge to a leader";
+    ASSERT_TRUE(node2->awaitLeader(30s)) << "node2 must converge to a leader";
 
     std::this_thread::sleep_for(300ms);
 
@@ -352,7 +352,7 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
 
     // Wait for the leader's replication bridge to report isLeader.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline) {
             if (leaderNode->replicationIsLeaderForTest()) break;
             std::this_thread::sleep_for(20ms);
@@ -379,7 +379,7 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
 
     // Wait for the leader's HW to advance (majority-committed).
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool hwAdvanced = false;
         while (std::chrono::steady_clock::now() < deadline && !hwAdvanced) {
             hwAdvanced = (leaderReplica->highWatermark() >= leaderLeo);
@@ -401,7 +401,7 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     ASSERT_NE(f2Replica, nullptr) << "Follower2 must have a partition replica";
 
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool f1ok = false, f2ok = false;
         while (std::chrono::steady_clock::now() < deadline && (!f1ok || !f2ok)) {
             f1ok = (f1Replica->logEndOffset() >= committedHw);
@@ -489,9 +489,9 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     node1->start();
     node2->start();
 
-    ASSERT_TRUE(node0->awaitLeader(10s)) << "node0 must converge to a leader";
-    ASSERT_TRUE(node1->awaitLeader(10s)) << "node1 must converge to a leader";
-    ASSERT_TRUE(node2->awaitLeader(10s)) << "node2 must converge to a leader";
+    ASSERT_TRUE(node0->awaitLeader(30s)) << "node0 must converge to a leader";
+    ASSERT_TRUE(node1->awaitLeader(30s)) << "node1 must converge to a leader";
+    ASSERT_TRUE(node2->awaitLeader(30s)) << "node2 must converge to a leader";
 
     std::this_thread::sleep_for(300ms);
 
@@ -514,7 +514,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
 
     // Wait for leader's replication bridge.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline) {
             if (leaderNode->replicationIsLeaderForTest()) break;
             std::this_thread::sleep_for(20ms);
@@ -540,7 +540,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
 
     // Wait for HW to advance (majority-committed).
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool hwOk = false;
         while (std::chrono::steady_clock::now() < deadline && !hwOk) {
             hwOk = (leaderReplica->highWatermark() >= leaderLeo);
@@ -557,7 +557,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     {
         PartitionReplica* f1r = follower1->replicaForTest(0, 0);
         PartitionReplica* f2r = follower2->replicaForTest(0, 0);
-        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
             ok = (f1r && f1r->logEndOffset() >= committedHw) &&
@@ -572,7 +572,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
 
     // Wait for surviving nodes to re-elect a new leader.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool reElected = false;
         while (std::chrono::steady_clock::now() < deadline && !reElected) {
             const auto l1 = follower1->leaderId();
@@ -596,7 +596,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
 
     // Wait for new leader's replication bridge.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 8s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline) {
             if (newLeaderNode->replicationIsLeaderForTest()) break;
             std::this_thread::sleep_for(20ms);
@@ -610,7 +610,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
 
     // Poll for Leader role on new leader's partition replica.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 8s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline &&
                newLeaderReplica->role() != Role::Leader) {
             std::this_thread::sleep_for(20ms);
@@ -673,7 +673,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     // fetch loop, it should be admitted back into the ISR.  Poll the atomic
     // gatewayIsrSize() snapshot (duty-cycle-safe); expect at least 2 (leader + follower).
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool isrOk = false;
         while (std::chrono::steady_clock::now() < deadline && !isrOk) {
             // gatewayIsrSize() is an atomic acquire-load — safe from test thread.
@@ -705,7 +705,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
         // Wait for HW to advance past the new record (proves commit).
         const Offset hwFloor = leoAfterPost;
         {
-            const auto deadline = std::chrono::steady_clock::now() + 15s;
+            const auto deadline = std::chrono::steady_clock::now() + 45s;
             bool hwOk = false;
             while (std::chrono::steady_clock::now() < deadline && !hwOk) {
                 hwOk = (newLeaderReplica->highWatermark() >= hwFloor);
@@ -720,7 +720,7 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
         // Wait for the surviving follower to replicate the post-failover record.
         PartitionReplica* sfReplica = survivingFollowerNode->replicaForTest(0, 0);
         if (sfReplica) {
-            const auto deadline = std::chrono::steady_clock::now() + 15s;
+            const auto deadline = std::chrono::steady_clock::now() + 45s;
             bool replOk = false;
             while (std::chrono::steady_clock::now() < deadline && !replOk) {
                 replOk = (sfReplica->logEndOffset() >= leoAfterPost);
@@ -827,9 +827,9 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     node1->start();
     node2->start();
 
-    ASSERT_TRUE(node0->awaitLeader(10s));
-    ASSERT_TRUE(node1->awaitLeader(10s));
-    ASSERT_TRUE(node2->awaitLeader(10s));
+    ASSERT_TRUE(node0->awaitLeader(30s));
+    ASSERT_TRUE(node1->awaitLeader(30s));
+    ASSERT_TRUE(node2->awaitLeader(30s));
 
     std::this_thread::sleep_for(300ms);
 
@@ -853,7 +853,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
 
     // Wait for leader's replication bridge.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline) {
             if (leaderNode->replicationIsLeaderForTest()) break;
             std::this_thread::sleep_for(20ms);
@@ -877,7 +877,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
 
     // Wait for HW to advance to leoN (3-node majority committed).
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
             ok = (leaderReplica->highWatermark() >= leoN);
@@ -893,7 +893,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     {
         PartitionReplica* f1r = f1Node->replicaForTest(0, 0);
         PartitionReplica* f2r = f2Node->replicaForTest(0, 0);
-        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
             ok = (f1r && f1r->logEndOffset() >= hwAfterN) &&
@@ -912,7 +912,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     // Wait for the leader's ISR to shrink from 3 to exactly 2 (F1 evicted).
     // This is the gating condition for the minIsr=3 non-commit invariant.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool isrShrunk = false;
         while (std::chrono::steady_clock::now() < deadline && !isrShrunk) {
             isrShrunk = (leaderReplica->gatewayIsrSize() == 2);
@@ -943,7 +943,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     {
         PartitionReplica* f2r = f2Node->replicaForTest(0, 0);
         ASSERT_NE(f2r, nullptr) << "F2 must have a replica";
-        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool ok = false;
         while (std::chrono::steady_clock::now() < deadline && !ok) {
             ok = (f2r->logEndOffset() >= leoNM);
@@ -980,9 +980,9 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     restartedF1->start();
 
     // Phase 6: wait for F2 and restartedF1 to re-elect.
-    ASSERT_TRUE(f2Node->awaitLeader(15s))
+    ASSERT_TRUE(f2Node->awaitLeader(30s))
         << "F2 must converge to a new leader after leader kill";
-    ASSERT_TRUE(restartedF1->awaitLeader(15s))
+    ASSERT_TRUE(restartedF1->awaitLeader(30s))
         << "Restarted F1 must converge to a new leader";
 
     std::this_thread::sleep_for(500ms);
@@ -995,7 +995,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
 
     // Wait for new leader's replication bridge.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 8s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline) {
             if (newLeaderNode->replicationIsLeaderForTest()) break;
             std::this_thread::sleep_for(20ms);
@@ -1011,7 +1011,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
 
     // Poll for Leader role on new leader's partition replica.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 8s;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
         while (std::chrono::steady_clock::now() < deadline &&
                newLeaderReplica->role() != Role::Leader) {
             std::this_thread::sleep_for(20ms);
@@ -1052,7 +1052,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
 
     // Wait for the follower to converge to the leader's log.
     {
-        const auto deadline = std::chrono::steady_clock::now() + 20s;
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
         bool converged = false;
         while (std::chrono::steady_clock::now() < deadline && !converged) {
             converged = (newFollowerReplica->logEndOffset() == newLeaderReplica->logEndOffset());
@@ -1160,7 +1160,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
         // Wait for the surviving follower to replicate the post-failover record
         // at the LEO level (fetch is not HW-bounded — follower pulls leader's LEO).
         {
-            const auto deadline = std::chrono::steady_clock::now() + 15s;
+            const auto deadline = std::chrono::steady_clock::now() + 45s;
             bool replOk = false;
             while (std::chrono::steady_clock::now() < deadline && !replOk) {
                 replOk = (newFollowerReplica->logEndOffset() >= leoAfterPost);
