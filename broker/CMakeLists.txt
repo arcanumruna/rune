@@ -74,6 +74,18 @@ if(BUILD_TESTING)
     enable_testing()
 endif()
 
+# gtest_discover_tests() defaults to running each test binary with
+# --gtest_list_tests at BUILD time, under a hardcoded 5s DISCOVERY_TIMEOUT.
+# Under load (e.g. two large builds running in parallel on the same box),
+# that listing step can exceed 5s and fail the whole build even though the
+# binary itself is fine — seen on rune_per_worker_replication_integration_tests
+# and rune_gateway_psm_failover_tests (idle machine: both list in <1s).
+# Setting DISCOVERY_MODE to PRE_TEST here, before any add_subdirectory() that
+# calls gtest_discover_tests(), moves discovery to `ctest` invocation time
+# instead of build time for every call below (none pass DISCOVERY_MODE
+# explicitly), so machine load at build time can never fail the build.
+set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)
