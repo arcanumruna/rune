@@ -87,6 +87,32 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_worker_replication_validator_tests)
 
     # ---------------------------------------------------------------------------
+    # E5 Task 5: PerWorkerReplicationWiring unit tests — BrokerNode wiring logic.
+    #
+    # Tests:
+    #   1. FlagOffUsesLegacyTransportForAll — zero planes; legacy for all.
+    #   2. FlagOnUserPartsOnPlanesInternalOnLegacy — W planes; user→plane; internal→legacy.
+    #   3. *Regression*: MismatchedPeerWorkerCountRefusesStart — THROWS.
+    #   4. *Regression*: UnresolvedPlaneAbortsStart — THROWS.
+    #   5. SingleNodeNoPeersSkipsPlaneConstruction — no planes on single-node.
+    #   6. WorkerReplicationTransportPointerRoundTrip — pointer type compiles.
+    #
+    # Test seam: FakePubRegistry (inline) injected via WorkerReplicationTransportImpl<>.
+    # WorkerReplicationTransport.h includes Aeron headers → gated behind aeron_FOUND.
+    # No Aeron driver started, no filesystem, no network.
+    # ---------------------------------------------------------------------------
+    if(aeron_FOUND)
+        add_executable(rune_per_worker_replication_wiring_tests
+            tests/node/PerWorkerReplicationWiringTest.cpp)
+        target_link_libraries(rune_per_worker_replication_wiring_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_per_worker_replication_wiring_tests)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # E5 Task 3: WorkerReplicationTransport unit tests — send path (per-worker
     # sub + per-peer pubs, direct-claim encode).
     #

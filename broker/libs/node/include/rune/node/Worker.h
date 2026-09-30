@@ -77,6 +77,7 @@
 #include <rune_protocol_internal_sbe/TailKind.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
+#include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
@@ -224,6 +225,19 @@ public:
     // -----------------------------------------------------------------------
     void setWorkerEgress(WorkerEgress* egress) noexcept { workerEgress_ = egress; }
     [[nodiscard]] WorkerEgress* workerEgress() const noexcept { return workerEgress_; }
+
+    // -----------------------------------------------------------------------
+    // E5 Task 5: wire this worker's per-worker replication transport.
+    // Non-owning: BrokerNode owns the WorkerReplicationTransport lifetime.
+    // Must be called BEFORE the worker's AgentRunner starts.
+    // Task 6 will drive poll() from doWork; for now only stores the pointer.
+    // -----------------------------------------------------------------------
+    void setReplicationTransport(WorkerReplicationTransport* transport) noexcept {
+        workerReplTransport_ = transport;
+    }
+    [[nodiscard]] WorkerReplicationTransport* replicationTransport() const noexcept {
+        return workerReplTransport_;
+    }
 
     // -----------------------------------------------------------------------
     // read-rework T3/T4: worker-local subscription cursor (shared-nothing).
@@ -1887,6 +1901,12 @@ private:
     // publication.  Null until setWorkerEgress() is called.  The worker thread is
     // the SOLE writer (shared-nothing); the control thread never touches it.
     WorkerEgress* workerEgress_ = nullptr;
+
+    // E5 Task 5: non-owning pointer to this worker's per-worker replication
+    // transport.  Null until setReplicationTransport() is called.
+    // BrokerNode owns the WorkerReplicationTransport lifetime.
+    // Task 6 will poll this from doWork; for Task 5 it is stored only.
+    WorkerReplicationTransport* workerReplTransport_ = nullptr;
 
     // read-rework T3/T4: worker-local subscription cursors.  Worker-thread-only;
     // Subscribe/Unsubscribe ring ops mutate it, the I3 push loop iterates it.

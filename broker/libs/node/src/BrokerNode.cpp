@@ -7,6 +7,7 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -367,6 +368,43 @@ void BrokerNode::buildReplication() {
     }
 
     // -----------------------------------------------------------------------
+    // E5 Task 5: per-worker replication — pre-flight validation.
+    //
+    // Hard-refuse to start with invalid config when perWorkerReplication=true:
+    //   (a) Stream range collision: replBaseStreamId range must not overlap
+    //       client/consensus/workerIngress/workerEgress ranges.
+    //   (b) Asymmetric worker count: every peer that has advertised a worker count
+    //       must match this node's count; partial-knowledge peers (wc==0) are
+    //       tolerated (they will be re-checked on membership change).
+    //
+    // Neither validation requires aeron_ to be live; they gate the hard invariants
+    // that cannot be safely recovered from at runtime (stream collision = silent
+    // message loss; asymmetric W = split replication planes).
+    // -----------------------------------------------------------------------
+    if (config_.perWorkerReplication) {
+        if (auto err = config_.validateStreamRanges(); err.has_value()) {
+            throw std::runtime_error(
+                "BrokerNode[" + std::to_string(config_.nodeId) +
+                "]: per-worker replication stream range collision — " + *err);
+        }
+
+        // Build (nodeId, workerCount) peer list for symmetric-count check.
+        std::vector<std::pair<int32_t, int32_t>> wPeers;
+        wPeers.reserve(config_.peers.size());
+        for (const auto& p : config_.peers) {
+            if (p.id == config_.nodeId) continue;   // skip self
+            if (p.workerCount != 0)                 // 0 = not yet advertised
+                wPeers.push_back({p.id, p.workerCount});
+        }
+        auto wCheck = validateSymmetricWorkerCount(config_.workerCount, wPeers);
+        if (!wCheck.ok) {
+            throw std::runtime_error(
+                "BrokerNode[" + std::to_string(config_.nodeId) +
+                "]: per-worker replication refused — " + wCheck.error);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Build replTransport_ — AeronPartitionTransport (requires aeron_).
     // Only constructed when this node has a replication port configured.
     // Built FIRST so we have the transport pointer ready for replica construction.
@@ -413,6 +451,71 @@ void BrokerNode::buildReplication() {
     }
 
     // -----------------------------------------------------------------------
+    // E5 Task 5: per-worker replication transports.
+    //
+    // When perWorkerReplication is true AND aeron_ is live AND there are
+    // replication peers, construct one WorkerReplicationTransport per worker.
+    // Each transport W subscribes on stream (replBaseStreamId + W) and publishes
+    // to each peer's replication channel on the same stream offset.
+    //
+    // Single-node / no-peers: skip — nothing to replicate, and the brief
+    // explicitly says "do NOT build per-worker planes" when peers is empty
+    // (WorkerReplicationTransport::allResolved() returns false on empty peers).
+    //
+    // Hard-refuse if any transport fails to resolve: a half-wired replication
+    // plane silently drops messages for the partitions assigned to that worker.
+    // -----------------------------------------------------------------------
+    if (config_.perWorkerReplication && aeron_) {
+        // Collect (peerId, peerChannel) pairs for all peers with a replication port.
+        std::vector<std::pair<rune::replication::NodeId, std::string>> replPeers;
+        replPeers.reserve(config_.peers.size());
+        for (const auto& peer : config_.peers) {
+            if (peer.id == config_.nodeId) continue;
+            if (peer.replicationPort == 0) continue;
+            replPeers.push_back({
+                static_cast<rune::replication::NodeId>(peer.id),
+                peer.replicationChannel()
+            });
+        }
+
+        if (!replPeers.empty()) {
+            const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+            const std::string& inboundChannel = selfPeer.replicationChannel();
+            if (inboundChannel.empty()) {
+                spdlog::warn("BrokerNode[{}]: perWorkerReplication=true but self has no "
+                             "replicationPort — per-worker transports skipped",
+                             config_.nodeId);
+            } else {
+                perWorkerReplTransports_.reserve(static_cast<std::size_t>(wc));
+                for (int32_t w = 0; w < wc; ++w) {
+                    const int32_t streamId = config_.replBaseStreamId + w;
+                    auto t = std::make_unique<WorkerReplicationTransport>(
+                        aeron_, w, inboundChannel, streamId, replPeers, streamId);
+                    if (!t->resolved()) {
+                        // Hard-refuse: partial plane = silent message loss for the
+                        // partitions assigned to worker w.
+                        throw std::runtime_error(
+                            "BrokerNode[" + std::to_string(config_.nodeId) +
+                            "]: per-worker replication transport for worker " +
+                            std::to_string(w) + " did not resolve within 5s "
+                            "(stream=" + std::to_string(streamId) + ") — "
+                            "refusing to start with a half-wired plane");
+                    }
+                    perWorkerReplTransports_.push_back(std::move(t));
+                }
+                spdlog::info("BrokerNode[{}]: {} per-worker replication transport(s) built "
+                             "(replBaseStreamId={}, {} peer(s))",
+                             config_.nodeId, wc, config_.replBaseStreamId,
+                             replPeers.size());
+            }
+        } else {
+            spdlog::info("BrokerNode[{}]: perWorkerReplication=true but no replication peers — "
+                         "per-worker planes skipped (single-node or no peer repl ports)",
+                         config_.nodeId);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Build replicaRegistry_ — one PartitionReplica per (topicId, partition).
     // Each replica shares the Log* from topicRegistry_ (non-owning).
     // Initial role: Follower / epoch 0 (bridge will set correct role on first cycle).
@@ -423,6 +526,27 @@ void BrokerNode::buildReplication() {
     // is available.  This avoids the PartitionReplica assert(transport != nullptr).
     // -----------------------------------------------------------------------
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
+
+    // E5 Task 5: build a local ShardRouter for per-worker transport selection
+    // when per-worker planes are available.  Mirrors buildWorkerPool() exactly
+    // so the transport assignment matches the worker's owned shard set.
+    // Only constructed when we have planes to route to.
+    std::optional<rune::metadata::ShardRouter> replRouter;
+    if (!perWorkerReplTransports_.empty()) {
+        const int32_t wc = static_cast<int32_t>(perWorkerReplTransports_.size());
+        std::set<std::string> groups;
+        for (const auto& ts : config_.topics)
+            if (!ts.coPartitionGroup.empty()) groups.insert(ts.coPartitionGroup);
+        std::unordered_map<std::string, int32_t> groupKey;
+        int32_t nextGk = -1;
+        for (const auto& g : groups) groupKey[g] = nextGk--;
+        rune::metadata::ShardRouter sr(wc);
+        for (const auto& ts : config_.topics) {
+            if (!ts.coPartitionGroup.empty())
+                sr.mapTopicToGroupKey(ts.topicId, groupKey[ts.coPartitionGroup]);
+        }
+        replRouter = std::move(sr);
+    }
 
     const int32_t topicCount = topicRegistry_->topicCount();
     for (int32_t topicId = 0; topicId < topicCount; ++topicId) {
@@ -505,14 +629,36 @@ void BrokerNode::buildReplication() {
             // E3 Task 5: forward async-durability tier (0=Leader, 1=Majority, 2=Strict).
             pcfg.durabilityTier = spec->durabilityTier;
 
-            // Determine the transport: real Aeron transport if available,
-            // otherwise a per-replica InMemoryTransport (no-op: no peers wired).
-            PartitionTransport* transport = replTransport_.get();
-            if (!transport) {
-                // Allocate a no-op InMemoryTransport owned by the replica registry.
-                // InMemoryTransport with no registered leader/follower drops all frames.
-                nullTransports_.push_back(std::make_unique<InMemoryTransport>());
-                transport = nullTransports_.back().get();
+            // Determine the transport:
+            //
+            //   E5 Task 5 routing rules:
+            //   1. topicId < 0 (internal: __consumer_offsets=-1, __transaction_state=-2,
+            //      __cluster_metadata=-3, __topic_schemas=-4):
+            //      ALWAYS the legacy replTransport_ regardless of flag.
+            //      Rationale: per-worker planes are worker-thread-only; internal
+            //      partitions are driven on the control thread by the bridge/services.
+            //
+            //   2. topicId >= 0 AND per-worker planes were built:
+            //      Use the plane for the worker that owns this (topicId, partition).
+            //      Transport selection is pure (deterministic ShardRouter hash) and
+            //      matches the worker's owned shard set exactly.
+            //
+            //   3. Flag off, or no planes built (no peers / no aeron_):
+            //      Legacy replTransport_ exactly as before (flag-off path unchanged).
+            PartitionTransport* transport = nullptr;
+            if (topicId >= 0 && !perWorkerReplTransports_.empty() && replRouter) {
+                // E5 Task 5: per-worker transport for user partitions.
+                const int32_t workerIdx = replRouter->workerForPartition(topicId, part);
+                transport = perWorkerReplTransports_[static_cast<std::size_t>(workerIdx)].get();
+            } else {
+                // Legacy path: real Aeron transport if available, else no-op.
+                transport = replTransport_.get();
+                if (!transport) {
+                    // Allocate a no-op InMemoryTransport owned by the replica registry.
+                    // InMemoryTransport with no registered leader/follower drops all frames.
+                    nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+                    transport = nullTransports_.back().get();
+                }
             }
 
             // De-virtualized seam (Milestone D P2): dispatch to the matching
@@ -529,7 +675,18 @@ void BrokerNode::buildReplication() {
                 // DR-BUG-5: register with composite (topicId, partitionId) key so
                 // replicas from different topics with the same partition index do not
                 // collide in the transport routing table.
-                replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
+                //
+                // E5 Task 5: when per-worker planes are live, user (topicId>=0) replicas
+                // are routed through per-worker transports — do NOT register them with
+                // the legacy transport's routing table (that would cause the control
+                // thread's AeronPartitionTransport::poll to dispatch to them, which
+                // violates shared-nothing: only the worker thread should drive them).
+                // Internal (topicId<0) replicas ALWAYS stay on the legacy transport.
+                const bool onPerWorkerPlane =
+                    (topicId >= 0 && !perWorkerReplTransports_.empty());
+                if (!onPerWorkerPlane) {
+                    replTransport_->registerReplica(topicId, replica->partitionId(), replica.get());
+                }
             }
 
             replicaRegistry_->add(topicId, part, std::move(replica));
@@ -859,6 +1016,29 @@ void BrokerNode::buildWorkerPool() {
         spdlog::warn("BrokerNode[{}]: RUNE_PER_WORKER_EGRESS=true but aeron_ is null — "
                      "per-worker egress NOT activated (no embedded driver)",
                      config_.nodeId);
+    }
+
+    // -----------------------------------------------------------------------
+    // E5 Task 5: wire each worker's per-worker replication transport.
+    //
+    // perWorkerReplTransports_ is populated by buildReplication() when
+    // perWorkerReplication=true && aeron_ && there are replication peers.
+    // At this point the workers' AgentRunners have NOT yet started, so it is
+    // safe to call setReplicationTransport (startup / single-threaded path).
+    //
+    // Non-owning: BrokerNode owns the WorkerReplicationTransport lifetime;
+    // workers hold raw pointers.  Task 6 will drive poll() from doWork;
+    // for this task the pointer is just stored on the worker.
+    // -----------------------------------------------------------------------
+    if (!perWorkerReplTransports_.empty()) {
+        const std::size_t planeCount = perWorkerReplTransports_.size();
+        for (int32_t i = 0; i < wc; ++i) {
+            const std::size_t idx = static_cast<std::size_t>(i) % planeCount;
+            workerPool_->worker(i).setReplicationTransport(
+                perWorkerReplTransports_[idx].get());
+        }
+        spdlog::info("BrokerNode[{}]: per-worker replication transport wired to {} worker(s)",
+                     config_.nodeId, wc);
     }
 
     spdlog::info("BrokerNode[{}]: WorkerPool built ({} workers, {} replicas assigned)",

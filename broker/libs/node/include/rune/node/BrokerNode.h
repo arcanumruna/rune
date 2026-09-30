@@ -33,6 +33,8 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
+#include <rune/node/WorkerReplicationTransport.h>
+#include <rune/node/WorkerReplicationValidator.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
@@ -369,6 +371,12 @@ public:
         return workerEgresses_;
     }
 
+    /// E5 Task 5 test-only: number of per-worker replication planes constructed
+    /// in buildReplication() (0 when flag off or no peers).
+    [[nodiscard]] std::size_t perWorkerPlanesConstructedForTest() const noexcept {
+        return perWorkerReplTransports_.size();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Helpers
@@ -566,6 +574,14 @@ private:
     // when perWorkerIngressEnabled && aeron_.  Owned here; workers hold non-owning
     // raw pointers (via setWorkerEgress).  Empty otherwise.
     std::vector<std::unique_ptr<WorkerEgress>> workerEgresses_;
+
+    // E5 Task 5: per-worker replication transports.
+    // One WorkerReplicationTransport per worker when perWorkerReplication && aeron_
+    // AND there are replication peers (non-empty peer list).  Owned here; workers
+    // hold non-owning pointers (via setReplicationTransport).  Empty otherwise.
+    // Worker W uses perWorkerReplTransports_[W] for user (topicId>=0) partitions.
+    // Internal partitions (topicId<0) always use the legacy replTransport_.
+    std::vector<std::unique_ptr<WorkerReplicationTransport>> perWorkerReplTransports_;
 
     // Composite agent: wraps inner consensus agent + gateway + replication (single-writer).
     std::unique_ptr<NodeRuntimeAgent> runtimeAgent_;
