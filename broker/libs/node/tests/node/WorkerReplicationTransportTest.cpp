@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -899,12 +900,27 @@ TEST(WorkerReplicationTransportRegression, BackToBackPollsDoNotAliasRecords)
     const std::vector<uint8_t> records1(1024, 0xAA);
     const std::vector<uint8_t> records2(1024, 0xBB);
 
-    // Single backing buffer — the Aeron term-buffer stand-in.  Both frames
-    // will occupy the SAME memory at different points in time.
-    std::vector<uint8_t> sharedBuf;
+    const auto frame1 = makeFetchResponseFrame(/*partition=*/5, /*topicId=*/0, records1);
+    const auto frame2 = makeFetchResponseFrame(/*partition=*/6, /*topicId=*/0, records2);
 
-    // --- Frame 1 (0xAA) --- encode into sharedBuf, inject as a raw view.
-    sharedBuf = makeFetchResponseFrame(/*partition=*/5, /*topicId=*/0, records1);
+    // Single backing buffer — the Aeron term-buffer stand-in.  Both frames
+    // will occupy the SAME memory (same allocation, same address) at different
+    // points in time.  We reserve up front so subsequent resize() never
+    // reallocates, and overwrite the bytes IN PLACE via memcpy.
+    //
+    // This is essential to the guard: a move-assign from a temporary (e.g.
+    // `sharedBuf = makeFetchResponseFrame(...)`) would FREE the old block and
+    // swap in a fresh allocation at a DIFFERENT address — a stale pointer would
+    // then dangle into freed memory (UB), not deterministically read 0xBB, and
+    // the test would be vacuous.  In-place overwrite keeps the address stable so
+    // a deferred read reliably observes frame2's 0xBB bytes.
+    std::vector<uint8_t> sharedBuf;
+    sharedBuf.reserve(std::max(frame1.size(), frame2.size()));
+
+    // --- Frame 1 (0xAA) --- write into sharedBuf IN PLACE, inject as a raw view.
+    sharedBuf.resize(frame1.size());
+    std::memcpy(sharedBuf.data(), frame1.data(), frame1.size());
+    const uint8_t* const backingAddr = sharedBuf.data();  // stable across the test
     h.transport->injectFrameViewForTest(sharedBuf.data(), sharedBuf.size());
 
     uint8_t     firstByte1 = 0;
@@ -929,10 +945,14 @@ TEST(WorkerReplicationTransportRegression, BackToBackPollsDoNotAliasRecords)
         << "first poll must see 0xAA; failure here = dispatch read the pointer "
            "AFTER sharedBuf was overwritten (aliasing bug)";
 
-    // Overwrite sharedBuf with frame2 (0xBB) — this simulates the Aeron driver
-    // reusing the term-buffer slot for the next frame.  Any stale pointer from
-    // the first poll now points to frame2 bytes.
-    sharedBuf = makeFetchResponseFrame(/*partition=*/6, /*topicId=*/0, records2);
+    // Overwrite sharedBuf with frame2 (0xBB) IN PLACE — same allocation, same
+    // address — simulating the Aeron driver reusing the term-buffer slot for the
+    // next frame.  A stale pointer from the first poll now reads frame2's bytes.
+    sharedBuf.resize(frame2.size());
+    std::memcpy(sharedBuf.data(), frame2.data(), frame2.size());
+    ASSERT_EQ(sharedBuf.data(), backingAddr)
+        << "backing buffer must NOT reallocate — the aliasing guard depends on the "
+           "second frame occupying the SAME address as the first";
     h.transport->injectFrameViewForTest(sharedBuf.data(), sharedBuf.size());
 
     uint8_t     firstByte2 = 0;
