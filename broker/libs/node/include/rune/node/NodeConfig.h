@@ -344,6 +344,10 @@ struct NodeConfig {
     //     ranges non-overlapping).  RUNE_WORKER_EGRESS_BASE_STREAM.
     std::string workerEgressControlHost     = "127.0.0.1";
     int32_t     workerEgressControlBasePort = 40300;
+    // True iff RUNE_WORKER_EGRESS_CONTROL_BASE_PORT was explicitly configured.  Shard
+    // mode refuses to start without it (spec §3.3: every per-worker port explicit;
+    // the 40300 default would let co-located shard nodes silently collide).
+    bool        workerEgressControlBasePortExplicit = false;
     int32_t     workerEgressBaseStreamId    = 0;  // 0 = unset; resolved in buildWorkerPool
 
     // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread

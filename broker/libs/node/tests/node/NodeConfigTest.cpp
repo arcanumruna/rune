@@ -1978,4 +1978,80 @@ TEST(ShardConfigRegression, MoreThanSixtyFourShardWorkersRefused) {
     EXPECT_NE(e->find("64"), std::string::npos);
 }
 
+
+// --- Task 6 fix round 1: egress-control base port explicit + range + collisions ---
+TEST(ShardConfigRegression, MissingEgressControlBasePortRefused) {
+    auto env = shard3node(); env.erase("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT");
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value()) << "shard mode must not fall back to the 40300 default";
+    EXPECT_NE(e->find("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"), std::string::npos) << *e;
+}
+
+TEST(NodeConfigRegression, LegacyModeKeepsDefaultEgressControlBasePort) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->workerEgressControlBasePort, 40300);
+    EXPECT_FALSE(r.config->validateShardConfig().has_value());
+}
+
+TEST(ShardConfigRegression, EgressControlBasePortOutOfRangeRefused) {
+    for (const char* bad : {"0", "-5", "65535"}) {   // 65535 + (W=2) - 1 overflows
+        auto env = shard3node(); env["RUNE_WORKERS"] = "2";
+        env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"] = bad;
+        auto e = shardErr(env);
+        ASSERT_TRUE(e.has_value()) << "egress base " << bad << " must be refused";
+        EXPECT_NE(e->find("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"), std::string::npos) << *e;
+    }
+}
+
+TEST(ShardConfigRegression, EgressRangeCollidingWithIngressRangeRefused) {
+    auto env = shard3node(); env["RUNE_WORKERS"] = "4";
+    env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"] = "40497";   // [40497,40500] hits ingress w0=40500
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("40500"), std::string::npos) << *e;
+    EXPECT_NE(e->find("workerIngress"), std::string::npos) << *e;
+    EXPECT_NE(e->find("workerEgressControl"), std::string::npos) << *e;
+}
+
+TEST(ShardConfigRegression, EgressRangeCollidingWithReplRangeRefused) {
+    auto env = shard3node(); env["RUNE_WORKERS"] = "4";
+    env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"] = "40602";   // [40602,40605] hits repl w2/w3
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("workerRepl"), std::string::npos) << *e;
+    EXPECT_NE(e->find("workerEgressControl"), std::string::npos) << *e;
+}
+
+TEST(NodeConfigRegression, IngressAndReplBasePortsOutOfRangeRejectedAtParseEvenInLegacy) {
+    for (const char* key : {"RUNE_WORKER_INGRESS_BASE_PORT", "RUNE_WORKER_REPL_BASE_PORT"}) {
+        for (const char* bad : {"-1", "0", "65536", "100000"}) {
+            auto env = base1node(); env[key] = bad;         // legacy mode
+            auto r = parseNodeConfig(fakeEnv(env));
+            EXPECT_FALSE(r.config.has_value()) << key << "=" << bad << " must be a parse error";
+            EXPECT_NE(r.error.find(key), std::string::npos) << r.error;
+        }
+        auto env = base1node(); env[key] = "65535";
+        EXPECT_TRUE(parseNodeConfig(fakeEnv(env)).config.has_value()) << key << "=65535 is a valid port";
+    }
+}
+
+TEST(ShardConfigRegression, SixtyFourShardWorkersAcceptedSixtyFiveRefused) {
+    // Spread the three per-worker ranges 100 apart so W=64 cannot self-collide.
+    auto env = shard3node(0);
+    env["RUNE_PEERS"] = "0@127.0.0.1:40110:40200:40220:41000:41100,"
+                        "1@10.0.0.2:40111:40201:40221:41000:41100,"
+                        "2@10.0.0.3:40112:40202:40222:41000:41100";
+    env["RUNE_WORKER_REPL_BASE_PORT"]            = "41000";
+    env["RUNE_WORKER_INGRESS_BASE_PORT"]         = "41100";
+    env["RUNE_WORKER_EGRESS_CONTROL_BASE_PORT"]  = "41200";
+    env["RUNE_WORKERS"] = "64";
+    auto ok = shardErr(env);
+    EXPECT_FALSE(ok.has_value()) << "W=64 must be accepted: " << *ok;
+    env["RUNE_WORKERS"] = "65";
+    auto e = shardErr(env);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_NE(e->find("64"), std::string::npos) << *e;
+}
+
 } // namespace rune::node
