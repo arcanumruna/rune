@@ -15,6 +15,8 @@
 //     resolves/rejects promises while holding mtx_ for minimal scopes.
 
 #include <rune/client/Client.h>
+#include <rune/client/agent/AgentProduceSink.h>
+#include <rune/client/detail/CpuAffinity.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -72,6 +74,11 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.transport.mtuLength         = c.mtuBytes;
     acfg.transport.socketSndBufBytes = c.socketBufferBytes;
     acfg.transport.socketRcvBufBytes = c.socketBufferBytes;
+    // Task 12: RunnerMode::Invoker = no threads (invoker driver + conductor).
+    acfg.transport.driverMode = (c.runnerMode == RunnerMode::Invoker)
+                                    ? transport::DriverMode::Invoker
+                                    : transport::DriverMode::Thread;
+    acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     transport::applyEnvOverrides(acfg.transport);
 
     return acfg;
@@ -84,8 +91,6 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 Client::Client(ClientConfig cfg)
     : cfg_(std::move(cfg))
     , agent_(toAgentConfig(cfg_))
-    , nextSweep_(std::chrono::steady_clock::now() +
-                 std::chrono::milliseconds(kSweepIntervalMs))
     , partitionRouter_(metadataCache_)
 {
     // MD1 IMPORTANT-2: the seed session's currentLeaderChannel is initialised to
@@ -98,106 +103,65 @@ Client::Client(ClientConfig cfg)
         onEgressFrame(tid, buf, len);
     });
 
-    // CB-2: Wire the ProducerHub into the agent via function hooks so doWork
-    // drives producer drain+flush and ProduceResponse frames are routed.
-    // Using std::function keeps ClientAgent free of a header dependency on
-    // ProducerHub (the agent links to no producer symbols at all).
-    agent_.setProducerDrainFn(
-        [this](int64_t nowNs, int64_t sessionId,
-               agent::ClientAgent::SendFn sendFn) -> int {
-            // Task 1.3: produce routing now happens at the flush→sendFn boundary
-            // inside the agent (ClientAgent's send lambda consults the agent-owned
-            // partition routing table and offers each record to its leader session's
-            // endpoint, re-stamping the leader sessionId).  The old single-transport
-            // routeProduceToLeader() retarget model is DELETED — a single client no
-            // longer thrashes one connection between leaders; each partition's
-            // records land on their leader session directly.
-            //
-            // No-progress backstop (preserved from the old routeProduceToLeader):
-            // if a pending produce partition has NO known leader in the cache, arm
-            // a backoff-gated background metadata refresh so routing self-corrects
-            // without app action.  Pure metadata trigger — no retarget/reconnect.
-            {
-                int32_t topicId = -1, partition = -1;
-                if (producerHub_.firstPendingPartition(topicId, partition) &&
-                    metadataCache_.leaderFor(topicId, partition) ==
-                        metadata::MetadataCache::kNoLeader) {
-                    scheduleMetadataRefresh();
-                }
-            }
-            int work = producerHub_.drainAndFlush(nowNs, sessionId, sendFn);
-            // TX-5: drain all transactional producers (rarely >1; mutex is fine).
-            // Task 1.4: the produce SendFn is now (topicId, partition, streamId, buf,
-            // len) — keyed by (topicId, partition) so cross-node stream ids don't
-            // collide.  Txn producers keep their OWN 3-arg SendFn (streamId, buf, len)
-            // and route to the coordinator session (Task 3.2), so adapt: the txn path
-            // passes streamId=0 and has no per-partition leader route, so topicId/
-            // partition default to 0 — the empty/default offer path in the agent.
-            std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-            {
-                std::lock_guard<std::mutex> lk(txnHubMtx_);
-                txnSnap = txnProducers_;
-            }
-            auto txnSendFn = [&sendFn](int32_t ingressStreamId, const uint8_t* buf,
-                                       std::size_t len) -> bool {
-                return sendFn(/*topicId=*/0, /*partition=*/0, ingressStreamId, buf, len);
-            };
-            for (auto& tp : txnSnap) {
-                work += tp->doWork(sessionId, txnSendFn);
-            }
-            (void)nowNs;
-            return work;
-        });
-    agent_.setProduceResponseFn(
-        [this](int64_t correlationId, int64_t baseOffset) {
-            producerHub_.onProduceResponse(correlationId, baseOffset);
-        });
+    // Produce + ack path: plain member calls from dutyCycle() (spec §4.3).  No
+    // producer-drain / ProduceResponse std::function hooks are installed on the
+    // agent (they remain only as test-harness seams).  ProduceResponses are
+    // buffered by the agent (produceAcks()) and routed to the hub by dutyCycle().
+    agent_.setForwardProduceResponses(false);  // re-enabled when a txn producer registers
 
     // Task 1.4 (multi-node redirect convergence): fired on the agent thread when a
     // partition-leader session reaches Connected.  Re-offer every in-flight frame
-    // through its partition route — batches held while their leader was connecting
-    // now flush to the correct leader session.  Runs only in multi-node mode (the
-    // agent gates the callback on a non-empty routing table), so single-node pays
-    // nothing.  Same agent thread as the drain path ⇒ no lock on the producer state.
-    agent_.setProduceResendFn(
-        [this]() {
-            std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
-                [this](int32_t t, int32_t p, int32_t sid,
-                       const uint8_t* fb, std::size_t fl) -> bool {
-                    return agent_.offerToPartition(t, p, sid, fb, fl);
-                };
-            producerHub_.resendAllViaRoute(sendFn);
-        });
+    // through its partition route.  Cold path (connect event), unchanged.
+    agent_.setProduceResendFn([this]() {
+        producer::ProducerImpl::SendFn sendFn =
+            [this](int32_t t, int32_t p, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
+                return agent_.offerToPartition(t, p, sid, fb, fl);
+            };
+        producerHub_.resendAllViaRoute(sendFn);
+    });
 
-    // Shared-nothing producer registration: the runner thread drains a
-    // kMsgRegisterProducer command and lands here (on the runner thread), adopting
-    // the producer into the single-owner ProducerHub list.  `holder` is a
-    // heap std::shared_ptr<ProducerImpl>* created by Client::producer(); we move the
-    // shared_ptr out and free the holder.  No lock, no atomic — the list is only
-    // ever touched by this thread.
-    agent_.setProducerRegisterFn(
-        [this](void* holder) {
-            auto* sp = static_cast<std::shared_ptr<producer::ProducerImpl>*>(holder);
-            producerHub_.add(std::move(*sp));
-            delete sp;
-        });
+    // Shared-nothing producer registration: the duty-cycle thread drains a
+    // kMsgRegisterProducer command and lands here, adopting the producer into the
+    // single-owner ProducerHub list.  `holder` is a heap shared_ptr<ProducerImpl>*
+    // created by Client::producer(); we move the shared_ptr out and free the holder.
+    agent_.setProducerRegisterFn([this](void* holder) {
+        auto* sp = static_cast<std::shared_ptr<producer::ProducerImpl>*>(holder);
+        producerHub_.add(std::move(*sp));
+        delete sp;
+    });
+    // Same hand-off for transactional producers (was a mutex-guarded vector that
+    // the runner locked and copied every duty cycle).
+    agent_.setTxnProducerRegisterFn([this](void* holder) {
+        auto* sp = static_cast<std::shared_ptr<producer::TransactionalProducerImpl>*>(holder);
+        txnProducers_.push_back(std::move(*sp));
+        delete sp;
+        agent_.setForwardProduceResponses(true);  // txn producers consume raw ProduceResponses
+    });
 
     // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
-    // on the agent (runner) thread without any extra lock.
-    agent_.setMetadataResponseFn(
-        [this](const codec::MetadataResponseDecoded& resp) {
-            onMetadataResponse(resp);
-        });
+    // on the duty-cycle thread without any extra lock.
+    agent_.setMetadataResponseFn([this](const codec::MetadataResponseDecoded& resp) {
+        onMetadataResponse(resp);
+    });
 
-    // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence;
-    // fine for heartbeat ~10 s and auto-commit ~5 s timescales).
-    // Egress frame routing is wired in onEgressFrame below.
+    // Built ONCE (not per duty cycle / per frame).  TX-5 / Task 1.4: txn producers
+    // keep their 3-arg SendFn (streamId, buf, len); the data path has no
+    // per-partition route, so topicId/partition = 0 → the agent's default offer path.
+    txnSendFn_ = [this](int32_t streamId, const uint8_t* buf, std::size_t len) -> bool {
+        return agent_.offerToPartition(/*topicId=*/0, /*partition=*/0, streamId, buf, len);
+    };
+    txnControlSendFn_ = [this](int32_t, const uint8_t* buf, std::size_t len) -> bool {
+        return agent_.submitSend(buf, len);
+    };
 
-    // Start the agent (transport + embedded driver).
-    agent_.start();
+    // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).
 
-    // Launch the background runner thread.
-    runnerThread_ = std::thread([this]() { runLoop(); });
+    agent_.start();  // Invoker: pumps its own driver while resolving (no threads)
+    ownerThread_ = std::this_thread::get_id();
+    nextSweepNs_ = now() + kSweepIntervalMs * 1'000'000LL;
+    if (cfg_.runnerMode == RunnerMode::Thread) {
+        runnerThread_ = std::thread([this]() { runLoop(); });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,12 +224,10 @@ void Client::close() {
     // longer in drainAndFlush / onProduceResponse (no concurrent access to the ack rings).
     producerHub_.failAll("Client closed");
 
-    // TX-5: fail all pending txn producer ops.
-    {
-        std::lock_guard<std::mutex> lk(txnHubMtx_);
-        for (auto& tp : txnProducers_) {
-            tp->failAll("Client closed");
-        }
+    // TX-5: fail all pending txn producer ops.  No lock: the runner was joined
+    // above (Thread mode) or this is the owner thread (Invoker mode).
+    for (auto& tp : txnProducers_) {
+        tp->failAll("Client closed");
     }
 
     // M2 FIX: clear the seed session's redirect latch on close so it does not
@@ -607,57 +569,72 @@ std::vector<std::pair<std::string, int32_t>> Client::listTopics()
 }
 
 // ---------------------------------------------------------------------------
-// runLoop() — background runner thread
+// doWork() / dutyCycle() — the ONE duty cycle shared by both runner modes
+// ---------------------------------------------------------------------------
+
+int Client::doWork() {
+    if (cfg_.runnerMode != RunnerMode::Invoker) {
+        throw std::logic_error("Client::doWork(): only valid in RunnerMode::Invoker");
+    }
+    assert(std::this_thread::get_id() == ownerThread_ && "doWork() from a non-owner thread");
+    if (inDutyCycle_) return 0;  // re-entered from a callback: never nest the duty cycle
+    return dutyCycle(now());
+}
+
+int Client::dutyCycle(int64_t nowNs) {
+    struct InCycle {
+        bool& flag;
+        explicit InCycle(bool& f) : flag(f) { flag = true; }
+        ~InCycle() { flag = false; }
+    } inCycle(inDutyCycle_);
+
+    // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
+    //    ProduceResponses are decoded and buffered, not dispatched through hooks.
+    int work = agent_.doWork(nowNs);
+
+    // 2. ProduceResponses → hub with plain calls (O(1) ordinal routing).
+    const auto acks = agent_.produceAcks();
+    const int ackCount = static_cast<int>(acks.size());
+    for (const auto& a : acks) producerHub_.onProduceResponse(a.correlationId, a.baseOffsetOrError);
+    agent_.clearProduceAcks();
+
+    // 3. Producer drain/flush through AgentProduceSink (no per-cycle std::function).
+    work += ackCount + producerDuty_(nowNs);
+
+    // 4. Periodic sweep on the duty-cycle clock.
+    if (nowNs >= nextSweepNs_) {
+        sweepTimeouts(nowNs);
+        nextSweepNs_ = nowNs + kSweepIntervalMs * 1'000'000LL;
+    }
+    return work;
+}
+
+int Client::producerDuty_(int64_t nowNs) {
+    const int64_t sessionId = agent_.seedSession().machine.sessionId();
+    int work = producerHub_.drainAndFlush(nowNs, sessionId, agent::AgentProduceSink{&agent_});
+    for (auto& tp : txnProducers_) work += tp->doWork(sessionId, txnSendFn_);
+    return work;
+}
+
+// ---------------------------------------------------------------------------
+// runLoop() — background runner thread (RunnerMode::Thread)
 // ---------------------------------------------------------------------------
 
 void Client::runLoop() {
-    // Select idle strategy based on ClientConfig::idleMode.
-    //
-    // LowLatency — YieldingIdleStrategy: on idle cycles the runner yields the
-    //   OS scheduler quantum instead of parking.  No park ≡ no OS wake-up
-    //   latency; the runner picks up a submitted command / inbound frame in
-    //   ~µs.  Cost: one CPU core at ~100% while the runner is alive.
-    //
-    // Balanced (default) — BackoffIdleStrategy: spins a few cycles, then
-    //   yields, then parks up to 1 ms.  CPU-friendly for clients that do not
-    //   need sub-millisecond reaction time.
+    if (cfg_.runnerCore >= 0 && !detail::pinCurrentThreadToCore(cfg_.runnerCore)) {
+        std::fprintf(stderr, "rune-client: could not pin the runner to core %d\n", cfg_.runnerCore);
+    }
     if (cfg_.idleMode == IdleMode::LowLatency) {
-        // Backoff (not a tight yield-loop): spin 5, yield 3, then park in the
-        // MICROSECOND range when idle.  The runner drives BOTH the producer drain
-        // and the egress ack-poll, so its park ceiling is the client-side floor on
-        // ack-delivery latency at low load: a park of 1ms→15ms (an earlier setting)
-        // left an arriving ack sitting until the runner woke, giving ~10ms p50 on a
-        // near-idle client.  A 1µs→100µs park keeps LowLatency genuinely low-latency
-        // (finer than Balanced's 1µs–1ms) while still parking a truly idle client so
-        // it does not peg a core.
-        aeron::concurrent::BackoffIdleStrategy idleStrategy(
-            /*maxSpins=*/5,
-            /*maxYields=*/3,
-            /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000),      // 1 µs
-            /*maxParkNs=*/std::chrono::duration<long, std::nano>(100'000));   // 100 µs
-
-        while (!stopped_.load(std::memory_order_acquire)) {
-            const int64_t now = nowNs();
-            const int work = agent_.doWork(now);
-            idleStrategy.idle(work);
-
-            const auto wallNow = std::chrono::steady_clock::now();
-            if (wallNow >= nextSweep_) {
-                sweepTimeouts();
-                nextSweep_ = wallNow +
-                             std::chrono::milliseconds(kSweepIntervalMs);
-            }
-        }
+        // spin 5, yield 3, park 1 µs .. 100 µs: the runner drives the producer drain
+        // AND the ack poll, so its park ceiling is the client floor on ack latency.
+        aeron::concurrent::BackoffIdleStrategy idle(
+            5, 3, std::chrono::duration<long, std::nano>(1'000),
+            std::chrono::duration<long, std::nano>(100'000));
+        while (!stopped_.load(std::memory_order_acquire)) idle.idle(dutyCycle(now()));
     } else if (cfg_.idleMode == IdleMode::BusySpin) {
-        // BusySpin: NEVER park or yield — the runner drives both the producer drain
-        // and the egress ack/record poll every cycle with only a cpu_pause() on idle
-        // cycles.  This removes the client-side park from a produce/ack or consume
-        // round-trip (LowLatency's 1–100µs park is the p99 floor otherwise).  Pegs
-        // one core; pin it to a dedicated CPU.
+        // Never park or yield: pin this runner to a dedicated core.
         while (!stopped_.load(std::memory_order_acquire)) {
-            const int64_t now = nowNs();
-            const int work = agent_.doWork(now);
-            if (work == 0) {
+            if (dutyCycle(now()) == 0) {
 #if defined(__x86_64__) || defined(__i386__)
                 __asm__ volatile("pause" ::: "memory");
 #elif defined(__aarch64__) || defined(__arm__)
@@ -666,35 +643,12 @@ void Client::runLoop() {
                 __asm__ volatile("" ::: "memory");
 #endif
             }
-            const auto wallNow = std::chrono::steady_clock::now();
-            if (wallNow >= nextSweep_) {
-                sweepTimeouts();
-                nextSweep_ = wallNow + std::chrono::milliseconds(kSweepIntervalMs);
-            }
         }
     } else {
-        // Balanced: Aeron BackoffIdleStrategy: spins → yields → parks (max 1 ms).
-        aeron::concurrent::BackoffIdleStrategy idleStrategy(
-            /*maxSpins=*/10,
-            /*maxYields=*/20,
-            /*minParkNs=*/std::chrono::duration<long, std::nano>(1'000),
-            /*maxParkNs=*/std::chrono::milliseconds(1));
-
-        while (!stopped_.load(std::memory_order_acquire)) {
-            const int64_t now = nowNs();
-            const int work = agent_.doWork(now);
-
-            // Idle strategy: backs off on 0 work, resets on positive work.
-            idleStrategy.idle(work);
-
-            // Periodic timeout sweep (bounded, steady clock).
-            const auto wallNow = std::chrono::steady_clock::now();
-            if (wallNow >= nextSweep_) {
-                sweepTimeouts();
-                nextSweep_ = wallNow +
-                             std::chrono::milliseconds(kSweepIntervalMs);
-            }
-        }
+        // Balanced: spins -> yields -> parks (max 1 ms).
+        aeron::concurrent::BackoffIdleStrategy idle(
+            10, 20, std::chrono::duration<long, std::nano>(1'000), std::chrono::milliseconds(1));
+        while (!stopped_.load(std::memory_order_acquire)) idle.idle(dutyCycle(now()));
     }
 }
 
@@ -702,13 +656,28 @@ void Client::runLoop() {
 // sweepTimeouts() — called from the runner thread
 // ---------------------------------------------------------------------------
 
-void Client::sweepTimeouts() {
+void Client::sweepTimeouts(int64_t nowNs) {
+    // Connect/ping/subscribe/define/get promise deadlines are created on app
+    // threads with steady_clock, so they keep their own steady_clock sample.
     const auto now = std::chrono::steady_clock::now();
 
     // --- Producer delivery timeouts (duty-cycle thread; no lock — ack rings are single-owner) ---
-    // Mirror the connect/ping sweep: any pending ProduceResponse ack older than
-    // produceTimeoutMs is failed so futures/callbacks never hang.
-    producerHub_.sweepTimedOut(now);
+    // Producer deadlines are on the duty-cycle clock (injected in tests): any
+    // pending ProduceResponse ack older than produceTimeoutMs is failed so
+    // futures/callbacks never hang.
+    producerHub_.sweepTimedOut(
+        std::chrono::steady_clock::time_point{std::chrono::nanoseconds{nowNs}});
+
+    // No-progress backstop (moved from the per-cycle drain hook; the refresh it arms
+    // is itself backoff-gated at >= 100 ms, so the 100 ms sweep cadence loses nothing):
+    // a pending produce partition with NO known leader arms a metadata refresh.
+    {
+        int32_t topicId = -1, partition = -1;
+        if (producerHub_.firstPendingPartition(topicId, partition) &&
+            metadataCache_.leaderFor(topicId, partition) == metadata::MetadataCache::kNoLeader) {
+            scheduleMetadataRefresh();
+        }
+    }
 
     // --- M2 FIX: Pending subscribe-request timeouts ---
     // A Subscribe that gets no SubscribeResponse within subscribeTimeoutMs is
@@ -722,12 +691,12 @@ void Client::sweepTimeouts() {
     // very first doWork call after a state transition (no extra latency).
     if (!groupConsumerHub_.empty()) {
         const auto snap = agent_.stateAndSessionId();
-        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        const int64_t wallNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
         const group::SendFn sendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
             return agent_.submitSend(fb, fl);
         };
-        groupConsumerHub_.doWork(nowNs, snap.sessionId, sendFn);
+        groupConsumerHub_.doWork(wallNs, snap.sessionId, sendFn);
     }
 
     // --- MD1 IMPORTANT-3: fire an armed background metadata refresh if due ------
@@ -957,12 +926,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // a genuine data-op redirect rather than dropped as a connect-time
             // redirect.  All four components are agent-thread reads (no locks).
             const bool groupActive = !groupConsumerHub_.empty();
-            bool txnPending = false;
-            {
-                // Cold-path lock: only to test for ANY registered txn producer.
-                std::lock_guard<std::mutex> lk(txnHubMtx_);
-                txnPending = !txnProducers_.empty();
-            }
+            const bool txnPending = !txnProducers_.empty();  // duty-cycle thread
             const bool haveWork =
                 producerHub_.hasInFlight() || subscriberHub_.hasPending()
                 || groupActive || txnPending;
@@ -1140,11 +1104,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // is in flight is retried rather than dropped.
             {
                 bool groupActiveNL = !groupConsumerHub_.empty();
-                bool txnPendingNL  = false;
-                {
-                    std::lock_guard<std::mutex> lk(txnHubMtx_);
-                    txnPendingNL = !txnProducers_.empty();
-                }
+                const bool txnPendingNL = !txnProducers_.empty();  // duty-cycle thread
                 const bool haveWork =
                     producerHub_.hasInFlight() || subscriberHub_.hasPending()
                     || groupActiveNL || txnPendingNL;
@@ -1363,90 +1323,51 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     // ---- TX-5: Transactional producer responses --------------------------------
-    // ProduceResponse (tid 17) also lands here via the agent's egressObserver;
-    // the producerHub_ regular path is driven via setProduceResponseFn (above).
+    // ProduceResponse (tid 17) lands here only once a txn producer registered
+    // (setForwardProduceResponses(true)); the producerHub_ path is the plain-call
+    // ack routing in dutyCycle().  Txn producers iterate the duty-cycle-owned list.
     // Txn producers need the full buf+len+sendFn for their retry logic.
 
     case codec::TemplateId::ProduceResponse: {
-        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-        {
-            std::lock_guard<std::mutex> lk(txnHubMtx_);
-            txnSnap = txnProducers_;
-        }
-        if (!txnSnap.empty()) {
-            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
-                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                    return agent_.submitSend(fb, fl);
-                };
-            for (auto& tp : txnSnap) {
-                tp->onProduceResponse(buf, len, sendFn);
-            }
+        for (auto& tp : txnProducers_) {
+            tp->onProduceResponse(buf, len, txnControlSendFn_);
         }
         break;
     }
 
     case codec::TemplateId::InitProducerIdResponse: {
-        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-        {
-            std::lock_guard<std::mutex> lk(txnHubMtx_);
-            txnSnap = txnProducers_;
-        }
-        for (auto& tp : txnSnap) {
+        for (auto& tp : txnProducers_) {
             tp->onInitProducerIdResponse(buf, len);
         }
         break;
     }
 
     case codec::TemplateId::AddPartitionsToTxnResponse: {
-        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-        {
-            std::lock_guard<std::mutex> lk(txnHubMtx_);
-            txnSnap = txnProducers_;
-        }
-        for (auto& tp : txnSnap) {
+        for (auto& tp : txnProducers_) {
             tp->onAddPartitionsToTxnResponse(buf, len);
         }
         break;
     }
 
     case codec::TemplateId::AddOffsetsToTxnResponse: {
-        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-        {
-            std::lock_guard<std::mutex> lk(txnHubMtx_);
-            txnSnap = txnProducers_;
-        }
-        if (!txnSnap.empty()) {
+        if (!txnProducers_.empty()) {
             const auto snap = agent_.stateAndSessionId();
-            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn =
-                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                    return agent_.submitSend(fb, fl);
-                };
-            for (auto& tp : txnSnap) {
-                tp->onAddOffsetsToTxnResponse(buf, len, snap.sessionId, sendFn);
+            for (auto& tp : txnProducers_) {
+                tp->onAddOffsetsToTxnResponse(buf, len, snap.sessionId, txnControlSendFn_);
             }
         }
         break;
     }
 
     case codec::TemplateId::TxnOffsetCommitResponse: {
-        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-        {
-            std::lock_guard<std::mutex> lk(txnHubMtx_);
-            txnSnap = txnProducers_;
-        }
-        for (auto& tp : txnSnap) {
+        for (auto& tp : txnProducers_) {
             tp->onTxnOffsetCommitResponse(buf, len);
         }
         break;
     }
 
     case codec::TemplateId::EndTxnResponse: {
-        std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnSnap;
-        {
-            std::lock_guard<std::mutex> lk(txnHubMtx_);
-            txnSnap = txnProducers_;
-        }
-        for (auto& tp : txnSnap) {
+        for (auto& tp : txnProducers_) {
             tp->onEndTxnResponse(buf, len);
         }
         break;
@@ -1609,24 +1530,11 @@ Producer Client::producer(ProducerConfig cfg) {
     // address travels the ring; the runner adopts the shared_ptr and frees the
     // holder.  Both `impl` (returned to the caller) and the hub's entry keep the
     // ProducerImpl alive.  Retry on a transiently full ring (off the hot path).
+    // Bounded setup-phase submit; in Invoker mode the duty cycle runs between
+    // attempts (this thread is the ring's only consumer).
     auto* holder = new std::shared_ptr<producer::ProducerImpl>(impl);
-    // Cold-path (setup) submit, BOUNDED — not an unbounded busy-spin.  The runner
-    // drains the command ring every duty cycle (microseconds), so the first attempt
-    // essentially always succeeds; a full ring is pathological.  Bounded by a
-    // deadline like the other cold-path setup waits; parks briefly between attempts
-    // and throws (freeing the holder) rather than spinning forever.
-    if (!agent_.submitRegisterProducer(holder)) {
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (!agent_.submitRegisterProducer(holder)) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                delete holder;
-                throw std::runtime_error(
-                    "Client::producer(): command ring full — registration timed out");
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds{100});
-        }
-    }
+    submitRegistration_([&] { return agent_.submitRegisterProducer(holder); },
+                        [&] { delete holder; });
 
     return Producer(std::move(impl));
 }
@@ -1772,8 +1680,11 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
         cfg,
         nextCorrId_);
 
-    std::lock_guard<std::mutex> lk(txnHubMtx_);
-    txnProducers_.push_back(impl);
+    // Shared-nothing registration through the agent ring (like producer()): the
+    // duty-cycle thread adopts it into txnProducers_ — no mutex, no per-cycle copy.
+    auto* holder = new std::shared_ptr<producer::TransactionalProducerImpl>(impl);
+    submitRegistration_([&] { return agent_.submitRegisterTxnProducer(holder); },
+                        [&] { delete holder; });
     return TransactionalProducer(std::move(impl));
 }
 

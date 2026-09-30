@@ -199,11 +199,23 @@ inline constexpr int64_t kLegacyStubProducerId =
 // processes started at the same instant). The result is masked to 63 bits
 // (always >= 0 — the wire protocol reserves -1 for "non-idempotent"); on the
 // vanishingly unlikely chance it comes out as 0 or the old stub, it redraws.
+//
+// std::random_device may throw (no entropy source / sandboxed /dev/urandom), and
+// this function is noexcept (a throw would std::terminate the producer ctor).  On
+// failure the OS-entropy term falls back to steady_clock ^ pid; the clock and pid
+// terms are mixed in below regardless, and the redraw loop still advances
+// because steady_clock moves between iterations.
+uint64_t osEntropyOrFallback(uint64_t clockBits, uint64_t pidBits) noexcept {
+    try {
+        std::random_device rd;
+        return (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    } catch (...) {
+        return splitmix64(clockBits ^ splitmix64(pidBits));
+    }
+}
+
 int64_t generateProducerId() noexcept {
     for (;;) {
-        std::random_device rd;
-        const uint64_t rdBits = (static_cast<uint64_t>(rd()) << 32) ^
-                                 static_cast<uint64_t>(rd());
         const uint64_t clockBits = static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
         const uint64_t pidBits = static_cast<uint64_t>(
@@ -213,6 +225,7 @@ int64_t generateProducerId() noexcept {
             ::getpid()
 #endif
         );
+        const uint64_t rdBits = osEntropyOrFallback(clockBits, pidBits);
 
         uint64_t mixed = splitmix64(rdBits);
         mixed = splitmix64(mixed ^ splitmix64(clockBits));

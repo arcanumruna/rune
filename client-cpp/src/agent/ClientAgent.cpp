@@ -175,6 +175,14 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 }
                 break;
 
+            case kMsgRegisterTxnProducer:
+                if (txnProducerRegisterFn_) {
+                    const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                    auto msg = ring_msg::RegisterProducer::decode(p, static_cast<std::size_t>(len));
+                    if (msg) txnProducerRegisterFn_(reinterpret_cast<void*>(msg->handle));
+                }
+                break;
+
             default:
                 // Unknown command: drop silently.
                 break;
@@ -301,6 +309,14 @@ bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
     uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
     const std::size_t n = msg.encode(buf);
     return writeCommand(kMsgRegisterProducer, buf, n);
+}
+
+bool ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {
+    ring_msg::RegisterProducer msg;
+    msg.handle = reinterpret_cast<uint64_t>(holder);
+    uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
+    const std::size_t n = msg.encode(buf);
+    return writeCommand(kMsgRegisterTxnProducer, buf, n);
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,10 @@
 // Namespace: rune::client
 //
 // Threading model:
-//   - The Client owns a background runner thread that loops agent_.doWork()
+//   - Task 12: RunnerMode::Invoker (opt-in) runs NO threads — the constructing
+//     thread calls Client::doWork() (one dutyCycle) in its own loop; everything
+//     below that says "runner thread" then means that owner thread.
+//   - The Client owns a background runner thread that loops dutyCycle()
 //     under the configured IdleStrategy (BackoffIdleStrategy by default for
 //     CPU-friendly behaviour; YieldingIdleStrategy for LowLatency mode which
 //     trades a CPU core for sub-µs reaction time).
@@ -64,6 +67,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -114,6 +118,18 @@ struct TopicSchemaResult {
 enum class IdleMode { Balanced, LowLatency, BusySpin };
 
 // ---------------------------------------------------------------------------
+// RunnerMode — who runs the client duty cycle (spec §4.1).
+//   Thread  (default): a background runner thread under the IdleMode strategy.
+//   Invoker (opt-in):  no threads at all — the embedded driver and the Aeron
+//                      client conductor are invoker-driven and the constructing
+//                      thread calls Client::doWork() in its own loop.
+// ---------------------------------------------------------------------------
+enum class RunnerMode : uint8_t { Thread, Invoker };
+
+// Injected monotonic clock (ns), sampled once per duty cycle.  nullptr = steady clock.
+using NanoClock = int64_t (*)() noexcept;
+
+// ---------------------------------------------------------------------------
 // ClientConfig
 // ---------------------------------------------------------------------------
 struct ClientConfig {
@@ -150,6 +166,14 @@ struct ClientConfig {
     // Balanced (default) parks up to 1 ms between doWork() calls — CPU-friendly.
     // LowLatency uses a yielding idle — no park, sub-µs reaction time, 1 CPU core cost.
     IdleMode idleMode = IdleMode::Balanced;
+
+    RunnerMode runnerMode = RunnerMode::Thread;
+    // Thread mode: pin the runner thread to this CPU (Linux; -1 = do not pin).
+    int32_t    runnerCore = -1;
+    // Duty-cycle clock (tests inject; nullptr = std::chrono::steady_clock).
+    NanoClock  nanoClock  = nullptr;
+    // Aeron client liveness: in Invoker mode doWork() must run at least this often.
+    int64_t    aeronClientLivenessTimeoutNs = 10'000'000'000LL;
 
     // CB-2: Static topic configuration for the producer.
     // Mirrors the broker's RUNE_TOPICS environment variable.
@@ -197,6 +221,20 @@ public:
     /// futures with an error, and fire onDisconnected.
     /// Idempotent: safe to call multiple times or after the dtor.
     void close();
+
+    /// Invoker mode: one duty cycle (driver + conductor, commands, egress, sessions,
+    /// ProduceResponses, producers, periodic sweep).  Returns the work count
+    /// (0 = idle; the caller applies its own idle strategy).  Call only from the
+    /// constructing thread.  Re-entry from a callback fired inside the duty cycle
+    /// returns 0 without running a nested cycle.  Thread mode: throws logic_error.
+    int doWork();
+
+    /// True once the Aeron client closed itself (invoker owner stalled past
+    /// aeronClientLivenessTimeoutNs, or the driver timed out).
+    [[nodiscard]] bool transportClosed() const noexcept { return agent_.transportClosed(); }
+
+    /// Test hook: transactional producers adopted by the duty-cycle thread.
+    [[nodiscard]] std::size_t testTxnProducerCount() const noexcept { return txnProducers_.size(); }
 
     // -------------------------------------------------------------------------
     // Callback registration — MUST be called before connect()  (FIX F4)
@@ -462,8 +500,38 @@ private:
     /// until stopped_, performing a periodic timeout sweep.
     void runLoop();
 
-    /// Check pending-connect / pending-ping timeouts.  Called from the runner.
-    void sweepTimeouts();
+    /// Check pending-connect / pending-ping timeouts.  Called from the duty cycle
+    /// every kSweepIntervalMs of duty-cycle time.
+    void sweepTimeouts(int64_t nowNs);
+
+    /// One duty cycle: agent -> ProduceResponses (plain calls into the hub) ->
+    /// producer drain/flush through AgentProduceSink -> periodic sweep.  Shared by
+    /// the runner thread (Thread mode) and Client::doWork() (Invoker mode).
+    int  dutyCycle(int64_t nowNs);
+    int  producerDuty_(int64_t nowNs);
+    [[nodiscard]] int64_t now() const noexcept {
+        return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : nowNs();
+    }
+
+    /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
+    /// between attempts — this thread IS the ring's consumer; thread mode parks
+    /// 100 µs.  On timeout runs `onFail` and throws.
+    template <class Submit, class OnFail>
+    void submitRegistration_(Submit&& submit, OnFail&& onFail) {
+        if (submit()) return;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!submit()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                onFail();
+                throw std::runtime_error("Client: command ring full — registration timed out");
+            }
+            if (cfg_.runnerMode == RunnerMode::Invoker) {
+                (void)dutyCycle(now());
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds{100});
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Egress observer (runs on the runner/agent thread)
@@ -538,7 +606,12 @@ private:
     // Sweep every ~100 ms (50 iterations × 2 ms sleep inside BackoffIdleStrategy
     // max-park period is 1 ms, so we sweep roughly every N doWork calls).
     static constexpr int64_t kSweepIntervalMs = 100;
-    std::chrono::steady_clock::time_point nextSweep_;
+    int64_t         nextSweepNs_ = 0;       // duty-cycle thread only
+    bool            inDutyCycle_ = false;   // duty-cycle thread only
+    std::thread::id ownerThread_;           // constructing thread (Invoker owner)
+    // Built ONCE: the txn producers' send paths (no per-cycle std::function build).
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> txnSendFn_;
+    std::function<bool(int32_t, const uint8_t*, std::size_t)> txnControlSendFn_;
 
     // ---- Flag: did we already fire onDisconnected on close()? ----------------
     std::atomic<bool> disconnectedFired_ {false};
@@ -548,9 +621,8 @@ private:
     producer::ProducerHub producerHub_;
 
     // ---- TX-5: Transactional producers ---------------------------------------
-    // Mutex guards the list; drain lambda loads a copy under the lock.
+    // Duty-cycle-thread owned (registered through the agent ring, like producers).
     // Created at setup time (before connect()); rarely more than one per client.
-    std::mutex txnHubMtx_;
     std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnProducers_;
 
     // ---- CB-4: SubscriberHub -------------------------------------------------

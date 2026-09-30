@@ -176,7 +176,7 @@ std::future<void> TransactionalProducerImpl::submitAbort()
 
 int TransactionalProducerImpl::doWork(
     int64_t sessionId,
-    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn)
+    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn)
 {
     if (sessionId == 0) return 0;
 

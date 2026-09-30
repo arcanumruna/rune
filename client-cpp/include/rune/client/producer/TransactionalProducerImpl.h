@@ -148,7 +148,7 @@ public:
     ///   the coordinator session without an adapter at every call site.
     /// Returns work count.
     int doWork(int64_t sessionId,
-               std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
+               const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
 
     /// Called when InitProducerIdResponse (templateId 46) arrives.
     void onInitProducerIdResponse(const uint8_t* buf, std::size_t len);

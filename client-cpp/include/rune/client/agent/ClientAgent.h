@@ -249,6 +249,10 @@ public:
     /// pointer is only its 8-byte address — no producer bytes cross the ring.
     bool submitRegisterProducer(void* holder) noexcept;
 
+    /// Same shared-nothing hand-off for a transactional producer: `holder` is a heap
+    /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
+    bool submitRegisterTxnProducer(void* holder) noexcept;
+
     /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
     /// subscription so the client receives Records pushed by the owning worker.
     /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
@@ -336,6 +340,9 @@ public:
     using ProducerRegisterFn = std::function<void(void*)>;
     void setProducerRegisterFn(ProducerRegisterFn fn) noexcept {
         producerRegisterFn_ = std::move(fn);
+    }
+    void setTxnProducerRegisterFn(ProducerRegisterFn fn) noexcept {
+        txnProducerRegisterFn_ = std::move(fn);
     }
 
     // -------------------------------------------------------------------------
@@ -447,6 +454,7 @@ private:
     static constexpr int32_t kMsgSend       = 4;
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
+    static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
     // starts its correlationId counter at i*stride so concurrent connects demux
@@ -586,6 +594,7 @@ private:
     ProduceResponseFn  produceResponseFn_;
     ProduceResendFn    produceResendFn_;    // Task 1.4: fired on session-connect (multi-node)
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
+    ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
 
     // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
     MetadataResponseFn metadataResponseFn_;
