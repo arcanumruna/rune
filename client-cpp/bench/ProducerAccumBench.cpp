@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -66,12 +67,13 @@ int main() {
     std::atomic<int64_t> corr{1};
     ProducerImpl impl(cfg, corr, ringCap);
 
-    std::atomic<uint64_t> frames{0}, bytes{0};
-    auto sink = [&](int32_t /*stream*/, const uint8_t* /*b*/, std::size_t len) -> bool {
-        frames.fetch_add(1, std::memory_order_relaxed);
-        bytes.fetch_add(len, std::memory_order_relaxed);
-        return true;                       // always accept (counting sink)
-    };
+    uint64_t frames = 0, bytes = 0;   // agent-thread only; read after join()
+    const std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sink =
+        [&frames, &bytes](int32_t, int32_t, int32_t, const uint8_t*, std::size_t len) -> bool {
+            ++frames;
+            bytes += len;
+            return true;  // always accept (counting sink)
+        };
 
     const std::vector<uint8_t> val((std::size_t)valueBytes, uint8_t{0xAB});
     std::atomic<bool> appDone{false};
