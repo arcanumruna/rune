@@ -893,6 +893,7 @@ if(BUILD_TESTING)
     # ── Sharded invoker client: pure (Aeron-free) unit tests ─────────────────
     add_executable(rune_pure_tests
         tests/transport/TransportConfigTest.cpp
+        tests/detail/FlatIndexMapTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
