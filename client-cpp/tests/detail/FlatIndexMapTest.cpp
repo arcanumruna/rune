@@ -89,3 +89,20 @@ TEST(FlatIndexMap, ForEachVisitsEveryLiveEntryOnce) {
     EXPECT_EQ(seen, 25u);
     EXPECT_EQ(sum, 25u * 25u);   // 1 + 3 + ... + 49
 }
+
+// Regression (Task 7 review minor b): AeronTransport::stop() is noexcept and used
+// to reset the map by assigning a freshly allocated FlatIndexMap.  clear() must
+// empty it in place (keeping capacity, no allocation) and leave it fully usable.
+TEST(FlatIndexMap, ClearEmptiesInPlaceWithoutReallocatingRegression) {
+    FlatIndexMap m;
+    for (int64_t k = 0; k < 100; ++k) m.insert(k, static_cast<uint32_t>(k));
+    const uint32_t cap = m.capacity();
+    static_assert(noexcept(m.clear()));
+    m.clear();
+    EXPECT_EQ(m.size(), 0u);
+    EXPECT_EQ(m.capacity(), cap) << "clear keeps the slot array (no allocation)";
+    for (int64_t k = 0; k < 100; ++k) EXPECT_EQ(m.find(k), FlatIndexMap::kNone);
+    EXPECT_TRUE(m.insert(7, 70));
+    EXPECT_EQ(m.find(7), 70u);
+    EXPECT_EQ(m.size(), 1u);
+}

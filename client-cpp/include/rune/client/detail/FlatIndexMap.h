@@ -76,6 +76,12 @@ public:
         return true;
     }
 
+    /// Empties the map in place: keeps the slot array, never allocates.
+    void clear() noexcept {
+        for (Slot& s : slots_) s.used = false;
+        size_ = 0;
+    }
+
     [[nodiscard]] uint32_t size() const noexcept { return size_; }
     [[nodiscard]] uint32_t capacity() const noexcept {
         return static_cast<uint32_t>(slots_.size());

@@ -11,6 +11,9 @@
 #include <iterator>
 #include <string>
 #include <thread>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
@@ -47,6 +50,29 @@ bool pumpUntil(Transport& t, Pred&& pred) {
         if (pred()) return true;
     }
     return false;
+}
+
+// Injected Resolution clock (single-threaded: the test thread is the owner).
+int64_t g_nowNs = 0;
+int64_t fakeNow() noexcept { return g_nowNs; }
+// >= AeronTransport's 100 ms Resolution retry backoff.
+constexpr int64_t kPastRetryBackoffNs = 200'000'000LL;
+
+// Holds 127.0.0.1:port with a plain (non-SO_REUSEADDR) UDP socket so the
+// driver's unicast bind of that port fails with EADDRINUSE: a real, transient
+// driver rejection that ends when the socket is closed.
+int holdUdpPort(uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_port        = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 } // namespace
@@ -150,15 +176,16 @@ TEST(InvokerTransport, MinimumAcceptedLivenessStartsDriverRegression) {
 
 // Regression: offer(streamId) used to add a per-worker publication and SLEEP up to
 // 5 s for the conductor.  In invoker mode nobody else runs the conductor, so the
-// caller blocked for the full timeout.  It must return at once (falling back to
-// the default publication while the per-worker one resolves) and the handle must
-// resolve through the owner's duty cycle.
+// caller blocked for the full timeout.  It must return at once (back-pressure
+// while the per-worker publication resolves — never the default publication, see
+// ResolvingPerWorkerStreamBackPressuresNeverFallsBackRegression) and the handle
+// must resolve through the owner's duty cycle.
 TEST(InvokerTransport, PerStreamPublicationResolvesWithoutBlockingRegression) {
     Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3200)};
     t.start();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected(); }));
     const uint8_t b[] = {9};
-    EXPECT_TRUE(t.offer(3201, b, 1)) << "unresolved per-worker stream falls back to default";
+    EXPECT_FALSE(t.offer(3201, b, 1)) << "unresolved per-worker stream back-pressures";
     const Transport::PubHandle h = t.publicationHandle("aeron:ipc", 3201);
     EXPECT_FALSE(t.publicationReady(h)) << "offer() must not have blocked until resolution";
     ASSERT_TRUE(pumpUntil(t, [&] { t.offerOn(h, b, 1); return t.publicationReady(h); }));
@@ -210,5 +237,118 @@ TEST(InvokerTransport, StartBringsDriverUpBeforeClientConnectRegression) {
         << "connect waited on a driver nobody was driving";
     EXPECT_FALSE(t.usesDriverThread());
     EXPECT_FALSE(t.closed());
+    t.stop();
+}
+
+// Regression (Task 7 review I3, controller ruling): while a per-worker
+// publication is still resolving, offer(streamId) used to fall back to the
+// DEFAULT publication.  With maxInFlight > 1 one partition's consecutive batches
+// then travel on two Aeron streams and can be processed out of order (ordering +
+// idempotence break).  It must back-pressure (false, nothing sent) instead, and
+// once Ready every frame arrives on the per-worker stream, in order.
+TEST(InvokerTransport, ResolvingPerWorkerStreamBackPressuresNeverFallsBackRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3700)};  // default pub loops to egress
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    t.addEgressSubscription("aeron:ipc", 3701);
+    std::vector<uint8_t> got;
+    auto drain = [&] {
+        t.poll([&](const uint8_t* p, std::size_t n) { if (n == 1) got.push_back(p[0]); }, 10);
+    };
+    // No duty cycle between offers: the conductor cannot answer, so the per-worker
+    // publication stays Resolving for all of these.
+    const uint8_t zero[] = {0};
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_FALSE(t.offer(3701, zero, 1)) << "attempt " << i << " must back-pressure";
+    }
+    for (int i = 0; i < 2'000; ++i) {  // a fallback frame would loop back on 3700 here
+        t.dutyCycle();
+        drain();
+    }
+    EXPECT_TRUE(got.empty()) << "a frame leaked onto the default publication";
+
+    constexpr uint8_t kFrames = 16;
+    uint8_t next = 0;
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        if (next < kFrames) {
+            const uint8_t b[] = {next};
+            if (t.offer(3701, b, 1)) ++next;
+        }
+        drain();
+        return got.size() >= kFrames;
+    }));
+    std::vector<uint8_t> want(kFrames);
+    for (uint8_t i = 0; i < kFrames; ++i) want[i] = i;
+    EXPECT_EQ(got, want) << "exactly the offered frames, once each, in order";
+    t.stop();
+}
+
+// Regression (Task 7 review I2): a driver rejection used to be terminal, so one
+// transient error (here: the control port briefly held by another socket) left
+// offerTo() failing until stop() and every batch hit produce timeout.  After the
+// backoff (injected clock) the slot must register afresh and become Ready.
+TEST(InvokerTransport, PublicationRecoversFromTransientRejectionRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3800)};
+    t.start();
+    g_nowNs = 1'000'000'000LL;
+    t.setResolveClock(&fakeNow);
+    const int fd = holdUdpPort(24761);
+    ASSERT_GE(fd, 0);
+    const std::string ch = "aeron:udp?control=127.0.0.1:24761|control-mode=dynamic";
+    const Transport::PubHandle h = t.publicationHandle(ch, 3801);
+    const uint8_t b[] = {1};
+    bool anySent = false;
+    for (int i = 0; i < 20'000; ++i) {  // port held: the driver rejects the bind
+        t.dutyCycle();
+        anySent |= t.offerOn(h, b, 1);
+    }
+    EXPECT_FALSE(anySent);
+    EXPECT_FALSE(t.publicationReady(h)) << "control port held: must not resolve";
+    ::close(fd);
+    for (int i = 0; i < 2'000; ++i) {  // clock frozen: backoff not elapsed, stays down
+        t.dutyCycle();
+        t.offerOn(h, b, 1);
+    }
+    EXPECT_FALSE(t.publicationReady(h)) << "re-registration must wait for the backoff";
+    g_nowNs += kPastRetryBackoffNs;
+    EXPECT_TRUE(pumpUntil(t, [&] { t.offerOn(h, b, 1); return t.publicationReady(h); }))
+        << "a transiently rejected publication must recover after the backoff";
+    t.setResolveClock(nullptr);
+    t.stop();
+}
+
+// Regression (Task 7 review I2): same for a per-worker egress subscription —
+// addEgressSubscription() sees the existing (rejected) slot and returns, so the
+// worker's egress used to be dead for good.
+TEST(InvokerTransport, EgressSubscriptionRecoversFromTransientRejectionRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3900)};
+    t.start();
+    g_nowNs = 1'000'000'000LL;
+    t.setResolveClock(&fakeNow);
+    const int fd = holdUdpPort(24762);
+    ASSERT_GE(fd, 0);
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:24762";
+    t.addEgressSubscription(ch, 3901);
+    const Transport::PubHandle h = t.publicationHandle(ch, 3901);
+    const uint8_t payload[] = {0x5A, 0xA5};
+    std::vector<uint8_t> got;
+    auto step = [&] {
+        t.dutyCycle();
+        t.offerOn(h, payload, sizeof payload);
+        t.poll([&](const uint8_t* p, std::size_t n) {
+            if (n == sizeof payload) got.assign(p, p + n);
+        }, 10);
+    };
+    for (int i = 0; i < 20'000; ++i) step();  // endpoint held: subscription rejected
+    EXPECT_TRUE(got.empty()) << "endpoint port held: nothing can be received";
+    ::close(fd);
+    t.addEgressSubscription(ch, 3901);  // the idempotent re-add the client issues
+    for (int i = 0; i < 2'000; ++i) step();
+    EXPECT_TRUE(got.empty()) << "re-registration must wait for the backoff";
+    g_nowNs += kPastRetryBackoffNs;
+    ASSERT_TRUE(pumpUntil(t, [&] { step(); return !got.empty(); }))
+        << "a transiently rejected egress subscription must recover after the backoff";
+    EXPECT_EQ(got, std::vector<uint8_t>(std::begin(payload), std::end(payload)));
+    t.setResolveClock(nullptr);
     t.stop();
 }

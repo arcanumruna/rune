@@ -101,9 +101,13 @@ public:
     bool offer(const uint8_t* buf, std::size_t len) noexcept;
 
     /// Publish buf[0..len-1] to the per-worker ingress ExclusivePublication
-    /// for the given ingressStreamId.  The (currentChannel, ingressStreamId)
-    /// publication resolves asynchronously (never sleeps); while it is not Ready
-    /// (or if ingressStreamId == 0) the frame goes to the default publication.
+    /// for the given ingressStreamId (0 or the default stream id -> the default
+    /// publication).  The (currentChannel, ingressStreamId) publication resolves
+    /// asynchronously (never sleeps).  While it is not Ready this returns false
+    /// (back-pressure: the caller keeps the batch and retries) — it NEVER falls
+    /// back to the default publication: with maxInFlight > 1 that would split one
+    /// partition's consecutive batches across two Aeron streams and let the
+    /// broker process them out of order (ordering + idempotence break).
     /// E5.1: called from the ProducerImpl flush path with the per-partition
     /// worker stream id decoded from the metadata response.
     bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept;
@@ -120,8 +124,10 @@ public:
                  const uint8_t* buf, std::size_t len) noexcept;
 
     /// Stable handle of the publication for (channel, streamId).  Cold path: the
-    /// first call creates the slot; resolution then advances inside offerOn() /
-    /// dutyCycle() without ever blocking.
+    /// first call creates the slot.  Resolution advances only inside offerOn()
+    /// (and offer(streamId)/offerTo(), which call it) — never blocking; in
+    /// invoker mode the owner's dutyCycle() is what lets the driver + client
+    /// conductor answer the registration between those calls.
     using PubHandle = int32_t;
     static constexpr PubHandle kNoPub = -1;
     PubHandle publicationHandle(const std::string& channel, int32_t streamId);
@@ -129,6 +135,13 @@ public:
     /// Hot path: one bounds check + one variant check + tryClaim.  Returns false
     /// while the publication resolves or is back-pressured (retry next cycle).
     bool offerOn(PubHandle h, const uint8_t* buf, std::size_t len) noexcept;
+
+    /// Test/simulation seam: the clock that drives every Resolution deadline and
+    /// retry backoff (default: steady_clock).  pumpUntil_'s own wall-time bound
+    /// in start()/retarget() stays on the real clock.  nullptr restores default.
+    void setResolveClock(int64_t (*nowNs)() noexcept) noexcept {
+        resolveNow_ = nowNs != nullptr ? nowNs : &monoNs_;
+    }
 
     [[nodiscard]] bool publicationReady(PubHandle h) const noexcept {
         return h >= 0 && static_cast<std::size_t>(h) < pubSlots_.size() &&
@@ -221,6 +234,7 @@ private:
     template <class Ready>
     bool pumpUntil_(Ready&& ready, int64_t timeoutNs);
     static int64_t monoNs_() noexcept;
+    int64_t (*resolveNow_)() noexcept = &monoNs_;  // Resolution clock (injectable)
 
     // ---- Aeron C++ client + pub/sub -----------------------------------------
     std::shared_ptr<aeron::Aeron>                aeron_;

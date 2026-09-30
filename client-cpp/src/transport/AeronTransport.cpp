@@ -146,7 +146,7 @@ void AeronTransport::start() {
     PubRegistry preg{*aeron_, cfg_.ingressChannel, cfg_.ingressStreamId};
     SubRegistry sreg{*aeron_, cfg_.egressChannel, cfg_.egressStreamId};
     pumpUntil_([&] {
-        const int64_t now = monoNs_();
+        const int64_t now = resolveNow_();
         const bool pubOk = pubRes.poll(preg, now) == ResolveStatus::Ready;
         const bool subOk = subRes.poll(sreg, now) == ResolveStatus::Ready;
         return (pubOk && subOk) || pubRes.rejected() || subRes.rejected();
@@ -210,7 +210,7 @@ void AeronTransport::stop() noexcept {
     ingressPub_.reset();
     egressSub_.reset();
     pubSlots_.clear();                  // every per-stream / per-endpoint publication
-    streamPub_ = detail::FlatIndexMap{};
+    streamPub_.clear();                 // in place: stop() is noexcept, no allocation
 
     // Step 3: Close the Aeron C++ client (joins the conductor thread; the
     //   conductor's onClose() flushes remaining commands into the CnC ring).
@@ -290,7 +290,7 @@ bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len) n
     if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len);
     if (!aeron_) return false;
     PubRegistry reg{*aeron_, s.channel, s.streamId};
-    if (s.res.poll(reg, monoNs_()) != ResolveStatus::Ready) return false;
+    if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) return false;
     return offerToPub(*s.res.ready(), buf, len);
 }
 
@@ -307,14 +307,13 @@ bool AeronTransport::offer(int32_t ingressStreamId, const uint8_t* buf, std::siz
             h = static_cast<uint32_t>(publicationHandle(cfg_.ingressChannel, ingressStreamId));
             streamPub_.insert(ingressStreamId, h);
         } catch (...) {
-            return offer(buf, len);
+            return false;  // back-pressure: the caller keeps the batch and retries
         }
     }
-    const auto ph = static_cast<PubHandle>(h);
-    if (offerOn(ph, buf, len)) return true;
-    // Unresolved: keep the historical fallback to the default publication (the
-    // runtime routes it).  Resolved but back-pressured: report it (retry).
-    return publicationReady(ph) ? false : offer(buf, len);
+    // Resolving or back-pressured -> false.  Never fall back to the default
+    // publication: one partition's batches must stay on ONE stream, or the broker
+    // may process consecutive in-flight batches out of order.
+    return offerOn(static_cast<PubHandle>(h), buf, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +357,7 @@ int AeronTransport::poll(const Handler& handler, int fragmentLimit) {
         if (sub == nullptr) {
             if (!aeron_) continue;
             SubRegistry reg{*aeron_, s.channel, s.streamId};
-            if (s.res.poll(reg, monoNs_()) != ResolveStatus::Ready) continue;
+            if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) continue;
             sub = s.res.ready();
             s.assembler = std::make_unique<aeron::FragmentAssembler>(
                 [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
@@ -422,15 +421,18 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
         Resolution<aeron::ExclusivePublication> res{kResolveTimeoutNs, kResolveRetryNs};
         PubRegistry reg{*aeron_, newIngressChannel, cfg_.ingressStreamId};
         pumpUntil_([&] {
-            return res.poll(reg, monoNs_()) == ResolveStatus::Ready || res.rejected();
+            return res.poll(reg, resolveNow_()) == ResolveStatus::Ready || res.rejected();
         }, kResolveTimeoutNs);
         if (res.ready() == nullptr) return false;  // old publication stays intact
         // Per-stream publications on the OLD default channel are released and
         // lazily re-resolved on the new channel (stream ids preserved).
+        // Only Ready slots are released: resetting a Resolving/TimedOut slot would
+        // orphan its pending driver registration (it would later come alive with
+        // no owner); such a slot keeps its registration and resolves on next use.
         for (PubSlot& s : pubSlots_) {
-            if (s.channel == cfg_.ingressChannel) s.res.reset();
+            if (s.channel == cfg_.ingressChannel && s.res.ready() != nullptr) s.res.reset();
         }
-        streamPub_ = detail::FlatIndexMap{};
+        streamPub_.clear();
         cfg_.ingressChannel = newIngressChannel;
         ingressPub_ = *res.readyShared();
         return true;
