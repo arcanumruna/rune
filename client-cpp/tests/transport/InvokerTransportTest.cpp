@@ -95,11 +95,15 @@ TEST(InvokerTransport, UdpLoopbackMovesOnlyWhenOwnerRunsDutyCycle) {
 // (ClientConductor.h:436) and cannot be injected.
 TEST(InvokerTransport, StalledOwnerSurfacesClosedInsteadOfExitingRegression) {
     Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3102);
-    c.clientLivenessTimeoutNs = 200'000'000;  // 200 ms
+    // The smallest liveness validate() accepts (1 s = 2x the client's 500 ms
+    // keepalive).  Sleep 2.5x it: > liveness trips the client conductor's
+    // inter-service check (strict '>' on a millisecond epoch clock) and the
+    // driver's client-timeout scan (every liveness/10) with ample margin.
+    c.clientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
     Transport t{c};
     t.start();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
-    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2'500));
     ASSERT_TRUE(pumpUntil(t, [&] { return t.closed(); }))
         << "inter-service timeout must close the client and be observable";
     const uint8_t b[] = {1};
@@ -128,5 +132,18 @@ TEST(InvokerTransport, LongLivenessTimeoutStartsDriverRegression) {
     Transport t{c};
     ASSERT_NO_THROW(t.start());
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    t.stop();
+}
+
+// Regression (Task 6 review I2): the smallest liveness validate() accepts must
+// start a real driver — the derived timer_interval must stay strictly below it
+// (aeron_driver_context.c:1335 rejects liveness <= timer_interval).
+TEST(InvokerTransport, MinimumAcceptedLivenessStartsDriverRegression) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3105);
+    c.clientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
+    Transport t{c};
+    ASSERT_NO_THROW(t.start());
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    EXPECT_FALSE(t.closed());
     t.stop();
 }

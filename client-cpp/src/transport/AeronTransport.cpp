@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -544,13 +545,17 @@ void AeronTransport::startEmbeddedDriver() {
         driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
     aeron_driver_context_set_mtu_length(driverCtx_, cfg_.mtuLength);
     // Aeron requires timer_interval < client_liveness < publication_unblock
-    // (aeron_driver_context.c:1322-1344).  validate() accepts any liveness > 0, so
-    // derive the two driver timers from it instead of failing driver init.
+    // (aeron_driver_context.c:1322-1344).  validate() bounds liveness to
+    // [kMinClientLivenessTimeoutNs, kMaxClientLivenessTimeoutNs]; derive the two
+    // driver timers from it so every accepted value starts the driver:
+    //   timer   = liveness/10  -> in [100 ms, 6 min], strictly < liveness
+    //   unblock = 1.5x liveness -> <= 5.4e12 ns, no int64 overflow in the conductor
+    static_assert(kMinClientLivenessTimeoutNs / 10 > 0);
+    static_assert(kMaxClientLivenessTimeoutNs <= INT64_MAX / 2);
     const auto livenessNs = static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs);
     aeron_driver_context_set_client_liveness_timeout_ns(driverCtx_, livenessNs);
     if (aeron_driver_context_get_timer_interval_ns(driverCtx_) >= livenessNs) {
-        aeron_driver_context_set_timer_interval_ns(driverCtx_,
-                                                   livenessNs / 10 > 0 ? livenessNs / 10 : 1);
+        aeron_driver_context_set_timer_interval_ns(driverCtx_, livenessNs / 10);
     }
     if (aeron_driver_context_get_publication_unblock_timeout_ns(driverCtx_) <= livenessNs) {
         aeron_driver_context_set_publication_unblock_timeout_ns(driverCtx_,

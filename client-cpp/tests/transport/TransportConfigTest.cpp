@@ -72,3 +72,39 @@ TEST(TransportConfig, MalformedEnvIsIgnored) {
     ::unsetenv("RUNE_CLIENT_AERON_MTU");
     EXPECT_EQ(c.mtuLength, 8192u);
 }
+
+// Regression (Task 6 review I1): the Aeron C++ client sends a driver keepalive
+// every 500 ms (ClientConductor.h:47) and takes its inter-service timeout from
+// the driver's liveness value, so liveness <= ~500 ms times out a HEALTHY,
+// properly pumped client.  validate() must reject it (floor 1 s = 2x keepalive).
+TEST(TransportConfig, RejectsLivenessBelowKeepaliveFloorRegression) {
+    using rune::client::transport::kMinClientLivenessTimeoutNs;
+    static_assert(kMinClientLivenessTimeoutNs == 1'000'000'000LL);
+    TransportConfig c;
+    for (int64_t bad : {int64_t{0}, int64_t{1}, int64_t{200'000'000}, int64_t{500'000'000},
+                        kMinClientLivenessTimeoutNs - 1}) {
+        c.clientLivenessTimeoutNs = bad;
+        ASSERT_TRUE(validate(c).has_value()) << bad;
+        EXPECT_NE(validate(c)->find("clientLivenessTimeoutNs"), std::string::npos);
+        EXPECT_NE(validate(c)->find("keepalive"), std::string::npos);
+    }
+    c.clientLivenessTimeoutNs = kMinClientLivenessTimeoutNs;
+    EXPECT_FALSE(validate(c).has_value());
+}
+
+// Regression (Task 6 review I2): the transport derives the driver's
+// publication_unblock_timeout as 1.5x liveness; the driver conductor casts it
+// to int64, which overflows above ~6.1e18 ns.  Cap liveness at 1 hour.
+TEST(TransportConfig, RejectsLivenessAboveOneHourCapRegression) {
+    using rune::client::transport::kMaxClientLivenessTimeoutNs;
+    static_assert(kMaxClientLivenessTimeoutNs == 3'600'000'000'000LL);
+    TransportConfig c;
+    c.clientLivenessTimeoutNs = kMaxClientLivenessTimeoutNs;
+    EXPECT_FALSE(validate(c).has_value());
+    for (int64_t bad : {kMaxClientLivenessTimeoutNs + 1, int64_t{6'200'000'000'000'000'000LL},
+                        INT64_MAX}) {
+        c.clientLivenessTimeoutNs = bad;
+        ASSERT_TRUE(validate(c).has_value()) << bad;
+        EXPECT_NE(validate(c)->find("clientLivenessTimeoutNs"), std::string::npos);
+    }
+}

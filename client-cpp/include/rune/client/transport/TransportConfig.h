@@ -27,6 +27,14 @@ inline constexpr std::size_t kAeronMaxUdpPayloadLength = 65504;  // AERON_MAX_UD
 inline constexpr std::size_t kAeronFrameAlignment      = 32;     // AERON_LOGBUFFER_FRAME_ALIGNMENT
 inline constexpr std::size_t kMinTermLength            = 64u * 1024;
 inline constexpr std::size_t kMaxTermLength            = 1024u * 1024 * 1024;
+/// Liveness floor: 2x the Aeron C++ client's fixed 500 ms driver keepalive
+/// (ClientConductor.h:47 KEEPALIVE_TIMEOUT_MS).  The client's inter-service
+/// timeout is the driver's liveness value (Aeron.cpp:57), so anything near
+/// 500 ms times out a healthy, properly pumped client.
+inline constexpr int64_t kMinClientLivenessTimeoutNs = 1'000'000'000LL;
+/// Liveness cap: 1 hour.  The transport derives publication_unblock_timeout =
+/// 1.5x liveness, which the driver conductor casts to int64 (overflow > ~6.1e18).
+inline constexpr int64_t kMaxClientLivenessTimeoutNs = 3'600'000'000'000LL;
 
 struct TransportConfig {
     std::string ingressChannel;        ///< Channel the client publishes to (→ gateway)
@@ -75,8 +83,14 @@ struct TransportConfig {
     if (c.socketRcvBufBytes != 0 && c.socketRcvBufBytes < c.mtuLength) {
         return "socketRcvBufBytes must be 0 (OS default) or >= mtuLength";
     }
-    if (c.clientLivenessTimeoutNs <= 0) {
-        return "clientLivenessTimeoutNs must be > 0";
+    if (c.clientLivenessTimeoutNs < kMinClientLivenessTimeoutNs) {
+        return "clientLivenessTimeoutNs must be >= 1000000000 (1 s = 2x the Aeron client's "
+               "500 ms driver keepalive; lower values time out a healthy client): " +
+               std::to_string(c.clientLivenessTimeoutNs);
+    }
+    if (c.clientLivenessTimeoutNs > kMaxClientLivenessTimeoutNs) {
+        return "clientLivenessTimeoutNs must be <= 3600000000000 (1 hour): " +
+               std::to_string(c.clientLivenessTimeoutNs);
     }
     return std::nullopt;
 }
