@@ -743,9 +743,9 @@ void BrokerNode::buildReplication() {
                 // Legacy path: real Aeron transport if available, else no-op.
                 transport = replTransport_.get();
                 if (!transport) {
-                    // Allocate a no-op InMemoryTransport owned by the replica registry.
-                    // InMemoryTransport with no registered leader/follower drops all frames.
-                    nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+                    // Allocate a no-op NullPartitionTransport owned by the replica registry.
+                    // NullPartitionTransport drops all frames (final, direct no-op calls).
+                    nullTransports_.push_back(std::make_unique<NullPartitionTransport>());
                     transport = nullTransports_.back().get();
                 }
             }
@@ -919,7 +919,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         } else {
             transport = replTransport_.get();
             if (!transport) {
-                nullTransports_.push_back(std::make_unique<InMemoryTransport>());
+                nullTransports_.push_back(std::make_unique<NullPartitionTransport>());
                 transport = nullTransports_.back().get();
             }
         }
@@ -1436,7 +1436,7 @@ void BrokerNode::buildGateway() {
             // topicId=-1 is the sentinel for the offset log (not a user topic).
             // When replTransport_ is available (multi-node cluster), use it so
             // committed offsets are replicated to all peers and survive leader
-            // failover.  On single-node (no transport), fall back to InMemoryTransport.
+            // failover.  On single-node (no transport), fall back to NullPartitionTransport.
             // The replica is added to replicaRegistry_ so the metadata bridge drives
             // its role transitions (Follower → Leader on election, Leader → Follower
             // on dethronement) exactly like user-topic replicas.
@@ -1474,10 +1474,10 @@ void BrokerNode::buildGateway() {
             // the coalescer group bound is consistent with what the cleaner uses per-topic.
             ocfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
 
-            // Transport: real Aeron transport if available, else no-op InMemoryTransport.
+            // Transport: real Aeron transport if available, else no-op NullPartitionTransport.
             rune::replication::PartitionTransport* offsetTransport = replTransport_.get();
             if (!offsetTransport) {
-                nullTransports_.push_back(std::make_unique<rune::replication::InMemoryTransport>());
+                nullTransports_.push_back(std::make_unique<rune::replication::NullPartitionTransport>());
                 offsetTransport = nullTransports_.back().get();
             }
 
@@ -1589,7 +1589,7 @@ void BrokerNode::buildGateway() {
             rune::replication::PartitionTransport* txnTransport = replTransport_.get();
             if (!txnTransport) {
                 nullTransports_.push_back(
-                    std::make_unique<rune::replication::InMemoryTransport>());
+                    std::make_unique<rune::replication::NullPartitionTransport>());
                 txnTransport = nullTransports_.back().get();
             }
 
@@ -1709,11 +1709,11 @@ void BrokerNode::buildGateway() {
             mcfg.deleteRetentionMs      = 86'400'000LL; // 1 day tombstone retention
             mcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
 
-            // Transport: real Aeron transport if available, else no-op InMemoryTransport.
+            // Transport: real Aeron transport if available, else no-op NullPartitionTransport.
             rune::replication::PartitionTransport* metaTransport = replTransport_.get();
             if (!metaTransport) {
                 nullTransports_.push_back(
-                    std::make_unique<rune::replication::InMemoryTransport>());
+                    std::make_unique<rune::replication::NullPartitionTransport>());
                 metaTransport = nullTransports_.back().get();
             }
 
@@ -1882,6 +1882,9 @@ void BrokerNode::buildGateway() {
     if (slowTickIntervalOverrideNs_ >= 0) runtimeAgent_->setSlowTickIntervalNs(slowTickIntervalOverrideNs_);
     // Task 11 fix 1: leadership handed to the gateway as a value each cycle.
     runtimeAgent_->setSelfId(config_.nodeId);
+    // Task 11 fix 2 (review m4): the production runtime path never takes a
+    // virtual fallback (Generic arms exist for test doubles only).
+    assert(runtimePathIsConcrete_() && "runtime duty cycle would dispatch virtually");
 
     // -----------------------------------------------------------------------
     // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.
@@ -2157,12 +2160,12 @@ void BrokerNode::buildAdminWorker() {
         // (which iterates allReplicas() and would call becomeLeader/Follower on
         // the admin-owned replica from the control thread — the RULING-2 race).
         //
-        // A dedicated InMemoryTransport backs it so no cross-thread transport
+        // A dedicated NullPartitionTransport backs it so no cross-thread transport
         // poll (AeronPartitionTransport::poll → replica->applyReplicated on the
         // control thread) ever touches it.  Real multi-node follower fetch
         // routing on an admin-thread-owned transport is Docker-gated (Task 8b).
         nullTransports_.push_back(
-            std::make_unique<rune::replication::InMemoryTransport>());
+            std::make_unique<rune::replication::NullPartitionTransport>());
         rune::replication::PartitionTransport* schemaTransport =
             nullTransports_.back().get();
 
@@ -2671,6 +2674,20 @@ int BrokerNode::serviceAdminControl_() {
 }
 
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+
+// ---------------------------------------------------------------------------
+// BrokerNode::runtimePathIsConcrete_ — Task 11 fix 2: every call the runtime duty
+// cycle makes through a polymorphic seam resolves to a concrete final type.
+// ---------------------------------------------------------------------------
+bool BrokerNode::runtimePathIsConcrete_() const noexcept {
+    if (!runtimeAgent_ || runtimeAgent_->consensusKind() == NodeRuntimeAgent::ConsensusKind::Generic) return false;
+    if (election_ && !election_->publishPathIsConcrete()) return false;
+    if (replicaRegistry_)
+        for (auto* r : replicaRegistry_->allReplicas())
+            if (r && r->topicId() < 0 && r->transportKindForTest() == rune::replication::TransportKind::Generic)
+                return false;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // BrokerNode::stopStartupPump_ — fused only: stop + JOIN the interim runtime

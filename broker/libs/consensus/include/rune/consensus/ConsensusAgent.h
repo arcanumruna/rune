@@ -153,7 +153,8 @@ private:
 
     Election&         election_;
     IngressRing&      ingressRing_;
-    ConsensusAdapter  adapter_;   // dispatches decoded frames back to *this
+    // Concrete (final) handler: every decoded message is a DIRECT call (fix 2, B2).
+    BasicConsensusAdapter<ConsensusAgent> adapter_;   // dispatches decoded frames back to *this
 
     // Count of ingress messages dispatched (for integration-test assertions).
     std::atomic<int64_t> messagesProcessed_{0};

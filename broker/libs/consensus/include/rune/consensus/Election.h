@@ -30,6 +30,10 @@
 
 #include <rune/consensus/ClusterMember.h>
 #include <rune/consensus/ConsensusPublisher.h>
+#include <rune/consensus/SbeConsensusPublisher.h>
+
+#include <type_traits>
+#include <utility>
 #include <rune/consensus/ElectionState.h>
 #include <rune/consensus/FollowerLiveness.h>
 #include <rune/consensus/NodeStateFile.h>
@@ -221,6 +225,13 @@ public:
                           int64_t logPosition,
                           NodeId  leaderMemberId);
 
+    /// Task 11 fix 2 (B2): true when every outbound consensus message is a direct
+    /// call (production SbeConsensusPublisher over a final sink); false only for
+    /// test doubles.  BrokerNode debug-asserts it.
+    [[nodiscard]] bool publishPathIsConcrete() const noexcept {
+        return publisher_.sbe != nullptr && publisher_.sbe->sinkIsConcrete();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // State handlers — one per ElectionState
@@ -289,7 +300,32 @@ private:
     NodeId                                   thisMemberId_;
 
     // Election.java:74    private final ConsensusPublisher consensusPublisher;
-    ConsensusPublisher&                      publisher_;
+    // Concrete publisher + construction-time tag (Task 11 fix 2, B2): the
+    // production SbeConsensusPublisher (final) is called DIRECTLY; Generic
+    // (virtual) = test doubles only.
+    struct PublisherRef {
+        SbeConsensusPublisher* sbe     = nullptr;
+        ConsensusPublisher*    generic = nullptr;
+        static PublisherRef of(ConsensusPublisher& p) noexcept {
+            PublisherRef r;
+            if (auto* s = dynamic_cast<SbeConsensusPublisher*>(&p)) r.sbe = s; else r.generic = &p;
+            return r;
+        }
+#define RUNE_ELECTION_PUB_FWD(m)                                                      \
+        template <class... A> void m(A&&... a) const {                                \
+            if (sbe) [[likely]] sbe->m(std::forward<A>(a)...);                         \
+            else generic->m(std::forward<A>(a)...);                                    \
+        }
+        RUNE_ELECTION_PUB_FWD(canvassPosition)
+        RUNE_ELECTION_PUB_FWD(requestVote)
+        RUNE_ELECTION_PUB_FWD(placeVote)
+        RUNE_ELECTION_PUB_FWD(newLeadershipTerm)
+        RUNE_ELECTION_PUB_FWD(appendPosition)
+        RUNE_ELECTION_PUB_FWD(commitPosition)
+#undef RUNE_ELECTION_PUB_FWD
+    };
+    static_assert(std::is_final_v<SbeConsensusPublisher>);
+    PublisherRef                             publisher_;
 
     // Persistence (replacing ctx.nodeStateFile() and ctx.recordingLog())
     NodeStateFile&                           nodeStateFile_;

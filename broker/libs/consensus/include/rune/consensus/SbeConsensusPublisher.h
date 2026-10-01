@@ -11,8 +11,11 @@
 
 #include <rune/consensus/ConsensusPublisher.h>
 #include <rune/consensus/MessageSink.h>
+#include <rune/consensus/NullSink.h>
+#include <rune/consensus/UdpMessageSink.h>
 #include <rune/consensus/ConsensusMessages.h>
 #include <array>
+#include <type_traits>
 
 namespace rune::consensus {
 
@@ -23,8 +26,12 @@ inline constexpr std::size_t kEncodeBufCapacity = 128;
 class SbeConsensusPublisher final : public ConsensusPublisher {
 public:
     explicit SbeConsensusPublisher(MessageSink& sink) noexcept
-        : sink_{sink}
+        : sink_{SinkRef::of(sink)}
     {}
+
+    /// Task 11 fix 2 (B2): true when the sink is a production (final) sink —
+    /// every send is a direct call.  False only for test doubles (virtual).
+    [[nodiscard]] bool sinkIsConcrete() const noexcept { return sink_.kind != SinkKind::Generic; }
 
     ~SbeConsensusPublisher() override = default;
 
@@ -85,7 +92,29 @@ public:
         NodeId  leaderMemberId) override;
 
 private:
-    MessageSink& sink_;
+    // Concrete sink + construction-time tag (Task 11 fix 2, B2): the runtime duty
+    // cycle (worker 0's pass under fused placement) never dispatches through the
+    // MessageSink vtable.  Generic = test doubles only.
+    enum class SinkKind : uint8_t { Udp, Null, Generic };
+    struct SinkRef {
+        SinkKind        kind    = SinkKind::Generic;
+        UdpMessageSink* udp     = nullptr;
+        MessageSink*    generic = nullptr;
+        static SinkRef of(MessageSink& s) noexcept {
+            SinkRef r;
+            if (auto* u = dynamic_cast<UdpMessageSink*>(&s)) { r.kind = SinkKind::Udp; r.udp = u; }
+            else if (dynamic_cast<NullSink*>(&s) != nullptr)  { r.kind = SinkKind::Null; }
+            else                                              { r.generic = &s; }
+            return r;
+        }
+        void send(NodeId to, const uint8_t* buf, std::size_t len) const {
+            if (kind == SinkKind::Udp) [[likely]] { udp->send(to, buf, len); return; }   // final → direct
+            if (kind == SinkKind::Null) return;                                          // no-op sink
+            generic->send(to, buf, len);                                                 // test doubles
+        }
+    };
+    static_assert(std::is_final_v<UdpMessageSink> && std::is_final_v<NullSink>);
+    SinkRef sink_;
     // Single reusable encode buffer — no per-message allocation.
     std::array<uint8_t, kEncodeBufCapacity> buf_{};
 };

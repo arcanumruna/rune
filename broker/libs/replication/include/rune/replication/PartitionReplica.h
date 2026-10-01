@@ -148,8 +148,10 @@ struct PartitionConfig {
 // pumps requests back into the follower via its applyReplicated().
 // ---------------------------------------------------------------------------
 enum class TransportKind : uint8_t {
-    Generic   = 0,  ///< virtual dispatch (legacy control-thread transport, test fakes)
+    Generic   = 0,  ///< virtual dispatch — test fakes only (BrokerNode asserts never in production)
     PerWorker = 1,  ///< concrete final WorkerReplicationTransport — direct calls
+    Aeron     = 2,  ///< concrete final AeronPartitionTransport (internal partitions) — direct calls
+    Null      = 3,  ///< concrete final NullPartitionTransport (no peers) — direct no-op calls
 };
 
 class PartitionTransport {
@@ -208,6 +210,25 @@ public:
 
 class AeronPubRegistry;
 template <typename PubRegistry> class WorkerReplicationTransportImpl;
+class AeronPartitionTransport;
+
+// ---------------------------------------------------------------------------
+// NullPartitionTransport — production transport for a replica with no
+// replication endpoint (single-node / no repl port): every send is a no-op.
+// Final + TransportKind::Null so the replica calls it directly (Task 11 fix 2;
+// replaces the test InMemoryTransport — mutex + unbounded queues — in BrokerNode).
+// ---------------------------------------------------------------------------
+class NullPartitionTransport final : public PartitionTransport {
+public:
+    [[nodiscard]] TransportKind kind() const noexcept override { return TransportKind::Null; }
+    void sendFetchRequest(const FetchRequestMsg&) override {}
+    void sendFetchRequestTo(NodeId, const FetchRequestMsg&) override {}
+    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    void sendOffsetsForLeaderEpochRequest(NodeId, const OffsetsForLeaderEpochReqMsg&) override {}
+    void sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override {}
+    void sendReconcileRequest(NodeId, const FetchRequestMsg&) override {}
+    void sendReconcileResponse(NodeId, const FetchResponseMsg&) override {}
+};
 
 // ---------------------------------------------------------------------------
 // PartitionReplica
@@ -725,6 +746,8 @@ private:
     using PerWorkerTransport = WorkerReplicationTransportImpl<AeronPubRegistry>;
     TransportKind       tkind_     = TransportKind::Generic;  ///< fixed at construction
     PerWorkerTransport* perWorker_ = nullptr;                 ///< non-null iff tkind_ == PerWorker
+    AeronPartitionTransport* aeronT_ = nullptr;               ///< non-null iff tkind_ == Aeron
+    NullPartitionTransport*  nullT_  = nullptr;               ///< non-null iff tkind_ == Null
     /// Apply f to the concrete transport: one predicted branch, direct call on the
     /// PerWorker arm.  Defined in PartitionReplica.cpp (its only user).
     template <class F> void onTransport(F&& f);

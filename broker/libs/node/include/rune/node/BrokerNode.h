@@ -54,6 +54,7 @@
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/MessageSink.h>
+#include <rune/consensus/NullSink.h>
 #include <rune/consensus/SbeConsensusPublisher.h>
 #include <rune/consensus/ClusterMember.h>
 #include <rune/consensus/Election.h>
@@ -88,12 +89,7 @@ namespace rune::node {
 // ---------------------------------------------------------------------------
 // NullSink — no-op outbound transport (sufficient for 1-node; BR-3 replaces)
 // ---------------------------------------------------------------------------
-class NullSink final : public rune::consensus::MessageSink {
-public:
-    void send(rune::consensus::NodeId,
-              const uint8_t*,
-              std::size_t) override {}
-};
+using NullSink = rune::consensus::NullSink;   // moved to rune/consensus/NullSink.h (Task 11 fix 2)
 
 // ---------------------------------------------------------------------------
 // AdminWorkerAgent — wraps AdminWorker + its cross-thread SPSC rings into an
@@ -424,6 +420,9 @@ public:
     [[nodiscard]] NodeRuntimeAgent::ConsensusKind runtimeConsensusKindForTest() const noexcept {
         return runtimeAgent_ ? runtimeAgent_->consensusKind() : NodeRuntimeAgent::ConsensusKind::Generic;
     }
+    /// Test-only: every runtime-cycle call is concrete (consensus agent, consensus
+    /// publisher + sink, internal-replica transports) — no virtual fallback taken.
+    [[nodiscard]] bool runtimePathIsConcreteForTest() const noexcept { return runtimePathIsConcrete_(); }
 
     /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
     /// runtime duty cycles run / routing-image publishes so far.
@@ -565,6 +564,7 @@ private:
     // -----------------------------------------------------------------------
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;
+    [[nodiscard]] bool runtimePathIsConcrete_() const noexcept;   // Task 11 fix 2 (review m4)
     void stopStartupPump_() noexcept;   // fused: join the interim runtime-driver pump (idempotent)
     void buildConsensusObjects();
     void buildSingleNodeConsensus();
@@ -646,9 +646,9 @@ private:
     std::unique_ptr<ReplicaRegistry>                        replicaRegistry_;
     std::unique_ptr<rune::replication::AeronPartitionTransport> replTransport_;
     std::unique_ptr<ReplicationMetadataBridge>              replBridge_;
-    // Per-replica no-op InMemoryTransport instances used when replTransport_ is null.
+    // Per-replica no-op NullPartitionTransport instances used when replTransport_ is null.
     // Prevents PartitionReplica assert(transport!=nullptr) in single-node / no-repl-port nodes.
-    std::vector<std::unique_ptr<rune::replication::InMemoryTransport>> nullTransports_;
+    std::vector<std::unique_ptr<rune::replication::NullPartitionTransport>> nullTransports_;
 
     // -----------------------------------------------------------------------
     // Client gateway (BR-7a) — runs inside the duty-cycle via NodeRuntimeAgent.

@@ -651,6 +651,8 @@ TEST(ShardModeFusedRegression, SingleNodeRunsRuntimeOnWorkerZero) {
     EXPECT_FALSE(node.runtimeThreadStartedForTest());
     EXPECT_EQ(node.runtimeConsensusKindForTest(), NodeRuntimeAgent::ConsensusKind::Single)
         << "worker 0's pass must call the concrete consensus agent (no virtual dispatch)";
+    EXPECT_TRUE(node.runtimePathIsConcreteForTest())
+        << "consensus publisher/sink + internal-replica transports must be concrete (no virtual)";
     {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -699,6 +701,8 @@ TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
     EXPECT_FALSE(n0.runtimeThreadStartedForTest());
     EXPECT_EQ(n0.runtimeConsensusKindForTest(), NodeRuntimeAgent::ConsensusKind::Multi)
         << "worker 0's pass must call the concrete consensus agent (no virtual dispatch)";
+    EXPECT_TRUE(n0.runtimePathIsConcreteForTest())
+        << "consensus publisher/sink + internal-replica transports must be concrete (no virtual)";
     {
         ShardTestClient c(cdir.path);
         const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);

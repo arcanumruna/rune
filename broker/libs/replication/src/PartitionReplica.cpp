@@ -16,6 +16,7 @@
 #include <rune_fr/FlightRecorder.h>
 #if RUNE_REPLICATION_HAS_AERON
 #include <rune/replication/WorkerReplicationTransport.h>
+#include <rune/replication/AeronPartitionTransport.h>
 #endif
 
 #include <spdlog/spdlog.h>
@@ -89,8 +90,10 @@ template <class F>
 {
 #if RUNE_REPLICATION_HAS_AERON
     if (tkind_ == TransportKind::PerWorker) { f(*perWorker_); return; }
+    if (tkind_ == TransportKind::Aeron)     { f(*aeronT_);    return; }   // final → direct
 #endif
-    f(*transport_);
+    if (tkind_ == TransportKind::Null)      { f(*nullT_);     return; }   // final → direct no-op
+    f(*transport_);                                                       // test fakes only
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +154,11 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
     tkind_ = transport_->kind();
 #if RUNE_REPLICATION_HAS_AERON
     if (tkind_ == TransportKind::PerWorker) perWorker_ = static_cast<PerWorkerTransport*>(transport_);
+    if (tkind_ == TransportKind::Aeron)     aeronT_    = static_cast<AeronPartitionTransport*>(transport_);
 #else
-    tkind_ = TransportKind::Generic;
+    if (tkind_ != TransportKind::Null) tkind_ = TransportKind::Generic;
 #endif
+    if (tkind_ == TransportKind::Null)      nullT_     = static_cast<NullPartitionTransport*>(transport_);
 
     // Retain the full replica set (RF) for the lifetime of this replica so a
     // follower-first replica can rebuild a correct IsrManager on a later

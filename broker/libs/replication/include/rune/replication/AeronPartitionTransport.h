@@ -178,6 +178,11 @@ public:
     /// (Follower → Leader) encode and offer a FetchRequest on the leader's pub.
     /// Non-blocking: drops if the pub is not yet resolved or back-pressured.
     void sendFetchRequest(const FetchRequestMsg& req) override;
+    /// Same broadcast as sendFetchRequest (the leader NodeId is not on this wire);
+    /// overridden so the call stays direct on this final class (Task 11 fix 2).
+    void sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) override { sendFetchRequest(req); }
+    /// Task 11 fix 2 (B2): PartitionReplica dispatches this final class directly.
+    [[nodiscard]] TransportKind kind() const noexcept override { return TransportKind::Aeron; }
 
     /// (Leader → Follower) encode and offer a FetchResponse to a follower.
     /// Non-blocking: drops if the follower's pub is not yet resolved.

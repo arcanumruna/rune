@@ -24,24 +24,18 @@ endif()
 # The base rune_replication library remains Aeron-free (pure + InMemoryTransport).
 # ---------------------------------------------------------------------------
 if(aeron_FOUND)
-    add_library(rune_replication_aeron
-        src/AeronPartitionTransport.cpp)
-    target_include_directories(rune_replication_aeron PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        ${RUNE_NODE_INCLUDE})
-    target_link_libraries(rune_replication_aeron PUBLIC
-        rune_replication
-        rune_consensus
-        rune_metadata
-        aeron::aeron)
-    # spdlog PUBLIC because AeronPartitionTransport.h includes WorkerPool.h→Worker.h
-    # which uses spdlog inline methods; consumers must see spdlog headers.
-    target_link_libraries(rune_replication_aeron PUBLIC spdlog::spdlog)
-    # rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
-    # includes rune/codec/Validator.h + rune/codec/Serialize.h for the Task 7
-    # per-worker schema validation hook.  Any consumer of rune_replication_aeron
-    # that includes Worker.h (directly or transitively) needs rune_codec headers.
-    target_link_libraries(rune_replication_aeron PUBLIC rune_codec)
+    # Task 11 fix 2 (B2): AeronPartitionTransport is compiled INTO rune_replication
+    # so PartitionReplica can call it directly (final class, TransportKind::Aeron)
+    # — internal partitions' sends on the runtime duty cycle are never virtual.
+    # Its .cpp only needs node HEADERS (all header-inline; no node link deps).
+    target_sources(rune_replication PRIVATE src/AeronPartitionTransport.cpp)
+    target_include_directories(rune_replication PRIVATE ${RUNE_NODE_INCLUDE})
+    target_link_libraries(rune_replication PUBLIC rune_consensus rune_metadata rune_codec)
+    # Kept as the consumer-facing name (same usage requirements as before).
+    add_library(rune_replication_aeron INTERFACE)
+    target_include_directories(rune_replication_aeron INTERFACE ${RUNE_NODE_INCLUDE})
+    target_link_libraries(rune_replication_aeron INTERFACE
+        rune_replication rune_consensus rune_metadata aeron::aeron spdlog::spdlog rune_codec)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING

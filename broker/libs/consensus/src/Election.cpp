@@ -43,7 +43,7 @@ Election::Election(bool             isNodeStartup,
                    uint64_t         rngSeed)
     : clusterMembers_(std::move(clusterMembers))
     , thisMemberId_(thisMemberId)
-    , publisher_(publisher)
+    , publisher_(PublisherRef::of(publisher))
     , nodeStateFile_(nodeStateFile)
     , termLog_(termLog)
     , logPosition_(logPosition)

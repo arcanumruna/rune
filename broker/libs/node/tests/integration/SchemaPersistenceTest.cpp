@@ -76,11 +76,7 @@ struct TmpSchemaDir {
 };
 
 // Minimal no-op PartitionTransport (single-node: no peers).
-class NullPartitionTransport : public PartitionTransport {
-public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
-};
+// NullPartitionTransport — now the production rune::replication one (Task 11 fix 2).
 
 static PartitionConfig makeSingleNodeSchemaConfig() {
     PartitionConfig cfg;

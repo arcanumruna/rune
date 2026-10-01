@@ -200,3 +200,34 @@ TEST(AeronPumpInvokerRegression, ClientGatewayResolvesOnInvokerDriver) {
                                     rune::gateway::ClientGateway::kDefaultConnectResolveTimeoutNs, s.pump());
     SUCCEED() << "constructor would throw 'ingress subscription not resolved' without the pump";
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 fix 2 (B2): the production transports of internal partitions are
+// dispatched concretely by PartitionReplica (TransportKind::Aeron / ::Null),
+// never through the PartitionTransport vtable (Generic = test fakes only).
+// ---------------------------------------------------------------------------
+#include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
+
+namespace {
+rune::replication::PartitionConfig internalCfg() {
+    rune::replication::PartitionConfig c;
+    c.topicId = -2; c.partitionId = 0; c.selfId = 1;
+    c.replicaLagMaxMs = 10'000; c.replicaLagMaxOffset = 10'000;
+    return c;
+}
+}
+
+TEST(PartitionTransportKindRegression, AeronAndNullTransportsAreConcreteKinds) {
+    InvokerShard s;
+    rune::replication::AeronPartitionTransport aeronT(s.client, "aeron:ipc", 7301, /*selfId=*/1,
+                                                      64 * 1024, s.pump());
+    rune::storage::InMemoryLog log1(1 << 20, 1024), log2(1 << 20, 1024);
+    rune::replication::PartitionReplica viaAeron(internalCfg(), rune::replication::Role::Leader, 1,
+                                                 {1, 2}, {1, 2}, &log1, &aeronT);
+    EXPECT_EQ(viaAeron.transportKindForTest(), rune::replication::TransportKind::Aeron);
+    rune::replication::NullPartitionTransport nullT;
+    rune::replication::PartitionReplica viaNull(internalCfg(), rune::replication::Role::Leader, 1,
+                                                {1}, {1}, &log2, &nullT);
+    EXPECT_EQ(viaNull.transportKindForTest(), rune::replication::TransportKind::Null);
+}
