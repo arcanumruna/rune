@@ -25,56 +25,39 @@ LIGHT_J=$(( CORES > 2 ? CORES / 2 : 1 ))
 echo "== tier 1: fast tests (-j$LIGHT_J, no lock)"
 ctest --test-dir "$B" -E "$HEAVY_RE" -j "$LIGHT_J" --timeout 300 "$@"; rc1=$?
 
-echo "== tier 2: heavy multi-node tests (-j2, waiting for /tmp/rune-heavy.lock)"
-LOCK=/tmp/rune-heavy.lock
-# Owned lock = a SYMLINK whose target is the owner pid, created with symlink(2)
-# directly (perl): it fails with EEXIST on ANY existing path — including a
-# legacy holder's mkdir'd directory, which plain `ln -s` would silently write
-# INTO.  Create + record-owner is one atomic step.  A lock whose owner process is
-# gone is reclaimed under a separate $LOCK.reclaim mutex that re-reads the owner
-# AND re-checks it is still dead before removing.  A reclaim mutex left behind by
-# a killed reclaimer is broken after RECLAIM_STALE_S seconds (logged).
-RECLAIM_STALE_S=60
-mklock() { perl -e 'symlink($ARGV[0], $ARGV[1]) or exit 1' "$1" "$LOCK"; }
-# ps -p works on macOS + procps; containers with a separate PID namespace sharing
-# /tmp would see live owners as dead — the heavy lock is host-local by design.
-owner_alive() { ps -p "$1" >/dev/null 2>&1; }
-mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
-acquire_lock() {
-  local owner warned=0
-  while :; do
-    if mklock "$$" 2>/dev/null; then return 0; fi
-    owner=$(readlink "$LOCK" 2>/dev/null || true)
-    if [ -n "$owner" ] && ! owner_alive "$owner"; then
-      if mkdir "$LOCK.reclaim" 2>/dev/null; then
-        if [ "$(readlink "$LOCK" 2>/dev/null)" = "$owner" ] && ! owner_alive "$owner" && rm -f "$LOCK"; then
-          echo "reclaimed stale $LOCK (owner pid $owner is gone)" >&2
-        fi
-        rmdir "$LOCK.reclaim" 2>/dev/null || true
-        continue
-      fi
-      age=$(( $(date +%s) - $(mtime "$LOCK.reclaim") ))
-      if [ "$age" -gt "$RECLAIM_STALE_S" ]; then
-        echo "breaking stale $LOCK.reclaim (${age}s old; a reclaimer was killed)" >&2
-        rmdir "$LOCK.reclaim" 2>/dev/null || true
-        continue
-      fi
-    fi
-    if [ -z "$owner" ] && [ "$warned" = 0 ]; then
-      echo "waiting on $LOCK held by a legacy (pid-less, mkdir) holder" >&2; warned=1
+echo "== tier 2: heavy multi-node tests (-j2, waiting for the heavy-test lock)"
+# Mutual exclusion, in two layers:
+#  1. A kernel flock(2) on /tmp/rune-heavy.flock, held by a perl wrapper for the
+#     whole tier.  The kernel releases it when the holder dies (SIGKILL/OOM/crash),
+#     so there is NO stale-lock or reclaim logic among new-style runners.
+#  2. Under that flock, the legacy directory lock /tmp/rune-heavy.lock (still used
+#     by older agents' plain mkdir/rmdir) is taken too, with our pid in a marker
+#     file.  Only one new-style runner can be here at a time, so reclaiming a
+#     marker whose pid is dead is race-free; a pid-less (legacy) dir is waited for.
+command -v perl >/dev/null || { echo "perl is required for the heavy-test lock" >&2; exit 2; }
+: "${RUNE_HEAVY_FLOCK:=/tmp/rune-heavy.flock}" "${RUNE_HEAVY_LOCK_DIR:=/tmp/rune-heavy.lock}"
+export RUNE_HEAVY_FLOCK RUNE_HEAVY_LOCK_DIR
+HEAVY_RE="$HEAVY_RE" B="$B" perl -e '
+  use Fcntl ":flock";
+  open(my $fh, ">>", $ENV{RUNE_HEAVY_FLOCK}) or die "open flock: $!";
+  flock($fh, LOCK_EX) or die "flock: $!";
+  exit(system(@ARGV) == 0 ? 0 : 1);
+' -- bash -c '
+  D="$RUNE_HEAVY_LOCK_DIR"
+  while ! mkdir "$D" 2>/dev/null; do
+    owner=$(cat "$D/owner.pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! ps -p "$owner" >/dev/null 2>&1; then
+      echo "reclaiming $D left by dead runner pid $owner" >&2
+      rm -f "$D/owner.pid"; rmdir "$D" 2>/dev/null || sleep 5
+      continue
     fi
     sleep 5
   done
-}
-release_lock() {
-  [ "$(readlink "$LOCK" 2>/dev/null)" = "$$" ] && rm -f "$LOCK"
-  return 0
-}
-acquire_lock
-trap 'release_lock' EXIT
-trap 'release_lock; exit 130' INT
-trap 'release_lock; exit 143' TERM
-ctest --test-dir "$B" -R "$HEAVY_RE" -j2 --timeout 300 "$@"; rc2=$?
-release_lock
+  echo $$ > "$D/owner.pid"
+  release() { [ "$(cat "$D/owner.pid" 2>/dev/null)" = "$$" ] && { rm -f "$D/owner.pid"; rmdir "$D" 2>/dev/null; }; return 0; }
+  trap release EXIT; trap "release; exit 130" INT; trap "release; exit 143" TERM
+  ctest --test-dir "$B" -R "$HEAVY_RE" -j2 --timeout 300 "$@"
+' run-heavy "$@"
+rc2=$?
 
 [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]
