@@ -37,6 +37,7 @@
 // ClientSchemaTest.cpp (included via the same translation unit pattern).
 // Stream ranges start at 1200 to avoid collisions with ClientSchemaTest (1100-1119).
 
+#include "support/AeronTestErrors.h"
 #include "rune/cli/Cli.h"
 
 #include <rune/client/Client.h>
@@ -156,7 +157,7 @@ struct CliTestGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) throw std::runtime_error("CliTestGateway: Aeron::connect failed");

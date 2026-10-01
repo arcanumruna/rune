@@ -56,6 +56,7 @@
 // The gateway intercepts Subscribe messages and immediately pushes one or more
 // Records{subscriptionId} back.  This keeps the test self-contained.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -197,7 +198,7 @@ struct SubscribeGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         if (!gwAeron) throw std::runtime_error("SubscribeGateway: connect failed");

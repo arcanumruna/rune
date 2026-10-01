@@ -29,6 +29,7 @@
 //   - Injected clock for linger tests: pass synthetic nowNs to doWork().
 //   - No background runner thread in these tests: we drive doWork() directly.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -153,7 +154,7 @@ struct ProduceGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         if (!gwAeron) throw std::runtime_error("ProduceGateway: connect failed");

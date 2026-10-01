@@ -162,8 +162,19 @@ Client::Client(ClientConfig cfg)
     dutyThreadId_ = ownerThread_;
     nextSweepNs_  = now() + kSweepIntervalMs * 1'000'000LL;
     if (cfg_.runnerMode == RunnerMode::Thread) {
-        runnerThread_ = std::thread([this]() { runLoop(); });
+        // dutyThreadId_ is written BEFORE the runner runs its first duty cycle: the
+        // runner blocks on `go` until the write is done, and set_value() → wait()
+        // is a happens-before edge, so the runner's reads (submitRegistration_ /
+        // ~Client from a callback) never race the write.  App threads see it via
+        // the Client's construction (they cannot hold the Client earlier).
+        std::promise<void> go;
+        std::future<void>  goF = go.get_future();
+        runnerThread_ = std::thread([this, goF = std::move(goF)]() mutable {
+            goF.wait();
+            runLoop();
+        });
         dutyThreadId_ = runnerThread_.get_id();
+        go.set_value();
     }
 }
 
@@ -172,7 +183,21 @@ Client::Client(ClientConfig cfg)
 // ---------------------------------------------------------------------------
 
 Client::~Client() {
-    close();
+    // Never throws (close()'s contract checks would std::terminate here).
+    //  - Destroyed from inside its own duty-cycle callback (owner in Invoker mode,
+    //    runner in Thread mode): every frame above us still uses `this` — a silent
+    //    use-after-free.  Programming error: fail loud.
+    //  - Invoker mode, destroyed OFF the owner thread: legitimate ("construct and
+    //    drive on a worker, join it, destroy on main") — destruction ends the
+    //    lifetime and the app guarantees no concurrent doWork(), so tear down.
+    if (std::this_thread::get_id() == dutyThreadId_ && inDutyCycle_) {
+        std::fprintf(stderr,
+                     "rune-client: FATAL: Client destroyed from inside its own duty-cycle "
+                     "callback (use-after-free); aborting\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+    closeImpl_();
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +216,10 @@ void Client::close() {
                 "down under its own poll)");
         }
     }
+    closeImpl_();
+}
+
+void Client::closeImpl_() {
     // Atomically transition to stopped; only the first caller does the work.
     bool alreadyStopped = stopped_.exchange(true, std::memory_order_acq_rel);
     if (alreadyStopped) return;

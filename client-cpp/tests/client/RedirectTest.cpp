@@ -19,6 +19,7 @@
 // starting with "aeron:") as-is so that ipc-based tests don't have UDP URIs
 // forced onto them.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -120,7 +121,7 @@ struct RedirectGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         if (!gwAeron)
@@ -537,7 +538,7 @@ struct M1Gateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
@@ -766,7 +767,7 @@ struct DeadGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
@@ -972,7 +973,7 @@ struct MaxRedirectGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);

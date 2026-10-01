@@ -239,6 +239,10 @@ public:
     [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
     /// Test hook: fill the agent command ring so the next registration finds it full.
     void testFillCommandRing() { agent_.testFillCommandRing(); }
+    /// Test hook (duty-cycle thread only): install a partition route as metadata would.
+    void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
+        agent_.setRoute(topicId, partition, endpoint);
+    }
 
     // -------------------------------------------------------------------------
     // Callback registration — MUST be called before connect()  (FIX F4)
@@ -499,6 +503,9 @@ private:
     // Runner
     // -------------------------------------------------------------------------
 
+    /// Teardown shared by close() and ~Client (no contract checks; idempotent).
+    void closeImpl_();
+
     /// Background thread body: loops doWork() under the configured IdleStrategy
     /// (YieldingIdleStrategy for LowLatency, BackoffIdleStrategy for Balanced)
     /// until stopped_, performing a periodic timeout sweep.
@@ -526,6 +533,12 @@ private:
     /// 100 µs.  On timeout runs `onFail` and throws.
     template <class Submit, class OnFail>
     void submitRegistration_(Submit&& submit, OnFail&& onFail) {
+        // After close() no duty cycle will ever adopt the holder (and Thread mode
+        // would park 5 s on a ring nobody drains): fail fast, nothing leaks.
+        if (stopped_.load(std::memory_order_acquire)) {
+            onFail();
+            throw std::logic_error("client closed");
+        }
         if (submit()) return;
         // Ring full.  Pumping is only safe on the duty-cycle thread OUTSIDE a cycle:
         // from a duty-cycle callback it would re-enter the agent's own poll, and in

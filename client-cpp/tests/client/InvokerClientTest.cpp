@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <memory>
 #include <future>
 #include <span>
 #include <stdexcept>
@@ -335,4 +337,111 @@ TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
                       rc::want_future);
     ASSERT_TRUE(r.drive([&] { return ready(fut); }));
     EXPECT_EQ(fut.get(), 100);
+}
+
+// ---------------------------------------------------------------------------
+// Task 12 fix round 2
+// ---------------------------------------------------------------------------
+
+// ~Client must never throw: an Invoker client built and driven on a worker thread,
+// joined, then destroyed on another thread tears down (futures failed, driver
+// stopped — its dir_delete_on_shutdown removes the aeron dir) with no terminate.
+TEST(InvokerClient, DestroyInvokerClientOffOwnerThreadTearsDownRegression) {
+    const rc::ClientConfig c = invokerCfg(3770, 3771);
+    std::unique_ptr<rc::Client> client;
+    std::future<int64_t> fut;
+    std::thread a([&] {
+        client = std::make_unique<rc::Client>(c);
+        rc::ProducerConfig pcfg;
+        pcfg.acks = rc::Acks::Leader;
+        pcfg.lingerUs = 0;
+        auto p = client->producer(pcfg);
+        fut = p.send(client->topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                     rc::want_future);
+        for (int i = 0; i < 100; ++i) client->doWork();
+    });
+    a.join();
+    ASSERT_TRUE(std::filesystem::exists(c.dataDir + "/aeron"));
+    client.reset();  // NOT the owner thread
+    ASSERT_TRUE(ready(fut));
+    EXPECT_THROW(fut.get(), std::runtime_error);
+    EXPECT_FALSE(std::filesystem::exists(c.dataDir + "/aeron")) << "embedded driver not stopped";
+}
+
+// Destroying the client from inside its own duty-cycle callback is a programming
+// error that would otherwise be a silent use-after-free: fail loud.
+TEST(InvokerClientDeathTest, DestroyFromCallbackAbortsRegression) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            const rc::ClientConfig c = invokerCfg(3772, 3773);
+            auto client = std::make_unique<rc::Client>(c);
+            test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel,
+                                            c.gatewayStreamId, c.egressChannel,
+                                            c.egressStreamId);
+            client->onConnected([&](int64_t) { client.reset(); });
+            for (int i = 0; i < 200'000 && !gw.ready(); ++i) {
+                client->doWork();
+                gw.pump();
+            }
+            auto f = client->connect();
+            for (int i = 0; i < 200'000 && client; ++i) {
+                client->doWork();
+                gw.pump();
+            }
+        },
+        "destroyed from inside its own duty-cycle callback");
+}
+
+// Minor 1: registration after close() fails fast (no leak, no 5 s park).
+TEST(InvokerClient, ProducerAfterCloseThrowsRegression) {
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
+        rc::ClientConfig c = invokerCfg(mode == rc::RunnerMode::Invoker ? 3774 : 3776,
+                                        mode == rc::RunnerMode::Invoker ? 3775 : 3777);
+        c.runnerMode = mode;
+        rc::Client client(c);
+        client.close();
+        EXPECT_THROW((void)client.producer(), std::logic_error);
+        EXPECT_THROW((void)client.transactionalProducer("tx-after-close"), std::logic_error);
+        EXPECT_EQ(client.testProducerCount(), 0u);
+        EXPECT_EQ(client.testTxnProducerCount(), 0u);
+    }
+}
+
+// Minor 3: the produceResendFn_ (multi-node, a leader session reached Connected)
+// path routes acks earlier in the same poll before re-driving in-flight batches.
+// "aeron:ipc?alias=leaderN" is a distinct route endpoint (its own session) that
+// still reaches the gateway's aeron:ipc subscription.
+TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
+    Rig r(invokerCfg(3778, 3779));
+    r.connect();
+    r.gw.replyAcks = false;
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::Leader;
+    pcfg.lingerUs = 0;
+    auto p = r.client.producer(pcfg);
+    r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader1");
+    auto fx = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                     rc::want_future);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && !r.gw.produced.empty(); }));
+    for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // settle
+    const auto X = r.gw.produced.front();
+    auto countCorr = [&](int64_t corr) {
+        int k = 0;
+        for (const auto& pr : r.gw.produced) k += (pr.corrId == corr) ? 1 : 0;
+        return k;
+    };
+    const int base = countCorr(X.corrId);
+    ASSERT_GE(base, 1);
+    r.gw.held.clear();
+
+    // A second leader session connects; X's ack precedes its ConnectResponse.
+    r.gw.ackBeforeNextConnect.push_back(X);
+    r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader2");
+    auto fy = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                     rc::want_future);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && ready(fx); }));
+    for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // let any resend land
+    EXPECT_EQ(countCorr(X.corrId), base) << "acked batch X must not be re-driven by the resend fn";
+    EXPECT_EQ(fx.get(), 100);
 }

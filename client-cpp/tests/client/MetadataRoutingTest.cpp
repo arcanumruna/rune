@@ -20,6 +20,7 @@
 // level (endpoint resolved from cached metadata) plus the retarget/redirect
 // machinery to reach it; N simultaneous leader connections are out of scope.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -100,7 +101,7 @@ struct MetaGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);

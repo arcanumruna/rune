@@ -51,6 +51,7 @@
 // All tests are bounded (kFutureTimeout) and use the same GatewayHarness
 // idiom from ClientTest.cpp.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -170,7 +171,7 @@ struct SchemaTestGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) throw std::runtime_error("SchemaTestGateway: Aeron::connect failed");

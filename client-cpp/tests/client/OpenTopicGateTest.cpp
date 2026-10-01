@@ -12,6 +12,7 @@
 //   2. OpenTopicFailsOnMismatch  — StubT_Mismatch: kFingerprint != blob fingerprint → throws
 //   3. OpenTopicSendDoesNotThrow — After a Match resolve, send() does not throw (fire-and-forget)
 
+#include "../support/AeronTestErrors.h"
 #include <gtest/gtest.h>
 #include <rune/client/Client.h>
 #include <rune/client/TypedTopic.h>
@@ -93,7 +94,7 @@ struct GateGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) throw std::runtime_error("GateGateway: connect failed");

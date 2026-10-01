@@ -17,6 +17,7 @@
 //   - Unique temp driver dirs: getpid() + atomic counter.
 //   - Real transport over aeron:ipc where the brief demands it.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/transport/AeronTransport.h>
 #include <rune/client/codec/Codec.h>
@@ -186,7 +187,7 @@ struct Gateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         aeron = aeron::Aeron::connect(ctx);
         if (!aeron) throw std::runtime_error("Gateway: Aeron::connect failed");
@@ -444,7 +445,7 @@ TEST(ClientAgent, EndToEndAgentLoop) {
     aeron::Context gwCtx;
     // Aeron's default handler ::exit(-1)s the test process when the client's
     // embedded driver stops before this test-side client is closed.
-    gwCtx.errorHandler([](const std::exception&) {});
+    gwCtx.errorHandler(test_support::countAeronError);
     gwCtx.aeronDir(aeronDir);
     auto gwAeron = aeron::Aeron::connect(gwCtx);
     ASSERT_NE(gwAeron, nullptr) << "Gateway: Aeron::connect to agent driver failed";
@@ -709,7 +710,7 @@ TEST(ClientAgent, KeepaliveViaAgent) {
     aeron::Context gwCtx;
     // Aeron's default handler ::exit(-1)s the test process when the client's
     // embedded driver stops before this test-side client is closed.
-    gwCtx.errorHandler([](const std::exception&) {});
+    gwCtx.errorHandler(test_support::countAeronError);
     gwCtx.aeronDir(aeronDir);
     auto gwAeron = aeron::Aeron::connect(gwCtx);
     ASSERT_NE(gwAeron, nullptr);
@@ -1011,7 +1012,7 @@ TEST(ClientAgent, MalformedEgressFrameDropped) {
     aeron::Context gwCtx;
     // Aeron's default handler ::exit(-1)s the test process when the client's
     // embedded driver stops before this test-side client is closed.
-    gwCtx.errorHandler([](const std::exception&) {});
+    gwCtx.errorHandler(test_support::countAeronError);
     gwCtx.aeronDir(aeronDir);
     auto gwAeron = aeron::Aeron::connect(gwCtx);
     ASSERT_NE(gwAeron, nullptr);
@@ -1138,7 +1139,7 @@ TEST(ClientAgent, SessionStateAtomicSnapshotAfterConnect) {
     aeron::Context gwCtx;
     // Aeron's default handler ::exit(-1)s the test process when the client's
     // embedded driver stops before this test-side client is closed.
-    gwCtx.errorHandler([](const std::exception&) {});
+    gwCtx.errorHandler(test_support::countAeronError);
     gwCtx.aeronDir(aeronDir);
     auto gwAeron = aeron::Aeron::connect(gwCtx);
     ASSERT_NE(gwAeron, nullptr);

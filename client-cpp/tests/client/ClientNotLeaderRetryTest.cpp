@@ -23,6 +23,7 @@
 //   - a separate case: a gateway that ALWAYS returns bare NotLeader exhausts the
 //     redirect/retry budget and the future then fails (cbError only after budget).
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -93,7 +94,7 @@ struct NotLeaderGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);

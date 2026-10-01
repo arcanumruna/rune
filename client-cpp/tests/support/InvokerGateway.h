@@ -8,6 +8,7 @@
 // client's egress channel (shard-mode brokers ack from a different publication).
 #pragma once
 
+#include "AeronTestErrors.h"
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/RecordBatch.h>
@@ -82,7 +83,7 @@ struct InvokerGateway {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         ctx.useConductorAgentInvoker(true);
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         aeron = aeron::Aeron::connect(ctx);
         addEndpoint(controlChannel, controlStream);
     }

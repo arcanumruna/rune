@@ -17,6 +17,7 @@
 // Before the fix: this test crashes or TSan reports a DATA RACE on impls_.
 // After the fix: all iterations pass cleanly with zero TSan races.
 
+#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
@@ -95,7 +96,7 @@ struct RaceGateway {
         aeron::Context ctx;
         // Aeron's default handler ::exit(-1)s the test process when the client's
         // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler([](const std::exception&) {});
+        ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) throw std::runtime_error("RaceGateway: connect failed");
