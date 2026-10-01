@@ -3164,6 +3164,11 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // Session gone — drop result silently.
                 return;
             }
+            // F23: per-worker ingress (forced on in shard mode) delivers Produce
+            // straight to the worker, bypassing onFragment, and every such
+            // produce (acks=0 included) returns here — refresh liveness on the
+            // lookup we already do (ack time >= request time: never early).
+            session->lastSeenNs = nowNs_;
 
             // Error path: worker failed to append (e.g. Log threw).
             if (ret.errorCode != 0) {

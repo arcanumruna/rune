@@ -16,6 +16,8 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/GroupMessages.h>
+#include <rune/node/WorkerOp.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
@@ -735,6 +737,51 @@ TEST_F(GatewayTimeoutFixture, SubscribeRefreshesSessionLivenessRegression) {
     gw_->reapExpired(t0 + kTimeoutNs + 1);
     EXPECT_EQ(gw_->sessionCount(), 1u)
         << "a session that subscribed at t0+Δ must not be reaped at t0+timeout+1";
+}
+
+// F23 (review): per-worker ingress (forced on in shard mode) delivers Produce
+// straight to the worker — it never passes onFragment.  Every such produce
+// comes back to the gateway as a ProduceResult; that must refresh liveness, or
+// a shard-mode producer without keepalives is reaped after sessionTimeoutNs.
+TEST_F(GatewayTimeoutFixture, WorkerIngressProduceResultRefreshesSessionLivenessRegression) {
+    auto client = makeClient(kEgressBase + 44);
+    const int64_t t0    = 1'000'000'000LL;
+    const int64_t delta = kTimeoutNs / 2;
+    auto result = doConnect(client, /*corrId=*/44, t0);
+    ASSERT_GE(result.resp.assignedSessionId, 1);
+    const int64_t sid = result.resp.assignedSessionId;
+
+    gw_->doWork(t0 + delta);                       // gateway clock at t0+Δ
+    rune::node::WorkerReturn ret;
+    ret.type          = rune::node::WorkerReturn::Type::ProduceResult;
+    ret.sessionId     = sid;
+    ret.correlationId = 45;
+    ret.baseOffset    = 0;
+    gw_->handleWorkerReturnForTest(ret);           // a worker-ingress produce's result
+
+    gw_->reapExpired(t0 + kTimeoutNs + 1);
+    EXPECT_EQ(gw_->sessionCount(), 1u)
+        << "a session whose worker-ingress produce returned at t0+Δ must not be reaped at t0+timeout+1";
+}
+
+// F23 (review minor): pin the generic request branch with a group template.
+TEST_F(GatewayTimeoutFixture, GroupHeartbeatRefreshesSessionLivenessRegression) {
+    auto client = makeClient(kEgressBase + 46);
+    const int64_t t0    = 1'000'000'000LL;
+    const int64_t delta = kTimeoutNs / 2;
+    auto result = doConnect(client, /*corrId=*/46, t0);
+    ASSERT_GE(result.resp.assignedSessionId, 1);
+    const int64_t sid = result.resp.assignedSessionId;
+
+    pc::Heartbeat hb;
+    hb.sessionId = sid; hb.correlationId = 47;
+    uint8_t buf[512] = {};
+    const std::size_t n = hb.encode(buf);
+    sendAndPump(*gw_, *client.ingressPub, buf, n, t0 + delta);
+
+    gw_->reapExpired(t0 + kTimeoutNs + 1);
+    EXPECT_EQ(gw_->sessionCount(), 1u)
+        << "a session that sent a group Heartbeat at t0+Δ must not be reaped at t0+timeout+1";
 }
 } // namespace
 } // namespace rune::gateway
