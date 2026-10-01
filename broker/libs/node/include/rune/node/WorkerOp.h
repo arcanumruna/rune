@@ -140,6 +140,10 @@ struct WorkerOp {
     // replica/logPtr).  nullptr → worker uses the shared MDC pub (broadcast).
     void* egressPub = nullptr;
 
+    // SetOwnership: the ReplicaRegistry generation this owned set reflects
+    // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.
+    uint64_t ownershipGen = 0;
+
     // lastOffsetDelta from the RecordBatch header (kLastOffsetDeltaOffset=23, LE32).
     // The worker computes lastOffset = worker_base + lastOffsetDelta.
     int32_t lastOffsetDelta = 0;
@@ -277,6 +281,11 @@ struct WorkerReturn {
         /// partition name it, errorCode = errno, chunk = the log directory.  The
         /// runtime logs critical and halts the broker (kExitStorageFailure).
         StorageFailure = 3,   ///< == sbe ReturnType::STORAGE_FAILURE
+        /// SetOwnership applied: partition = workerId, lastOffset = ownershipGen.
+        OwnershipAck = 4,
+        /// AppendControlRecord refused by the ownership guard: topicId /
+        /// partition, the marker in chunk (re-routed or surfaced as NotLeader).
+        ControlRecordRefused = 5,
     };
 
     Type    type = Type::ProduceResult;

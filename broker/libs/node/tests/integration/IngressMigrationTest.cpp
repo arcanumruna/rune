@@ -50,6 +50,7 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
@@ -345,28 +346,12 @@ TEST_F(IngressMigrationFixture, ExOwner_RejectsWithNotLeader)
     waitConnected(*pubA, *ingressA_);
 
     // --- Step 1: Transfer ownership away from worker A ---
-    // Send BecomeFollower via the ingress_ ring (control-thread → worker thread).
-    {
-        WorkerOp op{};
-        op.type        = WorkerOp::Type::BecomeFollower;
-        op.topicId     = kTopicId;
-        op.partition   = kPartition;
-        op.replica     = replica.get();
-        op.roleEpoch   = static_cast<rune::replication::Epoch>(2);
-        op.roleLeaderId = static_cast<rune::replication::NodeId>(99); // dummy new leader
-        ASSERT_TRUE(workerA.tryEnqueueOp(op))
-            << "Failed to enqueue BecomeFollower to worker A";
-    }
-    // SetOwnership: empty set (worker A loses the partition).
-    {
-        WorkerOp op{};
-        op.type     = WorkerOp::Type::SetOwnership;
-        op.topicId  = kTopicId;
-        op.partition = kPartition;
-        // ownedSet empty → worker A owns nothing after this
-        ASSERT_TRUE(workerA.tryEnqueueOp(op))
-            << "Failed to enqueue SetOwnership(empty) to worker A";
-    }
+    // Task 10 fix 3 / F7: the explicit test-only two-phase migration API —
+    // RELEASE on worker A (BecomeFollower, then SetOwnership(empty), FIFO).
+    ASSERT_TRUE(rune::node::WorkerPool::releaseReplicaForTestMigration(
+        workerA, replica.get(), {}, static_cast<rune::replication::Epoch>(2),
+        static_cast<rune::replication::NodeId>(99)))
+        << "Failed to enqueue the release to worker A";
 
     // Drive doWork to process the ring ops (BecomeFollower + SetOwnership).
     {
@@ -568,26 +553,10 @@ TEST_F(IngressMigrationFixture, PsmReconstructionOnOwnershipGain_DedupsAcrossMov
     //   d. SetOwnership({replica}) → Worker B's ingress_ ring.
     // -------------------------------------------------------------------
 
-    // (a) BecomeFollower to Worker A.
-    {
-        WorkerOp op{};
-        op.type         = WorkerOp::Type::BecomeFollower;
-        op.topicId      = kTopicId;
-        op.partition    = kPartition;
-        op.replica      = replica.get();
-        op.roleEpoch    = static_cast<rune::replication::Epoch>(2);
-        op.roleLeaderId = static_cast<rune::replication::NodeId>(99);
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
-    // (b) SetOwnership(empty) to Worker A.
-    {
-        WorkerOp op{};
-        op.type     = WorkerOp::Type::SetOwnership;
-        op.topicId  = kTopicId;
-        op.partition = kPartition;
-        // ownedSet empty → Worker A owns nothing.
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
+    // (a)+(b) RELEASE on Worker A via the test-only migration API.
+    ASSERT_TRUE(rune::node::WorkerPool::releaseReplicaForTestMigration(
+        *workerA, replica.get(), {}, static_cast<rune::replication::Epoch>(2),
+        static_cast<rune::replication::NodeId>(99)));
 
     // Drive Worker A to process BecomeFollower + SetOwnership.
     {
@@ -606,27 +575,12 @@ TEST_F(IngressMigrationFixture, PsmReconstructionOnOwnershipGain_DedupsAcrossMov
     ASSERT_NE(replica->role(), rune::replication::Role::Leader)
         << "Replica must not be Leader after BecomeFollower";
 
-    // (c) BecomeLeader to Worker B (triggers PSM reconstruction on worker B's thread).
-    {
-        WorkerOp op{};
-        op.type        = WorkerOp::Type::BecomeLeader;
-        op.topicId     = kTopicId;
-        op.partition   = kPartition;
-        op.replica     = replica.get();
-        op.roleEpoch   = static_cast<rune::replication::Epoch>(2);
-        op.roleLeaderId = 0; // unused for BecomeLeader
-        op.isr         = {static_cast<rune::replication::NodeId>(1)}; // new ISR
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
-    // (d) SetOwnership({replica}) to Worker B.
-    {
-        WorkerOp op{};
-        op.type     = WorkerOp::Type::SetOwnership;
-        op.topicId  = kTopicId;
-        op.partition = kPartition;
-        op.ownedSet = {replica.get()};
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
+    // (c)+(d) GRANT on Worker B — only after A released (drained above).  The
+    // test-only migration API orders SetOwnership BEFORE BecomeLeader, so the
+    // role op passes the ownership guard (PSM reconstruction still fires on B).
+    ASSERT_TRUE(rune::node::WorkerPool::grantReplicaForTestMigration(
+        *workerB, replica.get(), {replica.get()}, static_cast<rune::replication::Epoch>(2),
+        {static_cast<rune::replication::NodeId>(1)}));
 
     // Drive Worker B to process BecomeLeader + SetOwnership.
     // After BecomeLeader the PSM reconstruction seam fires:
@@ -903,20 +857,9 @@ TEST_F(IngressMigrationFixture, ExactlyOnceAcrossMove_RetrySpanningMove)
 
     ASSERT_EQ(log.logEndOffset(), static_cast<int64_t>(kN));
 
-    // --- Phase 2: Demote Worker A, promote Worker B ---
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::BecomeFollower;
-        op.topicId = kTopicId; op.partition = kPartition;
-        op.replica = replica.get();
-        op.roleEpoch = 3; op.roleLeaderId = 99;
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::SetOwnership;
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
+    // --- Phase 2: Demote Worker A, promote Worker B (test-only migration API) ---
+    ASSERT_TRUE(rune::node::WorkerPool::releaseReplicaForTestMigration(
+        *workerA, replica.get(), {}, 3, 99));
     {
         using clk = std::chrono::steady_clock;
         const auto dl = clk::now() + 3s;
@@ -930,21 +873,8 @@ TEST_F(IngressMigrationFixture, ExactlyOnceAcrossMove_RetrySpanningMove)
     }
     ASSERT_EQ(workerA->ownedCount(), 0u);
 
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::BecomeLeader;
-        op.topicId = kTopicId; op.partition = kPartition;
-        op.replica = replica.get();
-        op.roleEpoch = 3;
-        op.isr = {2};
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::SetOwnership;
-        op.ownedSet = {replica.get()};
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
+    ASSERT_TRUE(rune::node::WorkerPool::grantReplicaForTestMigration(
+        *workerB, replica.get(), {replica.get()}, 3, {2}));
     {
         using clk = std::chrono::steady_clock;
         const auto dl = clk::now() + 3s;

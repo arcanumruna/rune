@@ -35,10 +35,21 @@ public:
              std::unique_ptr<rune::replication::PartitionReplica> replica)
     {
         const Key key{topicId, partition};
+        if (map_.count(key)) remove(topicId, partition);   // never destroy a live, owned replica in place
+        // Task 10 fix 3: a dense id (reused only after the previous holder is
+        // freed) + a never-reused incarnation.  Workers guard every op by
+        // (id, incarnation): pointer reuse can never pass as ownership.
+        uint32_t id;
+        if (!freeIds_.empty()) { id = freeIds_.back(); freeIds_.pop_back(); }
+        else id = nextId_++;
+        replica->setRegistryHandle(id, nextIncarnation_++);
         map_[key] = std::move(replica);
         ordered_.push_back(map_[key].get());
         ++generation_;
     }
+
+    /// One past the largest dense id handed out (workers size their tables by it).
+    [[nodiscard]] uint32_t idCapacity() const noexcept { return nextId_; }
 
     // -----------------------------------------------------------------------
     // lookup — non-owning pointer; nullptr if not found.
@@ -100,10 +111,32 @@ public:
         auto  oit = std::find(ordered_.begin(), ordered_.end(), raw);
         if (oit != ordered_.end()) ordered_.erase(oit);
 
-        // Destroy the owned PartitionReplica.
-        map_.erase(it);
+        // Task 10 fix 3: do NOT destroy yet — a worker may still own it until it
+        // applies the SetOwnership for this generation.  Retired here, freed by
+        // collectRetired() once every worker acked an ownership gen >= this one.
         ++generation_;
+        retired_.push_back(Retired{generation_, std::move(it->second)});
+        map_.erase(it);
     }
+
+    /// Free retired replicas no worker can still reference: those removed at a
+    /// generation <= safeGen (the minimum OWNERSHIP_ACK across workers; the
+    /// current generation when no worker pool exists).  Control thread only.
+    std::size_t collectRetired(std::uint64_t safeGen) {
+        std::size_t freed = 0;
+        for (std::size_t i = 0; i < retired_.size(); ) {
+            if (retired_[i].gen <= safeGen) {
+                freeIds_.push_back(retired_[i].replica->registryId());
+                retired_[i] = std::move(retired_.back());
+                retired_.pop_back();
+                ++freed;
+            } else {
+                ++i;
+            }
+        }
+        return freed;
+    }
+    [[nodiscard]] std::size_t retiredCountForTest() const noexcept { return retired_.size(); }
 
     // -----------------------------------------------------------------------
     // replicaCount
@@ -138,6 +171,14 @@ private:
     std::unordered_map<Key, std::unique_ptr<rune::replication::PartitionReplica>, KeyHash> map_;
     std::vector<rune::replication::PartitionReplica*> ordered_;  // stable insertion order
     std::uint64_t generation_ = 0;
+    struct Retired {
+        std::uint64_t gen;
+        std::unique_ptr<rune::replication::PartitionReplica> replica;
+    };
+    std::vector<Retired>  retired_;
+    std::vector<uint32_t> freeIds_;
+    uint32_t              nextId_          = 1;   // 0 = unregistered (not gated)
+    uint32_t              nextIncarnation_ = 1;
 };
 
 } // namespace rune::node

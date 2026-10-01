@@ -35,6 +35,7 @@
 //   lookup — transparent comparators (std::less<>) on the coordinator map.
 // ---------------------------------------------------------------------------
 
+#include <spdlog/spdlog.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/Types.h>
@@ -148,7 +149,18 @@ public:
     size_t handleEndTxn         (const uint8_t* buf, size_t len,
                                   int64_t nowNs, uint8_t* out, size_t outCap) override;
 
+    /// Task 10 fix 3: a control marker this node could not append (NotLeader:
+    /// the partition is no longer here).  Recorded + logged — never silent.
+    void onControlMarkerRefused(int32_t topicId, int32_t partition,
+                                int64_t producerId, int16_t errorCode) override {
+        ++controlMarkersRefused_;
+        spdlog::error("TCS: control marker REFUSED topic={} partition={} producerId={} err={} "
+                      "(partition moved off this node)", topicId, partition, producerId, errorCode);
+    }
+    [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
+
 private:
+    uint64_t controlMarkersRefused_ = 0;
     // -----------------------------------------------------------------------
     // Members
     // -----------------------------------------------------------------------

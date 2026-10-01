@@ -189,8 +189,27 @@ public:
 
         // 4. Advance the DDL state machine + drive the replica.
         work += worker_.doWork(nowNs);
+
+        // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
+        //    failed an fsync → hand it to the control thread (ring, no shared
+        //    state), which halts the broker.  Signalled once (retried while the
+        //    ring is full).
+        if (!storageFailureSignalled_) {
+            auto* r = worker_.replica();
+            if (r && r->isDiskBacked() && r->log()->storageFailed()) [[unlikely]] {
+                const std::string& dir = r->log()->dir();
+                std::vector<uint8_t> msg(4 + dir.size());
+                const int32_t e = r->log()->storageErrno();
+                std::memcpy(msg.data(), &e, 4);
+                std::memcpy(msg.data() + 4, dir.data(), dir.size());
+                if (failureRing_.write(msg.data(), msg.size(), 1)) storageFailureSignalled_ = true;
+            }
+        }
         return work;
     }
+
+    /// admin → control: schema-log storage failure ([errno:i32][dir]).
+    OneToOneByteRing& failureRing() noexcept { return failureRing_; }
 
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
@@ -213,6 +232,8 @@ private:
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
     OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    OneToOneByteRing failureRing_{4096};                     // admin → control (storage failure)
+    bool             storageFailureSignalled_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +275,7 @@ public:
     // Restart recovery truncates the torn tail; replication re-heals it.
     // -----------------------------------------------------------------------
     static constexpr int kExitStorageFailure = 74;   // EX_IOERR
+    static constexpr int kExitInvariantViolation = 70;   // EX_SOFTWARE (F7 ownership invariant)
     using HaltHandler = void (*)(void* ctx, int exitCode);
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
     /// Test-only: drive the runtime's storage-failure path directly.
@@ -261,6 +283,8 @@ public:
     /// Test-only: during start(), re-run one user log's recovery with this msync
     /// errno injected (exercises the refuse-to-start path).
     void setRecoveryFaultForTest(int err) noexcept { recoveryFaultForTest_ = err; }
+    /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
+    void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
 
     // -----------------------------------------------------------------------
     // Observers (thread-safe: atomic reads)
@@ -701,7 +725,9 @@ private:
     bool                                         haltRaised_  = false;   // runtime thread only
     void onStorageFailure_(const std::string& logDir, int err);
     void refuseStartOnFailedRecovery_();
+    void onInvariantViolation_(const std::string& what);
     int  recoveryFaultForTest_ = 0;
+    int  schemaRecoveryFaultForTest_ = 0;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

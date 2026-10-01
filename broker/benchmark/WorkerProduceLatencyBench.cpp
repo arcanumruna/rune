@@ -159,9 +159,9 @@ static void BM_WorkerProduce_Majority_256B(benchmark::State& s) { runTier(s, 1, 
 static void BM_WorkerProduce_Strict_1KiB(benchmark::State& s)   { runTier(s, 2, 1024); }
 static void BM_WorkerProduce_Strict_256B(benchmark::State& s)   { runTier(s, 2, 256);  }
 
-// Task 10: the per-op ownership guard in Worker::executeFromWire_ (stale
-// routing after an ownership move).  N owned partitions; looks up a rotating
-// owned replica (the always-taken path).  Expected: ~1 indexed load + branch.
+// Task 10 fix 3: the per-op (id, incarnation) ownership guard in
+// Worker::executeFromWire_.  N owned partitions; rotating owned id (the
+// always-taken path).  Expected: one indexed load + compare + branch.
 static void BM_WorkerOwnershipCheck(benchmark::State& state) {
     const auto n = static_cast<std::size_t>(state.range(0));
     NullTransport t;
@@ -175,13 +175,16 @@ static void BM_WorkerOwnershipCheck(benchmark::State& state) {
         reps.push_back(std::make_unique<PartitionReplica>(
             cfg, rune::replication::Role::Leader, 1, std::vector<rune::replication::NodeId>{1},
             std::vector<rune::replication::NodeId>{1}, logs.back().get(), &t));
+        reps.back()->setRegistryHandle(static_cast<uint32_t>(i + 1), static_cast<uint32_t>(i + 1));
         owned.push_back(reps.back().get());
     }
     Worker w(0, 1 << 16, 1 << 16, 16, 16);
     w.setOwnedDirect(owned);
     std::size_t i = 0;
     for (auto _ : state) {
-        benchmark::DoNotOptimize(w.ownsReplicaForTest(owned[i]));
+        // Exactly the dispatch guard: (id, incarnation) carried in the op.
+        benchmark::DoNotOptimize(w.ownsIncarnationForTest(static_cast<uint32_t>(i + 1),
+                                                         static_cast<uint32_t>(i + 1)));
         i = (i + 1 == n) ? 0 : i + 1;
     }
     state.SetItemsProcessed(state.iterations());

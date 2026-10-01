@@ -165,9 +165,37 @@ public:
     const char* name() const noexcept override { return "rune-runtime"; }
 
     int doWork(int64_t nowNs) override {
+        // F7 ownership invariant (WorkerPool): a runtime replica move is a hard
+        // error → halt (no exception escapes onto the AgentRunner thread).
+        try {
+            return doWorkImpl_(nowNs);
+        } catch (const std::logic_error& e) {
+            if (!fatalReported_) {
+                fatalReported_ = true;
+                spdlog::critical("NodeRuntimeAgent: invariant violation: {} — halting", e.what());
+                if (fatalHook_) fatalHook_(e.what());
+            }
+            return 0;
+        }
+    }
+
+    // Halt on an invariant violation (BrokerNode wires it; called once).
+    void setFatalHook(std::function<void(const std::string&)> hook) { fatalHook_ = std::move(hook); }
+
+private:
+    int doWorkImpl_(int64_t nowNs) {
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);
+
+        // 1b. Task 10 fix 3 (I2a): fan ownership out BEFORE anything this cycle
+        //     can route ops (bridge role ops, transport poll, gateway), and free
+        //     removed replicas no worker can still reference (all acked).
+        if (workerPool_ && registry_) workerPool_->reconcile(*registry_);
+        if (registry_) {
+            registry_->collectRetired(workerPool_ ? workerPool_->minAckedOwnershipGen()
+                                                  : registry_->generation());
+        }
 
         // 2. Metadata bridge — detect leader/epoch change and flip replica roles.
         //    Reads election_ AFTER consensus step so the state is current.
@@ -505,6 +533,8 @@ public:
         return work;
     }
 
+public:
+
     // -----------------------------------------------------------------------
     // F1: TEST-ONLY owner-thread hook — producer side (TEST thread).
     //
@@ -767,6 +797,8 @@ private:
     // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
     std::function<int(int64_t)>                        adminControlHook_;
     StorageFailureHook                                 storageFailureHook_;
+    std::function<void(const std::string&)>            fatalHook_;
+    bool                                               fatalReported_ = false;
     bool                                               storageFailureReported_ = false;
     void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {
         if (!replica->isDiskBacked()) return;

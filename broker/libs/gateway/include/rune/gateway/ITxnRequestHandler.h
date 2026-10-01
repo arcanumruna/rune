@@ -52,6 +52,12 @@ struct ITxnRequestHandler {
     virtual size_t handleEndTxn         (const uint8_t* buf, size_t len,
                                          int64_t nowNs,
                                          uint8_t* out, size_t outCap) = 0;
+
+    // Task 10 fix 3: a COMMIT/ABORT control marker this node could not append
+    // (the partition is no longer here: NotLeader).  Never silently dropped —
+    // the coordinator is told.  Cold path; default no-op for test doubles.
+    virtual void onControlMarkerRefused(int32_t /*topicId*/, int32_t /*partition*/,
+                                        int64_t /*producerId*/, int16_t /*errorCode*/) {}
 };
 
 } // namespace rune::gateway

@@ -107,6 +107,8 @@ public:
     // Returns a work count (>0 if progress made).  Called every admin-thread tick.
     // -----------------------------------------------------------------------
     int doWork(int64_t nowNs);
+    /// The __topic_schemas replica this (admin) thread solely drives.
+    [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }
 
     // -----------------------------------------------------------------------
     // Test / introspection.

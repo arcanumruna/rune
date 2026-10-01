@@ -53,7 +53,7 @@
 // Forward-declared to avoid pulling the full WorkerPool header (and its heavy
 // chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
 // header.  All WorkerPool calls are in ClientGateway.cpp.
-namespace rune::node { class WorkerPool; }
+namespace rune::node { class WorkerPool; struct WorkerReturn; }
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -1233,6 +1233,15 @@ private:
     StorageFailureHandler storageFailureHandler_;
     bool                  storageFailureRaised_ = false;
     void raiseStorageFailure_(const std::string& logDir, int err);
+    void handleWorkerReturn_(rune::node::WorkerReturn ret);   // by value: WorkerReturn complete in the .cpp
+    void onControlRecordRefused_(int32_t topicId, int32_t partition,
+                                 const std::vector<uint8_t>& marker, int16_t err);
+    uint64_t controlRecordsRefused_ = 0;
+public:
+    [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
+    /// Test-only: feed a worker return through the real drain handler.
+    void handleWorkerReturnForTest(const rune::node::WorkerReturn& ret);
+private:
     int64_t                                 lastFlushNs_ = 0;
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription

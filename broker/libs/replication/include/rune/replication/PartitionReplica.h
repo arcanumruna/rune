@@ -548,6 +548,15 @@ public:
     /// owning worker submits to its io backend; the disk log's roll seal is
     /// deferred to the worker too (Log::setDeferSealSync).  Set before the
     /// replica is driven; legacy = false (inline fsyncs, unchanged).
+    /// Task 10 fix 3: registry identity (set once by ReplicaRegistry::add on the
+    /// control thread, before any worker learns of the replica).  (0, 0) =
+    /// unregistered: ops for it are not ownership-gated.
+    void setRegistryHandle(uint32_t id, uint32_t incarnation) noexcept {
+        registryId_ = id; incarnation_ = incarnation;
+    }
+    [[nodiscard]] uint32_t registryId()  const noexcept { return registryId_; }
+    [[nodiscard]] uint32_t incarnation() const noexcept { return incarnation_; }
+
     void setExternalFollowerFlush(bool on) noexcept {
         externalFollowerFlush_ = on;
         if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
@@ -806,6 +815,8 @@ private:
     bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
     int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
     bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
+    uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
+    uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     void checkpointEpochs_();
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker

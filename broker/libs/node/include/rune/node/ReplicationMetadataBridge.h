@@ -416,9 +416,13 @@ private:
         const rune::replication::Epoch fenceEpoch =
             pa ? static_cast<rune::replication::Epoch>(pa->leaderEpoch) : 0;
 
-        replica->becomeFollower(fenceEpoch, rune::metadata::NO_LEADER);
+        // Task 10 fix 3: a USER replica is owned by a worker — fence it on the
+        // owner's thread (routed role op, FIFO before the SetOwnership that drops
+        // it), never by a direct cross-thread call.  Internal: direct (control).
+        routeBecomeFollower_(replica, fenceEpoch, rune::metadata::NO_LEADER);
 
-        // Quarantine: erase from routing.  The replica is destroyed here.
+        // Quarantine: erase from routing.  The replica is RETIRED in the registry
+        // and freed only after every worker acked the SetOwnership that drops it.
         registry_.remove(key.topicId, key.partition);
     }
 

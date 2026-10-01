@@ -490,7 +490,16 @@ int64_t LogSegment::recover() {
         if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
-        throw std::system_error(errno, std::system_category(),
+        const int e = errno;
+        if (storage_) {
+            // Task 10 fix 3: fail-stop, not an exception escaping a worker loop
+            // (truncateTo on a role change runs on the owning worker).  The log
+            // is permanently failed; its owner's loop routes it to the halt.  The
+            // rebuilt in-memory index (on the .tmp file) stays valid meanwhile.
+            if (storage_->failedErrno == 0) storage_->failedErrno = e != 0 ? e : EIO;
+            return nextOffset_;
+        }
+        throw std::system_error(e, std::system_category(),
                                 "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
     }
     // fsync the directory for durability of the rename

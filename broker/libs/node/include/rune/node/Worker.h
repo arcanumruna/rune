@@ -297,6 +297,8 @@ public:
         /// False while the partition is not owned by this worker (ownership
         /// moved): parked, no reads of the moved replica / log.
         bool    active               = true;
+        uint32_t registryId          = 0;   ///< target replica identity (Task 10 fix 3)
+        uint32_t incarnation         = 0;
         // Hybrid egress: per-consumer UNICAST egress publication for this
         // subscription's consumer session.  Created + lifetime-owned by the
         // gateway; written ONLY here on the worker thread (single-writer,
@@ -479,6 +481,9 @@ public:
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
            .oleFollowerLeo(static_cast<std::int64_t>(op.offsEpochReqPayload.followerLeo))
            .egressPub(reinterpret_cast<std::uint64_t>(op.egressPub))
+           .targetReplicaId(op.replica ? op.replica->registryId() : 0u)
+           .incarnation(op.replica ? op.replica->incarnation() : 0u)
+           .ownershipGen(op.ownershipGen)
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
@@ -612,9 +617,14 @@ public:
     }
     [[nodiscard]] const char* ioBackendNameForTest() const noexcept { return io_.name(); }
     [[nodiscard]] uint64_t opsRefusedNotOwnedForTest() const noexcept { return opsRefusedNotOwned_; }
+    [[nodiscard]] uint64_t ownershipAcksForTest() const noexcept { return ownershipAcks_; }
     /// Bench / test: the per-op ownership check.
     [[nodiscard]] bool ownsReplicaForTest(const rune::replication::PartitionReplica* r) const noexcept {
-        return ownsReplica_(r);
+        return ownsIncarnation_(r->registryId(), r->incarnation());
+    }
+    /// Bench: the per-op guard exactly as the dispatch runs it.
+    [[nodiscard]] bool ownsIncarnationForTest(uint32_t id, uint32_t inc) const noexcept {
+        return ownsIncarnation_(id, inc);
     }
     /// False when RUNE_IO_BACKEND selects a backend that cannot submit — shard
     /// mode refuses to start on such a worker (BrokerNode).
@@ -1135,21 +1145,21 @@ private:
         op.wrapForDecode(cbuf, sbe::MessageHeader::encodedLength(),
                          mh.blockLength(), mh.version(), len);
         const auto type = static_cast<WorkerOp::Type>(static_cast<std::uint8_t>(op.opType()));
-        // Ownership guard (shared-nothing): an op routed to this worker under a
-        // stale ownership view must not dereference a replica / log another
-        // worker now owns.  One hashed index load + compare + branch (the owned
-        // table is rebuilt cold on SetOwnership, on this thread).  Ops with no
-        // replica (passthrough / no ownership) and the ownership-neutral ops
+        // Ownership guard (Task 10 fix 3): every partition op — role ops
+        // included — carries the target replica's (registry id, incarnation).
+        // It runs only if THIS worker currently owns that exact incarnation: one
+        // indexed load + compare + branch (ownedInc_ is rebuilt cold, on this
+        // thread, when SetOwnership is applied).  A stale op (ownership moved,
+        // replica removed, or a new replica at a reused address) is refused
+        // without dereferencing anything it carries.  Unregistered replicas
+        // (incarnation 0: tests / passthrough) and ownership-neutral ops
         // (SetOwnership, Unsubscribe, SchemaUpdate, TestTask) are not gated.
-        // Role ops (BecomeLeader / BecomeFollower) are not gated either: the
-        // bridge routes them by the deterministic shard router to the GAINING
-        // worker, where they legitimately precede SetOwnership (ownership-gain
-        // hand-off: PSM rebuild before intake), and the losing worker processes
-        // its own BecomeFollower before its SetOwnership (ring FIFO).
-        if (const uint64_t rp = op.replica(); rp != 0 && gatedByOwnership_(type) &&
-            !ownsReplica_(reinterpret_cast<const rune::replication::PartitionReplica*>(rp))) [[unlikely]] {
-            refuseNotOwned_(op, type);
-            return;
+        if (const uint32_t inc = op.incarnation(); inc != 0 && gatedByOwnership_(type)) {
+            const uint32_t id = op.targetReplicaId();
+            if (id >= ownedInc_.size() || ownedInc_[id] != inc) [[unlikely]] {
+                refuseNotOwned_(op, type);
+                return;
+            }
         }
         switch (type) {
         case WorkerOp::Type::Produce:
@@ -1241,6 +1251,9 @@ private:
                 s.isGroup              = op.isGroup() != 0;
                 s.groupCarrierReceived = op.groupCarrierReceived() != 0;
                 s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
+                s.registryId           = op.targetReplicaId();
+                s.incarnation          = op.incarnation();
+                s.active               = true;   // re-subscribe (passed the guard) re-activates
                 return;
             }
         }
@@ -1256,6 +1269,8 @@ private:
         s.isGroup              = op.isGroup() != 0;
         s.groupCarrierReceived = op.groupCarrierReceived() != 0;
         s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
+        s.registryId           = op.targetReplicaId();
+        s.incarnation          = op.incarnation();
         subs_.push_back(s);
     }
 
@@ -1894,6 +1909,15 @@ private:
             }
         }
         rebuildFlushSlots_();   // cold: carry still-owned slots, purge the rest (M2)
+        // Task 10 fix 3: ack the registry generation this SetOwnership reflects.
+        // The runtime frees a removed replica only once EVERY worker acked a
+        // generation >= its removal (no worker can still hold / reach it).
+        WorkerReturn ack;
+        ack.type       = WorkerReturn::Type::OwnershipAck;
+        ack.partition  = workerId_;
+        ack.lastOffset = static_cast<int64_t>(op.ownershipGen());
+        enqueueSignal_(ack);
+        ++ownershipAcks_;
     }
 
     // -------------------------------------------------------------------
@@ -2621,15 +2645,18 @@ private:
     static std::size_t ptrHash_(const void* p) noexcept {
         return static_cast<std::size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull);
     }
-    // ---- Ownership table: owned replica pointers (open addressing, pow2 ≥ 2n+2).
-    std::vector<const rune::replication::PartitionReplica*> ownedIndex_;
-    std::size_t ownedMask_ = 0;
+    // ---- Ownership table: ownedInc_[registryId] = the incarnation this worker
+    // owns (0 = not owned).  Dense, indexed by the registry id carried in the op.
+    std::vector<uint32_t> ownedInc_;
     uint64_t    opsRefusedNotOwned_ = 0;
+    uint64_t    ownershipAcks_      = 0;
     static constexpr bool gatedByOwnership_(WorkerOp::Type t) noexcept {
         switch (t) {
         case WorkerOp::Type::Produce:
         case WorkerOp::Type::PushRead:
         case WorkerOp::Type::ApplyReplicated:
+        case WorkerOp::Type::BecomeLeader:
+        case WorkerOp::Type::BecomeFollower:
         case WorkerOp::Type::FetchRequest:
         case WorkerOp::Type::OffsetsForLeaderEpochReq:
         case WorkerOp::Type::ReconcileFetchResp:
@@ -2640,23 +2667,22 @@ private:
             return false;
         }
     }
-    [[nodiscard]] bool ownsReplica_(const rune::replication::PartitionReplica* r) const noexcept {
-        if (ownedIndex_.empty()) return false;
-        for (std::size_t i = ptrHash_(r) & ownedMask_;; i = (i + 1) & ownedMask_) {
-            const auto* e = ownedIndex_[i];
-            if (e == r) return true;
-            if (e == nullptr) return false;
-        }
+    [[nodiscard]] bool ownsIncarnation_(uint32_t id, uint32_t inc) const noexcept {
+        return inc != 0 && id < ownedInc_.size() && ownedInc_[id] == inc;
     }
     void rebuildOwnedIndex_() {
-        const std::size_t cap = pow2AtLeast_(2 * owned_.size() + 2);
-        ownedIndex_.assign(cap, nullptr);
-        ownedMask_ = cap - 1;
-        for (const auto* r : owned_) {
-            if (!r) continue;
-            std::size_t i = ptrHash_(r) & ownedMask_;
-            while (ownedIndex_[i] != nullptr && ownedIndex_[i] != r) i = (i + 1) & ownedMask_;
-            ownedIndex_[i] = r;
+        uint32_t maxId = 0;
+        for (const auto* r : owned_) if (r && r->registryId() > maxId) maxId = r->registryId();
+        ownedInc_.assign(static_cast<std::size_t>(maxId) + 1, 0u);
+        for (const auto* r : owned_) if (r && r->incarnation() != 0) ownedInc_[r->registryId()] = r->incarnation();
+        // Parked / active push subscriptions follow ownership by id + incarnation.
+        for (auto& sub : subs_) {
+            if (sub.incarnation != 0) sub.active = ownsIncarnation_(sub.registryId, sub.incarnation);
+            else if (sub.replica) {
+                bool owned = false;
+                for (const auto* r : owned_) owned = owned || r == sub.replica;
+                sub.active = owned;
+            }
         }
     }
     // A partition op for a replica this worker does not own: answer through the
@@ -2695,10 +2721,26 @@ private:
             return;
         }
         case WorkerOp::Type::Subscribe:
-            // Registered PARKED (no reads) — activated if the partition arrives here.
+            // Registered PARKED (no reads) — activated (by id + incarnation) if
+            // that exact replica incarnation is later granted to this worker.
             executeSubscribeWire_(op);
             for (auto& sub : subs_) if (sub.subscriptionId == op.subscriptionId()) sub.active = false;
             return;
+        case WorkerOp::Type::AppendControlRecord: {
+            // Never silently lost: the marker goes back to the runtime, which
+            // re-routes it with the current routing or surfaces NotLeader to the
+            // transaction coordinator.
+            WorkerReturn ret;
+            ret.type      = WorkerReturn::Type::ControlRecordRefused;
+            ret.topicId   = op.topicId();
+            ret.partition = op.partition();
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            const uint32_t n = op.tailLength();
+            const auto* t = reinterpret_cast<const uint8_t*>(op.tail());
+            if (t && n) ret.chunk.assign(t, t + n);
+            enqueueSignal_(ret);
+            return;
+        }
         default:
             // Apply / fetch / epoch / reconcile / role / marker ops carry no
             // response: the replication protocol re-drives them against the new

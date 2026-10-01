@@ -570,3 +570,16 @@ TEST(ShardModeRegression, StartRefusesWhenALogFailedRecovery) {
     EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure) << "through the halt path (exit 74)";
     node.stop();
 }
+
+TEST(ShardModeRegression, StartRefusesWhenTheSchemaLogFailedRecovery) {
+    // Task 10 fix 3 / I1: the schema log lives outside the replica registry.
+    TmpDir dir{"schemafail"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    HaltCapture halt;
+    node.setHaltHandler(&HaltCapture::handler, &halt);
+    node.setSchemaRecoveryFaultForTest(EIO);
+    EXPECT_THROW(node.start(), std::runtime_error) << "a failed schema log never serves";
+    EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure);
+    node.stop();
+}

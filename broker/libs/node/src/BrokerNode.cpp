@@ -983,6 +983,9 @@ void BrokerNode::buildWorkerPool() {
                    "partitionId() must be a non-negative ordinal (pcfg.partitionId = part)");
         }
         workerPool_->assignFromRegistry(*replicaRegistry_);
+        // Task 10 fix 3 (I2): ops are only routed after an inline reconcile, so
+        // the SetOwnership that governs them is always ahead of them.
+        workerPool_->setRegistry(replicaRegistry_.get());
     }
 
     // -----------------------------------------------------------------------
@@ -1191,7 +1194,43 @@ void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
     std::_Exit(kExitStorageFailure);
 }
 
+void BrokerNode::onInvariantViolation_(const std::string& what) {
+    if (haltRaised_) return;
+    haltRaised_ = true;
+    spdlog::critical("BrokerNode[{}]: INVARIANT VIOLATION — {} — halting (exit {})",
+                     config_.nodeId, what, kExitInvariantViolation);
+    if (haltHandler_) { haltHandler_(haltCtx_, kExitInvariantViolation); return; }
+    spdlog::default_logger()->flush();
+    std::_Exit(kExitInvariantViolation);
+}
+
 void BrokerNode::refuseStartOnFailedRecovery_() {
+    // Every log this node will serve — registry replicas AND the logs outside
+    // the registry (schema; the internal offset / txn / metadata logs; every
+    // configured topic's partition logs).  Enumerated explicitly (Task 10 fix 3
+    // / I1): the registry is not assumed to be complete.
+    std::vector<rune::storage::Log*> logs;
+    if (replicaRegistry_)
+        for (auto* r : replicaRegistry_->allReplicas())
+            if (r && r->isDiskBacked()) logs.push_back(r->log());
+    for (auto* l : {schemaLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})
+        if (l) logs.push_back(l);
+    if (topicRegistry_)
+        for (const auto& ts : config_.topics)
+            for (int32_t p = 0; p < ts.partitionCount; ++p)
+                if (auto* l = topicRegistry_->log(ts.topicId, p)) logs.push_back(l);
+    if (schemaRecoveryFaultForTest_ != 0 && schemaLog_) {
+        schemaLog_->setSyncFaultForTest(schemaRecoveryFaultForTest_);
+        schemaLog_->recover();
+        schemaLog_->setSyncFaultForTest(0);
+    }
+    for (auto* l : logs) {
+        if (!l->storageFailed()) continue;
+        spdlog::critical("BrokerNode[{}]: log {} FAILED recovery (errno={}) — refusing to start",
+                         config_.nodeId, l->dir(), l->storageErrno());
+        onStorageFailure_(l->dir(), l->storageErrno());
+        throw std::runtime_error("BrokerNode: log " + l->dir() + " failed recovery (storage failure) — refusing to start");
+    }
     if (!replicaRegistry_) return;
     if (recoveryFaultForTest_ != 0) {
         // Test-only: re-run the first disk-backed user log's recovery with an
@@ -1776,6 +1815,8 @@ void BrokerNode::buildGateway() {
     runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
         onStorageFailure_(dir, err);
     });
+    // F7 ownership invariant violation (a runtime replica move) → halt.
+    runtimeAgent_->setFatalHook([this](const std::string& what) { onInvariantViolation_(what); });
 
     // -----------------------------------------------------------------------
     // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.
@@ -1814,6 +1855,18 @@ void BrokerNode::buildGateway() {
                     }
                     // else: ring full (impossible for 1-deep role churn) → retry next cycle
                 }
+
+                // (1b) Task 10 fix 3 / I1: schema-log storage failure (admin →
+                //      control ring) → the same halt path as every other log.
+                work += agent->failureRing().drain(
+                    [this](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b,
+                           aeron::util::index_t off, aeron::util::index_t len) {
+                        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                        int32_t e = 0;
+                        std::memcpy(&e, p, 4);
+                        onStorageFailure_(std::string(reinterpret_cast<const char*>(p) + 4,
+                                                      static_cast<std::size_t>(len) - 4), e);
+                    }, 4);
 
                 // (2) Drain create-topic requests (admin → control).
                 work += agent->createReqRing().drain(
