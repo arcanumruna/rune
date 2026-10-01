@@ -150,7 +150,9 @@ def default_cluster() -> Iterator[Cluster]:
     This is the critical fixture for test A: it exercises the exact default
     path that was broken before 7d087e7.
     """
-    c = Cluster(project="rune-dr-pwi-default")
+    # global_overlays=False: this arm must stay the TRUE default config even when
+    # the matrix runs with a global overlay (e.g. the shard overlay).
+    c = Cluster(project="rune-dr-pwi-default", global_overlays=False)
     try:
         c.up(build=_build_flag(), leader_timeout=120)
         c.wait_data_plane_ready(max_attempts=10, timeout_s=180)

@@ -183,6 +183,13 @@ void BrokerNode::start() {
 
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
     // side effect (no dataDir, no driver, no ports).
+    // The Aeron dir is deleted recursively by the embedded driver: refuse one that
+    // equals/contains the data dir (covers programmatic configs that bypass the env
+    // parser).
+    if (auto err = config_.validateAeronDir(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
     if (auto err = config_.validateShardConfig(); err.has_value()) {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
@@ -232,6 +239,17 @@ void BrokerNode::start() {
     if (ec) {
         throw std::runtime_error("BrokerNode: cannot create dataDir '" +
                                  config_.dataDir + "': " + ec.message());
+    }
+    // The embedded driver creates (and deletes) the Aeron dir itself but not its
+    // parents: a RUNE_AERON_DIR under a not-yet-existing parent fails driver init
+    // with a bare EINVAL.  Create the parent chain up front.
+    if (const fs::path aeronParent = fs::path{config_.effectiveAeronDir()}.parent_path();
+        !aeronParent.empty()) {
+        fs::create_directories(aeronParent, ec);
+        if (ec) {
+            throw std::runtime_error("BrokerNode: cannot create parent of aeronDir '" +
+                                     config_.effectiveAeronDir() + "': " + ec.message());
+        }
     }
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).

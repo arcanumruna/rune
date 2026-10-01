@@ -17,11 +17,28 @@ rune_cluster_peers() {
     echo "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"
   fi
 }
-# rune_shard_env <i> -> extra env for node i (empty unless RUNE_SHARD=1).  Broker i's
-# shard worker 0 (runtime fused) is pinned to core RUNE_SHARD_CORE0+i (client: core 0).
+# rune_shard_env <i> <workers> -> extra env for node i (empty unless RUNE_SHARD=1).
+# Node i's W busy-spinning shard workers are pinned to cores CORE0+i*W .. CORE0+i*W+W-1
+# (WorkerPool pins worker w to RUNE_WORKER_CORE_BASE+w), so nodes never share a core.
 rune_shard_env() {
   [ "${RUNE_SHARD:-0}" = "1" ] || return 0
-  echo "RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=${RUNE_RUNTIME_PLACEMENT:-fused} RUNE_WORKER_INGRESS_BASE_PORT=$((40500+20*$1)) RUNE_WORKER_REPL_BASE_PORT=$((40600+20*$1)) RUNE_WORKER_CORE_BASE=$(( ${RUNE_SHARD_CORE0:-1} + $1 ))"
+  local w="${2:-1}"
+  echo "RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=${RUNE_RUNTIME_PLACEMENT:-fused} RUNE_WORKER_INGRESS_BASE_PORT=$((40500+20*$1)) RUNE_WORKER_REPL_BASE_PORT=$((40600+20*$1)) RUNE_WORKER_CORE_BASE=$(( ${RUNE_SHARD_CORE0:-1} + $1 * w ))"
+}
+# rune_shard_layout_check <workers> [cores] -> non-zero (with a message) when the 3
+# nodes' pinned busy-spin workers do not fit on distinct cores: overlapping or
+# out-of-range pins silently distort every shard-mode number.
+rune_shard_layout_check() {
+  [ "${RUNE_SHARD:-0}" = "1" ] || return 0
+  local w="$1" cores="${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}" core0="${RUNE_SHARD_CORE0:-1}"
+  local need=$(( core0 + 3 * w ))
+  if [ "$need" -gt "$cores" ]; then
+    echo "refusing shard layout: 3 nodes x $w workers from core $core0 needs cores ${core0}..$((need-1)) but the box has $cores" >&2
+    return 1
+  fi
+  local i; for i in 0 1 2; do
+    echo "node $i -> cores $(( core0 + i*w ))..$(( core0 + i*w + w - 1 ))" >&2
+  done
 }
 # The broker honours RUNE_AERON_DIR (set to $WORK/rune-c$i/a below, on tmpfs):
 # Aeron's CnC + term buffers must NOT live on the disk-backed data dir, and
@@ -47,6 +64,7 @@ rune_start_cluster() {
   local peers; peers="$(rune_cluster_peers)"
   pkill -9 -x rune_broker 2>/dev/null; sleep 0.5
   RUNE_CLUSTER_PIDS=()
+  rune_shard_layout_check "$workers" || return 1
   local i
   for i in 0 1 2; do
     local cport=$((40200+i)) egbase=$((40400+i*20))
@@ -62,7 +80,7 @@ rune_start_cluster() {
         RUNE_WORKER_INGRESS_RING_BYTES="$iring" RUNE_WORKER_RETURN_RING_BYTES="$rring" \
         RUNE_REPL_OUTBOUND_RING_BYTES="$oring" \
         RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$egbase \
-        $(rune_shard_env "$i") \
+        $(rune_shard_env "$i" "$workers") \
         RUNE_ELECTION_TIMEOUT_MS="${RUNE_ELECTION_TIMEOUT_MS:-300}" \
         RUNE_ELECTION_STATUS_INTERVAL_MS="${RUNE_ELECTION_STATUS_INTERVAL_MS:-50}" \
         RUNE_STARTUP_CANVASS_TIMEOUT_MS="${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-200}" \

@@ -576,6 +576,13 @@ struct NodeConfig {
     /// must invoke this after parsing and refuse to start if it returns an error.
     std::optional<std::string> validateStreamRanges() const;
 
+    /// Refuses an Aeron dir that would destroy the log: the embedded driver runs
+    /// with dir_delete_on_start + delete-on-shutdown and recursively deletes its
+    /// directory, so aeronDir must not be a filesystem root, equal to dataDir, or an
+    /// ancestor of dataDir.  Paths are compared absolute + weakly-canonical (symlinks
+    /// resolved for the existing prefix).  Empty aeronDir (→ dataDir/aeron) is safe.
+    std::optional<std::string> validateAeronDir() const;
+
     /// Shard mode: every port this node binds + co-located peers' advertised
     /// ranges, peer base ports, symmetric worker count, stream ranges.  nullopt =
     /// valid (always nullopt in legacy mode unless placement=fused).  BrokerNode

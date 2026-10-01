@@ -46,7 +46,8 @@ def service_to_node_id(service: str) -> int:
 
 class Cluster:
     def __init__(self, project: str = "rune-dr", topics: str = "events:1",
-                 override_files: list[str] | None = None):
+                 override_files: list[str] | None = None,
+                 global_overlays: bool = True):
         """Initialise a Cluster.
 
         Args:
@@ -54,6 +55,9 @@ class Cluster:
             topics:         Legacy/informational field (unused by the harness;
                             the actual RUNE_TOPICS value comes from the compose
                             file or a compose override file in override_files).
+            global_overlays: Apply RUNE_DR_COMPOSE_OVERRIDES (e.g. the shard
+                            overlay).  Default-config baseline arms pass False so
+                            they keep measuring the true default config.
             override_files: Optional list of additional docker-compose YAML
                             files to merge on top of the canonical compose file.
                             Used by compaction/retention e2e tests to inject
@@ -69,11 +73,14 @@ class Cluster:
         # containerd snapshot store has stale layers from a previous build).
         # _git_sha falls back to "local" in bare-binary CI environments.
         _sha = _git_sha(BROKER_REPO)
-        # RUNE_DR_COMPOSE_OVERRIDES: extra overlays (e.g. docker/docker-compose.shard.yml)
-        # appended after explicit override_files — runs the whole matrix in shard mode.
-        extra = [p for p in os.environ.get("RUNE_DR_COMPOSE_OVERRIDES", "").split(os.pathsep) if p]
+        # RUNE_DR_COMPOSE_OVERRIDES: global overlays (e.g. docker/docker-compose.shard.yml)
+        # that run the whole matrix in a mode.  They go FIRST so a test's own
+        # override_files still win, and default-config baseline arms opt out entirely
+        # (global_overlays=False) so they keep measuring the real default.
+        extra = ([p for p in os.environ.get("RUNE_DR_COMPOSE_OVERRIDES", "").split(os.pathsep) if p]
+                 if global_overlays else [])
         self.compose = Compose(COMPOSE_FILE, project,
-                               override_files=list(override_files or []) + extra,
+                               override_files=extra + list(override_files or []),
                                image_tag=_sha)
         self._up = False
         self._serving_cache: str | None = None

@@ -26,7 +26,10 @@ echo "=== box: load1=$load1 cores=$(nproc) shard=${RUNE_SHARD:-0} placement=${RU
 PARTS="${1:-${REPL_PARTS:-4}}"
 RECS="${2:-${REPL_RECS:-1000000}}"
 WIN="${3:-${REPL_WINDOW:-8000}}"
-WORKERS="${REPL_WORKERS:-2}"
+# Shard mode pins W busy-spinning workers per node on distinct cores (3 nodes):
+# the fused design is 1 thread/node, so default W=1 there (cluster.sh refuses
+# layouts that oversubscribe the box).
+if [ "${RUNE_SHARD:-0}" = "1" ]; then WORKERS="${REPL_WORKERS:-1}"; else WORKERS="${REPL_WORKERS:-2}"; fi
 VBYTES="${REPL_VBYTES:-256}"
 LINGER_US="${REPL_LINGER_US:-200}"     # batching: >0 so records coalesce into batches
 BATCH_BYTES="${REPL_BATCH_BYTES:-1048576}"   # 1 MiB batch cap
