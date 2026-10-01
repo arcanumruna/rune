@@ -5,6 +5,7 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <gtest/gtest.h>
+#include <chrono>
 
 #include <cstdint>
 #include <cstring>
@@ -201,10 +202,15 @@ TEST(O2ORingBufferRegression, CrossThreadPayloadHandoffIsOrdered) {
     constexpr std::uint32_t kN = 50'000;
     constexpr std::size_t   kLen = 40;   // 48 B records don't divide 4096 → padding on wrap
 
+    // A lost message must FAIL, not hang until the ctest timeout.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::thread producer([&] {
         for (std::uint32_t i = 0; i < kN; ++i) {
             aeron::util::index_t idx;
-            while ((idx = ring.tryClaim(kType, kLen)) < 0) std::this_thread::yield();
+            while ((idx = ring.tryClaim(kType, kLen)) < 0) {
+                if (std::chrono::steady_clock::now() >= deadline) return;
+                std::this_thread::yield();
+            }
             std::uint8_t* p = ring.base() + idx;
             std::memcpy(p, &i, sizeof(i));
             std::memset(p + sizeof(i), static_cast<int>(i & 0xFF), kLen - sizeof(i));
@@ -214,7 +220,7 @@ TEST(O2ORingBufferRegression, CrossThreadPayloadHandoffIsOrdered) {
 
     std::uint32_t next = 0;
     bool ok = true;
-    while (next < kN) {
+    while (next < kN && std::chrono::steady_clock::now() < deadline) {
         const int n = ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& buf,
                                     aeron::util::index_t off, aeron::util::index_t len) {
             const std::uint8_t* p = buf.buffer() + off;

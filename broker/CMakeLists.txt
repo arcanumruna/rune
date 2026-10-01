@@ -120,6 +120,11 @@ if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)
 endif()
 
+# TSan environment for every Aeron-using test target (vendored Aeron client
+# internals are suppressed via cmake/tsan-aeron.supp; rune code is not).
+set(RUNE_TSAN_AERON_SUPP "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+set(RUNE_AERON_TSAN_ENV "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
+
 add_subdirectory(libs/aeronutil)
 add_subdirectory(libs/metadata)
 add_subdirectory(libs/storage)

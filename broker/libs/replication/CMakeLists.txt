@@ -60,7 +60,7 @@ if(BUILD_REPLICATION_INTEGRATION_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_replication_integration_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
 if(BUILD_TESTING)
@@ -127,7 +127,7 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_replication_aeron_tests
-            PROPERTIES TIMEOUT 60)
+            PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     elseif(BUILD_AERON_REPLICATION_TESTS AND NOT aeron_FOUND)
         message(WARNING
             "BUILD_AERON_REPLICATION_TESTS=ON requires aeron; disabling rune_replication_aeron_tests")
@@ -165,5 +165,5 @@ if(BUILD_AERON_ARCHIVE_TESTS)
         aeron::aeron
         GTest::gtest_main)
     gtest_discover_tests(rune_aeron_archive_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()

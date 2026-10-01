@@ -491,10 +491,15 @@ TEST(IngressRingRegression, MultiProducerHandoffWithPaddingIsOrdered) {
     rune::consensus::IngressRing ring(4096);
     constexpr std::uint32_t kPerProducer = 20'000;
     constexpr std::size_t   kLen = 40;
+    // A lost message must FAIL, not hang until the ctest timeout.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     auto produce = [&](std::uint32_t pid) {
         for (std::uint32_t i = 0; i < kPerProducer; ++i) {
             aeron::util::index_t idx;
-            while ((idx = ring.tryClaim(kLen)) < 0) std::this_thread::yield();
+            while ((idx = ring.tryClaim(kLen)) < 0) {
+                if (std::chrono::steady_clock::now() >= deadline) return;
+                std::this_thread::yield();
+            }
             std::uint8_t* p = ring.base() + idx;
             std::memcpy(p, &pid, sizeof(pid));
             std::memcpy(p + 4, &i, sizeof(i));
@@ -505,7 +510,7 @@ TEST(IngressRingRegression, MultiProducerHandoffWithPaddingIsOrdered) {
     std::thread p0(produce, 0u), p1(produce, 1u);
     std::array<std::uint32_t, 2> next{0, 0};
     bool ok = true;
-    while (next[0] < kPerProducer || next[1] < kPerProducer) {
+    while ((next[0] < kPerProducer || next[1] < kPerProducer) && std::chrono::steady_clock::now() < deadline) {
         const int n = ring.drain([&](std::int32_t, aeron::concurrent::AtomicBuffer& buf,
                                      aeron::util::index_t off, aeron::util::index_t len) {
             const std::uint8_t* p = buf.buffer() + off;
