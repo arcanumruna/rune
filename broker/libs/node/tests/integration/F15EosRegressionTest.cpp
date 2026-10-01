@@ -13,6 +13,7 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/WorkerReturnCodec.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -626,4 +627,174 @@ TEST(TxnCoordinatorFailoverRegression, LossOfLeadershipAnswersNotCoordinatorAndC
     EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "marker tasks of a deposed coordinator must be dropped";
     ASSERT_EQ(T.controlFrames.size(), 1u) << "the deferred EndTxn must be answered on unload";
     EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), kNotCoordinator);
+}
+
+// ============================================================================
+// F15 S1 — new regression tests (design note §8 S1 row).
+// ============================================================================
+namespace {
+// The DEFAULT (Legacy) config: a worker pool is set but per-worker ingress is
+// OFF.  Produces are routed to the owning worker through the op ring; markers
+// must take the SAME route (K3), so the control thread never appends to a
+// worker-owned log.
+struct LegacyRig {
+    TmpDir d;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    NullTransport t;
+    ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    std::vector<std::pair<int16_t, int64_t>> produced;   // (errorCode, baseOffset)
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [this](const uint8_t* b, std::size_t n) -> int64_t {
+            if (auto r = pc::ProduceResponse::decode(b, n)) produced.emplace_back(r->errorCode, r->baseOffset);
+            return 1;
+        });
+    PartitionReplica* r = nullptr;
+    explicit LegacyRig(uint8_t tier = 1) {
+        auto rep = std::make_unique<PartitionReplica>(cfg(1, tier, 0, 0), Role::Leader, 1,
+                                                      std::vector<NodeId>{1}, std::vector<NodeId>{1},
+                                                      topics.log(0, 0), &t);
+        r = rep.get();
+        reg.add(0, 0, std::move(rep));
+        pool.assignFromRegistry(reg);
+        pool.setRegistry(&reg);
+        pool.setRunnersStartedForTest(true);
+        gw.setTopicRegistry(&topics);
+        gw.setReplicaRegistry(&reg);
+        gw.setWorkerPool(&pool);
+        // NOTE: no setPerWorkerIngressActive(true) — the default config.
+        runWorker(1);   // ownership applied
+    }
+    Worker& w() { return pool.worker(0); }
+    void runWorker(int64_t now) {
+        w().doWork(now);
+        w().drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
+    }
+    void produce(int64_t sid, int64_t corr) {
+        const auto f = produceFrame(sid, corr, batchAt(0), /*acks=leader*/0, 0, 0);
+        gw.applyProduceForTest(f.data(), f.size());
+    }
+};
+// Offset of the first REAL control batch in the log, or -1.
+int64_t controlBatchOffset(Log& log) {
+    const auto raw = log.read(0, 1 << 20);
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= raw.size()) {
+        rune::protocol::RecordBatchReader rd(raw.data() + pos, raw.size() - pos);
+        const int32_t total = rd.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > raw.size()) break;
+        if (tx::ControlMarker::isControlBatch(raw.data(), pos, raw.size() - pos)) return rd.baseOffset();
+        pos += static_cast<std::size_t>(total);
+    }
+    return -1;
+}
+} // namespace
+
+TEST(MarkerRoutingRegression, LegacyModeMarkerAppendedByOwningWorker) {
+    // K3: in the default config the marker must be appended by the OWNING worker
+    // (the single appender of the partition, L1) — never inline on the control
+    // thread.  Observable: the log is untouched until the worker runs.
+    LegacyRig R;
+    const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
+    const int64_t rc = R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false);
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0)
+        << "the control thread appended the marker inline to a worker-owned log (write-write race)";
+    EXPECT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync) << "the marker must be routed to the worker";
+    for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.gw.markersInFlightForTest(), 0u) << "the marker reply reached the gateway";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the worker appended the marker";
+    EXPECT_EQ(controlBatchOffset(*R.r->log()), 0) << "as a real control batch";
+}
+
+TEST(MarkerRoutingRegression, LegacyMarkerLandsAfterQueuedProduce) {
+    // K3 + L4: a produce routed to the worker and THEN a marker: the marker is
+    // queued behind the produce on the same op ring, so it lands after it.
+    LegacyRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    R.produce(sid, 1);
+    ASSERT_EQ(R.r->log()->logEndOffset(), 0) << "precondition: the produce is queued on the worker's op ring";
+    const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
+    const int64_t rc = R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false);
+    for (int i = 0; i < 64 && (R.gw.markersInFlightForTest() > 0 || R.produced.empty()); ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.produced.size(), 1u);
+    ASSERT_EQ(R.produced[0].first, 0) << "the produce succeeded";
+    // The inline (pre-fix) path returns the marker's offset synchronously; the
+    // routed path reports it through the worker — read it from the log.
+    const int64_t markerOff = rc >= 0 ? rc : controlBatchOffset(*R.r->log());
+    ASSERT_GE(markerOff, 0) << "the marker is in the log";
+    EXPECT_GT(markerOff, R.produced[0].second)
+        << "the marker (offset " << markerOff << ") overtook the produce queued before it (offset "
+        << R.produced[0].second << ")";
+}
+
+TEST(ControlBatchRegression, MarkerAppendRequestsFlush) {
+    // N2 (Minor): appendControlBatch keeps append()'s flush request.  On a
+    // Strict-tier worker the marker's log joins dirtyThisCycle_, so the pass's
+    // coalesced (durable-route) flush covers the marker.  Both modes.
+    {   // shard mode (per-worker ingress, external follower flush)
+        EosRig R({1}, /*tier=*/2);
+        const uint64_t before = R.w().ioSubmitCountForTest();
+        R.abortMarker(7, 0, 10);
+        ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+        EXPECT_GT(R.w().ioSubmitCountForTest(), before)
+            << "shard mode: no coalesced flush was submitted for the Strict-tier marker";
+    }
+    {   // default (Legacy) mode
+        LegacyRig R(/*tier=*/2);
+        const uint64_t before = R.w().ioSubmitCountForTest();
+        const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
+        (void)R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false);
+        for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+        ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+        EXPECT_GT(R.w().ioSubmitCountForTest(), before)
+            << "Legacy mode: no coalesced flush was submitted for the Strict-tier marker";
+    }
+}
+
+// ============================================================================
+// §7 protocol: TxnReturn (template id 6) on ret_; WorkerReturn layout pinned.
+// ============================================================================
+
+TEST(ProtocolRegression, TxnReturnRoundTrip) {
+    std::array<char, 128> buf{};
+    for (const auto kind : {TxnReturn::Kind::ControlRecordCommitted, TxnReturn::Kind::TxnHanging}) {
+        TxnReturn in;
+        in.kind = kind; in.topicId = 3; in.partition = 7; in.incarnation = 0xABCDu;
+        in.leaderEpoch = 42; in.token = 0x0102030405060708LL; in.errorCode = kNotLeader;
+        const std::size_t n = encodeTxnReturn(buf.data(), buf.size(), in);
+        ASSERT_GT(n, 0u) << "TxnReturn could not be encoded";
+        // SBE message header: blockLength u16 @0, templateId u16 @2, schemaId u16 @4 (LE).
+        const auto u16 = [&](std::size_t o) {
+            return static_cast<uint16_t>(static_cast<uint8_t>(buf[o]) | (static_cast<uint8_t>(buf[o + 1]) << 8));
+        };
+        EXPECT_EQ(u16(2), kTxnReturnTemplateId) << "TxnReturn must carry template id 6";
+        EXPECT_EQ(u16(4), 7) << "internal ring schema id";
+        TxnReturn out;
+        ASSERT_TRUE(decodeTxnReturn(buf.data(), n, out));
+        EXPECT_EQ(out.kind, in.kind);
+        EXPECT_EQ(out.topicId, in.topicId);
+        EXPECT_EQ(out.partition, in.partition);
+        EXPECT_EQ(out.incarnation, in.incarnation);
+        EXPECT_EQ(out.leaderEpoch, in.leaderEpoch);
+        EXPECT_EQ(out.token, in.token);
+        EXPECT_EQ(out.errorCode, in.errorCode);
+        EXPECT_FALSE(decodeTxnReturn(buf.data(), n - 1, out)) << "a truncated frame must be refused";
+    }
+    EXPECT_EQ(encodeTxnReturn(buf.data(), 8, TxnReturn{}), 0u) << "a too-small buffer must be refused";
+    // A WorkerReturn frame is not a TxnReturn (discriminated by template id).
+    std::array<char, 512> wr{};
+    WorkerReturn ret;
+    encodeWorkerReturnSbe(wr.data(), workerReturnEncodedLength(ret), ret);
+    TxnReturn out;
+    EXPECT_FALSE(decodeTxnReturn(wr.data(), workerReturnEncodedLength(ret), out));
+}
+
+TEST(ProtocolRegression, WorkerReturnLayoutUnchanged) {
+    // The ProduceResult carrier must not grow: the new transactional returns use
+    // their own template (TxnReturn), never new WorkerReturn fields.
+    namespace isbe = rune::protocol::internal::sbe;
+    EXPECT_EQ(isbe::WorkerReturn::sbeTemplateId(), 2);
+    EXPECT_EQ(isbe::WorkerReturn::sbeBlockLength(), 123);
+    WorkerReturn produceResult;   // empty chunk
+    EXPECT_EQ(workerReturnEncodedLength(produceResult), 8u + 123u + 4u);
 }

@@ -70,6 +70,7 @@
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerReturnCodec.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/WorkerOp.h>
 #include <rune_protocol_internal_sbe/WorkerReturn.h>
@@ -881,36 +882,7 @@ private:
     // ret_.base()+idx (no intermediate struct/memcpy).  Shared by enqueueReturn_
     // and flushRetOverflow_.
     void encodeReturnSbe_(const WorkerReturn& ret, aeron::util::index_t idx, std::size_t n) {
-        sbe::WorkerReturn enc;
-        enc.wrapAndApplyHeader(reinterpret_cast<char*>(ret_.base() + idx), 0, n);
-        enc.returnType(static_cast<sbe::ReturnType::Value>(static_cast<std::uint8_t>(ret.type)))
-           .sessionId(ret.sessionId)
-           .correlationId(ret.correlationId)
-           .partition(ret.partition)
-           .baseOffset(ret.baseOffset)
-           .lastOffset(ret.lastOffset)
-           .errorCode(ret.errorCode)
-           .deferAck(ret.deferAck ? 1 : 0)
-           .replica(reinterpret_cast<std::uint64_t>(ret.replica))
-           .producerId(ret.producerId)
-           .producerEpoch(ret.producerEpoch)
-           .baseSequence(ret.baseSequence)
-           .recordCount(ret.recordCount)
-           .topicId(ret.topicId)
-           .batchAttrs(ret.batchAttrs)
-           .enqueuedAtNs(ret.enqueuedAtNs)
-           .subscriptionId(ret.subscriptionId)
-           .readTopicId(ret.readTopicId)
-           .readPartition(ret.readPartition)
-           .newNextOffset(ret.newNextOffset)
-           .hwBound(ret.hwBound)
-           .isolation(ret.isolation)
-           .isGroup(ret.isGroup ? 1 : 0)
-           .groupCarrierReceived(ret.groupCarrierReceived ? 1 : 0)
-           .targetReplicaId(ret.targetReplicaId)
-           .incarnation(ret.incarnation);
-        enc.putChunk(reinterpret_cast<const char*>(ret.chunk.data()),
-                     static_cast<std::uint32_t>(ret.chunk.size()));
+        encodeWorkerReturnSbe(reinterpret_cast<char*>(ret_.base() + idx), n, ret);
     }
 
     void enqueueReturn_(const WorkerReturn& ret) {
