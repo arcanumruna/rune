@@ -38,3 +38,10 @@ race:aeron::ExclusivePublication::newPosition
 
 # Broadcast receiver image-created callback (conductor publishes new Image).
 race:aeron::concurrent::broadcast::CopyBroadcastReceiver::receive
+
+# Subscription image array: the conductor publishes a new array through
+# AtomicArrayUpdater (a seqlock whose ordering comes from STANDALONE acquire/
+# release fences, which TSan does not model); the polling thread reads it in
+# Subscription::poll / imageCount / imageBySessionId.  Aeron-internal.
+race:aeron::util::addToArray
+race:aeron::util::removeFromArray
