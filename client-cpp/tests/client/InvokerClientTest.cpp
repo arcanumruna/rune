@@ -1,6 +1,7 @@
 // tests/client/InvokerClientTest.cpp — Client in RunnerMode::Invoker against the
 // single-threaded InvokerGateway.  The test thread is the only thread: every drive
 // loop is iteration-capped and advances an injected clock instead of sleeping.
+#include "../support/TestCompletions.h"
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
@@ -82,9 +83,10 @@ struct Rig {
 
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = client.connect();
-        ASSERT_TRUE(drive([&] { return ready(f); }));
-        f.get();
+        test_support::TestCq cq(client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
         ASSERT_TRUE(drive([&] { return gw.metadataRequests > 0; }));
     }
 };
@@ -109,10 +111,12 @@ TEST(InvokerClient, ConnectsAndProducesWithNoThreads) {
 TEST(InvokerClient, NothingProgressesUnlessTheOwnerCallsDoWork) {
     Rig r(invokerCfg(3702, 3703));
     ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
-    auto f = r.client.connect();
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(f.accepted());
     for (int i = 0; i < 10'000; ++i) r.gw.pump();
     EXPECT_EQ(r.gw.connects, 0) << "no background runner may drain the connect command";
-    ASSERT_TRUE(r.drive([&] { return ready(f); }));
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
 }
 
 TEST(InvokerClient, InjectedClockDrivesRetransmitAndDeliveryTimeout) {
@@ -393,7 +397,8 @@ TEST(InvokerClientDeathTest, DestroyFromCallbackAbortsRegression) {
                 client->doWork();
                 gw.pump();
             }
-            auto f = client->connect();
+            test_support::TestCq cq(*client);
+            auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
             for (int i = 0; i < 200'000 && client; ++i) {
                 client->doWork();
                 gw.pump();

@@ -95,22 +95,27 @@ int runLive(const std::string& topic,
 
     Client client(cfg);
     try {
-        // Connect with a 10-second timeout.
-        auto connectFut = client.connect();
-        if (connectFut.wait_for(std::chrono::seconds(10)) !=
-                std::future_status::ready) {
-            std::cerr << "rune_schema_gen: connect timed out to " << cfg.gatewayChannel << "\n";
-            return 1;
+        // Connect with a 10-second timeout (F8c: *AndWait, no futures).
+        try {
+            client.connectAndWait(std::chrono::seconds(10));
+        } catch (const std::exception& e) {
+            if (std::string_view(e.what()).find("timed out") != std::string_view::npos) {
+                std::cerr << "rune_schema_gen: connect timed out to " << cfg.gatewayChannel << "\n";
+                return 1;
+            }
+            throw;
         }
-        connectFut.get(); // throws on error
 
-        auto schemaFut = client.getTopicSchema(topic);
-        if (schemaFut.wait_for(std::chrono::seconds(10)) !=
-                std::future_status::ready) {
-            std::cerr << "rune_schema_gen: getTopicSchema timed out for topic: " << topic << "\n";
-            return 1;
+        TopicSchemaResult r;
+        try {
+            r = client.getTopicSchemaAndWait(topic, std::chrono::seconds(10));
+        } catch (const std::exception& e) {
+            if (std::string_view(e.what()).find("timed out") != std::string_view::npos) {
+                std::cerr << "rune_schema_gen: getTopicSchema timed out for topic: " << topic << "\n";
+                return 1;
+            }
+            throw;
         }
-        TopicSchemaResult r = schemaFut.get();
 
         if (r.errorCode != 0) {
             std::cerr << "rune_schema_gen: broker returned error code "

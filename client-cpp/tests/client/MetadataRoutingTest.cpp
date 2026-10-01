@@ -20,6 +20,7 @@
 // level (endpoint resolved from cached metadata) plus the retarget/redirect
 // machinery to reach it; N simultaneous leader connections are out of scope.
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -300,12 +301,14 @@ static Client* makeConnectedClient(std::unique_ptr<Client>& holder,
     std::this_thread::sleep_for(150ms);
     gw = std::make_unique<MetaGateway>(agentDir + "/aeron", inStr, egStr, leaderEp);
 
-    auto connFut = holder->connect();
-    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+    test_support::TestCq connFutCq(*holder);
+
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return holder->connect(q, t); });
+    for (int i = 0; i < kPumpMax && !connFut.ready(); ++i) {
         gw->poll(16);
         std::this_thread::sleep_for(kPumpSleep);
     }
-    connFut.get();
+    connFut.check();
     return holder.get();
 }
 
@@ -345,10 +348,11 @@ static void makeInvokerConnectedClient(InvokerRig& rig, const std::string& agent
     rig.client = std::make_unique<Client>(cfg);
     rig.gw = std::make_unique<MetaGateway>(MetaGateway::InvokerTag{}, agentDir + "/aeron",
                                            inStr, egStr, leaderEp);
-    auto connFut = rig.client->connect();
-    ASSERT_TRUE(rig.drive([&] { return connFut.wait_for(0s) == std::future_status::ready; }))
+    test_support::TestCq connFutCq(*rig.client);
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return rig.client->connect(q, t); });
+    ASSERT_TRUE(rig.drive([&] { return connFut.ready(); }))
         << "invoker client never connected";
-    connFut.get();
+    connFut.check();
 }
 
 // ===========================================================================

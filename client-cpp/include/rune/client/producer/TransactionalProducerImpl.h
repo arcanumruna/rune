@@ -90,7 +90,7 @@ public:
     explicit TransactionalProducerImpl(
         std::string transactionalId,
         ProducerConfig cfg,
-        std::atomic<int64_t>& nextCorrId,
+        int64_t& nextCorrId,
         int32_t transactionTimeoutMs = 60'000);
 
     ~TransactionalProducerImpl() = default;
@@ -233,8 +233,10 @@ private:
     ProducerConfig cfg_;
     int32_t        transactionTimeoutMs_;
 
-    // Shared correlationId counter with other client ops.
-    std::atomic<int64_t>& nextCorrId_;
+    // Shared correlationId counter with other client ops (F8c C3: the
+    // Client's duty-owned plain counter — drawn only on the duty thread, in
+    // doWork() and the response handlers).
+    int64_t& nextCorrId_;
 
     // Idempotent producer identity (acquired via InitProducerId).
     // Stored atomically so accessors can read from any thread.

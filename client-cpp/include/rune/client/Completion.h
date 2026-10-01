@@ -30,6 +30,7 @@ enum class OpKind : uint8_t {
     CommitSync,                                                          // group consumer
     InitTransactions, SendOffsets, CommitTransaction, AbortTransaction,  // txn
     SubscribeBound,                                                      // optional (§2.6)
+    ListTopics,                                                          // client control (C3: listTopics())
 };
 
 enum class OpStatus : uint8_t {
@@ -87,6 +88,21 @@ struct CompletionHandler {
         fn(ctx, c, payload);
     }
 };
+
+/// A registered Completions' reference in the Client's duty-side registry
+/// (spec §2.2): a 10-bit slot index and a 5-bit generation.  A completion
+/// addressed to a released (and possibly reused) slot fails the generation
+/// check and is dropped, never misdelivered.  kNoCqRef: not registered.
+using CqRef = uint16_t;
+inline constexpr CqRef    kNoCqRef        = 0xFFFF;
+inline constexpr uint32_t kCqRefIndexBits = 10;
+inline constexpr uint32_t kMaxCqs         = 1u << kCqRefIndexBits;  // registry capacity
+inline constexpr uint32_t kCqRefGenMask   = 0x1F;
+[[nodiscard]] constexpr CqRef makeCqRef(uint32_t index, uint32_t gen) noexcept {
+    return static_cast<CqRef>((index & (kMaxCqs - 1)) | ((gen & kCqRefGenMask) << kCqRefIndexBits));
+}
+[[nodiscard]] constexpr uint32_t cqRefIndex(CqRef r) noexcept { return r & (kMaxCqs - 1); }
+[[nodiscard]] constexpr uint32_t cqRefGen(CqRef r) noexcept { return (r >> kCqRefIndexBits) & kCqRefGenMask; }
 
 /// Synchronous result of ISSUING an op: only Accepted is ever followed by a
 /// completion.

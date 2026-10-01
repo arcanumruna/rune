@@ -4,10 +4,10 @@
 // (default config, NOT in-process), a typed client exercises the FULL 0b typed
 // transport path:
 //
-//   1. connect()                                       — real Aeron session
+//   1. connectAndWait()                                     — real Aeron session
 //   2. defineTopic("characters", 1, "userId",          — runtime DDL, validate ON
 //                  validate=true, <characters blob>)      broker registers schema
-//   3. openTopic<rune::gen::Characters>("characters")  — EXACT-fingerprint gate
+//   3. openTopicAndWait<rune::gen::Characters>("characters")— EXACT-fingerprint gate
 //   4. topic.send(Characters{...}) × N                 — typed produce
 //   5. subscribe(from earliest) + decode each record   — typed consume + decode
 //      via rune::gen::Characters::decode → assert fields == what was sent
@@ -54,6 +54,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <optional>
+#include <string_view>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -143,14 +145,13 @@ int main() {
 
         // ---- 1. Connect ------------------------------------------------------
         std::cerr << "PROBE: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "PROBE: connected\n";
 
         // ---- 2. defineTopic (validate = ON) ----------------------------------
         std::cerr << "PROBE: defineTopic(\"characters\", 1, \"userId\", validate=true, blob)\n";
-        auto defFut = c.defineTopic("characters", /*partitions=*/1, /*keyField=*/"userId",
-                                    /*validate=*/true, std::span<const uint8_t>(blob));
-        DefineTopicResult def = defFut.get();
+        DefineTopicResult def = c.defineTopicAndWait("characters", /*partitions=*/1, /*keyField=*/"userId",
+                                                     /*validate=*/true, std::span<const uint8_t>(blob));
         if (def.errorCode != 0) {
             std::cerr << "PROBE: FAIL defineTopic errorCode=" << def.errorCode << "\n";
             c.close();
@@ -162,16 +163,21 @@ int main() {
 
         // ---- 3. openTopic<Characters> — EXACT-fingerprint gate ---------------
         std::cerr << "PROBE: openTopic<Characters>(\"characters\")...\n";
-        auto topicFut = c.openTopic<rune::gen::Characters>("characters");
-        {
-            const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-            if (topicFut.wait_until(dl) != std::future_status::ready) {
+        // F8c C3: openTopicAndWait — no std::async thread; throws on a stale
+        // fingerprint, a broker error or the wait timeout.
+        std::optional<TypedTopic<rune::gen::Characters>> topicOpt;
+        try {
+            topicOpt.emplace(c.openTopicAndWait<rune::gen::Characters>(
+                "characters", std::chrono::milliseconds(timeoutMs)));
+        } catch (const std::exception& e) {
+            if (std::string_view(e.what()).find("timed out") != std::string_view::npos) {
                 std::cerr << "PROBE: FAIL openTopic TIMEOUT\n";
                 c.close();
                 return 4;
             }
+            throw;
         }
-        TypedTopic<rune::gen::Characters> topic = topicFut.get();  // throws if fingerprint stale
+        TypedTopic<rune::gen::Characters>& topic = *topicOpt;
         std::cerr << "PROBE: openTopic OK (fingerprint matched broker schema)\n";
 
         // ---- 4. Produce N typed records --------------------------------------

@@ -239,6 +239,7 @@ endif()
 if(aeron_FOUND)
     add_library(rune_client_api STATIC
         src/Client.cpp
+        src/Completions.cpp
         src/detail/CpuAffinity.cpp
         src/shard/ShardConfig.cpp
     )

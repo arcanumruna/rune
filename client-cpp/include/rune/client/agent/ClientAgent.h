@@ -37,7 +37,6 @@
 #include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -233,6 +232,20 @@ public:
     // Thread-safe submission API (callable from ANY thread)
     // -------------------------------------------------------------------------
 
+    /// F8c C2: verdict of a command-ring submit.  Closed is LINEARIZABLE with
+    /// closeCommandRing() (the closed bit lives in the ring's tail word, C1):
+    /// a command accepted before the close is drained by the close path, a
+    /// command refused as Closed was never written.
+    enum class Submit : uint8_t { Accepted, Full, Closed };
+
+    /// F8c C2: close the command ring to producers (any thread; one RMW in
+    /// ring internals).  True only for the call that closed it.  Every command
+    /// accepted before it is still in the ring (drainRegistrationsForClose()
+    /// reads up to the frozen tail); every later submit returns Closed.
+    bool closeCommandRing() noexcept { return ring_.close(); }
+    /// Any thread: has closeCommandRing() run?  (acquire)
+    [[nodiscard]] bool commandRingClosed() const noexcept { return ring_.closed(); }
+
     /// Submit a CONNECT command.  Returns false if the ring is full.
     bool submitConnect() noexcept;
 
@@ -259,16 +272,24 @@ public:
     /// deletes the holder), so the producer list is never touched cross-thread.
     /// Returns false if the ring is momentarily full (caller retries).  The holder
     /// pointer is only its 8-byte address — no producer bytes cross the ring.
-    bool submitRegisterProducer(void* holder) noexcept;
+    Submit submitRegisterProducer(void* holder) noexcept;
 
     /// Same shared-nothing hand-off for a transactional producer: `holder` is a heap
     /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
-    bool submitRegisterTxnProducer(void* holder) noexcept;
+    Submit submitRegisterTxnProducer(void* holder) noexcept;
 
-    /// F8a: hand a subscriber / group-consumer command to the duty thread
-    /// (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty thread drains it
-    /// and invokes the hub-command hook.  Returns false if the ring is full.
-    bool submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept;
+    /// F8a: hand a subscriber / group-consumer / completion-queue command to
+    /// the duty thread (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty
+    /// thread drains it and invokes the hub-command hook.
+    Submit submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept;
+
+    /// F8c C3: hand a client control op (connect / ping / defineTopic /
+    /// getTopicSchema / listTopics) to the duty thread: `hdr` (a trivially
+    /// copyable header, `hdrLen` bytes) followed by the op's wire frame, copied
+    /// into ONE ring record (kMsgControlOp).  The duty thread invokes the
+    /// control-op hook with the whole record.
+    Submit submitControlOp(const void* hdr, std::size_t hdrLen,
+                           std::span<const uint8_t> frame) noexcept;
 
     /// close() path, single-threaded (runner joined / Invoker owner): drain the
     /// WHOLE command ring once, adopting producer + txn-producer registrations
@@ -443,7 +464,8 @@ public:
     }
 
     /// F8a fix2: control frames dropped because their session no longer exists,
-    /// and ring-drained frames the transport refused (each retried later).
+    /// and frames the transport refused — ring-drained or duty-thread direct
+    /// sends (each retried later).
     /// Duty thread only (or after the runner is joined).
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
@@ -477,6 +499,11 @@ public:
     void setHubCommandFn(HubCommandFn fn) noexcept {
         hubCommandFn_ = std::move(fn);
     }
+
+    /// F8c C3: hook invoked (duty thread, or close()'s drain) for every drained
+    /// kMsgControlOp with the record bytes (header + frame).  Set before start().
+    using ControlOpFn = std::function<void(const uint8_t*, std::size_t)>;
+    void setControlOpFn(ControlOpFn fn) noexcept { controlOpFn_ = std::move(fn); }
 
     // -------------------------------------------------------------------------
     // Observers
@@ -530,35 +557,22 @@ public:
     /// Set the MetadataResponse routing hook.  MUST be called before start().
     void setMetadataResponseFn(MetadataResponseFn fn) noexcept;
 
-    /// Return the session state snapshot published by the agent thread.
-    /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
-    /// state at the end of the most recent doWork() call.  Safe to call from
-    /// ANY thread — this is the cross-thread observer path used by CC-6.
+    /// The seed session's state.  F8c C3: DUTY-THREAD ONLY (the thread that
+    /// drives doWork(), or the closing thread once no duty thread runs) — a
+    /// plain read of duty-owned state.  The cross-thread atomic snapshot is
+    /// gone: an app thread learns the session state from Client::state()
+    /// (a duty-published StatusRing) and op outcomes from completions.
     [[nodiscard]] session::SessionState sessionState() const noexcept;
 
-    /// Return the session-id snapshot published by the agent thread.
-    /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
-    /// session-id at the end of the most recent doWork() call.
+    /// The seed session's id.  Duty-thread only (see sessionState()).
     [[nodiscard]] int64_t sessionId() const noexcept;
 
-    // -------------------------------------------------------------------------
-    // Coherent (state, sessionId) snapshot — FIX F3
-    // -------------------------------------------------------------------------
-
-    /// A coherent (state, sessionId) pair read from a SINGLE atomic load.
-    /// Neither field can be torn against the other: they are published together
-    /// (packed into one uint64_t) by the agent thread, so a caller never sees
-    /// state==Connected paired with a sessionId from a different session epoch.
+    /// (state, sessionId) of the seed session.  Duty-thread only — both are
+    /// read from the one duty-owned SessionMachine, so they are coherent.
     struct StateSnapshot {
         session::SessionState state;
         int64_t               sessionId;
     };
-
-    /// Return a coherent (state, sessionId) pair in ONE atomic acquire load.
-    /// This is the accessor Client::ping() MUST use so the sessionId it stamps
-    /// on the Ping always belongs to the same session epoch as the observed
-    /// Connected state.  (Two independent atomic loads could tear across a
-    /// resume — FIX F3.)
     [[nodiscard]] StateSnapshot stateAndSessionId() const noexcept;
 
     // CB-2: Allow Client to access ring_ for ProducerImpl construction.
@@ -589,6 +603,7 @@ private:
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
     static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
     static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
+    static constexpr int32_t kMsgControlOp  = 9;          // F8c C3 client control op (header + frame)
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
@@ -601,6 +616,8 @@ private:
     // Helpers
     // -------------------------------------------------------------------------
     bool writeCommand(int32_t msgTypeId, const uint8_t* payload, std::size_t payloadLen) noexcept;
+    /// writeCommand() with the Full / Closed distinction (C2).
+    Submit writeCommand3_(int32_t msgTypeId, const uint8_t* payload, std::size_t payloadLen) noexcept;
     void dispatchEgressFrame(int64_t nowNs, const uint8_t* buf, std::size_t len) noexcept;
 
     /// Task 1.3: resolve the Session whose IN-FLIGHT ConnectRequest carries
@@ -608,32 +625,6 @@ private:
     /// Falls back to the seed session when no session matches (single-node, a
     /// steady-state frame, or an already-established session).  Agent-thread only.
     Session& sessionForConnectCorrId(int64_t corrId) noexcept;
-
-    /// Publish the current (state, sessionId) as ONE packed atomic store
-    /// (release).  Called on the agent thread (a) after each frame is fed to the
-    /// session and BEFORE the egress observer runs (FIX F1), and (b) at the end
-    /// of each doWork() as the catch-all for tick-driven transitions.
-    void publishSnapshot() noexcept;
-
-    // ---- Packed (state, sessionId) snapshot codec (FIX F1 + F3) -------------
-    // Layout: high 16 bits = SessionState (fits in 8 bits), low 48 bits =
-    // sessionId.  sessionId is monotonic from 1 (server-assigned) and 0 when no
-    // session — it comfortably fits in 48 bits.  Packing both into ONE uint64_t
-    // makes the pair readable in a single atomic load with no torn read.
-    static constexpr int      kStateShift    = 48;
-    static constexpr uint64_t kSessionIdMask = (uint64_t{1} << kStateShift) - 1;
-
-    static uint64_t packSnapshot(session::SessionState st, int64_t sid) noexcept {
-        const uint64_t usid = static_cast<uint64_t>(sid) & kSessionIdMask;
-        return (static_cast<uint64_t>(static_cast<uint8_t>(st)) << kStateShift) | usid;
-    }
-    static session::SessionState unpackState(uint64_t v) noexcept {
-        return static_cast<session::SessionState>(
-            static_cast<uint8_t>(v >> kStateShift));
-    }
-    static int64_t unpackSessionId(uint64_t v) noexcept {
-        return static_cast<int64_t>(v & kSessionIdMask);
-    }
 
     // -------------------------------------------------------------------------
     // Members
@@ -739,6 +730,7 @@ private:
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
     ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
     HubCommandFn       hubCommandFn_;          // F8a subscriber / group-consumer commands
+    ControlOpFn        controlOpFn_;           // F8c C3 client control ops
     // F8a fix2: duty-thread counters for the kMsgSend drain rule (plain; read
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
@@ -762,16 +754,6 @@ private:
     // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
     MetadataResponseFn metadataResponseFn_;
 
-    // ---- Thread-safe observer snapshot (BrokerNode mirror pattern) ----------
-    // FIX F1 + F3: (state, sessionId) are packed into ONE atomic uint64_t and
-    // published together (release) so cross-thread readers get a COHERENT pair
-    // in a single acquire load — no torn read across a resume, and the snapshot
-    // is fresh at the moment the egress observer resolves the connect promise.
-    // Written on the agent thread; read by sessionState()/sessionId()/
-    // stateAndSessionId() from any thread.
-    std::atomic<uint64_t> snapshot_ {
-        packSnapshot(session::SessionState::Disconnected, 0)
-    };
 };
 
 } // namespace rune::client::agent

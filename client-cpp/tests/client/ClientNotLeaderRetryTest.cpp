@@ -23,6 +23,7 @@
 //   - a separate case: a gateway that ALWAYS returns bare NotLeader exhausts the
 //     redirect/retry budget and the future then fails (cbError only after budget).
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -219,15 +220,17 @@ static std::unique_ptr<Client> makeConnectedClient(const std::string& agentDir,
     std::this_thread::sleep_for(150ms);
     gwOut = std::make_unique<GW>(aeronDir, inStr, egStr);
 
-    auto connFut = client->connect();
+    test_support::TestCq connFutCq(*client);
+
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
     bool connected = false;
     for (int i = 0; i < kPumpMax; ++i) {
         gwOut->poll(16);
-        if (connFut.wait_for(0s) == std::future_status::ready) { connected = true; break; }
+        if (connFut.ready()) { connected = true; break; }
         std::this_thread::sleep_for(kPumpSleep);
     }
     EXPECT_TRUE(connected) << "Failed to connect to NotLeader gateway";
-    connFut.get();
+    connFut.check();
     return client;
 }
 

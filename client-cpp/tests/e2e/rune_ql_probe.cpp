@@ -58,7 +58,9 @@
 #include <future>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -145,23 +147,28 @@ int main() {
 
         // ---- 1. Connect ------------------------------------------------------
         std::cerr << "PROBE: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "PROBE: connected\n";
 
         // ---- 2. openTopic<Characters> — EXACT-fingerprint gate ---------------
         // The topic was defined by `rune schema apply ... --validate` before this
         // probe ran; here we OPEN it (schema fetched + fingerprint compared).
         std::cerr << "PROBE: openTopic<Characters>(\"characters\")...\n";
-        auto topicFut = c.openTopic<rune::gen::Characters>("characters");
-        {
-            const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-            if (topicFut.wait_until(dl) != std::future_status::ready) {
+        // F8c C3: openTopicAndWait — no std::async thread; throws on a stale
+        // fingerprint, a broker error or the wait timeout.
+        std::optional<TypedTopic<rune::gen::Characters>> topicOpt;
+        try {
+            topicOpt.emplace(c.openTopicAndWait<rune::gen::Characters>(
+                "characters", std::chrono::milliseconds(timeoutMs)));
+        } catch (const std::exception& e) {
+            if (std::string_view(e.what()).find("timed out") != std::string_view::npos) {
                 std::cerr << "PROBE: FAIL openTopic TIMEOUT\n";
                 c.close();
                 return 4;
             }
+            throw;
         }
-        TypedTopic<rune::gen::Characters> topic = topicFut.get();  // throws if fingerprint stale
+        TypedTopic<rune::gen::Characters>& topic = *topicOpt;
         std::cerr << "PROBE: openTopic OK (fingerprint matched broker schema)\n";
 
         // Resolve the topicId for subscribe/raw-produce below.  openTopic<T>
@@ -169,14 +176,14 @@ int main() {
         // metadata lookup that returns the broker-assigned topicId.
         int32_t topicId = -1;
         {
-            auto schemaFut = c.getTopicSchema("characters");
-            const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-            if (schemaFut.wait_until(dl) != std::future_status::ready) {
-                std::cerr << "PROBE: FAIL getTopicSchema TIMEOUT\n";
+            TopicSchemaResult sr;
+            try {
+                sr = c.getTopicSchemaAndWait("characters", std::chrono::milliseconds(timeoutMs));
+            } catch (const std::exception& e) {
+                std::cerr << "PROBE: FAIL getTopicSchema " << e.what() << "\n";
                 c.close();
                 return 4;
             }
-            TopicSchemaResult sr = schemaFut.get();
             if (sr.errorCode != 0 || sr.topicId < 0) {
                 std::cerr << "PROBE: FAIL getTopicSchema errorCode=" << sr.errorCode
                           << " topicId=" << sr.topicId << "\n";

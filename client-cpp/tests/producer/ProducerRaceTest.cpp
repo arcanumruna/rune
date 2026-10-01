@@ -17,6 +17,7 @@
 // Before the fix: this test crashes or TSan reports a DATA RACE on impls_.
 // After the fix: all iterations pass cleanly with zero TSan races.
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -217,10 +218,11 @@ TEST(ProducerRace, ConnectThenImmediateFirstProduceSingleIteration) {
     });
 
     // Connect (future-based, wait for completion).
-    auto connFut = client->connect();
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+    test_support::TestCq connFutCq(*client);
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+    ASSERT_TRUE(connFut.waitReady())
         << "connect() timed out";
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_NO_THROW(connFut.check());
 
     // --- THE RACE: call producer() and send() immediately after connect() ---
     // NO sleep. NO settle. This is the exact scenario that crashed ~80% of runs.
@@ -308,10 +310,11 @@ TEST(ProducerRace, ConnectThenImmediateFirstProduceTightLoop) {
         });
 
         // 1. Connect.
-        auto connFut = client->connect();
-        ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+        test_support::TestCq connFutCq(*client);
+        auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+        ASSERT_TRUE(connFut.waitReady())
             << "connect() timed out at iter " << iter;
-        ASSERT_NO_THROW(connFut.get())
+        ASSERT_NO_THROW(connFut.check())
             << "connect() threw at iter " << iter;
 
         // 2. Immediately create a producer and send — NO sleep, NO settle.

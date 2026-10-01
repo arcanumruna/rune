@@ -66,7 +66,7 @@ inline int64_t wallNs() noexcept {
 TransactionalProducerImpl::TransactionalProducerImpl(
     std::string transactionalId,
     ProducerConfig cfg,
-    std::atomic<int64_t>& nextCorrId,
+    int64_t& nextCorrId,
     int32_t transactionTimeoutMs)
     : transactionalId_(std::move(transactionalId))
     , cfg_(cfg)
@@ -238,7 +238,7 @@ int TransactionalProducerImpl::doWork(
         case CmdKind::InitTransactions: {
             // Emit InitProducerId.
             const int64_t corrId =
-                nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+                nextCorrId_++;
 
             if (sendInitProducerId(sessionId, corrId, sendFn)) {
                 // Register pending op.
@@ -274,7 +274,7 @@ int TransactionalProducerImpl::doWork(
                 break;
             }
             const int64_t corrId =
-                nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+                nextCorrId_++;
             const auto grpSpan = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(cmd.groupId.data()),
                 cmd.groupId.size());
@@ -356,7 +356,7 @@ int TransactionalProducerImpl::doWork(
 
             const bool commit = (cmd.kind == CmdKind::EndTxnCommit);
             const int64_t corrId =
-                nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+                nextCorrId_++;
 
             if (sendEndTxn(sessionId, corrId, (cmd.kind == CmdKind::EndTxnCommit), sendFn)) {
                 PendingTxnOp op;
@@ -427,7 +427,7 @@ void TransactionalProducerImpl::drainPendingSends(
             addedPartitions_.find(tpk) == addedPartitions_.end())
         {
             const int64_t apCorrId =
-                nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+                nextCorrId_++;
             std::vector<rpc::TxnTopicPartition> parts;
             parts.push_back({sr.topicId, sr.partition});
             if (sendAddPartitionsToTxn(sessionId, apCorrId, parts, sendFn)) {
@@ -474,7 +474,7 @@ void TransactionalProducerImpl::drainPendingSends(
         ps.nextBaseSequence += builder.recordCount();
 
         // Assign a real correlationId so we receive a ProduceResponse.
-        const int64_t prodCorrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+        const int64_t prodCorrId = nextCorrId_++;
 
         // Encode Produce frame with real acks (not fire-and-forget).
         rpc::Produce msg;
@@ -710,7 +710,7 @@ void TransactionalProducerImpl::onAddOffsetsToTxnResponse(
     }
 
     // OK — now send TxnOffsetCommit.
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+    const int64_t corrId = nextCorrId_++;
 
     const auto grpSpan = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(pendingOffsetOp_->groupId.data()),

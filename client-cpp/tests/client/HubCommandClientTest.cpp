@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include "../support/TestCompletions.h"
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -187,8 +188,9 @@ TEST(HubCommandClient, HubCommandFromCallbackWithFullRingFailsFastRegression) {
         return false;
     };
     ASSERT_TRUE(drive([&] { return gw.ready(); }));
-    auto f = client.connect();
-    ASSERT_TRUE(drive([&] { return readyNow(f); }));
+    test_support::TestCq cq(client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(drive([&] { return f.ready(); }));
     EXPECT_FALSE(commitThrew) << "commit() inside a callback is applied directly";
     EXPECT_TRUE(threw) << "a ring-only command fails fast on a full ring inside a callback";
 
@@ -233,11 +235,16 @@ struct HubRig {
     void settle(int cycles = 2'000) {
         for (int i = 0; i < cycles; ++i) { client.doWork(); gw.pump(); }
     }
+    // F8c C3: the test thread's completions (Invoker: this thread is the owner).
+    test_support::TestCq cq{client};
+    test_support::PendingOp pingOp(const rc::Bytes& payload) {
+        return cq.issue([&](rc::Completions& q, rc::Token t) { return client.ping(payload, q, t); });
+    }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = client.connect();
-        ASSERT_TRUE(drive([&] { return readyNow(f); }));
-        f.get();
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
     }
 };
 
@@ -384,8 +391,11 @@ TEST(HubCommandClient, RingDrainedFrameRetriedUnderTransportBackPressureRegressi
     r.connect();
     r.gw.pauseIngress = true;  // the gateway stops consuming: the publication fills
     constexpr int kPings = 120;  // ~120 KiB >> the 64 KiB term's window
-    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
-    for (int i = 0; i < kPings; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, static_cast<uint8_t>(i))));
+    std::vector<test_support::PendingOp> futs;
+    for (int i = 0; i < kPings; ++i) {
+        futs.push_back(r.pingOp(rc::Bytes(1024, static_cast<uint8_t>(i))));
+        ASSERT_TRUE(futs.back().accepted()) << futs.back().describe();
+    }
     r.settle(5'000);
     ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "the transport must have refused (back-pressure)";
     r.gw.pauseIngress = false;
@@ -404,8 +414,11 @@ TEST(HubCommandClient, UnsubscribeRetriedWhenTheTransportRefusesItRegression) {
     ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() > 0; }));
 
     r.gw.pauseIngress = true;
-    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
-    for (int i = 0; i < 120; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, 1)));
+    std::vector<test_support::PendingOp> futs;
+    for (int i = 0; i < 120; ++i) {
+        futs.push_back(r.pingOp(rc::Bytes(1024, 1)));
+        ASSERT_TRUE(futs.back().accepted()) << futs.back().describe();
+    }
     r.settle(5'000);
     ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "the publication must be back-pressured";
 
@@ -486,10 +499,10 @@ TEST(HubCommandClient, OversizePingFailsAtSubmitAndNeverWedgesTheRingRegression)
     HubRig r(4000, /*termBytes=*/64 * 1024);  // max message = 8 KiB
     r.connect();
     ASSERT_EQ(r.client.testMaxFrameLength(), 8u * 1024);
-    auto big = r.client.ping(rc::Bytes(16 * 1024, 7));
-    ASSERT_TRUE(readyNow(big)) << "an oversize frame must fail at submit";
-    EXPECT_THROW(big.get(), std::length_error);
-    auto small = r.client.ping(rc::Bytes(64, 1));
+    auto big = r.pingOp(rc::Bytes(16 * 1024, 7));
+    EXPECT_EQ(big.issued(), rc::OpResult::InvalidArgument) << "an oversize frame must fail at submit";
+    auto small = r.pingOp(rc::Bytes(64, 1));
+    ASSERT_TRUE(small.accepted()) << small.describe();
     ASSERT_TRUE(r.drive([&] { return r.gw.pings == 1; })) << "a later command was wedged";
 }
 
@@ -501,8 +514,8 @@ TEST(HubCommandClient, FatalOfferIsDroppedAndLaterCommandsProceedRegression) {
     ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));  // ring idle
     r.settle(200);
     r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 1);
-    auto a = r.client.ping(rc::Bytes(8, 1));
-    auto b = r.client.ping(rc::Bytes(8, 2));
+    auto a = r.pingOp(rc::Bytes(8, 1));
+    auto b = r.pingOp(rc::Bytes(8, 2));
     ASSERT_TRUE(r.drive([&] { return r.gw.pings >= 1; })) << "the ring was wedged by a Fatal offer";
     r.settle(200);
     EXPECT_EQ(r.gw.pings, 1);
@@ -569,8 +582,11 @@ TEST(HubCommandClient, SubscribeRefusedAtAdoptionIsRetriedRegression) {
     HubRig r(4010, /*termBytes=*/64 * 1024);
     r.connect();
     r.gw.pauseIngress = true;
-    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
-    for (int i = 0; i < 120; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, 1)));
+    std::vector<test_support::PendingOp> futs;
+    for (int i = 0; i < 120; ++i) {
+        futs.push_back(r.pingOp(rc::Bytes(1024, 1)));
+        ASSERT_TRUE(futs.back().accepted()) << futs.back().describe();
+    }
     r.settle(5'000);
     ASSERT_GT(r.client.testIngressOfferRefused(), 0u);
     auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
@@ -599,8 +615,9 @@ TEST(HubCommandClient, RunnerCallbackUnsubscribesAnUnadoptedAppHandleRegression)
         return false;
     };
     ASSERT_TRUE(pump([&] { return gw.ready(); }));
-    auto cf = client.connect();
-    ASSERT_TRUE(pump([&] { return readyNow(cf); }));
+    test_support::TestCq cq(client);
+    auto cf = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(pump([&] { return cf.ready(); }));
 
     std::unique_ptr<rc::Subscription> b;  // written by the test thread before `ev`
     std::atomic<int> inHandler{kPending}; // runner -> test: "blocked in A's handler"
@@ -629,7 +646,7 @@ TEST(HubCommandClient, RunnerCallbackUnsubscribesAnUnadoptedAppHandleRegression)
     // (a direct Subscribe sent at B's adoption, or the ring-drained ping) goes
     // out on the same ingress publication — so once the gateway has seen the
     // ping, it has already seen any Subscribe B's adoption could have sent.
-    auto barrier = client.ping(rc::Bytes(8, 1));
+    auto barrier = cq.issue([&](rc::Completions& q, rc::Token t) { return client.ping(rc::Bytes(8, 1), q, t); });
     ASSERT_TRUE(pump([&] { return gw.pings == 1; })) << "the barrier ping never arrived";
     EXPECT_EQ(gw.subscribed.size(), 1u) << "the unsubscribed handle was revived by its late adoption";
     client.close();
@@ -720,7 +737,7 @@ TEST(HubCommandClient, FatalUnsubscribeOfferFinishesLocallyRegression) {
     sub.unsubscribe();  // owner: applied directly -> Fatal
     EXPECT_TRUE(sub.finished());
     EXPECT_EQ(r.client.testPendingUnsubscribes(), 0u) << "a Fatal Unsubscribe is never retried";
-    auto barrier = r.client.ping(rc::Bytes(8, 1));  // FIFO barrier on the same publication
+    auto barrier = r.pingOp(rc::Bytes(8, 1));  // FIFO barrier on the same publication
     ASSERT_TRUE(r.drive([&] { return r.gw.pings == 1; }));
     EXPECT_TRUE(r.gw.unsubscribed.empty());
     EXPECT_EQ(r.client.testIngressFatalDropped(), 1u);
@@ -735,9 +752,9 @@ TEST(HubCommandClient, FatalDropLogIsRateLimitedRegression) {
     r.settle(200);
     r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 3);
     testing::internal::CaptureStderr();
-    auto p1 = r.client.ping(rc::Bytes(8, 1));
-    auto p2 = r.client.ping(rc::Bytes(8, 2));
-    auto p3 = r.client.ping(rc::Bytes(8, 3));
+    auto p1 = r.pingOp(rc::Bytes(8, 1));
+    auto p2 = r.pingOp(rc::Bytes(8, 2));
+    auto p3 = r.pingOp(rc::Bytes(8, 3));
     const bool all = r.drive([&] { return r.client.testIngressFatalDropped() == 3; });
     const std::string err = testing::internal::GetCapturedStderr();
     ASSERT_TRUE(all);

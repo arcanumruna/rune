@@ -6,6 +6,7 @@
 // iteration cap.  The AUTO / pinning tests are pure: the CPU set and the cgroup
 // quota are injected, so nothing depends on the test machine except the two
 // tests that check the platform probes themselves.
+#include "../support/TestCompletions.h"
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
@@ -561,9 +562,10 @@ TEST(ShardConfigRegression, DriverHandoffStartThreadToRunnerIsRaceFree) {
             return false;
         };
         ASSERT_TRUE(pumpUntil([&] { return gw->ready(); }));
-        auto f = client.connect();
-        ASSERT_TRUE(pumpUntil([&] { return f.wait_for(0s) == std::future_status::ready; }));
-        f.get();
+        test_support::TestCq cq(client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(pumpUntil([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
         ASSERT_TRUE(pumpUntil([&] { return gw->metadataRequests > 0; }));
         gw.reset();
         client.close();

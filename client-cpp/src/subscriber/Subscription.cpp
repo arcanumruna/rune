@@ -91,8 +91,11 @@ void Subscription::unsubscribe() {
 
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::Unsubscribe;
-    cmd.a      = impl_->correlationId;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());  // direct path only (fix3 I3)
+    // F8c C3: the identity is the impl ADDRESS (the Subscribe correlationId is
+    // duty-assigned at adoption and never read by an app thread).  The duty
+    // side only compares it against the impls its own tables hold — it never
+    // dereferences it on the ring path (fix3 I3: the direct path may).
+    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
 
     if (onDutyThread_()) {
         // Inside a callback (Thread mode): the sink applies it directly on this
@@ -109,7 +112,7 @@ void Subscription::unsubscribe() {
     // touch the sink again.
     if (impl_->status.closed()) return;
     // Lifecycle command: guaranteed delivery (progress-based wait on a full
-    // ring, never a timeout).  Closed / ClosedAfterSubmit: the close path
+    // ring, never a timeout).  Closed: the close path
     // finishes the subscription.
     (void)sink_(sinkCtx_, cmd);
 }

@@ -124,7 +124,10 @@ struct SubscriptionStatus {
 // table (duty thread), but NO field is ever read or written by both:
 //   - immutable after construction (written by the creating app thread BEFORE
 //     the SubscribeAdd command is put on the agent ring, whose release/acquire
-//     publishes them): correlationId, topicId, partition, handler;
+//     publishes them): topicId, partition, handler;
+//   - correlationId: F8c C3 — assigned by the duty thread when it adopts the
+//     SubscribeAdd (the duty-owned correlation counter), never read by an app
+//     thread (an app-side Unsubscribe identifies the impl by address);
 //   - duty-thread owned (plain fields, never touched by an app thread):
 //     subscriptionId, nextOffset, active, statusDirty, the dirty-list links,
 //     the pending-Unsubscribe fields;
@@ -134,7 +137,7 @@ struct SubscriptionStatus {
 // ---------------------------------------------------------------------------
 struct SubscriptionImpl {
     // ---- Immutable after construction -----------------------------------------
-    int64_t       correlationId = 0;   // the Subscribe correlationId (subscription identity)
+    int64_t       correlationId = 0;   // the Subscribe correlationId (duty-assigned at adoption)
     int32_t       topicId       = 0;
     int32_t       partition     = 0;
     RecordHandler handler;             // always valid (non-null after subscribe())

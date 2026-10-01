@@ -285,6 +285,9 @@ private:
     uint64_t    staleResponsesIgnored_ = 0;
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
     detail::SendResult sendSubscribeFrame_(const SubscribeRequest& req);
+    /// F8c C3: the Subscribe correlationId of the subscription whose impl is
+    /// `key`, found by address in this hub's own tables (0 = not held).
+    [[nodiscard]] int64_t correlationIdOf_(const SubscriptionImpl* key) const noexcept;
     /// fix4 M1: fail + erase a pending request whose Subscribe is never deliverable.
     PendingMap::iterator failRequest_(PendingMap::iterator it);
     void markUnsent_(SubscribeRequest& req) noexcept;

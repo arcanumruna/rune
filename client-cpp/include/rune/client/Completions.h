@@ -1,5 +1,5 @@
 #pragma once
-// Completions — F8c C1(b): the polled completion queue (spec §2.2, §2.3).
+// Completions — F8c: the polled completion queue (spec §2.2, §2.3, §3.3).
 //
 // Owned by ONE app thread.  Wraps a detail::CompletionRing whose single
 // producer is the duty thread and whose single consumer is the owner, which
@@ -12,8 +12,28 @@
 // thread IS the polling thread (single-owner contract).  The only cross-thread
 // memory is the ring's own.
 //
-// Standalone in C1: the Client registry / CqRef / release protocol (C2) and
-// the op wiring (C3+) come later; the duty side reaches the ring via ring().
+// Two forms:
+//   * Completions(cfg): standalone (C1) — no Client; the duty side reaches the
+//     ring via ring() (tests, custom producers).
+//   * Completions(client, cfg) (C2): registered with the Client.  The
+//     constructor hands the ring to the duty thread (CqAdd on the agent
+//     command ring) and waits for its CqRef (a registration record in its own
+//     ring: one duty round trip, cold path).  Ops then carry that CqRef; the
+//     duty thread resolves it in its registry and checks the generation, so a
+//     completion for a released / reused slot is dropped, never misdelivered.
+//
+// Lifetime (§3.3 release protocol, no atomics outside rings).  The ring block
+// has exactly ONE owner at a time:
+//   * the duty registry, from CqAdd until (a) it applies this queue's
+//     CqRelease (it then frees the block), or (b) Client close transfers the
+//     block back (it delivers every outstanding `Closed` completion, then
+//     producer-closes the ring — the last thing it ever does with it);
+//   * this object otherwise.
+// The destructor decides from ring words only: producer-closed -> free it
+// here; else submit CqRelease: accepted -> the duty side frees it; refused
+// because the Client is closing -> wait (idle strategy) until close
+// producer-closes it, then free it here.  A Completions may outlive its
+// Client (after close it holds only `Closed` completions, then finished()).
 
 #include <rune/client/Completion.h>
 #include <rune/client/detail/CompletionRing.h>
@@ -27,6 +47,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace rune::client {
@@ -53,21 +74,52 @@ struct NoPump {
     int operator()() const noexcept { return 0; }
 };
 
+class Client;
+
 class Completions {
 public:
+    /// Standalone queue (no Client).
     explicit Completions(CompletionsConfig cfg = {})
         : cfg_(validate(cfg))
-        , ring_(std::make_unique<detail::CompletionRing>(cfg_.capacityBytes))
+        , ring_(new detail::CompletionRing(cfg_.capacityBytes))
         , stash_(new uint8_t[cfg_.capacityBytes])
         , maxRecordBytes_(detail::CompletionRing::completionRecordBytes(
-              cfg_.maxResultBytes > cfg_.maxErrorText ? cfg_.maxResultBytes : cfg_.maxErrorText)) {}
+              cfg_.maxResultBytes > cfg_.maxErrorText ? cfg_.maxResultBytes : cfg_.maxErrorText))
+        , owner_(std::this_thread::get_id()) {}
+
+    /// Registered with `client` (C2).  The constructing thread becomes the
+    /// owner: the only thread that may issue ops on, poll, wait on, or destroy
+    /// this queue.  Blocks for one duty round trip (Invoker owner / a duty-
+    /// cycle callback: applied directly, no wait).  Throws std::logic_error in
+    /// Invoker mode off the owner thread, std::runtime_error when the Client's
+    /// registry is full (kMaxCqs).  If the Client is already closed the queue
+    /// is born finished (every op on it is rejected with OpResult::Closed).
+    explicit Completions(Client& client, CompletionsConfig cfg = {});
+
+    /// Release protocol (§3.3).  Never blocks unless a Client close() is in
+    /// progress on another thread (then until it hands the ring back).
+    ~Completions();
 
     Completions(const Completions&)            = delete;
     Completions& operator=(const Completions&) = delete;
-    /// Moving keeps the ring in place (heap).  A moved-from Completions has no
-    /// ring and must not be used again (review m10) — only destroyed/assigned.
-    Completions(Completions&&) noexcept            = default;
-    Completions& operator=(Completions&&) noexcept = default;
+    /// Moving keeps the ring in place (heap) and the owner thread.  A
+    /// moved-from Completions has no ring and must not be used again (review
+    /// m10) — only destroyed/assigned.
+    Completions(Completions&& o) noexcept { moveFrom_(o); }
+    Completions& operator=(Completions&& o) noexcept {
+        if (this != &o) {
+            release_();
+            moveFrom_(o);
+        }
+        return *this;
+    }
+
+    /// The Client this queue is registered with (nullptr: standalone).
+    [[nodiscard]] Client* client() const noexcept { return client_; }
+    /// The duty-registry reference (kNoCqRef: standalone, or born closed).
+    [[nodiscard]] CqRef cqRef() const noexcept { return cqRef_; }
+    /// True on the owner (constructing) thread.
+    [[nodiscard]] bool onOwnerThread() const noexcept { return std::this_thread::get_id() == owner_; }
 
     // ---- Issuing side (owner thread) --------------------------------------
 
@@ -81,8 +133,11 @@ public:
         case OpKind::Flush:
             return detail::CompletionRing::completionRecordBytes(0);
         case OpKind::Ping:
-            return detail::CompletionRing::completionRecordBytes(payloadBytes);
+            // The echo, or the error text of a failed ping, whichever is longer.
+            return detail::CompletionRing::completionRecordBytes(
+                payloadBytes > cfg_.maxErrorText ? payloadBytes : cfg_.maxErrorText);
         case OpKind::GetTopicSchema:
+        case OpKind::ListTopics:
             return detail::CompletionRing::completionRecordBytes(cfg_.maxResultBytes);
         default:
             return detail::CompletionRing::completionRecordBytes(cfg_.maxErrorText);
@@ -93,8 +148,13 @@ public:
     /// op may be issued (and must complete exactly once, or be unreserve()d if
     /// it is then rejected).  QueueFull: poll() first.  Closed: the producer
     /// side closed this queue.  InvalidArgument: not an 8-aligned record size
-    /// (use reservationFor()) or larger than one maximal record.
+    /// (use reservationFor()) or larger than one maximal record.  WrongThread
+    /// (debug builds): called off the owner thread — the credit counters are
+    /// owner-thread state (spec risk 3).
     [[nodiscard]] OpResult reserve(uint32_t bytes) noexcept {
+#ifndef NDEBUG
+        if (!onOwnerThread()) return OpResult::WrongThread;
+#endif
         if (ring_->producerClosed()) return OpResult::Closed;
         // A reservation is a ring record size: 8-aligned (review m2) — an
         // unaligned one could under-reserve the aligned record by up to 7 bytes.
@@ -214,7 +274,29 @@ public:
     [[nodiscard]] const CompletionsConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] uint32_t maxRecordBytes() const noexcept { return maxRecordBytes_; }
 
+    /// Token of the internal registration record (outside the app's 48-bit space).
+    static constexpr Token kRegistrationToken = ~Token{0};
+
 private:
+    friend class Client;
+
+    void moveFrom_(Completions& o) noexcept {
+        cfg_            = o.cfg_;
+        ring_           = std::exchange(o.ring_, nullptr);
+        stash_          = std::move(o.stash_);
+        maxRecordBytes_ = o.maxRecordBytes_;
+        reservedTotal_  = o.reservedTotal_;
+        outstanding_    = o.outstanding_;
+        stashHead_      = o.stashHead_;
+        stashTail_      = o.stashTail_;
+        stashLive_      = o.stashLive_;
+        client_         = std::exchange(o.client_, nullptr);
+        owner_          = o.owner_;
+        cqRef_          = std::exchange(o.cqRef_, kNoCqRef);
+    }
+    /// The §3.3 release (out of line: it talks to the Client).
+    void release_() noexcept;
+
     struct StashHdr {
         uint32_t size;  // whole entry, 8-aligned (== the ring record size)
         uint32_t live;  // 0 once taken by waitFor()
@@ -300,15 +382,28 @@ private:
         return false;
     }
 
-    CompletionsConfig                       cfg_;
-    std::unique_ptr<detail::CompletionRing> ring_;
-    std::unique_ptr<uint8_t[]>              stash_;
+    CompletionsConfig          cfg_;
+    detail::CompletionRing*    ring_ = nullptr;  // owned per the §3.3 protocol (see the class doc)
+    std::unique_ptr<uint8_t[]> stash_;
     uint32_t maxRecordBytes_ = 0;
     uint32_t reservedTotal_  = 0;  // owner thread only
     uint32_t outstanding_    = 0;  // owner thread only
     uint32_t stashHead_      = 0;  // owner thread only
     uint32_t stashTail_      = 0;
     uint32_t stashLive_      = 0;
+    Client*         client_ = nullptr;   // registered with (nullptr: standalone)
+    std::thread::id owner_;              // the constructing thread
+    CqRef           cqRef_  = kNoCqRef;  // duty-assigned at registration
+};
+
+/// Where an op's single completion goes (spec §2.1): a Completions queue the
+/// issuing thread owns and polls, or a CompletionHandler called on the duty
+/// thread.  Implicit from either, so every op takes `CompletionTarget`.
+struct CompletionTarget {
+    Completions*      cq = nullptr;
+    CompletionHandler handler{};
+    CompletionTarget(Completions& q) noexcept : cq(&q) {}             // NOLINT(google-explicit-constructor)
+    CompletionTarget(CompletionHandler h) noexcept : handler(h) {}    // NOLINT(google-explicit-constructor)
 };
 
 } // namespace rune::client

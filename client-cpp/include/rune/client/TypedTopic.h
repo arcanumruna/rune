@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include <rune/client/Completion.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/codec/Fingerprint.h>
@@ -39,6 +40,8 @@
 
 #include <cstdint>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace rune::client {
@@ -86,6 +89,26 @@ public:
     TypedTopic& operator=(TypedTopic&&) = default;
 
     ~TypedTopic() = default;
+
+    /// F8c C3: build a typed topic from a GetTopicSchema completion (spec
+    /// §2.5), on the CALLER's thread — the replacement for openTopic's
+    /// std::async continuation.  `client` is the Client the op was issued on
+    /// (any type with producer(): a template, so this header does not include
+    /// Client.h).  Throws std::runtime_error unless the completion is Ok AND
+    /// the descriptor's fingerprint equals T::kFingerprint exactly.
+    template <class ClientT>
+    [[nodiscard]] static TypedTopic fromSchema(ClientT& client, const Completion& c,
+                                               std::span<const uint8_t> descriptorBlob) {
+        if (c.status != OpStatus::Ok) {
+            throw std::runtime_error("openTopic: schema lookup failed (status " +
+                                     std::to_string(static_cast<int>(c.status)) + ", errorCode " +
+                                     std::to_string(c.errorCode) + ")");
+        }
+        if (!schemaMatches(T::kFingerprint, descriptorBlob)) {
+            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        }
+        return TypedTopic(client.producer(), static_cast<int32_t>(c.value));
+    }
 
     // ---- Hot path — ZERO per-send heap allocation ----------------------------
 

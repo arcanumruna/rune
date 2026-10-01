@@ -451,7 +451,7 @@ static int doGroup(Client& client,
 
     // All callbacks registered before connect() — setup-phase contract satisfied.
     std::cerr << "CLIENT: group connecting...\n";
-    client.connect().get();
+    client.connectAndWait();
     std::cerr << "CLIENT: group connected\n";
 
     // Drain the queue until windowMs expires.
@@ -646,7 +646,7 @@ static int doTxnConsume(Client& c,
     });
 
     std::cerr << "CLIENT: txn_consume group connecting...\n";
-    c.connect().get();
+    c.connectAndWait();
     std::cerr << "CLIENT: txn_consume group connected\n";
 
     const auto deadline =
@@ -803,7 +803,7 @@ int main() {
             std::cerr << "CLIENT: txn_produce mode txnId=" << txnId
                       << " commit=" << txnCommit << " records=" << records << "\n";
             std::cerr << "CLIENT: connecting...\n";
-            c.connect().get();
+            c.connectAndWait();
             std::cerr << "CLIENT: connected\n";
             const TopicHandle thTxn = c.topic(cfg.topics[0].name);
             if (!thTxn.valid()) {
@@ -859,7 +859,7 @@ int main() {
         }
 
         std::cerr << "CLIENT: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "CLIENT: connected\n";
 
         // No settle window needed: DR-BUG-1 is fixed. Producer registration

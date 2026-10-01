@@ -94,7 +94,6 @@ void GroupConsumer::setCallback_(int which, Fn cb) {
     cmd.b      = static_cast<int64_t>(reinterpret_cast<uintptr_t>(holder.get()));
     switch (submit_(cmd)) {  // throws: holder frees itself
     case detail::HubSubmit::Accepted:
-    case detail::HubSubmit::ClosedAfterSubmit:  // indeterminate ownership: leak, never free
         (void)holder.release();
         break;
     case detail::HubSubmit::Closed:
@@ -151,12 +150,6 @@ std::future<void> GroupConsumer::commitSync() {
         return fut;
     case detail::HubSubmit::Closed:
         return failed(impl_->status.closed() ? "GroupConsumer closed" : "Client closed");
-    case detail::HubSubmit::ClosedAfterSubmit:
-        // Racing Client::close(): the promise may already be adopted (and then
-        // failed by closeAll) or be stranded in the ring — ownership is
-        // indeterminate, so leak it and hand back a future that is failed now.
-        (void)prom.release();
-        return failed("Client closed");
     }
     return failed("Client closed");  // unreachable
 }

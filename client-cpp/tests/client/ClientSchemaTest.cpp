@@ -67,7 +67,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <future>
+#include "../support/TestCompletions.h"
 #include <memory>
 #include <string>
 #include <thread>
@@ -323,6 +323,21 @@ struct SchemaHarness {
 
     std::unique_ptr<Client>            client;
     std::unique_ptr<SchemaTestGateway> gw;
+    std::unique_ptr<test_support::TestCq> cq;  // F8c C3: the test thread's completions
+
+    test_support::PendingOp connectOp() {
+        return cq->issue([&](Completions& q, Token t) { return client->connect(q, t); });
+    }
+    test_support::PendingOp defineTopicOp(std::string_view name, uint32_t partitions,
+                                          std::string_view keyField, bool validate,
+                                          std::span<const uint8_t> blob) {
+        return cq->issue([&](Completions& q, Token t) {
+            return client->defineTopic(name, partitions, keyField, validate, blob, q, t);
+        });
+    }
+    test_support::PendingOp getTopicSchemaOp(std::string_view name) {
+        return cq->issue([&](Completions& q, Token t) { return client->getTopicSchema(name, q, t); });
+    }
 
     int64_t connectTimeoutMs = 5000;
     int64_t pingTimeoutMs    = 5000;  // also used as schema op timeout
@@ -347,6 +362,7 @@ struct SchemaHarness {
         clientCfg.pingTimeoutMs    = pingTimeoutMs;
 
         client = std::make_unique<Client>(clientCfg);
+        cq     = std::make_unique<test_support::TestCq>(*client);
 
         // Give the embedded driver a moment to write cnc.dat.
         std::this_thread::sleep_for(150ms);
@@ -371,13 +387,13 @@ struct SchemaHarness {
 
     /// Connect the client via the gateway and wait for Connected.
     void connectAndWait() {
-        auto fut = client->connect();
+        auto fut = connectOp();
         pumpGwUntil([&]() {
             return client->state() == rcs::SessionState::Connected;
         });
-        ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(fut.waitReady())
             << "connect() future did not resolve";
-        ASSERT_NO_THROW(fut.get()) << "connect() threw";
+        ASSERT_NO_THROW(fut.defineResult()) << "connect() threw";
     }
 
     ~SchemaHarness() {
@@ -401,18 +417,18 @@ TEST(ClientSchema, DefineTopicFutureResolvesOnOK) {
     h.gw->defineErrorCode = 0;
 
     std::vector<uint8_t> blob = {0x01, 0x02, 0x03};
-    auto fut = h.client->defineTopic("characters", 16, "userId", false,
+    auto fut = h.defineTopicOp("characters", 16, "userId", false,
                                      std::span<const uint8_t>(blob));
 
     h.pumpGwUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+        return fut.ready();
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "defineTopic() future did not resolve";
 
     DefineTopicResult r;
-    ASSERT_NO_THROW(r = fut.get()) << "defineTopic() threw";
+    ASSERT_NO_THROW(r = fut.defineResult()) << "defineTopic() threw";
     EXPECT_EQ(r.topicId,   0x40000001);
     EXPECT_EQ(r.version,   1u);
     EXPECT_EQ(r.errorCode, 0u);
@@ -432,18 +448,18 @@ TEST(ClientSchema, DefineTopicResponseErrorCodePropagates) {
     h.gw->defineErrorCode = static_cast<uint16_t>(rpc::ErrorCode::TopicExists);
 
     std::vector<uint8_t> blob;
-    auto fut = h.client->defineTopic("existing_topic", 1, "", false,
+    auto fut = h.defineTopicOp("existing_topic", 1, "", false,
                                      std::span<const uint8_t>(blob));
 
     h.pumpGwUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+        return fut.ready();
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "defineTopic() future did not resolve with error code";
 
     DefineTopicResult r;
-    ASSERT_NO_THROW(r = fut.get())
+    ASSERT_NO_THROW(r = fut.defineResult())
         << "defineTopic() with non-OK errorCode must NOT throw — errorCode is in the result";
     EXPECT_EQ(r.errorCode, static_cast<uint16_t>(rpc::ErrorCode::TopicExists));
     EXPECT_EQ(r.topicId, -1);
@@ -462,17 +478,17 @@ TEST(ClientSchema, GetTopicSchemaFutureResolvesWithBlob) {
     h.gw->getErrorCode = 0;
     h.gw->getBlob      = {0xDE, 0xAD, 0xBE, 0xEF};
 
-    auto fut = h.client->getTopicSchema("characters");
+    auto fut = h.getTopicSchemaOp("characters");
 
     h.pumpGwUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+        return fut.ready();
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "getTopicSchema() future did not resolve";
 
     TopicSchemaResult r;
-    ASSERT_NO_THROW(r = fut.get()) << "getTopicSchema() threw";
+    ASSERT_NO_THROW(r = fut.schemaResult()) << "getTopicSchema() threw";
     EXPECT_EQ(r.topicId,   0x40000001);
     EXPECT_EQ(r.version,   1u);
     EXPECT_EQ(r.errorCode, 0u);
@@ -493,17 +509,17 @@ TEST(ClientSchema, GetTopicSchemaUnknownTopicPropagates) {
     h.gw->getErrorCode = static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic);
     h.gw->getBlob.clear();
 
-    auto fut = h.client->getTopicSchema("missing_topic");
+    auto fut = h.getTopicSchemaOp("missing_topic");
 
     h.pumpGwUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+        return fut.ready();
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "getTopicSchema() with UnknownTopic did not resolve";
 
     TopicSchemaResult r;
-    ASSERT_NO_THROW(r = fut.get())
+    ASSERT_NO_THROW(r = fut.schemaResult())
         << "getTopicSchema() with UnknownTopic must NOT throw — errorCode in result";
     EXPECT_EQ(r.errorCode, static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic));
     EXPECT_EQ(r.topicId, -1);
@@ -523,15 +539,14 @@ TEST(ClientSchema, DefineTopicTimeoutFailsPromise) {
     h.gw->replyDefineTopic = false;
 
     std::vector<uint8_t> blob;
-    auto fut = h.client->defineTopic("timeout_topic", 1, "", false,
+    auto fut = h.defineTopicOp("timeout_topic", 1, "", false,
                                      std::span<const uint8_t>(blob));
 
     // Future must fail within pingTimeoutMs + generous test margin (3 s).
-    const auto status = fut.wait_for(3s);
-    ASSERT_EQ(status, std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "defineTopic() future did not fail within timeout — potential hang";
 
-    EXPECT_THROW(fut.get(), std::exception)
+    EXPECT_THROW(fut.defineResult(), std::exception)
         << "defineTopic() must throw on timeout, not return a value";
 }
 
@@ -547,13 +562,12 @@ TEST(ClientSchema, GetTopicSchemaTimeoutFailsPromise) {
     // Gateway will NOT reply to GetTopicSchema.
     h.gw->replyGetTopicSchema = false;
 
-    auto fut = h.client->getTopicSchema("timeout_topic");
+    auto fut = h.getTopicSchemaOp("timeout_topic");
 
-    const auto status = fut.wait_for(3s);
-    ASSERT_EQ(status, std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "getTopicSchema() future did not fail within timeout — potential hang";
 
-    EXPECT_THROW(fut.get(), std::exception)
+    EXPECT_THROW(fut.schemaResult(), std::exception)
         << "getTopicSchema() must throw on timeout, not return a value";
 }
 
@@ -566,12 +580,12 @@ TEST(ClientSchema, DefineTopicWithoutSessionRejected) {
     // Do NOT connect.
 
     std::vector<uint8_t> blob;
-    auto fut = h.client->defineTopic("topic", 1, "", false,
+    auto fut = h.defineTopicOp("topic", 1, "", false,
                                      std::span<const uint8_t>(blob));
 
-    ASSERT_EQ(fut.wait_for(1s), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "defineTopic() without session was not rejected promptly";
-    EXPECT_THROW(fut.get(), std::exception)
+    EXPECT_THROW(fut.defineResult(), std::exception)
         << "defineTopic() without session must throw";
 }
 
@@ -583,11 +597,11 @@ TEST(ClientSchema, GetTopicSchemaWithoutSessionRejected) {
     h.build();
     // Do NOT connect.
 
-    auto fut = h.client->getTopicSchema("topic");
+    auto fut = h.getTopicSchemaOp("topic");
 
-    ASSERT_EQ(fut.wait_for(1s), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "getTopicSchema() without session was not rejected promptly";
-    EXPECT_THROW(fut.get(), std::exception)
+    EXPECT_THROW(fut.schemaResult(), std::exception)
         << "getTopicSchema() without session must throw";
 }
 
@@ -608,18 +622,18 @@ TEST(ClientSchema, DefineTopicCorrectCorrelationId) {
     h.gw->defineErrorCode = 0;
 
     std::vector<uint8_t> blob = {0xAB, 0xCD};
-    auto fut = h.client->defineTopic("reg_topic", 4, "id", false,
+    auto fut = h.defineTopicOp("reg_topic", 4, "id", false,
                                      std::span<const uint8_t>(blob));
 
     h.pumpGwUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+        return fut.ready();
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "regression: defineTopic() future did not resolve";
 
     DefineTopicResult r;
-    ASSERT_NO_THROW(r = fut.get()) << "regression: defineTopic() threw";
+    ASSERT_NO_THROW(r = fut.defineResult()) << "regression: defineTopic() threw";
     EXPECT_EQ(r.topicId,   0x40000042) << "topicId mismatch — correlationId routing broken";
     EXPECT_EQ(r.version,   3u);
     EXPECT_EQ(r.errorCode, 0u);
@@ -665,28 +679,28 @@ TEST(ClientSchema, MultipleSchemaOpsInflight) {
     std::vector<uint8_t> blob2 = {0xBB};
 
     // Submit all three before any gateway polling.
-    auto fDefine1 = h.client->defineTopic("t1", 1, "k", false,
+    auto fDefine1 = h.defineTopicOp("t1", 1, "k", false,
                                            std::span<const uint8_t>(blob1));
-    auto fDefine2 = h.client->defineTopic("t2", 2, "k", false,
+    auto fDefine2 = h.defineTopicOp("t2", 2, "k", false,
                                            std::span<const uint8_t>(blob2));
-    auto fGet1    = h.client->getTopicSchema("t1");
+    auto fGet1 = h.getTopicSchemaOp("t1");
 
     // Drive until all three are ready.
     h.pumpGwUntil([&]() {
-        return (fDefine1.wait_for(0ms) == std::future_status::ready) &&
-               (fDefine2.wait_for(0ms) == std::future_status::ready) &&
-               (fGet1.wait_for(0ms)    == std::future_status::ready);
+        return (fDefine1.ready()) &&
+               (fDefine2.ready()) &&
+               (fGet1.ready());
     });
 
-    ASSERT_EQ(fDefine1.wait_for(kFutureTimeout), std::future_status::ready) << "fDefine1 not ready";
-    ASSERT_EQ(fDefine2.wait_for(kFutureTimeout), std::future_status::ready) << "fDefine2 not ready";
-    ASSERT_EQ(fGet1.wait_for(kFutureTimeout),    std::future_status::ready) << "fGet1 not ready";
+    ASSERT_TRUE(fDefine1.waitReady()) << "fDefine1 not ready";
+    ASSERT_TRUE(fDefine2.waitReady()) << "fDefine2 not ready";
+    ASSERT_TRUE(fGet1.waitReady()) << "fGet1 not ready";
 
     DefineTopicResult r1, r2;
     TopicSchemaResult r3;
-    ASSERT_NO_THROW(r1 = fDefine1.get()) << "fDefine1 threw";
-    ASSERT_NO_THROW(r2 = fDefine2.get()) << "fDefine2 threw";
-    ASSERT_NO_THROW(r3 = fGet1.get())    << "fGet1 threw";
+    ASSERT_NO_THROW(r1 = fDefine1.defineResult()) << "fDefine1 threw";
+    ASSERT_NO_THROW(r2 = fDefine2.defineResult()) << "fDefine2 threw";
+    ASSERT_NO_THROW(r3 = fGet1.schemaResult())    << "fGet1 threw";
 
     EXPECT_EQ(r1.topicId, 0x40000001) << "fDefine1 topicId mismatch";
     EXPECT_EQ(r2.topicId, 0x40000001) << "fDefine2 topicId mismatch";

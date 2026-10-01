@@ -56,6 +56,15 @@ public:
     CompletionRing(const CompletionRing&)            = delete;
     CompletionRing& operator=(const CompletionRing&) = delete;
 
+    /// Test seam (F8c C2 release-protocol tests): called by the destructor
+    /// when set — counts frees.  Set it before any thread that may free a
+    /// ring runs and clear it after they are joined (never written while
+    /// another thread reads it).  nullptr in production.
+    static inline void (*testOnDestroy)(const CompletionRing*) noexcept = nullptr;
+    ~CompletionRing() {
+        if (testOnDestroy != nullptr) testOnDestroy(this);
+    }
+
     [[nodiscard]] std::uint32_t capacity() const noexcept {
         return static_cast<std::uint32_t>(ring_.capacity());
     }

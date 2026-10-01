@@ -49,6 +49,19 @@ struct HubCommand {
         /// installs it and frees the holder).  Always via the ring (never
         /// applied directly: replacing a callback while it runs is UB).
         GroupSetCallback = 14,
+
+        // ---- Client (F8c) ------------------------------------------------------
+        /// handle = detail::CompletionRing* of a client-bound Completions: the
+        /// duty registry adopts it (C2) and answers with a registration record
+        /// carrying its CqRef (or -1: registry full, not adopted).
+        CqAdd           = 20,
+        /// handle = the CompletionRing*, a = its CqRef: the duty side unlinks
+        /// it from the registry and frees it (§3.3 case (a)).
+        CqRelease       = 21,
+        /// handle = heap std::function holder of the Client callback chosen by
+        /// a (0 onConnected, 1 onDisconnected, 2 onError); ownership passes to
+        /// the duty thread, which installs it and frees the holder (C3).
+        ClientSetCallback = 22,
     };
 
     Op       op     = Op::SubscribeAdd;
@@ -64,12 +77,11 @@ enum class HubSubmit : uint8_t {
     Accepted,
     /// NOT submitted (the Client is already closed).  The caller still owns
     /// any heap payload it put in the command and must free/fail it.
+    /// F8c C2: linearizable — the agent command ring's closed bit lives in its
+    /// tail word, so a command is either Accepted (before the close: drained
+    /// by close()) or Closed (never written).  F8a's indeterminate
+    /// ClosedAfterSubmit outcome (and its accepted leak) no longer exists.
     Closed,
-    /// Submitted, but racing Client::close(): it may or may not have been
-    /// drained.  Heap-payload ownership is INDETERMINATE — the caller must
-    /// neither free it nor rely on it being applied (an accepted shutdown
-    /// leak, same as Client::producerWithRingCap_'s fix3 M1 branch).
-    ClosedAfterSubmit,
 };
 
 /// F8a fix4 M1: verdict of a duty-thread DIRECT send (Subscribe /
@@ -86,7 +98,8 @@ enum class SendResult : uint8_t { Accepted, Retry, Fatal };
 /// otherwise a full ring is waited out on duty-thread progress) — never throw
 /// for a full ring.
 [[nodiscard]] constexpr bool isLifecycle(HubCommand::Op op) noexcept {
-    return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose;
+    return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose ||
+           op == HubCommand::Op::CqRelease;
 }
 
 /// Plain function pointer + opaque context (no std::function, no virtual):

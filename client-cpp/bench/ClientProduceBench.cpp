@@ -350,12 +350,7 @@ struct BenchFixture {
         gw->start(kIngressStream, kEgressStream);
 
         // Connect.
-        auto fut = client->connect();
-        const auto dl = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kConnTimeoutMs);
-        if (fut.wait_until(dl) != std::future_status::ready)
-            throw std::runtime_error("BenchFixture: connect() timed out");
-        fut.get();
+        client->connectAndWait(std::chrono::milliseconds(kConnTimeoutMs));
 
         th = client->topic("bench_topic");
         if (!th.valid())

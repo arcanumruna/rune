@@ -99,9 +99,6 @@ void ClientAgent::start() {
     if (started_) return;  // already started (owner state, see ClientAgent.h)
     started_ = true;
     transport_.start();
-
-    // Publish initial snapshot so observers see a consistent value immediately.
-    publishSnapshot();
 }
 
 void ClientAgent::stop() noexcept {
@@ -269,6 +266,15 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 }
                 break;
 
+            case kMsgControlOp:
+                // F8c C3: a client control op (its pending entry and its
+                // completion are duty-thread owned from here on).
+                if (controlOpFn_) {
+                    controlOpFn_(reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                                 static_cast<std::size_t>(len));
+                }
+                break;
+
             default:
                 // Unknown command: drop silently.
                 break;
@@ -329,19 +335,39 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
         totalWork += producerWork;
     }
 
-    // ---- Step 5: Publish observer snapshot (release) ------------------------
-    // Catch-all publish for tick-driven transitions (keepalive/timeout/resume).
-    // Frame-driven transitions are ALSO published inside dispatchEgressFrame
-    // BEFORE the observer runs (FIX F1), so a thread woken by the observer sees
-    // a snapshot at least as fresh as the state that woke it.
-    publishSnapshot();
-
     return totalWork;
 }
 
 // ---------------------------------------------------------------------------
 // Thread-safe submission API
 // ---------------------------------------------------------------------------
+
+ClientAgent::Submit ClientAgent::writeCommand3_(int32_t msgTypeId, const uint8_t* payload,
+                                                std::size_t payloadLen) noexcept {
+    if (writeCommand(msgTypeId, payload, payloadLen)) return Submit::Accepted;
+    // The closed bit is permanent: a refused write on a closed ring is Closed
+    // (it was never written, whichever of full / closed refused it).
+    return ring_.closed() ? Submit::Closed : Submit::Full;
+}
+
+ClientAgent::Submit ClientAgent::submitControlOp(const void* hdr, std::size_t hdrLen,
+                                                 std::span<const uint8_t> frame) noexcept {
+    const std::size_t total = hdrLen + frame.size();
+    if (total > static_cast<std::size_t>(ring_.maxMsgLength())) return Submit::Full;
+    bool ok = false;
+    try {
+        ok = ring_.writeWith(kMsgControlOp, static_cast<aeron::util::index_t>(total),
+                             [&](aeron::concurrent::AtomicBuffer& dst, aeron::util::index_t at) {
+                                 uint8_t* p = dst.buffer() + at;
+                                 std::memcpy(p, hdr, hdrLen);
+                                 if (!frame.empty()) std::memcpy(p + hdrLen, frame.data(), frame.size());
+                             });
+    } catch (...) {
+        ok = false;
+    }
+    if (ok) return Submit::Accepted;
+    return ring_.closed() ? Submit::Closed : Submit::Full;
+}
 
 bool ClientAgent::writeCommand(int32_t msgTypeId,
                                 const uint8_t* payload,
@@ -409,6 +435,9 @@ transport::AeronTransport::OfferResult ClientAgent::offerDefault(const uint8_t* 
                                                                 std::size_t len) noexcept {
     const auto r = offerIngress_(buf, len);
     if (r == transport::AeronTransport::OfferResult::Fatal) [[unlikely]] noteFatalDrop_(len);
+    // F8c C3: a refusal of a duty-thread direct send (control ops, Subscribe,
+    // Unsubscribe, ...) is counted like a ring-drained one (the owner retries).
+    if (r == transport::AeronTransport::OfferResult::Retry) [[unlikely]] ++ingressOfferRefused_;
     return r;
 }
 
@@ -431,7 +460,7 @@ transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t*
     return transport_.offerResult(buf, len);
 }
 
-bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
+ClientAgent::Submit ClientAgent::submitRegisterProducer(void* holder) noexcept {
     // Encode an SBE RegisterProducer message (MessageHeader + handle) and enqueue
     // it as the command payload — self-describing/versioned, like every other ring
     // message, rather than a raw pointer memcpy.
@@ -439,7 +468,7 @@ bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
     msg.handle = reinterpret_cast<uint64_t>(holder);
     uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
     const std::size_t n = msg.encode(buf);
-    return writeCommand(kMsgRegisterProducer, buf, n);
+    return writeCommand3_(kMsgRegisterProducer, buf, n);
 }
 
 int ClientAgent::drainRegistrationsForClose() noexcept {
@@ -507,11 +536,18 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
                 const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
                 if (msgTypeId == kMsgHubCommand) {
                     // F8a: adopt/apply so heap payloads (subscribe requests,
-                    // commitSync promises, group registrations) are owned and
-                    // then finished by the close path — never stranded.
+                    // commitSync promises, group registrations, completion
+                    // queues) are owned and then finished by the close path —
+                    // never stranded.
                     if (!hubCommandFn_) return;
                     auto cmd = ring_msg::HubCommandMsg::decode(p, static_cast<std::size_t>(len));
                     if (cmd) hubCommandFn_(*cmd);
+                    return;
+                }
+                if (msgTypeId == kMsgControlOp) {
+                    // F8c C3: an accepted control op completes exactly once —
+                    // here, with Closed (the hook knows the Client is closing).
+                    if (controlOpFn_) controlOpFn_(p, static_cast<std::size_t>(len));
                     return;
                 }
                 const ProducerRegisterFn* fn =
@@ -571,18 +607,18 @@ void ClientAgent::testFillCommandRing() {
     }
 }
 
-bool ClientAgent::submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept {
+ClientAgent::Submit ClientAgent::submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept {
     uint8_t buf[ring_msg::HubCommandMsg::ENCODED_SIZE];
     const std::size_t n = ring_msg::HubCommandMsg::encode(cmd, buf);
-    return writeCommand(kMsgHubCommand, buf, n);
+    return writeCommand3_(kMsgHubCommand, buf, n);
 }
 
-bool ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {
+ClientAgent::Submit ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {
     ring_msg::RegisterProducer msg;
     msg.handle = reinterpret_cast<uint64_t>(holder);
     uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
     const std::size_t n = msg.encode(buf);
-    return writeCommand(kMsgRegisterTxnProducer, buf, n);
+    return writeCommand3_(kMsgRegisterTxnProducer, buf, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,32 +641,18 @@ void ClientAgent::setMetadataResponseFn(MetadataResponseFn fn) noexcept {
     metadataResponseFn_ = std::move(fn);
 }
 
-void ClientAgent::publishSnapshot() noexcept {
-    // Pack (state, sessionId) into ONE atomic value and publish (release).
-    // Guard the sessionId range so the packing assumption (48 bits) holds.
-    const int64_t sid = seedSession().machine.sessionId();
-    assert(sid >= 0 && (static_cast<uint64_t>(sid) & ~kSessionIdMask) == 0 &&
-           "sessionId does not fit in 48 bits — packing invariant violated");
-    snapshot_.store(packSnapshot(seedSession().machine.state(), sid),
-                    std::memory_order_release);
-}
-
 session::SessionState ClientAgent::sessionState() const noexcept {
-    // Reads the packed atomic snapshot (release-published on the agent thread).
-    // Thread-safe: callable from any thread.
-    return unpackState(snapshot_.load(std::memory_order_acquire));
+    // F8c C3: duty-thread only (plain read of the duty-owned seed machine).
+    return seedSession().machine.state();
 }
 
 int64_t ClientAgent::sessionId() const noexcept {
-    // Reads the packed atomic snapshot (release-published on the agent thread).
-    // Thread-safe: callable from any thread.
-    return unpackSessionId(snapshot_.load(std::memory_order_acquire));
+    return seedSession().machine.sessionId();
 }
 
 ClientAgent::StateSnapshot ClientAgent::stateAndSessionId() const noexcept {
-    // Single atomic load → coherent (state, sessionId) pair (FIX F3).
-    const uint64_t v = snapshot_.load(std::memory_order_acquire);
-    return StateSnapshot{unpackState(v), unpackSessionId(v)};
+    const auto& m = seedSession().machine;
+    return StateSnapshot{m.state(), m.sessionId()};
 }
 
 // ---------------------------------------------------------------------------
@@ -687,10 +709,9 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             opt->correlationId,
             nowNs);
         s.machine.onActivity(nowNs);
-        // FIX F1: publish the fresh (state, sessionId) BEFORE waking any thread
-        // via the observer, so a thread returning from connect().get() and
-        // immediately calling ping() reads Connected (not the stale snapshot).
-        publishSnapshot();
+        // (F8c C3: the observer — Client::onEgressFrame — publishes the new
+        // state to app threads (Client::state()) BEFORE it completes the
+        // connect, so a thread woken by that completion reads Connected.)
         // Task 1.4 (redirect convergence): a leader session just (re)connected.
         // In multi-node mode, re-drive all in-flight produce frames through their
         // partition routes — held batches whose leader is THIS newly-connected
@@ -720,7 +741,6 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         }
         s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
         s.machine.onActivity(nowNs);
-        publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }
@@ -729,7 +749,6 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
 
     case codec::TemplateId::Pong: {
         seedSession().machine.onActivity(nowNs);
-        publishSnapshot();  // FIX F1: fresh snapshot before observer
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }

@@ -173,7 +173,10 @@ TEST(SubscriberHubCommand, UnsubscribeIsACommandNotASharedWriteRegression) {
     EXPECT_FALSE(sub.active()) << "the handle reports inactive at once (handle-local)";
     ASSERT_EQ(sink.cmds.size(), 1u);
     EXPECT_EQ(sink.cmds[0].op, rcd::HubCommand::Op::Unsubscribe);
-    EXPECT_EQ(sink.cmds[0].a, 13);
+    // F8c C3: identified by the impl address (the correlationId is duty-
+    // assigned and never read by the app thread).
+    EXPECT_EQ(sink.cmds[0].handle, reinterpret_cast<uint64_t>(impl.get()));
+    EXPECT_EQ(sink.cmds[0].a, 0);
     EXPECT_EQ(hub.activeCount(), 1u) << "app thread touched no hub state";
     EXPECT_TRUE(impl->active)        << "app thread touched no duty-owned impl field";
 

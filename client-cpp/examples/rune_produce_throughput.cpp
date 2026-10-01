@@ -169,7 +169,7 @@ int main() {
         Client c(cfg);
         c.onError([](const std::string& m){ std::cerr << "onError: " << m << "\n"; });
         std::cerr << "connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "connected\n";
         const TopicHandle th = c.topic(cfg.topics[0].name);
         if (!th.valid()) { std::cerr << "topic invalid\n"; return 2; }

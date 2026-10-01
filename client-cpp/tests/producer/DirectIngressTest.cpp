@@ -4,6 +4,7 @@
 // thread, so send() appends straight into the partition builder (no ring hop) and
 // the records of one pass leave as one frame per partition at the end of the pass.
 // Every drive loop is iteration-capped; nothing sleeps.
+#include "../support/TestCompletions.h"
 #include "../support/AllocCounter.h"
 #include "../support/InvokerGateway.h"
 
@@ -89,9 +90,10 @@ struct Rig {
     }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = client->connect();
-        ASSERT_TRUE(drive([&] { return f.wait_for(0s) == std::future_status::ready; }));
-        f.get();
+        test_support::TestCq cq(*client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
     }
 };
 } // namespace

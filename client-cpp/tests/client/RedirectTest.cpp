@@ -19,6 +19,7 @@
 // starting with "aeron:") as-is so that ipc-based tests don't have UDP URIs
 // forced onto them.
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -310,18 +311,19 @@ TEST(Redirect, ProduceRedirectFollow) {
     auto gw = std::make_unique<RedirectGateway>(aeronDir, kInStr, kEgStr);
 
     // Connect.
-    auto connFut = client->connect();
+    test_support::TestCq connFutCq(*client);
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
     bool connected = false;
     for (int i = 0; i < kPumpMax; ++i) {
         gw->poll(16);
-        if (connFut.wait_for(0s) == std::future_status::ready) {
+        if (connFut.ready()) {
             connected = true;
             break;
         }
         std::this_thread::sleep_for(kPumpSleep);
     }
     ASSERT_TRUE(connected) << "Failed to connect to redirect gateway";
-    ASSERT_NO_THROW(connFut.get()) << "connect() must not throw";
+    ASSERT_NO_THROW(connFut.check()) << "connect() must not throw";
 
     // Create a producer with minimal linger so the Produce fires quickly.
     ProducerConfig pcfg;
@@ -425,18 +427,19 @@ TEST(Redirect, SubscribeRedirectFollow) {
     auto gw = std::make_unique<RedirectGateway>(aeronDir, kInStr, kEgStr);
 
     // Connect.
-    auto connFut = client->connect();
+    test_support::TestCq connFutCq(*client);
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
     bool connected = false;
     for (int i = 0; i < kPumpMax; ++i) {
         gw->poll(16);
-        if (connFut.wait_for(0s) == std::future_status::ready) {
+        if (connFut.ready()) {
             connected = true;
             break;
         }
         std::this_thread::sleep_for(kPumpSleep);
     }
     ASSERT_TRUE(connected) << "Failed to connect to redirect gateway";
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_NO_THROW(connFut.check());
 
     auto th = client->topic("inventory");
     ASSERT_TRUE(th.valid());
@@ -655,12 +658,13 @@ TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
     auto gw = std::make_unique<M1Gateway>(aeronDir, kInStr, kEgStr);
 
     // Connect
-    auto connFut = client->connect();
-    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+    test_support::TestCq connFutCq(*client);
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+    for (int i = 0; i < kPumpMax && !connFut.ready(); ++i) {
         gw->poll(16);
         std::this_thread::sleep_for(kPumpSleep);
     }
-    ASSERT_NO_THROW(connFut.get()) << "Initial connect must succeed";
+    ASSERT_NO_THROW(connFut.check()) << "Initial connect must succeed";
 
     ProducerConfig pcfg;
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
@@ -882,12 +886,13 @@ TEST(Redirect, M2DeadEndpointProduceFutureFails_SubscribeDoesNotHang) {
     auto gw = std::make_unique<DeadGateway>(aeronDir, kInStr, kEgStr);
 
     // Connect (first ConnectRequest → OK)
-    auto connFut = client->connect();
-    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+    test_support::TestCq connFutCq(*client);
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+    for (int i = 0; i < kPumpMax && !connFut.ready(); ++i) {
         gw->poll(16);
         std::this_thread::sleep_for(kPumpSleep);
     }
-    ASSERT_NO_THROW(connFut.get()) << "Initial connect must succeed";
+    ASSERT_NO_THROW(connFut.check()) << "Initial connect must succeed";
 
     ProducerConfig pcfg;
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
@@ -1064,12 +1069,14 @@ TEST(Redirect, M2bMaxRedirectsExhaustedFailsCleanly) {
     std::this_thread::sleep_for(150ms);
     auto gw = std::make_unique<MaxRedirectGateway>(aeronDir, kInStr, kEgStr);
 
-    auto connFut = client->connect();
-    for (int i = 0; i < kPumpMax && connFut.wait_for(0s) != std::future_status::ready; ++i) {
+    test_support::TestCq connFutCq(*client);
+
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
+    for (int i = 0; i < kPumpMax && !connFut.ready(); ++i) {
         gw->poll(16);
         std::this_thread::sleep_for(kPumpSleep);
     }
-    ASSERT_NO_THROW(connFut.get()) << "Initial connect must succeed";
+    ASSERT_NO_THROW(connFut.check()) << "Initial connect must succeed";
 
     ProducerConfig pcfg;
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;

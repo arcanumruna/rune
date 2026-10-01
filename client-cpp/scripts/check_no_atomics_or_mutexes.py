@@ -77,32 +77,19 @@ RING_FILES = {
 # path -> {(kind, normalized snippet): count}.  Regenerate a file's entry with
 # `--dump PATH` after a deliberate slice-B change (the reviewer sees the diff).
 SLICE_B = {
-    "include/rune/client/Client.h": {
-        ("atomic", "std::atomic"): 4,
-        ("include", "#include <atomic>"): 1,
-        ("include", "#include <mutex>"): 1,
-        ("lock", "std::lock_guard"): 1,
-        ("mutex", "std::mutex"): 2,
-    },
-    "src/Client.cpp": {
-        ("lock", "std::lock_guard"): 18,
-        ("mutex", "std::mutex"): 18,
-    },
+    # F8c C2/C3 removed every Client / ClientAgent entry (stopped_,
+    # connectCalled_, nextCorrId_, disconnectedFired_, mtx_ and the PendingX
+    # maps, ClientAgent::snapshot_).  What remains is the transactional
+    # producer (F8c C5).
     "include/rune/client/producer/TransactionalProducerImpl.h": {
-        ("atomic", "std::atomic"): 5,
+        ("atomic", "std::atomic"): 3,
         ("include", "#include <atomic>"): 1,
         ("include", "#include <mutex>"): 1,
         ("mutex", "std::mutex"): 2,
     },
     "src/producer/TransactionalProducerImpl.cpp": {
-        ("atomic", "std::atomic"): 1,
         ("lock", "std::lock_guard"): 12,
         ("mutex", "std::mutex"): 12,
-    },
-    "include/rune/client/agent/ClientAgent.h": {
-        # snapshot_ only (app-thread state()/NotConnected reads: F8c C3).
-        ("atomic", "std::atomic"): 1,
-        ("include", "#include <atomic>"): 1,
     },
 }
 

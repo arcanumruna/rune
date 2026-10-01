@@ -255,7 +255,7 @@ int main() {
         });
 
         std::cerr << "CLIENT: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "CLIENT: connected\n";
 
         // Use the first topic for produce+subscribe.

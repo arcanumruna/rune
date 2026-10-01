@@ -195,7 +195,7 @@ struct CaptureSink {
 // ---------------------------------------------------------------------------
 class TransactionalProducerTest : public ::testing::Test {
 protected:
-    std::atomic<int64_t> nextCorrId{1};
+    int64_t nextCorrId{1};  // duty-owned (single test thread)
 
     std::shared_ptr<TransactionalProducerImpl> makeImpl(
         const std::string& txnId = "test-txn-id",

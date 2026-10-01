@@ -145,9 +145,16 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
         adoptSubscribe(std::move(req), submitFn);
         break;
     }
-    case detail::HubCommand::Op::Unsubscribe:
-        unsubscribe(cmd.a, unsubCorrId, sessionId, submitFn);
+    case detail::HubCommand::Op::Unsubscribe: {
+        // F8c C3: identified by the impl address (handle) — resolved against
+        // this hub's own tables only, never dereferenced unless found; the
+        // correlationId form (a) is kept for hub-level callers.
+        const int64_t corr = (cmd.handle != 0)
+            ? correlationIdOf_(reinterpret_cast<const SubscriptionImpl*>(cmd.handle))
+            : cmd.a;
+        if (corr != 0) unsubscribe(corr, unsubCorrId, sessionId, submitFn);
         break;
+    }
     default:
         break;  // not a subscriber op
     }
@@ -236,6 +243,17 @@ int SubscriberHub::retryUnsentSubscribes()
         }
     }
     return sent;
+}
+
+int64_t SubscriberHub::correlationIdOf_(const SubscriptionImpl* key) const noexcept
+{
+    for (const auto& [corr, req] : pendingByCorrelation_) {
+        if (req->impl.get() == key) return corr;
+    }
+    for (const auto& [id, impl] : activeById_) {
+        if (impl.get() == key) return impl->correlationId;
+    }
+    return 0;  // not (or no longer) held: nothing to unsubscribe
 }
 
 bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
