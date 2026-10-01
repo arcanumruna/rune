@@ -2914,6 +2914,17 @@ struct RcRig {
         EXPECT_EQ(rs.size(), 1u);
         return rs.empty() ? WorkerReturn{} : std::move(rs[0]);
     }
+    // PushRead results of one pass (a held read yields none).
+    std::vector<WorkerReturn> pushReads(int64_t next, int64_t hw, uint8_t iso) {
+        EXPECT_TRUE(w->tryEnqueueOp(pushReadIso(rep.get(), 7, next, hw, iso)));
+        pass();
+        return pushResults();
+    }
+    std::vector<WorkerReturn> pushResults() {
+        std::vector<WorkerReturn> rs;
+        for (auto& r : drainAll(*w)) if (r.type == WorkerReturn::Type::PushReadResult) rs.push_back(std::move(r));
+        return rs;
+    }
     std::vector<WorkerReturn> run(WorkerOp op) {
         EXPECT_TRUE(w->tryEnqueueOp(std::move(op)));
         pass();
@@ -3032,11 +3043,18 @@ TEST(TxnRcRegression, SelfDemotionStopsServing) {
     ASSERT_FALSE(served.chunk.empty()) << "precondition: the leader serves read_committed";
     selfDemote(*R.rep, 2, R.now);
     ASSERT_EQ(R.rep->role(), Role::Follower);
-    const auto r = R.pushRead(0, 1, 1);
-    EXPECT_TRUE(r.chunk.empty()) << "a self-demoted replica served read_committed data";
-    EXPECT_EQ(r.newNextOffset, 0);
-    EXPECT_TRUE(r.pushRcNotReady());
+    // Fix round 1 (review I-2): a read_committed read on a not-Ready partition
+    // is HELD on the worker (no answer, nothing served) …
+    const auto held = R.pushReads(0, 1, 1);
+    for (const auto& r : held) EXPECT_TRUE(r.chunk.empty()) << "a self-demoted replica served read_committed data";
+    EXPECT_TRUE(held.empty()) << "the read was answered instead of held while RC is not Ready";
     EXPECT_NE(R.status(), Worker::kRcReady);
+    // … and answered once the partition is Ready again (leader, rebuilt).
+    R.rep->becomeLeader(3, {1});
+    std::vector<WorkerReturn> later;
+    for (int i = 0; i < 64 && later.empty(); ++i) { R.pass(); later = R.pushResults(); }
+    ASSERT_EQ(later.size(), 1u);
+    EXPECT_EQ(batchesIn(later[0].chunk).size(), 1u);
 }
 
 TEST(TxnRcRegression, GatewayPushUsesWorkerBoundNotGatewayHw) {
@@ -3116,12 +3134,19 @@ TEST(TxnRcRegression, GatewayPushReadCommittedEmptyWhileBuilding) {
     R.own(4096);
     R.pass();
     ASSERT_EQ(R.status(), Worker::kRcScanning) << "precondition: building";
-    const auto rc = R.pushRead(0, hw, 1);
-    EXPECT_TRUE(rc.chunk.empty()) << "read_committed served while the RC state is still building";
-    EXPECT_EQ(rc.newNextOffset, 0);
-    EXPECT_TRUE(rc.pushRcNotReady());
+    // Fix round 1 (review I-2): the read_committed read is HELD (nothing
+    // served, no per-cycle re-issue) and answered once RC is Ready.
+    const auto rc = R.pushReads(0, hw, 1);
+    EXPECT_TRUE(rc.empty()) << "read_committed answered while the RC state is still building";
     const auto ru = R.pushRead(0, hw, 0);
     EXPECT_FALSE(ru.chunk.empty()) << "read_uncommitted must not wait for the RC build";
+    std::vector<WorkerReturn> later;
+    for (int i = 0; i < 4096 && later.empty(); ++i) { R.pass(); later = R.pushResults(); }
+    ASSERT_EQ(later.size(), 1u) << "the held read was never answered";
+    EXPECT_EQ(R.status(), Worker::kRcReady);
+    EXPECT_TRUE(batchesIn(later[0].chunk).empty()) << "data behind the open txn at 0 was served";
+    EXPECT_FALSE(later[0].pushRcNotReady());
+    EXPECT_EQ(later[0].pushEffectiveBound(), 0) << "the LSO (the open txn at 0) bounds the answer";
 }
 
 TEST(TxnRcRegression, RetentionDuringBuildCompletes) {
@@ -3462,4 +3487,46 @@ TEST(TxnRcRegression, BuildScanNeverReadsNonResidentBytes) {
     EXPECT_EQ(R.status(), Worker::kRcScanning);
     ASSERT_TRUE(R.runUntilReady(8192)) << "the build did not complete on a slow device";
     EXPECT_EQ(R.open(), 1u);
+}
+
+TEST(TxnRcRegression, HeldPushReadUnansweredOnOwnershipLoss) {
+    // Review I-2 + I-1: a read held while RC builds, then ownership moves away:
+    // it is answered UNANSWERED (bound -1, no data) so the gateway re-issues it
+    // to the new owner — never left hanging, never parked.
+    RcRig R;
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning);
+    ASSERT_TRUE(R.pushReads(0, R.log->logEndOffset(), 1).empty()) << "precondition: held";
+    ASSERT_EQ(R.w->heldPushReadsForTest(), 1u);
+    EXPECT_EQ(R.w->reservedAckSlotsForTest(), 1) << "a held read owes a return (G-A6 reservation)";
+    R.w->setOwnedDirect(Worker::OwnedSet{});
+    R.pass();
+    const auto rs = R.pushResults();
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_TRUE(rs[0].chunk.empty());
+    EXPECT_EQ(rs[0].pushEffectiveBound(), -1) << "an ownership-loss answer must be unanswered (re-issue)";
+    EXPECT_EQ(R.w->heldPushReadsForTest(), 0u);
+}
+
+TEST(TxnRcRegression, HoldCapacityExhaustedAnswersNotReady) {
+    // Review I-2: beyond kMaxHeldPushReads the worker answers notReady (the
+    // gateway then backs off in push cycles) — the hold set never grows.
+    RcRig R;
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(1024);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning);
+    const int64_t hw = R.log->logEndOffset();
+    for (std::size_t i = 0; i <= Worker::kMaxHeldPushReads; ++i)
+        ASSERT_TRUE(R.w->tryEnqueueOp(pushReadIso(R.rep.get(), static_cast<int64_t>(100 + i), 0, hw, 1)));
+    R.pass();
+    R.pass();                                              // the op drain takes <= 1024 ops per pass
+    ASSERT_EQ(R.status(), Worker::kRcScanning) << "precondition: still building";
+    const auto rs = R.pushResults();
+    ASSERT_EQ(rs.size(), 1u) << "exactly the read beyond the hold capacity is answered";
+    EXPECT_TRUE(rs[0].pushRcNotReady());
+    EXPECT_EQ(rs[0].pushEffectiveBound(), -1);
+    EXPECT_EQ(R.w->heldPushReadsForTest(), Worker::kMaxHeldPushReads);
 }
