@@ -243,6 +243,7 @@ struct TxnRig {
     TxnOp init() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.initTransactions(handler(), t)}; }
     TxnOp commit() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.commitTransaction(handler(), t)}; }
     TxnOp abort() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.abortTransaction(handler(), t)}; }
+    TxnOp close() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.close(handler(), t)}; }
     TxnOp sendOffsets(const std::map<TopicPartitionKey, int64_t>& o, const std::string& g) {
         const Token t = ++nextToken;
         return TxnOp{&ledger, t, tp.sendOffsetsToTransaction(o, g, handler(), t)};
@@ -1857,3 +1858,149 @@ TEST(TransactionalProducerTest, LateOriginalEndTxnAnswerAfterRetryIsIgnoredRegre
     EXPECT_EQ(r.tp.state(), TxnState::Ready);
 }
 
+// ===========================================================================
+// F8c C7 — TransactionalProducer close() / closeImmediately() (user decision 2)
+// ===========================================================================
+
+// close() aborts an open broker transaction before it reports closed: EndTxn
+// (abort) is sent; the token completes only after its answer (Ok); the
+// producer is closed afterwards (later ops rejected Closed, the status
+// channel finished).  RED (mutation): finishing the close at once (skipping
+// the abort in closeStep_) sends no EndTxn and completes the token before it.
+TEST(TransactionalProducerTest, TxnCloseAbortsOpenBrokerTransactionBeforeReportingClosedRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    r.startTxn();  // started: AddPartitions acknowledged, its record acked
+    ASSERT_TRUE(r.tp.transactionActive());
+    auto cl = r.close();
+    ASSERT_EQ(cl.r, OpResult::Accepted);
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty()) << "close() must end the open transaction";
+    EXPECT_EQ(rpc::EndTxn::decode(et.data(), et.size())->commit, uint8_t{0}) << "with EndTxn(abort)";
+    EXPECT_FALSE(cl.ready()) << "not closed before the abort's answer";
+    EXPECT_FALSE(r.impl->closedDuty());
+    auto ok = makeEndTxnResponse(corrIdOf(et), 0);
+    r.impl->onEndTxnResponse(ok.data(), ok.size());
+    r.doWork();
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+    EXPECT_EQ(cl.c().op, OpKind::TxnClose);
+    EXPECT_TRUE(r.impl->closedDuty());
+    EXPECT_EQ(r.tp.commitTransaction(r.handler(), 99), OpResult::Closed) << "rejected after close";
+    EXPECT_EQ(r.cycles(16, rpc::TemplateId::EndTxn), 0) << "nothing sent after close";
+}
+
+// close() with nothing open on the broker (Ready; a transaction that never
+// started; Uninitialized) closes at once: Ok, no EndTxn.  A second close
+// completes Closed exactly once.
+TEST(TransactionalProducerTest, TxnCloseWithNothingOpenClosesAtOnceRegression) {
+    {
+        TxnRig r;  // Uninitialized
+        auto cl = r.close();
+        ASSERT_TRUE(cl.ready());
+        EXPECT_EQ(cl.status(), OpStatus::Ok);
+        EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0);
+    }
+    {
+        TxnRig r;
+        r.acquire();
+        r.tp.beginTransaction();  // begun, nothing added: ends locally
+        auto cl = r.close();
+        r.doWork();
+        ASSERT_TRUE(cl.ready());
+        EXPECT_EQ(cl.status(), OpStatus::Ok);
+        EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "never started: no EndTxn";
+        auto again = r.impl.get();
+        rune::client::detail::HubCommand c2;  // a second close reaching the duty side
+        c2.op = rune::client::detail::HubCommand::Op::TxnClose;
+        c2.a  = 555;
+        rune::client::detail::OpTarget t;
+        t.handler = r.handler();
+        rune::client::detail::encodeTarget(t, c2);
+        again->applyCommand(c2, r.now);
+        ASSERT_EQ(r.ledger.e.count(555), 1u);
+        EXPECT_EQ(r.ledger.e.at(555).c.status, OpStatus::Closed);
+        EXPECT_EQ(r.ledger.e.at(555).times, 1);
+    }
+}
+
+// close() never aborts a commit already running (Kafka: COMMITTING ->
+// ABORTING is invalid): it waits for the commit's answer, then closes Ok —
+// the commit completes Ok on its own.
+TEST(TransactionalProducerTest, TxnCloseWaitsForARunningCommitRegression) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    auto commit = r.commit();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty());
+    auto cl = r.close();
+    r.doWork();
+    EXPECT_FALSE(cl.ready());
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1) << "no EndTxn(abort) over a running commit";
+    auto ok = makeEndTxnResponse(corrIdOf(et), 0);
+    r.impl->onEndTxnResponse(ok.data(), ok.size());
+    r.doWork();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Ok);
+    EXPECT_TRUE(r.impl->closedDuty());
+}
+
+// close() reports a failed abort (EndTxn never answered: Timeout at
+// transactionOpTimeoutMs) and the producer is closed anyway.
+TEST(TransactionalProducerTest, TxnCloseReportsAFailedAbortAndClosesAnywayRegression) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    auto cl = r.close();
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1);  // never answered
+    r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
+    r.doWork();
+    r.doWork();
+    ASSERT_TRUE(cl.ready());
+    EXPECT_EQ(cl.status(), OpStatus::Timeout);
+    EXPECT_EQ(cl.times(), 1);
+    EXPECT_TRUE(r.impl->closedDuty());
+}
+
+// closeImmediately() discards locally: no EndTxn, every pending op (and a
+// pending close token) completes Closed exactly once; the producer is closed.
+// The handle's destructor does the same (here: the rig's sink maps the
+// HandleRelease to the duty side's applyHandleRelease, as the Client does).
+TEST(TransactionalProducerTest, TxnCloseImmediatelyDiscardsLocallyRegression) {
+    {
+        TxnRig r;
+        r.acquire();
+        r.startTxn();
+        auto offs = r.sendOffsets({{{5, 0}, 3}}, "g");
+        auto cl   = r.close();  // the abort is in flight
+        r.doWork();
+        const int endTxnsBefore = r.sink.count(rpc::TemplateId::EndTxn);
+        EXPECT_EQ(r.tp.closeImmediately(), OpResult::Accepted);
+        for (auto* op : {&offs, &cl}) {
+            ASSERT_TRUE(op->ready());
+            EXPECT_EQ(op->status(), OpStatus::Closed);
+            EXPECT_EQ(op->times(), 1);
+        }
+        EXPECT_TRUE(r.impl->closedDuty());
+        EXPECT_EQ(r.cycles(16, rpc::TemplateId::EndTxn), 0) << "nothing more sent";
+        EXPECT_LE(endTxnsBefore, 1);
+        EXPECT_EQ(r.tp.closeImmediately(), OpResult::Closed) << "idempotent; already closed";
+    }
+    {
+        TxnRig r;
+        r.acquire();
+        r.startTxn();
+        auto offs = r.sendOffsets({{{5, 0}, 3}}, "g");
+        r.impl->applyHandleRelease();  // the destructor's duty side (the Client's HandleRelease)
+        ASSERT_TRUE(offs.ready());
+        EXPECT_EQ(offs.status(), OpStatus::Closed);
+        EXPECT_TRUE(r.impl->closedDuty());
+        EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "the destructor never sends EndTxn";
+    }
+}

@@ -115,6 +115,10 @@ struct InvokerGateway {
     std::deque<int16_t> initPidCodes;
     int64_t             initPid = 4242;
     int initPids = 0, addPartitions = 0, addOffsets = 0, txnOffsetCommits = 0, endTxns = 0;
+    // F8c C7: answer AddPartitionsToTxn and EndTxn OK (txn close tests); the
+    // commit flag of every EndTxn received (1 commit / 0 abort).
+    bool                 replyTxn = false;
+    std::vector<uint8_t> endTxnCommits;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -392,10 +396,34 @@ private:
             send(0, out.data(), n);
             return;
         }
-        case rcc::TemplateId::AddPartitionsToTxn: ++addPartitions; return;
+        case rcc::TemplateId::AddPartitionsToTxn: {
+            ++addPartitions;
+            const auto ap = rp::AddPartitionsToTxn::decode(buf, len);
+            if (!ap || !replyTxn) return;
+            rp::AddPartitionsToTxnResponse rsp;
+            rsp.sessionId     = ap->sessionId;
+            rsp.correlationId = ap->correlationId;
+            std::vector<uint8_t> out(rp::AddPartitionsToTxnResponse::encodedSizeFor(0));
+            const std::size_t n = rsp.encode(out.data(), {});
+            send(0, out.data(), n);
+            return;
+        }
         case rcc::TemplateId::AddOffsetsToTxn:    ++addOffsets; return;
         case rcc::TemplateId::TxnOffsetCommit:    ++txnOffsetCommits; return;
-        case rcc::TemplateId::EndTxn:             ++endTxns; return;
+        case rcc::TemplateId::EndTxn: {
+            ++endTxns;
+            const auto et = rp::EndTxn::decode(buf, len);
+            if (!et) return;
+            endTxnCommits.push_back(et->commit);
+            if (!replyTxn) return;
+            rp::EndTxnResponse rsp;
+            rsp.sessionId     = et->sessionId;
+            rsp.correlationId = et->correlationId;
+            std::vector<uint8_t> out(rp::EndTxnResponse::ENCODED_SIZE);
+            const std::size_t n = rsp.encode(out.data());
+            send(0, out.data(), n);
+            return;
+        }
         case rcc::TemplateId::Unsubscribe: {
             const auto uv = rcc::decodeUnsubscribe(buf, len);
             if (uv) unsubscribed.push_back(uv->subscriptionId);

@@ -1,0 +1,833 @@
+// tests/client/HandleLifetimeTest.cpp — F8c C7: move-only handles and the §3.3
+// release protocol (no shared_ptr, no refcount, no waits), handle destructors
+// (Producer / TransactionalProducer = closeImmediately, Subscription =
+// unsubscribe, GroupConsumer = close) and the Client close() / closeImmediately()
+// pair (user decision 2).
+//
+// Every handle impl is owned jointly by its handle and the duty side; each side
+// detaches its share of the impl's ownership word (a ring word) exactly once and
+// whichever detaches LAST frees it.  rcd::testOnImplFree counts the frees (and
+// where they happened).
+//
+// Invoker-mode tests are single-threaded (the test thread is the owner and
+// drives doWork() + the gateway with a progress-or-10 s-deadline loop); the
+// Thread-mode tests exercise the real runner (TSan: cross-thread traffic only
+// through rings / the ownership words).  Nothing sleeps to pass time.
+#include "../support/AckLedger.h"
+#include "../support/InvokerGateway.h"
+#include "../support/TestCompletions.h"
+
+#include <rune/client/Client.h>
+#include <rune/client/Completions.h>
+#include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/producer/TransactionalProducerImpl.h>
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <unistd.h>
+#include <vector>
+
+namespace rc  = rune::client;
+namespace rcd = rune::client::detail;
+using rc::AckToken;
+using rc::OpResult;
+using rc::OpStatus;
+using rc::SendResult;
+using test_support::AckLedger;
+using test_support::PendingOp;
+using test_support::TestCq;
+
+namespace {
+
+std::atomic<int> g_ctr{0};
+const std::vector<uint8_t> kVal(16, 0x5C);
+
+// ---- free accounting (the testOnImplFree seam) --------------------------------
+std::atomic<int>  g_frees[5];            // by HandleKind
+std::atomic<int>  g_freesInDoWork{0};    // Invoker tests: freed inside client.doWork()
+bool              g_inDoWork = false;    // Invoker tests: the test (owner) thread only
+std::atomic<int>  g_freesOnMain{0};      // freed on the registered "main" thread
+std::thread::id   g_mainThread{};        // set before any thread that may free runs
+
+void countFree(rcd::HandleKind k, const void*) noexcept {
+    g_frees[static_cast<int>(k)].fetch_add(1);
+    if (g_inDoWork) g_freesInDoWork.fetch_add(1);
+    if (std::this_thread::get_id() == g_mainThread) g_freesOnMain.fetch_add(1);
+}
+int frees(rcd::HandleKind k) { return g_frees[static_cast<int>(k)].load(); }
+int totalFrees() {
+    int n = 0;
+    for (auto& f : g_frees) n += f.load();
+    return n;
+}
+/// Installs the free hook for one test (no other thread runs yet) and removes
+/// it at the end (every thread that may free has been joined by then).
+struct FreeHook {
+    FreeHook() {
+        for (auto& f : g_frees) f.store(0);
+        g_freesInDoWork.store(0);
+        g_freesOnMain.store(0);
+        g_inDoWork  = false;
+        g_mainThread = std::this_thread::get_id();
+        rcd::testOnImplFree = &countFree;
+    }
+    ~FreeHook() { rcd::testOnImplFree = nullptr; }
+};
+
+/// Aborts the process if a test hangs (a release must never wait).
+struct Watchdog {
+    std::atomic<bool> done{false};
+    std::thread       t;
+    explicit Watchdog(const char* what)
+        : t([this, what] {
+              const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+              while (!done.load()) {
+                  if (std::chrono::steady_clock::now() > deadline) {
+                      std::fprintf(stderr, "WATCHDOG: hung in %s\n", what);
+                      std::abort();
+                  }
+                  std::this_thread::yield();
+              }
+          }) {}
+    ~Watchdog() {
+        done.store(true);
+        t.join();
+    }
+};
+
+rc::ClientConfig cfgFor(int32_t in, rc::RunnerMode mode = rc::RunnerMode::Invoker) {
+    rc::ClientConfig c;
+    c.gatewayChannel  = "aeron:ipc";
+    c.gatewayStreamId = in;
+    c.egressChannel   = "aeron:ipc";
+    c.egressStreamId  = in + 1;
+    c.dataDir = "/tmp/handle_life_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.runnerMode         = mode;
+    c.subscribeTimeoutMs = 200;  // an unanswered Subscribe is swept quickly (Thread-mode tests)
+    rc::TopicSpec ts;
+    ts.name           = "t";
+    ts.topicId        = 1;
+    ts.partitionCount = 1;
+    c.topics.push_back(ts);
+    return c;
+}
+
+rc::ProducerConfig ackCfg() {
+    rc::ProducerConfig c;
+    c.acks              = rc::Acks::Leader;
+    c.lingerUs          = 60'000'000;  // only a flush (or a closing producer) ends a batch
+    c.batchBytes        = 64 * 1024;
+    c.maxInFlight       = 8;
+    c.produceTimeoutMs  = 1'000;
+    c.deliveryTimeoutMs = 10'000;
+    return c;
+}
+
+struct Rig {
+    rc::ClientConfig              cfg;
+    std::unique_ptr<rc::Client>   client;
+    test_support::InvokerGateway  gw;
+    explicit Rig(rc::ClientConfig c)
+        : cfg(std::move(c)), client(std::make_unique<rc::Client>(cfg)),
+          gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId, cfg.egressChannel,
+             cfg.egressStreamId) {}
+    int doWork() {
+        g_inDoWork = true;
+        const int w = client->doWork();
+        g_inDoWork = false;
+        return w;
+    }
+    // Drive until pred holds; the 10 s deadline is only reached by a FAILING test.
+    template <class P>
+    bool drive(P&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            doWork();
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+    void connect() {
+        ASSERT_TRUE(drive([&] { return gw.ready(); }));
+        TestCq cq(*client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
+    }
+};
+
+/// Pumps the (invoker-driven) gateway from a helper thread while the test
+/// thread blocks in Client::close() (whose Invoker form pumps only the
+/// Client).  The gateway is touched by this thread alone until stop().
+struct GatewayPump {
+    test_support::InvokerGateway& gw;
+    std::atomic<bool>             stopFlag{false};
+    std::thread                   t;
+    explicit GatewayPump(test_support::InvokerGateway& g)
+        : gw(g), t([this] {
+              while (!stopFlag.load(std::memory_order_acquire)) {
+                  if (gw.pump() == 0) std::this_thread::yield();
+              }
+          }) {}
+    void stop() {
+        if (t.joinable()) {
+            stopFlag.store(true, std::memory_order_release);
+            t.join();
+        }
+    }
+    ~GatewayPump() { stop(); }
+};
+
+void noopRecords(const rc::Record&) {}
+
+} // namespace
+
+// ===========================================================================
+// Move-only handles (spec §3.1 rules 1 and 3)
+// ===========================================================================
+
+static_assert(!std::is_copy_constructible_v<rc::Producer> && !std::is_copy_assignable_v<rc::Producer>);
+static_assert(std::is_nothrow_move_constructible_v<rc::Producer> &&
+              std::is_nothrow_move_assignable_v<rc::Producer>);
+static_assert(!std::is_copy_constructible_v<rc::TransactionalProducer> &&
+              !std::is_copy_assignable_v<rc::TransactionalProducer>);
+static_assert(std::is_nothrow_move_constructible_v<rc::TransactionalProducer>);
+static_assert(!std::is_copy_constructible_v<rc::Subscription> && !std::is_copy_constructible_v<rc::GroupConsumer>);
+static_assert(!std::is_copy_constructible_v<rc::BatchBuilder>);
+struct StubT {
+    static constexpr uint64_t kFingerprint = 0;
+};
+static_assert(!std::is_copy_constructible_v<rc::TypedTopic<StubT>> &&
+              std::is_move_constructible_v<rc::TypedTopic<StubT>>);
+
+// Moving a handle moves its share (a moved-from handle releases nothing);
+// move-assigning over a live handle releases the old one (its destructor
+// semantics) — exactly one free per impl.
+TEST(HandleLifetime, MoveOnlyHandlesRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5400));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    {
+        rc::Producer a = r.client->producer(ackCfg());
+        rc::Producer b = std::move(a);
+        EXPECT_FALSE(a.valid());  // NOLINT(bugprone-use-after-move): moved-from is checkable
+        EXPECT_EQ(a.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::InvalidTopic);
+        EXPECT_TRUE(b.valid());
+        EXPECT_EQ(b.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
+        rc::Producer c = r.client->producer(ackCfg());
+        c = std::move(b);  // c's own producer: released (closeImmediately)
+        EXPECT_EQ(c.trySend(topic, rc::Key(uint64_t{2}), kVal), SendResult::Ok);
+        ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }))
+            << "the overwritten producer is freed once the duty side let go";
+
+        rc::TransactionalProducer t1 = r.client->transactionalProducer("tx-move");
+        rc::TransactionalProducer t2 = std::move(t1);
+        EXPECT_EQ(t1.closeImmediately(), OpResult::Closed);  // NOLINT(bugprone-use-after-move)
+        rc::Subscription s1 = r.client->subscribe(topic, 0, {}, &noopRecords);
+        rc::Subscription s2 = std::move(s1);
+        EXPECT_FALSE(s1.active());  // NOLINT(bugprone-use-after-move)
+    }
+    ASSERT_TRUE(r.drive([&] { return totalFrees() == 4; }));
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), 2);
+    EXPECT_EQ(frees(rcd::HandleKind::TxnProducer), 1);
+    EXPECT_EQ(frees(rcd::HandleKind::Subscription), 1);
+    r.client->closeImmediately();
+    r.client.reset();
+    EXPECT_EQ(totalFrees(), 4) << "no impl freed twice";
+}
+
+// ===========================================================================
+// §3.3 (a): an accepted release — the duty side lets go last and frees
+// ===========================================================================
+
+// Invoker mode: every handle kind released on the owner thread, outside a duty
+// cycle, is applied directly (duty work) but freed only at the end of the NEXT
+// duty cycle — by the duty side (the handle already let go), once nothing on
+// the duty side references the impl.  RED (parent): the hubs held a
+// shared_ptr; a released handle's impl stayed registered until Client close.
+TEST(HandleLifetime, HandleReleaseAcceptedDutyFreesRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5402));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    {
+        auto p   = r.client->producer(ackCfg());
+        auto tp  = r.client->transactionalProducer("tx-release");
+        auto sub = r.client->subscribe(topic, 0, {}, &noopRecords);
+        auto gc  = r.client->subscribeGroup("g-release", {"t"});
+        ASSERT_TRUE(r.drive([&] {
+            return r.client->testProducerCount() == 1 && r.client->testTxnProducerCount() == 1 &&
+                   r.client->testSubscriptionImplsHeld() == 1 && r.client->testGroupImplsHeld() == 1 &&
+                   sub.subscriptionId() > 0;
+        }));
+    }  // all four destroyed here: owner thread, outside a duty cycle
+    EXPECT_EQ(totalFrees(), 0) << "the duty side still holds its share";
+    EXPECT_EQ(r.client->testPendingReleases(), 4u);
+    ASSERT_TRUE(r.drive([&] { return totalFrees() == 4; }));
+    for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer, rcd::HandleKind::Subscription,
+                         rcd::HandleKind::GroupConsumer}) {
+        EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
+    }
+    EXPECT_EQ(g_freesInDoWork.load(), 4) << "each one freed by the duty side (the handle let go first)";
+    EXPECT_EQ(r.client->testPendingReleases(), 0u);
+    EXPECT_EQ(r.client->testProducerCount(), 0u);
+    EXPECT_EQ(r.client->testTxnProducerCount(), 0u);
+    EXPECT_EQ(r.client->testSubscriptionImplsHeld(), 0u);
+    EXPECT_EQ(r.client->testGroupImplsHeld(), 0u);
+    ASSERT_FALSE(r.gw.unsubscribed.empty()) << "the Subscription destructor unsubscribed";
+    r.client->closeImmediately();
+    EXPECT_EQ(r.client->testImplsHandedBack(), 0u) << "nothing left to hand back";
+    r.client.reset();
+    EXPECT_EQ(totalFrees(), 4);
+}
+
+// Thread mode: handles destroyed on an app thread release through the agent
+// command ring (FIFO behind their own ops); the runner applies the release and
+// the impl is freed exactly once.  TSan: the only shared memory is the rings
+// and the ownership words.
+TEST(HandleLifetime, ThreadModeReleaseFreesExactlyOnceRegression) {
+    Watchdog wd("Thread-mode handle release");
+    FreeHook hook;
+    auto client = std::make_unique<rc::Client>(cfgFor(5404, rc::RunnerMode::Thread));  // never connected
+    const auto topic = client->topic("t");
+    {
+        auto p   = client->producer(ackCfg());
+        auto tp  = client->transactionalProducer("tx-thread");
+        auto sub = client->subscribe(topic, 0, {}, &noopRecords);
+        auto gc  = client->subscribeGroup("g-thread", {"t"});
+        EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
+    }
+    aeron::concurrent::BackoffIdleStrategy idle(10, 5, std::chrono::duration<long, std::nano>(1'000),
+                                                std::chrono::milliseconds(1));
+    const auto backstop = std::chrono::steady_clock::now() + std::chrono::seconds(20);  // hang guard only
+    while (totalFrees() < 4 && std::chrono::steady_clock::now() < backstop) idle.idle(0);
+    ASSERT_EQ(totalFrees(), 4) << "a released impl was never freed";
+    client->close();
+    EXPECT_EQ(client->testImplsHandedBack(), 0u);
+    client.reset();
+    for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer, rcd::HandleKind::Subscription,
+                         rcd::HandleKind::GroupConsumer}) {
+        EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
+    }
+}
+
+// ===========================================================================
+// §3.3 (b): Client close hands every impl back; the handle frees it later
+// ===========================================================================
+
+// The handles outlive their Client: close() hands each impl back (the duty
+// side detaches — nothing is freed while the handle lives), the Client is
+// destroyed, and each handle then frees its impl on its own thread without
+// touching the (gone) Client (ASan).  Both runner modes.
+TEST(HandleLifetime, HandleReleaseAfterCloseHandleFreesRegression) {
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
+        SCOPED_TRACE(mode == rc::RunnerMode::Invoker ? "Invoker" : "Thread");
+        FreeHook hook;
+        auto client = std::make_unique<rc::Client>(cfgFor(mode == rc::RunnerMode::Invoker ? 5406 : 5408, mode));
+        const auto topic = client->topic("t");
+        std::optional<rc::Producer>              p(client->producer(ackCfg()));
+        std::optional<rc::TransactionalProducer> tp(client->transactionalProducer("tx-after"));
+        std::optional<rc::Subscription>          sub(client->subscribe(topic, 0, {}, &noopRecords));
+        std::optional<rc::GroupConsumer>         gc(client->subscribeGroup("g-after", {"t"}));
+        if (mode == rc::RunnerMode::Invoker) {
+            for (int i = 0; i < 10; ++i) client->doWork();  // adopt the ring registrations
+        }
+        client->close();
+        EXPECT_EQ(client->testImplsHandedBack(), 4u);
+        EXPECT_EQ(totalFrees(), 0) << "handed back, still owned by the live handles";
+        client.reset();  // the handles outlive the Client
+        EXPECT_EQ(p->trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Closed);
+        EXPECT_EQ(p->closeImmediately(), OpResult::Closed);
+        EXPECT_EQ(tp->closeImmediately(), OpResult::Closed);
+        EXPECT_TRUE(sub->finished());
+        EXPECT_TRUE(gc->finished());
+        p.reset();
+        tp.reset();
+        sub.reset();
+        gc.reset();
+        EXPECT_EQ(totalFrees(), 4);
+        EXPECT_EQ(g_freesOnMain.load(), 4) << "each handle freed its impl itself";
+    }
+}
+
+// ===========================================================================
+// Release racing close: exactly one free per impl, nothing waits
+// ===========================================================================
+
+// The ownership word itself: the duty side and the handle detach concurrently
+// (one acq_rel RMW each) — exactly one of them frees the impl, every time.
+// Both word kinds: the M2O ring's (ProducerImpl) and the O2O status ring's
+// (Subscription / GroupConsumer / TransactionalProducer impls).  1000
+// iterations each (TSan: the freeing side observes the other side's writes;
+// ASan: never freed twice, never used after free).
+TEST(HandleLifetime, ReleaseRacingCloseExactlyOneFreeRegression) {
+    FreeHook hook;
+    constexpr int kIterations = 1000;
+    auto race = [](auto* impl, auto dutyDetach, auto handleDetach, auto touchDuty, auto touchHandle) {
+        std::atomic<int> go{0};
+        std::thread duty([&] {
+            go.fetch_add(1);
+            while (go.load() < 2) {}
+            touchDuty(impl);
+            if (dutyDetach(impl)) delete impl;
+        });
+        go.fetch_add(1);
+        while (go.load() < 2) {}
+        touchHandle(impl);
+        if (handleDetach(impl)) delete impl;
+        duty.join();
+    };
+    for (int i = 0; i < kIterations; ++i) {
+        auto* p = new rc::producer::ProducerImpl(ackCfg(), 1024);
+        race(
+            p, [](rc::producer::ProducerImpl* x) { return x->detachDuty(); },
+            [](rc::producer::ProducerImpl* x) { return x->detachHandle(); },
+            [](rc::producer::ProducerImpl* x) { x->setOrdinal(7); },              // a duty write
+            [](rc::producer::ProducerImpl* x) { (void)x->dutyDetached(); });       // a handle read
+        auto* s = new rc::SubscriptionImpl();
+        race(
+            s, [](rc::SubscriptionImpl* x) { return x->status.detachProducer(); },
+            [](rc::SubscriptionImpl* x) { return x->status.detachConsumer(); },
+            [](rc::SubscriptionImpl* x) { x->nextOffset = 9; },
+            [](rc::SubscriptionImpl* x) { rc::SubscriptionStatus st; (void)x->status.drainLatest(st); });
+        auto* g = new rc::GroupConsumerImpl();
+        race(
+            g, [](rc::GroupConsumerImpl* x) { return x->status.detachProducer(); },
+            [](rc::GroupConsumerImpl* x) { return x->status.detachConsumer(); },
+            [](rc::GroupConsumerImpl* x) { x->generationId = 3; },
+            [](rc::GroupConsumerImpl* x) { rc::GroupConsumerStatus st; (void)x->status.drainLatest(st); });
+    }
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), kIterations);
+    EXPECT_EQ(frees(rcd::HandleKind::Subscription), kIterations);
+    EXPECT_EQ(frees(rcd::HandleKind::GroupConsumer), kIterations);
+}
+
+// Client level: handles of every kind destroyed on worker threads while the
+// main thread closes the Client (close() and closeImmediately() alternately) —
+// each impl freed exactly once, no release ever waits (Thread mode; ASan + TSan).
+TEST(HandleLifetime, ClientReleaseRacingCloseExactlyOneFreeRegression) {
+    Watchdog wd("handle releases racing Client close");
+    FreeHook hook;
+    constexpr int kIterations = 30;
+    constexpr int kWorkers    = 4;
+    int created = 0;
+    for (int it = 0; it < kIterations; ++it) {
+        auto client = std::make_unique<rc::Client>(cfgFor(5410, rc::RunnerMode::Thread));
+        const auto topic = client->topic("t");
+        std::atomic<int>  ready{0};
+        std::atomic<bool> go{false};
+        std::atomic<int>  made{0};
+        std::vector<std::thread> ts;
+        for (int k = 0; k < kWorkers; ++k) {
+            ts.emplace_back([&, k] {
+                std::optional<rc::Producer>              p(client->producer(ackCfg()));
+                std::optional<rc::TransactionalProducer> tp(client->transactionalProducer("tx-" + std::to_string(k)));
+                std::optional<rc::Subscription>          sub(client->subscribe(topic, 0, {}, &noopRecords));
+                std::optional<rc::GroupConsumer>         gc;
+                if (k == 0) gc.emplace(client->subscribeGroup("g-race", {"t"}));  // one group per Client
+                made.fetch_add(k == 0 ? 4 : 3);
+                // A record only when the Client is closed immediately (close()
+                // would drain it until its delivery timeout: never connected).
+                if (it % 2 == 1) (void)p->trySend(topic, rc::Key(static_cast<uint64_t>(k)), kVal);
+                ready.fetch_add(1);
+                while (!go.load()) std::this_thread::yield();
+                if ((k + it) % 3 == 0) std::this_thread::yield();  // vary the interleaving
+                p.reset();
+                tp.reset();
+                sub.reset();
+                gc.reset();
+            });
+        }
+        while (ready.load() != kWorkers) std::this_thread::yield();
+        go.store(true);
+        if (it % 2 == 0) client->close(); else client->closeImmediately();
+        for (auto& t : ts) t.join();
+        client.reset();
+        created += made.load();
+        ASSERT_EQ(totalFrees(), created) << "iteration " << it << ": an impl leaked or was freed twice";
+    }
+}
+
+// ===========================================================================
+// A handle destroyed inside its own callback: the free waits for the walk
+// ===========================================================================
+
+namespace {
+struct SelfDestroyingProducer {
+    std::optional<rc::Producer>* p     = nullptr;
+    AckLedger                    led;
+    int                          freesInHandler = -1;
+    static void onAck(void* ctx, rc::Token t, int64_t v, OpStatus st, uint16_t ec) noexcept {
+        auto* self = static_cast<SelfDestroyingProducer*>(ctx);
+        AckLedger::onAck(&self->led, t, v, st, ec);
+        if (self->p->has_value()) {
+            self->p->reset();  // destroyed inside its own ack handler (the duty walk)
+            self->freesInHandler = totalFrees();
+        }
+    }
+};
+struct SelfDestroyingTxn {
+    std::optional<rc::TransactionalProducer>* tp = nullptr;
+    int  calls          = 0;
+    int  freesInHandler = -1;
+    static void on(void* ctx, const rc::Completion&, std::span<const uint8_t>) noexcept {
+        auto* self = static_cast<SelfDestroyingTxn*>(ctx);
+        ++self->calls;
+        self->tp->reset();
+        self->freesInHandler = totalFrees();
+    }
+};
+struct SelfDestroyingGroup {
+    std::optional<rc::GroupConsumer>* gc = nullptr;
+    int      calls          = 0;
+    OpStatus status         = OpStatus::Ok;
+    int      freesInHandler = -1;
+    static void on(void* ctx, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        auto* self = static_cast<SelfDestroyingGroup*>(ctx);
+        ++self->calls;
+        self->status = c.status;
+        self->gc->reset();
+        self->freesInHandler = totalFrees();
+    }
+};
+} // namespace
+
+// A Producer destroyed inside its own onAck, a Subscription inside its own
+// record handler, a TransactionalProducer inside its own completion handler
+// and a GroupConsumer inside its own commitSync completion: the destructor's
+// semantics apply at once, but the impl is freed only after the walk that
+// fired the callback finished (end of the duty cycle) — never under it (ASan).
+// Every accepted op still completes exactly once.
+TEST(HandleLifetime, HandleDestroyedInsideOwnCallbackDefersFreeRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5412));
+    r.connect();
+    const auto topic = r.client->topic("t");
+
+    {  // Producer, from its own onAck (inside the ProduceResponse walk)
+        SCOPED_TRACE("Producer");
+        std::optional<rc::Producer> p(r.client->producer(ackCfg()));
+        SelfDestroyingProducer ctx;
+        ctx.p = &p;
+        (*p).onAck(&SelfDestroyingProducer::onAck, &ctx);
+        for (rc::Token t = 1; t <= 3; ++t) {
+            ASSERT_EQ(p->trySend(topic, rc::Key(uint64_t{1}), kVal, AckToken{t}), SendResult::Ok);
+        }
+        p->flush();
+        ASSERT_TRUE(r.drive([&] { return ctx.led.recs.size() == 3 && frees(rcd::HandleKind::Producer) == 1; }));
+        EXPECT_EQ(ctx.freesInHandler, 0) << "freed under its own ack walk";
+        EXPECT_TRUE(ctx.led.exactlyOnce(1, 4));
+    }
+    {  // Subscription, from its own record handler (inside onRecords)
+        SCOPED_TRACE("Subscription");
+        std::optional<rc::Subscription> sub;
+        int got = 0, freesInHandler = -1;
+        sub.emplace(r.client->subscribe(topic, 0, rc::SubscribeOptions{rc::From::earliest()},
+                                        [&](const rc::Record&) {
+                                            ++got;
+                                            sub.reset();
+                                            freesInHandler = totalFrees();
+                                        }));
+        ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.has_value() && sub->subscriptionId() > 0; }));
+        r.gw.pushRecords(r.gw.subscribed.back(), 0, 3);
+        ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Subscription) == 1; }));
+        EXPECT_EQ(got, 1) << "no record after the handle was destroyed";
+        EXPECT_EQ(freesInHandler, 1) << "only the producer above was freed while the handler ran";
+    }
+    {  // TransactionalProducer, from its own initTransactions completion
+        SCOPED_TRACE("TransactionalProducer");
+        r.gw.initPidReply = true;
+        std::optional<rc::TransactionalProducer> tp(r.client->transactionalProducer("tx-self"));
+        SelfDestroyingTxn ctx;
+        ctx.tp = &tp;
+        ASSERT_EQ(tp->initTransactions(rc::CompletionHandler{&SelfDestroyingTxn::on, &ctx}, 1), OpResult::Accepted);
+        ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::TxnProducer) == 1; }));
+        EXPECT_EQ(ctx.calls, 1);
+        EXPECT_EQ(ctx.freesInHandler, 2) << "freed under its own response walk";
+    }
+    {  // GroupConsumer, from its own commitSync completion (applied directly on
+       // the owner, outside a duty cycle: completed at once, SessionLost —
+       // nothing joined)
+        SCOPED_TRACE("GroupConsumer");
+        rc::ClientConfig c = cfgFor(5414);
+        rc::Client unconnected(c);
+        std::optional<rc::GroupConsumer> gc(unconnected.subscribeGroup("g-self", {"t"}));
+        SelfDestroyingGroup ctx;
+        ctx.gc = &gc;
+        ASSERT_EQ(gc->commitSync(rc::CompletionHandler{&SelfDestroyingGroup::on, &ctx}, 1), OpResult::Accepted);
+        EXPECT_EQ(ctx.calls, 1);
+        EXPECT_EQ(ctx.status, OpStatus::SessionLost);
+        EXPECT_EQ(ctx.freesInHandler, 3) << "freed under its own completion";
+        EXPECT_EQ(frees(rcd::HandleKind::GroupConsumer), 0) << "the duty share waits for a duty cycle";
+        g_inDoWork = true;
+        (void)unconnected.doWork();
+        g_inDoWork = false;
+        EXPECT_EQ(frees(rcd::HandleKind::GroupConsumer), 1);
+    }
+}
+
+// ===========================================================================
+// Invoker off-owner destroy: release is duty work, never waits
+// ===========================================================================
+
+// The Client is driven on a worker and its handles are destroyed on main after
+// the worker joined (the documented off-owner destroy), with the command ring
+// FULL: each release applies directly (duty work — nobody else pumps), never
+// waits for ring room, and the Client's destruction (also off-owner) frees
+// every impl exactly once.  RED (round-1 design / parent semantics for a
+// full ring): a release through the ring would wait forever.
+TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
+    Watchdog wd("Invoker off-owner handle destroy with a full command ring");
+    FreeHook hook;
+    std::unique_ptr<rc::Client>               client;
+    std::optional<rc::Producer>               p;
+    std::optional<rc::TransactionalProducer>  tp;
+    std::optional<rc::Subscription>           sub;
+    std::optional<rc::GroupConsumer>          gc;
+    std::thread owner([&] {
+        client = std::make_unique<rc::Client>(cfgFor(5416));
+        const auto topic = client->topic("t");
+        p.emplace(client->producer(ackCfg()));
+        tp.emplace(client->transactionalProducer("tx-offowner"));
+        sub.emplace(client->subscribe(topic, 0, {}, &noopRecords));
+        gc.emplace(client->subscribeGroup("g-offowner", {"t"}));
+        for (int i = 0; i < 10; ++i) client->doWork();  // adopt the ring registrations
+        client->testFillCommandRing();
+    });
+    owner.join();
+    p.reset();
+    tp.reset();
+    sub.reset();
+    gc.reset();
+    EXPECT_EQ(totalFrees(), 0) << "the duty side's share is let go by a duty cycle or the close";
+    client.reset();  // off-owner close: drains the full ring, hands back / frees
+    EXPECT_EQ(totalFrees(), 4);
+    for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer, rcd::HandleKind::Subscription,
+                         rcd::HandleKind::GroupConsumer}) {
+        EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
+    }
+}
+
+// ===========================================================================
+// Producer destructor = closeImmediately (user decision 2)
+// ===========================================================================
+
+// close() is the delivering path: records accepted before it complete Ok —
+// also when the handle is destroyed right after the begin-close (a destructor
+// never aborts a close in progress: the drain continues on the duty side and
+// its token still completes), and the impl is freed only once drained.
+TEST(HandleLifetime, ProducerDtorFlushesAcceptedRecordsRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5418));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    TestCq cq(*r.client);
+    r.gw.replyAcks = false;  // acks held until released
+    std::vector<PendingOp> recs;
+    PendingOp tok;
+    {
+        auto p = r.client->producer(ackCfg());  // linger 60 s: the records wait in the builder
+        for (int i = 0; i < 5; ++i) recs.push_back(cq.send(p, topic, rc::Key(uint64_t{1}), kVal));
+        tok = cq.issue([&](rc::Completions& q, rc::Token t) { return p.close(q, t); });
+        ASSERT_TRUE(tok.accepted());
+    }  // destroyed with the drain pending: NOT closeImmediately
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty(); })) << "the close flushed the builder";
+    EXPECT_FALSE(tok.ready());
+    EXPECT_EQ(totalFrees(), 0) << "the drain still needs the impl";
+    r.gw.releaseHeld();
+    ASSERT_TRUE(r.drive([&] { return tok.ready() && frees(rcd::HandleKind::Producer) == 1; }));
+    EXPECT_EQ(tok.status(), OpStatus::Ok);
+    for (const auto& rec : recs) {
+        ASSERT_TRUE(rec.ready());
+        EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
+        EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+    }
+    EXPECT_EQ(cq.timesCompleted(tok.token()), 1);
+}
+
+// Destroying an OPEN producer is closeImmediately(): every accepted record not
+// yet acknowledged — in flight, in the builder — completes Closed exactly once,
+// synchronously on the owner (Invoker: applied directly), and nothing more is
+// sent.  RED (parent): the destructor of a copyable handle did nothing; the
+// records stayed outstanding until Client close.
+TEST(HandleLifetime, ProducerDtorIsCloseImmediatelyRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5420));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    TestCq cq(*r.client);
+    r.gw.replyAcks = false;
+    std::vector<PendingOp> recs;
+    {
+        auto p = r.client->producer(ackCfg());
+        for (int i = 0; i < 3; ++i) recs.push_back(cq.send(p, topic, rc::Key(uint64_t{1}), kVal));
+        p.flush();
+        ASSERT_TRUE(r.drive([&] { return r.gw.held.size() == 1; }));  // in flight, unacked
+        for (int i = 0; i < 2; ++i) recs.push_back(cq.send(p, topic, rc::Key(uint64_t{1}), kVal));  // builder
+    }
+    for (const auto& rec : recs) {
+        ASSERT_TRUE(rec.ready()) << "completed by the destructor itself";
+        EXPECT_EQ(rec.status(), OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+    }
+    const auto producedBefore = r.gw.produced.size();
+    r.gw.releaseHeld();  // a late ack completes nothing
+    ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }));
+    for (const auto& rec : recs) EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+    EXPECT_EQ(r.gw.produced.size(), producedBefore) << "nothing sent after the destructor";
+}
+
+// closeImmediately() (the abort) completes every outstanding record AND a
+// pending begin-close token Closed, exactly once; the destructor afterwards
+// changes nothing (the producer is no longer open) and frees it.
+TEST(HandleLifetime, ProducerAbortFailsClosedRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5422));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    TestCq cq(*r.client);
+    r.gw.replyAcks = false;
+    std::vector<PendingOp> recs;
+    PendingOp tok;
+    {
+        auto p = r.client->producer(ackCfg());
+        for (int i = 0; i < 4; ++i) recs.push_back(cq.send(p, topic, rc::Key(uint64_t{1}), kVal));
+        tok = cq.issue([&](rc::Completions& q, rc::Token t) { return p.close(q, t); });
+        ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty(); }));  // the drain is in flight
+        EXPECT_EQ(p.closeImmediately(), OpResult::Accepted);
+        ASSERT_TRUE(tok.ready());
+        EXPECT_EQ(tok.status(), OpStatus::Closed);
+        for (const auto& rec : recs) {
+            ASSERT_TRUE(rec.ready());
+            EXPECT_EQ(rec.status(), OpStatus::Closed);
+        }
+        EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Closed);
+    }
+    r.gw.releaseHeld();
+    ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }));
+    EXPECT_EQ(cq.timesCompleted(tok.token()), 1);
+    for (const auto& rec : recs) EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+}
+
+// A BatchBuilder borrows its producer (spec §3.1 rule 1): used after the
+// Producer was destroyed (while the duty side still holds the impl) it throws
+// instead of touching a producer nobody owns.
+TEST(HandleLifetime, BatchBuilderOutlivingItsProducerIsCaughtRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5424));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    std::optional<rc::Producer> p(r.client->producer(ackCfg()));
+    auto b = p->batch(topic, rc::Key(uint64_t{1}));
+    b.add(kVal);
+    p.reset();
+    EXPECT_THROW((void)b.send(), std::logic_error);
+    ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }));
+}
+
+// ===========================================================================
+// Client close() drains, closeImmediately() / the destructor discard
+// ===========================================================================
+
+// close() first drains every producer — records in a builder (linger 60 s) are
+// flushed and acknowledged Ok, also those of a producer created right before
+// close() (its registration still in the command ring: the drain command is
+// applied behind it) — then tears down.  RED (parent): close() completed them
+// Closed without sending.
+TEST(HandleLifetime, ClientCloseDrainsProducersBeforeTeardownRegression) {
+    FreeHook hook;
+    Rig r(cfgFor(5426));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    TestCq cq(*r.client);
+    auto p = r.client->producer(ackCfg());
+    std::vector<PendingOp> recs;
+    for (int i = 0; i < 3; ++i) recs.push_back(cq.send(p, topic, rc::Key(uint64_t{1}), kVal));
+    ASSERT_TRUE(r.drive([&] { return r.client->testProducerCount() == 1; }));
+    auto late = r.client->producer(ackCfg());  // registration not yet adopted
+    recs.push_back(cq.send(late, topic, rc::Key(uint64_t{2}), kVal));
+    EXPECT_TRUE(r.gw.produced.empty()) << "nothing flushed before close()";
+    {
+        GatewayPump pump(r.gw);  // the gateway answers while close() pumps the Client
+        r.client->close();
+        pump.stop();
+    }
+    for (const auto& rec : recs) {
+        ASSERT_TRUE(rec.ready());
+        EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
+        EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+    }
+    EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Closed);
+}
+
+// closeImmediately() — and the Client destructor — discard instead: every
+// accepted record completes Closed exactly once, nothing is flushed.
+TEST(HandleLifetime, ClientCloseImmediatelyAndDestructorDiscardRegression) {
+    for (const bool viaDtor : {false, true}) {
+        SCOPED_TRACE(viaDtor ? "destructor" : "closeImmediately");
+        FreeHook hook;
+        Rig r(cfgFor(viaDtor ? 5428 : 5430));
+        r.connect();
+        const auto topic = r.client->topic("t");
+        TestCq cq(*r.client);  // outlives the Client: it then holds only Closed completions
+        auto p = r.client->producer(ackCfg());
+        std::vector<PendingOp> recs;
+        for (int i = 0; i < 3; ++i) recs.push_back(cq.send(p, topic, rc::Key(uint64_t{1}), kVal));
+        ASSERT_TRUE(r.drive([&] { return r.client->testProducerCount() == 1; }));
+        if (viaDtor) r.client.reset(); else r.client->closeImmediately();
+        for (const auto& rec : recs) {
+            ASSERT_TRUE(rec.ready());
+            EXPECT_EQ(rec.status(), OpStatus::Closed);
+            EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+        }
+        EXPECT_TRUE(r.gw.produced.empty()) << "nothing flushed";
+    }
+}
+
+// close() closes every transactional producer first: an open broker
+// transaction is aborted (EndTxn(abort) sent and answered) before the
+// teardown.  closeImmediately() sends no EndTxn (discard locally).
+TEST(HandleLifetime, ClientCloseAbortsOpenTransactionsRegression) {
+    for (const bool immediately : {false, true}) {
+        SCOPED_TRACE(immediately ? "closeImmediately" : "close");
+        Rig r(cfgFor(immediately ? 5432 : 5434));
+        r.connect();
+        r.gw.initPidReply = true;
+        r.gw.replyTxn     = true;
+        auto tp = r.client->transactionalProducer("tx-client-close");
+        TestCq cq(*r.client);
+        auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+        ASSERT_TRUE(init.ok()) << init.describe();
+        tp.beginTransaction();
+        tp.send(r.client->topic("t"), rc::Key(uint64_t{1}), kVal);
+        ASSERT_TRUE(r.drive([&] { return r.gw.addPartitions == 1 && !r.gw.produced.empty(); }));
+        ASSERT_TRUE(tp.transactionActive());
+        if (immediately) {
+            r.client->closeImmediately();
+            EXPECT_EQ(r.gw.endTxns, 0) << "discarded locally";
+        } else {
+            GatewayPump pump(r.gw);
+            r.client->close();
+            pump.stop();
+            ASSERT_EQ(r.gw.endTxnCommits.size(), 1u) << "the open transaction was ended";
+            EXPECT_EQ(r.gw.endTxnCommits[0], 0) << "with EndTxn(abort)";
+        }
+        EXPECT_EQ(tp.commitTransaction(rc::CompletionHandler{[](void*, const rc::Completion&,
+                                                                std::span<const uint8_t>) noexcept {},
+                                                            nullptr},
+                                       1),
+                  OpResult::Closed);
+    }
+}

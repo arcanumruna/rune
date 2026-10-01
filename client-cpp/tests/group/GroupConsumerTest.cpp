@@ -1639,6 +1639,48 @@ TEST_F(GroupConsumerHubTest, HandleCallsOnDutyThreadActDirectlyRegression) {
     EXPECT_EQ(records, 1) << "no callback after finished()";
 }
 
+// F8c C7: a GroupConsumer destroyed inside its own onRecords callback.  The
+// destructor's close is applied at once (directly, on the duty thread), but
+// the hub keeps referencing the impl while its callback runs — release()
+// refuses until the dispatch ended; only then does the duty side let go, and
+// the last of the two shares frees the impl (never under the running callback).
+namespace {
+int g_groupFrees = 0;  // test thread only
+} // namespace
+TEST_F(GroupConsumerHubTest, HandleDestroyedInsideOnRecordsDefersFreeRegression) {
+    g_groupFrees = 0;
+    rune::client::detail::testOnImplFree = [](rune::client::detail::HandleKind k, const void*) noexcept {
+        if (k == rune::client::detail::HandleKind::GroupConsumer) ++g_groupFrees;
+    };
+    GroupConsumerImpl* raw = impl_.release();  // shared by the handle and the hub (spec 3.3)
+    auto gc = std::make_unique<GroupConsumer>(raw, &directSink, hub_.get(), std::this_thread::get_id(),
+                                              &directOpSink);
+    int  records = 0, freesInside = -1;
+    bool releasedInside = true;
+    raw->cbRecords = [&](const RecordSet&) {
+        ++records;
+        gc.reset();  // the destructor: close + release, inside its own callback
+        freesInside    = g_groupFrees;
+        releasedInside = hub_->release(raw);
+    };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    codec::RecordsView rv;
+    rv.topicId   = kTopicId;
+    rv.partition = kPartition;
+    hub_->onRecords(rv);
+    EXPECT_EQ(records, 1);
+    EXPECT_EQ(freesInside, 0);
+    EXPECT_FALSE(releasedInside) << "the running callback keeps the hub's reference";
+    hub_->onRecords(rv);
+    EXPECT_EQ(records, 1) << "closed: no further callback";
+    ASSERT_TRUE(hub_->release(raw)) << "after the dispatch the duty side may forget it";
+    EXPECT_EQ(hub_->ownedCount(), 0u);
+    ASSERT_TRUE(raw->status.detachProducer()) << "the handle let go first: the duty side frees";
+    delete raw;
+    EXPECT_EQ(g_groupFrees, 1);
+    rune::client::detail::testOnImplFree = nullptr;
+}
+
 // I1: callback setters are commands applied by the duty thread — an app thread
 // setting callbacks while the duty thread dispatches shares nothing (TSan).
 // Also exercises I2 (generation read on the app thread during rebalances).

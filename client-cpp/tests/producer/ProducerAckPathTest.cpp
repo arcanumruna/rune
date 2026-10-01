@@ -122,6 +122,31 @@ TEST(ProducerInFlight, OutOfOrderAckNeverOverwritesALiveSlot) {
     EXPECT_EQ(batchcorr::seq(cap.frames[2].corrId), 2u);
 }
 
+// F8c C7: a released producer's ordinal (its slot in the hub, encoded into its
+// batch ids) is a tombstone — a late ProduceResponse for it is dropped, never
+// routed to another producer — and it is reused only once every fresh ordinal
+// is taken, oldest first.
+TEST(ProducerInFlight, ReleasedOrdinalReusedOnlyAfterFreshOnesRegression) {
+    ProducerHub hub;
+    std::vector<std::unique_ptr<ProducerImpl>> impls;
+    for (uint32_t i = 0; i <= batchcorr::kMaxOrdinal; ++i) {
+        impls.push_back(std::make_unique<ProducerImpl>(ackCfg(1), 1024));
+        hub.add(impls.back().get());
+        ASSERT_EQ(impls.back()->ordinal(), i);
+    }
+    EXPECT_THROW(hub.add(impls.front().get()), std::length_error) << "every ordinal taken";
+    hub.remove(impls[7].get());
+    hub.remove(impls[3].get());
+    EXPECT_EQ(hub.size(), static_cast<std::size_t>(batchcorr::kMaxOrdinal) + 1 - 2);
+    hub.onProduceResponse(batchcorr::make(7, 0, 0), 100);  // a late ack for the released one: dropped
+    auto a = std::make_unique<ProducerImpl>(ackCfg(1), 1024);
+    auto b = std::make_unique<ProducerImpl>(ackCfg(1), 1024);
+    hub.add(a.get());
+    hub.add(b.get());
+    EXPECT_EQ(a->ordinal(), 7u) << "the oldest released ordinal first";
+    EXPECT_EQ(b->ordinal(), 3u);
+}
+
 TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {
     ProducerHub hub;
     auto a = std::make_unique<ProducerImpl>(ackCfg(4));  // F8c C7: the bare hub holds raw pointers
