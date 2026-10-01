@@ -1166,3 +1166,48 @@ TEST(ClientConfigMapping, EnvMtuOverridesClientConfig) {
     ::unsetenv("RUNE_CLIENT_AERON_MTU");
     EXPECT_EQ(a.transport.mtuLength, 4096u);
 }
+
+// ---------------------------------------------------------------------------
+// F8c C0: ClientAgent's lifecycle flags (started_/stopped_) are plain owner
+// state — no atomics.  A stop requested from another thread goes through the
+// runner shutdown path: Client::close() ends the runner loop, JOINS it, and only
+// then calls ClientAgent::stop().  This connected Thread-mode client (the runner
+// has run many duty cycles, each reading stopped_) is closed from the app
+// thread; under TSan the join edge must order the runner's reads before the
+// stop() write (RED by mutation: stop() before the join -> data race report).
+// No sleeps: the test thread pumps the gateway until each step is observed.
+// ---------------------------------------------------------------------------
+TEST(ClientLifecycle, CloseStopsAgentOnlyAfterRunnerJoinRegression) {
+    const std::string dir = uniqueDir();
+    ClientConfig cfg;
+    cfg.gatewayChannel   = "aeron:ipc";
+    cfg.gatewayStreamId  = 990;
+    cfg.egressChannel    = "aeron:ipc";
+    cfg.egressStreamId   = 991;
+    cfg.dataDir          = dir;
+    cfg.connectTimeoutMs = 30'000;
+    auto client = std::make_unique<Client>(cfg);   // Thread mode: runner is live
+    auto gw = std::make_unique<TestGateway>(dir + "/aeron");
+    gw->replyWithOK = true;
+    gw->start(990, 991);
+    auto fut = client->connect();
+    for (int i = 0; i < 50'000'000 && fut.wait_for(0ms) != std::future_status::ready; ++i) {
+        gw->poll(16);
+    }
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+    ASSERT_NO_THROW(fut.get());
+    // A duty cycle AFTER the last runner->app synchronisation: the runner drains
+    // this ping and offers it over Aeron IPC; the gateway (this thread) seeing it
+    // proves that cycle ran — and its doWork() read of ClientAgent::stopped_ is
+    // ordered before the close only by the join (no Pong: nothing else syncs).
+    gw->echoPong = false;
+    auto pingFut = client->ping(Bytes{'z'});
+    for (int i = 0; i < 50'000'000 && gw->pingsSeen.load() == 0; ++i) gw->poll(16);
+    ASSERT_EQ(gw->pingsSeen.load(), 1);
+    client->close();                                // from the app thread
+    EXPECT_THROW((void)client->producer(), std::logic_error);  // closed for good
+    gw.reset();
+    client.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}

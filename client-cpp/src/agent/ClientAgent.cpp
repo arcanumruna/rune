@@ -96,11 +96,8 @@ ClientAgent::~ClientAgent() {
 // ---------------------------------------------------------------------------
 
 void ClientAgent::start() {
-    bool expected = false;
-    if (!started_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return; // already started
-    }
+    if (started_) return;  // already started (owner state, see ClientAgent.h)
+    started_ = true;
     transport_.start();
 
     // Publish initial snapshot so observers see a consistent value immediately.
@@ -108,11 +105,8 @@ void ClientAgent::start() {
 }
 
 void ClientAgent::stop() noexcept {
-    bool expected = false;
-    if (!stopped_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return; // already stopped
-    }
+    if (stopped_) return;  // already stopped (owner state, see ClientAgent.h)
+    stopped_ = true;
     transport_.stop();
 }
 
@@ -124,7 +118,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // fix1 C2/I3: a no-op after stop() — belt-and-suspenders against any stray
     // call reaching here once the transport (and everything it touches) is
     // being/has been torn down.
-    if (stopped_.load(std::memory_order_acquire)) return 0;
+    if (stopped_) return 0;
 
     int totalWork = transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
 

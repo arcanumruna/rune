@@ -100,7 +100,8 @@ SLICE_B = {
         ("mutex", "std::mutex"): 12,
     },
     "include/rune/client/agent/ClientAgent.h": {
-        ("atomic", "std::atomic"): 3,
+        # snapshot_ only (app-thread state()/NotConnected reads: F8c C3).
+        ("atomic", "std::atomic"): 1,
         ("include", "#include <atomic>"): 1,
     },
     "include/rune/client/transport/AeronTransport.h": {

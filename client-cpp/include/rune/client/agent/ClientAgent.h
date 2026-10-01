@@ -204,6 +204,9 @@ public:
     void start();
 
     /// Stop the agent (idempotent).  Stops transport.  Dtor calls stop.
+    /// Single-threaded lifecycle call: only when no thread is inside doWork()
+    /// (after the runner is joined / on the Invoker owner) — never as a
+    /// cross-thread stop signal (use the runner shutdown path or submitClose()).
     void stop() noexcept;
 
     // -------------------------------------------------------------------------
@@ -708,8 +711,16 @@ private:
     rune::client::detail::M2ORingBuffer      ring_;
 
     // ---- Lifecycle -----------------------------------------------------------
-    std::atomic<bool> started_ {false};
-    std::atomic<bool> stopped_ {false};
+    // F8c C0: plain owner state, no atomics.  start() runs on the constructing
+    // thread before any duty thread exists; stop() runs only once no duty
+    // thread can be inside doWork() — Client::closeImpl_ after joining the
+    // runner (Thread mode) / on the owner thread (Invoker), or the destructor.
+    // A cross-thread stop REQUEST never touches these: it goes through the
+    // runner shutdown path (Client::close(): stop the runner loop, join it, then
+    // stop()) or the command ring (submitClose()).  The thread creation / join
+    // edges order every access, so doWork()'s read below is race-free.
+    bool started_ = false;
+    bool stopped_ = false;
 
     // ---- Egress observer (agent thread only; must be set before start()) ----
     EgressObserver egressObserver_;
