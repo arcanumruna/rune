@@ -102,11 +102,18 @@ The transport's verdict is 3-way: Accepted; Retry (back-pressure / not connected
 / admin action) leaves it at the ring head (ABORT, re-offered next cycle — held
 for exactly as long as the transport stays transiently unavailable; there is NO
 fixed time bound); Fatal (publication closed / max position / Aeron threw) is
-dropped, logged and counted. Frames over the transport's max message length are
+dropped, counted and logged rate-limited (first, then every 1024th). Frames over the transport's max message length are
 rejected synchronously by `submitSend()`. A frame of a session that no longer
 exists is dropped, counted, logged rate-limited. Subscribe (adoption + reconnect
 resend), Unsubscribe, OffsetCommit and LeaveGroup bypass the ring (duty-thread
-direct send on the default ingress publication, retried every duty cycle).
+direct send on the default ingress publication): Retry = retried every duty
+cycle; Fatal = dropped and the request ends (Subscribe fails the subscription,
+Unsubscribe finishes locally, OffsetCommit fails commitSync, LeaveGroup is
+dropped). The hubs learn the seed session's (connected, sessionId, connect
+episode) AT the transition (`Client::syncSeedSession_`: ConnectResponse /
+ErrorResponse handlers, before every hub command, and once per duty cycle) —
+never only at the end of the cycle. Leaving a connected (sessionId, episode)
+fails pending commitSyncs with the retriable `SessionLostError`.
 
 ### 2.3 Group consumer (`group/`)
 `GroupConsumer` runs the full join/sync/stable/rejoin state machine, heartbeat,

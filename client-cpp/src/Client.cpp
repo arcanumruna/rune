@@ -709,22 +709,16 @@ int Client::dutyCycle(int64_t nowNs) {
         }
     }
 
-    // 3c. F8a fix2/fix3 (IM-2, I2): session state is LEVEL-triggered for
-    //     commitSync — it fails on the Connected -> not-Connected transition,
-    //     and on every cycle the session is not Connected while one is pending
-    //     (a commitSync applied while down fails at once inside the hub).
-    {
-        const session::SessionState st = agent_.seedSession().machine.state();
-        if (st != lastSeedState_) [[unlikely]] {
-            const bool connected = st == session::SessionState::Connected;
-            groupConsumerHub_.setSessionConnected(connected, agent_.seedSession().machine.sessionId());
-            subscriberHub_.setSessionConnected(connected);
-            lastSeedState_ = st;
-        }
-        if (st != session::SessionState::Connected && !groupConsumerHub_.empty() &&
-            groupConsumerHub_.hasPendingCommitSync()) [[unlikely]] {
-            groupConsumerHub_.onSessionDown();
-        }
+    // 3c. F8a fix2/fix3/fix4 (IM-2, I2, M5): session state is LEVEL-triggered
+    //     for commitSync — it fails on leaving a connected (state, sessionId,
+    //     episode) (syncSeedSession_, also run at the transition itself by
+    //     the egress handlers and before every hub command), and on every
+    //     cycle the session is not Connected while one is pending (a
+    //     commitSync applied while down fails at once inside the hub).
+    syncSeedSession_();
+    if (lastSeedState_ != session::SessionState::Connected && !groupConsumerHub_.empty() &&
+        groupConsumerHub_.hasPendingCommitSync()) [[unlikely]] {
+        groupConsumerHub_.onSessionDown();
     }
 
     // 4. Periodic sweep on the duty-cycle clock.
@@ -733,6 +727,23 @@ int Client::dutyCycle(int64_t nowNs) {
         nextSweepNs_ = nowNs + kSweepIntervalMs * 1'000'000LL;
     }
     return work;
+}
+
+void Client::syncSeedSession_() noexcept {
+    const auto& m = agent_.seedSession().machine;
+    const session::SessionState st  = m.state();
+    const int64_t               sid = m.sessionId();
+    // The connect correlationId changes on every connect / resume attempt and
+    // never while Connected: it identifies the connect episode, so a resume
+    // that gets the SAME sessionId back is still a transition.
+    const int64_t episode = m.correlationId();
+    if (st == lastSeedState_ && sid == lastSeedSessionId_ && episode == lastSeedEpisode_) [[likely]] return;
+    const bool connected = st == session::SessionState::Connected;
+    groupConsumerHub_.setSessionConnected(connected, sid, episode);
+    subscriberHub_.setSessionConnected(connected);
+    lastSeedState_     = st;
+    lastSeedSessionId_ = sid;
+    lastSeedEpisode_   = episode;
 }
 
 int Client::routeBufferedAcks_() {
@@ -932,6 +943,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
     // ---- ConnectResponse ----
     case codec::TemplateId::ConnectResponse: {
+        // F8a fix4 I-1: the hubs learn the session transition HERE, before the
+        // resends / onConnected callback / later frames of this same poll (a
+        // record handler subscribing) — never only at the end of the cycle.
+        syncSeedSession_();
         auto opt = codec::decodeConnectResponse(buf, len);
         if (!opt) break;
 
@@ -1036,6 +1051,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
     // ---- ErrorResponse ----
     case codec::TemplateId::ErrorResponse: {
+        syncSeedSession_();  // fix4: a SessionExpired just took the session down
         auto opt = codec::decodeErrorResponse(buf, len);
         if (!opt) break;
 
@@ -1853,6 +1869,15 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     auto req = subscriber::SubscriberHub::makeSubscribeRequest(
         impl, snap.sessionId, partitionKnown, opts.from.toWire(),
         static_cast<uint8_t>(opts.isolation), keyBytes, subscribeDL);
+    // F8a fix4 M1: a Subscribe frame no ingress publication can carry fails
+    // HERE, synchronously — it never reaches the duty thread (where it could
+    // only be dropped as Fatal).
+    if (req->subscribeFrame.empty() || req->subscribeFrame.size() > agent_.maxFrameLength()) {
+        throw std::length_error(
+            "subscribe(): Subscribe frame of " + std::to_string(req->subscribeFrame.size()) +
+            " bytes cannot be sent (transport max message length " +
+            std::to_string(agent_.maxFrameLength()) + ")");
+    }
 
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::SubscribeAdd;
@@ -1888,6 +1913,7 @@ std::exception_ptr Client::submitError_(const char* what, std::size_t frameLen) 
 }
 
 void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
+    syncSeedSession_();  // fix4 I-1: the hubs act on the session's CURRENT state
     // fix3 I3: the caller's handle holds the impl (cmd.handle) for the whole
     // call, so the hubs may act on the impl itself — even when its Add is still
     // queued in the ring (created on another thread) — and adoption honours it.
@@ -1909,11 +1935,18 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
     applyHubCommand_(cmd);
 }
 
-bool Client::directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
-    return static_cast<Client*>(ctx)->agent_.offerDefault(buf, len);
+detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
+    using R = transport::AeronTransport::OfferResult;
+    switch (static_cast<Client*>(ctx)->agent_.offerDefault(buf, len)) {
+    case R::Accepted: return detail::SendResult::Accepted;
+    case R::Retry:    return detail::SendResult::Retry;
+    case R::Fatal:    break;
+    }
+    return detail::SendResult::Fatal;
 }
 
 void Client::applyHubCommand_(const detail::HubCommand& cmd) {
+    syncSeedSession_();  // fix4 I-1: the hubs act on the session's CURRENT state
     using Op = detail::HubCommand::Op;
     if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
         const auto snap = agent_.stateAndSessionId();

@@ -177,16 +177,33 @@ void SubscriberHub::adoptSubscribe(std::unique_ptr<SubscribeRequest> req,
     // fix3 I4: straight to the transport (never the command ring).  While the
     // session is down the next ConnectResponse re-sends every pending one
     // (resendPending); a refused offer is retried every duty cycle.
-    if (!sessionConnected_) return;
-    if (!sendSubscribeFrame_(pr)) markUnsent_(pr);
+    // fix4 I-1 (belt and braces): "down" also marks it UNSENT, so even if no
+    // further ConnectResponse arrives the per-cycle retry offers it as soon
+    // as the hub learns the session is connected — never silently dropped.
+    if (!sessionConnected_) { markUnsent_(pr); return; }
+    switch (sendSubscribeFrame_(pr)) {
+    case detail::SendResult::Accepted: break;
+    case detail::SendResult::Retry:    markUnsent_(pr); break;
+    case detail::SendResult::Fatal:    failRequest_(it); break;  // fix4 M1: never re-offered
+    }
 }
 
-bool SubscriberHub::sendSubscribeFrame_(const SubscribeRequest& req)
+detail::SendResult SubscriberHub::sendSubscribeFrame_(const SubscribeRequest& req)
 {
-    if (req.subscribeFrame.empty()) return true;
+    if (req.subscribeFrame.empty()) return detail::SendResult::Accepted;  // nothing to send
     assert(directSend_ != nullptr && "SubscriberHub: direct send not wired");
-    if (directSend_ == nullptr) return false;  // never claim "sent"
+    if (directSend_ == nullptr) return detail::SendResult::Retry;  // never claim "sent"
     return directSend_(directSendCtx_, req.subscribeFrame.data(), req.subscribeFrame.size());
+}
+
+SubscriberHub::PendingMap::iterator SubscriberHub::failRequest_(PendingMap::iterator it)
+{
+    // fix4 M1: the transport can never carry this Subscribe — fail the
+    // subscription (the handle sees finished()) and forget the request.
+    clearUnsent_(*it->second);
+    if (it->second->impl) finish_(*it->second->impl);
+    ++subscribesFailed_;
+    return pendingByCorrelation_.erase(it);
 }
 
 void SubscriberHub::markUnsent_(SubscribeRequest& req) noexcept
@@ -207,13 +224,15 @@ int SubscriberHub::retryUnsentSubscribes()
 {
     if (!sessionConnected_) return 0;  // the next connect re-sends every pending one
     int sent = 0;
-    for (auto& [corrId, req] : pendingByCorrelation_) {
-        if (unsentSubscribes_ == 0) break;
-        if (!req->unsent) continue;
-        if (!req->impl || !req->impl->active) { clearUnsent_(*req); continue; }
-        if (sendSubscribeFrame_(*req)) {
-            clearUnsent_(*req);
-            ++sent;
+    for (auto it = pendingByCorrelation_.begin();
+         it != pendingByCorrelation_.end() && unsentSubscribes_ != 0; ) {
+        SubscribeRequest& req = *it->second;
+        if (!req.unsent) { ++it; continue; }
+        if (!req.impl || !req.impl->active) { clearUnsent_(req); ++it; continue; }
+        switch (sendSubscribeFrame_(req)) {
+        case detail::SendResult::Accepted: clearUnsent_(req); ++sent; ++it; break;
+        case detail::SendResult::Retry:    ++it; break;
+        case detail::SendResult::Fatal:    it = failRequest_(it); break;
         }
     }
     return sent;
@@ -248,7 +267,8 @@ bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
         // unsubPending) and the duty cycle retries it — never dropped.
         impl.unsubCorrId    = unsubCorrId;
         impl.unsubSessionId = sessionId;
-        const bool sent = trySendUnsubscribe_(impl, submitFn);
+        // fix4 M1: Fatal = never deliverable: finished locally, not retried.
+        const bool sent = trySendUnsubscribe_(impl, submitFn) != detail::SendResult::Retry;
         if (!sent) markUnsubPending_(impl);
         // Its handler is running (it unsubscribed itself): onRecords erases the
         // entry after the handler returns — erasing now could free the
@@ -270,24 +290,26 @@ void SubscriberHub::unsubscribeDirect(SubscriptionImpl& impl, int64_t unsubCorrI
     }
 }
 
-bool SubscriberHub::trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn)
+detail::SendResult SubscriberHub::trySendUnsubscribe_(const SubscriptionImpl& impl,
+                                                      const SendFn&           submitFn)
 {
     uint8_t frameBuf[64]{};
     const std::size_t frameLen = codec::encodeUnsubscribe(
         frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
-    if (frameLen == 0) return true;  // cannot encode: nothing to retry
+    if (frameLen == 0) return detail::SendResult::Accepted;  // cannot encode: nothing to retry
     if (directSend_ != nullptr) return directSend_(directSendCtx_, frameBuf, frameLen);
-    return submitFn ? submitFn(0, frameBuf, frameLen) : true;
+    return (!submitFn || submitFn(0, frameBuf, frameLen)) ? detail::SendResult::Accepted
+                                                          : detail::SendResult::Retry;
 }
 
-bool SubscriberHub::retrySendUnsubscribe_(const SubscriptionImpl& impl)
+detail::SendResult SubscriberHub::retrySendUnsubscribe_(const SubscriptionImpl& impl)
 {
     assert(directSend_ != nullptr && "SubscriberHub: direct send not wired");
-    if (directSend_ == nullptr) return false;  // never claim "sent"
+    if (directSend_ == nullptr) return detail::SendResult::Retry;  // never claim "sent"
     uint8_t frameBuf[64]{};
     const std::size_t frameLen = codec::encodeUnsubscribe(
         frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
-    if (frameLen == 0) return true;
+    if (frameLen == 0) return detail::SendResult::Accepted;
     return directSend_(directSendCtx_, frameBuf, frameLen);
 }
 
@@ -312,11 +334,11 @@ int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
                 "no longer exists\n",
                 static_cast<long long>(impl.subscriptionId),
                 static_cast<long long>(impl.unsubSessionId));
-        } else if (!retrySendUnsubscribe_(impl)) {
-            ++it;
-            continue;
         } else {
-            ++sent;
+            const detail::SendResult r = retrySendUnsubscribe_(impl);
+            if (r == detail::SendResult::Retry) { ++it; continue; }
+            if (r == detail::SendResult::Accepted) ++sent;
+            // Fatal (fix4 M1): never deliverable — finished locally, dropped.
         }
         impl.unsubPending = false;
         --pendingUnsubCount_;
@@ -360,7 +382,7 @@ void SubscriberHub::onSubscribeResponse(
         // duty-cycle retry: an inactive entry is kept only while it is pending).
         if (impl->unsubCorrId == 0) impl->unsubCorrId = unsubCorrId;
         impl->unsubSessionId = sessionId;
-        if (!trySendUnsubscribe_(*impl, submitFn)) {
+        if (trySendUnsubscribe_(*impl, submitFn) == detail::SendResult::Retry) {  // Fatal: dropped
             markUnsubPending_(*impl);
             activeById_.emplace(rsp.subscriptionId, std::move(impl));  // cold path
         }
@@ -482,23 +504,28 @@ int SubscriberHub::resendPending(
     constexpr std::size_t kHeaderSessionIdOff = 8;
 
     int resent = 0;
-    for (auto& [corrId, req] : pendingByCorrelation_) {
-        if (!req || !req->impl) continue;
-        if (!req->impl->active) continue; // unsubscribed
+    for (auto it = pendingByCorrelation_.begin(); it != pendingByCorrelation_.end(); ) {
+        auto& req = it->second;
+        if (!req || !req->impl || !req->impl->active) { ++it; continue; }  // unsubscribed
         auto& frame = req->subscribeFrame;
-        if (frame.size() < kHeaderSessionIdOff + 8) continue;
+        if (frame.size() < kHeaderSessionIdOff + 8) { ++it; continue; }
 
         const uint64_t u = static_cast<uint64_t>(newSessionId);
         for (int i = 0; i < 8; ++i)
             frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
 
         if (directSend_ != nullptr) {
-            // fix3 I4: direct, with per-cycle retry on refusal.
-            if (sendSubscribeFrame_(*req)) { clearUnsent_(*req); ++resent; }
-            else markUnsent_(*req);
+            // fix3 I4: direct, with per-cycle retry on refusal; fix4 M1: a
+            // Fatal one fails its subscription (never re-offered).
+            switch (sendSubscribeFrame_(*req)) {
+            case detail::SendResult::Accepted: clearUnsent_(*req); ++resent; break;
+            case detail::SendResult::Retry:    markUnsent_(*req); break;
+            case detail::SendResult::Fatal:    it = failRequest_(it); continue;
+            }
         } else if (submitFn && submitFn(0, frame.data(), frame.size())) {
             ++resent;
         }
+        ++it;
     }
     return resent;
 }

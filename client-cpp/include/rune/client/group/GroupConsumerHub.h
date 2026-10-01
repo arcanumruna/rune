@@ -129,7 +129,7 @@ public:
 
     /// F8a fix2: duty-thread direct send on the default ingress publication for
     /// OffsetCommit frames (plain fn pointer + ctx, set once before start).
-    using DirectSendFn = bool (*)(void* ctx, const uint8_t* buf, std::size_t len);
+    using DirectSendFn = detail::SendResult (*)(void* ctx, const uint8_t* buf, std::size_t len);
     void setDirectSend(DirectSendFn fn, void* ctx) noexcept { directSend_ = fn; directSendCtx_ = ctx; }
 
     /// F8a fix2: send every requested commit now (duty cycle; a refused offer
@@ -144,10 +144,12 @@ public:
     /// F8a fix3 I2 (level-triggered session state, duty thread).  While not
     /// connected: a commitSync applied is failed at once, and commits are not
     /// offered.  Default true (hub-level tests have no session).
-    void setSessionConnected(bool connected, int64_t sessionId = 0) noexcept {
-        sessionConnected_ = connected;
-        currentSessionId_ = sessionId;
-    }
+    /// fix4 M5: called AT THE TRANSITION (the Client's ConnectResponse /
+    /// ErrorResponse handlers, before applying any hub command, and once per
+    /// duty cycle).  Leaving a connected (sessionId, episode) — going down, or
+    /// replaced by a new session / connect episode without ever being seen
+    /// down — fails every pending commitSync with SessionLostError.
+    void setSessionConnected(bool connected, int64_t sessionId = 0, int64_t episode = 0) noexcept;
     [[nodiscard]] bool sessionConnected() const noexcept { return sessionConnected_; }
     [[nodiscard]] bool hasPendingCommitSync() const noexcept;
 
@@ -187,6 +189,7 @@ private:
     // F8a fix3 I2 / M4.
     bool sessionConnected_ = true;
     int64_t currentSessionId_ = 0;
+    int64_t sessionEpisode_   = 0;
     std::size_t pendingLeaves_ = 0;
     void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl);
     static std::size_t encodeLeave_(GroupConsumerImpl& impl, int64_t sessionId);
@@ -207,9 +210,10 @@ private:
         DispatchScope& operator=(const DispatchScope&) = delete;
     };
 
-    enum class CommitSend : uint8_t { Nothing, Sent, SendFailed };
+    enum class CommitSend : uint8_t { Nothing, Sent, SendFailed, Fatal };
 
     static void failCommitSync_(GroupConsumerImpl& impl, const char* why);
+    static void failCommitSyncSessionLost_(GroupConsumerImpl& impl, const char* why);
     int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);
     void toRejoining_(GroupConsumerImpl& impl);

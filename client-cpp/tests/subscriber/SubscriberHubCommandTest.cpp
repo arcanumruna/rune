@@ -471,13 +471,23 @@ TEST(SubscriberHubCommand, AppAndDutyThreadsShareOnlyRingsRegression) {
 // ---------------------------------------------------------------------------
 namespace {
 struct RefusingTransport {
-    int refuseNext = 0;          // refuse this many offers, then accept
+    int refuseNext = 0;          // refuse (Retry) this many offers, then accept
+    int fatalNext  = 0;          // then reject this many as never deliverable (Fatal)
+    int fatals     = 0;
     std::vector<Frame> accepted;
-    static bool fn(void* ctx, const uint8_t* b, std::size_t n) {
+    static rcd::SendResult fn(void* ctx, const uint8_t* b, std::size_t n) {
         auto* self = static_cast<RefusingTransport*>(ctx);
-        if (self->refuseNext > 0) { --self->refuseNext; return false; }
+        if (self->refuseNext > 0) { --self->refuseNext; return rcd::SendResult::Retry; }
+        if (self->fatalNext > 0) { --self->fatalNext; ++self->fatals; return rcd::SendResult::Fatal; }
         self->accepted.push_back({std::vector<uint8_t>(b, b + n)});
-        return true;
+        return rcd::SendResult::Accepted;
+    }
+    int subscribes() const {
+        int c = 0;
+        for (const auto& f : accepted) {
+            if (rc::codec::decodeSubscribe(f.bytes.data(), f.bytes.size())) ++c;
+        }
+        return c;
     }
     int unsubscribesFor(int64_t subId) const {
         int c = 0;
@@ -575,4 +585,110 @@ TEST(SubscriberHubCommand, ResponseOfAnOldSessionNeverBindsRegression) {
     EXPECT_EQ(hub.activeCount(), 0u);
     EXPECT_EQ(hub.pendingCount(), 1u) << "kept pending for the current session";
     EXPECT_EQ(hub.staleResponsesIgnored(), 1u);
+}
+
+// ===========================================================================
+// F8a fix round 4
+// ===========================================================================
+
+// I-1 (belt and braces): a Subscribe adopted while the hub believes the session
+// is down is kept as UNSENT (offered once connected) — never silently dropped.
+TEST(SubscriberHubCommand, SubscribeAdoptedWhileSessionDownIsKeptUnsentRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    hub.setSessionConnected(false);
+    auto impl = makeImpl(90);
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    EXPECT_EQ(tx.subscribes(), 0);
+    EXPECT_EQ(hub.unsentSubscribes(), 1u) << "dropped without a retry";
+    EXPECT_EQ(hub.retryUnsentSubscribes(), 0) << "never offered while down";
+    hub.setSessionConnected(true);
+    EXPECT_EQ(hub.retryUnsentSubscribes(), 1);
+    EXPECT_EQ(tx.subscribes(), 1);
+    EXPECT_EQ(hub.unsentSubscribes(), 0u);
+    EXPECT_EQ(hub.pendingCount(), 1u);
+}
+
+// M1: a Subscribe the transport can never carry fails the subscription — at
+// adoption, on a per-cycle retry, or on a reconnect resend — never re-offered.
+TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+
+    // At adoption.
+    auto a = makeImpl(91);
+    tx.fatalNext = 1;
+    hub.applyCommand(addCmd(a), 0, kSession, send.fn());
+    EXPECT_FALSE(a->active);
+    EXPECT_TRUE(a->status.closed()) << "the handle learns it failed";
+    EXPECT_EQ(hub.pendingCount(), 0u);
+    EXPECT_EQ(hub.unsentSubscribes(), 0u);
+
+    // On the per-cycle retry of a refused one.
+    auto b = makeImpl(92);
+    tx.refuseNext = 1;
+    hub.applyCommand(addCmd(b), 0, kSession, send.fn());
+    ASSERT_EQ(hub.unsentSubscribes(), 1u);
+    tx.fatalNext = 1;
+    EXPECT_EQ(hub.retryUnsentSubscribes(), 0);
+    EXPECT_FALSE(b->active);
+    EXPECT_TRUE(b->status.closed());
+    EXPECT_EQ(hub.unsentSubscribes(), 0u);
+    EXPECT_EQ(hub.pendingCount(), 0u);
+
+    // On a reconnect resend (c fails, d still goes out).
+    auto c = makeImpl(93);
+    auto d = makeImpl(94);
+    hub.applyCommand(addCmd(c), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(d), 0, kSession, send.fn());
+    ASSERT_EQ(tx.subscribes(), 2);
+    tx.fatalNext = 1;
+    EXPECT_EQ(hub.resendPending(kSession + 1, send.fn()), 1);
+    EXPECT_FALSE(c->active);
+    EXPECT_TRUE(c->status.closed());
+    EXPECT_TRUE(d->active);
+    EXPECT_EQ(hub.pendingCount(), 1u);
+    EXPECT_EQ(tx.subscribes(), 3);
+
+    EXPECT_EQ(hub.retryUnsentSubscribes(), 0);
+    EXPECT_EQ(tx.fatals, 3) << "a Fatal frame is never re-offered";
+}
+
+// M1: an Unsubscribe the transport can never carry finishes locally (dropped,
+// never kept pending) — on the direct path and on the late-response (A2) path.
+TEST(SubscriberHubCommand, FatalUnsubscribeFinishesLocallyRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+
+    auto a = makeImpl(95);
+    hub.applyCommand(addCmd(a), 0, kSession, send.fn());
+    hub.onSubscribeResponse(bindRsp(95, 65), 0, kSession, send.fn());
+    ASSERT_EQ(hub.activeCount(), 1u);
+    tx.fatalNext = 1;
+    rcd::HubCommand u;
+    u.op = rcd::HubCommand::Op::Unsubscribe;
+    u.a  = 95;
+    hub.applyCommand(u, 905, kSession, send.fn());
+    EXPECT_TRUE(a->status.closed());
+    EXPECT_EQ(hub.pendingUnsubscribes(), 0u) << "a Fatal Unsubscribe is never retried";
+    EXPECT_EQ(hub.activeCount(), 0u);
+
+    auto b = makeImpl(96);
+    hub.applyCommand(addCmd(b), 0, kSession, send.fn());
+    u.a = 96;
+    hub.applyCommand(u, 906, kSession, send.fn());  // still pending: late Unsubscribe
+    tx.fatalNext = 1;
+    hub.onSubscribeResponse(bindRsp(96, 66), 907, kSession, send.fn());
+    EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
+    EXPECT_EQ(hub.activeCount(), 0u);
+
+    EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 0);
+    EXPECT_EQ(tx.fatals, 2);
+    EXPECT_EQ(tx.unsubscribesFor(65) + tx.unsubscribesFor(66), 0);
 }

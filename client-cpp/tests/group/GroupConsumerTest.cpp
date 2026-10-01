@@ -1592,13 +1592,20 @@ TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression
 // ---------------------------------------------------------------------------
 namespace {
 struct RefusingGroupTransport {
-    int refuseNext = 0;
+    int refuseNext = 0;  // transiently refuse (Retry) this many offers
+    int fatalNext  = 0;  // then reject this many as never deliverable (Fatal)
+    int fatals     = 0;
     std::vector<std::vector<uint8_t>> accepted;
-    static bool fn(void* ctx, const uint8_t* b, std::size_t n) {
+    static rune::client::detail::SendResult fn(void* ctx, const uint8_t* b, std::size_t n) {
         auto* self = static_cast<RefusingGroupTransport*>(ctx);
-        if (self->refuseNext > 0) { --self->refuseNext; return false; }
+        if (self->refuseNext > 0) { --self->refuseNext; return rune::client::detail::SendResult::Retry; }
+        if (self->fatalNext > 0) {
+            --self->fatalNext;
+            ++self->fatals;
+            return rune::client::detail::SendResult::Fatal;
+        }
         self->accepted.emplace_back(b, b + n);
-        return true;
+        return rune::client::detail::SendResult::Accepted;
     }
 };
 } // namespace
@@ -1678,4 +1685,182 @@ TEST_F(GroupConsumerHubTest, PendingLeaveGroupDroppedOnSessionChangeRegression) 
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId + 1), 0);
     EXPECT_EQ(hub_->pendingLeaves(), 0u);
     EXPECT_TRUE(tx.accepted.empty());
+}
+
+// ---------------------------------------------------------------------------
+// F8a fix round 4
+// ---------------------------------------------------------------------------
+
+// M1: an OffsetCommit the transport can never carry (Fatal) fails commitSync
+// at once and is dropped — never re-offered forever.  An async commit()'s
+// Fatal offer is dropped too.
+TEST_F(GroupConsumerHubTest, FatalOffsetCommitFailsCommitSyncAndIsNotReofferedRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+
+    auto fut = gc.commitSync();
+    tx.fatalNext = 1;
+    (void)hub_->flushRequestedCommits(kSessionId);
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready) << "a Fatal OffsetCommit must fail commitSync";
+    EXPECT_THROW(fut.get(), std::runtime_error);
+    EXPECT_FALSE(impl_->commitRequested) << "dropped, not kept for retry";
+    (void)hub_->flushRequestedCommits(kSessionId);
+    EXPECT_EQ(tx.fatals, 1);
+    EXPECT_TRUE(tx.accepted.empty()) << "never re-offered";
+
+    gc.commit();
+    tx.fatalNext = 1;
+    (void)hub_->flushRequestedCommits(kSessionId);
+    EXPECT_FALSE(impl_->commitRequested);
+    (void)hub_->flushRequestedCommits(kSessionId);
+    EXPECT_EQ(tx.fatals, 2);
+    EXPECT_TRUE(tx.accepted.empty());
+}
+
+// M1: a LeaveGroup the transport can never carry is dropped, not kept pending.
+TEST_F(GroupConsumerHubTest, FatalLeaveGroupIsDroppedNotRetriedRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    hub_->setSessionConnected(true, kSessionId);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    tx.fatalNext = 1;
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    gc.close();
+    EXPECT_EQ(hub_->pendingLeaves(), 0u);
+    EXPECT_EQ(hub_->retryPendingLeaves(kSessionId), 0);
+    EXPECT_EQ(tx.fatals, 1);
+    EXPECT_TRUE(tx.accepted.empty());
+}
+
+// M4: an onRevoked callback that closes its consumer during closeAll must not
+// make closeAll send a second LeaveGroup.
+TEST_F(GroupConsumerHubTest, CloseAllSendsOneLeaveGroupWhenOnRevokedClosesRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    hub_->setSessionConnected(true, kSessionId);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id());
+    impl_->cbRevoked = [&](std::vector<TopicPartition>) { gc.close(); };
+    sink_.clear();
+    hub_->closeAll(kSessionId, sink_.fn());
+    const auto leaveTid = static_cast<uint16_t>(rpc::TemplateId::LeaveGroup);
+    int leaves = 0;
+    for (const auto& f : tx.accepted)
+        if (static_cast<uint16_t>(f[2] | (f[3] << 8)) == leaveTid) ++leaves;
+    for (std::size_t i = 0; i < sink_.frames.size(); ++i)
+        if (sink_.templateId(i) == leaveTid) ++leaves;
+    EXPECT_EQ(leaves, 1) << "LeaveGroup sent twice";
+    EXPECT_TRUE(gc.finished());
+}
+
+// M5: a new session replacing the one a commitSync's OffsetCommit went out on
+// (a reconnect inside ONE duty cycle: the hub never observes "down") strands
+// it — the transition (connected, sessionId, episode) must fail it.
+TEST_F(GroupConsumerHubTest, CommitSyncFailsWhenANewSessionReplacesItsOwnRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    hub_->setSessionConnected(true, kSessionId, /*episode=*/1);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+
+    auto f1 = gc.commitSync();
+    ASSERT_EQ(hub_->flushRequestedCommits(kSessionId), 1);
+    ASSERT_NE(impl_->commitSyncCorrId, 0);
+    hub_->setSessionConnected(true, kSessionId + 1, /*episode=*/2);  // new session, never "down"
+    ASSERT_EQ(f1.wait_for(0ms), std::future_status::ready) << "stranded on a dead session";
+    EXPECT_THROW(f1.get(), SessionLostError);
+
+    // Same sessionId resumed in a new connect episode: the commit's fate is
+    // just as unknown.
+    auto f2 = gc.commitSync();
+    ASSERT_EQ(hub_->flushRequestedCommits(kSessionId + 1), 1);
+    hub_->setSessionConnected(true, kSessionId + 1, /*episode=*/3);
+    ASSERT_EQ(f2.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(f2.get(), SessionLostError);
+
+    // An unchanged observation fails nothing.
+    auto f3 = gc.commitSync();
+    hub_->setSessionConnected(true, kSessionId + 1, /*episode=*/3);
+    EXPECT_NE(f3.wait_for(0ms), std::future_status::ready);
+}
+
+// M6: a commitSync failed by session loss is a distinguishable, retriable
+// error (SessionLostError); other failures (rejoin, close) are not.
+TEST_F(GroupConsumerHubTest, CommitSyncSessionLossIsADistinctRetriableErrorRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+
+    auto down = gc.commitSync();
+    hub_->onSessionDown();
+    ASSERT_EQ(down.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(down.get(), SessionLostError);
+
+    hub_->setSessionConnected(false);
+    auto whileDown = gc.commitSync();
+    ASSERT_EQ(whileDown.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(whileDown.get(), SessionLostError);
+    hub_->setSessionConnected(true, kSessionId);
+
+    auto rejoin = gc.commitSync();
+    auto hb = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress));
+    hub_->onHeartbeatResponse(hb.data(), hb.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(rejoin.wait_for(0ms), std::future_status::ready);
+    try {
+        rejoin.get();
+        ADD_FAILURE() << "expected a failure";
+    } catch (const SessionLostError&) {
+        ADD_FAILURE() << "a rejoin is not a session loss";
+    } catch (const std::runtime_error&) {
+    }
+}
+
+// M7: a direct GroupCommit and GroupCommitSync applied to an impl whose
+// GroupAdd is still queued (not adopted yet) are honoured after adoption:
+// the commit goes out once Stable and the commitSync resolves on its response.
+TEST(GroupConsumerHubCommand, DirectCommitAndCommitSyncBeforeAdoptionAreHonouredRegression) {
+    using rune::client::detail::HubCommand;
+    GroupConsumerHub hub;
+    RefusingGroupTransport tx;
+    hub.setDirectSend(&RefusingGroupTransport::fn, &tx);
+    auto impl = std::make_shared<GroupConsumerImpl>();
+    impl->groupId  = "g";
+    impl->topicIds = {kTopicId};
+    impl->active   = true;
+
+    auto prom = std::make_unique<std::promise<void>>();
+    auto fut  = prom->get_future();
+    HubCommand sync;
+    sync.op     = HubCommand::Op::GroupCommitSync;
+    sync.handle = reinterpret_cast<uint64_t>(impl.get());
+    sync.a      = static_cast<int64_t>(reinterpret_cast<uintptr_t>(prom.release()));
+    hub.applyCommandDirect(sync);  // not adopted yet
+    HubCommand commit;
+    commit.op     = HubCommand::Op::GroupCommit;
+    commit.handle = reinterpret_cast<uint64_t>(impl.get());
+    hub.applyCommandDirect(commit);
+    EXPECT_TRUE(hub.empty());
+    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready) << "must not fail as 'closed'";
+
+    HubCommand add;  // the queued GroupAdd, drained later
+    add.op     = HubCommand::Op::GroupAdd;
+    add.handle = reinterpret_cast<uint64_t>(new std::shared_ptr<GroupConsumerImpl>(impl));
+    hub.applyCommand(add);
+    ASSERT_FALSE(hub.empty());
+
+    CaptureSink sink;
+    bringToStable(hub, sink, kTopicId, kPartition);
+    seedPosition(hub, 11);
+    ASSERT_EQ(hub.flushRequestedCommits(kSessionId), 1);
+    ASSERT_EQ(tx.accepted.size(), 1u);
+    auto oc = rpc::OffsetCommit::decode(tx.accepted[0].data(), tx.accepted[0].size());
+    ASSERT_TRUE(oc.has_value());
+    EXPECT_NE(oc->correlationId, 0) << "the commitSync owns this commit";
+    auto ocr = makeOffsetCommitResponse(oc->correlationId);
+    hub.onOffsetCommitResponse(ocr.data(), ocr.size());
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_NO_THROW(fut.get());
 }

@@ -624,7 +624,138 @@ TEST(HubCommandClient, RunnerCallbackUnsubscribesAnUnadoptedAppHandleRegression)
         client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, [](const rc::Record&) {}));
     signal(bReady, kFull);
     ASSERT_TRUE(pump([&] { return b->finished(); })) << "the direct unsubscribe was lost";
-    for (int i = 0; i < 20'000; ++i) gw.pump();
+    // fix4 M3: FIFO barrier instead of "pump a while".  The ping is submitted
+    // AFTER B's SubscribeAdd on the same command ring, and every control frame
+    // (a direct Subscribe sent at B's adoption, or the ring-drained ping) goes
+    // out on the same ingress publication — so once the gateway has seen the
+    // ping, it has already seen any Subscribe B's adoption could have sent.
+    auto barrier = client.ping(rc::Bytes(8, 1));
+    ASSERT_TRUE(pump([&] { return gw.pings == 1; })) << "the barrier ping never arrived";
     EXPECT_EQ(gw.subscribed.size(), 1u) << "the unsubscribed handle was revived by its late adoption";
     client.close();
+}
+
+// ===========================================================================
+// F8a fix round 4
+// ===========================================================================
+
+// I-1: a Subscribe adopted between the ConnectResponse and the end of the
+// duty cycle (here: from the onConnected callback, which runs inside the
+// ConnectResponse handler) must reach the broker.  Before: the hubs learned
+// "connected" only at the END of the cycle, so the direct adoption saw "down",
+// sent nothing and never retried — no later ConnectResponse re-sends it.
+TEST(HubCommandClient, SubscribeFromOnConnectedCallbackReachesTheBrokerRegression) {
+    HubRig r(4014);
+    std::unique_ptr<rc::Subscription> sub;
+    r.client.onConnected([&](int64_t) {
+        sub = std::make_unique<rc::Subscription>(subscribeT(r.client));  // duty thread: direct
+    });
+    r.connect();
+    ASSERT_TRUE(sub);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); }))
+        << "the Subscribe adopted inside the ConnectResponse handler was lost";
+    ASSERT_TRUE(r.drive([&] { return sub->subscriptionId() > 0; }));
+}
+
+// I-1, the reviewer's exact path: after a reconnect, the ConnectResponse and a
+// Records push arrive in ONE poll; the record handler subscribes (duty thread,
+// direct) — the new Subscribe must reach the broker.
+TEST(HubCommandClient, SubscribeFromARecordHandlerInTheReconnectPollReachesTheBrokerRegression) {
+    HubRig r(4016, 0, &hubNow);
+    r.connect();
+    std::unique_ptr<rc::Subscription> b;
+    int got = 0;
+    auto a = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+        [&](const rc::Record&) {
+            if (++got == 1) b = std::make_unique<rc::Subscription>(subscribeT(r.client));
+        });
+    ASSERT_TRUE(r.drive([&] { return a.subscriptionId() > 0; }));
+    ASSERT_EQ(r.gw.subscribed.size(), 1u);
+
+    // The session goes down (liveness timeout on the duty clock) ...
+    g_hubNow += 11'000'000'000LL;
+    for (int i = 0; i < 1'000 && r.client.state() == rc::session::SessionState::Connected; ++i) {
+        r.client.doWork();
+    }
+    ASSERT_NE(r.client.state(), rc::session::SessionState::Connected);
+    // ... and resumes: the gateway answers the next Connect with
+    // [ConnectResponse, Records(A)] back to back on one publication.
+    r.gw.recordsAfterNextConnect.emplace_back(r.gw.subscribed[0], 0);
+    const int connectsBefore = r.gw.connects;
+    ASSERT_TRUE(r.drive([&] { return b != nullptr; })) << "A's handler never ran after the reconnect";
+    ASSERT_GT(r.gw.connects, connectsBefore);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 2; }))
+        << "the Subscribe adopted in the reconnect poll was lost";
+    ASSERT_TRUE(r.drive([&] { return b->subscriptionId() > 0; }));
+}
+
+// M1: a Subscribe the transport can never carry (Fatal) fails the subscription
+// at once — it is not re-offered forever.
+TEST(HubCommandClient, FatalSubscribeOfferFailsTheSubscriptionRegression) {
+    HubRig r(4018);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+    r.settle(200);
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 1);
+    auto sub = subscribeT(r.client);  // owner: adopted directly -> Fatal
+    r.settle(200);
+    EXPECT_TRUE(sub.finished()) << "a never-deliverable Subscribe must fail the subscription";
+    EXPECT_FALSE(sub.active());
+    EXPECT_EQ(r.client.testUnsentSubscribes(), 0u) << "never kept for retry";
+    EXPECT_EQ(r.client.testIngressFatalDropped(), 1u);
+    EXPECT_TRUE(r.gw.subscribed.empty());
+    auto ok = subscribeT(r.client);
+    ASSERT_TRUE(r.drive([&] { return ok.subscriptionId() > 0; })) << "later subscribes proceed";
+}
+
+// M1: an Unsubscribe the transport can never carry finishes locally — dropped,
+// never kept pending / re-offered.
+TEST(HubCommandClient, FatalUnsubscribeOfferFinishesLocallyRegression) {
+    HubRig r(4020);
+    r.connect();
+    auto sub = subscribeT(r.client);
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() > 0; }));
+    r.settle(200);
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 1);
+    sub.unsubscribe();  // owner: applied directly -> Fatal
+    EXPECT_TRUE(sub.finished());
+    EXPECT_EQ(r.client.testPendingUnsubscribes(), 0u) << "a Fatal Unsubscribe is never retried";
+    auto barrier = r.client.ping(rc::Bytes(8, 1));  // FIFO barrier on the same publication
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings == 1; }));
+    EXPECT_TRUE(r.gw.unsubscribed.empty());
+    EXPECT_EQ(r.client.testIngressFatalDropped(), 1u);
+}
+
+// M2: Fatal drops are all counted but logged only on the first and every
+// 1024th — a stream of them never floods stderr.
+TEST(HubCommandClient, FatalDropLogIsRateLimitedRegression) {
+    HubRig r(4022);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+    r.settle(200);
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 3);
+    testing::internal::CaptureStderr();
+    auto p1 = r.client.ping(rc::Bytes(8, 1));
+    auto p2 = r.client.ping(rc::Bytes(8, 2));
+    auto p3 = r.client.ping(rc::Bytes(8, 3));
+    const bool all = r.drive([&] { return r.client.testIngressFatalDropped() == 3; });
+    const std::string err = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(all);
+    std::size_t lines = 0;
+    for (std::size_t pos = 0; (pos = err.find("can never accept", pos)) != std::string::npos; ++pos) ++lines;
+    EXPECT_EQ(lines, 1u) << err;
+}
+
+// M1: a Subscribe frame longer than the transport's max message length is
+// rejected synchronously by subscribe() — it never reaches the duty thread.
+TEST(HubCommandClient, OversizeSubscribeFrameFailsAtSubscribeRegression) {
+    HubRig r(4024);
+    r.connect();
+    r.client.testCapMaxFrameLength(16);  // Invoker, single thread: below any Subscribe frame
+    EXPECT_THROW((void)subscribeT(r.client), std::length_error);
+    r.client.testCapMaxFrameLength(0);   // uncapped
+    r.settle(200);
+    EXPECT_TRUE(r.gw.subscribed.empty());
+    auto ok = subscribeT(r.client);
+    ASSERT_TRUE(r.drive([&] { return ok.subscriptionId() > 0; }));
 }

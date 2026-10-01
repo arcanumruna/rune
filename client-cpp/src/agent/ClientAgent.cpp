@@ -235,11 +235,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                         ++ingressOfferRefused_;
                         return CA::ABORT;  // stays at the head; retried next cycle
                     case transport::AeronTransport::OfferResult::Fatal:
-                        ++ingressFatalDropped_;
-                        std::fprintf(stderr,
-                            "rune-client: dropped a control frame the transport can never "
-                            "accept (len %zu; %llu dropped so far)\n",
-                            n, static_cast<unsigned long long>(ingressFatalDropped_));
+                        noteFatalDrop_(n);  // fix4 M2: rate-limited log, every drop counted
                         break;
                     }
                 }
@@ -411,8 +407,25 @@ bool ClientAgent::submitSend(const uint8_t* frame, std::size_t len) noexcept {
     // F8a fix3 I1(a): a frame no ingress publication can ever carry is
     // rejected HERE, synchronously — it must never reach the ring (where it
     // would be a permanent offer failure).
-    if (len > transport_.maxMessageLength()) return false;
+    if (len > maxFrameLength()) return false;
     return writeCommand(kMsgSend, frame, len);
+}
+
+transport::AeronTransport::OfferResult ClientAgent::offerDefault(const uint8_t* buf,
+                                                                std::size_t len) noexcept {
+    const auto r = offerIngress_(buf, len);
+    if (r == transport::AeronTransport::OfferResult::Fatal) [[unlikely]] noteFatalDrop_(len);
+    return r;
+}
+
+void ClientAgent::noteFatalDrop_(std::size_t len) noexcept {
+    // F8a fix4 M2: counted every time, logged on the first and every 1024th.
+    if ((ingressFatalDropped_++ & 1023u) == 0) {
+        std::fprintf(stderr,
+            "rune-client: dropped a control frame the transport can never accept "
+            "(len %zu; %llu dropped so far)\n",
+            len, static_cast<unsigned long long>(ingressFatalDropped_));
+    }
 }
 
 transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t* buf,

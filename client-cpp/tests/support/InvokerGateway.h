@@ -75,12 +75,16 @@ struct InvokerGateway {
     // Acks sent immediately BEFORE the next ConnectResponse, from the same
     // publication, so the client receives [ack..., ConnectResponse] in one poll.
     std::vector<Produced> ackBeforeNextConnect;
+    // F8a fix4: Records pushed immediately AFTER the next ConnectResponse, from
+    // the same publication, so the client receives [ConnectResponse, Records...]
+    // in one poll.  Element: (subscription, baseOffset).
     int connects = 0;
     int metadataRequests = 0;
     // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
     struct Subscribed { int64_t subscriptionId; int32_t topicId; int32_t partition; int64_t sessionId; };
     std::vector<Subscribed> subscribed;
     std::vector<int64_t>    unsubscribed;  // subscriptionIds
+    std::vector<std::pair<Subscribed, int64_t>> recordsAfterNextConnect;
     int64_t nextSubscriptionId = 500;
     // F8a fix2: stop consuming client ingress (the client's publication then
     // back-pressures once its term window is full).
@@ -244,6 +248,8 @@ private:
                 out, sizeof out, static_cast<int16_t>(rcc::ErrorCode::OK), 0, assignedSessionId,
                 c->sessionId, c->correlationId);
             send(0, out, n);
+            for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
+            recordsAfterNextConnect.clear();
             return;
         }
         case rcc::TemplateId::MetadataRequest: {

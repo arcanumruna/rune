@@ -188,6 +188,15 @@ struct SubscriptionImpl {
 //   - Once finished, the handle never touches the Client again — a handle may
 //     safely outlive its Client (but must not be used CONCURRENTLY with the
 //     Client's destruction).
+//   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
+//     or moved into while ANY thread may still be calling it — its owner app
+//     thread, or a runner callback (e.g. a record handler of another
+//     subscription that unsubscribes this one).  The direct (duty-thread) path
+//     acts on the impl through the caller's handle for the whole call; a
+//     concurrent destroy/move is a data race on the handle itself.  Hand a
+//     handle to a callback only if it outlives every callback that may use it
+//     (e.g. unsubscribe it, wait for finished() of the callback's own
+//     subscription, then destroy it).
 //
 // Records start arriving once the broker acknowledges (SubscribeResponse).
 // There is no wait for the ack in subscribe() itself; the Subscription is

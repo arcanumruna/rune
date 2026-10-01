@@ -41,11 +41,27 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace rune::client {
+
+// ---------------------------------------------------------------------------
+// SessionLostError — F8a fix4 M6: commitSync() failed because the session to
+// the broker was lost (it went down, or a new session / connect episode
+// replaced the one the commit was sent on) or was down when commitSync() was
+// applied.  The commit's fate is UNKNOWN (it may or may not have been
+// applied).  RETRIABLE: wait for the next onAssigned (the consumer rejoins
+// after the reconnect and re-seeds its positions), then commit again.  Every
+// other commitSync failure (closed, superseded, rejoin, broker error code) is
+// a plain std::runtime_error.
+// ---------------------------------------------------------------------------
+class SessionLostError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // ---------------------------------------------------------------------------
 // TopicPartition — (topicId, partition) pair used in assignments.
@@ -212,6 +228,12 @@ struct GroupConsumerImpl {
 //     callback will run.  A finished handle never touches the Client again, so
 //     a handle may outlive its Client (not be used CONCURRENTLY with its
 //     destruction); commitSync() then returns an already-failed future.
+//   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
+//     or moved into while ANY thread may still be calling it — its owner app
+//     thread, or a runner callback (onAssigned / onRevoked / onRecords calling
+//     commit() / close() on it).  The direct (duty-thread) path acts on the
+//     impl through the caller's handle for the whole call; a concurrent
+//     destroy/move is a data race on the handle itself.
 // ---------------------------------------------------------------------------
 class GroupConsumer {
 public:
@@ -258,11 +280,17 @@ public:
     /// THIS commit (OffsetCommitResponse matched by correlationId, error codes
     /// checked — a failed commit throws from get()), or resolves at once when
     /// there is nothing to commit.  It fails when superseded by a newer
-    /// commitSync(), on close(), on a group rejoin, as soon as the session to
-    /// the broker goes DOWN (the session machine's Connected -> not-Connected
-    /// transition — no timeout of its own) or a new session replaces the one
-    /// its commit was sent on, or when the Client closes.  An OffsetCommit the
-    /// transport refuses is retried every duty cycle (never dropped).
+    /// commitSync(), on close(), on a group rejoin, or when the Client closes
+    /// (std::runtime_error).
+    /// SESSION LOSS (fix4 M6) throws rune::client::SessionLostError (a
+    /// std::runtime_error): the session to the broker went DOWN (the session
+    /// machine's own liveness verdict — no timeout of its own), a new session
+    /// or connect episode replaced the one its commit was sent on, or the
+    /// session was already down when commitSync() was applied.  The commit's
+    /// fate is unknown; it is RETRIABLE — retry after the next onAssigned
+    /// (the consumer rejoins after the reconnect).
+    /// An OffsetCommit the transport transiently refuses is retried every duty
+    /// cycle; one it can never carry (Fatal) fails the commitSync at once.
     /// Waiting: Thread mode — get() from an app thread.  Invoker mode — keep
     /// calling Client::doWork() until it is ready.  NEVER from inside a duty-
     /// cycle callback: commitSync() throws std::logic_error there.

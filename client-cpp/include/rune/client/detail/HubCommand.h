@@ -72,6 +72,16 @@ enum class HubSubmit : uint8_t {
     ClosedAfterSubmit,
 };
 
+/// F8a fix4 M1: verdict of a duty-thread DIRECT send (Subscribe /
+/// Unsubscribe / OffsetCommit / LeaveGroup straight to the transport).
+///   Accepted — on the wire.
+///   Retry    — transiently refused (back-pressure, not connected, admin
+///              action): the owner keeps it and retries next duty cycle.
+///   Fatal    — the transport can never carry it (publication closed, max
+///              position, frame over the max message length): the owner
+///              drops it and fails / finishes the request — never re-offered.
+enum class SendResult : uint8_t { Accepted, Retry, Fatal };
+
 /// Lifecycle ops: delivery is guaranteed (applied directly on the duty thread;
 /// otherwise a full ring is waited out on duty-thread progress) — never throw
 /// for a full ring.

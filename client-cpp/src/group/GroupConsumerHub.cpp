@@ -100,6 +100,32 @@ void GroupConsumerHub::failCommitSync_(GroupConsumerImpl& impl, const char* why)
 }
 
 /*static*/
+void GroupConsumerHub::failCommitSyncSessionLost_(GroupConsumerImpl& impl, const char* why) {
+    // fix4 M6: the distinguishable, retriable session-loss failure.
+    if (!impl.commitSyncPromise) return;
+    try {
+        impl.commitSyncPromise->set_exception(std::make_exception_ptr(SessionLostError(why)));
+    } catch (...) {}
+    impl.commitSyncPromise.reset();
+    impl.commitSyncCorrId = 0;
+}
+
+void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, int64_t episode) noexcept {
+    // fix4 M5: the transition is (connected, sessionId, connect episode), not
+    // the connected bit alone — a reconnect inside one duty cycle (never
+    // observed "down") still strands every commitSync of the old session.
+    if (sessionConnected_ &&
+        (!connected || sessionId != currentSessionId_ || episode != sessionEpisode_)) {
+        for (auto& impl : impls_) {
+            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session to the broker was lost");
+        }
+    }
+    sessionConnected_ = connected;
+    currentSessionId_ = sessionId;
+    sessionEpisode_   = episode;
+}
+
+/*static*/
 void GroupConsumerHub::closeStatus_(GroupConsumerImpl& impl) {
     if (impl.status.producerClosed()) return;
     // Final snapshot (the reserve guarantees it fits), THEN close.
@@ -202,7 +228,7 @@ void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl
         // fix3 I2 (level-triggered): applied while the session is down — it can
         // never be acknowledged; fail it now.
         if (!sessionConnected_) {
-            failCommitSync_(*impl, "commitSync() aborted: the session to the broker is down");
+            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session to the broker is down");
         }
         break;
     }
@@ -248,7 +274,10 @@ void GroupConsumerHub::sendLeave_(GroupConsumerImpl& impl) {
     impl.leaveSessionId = currentSessionId_;
     const std::size_t len = encodeLeave_(impl, impl.leaveSessionId);
     if (len == 0) return;
-    if (!directSend_(directSendCtx_, impl.sendBuf.data(), len) && !impl.leavePending) {
+    // fix4 M1: only a transient refusal is retried; Fatal = never deliverable,
+    // dropped (the broker expires the member with its session).
+    if (directSend_(directSendCtx_, impl.sendBuf.data(), len) == detail::SendResult::Retry &&
+        !impl.leavePending) {
         impl.leavePending = true;
         ++pendingLeaves_;
     }
@@ -265,8 +294,10 @@ int GroupConsumerHub::retryPendingLeaves(int64_t currentSessionId) {
             done = false;
         } else {
             const std::size_t len = encodeLeave_(*impl, impl->leaveSessionId);
-            done = len == 0 || directSend_(directSendCtx_, impl->sendBuf.data(), len);
-            if (done) ++sent;
+            const detail::SendResult r = len == 0 ? detail::SendResult::Accepted
+                                                  : directSend_(directSendCtx_, impl->sendBuf.data(), len);
+            done = r != detail::SendResult::Retry;  // Fatal (fix4 M1): dropped
+            if (r == detail::SendResult::Accepted) ++sent;
         }
         if (done) { impl->leavePending = false; --pendingLeaves_; }
     }
@@ -417,10 +448,15 @@ GroupConsumerHub::CommitSend GroupConsumerHub::sendOffsetCommit(GroupConsumerImp
 
     // F8a fix2: straight to the transport from the duty thread when wired (the
     // caller keeps commitRequested set and retries every duty cycle on refusal).
-    const bool ok = directSend_ != nullptr
-        ? directSend_(directSendCtx_, impl.sendBuf.data(), len)
-        : sendFn(0, impl.sendBuf.data(), len);
-    return ok ? CommitSend::Sent : CommitSend::SendFailed;
+    if (directSend_ == nullptr) {
+        return sendFn(0, impl.sendBuf.data(), len) ? CommitSend::Sent : CommitSend::SendFailed;
+    }
+    switch (directSend_(directSendCtx_, impl.sendBuf.data(), len)) {
+    case detail::SendResult::Accepted: return CommitSend::Sent;
+    case detail::SendResult::Retry:    return CommitSend::SendFailed;
+    case detail::SendResult::Fatal:    break;
+    }
+    return CommitSend::Fatal;  // fix4 M1: never deliverable
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +702,13 @@ int GroupConsumerHub::drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, c
         impl.commitRequested = true;  // retried next duty cycle (never silently lost)
         return 0;
     }
+    if (r == CommitSend::Fatal) {
+        // fix4 M1: the transport can never carry it — dropped (not re-offered
+        // forever); a commitSync waiting on it fails now.
+        failCommitSync_(impl, "commitSync() failed: the OffsetCommit frame can never be sent "
+                              "(the transport rejected it permanently)");
+        return 1;
+    }
     if (forSync) {
         if (r == CommitSend::Sent) {
             impl.commitSyncCorrId = corr;  // resolved by the matching response
@@ -699,7 +742,7 @@ void GroupConsumerHub::onSessionDown()
 {
     for (auto& impl : impls_) {
         if (impl->active) {
-            failCommitSync_(*impl, "commitSync() aborted: the session to the broker went down");
+            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session to the broker went down");
         }
     }
 }
@@ -1007,7 +1050,7 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
         // fix1 I6: a NEW session (reconnect) means the old one was lost — a
         // commitSync whose OffsetCommit went out on it can never be answered.
         if (impl->commitSyncCorrId != 0) {
-            failCommitSync_(*impl, "commitSync() aborted: the session was lost before the commit was acknowledged");
+            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session was lost before the commit was acknowledged");
         }
 
         if (impl->state == GroupConsumerState::Unjoined  ||
@@ -1045,6 +1088,9 @@ void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
                     "rune-client: group onRevoked (close) threw a non-std::exception (caught)\n");
             }
         }
+        // fix4 M4: the callback may have closed this consumer (its close sent
+        // the LeaveGroup and finished it) — never a second LeaveGroup.
+        if (!impl->active) continue;
 
         // Send LeaveGroup (best-effort; may fail if transport is down).
         if (!impl->memberId.empty()) {

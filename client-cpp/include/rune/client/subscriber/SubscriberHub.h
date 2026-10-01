@@ -189,7 +189,7 @@ public:
     /// (plain function pointer + context; set once before start).  Used for
     /// Unsubscribe frames so they never depend on command-ring space.  Unset
     /// (hub-level tests): the SendFn passed to the call is used.
-    using DirectSendFn = bool (*)(void* ctx, const uint8_t* buf, std::size_t len);
+    using DirectSendFn = detail::SendResult (*)(void* ctx, const uint8_t* buf, std::size_t len);
     void setDirectSend(DirectSendFn fn, void* ctx) noexcept { directSend_ = fn; directSendCtx_ = ctx; }
 
     /// F8a fix2: Unsubscribe frames the transport refused, retried by the duty
@@ -206,9 +206,14 @@ public:
     [[nodiscard]] std::size_t unsentSubscribes() const noexcept { return unsentSubscribes_; }
     int retryUnsentSubscribes();
 
-    /// fix3: session state (duty thread; default connected for hub-level tests).
+    /// fix3/fix4: session state (duty thread; default connected for hub-level
+    /// tests).  The Client updates it AT THE TRANSITION (the ConnectResponse
+    /// handler, before any callback of that poll; and before applying any hub
+    /// command), so an adoption later in the same poll sees the truth.
     void setSessionConnected(bool connected) noexcept { sessionConnected_ = connected; }
     [[nodiscard]] uint64_t staleResponsesIgnored() const noexcept { return staleResponsesIgnored_; }
+    /// fix4 M1: subscriptions failed because their Subscribe frame was Fatal.
+    [[nodiscard]] uint64_t subscribesFailed() const noexcept { return subscribesFailed_; }
 
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;
@@ -240,7 +245,8 @@ private:
     // Pending subscriptions: Subscribe sent, SubscribeResponse not yet received.
     // Key: correlationId.  The request keeps the encoded Subscribe frame so it
     // can be re-stamped + resent on a leader redirect (CB-5 B).
-    std::map<int64_t, std::unique_ptr<SubscribeRequest>> pendingByCorrelation_;
+    using PendingMap = std::map<int64_t, std::unique_ptr<SubscribeRequest>>;
+    PendingMap pendingByCorrelation_;
 
     // Active subscriptions: SubscribeResponse received, subscriptionId bound.
     // Key: subscriptionId.
@@ -271,13 +277,16 @@ private:
     void*        directSendCtx_ = nullptr;
     std::size_t  pendingUnsubCount_  = 0;
     uint64_t     unsubscribesDropped_ = 0;
-    bool trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn);
-    bool retrySendUnsubscribe_(const SubscriptionImpl& impl);
+    detail::SendResult trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn);
+    detail::SendResult retrySendUnsubscribe_(const SubscriptionImpl& impl);
     // fix3 I4.
     bool        sessionConnected_      = true;
     std::size_t unsentSubscribes_      = 0;
     uint64_t    staleResponsesIgnored_ = 0;
-    bool sendSubscribeFrame_(const SubscribeRequest& req);
+    uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
+    detail::SendResult sendSubscribeFrame_(const SubscribeRequest& req);
+    /// fix4 M1: fail + erase a pending request whose Subscribe is never deliverable.
+    PendingMap::iterator failRequest_(PendingMap::iterator it);
     void markUnsent_(SubscribeRequest& req) noexcept;
     void clearUnsent_(SubscribeRequest& req) noexcept;
     void markUnsubPending_(SubscriptionImpl& impl) noexcept;

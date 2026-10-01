@@ -437,7 +437,13 @@ public:
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
     [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
     /// F8a fix3: the transport's max frame length (immutable; any thread).
-    [[nodiscard]] std::size_t maxFrameLength() const noexcept { return transport_.maxMessageLength(); }
+    [[nodiscard]] std::size_t maxFrameLength() const noexcept {
+        const std::size_t m = transport_.maxMessageLength();
+        return (testMaxFrameCap_ != 0 && testMaxFrameCap_ < m) ? testMaxFrameCap_ : m;
+    }
+    /// fix4 test seam (Invoker tests, owner thread only — a plain field):
+    /// cap maxFrameLength() below the transport's (0 = uncapped).
+    void testCapMaxFrameLength(std::size_t cap) noexcept { testMaxFrameCap_ = cap; }
     /// fix3 test seam (duty thread): the next `n` ring-drained kMsgSend offers
     /// return `r` instead of reaching the transport.
     void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
@@ -445,12 +451,13 @@ public:
         testForcedOffers_ = n;
     }
 
-    /// F8a fix2: duty-thread direct send on the default ingress publication
-    /// (the one kMsgSend frames use) — for frames whose owner retries them
-    /// itself instead of going through the ring.  false = refused.
-    bool offerDefault(const uint8_t* buf, std::size_t len) noexcept {
-        return transport_.offer(buf, len);
-    }
+    /// F8a fix2/fix4: duty-thread direct send on the default ingress
+    /// publication (the one kMsgSend frames use) — for frames whose owner
+    /// retries them itself instead of going through the ring.  Returns the
+    /// 3-way verdict: Retry = transiently refused (the owner retries), Fatal =
+    /// never deliverable (counted in ingressFatalDropped, rate-limited log; the
+    /// owner drops it).  Honours testForceIngressOffers.
+    transport::AeronTransport::OfferResult offerDefault(const uint8_t* buf, std::size_t len) noexcept;
 
     /// F8a: hook invoked (duty thread, or close()'s drain) for every drained
     /// kMsgHubCommand.  Set before start().  Cold path (control-plane commands).
@@ -720,7 +727,9 @@ private:
     // fix3 test seam: force the next N ring-drained offers' verdicts.
     int testForcedOffers_ = 0;
     transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;
+    std::size_t testMaxFrameCap_ = 0;  // fix4 test seam (0 = uncapped)
     transport::AeronTransport::OfferResult offerIngress_(const uint8_t* buf, std::size_t len) noexcept;
+    void noteFatalDrop_(std::size_t len) noexcept;
 
     // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
     // wait loop (see testSetCloseDrainYieldHook()). Empty by default.

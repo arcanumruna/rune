@@ -269,6 +269,8 @@ public:
     [[nodiscard]] bool testGroupHubEmpty() const noexcept { return groupConsumerHub_.empty(); }
     [[nodiscard]] std::size_t testUnsentSubscribes() const noexcept { return subscriberHub_.unsentSubscribes(); }
     [[nodiscard]] std::size_t testMaxFrameLength() const noexcept { return agent_.maxFrameLength(); }
+    /// fix4 test seam (Invoker, owner thread only): cap the max frame length.
+    void testCapMaxFrameLength(std::size_t cap) noexcept { agent_.testCapMaxFrameLength(cap); }
     void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
         agent_.testForceIngressOffers(r, n);
     }
@@ -466,6 +468,10 @@ public:
     ///     handler call can run any more (then position() is final).
     ///   - After close(): returns an already-finished Subscription (active() and
     ///     finished() report it at once; nothing is submitted).
+    ///   - Throws std::length_error (nothing submitted) if the Subscribe frame
+    ///     can never be carried by the transport (over its max message length).
+    ///     A Subscribe the transport later rejects permanently (Fatal) finishes
+    ///     the Subscription instead (finished() turns true, never bound).
     ///
     /// Demand / back-pressure: default is broker-paced push (the broker pauses
     /// when egress back-pressure applies, per GB-3).
@@ -642,9 +648,19 @@ private:
     /// F8a fix3: the error for a failed submitSend (oversize vs ring full).
     [[nodiscard]] std::exception_ptr submitError_(const char* what, std::size_t frameLen) const;
     /// F8a fix2: duty-thread direct send on the default ingress publication.
-    static bool directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
+    static detail::SendResult directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
     /// F8a fix2: last observed seed-session state (duty thread only).
     session::SessionState lastSeedState_ = session::SessionState::Disconnected;
+    // fix4 M5: the last (state, sessionId, connect episode) of the seed session
+    // the hubs were told about (duty thread only).
+    int64_t lastSeedSessionId_ = 0;
+    int64_t lastSeedEpisode_   = 0;
+    /// fix4 I-1/M5: tell both hubs the seed session's current (connected,
+    /// sessionId, episode) if it changed since the last call.  Called AT the
+    /// transition points: the ConnectResponse / ErrorResponse handlers (before
+    /// any resend or callback of that poll), before applying any hub command,
+    /// and once per duty cycle (step 3c).  Duty thread only; O(1) when unchanged.
+    void syncSeedSession_() noexcept;
     /// F8a: apply one hub command on the duty thread (ring drain, close drain,
     /// or directly when a handle is used on the duty thread).
     void applyHubCommand_(const detail::HubCommand& cmd);
