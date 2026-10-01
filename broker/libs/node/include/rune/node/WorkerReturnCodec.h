@@ -16,6 +16,8 @@
 
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/ReturnType.h>
+#include <rune_protocol_internal_sbe/TxnReturn.h>
+#include <rune_protocol_internal_sbe/TxnReturnKind.h>
 #include <rune_protocol_internal_sbe/WorkerReturn.h>
 
 #include <cstddef>
@@ -90,18 +92,59 @@ struct TxnReturn {
     std::int16_t errorCode   = 0;
 };
 
-/// Encode `r` into [buf, buf+cap).  Returns the bytes written, or 0 if `cap`
-/// is too small.
-[[nodiscard]] inline std::size_t encodeTxnReturn(char* /*buf*/, std::size_t /*cap*/,
-                                                 const TxnReturn& /*r*/) noexcept {
-    return 0;   // F15 S1 RED stub: TxnReturn not in the schema yet
+/// Bytes one TxnReturn occupies in a ring slot (header + fixed block).
+[[nodiscard]] constexpr std::size_t txnReturnEncodedLength() noexcept {
+    namespace sbe = rune::protocol::internal::sbe;
+    return sbe::MessageHeader::encodedLength() + sbe::TxnReturn::sbeBlockLength();
+}
+
+/// Encode `r` into [buf, buf+cap) (SBE wrap-in-place).  Returns the bytes
+/// written, or 0 if `cap` is too small.
+[[nodiscard]] inline std::size_t encodeTxnReturn(char* buf, std::size_t cap, const TxnReturn& r) noexcept {
+    namespace sbe = rune::protocol::internal::sbe;
+    const std::size_t n = txnReturnEncodedLength();
+    if (buf == nullptr || cap < n) return 0;
+    sbe::TxnReturn enc;
+    enc.wrapAndApplyHeader(buf, 0, cap);
+    enc.kind(static_cast<sbe::TxnReturnKind::Value>(static_cast<std::uint8_t>(r.kind)))
+       .topicId(r.topicId)
+       .partition(r.partition)
+       .incarnation(r.incarnation)
+       .leaderEpoch(r.leaderEpoch)
+       .token(r.token)
+       .errorCode(r.errorCode);
+    return n;
 }
 
 /// Decode a TxnReturn frame.  Returns false if the frame is not a TxnReturn
-/// (template id / schema id mismatch) or is truncated.
-[[nodiscard]] inline bool decodeTxnReturn(const char* /*buf*/, std::size_t /*len*/,
-                                          TxnReturn& /*out*/) noexcept {
-    return false;   // F15 S1 RED stub
+/// (template id / schema id mismatch), carries an unknown kind, or is
+/// truncated.  Never throws.
+[[nodiscard]] inline bool decodeTxnReturn(const char* buf, std::size_t len, TxnReturn& out) noexcept {
+    namespace sbe = rune::protocol::internal::sbe;
+    const std::size_t hdrLen = sbe::MessageHeader::encodedLength();
+    if (buf == nullptr || len < hdrLen) return false;
+    char* frame = const_cast<char*>(buf);   // SBE flyweights take char*; decode only reads
+    sbe::MessageHeader mh;
+    mh.wrap(frame, 0, sbe::TxnReturn::sbeSchemaVersion(), len);
+    if (mh.templateId() != sbe::TxnReturn::sbeTemplateId() ||
+        mh.schemaId() != sbe::TxnReturn::sbeSchemaId()) return false;
+    if (len < hdrLen + mh.blockLength() || mh.blockLength() < sbe::TxnReturn::sbeBlockLength()) return false;
+    sbe::TxnReturn dec;
+    dec.wrapForDecode(frame, hdrLen, mh.blockLength(), mh.version(), len);
+    const std::uint8_t kind = dec.kindRaw();
+    if (kind != static_cast<std::uint8_t>(TxnReturn::Kind::ControlRecordCommitted) &&
+        kind != static_cast<std::uint8_t>(TxnReturn::Kind::TxnHanging)) return false;
+    out.kind        = static_cast<TxnReturn::Kind>(kind);
+    out.topicId     = dec.topicId();
+    out.partition   = dec.partition();
+    out.incarnation = dec.incarnation();
+    out.leaderEpoch = dec.leaderEpoch();
+    out.token       = dec.token();
+    out.errorCode   = dec.errorCode();
+    return true;
 }
+
+static_assert(kTxnReturnTemplateId == rune::protocol::internal::sbe::TxnReturn::sbeTemplateId(),
+              "TxnReturn template id (design note §7)");
 
 } // namespace rune::node
