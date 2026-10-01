@@ -55,8 +55,14 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     }
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
+    // F3: eager read-map ONLY the LAST (highest-base) segment — it becomes the
+    // active segment.  Earlier (sealed) segments map their .log lazily on first
+    // readView(), so N retained segments no longer means N read mmaps + N fds
+    // kept alive for the whole process lifetime.
     for (int64_t b : bases)
-        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
+                                                     indexMaxBytes_, /*prefaultIndex*/false,
+                                                     /*eagerReadMap*/ b == bases.back());
     logEndOffset_ = activeSegment().nextOffset();
     // #5 non-blocking append: preallocate the active segment's blocks so hot-path
     // O_APPEND pwrite()s never stall on block allocation (append-p99 tail).
@@ -269,9 +275,11 @@ void Log::installNextSegment(int64_t base) {
         // No prepared segment yet (startup, or two rolls closer together than one
         // bg cycle).  Correctness fallback: synchronous create.  A build in
         // progress will publish a segment that the NEXT roll consumes; we do NOT
-        // touch preprovInFlight_ here.
+        // touch preprovInFlight_ here.  This IS a brand-new ACTIVE segment (F3):
+        // eagerReadMap=true, matching prepareStaging's own openReadMap() call.
         segments_[base] = std::make_unique<LogSegment>(
-            dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+            dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_,
+            /*prefaultIndex*/false, /*eagerReadMap*/true);
     }
 }
 
@@ -470,7 +478,7 @@ std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
     --it;
     return it->second->read(startOffset, maxBytes);
 }
-LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) {
+LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
@@ -570,9 +578,12 @@ void Log::truncateTo(int64_t truncateOffset) {
     }
 
     if (segments_.empty()) {
-        // Re-create a fresh segment at truncateOffset (or 0 if negative).
+        // Re-create a fresh segment at truncateOffset (or 0 if negative).  This
+        // is the ONLY (hence active) segment — F3: eagerReadMap=true.
         int64_t base = std::max<int64_t>(0, truncateOffset);
-        segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
+                                                        indexMaxBytes_, /*prefaultIndex*/false,
+                                                        /*eagerReadMap*/true);
         logEndOffset_ = base;
         return;
     }
@@ -644,10 +655,14 @@ void Log::truncateTo(int64_t truncateOffset) {
     std::string ipath = indexPathForLog(lpath);
     std::filesystem::remove(ipath);
 
-    // Rebuild the active segment from disk.
+    // Rebuild the active segment from disk.  It IS the active segment (the code
+    // above only reaches here when truncateOffset falls inside it) — F3:
+    // eagerReadMap=true.
     int64_t base = seg.baseOffset();
     segments_.erase(base);
-    segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+    segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
+                                                    indexMaxBytes_, /*prefaultIndex*/false,
+                                                    /*eagerReadMap*/true);
     // Re-run recover to rebuild the index and set nextOffset correctly.
     // Use the segment's actual nextOffset_ (derived from the physically truncated
     // file) rather than hard-coding truncateOffset, so that LEO and the segment's
@@ -666,8 +681,11 @@ void Log::reloadSegments() {
             bases.push_back(std::stoll(e.path().stem().string()));
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
+    // F3: same eager-only-for-the-active-segment rule as the constructor.
     for (int64_t b : bases)
-        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
+                                                     indexMaxBytes_, /*prefaultIndex*/false,
+                                                     /*eagerReadMap*/ b == bases.back());
     // Run recover() to rebuild indices and set nextOffset_ for each segment.
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();

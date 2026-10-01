@@ -28,6 +28,14 @@ MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, boo
             data_[off] = data_[off];
         }
     }
+    if (!writable_) {
+        // F3: a read-only mapping never needs its fd again — mmap(MAP_SHARED)
+        // keeps the page-cache binding alive via the mapping itself, and a
+        // read-only mapping is never ftruncate'd.  Close the fd right away so N
+        // retained (e.g. sealed) segments don't each hold an extra fd forever.
+        ::close(fd_);
+        fd_ = -1;
+    }
 }
 void MappedFile::mapNow() {
     int prot = writable_ ? (PROT_READ|PROT_WRITE) : PROT_READ;
@@ -37,10 +45,23 @@ void MappedFile::mapNow() {
 }
 void MappedFile::resize(size_t newBytes) {
     if (data_) ::munmap(data_, size_);
+    data_ = nullptr;   // exception-safety: never leave a dangling pointer around
+                        // if ftruncate/reopen/mmap below throws before remapping.
     size_ = newBytes;
-    if (writable_ && ::ftruncate(fd_, static_cast<off_t>(size_)) != 0)
-        throw std::runtime_error("ftruncate failed: " + path_);
-    mapNow();
+    if (writable_) {
+        if (::ftruncate(fd_, static_cast<off_t>(size_)) != 0)
+            throw std::runtime_error("ftruncate failed: " + path_);
+        mapNow();
+    } else {
+        // F3: the fd was closed right after the initial mmap (read-only mode
+        // holds no fd between calls).  Reopen briefly to remap at the new size,
+        // then close it again — a read-only mapping never needs it once mapped.
+        fd_ = ::open(path_.c_str(), O_RDONLY, 0644);
+        if (fd_ < 0) throw std::runtime_error("open failed: " + path_);
+        mapNow();
+        ::close(fd_);
+        fd_ = -1;
+    }
 }
 void MappedFile::sync() { if (data_) ::msync(data_, size_, MS_SYNC); }
 void MappedFile::sync(size_t bytes) {

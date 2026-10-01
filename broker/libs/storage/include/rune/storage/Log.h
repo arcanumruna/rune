@@ -87,7 +87,9 @@ public:
     /// span into its read-only mmap covering whole record batches (see
     /// LogSegment::readView / LogReadView).  No heap allocation, no copy.  Returns
     /// an empty view if startOffset is below logStartOffset() or at/after the LEO.
-    LogReadView readView(int64_t startOffset, int32_t maxBytes);
+    /// noexcept (F3): a failed lazy map on the target segment returns an empty
+    /// view rather than throwing — see LogSegment::readView.
+    LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
 
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     /// The lowest offset still readable from this log — the base offset of the
@@ -285,6 +287,15 @@ public:
     /// lastOffset <= flushBoundary after the completion is reaped.
     int64_t flushBoundary()    const noexcept { return logEndOffset_; }
 
+    /// TEST-ONLY: direct access to a segment by its base offset (e.g. to assert
+    /// on LogSegment::hasReadMapForTest() / readMapFailures() for a specific
+    /// sealed vs. active segment after recovery).  Returns nullptr if no segment
+    /// is registered at that exact base offset.
+    [[nodiscard]] LogSegment* segmentForTest(int64_t base) const noexcept {
+        auto it = segments_.find(base);
+        return it == segments_.end() ? nullptr : it->second.get();
+    }
+
 private:
     LogSegment& activeSegment() { return *segments_.rbegin()->second; }
     void maybeRoll();
@@ -423,4 +434,8 @@ private:
     alignas(64) std::atomic<std::size_t> renameDoneHead_{0}; // append (consumer)
     alignas(64) std::atomic<std::size_t> renameDoneTail_{0}; // bg (producer)
 };
+
+static_assert(noexcept(std::declval<Log&>().readView(int64_t{0}, int32_t{0})),
+              "Log::readView must be noexcept (F3)");
+
 } // namespace rune::storage

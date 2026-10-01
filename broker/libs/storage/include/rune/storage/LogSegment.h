@@ -8,6 +8,7 @@
 #include <memory>
 #include <fstream>
 #include <unistd.h>
+#include <utility>
 namespace rune::storage {
 
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.
@@ -37,8 +38,15 @@ public:
     /// @param prefaultIndex  touch every index page at construction so the cold
     ///   minor-page-faults are paid HERE.  Set true by the background segment
     ///   pre-provisioner so the append/roll hot path never faults index pages.
+    /// @param eagerReadMap  create the read-only .log mapping WITH the segment
+    ///   (off the hot path) instead of lazily on first readView().  F3: only the
+    ///   segment that IS or WILL BE active needs this — Log passes true when
+    ///   creating a brand-new active segment or recovering the last (active)
+    ///   segment.  Sealed segments recovered from disk default to false: N
+    ///   retained sealed segments no longer cost N read mmaps + N fds up front.
     LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096,
-               int32_t indexMaxBytes = 8 * 1024 * 1024, bool prefaultIndex = false);
+               int32_t indexMaxBytes = 8 * 1024 * 1024, bool prefaultIndex = false,
+               bool eagerReadMap = false);
     ~LogSegment();
     /// Raw-pointer overload — avoids heap allocation on the produce hot path.
     /// [data, data+len) must be a valid record batch.  Returns nextOffset.
@@ -88,7 +96,10 @@ public:
     /// guarantee).  No heap allocation, no pread copy.  Returns an empty view if
     /// startOffset is at/after the segment's next offset.  See LogReadView for
     /// lifetime rules.  Non-const: may lazily create / grow-remap the read mmap.
-    LogReadView readView(int64_t startOffset, int32_t maxBytes);
+    /// noexcept (F3): a failed lazy map (ENOMEM, missing file, max_map_count,
+    /// ...) returns an empty LogReadView instead of throwing — callers already
+    /// treat empty as "nothing now; retry next cycle".  See readMapFailures().
+    LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
 
     int64_t recover();
 
@@ -157,6 +168,15 @@ public:
     /// True if this segment is still in the staging (un-adopted) state.
     bool isStaging() const noexcept { return staging_; }
 
+    /// TEST-ONLY: whether the read-only .log mapping currently exists.  A
+    /// sealed segment recovered from disk starts false (F3: lazy mapping) and
+    /// flips true after its first successful readView().
+    [[nodiscard]] bool hasReadMapForTest() const noexcept { return static_cast<bool>(readMap_); }
+    /// Count of readView() calls that failed to (re)establish the read mapping
+    /// (ensureReadMap() returned false), e.g. because the backing file is gone
+    /// or the map/open syscall failed.  Monotonically increasing; never reset.
+    [[nodiscard]] uint64_t readMapFailures() const noexcept { return readMapFailures_; }
+
     /// Update the in-memory .log path after the background thread renamed the
     /// staging file to its final <base>.log on disk (append thread only).  The
     /// open fd_ / mmap are unaffected by the rename; this only keeps logPath_
@@ -177,7 +197,12 @@ private:
     /// headroom past EOF, so the active segment only remaps when it outgrows it.  No-op for logSize_==0
     /// (mmap of length 0 is EINVAL).  The read mmap shares the page cache with the
     /// writer's fd, so appendNoSync()/flushed append() bytes are visible at once.
-    void ensureReadMap();
+    /// noexcept (F3): catches everything internally.  Returns true if the map is
+    /// ready (including the logSize_==0 / already-sufficient no-op cases), false
+    /// on failure — readMap_/readMapSize_ are left null/0 (never a dangling or
+    /// stale mapping) and readMapFailures_ is bumped, with a rate-limited spdlog
+    /// warn (first failure, then every 1024th).
+    bool ensureReadMap() noexcept;
     /// Eagerly create the read mapping at segment construction (off the hot path).
     void openReadMap() noexcept;
     int64_t baseOffset_; int32_t indexIntervalBytes_;
@@ -196,5 +221,10 @@ private:
     std::unique_ptr<MappedFile> readMap_;
     std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_ (>= logSize_ headroom)
     static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
+    uint64_t readMapFailures_ = 0;  // count of failed ensureReadMap() calls — see readMapFailures()
 };
+
+static_assert(noexcept(std::declval<LogSegment&>().readView(int64_t{0}, int32_t{0})),
+              "LogSegment::readView must be noexcept (F3)");
+
 } // namespace rune::storage

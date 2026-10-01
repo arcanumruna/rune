@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <system_error>
 #include <cerrno>
+#include <spdlog/spdlog.h>
 namespace rune::storage {
 
 namespace {
@@ -83,7 +84,7 @@ void LogSegment::adoptAsActive(int64_t base) {
 void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; }
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
-                       int32_t indexMaxBytes, bool prefaultIndex)
+                       int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)
     : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
       indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
@@ -103,7 +104,12 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // append/roll hot path never faults them.
     index_ = std::make_unique<OffsetIndex>(fname(dir, baseOffset, ".index"), baseOffset,
                                            indexMaxBytes_, prefaultIndex);
-    openReadMap();
+    // F3: only the segment that IS or WILL BE active gets an eager read mapping
+    // (+ its own read-only fd, though that fd is now closed right after mmap —
+    // see MappedFile).  A sealed segment recovered from disk (eagerReadMap ==
+    // false, the default) maps lazily on its first readView(): N retained
+    // segments no longer means N eager read mmaps kept forever.
+    if (eagerReadMap) openReadMap();
 }
 
 void LogSegment::openReadMap() noexcept {
@@ -335,10 +341,10 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
     }
 }
 
-void LogSegment::ensureReadMap() {
-    if (logSize_ <= 0) return;                       // mmap(len=0) is EINVAL
+bool LogSegment::ensureReadMap() noexcept {
+    if (logSize_ <= 0) return true;                   // mmap(len=0) is EINVAL — nothing to map yet
     const std::size_t want = static_cast<std::size_t>(logSize_);
-    if (readMap_ && readMapSize_ >= want) return;    // steady state: no syscall
+    if (readMap_ && readMapSize_ >= want) return true; // steady state: no syscall
     // Map with GEOMETRIC HEADROOM past EOF (read-only, so the file is never
     // extended; the pages beyond EOF are never touched — readView reads only
     // [0, logSize_)).  The active segment then grows inside one mapping instead of
@@ -346,19 +352,35 @@ void LogSegment::ensureReadMap() {
     // costs no syscalls.  A remap happens only O(log(segment/kMin)) times.
     std::size_t cap = readMapSize_ > 0 ? readMapSize_ : kReadMapMinBytes;
     while (cap < want) cap *= 2;
-    if (!readMap_) {
-        // Read-only mapping (writable=false → no ftruncate; never mutates .log).
-        readMap_ = std::make_unique<MappedFile>(logPath_, cap, /*writable*/false);
-    } else {
-        // For a read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate.
-        readMap_->resize(cap);
+    try {
+        if (!readMap_) {
+            // Read-only mapping (writable=false → no ftruncate; never mutates .log).
+            readMap_ = std::make_unique<MappedFile>(logPath_, cap, /*writable*/false);
+        } else {
+            // For a read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate.
+            readMap_->resize(cap);
+        }
+        readMapSize_ = readMap_->size();
+        // readMapSize_ > logSize_ (headroom / post-truncate) is memory-safe: readView()
+        // only accesses bytes in [0, logSize_), which are backed by the file.
+        return true;
+    } catch (...) {
+        // F3: readView() must never throw.  A map failure (missing file, ENOMEM,
+        // max_map_count, ...) leaves readMap_/readMapSize_ null/0 — never a
+        // half-constructed or stale mapping — and readView() returns empty this
+        // cycle; callers already treat empty as "nothing now, retry next cycle".
+        readMap_.reset();
+        readMapSize_ = 0;
+        ++readMapFailures_;
+        if (readMapFailures_ == 1 || readMapFailures_ % 1024 == 0) {
+            spdlog::warn("LogSegment: read-map failed for {} (failures={})",
+                         logPath_, readMapFailures_);
+        }
+        return false;
     }
-    readMapSize_ = readMap_->size();
-    // readMapSize_ > logSize_ (headroom / post-truncate) is memory-safe: readView()
-    // only accesses bytes in [0, logSize_), which are backed by the file.
 }
 
-LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) {
+LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     if (logSize_ <= 0) return {};
     ensureReadMap();
     const uint8_t* base = readMap_ ? readMap_->data() : nullptr;

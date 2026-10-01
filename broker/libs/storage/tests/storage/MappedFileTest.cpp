@@ -144,6 +144,38 @@ TEST(MappedFile, BoundaryLastByteWriteRead) {
     std::filesystem::remove(p);
 }
 
+// F3.2: a read-only MappedFile must not retain a POSIX fd once mapped — the
+// mapping itself keeps the page-cache binding alive, so the fd is dead weight
+// (one fewer fd per retained segment).  A writable mapping still needs its fd
+// (ftruncate on resize()), so it must keep it.
+TEST(MappedFileRegression, ReadOnlyMappingRetainsNoFd) {
+    auto p = makeTempPath("rune_mf_nofd");
+    std::filesystem::remove(p);
+    {
+        MappedFile writer(p.string(), 4096, true);
+        writer.data()[0]    = 0xAA;
+        writer.data()[4095] = 0xBB;
+        writer.sync();
+    }
+
+    MappedFile ro(p.string(), 4096, false);
+    EXPECT_EQ(ro.fdForTest(), -1) << "read-only MappedFile must close its fd right after mmap";
+    EXPECT_EQ(ro.data()[0],    0xAA);
+    EXPECT_EQ(ro.data()[4095], 0xBB);
+
+    // A larger resize() must remap (via a brief reopen) but end up fd-less again.
+    ro.resize(8192);
+    EXPECT_EQ(ro.fdForTest(), -1) << "resize() must close the fd again after remapping";
+    EXPECT_EQ(ro.data()[0],    0xAA) << "data must survive the resize-remap";
+    EXPECT_EQ(ro.data()[4095], 0xBB);
+
+    // Writable mode is unchanged: it must still hold its fd (needed for ftruncate).
+    MappedFile writable(p.string(), 4096, true);
+    EXPECT_NE(writable.fdForTest(), -1) << "writable MappedFile must keep its fd open";
+
+    std::filesystem::remove(p);
+}
+
 // Edge: sync() actually persists (read-only reopen after sync sees correct data)
 TEST(MappedFile, SyncPersistsBeforeReopen) {
     auto p = makeTempPath("rune_mf_sync");

@@ -1380,3 +1380,116 @@ TEST(Log, ActiveSegmentFdIsFsyncable) {
     std::filesystem::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// F3: LogSegment read mapping — lazy for sealed segments, no retained fd,
+// noexcept readView.
+// ---------------------------------------------------------------------------
+
+// F3.1: a sealed segment recovered from disk must NOT get an eager read mmap;
+// only the last (active) recovered segment does.  The sealed segment's mapping
+// is created lazily, on its first readView() — and that readView() must still
+// return the correct data.
+TEST(LogSegmentRegression, SealedRecoveredSegmentMapsLazily) {
+    auto dir = makeTempDir("rune_f3_lazy");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    std::vector<int64_t> bases;
+    int64_t midOffset = -1;
+    {
+        // Small rollBytes forces >= 3 segments across ~30 tiny batches.
+        Log log(dir.string(), /*rollBytes=*/256);
+        int64_t off = 0;
+        for (int i = 0; i < 30; ++i) {
+            RecordBatchBuilder b(off, 6000 + i); b.append("k", "v" + std::to_string(i), 6000 + i);
+            off = log.append(b.build(), off);
+        }
+        bases = log.segmentBaseOffsets();
+        ASSERT_GE(bases.size(), 3u) << "test needs >= 3 segments to have real sealed segments";
+        midOffset = bases[1]; // base offset of a sealed (non-active, non-first) segment
+    }
+
+    // Reopen (recovery) — a brand-new Log over the same directory.
+    Log log2(dir.string(), /*rollBytes=*/256);
+    int64_t recovered = log2.recover();
+    ASSERT_GT(recovered, 0);
+
+    int64_t activeBase = bases.back();
+
+    // Every sealed segment must have NO read map yet; the active one must.
+    for (int64_t b : bases) {
+        LogSegment* seg = log2.segmentForTest(b);
+        ASSERT_NE(seg, nullptr) << "segment " << b << " missing after recovery";
+        if (b == activeBase) {
+            EXPECT_TRUE(seg->hasReadMapForTest())
+                << "active segment (base=" << b << ") must be eagerly mapped";
+        } else {
+            EXPECT_FALSE(seg->hasReadMapForTest())
+                << "sealed segment (base=" << b << ") must NOT be eagerly mapped (F3 lazy)";
+        }
+    }
+
+    // readView() into the sealed segment must still return correct data, and
+    // must lazily create the mapping as a side effect.
+    LogSegment* sealedSeg = log2.segmentForTest(midOffset);
+    ASSERT_NE(sealedSeg, nullptr);
+    ASSERT_FALSE(sealedSeg->hasReadMapForTest());
+
+    LogReadView view = log2.readView(midOffset, 1 << 20);
+    ASSERT_FALSE(view.empty()) << "readView() on the sealed segment must return data";
+    RecordBatchReader r(view.data, view.len);
+    EXPECT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), midOffset);
+
+    EXPECT_TRUE(sealedSeg->hasReadMapForTest())
+        << "the sealed segment must now have a read map after its first readView()";
+
+    std::filesystem::remove_all(dir);
+}
+
+// F3.3: readView() must never throw, even when the lazy map fails (backing
+// .log file gone).  It returns an empty view and increments readMapFailures().
+TEST(LogSegmentRegression, ReadViewNoexceptOnMapFailure) {
+    auto dir = makeTempDir("rune_f3_noexcept");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    std::vector<int64_t> bases;
+    int64_t sealedBase = -1;
+    {
+        Log log(dir.string(), /*rollBytes=*/256);
+        int64_t off = 0;
+        for (int i = 0; i < 30; ++i) {
+            RecordBatchBuilder b(off, 6500 + i); b.append("k", "v" + std::to_string(i), 6500 + i);
+            off = log.append(b.build(), off);
+        }
+        bases = log.segmentBaseOffsets();
+        ASSERT_GE(bases.size(), 3u);
+        sealedBase = bases[1];
+    }
+
+    Log log2(dir.string(), /*rollBytes=*/256);
+    log2.recover();
+
+    LogSegment* sealedSeg = log2.segmentForTest(sealedBase);
+    ASSERT_NE(sealedSeg, nullptr);
+    ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be unmapped (F3 lazy)";
+    EXPECT_EQ(sealedSeg->readMapFailures(), 0u);
+
+    // Delete the sealed segment's backing .log file out from under it — the
+    // (still-open) write fd_ keeps the inode alive, but a brand-new open() by
+    // pathname (what the lazy MappedFile ctor does) now fails with ENOENT.
+    ::unlink(sealedSeg->logPath().c_str());
+
+    LogReadView v1;
+    EXPECT_NO_THROW(v1 = log2.readView(sealedBase, 1 << 20));
+    EXPECT_TRUE(v1.empty()) << "readView() must return empty on a map failure, not stale/garbage data";
+    EXPECT_EQ(sealedSeg->readMapFailures(), 1u);
+
+    LogReadView v2;
+    EXPECT_NO_THROW(v2 = log2.readView(sealedBase, 1 << 20));
+    EXPECT_TRUE(v2.empty());
+    EXPECT_EQ(sealedSeg->readMapFailures(), 2u)
+        << "each failed readView() must bump readMapFailures(), no throw either time";
+
+    std::filesystem::remove_all(dir);
+}
+
