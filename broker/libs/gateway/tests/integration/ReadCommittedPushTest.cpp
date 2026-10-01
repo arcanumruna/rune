@@ -295,7 +295,6 @@ public:
     static constexpr int32_t kIngressStream = 7001;
     static constexpr int32_t kTopicId       = 0;   // "events" → vector index 0
     static constexpr int32_t kPartition     = 0;
-    static constexpr int     kPumpIter      = 50'000;
 
     // All captured egress frames: (sessionId, encoded bytes).
     // Single shared callback; tests filter by sessionId.
@@ -356,7 +355,7 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Pump doWork until condition is met or kPumpIter is exceeded.
+    // Pump doWork until a condition is met (see pump / pumpUntilQuiescent).
     // -----------------------------------------------------------------------
     // Progress-driven condition wait: run the gateway until done() holds, yielding
     // only on idle passes (the driver thread delivers asynchronously).  Bounded by

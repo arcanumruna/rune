@@ -27,25 +27,34 @@ ctest --test-dir "$B" -E "$HEAVY_RE" -j "$LIGHT_J" --timeout 300 "$@"; rc1=$?
 
 echo "== tier 2: heavy multi-node tests (-j2, waiting for /tmp/rune-heavy.lock)"
 LOCK=/tmp/rune-heavy.lock
-# Owned lock: our pid lives in $LOCK/pid.  A lock whose recorded owner is dead
-# (SIGKILL / OOM / crash) is stale and reclaimed; we only ever remove a lock
-# that records OUR pid.  (Legacy holders using plain mkdir/rmdir write no pid
-# file and are simply waited for.)
+# Owned lock = a SYMLINK whose target is the owner pid: `ln -s` creates it and
+# records the owner in one atomic step (no mkdir→write-pid gap).  Legacy holders
+# (plain mkdir/rmdir) still exclude us: ln -s fails on an existing dir, and their
+# rmdir cannot remove our symlink.  A lock whose owner process no longer exists
+# is reclaimed — under a separate reclaim mutex, re-reading the owner inside it,
+# so two waiters can never both reclaim (and then both hold) the lock.
+owner_alive() { ps -p "$1" >/dev/null 2>&1; }   # EPERM-safe (unlike kill -0)
 acquire_lock() {
+  local owner warned=0
   while :; do
-    if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid"; return 0; fi
-    owner=$(cat "$LOCK/pid" 2>/dev/null || true)
-    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-      echo "reclaiming stale $LOCK (owner pid $owner is gone)" >&2
-      rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true
+    if ln -s "$$" "$LOCK" 2>/dev/null; then return 0; fi
+    owner=$(readlink "$LOCK" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! owner_alive "$owner" && mkdir "$LOCK.reclaim" 2>/dev/null; then
+      if [ "$(readlink "$LOCK" 2>/dev/null)" = "$owner" ] && rm -f "$LOCK"; then
+        echo "reclaimed stale $LOCK (owner pid $owner is gone)" >&2
+      fi
+      rmdir "$LOCK.reclaim" 2>/dev/null || true
       continue
+    fi
+    if [ -z "$owner" ] && [ "$warned" = 0 ]; then
+      echo "waiting on $LOCK held by a legacy (pid-less) holder" >&2; warned=1
     fi
     sleep 5
   done
 }
 release_lock() {
-  [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
-  rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true
+  [ "$(readlink "$LOCK" 2>/dev/null)" = "$$" ] && rm -f "$LOCK"
+  return 0
 }
 acquire_lock
 trap 'release_lock' EXIT
