@@ -680,11 +680,19 @@ TEST(InvokerClient, RingSeamHeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDra
 
     std::atomic<bool> threw{false};
     std::atomic<bool> succeeded{false};
+    // C-F22: catch EVERYTHING and keep the message — an exception escaping this
+    // thread used to std::terminate the whole binary ("Subprocess aborted", no
+    // output) instead of failing this test with a diagnosis.
+    std::string what;   // written only by appThread, read after join()
     std::thread appThread([&] {
         try {
             p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
             succeeded.store(true, std::memory_order_release);
-        } catch (const std::runtime_error&) {
+        } catch (const std::exception& e) {
+            what = e.what();
+            threw.store(true, std::memory_order_release);
+        } catch (...) {
+            what = "non-std exception";
             threw.store(true, std::memory_order_release);
         }
     });
@@ -715,18 +723,27 @@ TEST(InvokerClient, RingSeamHeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDra
     // follows) is one step = 500 us < 1 ms — a real 2x margin. (A 1 ms step
     // made that worst-case gap EQUAL to the window, passing only because the
     // check is a strict `>`.)
-    for (int i = 0; i < 2000 &&
-                    !succeeded.load(std::memory_order_acquire) &&
-                    !threw.load(std::memory_order_acquire);
-         ++i) {
+    // C-F22: drain until the app thread finishes — bounded by progress, with a
+    // real-time hang guard only for a FAILING run (a fixed 2000-iteration cap
+    // could end before a starved app thread ran, leaving it blocked on a frozen
+    // clock).  On a hang, close() first so the blocked sender exits (Closed →
+    // logic_error, caught above) and join() can never wait forever.
+    const auto hangGuard = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!succeeded.load(std::memory_order_acquire) &&
+           !threw.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < hangGuard) {
         g_fakeNowMt.fetch_add(500'000, std::memory_order_relaxed); // +500us injected
         r.client.doWork();
         r.gw.pump();
     }
+    const bool hung = !succeeded.load(std::memory_order_acquire) &&
+                      !threw.load(std::memory_order_acquire);
+    if (hung) r.client.close();
     appThread.join();
 
-    EXPECT_TRUE(succeeded.load());
-    EXPECT_FALSE(threw.load()) << "spurious timeout: the heartbeat writer/reader clocks disagreed";
+    EXPECT_FALSE(hung) << "app thread never completed while the duty cycle drained (hang guard)";
+    EXPECT_TRUE(succeeded.load()) << "send failed: " << what;
+    EXPECT_FALSE(threw.load()) << "spurious failure in send(): " << what;
 }
 
 // fix3 I2: a deliberately large (60 s) liveness window that the injected
