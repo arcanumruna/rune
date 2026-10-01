@@ -29,7 +29,8 @@ if(BUILD_TESTING)
         tests/consensus/ConsensusAgentTest.cpp
         tests/consensus/IdleStrategyTest.cpp
         tests/consensus/AgentRunnerIngressRingTest.cpp
-        tests/consensus/SlowTickTest.cpp)
+        tests/consensus/SlowTickTest.cpp
+        tests/consensus/IngressRingDrainTest.cpp)
     target_link_libraries(rune_consensus_tests PRIVATE rune_consensus GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests)
