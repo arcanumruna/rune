@@ -50,8 +50,21 @@ struct ShardPorts {
     static ShardPorts discover(int nodes, int workers) {
         ShardPorts p;
         auto blocks = freeUdpPortBlocks(3 * nodes, workers);
+        // Singles must avoid every block AND each other (freeUdpPort releases
+        // the port, so the kernel may hand back one inside a block or a repeat).
+        std::vector<uint16_t> singles;
+        auto single = [&]() -> uint16_t {
+            for (int attempt = 0; attempt < 2000; ++attempt) {
+                const uint16_t q = freeUdpPort();
+                bool ok = q != 0;
+                for (uint16_t b : blocks) if (q >= b && q < b + workers) ok = false;
+                for (uint16_t t : singles) if (q == t) ok = false;
+                if (ok) { singles.push_back(q); return q; }
+            }
+            return 0;
+        };
         for (int i = 0; i < nodes; ++i) {
-            p.cons.push_back(freeUdpPort()); p.client.push_back(freeUdpPort()); p.repl.push_back(freeUdpPort());
+            p.cons.push_back(single()); p.client.push_back(single()); p.repl.push_back(single());
             p.ib.push_back(blocks[3 * i]); p.rb.push_back(blocks[3 * i + 1]); p.eg.push_back(blocks[3 * i + 2]);
         }
         return p;
