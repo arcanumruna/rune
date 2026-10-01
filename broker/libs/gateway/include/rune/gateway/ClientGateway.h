@@ -69,6 +69,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/node/RecordsPush.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
 
@@ -868,6 +869,13 @@ private:
         // correct isolation is applied on the next duty cycle — no data loss, no
         // premature skip under a wrong isolation assumption.
         bool    groupCarrierReceived = false;
+        // F19 (same shape as F15 S3 I-4): the next stored batch cannot be
+        // delivered on this session's egress (its Records frame exceeds the
+        // publication's maxMessageLength).  The client got one non-retriable
+        // ErrorResponse{MessageTooLarge, correlationId = subscriptionId}; the
+        // subscription is parked AT that batch (nextOffset not advanced, no
+        // further reads/pushes: no spin) until the client unsubscribes.
+        bool    failed = false;
     };
 
     // -----------------------------------------------------------------------
@@ -1003,6 +1011,19 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+
+    // F19: fail push subscription `sub` once — its next batch (at `atOffset`,
+    // Records frame `frameLen` bytes) exceeds the session egress
+    // maxMessageLength.  Sets sub.failed, logs, and sends one reliable
+    // ErrorResponse{MessageTooLarge, correlationId = subscriptionId}.  The cursor
+    // is NOT advanced.  Cold path.  Single-writer: duty-cycle thread only.
+    void failPushSubscriptionTooLarge_(Subscription& sub, Session& session,
+                                       int64_t atOffset, std::size_t frameLen);
+
+    // F19: send one Records frame for `rec` on `session` (tryClaim fast path /
+    // vectored offer / null-egress test hook).  Returns the RecordsSendResult.
+    rune::node::RecordsSendResult pushRecords_(Session& session,
+                                               const rune::protocol::client::Records& rec);
 
     // -----------------------------------------------------------------------
     // G0.1: sendRespReliable_ — private production implementation.
@@ -1380,13 +1401,14 @@ private:
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.
     // Bounded to avoid reading unbounded data from a fast-filling log.
-    // Each batch is at most 65535 bytes (u16 var field cap) + overhead ≈ 64 KiB.
+    // The first whole batch is always returned even if larger (F19: batches are
+    // not size-capped by the Records frame — its length prefix is u32).
     static constexpr int32_t kMaxChunkBytes = static_cast<int32_t>(512 * 1024); // 512 KiB
 
-    // GB-3: Reusable push scratch — sized to hold one encoded Records frame.
-    // Records header = 50 bytes fixed + up to 65535 bytes of recordBatch.
-    // 68 KiB covers that; share kScratchSize constant.
-    // NOTE: scratch_ is already kScratchSize = 68 KiB and is reused here.
+    // GB-3: push encode scratch — scratch_ (kScratchSize) holds one encoded
+    // single-fragment Records frame (tryClaim fast path), or only the 52-byte
+    // fixed part of a larger frame sent as a vectored [fixed | batch] offer
+    // (F19: the scratch size does not bound the deliverable batch size).
     // We encode into scratch_ during push; this is safe because push happens
     // AFTER the ingress poll (handlers that use scratch_ are done for this cycle).
 
