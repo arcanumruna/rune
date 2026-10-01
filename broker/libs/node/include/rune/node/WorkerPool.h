@@ -177,6 +177,18 @@ public:
         }
 
         const std::uint64_t gen = registry.generation();
+        // Bound the invariant map: an incarnation no longer registered is
+        // erased once every worker acked an ownership gen >= this one (the same
+        // ack that frees the retired replica).
+        for (const auto& [inc, w] : ownerOfIncarnation_) {
+            (void)w;
+            bool live = false;
+            for (auto* r : registry.allReplicas()) live = live || (r && r->incarnation() == inc);
+            if (live) continue;
+            bool queued = false;
+            for (const auto& pe : pendingOwnerErase_) queued = queued || pe.second == inc;
+            if (!queued) pendingOwnerErase_.emplace_back(gen, inc);
+        }
         bool allDelivered = true;
         ownershipDelivered_.resize(n, true);
         ackedGen_.resize(n, 0);
@@ -196,6 +208,21 @@ public:
         }
 
         lastGeneration_ = allDelivered ? gen : static_cast<std::uint64_t>(-1);
+        pruneOwnerMap_();
+    }
+
+    void pruneOwnerMap_() {
+        if (pendingOwnerErase_.empty()) return;
+        const std::uint64_t safe = minAckedOwnershipGen();
+        for (std::size_t i = 0; i < pendingOwnerErase_.size(); ) {
+            if (pendingOwnerErase_[i].first <= safe) {
+                ownerOfIncarnation_.erase(pendingOwnerErase_[i].second);
+                pendingOwnerErase_[i] = pendingOwnerErase_.back();
+                pendingOwnerErase_.pop_back();
+            } else {
+                ++i;
+            }
+        }
     }
 
     /// Runtime (control thread) — a worker applied SetOwnership(gen).
@@ -203,6 +230,7 @@ public:
         if (workerId < 0 || static_cast<std::size_t>(workerId) >= ackedGen_.size()) return;
         if (gen > ackedGen_[static_cast<std::size_t>(workerId)])
             ackedGen_[static_cast<std::size_t>(workerId)] = gen;
+        pruneOwnerMap_();
     }
     /// Removed replicas at or below this generation are unreachable by any worker.
     [[nodiscard]] std::uint64_t minAckedOwnershipGen() const noexcept {
@@ -220,6 +248,7 @@ public:
     /// Test-only: record that `incarnation` was owned by `workerId` (to exercise
     /// the F7 runtime-move refusal, which no production router can trigger).
     void seedOwnerForTest(uint32_t incarnation, int32_t workerId) { ownerOfIncarnation_[incarnation] = workerId; }
+    [[nodiscard]] std::size_t ownerMapSizeForTest() const noexcept { return ownerOfIncarnation_.size(); }
 
     // ---- Test-only two-phase migration (the ONLY sanctioned move) -----------
     // Release: the losing worker demotes the replica and drops it from its owned
@@ -407,7 +436,8 @@ private:
     const ReplicaRegistry*               registry_ = nullptr;
     std::vector<bool>                    ownershipDelivered_;   // per worker: latest SetOwnership enqueued
     std::vector<std::uint64_t>           ackedGen_;             // per worker: latest OwnershipAck
-    std::unordered_map<uint32_t, int32_t> ownerOfIncarnation_;  // F7 invariant (cold)
+    std::unordered_map<uint32_t, int32_t> ownerOfIncarnation_;  // F7 invariant (cold, bounded: live replicas)
+    std::vector<std::pair<std::uint64_t, uint32_t>> pendingOwnerErase_;   // (removal gen, incarnation)
 
     // Shared-nothing: true once per-worker AgentRunners are started. Before this,
     // ownership is set directly (single-threaded); after, via SetOwnership ring ops.

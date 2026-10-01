@@ -63,6 +63,7 @@
 #include <rune/metadata/MetadataStateMachine.h>
 
 #include <atomic>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -167,7 +168,10 @@ public:
             currentEpoch = lastObservedEpoch_;
         }
 
-        int work = 0;
+        // Task 10 round-3 addendum: role ops the worker ring could not take
+        // (back-pressure / full ring) are retried every cycle, in order, until
+        // delivered — never silently dropped.  Time-independent (no timers).
+        int work = flushPendingRoleOps_();
 
         // ── Step A: INTERNAL partitions ──────────────────────────────────────
         // Drive internal partitions (topicId < 0) from cluster-consensus
@@ -333,6 +337,33 @@ private:
         rune::replication::PartitionReplica*          replica,
         rune::replication::Epoch                      epoch,
         std::vector<rune::replication::NodeId>        isr) noexcept;
+
+    // Role ops not yet accepted by the owning worker's ring.  FIFO (order is
+    // preserved per replica: nothing is attempted directly while older ops
+    // wait).  Each entry remembers its replica's (topic, partition,
+    // incarnation): an op whose replica was removed / re-registered meanwhile
+    // is dropped without dereferencing the stale pointer.
+    struct PendingRoleOp {
+        WorkerOp op;
+        uint32_t incarnation = 0;
+    };
+    std::deque<PendingRoleOp> pendingRoleOps_;
+    void enqueueRoleOp_(WorkerOp op) noexcept;
+    int  flushPendingRoleOps_() noexcept;
+
+public:
+    /// Test-only.
+    void routeBecomeLeaderForTest(rune::replication::PartitionReplica* r, rune::replication::Epoch e,
+                                  std::vector<rune::replication::NodeId> isr) noexcept {
+        routeBecomeLeader_(r, e, std::move(isr));
+    }
+    void routeBecomeFollowerForTest(rune::replication::PartitionReplica* r, rune::replication::Epoch e,
+                                    rune::replication::NodeId leader) noexcept {
+        routeBecomeFollower_(r, e, leader);
+    }
+    [[nodiscard]] std::size_t pendingRoleOpsForTest() const noexcept { return pendingRoleOps_.size(); }
+    int flushPendingRoleOpsForTest() noexcept { return flushPendingRoleOps_(); }
+private:
 
     void routeBecomeFollower_(
         rune::replication::PartitionReplica*  replica,

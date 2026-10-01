@@ -2875,11 +2875,17 @@ void ClientGateway::onControlRecordRefused_(int32_t topicId, int32_t partition,
                                             const std::vector<uint8_t>& marker, int16_t err)
 {
     ++controlRecordsRefused_;
-    if (replicaRegistry_ && replicaRegistry_->lookup(topicId, partition) && !marker.empty() &&
-        appendControlRecord(topicId, partition,
-                            std::span<const uint8_t>(marker.data(), marker.size())) >= 0) {
-        spdlog::warn("ClientGateway: control marker for topic={} partition={} refused by a stale "
-                     "owner — re-routed to the current owner", topicId, partition);
+    if (replicaRegistry_ && replicaRegistry_->lookup(topicId, partition)) [[unlikely]] {
+        // INVARIANT: with ownership fanned out before routing and the
+        // (id, incarnation) guard, a marker can only be refused for a partition
+        // no longer on this node.  The coordinator was already told the marker's
+        // pre-computed offset — re-routing would land it at a DIFFERENT offset
+        // (a silent LSO / abort-index corruption).  Never do that: halt.
+        const std::string what = "control marker refused while topic=" + std::to_string(topicId) +
+                                 " partition=" + std::to_string(partition) +
+                                 " is still registered on this node (would re-land at a new offset)";
+        spdlog::critical("ClientGateway: INVARIANT VIOLATION — {}", what);
+        if (invariantViolationHandler_) invariantViolationHandler_(what);
         return;
     }
     int64_t pid = -1;

@@ -1296,6 +1296,9 @@ void BrokerNode::buildGateway() {
         gateway_->setStorageFailureHandler([this](const std::string& dir, int err) {
             onStorageFailure_(dir, err);
         });
+        gateway_->setInvariantViolationHandler([this](const std::string& what) {
+            onInvariantViolation_(what);
+        });
 
         // Wire in the ReplicaRegistry (GR-4). Non-owning pointer; replicaRegistry_
         // outlives the gateway (gateway_ is destroyed before replicaRegistry_ in stop()).

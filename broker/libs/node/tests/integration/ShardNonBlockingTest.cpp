@@ -13,6 +13,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/gateway/ClientGateway.h>
@@ -1242,4 +1243,112 @@ TEST(StorageFailStopRegression, RecoverIndexRenameFailureFailStopsWithoutThrowin
     fs::create_directories(idx / "blocker");               // rename(.tmp → .index) now fails
     EXPECT_NO_THROW(log.recover());
     EXPECT_TRUE(log.storageFailed()) << "recover rename failure = fail-stop (halt), not an uncaught throw";
+}
+
+// ============================================================================
+// Fix round 3 addendum.
+// ============================================================================
+
+TEST(OwnershipGuardRegression, BackPressuredRoleOpIsDeliveredOnALaterCycle) {
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), /*ingress*/ 1 << 12, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    auto* r = R.add(5, 0);
+    pool.reconcile(R.reg);
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (pool.worker(0).tryEnqueueOp(filler)) {}          // ring full: the role op is back-pressured
+    ReplicationMetadataBridge bridge(1, {1, 2}, R.reg);
+    bridge.setWorkerPool(&pool);
+    bridge.routeBecomeFollowerForTest(r, 2, 2);
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 1u) << "not dropped: queued for retry";
+    for (int i = 0; i < 16 && bridge.pendingRoleOpsForTest() > 0; ++i) {   // later cycles
+        pool.worker(0).doWork(1 + i);
+        pool.worker(0).drainReturn([](WorkerReturn) {});
+        bridge.flushPendingRoleOpsForTest();
+    }
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 0u);
+    for (int i = 0; i < 16 && r->role() != Role::Follower; ++i) pool.worker(0).doWork(100 + i);
+    EXPECT_EQ(r->role(), Role::Follower) << "the role change was delivered and applied";
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u);
+}
+
+TEST(OwnershipGuardRegression, PendingRoleOpsKeepPerReplicaOrderAndDropRemovedReplicas) {
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 12, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    auto* r = R.add(5, 0);
+    auto* gone = R.add(6, 0);
+    pool.reconcile(R.reg);
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (pool.worker(0).tryEnqueueOp(filler)) {}
+    ReplicationMetadataBridge bridge(1, {1, 2}, R.reg);
+    bridge.setWorkerPool(&pool);
+    bridge.routeBecomeFollowerForTest(r, 2, 2);
+    bridge.routeBecomeLeaderForTest(r, 3, {1});              // must apply AFTER the follower op
+    bridge.routeBecomeFollowerForTest(gone, 2, 2);
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 3u);
+    R.reg.remove(6, 0);                                      // removed before delivery: moot
+    for (int i = 0; i < 32 && bridge.pendingRoleOpsForTest() > 0; ++i) {
+        pool.worker(0).doWork(1 + i);
+        pool.worker(0).drainReturn([](WorkerReturn) {});
+        bridge.flushPendingRoleOpsForTest();
+    }
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 0u);
+    for (int i = 0; i < 16; ++i) pool.worker(0).doWork(100 + i);
+    EXPECT_EQ(r->role(), Role::Leader) << "FIFO: follower then leader";
+}
+
+TEST(OwnershipGuardRegression, RefusedMarkerForRegisteredPartitionHaltsInsteadOfReRouting) {
+    Reg R;
+    R.add(5, 0);
+    auto gw = rune::gateway::ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; });
+    gw.setReplicaRegistry(&R.reg);
+    CapturingTxn txn;
+    gw.setTxnService(&txn);
+    std::string what;
+    gw.setInvariantViolationHandler([&](const std::string& w) { what = w; });
+    WorkerReturn ret;                                        // forced: refused while still on the node
+    ret.type = WorkerReturn::Type::ControlRecordRefused;
+    ret.topicId = 5; ret.partition = 0;
+    ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    const auto m = batchAt(0);
+    ret.chunk.assign(m.begin(), m.end());
+    const int64_t leoBefore = R.reg.lookup(5, 0)->log()->logEndOffset();
+    gw.handleWorkerReturnForTest(ret);
+    EXPECT_NE(what.find("still registered"), std::string::npos) << "halt (exit 70), never a re-land";
+    EXPECT_EQ(R.reg.lookup(5, 0)->log()->logEndOffset(), leoBefore) << "the marker is NOT re-appended";
+    EXPECT_EQ(txn.refused, 0);
+}
+
+TEST(OwnershipGuardRegression, InvariantMapStaysBoundedUnderChurn) {
+    Reg R;
+    WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+    R.add(1, 0);                                             // two long-lived replicas
+    R.add(1, 1);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    auto ackAll = [&] {
+        for (int w = 0; w < 2; ++w) {
+            pool.worker(w).doWork(1);
+            pool.worker(w).drainReturn([&](WorkerReturn ret) {
+                if (ret.type == WorkerReturn::Type::OwnershipAck)
+                    pool.onOwnershipAck(ret.partition, static_cast<std::uint64_t>(ret.lastOffset));
+            });
+        }
+        R.reg.collectRetired(pool.minAckedOwnershipGen());
+    };
+    for (int i = 0; i < 200; ++i) {
+        R.add(100 + i, 0);
+        pool.reconcile(R.reg); ackAll();
+        R.reg.remove(100 + i, 0);
+        pool.reconcile(R.reg); ackAll();
+        pool.reconcile(R.reg); ackAll();
+    }
+    EXPECT_EQ(pool.ownerMapSizeForTest(), R.reg.replicaCount()) << "bounded by the live replicas";
+    EXPECT_EQ(R.reg.retiredCountForTest(), 0u);
 }

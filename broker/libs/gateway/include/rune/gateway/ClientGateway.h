@@ -605,6 +605,9 @@ public:
     // -----------------------------------------------------------------------
     using StorageFailureHandler = std::function<void(const std::string& logDir, int err)>;
     void setStorageFailureHandler(StorageFailureHandler h) { storageFailureHandler_ = std::move(h); }
+    /// Invariant violations detected on the duty-cycle thread (halt, exit 70).
+    using InvariantViolationHandler = std::function<void(const std::string& what)>;
+    void setInvariantViolationHandler(InvariantViolationHandler h) { invariantViolationHandler_ = std::move(h); }
 
     // -----------------------------------------------------------------------
     // CG-4 test / introspection hooks — not used in production code paths.
@@ -1231,6 +1234,7 @@ private:
     static constexpr int64_t kGroupCommitIntervalNs = 10LL * 1'000'000LL; // 10 ms
     std::unordered_set<rune::storage::Log*> dirtyLogs_;
     StorageFailureHandler storageFailureHandler_;
+    InvariantViolationHandler invariantViolationHandler_;
     bool                  storageFailureRaised_ = false;
     void raiseStorageFailure_(const std::string& logDir, int err);
     void handleWorkerReturn_(rune::node::WorkerReturn ret);   // by value: WorkerReturn complete in the .cpp

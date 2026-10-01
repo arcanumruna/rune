@@ -39,9 +39,8 @@ void ReplicationMetadataBridge::routeBecomeLeader_(
         op.replica   = replica;
         op.roleEpoch = epoch;
         op.isr       = std::move(isr);
-        // tryEnqueueOp is lock-free SPSC; back-pressure is acceptable on
-        // role-change (rare event, retried next cycle if ring is full).
-        (void)workerPool_->tryEnqueueOp(op.topicId, op.partition, std::move(op));
+        // Never dropped: retried every cycle until the owning ring accepts it.
+        enqueueRoleOp_(std::move(op));
     } else {
         // Internal partition (topicId < 0) or no worker pool: direct call.
         // Both the internal replica's doWork AND MetadataService/GCS/TCS run
@@ -69,11 +68,42 @@ void ReplicationMetadataBridge::routeBecomeFollower_(
         op.replica      = replica;
         op.roleEpoch    = epoch;
         op.roleLeaderId = leaderId;
-        (void)workerPool_->tryEnqueueOp(op.topicId, op.partition, std::move(op));
+        enqueueRoleOp_(std::move(op));
     } else {
         // Internal partition (topicId < 0) or no worker pool: direct call.
         replica->becomeFollower(epoch, leaderId);
     }
+}
+
+void ReplicationMetadataBridge::enqueueRoleOp_(WorkerOp op) noexcept
+{
+    const uint32_t inc = op.replica ? op.replica->incarnation() : 0;
+    if (pendingRoleOps_.empty()) {
+        WorkerOp attempt = op;   // copy: tryEnqueueOp consumes it
+        if (workerPool_->tryEnqueueOp(attempt.topicId, attempt.partition, std::move(attempt))) return;
+    }
+    pendingRoleOps_.push_back(PendingRoleOp{std::move(op), inc});
+}
+
+int ReplicationMetadataBridge::flushPendingRoleOps_() noexcept
+{
+    if (pendingRoleOps_.empty() || !workerPool_) return 0;
+    int delivered = 0;
+    while (!pendingRoleOps_.empty()) {
+        PendingRoleOp& p = pendingRoleOps_.front();
+        // Still the same registered replica?  (lookup returns only live ones;
+        // the stale pointer itself is never dereferenced.)
+        auto* live = registry_.lookup(p.op.topicId, p.op.partition);
+        if (live != p.op.replica || live->incarnation() != p.incarnation) {
+            pendingRoleOps_.pop_front();   // replica removed / replaced: the op is moot
+            continue;
+        }
+        WorkerOp attempt = p.op;
+        if (!workerPool_->tryEnqueueOp(attempt.topicId, attempt.partition, std::move(attempt))) break;
+        pendingRoleOps_.pop_front();
+        ++delivered;
+    }
+    return delivered;
 }
 
 } // namespace rune::node
