@@ -680,7 +680,9 @@ TEST(CompletionsClient, StateIsPublishedToTheOwnerThroughARingRegression) {
     EXPECT_EQ(r.client.state(), rcs::SessionState::Disconnected);
     ASSERT_TRUE(r.pump([&] { return r.gw.ready(); }));
     auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
-    ASSERT_TRUE(r.pump([&] { return f.ready(); }));
+    // Read state() WHILE the runner drives the transition (TSan: a direct read
+    // of the duty-owned session machine here is a data race).
+    ASSERT_TRUE(r.pump([&] { return r.client.state() == rcs::SessionState::Connected && f.ready(); }));
     ASSERT_TRUE(f.ok()) << f.describe();
     EXPECT_EQ(r.client.state(), rcs::SessionState::Connected)
         << "the status must be published before the connect completion";
@@ -710,8 +712,23 @@ TEST(CompletionsClient, CallbackSetterIsARingCommandRegression) {
     ASSERT_TRUE(f.ok()) << f.describe();
 
     std::atomic<int> errors{0};
-    r.client.onError([&](const std::string&) { errors.fetch_add(1); });  // after connect
-    r.gw.pingErrorCode = 99;  // a non-fatal ErrorResponse for the next ping
+    r.gw.pingErrorCode = 99;  // a non-fatal ErrorResponse for every ping
+    // Replace onError (after connect) while the runner is invoking it for
+    // earlier errors: every replacement is a ring command, applied between
+    // invocations (TSan: a direct write here races the runner's call).
+    std::vector<PendingOp> earlier;
+    for (int i = 0; i < 20; ++i) {
+        earlier.push_back(cq.issue([&](rc::Completions& q, rc::Token t) {
+            return r.client.ping(std::vector<uint8_t>{1}, q, t);
+        }));
+        r.client.onError([&](const std::string&) { errors.fetch_add(1); });
+        r.gw.pump();
+    }
+    ASSERT_TRUE(r.pump([&] {
+        for (const auto& e : earlier) if (!e.ready()) return false;
+        return true;
+    }));
+    r.client.onError([&](const std::string&) { errors.fetch_add(1000); });
     auto p = cq.issue([&](rc::Completions& q, rc::Token t) {
         return r.client.ping(std::vector<uint8_t>{1}, q, t);
     });
@@ -721,7 +738,8 @@ TEST(CompletionsClient, CallbackSetterIsARingCommandRegression) {
     const std::vector<uint8_t> text = p.bytes();
     EXPECT_EQ(std::string(text.begin(), text.end()), "ping refused");
     r.client.close();  // joins the runner: every onError call happened before
-    EXPECT_EQ(errors.load(), 1) << "the callback set after connect() was not installed";
+    EXPECT_GE(errors.load(), 1000) << "the callback set after connect() was not installed";
+    EXPECT_LT(errors.load(), 2000) << "the last callback ran once";
 }
 
 // Correlation ids come from the duty-owned counter (nextCorrId_, an atomic, is
