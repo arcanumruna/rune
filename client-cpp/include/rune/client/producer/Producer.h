@@ -255,7 +255,9 @@ public:
     /// thread hands it over on the command ring, FIFO behind its own ops; if
     /// the ring is full the release is ORPHANED instead — no wait, no time
     /// bound: the duty side discovers it and applies it in the same FIFO
-    /// order (or Client close frees the impl).
+    /// order (or Client close frees the impl).  Like every handle, it must not
+    /// run concurrently with its Client's destruction (the release touches
+    /// the Client's command ring); after the Client is gone it never does.
     ~Producer();
 
     /// The handle owns no producer (moved-from).

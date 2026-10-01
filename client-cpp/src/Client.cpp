@@ -2524,34 +2524,46 @@ void Client::orphanRelease_(const detail::HubCommand& cmd) noexcept {
     const std::int64_t fence = agent_.commandRingTail();
     // The fence (a plain field) first, then ONE RMW that orphans the release
     // and detaches the handle's share (release-ordered: it publishes the
-    // fence).  If the duty side already let go, this side frees the impl.
+    // fence).  If the duty side already let go, this side frees the impl —
+    // and raises no hint (review N3: nothing is left to scan for, and this
+    // thread then never touches the Client after the free).
+    bool freed = false;
     switch (static_cast<K>(cmd.a)) {
     case K::Producer: {
         auto* p = static_cast<producer::ProducerImpl*>(impl);
         p->setOrphanFence(fence);
-        if (p->detachHandleOrphaned()) delete p;
+        freed = p->detachHandleOrphaned();
+        if (freed) delete p;
         break;
     }
     case K::TxnProducer: {
         auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
         t->orphanFence = fence;
-        if (t->status.detachConsumerOrphaned()) delete t;
+        freed = t->status.detachConsumerOrphaned();
+        if (freed) delete t;
         break;
     }
     case K::Subscription: {
         auto* sub = static_cast<SubscriptionImpl*>(impl);
         sub->orphanFence = fence;
-        if (sub->status.detachConsumerOrphaned()) delete sub;
+        freed = sub->status.detachConsumerOrphaned();
+        if (freed) delete sub;
         break;
     }
     case K::GroupConsumer: {
         auto* gc = static_cast<GroupConsumerImpl*>(impl);
         gc->orphanFence = fence;
-        if (gc->status.detachConsumerOrphaned()) delete gc;
+        freed = gc->status.detachConsumerOrphaned();
+        if (freed) delete gc;
         break;
     }
     }
-    agent_.raiseOrphanHint();  // after the RMW: a scan that takes it sees the mark
+    // After the RMW (never before: that would reopen the lost wakeup) — a scan
+    // that takes the hint sees the mark.  This store is the handle thread's
+    // last touch of the Client: a handle destructor must not race the
+    // Client's destruction (the documented handle contract — the submit above
+    // touches the Client too).
+    if (!freed) agent_.raiseOrphanHint();
 }
 
 void Client::noteOrphan_(detail::HandleKind kind, void* impl, std::int64_t fence) {
