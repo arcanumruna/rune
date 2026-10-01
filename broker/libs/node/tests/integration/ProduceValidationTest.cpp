@@ -46,6 +46,10 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/Worker.h>
+#include <rune/node/BrokerNode.h>      // AdminWorkerAgent (admin->control ring)
+#include <rune/node/SchemaFanout.h>
+#include <rune/node/SchemaRegistry.h>
+#include <thread>
 #include <rune/node/WorkerOp.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -397,4 +401,186 @@ TEST(ProduceValidation, SchemaUpdate_Regression_NoValidator_FallsThrough) {
 }
 
 } // namespace
+// ===========================================================================
+// F3 round 6, item 3: CONFIRMED data race fix.  The AdminWorker (ADMIN thread)
+// used to call worker.tryEnqueueOp() directly from deps.pushValidators — a
+// SECOND producer on each worker's SPSC ingress ring (the control thread is
+// the first): ring corruption + a race on the worker's producer-side state.
+// Now the admin thread only posts on its admin->control ring (T10's ring,
+// extended with a SchemaUpdate message) and the CONTROL thread fans out to
+// the workers (the single producer is preserved).  Deterministic proof via a
+// thread-id test hook: every worker-ring enqueue happens on the control
+// thread, never the admin thread — while the control thread is concurrently
+// producing ordinary ops to the same worker ring.  (The TSan proof is
+// deferred to the Task-16 TSan run: build-fast is not TSan-instrumented.)
+// ===========================================================================
+TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegression) {
+    const Descriptor desc = makeCharactersDescriptor();
+    const std::vector<uint8_t> blob = rune::codec::serialize(desc);
+
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    rune::metadata::ShardRouter router(2);
+    rune::node::WorkerPool pool(2, router, /*ingressRingBytes=*/1 << 20);
+    rune::node::SchemaFanout fanout;
+    // Test-only thread-identity capture (null in production — item 5 of round 7).
+    struct EnqueueThreads {
+        std::thread::id first{};
+        bool            foreign = false;
+        static void hook(void* ctx) noexcept {
+            auto* t = static_cast<EnqueueThreads*>(ctx);
+            const auto id = std::this_thread::get_id();
+            if (t->first == std::thread::id{}) t->first = id;
+            else if (t->first != id) t->foreign = true;
+        }
+    } threads;
+    fanout.setEnqueueHookForTest(&EnqueueThreads::hook, &threads);
+
+    // No std::atomic / mutex (Rune rule): completion is the message count the
+    // control thread drains off the ring (ring-only synchronisation).
+    constexpr int kTopics = 50;
+    std::thread::id adminId, controlId;
+    std::thread admin([&] {
+        adminId = std::this_thread::get_id();
+        for (int t = 0; t < kTopics; ++t) agent.postSchemaUpdate(100 + t, blob);
+        while (agent.schemaBacklogForTest() != 0) agent.flushSchemaBacklogForTest();
+    });
+    std::thread control([&] {
+        controlId = std::this_thread::get_id();
+        int produced = 0;
+        int received = 0;
+        for (;;) {
+            received += agent.failureRing().drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b,
+                                          aeron::util::index_t off, aeron::util::index_t len) {
+                ASSERT_EQ(tid, rune::node::kA2cSchemaUpdate);
+                const auto m = rune::node::decodeSchemaUpdate(
+                    reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
+                fanout.post(m.topicId, m.blob);
+            }, 16);
+            (void)fanout.pump(pool);
+            if (received == kTopics && fanout.pendingForTest() == 0) break;
+            // Concurrent ordinary produce-path traffic from the SAME (control) thread.
+            // (A Produce with no log → the worker answers an error return.)
+            WorkerOp op;
+            op.type = WorkerOp::Type::Produce;
+            op.recordBatchBytes.assign(16, 0x5);
+            if (static_cast<bool>(pool.worker(produced % 2).tryEnqueueOp(std::move(op)))) ++produced;
+            for (int w = 0; w < 2; ++w) {                 // consumer side (this test's worker owner)
+                (void)pool.worker(w).doWork(1);
+                pool.worker(w).drainReturn([](const WorkerReturn&) {});
+            }
+        }
+    });
+    admin.join();
+    control.join();
+    for (int w = 0; w < 2; ++w) {
+        (void)pool.worker(w).doWork(1);
+        pool.worker(w).drainReturn([](const WorkerReturn&) {});
+    }
+
+    EXPECT_EQ(fanout.enqueuedForTest(), static_cast<uint64_t>(kTopics * 2));
+    EXPECT_EQ(threads.first, controlId)
+        << "SchemaUpdate must be enqueued into worker rings by the CONTROL thread";
+    EXPECT_NE(threads.first, adminId)
+        << "the admin thread must never produce into a worker SPSC ring";
+    EXPECT_FALSE(threads.foreign) << "every enqueue on one thread";
+    for (int w = 0; w < 2; ++w) {
+        for (int t = 0; t < kTopics; ++t)
+            EXPECT_TRUE(pool.worker(w).hasValidatorForTest(100 + t)) << "worker " << w << " topic " << t;
+    }
+}
+
+// Retry-on-full is preserved (the control thread keeps the update pending and
+// retries next cycle), and an update that can NEVER fit is dropped with an
+// error naming the size (TooLarge), not retried forever as "ring full".
+TEST(ProduceValidationRegression, SchemaFanoutRetriesOnFullDropsTooLargeRegression) {
+    const std::vector<uint8_t> blob = rune::codec::serialize(makeCharactersDescriptor());
+    rune::metadata::ShardRouter router(1);
+    rune::node::WorkerPool pool(1, router, /*ingressRingBytes=*/64 * 1024);
+    rune::node::SchemaFanout fanout;
+
+    // Fill worker 0's ring until Full.
+    for (int i = 0; i < 10000; ++i) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::Produce;
+        op.recordBatchBytes.assign(pool.maxIngressTail(), 0x1);
+        if (!pool.worker(0).tryEnqueueOp(std::move(op))) break;
+    }
+    for (int i = 0; i < 10000; ++i) {   // top off: no gap left for a blob-sized op
+        WorkerOp op;
+        op.type = WorkerOp::Type::Produce;
+        op.recordBatchBytes.assign(blob.size(), 0x1);
+        if (!pool.worker(0).tryEnqueueOp(std::move(op))) break;
+    }
+    fanout.post(7, blob);
+    (void)fanout.pump(pool);
+    EXPECT_EQ(fanout.pendingForTest(), 1u) << "ring full → kept pending (retry), not dropped";
+    auto drainWorker = [&] {   // bounded: the ring holds a finite number of ops
+        for (int i = 0; i < 1000; ++i) {
+            (void)pool.worker(0).doWork(1);
+            pool.worker(0).drainReturn([](const WorkerReturn&) {});
+        }
+    };
+    drainWorker();
+    (void)fanout.pump(pool);
+    EXPECT_EQ(fanout.pendingForTest(), 0u) << "retried and delivered next cycle";
+    drainWorker();
+    EXPECT_TRUE(pool.worker(0).hasValidatorForTest(7));
+
+    fanout.post(8, std::vector<uint8_t>(pool.maxIngressTail() + 1, 0x2));
+    (void)fanout.pump(pool);
+    EXPECT_EQ(fanout.pendingForTest(), 0u) << "TooLarge is dropped (error names the size)";
+    EXPECT_EQ(fanout.tooLargeDropsForTest(), 1u);
+}
+
+// F3 round 7, item 3: the admin→control ring is dispatched on the message
+// type EXPLICITLY.  Before: any non-SchemaUpdate frame was decoded as a
+// storage failure — an unknown type (or a <4-byte frame) would have been
+// misread as an fsync failure and HALTED the broker.
+TEST(ProduceValidationRegression, AdminToControlDispatchIsExplicitRegression) {
+    int failures = 0, schemas = 0;
+    int32_t gotErr = 0; std::string gotDir; int32_t gotTopic = -1;
+    auto onFailure = [&](int32_t e, std::string_view d) { ++failures; gotErr = e; gotDir = d; };
+    auto onSchema  = [&](rune::node::SchemaUpdateMsg m) { ++schemas; gotTopic = m.topicId; };
+
+    std::vector<uint8_t> fail(4 + 3);
+    const int32_t eio = 5; std::memcpy(fail.data(), &eio, 4); std::memcpy(fail.data() + 4, "dir", 3);
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cStorageFailure, fail.data(), fail.size(),
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::StorageFailure);
+    EXPECT_EQ(failures, 1); EXPECT_EQ(gotErr, 5); EXPECT_EQ(gotDir, "dir");
+
+    std::vector<uint8_t> su(4 + 2, 0x7); const int32_t tid = 42; std::memcpy(su.data(), &tid, 4);
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cSchemaUpdate, su.data(), su.size(),
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::SchemaUpdate);
+    EXPECT_EQ(schemas, 1); EXPECT_EQ(gotTopic, 42);
+
+    // Unknown type: skipped — NEVER treated as a storage failure.
+    EXPECT_EQ(rune::node::dispatchAdminToControl(99, fail.data(), fail.size(), onFailure, onSchema),
+              rune::node::A2cDispatch::Unknown);
+    // Short frames: rejected, never decoded.
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cStorageFailure, fail.data(), 3,
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::Malformed);
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cSchemaUpdate, su.data(), 3,
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::Malformed);
+    EXPECT_EQ(failures, 1) << "no halt from an unknown/short frame";
+    EXPECT_EQ(schemas, 1);
+}
+
+// F3 round 7, item 4: the largest descriptor the request ring can deliver
+// (DefineTopic with empty name/key) actually round-trips through BOTH rings.
+TEST(ProduceValidationRegression, MaxDescriptorFitsBothAdminRingsRegression) {
+    rune::node::OneToOneByteRing request(rune::node::kAdminRequestRingBytes);
+    rune::node::OneToOneByteRing a2c(rune::node::kAdminToControlRingBytes);
+    rune::node::DefineTopicMsg m;
+    m.blob.assign(rune::node::kMaxDescriptorViaRequestRing, 0x5A);
+    EXPECT_TRUE(rune::node::encodeDefineTopic(request, m));
+    EXPECT_TRUE(rune::node::encodeSchemaUpdate(a2c, 1, m.blob))
+        << "a descriptor accepted by the request ring must fit the admin->control ring";
+}
+
 } // namespace rune::node::test

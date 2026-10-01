@@ -844,3 +844,33 @@ TEST(LogSegment, OffsetIndexAppendGuards2GiBPosition) {
 
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-1, item 2 (IMPORTANT, fix-on-sight): LogSegment's write-fd
+// open() was unchecked — on failure fd_ stayed -1 and sync() silently skipped
+// the fdatasync forever (silent durability loss).  Construction must now
+// throw std::system_error, surfacing the failure exactly like the segment's
+// other construction failures (OffsetIndex, MappedFile) already do.
+// ---------------------------------------------------------------------------
+TEST(LogSegmentRegression, OpenFailureThrowsNotSilentNoSync) {
+    auto dir = makeTempDir("rune_seg_open_fail");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    // Pre-create a DIRECTORY at the exact path LogSegment would use for its
+    // .log file.  The fstream open silently fails (is_open() == false, no
+    // throw — fstream never throws by default), and the raw
+    // ::open(..., O_RDWR|O_CREAT) also fails (EISDIR: can't open a directory
+    // for writing) — while the SEPARATE .index file can still be created
+    // normally, isolating the .log open() failure from any other
+    // construction step (OffsetIndex, MappedFile) that might also throw.
+    // This also works when run as root (EISDIR, unlike EACCES, isn't a
+    // permission check), so no uid-based skip is needed.
+    std::string logPath = (dir / "00000000000000000000.log").string();
+    std::filesystem::create_directory(logPath);
+
+    EXPECT_THROW({ LogSegment seg(dir.string(), 0); }, std::system_error)
+        << "LogSegment construction must THROW (not silently continue with fd_ == -1) "
+           "when the .log file cannot be opened";
+
+    std::filesystem::remove_all(dir);
+}

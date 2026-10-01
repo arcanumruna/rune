@@ -99,13 +99,37 @@ inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
 // RESETS its fallback probe counter so a slow reconcile under packet loss never
 // trips the destructive fallback-to-committedHw truncation (the DR-8 loss).
 inline constexpr int16_t kErrReconcileDeferred = -5;
-// F18: the first batch at the requested offset cannot fit ONE replication frame
-// (leader: its outbound/publication frame; follower: its own worker-ingress ring).
-// NOT retriable for this offset: the follower stops fetching it ("wedged") and the
-// leader does not count the request as ISR liveness, so the follower leaves the
-// ISR visibly instead of pinning HW forever.  Cleared by a leadership/epoch change
-// or a truncation that moves the follower's LEO.
+// F18 ⇄ F3 (one code, both meanings): the first batch at the requested offset
+// cannot be delivered AT ALL over this transport — it does not fit ONE
+// replication frame (leader: its outbound/publication frame; follower: its own
+// worker-ingress ring), independent of the follower's requested maxBytes.
+// Distinct from kErrNone-with-empty-records ("caught up"): there is real data
+// here that can never reach the follower at this size.  NOT retriable for this
+// offset: the follower is forced Behind (F3, FollowerSync::forceBehind) and
+// stops fetching it ("wedged", F18), and the leader does not count the request
+// as ISR liveness, so the follower leaves the ISR visibly instead of pinning HW
+// forever.  Cleared by a leadership/epoch change or a truncation that moves the
+// follower's LEO.
 inline constexpr int16_t kErrRecordTooLarge = -6;
+// The default replication fetch-ceiling (requested chunk size) used for
+// every PartitionConfig across the broker (see BrokerNode.cpp).  This is
+// deliberately NOT required to cover the gateway's max accepted produce
+// batch: F3 round 2's progress rule means a first batch larger than this
+// value is still served ALONE whenever it fits the transport's real hard
+// per-message maximum (see onFetchRequest/pushToFollowers and
+// PartitionTransport::maxFetchRecordsBytes()) — only a batch that exceeds
+// even that hard transport maximum is genuinely unfetchable
+// (kErrRecordTooLarge).  THE batch limit (NodeConfig::produceIntakeLimit)
+// guarantees no such batch is ever ACCEPTED: the gateway and every worker
+// reject a produce batch above THE batch limit (Worker::maxAcceptableBatchBytes) with
+// MessageTooLarge (F3 round 5).
+//
+// F3 round 2 briefly raised this to 8 MiB to (wrongly) paper over a gap that
+// the progress rule above already closes correctly; round 3 reverted it to
+// 1 MiB — raising it changes replication chunking/latency for every topic
+// with no benchmark, a real risk against the p99 <=100µs target, and is not
+// needed now that the progress rule handles the oversize case correctly.
+inline constexpr int32_t kDefaultMaxFetchBytes = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // PartitionConfig — constructor argument bundle
@@ -222,6 +246,10 @@ public:
     /// Reuses the FetchResponse shape.
     virtual void sendReconcileResponse(
             NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) {}
+
+    // (F3 fix-round-2 item A's maxFetchResponseBytes() — the hard per-message
+    //  records ceiling a FIRST batch is served alone within — is the SAME
+    //  quantity as F18's maxFetchRecordsBytes() above: one virtual.)
 };
 
 class AeronPubRegistry;
@@ -674,6 +702,27 @@ public:
         return psm_;
     }
 
+    /// F3 fix-round-2, item A.3 test accessor: drive the private pushToFollowers()
+    /// directly, so a test can control fromOffset/pushCeiling precisely without
+    /// needing GR-10's real coalesced-push cadence.
+    void pushToFollowersForTest(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept {
+        pushToFollowers(fromOffset, pushCeiling);
+    }
+
+    /// F3 round 5, item I2 test accessors: how many times the "batch exceeds the
+    /// transport's hard ceiling" condition was EVALUATED (each one is a log read
+    /// + parse), and how many critical log lines it actually EMITTED.
+    [[nodiscard]] uint64_t unsendableBatchEvaluationsForTest() const noexcept {
+        return unsendableBatchLogCount_;
+    }
+    [[nodiscard]] uint64_t unsendablePushLogEmitsForTest() const noexcept {
+        return unsendablePushLogEmits_;
+    }
+    /// F3 round 6: FETCH responses that carried records (Data serves) — with
+    /// push on, a non-zero count means the follower had to be re-served
+    /// (lost/dropped push → 20 ms resend window).
+    [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
+
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
     /// replica is disk-backed — asserts !memoryBacked_.  Callers MUST gate on
@@ -778,6 +827,15 @@ private:
     /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
     /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
     void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+
+    /// F3 round 5, item I2: true while the push head is a remembered UNSENDABLE
+    /// batch and nothing that could change the outcome (LEO, ISR, follower
+    /// position via pushCeiling, epoch) has changed — doWork() then skips the
+    /// push entirely (no readView/parse, no work count).  One compare when unarmed.
+    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling) const noexcept;
+    /// Order-sensitive signature of the current ISR (cold: only computed while
+    /// an unsendable-push memo is armed or being armed).
+    [[nodiscard]] uint64_t isrSignature_() const noexcept;
     // Spec §3.5.2: follower FetchRequests are unicast to the known leader.
     void sendFetchToLeader_(const FetchRequestMsg& req);
 
@@ -828,7 +886,9 @@ private:
     NullPartitionTransport*  nullT_  = nullptr;               ///< non-null iff tkind_ == Null
     /// Apply f to the concrete transport: one predicted branch, direct call on the
     /// PerWorker arm.  Defined in PartitionReplica.cpp (its only user).
-    template <class F> void onTransport(F&& f);
+    /// F3 fix-round-2: returns auto (was void) so callers can also use this to
+    /// QUERY the transport (e.g. maxFetchResponseBytes()), not just send.
+    template <class F> auto onTransport(F&& f);
 
     // -----------------------------------------------------------------------
     // De-virtualized hot-path log dispatch.
@@ -936,6 +996,28 @@ private:
     Offset   wedgedAtOffset_       = -1;
     void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
+
+    // F3 fix-round-2, item A: count of "batch exceeds even this transport's
+    // hard ceiling" events (onFetchRequest or pushToFollowers), for
+    // rate-limited critical logging (first occurrence, then every 1024th) —
+    // same convention as LogSegment::readMapFailures_.
+    uint64_t unsendableBatchLogCount_ = 0;
+    // F3 round 5, item I2: critical log lines actually emitted by the push path
+    // (rate-limited to once per unsendable-offset transition).
+    uint64_t unsendablePushLogEmits_ = 0;
+    uint64_t fetchDataServes_ = 0;   // F3 r6: Data fetch responses with records
+    // F3 round 5, item I2: memo of the last unsendable push head.  Armed
+    // (fromOffset >= 0) by pushToFollowers() when the head batch exceeds the
+    // transport's hard ceiling; cleared by any successful push.
+    struct UnsendablePushMemo {
+        Offset   fromOffset  = -1;   ///< lastPushedOffset_ at the failed push (-1 = unarmed)
+        Offset   leo         = -1;
+        Offset   pushCeiling = -1;
+        uint64_t isrSig      = 0;
+        Epoch    epoch       = 0;
+    };
+    UnsendablePushMemo unsendablePush_{};
+    Offset             unsendablePushLoggedOffset_ = -1;   ///< last offset logged critical
 
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
     //

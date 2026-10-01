@@ -1371,3 +1371,121 @@ TEST(LargeBatchReplicationRegression, MultiBatchPushAboveFollowerFrameNeverWedge
     EXPECT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
     for (auto& n : nodes) n->stop();
 }
+
+
+// ===========================================================================
+// F3 round 5, item C1: a batch of EXACTLY the derived effective max produce
+// size must replicate end to end (leader -> both followers' LEO advance) on
+// BOTH replication transports — the legacy AeronPartitionTransport (outbound
+// ring path) and the per-worker WorkerReplicationTransport (gather path) — and
+// the gateway must enforce that same value (effective max + 1 -> MessageTooLarge
+// is pinned at the gateway/worker layers: ClientGatewayHotPath.ProduceBatch-
+// ExactEffectiveMaxBoundaryRegression, WorkerProduceRegression.*).  Round 4
+// derived 524242 for the defaults, 16 bytes above what the legacy ring path
+// can carry (524226): such a batch was accepted and then never delivered.
+// Real 3-node BrokerNodes, real embedded drivers, default 4 MiB term/rings.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> pwBatchOfExactSize(int64_t baseOffset, std::size_t target) {
+    auto build = [baseOffset](std::size_t keyLen, std::size_t valLen) {
+        rune::protocol::RecordBatchBuilder b(baseOffset, 1000LL);
+        b.append(std::string(keyLen, 'k'), std::string(valLen, 'v'), 1000LL);
+        return b.build();
+    };
+    for (std::size_t keyLen = 1; keyLen <= 4; ++keyLen) {
+        std::size_t val = target - build(keyLen, 0).size();
+        for (int iter = 0; iter < 8; ++iter) {
+            auto b = build(keyLen, val);
+            if (b.size() == target) return b;
+            if (b.size() > target) { const std::size_t o = b.size() - target; if (o > val) break; val -= o; }
+            else val += target - b.size();
+        }
+    }
+    ADD_FAILURE() << "could not build a batch of exactly " << target << " bytes";
+    return {};
+}
+
+void runExactEffectiveMaxReplicates(bool perWorker) {
+    PwTempDir dir0{"pwmax_0_"}, dir1{"pwmax_1_"}, dir2{"pwmax_2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+    std::array<rune::node::NodeConfig, 3> cfgs = {
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts)};
+    for (auto& c : cfgs) c.perWorkerReplication = perWorker;
+
+    const std::size_t effMax = rune::node::effectiveMaxProduceBatchBytes(cfgs[0]);
+    ASSERT_EQ(effMax, 524226u) << "default multi-node derivation (see BrokerNodeRegression)";
+
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+
+    const auto lid = nodes[0]->leaderId();
+    ASSERT_GE(lid, 0);
+    ASSERT_LE(lid, 2);
+    rune::node::BrokerNode* leader = nodes[static_cast<std::size_t>(lid)].get();
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline &&
+               !(leader->replicationIsLeaderForTest() && hasReplica(*leader) &&
+                 roleOnOwner(*leader) == Role::Leader)) {
+            std::this_thread::sleep_for(20ms);
+        }
+    }
+    ASSERT_EQ(roleOnOwner(*leader), Role::Leader);
+    for (auto& n : nodes) {
+        ASSERT_EQ(n->gatewayForTest()->maxProduceBatchBytes(), effMax)
+            << "the gateway enforces exactly the derived effective max";
+        // F3 round 6, item 7: every worker enforces the SAME value on its
+        // per-worker ingress path (installed before the runners start; never
+        // written afterwards).
+        for (int32_t w = 0; w < cfgs[0].workerCount; ++w) {
+            ASSERT_NE(n->workerForTest(w), nullptr);
+            EXPECT_EQ(n->workerForTest(w)->maxIntakeBatchBytes(), effMax) << "worker " << w;
+        }
+    }
+
+    // Append ONE batch of exactly effMax bytes on the leader's owning thread
+    // (the produce hot-path seam: Log append + onLeaderLogAppended -> the
+    // coalesced doWork push / follower fetch replicate it).
+    const Offset target = leader->onOwnerThreadForTest(0, 0, [effMax](PartitionReplica& r) {
+        const Offset base = r.logEndOffset();
+        auto batch = pwBatchOfExactSize(base, effMax);
+        if (batch.size() != effMax) return Offset{-1};
+        r.log()->append(batch, base);
+        r.onLeaderLogAppended();
+        return r.logEndOffset();
+    });
+    ASSERT_GT(target, 0);
+
+    const auto deadline = std::chrono::steady_clock::now() + 45s;
+    bool ok = false;
+    while (std::chrono::steady_clock::now() < deadline && !ok) {
+        ok = true;
+        for (auto& n : nodes) {
+            if (n.get() == leader) continue;
+            if (leoOrMinusOne(*n) < target) ok = false;
+        }
+        if (!ok) std::this_thread::sleep_for(20ms);
+    }
+    for (auto& n : nodes) {
+        if (n.get() == leader) continue;
+        EXPECT_GE(leoOrMinusOne(*n), target)
+            << "follower LEO must advance past the exactly-max batch ("
+            << (perWorker ? "per-worker" : "legacy") << " transport)";
+    }
+    for (auto& n : nodes) n->stop();
+}
+} // namespace
+
+TEST(PerWorkerReplication, ExactEffectiveMaxBatchReplicatesLegacyRegression) {
+    runExactEffectiveMaxReplicates(/*perWorker=*/false);
+}
+
+TEST(PerWorkerReplication, ExactEffectiveMaxBatchReplicatesPerWorkerRegression) {
+    runExactEffectiveMaxReplicates(/*perWorker=*/true);
+}

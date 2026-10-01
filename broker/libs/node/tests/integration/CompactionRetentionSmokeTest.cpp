@@ -892,9 +892,20 @@ TEST(CompactionRetentionSmoke, InternalTopic_Recovery_CompactedLog) {
     ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
         << "Smoke5: replication bridge must propagate within 2 s";
     // HW advanced by becomeLeader() on the duty-cycle thread.
-    // No test-thread replica calls (duty-thread-only invariant).
-
-    std::this_thread::sleep_for(2500ms);
+    //
+    // F3 round 8: condition-driven, never a fixed sleep.  This test used to
+    // sleep 2500 ms and then ASSERT that compaction had run — under ctest -j2
+    // load the cleaner sometimes had not completed a pass yet (flaky RED).
+    // The LogCleanerAgent advances the replica's lastCleanOffset only AFTER a
+    // pass has written + renamed the cleaned segment on disk, so wait for it
+    // (probed on the replica's OWNING thread: __consumer_offsets is
+    // control-thread-owned).
+    ASSERT_TRUE(waitFor([&] {
+        return rune::node::test::hasReplica(node, /*topicId=*/-1, 0) &&
+               node.onOwnerThreadForTest(-1, 0, [](rune::replication::PartitionReplica& r) {
+                   return r.lastCleanOffset() > 0;
+               });
+    }, 20s)) << "Smoke5: the cleaner never completed a compaction pass on __consumer_offsets";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();

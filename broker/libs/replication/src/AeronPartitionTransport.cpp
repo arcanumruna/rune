@@ -270,6 +270,10 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
         isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::computeLength(payloadLen);
     // Oversized guard (identical policy to enqueueOutbound): a frame beyond the
     // ring's maxMsgLength is a caller cap bug — reject as retriable back-pressure.
+    // F3 round 6: unreachable by construction — every FetchResponse/push is
+    // capped at maxFetchRecordsBytes() (which includes this envelope) before it
+    // gets here.  This runs on ANY worker thread (multi-producer), so it keeps
+    // no counter (no shared state); the log is the backstop.
     if (frameLen > outboundRing_.maxMsgLength()) {
         spdlog::error(
             "AeronPartitionTransport::enqueueFetchResponse: framed message {} B exceeds "
@@ -527,6 +531,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         const int32_t kFetchResponseOverhead =
             static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
 
+        // F3 round 5 ⇄ F18: the unconditional base IS maxFetchRecordsBytes() (ring
+        // AND publication bound) — the transport's ONE records ceiling.
         // The records tail must survive TWO framing hops without exceeding either
         // transport bound:
         //   1. enqueueOutbound writes [int32 targetNodeId][SBE frame] into the
@@ -539,10 +545,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // Previously the cap was gated on followerPeer->pub AND ignored the ring bound
         // + the 4-byte outbound header, so an early/large fetch slipped through and
         // threw inside the worker's onFetchRequest — the fetch was lost.
-        int32_t ceiling =
-            static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
-            - kFetchResponseOverhead;
+        int32_t ceiling = maxFetchResponseBytes();   // = clamp(maxFetchRecordsBytes())
         auto* followerPeer = findPeer(req.followerId);
         if (followerPeer && followerPeer->pub) {
             const int32_t pubCeiling =
@@ -683,6 +686,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // inline here (routing them to a worker would race the control thread's
         // NodeRuntimeAgent doWork on the same internal replica).
         if (workerPool_ && resp.topicId >= 0) {
+            // (F3 round 5 item I1 — unfittable records dropped, never ABORT-retried
+            //  or thrown — is F18's opTailFits handling just above: one mechanism.)
             rune::node::WorkerOp op;
             op.type                              = rune::node::WorkerOp::Type::ApplyReplicated;
             op.topicId                           = resp.topicId;
@@ -701,8 +706,11 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
                     resp.records.data(),
                     resp.records.data() + resp.records.size());
             }
-            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition,
-                                           std::move(op))) {
+            const auto er = workerPool_->enqueueOp(resp.topicId, resp.partition,
+                                                   std::move(op));
+            if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]]
+                return Action::CONTINUE;   // never fits: drop (F3 r6 item 5; pre-checked above)
+            if (er != rune::node::EnqueueResult::Enqueued) {
                 // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
                 // The records span still lives in the term buffer (fragment not
                 // consumed), so the re-delivered fragment re-copies correctly. No drop.
@@ -781,10 +789,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // resolved, minus the outbound header — so the reconcile response never
         // overflows the outbound ring and throws inside the worker.
         const int32_t kOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
-        int32_t ceiling =
-            static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
-            - kOverhead;
+        int32_t ceiling = maxFetchResponseBytes();   // F3 r5 ⇄ F18: ring AND publication bound
         auto* peer = findPeer(req.followerId);
         if (peer && peer->pub) {
             const int32_t pubCeiling =
@@ -855,7 +860,10 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
                     resp.records.data(),
                     resp.records.data() + resp.records.size());
             }
-            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op))) {
+            const auto er = workerPool_->enqueueOp(resp.topicId, resp.partition, std::move(op));
+            if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]]
+                return Action::CONTINUE;   // never fits: drop (F3 r6 item 5; pre-checked above)
+            if (er != rune::node::EnqueueResult::Enqueued) {
                 // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
                 return Action::ABORT;
             }

@@ -575,6 +575,50 @@ TEST(WorkerReplicationTransportInteg, GatherSendArrivesByteIdenticalRegression) 
     EXPECT_NO_THROW(a.sendFetchResponse(2, mk(huge)));
 }
 
+// ===========================================================================
+// F3 round 5, item I3: AeronPartitionTransport::maxFetchResponseBytes() must
+// be the min of the outbound-ring bound AND the Aeron term bound (term/8 −
+// FetchResponse framing).  Before the fix it used the ring bound only, so with
+// a term whose maxMessageLength (term/8) is smaller than ring/8 it claimed
+// "sendable" for batches that sendOnPub() then silently DROPS (oversized
+// frame) — a follower stalled forever on such a batch.  Driver term here is
+// 64 KiB (maxMessageLength 8192) against a 4 MiB outbound ring (8× larger).
+// ===========================================================================
+TEST(AeronPartitionTransportInteg, MaxFetchResponseHonorsTermBoundRegression) {
+    TempDir driverTd("rune_apt_termbound_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());   // 64 KiB term
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kTermBytes = 64 * 1024;
+    constexpr int     kRingBytes = 4 * 1024 * 1024;
+    // Integration wave 2: the publication bound is F18's setter (the ctor's 5th
+    // argument is the outbound ring size — F3's required term argument is gone).
+    AeronPartitionTransport t(aeronClient, udpChannel(discoverFreeUdpPort()), 801,
+                              /*selfId=*/1, kRingBytes);
+    t.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(kTermBytes));
+
+    const int32_t kFrameworkOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
+    // Aeron maxMessageLength(64 KiB term) = 8192; minus the FetchResponse framing.
+    EXPECT_EQ(t.maxFetchResponseBytes(), 8192 - kFrameworkOverhead)
+        << "the term bound (8192) is tighter than the ring bound (524288) and must win";
+    EXPECT_EQ(t.maxFetchResponseBytes(),
+              AeronPartitionTransport::maxFetchResponseBytesFor(kRingBytes, kTermBytes))
+        << "the config-only helper BrokerNode uses must equal the live instance";
+
+    // Ring tighter than term: the ring bound (ring/8 − outbound envelope −
+    // framing) must win instead.
+    AeronPartitionTransport t2(aeronClient, udpChannel(discoverFreeUdpPort()), 802,
+                               /*selfId=*/1, /*outboundRingBytes=*/64 * 1024);
+    t2.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(16 * 1024 * 1024));
+    EXPECT_EQ(t2.maxFetchResponseBytes(),
+              8192 - static_cast<int32_t>(AeronPartitionTransport::kOutboundEnvelopeOverhead)
+                   - kFrameworkOverhead);
+    EXPECT_EQ(t2.maxFetchResponseBytes(),
+              AeronPartitionTransport::maxFetchResponseBytesFor(64 * 1024, 16 * 1024 * 1024));
+}
+
 // F16 regression: transport traffic counters / flight-recorder sequences were
 // file-static globals shared by every AeronPartitionTransport in the process, so
 // two transports polled on two threads (two in-process nodes, or per-worker

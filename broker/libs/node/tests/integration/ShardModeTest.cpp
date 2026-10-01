@@ -973,7 +973,8 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
     ASSERT_EQ(limit, Worker::maxAcceptableBatchBytes(
         static_cast<std::size_t>(c0.workerIngressRingBytes), static_cast<std::size_t>(c0.workerReturnRingBytes),
         static_cast<std::size_t>(c0.replicationOutboundRingBytes),
-        static_cast<std::size_t>(c0.aeronTermBufferBytes), static_cast<std::size_t>(c0.aeronTermBufferBytes)));
+        static_cast<std::size_t>(c0.aeronTermBufferBytes), static_cast<std::size_t>(c0.aeronTermBufferBytes),
+        static_cast<std::size_t>(c0.aeronTermBufferBytes)));
     // Default 4 MiB term: the egress Records frame (term / 8 = 512 KiB) is one
     // of the binding hops — the case the unification closes.
     ASSERT_LE(limit + rune::node::kRecordsFixedBytes, 512u * 1024u);

@@ -2154,6 +2154,7 @@ TEST(ProduceBatchLimitRegression, IntakeLimitNeverExceedsOneFrameOnAnyHop) {
                       static_cast<std::size_t>(c.workerReturnRingBytes),
                       static_cast<std::size_t>(c.replicationOutboundRingBytes),
                       static_cast<std::size_t>(c.aeronTermBufferBytes),
+                      static_cast<std::size_t>(c.aeronTermBufferBytes),
                       static_cast<std::size_t>(c.aeronTermBufferBytes)));
         EXPECT_LE(c.produceIntakeLimit(), NodeConfig::kDefaultMaxProduceBatchBytes);
     }

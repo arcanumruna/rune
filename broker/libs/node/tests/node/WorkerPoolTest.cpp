@@ -913,7 +913,7 @@ TEST(WorkerPool, RealThreadProduceConcurrentTSan) {
 
             bool ok = false;
             for (int retry = 0; retry < 10000 && !ok; ++retry) {
-                ok = pool.tryEnqueueOp(kTopicId, p, op);
+                ok = static_cast<bool>(pool.tryEnqueueOp(kTopicId, p, op));
                 if (!ok) std::this_thread::yield();
             }
             ASSERT_TRUE(ok) << "failed to enqueue PushRead for partition=" << p << " iter=" << iter;
@@ -979,4 +979,61 @@ TEST(WorkerPool, RealThreadProduceConcurrentTSan) {
 
     // If we reach here without a TSan report: shared-nothing-under-real-threads proved.
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+using rune::node::Worker;
+using rune::node::WorkerOp;
+using rune::node::EnqueueResult;
+
+// F3 round 6, item 5: the enqueue outcome distinguishes {Enqueued, Full,
+// TooLarge} (integration wave 2: F18's EnqueueResult via enqueueOp — one
+// outcome type), and a SetOwnership that can NEVER fit the worker ingress ring
+// is a hard error (critical + std::logic_error → the control loop halts the
+// broker, same fail-stop as the F7 ownership invariant) — never a silent
+// infinite retry (round 5 conflated it with "ring full", so reconcile retried
+// forever).
+// ---------------------------------------------------------------------------
+TEST(WorkerPoolRegression, EnqueueStatusDistinguishesFullAndTooLargeRegression) {
+    // 1 KiB ring: maxMsgLength 128 < WorkerOp framing → max tail 0.
+    Worker w(0, /*ingressRingBytes=*/1024);
+    ASSERT_EQ(w.maxOpTailBytes(), 0u);
+    WorkerOp big;
+    big.type = WorkerOp::Type::Produce;
+    big.recordBatchBytes.assign(1, 0xAB);
+    const EnqueueResult r = w.enqueueOp(std::move(big));
+    EXPECT_EQ(r, EnqueueResult::TooLarge);
+
+    // 64 KiB ring: fill it with max-size ops until Full (never TooLarge).
+    Worker w2(0, 64 * 1024);
+    EnqueueResult last = EnqueueResult::Enqueued;
+    for (int i = 0; i < 1000 && last == EnqueueResult::Enqueued; ++i) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::Produce;
+        op.recordBatchBytes.assign(w2.maxOpTailBytes(), 0xCD);
+        last = w2.enqueueOp(std::move(op));
+    }
+    EXPECT_EQ(last, EnqueueResult::Full) << "a full ring is back-pressure, not TooLarge";
+}
+
+TEST(WorkerPoolRegression, SetOwnershipTooLargeIsFailStopRegression) {
+    Rep a(0, 0);
+    ReplicaRegistry reg;
+    reg.add(0, 0, std::move(a.replica));
+    ShardRouter router(1);
+    WorkerPool pool(1, router, /*ingressRingBytes=*/1024);   // max tail 0: any owned set is too large
+    pool.setRunnersStartedForTest(true);                       // SetOwnership goes over the ring
+    EXPECT_THROW(pool.assignFromRegistry(reg), std::logic_error)
+        << "an unfittable SetOwnership must fail-stop, not be retried forever as 'ring full'";
+}
+
+// F3 round 6, item 4: the replicated-frame fit check is ONE compare against a
+// pool-level cached max (all workers share one ring size) — no owner lookup.
+TEST(WorkerPoolRegression, FitsIngressTailIsPoolLevelCompareRegression) {
+    ShardRouter router(2);
+    WorkerPool pool(2, router, /*ingressRingBytes=*/64 * 1024);
+    EXPECT_EQ(pool.maxIngressTail(), pool.worker(0).maxOpTailBytes());
+    EXPECT_EQ(pool.maxIngressTail(), pool.worker(1).maxOpTailBytes());
+    EXPECT_TRUE(pool.fitsIngressTail(pool.maxIngressTail()));
+    EXPECT_FALSE(pool.fitsIngressTail(pool.maxIngressTail() + 1));
 }

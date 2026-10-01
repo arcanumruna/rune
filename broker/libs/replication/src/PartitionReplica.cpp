@@ -88,14 +88,14 @@ static bool fsLogEnabled() noexcept {
 // final WorkerReplicationTransport (inlinable), everything else goes virtual.
 // ---------------------------------------------------------------------------
 template <class F>
-[[gnu::always_inline]] inline void PartitionReplica::onTransport(F&& f)
+[[gnu::always_inline]] inline auto PartitionReplica::onTransport(F&& f)
 {
 #if RUNE_REPLICATION_HAS_AERON
-    if (tkind_ == TransportKind::PerWorker) { f(*perWorker_); return; }
-    if (tkind_ == TransportKind::Aeron)     { f(*aeronT_);    return; }   // final → direct
+    if (tkind_ == TransportKind::PerWorker) { return f(*perWorker_); }
+    if (tkind_ == TransportKind::Aeron)     { return f(*aeronT_); }       // final → direct
 #endif
-    if (tkind_ == TransportKind::Null)      { f(*nullT_);     return; }   // final → direct no-op
-    f(*transport_);                                                       // test fakes only
+    if (tkind_ == TransportKind::Null)      { return f(*nullT_); }        // final → direct no-op
+    return f(*transport_);                                                // test fakes only
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +810,16 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // memory ring).  The transport copies the bytes ONCE, straight into the
     // publication term.  (No append/truncate/readView ran in between.)
     std::span<const uint8_t> records{};
+    // F3 fix-round-1, item 3 (merged onto F18's single read): fetchOffset < LEO
+    // means there IS more data past this point, so an EMPTY view can only be a
+    // transient local read-map failure (readView()/ensureReadMap() are noexcept
+    // and return empty on failure — LogSegment::readMapFailures()), NEVER
+    // "caught up".  An empty kErrNone Data response would make the follower's
+    // FollowerSync treat it as caught up; skip responding this cycle instead —
+    // the follower's un-acked fetch resends and the lazy map retries.  ISR
+    // liveness / HW bookkeeping above is unaffected.
+    if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_() && view.empty())
+        [[unlikely]] return kErrNone;
     if (serve == FetchServe::Data && !view.empty()) {
         // GR-1: whole batches only.  F18 / KIP-74: the first batch at fetchOffset
         // is ALWAYS served whole even above req.maxBytes (readView already always
@@ -830,6 +840,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // lets the leader's real (majority) HW advance and the ISR re-expand.  Only
     // the follower's *committed view* (followerHw_) is held at the majority floor
     // until the ISR heals.
+    if (!records.empty()) ++fetchDataServes_;
     const Offset advertiseHw = highWatermark();
     auto resp = makeFetchResponse(advertiseHw, kErrNone, records);
     onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
@@ -895,17 +906,21 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchRespApply,
                              static_cast<uint32_t>(cfg_.partitionId));
     if (resp.errorCode != kErrNone) {
-        // F18 (I-1): the batch at our LEO cannot be replicated in one frame (the
-        // leader's, or — injected by our own transport — our worker ring's).  Not
-        // retriable for this offset: WEDGE here (no further fetches → no ISR
-        // liveness → the leader evicts us by its existing lag check).  Counted +
-        // logged.  Cleared by a leadership/epoch change or a truncation moving LEO.
-        // A stale-epoch answer (deposed leader) never wedges.
+        // F18 (I-1) ⇄ F3 (fix-round-2 item A): the batch at our LEO cannot be
+        // replicated in one frame (the leader's, or — injected by our own
+        // transport — our worker ring's).  Real data, never "caught up": force
+        // FollowerSync Behind (F3) and, not retriable for this offset, WEDGE here
+        // (F18: no further fetches → no ISR liveness → the leader evicts us by its
+        // existing lag check).  Counted + logged.  Cleared by a leadership/epoch
+        // change or a truncation moving LEO.  A stale-epoch answer (deposed
+        // leader) never wedges.
         // (The leader answers for the offset we fetched = our LEO: a false wedge
         //  is impossible on this path — nothing can move LEO past an unservable batch.)
-        if (resp.errorCode == kErrRecordTooLarge && role_ == Role::Follower &&
-            resp.leaderEpoch >= epoch_)
-            wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
+        if (resp.errorCode == kErrRecordTooLarge) {
+            followerSync_.forceBehind();
+            if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
+                wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
+        }
         // Other errors — ignore (control plane handles epoch changes externally).
         return;
     }
@@ -1774,7 +1789,8 @@ int PartitionReplica::doWork(int64_t nowNs)
                 if (fl < minFollowerLeo) minFollowerLeo = fl;
             }
             const Offset pushCeiling = minFollowerLeo + kPushFlowWindow;
-            if (pushCeiling > lastPushedOffset_) {
+            if (pushCeiling > lastPushedOffset_ &&
+                !unsendablePushSuppressed_(pushCeiling)) {
                 pushToFollowers(lastPushedOffset_, pushCeiling);
                 ++work;
             }
@@ -2358,28 +2374,59 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     ++rtPushes_;
     // Zero-copy: a view into the log (same path as onFetchRequest()); the
     // transport copies the bytes once, straight into each follower's term buffer.
+    //
+    // (F3 round 6 item 1 — push chunk capped at the transport's LIVE ceiling, so
+    // a coalesced push is never dropped after lastPushedOffset_ advanced — is
+    // exactly F18 m-3's pushCap above; one ceiling: maxFetchRecordsBytes().)
     const rune::storage::LogReadView v =
         onLog([&](auto& L) { return L.readView(fromOffset, static_cast<int32_t>(pushCap)); });
     // Advance lastPushedOffset_ by ONLY what is actually pushed (ceiling + cap bound).
-    // The read is capped at maxFetchBytes; under a large backlog one push covers a
-    // prefix and the next duty cycle pushes the rest.  F18 / KIP-74: a first batch
-    // larger than maxFetchBytes is still pushed whole (never stuck).  FLOW CONTROL: no batch that
-    // begins at or beyond pushCeiling is pushed (in-flight <= kPushFlowWindow).
+    // The read is capped at min(maxFetchBytes, frame); under a large backlog one
+    // push covers a prefix and the next duty cycle pushes the rest.  F18 / KIP-74:
+    // a first batch larger than maxFetchBytes is still pushed whole (never stuck).
+    // FLOW CONTROL: no batch that begins at or beyond pushCeiling is pushed
+    // (in-flight <= kPushFlowWindow).
     const BatchPrefix pre = wholeBatchPrefix(v.data, v.len, pushCap, pushCeiling);
     if (pre.bytes == 0) return;   // nothing deliverable within ceiling/cap this pass
     // F18 (I-1): an oversized first batch (KIP-74) that exceeds the FRAME is
     // unservable — never push it (the transport would drop it and pushedThrough
     // would lie); the fetch path answers kErrRecordTooLarge and the followers
     // leave the ISR, after which this partition stops pushing (ISR = self).
-    if (static_cast<int64_t>(pre.bytes) > frame) [[unlikely]] return;
-    const Offset pushedThrough = pre.endOffset;
+    if (static_cast<int64_t>(pre.bytes) > frame) [[unlikely]] {
+        // F3 round 6, item 8: frame 0 = no publication resolved yet — not a
+        // property of this batch: never arm the memo / log a "ceiling of 0".
+        if (frame <= 0) return;
+        // F3 round 5, item I2: remember this head so doWork() does not re-read /
+        // re-parse it every cycle until LEO, the ISR, the follower position
+        // (pushCeiling) or the epoch changes; the critical log fires once per
+        // unsendable-offset transition.
+        const Offset firstBase = rune::protocol::RecordBatchReader(v.data, v.len).baseOffset();
+        ++unsendableBatchLogCount_;
+        unsendablePush_ = UnsendablePushMemo{fromOffset, currentLeo, pushCeiling,
+                                             isrSignature_(), epoch_};
+        if (firstBase != unsendablePushLoggedOffset_) {
+            unsendablePushLoggedOffset_ = firstBase;
+            ++unsendablePushLogEmits_;
+            spdlog::critical(
+                "PartitionReplica[node={} part={}] PUSH batch at offset={} is {} "
+                "bytes — exceeds this transport's replication frame of {} bytes.  Push "
+                "cannot deliver it (evaluations={}); the follower's own fetch gets "
+                "kErrRecordTooLarge.",
+                cfg_.selfId, cfg_.partitionId, firstBase, pre.bytes, frame,
+                unsendableBatchLogCount_);
+        }
+        return;
+    }
+    const Offset      pushedThrough = pre.endOffset;
+    const std::size_t sendBytes     = pre.bytes;
+    unsendablePush_.fromOffset = -1;   // F3 r5 I2: a sendable head disarms the memo
 
     // Build once — reused for all ISR followers; the view stays valid for the loop
     // (no append/truncate on this thread in between).
     // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
     auto resp = makeFetchResponse(highWatermark(), kErrNone,
-                                  std::span<const uint8_t>(v.data, pre.bytes));
-    rtPushBytes_ += static_cast<int64_t>(pre.bytes);
+                                  std::span<const uint8_t>(v.data, sendBytes));
+    rtPushBytes_ += static_cast<int64_t>(sendBytes);
 
     for (NodeId followerId : isrList) {
         if (followerId == cfg_.selfId) continue;
@@ -2390,6 +2437,29 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     }
     lastPushedOffset_ = pushedThrough;   // next cycle pushes the rest once the
                                          // follower's ack lifts the window.
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 5, item I2: unsendable-push suppression (see header).
+// ---------------------------------------------------------------------------
+bool PartitionReplica::unsendablePushSuppressed_(Offset pushCeiling) const noexcept
+{
+    if (unsendablePush_.fromOffset < 0) [[likely]] return false;   // unarmed
+    return unsendablePush_.fromOffset  == lastPushedOffset_ &&
+           unsendablePush_.leo         == logEndOffset_() &&
+           unsendablePush_.pushCeiling == pushCeiling &&
+           unsendablePush_.epoch       == epoch_ &&
+           unsendablePush_.isrSig      == isrSignature_();
+}
+
+uint64_t PartitionReplica::isrSignature_() const noexcept
+{
+    uint64_t sig = 1469598103934665603ULL;   // FNV-1a over (size, ids in order)
+    if (!isrManager_) return sig;
+    const std::vector<NodeId>& isr = isrManager_->isr();
+    sig = (sig ^ static_cast<uint64_t>(isr.size())) * 1099511628211ULL;
+    for (NodeId id : isr) sig = (sig ^ static_cast<uint64_t>(id)) * 1099511628211ULL;
+    return sig;
 }
 
 } // namespace rune::replication

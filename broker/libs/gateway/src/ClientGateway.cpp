@@ -1587,9 +1587,15 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                   "gateway and shard-ingress max produce batch must match");
     static_assert(kMaxChunkBytes == rune::node::Worker::kMaxPushReadChunkBytes,
                   "gateway and worker PushRead chunk budget must match");
-    if (batchLen > maxProduceBatchBytes_) {
-        spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected (MessageTooLarge)",
-                     batchLen, maxProduceBatchBytes_);
+    if (batchLen > maxProduceBatchBytes_) [[unlikely]] {
+        // F3 round 6, item 2: rate-limited (first, then every 1024th) —
+        // control-thread-owned counter (single-writer).
+        if (oversizeProduceRejects_++ % 1024 == 0) {
+            ++oversizeProduceRejectLogs_;
+            spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected "
+                         "(MessageTooLarge, rejects={})",
+                         batchLen, maxProduceBatchBytes_, oversizeProduceRejects_);
+        }
         sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
         return;
     }

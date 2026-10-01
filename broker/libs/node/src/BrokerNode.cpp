@@ -33,6 +33,8 @@
 #include <rune/protocol/RecordBatch.h>
 // Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <cstdlib>
 #include <cstring>
 
@@ -46,6 +48,113 @@ namespace rune::node {
 // fields are not yet wired. Multi-node path reads from config_.
 // ---------------------------------------------------------------------------
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
+
+// ---------------------------------------------------------------------------
+// Max produce-batch derivation (F3 rounds 4-5) — see BrokerNode.h.  Every
+// limit CALLS the transport's/ring's own function; no hand arithmetic here.
+// ---------------------------------------------------------------------------
+namespace {
+int32_t clampI32(int64_t v) noexcept {
+    if (v < 0) return 0;
+    if (v > INT32_MAX) return INT32_MAX;
+    return static_cast<int32_t>(v);
+}
+} // namespace
+
+// Integration wave 2 (F3 ⇄ F18 ⇄ F15 S3 ⇄ F19): F3's derivation helpers are
+// thin views of THE formula (Worker::maxAcceptableBatchBytes, via
+// NodeConfig::batchLimitFormula / produceIntakeLimit) and of its components,
+// built on the SAME primitives (Worker::maxOpTailBytesFor = op ring term;
+// ReplicationFrameLimits.h = replication terms; Worker::kProduceFrameFixedBytes
+// = client ingress term) — no second formula.
+std::size_t workerIngressMaxBatchBytes(const NodeConfig& config) noexcept {
+    return Worker::maxOpTailBytesFor(static_cast<std::size_t>(
+        config.workerIngressRingBytes > 0 ? config.workerIngressRingBytes : 0));
+}
+
+int32_t aeronIngressMaxBatchBytes(const NodeConfig& config) noexcept {
+    if (config.aeronTermBufferBytes <= 0) return 0;
+    const int64_t maxMsg = rune::replication::aeronMaxMessageLength(config.aeronTermBufferBytes);
+    return clampI32(maxMsg - static_cast<int64_t>(Worker::kProduceFrameFixedBytes));
+}
+
+int32_t ingressHardTransportMaxBytes(const NodeConfig& config) noexcept {
+    return clampI32(std::min<int64_t>(
+        static_cast<int64_t>(workerIngressMaxBatchBytes(config)),
+        static_cast<int64_t>(aeronIngressMaxBatchBytes(config))));
+}
+
+int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept {
+    // Both replication transport kinds: the legacy ring + publication path and
+    // the per-worker publication path (F18's frame limits, one source of truth).
+    namespace rr = rune::replication;
+    return clampI32(std::min(rr::maxFetchRecordsViaOutboundRing(config.replicationOutboundRingBytes),
+                             rr::maxFetchRecordsViaPublication(config.aeronTermBufferBytes)));
+}
+
+int32_t userTopicMaxFetchBytes(const NodeConfig& config) noexcept {
+    // A follower's FetchResponse records for a USER partition are forwarded
+    // to the owning worker through its ingress ring (ApplyReplicated) on the
+    // legacy transport — so a fetch/push chunk must never exceed what that
+    // ring can carry.  Unchanged (1 MiB) for the default 32 MiB ring.
+    //
+    // F3 round 6, item 1: multi-node also bounds it by the replication hard
+    // max — a coalesced push larger than what the transport carries is
+    // dropped, stalling acks=all for the 20 ms re-serve.  (PartitionReplica
+    // additionally caps each push at the transport's frame, F18 m-3.)
+    int64_t cap = std::min<int64_t>(rune::replication::kDefaultMaxFetchBytes,
+                                    static_cast<int64_t>(workerIngressMaxBatchBytes(config)));
+    if (!config.isSingleNode())
+        cap = std::min<int64_t>(cap, replicationHardTransportMaxBytes(config));
+    return clampI32(cap);
+}
+
+std::size_t configuredMaxProduceBatchBytes(const NodeConfig& config) noexcept {
+    if (config.maxProduceBatchBytes && *config.maxProduceBatchBytes > 0) {
+        return static_cast<std::size_t>(*config.maxProduceBatchBytes);
+    }
+    return rune::gateway::ClientGateway::kMaxProduceBatchBytes;
+}
+
+std::size_t effectiveMaxProduceBatchBytes(const NodeConfig& config) noexcept {
+    return static_cast<std::size_t>(config.produceIntakeLimit());
+}
+
+std::optional<std::string> validateEffectiveMaxProduceBatch(const NodeConfig& config) {
+    const std::size_t eff = effectiveMaxProduceBatchBytes(config);
+    if (eff >= kMinSaneMaxProduceBatchBytes) return std::nullopt;
+    return "effective max produce batch is " + std::to_string(eff) + " bytes (configured=" +
+           std::to_string(configuredMaxProduceBatchBytes(config)) + ", formula=" +
+           std::to_string(config.batchLimitFormula()) + ", workerIngress=" +
+           std::to_string(workerIngressMaxBatchBytes(config)) + ", aeronIngress=" +
+           std::to_string(aeronIngressMaxBatchBytes(config)) + ", replication=" +
+           std::to_string(replicationHardTransportMaxBytes(config)) +
+           ") — below the minimum of " + std::to_string(kMinSaneMaxProduceBatchBytes) +
+           " bytes needed to carry even one record.  Raise workerIngressRingBytes / "
+           "workerReturnRingBytes / replicationOutboundRingBytes / aeronTermBufferBytes "
+           "(or RUNE_MAX_PRODUCE_BATCH_BYTES).";
+}
+
+std::optional<std::string> validateExplicitMaxProduceBatch(const NodeConfig& config) {
+    // The default (unset) config always passes: there is nothing to refuse —
+    // the effective value is the formula (never a promise that was broken,
+    // since none was explicitly made).
+    if (!config.maxProduceBatchBytes || *config.maxProduceBatchBytes <= 0) {
+        return std::nullopt;
+    }
+    const std::size_t explicitBytes = static_cast<std::size_t>(*config.maxProduceBatchBytes);
+    const std::size_t hardMax = config.batchLimitFormula();
+    if (explicitBytes > hardMax) {
+        return "explicit max produce batch config (RUNE_MAX_PRODUCE_BATCH_BYTES=" +
+               std::to_string(explicitBytes) + " bytes) exceeds the broker's batch limit (" +
+               std::to_string(hardMax) + " bytes = min(8 MiB, every ring / Aeron frame a batch "
+               "crosses)) — such a batch could never be ingested, replicated or pushed.  Raise "
+               "workerIngressRingBytes/workerReturnRingBytes/replicationOutboundRingBytes/"
+               "aeronTermBufferBytes so the limit covers the requested max batch size, or "
+               "lower RUNE_MAX_PRODUCE_BATCH_BYTES.";
+    }
+    return std::nullopt;
+}
 
 // ---------------------------------------------------------------------------
 // BrokerNode::BrokerNode
@@ -86,6 +195,28 @@ void BrokerNode::start() {
             static_cast<std::size_t>(config_.workerReturnRingBytes),
             static_cast<std::size_t>(config_.workerIngressRingBytes), config_.workerMaxOwedReturns);
         err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+
+    // F3 round 4 (corrects round 3): refuse to start ONLY if the operator
+    // EXPLICITLY configured a max produce batch (RUNE_MAX_PRODUCE_BATCH_BYTES)
+    // that exceeds what the transport can ever carry.  The default (unset)
+    // config always passes this check by construction — see
+    // validateExplicitMaxProduceBatch()'s doc comment — because the gateway's
+    // EFFECTIVE max batch (installed on gateway_ below, once constructed) is
+    // always safely derived down to whatever the transport can actually
+    // carry, so an oversize-vs-transport batch is simply never ACCEPTED by
+    // the gateway in the first place (MessageTooLarge), rather than being
+    // accepted and then permanently unfetchable.  Same hard-refusal-before-
+    // any-side-effect pattern as the shard-config check above.
+    if (auto err = validateExplicitMaxProduceBatch(config_); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    // F3 round 5, item M3: an effective max too small to carry one record is a
+    // misconfiguration — refuse loudly (never silently fall back to 8 MiB).
+    if (auto err = validateEffectiveMaxProduceBatch(config_); err.has_value()) {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
@@ -708,7 +839,7 @@ void BrokerNode::buildReplication() {
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
             pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
-            pcfg.maxFetchBytes        = 1 << 20;
+            pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
             // runBoundedCompaction() reads the correct policy from every replica.
             // TopicSpec::CleanupPolicy and rune::replication::CleanupPolicy share
@@ -916,7 +1047,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.minIsr               = config_.gatewayMinIsr;
         pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
         pcfg.isrCheckIntervalNs   = 10'000'000LL;
-        pcfg.maxFetchBytes        = 1 << 20;
+        pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
         pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
             static_cast<uint8_t>(spec.cleanupPolicy));
         pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
@@ -1415,6 +1546,20 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: gateway fragmentLimit set to {}",
                      nodeId, config_.gatewayFragmentLimit);
 
+        // F3 round 6, item 6: the batch limit is a CLUSTER-WIDE constraint (a
+        // follower must carry what any leader accepted).  Shard mode verifies it
+        // per plane (PlaneHello → Refused on mismatch); legacy mode cannot, so
+        // the config MUST be homogeneous.  (F3 rounds 4-5's install is the ONE
+        // setMaxProduceBatchBytes(produceIntakeLimit()) above.)
+        if (!config_.isSingleNode() && !config_.shardMode()) {
+            spdlog::info("BrokerNode[{}]: legacy replication mode — max produce batch {} B "
+                         "(worker ingress ring {} B) is NOT verified against peers: "
+                         "RUNE_AERON_TERM_BUFFER_BYTES / RUNE_WORKER_INGRESS_RING_BYTES / "
+                         "RUNE_WORKER_RETURN_RING_BYTES / RUNE_REPLICATION_OUTBOUND_RING_BYTES / "
+                         "RUNE_MAX_PRODUCE_BATCH_BYTES MUST be identical on every node",
+                         nodeId, config_.produceIntakeLimit(), config_.workerIngressRingBytes);
+        }
+
         // E5.1: Apply per-worker ingress base stream id (RUNE_WORKER_INGRESS_BASE_STREAM).
         // Each PartitionEntry in the MetadataResponse will carry
         //   ingressStreamId = base + ShardRouter.workerForPartition(topicId, partition)
@@ -1508,7 +1653,7 @@ void BrokerNode::buildGateway() {
             ocfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             ocfg.fetchIntervalNs      = config_.fetchIntervalNs;
             ocfg.isrCheckIntervalNs   = 10'000'000LL;
-            ocfg.maxFetchBytes        = 1 << 20;
+            ocfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
             ocfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
             // CP-2: compaction tuning for __consumer_offsets sentinel topic.
@@ -1620,7 +1765,7 @@ void BrokerNode::buildGateway() {
             tcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             tcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             tcfg.isrCheckIntervalNs   = 10'000'000LL;
-            tcfg.maxFetchBytes        = 1 << 20;
+            tcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
             tcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
             // CP-2: compaction tuning for __transaction_state sentinel topic.
@@ -1748,7 +1893,7 @@ void BrokerNode::buildGateway() {
             mcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             mcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             mcfg.isrCheckIntervalNs   = 10'000'000LL;
-            mcfg.maxFetchBytes        = 1 << 20;
+            mcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // __cluster_metadata: compacted log (keep latest assignment per key).
             mcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
             mcfg.minCleanableDirtyRatio = 0.5;
@@ -2192,7 +2337,7 @@ void BrokerNode::buildAdminWorker() {
         scfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only
         scfg.fetchIntervalNs      = config_.fetchIntervalNs;
         scfg.isrCheckIntervalNs   = 10'000'000LL;
-        scfg.maxFetchBytes        = 1 << 20;
+        scfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
         // Compacted: keep latest schema record per topicId (key = topicId bytes).
         scfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
         scfg.minCleanableDirtyRatio = 0.5;
@@ -2321,47 +2466,17 @@ void BrokerNode::buildAdminWorker() {
             return encodeCreateTopicReq(adminWorkerAgent_->createReqRing(), m);
         };
 
-        // Task 7: pushValidators — enqueue a SchemaUpdate WorkerOp to EVERY
-        // produce worker's ingress ring.
-        //
-        // Admin→worker hand-off: this lambda is called on the AdminWorker thread
-        // after a DefineTopic DDL commit (validate=true).  It fans out a
-        // SchemaUpdate op to each worker in the pool by calling
-        // worker.tryEnqueueOp().  Each worker builds a local rune::codec::Validator
-        // from the blob on ITS OWN thread (shared-nothing — single-writer per
-        // validators_ map entry).
-        //
-        // Back-pressure: if a worker's ingress ring is full, we log a warning and
-        // skip that worker for this cycle.  The validator will be retried when a
-        // later DefineTopic DDL commit fires (rare admin path — not a problem in
-        // practice, and a full ring means the worker is processing under load).
-        // A TODO(T8) can add a retry queue if needed.
-        //
-        // No blocking: the lambda enqueues and returns.  The worker thread applies
-        // the op the next time it drains its ingress ring.
+        // Task 7 / F3 round 6, item 3: pushValidators runs on the ADMIN thread
+        // (AdminWorker::advance_ after a validate=true DefineTopic commit).  It
+        // must NOT enqueue into the worker SPSC ingress rings — the control
+        // thread is their single producer (round 5 review: confirmed data race,
+        // two producers on an SPSC ring).  It posts on the admin→control ring
+        // (T10's ring, kA2cSchemaUpdate); the control thread's admin hook drains
+        // it into schemaFanout_, which fans out to every worker with
+        // retry-on-full (each worker builds its Validator on ITS OWN thread).
         deps.pushValidators = [this](const RegistryEntry& entry, int32_t topicId) {
-            if (!workerPool_) {
-                spdlog::warn(
-                    "BrokerNode: pushValidators — no WorkerPool; "
-                    "validator for topicId={} not pushed", topicId);
-                return;
-            }
-            const int32_t nWorkers = workerPool_->workerCount();
-            for (int32_t i = 0; i < nWorkers; ++i) {
-                WorkerOp op;
-                op.type              = WorkerOp::Type::SchemaUpdate;
-                op.topicId           = topicId;
-                op.schemaUpdateBlob  = entry.descriptorBlob; // copy (admin-path, not hot)
-                if (!workerPool_->worker(i).tryEnqueueOp(std::move(op))) {
-                    spdlog::warn(
-                        "BrokerNode: pushValidators — worker {} ingress ring full; "
-                        "SchemaUpdate for topicId={} dropped (back-pressure)",
-                        i, topicId);
-                }
-            }
-            spdlog::info(
-                "BrokerNode: pushValidators — SchemaUpdate for topicId={} "
-                "enqueued to {} workers", topicId, nWorkers);
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postSchemaUpdate(topicId, entry.descriptorBlob);
         };
 
         // respondDefine / respondGet (RULING-2 F): encode the protocol response
@@ -2643,17 +2758,36 @@ int BrokerNode::serviceAdminControl_() {
         // else: ring full (impossible for 1-deep role churn) → retry next cycle
     }
 
-    // (1b) Task 10 fix 3 / I1: schema-log storage failure (admin →
-    //      control ring) → the same halt path as every other log.
+    // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
+    //      control plane):
+    //   kA2cStorageFailure (Task 10 fix 3 / I1): schema-log storage failure →
+    //     the same halt path as every other log.
+    //   kA2cSchemaUpdate (F3 round 6, item 3): queue for the control-thread
+    //     fan-out to the worker rings.
+    //   F3 round 7, item 3: explicit per-type dispatch; an unknown/short frame
+    //   is logged (rate-limited) and skipped, never decoded as a failure.
     work += agent->failureRing().drain(
-        [this](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b,
+        [this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
                aeron::util::index_t off, aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-            int32_t e = 0;
-            std::memcpy(&e, p, 4);
-            onStorageFailure_(std::string(reinterpret_cast<const char*>(p) + 4,
-                                          static_cast<std::size_t>(len) - 4), e);
-        }, 4);
+            const auto  n = static_cast<std::size_t>(len);
+            const A2cDispatch d = dispatchAdminToControl(tid, p, n,
+                [this](int32_t e, std::string_view dir) {
+                    onStorageFailure_(std::string(dir), e);
+                },
+                [this](SchemaUpdateMsg m) {
+                    schemaFanout_.post(m.topicId, std::move(m.blob));
+                });
+            if ((d == A2cDispatch::Unknown || d == A2cDispatch::Malformed) &&
+                adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                spdlog::error("BrokerNode[{}]: admin→control frame skipped ({} type={} "
+                              "len={}; rejects={})", config_.nodeId,
+                              d == A2cDispatch::Unknown ? "unknown" : "malformed",
+                              tid, n, adminToControlRejects_);
+            }
+        }, 16);
+    // Control (runtime) thread = the single producer of every worker ring.
+    if (workerPool_) work += schemaFanout_.pump(*workerPool_);
 
     // (2) Drain create-topic requests (admin → control).
     work += agent->createReqRing().drain(
@@ -2857,7 +2991,11 @@ void BrokerNode::attachShardRuntimes_() {
                                          std::to_string(w) + " replication plane did not resolve — refusing to start");
             // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
             // are unknown at parse time, so each plane verifies them in-band.
-            plane.enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds);
+            // F3 round 6, item 6: the max-batch constraint is cluster-wide —
+            // advertise this node's effective max + worker ingress ring size.
+            plane.enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds,
+                                       static_cast<int64_t>(config_.produceIntakeLimit()),
+                                       config_.workerIngressRingBytes);
         }
         auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(w),
                                                    config_.workerIngressBaseStreamId + w, pump);

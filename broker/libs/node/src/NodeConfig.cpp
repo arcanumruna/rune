@@ -287,13 +287,24 @@ std::string NodeConfig::shardIngressEndpoint(const PeerConfig& p, int32_t w) {
 // egress — uses the embedded driver's term (no channel overrides term-length).
 static_assert(NodeConfig::kDefaultMaxProduceBatchBytes == Worker::kMaxProduceBatchBytes,
               "one 8 MiB ceiling");
-int32_t NodeConfig::produceIntakeLimit() const {
-    return static_cast<int32_t>(Worker::maxAcceptableBatchBytes(
+std::size_t NodeConfig::batchLimitFormula() const {
+    const auto term = static_cast<std::size_t>(aeronTermBufferBytes);
+    return Worker::maxAcceptableBatchBytes(
         static_cast<std::size_t>(workerIngressRingBytes),
         static_cast<std::size_t>(workerReturnRingBytes),
         static_cast<std::size_t>(replicationOutboundRingBytes),
-        static_cast<std::size_t>(aeronTermBufferBytes),
-        static_cast<std::size_t>(aeronTermBufferBytes)));
+        term,    // replication publications
+        term,    // client egress publications
+        term);   // client Produce frame on the broker's term (F3)
+}
+
+int32_t NodeConfig::produceIntakeLimit() const {
+    std::size_t limit = batchLimitFormula();
+    // F3 round 4: an EXPLICIT RUNE_MAX_PRODUCE_BATCH_BYTES can only LOWER it
+    // (BrokerNode refuses to start when it exceeds the formula).
+    if (maxProduceBatchBytes && *maxProduceBatchBytes > 0)
+        limit = std::min(limit, static_cast<std::size_t>(*maxProduceBatchBytes));
+    return static_cast<int32_t>(limit);
 }
 
 std::optional<std::string> NodeConfig::validateShardConfig() const {
@@ -1105,6 +1116,15 @@ ConfigResult parseNodeConfig(
         if (port < 1 || port > 65535)   // rejected in every mode (no silent fallback)
             return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT must be a port in [1, 65535], got: ") + raw};
         cfg.workerIngressBasePort = port;
+    }
+    // F3 round 4: EXPLICIT override of the gateway's max accepted produce-batch
+    // size.  Left unset (nullopt) by default — BrokerNode::start() then derives
+    // the effective ceiling from the transport instead of refusing startup.
+    if (const char* raw = getenv_fn("RUNE_MAX_PRODUCE_BATCH_BYTES"); raw && *raw) {
+        int64_t bytes{};
+        if (!parseInt64Positive(raw, bytes))
+            return {{}, std::string("RUNE_MAX_PRODUCE_BATCH_BYTES must be a positive integer, got: ") + raw};
+        cfg.maxProduceBatchBytes = bytes;
     }
     if (const char* raw = getenv_fn("RUNE_WORKER_REPL_BASE_PORT"); raw && *raw) {
         int32_t port{};

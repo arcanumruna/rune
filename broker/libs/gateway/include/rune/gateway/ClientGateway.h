@@ -513,6 +513,13 @@ public:
         return fragmentLimit_;
     }
 
+    // (F3 round 4/5's verbatim setMaxProduceBatchBytes is merged into the ONE
+    //  setter above — S3's, clamped to kMaxProduceBatchBytes; BrokerNode refuses
+    //  to start when the effective limit cannot carry one record, F3 M3.)
+    [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept {
+        return oversizeProduceRejectLogs_;
+    }
+
     // -----------------------------------------------------------------------
     // pendingAckCount — number of deferred acks=All entries waiting for HW.
     // For tests and monitoring.
@@ -1211,11 +1218,12 @@ private:
     // page cache / ring slot via pwritev — so this bound only guards against an
     // absurd/malformed length overrunning the worker ingress ring or a segment.
     // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
-    // F15 S3: == rune::node::Worker::kMaxProduceBatchBytes (static_assert in
-    // ClientGateway.cpp) — the shard-ingress guard and the return-ring startup
-    // check use the same bound.
-    static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
+    // kMaxProduceBatchBytes (public, below the accessors) == rune::node::Worker::
+    // kMaxProduceBatchBytes (F15 S3 static_assert in ClientGateway.cpp).
     std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
+    // F3 round 6, item 2: oversize-reject log rate limiting (control thread only).
+    uint64_t oversizeProduceRejects_    = 0;
+    uint64_t oversizeProduceRejectLogs_ = 0;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
@@ -1478,6 +1486,14 @@ public:
     [[nodiscard]] int maxBatchesPerSubPerCycleForTest() const noexcept {
         return maxBatchesPerSubPerCycle_;
     }
+
+    // The 8 MiB ceiling of the client-visible batch limit (F3: the CONFIGURED
+    // default when RUNE_MAX_PRODUCE_BATCH_BYTES is unset; F15 S3: == rune::node::
+    // Worker::kMaxProduceBatchBytes).  Never enforced as-is in a running broker:
+    // BrokerNode installs NodeConfig::produceIntakeLimit() (= min(configured,
+    // Worker::maxAcceptableBatchBytes(config))) via setMaxProduceBatchBytes().
+    static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
+
 private:
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.

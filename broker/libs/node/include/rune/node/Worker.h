@@ -125,6 +125,9 @@ namespace rune::node {
 // read-rework SBE-B: the worker ring codec now uses the SBE-generated flyweights.
 namespace sbe = rune::protocol::internal::sbe;
 
+// (F3 round 6 item 5's {Ok, Full, TooLarge} outcome is F18's EnqueueResult in
+//  WorkerOp.h — one enqueue outcome type; integration wave 2.)
+
 class Worker final : public rune::consensus::Agent {
 public:
     // Non-owning pointer set published as an immutable snapshot.
@@ -247,38 +250,52 @@ public:
     [[nodiscard]] bool returnRingCoversMaxPushChunk() const {
         return static_cast<std::size_t>(ret_.maxMsgLength()) >= maxPushReadResultBytes();
     }
+    /// Fixed framing of a key-less client Produce frame: header + fixed body +
+    /// key u16 prefix + batch u32 prefix (pc::Produce::encodedSize() − batch).
+    static constexpr std::size_t kProduceFrameFixedBytes =
+        static_cast<std::size_t>(rune::protocol::client::MessageHeader::ENCODED_SIZE) +
+        rune::protocol::client::Produce::BODY_FIXED + 2u + 4u;
+
     /// THE client-visible batch limit (F15 S3 re-review 2 B-1 / m-g, unified
-    /// with F18 + F19 in integration wave 2 — the ONE formula; every other
+    /// with F18, F19 and F3 in integration wave 2 — the ONE formula; every other
     /// limit — NodeConfig::produceIntakeLimit(), the gateway's MessageTooLarge
-    /// guard, this worker's shard/ingress guard — is this value): the largest
-    /// record batch any intake path accepts, and therefore the largest batch the
-    /// broker can store, replicate and push:
+    /// guard, every worker's ingress guard, the PlaneHello advertisement — is
+    /// this value, optionally LOWERED by an explicit RUNE_MAX_PRODUCE_BATCH_BYTES):
+    /// the largest record batch any intake path accepts, and therefore the
+    /// largest batch the broker can ingest, store, replicate and push:
     ///   min(8 MiB ceiling,
     ///       worker op ring max message − op framing         (gateway → worker op),
     ///       worker return ring max message − return framing  (one PushReadResult),
     ///       replication outbound ring frame − envelope − FetchResponse framing,
     ///       replication Aeron max message (min(16 MiB, term / 8)) − FetchResponse framing,
-    ///       client egress Aeron max message (min(16 MiB, term / 8)) − Records framing).
+    ///       client egress Aeron max message − Records framing             (F19),
+    ///       client ingress Aeron max message − Produce framing            (F3)).
     /// The replication terms apply ALWAYS, single-node too: the limit must not
     /// change when a node later joins a cluster.  The replication terms are
     /// F18's ReplicationFrameLimits.h (one source of truth with the transport's
     /// own fetch ceilings); the egress term is F19's Records frame (a batch at
-    /// the limit must be deliverable to a push consumer, never error-parked).
+    /// the limit must be deliverable to a push consumer, never error-parked);
+    /// the ingress term is F3's Produce frame on the broker's term (on UDP the
+    /// CLIENT's term governs the image — the explicit intake guards bound it).
     [[nodiscard]] static std::size_t maxAcceptableBatchBytes(std::size_t ingressRingBytes,
                                                              std::size_t returnRingBytes,
                                                              std::size_t replOutboundRingBytes,
                                                              std::size_t replTermBufferBytes,
-                                                             std::size_t egressTermBufferBytes) {
+                                                             std::size_t egressTermBufferBytes,
+                                                             std::size_t clientIngressTermBufferBytes) {
         namespace rr = rune::replication;
         auto fit  = [](std::size_t maxMsg, std::size_t fixed) { return maxMsg > fixed ? maxMsg - fixed : 0; };
         auto nn   = [](int64_t v) { return v > 0 ? static_cast<std::size_t>(v) : std::size_t{0}; };
+        auto aeronMax = [&](std::size_t term) {
+            return nn(rr::aeronMaxMessageLength(static_cast<int64_t>(term)));
+        };
         return std::min({kMaxProduceBatchBytes,
                          fit(ingressRingBytes / 8, opFixedBytes()),
                          fit(returnRingBytes / 8, returnFixedBytes()),
                          nn(rr::maxFetchRecordsViaOutboundRing(static_cast<int64_t>(replOutboundRingBytes))),
                          nn(rr::maxFetchRecordsViaPublication(static_cast<int64_t>(replTermBufferBytes))),
-                         fit(nn(rr::aeronMaxMessageLength(static_cast<int64_t>(egressTermBufferBytes))),
-                             kRecordsFixedBytes)});
+                         fit(aeronMax(egressTermBufferBytes), kRecordsFixedBytes),
+                         fit(aeronMax(clientIngressTermBufferBytes), kProduceFrameFixedBytes)});
     }
     /// The part of the limit this worker's own rings impose (op + return ring,
     /// under the 8 MiB ceiling) — the default and the upper bound for
@@ -712,6 +729,27 @@ public:
     // Signature UNCHANGED — all producer call sites (gateway, transport, bridge,
     // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // F3 round 5, item I1: the largest variable tail (record batch / replicated
+    // records / ...) a WorkerOp can carry through this worker's ingress O2O ring
+    // (agrona maxMsgLength = capacity/8, minus the op framing — S3's
+    // opFixedBytes(), the same framing workerOpFrameBytes() and opTailFits()
+    // use).  maxOpTailBytesFor() from the configured ring size, maxOpTailBytes()
+    // from the live ring.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] static constexpr std::size_t maxOpTailBytesFor(std::size_t ingressRingBytes) noexcept {
+        const std::size_t maxMsg = ingressRingBytes / 8;   // O2ORingBuffer: capacity / 8
+        return maxMsg > opFixedBytes() ? maxMsg - opFixedBytes() : 0;
+    }
+    [[nodiscard]] std::size_t maxOpTailBytes() const noexcept {
+        const std::size_t maxMsg = static_cast<std::size_t>(ingress_.maxMsgLength());
+        return maxMsg > opFixedBytes() ? maxMsg - opFixedBytes() : 0;
+    }
+    /// F3 round 6 item 2: oversize-produce rejects on the worker ingress path
+    /// (rate-limited log: first, then every 1024th).
+    [[nodiscard]] uint64_t oversizeProduceRejectsForTest() const noexcept { return oversizeProduceRejects_; }
+    [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
+
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
         return enqueueOp(std::move(op)) == EnqueueResult::Enqueued;
     }
@@ -779,11 +817,14 @@ public:
         // checkMsgLength) and terminate the control thread.  Unreachable when
         // intake is bounded (produceIntakeLimit) and the follower apply path
         // pre-checks opTailFits(); refuse loudly instead of crashing.
+        // (F3 round 5 item I1 — the same refusal — is folded in: one check,
+        //  rate-limited log: first, then every 1024th.)
         if (n > static_cast<std::size_t>(ingress_.maxMsgLength())) [[unlikely]] {
-            ++oversizedOpsRefused_;
-            spdlog::error("Worker {}: op type={} tail {} B exceeds the ingress ring frame "
-                          "({} B); refused (TooLarge, not retriable)", workerId_,
-                          static_cast<int>(op.type), tailLen, ingress_.maxMsgLength());
+            if (oversizedOpsRefused_++ % 1024 == 0)
+                spdlog::error("Worker {}: op type={} tail {} B exceeds the ingress ring frame "
+                              "({} B); refused (TooLarge, not retriable) (refused={})", workerId_,
+                              static_cast<int>(op.type), tailLen, ingress_.maxMsgLength(),
+                              oversizedOpsRefused_);
             return EnqueueResult::TooLarge;
         }
         const aeron::util::index_t idx =
@@ -3476,6 +3517,9 @@ private:
     // Configurable (RUNE_WORKER_ACK_SLOT_BYTES); see setAckSlotBytes.  256 comfortably
     // covers the ~160 B framed ProduceResult.
     int32_t ackSlotBytes_ = 256;
+    // F3 round 6, item 2: worker-thread-owned reject counters (per-worker ingress).
+    uint64_t    oversizeProduceRejects_    = 0;
+    uint64_t    oversizeProduceRejectLogs_ = 0;
     // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
     // default so routed replication ops / acks don't queue behind a tiny cap).
     int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
@@ -4781,10 +4825,19 @@ private:
         // F18 (merged): the same LOUD intake guard as the gateway path — one limit
         // (maxAcceptableBatchBytes), so an accepted batch always fits one frame on
         // every hop (op/return ring, replication outbound ring + term, egress).
+        // F3 round 5 C2 (same guard): the per-worker ingress path enforces the SAME
+        // limit as the gateway — a UDP client's own term governs the image frame,
+        // so nothing upstream bounds it; covers idempotent/transactional produce.
         if (rbSpan.size() > maxIntakeBatchBytes_) [[unlikely]] {
-            spdlog::warn("Worker {}: WorkerIngress: produce batch too large ({} > {}); "
-                         "rejected (MessageTooLarge)", workerId_, rbSpan.size(),
-                         maxIntakeBatchBytes_);
+            // F3 round 6, item 2: rate-limited (first, then every 1024th) —
+            // worker-thread-owned counters.
+            if (oversizeProduceRejects_++ % 1024 == 0) {
+                ++oversizeProduceRejectLogs_;
+                spdlog::warn("Worker {}: WorkerIngress: produce batch too large ({} > {}) "
+                             "topicId={} partition={}; rejected (MessageTooLarge, rejects={})",
+                             workerId_, rbSpan.size(), maxIntakeBatchBytes_,
+                             msg.topicId, msg.partition, oversizeProduceRejects_);
+            }
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;

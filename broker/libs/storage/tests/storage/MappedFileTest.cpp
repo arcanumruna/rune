@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <rune/storage/MappedFile.h>
+#include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
 #include <filesystem>
 #include <stdexcept>
 #include <atomic>
@@ -141,6 +143,144 @@ TEST(MappedFile, BoundaryLastByteWriteRead) {
         MappedFile mf(p.string(), sz, false);
         EXPECT_EQ(mf.data()[sz - 1], 0xDE);
     }
+    std::filesystem::remove(p);
+}
+
+// F3.2: a read-only MappedFile must not retain a POSIX fd once mapped — the
+// mapping itself keeps the page-cache binding alive, so the fd is dead weight
+// (one fewer fd per retained segment).  A writable mapping still needs its fd
+// (ftruncate on resize()), so it must keep it.
+TEST(MappedFileRegression, ReadOnlyMappingRetainsNoFd) {
+    auto p = makeTempPath("rune_mf_nofd");
+    std::filesystem::remove(p);
+    {
+        MappedFile writer(p.string(), 4096, true);
+        writer.data()[0]    = 0xAA;
+        writer.data()[4095] = 0xBB;
+        writer.sync();
+    }
+
+    MappedFile ro(p.string(), 4096, false);
+    EXPECT_EQ(ro.fdForTest(), -1) << "read-only MappedFile must close its fd right after mmap";
+    EXPECT_EQ(ro.data()[0],    0xAA);
+    EXPECT_EQ(ro.data()[4095], 0xBB);
+
+    // A larger resize() must remap (via a brief reopen) but end up fd-less again.
+    ro.resize(8192);
+    EXPECT_EQ(ro.fdForTest(), -1) << "resize() must close the fd again after remapping";
+    EXPECT_EQ(ro.data()[0],    0xAA) << "data must survive the resize-remap";
+    EXPECT_EQ(ro.data()[4095], 0xBB);
+
+    // Writable mode is unchanged: it must still hold its fd (needed for ftruncate).
+    MappedFile writable(p.string(), 4096, true);
+    EXPECT_NE(writable.fdForTest(), -1) << "writable MappedFile must keep its fd open";
+
+    std::filesystem::remove(p);
+}
+
+// F3 fix-round-1, item 1 (IMPORTANT): the MappedFile ctor must not leak fd_
+// when ftruncate/mmap fails AFTER open() already succeeded.  Before the fix,
+// a persistently-failing lazy-map retry (e.g. ensureReadMap() hammering a
+// backing path whose mmap always fails) leaked one fd per attempt and would
+// eventually exhaust the process's fd table.
+//
+// /dev/null: open() always succeeds, but mmap() on it fails with ENODEV (not
+// seekable/mappable) — the exact "open succeeded, mmap failed" shape named
+// in the review.  For the LogSegment half, a sealed segment's .log path is
+// replaced with a symlink to /dev/null so the LAZY read-map's open() (by
+// pathname) succeeds but its mmap() fails the same way, every retry.
+static int countOpenFdsForTest() {
+    int n = 0;
+    std::error_code ec;
+    for (auto& e : std::filesystem::directory_iterator("/dev/fd", ec)) { (void)e; ++n; }
+    return n;
+}
+
+TEST(MappedFileRegression, FailedMmapAfterOpenLeaksNoFd) {
+    // --- Part 1: direct MappedFile construction against /dev/null. ---
+    int before1 = countOpenFdsForTest();
+    for (int i = 0; i < 50; ++i) {
+        EXPECT_THROW(MappedFile(std::string("/dev/null"), 4096, /*writable*/false),
+                     std::runtime_error);
+    }
+    int after1 = countOpenFdsForTest();
+    EXPECT_EQ(after1, before1)
+        << "50 failed MappedFile(/dev/null) constructions must leak no fds";
+
+    // --- Part 2: 50 failing LogSegment::readView() calls via the lazy
+    // read-map path, where the backing path EXISTS (open succeeds) but mmap
+    // fails every time. ---
+    using namespace rune::storage; using namespace rune::protocol;
+    auto dir = makeTempPath("rune_mf_leak_seg_dir");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    std::vector<int64_t> bases;
+    int64_t sealedBase = -1;
+    {
+        Log log(dir.string(), /*rollBytes=*/256);
+        int64_t off = 0;
+        for (int i = 0; i < 30; ++i) {
+            RecordBatchBuilder b(off, 7000 + i); b.append("k", "v" + std::to_string(i), 7000 + i);
+            off = log.append(b.build(), off);
+        }
+        bases = log.segmentBaseOffsets();
+        ASSERT_GE(bases.size(), 3u);
+        sealedBase = bases[1];
+    }
+    Log log2(dir.string(), /*rollBytes=*/256);
+    log2.recover();
+    LogSegment* sealedSeg = log2.segmentForTest(sealedBase);
+    ASSERT_NE(sealedSeg, nullptr);
+    ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be unmapped";
+
+    // Replace the sealed segment's .log with a symlink to /dev/null: a fresh
+    // open() by pathname (what the lazy MappedFile ctor does) succeeds, but
+    // mmap() on it fails with ENODEV every time — a persistent, retried
+    // "open succeeds, mmap fails" failure exactly like the review's scenario.
+    std::string logPath = sealedSeg->logPath();
+    std::filesystem::remove(logPath);
+    std::filesystem::create_symlink("/dev/null", logPath);
+
+    int before2 = countOpenFdsForTest();
+    for (int i = 0; i < 50; ++i) {
+        LogReadView v = log2.readView(sealedBase, 1 << 20);
+        EXPECT_TRUE(v.empty());
+    }
+    EXPECT_EQ(sealedSeg->readMapFailures(), 50u);
+    int after2 = countOpenFdsForTest();
+    EXPECT_EQ(after2, before2)
+        << "50 failed lazy LogSegment readView() map attempts must leak no fds";
+
+    std::filesystem::remove_all(dir);
+}
+
+// F3 fix-round-1, item 4: a resize() failure (after the old mapping is
+// munmap'd) must leave the MappedFile in a fully consistent "nothing mapped"
+// state: data()==nullptr, size()==0, and no leaked fd.  Injected cheaply via
+// the same open-succeeds/mmap-fails symlink-to-/dev/null trick used above.
+TEST(MappedFileRegression, ResizeFailureLeavesConsistentState) {
+    auto p = makeTempPath("rune_mf_resize_fail");
+    std::filesystem::remove(p);
+    {
+        MappedFile mf(p.string(), 4096, true);
+        mf.data()[0] = 0x42;
+        mf.sync();
+    }
+
+    MappedFile ro(p.string(), 4096, false);
+    ASSERT_EQ(ro.data()[0], 0x42);
+    ASSERT_EQ(ro.fdForTest(), -1);
+
+    // Redirect the backing path: resize()'s read-only reopen (by pathname)
+    // will now succeed (symlink resolves to /dev/null) but mmap() will fail.
+    std::filesystem::remove(p);
+    std::filesystem::create_symlink("/dev/null", p);
+
+    EXPECT_THROW(ro.resize(8192), std::runtime_error);
+    EXPECT_EQ(ro.data(), nullptr) << "a failed resize() must leave data() null";
+    EXPECT_EQ(ro.size(), 0u)      << "a failed resize() must leave size() at 0, not the attempted new size";
+    EXPECT_EQ(ro.fdForTest(), -1) << "a failed resize() must not leak the reopened fd";
+
     std::filesystem::remove(p);
 }
 

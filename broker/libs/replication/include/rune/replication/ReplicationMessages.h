@@ -487,9 +487,14 @@ struct PlaneHelloMsg {
     int32_t workerId    = -1;
     int32_t workerCount = 0;
     int32_t flags       = 0;
+    // F3 round 6, item 6: the cluster-wide max produce-batch constraint — the
+    // node's effective max produce batch and worker ingress ring size; a
+    // mismatch refuses the plane exactly like a worker-count mismatch.
+    int64_t maxProduceBatchBytes   = 0;
+    int32_t workerIngressRingBytes = 0;
 
     static constexpr int32_t     kReplyRequested = 1;
-    static constexpr uint16_t    BLOCK_LENGTH    = 16;
+    static constexpr uint16_t    BLOCK_LENGTH    = 32;   // 16 + 8 + 4 + 4 pad
     static constexpr std::size_t TOTAL_SIZE      = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
 
     static std::size_t encode(uint8_t* buf, const PlaneHelloMsg& m) noexcept {
@@ -499,6 +504,9 @@ struct PlaneHelloMsg {
         detail::write_le<int32_t>(p + 4,  m.workerId);
         detail::write_le<int32_t>(p + 8,  m.workerCount);
         detail::write_le<int32_t>(p + 12, m.flags);
+        detail::write_le<int64_t>(p + 16, m.maxProduceBatchBytes);
+        detail::write_le<int32_t>(p + 24, m.workerIngressRingBytes);
+        detail::write_le<int32_t>(p + 28, 0);   // pad
         return TOTAL_SIZE;
     }
 
@@ -510,6 +518,8 @@ struct PlaneHelloMsg {
         out.workerId    = detail::read_le<int32_t>(p + 4);
         out.workerCount = detail::read_le<int32_t>(p + 8);
         out.flags       = detail::read_le<int32_t>(p + 12);
+        out.maxProduceBatchBytes   = detail::read_le<int64_t>(p + 16);
+        out.workerIngressRingBytes = detail::read_le<int32_t>(p + 24);
         return true;
     }
 };

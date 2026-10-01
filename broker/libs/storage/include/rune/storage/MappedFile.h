@@ -21,6 +21,12 @@ public:
     /// msync the ENTIRE mapping (MS_SYNC).
     /// msync the whole mapping.  Returns 0 or the errno of a failed msync.
     int sync();
+    /// TEST-ONLY: the POSIX fd currently held for this mapping.  For a read-only
+    /// mapping (writable == false) this is -1 once the mapping is established
+    /// (F3: the fd is closed right after mmap — dead weight for a read-only
+    /// mapping that is never ftruncate'd).  Writable mappings keep their fd open
+    /// for the object's lifetime (needed for ftruncate on resize()).
+    [[nodiscard]] int fdForTest() const noexcept { return fd_; }
     /// CP-10: msync only the first `bytes` of the mapping (page-aligned up),
     /// clamped to size_.  The OffsetIndex over-provisions an 8 MiB mapping but
     /// writes only a few KiB of real entries; syncing the full 8 MiB on every

@@ -2701,23 +2701,23 @@ TEST(ReturnOverflowRegression, OneBatchLimitOnEveryPath) {
     // every path: min(8 MiB, op ring, return ring, replication frame (outbound
     // ring / 8 and term / 8, minus framing)).
     constexpr std::size_t MiB = 1u << 20;
-    const std::size_t dflt = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 4 * MiB, 4 * MiB, 4 * MiB);
+    const std::size_t dflt = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 4 * MiB, 4 * MiB, 4 * MiB, 4 * MiB);
     EXPECT_LE(dflt, 512u * 1024u) << "default: bounded by the replication frame (4 MiB term / 8)";
     EXPECT_GT(dflt, 512u * 1024u - 512u);
     // CLAUDE.md env: 64 MiB term, 16 MiB replication outbound ring, 32 MiB rings.
-    const std::size_t claude = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 16 * MiB, 64 * MiB, 64 * MiB);
+    const std::size_t claude = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 16 * MiB, 64 * MiB, 64 * MiB, 64 * MiB);
     EXPECT_LE(claude, 2 * MiB) << "CLAUDE.md env: bounded by the 16 MiB outbound ring / 8";
     EXPECT_GT(claude, 2 * MiB - 512u);
     // Huge replication budget: the op ring (32 MiB / 8 − op framing) binds.
-    const std::size_t rings = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 256 * MiB, 256 * MiB, 256 * MiB);
+    const std::size_t rings = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB);
     EXPECT_LT(rings, 4 * MiB);
     EXPECT_GT(rings, 4 * MiB - 1024u);
-    EXPECT_EQ(Worker::maxAcceptableBatchBytes(256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB),
+    EXPECT_EQ(Worker::maxAcceptableBatchBytes(256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB),
               Worker::kMaxProduceBatchBytes) << "the 8 MiB ceiling";
     // Integration wave 2 (F19): the client EGRESS frame binds too — a batch at
     // the limit must be deliverable to a push consumer (egress term / 8 minus
     // the Records framing), never error-parked at delivery.
-    EXPECT_EQ(Worker::maxAcceptableBatchBytes(256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB, 4 * MiB),
+    EXPECT_EQ(Worker::maxAcceptableBatchBytes(256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB, 4 * MiB, 256 * MiB),
               512u * 1024u - rune::node::kRecordsFixedBytes) << "bounded by the 4 MiB egress term / 8";
     // Behavioural (shard path): a worker configured with the default limit
     // refuses limit + 1 and appends exactly the limit.

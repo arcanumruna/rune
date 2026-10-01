@@ -576,5 +576,167 @@ TEST_F(WorkerProduceFixture, G_A6_Backpressure_NoDropOnFullRet)
         << "Total acks must equal final LEO (exactly-once, no phantom appends)";
 }
 
+// ===========================================================================
+// F3 round 5 (C2 / I1 / M4): size limits on the per-worker produce path.
+// ===========================================================================
+
+// A valid RecordBatch whose encoded size is EXACTLY `target` bytes (value
+// length tuned; varint steps are bridged by also tuning the key length).
+static std::vector<uint8_t> makeBatchOfExactSize(std::size_t target) {
+    auto build = [](std::size_t keyLen, std::size_t valLen) {
+        rune::protocol::RecordBatchBuilder b(0, 1000LL);
+        b.append(std::string(keyLen, 'k'), std::string(valLen, 'v'), 1000LL);
+        return b.build();
+    };
+    for (std::size_t keyLen = 1; keyLen <= 4; ++keyLen) {
+        const std::size_t base = build(keyLen, 0).size();
+        if (base > target) break;
+        std::size_t val = target - base;
+        for (int iter = 0; iter < 8; ++iter) {
+            auto b = build(keyLen, val);
+            if (b.size() == target) return b;
+            if (b.size() > target) {
+                const std::size_t over = b.size() - target;
+                if (over > val) break;
+                val -= over;
+            } else {
+                val += target - b.size();
+            }
+        }
+    }
+    ADD_FAILURE() << "could not build a batch of exactly " << target << " bytes";
+    return {};
+}
+
+static std::vector<uint8_t> encodeProduceFrameIdem(int64_t correlationId,
+                                                   const std::vector<uint8_t>& batch,
+                                                   int64_t producerId) {
+    pc::Produce msg;
+    msg.sessionId      = 1;
+    msg.correlationId  = correlationId;
+    msg.topicId        = 0;
+    msg.partition      = 0;
+    msg.partitionKnown = 1;
+    msg.acks           = 0;
+    msg.producerId     = producerId;
+    msg.producerEpoch  = 0;
+    msg.baseSequence   = producerId >= 0 ? 0 : -1;
+    msg.key            = {};
+    msg.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> buf(msg.encodedSize());
+    msg.encode(buf.data());
+    return buf;
+}
+
+// C2 + M4: the per-worker ingress path (WorkerIngress -> handleWorkerIngressFrame_
+// -> handleProduceBatch) had NO size check: a UDP client's own (larger) term
+// governs the image frame size, so the broker's term never bounded it.  A
+// batch above the effective max must be rejected with MessageTooLarge (never
+// appended), exactly the max must be accepted, and the idempotent
+// (producerId >= 0) produce must be rejected identically.
+TEST(WorkerProduceRegression, IngressBatchAboveEffectiveMaxRejectedRegression) {
+    TempDir dir("f3r5_ingress_max_");
+    rune::storage::Log log(dir.path.string());
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    constexpr std::size_t kMax = 4096;
+    worker.setMaxBatchBytes(kMax);
+    ASSERT_EQ(worker.maxIntakeBatchBytes(), kMax);
+
+    auto runOne = [&](const std::vector<uint8_t>& frame) {
+        int16_t code = -999;
+        int n = 0;
+        (void)worker.handleIngressFrameForTest(frame.data(), frame.size(), /*nowNs=*/1);
+        worker.drainReturn([&](const WorkerReturn& ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult) { code = ret.errorCode; ++n; }
+        });
+        EXPECT_EQ(n, 1) << "exactly one ProduceResult per frame (never silently dropped)";
+        return code;
+    };
+
+    const auto atMax  = makeBatchOfExactSize(kMax);
+    const auto overBy = makeBatchOfExactSize(kMax + 1);
+    ASSERT_EQ(atMax.size(), kMax);
+    ASSERT_EQ(overBy.size(), kMax + 1);
+
+    EXPECT_EQ(runOne(encodeProduceFrameIdem(1, overBy, -1)),
+              static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(log.logEndOffset(), 0) << "an oversize batch must never be appended";
+
+    EXPECT_EQ(runOne(encodeProduceFrameIdem(2, overBy, /*producerId=*/7)),
+              static_cast<int16_t>(pc::ErrorCode::MessageTooLarge))
+        << "the idempotent/transactional produce must be size-checked too";
+    EXPECT_EQ(log.logEndOffset(), 0);
+
+    EXPECT_EQ(runOne(encodeProduceFrameIdem(3, atMax, -1)), 0)
+        << "a batch of exactly the effective max must be accepted";
+    EXPECT_EQ(log.logEndOffset(), 1);
+}
+
+// I1: tryEnqueueOp must never throw on a claim larger than the worker ingress
+// ring's maxMsgLength (agrona's checkMsgLength throws IllegalArgumentException).
+// The max tail = ring maxMsgLength - WorkerOp framing (SBE header 8 + block 219
+// + tail length prefix 4) — computed from the generated codec constants.
+TEST(WorkerProduceRegression, OversizeEnqueueNeverThrowsRegression) {
+    constexpr std::size_t kRing = 64 * 1024;
+    Worker worker(0, kRing);
+    constexpr std::size_t kExpectedTail = kRing / 8 -
+        (rune::protocol::internal::sbe::MessageHeader::encodedLength() +
+         rune::protocol::internal::sbe::WorkerOp::sbeBlockLength() +
+         rune::protocol::internal::sbe::WorkerOp::tailHeaderLength());
+    EXPECT_EQ(Worker::maxOpTailBytesFor(kRing), kExpectedTail);
+    EXPECT_EQ(worker.maxOpTailBytes(), kExpectedTail);
+
+    auto produceOp = [](std::size_t n) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::Produce;
+        op.recordBatchBytes.assign(n, 0xAB);
+        return op;
+    };
+    bool ok = true;
+    EXPECT_NO_THROW(ok = static_cast<bool>(worker.tryEnqueueOp(produceOp(kExpectedTail + 1))));
+    EXPECT_FALSE(ok) << "an oversize Produce op must be refused, not thrown";
+
+    WorkerOp apply;
+    apply.type = WorkerOp::Type::ApplyReplicated;
+    apply.replicatedPayload.records.assign(kExpectedTail + 1, 0xCD);
+    ok = true;
+    EXPECT_NO_THROW(ok = static_cast<bool>(worker.tryEnqueueOp(std::move(apply))));
+    EXPECT_FALSE(ok) << "an oversize ApplyReplicated op must be refused, not thrown";
+
+    ok = false;
+    EXPECT_NO_THROW(ok = static_cast<bool>(worker.tryEnqueueOp(produceOp(kExpectedTail))));
+    EXPECT_TRUE(ok) << "exactly the max tail must fit the ring";
+}
+
+// F3 round 6, item 2: the per-worker oversize-produce reject log is rate-
+// limited (first, then every 1024th) — a client spamming oversize batches must
+// not flood the log.  Every frame is still rejected with MessageTooLarge.
+TEST(WorkerProduceRegression, OversizeRejectLogRateLimitedRegression) {
+    TempDir dir("f3r6_ratelimit_");
+    rune::storage::Log log(dir.path.string());
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    worker.setMaxBatchBytes(256);
+    const auto over  = makeBatchOfExactSize(257);
+    const auto frame = encodeProduceFrameIdem(1, over, -1);
+    int rejects = 0;
+    for (int i = 0; i < 2100; ++i) {
+        (void)worker.handleIngressFrameForTest(frame.data(), frame.size(), 1);
+        worker.drainReturn([&](const WorkerReturn& r) {
+            if (r.errorCode == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) ++rejects;
+        });
+    }
+    EXPECT_EQ(rejects, 2100) << "every oversize frame is rejected";
+    EXPECT_EQ(worker.oversizeProduceRejectsForTest(), 2100u);
+    EXPECT_EQ(worker.oversizeProduceRejectLogsForTest(), 3u) << "logged at #1, #1025, #2049";
+    EXPECT_EQ(log.logEndOffset(), 0);
+}
+
 } // namespace
 } // namespace rune::node

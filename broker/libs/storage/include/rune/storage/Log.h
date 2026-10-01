@@ -87,7 +87,9 @@ public:
     /// span into its read-only mmap covering whole record batches (see
     /// LogSegment::readView / LogReadView).  No heap allocation, no copy.  Returns
     /// an empty view if startOffset is below logStartOffset() or at/after the LEO.
-    LogReadView readView(int64_t startOffset, int32_t maxBytes);
+    /// noexcept (F3): a failed lazy map on the target segment returns an empty
+    /// view rather than throwing — see LogSegment::readView.
+    LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
 
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     /// The lowest offset still readable from this log — the base offset of the
@@ -144,6 +146,9 @@ public:
     /// the log (truncate / retention / reload) is closed when this reaches 0.
     void unpinSegmentFlush(LogSegment* seg) noexcept;
     [[nodiscard]] std::size_t retiredSegmentsForTest() const noexcept { return retiredSegments_.size(); }
+    /// F3 round 7: make reloadSegments' pre-install allocation step throw
+    /// std::bad_alloc (tests the strong guarantee of the no-throw install).
+    void setReloadAllocFaultForTest(bool on) noexcept { reloadAllocFaultForTest_ = on; }
     /// Pending (un-submitted) async seals dropped because their segment was
     /// removed (truncate / retention / reload).  The owning worker fails its
     /// seal-gated durable entries retriably when this changes.
@@ -356,8 +361,25 @@ public:
     /// lastOffset <= flushBoundary after the completion is reaped.
     int64_t flushBoundary()    const noexcept { return logEndOffset_; }
 
+    /// TEST-ONLY: direct access to a segment by its base offset (e.g. to assert
+    /// on LogSegment::hasReadMapForTest() / readMapFailures() for a specific
+    /// sealed vs. active segment after recovery).  Returns nullptr if no segment
+    /// is registered at that exact base offset.
+    [[nodiscard]] LogSegment* segmentForTest(int64_t base) const noexcept {
+        auto it = segments_.find(base);
+        return it == segments_.end() ? nullptr : it->second.get();
+    }
+
 private:
-    LogSegment& activeSegment() { return *segments_.rbegin()->second; }
+    /// F3 fix-round-2, item B.3: segments_ must NEVER be empty once the Log is
+    /// constructed — but relying on that invariant with a bare
+    /// `*segments_.rbegin()->second` is silent UB the moment something
+    /// upstream breaks it (e.g. a future reconstruction bug).  Hard-asserts
+    /// (release-mode check + abort, not just a debug assert() that compiles
+    /// out) instead of dereferencing an invalid iterator.  Defined in Log.cpp
+    /// (needs spdlog; private + no external callers, so out-of-line costs
+    /// nothing and keeps spdlog out of this header).
+    LogSegment& activeSegment();
     void maybeRoll();
 
     /// Rebuild and atomically publish a new sealed-segment snapshot.
@@ -379,6 +401,7 @@ private:
     /// M1: segments removed from segments_ while an async flush was in flight on
     /// their fd.  Destroyed (fd closed) by unpinSegmentFlush.  Rare, cold.
     std::vector<std::unique_ptr<LogSegment>> retiredSegments_;
+    bool reloadAllocFaultForTest_ = false;   // F3 r7: test-only (cold path)
     uint32_t ownerTag_ = UINT32_MAX;
     using SegMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
     /// Wire `seg` into this log (storage state) and store it at `base`, retiring
@@ -514,4 +537,8 @@ private:
     alignas(64) std::atomic<std::size_t> renameDoneHead_{0}; // append (consumer)
     alignas(64) std::atomic<std::size_t> renameDoneTail_{0}; // bg (producer)
 };
+
+static_assert(noexcept(std::declval<Log&>().readView(int64_t{0}, int32_t{0})),
+              "Log::readView must be noexcept (F3)");
+
 } // namespace rune::storage

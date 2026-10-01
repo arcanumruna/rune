@@ -359,3 +359,54 @@ TEST(FollowerSyncRegression, InSyncCaughtUpKeepsPollingOnCadence) {
     EXPECT_FALSE(step(fs, kBase + kKeep - 1).emit);   // not before the keepalive window
     EXPECT_TRUE(step(fs, kBase + kKeep).emit);        // polls again on cadence (never silent)
 }
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item A: forceBehind() — used when the leader replies with
+// kErrRecordTooLarge (a batch it can NEVER deliver over this transport).
+// This is emphatically NOT "caught up": even a follower that was InSync (e.g.
+// caught up to an OLDER, smaller LEO before this oversized batch appeared)
+// must be forced to Behind, with the outstanding-fetch deadline cleared so
+// the next duty tick retries at the FAST cadence immediately, not after a
+// stale resend timer.
+// ---------------------------------------------------------------------------
+TEST(FollowerSyncRegression, ForceBehindFromInSyncClearsOutstandingAndStaysBehind) {
+    FollowerSync fs;
+    // Get to InSync first (the scenario the review was most worried about: a
+    // stale InSync must not survive an error response).
+    fs.onResponse(/*hadRecords=*/false, /*leaderHw=*/100);
+    ASSERT_EQ(fs.state(), FollowerSync::State::InSync);
+
+    fs.forceBehind();
+    EXPECT_EQ(fs.state(), FollowerSync::State::Behind);
+    EXPECT_FALSE(fs.fetchArmed()) << "no fetch should appear outstanding after forceBehind()";
+
+    // The very next tick must emit a fast data fetch (not wait out a keepalive
+    // or resend window) — forceBehind() must not leave any cadence timer armed
+    // that would delay this.
+    const Action a = step(fs, kBase);
+    EXPECT_TRUE(a.emit);
+    EXPECT_TRUE(a.wantData);
+}
+
+// Companion: forceBehind() from an already-Behind state (the more common case
+// — the follower was mid-catch-up when the oversized batch was hit) must
+// still clear the outstanding marker so the single-outstanding gate doesn't
+// suppress the next retry waiting for a response that will never arrive
+// (the error WAS the response, but onResponse() was never called for it).
+TEST(FollowerSyncRegression, ForceBehindFromBehindClearsOutstandingFetch) {
+    FollowerSync fs;   // bootstraps in Behind
+    const Action first = step(fs, kBase);
+    ASSERT_TRUE(first.emit && first.wantData);
+    ASSERT_TRUE(fs.fetchArmed()) << "test setup: a fetch must be outstanding";
+
+    fs.forceBehind();
+    EXPECT_EQ(fs.state(), FollowerSync::State::Behind);
+    EXPECT_FALSE(fs.fetchArmed());
+
+    // Single-outstanding gate (fetchArmed) must not block the next attempt
+    // now; only the ordinary fast-cadence throttle still applies (same as any
+    // other back-to-back decide() call).
+    const Action retry = step(fs, kBase + kFast);
+    EXPECT_TRUE(retry.emit);
+    EXPECT_TRUE(retry.wantData);
+}

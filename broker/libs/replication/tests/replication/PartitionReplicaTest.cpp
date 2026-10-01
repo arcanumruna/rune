@@ -21,6 +21,7 @@
 #include <rune/storage/Log.h>
 
 #include <algorithm>
+#include <deque>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -3654,6 +3655,581 @@ TEST(PartitionReplicaTest, OnFetchRequest_WholeBatchAlignment) {
     EXPECT_EQ(transport.lastResponseRecordsSize, committedEnd)
         << "transport got a whole-batch-aligned slice matching " << committedEnd << " bytes";
 
+    std::filesystem::remove_all(logDir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-1, item 3 (MINOR -> fix): a FETCH where fetchOffset < LEO but
+// the zero-copy readView() comes back empty (a transient local read-map
+// failure, NOT genuine end-of-log) must NOT send a Data response with zero
+// records.  The follower's FollowerSync treats an empty-but-kErrNone Data
+// response as "caught up" and would stop re-fetching, even though there is
+// genuinely more committed data past fetchOffset.  The leader must skip
+// responding this cycle; the follower's own un-acked fetch naturally resends.
+//
+// Reproduced with a REAL disk-backed Log (no mock/fake Log — onLog() dispatches
+// to a concrete rune::storage::Log, there is no injectable seam): a sealed,
+// not-yet-mapped segment's .log is replaced with a symlink to /dev/null (same
+// technique as MappedFileRegression.FailedMmapAfterOpenLeaksNoFd / F3 round 0)
+// so its lazy ensureReadMap() fails every time — open() succeeds (resolves to
+// /dev/null) but mmap() fails with ENODEV — producing a REAL, organically
+// empty LogReadView below LEO, exactly the condition under review.
+//
+// A segment only maps LAZILY after a RECOVER (reopen) — a segment created via
+// a live roll's synchronous fallback is always eagerly mapped (it genuinely
+// IS the new active segment at creation time; see F3 round 0).  So the data
+// is seeded with a throwaway Log, which is then closed and reopened +
+// recover()'d before the PartitionReplica under test is built on top of it —
+// exactly how a real broker restart leaves sealed segments lazily-unmapped.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, FetchMapFailureDoesNotReportCaughtUp) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r1_fetchmapfail_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    // Seed >= 3 segments, then close (destructor) so the next Log reopens
+    // them all from scratch via recover() — the lazy-mapping path.
+    {
+        rune::storage::Log seedLog(logDir.string(), /*rollBytes=*/256);
+        int64_t off = 0;
+        for (int i = 0; i < 15; ++i) {
+            rune::protocol::RecordBatchBuilder b(off, 8000 + i);
+            b.append("k", "v" + std::to_string(i), 8000 + i);
+            off = seedLog.append(b.build(), off);
+        }
+        ASSERT_GE(seedLog.segmentBaseOffsets().size(), 3u)
+            << "test setup: need >= 3 segments for a real sealed-but-unmapped one";
+    }
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        FetchResponseMsg last{};
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+            ++calls;
+            last = r;
+        }
+    };
+
+    rune::storage::Log log(logDir.string(), /*rollBytes=*/256);
+    log.recover();
+    CaptureTransport transport;
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 5000;
+    cfg.replicaLagMaxOffset = 100000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;
+    cfg.pushOnAppend        = false;   // force the FETCH-serve path (see OnFetchRequest_WholeBatchAlignment)
+
+    PartitionReplica leader(cfg, Role::Leader, 1,
+                            {1, 2}, {1, 2}, &log, &transport);
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u);
+    int64_t sealedBase = bases[1];   // a sealed segment, not the first and not active
+    rune::storage::LogSegment* sealedSeg = log.segmentForTest(sealedBase);
+    ASSERT_NE(sealedSeg, nullptr);
+    ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be lazily-unmapped (F3)";
+
+    // Break this segment's lazy map: open() succeeds (resolves to /dev/null),
+    // mmap() fails with ENODEV, every retry — readView() returns {} forever.
+    std::string sealedLogPath = sealedSeg->logPath();
+    std::filesystem::remove(sealedLogPath);
+    std::filesystem::create_symlink("/dev/null", sealedLogPath);
+
+    // Fetch at sealedBase: fetchOffset < LEO (more segments were appended after
+    // it), so the ONLY correct interpretation of an empty readView() here is
+    // "transient failure, retry" — never "caught up".
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1;
+    req.partition   = 0;
+    req.followerId  = 2;
+    req.fetchOffset = sealedBase;
+    req.maxBytes    = 1 << 20;
+
+    int16_t rc = leader.onFetchRequest(req, /*nowNs=*/1);
+    EXPECT_EQ(rc, 0) << "onFetchRequest itself must still report success (kErrNone) — "
+                         "the fix is to skip the SEND, not to error out";
+    EXPECT_EQ(transport.calls, 0)
+        << "a map-failure empty view below LEO must NOT be sent as a Data response "
+           "(the follower would wrongly treat empty+kErrNone as caught-up)";
+    EXPECT_EQ(sealedSeg->readMapFailures(), 1u);
+
+    // The leader must not be globally wedged by one broken sealed segment: a
+    // fetch against an UNAFFECTED segment (the active one — never touched)
+    // must still be served normally.
+    FetchRequestMsg reqActive{};
+    reqActive.leaderEpoch = 1;
+    reqActive.partition   = 0;
+    reqActive.followerId  = 2;
+    reqActive.fetchOffset = bases.back();
+    reqActive.maxBytes    = 1 << 20;
+    int16_t rc2 = leader.onFetchRequest(reqActive, /*nowNs=*/2);
+    EXPECT_EQ(rc2, 0);
+    EXPECT_EQ(transport.calls, 1)
+        << "a fetch against an UNAFFECTED (active) segment must still be served normally";
+
+    std::filesystem::remove_all(logDir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item A: a first batch larger than req.maxBytes (but within
+// this transport's REAL hard ceiling, which may be larger than what the
+// follower happened to request) must be sent alone — Kafka's progress
+// guarantee — instead of the old behaviour (an empty kErrNone response that
+// the follower's FollowerSync misreads as "caught up", PERMANENTLY, since
+// this batch is always too big for maxBytes and nothing ever changes that).
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, FetchOversizeFirstBatchIsServedAloneRegression) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r2_oversize_served_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        FetchResponseMsg last{};
+        int32_t ceiling = INT32_MAX;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+            ++calls;
+            last = r;
+        }
+        [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
+            return ceiling;
+        }
+    };
+
+    rune::storage::Log log(logDir.string());   // large default rollBytes — single segment
+    CaptureTransport transport;
+    transport.ceiling = 10'000;   // hard ceiling: comfortably fits one oversize-vs-maxBytes batch
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 5000;
+    cfg.replicaLagMaxOffset = 100000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 100;     // deliberately small — smaller than the batch below
+    cfg.pushOnAppend        = false;
+
+    PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+
+    // One batch whose encoded size is > cfg.maxFetchBytes(100) but well under
+    // the transport's hard ceiling(10000).
+    ASSERT_GE(leader.append(makePayload(0xAB, 300)), 0);
+
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1;
+    req.partition   = 0;
+    req.followerId  = 2;
+    req.fetchOffset = 0;
+    req.maxBytes    = cfg.maxFetchBytes;   // 100 — smaller than the batch
+
+    int16_t rc = leader.onFetchRequest(req, 0);
+    EXPECT_EQ(rc, kErrNone) << "the batch WAS served — this is success, not an error";
+    ASSERT_EQ(transport.calls, 1)
+        << "the oversize batch must still be sent alone (progress guarantee), not silently "
+           "withheld as an empty response";
+    EXPECT_EQ(transport.last.errorCode, kErrNone);
+    EXPECT_GT(transport.last.records.size(), static_cast<std::size_t>(cfg.maxFetchBytes))
+        << "the served batch is intentionally larger than maxBytes — sent alone because it "
+           "fits the transport's real hard ceiling";
+
+    std::filesystem::remove_all(logDir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item A: when a batch exceeds even the transport's hard
+// ceiling (truly unsendable at any size), the leader must reply with an
+// explicit ERROR (kErrRecordTooLarge), never kErrNone — an empty-records
+// kErrNone would be indistinguishable from "caught up" to the follower.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, FetchUnsendableBatchRepliesErrorNotCaughtUpRegression) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r2_unsendable_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        FetchResponseMsg last{};
+        int32_t ceiling = INT32_MAX;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+            ++calls;
+            last = r;
+        }
+        [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
+            return ceiling;
+        }
+    };
+
+    rune::storage::Log log(logDir.string());
+    CaptureTransport transport;
+    transport.ceiling = 50;   // smaller than the batch below — genuinely unsendable
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 5000;
+    cfg.replicaLagMaxOffset = 100000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 100;
+    cfg.pushOnAppend        = false;
+
+    PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+    ASSERT_GE(leader.append(makePayload(0xCD, 300)), 0);   // >> ceiling(50) and >> maxBytes(100)
+
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1;
+    req.partition   = 0;
+    req.followerId  = 2;
+    req.fetchOffset = 0;
+    req.maxBytes    = cfg.maxFetchBytes;
+
+    int16_t rc = leader.onFetchRequest(req, 0);
+    EXPECT_EQ(rc, kErrRecordTooLarge);
+    ASSERT_EQ(transport.calls, 1) << "an explicit error response must still be sent (not silently dropped)";
+    EXPECT_EQ(transport.last.errorCode, kErrRecordTooLarge)
+        << "must NEVER be kErrNone — that would be indistinguishable from caught-up";
+    EXPECT_TRUE(transport.last.records.empty());
+
+    // Follower-side consequence: applyReplicated() must not apply anything
+    // and must not advance the follower's own LEO from an error response.
+    auto followerLogDir = std::filesystem::temp_directory_path() /
+                          ("rune_f3r2_unsendable_follower_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(followerLogDir);
+    std::filesystem::create_directories(followerLogDir);
+    rune::storage::Log followerLog(followerLogDir.string());
+    PartitionConfig fcfg = cfg;
+    fcfg.selfId = 2;
+    PartitionReplica follower(fcfg, Role::Follower, 1, {1, 2}, {1, 2}, &followerLog, &transport);
+    const Offset leoBefore = follower.logEndOffset();
+    follower.applyReplicated(transport.last);
+    EXPECT_EQ(follower.logEndOffset(), leoBefore)
+        << "an error response must never be applied to the follower's log";
+
+    std::filesystem::remove_all(logDir);
+    std::filesystem::remove_all(followerLogDir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item A.3: pushToFollowers() must apply the SAME progress
+// rule as onFetchRequest() — an oversize-vs-cfg.maxFetchBytes first batch
+// that still fits the transport's hard ceiling must be DELIVERED by push,
+// not silently dropped (pre.bytes==0 early return).  Before this fix, only
+// the (now-fixed) fetch path could ever heal such a batch.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, PushOversizeFirstBatchIsDeliveredRegression) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r2_push_oversize_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        FetchResponseMsg last{};
+        int32_t ceiling = INT32_MAX;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+            ++calls;
+            last = r;
+        }
+        [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
+            return ceiling;
+        }
+    };
+
+    rune::storage::Log log(logDir.string());
+    CaptureTransport transport;
+    transport.ceiling = 10'000;   // hard ceiling comfortably fits the oversize batch
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 5000;
+    cfg.replicaLagMaxOffset = 100000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 100;     // smaller than the batch — forces pre.bytes==0 in push too
+    cfg.pushOnAppend        = true;    // GR-10 direct-append push path
+
+    PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+
+    // append() with pushOnAppend=true calls pushToFollowers(baseOffset) inline.
+    Offset base = leader.append(makePayload(0xEF, 300));
+    ASSERT_GE(base, 0);
+
+    ASSERT_EQ(transport.calls, 1)
+        << "pushToFollowers must deliver the oversize-vs-maxFetchBytes batch alone, "
+           "not silently withhold it (pre.bytes==0 early return)";
+    EXPECT_EQ(transport.last.errorCode, kErrNone);
+    EXPECT_GT(transport.last.records.size(), static_cast<std::size_t>(cfg.maxFetchBytes));
+
+    // Flow control is UNCHANGED: a pushCeiling at or below the batch's own
+    // base offset must still withhold it (genuinely flow-controlled), proving
+    // the relaxation only widened the maxBytes cap, never pushCeiling.
+    CaptureTransport transport2;
+    transport2.ceiling = 10'000;
+    auto logDir2 = std::filesystem::temp_directory_path() /
+                   ("rune_f3r2_push_oversize_ceiling_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir2);
+    std::filesystem::create_directories(logDir2);
+    rune::storage::Log log2(logDir2.string());
+    PartitionConfig cfg2 = cfg;
+    cfg2.pushOnAppend = false;   // drive pushToFollowers explicitly via the internal coalesced path
+    PartitionReplica leader2(cfg2, Role::Leader, 1, {1, 2}, {1, 2}, &log2, &transport2);
+    ASSERT_GE(leader2.append(makePayload(0xEF, 300)), 0);
+    leader2.pushToFollowersForTest(/*fromOffset=*/0, /*pushCeiling=*/0);
+    EXPECT_EQ(transport2.calls, 0)
+        << "a pushCeiling at/below the batch's own base offset must still withhold it "
+           "(flow control is never relaxed, only the maxBytes cap)";
+
+    std::filesystem::remove_all(logDir);
+    std::filesystem::remove_all(logDir2);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 5, item I2: an UNSENDABLE batch (larger than the transport's hard
+// ceiling) at the head of the push window must NOT make the leader spin.
+// Before the fix, every doWork() cycle re-ran pushToFollowers(): a fresh
+// readView + parse of the same batch, ++work (so the idle strategy never
+// engages) and a critical-log occurrence bump.  Now the unsendable offset is
+// remembered and push is skipped until LEO, the ISR or the follower position
+// (push ceiling) changes; the critical log fires once per offset transition.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, PushUnsendableHeadDoesNotSpinRegression) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r5_push_unsendable_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        int32_t ceiling = INT32_MAX;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; }
+        [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
+            return ceiling;
+        }
+    };
+
+    rune::storage::Log log(logDir.string());
+    CaptureTransport transport;
+    transport.ceiling = 50;   // every batch below is unsendable
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 1'000'000;      // no ISR shrink during the test
+    cfg.replicaLagMaxOffset = 1'000'000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 100;
+    cfg.pushOnAppend        = true;           // coalesced doWork push path
+
+    PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+
+    // Append DIRECTLY to the log (the produce hot path) so only doWork pushes.
+    {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", std::string(300, 'x'), 1000);
+        log.append(b.build(), 0);
+    }
+    leader.onLeaderLogAppended();
+
+    constexpr int kCycles = 1000;
+    int totalWork = 0;
+    for (int i = 0; i < kCycles; ++i) totalWork += leader.doWork(/*nowNs=*/1);
+
+    EXPECT_EQ(transport.calls, 0) << "the unsendable batch must never be sent";
+    EXPECT_LE(leader.unsendableBatchEvaluationsForTest(), 1u)
+        << "the unsendable head must be read/parsed once, not once per cycle";
+    EXPECT_LE(totalWork, 4) << "an unsendable head must not count as work every cycle "
+                               "(the idle strategy must engage)";
+    EXPECT_EQ(leader.unsendablePushLogEmitsForTest(), 1u)
+        << "exactly one critical log for this offset transition";
+
+    // LEO change -> re-evaluated once (still unsendable at the same head
+    // offset: no new log line, since the offset did not transition).
+    {
+        rune::protocol::RecordBatchBuilder b(1, 1001);
+        b.append("k", "v", 1001);
+        log.append(b.build(), 1);
+    }
+    leader.onLeaderLogAppended();
+    for (int i = 0; i < kCycles; ++i) (void)leader.doWork(/*nowNs=*/1);
+    EXPECT_EQ(leader.unsendableBatchEvaluationsForTest(), 2u)
+        << "a LEO change must re-evaluate the head exactly once";
+    EXPECT_EQ(leader.unsendablePushLogEmitsForTest(), 1u)
+        << "same unsendable offset -> no new critical log";
+
+    std::filesystem::remove_all(logDir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 6, item 1: a coalesced push must never exceed the transport's live
+// ceiling.  Before the fix the push was capped only by cfg.maxFetchBytes (1 MiB
+// default) while the real transport ceiling is ~512 KiB: a coalesced push over
+// the ceiling was DROPPED by the transport after lastPushedOffset_/pushedThrough
+// had advanced, so the follower recovered only via the 20 ms re-serve — a
+// 20 ms acks=all stall.  Here: several batches totalling > the ceiling are
+// appended in ONE cycle; the leader must push them in ceiling-bounded chunks,
+// nothing is dropped, and the follower reaches the LEO with NO fetch data
+// re-serve (simulated time stays far below the 20 ms resend window).
+// ---------------------------------------------------------------------------
+namespace {
+struct CeilingLoopback {
+    // leader -> follower responses (owned copies), follower -> leader requests.
+    struct Resp { std::vector<uint8_t> buf; FetchResponseMsg msg; };
+    std::deque<Resp> toFollower;
+    std::deque<FetchRequestMsg> toLeader;
+    int32_t ceiling = INT32_MAX;
+    int     drops   = 0;
+    std::size_t maxSent = 0;
+};
+struct CeilingLeaderTransport : PartitionTransport {
+    CeilingLoopback* lb;
+    explicit CeilingLeaderTransport(CeilingLoopback* l) : lb(l) {}
+    void sendFetchRequest(const FetchRequestMsg&) override {}
+    void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        // Mirrors the real transports: a frame over the ceiling is DROPPED.
+        if (r.records.size() > static_cast<std::size_t>(lb->ceiling)) { ++lb->drops; return; }
+        lb->maxSent = std::max(lb->maxSent, r.records.size());
+        CeilingLoopback::Resp x;
+        x.buf.assign(r.records.begin(), r.records.end());
+        x.msg = r;
+        lb->toFollower.push_back(std::move(x));
+        lb->toFollower.back().msg.records =
+            std::span<const uint8_t>(lb->toFollower.back().buf.data(), lb->toFollower.back().buf.size());
+    }
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return lb->ceiling; }
+};
+struct CeilingFollowerTransport : PartitionTransport {
+    CeilingLoopback* lb;
+    explicit CeilingFollowerTransport(CeilingLoopback* l) : lb(l) {}
+    void sendFetchRequest(const FetchRequestMsg& q) override { lb->toLeader.push_back(q); }
+    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+};
+} // namespace
+
+TEST(PartitionReplicaRegression, PushChunkBoundedByTransportCeilingRegression) {
+    auto dirL = std::filesystem::temp_directory_path() / ("rune_f3r6_pushcap_l_" + std::to_string(::getpid()));
+    auto dirF = std::filesystem::temp_directory_path() / ("rune_f3r6_pushcap_f_" + std::to_string(::getpid()));
+    for (auto& d : {dirL, dirF}) { std::filesystem::remove_all(d); std::filesystem::create_directories(d); }
+
+    CeilingLoopback lb;
+    lb.ceiling = 1000;                    // live transport ceiling
+    CeilingLeaderTransport   lt(&lb);
+    CeilingFollowerTransport ft(&lb);
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 1'000'000;
+    cfg.replicaLagMaxOffset = 1'000'000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;    // >> ceiling (the production shape)
+    cfg.pushOnAppend        = true;
+    PartitionConfig lcfg = cfg; lcfg.selfId = 1;
+    PartitionConfig fcfg = cfg; fcfg.selfId = 2;
+
+    rune::storage::Log logL(dirL.string());
+    rune::storage::Log logF(dirF.string());
+    PartitionReplica leader(lcfg, Role::Leader, 1, {1, 2}, {1, 2}, &logL, &lt);
+    PartitionReplica follower(fcfg, Role::Follower, 1, {1, 2}, {1, 2}, &logF, &ft);
+    follower.becomeFollower(1, 1);
+
+    // 8 batches x ~360 B = ~2.9 KB in ONE cycle (> 2x the 1000 B ceiling).
+    Offset off = 0;
+    for (int i = 0; i < 8; ++i) {
+        rune::protocol::RecordBatchBuilder b(off, 1000 + i);
+        b.append("k", std::string(300, static_cast<char>('a' + i)), 1000 + i);
+        logL.append(b.build(), off);
+        ++off;
+    }
+    leader.onLeaderLogAppended();
+    const Offset target = leader.logEndOffset();
+    ASSERT_EQ(target, 8);
+
+    int64_t now = 1'000'000;
+    for (int cycle = 0; cycle < 200 && follower.logEndOffset() < target; ++cycle) {
+        now += 1'000;                     // 1 µs steps: 0.2 ms total << 20 ms resend
+        (void)leader.doWork(now);
+        while (!lb.toFollower.empty()) {
+            follower.applyReplicated(lb.toFollower.front().msg);
+            lb.toFollower.pop_front();
+        }
+        (void)follower.doWork(now);
+        while (!lb.toLeader.empty()) {
+            (void)leader.onFetchRequest(lb.toLeader.front(), now);
+            lb.toLeader.pop_front();
+        }
+    }
+    EXPECT_EQ(lb.drops, 0) << "no push may exceed the transport's live ceiling (dropped)";
+    EXPECT_LE(lb.maxSent, static_cast<std::size_t>(lb.ceiling));
+    EXPECT_EQ(follower.logEndOffset(), target) << "follower must converge purely via pushes";
+    EXPECT_EQ(leader.fetchDataServesForTest(), 0u)
+        << "no resend-path (fetch Data) serve may be needed";
+
+    for (auto& d : {dirL, dirF}) std::filesystem::remove_all(d);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 6, item 8: while the transport ceiling is 0 (no publication
+// resolved yet) an unsendable-looking head must NOT arm the push memo nor log
+// "hard ceiling of 0" — it is not a property of the batch.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, PushMemoNotArmedWhileCeilingUnresolvedRegression) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r6_ceil0_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+    struct ZeroCeiling : PartitionTransport {
+        int calls = 0;
+        int32_t ceiling = 0;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; }
+        [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return ceiling; }
+    } t;
+    PartitionConfig cfg;
+    cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 1'000'000; cfg.replicaLagMaxOffset = 1'000'000;
+    cfg.fetchIntervalNs = 5'000'000LL; cfg.isrCheckIntervalNs = 10'000'000LL;
+    cfg.maxFetchBytes = 100;              // the batch is "oversize" vs maxFetchBytes
+    cfg.pushOnAppend = true;
+    rune::storage::Log log(logDir.string());
+    PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", std::string(300, 'x'), 1000);
+        log.append(b.build(), 0);
+    }
+    leader.onLeaderLogAppended();
+    for (int i = 0; i < 10; ++i) (void)leader.doWork(1);
+    EXPECT_EQ(leader.unsendablePushLogEmitsForTest(), 0u)
+        << "must not log 'hard ceiling of 0' before any publication is resolved";
+
+    // Publication resolves: the ceiling is real and still too small → now it
+    // is genuinely unsendable: armed + logged once.
+    t.ceiling = 50;
+    for (int i = 0; i < 10; ++i) (void)leader.doWork(1);
+    EXPECT_EQ(leader.unsendablePushLogEmitsForTest(), 1u);
+    EXPECT_EQ(t.calls, 0);
     std::filesystem::remove_all(logDir);
 }
 

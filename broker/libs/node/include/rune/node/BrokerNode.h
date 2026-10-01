@@ -33,6 +33,7 @@
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/Worker.h>
 #include <rune/node/ShardAgent.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
@@ -42,6 +43,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminControlPlane.h>
+#include <rune/node/SchemaFanout.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -49,6 +51,7 @@
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/storage/InMemoryLog.h>
 
 #include <rune/consensus/NodeStateFile.h>
@@ -78,6 +81,7 @@ extern "C" {
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -85,6 +89,82 @@ extern "C" {
 #include <vector>
 
 namespace rune::node {
+
+// ---------------------------------------------------------------------------
+// Max produce-batch size (F3 rounds 4-5).
+//
+// The broker derives the EFFECTIVE max produce-batch size it accepts from the
+// exact per-message maximum of every transport/ring a produced batch must
+// cross, and enforces it on EVERY produce path (gateway handleProduce AND
+// each Worker's per-worker ingress handler) with MessageTooLarge — so a batch
+// that could never be ingested or replicated is never accepted (an accepted-
+// but-unreplicable batch would stall its follower forever).
+//
+// ONE formula (integration wave 2, F3 ⇄ F18 ⇄ F15 S3 ⇄ F19): the effective
+// max IS NodeConfig::produceIntakeLimit() = min(explicit RUNE_MAX_PRODUCE_
+// BATCH_BYTES if set, Worker::maxAcceptableBatchBytes(config)).  The helpers
+// below are views of that formula's components, built on the SAME primitives
+// the transports / rings enforce at send / enqueue time:
+//   - replication: ReplicationFrameLimits.h (maxFetchRecordsViaOutboundRing /
+//     ViaPublication) — what a FetchResponse/push can carry, legacy ring path
+//     and per-worker publication path; ALWAYS applied, single-node too (the
+//     limit must not change when a node joins a cluster);
+//   - worker ingress ring: Worker::maxOpTailBytesFor() — what a WorkerOp tail
+//     can carry through the O2O ring (ring maxMsgLength − WorkerOp framing);
+//   - Aeron ingress: min(term/8, 16 MiB) − Produce framing — what a Produce
+//     frame on this broker's own term can carry.  NOTE: on UDP the CLIENT's
+//     term governs the image frame, so this does NOT by itself bound what
+//     arrives — the explicit size checks at the gateway and in every worker do.
+//   (the return ring and the client egress Records frame are formula terms too.)
+//
+// Startup refuses (before any side effect) when (a) the operator EXPLICITLY
+// configured a max that exceeds the transport maximum, or (b) the effective
+// max is below a sane minimum (cannot carry even one record).  The unset
+// default otherwise always starts: the effective value is derived down.
+// ---------------------------------------------------------------------------
+
+/// Worker ingress ring: largest record batch a Produce WorkerOp can carry
+/// (= Worker::maxOpTailBytesFor(workerIngressRingBytes)).
+[[nodiscard]] std::size_t workerIngressMaxBatchBytes(const NodeConfig& config) noexcept;
+
+/// Aeron ingress: largest record batch a key-less Produce frame can carry on
+/// this broker's term (computeMaxMessageLength(term) − Produce framing).
+[[nodiscard]] int32_t aeronIngressMaxBatchBytes(const NodeConfig& config) noexcept;
+
+/// min(workerIngressMaxBatchBytes, aeronIngressMaxBatchBytes).
+[[nodiscard]] int32_t ingressHardTransportMaxBytes(const NodeConfig& config) noexcept;
+
+/// Replication: min over BOTH replication transport kinds of what a
+/// FetchResponse/push can carry (ReplicationFrameLimits.h).
+[[nodiscard]] int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept;
+
+/// Replication fetch/push chunk for USER partitions: min(kDefaultMaxFetchBytes,
+/// workerIngressMaxBatchBytes, and — multi-node — replicationHardTransportMaxBytes).
+/// Replicated records are forwarded through the worker ingress ring (F3 r5 I1)
+/// and a chunk over the replication ceiling is dropped by the transport (F3 r6).
+[[nodiscard]] int32_t userTopicMaxFetchBytes(const NodeConfig& config) noexcept;
+
+/// The CONFIGURED max: the operator's EXPLICIT override
+/// (config.maxProduceBatchBytes) if set, else ClientGateway::kMaxProduceBatchBytes.
+[[nodiscard]] std::size_t configuredMaxProduceBatchBytes(const NodeConfig& config) noexcept;
+
+/// The EFFECTIVE max enforced by the gateway and every worker:
+/// NodeConfig::produceIntakeLimit() (THE formula, lowered by an explicit
+/// override).
+[[nodiscard]] std::size_t effectiveMaxProduceBatchBytes(const NodeConfig& config) noexcept;
+
+/// A record batch must at least hold its fixed header; an effective max at or
+/// below this cannot carry a single record → startup refusal (M3).
+inline constexpr std::size_t kMinSaneMaxProduceBatchBytes =
+    static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) + 1;
+
+/// Startup refusal when the EFFECTIVE max is below kMinSaneMaxProduceBatchBytes
+/// (e.g. tiny rings/term) — names the numbers; never silently falls back.
+[[nodiscard]] std::optional<std::string> validateEffectiveMaxProduceBatch(const NodeConfig& config);
+
+/// Startup refusal ONLY when an EXPLICIT max exceeds the hard maximum it
+/// would be capped to.  nullopt for the unset default.
+[[nodiscard]] std::optional<std::string> validateExplicitMaxProduceBatch(const NodeConfig& config);
 
 // ---------------------------------------------------------------------------
 // NullSink — no-op outbound transport (sufficient for 1-node; BR-3 replaces)
@@ -188,6 +268,10 @@ public:
         // 4. Advance the DDL state machine + drive the replica.
         work += worker_.doWork(nowNs);
 
+        // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
+        //     could not take (full) — retry-on-full, never a drop.
+        if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
+
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
         //    failed an fsync → hand it to the control thread (ring, no shared
         //    state), which halts the broker.  Signalled once (retried while the
@@ -206,15 +290,40 @@ public:
                 std::vector<uint8_t> msg(4 + shown.size());
                 const int32_t e = r->log()->storageErrno();
                 std::memcpy(msg.data(), &e, 4);
-                std::memcpy(msg.data() + 4, shown.data(), shown.size());
-                if (failureRing_.write(msg.data(), msg.size(), 1)) storageFailureSignalled_ = true;
+                std::memcpy(msg.data() + 4, shown.data(), shown.size());   // M3: tail-truncated
+                if (failureRing_.write(msg.data(), msg.size(), kA2cStorageFailure))   // F3 r6: typed
+                    storageFailureSignalled_ = true;
             }
         }
         return work;
     }
 
-    /// admin → control: schema-log storage failure ([errno:i32][dir]).
+    /// admin → control ring (T10; F3 r6 extended): kA2cStorageFailure
+    /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][blob]).
     OneToOneByteRing& failureRing() noexcept { return failureRing_; }
+
+    /// F3 round 6, item 3 — ADMIN thread only (called from deps.pushValidators
+    /// inside AdminWorker::doWork).  The admin thread must NEVER enqueue into a
+    /// worker's SPSC ingress ring (the control thread is its single producer):
+    /// post the update on the admin→control ring; the control thread fans it
+    /// out (SchemaFanout).  Ring full → admin-owned backlog, retried every
+    /// doWork.  A descriptor that can never fit the ring is refused loudly.
+    void postSchemaUpdate(int32_t topicId, const std::vector<uint8_t>& blob) {
+        // Unreachable by construction (static_assert in AdminChannels.h: every
+        // descriptor the request ring can deliver fits one SchemaUpdate); kept
+        // as a loud backstop rather than a silent tryClaim throw.
+        if (schemaUpdateWireLen(blob.size()) > static_cast<std::size_t>(failureRing_.maxMsgLength()))
+            [[unlikely]] {
+            spdlog::error("AdminWorkerAgent: SchemaUpdate for topicId={} ({} B descriptor) "
+                          "exceeds the admin→control ring max message ({} B); validator "
+                          "NOT pushed", topicId, blob.size(), failureRing_.maxMsgLength());
+            return;
+        }
+        if (!schemaBacklog_.empty() || !encodeSchemaUpdate(failureRing_, topicId, blob))
+            schemaBacklog_.push_back(SchemaUpdateMsg{topicId, blob});   // keep FIFO order
+    }
+    [[nodiscard]] std::size_t schemaBacklogForTest() const noexcept { return schemaBacklog_.size(); }
+    int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
 
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
@@ -237,8 +346,21 @@ private:
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
     OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
-    OneToOneByteRing failureRing_{4096};                     // admin → control (storage failure)
+    // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized like
+    // the other blob-carrying admin rings so a descriptor fits one message.
+    OneToOneByteRing failureRing_{kAdminToControlRingBytes};
     bool             storageFailureSignalled_ = false;
+    std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
+
+    int flushSchemaBacklog_() {
+        std::size_t sent = 0;
+        while (sent < schemaBacklog_.size() &&
+               encodeSchemaUpdate(failureRing_, schemaBacklog_[sent].topicId, schemaBacklog_[sent].blob))
+            ++sent;
+        schemaBacklog_.erase(schemaBacklog_.begin(),
+                             schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -761,6 +883,10 @@ private:
     std::vector<std::unique_ptr<EmbeddedDriver>> shardDrivers_;
     std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
     std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
+    // F3 round 6, item 3: control-thread-owned SchemaUpdate fan-out (the
+    // control thread is the single producer of every worker ingress ring).
+    SchemaFanout                                 schemaFanout_;
+    uint64_t                                     adminToControlRejects_ = 0;   // control thread only
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
     HaltHandler                                  haltHandler_ = nullptr;
     void*                                        haltCtx_     = nullptr;

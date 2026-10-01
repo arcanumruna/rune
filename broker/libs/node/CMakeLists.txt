@@ -738,8 +738,13 @@ if(BUILD_TESTING)
                 rune_node
                 aeron::aeron
                 GTest::gtest_main)
+            # RESOURCE_LOCK rune_udp_ports: these tests start real BrokerNodes /
+            # transports binding UDP ports (incl. discovered ephemeral ports for
+            # the F3 e2e client) — the same TOCTOU port race as the other UDP
+            # suites (seen under ctest -j2: a shard suite's discovered gateway
+            # port was taken concurrently → "Address already in use").
             gtest_discover_tests(rune_broker_node_tests
-                PROPERTIES TIMEOUT 60
+                PROPERTIES TIMEOUT 60 RESOURCE_LOCK rune_udp_ports
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).

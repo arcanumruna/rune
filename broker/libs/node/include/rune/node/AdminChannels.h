@@ -38,6 +38,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -56,11 +57,28 @@ enum : int32_t {
 };
 
 // ---------------------------------------------------------------------------
+// Admin → control ring (AdminWorkerAgent::failureRing_; T10) message ids.
+// One SPSC ring, producer = admin thread, consumer = control thread.
+//   kA2cStorageFailure : [errno:i32][logDir bytes]   (Task 10 fix 3 / I1)
+//   kA2cSchemaUpdate   : [topicId:i32][descriptor blob] (F3 round 6, item 3:
+//                        the control thread — the ONLY producer of the worker
+//                        SPSC ingress rings — fans it out to every worker)
+// ---------------------------------------------------------------------------
+enum : int32_t {
+    kA2cStorageFailure = 1,
+    kA2cSchemaUpdate   = 2,
+};
+
+// ---------------------------------------------------------------------------
 // Ring capacities.  DDL is rare; a small ring is plenty.  Power-of-two payload.
 // ---------------------------------------------------------------------------
 inline constexpr int kAdminRequestRingBytes     = 1 << 20;  // 1 MiB (descriptor blobs)
 inline constexpr int kCreateTopicRingBytes      = 1 << 16;  // 64 KiB
 inline constexpr int kAdminRoleRingBytes        = 1 << 12;  // 4 KiB
+// admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized so that
+// every descriptor the request ring can deliver fits ONE SchemaUpdate message
+// (static_assert below, F3 round 7, item 4).
+inline constexpr int kAdminToControlRingBytes   = kAdminRequestRingBytes;
 
 // ---------------------------------------------------------------------------
 // Wire layout helpers — little-endian fixed fields + length-prefixed byte runs.
@@ -280,6 +298,80 @@ inline AdminRoleMsg decodeAdminRole(const uint8_t* buf, std::size_t len) {
     m.epoch    = getI32(buf + 1);
     m.leaderId = getI32(buf + 5);
     return m;
+}
+
+// ---- SchemaUpdate (admin → control; F3 round 6, item 3) ----
+struct SchemaUpdateMsg {
+    int32_t              topicId = -1;
+    std::vector<uint8_t> blob;
+};
+
+/// Wire size of a SchemaUpdate message for `blobLen` descriptor bytes.
+[[nodiscard]] inline constexpr std::size_t schemaUpdateWireLen(std::size_t blobLen) noexcept {
+    return 4 + blobLen;
+}
+
+inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId,
+                               std::span<const uint8_t> blob) {
+    using namespace admin_wire;
+    const auto idx = ring.tryClaim(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()));
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    putI32(p, topicId);
+    if (!blob.empty()) std::memcpy(p + 4, blob.data(), blob.size());
+    ring.commit(idx);
+    return true;
+}
+
+inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
+    using namespace admin_wire;
+    SchemaUpdateMsg m;
+    if (len < 4) return m;
+    m.topicId = getI32(buf);
+    m.blob.assign(buf + 4, buf + len);
+    return m;
+}
+
+// ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----
+// A descriptor reaches the admin thread only inside a DefineTopic on the
+// request ring (O2O ring: maxMsgLength = capacity / 8), whose fixed framing is
+// session(8)+corr(8)+partitions(4)+validate(1)+nameLen(2)+keyLen(2)+blobLen(4).
+// The SchemaUpdate that re-posts it on the admin→control ring carries only a
+// 4-byte topicId in front, so every committed descriptor fits — the
+// "descriptor too large → validator not pushed" path in
+// AdminWorkerAgent::postSchemaUpdate is unreachable.
+inline constexpr std::size_t kDefineTopicFixedBytes = 8 + 8 + 4 + 1 + 2 + 2 + 4;
+inline constexpr std::size_t kMaxDescriptorViaRequestRing =
+    static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
+static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
+                  static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
+              "every descriptor the admin request ring can deliver must fit one "
+              "SchemaUpdate on the admin->control ring");
+
+// ---- admin → control dispatch (F3 round 7, item 3) ----
+// Explicit per-type dispatch: an unknown type or a too-short frame is
+// reported (the caller logs it, rate-limited) and SKIPPED — never decoded as
+// some other message (misreading a frame as a storage failure halts the broker).
+enum class A2cDispatch : uint8_t { StorageFailure, SchemaUpdate, Unknown, Malformed };
+
+template <typename OnStorageFailure, typename OnSchemaUpdate>
+A2cDispatch dispatchAdminToControl(int32_t typeId, const uint8_t* p, std::size_t n,
+                                   OnStorageFailure&& onStorageFailure,
+                                   OnSchemaUpdate&& onSchemaUpdate) {
+    switch (typeId) {
+    case kA2cStorageFailure: {
+        if (n < 4) return A2cDispatch::Malformed;
+        const int32_t err = admin_wire::getI32(p);
+        onStorageFailure(err, std::string_view(reinterpret_cast<const char*>(p) + 4, n - 4));
+        return A2cDispatch::StorageFailure;
+    }
+    case kA2cSchemaUpdate:
+        if (n < 4) return A2cDispatch::Malformed;
+        onSchemaUpdate(decodeSchemaUpdate(p, n));
+        return A2cDispatch::SchemaUpdate;
+    default:
+        return A2cDispatch::Unknown;
+    }
 }
 
 } // namespace rune::node

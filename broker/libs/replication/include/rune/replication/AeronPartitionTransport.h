@@ -58,6 +58,10 @@
 namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationFrameLimits.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OutboundFrame.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <rune/replication/ReplicationMessages.h>
 
 #include <rune/aeronutil/AeronPump.h>
@@ -100,6 +104,8 @@ public:
     /// The ingress Subscription is registered synchronously (bounded 5 s wait)
     /// in the constructor — this is the only synchronous resolve; it runs once
     /// at startup, never on the duty-cycle hot path.
+    /// (F3 round 5 item I3 — the publication bound term/8 — is F18's
+    ///  setPublicationMaxMessageBytes(), set once before any worker runs.)
     /// \param outboundRingBytes Payload bytes of the outbound ManyToOne ring
     ///        (NodeConfig::replicationOutboundRingBytes). Power of two.
     /// \param pump  Startup resolve pump (spec §3.6): an invoker driver +
@@ -113,6 +119,26 @@ public:
                             NodeId                         selfId,
                             int                            outboundRingBytes = 4 * 1024 * 1024,
                             rune::aeronutil::AeronPump     pump = {});
+
+    /// Fixed overhead of the SBE OutboundFrame envelope (SBE header +
+    /// targetNodeId block + varData length prefix) that wraps every frame in
+    /// the worker→control outbound ring — ReplicationFrameLimits.h's constant.
+    static constexpr std::size_t kOutboundEnvelopeOverhead =
+        ::rune::replication::kOutboundEnvelopeOverhead;
+
+    /// F3 round 5 (config-only view): the records payload a FetchResponse (or
+    /// push) can carry over this transport — min(outbound ring bound, Aeron
+    /// publication bound), i.e. ReplicationFrameLimits.h's two terms (the SAME
+    /// functions THE batch-limit formula uses).  The live instance reports the
+    /// same via maxFetchRecordsBytes() once setPublicationMaxMessageBytes() ran.
+    [[nodiscard]] static int32_t maxFetchResponseBytesFor(int outboundRingBytes,
+                                                          int32_t termBufferBytes) noexcept {
+        const int64_t c = std::min(
+            ::rune::replication::maxFetchRecordsViaOutboundRing(outboundRingBytes),
+            termBufferBytes > 0 ? ::rune::replication::maxFetchRecordsViaPublication(termBufferBytes)
+                                : int64_t{0});
+        return static_cast<int32_t>(std::clamp<int64_t>(c, 0, INT32_MAX));
+    }
 
     ~AeronPartitionTransport() override = default;
 
@@ -235,6 +261,23 @@ public:
             NodeId toPeer, const FetchRequestMsg& req) override;
     void sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override;
+
+    /// F3's int32 view of the ONE live ceiling, maxFetchRecordsBytes() (F18):
+    /// min(outbound ring bound, publication bound) — worker-safe (both fixed
+    /// before any worker runs).  poll()'s FetchRequest/reconcile clamps start
+    /// from it.
+    [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept {
+        return static_cast<int32_t>(std::clamp<int64_t>(maxFetchRecordsBytes(), 0, INT32_MAX));
+    }
+
+
+    /// F3 round 6: replicated-records frames that can never fit the owning
+    /// worker's ingress ring (heterogeneous config) — handled by F18's one
+    /// mechanism: dropped (front batch fits) or refused (follower wedged).
+    /// Control thread.
+    [[nodiscard]] uint64_t unfittableApplyDropsForTest() const noexcept {
+        return oversizedApplyDropped_ + oversizedApplyRefused_;
+    }
 
     // -----------------------------------------------------------------------
     // Duty-cycle step
@@ -429,6 +472,7 @@ private:
     int64_t  txFragsRecv_  = 0;   ///< fragments received
     int64_t  txOutDrained_ = 0;   ///< outbound messages drained to Aeron
     uint32_t inRecvSeq_    = 0;   ///< FR ReplFragRecv correlation
+
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.

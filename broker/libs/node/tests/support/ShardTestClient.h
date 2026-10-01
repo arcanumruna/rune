@@ -10,6 +10,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/SchemaMessages.h>
 
 #include <Aeron.h>
 #include <FragmentAssembler.h>
@@ -182,6 +183,65 @@ public:
     const std::vector<PushedRecords>& records() const noexcept { return records_; }
     const std::vector<ErrorSeen>&     errors()  const noexcept { return errors_; }
 
+    using Clock = std::chrono::steady_clock;
+
+    /// Await the ProduceResponse for `corr` until `deadline` (nullopt = no response).
+    std::optional<pc::ProduceResponse> awaitProduceResponseUntil(int64_t corr, Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    /// Send one DefineTopic and await ITS response until `deadline` (nullopt = no response).
+    std::optional<pc::DefineTopicResponse> defineTopicUntil(const std::string& gatewayChannel, int32_t stream,
+                                                            int64_t sessionId, std::string_view name,
+                                                            uint32_t partitions, bool validate,
+                                                            const std::vector<uint8_t>& descriptor,
+                                                            Clock::time_point deadline) {
+        pc::DefineTopic m;
+        m.sessionId = sessionId; m.correlationId = ++corr_;
+        m.topicName = name; m.partitionCount = partitions; m.validate = validate;
+        m.descriptorBlob = descriptor.data();
+        m.descriptorLen  = static_cast<uint32_t>(descriptor.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        const int64_t c = m.correlationId;
+        if (!send(gatewayChannel, stream, buf.data(), len)) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = defines_.find(c); it != defines_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    int64_t nextCorrelationId() noexcept { return ++corr_; }
+
+    /// DefineTopic (DDL) → the authoritative DefineTopicResponse (nullopt on timeout).
+    std::optional<pc::DefineTopicResponse> defineTopic(const std::string& gatewayChannel, int32_t stream,
+                                                       int64_t sessionId, std::string_view name,
+                                                       uint32_t partitions, bool validate,
+                                                       const std::vector<uint8_t>& descriptor) {
+        pc::DefineTopic m;
+        m.sessionId = sessionId; m.correlationId = ++corr_;
+        m.topicName = name; m.partitionCount = partitions; m.validate = validate;
+        m.descriptorBlob = descriptor.data();
+        m.descriptorLen  = static_cast<uint32_t>(descriptor.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        const int64_t c = m.correlationId;
+        if (!send(gatewayChannel, stream, buf.data(), len)) return std::nullopt;
+        for (int i = 0; i < kMaxIters * 4; ++i) {   // DDL commits through the schema log
+            poll_();
+            if (auto it = defines_.find(c); it != defines_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
     bool disconnect(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
         pc::Disconnect d; d.sessionId = sessionId; d.correlationId = ++corr_;
         std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
@@ -224,6 +284,9 @@ private:
             case pc::TemplateId::ProduceResponse:
                 if (auto r = pc::ProduceResponse::decode(p, n)) acks_[r->correlationId] = *r;
                 break;
+            case pc::TemplateId::DefineTopicResponse:
+                if (auto r = pc::DefineTopicResponse::decode(p, n)) defines_[r->correlationId] = *r;
+                break;
             case pc::TemplateId::MetadataResponse:
                 if (auto r = pc::MetadataResponse::decode(p, n)) {
                     std::vector<PartitionInfo> v;
@@ -257,6 +320,7 @@ private:
     }};
     std::optional<pc::ConnectResponse>              connect_;
     std::map<int64_t, pc::ProduceResponse>          acks_;
+    std::map<int64_t, pc::DefineTopicResponse>      defines_;
     std::optional<std::vector<PartitionInfo>>       metadata_;
     std::vector<PushedRecords>                      records_;
     std::vector<ErrorSeen>                          errors_;

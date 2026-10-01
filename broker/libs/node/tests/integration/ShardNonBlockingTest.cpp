@@ -1956,9 +1956,17 @@ TEST(ReplicaLifetimeRegression, SchemaFailureWithAnOverlongPathNeverThrowsOnTheA
         ++msgs;
         dir.assign(reinterpret_cast<const char*>(buf.buffer() + off) + 4, static_cast<std::size_t>(len) - 4);
     }, 4);
-    EXPECT_EQ(msgs, 1) << "signalled (truncated), never thrown";
-    EXPECT_EQ(dir.rfind("...", 0), 0u);
-    EXPECT_EQ(log.dir().substr(log.dir().size() - (dir.size() - 3)), dir.substr(3)) << "the path's tail is kept";
+    EXPECT_EQ(msgs, 1) << "signalled, never thrown";
+    // Integration wave 2: F3 round 6 grew the admin→control ring to carry
+    // SchemaUpdate descriptor blobs (max message 128 KiB > PATH_MAX), so a real
+    // path now arrives whole; the M3 tail-truncation stays as defence in depth.
+    const std::size_t maxDir = static_cast<std::size_t>(agent.failureRing().maxMsgLength()) - 4u;
+    if (log.dir().size() > maxDir) {
+        EXPECT_EQ(dir.rfind("...", 0), 0u);
+        EXPECT_EQ(log.dir().substr(log.dir().size() - (dir.size() - 3)), dir.substr(3)) << "the path's tail is kept";
+    } else {
+        EXPECT_EQ(dir, log.dir()) << "a path that fits the ring is signalled whole";
+    }
 }
 
 TEST(ReplicaLifetimeRegression, IncarnationWrapSkipsZeroStaleAndLiveValues) {

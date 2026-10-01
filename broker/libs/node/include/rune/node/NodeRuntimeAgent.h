@@ -830,7 +830,7 @@ private:
             op.partition = pid;
             op.replica   = replica;
             op.egressPub = ref;   // opaque task ref (WorkerOp::TestTask contract)
-            return workerPool_->tryEnqueueOp(tid, pid, std::move(op));
+            return static_cast<bool>(workerPool_->tryEnqueueOp(tid, pid, std::move(op)));
         }
         runOwnerThreadTestTask(ref, replica);   // control-thread-owned (or missing)
         return true;
