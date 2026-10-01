@@ -1115,7 +1115,11 @@ private:
     // page cache / ring slot via pwritev — so this bound only guards against an
     // absurd/malformed length overrunning the worker ingress ring or a segment.
     // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
-    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;
+    // F15 S3: == rune::node::Worker::kMaxProduceBatchBytes (static_assert in
+    // ClientGateway.cpp) — the shard-ingress guard and the return-ring startup
+    // check use the same bound.
+    static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
+    std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.

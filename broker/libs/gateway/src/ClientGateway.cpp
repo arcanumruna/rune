@@ -1485,6 +1485,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // silently drop.  The zero-copy append path has no fixed scratch cap anymore;
     // this bound only protects the worker ingress ring / log segment from an
     // absurd or malformed length.  The client caps its batch wire-size below this.
+    // F15 S3 (review m4 / I-1): the gateway and the worker share these bounds.
+    static_assert(kMaxProduceBatchBytes == rune::node::Worker::kMaxProduceBatchBytes,
+                  "gateway and shard-ingress max produce batch must match");
+    static_assert(kMaxChunkBytes == rune::node::Worker::kMaxPushReadChunkBytes,
+                  "gateway and worker PushRead chunk budget must match");
     if (batchLen > maxProduceBatchBytes_) {
         spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected (MessageTooLarge)",
                      batchLen, maxProduceBatchBytes_);

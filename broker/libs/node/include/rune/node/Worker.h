@@ -146,32 +146,42 @@ public:
     // F15 S3 (design note §6, m5 + I8): ONE return FIFO in every mode, bounded.
     //
     // Returns go to ret_ only while the local FIFO (retFifo_) is empty, else to
-    // its back; nothing is ever dropped.  The FIFO is bounded by construction:
-    //   |FIFO| <= max(kOverflowHighWater, kMaxIngressDrainLimit) * R
-    //             + kMaxFragmentLimit + kMaxOwedReturns
-    // where R = 1 is the most returns one op / one polled frame emits outside
-    // the owed (parked) set:
-    //   * the op-ring drain pauses once |FIFO| >= kOverflowHighWater and, with a
-    //     non-empty FIFO, drains at most kOverflowHighWater - |FIFO| ops (every
-    //     mode; with an empty FIFO at most the ingress drain limit);
-    //   * shard / per-worker ingress polls only while the FIFO is empty (G-A6),
-    //     at most kMaxFragmentLimit frames;
-    //   * owed returns that fire later (parked acks=all, Strict acks on their
-    //     fsync, owed Strict facts; S6 adds commit waiters / parked markers) are
-    //     capped at kMaxOwedReturns by the G-A6 reservation
-    //     (ackReservationAvailable_ / ingressPollBudget_).
-    // The capacity is static_assert-ed against that bound; exceeding it, a
-    // tryClaim exception or an encode error is an invariant-violation halt.
+    // its back; nothing is ever dropped.
+    //
+    // Bound (review S3 m1).  Let F = |FIFO| and O = owed returns (parked
+    // acks=all + durablePending_ + owed Strict facts; S6 adds commit waiters /
+    // parked markers — every owed source MUST be counted in reservedAckSlots_()).
+    //   * O <= maxOwedReturns_ always: the cap is checked BEFORE the append on
+    //     the gateway path (ackReservationAvailable_) and bounds the shard poll
+    //     budget (ingressPollBudget_, K <= cap - O, one owed per frame).
+    //   * Every owed→return conversion (HW fire, timeout, §3.2 fail, fsync
+    //     completion / failure, ownership purge) moves one unit from O to F:
+    //     F + O is unchanged.
+    //   * Outside the owed set, one op / one polled frame emits at most
+    //     kMaxReturnsPerOp (R = 1) return now.
+    //   * F + O grows only through: an op drain with F == 0 (at most the drain
+    //     limit, <= kMaxIngressDrainLimit, ops); an op drain with 0 < F <
+    //     kOverflowHighWater (at most kOverflowHighWater - F ops); nothing when
+    //     F >= kOverflowHighWater; a poll only when F == 0 (K <= cap - O).
+    //   So F <= max(F + O) <= max(kOverflowHighWater, kMaxIngressDrainLimit) * R
+    //   + kMaxOwedReturnsCeiling (the poll term kMaxFragmentLimit is kept in
+    //   kRetFifoBound for margin).  The capacity is static_assert-ed against it
+    //   for the CEILING of the configurable cap; exceeding it, a tryClaim
+    //   exception or an encode error is an invariant-violation halt.
     // -----------------------------------------------------------------------
     /// Invariant-violation halt code (== BrokerNode::kExitInvariantViolation).
     static constexpr int kExitInvariantViolation = 70;
     /// Op-ring drain pauses while the return FIFO holds at least this many.
     static constexpr std::size_t kOverflowHighWater = 1024;
-    /// Static cap on owed returns (G-A6 reservation): parked acks=all +
-    /// durablePending_ + owed Strict facts.  Both vectors are reserved to it,
-    /// so parking never allocates.  4096 waiters/worker = 4 M acks/s per
-    /// worker at a 1 ms replication round trip.
-    static constexpr std::size_t kMaxOwedReturns    = 4096;
+    /// Default static cap on owed returns (G-A6 reservation): parked acks=all +
+    /// durablePending_ + owed Strict facts.  Configurable per worker
+    /// (RUNE_WORKER_MAX_OWED_RETURNS → setMaxOwedReturns) within
+    /// [kMinOwedReturns, kMaxOwedReturnsCeiling].  Both vectors are reserved to
+    /// the configured cap, so parking never allocates.  4096 waiters/worker
+    /// binds only when append→HW exceeds ~41 ms at 100k batches/s per worker.
+    static constexpr std::size_t kMaxOwedReturns        = 4096;
+    static constexpr std::size_t kMinOwedReturns        = 256;
+    static constexpr std::size_t kMaxOwedReturnsCeiling = 8192;
     /// Clamps for the configurable per-pass limits (NodeConfig knobs).
     static constexpr int32_t     kMaxIngressDrainLimit = 4096;
     static constexpr int32_t     kMaxFragmentLimit     = 4096;
@@ -180,43 +190,107 @@ public:
     static constexpr std::size_t kRetFifoBound =
         (kOverflowHighWater > static_cast<std::size_t>(kMaxIngressDrainLimit)
              ? kOverflowHighWater : static_cast<std::size_t>(kMaxIngressDrainLimit)) * kMaxReturnsPerOp +
-        static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturns;
+        static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturnsCeiling;
     static constexpr std::size_t kRetFifoCapacity   = 16384;
-    static_assert(kRetFifoCapacity >= kRetFifoBound, "F15 §6: the return FIFO must hold its static bound");
+    static_assert(kRetFifoCapacity >= kRetFifoBound,
+                  "F15 §6: the return FIFO must hold its static bound at the owed-cap ceiling");
     static_assert((kRetFifoCapacity & (kRetFifoCapacity - 1)) == 0, "power of two (O(1) index mask)");
+    static_assert(kMinOwedReturns <= kMaxOwedReturns && kMaxOwedReturns <= kMaxOwedReturnsCeiling);
+    // Review S3 I-1: makes "ret ring >= ingress ring" exact for Legacy — a
+    // batch that fits an op frame always fits a return frame.
+    static_assert(sbe::WorkerReturn::sbeBlockLength() + sbe::WorkerReturn::chunkHeaderLength() <=
+                  sbe::WorkerOp::sbeBlockLength() + sbe::WorkerOp::tailHeaderLength(),
+                  "a WorkerReturn's framing must not exceed a WorkerOp's");
 
-    /// Largest chunk one PushRead reads (mirrored by ClientGateway).
+    /// Largest chunk one PushRead reads (ClientGateway::kMaxChunkBytes must
+    /// equal it — static_assert in ClientGateway.cpp).
     static constexpr int32_t     kMaxPushReadChunkBytes = 512 * 1024;
-    /// Framed bytes of a PushReadResult carrying a full chunk.
-    [[nodiscard]] static constexpr std::size_t maxPushReadResultBytes() noexcept {
+    /// Largest client produce batch any intake path stores (the gateway's
+    /// MessageTooLarge guard and the shard-ingress guard; static_assert-ed
+    /// equal to ClientGateway::kMaxProduceBatchBytes).
+    static constexpr std::size_t kMaxProduceBatchBytes  = 8u * 1024u * 1024u;
+    /// Aeron's hard cap on one message (min(16 MiB, term / 8)).
+    static constexpr std::size_t kAeronMaxMessageCeiling = 16u * 1024u * 1024u;
+
+    /// Fixed framing of one WorkerReturn on ret_ (header + block + chunk length).
+    [[nodiscard]] static constexpr std::size_t returnFixedBytes() noexcept {
         return static_cast<std::size_t>(sbe::MessageHeader::encodedLength()) +
                sbe::WorkerReturn::sbeBlockLength() +
-               static_cast<std::size_t>(sbe::WorkerReturn::chunkHeaderLength()) +
-               static_cast<std::size_t>(kMaxPushReadChunkBytes);
+               static_cast<std::size_t>(sbe::WorkerReturn::chunkHeaderLength());
     }
-    /// F15 §6 startup check: a tryClaim exception halts, so the return ring's
-    /// max message (capacity / 8) must hold one full PushReadResult chunk plus
-    /// its header.  BrokerNode refuses to start otherwise (the default, 32 MiB
-    /// — max message 4 MiB — does).
+    /// Fixed framing of one WorkerOp on ingress_ (header + block + tail length).
+    [[nodiscard]] static constexpr std::size_t opFixedBytes() noexcept {
+        return static_cast<std::size_t>(sbe::MessageHeader::encodedLength()) +
+               sbe::WorkerOp::sbeBlockLength() +
+               static_cast<std::size_t>(sbe::WorkerOp::tailHeaderLength());
+    }
+    /// Framed bytes of a PushReadResult carrying a full chunk.
+    [[nodiscard]] static constexpr std::size_t maxPushReadResultBytes() noexcept {
+        return returnFixedBytes() + static_cast<std::size_t>(kMaxPushReadChunkBytes);
+    }
+    /// F15 §6 startup check (part): the return ring's max message (capacity / 8)
+    /// holds one full PushReadResult chunk plus its header.
     [[nodiscard]] static constexpr bool returnRingCoversMaxPushChunk(std::size_t returnRingBytes) noexcept {
         return returnRingBytes / 8 >= maxPushReadResultBytes();
     }
     [[nodiscard]] bool returnRingCoversMaxPushChunk() const {
         return static_cast<std::size_t>(ret_.maxMsgLength()) >= maxPushReadResultBytes();
     }
-
-    // F15 S3 fix round 1 — RED stubs (behaviour-preserving).
-    static constexpr std::size_t kMaxProduceBatchBytes  = 8u * 1024u * 1024u;
-    static constexpr std::size_t kMinOwedReturns        = 256;
-    static constexpr std::size_t kMaxOwedReturnsCeiling = 8192;
+    /// Largest batch an intake path can store: Legacy (gateway → op ring)
+    /// min(max produce batch, ingress max message − op framing); shard
+    /// (client → worker ingress) min(max produce batch, Aeron max message =
+    /// min(16 MiB, term / 8)).  Replication only copies batches a leader stored.
+    [[nodiscard]] static constexpr std::size_t maxStorableBatchBytes(
+        std::size_t ingressRingBytes, bool shardMode, std::size_t aeronTermBufferBytes) noexcept {
+        const std::size_t ingressMax = ingressRingBytes / 8;
+        const std::size_t legacy = std::min(kMaxProduceBatchBytes,
+                                            ingressMax > opFixedBytes() ? ingressMax - opFixedBytes() : 0);
+        if (!shardMode) return legacy;
+        const std::size_t aeronMax = std::min(kAeronMaxMessageCeiling, aeronTermBufferBytes / 8);
+        return std::max(legacy, std::min(kMaxProduceBatchBytes, aeronMax));
+    }
+    /// F15 §6 + review S3 I-1: a return-ring claim exception halts, and a PushRead
+    /// returns a WHOLE batch even past its 512 KiB budget — so the return ring's
+    /// max message must hold max(one full PushReadResult chunk, the largest
+    /// storable batch) plus the return framing, or a legal batch halts the
+    /// broker on every restart (crash loop).  Also: ret ring >= ingress ring
+    /// (exact for Legacy since WorkerReturn's block <= WorkerOp's), and the
+    /// owed-return cap within [kMinOwedReturns, kMaxOwedReturnsCeiling].
+    /// nullopt = OK; else the refusal reason.  BrokerNode::start() calls it
+    /// before any side effect.
     [[nodiscard]] static std::optional<std::string> validateRingConfig(
-        std::size_t /*returnRingBytes*/, std::size_t /*ingressRingBytes*/, bool /*shardMode*/,
-        std::size_t /*aeronTermBufferBytes*/, int64_t /*maxOwedReturns*/) {
+        std::size_t returnRingBytes, std::size_t ingressRingBytes, bool shardMode,
+        std::size_t aeronTermBufferBytes, int64_t maxOwedReturns) {
+        const std::size_t retMax   = returnRingBytes / 8;
+        const std::size_t storable = maxStorableBatchBytes(ingressRingBytes, shardMode, aeronTermBufferBytes);
+        const std::size_t need     = std::max(maxPushReadResultBytes(), storable + returnFixedBytes());
+        if (retMax < need)
+            return "RUNE_WORKER_RETURN_RING_BYTES=" + std::to_string(returnRingBytes) +
+                   " is too small: its max message (capacity / 8 = " + std::to_string(retMax) +
+                   " B) must hold " + std::to_string(need) + " B (the largest storable batch " +
+                   std::to_string(storable) + " B or a 512 KiB PushRead chunk, plus the return header)";
+        if (returnRingBytes < ingressRingBytes)
+            return "RUNE_WORKER_RETURN_RING_BYTES=" + std::to_string(returnRingBytes) +
+                   " must be >= RUNE_WORKER_INGRESS_RING_BYTES=" + std::to_string(ingressRingBytes);
+        if (maxOwedReturns < static_cast<int64_t>(kMinOwedReturns) ||
+            maxOwedReturns > static_cast<int64_t>(kMaxOwedReturnsCeiling))
+            return "RUNE_WORKER_MAX_OWED_RETURNS=" + std::to_string(maxOwedReturns) + " must be in [" +
+                   std::to_string(kMinOwedReturns) + ", " + std::to_string(kMaxOwedReturnsCeiling) + "]";
         return std::nullopt;
     }
-    void setMaxOwedReturns(std::size_t /*n*/) noexcept {}
-    [[nodiscard]] std::size_t maxOwedReturns() const noexcept { return kMaxOwedReturns; }
-    [[nodiscard]] uint64_t owedCapThrottlesForTest() const noexcept { return 0; }
+    /// Configure this worker's owed-return cap (startup, before the runner
+    /// starts).  Clamped to [kMinOwedReturns, kMaxOwedReturnsCeiling] (the
+    /// FIFO capacity is static_assert-ed at the ceiling); both waiter vectors
+    /// are reserved to it so parking never allocates.
+    void setMaxOwedReturns(std::size_t n) {
+        maxOwedReturns_ = std::clamp(n, kMinOwedReturns, kMaxOwedReturnsCeiling);
+        pendingAcksAll_.reserve(maxOwedReturns_);
+        durablePending_.reserve(maxOwedReturns_);
+    }
+    [[nodiscard]] std::size_t maxOwedReturns() const noexcept { return maxOwedReturns_; }
+    /// Produces refused (gateway path) / shard polls skipped because the
+    /// owed-return cap — not the ring — was the limiter.
+    [[nodiscard]] uint64_t owedCapThrottlesForTest() const noexcept { return owedCapThrottles_; }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the
@@ -1046,6 +1120,11 @@ private:
     // as BrokerNode::kExitInvariantViolation).  Fail-stop: the worker cannot
     // deliver a return it owes, and dropping it would silently lose an answer
     // or a transactional fact.  Cold, never returns.
+    // Review S3 m8: this deliberately does NOT go through BrokerNode's
+    // HaltHandler — that handler is a runtime-thread hook that requests a
+    // graceful stop and RETURNS, and this worker cannot continue the call it
+    // is in (the owed return has nowhere to go).  Only the default spdlog
+    // logger is flushed before _Exit.
     [[noreturn]] [[gnu::cold]] [[gnu::noinline]]
     void haltInvariant_(const char* what, const char* detail, std::size_t chunkBytes) const noexcept {
         spdlog::critical("Worker {}: INVARIANT VIOLATION — {} ({}; chunk={} B, ret_ maxMsgLength={}, "
@@ -1250,6 +1329,10 @@ private:
         if (const std::size_t backlog = retFifo_.size(); backlog != 0) [[unlikely]] {
             if (backlog >= kOverflowHighWater) {
                 ++retFifoHighWaterPauses_;
+                if (retFifoHighWaterPauses_ == 1 || (retFifoHighWaterPauses_ & 1023u) == 0) [[unlikely]]
+                    spdlog::warn("Worker {}: return FIFO at high water ({} >= {}) — op drain paused "
+                                 "(retFifoHighWaterPauses={})", workerId_, backlog, kOverflowHighWater,
+                                 retFifoHighWaterPauses_);
                 return 0;
             }
             limit = std::min(limit, static_cast<int>(kOverflowHighWater - backlog));
@@ -1724,6 +1807,7 @@ private:
         const bool parks  = acksAll || strict;
         if (parks && !ackReservationAvailable_(/*returnsNow=*/1)) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
+            if (!owedCapAllows_(1)) noteOwedCapThrottle_("gateway-routed produce");
             if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
                 spdlog::warn("Worker {}: parked (acks=all / Strict) produce refused NotLeader — return-ring reservation "
                              "exhausted (owed={}, total refused={})", workerId_, reservedAckSlots_(),
@@ -2882,6 +2966,10 @@ private:
     // Passes whose op drain was paused at the high-water mark (DR matrix
     // watches it for ISR-lag interaction in Legacy mode).
     uint64_t retFifoHighWaterPauses_ = 0;
+    // F15 S3 fix round 1: this worker's owed-return cap (setMaxOwedReturns)
+    // and the count of intake throttled by it (cap, not ring, was the limit).
+    std::size_t maxOwedReturns_   = kMaxOwedReturns;
+    uint64_t    owedCapThrottles_ = 0;
 
     // E5.1.2d: acks=all commit-wait timeout (ns).
     int64_t ackTimeoutNs_ = kDefaultAckTimeoutNs;
@@ -3724,12 +3812,25 @@ private:
     [[nodiscard]] bool ackReservationAvailable_(int64_t returnsNow = 0) const noexcept {
         return ret_.freeSlotsForMsgSize(ackSlotBytes_) >
                reservedAckSlots_() + static_cast<int64_t>(retFifo_.size()) + returnsNow &&
-               // F15 S3 (addendum S3): the STATIC owed-return cap — the answer
-               // parked now (+1) plus any further owed return (returnsNow:
-               // Strict owes its facts at fsync) must stay within
-               // kMaxOwedReturns, so pendingAcksAll_ / durablePending_ never
-               // outgrow their reservation and the §6 FIFO bound holds.
-               reservedAckSlots_() + 1 + returnsNow <= static_cast<int64_t>(kMaxOwedReturns);
+               owedCapAllows_(returnsNow);
+    }
+    // F15 S3 (addendum S3): the STATIC owed-return cap — the answer parked now
+    // (+1) plus any further owed return (returnsNow: Strict owes its facts at
+    // fsync) must stay within maxOwedReturns_, so pendingAcksAll_ /
+    // durablePending_ never outgrow their reservation and the §6 FIFO bound
+    // holds.  (For non-Strict acks=all the facts are emitted now, not owed, so
+    // this is one conservative.)
+    [[nodiscard]] bool owedCapAllows_(int64_t returnsNow) const noexcept {
+        return reservedAckSlots_() + 1 + returnsNow <= static_cast<int64_t>(maxOwedReturns_);
+    }
+    // Cold: count + rate-limited log of an owed-cap throttle (the bench / DR
+    // matrix watches it: the cap, not the ring, was the limiter).
+    [[gnu::cold]] void noteOwedCapThrottle_(const char* where) noexcept {
+        ++owedCapThrottles_;
+        if (owedCapThrottles_ == 1 || (owedCapThrottles_ & 1023u) == 0)
+            spdlog::warn("Worker {}: owed-return cap {} reached ({}) — intake throttled "
+                         "(owedCapThrottles={}, RUNE_WORKER_MAX_OWED_RETURNS)",
+                         workerId_, maxOwedReturns_, where, owedCapThrottles_);
     }
 
     // -----------------------------------------------------------------------
@@ -3800,8 +3901,8 @@ private:
         const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
         const int64_t reserved  = static_cast<int64_t>(retFifo_.size()) + owed;
         const int64_t ringRoom  = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
-        const int64_t capRoom   = static_cast<int64_t>(kMaxOwedReturns) > owed
-                                      ? static_cast<int64_t>(kMaxOwedReturns) - owed : 0;
+        const int64_t capRoom   = static_cast<int64_t>(maxOwedReturns_) > owed
+                                      ? static_cast<int64_t>(maxOwedReturns_) - owed : 0;
         return std::min({static_cast<int64_t>(desiredFragmentLimit_), ringRoom, capRoom});
     }
 
@@ -3809,7 +3910,10 @@ private:
         if (!workerIngress_ || !workerIngress_->resolved()) return 0;
 
         const int32_t K = static_cast<int32_t>(ingressPollBudget_());
-        if (K <= 0) return 0; // no free slots — skip poll (G-A6 preserved)
+        if (K <= 0) [[unlikely]] {   // no room — skip poll (G-A6 preserved)
+            if (reservedAckSlots_() >= static_cast<int64_t>(maxOwedReturns_)) noteOwedCapThrottle_("shard poll");
+            return 0;
+        }
 
         int polled = 0;
         workerIngress_->poll(
@@ -3917,6 +4021,15 @@ private:
                          workerId_, msg.topicId, msg.partition);
             // E5.1.3 review fix #2: use enum, not magic literal.
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            enqueueReturn_(ret);
+            return 1;
+        }
+        // F15 S3 fix round 1 (review I-1): the same max-batch guard as the
+        // gateway (MessageTooLarge, non-retriable, never appended) — Aeron's
+        // term size must not silently raise the largest storable batch past
+        // what the return ring can carry on a PushRead (validateRingConfig).
+        if (rbSpan.size() > kMaxProduceBatchBytes) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;
         }

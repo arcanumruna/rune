@@ -75,16 +75,18 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
-    // F15 S3 (design note §6): a worker return-ring claim exception is an
-    // invariant-violation halt, so the return ring size is a correctness
-    // setting — its max message must hold one full PushReadResult chunk.
-    if (!Worker::returnRingCoversMaxPushChunk(static_cast<std::size_t>(config_.workerReturnRingBytes))) {
-        throw std::runtime_error(
-            "BrokerNode[" + std::to_string(config_.nodeId) + "]: refusing to start — "
-            "RUNE_WORKER_RETURN_RING_BYTES=" + std::to_string(config_.workerReturnRingBytes) +
-            " is too small: its max message (capacity / 8) must hold one " +
-            std::to_string(Worker::maxPushReadResultBytes()) + " B PushReadResult (512 KiB chunk + header); "
-            "use at least 8 MiB (default 32 MiB)");
+    // F15 S3 (design note §6, review S3 I-1): a worker return-ring claim
+    // exception is an invariant-violation halt, so the return ring size is a
+    // correctness setting — its max message must hold the largest batch any
+    // intake path can store (and a full PushRead chunk), else a legal batch
+    // halts the broker on every restart.  Also the owed-return cap range.
+    if (auto err = Worker::validateRingConfig(
+            static_cast<std::size_t>(config_.workerReturnRingBytes),
+            static_cast<std::size_t>(config_.workerIngressRingBytes), config_.shardMode(),
+            static_cast<std::size_t>(config_.aeronTermBufferBytes), config_.workerMaxOwedReturns);
+        err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
     }
 
     using sclock = std::chrono::steady_clock;
@@ -1035,6 +1037,7 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
+        workerPool_->worker(i).setMaxOwedReturns(static_cast<std::size_t>(config_.workerMaxOwedReturns));
     }
 
     // F15 S3 (§6): each worker re-checks its own return ring (defence in depth
