@@ -313,13 +313,14 @@ TEST_F(WorkerPushFixture, NoEgressWiredIsInertNoCrash) {
 //
 // Fixed: deliverable frames go out as a vectored offer (header from scratch +
 // batch bytes zero-copy from the log view); a frame above maxMessageLength
-// answers ONE ErrorResponse{MessageTooLarge, correlationId = subscriptionId}
+// answers ONE ErrorResponse{MessageTooLarge, correlationId = 0, message naming
+// the subscription/topic/partition/offset}
 // and parks that subscription (cursor not advanced; others unaffected);
 // back-pressure keeps the retry-from-same-cursor semantics.
 // ===========================================================================
 struct F19Egress {
     struct Rec { int64_t subId; int64_t baseOffset; std::vector<uint8_t> bytes; };
-    struct Err { int64_t sessionId; int64_t correlationId; int16_t code; };
+    struct Err { int64_t sessionId; int64_t correlationId; int16_t code; std::string message; };
     std::vector<Rec> records;
     std::vector<Err> errors;
     aeron::FragmentAssembler fa;
@@ -332,7 +333,7 @@ struct F19Egress {
                   records.push_back({r->subscriptionId, r->baseOffset,
                                      {r->recordBatch.begin(), r->recordBatch.end()}});
               else if (auto e = pc::ErrorResponse::decode(p, n))
-                  errors.push_back({e->sessionId, e->correlationId, e->code});
+                  errors.push_back({e->sessionId, e->correlationId, e->code, std::string(e->message)});
           }) {}
     [[nodiscard]] std::size_t recordsFor(int64_t subId) const {
         std::size_t c = 0;
@@ -471,7 +472,10 @@ TEST_F(WorkerOversizePushRegression, AboveMaxMessageLengthAnswersErrorNoSilentAd
         return !c.errors.empty() && c.recordsFor(2) >= 2;
     }, 10s)) << "errors=" << c.errors.size() << " sub2 records=" << c.recordsFor(2);
     ASSERT_EQ(c.errors.size(), 1u);
-    EXPECT_EQ(c.errors[0].correlationId, 1);
+    EXPECT_EQ(c.errors[0].correlationId, 0)
+        << "a subscription id must never be sent as a correlationId (collides with ping ids)";
+    EXPECT_NE(c.errors[0].message.find("subscription 1 topic 10 partition 0 offset 0"), std::string::npos)
+        << "message must name the subscription; got: " << c.errors[0].message;
     EXPECT_EQ(c.errors[0].sessionId, 4201);
     EXPECT_EQ(c.errors[0].code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
 

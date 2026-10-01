@@ -1672,7 +1672,9 @@ TEST_F(GatewaySubscribeFixture, MC5_MidChunkCorruptBatchSkip_ForwardProgress)
 //     + the batch bytes zero-copy from the log; Aeron fragments, the client's
 //     FragmentAssembler reassembles);
 //   - a frame above maxMessageLength answers that subscription ONE
-//     ErrorResponse{MessageTooLarge, correlationId = subscriptionId} and parks
+//     ErrorResponse{MessageTooLarge, correlationId = 0, message naming the
+//     subscription/topic/partition/offset} (F15 S3 m-f: a subscription id
+//     shares no namespace with client correlation ids) and parks
 //     it (cursor NOT advanced, no further pushes, no repeated errors); other
 //     subscriptions are unaffected;
 //   - back-pressure on a large offer keeps today's retry semantics (cursor not
@@ -1711,7 +1713,7 @@ public:
         std::vector<pc::SubscribeResponse> subResps;
         struct Rec { int64_t subId; int64_t baseOffset; std::vector<uint8_t> bytes; };
         std::vector<Rec> records;
-        struct Err { int64_t correlationId; int16_t code; };
+        struct Err { int64_t correlationId; int16_t code; std::string message; };
         std::vector<Err> errors;
         aeron::FragmentAssembler fa;
         Egress()
@@ -1725,7 +1727,7 @@ public:
                   } else if (auto sr = pc::SubscribeResponse::decode(p, n)) {
                       subResps.push_back(*sr);
                   } else if (auto e = pc::ErrorResponse::decode(p, n)) {
-                      errors.push_back({e->correlationId, e->code});
+                      errors.push_back({e->correlationId, e->code, std::string(e->message)});
                   }
               }) {}
         [[nodiscard]] std::size_t recordsFor(int64_t subId) const {
@@ -1843,7 +1845,13 @@ TEST_P(GatewayLargeBatchPushRegression, AboveMaxMessageLengthAnswersErrorNoSilen
          c.egressSub.get(), &eg.fa, kPumpIter, "F19 too-large error");
 
     ASSERT_EQ(eg.errors.size(), 1u);
-    EXPECT_EQ(eg.errors[0].correlationId, subBig);
+    EXPECT_EQ(eg.errors[0].correlationId, 0)
+        << "a subscription id must never be sent as a correlationId (collides with ping ids)";
+    const std::string want = "subscription " + std::to_string(subBig) + " topic " +
+                             std::to_string(kTopicIdA) + " partition " +
+                             std::to_string(kPartitionA0) + " offset 0";
+    EXPECT_NE(eg.errors[0].message.find(want), std::string::npos)
+        << "message must name the subscription; got: " << eg.errors[0].message;
     EXPECT_EQ(eg.errors[0].code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
     EXPECT_EQ(eg.recordsFor(subOther), 2u) << "other subscription must be unaffected";
 
