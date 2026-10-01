@@ -181,8 +181,9 @@ public:
 
     /// F18 (B-1): the largest records payload this node's worker ingress ring can
     /// take in ONE apply op (ring/8 − op framing).  Set ONCE before any worker
-    /// runs.  Caps this node's outgoing follower fetch maxBytes so a leader never
-    /// answers it with more than the follower can apply.  0 = no cap.
+    /// runs.  Caps this node's outgoing follower fetch AND reconcile-pull (B-3)
+    /// maxBytes so the answering peer never sends more than this node can apply.
+    /// 0 = no cap.
     void setApplyRecordsCap(int64_t n) noexcept { applyRecordsCap_ = n; }
     /// F18 (B-1): responses dropped (NOT wedged) because the whole response was
     /// above the apply frame while its batch at the front fit — recovered by the

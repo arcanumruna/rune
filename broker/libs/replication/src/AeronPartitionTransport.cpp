@@ -226,11 +226,18 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
 void AeronPartitionTransport::sendReconcileRequest(
         NodeId toPeer, const FetchRequestMsg& req)
 {
+    // F18 (B-3): the reverse pull lands on THIS node's worker ingress ring exactly
+    // like a follower fetch reply — cap it to our own apply frame (B-1), else the
+    // survivor's multi-batch reply (bounded only by ITS frame) is refused on every
+    // retry and reconcile never completes.
+    int32_t maxBytes = req.maxBytes;
+    if (applyRecordsCap_ > 0 && req.topicId >= 0 && maxBytes > applyRecordsCap_)
+        maxBytes = static_cast<int32_t>(applyRecordsCap_);
     uint8_t wire[kMaxWireFrame];
     const std::size_t len = FetchRequestMsg::encode(
         wire, 0,
         req.leaderEpoch, req.partition, req.followerId,
-        req.fetchOffset, req.maxBytes, req.topicId);
+        req.fetchOffset, maxBytes, req.topicId);
     stampTemplateId(wire, 0, kReconcileFetchReqTemplateId);
     enqueueOutbound(toPeer, wire, len);
 }
