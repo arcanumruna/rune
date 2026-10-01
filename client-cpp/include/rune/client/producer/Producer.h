@@ -91,7 +91,10 @@ struct ProducerConfig {
     int32_t directDeferredBytes = 256 * 1024; // Invoker (Direct ingress) only: room for sends made
                                               // from callbacks the producer fires mid-duty-work
                                               // (deferred, applied after the walk). Clamped up
-                                              // to fit one max-size record. See send()'s docs.
+                                              // to fit two max-size records. See send()'s docs.
+    int32_t directDeferredPartitionBytes = 0; // Invoker only: one partition's max share of that
+                                              // arena (0 = min(arena/2, 4 x batchBytes)), so a
+                                              // stalled partition cannot exhaust it.
 
     /// Build a ProducerConfig from environment variables, falling back to
     /// sane defaults for any variable that is not set.
@@ -244,13 +247,28 @@ public:
     /// window has room (void send() then pumps one duty cycle and retries).
     /// Sends made from a callback the producer fires inside its OWN duty work
     /// (an ack callback, onBatchAck, a delivery-timeout failure) are DEFERRED
-    /// into a preallocated owner-thread buffer (ProducerConfig::
-    /// directDeferredBytes) and applied, in submission order, right after that
-    /// work; while deferred records are queued, later sends queue behind them
-    /// (order).  When that buffer is full: trySend() returns BackPressured, a
-    /// void send() inside the duty cycle throws std::runtime_error, and the
-    /// callback/future overloads fail with a distinct "deferred buffer full"
-    /// reason.  Only the owner thread may send (others get WrongThread).
+    /// into a preallocated owner-thread arena (ProducerConfig::
+    /// directDeferredBytes) and applied right after that work, in submission
+    /// order PER PARTITION.  A partition that cannot take them yet (window full,
+    /// leader down) keeps its own deferred records — later sends to THAT
+    /// partition report BackPressured until they are applied — while every
+    /// other partition proceeds normally.  One partition may hold at most
+    /// directDeferredPartitionBytes of the arena.  When its share (or the
+    /// arena) is full: trySend() returns BackPressured, a void send() inside
+    /// the duty cycle throws std::runtime_error, and the callback/future
+    /// overloads fail with a distinct "deferred buffer full" reason.  A deferred
+    /// record has the normal delivery deadline (deliveryTimeoutMs from
+    /// acceptance; a void one is counted + logged), and flush() covers it.  Only
+    /// the owner thread may send (others get WrongThread).
+    ///
+    /// **Ordering vs a Tier-2 batch (both modes).**  A record is never placed
+    /// ahead of a Tier-2 batch (Producer::batch) queued earlier on the same
+    /// partition: it waits until that batch is sent.  In Thread mode (Ring
+    /// ingress) a waiting record is the head of the producer's ring, so the
+    /// whole ring drain pauses until the batch is sent (same as a record behind
+    /// a full builder at maxInFlight); sends keep accumulating in the ring and
+    /// back-pressure once it is full.  In Invoker mode only that partition's
+    /// sends report BackPressured.
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
     // ---- Opt-in ack paths (may allocate per send) ----------------------------

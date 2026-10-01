@@ -163,6 +163,13 @@ struct PartitionState {
     // Force-flush flag (set by flush() call from app thread, read here).
     bool flushRequested = false;
 
+    // Task 14 fix2: records of THIS partition waiting in the producer's
+    // DeferredArena (owner thread only).  >0 gates this partition's Direct
+    // sends (per-partition order) without touching any other partition.
+    uint32_t deferredCount    = 0;
+    uint32_t deferredBytes    = 0;  // arena bytes held (per-partition cap)
+    uint32_t deferBlockedPass = 0;  // apply pass in which this partition ABORTed
+
     // Per-record ack fan-out, ZERO-ALLOC ring (spec §4.3).  ackRing holds
     // PendingAck handles at their record's OWN index within the batch (void
     // records hold 0; zeros are back-filled lazily, trailing void records take no
@@ -216,72 +223,95 @@ struct PendingAck {
 };
 
 // ---------------------------------------------------------------------------
-// DeferredFifo — Task 14 fix1 C1: Direct-ingress sends made while the producer
-// is inside its OWN duty work (a user callback it fires mid-walk / mid-reset)
-// are queued here and applied after that work completes, in submission order.
+// DeferredArena — Task 14 fix1 C1 / fix2: Direct-ingress sends made while the
+// producer is inside its OWN duty work (a user callback it fires mid-walk /
+// mid-reset) are queued here and applied after that work, PER-PARTITION in
+// submission order (a stalled partition never holds back another one).
 //
-// NOT a cross-thread ring: a plain single-owner (Invoker owner thread) byte FIFO
-// — no atomics, no locks.  Preallocated once (enableDirectIngress); push() never
-// allocates.  Records are [u32 payloadLen][i32 type][payload], 8-byte aligned.
-// When a push does not fit contiguously at the end but fits in total, the live
-// bytes are compacted to the front (memmove; cold path — callback bursts only).
-// Full: push() returns nullptr (the caller reports back-pressure).
+// NOT a cross-thread ring: a plain single-owner (Invoker owner thread) byte
+// arena — no atomics, no locks — preallocated once (enableDirectIngress); push()
+// never allocates.  Records are [DeferredHdr][payload], 8-byte aligned, appended
+// at the tail.  Records leave by being applied / failed (dead: type 0); the
+// apply pass compacts in place with a read/write cursor (kept records slide
+// forward), and a push that does not fit compacts dead space first when no scan
+// is in progress.  Full: push() returns nullptr (the caller back-pressures).
 // ---------------------------------------------------------------------------
-class DeferredFifo {
+struct DeferredHdr {
+    uint32_t len       = 0;  ///< payload bytes
+    uint8_t  type      = 0;  ///< kMsgSendRecord / kMsgTier2Batch; 0 = dead
+    uint8_t  flags     = 0;  ///< kDefUnknownPartition | kDefFlushOnApply
+    uint16_t reserved  = 0;
+    int32_t  topicId   = 0;
+    int32_t  partition = 0;
+    int64_t  submitNs  = 0;  ///< duty clock at acceptance: delivery deadline + batch start
+};
+static_assert(sizeof(DeferredHdr) == 24);
+inline constexpr uint8_t kDefUnknownPartition = 0x01;  ///< counted in deferredUnknown_ (no PartitionState yet)
+inline constexpr uint8_t kDefFlushOnApply     = 0x02;  ///< flush() was called after acceptance
+
+class DeferredArena {
 public:
-    static constexpr std::size_t kHeader = 8;
     static constexpr std::size_t align8(std::size_t n) noexcept { return (n + 7u) & ~std::size_t{7}; }
+    static constexpr std::size_t recordSize(std::size_t payloadLen) noexcept {
+        return align8(sizeof(DeferredHdr) + payloadLen);
+    }
 
     void init(std::size_t capacity) {
         buf_.assign(align8(capacity), 0);
-        head_ = tail_ = 0;
-        count_ = 0;
+        tail_ = 0;
+        live_ = 0;
     }
-    [[nodiscard]] bool empty() const noexcept { return count_ == 0; }
-    [[nodiscard]] uint32_t count() const noexcept { return count_; }
+    [[nodiscard]] uint32_t    live() const noexcept { return live_; }
+    [[nodiscard]] bool        empty() const noexcept { return live_ == 0; }
+    [[nodiscard]] std::size_t tail() const noexcept { return tail_; }
     [[nodiscard]] std::size_t capacity() const noexcept { return buf_.size(); }
 
-    /// Payload pointer for a new record of `len` bytes, or nullptr when full.
-    uint8_t* push(int32_t type, uint32_t len) noexcept {
-        const std::size_t need = align8(kHeader + len);
-        if (need > buf_.size() - (tail_ - head_)) return nullptr;
-        if (tail_ + need > buf_.size()) {
-            std::memmove(buf_.data(), buf_.data() + head_, tail_ - head_);
-            tail_ -= head_;
-            head_ = 0;
-        }
-        uint8_t* h = buf_.data() + tail_;
-        std::memcpy(h, &len, 4);
-        std::memcpy(h + 4, &type, 4);
+    /// Payload pointer for a new record, or nullptr when it does not fit.
+    uint8_t* push(const DeferredHdr& h) noexcept {
+        const std::size_t need = recordSize(h.len);
+        if (tail_ + need > buf_.size()) return nullptr;
+        uint8_t* p = buf_.data() + tail_;
+        std::memcpy(p, &h, sizeof h);
         tail_ += need;
-        ++count_;
-        return h + kHeader;
+        ++live_;
+        return p + sizeof(DeferredHdr);
     }
-    struct Front {
-        int32_t        type;
-        const uint8_t* payload;  ///< valid until the next push() or pop()
-        uint32_t       len;
-    };
-    [[nodiscard]] Front front() const noexcept {
-        const uint8_t* h = buf_.data() + head_;
-        Front f{};
-        std::memcpy(&f.len, h, 4);
-        std::memcpy(&f.type, h + 4, 4);
-        f.payload = h + kHeader;
-        return f;
+    // Offset-based access (stable while no compaction runs: the buffer never moves).
+    [[nodiscard]] DeferredHdr* hdr(std::size_t off) noexcept {
+        return reinterpret_cast<DeferredHdr*>(buf_.data() + off);
     }
-    void pop() noexcept {
-        uint32_t len = 0;
-        std::memcpy(&len, buf_.data() + head_, 4);
-        head_ += align8(kHeader + len);
-        if (--count_ == 0) head_ = tail_ = 0;
+    [[nodiscard]] uint8_t* payload(std::size_t off) noexcept {
+        return buf_.data() + off + sizeof(DeferredHdr);
+    }
+    [[nodiscard]] std::size_t sizeAt(std::size_t off) noexcept { return recordSize(hdr(off)->len); }
+    void kill(std::size_t off) noexcept {
+        hdr(off)->type = 0;
+        --live_;
+    }
+    /// Move [from, from+n) to `to` (to <= from) — the apply pass's write cursor.
+    void move(std::size_t to, std::size_t from, std::size_t n) noexcept {
+        if (to != from && n != 0) std::memmove(buf_.data() + to, buf_.data() + from, n);
+    }
+    void setTail(std::size_t t) noexcept { tail_ = t; }
+    /// Slide live records forward over dead ones (order preserved).  Only when
+    /// no scan holds an offset.
+    void compactDead() noexcept {
+        std::size_t w = 0;
+        for (std::size_t r = 0; r < tail_;) {
+            const std::size_t n = sizeAt(r);
+            if (hdr(r)->type != 0) {
+                move(w, r, n);
+                w += n;
+            }
+            r += n;
+        }
+        tail_ = w;
     }
 
 private:
     std::vector<uint8_t> buf_;
-    std::size_t          head_  = 0;
-    std::size_t          tail_  = 0;
-    uint32_t             count_ = 0;
+    std::size_t          tail_ = 0;
+    uint32_t             live_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -430,7 +460,9 @@ public:
     /// never written in Ring mode.
     [[nodiscard]] bool lastRejectWasDeferredFull() const noexcept { return lastRejectDeferredFull_; }
     /// Diagnostics / tests (owner thread): records + Tier-2 tokens deferred.
-    [[nodiscard]] uint32_t deferredCount() const noexcept { return deferred_.count(); }
+    [[nodiscard]] uint32_t deferredCount() const noexcept { return deferred_.live(); }
+    /// Void deferred records failed by the delivery timeout (counted + logged).
+    [[nodiscard]] uint64_t deferredTimedOutVoid() const noexcept { return deferredTimedOutVoid_; }
 
     /// fix1 minor 9: publish the ring's consumer-liveness heartbeat ONCE per
     /// duty cycle (called by ProducerHub::drainAndFlush before its drainRing()
@@ -691,6 +723,14 @@ public:
     /// batches to get there. Never called from production code.
     void debugSetEpochForTest(int16_t epoch) noexcept { producerEpoch_ = epoch; }
 
+    /// Test-only seam (Task 14 fix2): lower the partition-table cap (default
+    /// batchcorr::kMaxSlot + 1) so the "unaddressable partition" path can be
+    /// exercised without creating 262144 partitions. Never called in production.
+    void debugSetMaxPartitionsForTest(std::size_t n) noexcept { maxPartitions_ = n; }
+    /// Task 14 fix2: accepted deferred records that could not be applied (and
+    /// were failed through their handle / counted + logged if void). Owner thread.
+    [[nodiscard]] uint64_t deferredApplyFailures() const noexcept { return deferredApplyFailures_; }
+
     // ---- Global flush flag (written by app thread, read by agent) -------------
     // Set by submitFlush(); cleared by flushBatches() after processing.
     std::atomic<bool> globalFlushPending_ {false};
@@ -875,11 +915,19 @@ private:
     // own partition state and fires user callbacks from it: flushBatches,
     // retransmitStalled, onProduceResponse, sweepTimedOut, failAllPending,
     // failBatch, retryRedirectedProduce, resendAll*.  A Direct send made while it
-    // is set (or while older deferred records are still queued — order) goes to
-    // deferred_ and is applied by applyDeferred_() when the OUTERMOST scope ends.
+    // is set goes to deferred_ and is applied by applyDeferred_() when the
+    // OUTERMOST scope ends (fix2: per-partition; outside a scope, a send to a
+    // partition with deferred records applies them inline first).
+    std::size_t  maxPartitions_ = static_cast<std::size_t>(batchcorr::kMaxSlot) + 1;
+    uint64_t     deferredApplyFailures_ = 0;
     bool         inDuty_ = false;
     bool         lastRejectDeferredFull_ = false;
-    DeferredFifo deferred_;
+    DeferredArena deferred_;
+    uint32_t     deferredUnknown_ = 0;   // deferred records for not-yet-created partitions
+    std::size_t  deferPartitionCap_ = 0; // per-partition arena share (bytes)
+    uint32_t     deferPass_ = 0;         // apply-pass id (PartitionState::deferBlockedPass)
+    bool         deferScanning_ = false; // a scan holds arena offsets: no compaction
+    uint64_t     deferredTimedOutVoid_ = 0;
 
     struct DutyScope {
         ProducerImpl& p;
@@ -894,14 +942,35 @@ private:
         DutyScope(const DutyScope&) = delete;
         DutyScope& operator=(const DutyScope&) = delete;
     };
-    /// Applies (in submission order) the deferred records present on entry
-    /// through appendRecord_; stops at the first ABORT (the rest stay queued
-    /// for the next scope end).  Records deferred by callbacks fired from here
-    /// wait for the next scope end.  Never throws: a record that cannot be
-    /// applied (exception) is failed via its handle and dropped.
+    /// One read/write-cursor pass over the arena (records present on entry):
+    /// each record is applied through appendRecord_ unless its partition
+    /// ABORTed earlier in this pass — then it (and every later record of that
+    /// partition) is kept, slid forward.  Per-partition order is preserved; no
+    /// partition blocks another.  Records deferred by callbacks fired from here
+    /// wait for the next pass.  Never throws: a record that cannot be applied
+    /// is failed via its handle (void: counted + logged) and dropped.
     void applyDeferred_() noexcept;
     /// failAllPending: fail + drop every record deferred before the call.
     void failDeferred_(const std::string& reason);
+    /// sweepTimedOut: fail deferred records accepted >= deliveryNs ago.
+    void expireDeferred_(int64_t nowNs, int64_t deliveryNs);
+    /// Accept one record / Tier-2 token into the arena (inDuty_).  Validates the
+    /// partition first (an unaddressable one is InvalidTopic at send time).
+    SendResult deferRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
+                            std::span<const uint8_t> value, uint8_t flags, int64_t ackHandle) noexcept;
+    bool deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept;
+    uint8_t* pushDeferred_(const DeferredHdr& h) noexcept;
+    PartitionState* findPartition_(int32_t topicId, int32_t partition) noexcept;
+    /// Removes a record's per-partition / unknown accounting.
+    void unaccountDeferred_(const DeferredHdr& h) noexcept;
+    /// The record's ack handle (record: wantAck handle; Tier-2: takes + frees
+    /// the entry and returns its handle).  0 = void.
+    uint64_t takeDeferredHandle_(std::size_t off) noexcept;
+    /// Outside inDuty_: run the apply pass if `ps`'s (or unknown partitions')
+    /// deferred records must go first.  Returns false if this partition still
+    /// has deferred records afterwards (the new send must not overtake them).
+    bool settleDeferredFor_(int32_t topicId, int32_t partition) noexcept;
+    void noteDeferredLoss_(const char* what) noexcept;
 };
 
 } // namespace rune::client::producer

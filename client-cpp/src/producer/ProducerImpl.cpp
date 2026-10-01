@@ -408,26 +408,15 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
     const auto kb = key.bytes();
     const uint8_t flags = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
     lastRejectDeferredFull_ = false;
-    // Task 14 fix1 C1: inside this producer's own duty work (a callback it fired
-    // mid-walk / mid-reset) — or behind records already deferred (submission
-    // order) — the record is DEFERRED, applied when that work completes.
-    if (inDuty_ || !deferred_.empty()) [[unlikely]] {
-        uint8_t* d = deferred_.push(kMsgSendRecord,
-                                    static_cast<uint32_t>(kRecHeaderSize + value.size()));
-        if (d == nullptr) {
-            lastRejectDeferredFull_ = true;
-            return SendResult::BackPressured;
-        }
-        writeLE32(d, kRecTopicIdOff, topicId);
-        writeLE32(d, kRecPartOff, partition);
-        d[kRecKeyLenOff] = static_cast<uint8_t>(kb.size());
-        std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);
-        if (!kb.empty()) std::memcpy(d + kRecKeyBytesOff, kb.data(), kb.size());
-        d[kRecFlagsOff] = flags;
-        writeLE64(d, kRecCorrIdOff, ackHandle);
-        writeLE32u(d, kRecValLenOff, static_cast<uint32_t>(value.size()));
-        if (!value.empty()) std::memcpy(d + kRecValBytesOff, value.data(), value.size());
-        return SendResult::Ok;  // the handle (if any) is owned by the producer now
+    // Task 14 fix1 C1 / fix2: inside this producer's own duty work (a callback
+    // it fired mid-walk / mid-reset) the record is DEFERRED into the arena and
+    // applied when that work completes.
+    if (inDuty_) [[unlikely]] return deferRecord_(topicId, partition, kb, value, flags, ackHandle);
+    // Outside: only THIS partition's deferred records (and, conservatively,
+    // records for not-yet-created partitions) must go first — applied inline
+    // now.  If this partition is still stalled the send must not overtake them.
+    if (!deferred_.empty()) [[unlikely]] {
+        if (!settleDeferredFor_(topicId, partition)) return SendResult::BackPressured;
     }
     try {
         const auto a = appendRecord_(topicId, partition, kb.data(), static_cast<uint8_t>(kb.size()),
@@ -450,82 +439,284 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
 }
 
 void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
-    // Clamp: the buffer must always fit one max-size record, or a deferred send
-    // of a legal value could never be accepted (livelock as back-pressure).
-    constexpr std::size_t kMinDeferred = DeferredFifo::align8(
-        DeferredFifo::kHeader + static_cast<std::size_t>(kRecHeaderSize) +
-        rune::client::Producer::kMaxSendValueBytes);
+    // Clamps: the arena must fit two max-size records and one partition's share
+    // must fit one (a legal deferred send can never livelock as back-pressure),
+    // and one partition may hold at most its share (default min(arena/2,
+    // 4 x batchBytes)) so a stalled partition cannot exhaust the arena.
+    constexpr std::size_t kMaxRec = DeferredArena::recordSize(
+        static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxSendValueBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
-    deferred_.init(std::max(want, kMinDeferred));
+    deferred_.init(std::max(want, 2 * kMaxRec));
+    const std::size_t arena = deferred_.capacity();
+    std::size_t share = cfg_.directDeferredPartitionBytes > 0
+        ? static_cast<std::size_t>(cfg_.directDeferredPartitionBytes)
+        : std::min(arena / 2, 4 * static_cast<std::size_t>(std::max(cfg_.batchBytes, 1)));
+    deferPartitionCap_ = std::clamp(share, kMaxRec, arena);
     setPumpFn(d.pump, d.pumpCtx, d.owner);
     mode_      = IngressMode::Direct;
     lastNowNs_ = d.nowNs;
+}
+
+PartitionState* ProducerImpl::findPartition_(int32_t topicId, int32_t partition) noexcept {
+    const uint32_t i = partitionIndex_.find(partKey(topicId, partition));
+    return (i == detail::FlatIndexMap::kNone) ? nullptr : partitions_[i].get();
+}
+
+uint8_t* ProducerImpl::pushDeferred_(const DeferredHdr& h) noexcept {
+    uint8_t* d = deferred_.push(h);
+    if (d == nullptr && !deferScanning_) {
+        deferred_.compactDead();  // reclaim records applied / failed since the last pass
+        d = deferred_.push(h);
+    }
+    return d;
+}
+
+SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
+                                      std::span<const uint8_t> key, std::span<const uint8_t> value,
+                                      uint8_t flags, int64_t ackHandle) noexcept {
+    PartitionState* ps = findPartition_(topicId, partition);
+    // fix2 minor 4: validate BEFORE accepting — a partition the table can never
+    // hold is reported now, never accepted and then lost at apply time.
+    // Conservative: every unknown deferred record counts as a new partition.
+    if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) {
+        return SendResult::InvalidTopic;
+    }
+    const uint32_t len = static_cast<uint32_t>(kRecHeaderSize + value.size());
+    const std::size_t size = DeferredArena::recordSize(len);
+    if (ps != nullptr && ps->deferredBytes + size > deferPartitionCap_) {
+        lastRejectDeferredFull_ = true;  // this partition's share is used up
+        return SendResult::BackPressured;
+    }
+    DeferredHdr h;
+    h.len       = len;
+    h.type      = static_cast<uint8_t>(kMsgSendRecord);
+    h.flags     = ps == nullptr ? kDefUnknownPartition : uint8_t{0};
+    h.topicId   = topicId;
+    h.partition = partition;
+    h.submitNs  = lastNowNs_;
+    uint8_t* d = pushDeferred_(h);
+    if (d == nullptr) {
+        lastRejectDeferredFull_ = true;
+        return SendResult::BackPressured;
+    }
+    writeLE32(d, kRecTopicIdOff, topicId);
+    writeLE32(d, kRecPartOff, partition);
+    d[kRecKeyLenOff] = static_cast<uint8_t>(key.size());
+    std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);
+    if (!key.empty()) std::memcpy(d + kRecKeyBytesOff, key.data(), key.size());
+    d[kRecFlagsOff] = flags;
+    writeLE64(d, kRecCorrIdOff, ackHandle);
+    writeLE32u(d, kRecValLenOff, static_cast<uint32_t>(value.size()));
+    if (!value.empty()) std::memcpy(d + kRecValBytesOff, value.data(), value.size());
+    if (ps != nullptr) {
+        ++ps->deferredCount;
+        ps->deferredBytes += static_cast<uint32_t>(size);
+    } else {
+        ++deferredUnknown_;
+    }
+    return SendResult::Ok;  // the handle (if any) is owned by the producer now
+}
+
+bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
+    PartitionState* ps = findPartition_(entry->topicId, entry->partition);
+    if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) return false;
+    const std::size_t size = DeferredArena::recordSize(kT2TokenSize);
+    if (ps != nullptr && ps->deferredBytes + size > deferPartitionCap_) {
+        lastRejectDeferredFull_ = true;
+        return false;
+    }
+    DeferredHdr h;
+    h.len       = kT2TokenSize;
+    h.type      = static_cast<uint8_t>(kMsgTier2Batch);
+    h.flags     = ps == nullptr ? kDefUnknownPartition : uint8_t{0};
+    h.topicId   = entry->topicId;
+    h.partition = entry->partition;
+    h.submitNs  = lastNowNs_;
+    uint8_t* d = pushDeferred_(h);
+    if (d == nullptr) {
+        lastRejectDeferredFull_ = true;
+        return false;
+    }
+    writeLE64(d, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.release())));
+    if (ps != nullptr) {
+        ++ps->deferredCount;
+        ps->deferredBytes += static_cast<uint32_t>(size);
+    } else {
+        ++deferredUnknown_;
+    }
+    return true;
+}
+
+void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
+    if (h.flags & kDefUnknownPartition) {
+        --deferredUnknown_;
+        return;
+    }
+    if (PartitionState* ps = findPartition_(h.topicId, h.partition)) {
+        --ps->deferredCount;
+        ps->deferredBytes -= static_cast<uint32_t>(DeferredArena::recordSize(h.len));
+    }
+}
+
+uint64_t ProducerImpl::takeDeferredHandle_(std::size_t off) noexcept {
+    const DeferredHdr* h = deferred_.hdr(off);
+    const uint8_t* p = deferred_.payload(off);
+    if (h->type == kMsgTier2Batch) {
+        std::unique_ptr<Tier2Entry> e(
+            reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
+        return e->ackHandle;
+    }
+    return (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
+}
+
+void ProducerImpl::noteDeferredLoss_(const char* what) noexcept {
+    ++deferredApplyFailures_;
+    const uint64_t n = deferredApplyFailures_;
+    if ((n & (n - 1)) == 0) {  // rate-limited: 1st, 2nd, 4th, 8th, ...
+        std::fprintf(stderr, "rune-client: deferred producer record %s (total %llu)\n", what,
+                     static_cast<unsigned long long>(n));
+    }
+}
+
+bool ProducerImpl::settleDeferredFor_(int32_t topicId, int32_t partition) noexcept {
+    const PartitionState* ps = findPartition_(topicId, partition);
+    if (deferredUnknown_ == 0 && (ps == nullptr || ps->deferredCount == 0)) return true;
+    { const DutyScope apply(*this); }  // outermost: its end runs the apply pass
+    ps = findPartition_(topicId, partition);
+    return ps == nullptr || ps->deferredCount == 0;
 }
 
 void ProducerImpl::applyDeferred_() noexcept {
     using rune::client::detail::ControlledAction;
     // Runs at the end of the OUTERMOST DutyScope: no walk over partitions_ /
     // ackRing / a builder is in progress.  inDuty_ is still set, so a callback
-    // fired from here (a failure completion) defers again (picked up next time).
-    uint32_t budget = deferred_.count();
-    while (budget-- > 0 && !deferred_.empty()) {
-        const DeferredFifo::Front f = deferred_.front();
-        if (f.type == kMsgTier2Batch) {
-            std::unique_ptr<Tier2Entry> e(
-                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(f.payload, 0))));
-            deferred_.pop();
+    // fired from here (a failure completion) defers again — appended past `end`,
+    // processed by the next pass.
+    const bool prevScan = deferScanning_;
+    deferScanning_ = true;
+    if (++deferPass_ == 0) deferPass_ = 1;
+    const std::size_t end = deferred_.tail();
+    std::size_t w = 0;
+    for (std::size_t r = 0; r < end;) {
+        const std::size_t size = deferred_.sizeAt(r);
+        DeferredHdr* h = deferred_.hdr(r);
+        if (h->type == 0) { r += size; continue; }  // dead: dropped by compaction
+        PartitionState* ps = findPartition_(h->topicId, h->partition);
+        bool keep = (ps != nullptr && ps->deferBlockedPass == deferPass_);
+        bool applied = false;
+        uint64_t lostHandle = 0;
+        const char* lostWhat = nullptr;
+        if (!keep && h->type == kMsgTier2Batch) {
+            std::unique_ptr<Tier2Entry> e(reinterpret_cast<Tier2Entry*>(
+                static_cast<uintptr_t>(readLE64(deferred_.payload(r), 0))));
             try {
-                PartitionState& ps = getOrCreatePartition(e->topicId, e->partition);
-                e->enqueuedNs = lastNowNs_;
+                PartitionState& tps = getOrCreatePartition(e->topicId, e->partition);
+                e->enqueuedNs = h->submitNs;
                 const int32_t rc = e->recordCount;
-                ps.pendingTier2Entries.push_back(std::move(*e));
-                if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
+                tps.pendingTier2Entries.push_back(std::move(*e));
+                if (tps.builder && tps.builder->recordCount() > 0) tps.flushRequested = true;
                 recordsSent_ += static_cast<uint64_t>(rc);
+                applied = true;
             } catch (...) {
-                const uint64_t h = e->ackHandle;
-                e->ackHandle = 0;
-                PendingAck::complete(h, -1, "deferred Tier-2 batch could not be queued",
-                                     &callbackExceptions_);
+                lostHandle = e->ackHandle;
+                lostWhat = "(Tier-2 batch) could not be queued";
             }
+        } else if (!keep) {
+            const uint8_t* p = deferred_.payload(r);
+            const uint8_t flags = p[kRecFlagsOff];
+            const uint64_t handle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
+            try {
+                const auto a = appendRecord_(h->topicId, h->partition, p + kRecKeyBytesOff,
+                                             p[kRecKeyLenOff], p + kRecValBytesOff,
+                                             readLE32u(p, kRecValLenOff), flags, handle, h->submitNs);
+                if (a == ControlledAction::ABORT) keep = true;
+                else applied = true;
+            } catch (...) {
+                // nothing committed (appendRecord_ ordering): we own the handle
+                lostHandle = (flags & kFlagWantAck) ? handle : 0u;
+                lostWhat = "could not be applied";
+            }
+        }
+        if (keep) {
+            ps = findPartition_(h->topicId, h->partition);  // may have been created this pass
+            if (ps != nullptr) {
+                ps->deferBlockedPass = deferPass_;  // later records of it: kept too (order)
+                if (h->flags & kDefUnknownPartition) {  // now a known (stalled) partition
+                    h->flags = static_cast<uint8_t>(h->flags & ~kDefUnknownPartition);
+                    --deferredUnknown_;
+                    ++ps->deferredCount;
+                    ps->deferredBytes += static_cast<uint32_t>(size);
+                }
+            }
+            deferred_.move(w, r, size);
+            w += size;
+            r += size;
             continue;
         }
-        const uint8_t* p = f.payload;
-        const uint8_t  flags  = p[kRecFlagsOff];
-        const uint64_t handle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
-        bool failed = false;
-        try {
-            const auto a = appendRecord_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff),
-                                         p + kRecKeyBytesOff, p[kRecKeyLenOff],
-                                         p + kRecValBytesOff, readLE32u(p, kRecValLenOff),
-                                         flags, handle, lastNowNs_);
-            if (a == ControlledAction::ABORT) return;  // head-of-line: keep order, retry later
-        } catch (...) {
-            failed = true;  // nothing committed (appendRecord_ ordering): we own the handle
+        const DeferredHdr done = *h;
+        unaccountDeferred_(done);
+        deferred_.kill(r);
+        if (applied && (done.flags & kDefFlushOnApply)) {
+            if (PartitionState* aps = findPartition_(done.topicId, done.partition)) aps->flushRequested = true;
         }
-        deferred_.pop();
-        if (failed && (flags & kFlagWantAck) && handle != 0) {
-            PendingAck::complete(handle, -1, "deferred send could not be applied",
-                                 &callbackExceptions_);
+        r += size;
+        if (lostWhat != nullptr) {
+            noteDeferredLoss_(lostWhat);
+            if (lostHandle != 0) {
+                PendingAck::complete(lostHandle, -1, "deferred send could not be applied",
+                                     &callbackExceptions_);
+            }
         }
     }
+    // Records pushed by callbacks during this pass sit in [end, tail): slide down.
+    const std::size_t extra = deferred_.tail() - end;
+    deferred_.move(w, end, extra);
+    deferred_.setTail(w + extra);
+    deferScanning_ = prevScan;
 }
 
 void ProducerImpl::failDeferred_(const std::string& reason) {
-    uint32_t n = deferred_.count();  // only those deferred before the call
-    while (n-- > 0 && !deferred_.empty()) {
-        const DeferredFifo::Front f = deferred_.front();
-        uint64_t handle = 0;
-        if (f.type == kMsgTier2Batch) {
-            std::unique_ptr<Tier2Entry> e(
-                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(f.payload, 0))));
-            handle = e->ackHandle;
-        } else if (f.payload[kRecFlagsOff] & kFlagWantAck) {
-            handle = static_cast<uint64_t>(readLE64(f.payload, kRecCorrIdOff));
-        }
-        deferred_.pop();  // pop BEFORE the callback: it may push (and compact)
+    const bool prevScan = deferScanning_;
+    deferScanning_ = true;  // callbacks below may push: never compact under our offsets
+    const std::size_t end = deferred_.tail();  // only those deferred before the call
+    for (std::size_t r = 0; r < end; r += deferred_.sizeAt(r)) {
+        if (deferred_.hdr(r)->type == 0) continue;
+        const DeferredHdr h = *deferred_.hdr(r);
+        const uint64_t handle = takeDeferredHandle_(r);
+        unaccountDeferred_(h);
+        deferred_.kill(r);
         if (handle != 0) PendingAck::complete(handle, -1, reason, &callbackExceptions_);
     }
+    deferScanning_ = prevScan;
+}
+
+void ProducerImpl::expireDeferred_(int64_t nowNs, int64_t deliveryNs) {
+    if (deferred_.empty()) return;
+    const bool prevScan = deferScanning_;
+    deferScanning_ = true;
+    const std::size_t end = deferred_.tail();
+    for (std::size_t r = 0; r < end; r += deferred_.sizeAt(r)) {
+        const DeferredHdr* hp = deferred_.hdr(r);
+        if (hp->type == 0 || nowNs - hp->submitNs < deliveryNs) continue;
+        const DeferredHdr h = *hp;
+        const uint64_t handle = takeDeferredHandle_(r);
+        unaccountDeferred_(h);
+        deferred_.kill(r);
+        if (handle != 0) {
+            PendingAck::complete(handle, -1, "produce delivery timed out (never sent)",
+                                 &callbackExceptions_);
+        } else {
+            ++deferredTimedOutVoid_;
+            const uint64_t n = deferredTimedOutVoid_;
+            if ((n & (n - 1)) == 0) {
+                std::fprintf(stderr,
+                    "rune-client: deferred void producer record delivery timed out (never "
+                    "sent; total %llu)\n", static_cast<unsigned long long>(n));
+            }
+        }
+    }
+    deferScanning_ = prevScan;
 }
 
 void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition, const Key& key,
@@ -625,6 +816,12 @@ void ProducerImpl::submitFlush() noexcept {
         // thread nothing can have been sent through this producer: a no-op.
         if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return;
         for (auto& up : partitions_) up->flushRequested = true;
+        // fix2 minor 3: flush() covers records already accepted into the
+        // deferred arena too — each is flushed when it is applied.
+        for (std::size_t r = 0; r < deferred_.tail(); r += deferred_.sizeAt(r)) {
+            DeferredHdr* h = deferred_.hdr(r);
+            if (h->type != 0) h->flags = static_cast<uint8_t>(h->flags | kDefFlushOnApply);
+        }
         return;
     }
     globalFlushPending_.store(true, std::memory_order_release);
@@ -648,21 +845,19 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
         // foreign thread): not accepted, the caller fails the handle.
         if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return false;
         lastRejectDeferredFull_ = false;
-        if (inDuty_ || !deferred_.empty()) {
-            // fix1 C1: deferred like a Tier-1 record (same order, same full policy).
+        if (inDuty_) {
+            // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
+            // order, same validation and full policy).
             auto entry = std::make_unique<Tier2Entry>();
             entry->topicId     = topicId;
             entry->partition   = partition;
             entry->ackHandle   = static_cast<uint64_t>(ackHandle);
             entry->recordCount = recordCount;
             entry->batchBytes  = std::move(batchBytes);
-            uint8_t* d = deferred_.push(kMsgTier2Batch, kT2TokenSize);
-            if (d == nullptr) {
-                lastRejectDeferredFull_ = true;
-                return false;  // caller fails the handle; entry (and bytes) freed here
-            }
-            writeLE64(d, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.release())));
-            return true;
+            return deferTier2_(entry);  // false: caller fails the handle; entry freed here
+        }
+        if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) {
+            return false;  // this partition's deferred records must go first
         }
         PartitionState& ps = getOrCreatePartition(topicId, partition);
         Tier2Entry e;
@@ -801,7 +996,7 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     ps->ackRing.assign(kAckRingCapacity, 0);  // preallocated ONCE (zero per-batch alloc)
     ps->ackMask = kAckRingCapacity - 1;
     ps->inflight = InFlightRing(static_cast<uint32_t>(cfg_.maxInFlight > 0 ? cfg_.maxInFlight : 1));
-    if (partitions_.size() > batchcorr::kMaxSlot) {
+    if (partitions_.size() >= maxPartitions_) {
         throw std::length_error("ProducerImpl: more than 262144 partitions");
     }
     partitions_.push_back(std::move(ps));
@@ -1043,7 +1238,9 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     ps.builder->append(kv, vv, wallNs());
 
     // ---- committed: nothing below throws (ack slots reserved above) ----------
-    if (index == 0) ps.batchStartNs = nowNs;
+    // fix2: the batch clock is the EARLIEST record's acceptance time (a deferred
+    // record carries its own; Kafka accumulator semantics).
+    if (index == 0 || nowNs < ps.batchStartNs) ps.batchStartNs = nowNs;
     if (wantAck) {
         if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
         while (ps.batchAckCount < index) pushAck_(ps, 0);
@@ -1609,6 +1806,9 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
     lastNowNs_ = nowNs;  // the duty-cycle clock (Client passes its own now)
     const DutyScope duty(*this);  // fix1 C1: failure callbacks below defer their retries
     const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
+    // fix2: deferred records are accepted records — same delivery deadline,
+    // measured from acceptance.  First, so an expired one is never applied.
+    expireDeferred_(nowNs, deliveryNs);
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
@@ -1824,16 +2024,8 @@ ProducerImpl::~ProducerImpl() {
     try {
         drainAppRingHandles_(discard);
     } catch (...) {}
-    while (!deferred_.empty()) {  // fix1 C1: deferred records / Tier-2 tokens
-        const DeferredFifo::Front f = deferred_.front();
-        if (f.type == kMsgTier2Batch) {
-            std::unique_ptr<Tier2Entry> e(
-                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(f.payload, 0))));
-            discard(e->ackHandle);
-        } else if (f.payload[kRecFlagsOff] & kFlagWantAck) {
-            discard(static_cast<uint64_t>(readLE64(f.payload, kRecCorrIdOff)));
-        }
-        deferred_.pop();
+    for (std::size_t r = 0; r < deferred_.tail(); r += deferred_.sizeAt(r)) {  // fix1/2: arena
+        if (deferred_.hdr(r)->type != 0) discard(takeDeferredHandle_(r));
     }
     for (auto& up : partitions_) {
         PartitionState& ps = *up;

@@ -8,14 +8,18 @@
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
+#include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/CountingSink.h>
 #include <rune/client/producer/ProducerImpl.h>
+
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <map>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -671,4 +675,206 @@ TEST(DirectIngress, UncaughtBlockingSendThrowInAckCallbackDoesNotTerminateRegres
     auto f = p.send(topic, k0, kVal, rc::want_future);
     ASSERT_TRUE(r.drive([&] { return f.wait_for(0s) == std::future_status::ready; }));
     EXPECT_GE(f.get(), 0);
+}
+
+// ===========================================================================
+// Task 14 fix round 2 — per-partition deferral, deferred delivery deadline,
+// flush() covers deferred records, partition validated before deferring.
+// ===========================================================================
+
+namespace {
+// A bare Direct producer with a frame-capturing sink: every frame's records
+// (value marker byte) are recorded per partition, in send order.
+struct Fx {
+    std::atomic<int64_t> corr{1};
+    ProducerImpl         impl;
+    std::map<int32_t, std::string> sent;  // partition -> marker bytes in wire order
+    ProducerImpl::SendFn sink;
+    explicit Fx(rc::ProducerConfig cfg) : impl(cfg, corr) {
+        impl.enableDirectIngress(ownerDirect());
+        sink = [this](int32_t, int32_t part, int32_t, const uint8_t* buf, std::size_t len) {
+            const auto pv = rc::codec::decodeProduce(buf, len);
+            if (!pv) return false;
+            rune::protocol::RecordBatchReader r(pv->recordBatch.data(), pv->recordBatch.size());
+            r.forEach([&](std::string_view, std::string_view v, int64_t, int64_t) {
+                sent[part].push_back(v.empty() ? '?' : v[0]);
+            });
+            return true;
+        };
+    }
+    rc::SendResult send(int32_t part, char marker, int64_t h = 0) {
+        std::vector<uint8_t> v(16, static_cast<uint8_t>(marker));
+        return impl.trySubmit(1, part, rc::Key(uint64_t{1}), v, h);
+    }
+    void flush(int64_t now) { impl.flushBatches(now, 42, sink); }
+    int64_t inflightCorr(int32_t part) {
+        auto* ps = const_cast<rc::producer::PartitionState*>(impl.partitionState(1, part));
+        return ps->inflight.oldestLive()->corrId;
+    }
+    /// Partition `part`: one batch in flight (maxInFlight 1) + a full builder.
+    void stall(int32_t part, char filler, int64_t now) {
+        ASSERT_EQ(send(part, filler), rc::SendResult::Ok);
+        flush(now);
+        rc::SendResult r = rc::SendResult::Ok;
+        for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) r = send(part, filler);
+        ASSERT_EQ(r, rc::SendResult::BackPressured);
+    }
+    /// Runs fn INSIDE the producer's own duty work (an ack callback of a batch
+    /// on partition `trigger`).
+    template <class F>
+    void inDuty(int32_t trigger, int64_t now, F fn) {
+        const int64_t h = impl.registerCallback([fn](int64_t) mutable { fn(); });
+        ASSERT_EQ(send(trigger, 't', h), rc::SendResult::Ok);
+        impl.submitFlush();
+        flush(now);
+        impl.onProduceResponse(inflightCorr(trigger), 100);
+    }
+};
+rc::ProducerConfig stallCfg() {
+    rc::ProducerConfig c;
+    c.acks = rc::Acks::Leader;
+    c.lingerUs = 0;
+    c.maxInFlight = 1;
+    c.batchBytes = 256;
+    return c;
+}
+} // namespace
+
+// A deferred record for a STALLED partition must not hold back sends to any
+// other partition (no cross-partition head-of-line blocking).
+TEST(DirectIngress, StalledPartitionDoesNotBlockOtherPartitionsRegression) {
+    Fx fx(stallCfg());
+    fx.stall(0, 'f', 1);
+    fx.inDuty(1, 2, [&] { for (int i = 0; i < 3; ++i) (void)fx.send(0, 'd'); });
+    ASSERT_EQ(fx.impl.deferredCount(), 3u) << "p0 is stalled: its records stay deferred";
+    for (int32_t part = 2; part <= 6; ++part) {
+        EXPECT_EQ(fx.send(part, 'x'), rc::SendResult::Ok);
+        EXPECT_EQ(builderRecords(fx.impl, part), 1) << "partition " << part << ": applied, not deferred";
+    }
+    EXPECT_EQ(fx.impl.deferredCount(), 3u);
+    EXPECT_EQ(fx.send(0, 'e'), rc::SendResult::BackPressured) << "p0 never overtakes its deferred records";
+}
+
+TEST(DirectIngress, PerPartitionOrderPreservedAcrossDeferralRegression) {
+    Fx fx(stallCfg());
+    fx.stall(0, 'f', 1);
+    fx.inDuty(1, 2, [&] {
+        for (char m : {'A', 'B', 'C', 'D'}) (void)fx.send((m == 'A' || m == 'C') ? 0 : 1, m);
+    });
+    EXPECT_EQ(builderRecords(fx.impl, 1), 2) << "p1's B, D applied at once (not behind stalled p0)";
+    EXPECT_EQ(fx.impl.deferredCount(), 2u);
+    EXPECT_EQ(fx.send(0, 'E'), rc::SendResult::BackPressured);
+    // Unblock p0: ack its in-flight batch; the next pass sends the full builder
+    // and then applies A, C; E follows.
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);
+    fx.flush(3);
+    EXPECT_EQ(fx.impl.deferredCount(), 0u);
+    ASSERT_EQ(fx.send(0, 'E'), rc::SendResult::Ok);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 200);
+    fx.impl.onProduceResponse(fx.inflightCorr(1), 300);
+    fx.impl.submitFlush();
+    fx.flush(4);
+    const std::string& p0 = fx.sent[0];
+    const std::string& p1 = fx.sent[1];
+    ASSERT_GE(p0.size(), 3u);
+    EXPECT_EQ(p0.substr(p0.size() - 3), "ACE") << p0;
+    EXPECT_NE(p1.find("BD"), std::string::npos) << p1;
+}
+
+TEST(DirectIngress, StalledPartitionCannotExhaustArenaRegression) {
+    rc::ProducerConfig cfg = stallCfg();
+    cfg.directDeferredBytes = 64 * 1024;
+    Fx fx(cfg);
+    fx.stall(0, 'f', 1);
+    int p0Deferred = 0;
+    rc::SendResult other = rc::SendResult::Closed;
+    fx.inDuty(1, 2, [&] {
+        while (p0Deferred < 100'000 && fx.send(0, 'd') == rc::SendResult::Ok) ++p0Deferred;
+        other = fx.send(2, 'o');
+    });
+    EXPECT_GT(p0Deferred, 0);
+    EXPECT_EQ(other, rc::SendResult::Ok) << "one stalled partition must not exhaust the arena";
+}
+
+// A deferred record is a sent record: it fails at deliveryTimeoutMs measured
+// from ACCEPTANCE, even if its partition never unblocks.
+TEST(DirectIngress, DeferredRecordFailsWithinDeliveryTimeoutRegression) {
+    rc::ProducerConfig cfg = stallCfg();
+    cfg.deliveryTimeoutMs = 10;
+    Fx fx(cfg);
+    constexpr int64_t t0 = 1'000;
+    constexpr int64_t D  = 10'000'000;
+    fx.stall(0, 'f', t0);
+    int64_t outcome = 0;
+    fx.inDuty(1, t0, [&] {
+        const int64_t h = fx.impl.registerCallback([&](int64_t off) { outcome = off == -1 ? -1 : 1; });
+        if (fx.send(0, 'd', h) != rc::SendResult::Ok) fx.impl.failUnsubmitted(h, "x");
+    });
+    ASSERT_EQ(fx.impl.deferredCount(), 1u);
+    fx.impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{t0 + D - 1}});
+    EXPECT_EQ(outcome, 0) << "not before the deadline";
+    fx.impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{t0 + D}});
+    EXPECT_EQ(outcome, -1) << "failed at deliveryTimeoutMs from acceptance";
+    EXPECT_EQ(fx.impl.deferredCount(), 0u);
+}
+
+// Applied into a fresh builder, a deferred record's batch clock starts at its
+// acceptance time (Kafka accumulator semantics), not at the apply time.
+TEST(DirectIngress, DeferredRecordBatchStartIsAcceptanceTimeRegression) {
+    Fx fx(stallCfg());
+    fx.stall(0, 'f', 1'000);
+    fx.inDuty(1, 1'000, [&] { (void)fx.send(0, 'd'); });
+    ASSERT_EQ(fx.impl.deferredCount(), 1u);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);
+    fx.flush(5'000);  // sends the full builder, then applies the deferred record
+    ASSERT_EQ(fx.impl.deferredCount(), 0u);
+    ASSERT_EQ(builderRecords(fx.impl, 0), 1);
+    EXPECT_EQ(fx.impl.partitionState(1, 0)->batchStartNs, 1'000);
+}
+
+// flush() covers records already accepted into the deferred buffer: they are
+// flushed when applied, even with a long linger.
+TEST(DirectIngress, FlushIncludesDeferredRecordsRegression) {
+    rc::ProducerConfig cfg = stallCfg();
+    cfg.lingerUs = 60'000'000;
+    Fx fx(cfg);
+    rc::SendResult r = rc::SendResult::Ok;
+    bool first = true;
+    for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) {
+        int64_t h = 0;
+        if (first) {
+            h = fx.impl.registerCallback([&](int64_t) { (void)fx.send(0, 'R'); });  // in-duty: deferred
+            first = false;
+        }
+        r = fx.send(0, 'f', h);
+        if (r != rc::SendResult::Ok && h != 0) fx.impl.failUnsubmitted(h, "x");
+    }
+    fx.flush(1'000);  // size-full: sent (window 1/1)
+    r = rc::SendResult::Ok;
+    for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) r = fx.send(0, 'g');
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);  // callback: R deferred (builder full)
+    ASSERT_EQ(fx.impl.deferredCount(), 1u);
+    fx.impl.submitFlush();  // must cover R
+    fx.flush(2'000);        // sends the 'g' builder, then applies R
+    ASSERT_EQ(builderRecords(fx.impl, 0), 1);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 200);
+    fx.flush(3'000);  // linger 60 s: only the flush request can send R now
+    ASSERT_FALSE(fx.sent[0].empty());
+    EXPECT_EQ(fx.sent[0].back(), 'R');
+}
+
+// An accepted deferred record is never silently dropped: a partition the
+// producer can never address is rejected AT SEND TIME (InvalidTopic), not
+// accepted and then lost at apply time.
+TEST(DirectIngress, UnaddressablePartitionRejectedBeforeDeferralRegression) {
+    Fx fx(stallCfg());
+    fx.impl.debugSetMaxPartitionsForTest(2);
+    rc::SendResult inDutyR = rc::SendResult::Ok;
+    fx.inDuty(0, 1, [&] { inDutyR = fx.send(5, 'z'); });  // p0 created; p5 would be the 2nd
+    EXPECT_EQ(inDutyR, rc::SendResult::Ok) << "room for one more partition";
+    rc::SendResult inDuty2 = rc::SendResult::Ok;
+    fx.inDuty(0, 2, [&] { inDuty2 = fx.send(6, 'z'); });   // p0 + p5 exist: table full
+    EXPECT_EQ(inDuty2, rc::SendResult::InvalidTopic);
+    EXPECT_EQ(fx.impl.deferredCount(), 0u);
+    EXPECT_EQ(fx.impl.deferredApplyFailures(), 0u);
 }
