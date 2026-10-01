@@ -3540,11 +3540,11 @@ namespace {
 struct DroppingCache {
     int calls = 0;
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
-    static bool readAhead(void* c, const RcReadAheadReq& r) {
+    static RcHint readAhead(void* c, const RcReadAheadReq& r) {
         auto* k = static_cast<DroppingCache*>(c);
-        if (++k->calls == 1) return false;                // dropped
+        if (++k->calls == 1) return RcHint::Done;         // dropped
         k->ranges.emplace_back(reinterpret_cast<uintptr_t>(r.addr), reinterpret_cast<uintptr_t>(r.addr) + r.len);
-        return false;                                     // synchronous (no completion)
+        return RcHint::Done;                              // synchronous (no completion)
     }
     static std::size_t probe(void* c, const uint8_t* p, std::size_t len) {
         auto* k = static_cast<DroppingCache*>(c);
@@ -3562,7 +3562,7 @@ struct DroppingCache {
 // An async read-ahead that stays IN FLIGHT until the test completes it.
 struct AsyncHints {
     int calls = 0;
-    static bool readAhead(void* c, const RcReadAheadReq&) { ++static_cast<AsyncHints*>(c)->calls; return true; }
+    static RcHint readAhead(void* c, const RcReadAheadReq&) { ++static_cast<AsyncHints*>(c)->calls; return RcHint::InFlight; }
     static std::size_t nothingResident(void*, const uint8_t*, std::size_t) { return 0; }
 };
 } // namespace
@@ -3800,9 +3800,95 @@ TEST(TxnRcRegression, SyncHintFallbackBacksOff) {
     SyncCache cache;
     R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
     R.w->setRcSyncHintForTest(&SyncCache::noop, &cache);
+    // Fix round 4 (RR3-1): on Linux the default backend issues async hints, so
+    // the sync hint is only reached past the RR2-1 latch — set it (the
+    // post-latch path, the same on every platform).
+    R.w->setRcAsyncHintsDisabledForTest(true);
     for (int i = 0; i < 128; ++i) R.pass();
     EXPECT_GT(cache.calls, 1) << "the window must still be re-requested (RR1-1)";
     EXPECT_LE(cache.calls, 16) << "a synchronous hint per pass while nothing is resident (" << cache.calls << ")";
+}
+
+namespace {
+// Fix round 4 (r3-2): an issuer that refuses (Skipped) while `skip` is set.
+struct SkippingHints {
+    bool skip     = true;
+    int  calls    = 0;
+    int  accepted = 0;
+    static RcHint readAhead(void* c, const RcReadAheadReq&) {
+        auto* h = static_cast<SkippingHints*>(c);
+        ++h->calls;
+        if (h->skip) return RcHint::Skipped;
+        ++h->accepted;
+        return RcHint::Done;
+    }
+};
+std::size_t allResident(void*, const uint8_t*, std::size_t len) { return len; }
+} // namespace
+
+TEST(TxnRcRegression, SkippedHintConsumesNoBackoff) {
+    // Review r3-2 / m5: a hint skipped by the issuer (per-worker cap / SQ full)
+    // was never issued — it must not count as a request, must not advance the
+    // read-ahead front, and must not double the re-request gap (else a starved
+    // partition retries only every <= 64 passes).
+    RcRig R;
+    for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    SkippingHints h;
+    R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
+    R.w->setRcReadAheadForTest(&SkippingHints::readAhead, &h);
+    for (int i = 0; i < 10; ++i) R.pass();
+    EXPECT_EQ(R.w->rcReadAheadRequestsForTest(R.topic(), 0), 0u) << "a skipped hint counted as issued";
+    EXPECT_EQ(h.calls, 10) << "a skipped hint consumed the backoff (retried on " << h.calls << " of 10 passes)";
+    h.skip = false;
+    R.pass();
+    EXPECT_EQ(h.accepted, 1) << "the first pass with a free slot must issue the hint";
+    EXPECT_EQ(R.w->rcReadAheadRequestsForTest(R.topic(), 0), 1u);
+}
+
+TEST(TxnRcRegression, HintCapIsFairAcrossPartitions) {
+    // Review r3-1: with more building partitions than kMaxRcHintsInFlight on
+    // one worker, the cap must rotate — every partition gets a hint within a
+    // bounded number of passes, not only the first ones in walk order.
+    constexpr int kParts = 12;
+    TmpDir d;
+    NullTransport t;
+    std::vector<std::unique_ptr<Log>> logs;
+    std::vector<std::unique_ptr<PartitionReplica>> reps;
+    Worker::OwnedSet owned;
+    for (int p = 0; p < kParts; ++p) {
+        auto dir = d.path / ("p" + std::to_string(p));
+        fs::create_directories(dir);
+        logs.push_back(std::make_unique<Log>(dir.string(), 64LL * 1024 * 1024));
+        logs.back()->recover();
+        for (int i = 0; i < 64; ++i) appendAt(*logs.back(), bigBatch(1000));
+        reps.push_back(std::make_unique<PartitionReplica>(cfg(1, 1, 1, p), Role::Leader, 1, std::vector<NodeId>{1},
+                                                          std::vector<NodeId>{1}, logs.back().get(), &t));
+        reps.back()->onLeaderLogAppended();
+        owned.push_back(reps.back().get());
+    }
+    Worker w(0, 1 << 22, 1 << 23, 64, 64);
+    w.setRcScanBytesPerPass(4096);
+    w.setOwnedDirect(owned);
+    w.setRcResidencyProbeForTest(&allResident, nullptr);   // builds progress; each wants its read-ahead front
+    w.setRcFakeAsyncHintsForTest(true);
+    CompletionToken delivered = w.lastRcHintTokenForTest();
+    if (delivered == kNoToken) delivered = (CompletionToken{1} << 40);
+    constexpr int kBoundPasses = kParts;
+    for (int i = 0; i < kBoundPasses; ++i) {
+        w.doWork(2 + i);
+        // Every hint of this pass completes before the next one (slots free).
+        const CompletionToken last = w.lastRcHintTokenForTest();
+        for (CompletionToken tok = delivered + 1; last != kNoToken && tok <= last; ++tok)
+            w.deliverCompletionForTest(FlushCompletion{tok, 0, 0});
+        if (last != kNoToken) delivered = last;
+        ASSERT_EQ(w.rcHintsInFlightForTest(), 0u);
+    }
+    for (int p = 0; p < kParts; ++p) {
+        ASSERT_NE(w.rcStatusForTest(1, p), Worker::kRcReady) << "precondition: still building (p" << p << ")";
+        EXPECT_GE(w.rcHintsSubmittedForTest(1, p), 1u)
+            << "partition " << p << " never got a hint in " << kBoundPasses << " passes (cap not rotated)";
+    }
 }
 
 TEST(TxnRcRegression, HeldPushReadUnansweredOnOwnershipLossRegistered) {

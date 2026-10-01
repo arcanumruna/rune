@@ -94,11 +94,15 @@ struct RcReadAheadReq {
     int            fd      = -1;
     int64_t        fileOff = 0;
 };
-/// Issue a read-ahead hint.  Returns true when the hint is now IN FLIGHT
-/// asynchronously (the issuer later calls RcState::onHintCompleted()); false
-/// when it was done synchronously or skipped.  fn-pointer + ctx (no
-/// std::function, no virtual).  nullptr = synchronous MADV_WILLNEED.
-using RcReadAhead = bool (*)(void* ctx, const RcReadAheadReq& req);
+/// The outcome of one read-ahead hint (fix round 4, r3-2 / m5).
+enum class RcHint : uint8_t {
+    Done,       ///< executed synchronously (MADV_WILLNEED): nothing in flight
+    InFlight,   ///< submitted asynchronously; the issuer later calls RcState::onHintCompleted()
+    Skipped,    ///< NOT issued (per-worker cap / SQ full): retried next pass, no backoff consumed
+};
+/// Issue a read-ahead hint.  fn-pointer + ctx (no std::function, no virtual).
+/// nullptr = synchronous MADV_WILLNEED.
+using RcReadAhead = RcHint (*)(void* ctx, const RcReadAheadReq& req);
 
 /// The replica facts one advance() step reads (owner thread, plain loads).
 struct RcFacts {
@@ -339,8 +343,10 @@ private:
         req.fd      = m.fd;
         req.fileOff = static_cast<int64_t>(from);
         const auto t0 = profile_ ? clock_() : 0;
-        if (readAheadFn_ != nullptr) hintInFlight_ = readAheadFn_(readAheadCtx_, req);
+        RcHint out = RcHint::Done;
+        if (readAheadFn_ != nullptr) out = readAheadFn_(readAheadCtx_, req);
         else                         syncWillNeed(req);
+        hintInFlight_ = out == RcHint::InFlight;
         if (profile_) profile_->hintNs += clock_() - t0;
         ++readAheadRequests_;
         if (to > s.readAheadTo) s.readAheadTo = to;

@@ -438,6 +438,20 @@ public:
     [[nodiscard]] std::size_t rcHintsInFlightForTest() const noexcept { return rcHintsInFlight_; }
     [[nodiscard]] bool ioAsyncHintsForTest() const noexcept { return io_.asyncHints(); }
     [[nodiscard]] bool rcAsyncHintsDisabledForTest() const noexcept { return rcAsyncHintsDisabled_; }
+    /// Fix round 4 (RR3-1): set the RR2-1 latch (synchronous hints from now on),
+    /// as a failing async hint would — the post-latch path on any backend.
+    void setRcAsyncHintsDisabledForTest(bool on) noexcept { rcAsyncHintsDisabled_ = on; }
+    /// Async hints submitted for (topicId, partition) by the default issuer.
+    [[nodiscard]] uint64_t rcHintsSubmittedForTest(int32_t topicId, int32_t partition) const {
+        const auto* r = findOwnedReplica_(topicId, partition);
+        for (const auto& sl : rcSlots_) if (sl.replica == r && sl.hint) return sl.hint->submitted;
+        return 0;
+    }
+    /// RcState::readAheadRequests() of (topicId, partition): hints actually issued.
+    [[nodiscard]] uint64_t rcReadAheadRequestsForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->readAheadRequests() : 0;
+    }
     /// Test seam: an async read-ahead hint of (topicId, partition) completed.
     void completeRcHintForTest(int32_t topicId, int32_t partition) {
         if (RcState* rc = const_cast<RcState*>(rcFor_(topicId, partition))) rc->onHintCompleted();
@@ -3550,8 +3564,9 @@ private:
     // F15 S4 fix round 2 (RR1-4): the per-partition context of the default
     // read-ahead issuer (stable address: owned by the slot through a pointer).
     struct RcHintCtx {
-        Worker*             w   = nullptr;
-        rune::storage::Log* log = nullptr;
+        Worker*             w         = nullptr;
+        rune::storage::Log* log       = nullptr;
+        uint64_t            submitted = 0;   ///< async hints submitted for this partition
     };
     struct RcSlot {
         rune::replication::PartitionReplica* replica = nullptr;
@@ -3570,27 +3585,28 @@ private:
     // when it runs, so a hint on a closed-and-reused fd advises an unrelated
     // file — benign for WILLNEED (a wasted read-ahead, never a correctness
     // effect).
-    static bool rcIssueHint_(void* c, const RcReadAheadReq& req) {
+    static RcHint rcIssueHint_(void* c, const RcReadAheadReq& req) {
         auto* h = static_cast<RcHintCtx*>(c);
         Worker& w = *h->w;
         if ((w.io_.asyncHints() || w.rcFakeAsyncHints_) && !w.rcAsyncHintsDisabled_ && req.fd >= 0 &&
             h->log != nullptr) [[likely]] {
-            if (w.rcHintsInFlight_ >= kMaxRcHintsInFlight) { ++w.rcHintsSkipped_; return false; }   // m1
+            if (w.rcHintsInFlight_ >= kMaxRcHintsInFlight) { ++w.rcHintsSkipped_; return RcHint::Skipped; }   // m1
             const auto len = static_cast<uint32_t>(std::min<std::size_t>(req.len, UINT32_MAX));
             const CompletionToken t = w.rcFakeAsyncHints_ ? ++w.rcFakeHintSeq_
                                                           : w.io_.submitWillNeed(req.fd, req.fileOff, len);
-            if (t == kNoToken) { ++w.rcHintsSkipped_; return false; }
+            if (t == kNoToken) { ++w.rcHintsSkipped_; return RcHint::Skipped; }
             if (!w.routeInsert_(TokenRoute{t, h->log, nullptr, 0, RouteKind::Hint}))
                 spdlog::critical("Worker {}: io token route table full (hint token={})", w.workerId_, t);
             ++w.rcHintsSubmitted_;
             ++w.rcHintsInFlight_;
+            ++h->submitted;
             w.lastRcHintToken_ = t;
-            return true;
+            return RcHint::InFlight;
         }
         ++w.rcHintsSync_;
         if (w.rcSyncHintFn_ != nullptr) w.rcSyncHintFn_(w.rcSyncHintCtx_, req);
         else                            RcState::syncWillNeed(req);
-        return false;
+        return RcHint::Done;
     }
     void installReadAhead_(RcSlot& sl) {
         if (rcReadAheadOverride_ != nullptr) { sl.rc->setReadAhead(rcReadAheadOverride_, rcReadAheadOverrideCtx_); return; }

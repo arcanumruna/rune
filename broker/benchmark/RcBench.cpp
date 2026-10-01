@@ -256,18 +256,18 @@ constexpr int kRusageWho = RUSAGE_SELF;
 struct BenchHints {
     rune::node::IoBackend* io = nullptr;
     uint64_t asyncIssued = 0, syncIssued = 0, skipped = 0;
-    static bool fn(void* c, const rune::node::RcReadAheadReq& r) {
+    static rune::node::RcHint fn(void* c, const rune::node::RcReadAheadReq& r) {
         auto* h = static_cast<BenchHints*>(c);
         if (h->io->asyncHints() && r.fd >= 0) {
             const auto t = h->io->submitWillNeed(r.fd, r.fileOff,
                                                  static_cast<uint32_t>(std::min<std::size_t>(r.len, UINT32_MAX)));
-            if (t == rune::node::kNoToken) { ++h->skipped; return false; }
+            if (t == rune::node::kNoToken) { ++h->skipped; return rune::node::RcHint::Skipped; }
             ++h->asyncIssued;
-            return true;
+            return rune::node::RcHint::InFlight;
         }
         ++h->syncIssued;
         RcState::syncWillNeed(r);
-        return false;
+        return rune::node::RcHint::Done;
     }
 };
 
