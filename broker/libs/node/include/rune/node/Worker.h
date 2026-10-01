@@ -1827,6 +1827,14 @@ private:
             return;
         }
 
+        // F18 (B-1): the transport could not hand us the batch at op.nextOffset()
+        // (too large for this ring on its own) — the replica decides whether that
+        // is the batch at its LEO (wedge) or not (ignore).
+        if (op.replErrorCode() == rune::replication::kErrRecordTooLarge) [[unlikely]] {
+            replica->onUnapplicableBatch(op.nextOffset(), op.replLeaderEpoch());
+            return;
+        }
+
         const uint32_t tailLen = op.tailLength();
         const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
 

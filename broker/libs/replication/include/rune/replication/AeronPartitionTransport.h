@@ -179,6 +179,16 @@ public:
     /// control-owned peers_/pubs.  0 = unknown (outbound-ring bound only).
     void setPublicationMaxMessageBytes(int64_t n) noexcept { pubMaxMessageBytes_ = n; }
 
+    /// F18 (B-1): the largest records payload this node's worker ingress ring can
+    /// take in ONE apply op (ring/8 − op framing).  Set ONCE before any worker
+    /// runs.  Caps this node's outgoing follower fetch maxBytes so a leader never
+    /// answers it with more than the follower can apply.  0 = no cap.
+    void setApplyRecordsCap(int64_t n) noexcept { applyRecordsCap_ = n; }
+    /// F18 (B-1): responses dropped (NOT wedged) because the whole response was
+    /// above the apply frame while its batch at the front fit — recovered by the
+    /// capped fetch.
+    [[nodiscard]] uint64_t oversizedApplyDropped() const noexcept { return oversizedApplyDropped_; }
+
     /// F18: largest records payload ONE FetchResponse can carry (worker-safe:
     /// reads only state immutable after start).  = outbound-ring frame and, when
     /// known, the publication frame, each minus its framing.
@@ -386,6 +396,8 @@ private:
     uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
     uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
     int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start
+    int64_t  applyRecordsCap_       = 0;   // F18 (B-1); immutable after start
+    uint64_t oversizedApplyDropped_ = 0;   // F18 (B-1); control thread only
 
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.

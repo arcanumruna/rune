@@ -6,6 +6,7 @@
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/OutboundFrame.h>
@@ -158,6 +159,11 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
     // Shared-nothing: encode into a per-call STACK buffer (no shared state),
     // then marshal to the control thread via the outbound ring. FetchRequest is
     // a broadcast (leader NodeId not on the wire) → kBroadcast target.
+    // F18 (B-1): never ask for more than this node's worker can apply in ONE op
+    // (user partitions are applied via the worker ingress ring; immutable cap).
+    int32_t maxBytes = req.maxBytes;
+    if (applyRecordsCap_ > 0 && req.topicId >= 0 && maxBytes > applyRecordsCap_)
+        maxBytes = static_cast<int32_t>(applyRecordsCap_);
     uint8_t wire[kMaxWireFrame];
     const std::size_t len = FetchRequestMsg::encode(
         wire, 0,
@@ -165,7 +171,7 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
         req.partition,
         req.followerId,
         req.fetchOffset,
-        req.maxBytes,
+        maxBytes,
         req.topicId);
     enqueueOutbound(kBroadcast, wire, len);
 }
@@ -606,18 +612,44 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         }
         if (workerPool_ && resp.topicId >= 0 &&
             !workerPool_->opTailFits(resp.topicId, resp.partition, resp.records.size())) [[unlikely]] {
-            // F18 (I-1): records that cannot fit ONE frame of the owning worker's
-            // ingress ring would THROW in tryClaim (terminating the process), and
-            // ABORT would redeliver them forever.  Instead tell the follower
-            // replica — on its owning worker — that this batch is unapplicable: a
-            // small record-less kErrRecordTooLarge apply op.  The replica WEDGES at
-            // its LEO (stops fetching → leaves the ISR visibly), exactly as when
-            // the leader answers kErrRecordTooLarge.  Counted + logged here.
+            // F18: records that cannot fit ONE frame of the owning worker's ingress
+            // ring would THROW in tryClaim (terminating the process), and ABORT would
+            // redeliver them forever.  Look at the FRONT batch only (B-1):
+            //  - it fits on its own → a multi-batch prefix / push / duplicate that
+            //    merely exceeds the frame in total: DROP (counted), never wedge.  The
+            //    follower's fetch is capped to this frame (setApplyRecordsCap), so it
+            //    re-fetches what it needs one frame at a time.
+            //  - it does not fit on its own → tell the follower replica (on its
+            //    owning worker) via a small record-less kErrRecordTooLarge op carrying
+            //    that batch's baseOffset; the replica wedges only if that is the batch
+            //    at its LEO (I-1: stops fetching → leaves the ISR visibly).
+            const std::size_t kOverhead =
+                static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+            std::size_t frontLen  = resp.records.size();
+            Offset      frontBase = -1;
+            if (resp.records.size() >= kOverhead) {
+                rune::protocol::RecordBatchReader r(resp.records.data(), resp.records.size());
+                if (r.totalLength() > 0) {
+                    frontLen  = std::min<std::size_t>(static_cast<std::size_t>(r.totalLength()),
+                                                      resp.records.size());
+                    frontBase = r.baseOffset();
+                }
+            }
+            if (frontBase < 0 || workerPool_->opTailFits(resp.topicId, resp.partition, frontLen)) {
+                if (oversizedApplyDropped_++ == 0 || (oversizedApplyDropped_ & 1023u) == 0) {
+                    spdlog::warn("AeronPartitionTransport: FetchResponse for (topicId={}, partition={}) "
+                                 "carries {} B — above the worker ingress frame in total; dropped "
+                                 "(each batch fits; the capped fetch recovers) (count={})",
+                                 resp.topicId, resp.partition, resp.records.size(),
+                                 oversizedApplyDropped_);
+                }
+                return Action::CONTINUE;
+            }
             if (oversizedApplyRefused_++ == 0 || (oversizedApplyRefused_ & 1023u) == 0) {
-                spdlog::error("AeronPartitionTransport: FetchResponse for (topicId={}, partition={}) "
-                              "carries {} B of records — exceeds this node's worker ingress frame "
-                              "(raise RUNE_WORKER_INGRESS_RING_BYTES); follower wedged (count={})",
-                              resp.topicId, resp.partition, resp.records.size(),
+                spdlog::error("AeronPartitionTransport: batch at offset {} for (topicId={}, partition={}) "
+                              "is {} B — exceeds this node's worker ingress frame on its own (raise "
+                              "RUNE_WORKER_INGRESS_RING_BYTES); follower told (count={})",
+                              frontBase, resp.topicId, resp.partition, frontLen,
                               oversizedApplyRefused_);
             }
             rune::node::WorkerOp op;
@@ -625,6 +657,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.topicId                           = resp.topicId;
             op.partition                         = resp.partition;
             op.replica                           = rep;
+            op.nextOffset                        = frontBase;   // the unapplicable batch
             op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
             op.replicatedPayload.partition       = resp.partition;
             op.replicatedPayload.highWatermark   = resp.highWatermark;

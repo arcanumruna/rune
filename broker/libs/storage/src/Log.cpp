@@ -493,6 +493,7 @@ std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
 }
 LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
+    ++readViewCalls_;
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
     --it;

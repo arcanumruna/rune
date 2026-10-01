@@ -74,6 +74,11 @@ public:
     int64_t frameCap        = std::numeric_limits<int64_t>::max();
     int     oversizeDropped = 0;
     int     fetchRequests   = 0;                       // every follower FetchRequest
+    int     oleRequests     = 0;                       // every OffsetsForLeaderEpoch probe
+    void sendOffsetsForLeaderEpochRequest(NodeId to, const OffsetsForLeaderEpochReqMsg& req) override {
+        ++oleRequests;
+        InMemoryTransport::sendOffsetsForLeaderEpochRequest(to, req);
+    }
 
     [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return frameCap; }
     void sendFetchRequest(const FetchRequestMsg& req) override {
@@ -405,4 +410,61 @@ TEST_F(LargeBatchReplicationRegression, PushPrefixBoundedByTransportFrame) {
     EXPECT_EQ(transport.oversizeDropped, 0) << "a push prefix above the frame was built and dropped";
     ASSERT_FALSE(transport.fetchResponses.empty()) << "nothing pushed";
     EXPECT_LE(static_cast<int64_t>(transport.fetchResponses.front().size()), transport.frameCap);
+}
+
+// F18 fix round 2 (B-2): the unservable-batch check must not add a log lookup.
+// A Data serve costs exactly ONE readView (the check and the serve share it),
+// and a conflated duplicate fetch reads nothing (as before F18).  Before round 2:
+// 2 lookups per Data fetch and 1 per conflated duplicate.
+TEST_F(LargeBatchReplicationRegression, FetchCheckCostsNoExtraLogLookup) {
+    build(/*push*/false, /*follower*/false);
+    appendBigThenSmalls();
+    uint64_t before = leaderLog.readViewCallsForTest();
+    ASSERT_EQ(leader->onFetchRequest(fetchReq(1, kMaxBytes), ++clock), kErrNone);    // Data
+    EXPECT_EQ(leaderLog.readViewCallsForTest() - before, 1u) << "a Data serve: one lookup";
+    ASSERT_EQ(transport.fetchResponses.size(), 1u);
+    before = leaderLog.readViewCallsForTest();
+    ASSERT_EQ(leader->onFetchRequest(fetchReq(1, kMaxBytes), ++clock), kErrNone);    // conflated
+    EXPECT_EQ(leaderLog.readViewCallsForTest() - before, 0u) << "a conflated duplicate reads nothing";
+    EXPECT_EQ(transport.fetchResponses.size(), 1u) << "the duplicate was conflated";
+    // The oversized-first-batch Data serve (KIP-74) also costs exactly one lookup.
+    before = leaderLog.readViewCallsForTest();
+    ASSERT_EQ(leader->onFetchRequest(fetchReq(0, kMaxBytes), ++clock), kErrNone);
+    EXPECT_EQ(leaderLog.readViewCallsForTest() - before, 1u);
+}
+
+// F18 fix round 2 (minor 1): OffsetsForLeaderEpoch probes refresh the leader's
+// ISR liveness, so a wedged follower must not keep probing (or plain-fetching
+// from the probe arm) — else it stays in the ISR while its probe is unanswered.
+TEST_F(LargeBatchReplicationRegression, WedgedFollowerSendsNoEpochProbe) {
+    const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
+    follower = std::make_unique<PartitionReplica>(lagCfg(kFollowerId), Role::Follower, 1,
+                                                  replicas, replicas, &followerLog, &transport);
+    // An uncommitted tail (LEO 1 > HW 0) + an epoch change ARMS the KIP-101 probe.
+    {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", "v", 1000);
+        ASSERT_GE(followerLog.append(b.build(), 0), 0);
+    }
+    follower->becomeFollower(2, kLeaderId);
+    follower->onUnapplicableBatch(/*batchBase=*/1, /*leaderEpoch=*/2);   // the batch at LEO
+    ASSERT_EQ(follower->wedgedAtOffset(), 1);
+    const int ole0 = transport.oleRequests, fetch0 = transport.fetchRequests;
+    for (int i = 0; i < 200; ++i) {                    // nobody answers the probe
+        clock += 1'000'000LL;
+        follower->doWork(clock);
+    }
+    EXPECT_EQ(transport.oleRequests - ole0, 0) << "a wedged follower must not probe (liveness)";
+    EXPECT_EQ(transport.fetchRequests - fetch0, 0) << "nor plain-fetch from the probe arm";
+}
+
+TEST_F(LargeBatchReplicationRegression, UnapplicableBatchNotAtLeoDoesNotWedge) {
+    build(false, true);
+    follower->becomeFollower(1, kLeaderId);
+    follower->onUnapplicableBatch(/*batchBase=*/5, /*leaderEpoch=*/1);    // LEO is 0
+    EXPECT_EQ(follower->wedgedAtOffset(), -1);
+    follower->onUnapplicableBatch(/*batchBase=*/0, /*leaderEpoch=*/0);    // stale epoch
+    EXPECT_EQ(follower->wedgedAtOffset(), -1);
+    follower->onUnapplicableBatch(/*batchBase=*/0, /*leaderEpoch=*/1);    // at LEO, current epoch
+    EXPECT_EQ(follower->wedgedAtOffset(), 0);
 }

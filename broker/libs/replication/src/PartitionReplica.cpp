@@ -656,31 +656,45 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         return kErrNone;
     }
 
-    // F18 / KIP-74 (I-1): the first batch at fetchOffset is always served WHOLE,
-    // so it must fit ONE replication frame.  The transport already capped
-    // req.maxBytes to its frame ceiling, so only a first batch ABOVE req.maxBytes
-    // needs the (cold) ceiling query.  An unservable batch — stored under a larger
-    // config, or by an older broker — is answered with an explicit, counted
-    // kErrRecordTooLarge, and the request is NOT recorded as ISR liveness: the
-    // follower stops fetching it and leaves the ISR through the existing lag check
-    // (HW advances with the remaining ISR; acks=all fails per min-ISR) instead of
-    // re-fetching forever behind silent transport drops with HW pinned.
-    if (req.maxBytes > 0 && req.fetchOffset < logEndOffset_()) {
-        const rune::storage::LogReadView first =
-            onLog([&](auto& L) { return L.readView(req.fetchOffset, 0); });   // one batch
-        if (first.len > static_cast<std::size_t>(req.maxBytes)) [[unlikely]] {
+
+    // FETCH CONFLATION + NO-DUP-FETCH (spec §3.5) — FollowerSlots.h.  Decided
+    // BEFORE the liveness update (B-2): the decision is slot-local (no ISR/HW
+    // input), and it lets the single log read below happen ONLY for a Data serve
+    // — a conflated or ack-only fetch reads nothing, exactly as before.
+    FollowerSlot* const slot = followerSlots_.find(req.followerId);
+    const FetchServe serve = slot
+        ? decideFetchServe(*slot, req.fetchOffset, req.maxBytes, logEndOffset_(),
+                           cfg_.pushOnAppend, nowNs, kFetchResendNs)
+        : (req.maxBytes > 0 ? FetchServe::Data : FetchServe::AckOnly);
+
+    // F18 / KIP-74 (I-1, B-2): ONE readView for a Data serve, reused for the serve
+    // below.  readView always includes the first batch whole, so v.len > maxBytes
+    // ⟺ that first batch ALONE exceeds maxBytes (the transport already capped
+    // maxBytes to its frame); only then is the (cold) frame ceiling queried.  An
+    // unservable batch — stored under a larger config, or by an older broker — is
+    // answered with an explicit, counted kErrRecordTooLarge, and the request is NOT
+    // recorded as ISR liveness: the follower stops fetching it and leaves the ISR
+    // through the existing lag check (HW advances with the remaining ISR; acks=all
+    // fails per min-ISR) instead of re-fetching forever behind silent drops.
+    rune::storage::LogReadView view{};
+    if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
+        view = onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
+        if (view.len > static_cast<std::size_t>(req.maxBytes)) [[unlikely]] {
             int64_t frame = std::numeric_limits<int64_t>::max();
             onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
-            if (static_cast<int64_t>(first.len) > frame) {
+            if (static_cast<int64_t>(view.len) > frame) {
                 if (recordTooLargeServed_++ == 0 || (recordTooLargeServed_ & 1023u) == 0) {
                     spdlog::error("PartitionReplica[node={} topic={} part={}]: batch at offset {} is "
                                   "{} B > the {} B replication frame — UNREPLICABLE; answering "
                                   "follower {} kErrRecordTooLarge (not ISR liveness; it will leave "
                                   "the ISR).  Raise RUNE_REPL_OUTBOUND_RING_BYTES / "
                                   "RUNE_AERON_TERM_BUFFER_BYTES.  (count={})",
-                                  cfg_.selfId, cfg_.topicId, cfg_.partitionId, first.baseOffset,
-                                  first.len, frame, req.followerId, recordTooLargeServed_);
+                                  cfg_.selfId, cfg_.topicId, cfg_.partitionId, view.baseOffset,
+                                  view.len, frame, req.followerId, recordTooLargeServed_);
                 }
+                // Never conflate an unservable fetch (a duplicate must not be
+                // answered silently or refresh liveness): forget this serve.
+                if (slot) slot->servedTimeNs = 0;
                 auto resp = makeFetchResponse(highWatermark(), kErrRecordTooLarge, {});
                 onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
                 return kErrRecordTooLarge;
@@ -730,29 +744,22 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // paths handled earlier.)
     // FETCH CONFLATION + NO-DUP-FETCH (spec §3.5) — FollowerSlots.h.  ISR liveness
     // and HW were updated above, so answering ack-only or nothing is safe.
-    FollowerSlot* const slot = followerSlots_.find(req.followerId);
-    const FetchServe serve = slot
-        ? decideFetchServe(*slot, req.fetchOffset, req.maxBytes, logEndOffset_(),
-                           cfg_.pushOnAppend, nowNs, kFetchResendNs)
-        : (req.maxBytes > 0 ? FetchServe::Data : FetchServe::AckOnly);
     if (serve == FetchServe::Conflate) return kErrNone;
 
     // Read records (Data only; AckOnly answers the HW with no records).
-    // Zero-copy: a view into the log (disk mmap / memory ring).  The transport
-    // copies the bytes ONCE, straight into the publication term.
+    // Zero-copy: the ONE view read above (B-2) — a view into the log (disk mmap /
+    // memory ring).  The transport copies the bytes ONCE, straight into the
+    // publication term.  (No append/truncate/readView ran in between.)
     std::span<const uint8_t> records{};
-    if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
-        const rune::storage::LogReadView v =
-            onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
+    if (serve == FetchServe::Data && !view.empty()) {
         // GR-1: whole batches only.  F18 / KIP-74: the first batch at fetchOffset
         // is ALWAYS served whole even above req.maxBytes (readView already always
-        // includes it); later batches stay bounded by req.maxBytes.  The produce
-        // intake limit keeps accepted batches within one frame; a batch that is
-        // not (stored under a larger config) was answered kErrRecordTooLarge above.
-        const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
+        // includes it); later batches stay bounded by req.maxBytes.  A first batch
+        // that does not fit one frame was answered kErrRecordTooLarge above.
+        const BatchPrefix pre = wholeBatchPrefix(view.data, view.len,
                                                  static_cast<std::size_t>(req.maxBytes),
                                                  kNoPushCeiling);
-        records = std::span<const uint8_t>(v.data, pre.bytes);
+        records = std::span<const uint8_t>(view.data, pre.bytes);
     }
 
     // DR-BUG-3: advertise the min-ISR-GATED committed HW to followers via the
@@ -835,16 +842,11 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         // liveness → the leader evicts us by its existing lag check).  Counted +
         // logged.  Cleared by a leadership/epoch change or a truncation moving LEO.
         // A stale-epoch answer (deposed leader) never wedges.
+        // (The leader answers for the offset we fetched = our LEO: a false wedge
+        //  is impossible on this path — nothing can move LEO past an unservable batch.)
         if (resp.errorCode == kErrRecordTooLarge && role_ == Role::Follower &&
-            resp.leaderEpoch >= epoch_ && wedgedAtOffset_ != logEndOffset_()) {
-            wedgedAtOffset_ = logEndOffset_();
-            ++wedgedRefusals_;
-            spdlog::error("PartitionReplica[node={} topic={} part={}]: follower WEDGED at offset "
-                          "{} — the batch there cannot be replicated in one frame "
-                          "(kErrRecordTooLarge); stopped fetching it, leaving the ISR "
-                          "(count={})", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
-                          wedgedAtOffset_, wedgedRefusals_);
-        }
+            resp.leaderEpoch >= epoch_)
+            wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
         // Other errors — ignore (control plane handles epoch changes externally).
         return;
     }
@@ -1075,6 +1077,26 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                             // (data flows via push / the single-outstanding fetch).
         sendFetchToLeader_(ack);
     }
+}
+
+// F18: enter the wedged state at `at` (idempotent per offset): no further fetch
+// or epoch probe (doWork), so the leader's existing lag check evicts us.
+void PartitionReplica::wedgeAt_(Offset at, const char* why)
+{
+    if (wedgedAtOffset_ == at) return;
+    wedgedAtOffset_ = at;
+    ++wedgedRefusals_;
+    spdlog::error("PartitionReplica[node={} topic={} part={}]: follower WEDGED at offset {} — "
+                  "the batch there is unreplicable ({}); stopped fetching it, leaving the ISR "
+                  "(count={})", cfg_.selfId, cfg_.topicId, cfg_.partitionId, at, why,
+                  wedgedRefusals_);
+}
+
+void PartitionReplica::onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch)
+{
+    if (role_ != Role::Follower || leaderEpoch < epoch_) return;   // stale / not a follower
+    if (batchBase != logEndOffset_()) return;   // not the batch we need: never wedge (B-1)
+    wedgeAt_(batchBase, "it cannot fit one frame of this node's worker ingress ring");
 }
 
 // Spec §3.5.2: the follower knows its leader — unicast.  Before the leader is
@@ -1802,7 +1824,13 @@ int PartitionReplica::doWork(int64_t nowNs)
         // truncation point — otherwise the leader could push us data before we
         // reconcile our own tail.  The probe is idempotent; re-issuing it until
         // the answer arrives is safe (the leader may not have been promoted yet).
-        if (epochProbePending_) {
+        // F18 (I-1): a wedge is bound to the offset — a truncation that moved our
+        // LEO clears it (time-independent: no timer).  While wedged the follower
+        // sends NOTHING: no fetch, no keepalive, and no KIP-101 epoch probe (minor 1:
+        // probes refresh the leader's ISR liveness), so the leader's lag check
+        // evicts it.  The probe re-arms on the next leadership/epoch change.
+        if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) wedgedAtOffset_ = -1;
+        if (epochProbePending_ && wedgedAtOffset_ < 0) {
             if (nowNs - lastFetchEmitNs_ >= cfg_.fetchIntervalNs) {
                 lastFetchEmitNs_ = nowNs;
 
@@ -1871,10 +1899,7 @@ int PartitionReplica::doWork(int64_t nowNs)
             const int64_t keepaliveNs = std::clamp<int64_t>(
                 (cfg_.replicaLagMaxMs * 1'000'000LL) / 4,
                 cfg_.fetchIntervalNs, 20'000'000LL);
-            // F18 (I-1): a wedge is bound to the offset — a truncation that moved
-            // our LEO clears it (time-independent: no timer).
-            if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) wedgedAtOffset_ = -1;
-            const bool wedged = wedgedAtOffset_ >= 0;
+            const bool wedged = wedgedAtOffset_ >= 0;   // (cleared above if LEO moved)
             const FollowerSync::State fsPrev = followerSync_.state();
             const bool fsWasArmed = followerSync_.fetchArmed();
             const FollowerSync::Action act = wedged

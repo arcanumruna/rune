@@ -107,6 +107,9 @@ public:
     /// (append's durable fsync, sync(), the inline seal) — spec §3.1: a shard
     /// loop must make none; its flushes go through the io backend.
     [[nodiscard]] uint64_t syncCallsForTest() const noexcept { return storage_.syncCalls; }
+    /// readView() calls on this log (single-owner counter; F18 B-2 proves a
+    /// fetch costs exactly one lookup and a conflated duplicate none).
+    [[nodiscard]] uint64_t readViewCallsForTest() const noexcept { return readViewCalls_; }
     /// Test hook: while non-zero every inline sync fails with this errno.
     void setSyncFaultForTest(int err) noexcept { storage_.faultForTest = err; }
 
@@ -348,6 +351,7 @@ private:
     void publishSealedSnapshot();
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
+    uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
     LogStorageState storage_{};     ///< fail-stop state + inline-sync accounting (shared with segments)
     bool deferSealSync_ = false;
     static constexpr std::size_t kMaxPendingSeals = 16;

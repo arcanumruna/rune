@@ -2400,3 +2400,84 @@ TEST(ProduceBatchLimitRegression, GatewayAnswersMessageTooLargeWhenWorkerFrameIs
     EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
     EXPECT_EQ(m.r->log()->logEndOffset(), 0);
 }
+
+// ============================================================================
+// F18 fix round 2 (B-1): the follower-side check must look at the BATCH at the
+// follower's LEO, not the whole response.  A multi-batch response (fetch
+// prefix / push / overlapping duplicate) larger than this node's worker frame,
+// where every batch fits on its own, must NOT wedge a healthy follower — it is
+// dropped (the follower's capped fetch then gets it one frame at a time).  An
+// oversized batch that is NOT at the follower's LEO must not wedge either.
+// ============================================================================
+namespace {
+std::vector<uint8_t> encodeFetchRespOf(int32_t topic, int32_t part, const std::vector<uint8_t>& recs) {
+    std::vector<uint8_t> f(rune::replication::FetchResponseMsg::encodedSize(recs.size()));
+    rune::replication::FetchResponseMsg::encode(f.data(), 0, 1, part, 0, 0, rune::replication::kErrNone,
+                                                std::span<const uint8_t>(recs), topic);
+    return f;
+}
+struct FollowerRig {
+    TmpDir ad;
+    EmbeddedDriverConfig dc;
+    std::unique_ptr<EmbeddedDriver> drv;
+    std::shared_ptr<aeron::Aeron> client;
+    std::unique_ptr<rune::replication::AeronPartitionTransport> tr;
+    Reg R;
+    std::unique_ptr<Log> flog;
+    PartitionReplica* follower = nullptr;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), /*ingress*/ 1 << 16, 1 << 16, 16, 16};   // 8 KiB frames
+    explicit FollowerRig(int32_t stream) {
+        dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+        drv = std::make_unique<EmbeddedDriver>(dc, DriverMode::Threaded);
+        aeron::Context ctx; ctx.aeronDir(ad.path.string());
+        client = aeron::Aeron::connect(ctx);
+        tr = std::make_unique<rune::replication::AeronPartitionTransport>(client, "aeron:ipc", stream, 1, 1 << 20);
+        fs::create_directories(R.d.path / "follower");
+        flog = std::make_unique<Log>((R.d.path / "follower").string(), 64LL * 1024 * 1024);
+        flog->recover();
+        auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 5, 0), Role::Follower, 1,
+            std::vector<rune::replication::NodeId>{1, 2}, std::vector<rune::replication::NodeId>{1, 2},
+            flog.get(), &R.t);
+        rep->becomeFollower(1, 2);
+        follower = rep.get();
+        R.reg.add(5, 0, std::move(rep));
+        pool.assignFromRegistry(R.reg);
+        pool.setRegistry(&R.reg);
+        pool.setRunnersStartedForTest(true);
+        tr->setReplicaRegistry(&R.reg);
+        tr->setWorkerPool(&pool);
+        pool.reconcile(R.reg);
+        ackAll(pool);
+    }
+};
+} // namespace
+
+TEST(ProduceBatchLimitRegression, MultiBatchResponseAboveWorkerFrameDoesNotWedgeHealthyFollower) {
+    FollowerRig rig(7304);
+    // Two batches [0] and [1], ~5 KiB each: each fits the 8 KiB frame, the pair does not.
+    std::vector<uint8_t> recs = batchAt(0, 1, 5 * 1024);
+    const auto b1 = batchAt(1, 1, 5 * 1024);
+    recs.insert(recs.end(), b1.begin(), b1.end());
+    ASSERT_FALSE(rig.pool.opTailFits(5, 0, recs.size()));
+    ASSERT_TRUE(rig.pool.opTailFits(5, 0, b1.size()));
+    const auto f = encodeFetchRespOf(5, 0, recs);
+    EXPECT_TRUE(rig.tr->deliverFrameForTest(f.data(), f.size(), 1));
+    rig.pool.worker(0).doWork(2);
+    EXPECT_EQ(rig.follower->wedgedAtOffset(), -1) << "every batch fits: a healthy follower must never wedge";
+    EXPECT_EQ(rig.follower->wedgedRefusals(), 0u);
+    // ...and a single fitting batch is then applied normally.
+    const auto f0 = encodeFetchRespOf(5, 0, batchAt(0, 1, 5 * 1024));
+    EXPECT_TRUE(rig.tr->deliverFrameForTest(f0.data(), f0.size(), 3));
+    rig.pool.worker(0).doWork(4);
+    EXPECT_EQ(rig.follower->logEndOffset(), 1);
+    EXPECT_EQ(rig.follower->wedgedAtOffset(), -1);
+}
+
+TEST(ProduceBatchLimitRegression, OversizedBatchNotAtFollowerLeoDoesNotWedge) {
+    FollowerRig rig(7305);
+    // An oversized batch at base 7 (e.g. a push from further ahead) while LEO = 0.
+    const auto f = encodeFetchRespOf(5, 0, batchAt(7, 1, 16 * 1024));
+    EXPECT_TRUE(rig.tr->deliverFrameForTest(f.data(), f.size(), 1));
+    rig.pool.worker(0).doWork(2);
+    EXPECT_EQ(rig.follower->wedgedAtOffset(), -1) << "only the batch AT the follower's LEO can wedge it";
+}

@@ -630,6 +630,12 @@ public:
     [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
     /// Follower: the offset it is wedged at (stops fetching it), or -1.
     [[nodiscard]] Offset wedgedAtOffset() const noexcept { return wedgedAtOffset_; }
+    /// F18 (B-1): this node's transport could not hand the follower the batch
+    /// whose baseOffset is `batchBase` (it cannot fit one worker-ingress frame on
+    /// its own).  Wedges ONLY if that batch is the one at our LEO and the answer
+    /// is from the current (or a newer) epoch — a multi-batch prefix, a push from
+    /// further ahead or a duplicate never wedges.
+    void onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch);
 
 private:
     // -----------------------------------------------------------------------
@@ -854,6 +860,7 @@ private:
     uint64_t recordTooLargeServed_ = 0;
     uint64_t wedgedRefusals_       = 0;
     Offset   wedgedAtOffset_       = -1;
+    void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
 
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.

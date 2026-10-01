@@ -1,5 +1,6 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/replication/ReplicationFrameLimits.h>
+#include <rune/node/WorkerOp.h>
 #include <rune/node/RoleCounter.h>
 
 #include <spdlog/spdlog.h>
@@ -466,6 +467,10 @@ void BrokerNode::buildReplication() {
             // (no channel overrides term-length) — fixed before any worker runs.
             replTransport_->setPublicationMaxMessageBytes(
                 rune::replication::aeronMaxMessageLength(config_.aeronTermBufferBytes));
+            // F18 (B-1): follower fetches never ask for more than one worker apply op.
+            replTransport_->setApplyRecordsCap(
+                static_cast<int64_t>(config_.workerIngressRingBytes) / 8 -
+                static_cast<int64_t>(rune::node::workerOpFrameBytes(0)));
 
             // Add each peer (excluding self) as an egress destination.
             for (const auto& peer : config_.peers) {

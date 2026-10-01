@@ -1303,3 +1303,72 @@ TEST(LargeBatchReplicationRegression, UnservableStoredBatchEvictsFollowersPerWor
 TEST(LargeBatchReplicationRegression, UnservableStoredBatchEvictsFollowersLegacyTransport) {
     runUnservableBatchEvictsFollowers(/*perWorkerReplication=*/false, "f18ul_");
 }
+
+// ===========================================================================
+// F18 fix round 2 (B-1, *Regression*): a uniform RUNE_WORKER_INGRESS_RING_BYTES =
+// 4 MiB gives a follower apply frame (~524,037 B) just BELOW the leader's
+// push/fetch frame (~524,226 B).  Two ~262 KiB batches — each far below every
+// limit — coalesced into ONE push (gateway-style direct append + one push) make
+// a ~524,1xx B response: above the follower frame, every batch fitting.  Before:
+// the follower transport compared the WHOLE response and falsely, permanently
+// wedged the healthy followers (they left the ISR).  Required: no wedge, the
+// followers converge (their fetch is capped to their own frame), HW = 2.
+// Legacy transport (the per-worker plane applies inline: no worker ring hop).
+// ===========================================================================
+TEST(LargeBatchReplicationRegression, MultiBatchPushAboveFollowerFrameNeverWedges4MiBRing) {
+    PwTempDir dir0{"f18b1_0_"}, dir1{"f18b1_1_"}, dir2{"f18b1_2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+    std::array<rune::node::NodeConfig, 3> cfgs{
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts)};
+    for (auto& c : cfgs) {
+        c.perWorkerReplication   = false;
+        c.workerIngressRingBytes = 4 * 1024 * 1024;           // the reviewer's config
+    }
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+    std::array<rune::node::BrokerNode*, 3> raw{nodes[0].get(), nodes[1].get(), nodes[2].get()};
+    const int lid = resolvePartitionLeader({raw.begin(), raw.end()});
+    ASSERT_GE(lid, 0);
+    rune::node::BrokerNode& leader = *raw[static_cast<std::size_t>(lid)];
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && rune::node::test::isrSizeOnOwner(leader) < 3)
+            std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
+
+    // Two ~262 KiB batches appended straight to the leader's log in ONE owner task,
+    // then one onLeaderLogAppended(): the next duty cycle pushes them as ONE frame.
+    const std::size_t kVal = 262'000;
+    const bool ok = leader.onOwnerThreadForTest(0, 0, [&](PartitionReplica& r) {
+        for (int64_t base = 0; base < 2; ++base) {
+            rune::protocol::RecordBatchBuilder b(base, 1000);
+            b.append("k", std::string(kVal, static_cast<char>(0x40 + base)), 1000);
+            if (r.log()->append(b.build(), base) < 0) return false;
+        }
+        r.onLeaderLogAppended();
+        return true;
+    });
+    ASSERT_TRUE(ok);
+
+    const auto deadline = std::chrono::steady_clock::now() + 45s;
+    bool converged = false;
+    while (std::chrono::steady_clock::now() < deadline && !converged) {
+        converged = hwOnOwner(leader) >= 2;
+        for (auto& n : nodes) converged = converged && leoOnOwner(*n) >= 2;
+        if (!converged) std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(converged) << "leader HW=" << hwOnOwner(leader);
+    for (auto& n : nodes) {
+        EXPECT_EQ(n->onOwnerThreadForTest(0, 0, [](PartitionReplica& r) { return r.wedgedRefusals(); }), 0u)
+            << "a healthy follower was falsely wedged";
+    }
+    EXPECT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
+    for (auto& n : nodes) n->stop();
+}
