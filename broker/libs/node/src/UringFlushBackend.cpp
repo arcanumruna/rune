@@ -280,6 +280,42 @@ CompletionToken UringFlushBackend::submitWithToken(int fd,
     return tok;
 }
 
+// ---------------------------------------------------------------------------
+// F15 S4 fix round 2 (RR1-4): IORING_OP_FADVISE — an asynchronous page-cache
+// read-ahead hint (POSIX_FADV_WILLNEED) on `fd` for [off, off + len).  The
+// kernel forces FADVISE async (io-wq): the worker pays one SQE write and the
+// shared submit.  Same in-flight cap / token space / reap as the fsyncs; the
+// caller routes the token (RouteKind::Hint) so a hint completion — success or
+// error — never reaches produce-ack matching or the fsync fail-stop.
+// ---------------------------------------------------------------------------
+CompletionToken UringFlushBackend::submitFadvise(int fd, int64_t off, uint32_t len, int advice) noexcept {
+    if (inFlight_ >= submitDepth_) return kNoToken;
+    const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
+    const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED);
+    const uint32_t mask = *sqRingMask_;
+    if (tail - head >= sqRingSize_) return kNoToken;   // SQ full: the caller skips this pass
+    CompletionToken tok = ++nextToken_;
+    if (tok == kNoToken) tok = ++nextToken_;
+    const uint32_t sqeIdx = tail & mask;
+    struct io_uring_sqe* sqe = sqes_ + sqeIdx;
+    std::memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode         = IORING_OP_FADVISE;
+    sqe->fd             = fd;
+    sqe->off            = static_cast<uint64_t>(off);
+    sqe->len            = len;
+    sqe->fadvise_advice = static_cast<uint32_t>(advice);
+    sqe->user_data      = static_cast<uint64_t>(tok);
+    sqArray_[sqeIdx] = sqeIdx;
+    __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE);
+    const int ret = rune_io_uring_enter(ringFd_, /*to_submit=*/1, /*min_complete=*/0, /*flags=*/0);
+    if (ret < 0) {
+        __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE);
+        return kNoToken;
+    }
+    ++inFlight_;
+    return tok;
+}
+
 } // namespace rune::node
 
 #endif // defined(__linux__)

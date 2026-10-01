@@ -32,6 +32,7 @@
 #endif
 
 #include <cstdlib>
+#include <fcntl.h>
 #include <optional>
 #include <string_view>
 
@@ -81,6 +82,27 @@ public:
         if (kind_ == IoBackendKind::Uring) [[likely]] return uring_->submit(fd, flushBoundary);
 #endif
         if (kind_ == IoBackendKind::Portable) return portable_->submit(fd, flushBoundary);
+        return kNoToken;
+    }
+
+    /// F15 S4 fix round 2 (RR1-4): true when read-ahead hints can be issued
+    /// asynchronously (io_uring IORING_OP_FADVISE); else the caller uses a
+    /// synchronous hint (counted).
+    [[nodiscard]] bool asyncHints() const noexcept {
+#if defined(__linux__)
+        return kind_ == IoBackendKind::Uring;
+#else
+        return false;
+#endif
+    }
+    /// An async POSIX_FADV_WILLNEED hint on [off, off + len) of fd: a token
+    /// (completion reaped like a flush — route it), or kNoToken (SQ full / no
+    /// async hints: skip this pass).
+    [[nodiscard]] CompletionToken submitWillNeed(int fd, int64_t off, uint32_t len) noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) return uring_->submitFadvise(fd, off, len, POSIX_FADV_WILLNEED);
+#endif
+        (void)fd; (void)off; (void)len;
         return kNoToken;
     }
 
