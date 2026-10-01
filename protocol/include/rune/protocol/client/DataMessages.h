@@ -412,11 +412,11 @@ struct SubscribeResponse {
 //   [36..39]  partition      : int32
 //   [40..47]  baseOffset     : int64
 //   BODY_FIXED = 24 (8+4+4+8), var field starts at offset 48 (header 24 + 24)
-//   [48..49]  recordBatch length : uint16  (var prefix)
-//   [50..]    recordBatch bytes   (opaque — never parsed by the codec)
+//   [48..51]  recordBatch length : uint32  (var prefix — batches may exceed 64 KiB)
+//   [52..]    recordBatch bytes   (opaque — never parsed by the codec)
 //
-// Total = 24 + 24 + 2 + recordBatch.size()
-//       = 50 + recordBatch.size()
+// Total = 24 + 24 + 4 + recordBatch.size()
+//       = 52 + recordBatch.size()
 // ---------------------------------------------------------------------------
 struct Records {
     int64_t sessionId      = 0;
