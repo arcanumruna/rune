@@ -240,6 +240,38 @@ public:
                           bool wantAck,
                           int64_t correlationId) noexcept;
 
+    /// Non-blocking submit (ZERO allocation, lock-free): validates the value
+    /// size, then writes the SEND_RECORD. Never drops silently — see SendResult.
+    [[nodiscard]] SendResult trySubmit(int32_t topicId, int32_t partition, const Key& key,
+                                       std::span<const uint8_t> value, int64_t ackHandle) noexcept;
+
+    /// Slow path of the void send: retries until accepted; throws on non-retryable
+    /// results. In Invoker mode (pumpFn_ wired by Client::producer()), a
+    /// BackPressured retry pumps the owning Client's duty cycle instead of idling
+    /// on the ring's consumer heartbeat (the owner thread IS that consumer, so
+    /// waiting on it would wait on itself forever); the hook declines (returns
+    /// false) when pumping would be unsafe (inside a duty-cycle callback, or off
+    /// the owner thread), in which case this throws immediately rather than spin.
+    /// With no pump hook wired (Thread mode, or a bare ProducerImpl in a test),
+    /// it backs off and bounds the wait by the ring's consumerHeartbeatTime vs.
+    /// agentLivenessTimeoutMs.
+    void sendBlocking(SendResult first, int32_t topicId, int32_t partition, const Key& key,
+                      std::span<const uint8_t> value);
+
+    using ClockFn = int64_t (*)() noexcept;
+    void setClockForTesting(ClockFn fn) noexcept { clock_ = fn; }
+
+    /// Invoker-mode pump hook, wired by Client::producer(): called from
+    /// sendBlocking() on BackPressured. Returns true if it pumped the duty cycle
+    /// (retry immediately), false if pumping is unsafe right now (the hook
+    /// enforces its own gate — owner thread, not already inside a duty-cycle
+    /// callback) — sendBlocking then fails fast instead of spinning. A plain
+    /// function pointer + opaque context: no std::function, no virtual call,
+    /// no new atomics (shared-nothing: this is set once, before any send(), by
+    /// the single thread that owns the producer).
+    using PumpFn = bool (*)(void* ctx) noexcept;
+    void setPumpFn(PumpFn fn, void* ctx) noexcept { pumpFn_ = fn; pumpCtx_ = ctx; }
+
     /// Write a flush trigger into the ring.  Zero-alloc.
     void submitFlush() noexcept;
 
@@ -589,6 +621,12 @@ private:
     std::function<void(const BatchAck&)> batchAckCb_;   // set before the first send
     bool                                 collectBatchAcks_ = false;
     std::vector<BatchAck>                completedAcks_;
+
+    // ---- sendBlocking() support (app thread only) -----------------------------
+    static int64_t steadyNowNs_() noexcept;
+    ClockFn clock_   = &steadyNowNs_;   // overridable by setClockForTesting()
+    PumpFn  pumpFn_  = nullptr;         // wired by Client::producer() in Invoker mode
+    void*   pumpCtx_ = nullptr;
 };
 
 } // namespace rune::client::producer

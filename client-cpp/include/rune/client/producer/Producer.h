@@ -86,6 +86,8 @@ struct ProducerConfig {
     int32_t maxFrameBytes    = 65536;   // hard per-FRAME wire cap (≤ this many bytes/frame),
                                          // independent of batchBytes — bounds fragmentation.
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
+    int64_t agentLivenessTimeoutMs = 1000; // void send(): back-pressured with no ring-consumer
+                                           // heartbeat for this long => throw (runner gone)
 
     /// Build a ProducerConfig from environment variables, falling back to
     /// sane defaults for any variable that is not set.
@@ -130,6 +132,20 @@ struct BatchAck {
 };
 
 // ---------------------------------------------------------------------------
+// SendResult — outcome of a non-blocking send (spec §4.3: back-pressure is
+// propagated, never a silent drop).
+// ---------------------------------------------------------------------------
+enum class SendResult : uint8_t {
+    Ok = 0,         ///< accepted: will be batched and sent
+    BackPressured,  ///< ring full / partition window full: retry after the duty cycle drains
+    ValueTooLarge,  ///< value > kMaxSendValueBytes (never retryable)
+    InvalidTopic,   ///< TopicHandle not valid
+    WrongThread,    ///< invoker-mode producer used off its owner thread
+    WrongShard,     ///< ClientShard: partition owned by another shard
+    Closed,         ///< the shard's transport closed
+};
+
+// ---------------------------------------------------------------------------
 // Producer
 //
 // Returned by Client::producer(config).  Owns a shared_ptr to ProducerImpl so
@@ -153,9 +169,9 @@ public:
     /// Maximum value size for a single send().
     ///
     /// The SEND_RECORD ring message is limited to kMaxSendValueBytes bytes of
-    /// value data.  Values larger than this are silently DROPPED on the void
-    /// send path (fire-and-forget) or will cause submitSendRecord() to return
-    /// false on the internal path.
+    /// value data.  Values larger than this are REJECTED, never silently
+    /// dropped: trySend() returns SendResult::ValueTooLarge and the void
+    /// send() throws std::length_error.
     ///
     /// Rationale: the ring write uses an 8 KiB stack scratch buffer
     /// (kMaxStackBuf = 8192) and the record header is 38 bytes, leaving
@@ -165,19 +181,19 @@ public:
 
     // ---- Hot path — void send (ZERO per-send heap allocation) ---------------
 
-    /// Fire-and-forget send (ZERO per-send heap allocation, lock-free).
-    ///
-    /// Computes the partition from Key via partitionForKey (shared FNV-1a),
-    /// then writes a compact SEND_RECORD into the agent's lock-free ring.
-    /// NO heap allocation, NO lock, NO std::function/promise on this path.
-    ///
-    /// **Drop policy (void path):** if the ring is full OR the value exceeds
-    /// kMaxSendValueBytes, the message is SILENTLY DROPPED.  This is the
-    /// fire-and-forget contract — callers that need delivery confirmation
-    /// must use the callback or want_future overloads instead.
-    void send(TopicHandle            topic,
-              const Key&             key,
-              std::span<const uint8_t> value) noexcept;
+    /// Non-blocking send (ZERO per-send heap allocation, lock-free).  Never drops
+    /// silently: anything but Ok means the record was NOT accepted.
+    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
+                                     std::span<const uint8_t> value) noexcept;
+
+    /// Fire-and-forget send that NEVER drops.  BackPressured → backs off (thread
+    /// mode: spin/yield/park until the runner drains; invoker mode: runs the duty
+    /// cycle itself) and retries.  Throws std::length_error (value too large),
+    /// std::invalid_argument (invalid topic), std::logic_error (off the invoker
+    /// owner thread, or back-pressured inside an invoker duty-cycle callback —
+    /// use trySend there), std::runtime_error (the runner stopped draining for
+    /// agentLivenessTimeoutMs — client closed).  Zero allocation when accepted.
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
     // ---- Opt-in ack paths (may allocate per send) ----------------------------
 

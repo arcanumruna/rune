@@ -70,6 +70,23 @@ public:
     /// Total trailer bytes to add on top of the pow2 payload capacity.
     static constexpr aeron::util::index_t trailerLength() { return TRAILER_LENGTH; }
 
+    /// Aeron ManyToOneRingBuffer::consumerHeartbeatTime: the single consumer
+    /// publishes its liveness (release store) so producers can tell a slow
+    /// consumer from a dead one — the ring primitive's own atomic, no other
+    /// shared state (spec §1a.1).  Uses storeRelease64_/loadAcquire64_ (the
+    /// __atomic builtins this class already uses for head/tail/length), NOT
+    /// AtomicBuffer::putInt64Ordered/getInt64Volatile (plain volatile + asm
+    /// barrier): the latter is invisible to ThreadSanitizer, which reported a
+    /// data race between this store and the cross-thread load in
+    /// ProducerImpl::sendBlocking even though the ordering was correct on
+    /// x86-64 — same reasoning as the class-level comment below.
+    void consumerHeartbeatTime(std::int64_t timeNs) noexcept {
+        storeRelease64_(m_consumerHeartbeatIndex, timeNs);
+    }
+    [[nodiscard]] std::int64_t consumerHeartbeatTime() const noexcept {
+        return loadAcquire64_(m_consumerHeartbeatIndex);
+    }
+
     // ------------------------------------------------------------------
     // Producer side (multi-thread): claim/commit or the write() convenience.
     // ------------------------------------------------------------------
@@ -254,19 +271,19 @@ private:
     // ordered CPUs by construction, and visible to ThreadSanitizer — which could
     // not see the publication edge, so every message handed through this ring
     // (and everything it points to) was reported as a data race.
-    [[nodiscard]] std::int32_t* word32_(aeron::util::index_t off) noexcept {
+    [[nodiscard]] std::int32_t* word32_(aeron::util::index_t off) const noexcept {
         return reinterpret_cast<std::int32_t*>(m_buffer.buffer() + off);
     }
-    [[nodiscard]] std::int64_t* word64_(aeron::util::index_t off) noexcept {
+    [[nodiscard]] std::int64_t* word64_(aeron::util::index_t off) const noexcept {
         return reinterpret_cast<std::int64_t*>(m_buffer.buffer() + off);
     }
-    [[nodiscard]] std::int32_t loadAcquire32_(aeron::util::index_t off) noexcept {
+    [[nodiscard]] std::int32_t loadAcquire32_(aeron::util::index_t off) const noexcept {
         return __atomic_load_n(word32_(off), __ATOMIC_ACQUIRE);
     }
     void storeRelease32_(aeron::util::index_t off, std::int32_t v) noexcept {
         __atomic_store_n(word32_(off), v, __ATOMIC_RELEASE);
     }
-    [[nodiscard]] std::int64_t loadAcquire64_(aeron::util::index_t off) noexcept {
+    [[nodiscard]] std::int64_t loadAcquire64_(aeron::util::index_t off) const noexcept {
         return __atomic_load_n(word64_(off), __ATOMIC_ACQUIRE);
     }
     void storeRelease64_(aeron::util::index_t off, std::int64_t v) noexcept {

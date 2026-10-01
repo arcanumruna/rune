@@ -913,6 +913,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerSinkTest.cpp
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
+            tests/producer/ProducerSendTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/support/AllocCounter.cpp
         )

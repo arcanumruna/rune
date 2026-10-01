@@ -445,3 +445,73 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     EXPECT_EQ(countCorr(X.corrId), base) << "acked batch X must not be re-driven by the resend fn";
     EXPECT_EQ(fx.get(), 100);
 }
+
+// ---------------------------------------------------------------------------
+// Task 13: void send() never drops. In Invoker mode the owner thread IS the
+// producer ring's only consumer, so a blocking send() must not wait on a
+// consumer that is itself — Client::producer() wires ProducerImpl's pump hook
+// (setPumpFn) to this Client for exactly that reason. See also
+// ProducerSendTest.cpp for the hook's gating logic tested in isolation.
+// ---------------------------------------------------------------------------
+
+// Regression: owner thread, outside any duty-cycle callback, back-pressured on
+// a full producer ring — the blocking send() must pump this Client's OWN duty
+// cycle (not wait on the heartbeat of a consumer that is this very thread) and
+// succeed, with no runner thread ever existing.
+TEST(InvokerClient, BlockingSendPumpsOwnDutyCycleWhenBackPressuredRegression) {
+    Rig r(invokerCfg(3780, 3781));
+    rc::ProducerConfig pcfg;
+    pcfg.acks     = rc::Acks::None;
+    pcfg.lingerUs = 0;
+    auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);  // small ring: fills fast
+    auto topic = r.client.topic("t");
+
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u) << "ring never filled";
+
+    // No runner thread exists in Invoker mode: if this blocked on the ring's
+    // consumer heartbeat (instead of pumping), it would hang until
+    // agentLivenessTimeoutMs (default 1s) and then throw. It must not throw at all.
+    EXPECT_NO_THROW(p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)));
+
+    // The pump actually made progress: another fill-to-backpressure round still
+    // succeeds (the ring recovers rather than staying permanently stuck).
+    uint64_t ok2 = 0;
+    for (; ok2 < 10'000; ++ok2) {
+        if (p.trySend(topic, rc::Key(ok2), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    EXPECT_GT(ok2, 0u);
+}
+
+// Regression: a blocking send() invoked FROM INSIDE a duty-cycle callback
+// (onConnected fires on the duty-cycle thread, with inDutyCycle_ set) must
+// fail fast with std::runtime_error, never pump (which would re-enter the
+// agent's own poll) and never spin waiting out the liveness timeout.
+TEST(InvokerClient, BlockingSendFromDutyCycleCallbackThrowsRegression) {
+    Rig r(invokerCfg(3782, 3783));
+    bool threwInCallback = false;
+    bool ranAtAll        = false;
+    r.client.onConnected([&](int64_t) {
+        ranAtAll = true;
+        rc::ProducerConfig pcfg;
+        pcfg.acks     = rc::Acks::None;
+        pcfg.lingerUs = 0;
+        auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
+        auto topic = r.client.topic("t");
+        uint64_t ok = 0;
+        for (; ok < 10'000; ++ok) {
+            if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+        }
+        try {
+            p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
+        } catch (const std::runtime_error&) {
+            threwInCallback = true;
+        }
+    });
+    r.connect();
+    EXPECT_TRUE(ranAtAll);
+    EXPECT_TRUE(threwInCallback);
+}

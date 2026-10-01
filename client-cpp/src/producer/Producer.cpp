@@ -48,16 +48,25 @@ Producer::Producer(std::shared_ptr<producer::ProducerImpl> impl) noexcept
 // Hot path — void send (ZERO per-send heap allocation)
 // ---------------------------------------------------------------------------
 
+SendResult Producer::trySend(TopicHandle            topic,
+                             const Key&             key,
+                             std::span<const uint8_t> value) noexcept
+{
+    if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
+    return impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value, 0);
+}
+
 void Producer::send(TopicHandle            topic,
                     const Key&             key,
-                    std::span<const uint8_t> value) noexcept
+                    std::span<const uint8_t> value)
 {
-    if (!impl_ || !topic.valid()) return;
-    // Compute partition client-side (same hash as the broker).
+    if (!impl_ || !topic.valid()) {
+        throw std::invalid_argument("Producer::send: invalid topic handle");
+    }
     const int32_t part = key.partition(topic.partitionCount);
-    // Submit to the ring — zero alloc, no lock.
-    impl_->submitSendRecord(topic.topicId, part, key, value,
-                             /*wantAck=*/false, /*correlationId=*/0);
+    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, 0);
+    if (r == SendResult::Ok) [[likely]] return;
+    impl_->sendBlocking(r, topic.topicId, part, key, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -75,9 +84,8 @@ void Producer::send(TopicHandle              topic,
     // Back-pressure: if the send ring is full the record never reaches the agent,
     // so the ack would never arrive — fail the pending callback immediately
     // (callback fires with offset=-1) rather than stranding it forever.
-    if (!impl_->submitSendRecord(topic.topicId, part, key, value,
-                                 /*wantAck=*/true, ackHandle)) {
-        impl_->failUnsubmitted(ackHandle, "producer send ring full — back-pressure (retry)");
+    if (impl_->trySubmit(topic.topicId, part, key, value, ackHandle) != SendResult::Ok) {
+        impl_->failUnsubmitted(ackHandle, "producer send not accepted (back-pressure or invalid value) — retry");
     }
 }
 
@@ -97,9 +105,8 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
     // Back-pressure: if the send ring is full the record never reaches the agent,
     // so the ack would never arrive and future.get() would hang forever. Reject
     // the future immediately with a retriable error instead of stranding it.
-    if (!impl_->submitSendRecord(topic.topicId, part, key, value,
-                                 /*wantAck=*/true, ackHandle)) {
-        impl_->failUnsubmitted(ackHandle, "producer send ring full — back-pressure (retry)");
+    if (impl_->trySubmit(topic.topicId, part, key, value, ackHandle) != SendResult::Ok) {
+        impl_->failUnsubmitted(ackHandle, "producer send not accepted (back-pressure or invalid value) — retry");
     }
     return std::move(fut);
 }

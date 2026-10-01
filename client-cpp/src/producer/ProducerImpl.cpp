@@ -16,6 +16,9 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
 
+#include <concurrent/BackOffIdleStrategy.h>
+
+#include <algorithm>
 #include <bit>
 #include <cassert>
 #include <climits>
@@ -348,6 +351,65 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
     }
 }
 
+int64_t ProducerImpl::steadyNowNs_() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
+                                   std::span<const uint8_t> value, int64_t ackHandle) noexcept {
+    if (value.size() > rune::client::Producer::kMaxSendValueBytes) return SendResult::ValueTooLarge;
+    return submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle)
+               ? SendResult::Ok
+               : SendResult::BackPressured;
+}
+
+void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition, const Key& key,
+                                std::span<const uint8_t> value) {
+    aeron::concurrent::BackoffIdleStrategy idle(
+        100, 10, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    const int64_t startNs    = clock_();
+    const int64_t livenessNs = cfg_.agentLivenessTimeoutMs * 1'000'000LL;
+    for (;;) {
+        switch (r) {
+        case SendResult::Ok:            return;
+        case SendResult::BackPressured: break;
+        case SendResult::ValueTooLarge:
+            throw std::length_error("Producer::send: value exceeds Producer::kMaxSendValueBytes");
+        case SendResult::InvalidTopic:
+            throw std::invalid_argument("Producer::send: invalid topic handle");
+        case SendResult::WrongThread:
+            throw std::logic_error("Producer::send: invoker-mode producer used off its owner thread");
+        case SendResult::WrongShard:
+            throw std::logic_error("Producer::send: partition owned by another shard");
+        case SendResult::Closed:
+            throw std::runtime_error("Producer::send: producer closed");
+        }
+        if (pumpFn_ != nullptr) {
+            // Invoker mode: the owner thread IS the ring's only consumer. Waiting
+            // on the ring's heartbeat here would wait on ourselves forever, so we
+            // drive the duty cycle ourselves instead of backing off. pumpFn_ runs
+            // the SAME gate as Client::submitRegistration_ (owner thread, not
+            // already inside a duty-cycle callback) and declines otherwise.
+            if (!pumpFn_(pumpCtx_)) {
+                throw std::runtime_error(
+                    "Producer::send: back-pressured (invoker mode: cannot pump the duty "
+                    "cycle from a callback or a non-owner thread) — use trySend here");
+            }
+        } else {
+            idle.idle(0);
+            const int64_t nowNs = clock_();
+            if (nowNs - std::max(ring_.consumerHeartbeatTime(), startNs) > livenessNs) {
+                throw std::runtime_error(
+                    "Producer::send: back-pressured and the runner stopped draining for "
+                    "> agentLivenessTimeoutMs (client closed?)");
+            }
+        }
+        r = trySubmit(topicId, partition, key, value, 0);
+    }
+}
+
 void ProducerImpl::submitFlush() noexcept {
     globalFlushPending_.store(true, std::memory_order_release);
     // Write a kMsgFlush with zero payload to wake the agent ring drain.
@@ -505,6 +567,7 @@ void ProducerImpl::growAckRing(PartitionState& ps) {
 
 int ProducerImpl::drainRing(int64_t nowNs) {
     using rune::client::detail::ControlledAction;
+    ring_.consumerHeartbeatTime(nowNs);
 
     // controlledRead with limit=1: drain ONE message per call so ProducerHub can
     // interleave flushBatches() between records (keeps every builder ≤ batchBytes).

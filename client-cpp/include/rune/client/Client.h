@@ -437,7 +437,16 @@ public:
     /// The producer uses the same underlying agent ring and session as the Client.
     /// May be called before or after connect(); registration is submitted through
     /// the agent command ring and is thread-safe.
+    ///
+    /// Invoker mode: wires the producer's pump hook (ProducerImpl::setPumpFn) to
+    /// this Client, so a back-pressured blocking send() drives the duty cycle
+    /// itself instead of waiting on a consumer that IS the calling (owner)
+    /// thread — see ProducerImpl::sendBlocking.
     Producer producer(ProducerConfig cfg = {});
+
+    /// Test hook: like producer(), but with an explicit ring capacity (small ring
+    /// to exercise back-pressure without filling the real default).
+    Producer testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap);
 
     // ---- TX-5: Transactional Producer API -----------------------------------
 
@@ -527,6 +536,16 @@ private:
     [[nodiscard]] int64_t now() const noexcept {
         return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : nowNs();
     }
+
+    /// Shared implementation of producer() / testProducerWithRingCap().
+    Producer producerWithRingCap_(ProducerConfig cfg, int32_t ringCap);
+
+    /// Invoker-mode pump hook bound to a ProducerImpl via setPumpFn(). Mirrors
+    /// submitRegistration_'s own gate exactly: pumping (running one duty cycle)
+    /// is safe only on the owner thread, outside a duty-cycle callback. Declines
+    /// (returns false) otherwise, so the blocking send() fails fast instead of
+    /// spinning or waiting on a consumer that is the calling thread itself.
+    static bool pumpTrampoline_(void* ctx) noexcept;
 
     /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
     /// between attempts — this thread IS the ring's consumer; thread mode parks

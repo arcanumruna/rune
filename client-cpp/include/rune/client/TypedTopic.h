@@ -19,7 +19,7 @@
 //     size_t encode(uint8_t*)  const noexcept
 //
 //   ProducerT contract (default = Producer):
-//     void send(TopicHandle, const Key&, std::span<const uint8_t>) noexcept
+//     void send(TopicHandle, const Key&, std::span<const uint8_t>)
 //
 //   The second template parameter exists as a test seam: production code uses
 //   TypedTopic<MyStruct> (ProducerT defaults to Producer); unit tests that must
@@ -100,7 +100,7 @@ public:
     /// void send (zero-alloc path).  The topicId is used to build a
     /// TopicHandle{topicId, 1} — partition routing on typed topics uses an
     /// empty key (partition 0).  T13 (e2e) will exercise the actual routing.
-    void send(const T& rec) noexcept {
+    void send(const T& rec) {
         const std::size_t needed = rec.encodedSize();
         // Grow buf_ if needed but never shrink (capacity persists — RULE #4).
         if (needed > buf_.size()) {

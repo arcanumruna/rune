@@ -1575,10 +1575,29 @@ TopicHandle Client::topic(const std::string& name) const noexcept {
 // ---------------------------------------------------------------------------
 
 Producer Client::producer(ProducerConfig cfg) {
+    return producerWithRingCap_(cfg, producer::kDefaultProducerRingCap);
+}
+
+Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
+    return producerWithRingCap_(cfg, ringCap);
+}
+
+Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     // ProducerImpl owns its own ring buffer; shares the correlationId counter.
     auto impl = std::make_shared<producer::ProducerImpl>(
         cfg,
-        nextCorrId_);
+        nextCorrId_,
+        ringCap);
+
+    // Invoker mode: a back-pressured blocking send() must not wait on a ring
+    // consumer that IS the calling (owner) thread. Wire the pump hook so
+    // ProducerImpl::sendBlocking runs one duty cycle itself instead — gated by
+    // pumpTrampoline_ exactly like submitRegistration_'s own safe path (owner
+    // thread, not already inside a duty-cycle callback). Plain function pointer
+    // + `this`: no std::function, no virtual call, no new atomic.
+    if (cfg_.runnerMode == RunnerMode::Invoker) {
+        impl->setPumpFn(&Client::pumpTrampoline_, this);
+    }
 
     // Shared-nothing registration: producer() may be called from any app thread,
     // including after start().  Rather than touch the runner-owned ProducerHub list
@@ -1596,6 +1615,21 @@ Producer Client::producer(ProducerConfig cfg) {
                         [&] { delete holder; });
 
     return Producer(std::move(impl));
+}
+
+bool Client::pumpTrampoline_(void* ctx) noexcept {
+    auto* self = static_cast<Client*>(ctx);
+    // Only ever wired in Invoker mode (see producerWithRingCap_), but checked
+    // again here defensively — this runs off a bare function pointer with no
+    // other type safety net.
+    if (self->cfg_.runnerMode != RunnerMode::Invoker) return false;
+    if (std::this_thread::get_id() != self->ownerThread_) return false;
+    // inDutyCycle_ is duty-cycle-thread-only state (no cross-thread read); safe
+    // here because in Invoker mode dutyThreadId_ == ownerThread_ always, and we
+    // just confirmed we ARE the owner thread.
+    if (self->inDutyCycle_) return false;
+    (void)self->dutyCycle(self->now());
+    return true;
 }
 
 // ---------------------------------------------------------------------------

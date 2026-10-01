@@ -1322,8 +1322,8 @@ TEST(Producer, MultiPartitionInterleave) {
 
 // ===========================================================================
 // FIX 5 — Test 19: OversizedValueRejected
-//   Value > kMaxSendValueBytes must NOT crash; the send is silently dropped
-//   (ring write returns false; void path ignores it).
+//   Value > kMaxSendValueBytes must NOT crash; the send is rejected with
+//   ValueTooLarge / std::length_error.
 //   A subsequent normal send must still succeed.
 // ===========================================================================
 TEST(Producer, OversizedValueRejected) {
@@ -1346,9 +1346,10 @@ TEST(Producer, OversizedValueRejected) {
     p.send(topic, key, std::span<const uint8_t>(maxVal));
     p.flush();
 
-    // Value one byte over — must be silently dropped.
+    // Value one byte over — reported to the caller, never silently dropped.
     const std::vector<uint8_t> overVal(rc::Producer::kMaxSendValueBytes + 1, 0xBB);
-    p.send(topic, key, std::span<const uint8_t>(overVal)); // must not crash
+    EXPECT_EQ(p.trySend(topic, key, std::span<const uint8_t>(overVal)), rc::SendResult::ValueTooLarge);
+    EXPECT_THROW(p.send(topic, key, std::span<const uint8_t>(overVal)), std::length_error);
     p.flush();
 
     // Only the max-size send should produce a batch (the oversized one was dropped).
