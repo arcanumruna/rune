@@ -811,8 +811,9 @@ TEST(TransactionalProducerTest, PoisonedCommitNeverCommitsOrphanedDataRegression
 
 // Fix round 1 (I-1): begin is refused while a commit is pending (pipelined
 // token ops: begin, send, commit, begin, send, commit): the second begin and
-// its send are refused (never produced), the second commit completes
-// BrokerError(19) at once, and the first commits only its own record.
+// its send are refused (never produced), and the first commits only its own
+// record.  Fix round 3 (m13, Kafka): the second commit JOINS the pending one
+// (one EndTxn, the same result for both tokens) instead of failing 19.
 TEST(TransactionalProducerTest, BeginWhileCommittingIsRefusedRegression) {
     TxnRig r;
     r.acquire();
@@ -824,9 +825,7 @@ TEST(TransactionalProducerTest, BeginWhileCommittingIsRefusedRegression) {
     auto commit2 = r.commit();
     EXPECT_EQ(r.impl->testRefusedBegins(), 1u);
     EXPECT_EQ(r.impl->testRefusedSends(), 1u);
-    ASSERT_TRUE(commit2.ready());
-    EXPECT_EQ(commit2.status(), OpStatus::BrokerError);
-    EXPECT_EQ(commit2.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::InvalidTxnState));
+    EXPECT_FALSE(commit2.ready()) << "m13: joined the pending commit";
     r.doWork();
     r.addPartitionsOk();
     r.doWork();
@@ -839,6 +838,9 @@ TEST(TransactionalProducerTest, BeginWhileCommittingIsRefusedRegression) {
     r.impl->onEndTxnResponse(ok.data(), ok.size());
     ASSERT_TRUE(commit1.ready());
     EXPECT_EQ(commit1.status(), OpStatus::Ok);
+    ASSERT_TRUE(commit2.ready());
+    EXPECT_EQ(commit2.status(), OpStatus::Ok);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1) << "one EndTxn for both";
     EXPECT_EQ(r.cycles(8, rpc::TemplateId::Produce), 0) << "the refused send was produced later";
 }
 
@@ -1700,3 +1702,151 @@ TEST(TransactionalProducerTest, InFlightRequestIsResentOnANewSessionRegression) 
     EXPECT_EQ(op.status(), OpStatus::Ok);
 }
 
+// ===========================================================================
+// Fix round 3
+// ===========================================================================
+
+// B-4: abort Ok -> the KIP-360 bump in flight -> the op's deadline -> the app
+// retries abort: ONLY the bump (InitProducerId) is re-sent — never EndTxn
+// under the stale epoch (which the coordinator, already at epoch+1 if the
+// first bump landed, would answer InvalidProducerEpoch -> fatal) — and the
+// producer reaches Ready under the bumped epoch.
+TEST(TransactionalProducerTest, InDoubtBumpRetryResendsOnlyTheBumpRegression) {
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;
+    TxnRig r("b4-txn-id", cfg);
+    r.acquire(42, 0);
+    r.startTxn(kTopic);
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.now += 40'000'000;
+    r.doWork();  // the batch is lost: a sequence gap
+    ASSERT_EQ(r.tp.state(), TxnState::AbortableError);
+    auto abort = r.abort();
+    r.doWork();
+    auto okAbort = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)), 0);
+    r.impl->onEndTxnResponse(okAbort.data(), okAbort.size());
+    r.doWork();
+    const auto firstBump = r.sink.last(rpc::TemplateId::InitProducerId);
+    ASSERT_FALSE(firstBump.empty());
+    // The bump lands on the broker but its answer is lost: the op expires.
+    r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
+    r.doWork();
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Timeout);
+    EXPECT_EQ(r.tp.state(), TxnState::AbortingTransaction) << "in doubt";
+    r.sink.clear();
+    auto retry = r.abort();
+    ASSERT_EQ(retry.r, OpResult::Accepted);
+    for (int i = 0; i < 4; ++i) r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "EndTxn re-sent under the stale epoch";
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::InitProducerId), 1) << "the bump was not re-sent";
+    // A late answer to the FIRST bump is ignored (its request is gone).
+    auto lateFirst = makeInitProducerIdResponse(corrIdOf(firstBump), 42, 1);
+    r.impl->onInitProducerIdResponse(lateFirst.data(), lateFirst.size());
+    EXPECT_FALSE(retry.ready());
+    r.bumpOk(42, 2);  // the coordinator bumped again
+    ASSERT_TRUE(retry.ready());
+    EXPECT_EQ(retry.status(), OpStatus::Ok);
+    EXPECT_EQ(r.tp.state(), TxnState::Ready) << "never Fatal";
+    EXPECT_EQ(r.tp.producerEpoch(), 2);
+}
+
+// m15: an AddPartitions SENT but unanswered past its deadline may have opened
+// the transaction on the coordinator.  The abort then SENDS EndTxn(abort):
+// (a) the broker had it open -> 0 -> aborted, Ready;
+// (b) the broker had nothing -> 19 -> in this ambiguous case only, the abort
+//     completes Ok (not fatal), Ready.
+TEST(TransactionalProducerTest, TimedOutAddPartitionsAbortsPossiblyStartedTxnRegression) {
+    for (const int16_t answer : {int16_t{0}, ecOf(rpc::ErrorCode::InvalidTxnState)}) {
+        SCOPED_TRACE(answer);
+        TxnRig r;
+        r.acquire();
+        r.tp.beginTransaction();
+        r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+        r.doWork();  // AddPartitions sent, never answered
+        ASSERT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 1);
+        r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
+        r.doWork();
+        ASSERT_EQ(r.tp.state(), TxnState::AbortableError);
+        r.sink.clear();
+        auto abort = r.abort();
+        r.doWork();
+        const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+        ASSERT_FALSE(et.empty()) << "a possibly-started transaction must be aborted on the broker";
+        EXPECT_EQ(rpc::EndTxn::decode(et.data(), et.size())->commit, uint8_t{0});
+        auto resp = makeEndTxnResponse(corrIdOf(et), answer);
+        r.impl->onEndTxnResponse(resp.data(), resp.size());
+        ASSERT_TRUE(abort.ready());
+        EXPECT_EQ(abort.status(), OpStatus::Ok);
+        EXPECT_EQ(r.tp.state(), TxnState::Ready) << "19 here means nothing was open: not fatal";
+    }
+    // Outside the ambiguous case 19 on EndTxn stays fatal.
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    auto abort = r.abort();
+    r.doWork();
+    auto bad = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)),
+                                  ecOf(rpc::ErrorCode::InvalidTxnState));
+    r.impl->onEndTxnResponse(bad.data(), bad.size());
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::BrokerError);
+    EXPECT_EQ(r.tp.state(), TxnState::FatalError);
+}
+
+// m15 (AddOffsets): a sendOffsets whose AddOffsetsToTxn was sent but timed
+// out makes the transaction possibly started: the abort sends EndTxn(abort).
+TEST(TransactionalProducerTest, TimedOutAddOffsetsAbortsPossiblyStartedTxnRegression) {
+    TxnRig r;
+    r.acquire();
+    r.tp.beginTransaction();
+    auto offs = r.sendOffsets({{{42, 0}, 1}}, "g");
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::AddOffsetsToTxn), 1);  // never answered
+    r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
+    r.doWork();
+    ASSERT_TRUE(offs.ready());
+    EXPECT_EQ(offs.status(), OpStatus::Timeout);
+    r.sink.clear();
+    auto abort = r.abort();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty());
+    auto none = makeEndTxnResponse(corrIdOf(et), ecOf(rpc::ErrorCode::InvalidTxnState));
+    r.impl->onEndTxnResponse(none.data(), none.size());
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    EXPECT_EQ(r.tp.state(), TxnState::Ready);
+}
+
+// m12: the ORIGINAL in-doubt EndTxn's late answer, arriving after the app
+// retried, completes nothing (its request is gone): only the retry's answer
+// completes, and exactly one Ok is delivered.
+TEST(TransactionalProducerTest, LateOriginalEndTxnAnswerAfterRetryIsIgnoredRegression) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    auto first = r.commit();
+    r.doWork();
+    const int64_t original = corrIdOf(r.sink.last(rpc::TemplateId::EndTxn));
+    r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
+    r.doWork();
+    ASSERT_TRUE(first.ready());
+    EXPECT_EQ(first.status(), OpStatus::Timeout);
+    auto retry = r.commit();
+    r.doWork();
+    const int64_t again = corrIdOf(r.sink.last(rpc::TemplateId::EndTxn));
+    ASSERT_NE(again, original);
+    auto late = makeEndTxnResponse(original, 0);
+    r.impl->onEndTxnResponse(late.data(), late.size());
+    EXPECT_FALSE(retry.ready()) << "completed by the stale answer";
+    auto ok = makeEndTxnResponse(again, 0);
+    r.impl->onEndTxnResponse(ok.data(), ok.size());
+    r.impl->onEndTxnResponse(late.data(), late.size());
+    ASSERT_TRUE(retry.ready());
+    EXPECT_EQ(retry.status(), OpStatus::Ok);
+    EXPECT_EQ(retry.times(), 1);
+    EXPECT_EQ(first.times(), 1);
+    EXPECT_EQ(r.tp.state(), TxnState::Ready);
+}

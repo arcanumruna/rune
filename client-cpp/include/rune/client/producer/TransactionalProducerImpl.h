@@ -233,6 +233,7 @@ private:
         int64_t              corrId = 0;
         std::vector<uint8_t> frame;    // encoded; sessionId re-stamped at each (re)send
         uint32_t             attempt = 0;
+        bool                 sent = false;  // offered at least once (m15: a timeout may have landed)
         uint64_t             opId = 0;  // the user op it serves (0: AddPartitions)
         rune::client::TopicPartitionKey tp{};  // AddPartitions
         int64_t              deadlineNs = 0;   // AddPartitions (ops carry their own)
@@ -288,14 +289,33 @@ private:
     // the same direction.  `endSent`: EndTxn went out (the data settled).
     // `bumpEpoch` (B-3, KIP-360): a sequence gap (lost batch / OOS) — after
     // EndTxn(abort), InitProducerId bumps the epoch and sequences restart.
-    struct SInTransaction { bool started = false; };
-    struct SCommitting { uint64_t opId = 0; bool started = false; bool endSent = false; };
-    struct SAborting { uint64_t opId = 0; bool started = false; bool endSent = false; bool bumpEpoch = false; };
+    // `maybeStarted` (fix round 3, m15): an AddPartitions / AddOffsets was
+    // SENT but timed out unanswered — the coordinator may hold an Ongoing
+    // transaction: abort sends EndTxn(abort), and only then a 19 (nothing open)
+    // completes it Ok.  `ended` (B-4): EndTxn(abort) was answered Ok and the
+    // KIP-360 bump is pending — a retried abort re-sends ONLY the bump
+    // (never EndTxn under the stale epoch).
+    struct SInTransaction { bool started = false; bool maybeStarted = false; };
+    struct SCommitting {
+        uint64_t opId = 0;
+        bool     started = false;
+        bool     endSent = false;
+        bool     maybeStarted = false;
+    };
+    struct SAborting {
+        uint64_t opId = 0;
+        bool     started = false;
+        bool     endSent = false;
+        bool     bumpEpoch = false;
+        bool     maybeStarted = false;
+        bool     ended = false;
+    };
     struct SAbortableError {
         OpStatus status = OpStatus::BrokerError;
         uint16_t errorCode = 0;
         bool     started = false;
         bool     bumpEpoch = false;
+        bool     maybeStarted = false;
     };
     struct SFatalError { uint16_t errorCode = 0; };
     using TxnSm = std::variant<SUninitialized, SInitializing, SReady, SInTransaction, SCommitting,
@@ -316,6 +336,7 @@ private:
     void poison_(OpStatus st, uint16_t errorCode, bool bumpEpoch = false);
     void finishTxn_();
     void markStarted_() noexcept;
+    void markMaybeStarted_() noexcept;
     /// The end op `opId` is done on the broker (EndTxn Ok, or a txn that never
     /// started): bump the epoch first when required (abort), else Ready + Ok.
     void endDone_(uint64_t opId, int64_t nowNs);
