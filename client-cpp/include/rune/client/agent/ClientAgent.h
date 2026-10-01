@@ -332,6 +332,26 @@ public:
         std::vector<uint8_t> scratch(payloadLen, 0);
         return writeCommand(kMsgTestNoop, scratch.data(), payloadLen);
     }
+    /// fix3 I1: claim ring space for a no-op WITHOUT committing — the record's
+    /// length stays negative (claimed, not yet readable) until
+    /// testCommitClaim() is called with the returned index. For regression
+    /// tests of drainRegistrationsForClose()'s wait-past-an-uncommitted-claim
+    /// behavior only. Returns a negative value on failure to claim (see
+    /// M2ORingBuffer::tryClaim()).
+    aeron::util::index_t testClaimNoopWithoutCommitting(std::size_t payloadLen) {
+        return ring_.tryClaim(kMsgTestNoop, payloadLen);
+    }
+    /// fix3 I1: commit a claim previously returned by
+    /// testClaimNoopWithoutCommitting().
+    void testCommitClaim(aeron::util::index_t claimIndex) { ring_.commit(claimIndex); }
+    /// fix3 I1: called (if set) every time drainRegistrationsForClose() yields
+    /// waiting on an uncommitted claim — lets a test commit the claim
+    /// deterministically, from inside the wait loop, on the SAME thread,
+    /// instead of needing a second thread and a real-time wait. Empty by
+    /// default (zero cost in production).
+    void testSetCloseDrainYieldHook(std::function<void()> fn) noexcept {
+        testCloseDrainYieldHook_ = std::move(fn);
+    }
 
     /// Task 1.4 (redirect convergence): route ONE pre-encoded produce frame to its
     /// partition leader session — the SAME routing the produce drain path uses
@@ -618,6 +638,10 @@ private:
     ProduceResendFn    produceResendFn_;    // Task 1.4: fired on session-connect (multi-node)
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
     ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
+
+    // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
+    // wait loop (see testSetCloseDrainYieldHook()). Empty by default.
+    std::function<void()> testCloseDrainYieldHook_;
 
     // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
     MetadataResponseFn metadataResponseFn_;

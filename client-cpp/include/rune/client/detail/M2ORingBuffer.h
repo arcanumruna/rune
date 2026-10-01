@@ -69,6 +69,20 @@ public:
     [[nodiscard]] aeron::util::index_t capacity()     const { return m_capacity; }
     [[nodiscard]] aeron::util::index_t maxMsgLength() const { return m_maxMsgLength; }
 
+    /// fix3 I1: read-only views of the ring's own head/tail position counters
+    /// (acquire) — ring-protocol words that already exist for tryClaim()/
+    /// read()'s own bookkeeping, exposed so a close-time drain can tell "ring
+    /// truly empty" (head caught up to a snapshotted tail) apart from "stuck
+    /// behind a claimed-but-not-yet-committed record" (head has not caught up,
+    /// even though read() currently has nothing it can consume). No new shared
+    /// state is introduced — shared-nothing is preserved.
+    [[nodiscard]] std::int64_t headPosition() const noexcept {
+        return loadAcquire64_(m_headPositionIndex);
+    }
+    [[nodiscard]] std::int64_t tailPosition() const noexcept {
+        return loadAcquire64_(m_tailPositionIndex);
+    }
+
     /// Raw writable base pointer — combined with a tryClaim() offset for a
     /// zero-copy in-place write (producer writes the message directly into the
     /// claimed ring slot, then commit()s).  Advanced use; single producer per claim.

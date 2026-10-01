@@ -614,6 +614,18 @@ TEST(InvokerClient, ProducerOutlivesClientNoUseAfterFreeRegression) {
 // steady_clock on either side) would misbehave immediately and obviously.
 // ---------------------------------------------------------------------------
 
+// fix3 I2: this test must actually be ABLE to detect the wiring regression.
+// The previous version drained the (tiny) ring on the very first doWork()
+// call, so the blocking send succeeded in well under a millisecond of REAL
+// time regardless of which clock sendBlocking's reader used — it passed even
+// with setClockForTesting's wiring removed (confirmed: see the fix3 report).
+// Fixed by deliberately holding off ANY doWork() call — nothing drains this
+// ring and the injected heartbeat is never republished — for LONGER than
+// agentLivenessTimeoutMs in REAL wall-clock time. A correctly-wired reader
+// uses the SAME injected (frozen) clock for "now", so its gap against the
+// heartbeat cannot grow no matter how much real time passes. A reader that
+// fell back to real steady_clock reads real elapsed time directly and WOULD
+// throw well within that real hold.
 TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingRegression) {
     rc::ClientConfig c = invokerCfg(3790, 3791);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
@@ -623,7 +635,7 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
     rc::ProducerConfig pcfg;
     pcfg.acks                   = rc::Acks::None;
     pcfg.lingerUs               = 0;
-    pcfg.agentLivenessTimeoutMs = 50; // tight: a clock mismatch would fire almost instantly
+    pcfg.agentLivenessTimeoutMs = 50; // the real-time hold below deliberately exceeds this
     auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
     auto topic = r.client.topic("t");
     uint64_t ok = 0;
@@ -643,10 +655,15 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
         }
     });
 
-    // The owner thread plays "the runner": advance the SAME injected clock by
-    // small steps and pump doWork(), draining the ring and refreshing the
-    // heartbeat every cycle. appThread's blocking send must succeed — never
-    // spuriously time out — despite the clock being nowhere near real time.
+    // Deliberate REAL sleep (this specific test is exactly about real-elapsed-
+    // time independence — it cannot be simulated via the injected clock,
+    // since the bug it catches IS a fallback to real-time reads).
+    std::this_thread::sleep_for(150ms);
+    EXPECT_FALSE(threw.load(std::memory_order_acquire))
+        << "spurious timeout: the heartbeat reader is not using the injected clock "
+           "(fell back to real steady_clock)";
+
+    // Now let it actually succeed (no further real-time dependency).
     for (int i = 0; i < 1000 &&
                     !succeeded.load(std::memory_order_acquire) &&
                     !threw.load(std::memory_order_acquire);
@@ -661,6 +678,18 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
     EXPECT_FALSE(threw.load()) << "spurious timeout: the heartbeat writer/reader clocks disagreed";
 }
 
+// fix3 I2: previously used agentLivenessTimeoutMs=5 (ms) and an unbounded
+// appThread.join() — both too weak/dangerous to actually detect the wiring
+// regression: a 5 ms liveness window is trivially crossed by EITHER the
+// injected clock OR a wrongly-defaulted real steady_clock within
+// milliseconds, so this passed either way (confirmed: see the fix3 report);
+// and an unbounded join would have HUNG the suite had the wiring genuinely
+// been broken in a way that never progresses. Fixed: a deliberately large
+// (60 s) liveness window that the injected clock crosses in a fraction of a
+// real second (pure atomic increments, no sleep) but a real steady_clock
+// fallback could only cross by actually waiting 60 REAL seconds — and the
+// join is bounded via a future with wait_for(), so a wiring regression FAILS
+// this test instead of hanging the suite.
 TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegression) {
     rc::ClientConfig c = invokerCfg(3792, 3793);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
@@ -670,7 +699,7 @@ TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegr
     rc::ProducerConfig pcfg;
     pcfg.acks                   = rc::Acks::None;
     pcfg.lingerUs               = 0;
-    pcfg.agentLivenessTimeoutMs = 5;
+    pcfg.agentLivenessTimeoutMs = 60'000; // only the injected clock can cross this quickly
     auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
     auto topic = r.client.topic("t");
     uint64_t ok = 0;
@@ -679,24 +708,39 @@ TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegr
     }
     ASSERT_GT(ok, 0u);
 
-    std::atomic<bool> threw{false};
+    std::promise<bool> threwPromise; // true = threw std::runtime_error, as expected
+    std::future<bool>  threwFuture = threwPromise.get_future();
     std::thread appThread([&] {
+        bool threw = false;
         try {
             p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
         } catch (const std::runtime_error&) {
-            threw.store(true, std::memory_order_release);
+            threw = true;
         }
+        threwPromise.set_value(threw);
     });
 
     // The runner NEVER runs here (no doWork() calls — simulating "wedged"):
-    // just advance the SAME injected clock past the liveness window.
-    // appThread's own reads of that same clock must see this and throw.
-    for (int i = 0; i < 1000 && !threw.load(std::memory_order_acquire); ++i) {
+    // just advance the SAME injected clock past the (huge) liveness window,
+    // as fast as the atomic increments themselves run (no real sleep).
+    while (threwFuture.wait_for(0ms) != std::future_status::ready) {
         g_fakeNowMt.fetch_add(1'000'000, std::memory_order_relaxed); // +1ms injected
-        std::this_thread::yield();
+        if (g_fakeNowMt.load(std::memory_order_relaxed) > 120'000'000'000LL) break; // 120s injected: safety stop
+    }
+
+    // Bounded: FAILS (does not hang the suite) if a wiring regression left the
+    // reader on real steady_clock, which would need 60 REAL seconds. (If this
+    // ever genuinely fails, appThread is still running and the join below can
+    // take up to that long — acceptable for a one-off RED/regression check,
+    // never expected in normal CI runs against the fixed code.)
+    const bool ready = threwFuture.wait_for(5s) == std::future_status::ready;
+    EXPECT_TRUE(ready)
+        << "appThread did not finish within 5 real seconds — the injected clock is likely "
+           "not being used by sendBlocking's reader (a steady_clock fallback needs 60 REAL "
+           "seconds to cross this test's liveness window)";
+    if (ready) {
+        EXPECT_TRUE(threwFuture.get())
+            << "must time out once the injected clock exceeds agentLivenessTimeoutMs";
     }
     appThread.join();
-
-    EXPECT_TRUE(threw.load()) << "must time out once the SAME injected clock exceeds "
-                                 "agentLivenessTimeoutMs with nothing draining";
 }

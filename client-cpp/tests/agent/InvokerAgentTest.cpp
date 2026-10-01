@@ -172,3 +172,62 @@ TEST(InvokerAgent, CloseAdoptsRegistrationPastRingWrapRegression) {
     EXPECT_EQ(registerCalls, 1);
     EXPECT_EQ(registeredHandle, fakeHandle);
 }
+
+// ---------------------------------------------------------------------------
+// fix3 I1: drainRegistrationsForClose() must wait past a record that is
+// CLAIMED but not yet COMMITTED, instead of treating "nothing currently
+// readable" the same as "ring empty" and missing a fully committed
+// registration sitting right behind it.
+// ---------------------------------------------------------------------------
+TEST(InvokerAgent, CloseDrainWaitsPastUncommittedClaimRegression) {
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = 3602;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = 3603;
+    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+                            std::to_string(g_ctr.fetch_add(1));
+    cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
+    cfg.session.egressChannel  = "aeron:ipc";
+    cfg.session.egressStreamId = 3603;
+    cfg.ringCapacity = 512;
+    rca::ClientAgent agent(cfg);
+    agent.start();
+
+    int   registerCalls = 0;
+    void* registeredHandle = nullptr;
+    agent.setProducerRegisterFn([&](void* h) {
+        ++registerCalls;
+        registeredHandle = h;
+    });
+
+    // Claim space WITHOUT committing: any read() stops dead at this record
+    // (its length word stays negative) regardless of what comes after it.
+    const auto claimIdx = agent.testClaimNoopWithoutCommitting(8);
+    ASSERT_GE(claimIdx, 0);
+
+    // A real registration, committed immediately, lands right behind the
+    // still-uncommitted claim above (the ring's tail already reflects both).
+    void* const fakeHandle = reinterpret_cast<void*>(0x5678);
+    ASSERT_TRUE(agent.submitRegisterProducer(fakeHandle));
+
+    // Deterministic, single-threaded: the yield hook commits the stuck claim
+    // from INSIDE drainRegistrationsForClose()'s own wait loop, on the same
+    // thread — no second thread, no real-time wait needed. Pre-fix, the old
+    // `if (n == 0) break;` would never reach a yield at all (it would return 0
+    // and stop on the very first call), so this hook firing at least once,
+    // AND the registration being adopted, both prove the fix.
+    int yieldCalls = 0;
+    agent.testSetCloseDrainYieldHook([&] {
+        ++yieldCalls;
+        if (yieldCalls == 1) agent.testCommitClaim(claimIdx);
+    });
+
+    const int total = agent.drainRegistrationsForClose();
+
+    EXPECT_GE(yieldCalls, 1) << "drainRegistrationsForClose() must wait (yield) past the "
+                                "uncommitted claim instead of stopping immediately";
+    EXPECT_EQ(total, 2) << "the committed noop + the registration behind it";
+    EXPECT_EQ(registerCalls, 1);
+    EXPECT_EQ(registeredHandle, fakeHandle);
+}

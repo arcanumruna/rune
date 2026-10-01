@@ -1667,20 +1667,48 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     submitRegistration_([&] { return agent_.submitRegisterProducer(holder); },
                         [&] { delete holder; });
 
-    // fix2 Important-3 (Dekker reasoning — see closeImpl_'s seq_cst exchange
-    // for the full argument): submitRegistration_'s initial stopped_ check
-    // above can read false and then succeed in submitting the registration
-    // into the agent ring CONCURRENTLY with a close() on another thread whose
-    // own drainRegistrationsForClose() already ran and so never adopts (or
-    // closes) this producer. Re-checking stopped_ here, seq_cst, after the
-    // submit has landed, closes that window: either the close-side drain
-    // already adopted this registration (closeAllRings() already marked this
-    // producer's ring closed — markRingClosed() below is then a harmless
-    // idempotent no-op), or it ran first and this check is guaranteed to
-    // observe stopped_==true, in which case THIS thread closes the ring itself
-    // so the Producer returned below reports Closed instead of silently
-    // accepting sends into a ring nobody will ever drain or mark closed.
-    if (stopped_.load(std::memory_order_seq_cst)) {
+    // fix3 C1 (Dekker correctness, corrected): submitRegistration_'s initial
+    // stopped_ check above can read false and then succeed in submitting the
+    // registration into the agent ring CONCURRENTLY with a close() on another
+    // thread whose own drainRegistrationsForClose() already ran and so never
+    // adopts (or closes) this producer.
+    //
+    // A plain `stopped_.load(seq_cst)` here is NOT sufficient to close that
+    // window. The registration's ring commit (inside submitRegistration_,
+    // above) is a RELEASE store, not seq_cst — a plain load, even a seq_cst
+    // one, does not by itself create a happens-before edge with that commit:
+    // on x86, a store can still sit in this core's store buffer when a
+    // *later, unrelated* load executes (the classic "store buffering"
+    // reordering), so there is no guarantee the commit is globally visible to
+    // another thread's drain by the time a plain load here would read
+    // stopped_==false.
+    //
+    // Fix: use a read-modify-write (compare_exchange) instead of a load. An
+    // RMW on a seq_cst atomic is required to read the immediately-preceding
+    // write in that atomic's modification order, and — unlike a plain load —
+    // is implemented as a LOCKed instruction, which acts as a full fence and
+    // cannot be reordered ahead of this thread's own preceding ring commit.
+    // So: if the CAS below reads false (succeeds), it does so having
+    // synchronized with closeImpl_'s stopped_.exchange(true, seq_cst) in the
+    // SAME modification-order chain — meaning that exchange has not
+    // completed yet, so closeImpl_'s drainRegistrationsForClose() (which
+    // strictly follows the exchange in program order) cannot have run yet
+    // either, and is still to come (it will adopt this registration). If the
+    // CAS instead reads true (fails), the exchange — and therefore, possibly,
+    // the drain — already happened; this thread closes the ring itself so the
+    // Producer returned below reports Closed instead of silently accepting
+    // sends into a ring nobody will ever drain or mark closed.
+    bool expectedNotStopped = false;
+    if (!stopped_.compare_exchange_strong(expectedNotStopped, false, std::memory_order_seq_cst)) {
+        // fix3 M1: intentional leak, not a bug. We cannot tell from here
+        // whether drainRegistrationsForClose() already adopted (and freed)
+        // `holder` before this registration's commit became visible to it, or
+        // whether it ran too early and `holder` is still sitting unread in the
+        // ring forever. Freeing `holder` ourselves would double-free in the
+        // first case; not freeing it leaks one small heap object in the
+        // second. A leak at shutdown, racing close(), is the safe choice —
+        // UAF/double-free is not. `impl` itself is NOT leaked (the local
+        // variable is still alive and is returned below via Producer).
         impl->markRingClosed();
     }
 
@@ -1710,7 +1738,10 @@ producer::PumpResult Client::pumpTrampoline_(void* ctx) noexcept {
     // Thread mode's runner thread calling from outside dutyCycle() should not
     // happen in practice (the runner's entire body IS the cycle loop) — never
     // pump proactively in Thread mode from here regardless; decline rather
-    // than assume it is safe.
+    // than assume it is safe. fix3 M2: sendBlocking's thrown message for
+    // DeclinedInCycle is phrased to cover this case too (it does not claim
+    // "inside a callback" specifically), since this branch reuses the same
+    // result for a technically distinct (if unreachable) condition.
     return producer::PumpResult::DeclinedInCycle;
 }
 

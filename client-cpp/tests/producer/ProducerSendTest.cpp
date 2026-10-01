@@ -424,3 +424,57 @@ TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
         << "sendBlocking waited instead of being decided promptly by the in-loop closed "
            "check (agentLivenessTimeoutMs=60s would otherwise make this take a minute)";
 }
+
+// ---------------------------------------------------------------------------
+// fix3 I3: failUnsubmitted() runs on the APP thread (Producer::send's
+// callback/future overloads, BatchBuilder::send()) and must never write the
+// duty-thread-only callbackExceptions_ counter — this producer's ring is
+// MPSC, so even multiple app threads could race each other on it, not just
+// the duty thread. Exercises both paths concurrently, each with a throwing
+// callback, under TSan.
+// ---------------------------------------------------------------------------
+TEST(ProducerSend, AppThreadFailUnsubmittedNeverRacesDutyThreadCounterRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    Producer p(impl);
+    impl->onBatchAck([](const rune::client::BatchAck&) {
+        throw std::runtime_error("duty-side throw");
+    });
+
+    std::atomic<bool> stop{false};
+    std::atomic<int>  appThrows{0};
+
+    // Plays "the duty thread": the one legitimate writer of
+    // callbackExceptions_. Repeatedly drains whatever the app thread below
+    // submitted (completing those acks via the COUNTED path) and fails
+    // anything else pending.
+    std::thread duty([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            impl->failAllPending("races with app-thread failUnsubmitted");
+        }
+    });
+
+    // Plays "the app thread": keeps submitting callback-sends. Depending on
+    // timing, trySubmit either succeeds (the record is later drained and
+    // failed by the "duty" thread above — the COUNTED path) or back-pressures
+    // (failed right here, via failUnsubmitted — the UNCOUNTED app-thread
+    // path). Both callbacks throw.
+    std::thread app([&] {
+        for (int i = 0; i < 1'000; ++i) {
+            p.send(kTopic, Key(static_cast<uint64_t>(i)), kVal, [&](int64_t) {
+                ++appThrows;
+                throw std::runtime_error("app-side throw");
+            });
+        }
+    });
+
+    app.join();
+    stop.store(true, std::memory_order_release);
+    duty.join();
+
+    EXPECT_GT(appThrows.load(), 0);
+    // Reading testCallbackExceptionCount() here (main thread) is safe: both
+    // writer threads above have been joined. Its exact value is a
+    // timing-dependent mix of drained-vs-dropped and is not the point — the
+    // point is that running the two paths concurrently is TSan-clean.
+}

@@ -221,11 +221,14 @@ public:
     ///                          Producer outlived it, or send() raced a
     ///                          concurrent close()) — consistent with
     ///                          Client::producer() after close().
-    ///   std::runtime_error    — EITHER back-pressured inside a duty-cycle
-    ///                          callback (cannot pump; use trySend there), OR
-    ///                          back-pressured and the runner stopped draining
-    ///                          for longer than agentLivenessTimeoutMs (a
-    ///                          wedged runner, NOT a closed Client).
+    ///   std::runtime_error    — EITHER back-pressured with pumping unsafe
+    ///                          right now (already inside a duty-cycle
+    ///                          callback — the common case — or, in Thread
+    ///                          mode, the runner thread itself outside its own
+    ///                          cycle; use trySend there), OR back-pressured
+    ///                          and the runner stopped draining for longer
+    ///                          than agentLivenessTimeoutMs (a wedged runner,
+    ///                          NOT a closed Client).
     /// Zero allocation when accepted.
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 

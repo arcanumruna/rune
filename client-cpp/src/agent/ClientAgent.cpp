@@ -22,6 +22,7 @@
 #include <cstdio>     // MNDBG instrumentation
 #include <cstring>    // memcpy
 #include <stdexcept>
+#include <thread>     // fix3 I1: std::this_thread::yield() in drainRegistrationsForClose
 
 namespace rune::client::agent {
 
@@ -329,6 +330,25 @@ bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
 }
 
 int ClientAgent::drainRegistrationsForClose() noexcept {
+    // fix3 I1: ring_.read() stops dead at a record that is CLAIMED but not yet
+    // COMMITTED (its length word is still negative) — it has no way to tell
+    // "nothing more was ever written" apart from "another app thread is
+    // mid-write, right now, on a producer()/transactionalProducer() call that
+    // raced this close()". The old `if (n == 0) break;` treated both the same
+    // and could leave a fully-committed registration sitting UNREAD behind
+    // that in-flight claim (leaked holder; its ring never marked closed).
+    //
+    // Fix: snapshot the ring's tail ONCE (acquire) as the drain target before
+    // looping. `n == 0` now only means "stop" once head has caught up to that
+    // snapshot — otherwise there is a committed-or-committing record still
+    // ahead of head, and we yield + retry. This is bounded and safe to spin
+    // on: writeCommand() (the only path that claims on this ring) is a plain
+    // claim+memcpy+commit with no syscalls and is noexcept, so the window
+    // between claim and commit is a handful of instructions; this function
+    // itself only ever runs once, at close(). No new shared state — head and
+    // tail are the ring's own existing protocol words (shared-nothing
+    // preserved).
+    const std::int64_t targetTail = ring_.tailPosition();
     int total = 0;
     for (;;) {
         const int n = ring_.read(
@@ -344,8 +364,15 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
                 if (msg) (*fn)(reinterpret_cast<void*>(msg->handle));
             },
             cfg_.ringDrainLimit);
-        if (n == 0) break;
         total += n;
+        if (ring_.headPosition() >= targetTail) break; // caught up to the snapshot: done
+        if (n == 0) {
+            // Nothing currently readable, but the snapshot says more exists:
+            // it must be an in-flight claim. Test-only observability hook
+            // (fix3 I1 regression), then yield and retry.
+            if (testCloseDrainYieldHook_) testCloseDrainYieldHook_();
+            std::this_thread::yield();
+        }
     }
     return total;
 }

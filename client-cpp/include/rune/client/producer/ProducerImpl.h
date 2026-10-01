@@ -370,6 +370,10 @@ public:
     std::pair<int64_t, std::future<int64_t>> registerFuture();
 
     /// App thread: fail an ack handle that never reached the ring (ring full).
+    /// fix3 I3: a throwing callback/promise is logged but NOT counted into
+    /// testCallbackExceptionCount() — this can run on any (possibly
+    /// concurrent, multiple) app thread, so it cannot safely share the
+    /// duty-thread-only plain counter.
     void failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept;
 
     /// Per-batch acknowledgements (setup-phase; see Producer::onBatchAck).
@@ -388,11 +392,20 @@ public:
         return n;
     }
 
-    /// fix2 minor: user-callback exceptions caught at the PendingAck::complete
-    /// and onBatchAck call sites (never let a throwing ack callback escape and
-    /// terminate the duty-cycle thread). PLAIN counter (shared-nothing rule —
-    /// no atomic): written only on the duty thread; read-safe under the same
-    /// contract as Client::testCallbackExceptionCount().
+    /// fix2 minor / fix3 I3: user-callback exceptions caught at the
+    /// duty-thread PendingAck::complete call sites and onBatchAck (never let a
+    /// throwing ack callback escape and terminate the duty-cycle thread).
+    /// PLAIN counter (shared-nothing rule — no atomic): written ONLY on the
+    /// duty thread; read-safe under the same contract as
+    /// Client::testCallbackExceptionCount() (owner thread in Invoker mode;
+    /// after close() in Thread mode).
+    ///
+    /// Does NOT include failUnsubmitted()'s app-thread path (Producer::send's
+    /// callback/future overloads, BatchBuilder::send()): that runs on
+    /// whichever (possibly multiple, concurrent — this producer's ring is
+    /// MPSC) app thread calls it, so it cannot share this duty-thread-only
+    /// counter without racing both the duty thread and other app threads.
+    /// failUnsubmitted() logs a throwing callback but does not count it.
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept { return callbackExceptions_; }
 
     // ---- Agent-thread API (single-writer) ------------------------------------

@@ -426,9 +426,19 @@ void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition
             // stalled call.
             const PumpResult pr = pumpFn_(pumpCtx_);
             if (pr == PumpResult::DeclinedInCycle) {
+                // fix3 M2: this covers TWO distinct conditions (see
+                // Client::pumpTrampoline_) — already inside a duty-cycle
+                // callback (the common case; pumping would recursively
+                // re-enter the agent's own poll), or this is the Thread-mode
+                // runner thread itself calling from outside its own cycle (not
+                // reachable in practice — the runner's whole body IS the cycle
+                // loop — but never assumed safe). The message deliberately
+                // does not claim "inside a callback" specifically, since that
+                // would be inaccurate for the second case.
                 throw std::runtime_error(
-                    "Producer::send: back-pressured inside a duty-cycle callback — cannot "
-                    "pump (would re-enter the agent's own poll); use trySend there instead");
+                    "Producer::send: back-pressured, and pumping the duty cycle from here is "
+                    "not safe right now (already inside a duty-cycle callback, or this is the "
+                    "duty-cycle thread itself outside any cycle) — use trySend instead");
             }
             pumped = (pr == PumpResult::Pumped);
         }
@@ -527,7 +537,14 @@ std::pair<int64_t, std::future<int64_t>> ProducerImpl::registerFuture() {
 }
 
 void ProducerImpl::failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept {
-    PendingAck::complete(static_cast<uint64_t>(ackHandle), -1, reason, &callbackExceptions_);
+    // fix3 I3: this runs on the APP thread — called only from Producer::send's
+    // callback/future overloads and BatchBuilder::send(), all app-thread APIs
+    // — and this producer's ring is MPSC, so MULTIPLE DIFFERENT app threads
+    // can legitimately call this concurrently on the SAME ProducerImpl.
+    // callbackExceptions_ is a plain, duty-thread-ONLY counter (see its doc);
+    // counting here would race both the duty thread and other app threads on
+    // a non-atomic variable. Log only on this path — never count.
+    PendingAck::complete(static_cast<uint64_t>(ackHandle), -1, reason, nullptr);
 }
 
 // ---------------------------------------------------------------------------
