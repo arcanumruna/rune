@@ -1068,7 +1068,7 @@ private:
     // page cache / ring slot via pwritev — so this bound only guards against an
     // absurd/malformed length overrunning the worker ingress ring or a segment.
     // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
-    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;
+    std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
@@ -1241,6 +1241,16 @@ public:
     [[nodiscard]] int maxBatchesPerSubPerCycleForTest() const noexcept {
         return maxBatchesPerSubPerCycle_;
     }
+
+    // F3 fix-round-2, item A.4: the default max accepted produce-batch WIRE
+    // size (see maxProduceBatchBytes_ below) — named/public so it can be
+    // startup-validated against rune::replication::kDefaultMaxFetchBytes
+    // (BrokerNode.cpp's validateReplicationFetchCeiling()): a batch this
+    // gateway can accept must never be larger than what replication's fetch
+    // path can ever deliver to a follower, or it becomes permanently
+    // unfetchable (kErrRecordTooLarge forever).
+    static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
+
 private:
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.

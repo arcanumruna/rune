@@ -3,9 +3,26 @@
 #include <rune_fr/FlightRecorder.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <spdlog/spdlog.h>
 namespace rune::storage {
+
+namespace {
+// F3 fix-round-2, items B.2/B.3: spdlog's default logger writes to STDOUT,
+// not stderr — a fatal halt must also be visible on stderr (where operator
+// tooling, `ctest --output-on-failure`, and EXPECT_DEATH's capture all look
+// for a crashing process's diagnostic) regardless of spdlog's sink config.
+[[noreturn]] void fatalHalt(const std::string& msg) {
+    spdlog::critical("{}", msg);
+    spdlog::default_logger()->flush();
+    std::fprintf(stderr, "FATAL: %s\n", msg.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+} // namespace
 
 namespace {
 // CL4: Shared helper to derive the .index path from a .log path.
@@ -92,6 +109,25 @@ Log::~Log() {
         std::filesystem::remove(stagingLogPathFor(seq), ec);
         std::filesystem::remove(stagingIndexPathFor(seq), ec);
     }
+}
+
+LogSegment& Log::activeSegment() {
+    // F3 fix-round-2, item B.3: segments_ must never be empty once the Log is
+    // constructed; every reconstruction path (ctor, reloadSegments(),
+    // truncateTo()) is now written to either fully succeed or leave segments_
+    // completely untouched on failure (items B.1/B.2).  This check converts
+    // what would otherwise be silent UB (dereferencing rbegin() on an empty
+    // map) into a loud, diagnosable halt if that invariant is EVER broken —
+    // intentionally a release-mode check (not a debug-only assert()), since
+    // this is a correctness invariant, not a performance-sensitive hot path
+    // (a single .empty() branch costs nothing measurable either way).
+    if (segments_.empty()) [[unlikely]] {
+        fatalHalt("Log::activeSegment(): invariant violation — segments_ is empty "
+                  "(dir=" + dir_ + ").  A prior reconstruction must have failed to "
+                  "maintain an active segment.  Halting rather than risk UB from "
+                  "dereferencing an invalid iterator.");
+    }
+    return *segments_.rbegin()->second;
 }
 
 void Log::maybeRoll() {
@@ -668,22 +704,49 @@ void Log::truncateTo(int64_t truncateOffset) {
 
     // Truncate the file at cutPos.
     std::filesystem::resize_file(lpath, static_cast<std::uintmax_t>(cutPos));
-    // Also truncate the index — simplest: just let recover() rebuild it.
-    // Re-open the segment via recover() to get correct state.
-    std::string ipath = indexPathForLog(lpath);
-    std::filesystem::remove(ipath);
-
-    // Rebuild the active segment from disk.  It IS the active segment (the code
-    // above only reaches here when truncateOffset falls inside it) — F3:
-    // eagerReadMap=true.
-    // F3 fix-round-1: construct into a LOCAL first — segments_.erase(base) just
-    // ran, so segments_ is momentarily empty of an active entry; a throwing
-    // ctor must leave it cleanly empty (clean exception), never a null entry.
+    // ===== POINT OF NO RETURN =====
+    // F3 fix-round-2, item B.2: the .log file is now PHYSICALLY truncated on
+    // disk.  Everything from here must either fully succeed or FAIL-STOP.
+    // The OLD in-memory `seg` still has its read mmap sized for the PRE-
+    // truncate file: if we threw here and silently continued using it, a
+    // readView() past the new (shorter) EOF risks SIGBUS, and disk/memory
+    // would permanently disagree.  This is a genuine storage failure, not a
+    // retryable condition — unlike every other reconstruction path (B.1,
+    // round-1's item 2), there is no "leave segments_ untouched and return
+    // the exception to the caller" option once the disk write has already
+    // happened.  Ruling: log critical (path + errno-bearing message) then
+    // std::abort() — Kafka halts a broker on a log-dir I/O failure the same
+    // way; the node restarts and recovers cleanly from disk, and replication
+    // heals the gap.  Construct the replacement BEFORE erasing the old
+    // entry, so a failure here leaves segments_ holding the OLD (stale but
+    // structurally valid) segment right up until the abort.
     int64_t base = seg.baseOffset();
+    std::unique_ptr<LogSegment> newSeg;
+    try {
+        // Also truncate the index — simplest: just let recover() rebuild it.
+        std::string ipath = indexPathForLog(lpath);
+        std::filesystem::remove(ipath);
+        // Rebuild the active segment from disk.  It IS the active segment
+        // (this code only reaches here when truncateOffset falls inside it)
+        // — F3: eagerReadMap=true.
+        newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
+                                               indexMaxBytes_, /*prefaultIndex*/false,
+                                               /*eagerReadMap*/true);
+    } catch (const std::exception& ex) {
+        fatalHalt("Log::truncateTo: post-truncate storage failure reopening segment "
+                  "dir=" + dir_ + " base=" + std::to_string(base) + " path=" + lpath +
+                  ": " + ex.what() + ".  The .log file is ALREADY truncated on disk "
+                  "(cutPos=" + std::to_string(cutPos) + "); disk and memory would now "
+                  "permanently disagree.  Halting (Kafka-style log-dir-failure halt) "
+                  "rather than risk SIGBUS or silent corruption — restart recovers "
+                  "cleanly from disk.");
+    } catch (...) {
+        fatalHalt("Log::truncateTo: post-truncate storage failure reopening segment "
+                  "dir=" + dir_ + " base=" + std::to_string(base) + " path=" + lpath +
+                  ": unknown exception.  The .log file is ALREADY truncated on disk "
+                  "(cutPos=" + std::to_string(cutPos) + ").  Halting.");
+    }
     segments_.erase(base);
-    auto newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
-                                                indexMaxBytes_, /*prefaultIndex*/false,
-                                                /*eagerReadMap*/true);
     segments_[base] = std::move(newSeg);
     // Re-run recover to rebuild the index and set nextOffset correctly.
     // Use the segment's actual nextOffset_ (derived from the physically truncated
@@ -694,8 +757,6 @@ void Log::truncateTo(int64_t truncateOffset) {
 }
 
 void Log::reloadSegments() {
-    // Destroy all in-memory segments (closes open file handles).
-    segments_.clear();
     // Re-discover segment files on disk (same logic as the constructor).
     std::vector<int64_t> bases;
     for (auto& e : std::filesystem::directory_iterator(dir_))
@@ -703,20 +764,37 @@ void Log::reloadSegments() {
             bases.push_back(std::stoll(e.path().stem().string()));
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
-    // F3: same eager-only-for-the-active-segment rule as the constructor.
-    // F3 fix-round-1: construct into a LOCAL first — if the LAST (active,
-    // eagerReadMap=true) segment's ctor throws, this guarantees segments_
-    // simply lacks that entry (clean exception) rather than risking a null
-    // entry at the highest base, which activeSegment() would dereference.
+
+    // F3 fix-round-2, item B.1: build the COMPLETE new segment generation
+    // (construct AND recover every segment) into a LOCAL map first — STRONG
+    // exception guarantee.  segments_ (the OLD generation, still fully valid
+    // and open) is NOT touched until every step below has fully succeeded.
+    // Before this fix, segments_.clear() ran FIRST: a throwing ctor or a
+    // throwing recover() partway through rediscovery left segments_ either
+    // completely empty or missing its active (highest-base) entry —
+    // activeSegment() on that map was silent UB (now also hard-asserted,
+    // item B.3).  Now: on ANY failure here, segments_ is left EXACTLY as it
+    // was before this call — the old segments are still open and usable, the
+    // exception propagates cleanly, and the caller may retry.
+    std::map<int64_t, std::unique_ptr<LogSegment>> newSegments;
     for (int64_t b : bases) {
-        auto seg = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
-                                                 indexMaxBytes_, /*prefaultIndex*/false,
-                                                 /*eagerReadMap*/ b == bases.back());
-        segments_[b] = std::move(seg);
+        // F3: same eager-only-for-the-active-segment rule as the constructor.
+        newSegments[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
+                                                       indexMaxBytes_, /*prefaultIndex*/false,
+                                                       /*eagerReadMap*/ b == bases.back());
     }
-    // Run recover() to rebuild indices and set nextOffset_ for each segment.
+    // Recover BEFORE installing — extends the same strong guarantee to the
+    // whole reconstruction, not just segment construction: a throwing
+    // recover() also leaves segments_ (the old generation) untouched.
     int64_t next = 0;
-    for (auto& [base, seg] : segments_) next = seg->recover();
+    for (auto& [base, seg] : newSegments) next = seg->recover();
+
+    // Everything succeeded — now it is safe to replace.  swap() installs the
+    // new generation; the OLD segments (now referenced by `newSegments`,
+    // destroyed when it goes out of scope below) are closed only AFTER the
+    // new, COMPLETE map is already the live segments_ — segments_ is never
+    // observably empty or partial.
+    segments_.swap(newSegments);
     logEndOffset_ = next;
 }
 

@@ -202,6 +202,21 @@ void AeronPartitionTransport::sendReconcileResponse(
     enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
 }
 
+int32_t AeronPartitionTransport::maxFetchResponseBytes() const noexcept
+{
+    // See the header doc: only the outbound ring's bound is safe to read from
+    // whichever thread calls this (worker or control) — peers_/pub are
+    // control-thread-owned.  Mirrors the unconditional half of the
+    // control-thread ingress clamp in poll()'s FetchRequest handling, minus
+    // the resolved-pub tightening (which needs peers_).
+    const int32_t kFetchResponseOverhead =
+        static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
+    const int32_t ceiling = static_cast<int32_t>(outboundRing_.maxMsgLength())
+                           - static_cast<int32_t>(kOutboundEnvelopeOverhead)
+                           - kFetchResponseOverhead;
+    return ceiling > 0 ? ceiling : 0;
+}
+
 // FR trace correlation via per-endpoint MONOTONIC SEQUENCE (not offset — offsets
 // repeat across fast-acks and collide).  Because each ring is FIFO, the k-th
 // enqueued frame is the k-th drained → ReplOutEnqueue(seq=k) pairs 1:1 with

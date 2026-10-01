@@ -621,8 +621,15 @@ public:
     //
     // The poll path caps FetchRequest.maxBytes to this value before dispatching
     // to onFetchRequest so the leader never builds an oversized response.
+    //
+    // F3 fix-round-2, item A: also the PartitionTransport virtual override —
+    // onFetchRequest()/pushToFollowers() call this (via onTransport()) to
+    // decide whether an oversized-relative-to-maxBytes first batch can still
+    // be sent alone.  Safe to call from this worker's own thread: this whole
+    // transport instance is owned by exactly one worker (no cross-thread
+    // state read here — pubReg_'s per-peer pubs are this worker's own).
     // -----------------------------------------------------------------------
-    [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept
+    [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept override
     {
         const int32_t kOverhead =
             static_cast<int32_t>(rune::replication::FetchResponseMsg::encodedSize(0));

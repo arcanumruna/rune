@@ -297,7 +297,15 @@ public:
     }
 
 private:
-    LogSegment& activeSegment() { return *segments_.rbegin()->second; }
+    /// F3 fix-round-2, item B.3: segments_ must NEVER be empty once the Log is
+    /// constructed — but relying on that invariant with a bare
+    /// `*segments_.rbegin()->second` is silent UB the moment something
+    /// upstream breaks it (e.g. a future reconstruction bug).  Hard-asserts
+    /// (release-mode check + abort, not just a debug assert() that compiles
+    /// out) instead of dereferencing an invalid iterator.  Defined in Log.cpp
+    /// (needs spdlog; private + no external callers, so out-of-line costs
+    /// nothing and keeps spdlog out of this header).
+    LogSegment& activeSegment();
     void maybeRoll();
 
     /// Rebuild and atomically publish a new sealed-segment snapshot.

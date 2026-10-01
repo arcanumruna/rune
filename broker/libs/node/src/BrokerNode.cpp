@@ -46,6 +46,23 @@ namespace rune::node {
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 
 // ---------------------------------------------------------------------------
+// F3 fix-round-2, item A.4
+// ---------------------------------------------------------------------------
+std::optional<std::string> validateReplicationFetchCeiling(
+        int32_t maxFetchBytes, std::size_t maxProduceBatchBytes) {
+    if (static_cast<std::size_t>(maxFetchBytes) < maxProduceBatchBytes) {
+        return "replication maxFetchBytes (" + std::to_string(maxFetchBytes) +
+               ") is smaller than the max accepted produce-batch size (" +
+               std::to_string(maxProduceBatchBytes) + ") — a producible batch "
+               "would be PERMANENTLY unfetchable by replication "
+               "(kErrRecordTooLarge forever, no way to recover without a code "
+               "change).  See rune::replication::kDefaultMaxFetchBytes and "
+               "rune::gateway::ClientGateway::kMaxProduceBatchBytes.";
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::BrokerNode
 // ---------------------------------------------------------------------------
 BrokerNode::BrokerNode(NodeConfig config)
@@ -72,6 +89,18 @@ void BrokerNode::start() {
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
     // side effect (no dataDir, no driver, no ports).
     if (auto err = config_.validateShardConfig(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+
+    // F3 fix-round-2, item A.4: refuse to start if replication's fetch ceiling
+    // could never deliver the largest batch the gateway accepts — see
+    // validateReplicationFetchCeiling().  Same hard-refusal-before-any-side-
+    // effect pattern as the shard-config check above.
+    if (auto err = validateReplicationFetchCeiling(
+            rune::replication::kDefaultMaxFetchBytes,
+            rune::gateway::ClientGateway::kMaxProduceBatchBytes);
+        err.has_value()) {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
@@ -652,7 +681,7 @@ void BrokerNode::buildReplication() {
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
             pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
-            pcfg.maxFetchBytes        = 1 << 20;
+            pcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
             // runBoundedCompaction() reads the correct policy from every replica.
             // TopicSpec::CleanupPolicy and rune::replication::CleanupPolicy share
@@ -857,7 +886,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.minIsr               = config_.gatewayMinIsr;
         pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
         pcfg.isrCheckIntervalNs   = 10'000'000LL;
-        pcfg.maxFetchBytes        = 1 << 20;
+        pcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
         pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
             static_cast<uint8_t>(spec.cleanupPolicy));
         pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
@@ -1342,7 +1371,7 @@ void BrokerNode::buildGateway() {
             ocfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             ocfg.fetchIntervalNs      = config_.fetchIntervalNs;
             ocfg.isrCheckIntervalNs   = 10'000'000LL;
-            ocfg.maxFetchBytes        = 1 << 20;
+            ocfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // CP-1: __consumer_offsets is a compacted topic (keep latest per key).
             ocfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
             // CP-2: compaction tuning for __consumer_offsets sentinel topic.
@@ -1454,7 +1483,7 @@ void BrokerNode::buildGateway() {
             tcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             tcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             tcfg.isrCheckIntervalNs   = 10'000'000LL;
-            tcfg.maxFetchBytes        = 1 << 20;
+            tcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // CP-1: __transaction_state is a compacted topic (keep latest per txnId).
             tcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
             // CP-2: compaction tuning for __transaction_state sentinel topic.
@@ -1580,7 +1609,7 @@ void BrokerNode::buildGateway() {
             mcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only (see note at first use)
             mcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             mcfg.isrCheckIntervalNs   = 10'000'000LL;
-            mcfg.maxFetchBytes        = 1 << 20;
+            mcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
             // __cluster_metadata: compacted log (keep latest assignment per key).
             mcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
             mcfg.minCleanableDirtyRatio = 0.5;
@@ -2103,7 +2132,7 @@ void BrokerNode::buildAdminWorker() {
         scfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only
         scfg.fetchIntervalNs      = config_.fetchIntervalNs;
         scfg.isrCheckIntervalNs   = 10'000'000LL;
-        scfg.maxFetchBytes        = 1 << 20;
+        scfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
         // Compacted: keep latest schema record per topicId (key = topicId bytes).
         scfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
         scfg.minCleanableDirtyRatio = 0.5;

@@ -98,6 +98,29 @@ inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
 // RESETS its fallback probe counter so a slow reconcile under packet loss never
 // trips the destructive fallback-to-committedHw truncation (the DR-8 loss).
 inline constexpr int16_t kErrReconcileDeferred = -5;
+// F3 fix-round-2, item A: a batch cannot be delivered AT ALL over this
+// transport — it exceeds even the transport's hard per-message ceiling
+// (independent of the follower's requested maxBytes).  Distinct from
+// kErrNone-with-empty-records (which means "caught up"): this means "there
+// is real data here, but it can never reach you over this transport" — the
+// follower must never treat it as progress or as caught-up.  See
+// PartitionReplica::onFetchRequest / FollowerSync::forceBehind().
+inline constexpr int16_t kErrRecordTooLarge    = -6;
+
+// F3 fix-round-2, item A.4: the default replication fetch-ceiling used for
+// every PartitionConfig across the broker (see BrokerNode.cpp).  MUST be >=
+// rune::gateway::ClientGateway::kMaxProduceBatchBytes (currently also 8 MiB —
+// replication cannot depend on the gateway library, so the two are each
+// named constants in their own layer, cross-checked at startup rather than
+// sharing a single definition) — see validateReplicationFetchCeiling() in
+// BrokerNode.cpp, which refuses to start otherwise.
+//
+// Was 1 MiB before F3 fix-round-2: strictly smaller than the gateway's 8 MiB
+// kMaxProduceBatchBytes, meaning any produced batch between 1 and 8 MiB was
+// PERMANENTLY unfetchable by replication (kErrRecordTooLarge forever, no
+// recovery) — a real, reachable-by-default latent bug the review's item A.4
+// surfaced, not a hypothetical misconfiguration.  Raised to match.
+inline constexpr int32_t kDefaultMaxFetchBytes = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // PartitionConfig — constructor argument bundle
@@ -204,6 +227,27 @@ public:
     /// Reuses the FetchResponse shape.
     virtual void sendReconcileResponse(
             NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) {}
+
+    /// F3 fix-round-2, item A: the hard ceiling (bytes) this transport can
+    /// EVER deliver a single FetchResponse's records payload within — e.g.
+    /// the underlying Aeron publication's maxMessageLength, or an outbound
+    /// marshalling ring's maxMsgLength, whichever is the tighter bound this
+    /// transport can safely report (see each override's own reasoning,
+    /// especially around which thread may call this).
+    ///
+    /// Used by onFetchRequest()/pushToFollowers() to decide whether a FIRST
+    /// batch that is larger than the caller's OWN requested maxBytes/cap (which
+    /// may be smaller than what this transport can actually carry) can still
+    /// be sent ALONE as a single frame — a Kafka-style progress guarantee,
+    /// instead of silently stalling the follower forever.
+    ///
+    /// Default INT32_MAX: "no additional known ceiling beyond the caller's
+    /// own maxBytes/pushCeiling" — safe for test fakes (InMemoryTransport,
+    /// test CaptureTransport doubles) that do not model a real transport
+    /// frame limit; they never trigger the oversize-relaxation path.
+    [[nodiscard]] virtual int32_t maxFetchResponseBytes() const noexcept {
+        return INT32_MAX;
+    }
 };
 
 class AeronPubRegistry;
@@ -560,6 +604,13 @@ public:
         return psm_;
     }
 
+    /// F3 fix-round-2, item A.3 test accessor: drive the private pushToFollowers()
+    /// directly, so a test can control fromOffset/pushCeiling precisely without
+    /// needing GR-10's real coalesced-push cadence.
+    void pushToFollowersForTest(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept {
+        pushToFollowers(fromOffset, pushCeiling);
+    }
+
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
     /// replica is disk-backed — asserts !memoryBacked_.  Callers MUST gate on
@@ -698,7 +749,9 @@ private:
     PerWorkerTransport* perWorker_ = nullptr;                 ///< non-null iff tkind_ == PerWorker
     /// Apply f to the concrete transport: one predicted branch, direct call on the
     /// PerWorker arm.  Defined in PartitionReplica.cpp (its only user).
-    template <class F> void onTransport(F&& f);
+    /// F3 fix-round-2: returns auto (was void) so callers can also use this to
+    /// QUERY the transport (e.g. maxFetchResponseBytes()), not just send.
+    template <class F> auto onTransport(F&& f);
 
     // -----------------------------------------------------------------------
     // De-virtualized hot-path log dispatch.
@@ -792,6 +845,12 @@ private:
     int64_t rtAppends_ = 0, rtApplies_ = 0, rtPushes_ = 0, rtFastAcks_ = 0;
     int64_t rtApplyBytes_ = 0, rtPushBytes_ = 0;
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
+
+    // F3 fix-round-2, item A: count of "batch exceeds even this transport's
+    // hard ceiling" events (onFetchRequest or pushToFollowers), for
+    // rate-limited critical logging (first occurrence, then every 1024th) —
+    // same convention as LogSegment::readMapFailures_.
+    uint64_t unsendableBatchLogCount_ = 0;
 
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
     //

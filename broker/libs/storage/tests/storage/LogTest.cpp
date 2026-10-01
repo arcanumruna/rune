@@ -1571,3 +1571,107 @@ TEST(LogRegression, FailedRollKeepsOldActiveSegmentAndRetrySucceeds) {
     std::filesystem::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item B.1: reloadSegments() must give a STRONG exception
+// guarantee — if ANY segment fails to (re)construct, segments_ must be left
+// EXACTLY as it was before the call (the old, still-open segments remain
+// fully usable), never partially cleared and never missing its active entry.
+// ---------------------------------------------------------------------------
+TEST(LogRegression, ReloadSegmentsFailureLeavesLogIntactRegression) {
+    auto dir = makeTempDir("rune_f3r2_reload_fail");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), /*rollBytes=*/256);
+    int64_t off = 0;
+    for (int i = 0; i < 30; ++i) {
+        RecordBatchBuilder b(off, 9500 + i); b.append("k", "v" + std::to_string(i), 9500 + i);
+        off = log.append(b.build(), off);
+    }
+    auto basesBefore = log.segmentBaseOffsets();
+    ASSERT_GE(basesBefore.size(), 3u)
+        << "test setup: need >= 3 segments so a sealed (non-active, non-first) one can be sabotaged";
+    int64_t endOffsetBefore = log.logEndOffset();
+
+    // Sabotage one SEALED segment's .log: replace it with a non-empty
+    // directory.  reloadSegments()'s re-discovery still finds it (extension
+    // matching doesn't care whether the entry is a file or a directory), and
+    // its LogSegment ctor throws EISDIR on open() (round-1's item 2 fix).
+    int64_t sabotageBase = basesBefore[1];
+    std::ostringstream sabotagePath;
+    sabotagePath << dir.string() << "/" << std::setw(20) << std::setfill('0')
+                 << sabotageBase << ".log";
+    std::filesystem::remove(sabotagePath.str());
+    std::filesystem::create_directory(sabotagePath.str());
+
+    EXPECT_THROW(log.reloadSegments(), std::system_error)
+        << "reloadSegments() must surface the failure, not silently continue";
+
+    // segments_ must be UNTOUCHED: same bases, same LEO, and the old active
+    // segment (and every other old segment) must still be fully usable.
+    EXPECT_EQ(log.segmentBaseOffsets(), basesBefore)
+        << "a failed reloadSegments() must leave segments_ exactly as it was";
+    EXPECT_EQ(log.logEndOffset(), endOffsetBefore);
+    {
+        auto bytes = log.read(0, 1 << 20);
+        ASSERT_FALSE(bytes.empty());
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+    // The log must still accept new appends — the OLD active segment (never
+    // touched by the failed reload attempt) is still fully open and valid.
+    RecordBatchBuilder afterB(off, 9999); afterB.append("k", "still-alive", 9999);
+    int64_t next = log.append(afterB.build(), off);
+    EXPECT_EQ(next, off + 1);
+
+    std::filesystem::remove_all(sabotagePath.str());
+    std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item B.2: truncateTo()'s active-segment "straddle" rebuild
+// physically truncates the .log file on disk BEFORE reopening it.  Past that
+// point of no return, a failure to reopen must FAIL-STOP (log critical +
+// abort), never silently continue with disk and memory disagreeing (which
+// risks SIGBUS via the old, now-oversized mmap).  EXPECT_DEATH (threadsafe
+// style): the statement runs in a forked child, so setup done in the parent
+// before EXPECT_DEATH is visible via copy-on-write.
+// ---------------------------------------------------------------------------
+TEST(LogRegression, TruncateRebuildFailureFailsStopRegression) {
+    auto dir = makeTempDir("rune_f3r2_truncate_abort");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    // Single segment (large rollBytes) with 5 single-record batches (offsets
+    // 0..4) so truncateTo(2) lands mid-log — the "active segment straddles
+    // truncateOffset" path, not the "segments_ empty" path.  Constructed and
+    // recovered successfully BEFORE any sabotage (fork() copy-on-write means
+    // the forked EXPECT_DEATH child inherits this already-valid `log`, so the
+    // sabotage below targets ONLY the reopen-after-truncate step, not Log's
+    // initial construction).
+    Log log(dir.string(), /*rollBytes=*/1 << 20);
+    int64_t off = 0;
+    for (int i = 0; i < 5; ++i) {
+        RecordBatchBuilder b(off, 9700 + i); b.append("k", "v" + std::to_string(i), 9700 + i);
+        off = log.append(b.build(), off);
+    }
+
+    // NOW sabotage the (only) segment's .index path: replace it with a
+    // NON-EMPTY directory, so std::filesystem::remove(ipath) — which runs
+    // AFTER truncateTo() has already physically resize_file()'d the .log —
+    // throws filesystem_error (ENOTEMPTY).  This is the exact "something
+    // fails past the point of no return" condition the fail-stop guard
+    // covers (the guard wraps BOTH the index removal and the segment ctor).
+    std::string indexPath;
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".index") { indexPath = e.path().string(); break; }
+    }
+    ASSERT_FALSE(indexPath.empty());
+    std::filesystem::remove(indexPath);
+    std::filesystem::create_directory(indexPath);
+    { std::ofstream dummy(indexPath + std::string("/dummy.txt")); dummy << "x"; }
+
+    EXPECT_DEATH(log.truncateTo(2), "FATAL");   // mid-batch -> straddle rebuild -> FATAL abort
+
+    std::filesystem::remove_all(dir);
+}
+

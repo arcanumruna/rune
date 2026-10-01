@@ -82,6 +82,19 @@ public:
         state_ = hadRecords ? State::Behind : State::InSync;
     }
 
+    /// F3 fix-round-2, item A: the leader replied with a non-recoverable error
+    /// (kErrRecordTooLarge — a batch that exceeds even the transport's hard
+    /// ceiling and can NEVER be delivered at this size).  This is emphatically
+    /// NOT "caught up": force Behind (never let a stale InSync linger past an
+    /// error response) and clear the outstanding-fetch deadline so the next
+    /// duty tick issues a fresh fetch at the FAST cadence rather than waiting
+    /// out a resend timer for a response that already arrived (as an error).
+    /// Does not touch leaderHw_ (still a valid, monotonic observation).
+    void forceBehind() noexcept {
+        fetchDeadlineNs_ = 0;
+        state_ = State::Behind;
+    }
+
     /// Decide this duty tick's fetch action.
     ///   nowNs    — monotonic clock (ns).
     ///   fastNs   — fast catch-up cadence (min spacing between data fetches).

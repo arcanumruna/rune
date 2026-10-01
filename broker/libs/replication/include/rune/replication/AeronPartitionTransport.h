@@ -165,6 +165,23 @@ public:
     void sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override;
 
+    /// F3 fix-round-2, item A: a CONSERVATIVE, always-thread-safe hard
+    /// ceiling.  onFetchRequest() (hence this call, via onTransport()) may
+    /// run on a WORKER thread for regular topics routed through workerPool_,
+    /// while peers_ / each peer's resolved pub are CONTROL-thread-owned
+    /// state (see the "Shared-nothing outbound marshalling" comment below) —
+    /// reading a per-follower pub->maxMessageLength() here would be a data
+    /// race.  outboundRing_'s capacity is fixed at construction and safe to
+    /// read from any thread, so this uses ONLY that bound (same formula as
+    /// the control-thread ingress clamp's unconditional component, minus the
+    /// resolved-pub tightening that clamp also applies when safe to do so).
+    /// This can be MORE conservative than a specific peer's true ceiling
+    /// (never less) — which only means we might decline to relax an
+    /// oversized batch a particular peer could have received, never the
+    /// reverse (never claim "sendable" for something that gets silently
+    /// dropped at the pub layer).
+    [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept override;
+
     // -----------------------------------------------------------------------
     // Duty-cycle step
     // -----------------------------------------------------------------------

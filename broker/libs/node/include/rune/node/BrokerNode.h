@@ -75,12 +75,27 @@ extern "C" {
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 namespace rune::node {
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-2, item A.4: startup config validation — a produced batch must
+// never be larger than what replication's fetch path can ever deliver to a
+// follower (otherwise it is PERMANENTLY unfetchable: kErrRecordTooLarge
+// forever, with no config knob to fix it after the fact).  Pure/testable —
+// BrokerNode::start() calls this with the two actual compile-time defaults
+// (rune::gateway::ClientGateway::kMaxProduceBatchBytes and
+// rune::replication::kDefaultMaxFetchBytes) before any other side effect,
+// same pattern as NodeConfig::validateShardConfig().
+// Returns an error message if maxFetchBytes < maxProduceBatchBytes, else nullopt.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::optional<std::string> validateReplicationFetchCeiling(
+        int32_t maxFetchBytes, std::size_t maxProduceBatchBytes);
 
 // ---------------------------------------------------------------------------
 // NullSink — no-op outbound transport (sufficient for 1-node; BR-3 replaces)

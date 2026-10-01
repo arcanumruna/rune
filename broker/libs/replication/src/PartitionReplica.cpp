@@ -85,12 +85,12 @@ static bool fsLogEnabled() noexcept {
 // final WorkerReplicationTransport (inlinable), everything else goes virtual.
 // ---------------------------------------------------------------------------
 template <class F>
-[[gnu::always_inline]] inline void PartitionReplica::onTransport(F&& f)
+[[gnu::always_inline]] inline auto PartitionReplica::onTransport(F&& f)
 {
 #if RUNE_REPLICATION_HAS_AERON
-    if (tkind_ == TransportKind::PerWorker) { f(*perWorker_); return; }
+    if (tkind_ == TransportKind::PerWorker) { return f(*perWorker_); }
 #endif
-    f(*transport_);
+    return f(*transport_);
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +720,53 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
                                                  static_cast<std::size_t>(req.maxBytes),
                                                  kNoPushCeiling);
-        records = std::span<const uint8_t>(v.data, pre.bytes);
+        if (pre.bytes == 0) {
+            // F3 fix-round-2, item A: readView()'s own progress guarantee means
+            // v always contains AT LEAST the first whole batch, even if it
+            // alone exceeds req.maxBytes — so pre.bytes==0 here can only mean
+            // that first batch is larger than req.maxBytes (v.len IS exactly
+            // that one batch's length: a second batch would only make the
+            // already-over-cap total even larger, so wholeBatchPrefix's walk
+            // can never have included one).
+            //
+            // Sending an EMPTY kErrNone Data response (the old behaviour)
+            // makes the follower's FollowerSync treat this as caught-up —
+            // PERMANENTLY, since this batch is always too big for req.maxBytes
+            // and the follower never requests a different size on its own.
+            // Skipping the response (as the round-1 fix does for a map
+            // failure) would ALSO stall it forever — there is nothing to
+            // naturally retry into a different outcome.
+            //
+            // Kafka's progress rule: if the transport itself can carry this
+            // ONE batch (independent of the follower's requested maxBytes,
+            // which may simply be smaller than the transport's real
+            // capability), send it anyway — progress guaranteed.  Only if it
+            // exceeds even the transport's hard ceiling is it genuinely
+            // unsendable, and that must be a visible ERROR, never kErrNone.
+            const int32_t hardCeiling =
+                onTransport([&](auto& t) { return t.maxFetchResponseBytes(); });
+            if (hardCeiling > 0 && v.len <= static_cast<std::size_t>(hardCeiling)) {
+                records = std::span<const uint8_t>(v.data, v.len);
+            } else {
+                ++unsendableBatchLogCount_;
+                if (unsendableBatchLogCount_ == 1 || unsendableBatchLogCount_ % 1024 == 0) {
+                    spdlog::critical(
+                        "PartitionReplica[node={} part={}] FETCH batch at offset={} is {} "
+                        "bytes — exceeds this transport's hard ceiling of {} bytes.  The "
+                        "follower can NEVER receive it over this transport (occurrence={}). "
+                        "This means a produced batch is larger than the replication "
+                        "fetch-ceiling config allows — see kDefaultMaxFetchBytes / "
+                        "validateReplicationFetchCeiling (BrokerNode.cpp).",
+                        cfg_.selfId, cfg_.partitionId, req.fetchOffset, v.len, hardCeiling,
+                        unsendableBatchLogCount_);
+                }
+                auto errResp = makeFetchResponse(highWatermark(), kErrRecordTooLarge, {});
+                onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, errResp); });
+                return kErrRecordTooLarge;
+            }
+        } else {
+            records = std::span<const uint8_t>(v.data, pre.bytes);
+        }
     }
 
     // DR-BUG-3: advertise the min-ISR-GATED committed HW to followers via the
@@ -797,6 +843,25 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchRespApply,
                              static_cast<uint32_t>(cfg_.partitionId));
     if (resp.errorCode != kErrNone) {
+        // F3 fix-round-2, item A: kErrRecordTooLarge means the leader has
+        // real, committed data here that it can NEVER deliver at this size —
+        // the polar opposite of "caught up".  Force Behind (never let a stale
+        // InSync linger past this) and surface it loudly on the follower side
+        // too (rate-limited) so an operator sees both ends of the problem.
+        // Other error codes keep the prior behaviour: ignore (control plane
+        // handles epoch changes externally) without touching FollowerSync —
+        // whatever state it was already in (typically Behind) is correct.
+        if (resp.errorCode == kErrRecordTooLarge) {
+            followerSync_.forceBehind();
+            ++unsendableBatchLogCount_;
+            if (unsendableBatchLogCount_ == 1 || unsendableBatchLogCount_ % 1024 == 0) {
+                spdlog::critical(
+                    "PartitionReplica[node={} part={}] follower received kErrRecordTooLarge "
+                    "from the leader — a batch exists that this transport can never deliver "
+                    "(occurrence={}).  Remaining Behind; this will NOT be treated as caught up.",
+                    cfg_.selfId, cfg_.partitionId, unsendableBatchLogCount_);
+            }
+        }
         // Error response — ignore (control plane handles epoch changes externally).
         return;
     }
@@ -2186,15 +2251,70 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
                                              static_cast<std::size_t>(cfg_.maxFetchBytes),
                                              pushCeiling);
-    if (pre.bytes == 0) return;   // nothing deliverable within ceiling/cap this pass
-    const Offset pushedThrough = pre.endOffset;
+    std::size_t sendBytes;
+    Offset      pushedThrough;
+    if (pre.bytes == 0) {
+        // F3 fix-round-2, item A.3: pre.bytes==0 here is AMBIGUOUS between two
+        // very different conditions (wholeBatchPrefix breaks on the FIRST
+        // batch for either reason, before ever setting out.bytes):
+        //   (a) the first available batch's baseOffset >= pushCeiling — a
+        //       perfectly NORMAL, frequent flow-control condition (nothing is
+        //       in-window to push yet this pass).  NOT an error; just return.
+        //   (b) the first batch is simply larger than cfg_.maxFetchBytes (the
+        //       cap), exactly the same oversize condition onFetchRequest()
+        //       now handles.  Silently returning here (the old behaviour)
+        //       means push NEVER delivers this batch — only the (now fixed)
+        //       fetch path would ever heal it, which the review flagged as
+        //       unacceptable for push to rely on exclusively.
+        // Disambiguate by reading the first batch's baseOffset directly (v's
+        // readView() progress guarantee means v always holds at least that
+        // one whole batch when non-empty).
+        if (v.data == nullptr || v.len == 0) return;   // nothing at all to push
+        rune::protocol::RecordBatchReader r(v.data, v.len);
+        const int32_t total = r.totalLength();
+        if (total <= 0) return;   // torn/invalid — nothing to push
+        const Offset firstBase = r.baseOffset();
+        if (firstBase >= pushCeiling) return;   // (a) genuinely flow-controlled this pass
+        // (b) oversize relative to cfg_.maxFetchBytes: apply the SAME
+        // transport-hard-ceiling relaxation as onFetchRequest().  pushCeiling
+        // itself is NEVER relaxed — only confirmed above that this one batch
+        // is within it; a batch beyond pushCeiling still returns at (a).
+        const int32_t hardCeiling =
+            onTransport([&](auto& t) { return t.maxFetchResponseBytes(); });
+        if (hardCeiling > 0 && static_cast<std::size_t>(total) <= static_cast<std::size_t>(hardCeiling)) {
+            sendBytes     = static_cast<std::size_t>(total);
+            pushedThrough = firstBase + r.lastOffsetDelta() + 1;
+        } else {
+            // Unsendable at any size over this transport.  Push has no
+            // per-follower response channel to carry an error on (it's a
+            // proactive broadcast, not a reply) — log critical (rate-limited,
+            // shared counter with onFetchRequest's identical condition) and
+            // return.  The follower's OWN pull-based fetch hits this exact
+            // batch in onFetchRequest() and gets the proper kErrRecordTooLarge
+            // response — push does not need to duplicate that signalling.
+            ++unsendableBatchLogCount_;
+            if (unsendableBatchLogCount_ == 1 || unsendableBatchLogCount_ % 1024 == 0) {
+                spdlog::critical(
+                    "PartitionReplica[node={} part={}] PUSH batch at offset={} is {} "
+                    "bytes — exceeds this transport's hard ceiling of {} bytes.  Push "
+                    "cannot deliver it (occurrence={}); the follower's own fetch will "
+                    "surface kErrRecordTooLarge.",
+                    cfg_.selfId, cfg_.partitionId, firstBase, total, hardCeiling,
+                    unsendableBatchLogCount_);
+            }
+            return;
+        }
+    } else {
+        sendBytes     = pre.bytes;
+        pushedThrough = pre.endOffset;
+    }
 
     // Build once — reused for all ISR followers; the view stays valid for the loop
     // (no append/truncate on this thread in between).
     // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
     auto resp = makeFetchResponse(highWatermark(), kErrNone,
-                                  std::span<const uint8_t>(v.data, pre.bytes));
-    rtPushBytes_ += static_cast<int64_t>(pre.bytes);
+                                  std::span<const uint8_t>(v.data, sendBytes));
+    rtPushBytes_ += static_cast<int64_t>(sendBytes);
 
     for (NodeId followerId : isrList) {
         if (followerId == cfg_.selfId) continue;
