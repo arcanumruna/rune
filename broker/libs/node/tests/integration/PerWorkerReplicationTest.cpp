@@ -1176,3 +1176,109 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     node1->stop();
     node2->stop();
 }
+
+// ===========================================================================
+// F18 (*Regression*): a stored batch LARGER than the followers' fetch maxBytes
+// (1 MiB) must still replicate — an acks=all produce of a legal 2 MiB batch at
+// RF=3 commits (leader HW advances past it) and both followers apply it, then a
+// following small produce commits too (replication continues normally).
+// Before the fix the leader trimmed every response to whole batches <= maxBytes,
+// so the 2 MiB batch was never sent and HW stayed at 0 forever.
+//
+// Runs on both replication planes: the per-worker plane (WorkerReplicationTransport,
+// bounded by the publication term/8) and the legacy AeronPartitionTransport
+// (outbound ring + publication).  Sizes are the documented bench profile (32 MiB
+// term / outbound ring), whose produce intake limit admits a 2 MiB batch.
+// Waits are deadline-bounded condition polls (same pattern as the suite above).
+// ===========================================================================
+namespace {
+void runLargeBatchAcksAllCommits(bool perWorkerReplication, std::string_view tag) {
+    PwTempDir dir0{std::string(tag) + "0_"}, dir1{std::string(tag) + "1_"},
+              dir2{std::string(tag) + "2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+
+    std::array<rune::node::NodeConfig, 3> cfgs{
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts)};
+    for (auto& c : cfgs) {
+        c.perWorkerReplication          = perWorkerReplication;
+        c.aeronTermBufferBytes          = 32 * 1024 * 1024;
+        c.replicationOutboundRingBytes  = 32 * 1024 * 1024;
+        c.workerIngressRingBytes        = 32 * 1024 * 1024;
+        ASSERT_GE(c.produceIntakeLimit(), 2 * 1024 * 1024) << "the profile must accept the batch";
+    }
+
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+
+    const rune::consensus::NodeId lid = nodes[0]->leaderId();
+    ASSERT_GE(lid, 0);
+    ASSERT_LE(lid, 2);
+    rune::node::BrokerNode& leader = *nodes[static_cast<std::size_t>(lid)];
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && !leader.replicationIsLeaderForTest())
+            std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(leader.replicationIsLeaderForTest());
+    ASSERT_TRUE(hasReplica(leader));
+    ASSERT_EQ(roleOnOwner(leader), Role::Leader);
+
+    // The follower fetch cap is 1 MiB (BrokerNode); this batch is ~2 MiB on disk.
+    const std::size_t kValue = 2 * 1024 * 1024 - 256;
+    const auto big = makePwPayload(0xF1, kValue);
+    ASSERT_EQ(appendOnOwner(leader, std::span<const uint8_t>(big.data(), big.size()),
+                            /*acksAll=*/true), 0);
+    const auto small = makePwPayload(0xF2, 32);
+
+    auto waitAll = [&](Offset target, const char* what) {
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
+        bool ok = false;
+        while (std::chrono::steady_clock::now() < deadline && !ok) {
+            ok = hwOnOwner(leader) >= target;
+            for (auto& n : nodes) ok = ok && leoOnOwner(*n) >= target;
+            if (!ok) std::this_thread::sleep_for(20ms);
+        }
+        EXPECT_TRUE(ok) << what << ": leader HW=" << hwOnOwner(leader) << " LEOs="
+                        << leoOnOwner(*nodes[0]) << "," << leoOnOwner(*nodes[1]) << ","
+                        << leoOnOwner(*nodes[2]) << " target=" << target;
+        return ok;
+    };
+    ASSERT_TRUE(waitAll(1, "acks=all 2 MiB batch must commit on every replica"));
+
+    // Replication continues normally after the oversized batch.
+    ASSERT_EQ(appendOnOwner(leader, std::span<const uint8_t>(small.data(), small.size()),
+                            /*acksAll=*/true), 1);
+    EXPECT_TRUE(waitAll(2, "the next produce after the oversized batch must commit"));
+
+    // Content: every follower holds the whole 2 MiB batch intact.
+    for (auto& n : nodes) {
+        if (n.get() == &leader) continue;
+        const auto raw = readLogOnOwner(*n, 0, 4 * 1024 * 1024);
+        ASSERT_GE(raw.size(), kValue);
+        rune::protocol::RecordBatchReader r(raw.data(), raw.size());
+        ASSERT_TRUE(r.ensureValid()) << "follower copy of the 2 MiB batch is corrupt";
+        std::size_t seen = 0;
+        r.forEach([&](std::string_view, std::string_view v, int64_t, int64_t) {
+            seen = v.size();
+            EXPECT_EQ(static_cast<uint8_t>(v.front()), 0xF1);
+            EXPECT_EQ(static_cast<uint8_t>(v.back()), 0xF1);
+        });
+        EXPECT_EQ(seen, kValue);
+    }
+    for (auto& n : nodes) n->stop();
+}
+} // namespace
+
+TEST(LargeBatchReplicationRegression, AcksAll2MiBBatchCommitsPerWorkerPlane) {
+    runLargeBatchAcksAllCommits(/*perWorkerReplication=*/true, "f18pw_");
+}
+
+TEST(LargeBatchReplicationRegression, AcksAll2MiBBatchCommitsLegacyTransport) {
+    runLargeBatchAcksAllCommits(/*perWorkerReplication=*/false, "f18lg_");
+}
