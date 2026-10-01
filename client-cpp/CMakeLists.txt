@@ -480,6 +480,25 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         endif()
     endif()
 
+    # F12 — per-duty-cycle producer cost vs partition count (in-process, no Aeron)
+    add_executable(rune_producer_flush_scaling_bench
+        bench/ProducerFlushScalingBench.cpp
+    )
+    target_include_directories(rune_producer_flush_scaling_bench PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(rune_producer_flush_scaling_bench PRIVATE
+        rune_client_api
+        rune_client_producer
+        benchmark::benchmark
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB uuid)
+        if(UUID_LIB)
+            target_link_libraries(rune_producer_flush_scaling_bench PRIVATE ${UUID_LIB})
+        endif()
+    endif()
+
     # CG-7 — GroupConsumer hot-path benchmarks (in-process, no Aeron)
     add_executable(rune_client_group_bench
         bench/GroupConsumerBench.cpp
@@ -915,6 +934,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerSendTest.cpp
             tests/producer/DirectIngressTest.cpp
+            tests/producer/ProducerFlushDirtyTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/support/AllocCounter.cpp

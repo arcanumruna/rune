@@ -80,14 +80,27 @@ public:
             // producer per cycle (not once per drainRing() call below, which can
             // run up to 256x/cycle — same relaxed store either way, just cheaper).
             impl->publishHeartbeat(nowNs);
-            // Drain ONE message then flush, so flush() boundaries between sends are
-            // honoured; bounded at 256 records per producer per cycle.
-            static constexpr int kMaxInnerIters = 256;
-            for (int iter = 0; iter < kMaxInnerIters; ++iter) {
-                const int drained = impl->drainRing(nowNs);
+            // F12: drain a whole pass, then flush ONCE (flushBatches walks only
+            // the dirty partitions).  The old loop drained ONE message and then
+            // flushed — a walk over EVERY partition per drained record (256 x
+            // partitions per producer per cycle).  The drain pass itself stops at
+            // the boundaries that need a flush in between (a flush() token; a
+            // record whose builder is full / whose Tier-2 batch is queued ahead):
+            // flush there, then drain on.  Bounded at kMaxDrainPerCycle messages
+            // per producer per cycle (as before); a Direct producer's drain is a
+            // no-op, so it gets exactly one flush pass.
+            static constexpr int kMaxDrainPerCycle = 256;
+            int budget = kMaxDrainPerCycle;
+            for (int pass = 0; pass < kMaxDrainPerCycle; ++pass) {
+                const int drained = impl->drainRing(nowNs, budget);
                 const int flushed = impl->flushBatches(nowNs, sessionId, sink);
                 work += drained + flushed;
-                if (drained == 0) break;
+                budget -= drained;
+                const ProducerImpl::DrainStop stop = impl->lastDrainStop();
+                if (budget <= 0 || stop == ProducerImpl::DrainStop::Drained) break;
+                // Blocked and the flush freed nothing: draining again is futile
+                // this cycle (window full / no session / transport back-pressure).
+                if (stop == ProducerImpl::DrainStop::Blocked && flushed == 0) break;
             }
             work += impl->retransmitStalled(nowNs, sink);
         }

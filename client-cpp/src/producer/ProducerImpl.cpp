@@ -680,6 +680,7 @@ void ProducerImpl::applyDeferred_() noexcept {
                 e->enqueuedNs = h->submitNs;
                 const int32_t rc = e->recordCount;
                 tps.pendingTier2Entries.push_back(std::move(*e));
+                markDirty_(tps);
                 if (tps.builder && tps.builder->recordCount() > 0) tps.flushRequested = true;
                 recordsSent_ += static_cast<uint64_t>(rc);
                 applied = true;
@@ -925,7 +926,9 @@ void ProducerImpl::submitFlush() noexcept {
         // partition; the end of the owner's pass flushes them.  Off the owner
         // thread nothing can have been sent through this producer: a no-op.
         if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return;
-        for (auto& up : partitions_) up->flushRequested = true;
+        // F12: only partitions with buffered work can have anything to flush —
+        // O(dirty), not O(partitions).
+        for (const uint32_t slot : dirty_) partitions_[slot]->flushRequested = true;
         // fix2 minor 3: flush() covers records already accepted into the
         // deferred arena too — each is flushed when it is applied.
         for (std::size_t r = 0; r < deferred_.tail(); r += deferred_.sizeAt(r)) {
@@ -985,6 +988,7 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
         e.enqueuedNs  = lastNowNs_;
         e.batchBytes  = std::move(batchBytes);
         ps.pendingTier2Entries.push_back(std::move(e));  // may throw: nothing changed yet
+        markDirty_(ps);
         if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
         recordsSent_ += static_cast<uint64_t>(recordCount);
         return RejectReason::None;
@@ -1117,6 +1121,12 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     if (partitions_.size() >= maxPartitions_) {
         throw std::length_error("ProducerImpl: more than 262144 partitions");
     }
+    // F12: the dirty list holds each slot at most once — keep its capacity >=
+    // the partition count (geometric, BEFORE the table grows: a bad_alloc here
+    // leaves no half-created partition), so markDirty_ never allocates.
+    if (dirty_.capacity() < partitions_.size() + 1) {
+        dirty_.reserve(std::max<std::size_t>(64, 2 * (partitions_.size() + 1)));
+    }
     partitions_.push_back(std::move(ps));
     partitionIndex_.insert(k, partitions_.back()->slotIndex);
     return *partitions_.back();
@@ -1147,8 +1157,9 @@ void ProducerImpl::growAckRing(PartitionState& ps) {
                  ps.topicId, ps.partition, oldCap, newCap);
 }
 
-int ProducerImpl::drainRing(int64_t nowNs) {
+int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     using rune::client::detail::ControlledAction;
+    lastDrainStop_ = DrainStop::Drained;
     // fix1 minor 9: the heartbeat is published once per duty cycle by
     // ProducerHub::drainAndFlush (publishHeartbeat()), not here — drainRing can
     // run up to 256x per producer per cycle.
@@ -1157,15 +1168,20 @@ int ProducerImpl::drainRing(int64_t nowNs) {
     // its ring never carries anything — skip the ring's head/tail reads entirely.
     if (mode_ == IngressMode::Direct) return 0;
 
-    // controlledRead with limit=1: drain ONE message per call so ProducerHub can
-    // interleave flushBatches() between records (keeps every builder ≤ batchBytes).
-    // The handler returns ABORT when the target partition is BLOCKED — its builder
-    // has hit batchBytes but cannot flush because it is at maxInFlight.  ABORT
-    // leaves the record UNCONSUMED in the ring (precise, in-order backpressure):
-    // the producer ring fills → Producer::send() back-pressures the app, and no
-    // builder ever grows past a sendable frame size (the fix for the 5s
-    // produceTimeout tail).  Unlike Aeron's ManyToOneRingBuffer, this ring both
-    // supports ABORT and dispatches the handler inline (no std::function).
+    // F12: drain up to messageLimit messages in ONE pass; ProducerHub flushes
+    // once after it (not once per record).  The pass stops early at a batch
+    // boundary only a flush can resolve (lastDrainStop_):
+    //   * a flush() token — BREAK (consumed): the hub flushes, then drains on,
+    //     so records after the token never join the batches it flushes;
+    //   * a record its partition cannot take yet — appendRecord_ ABORTs (builder
+    //     full / batchRecords / frame cap / Tier-2 queued ahead).  ABORT leaves
+    //     the record UNCONSUMED in the ring (precise, in-order backpressure):
+    //     the hub flushes and drains again; if the partition is also at
+    //     maxInFlight the ring fills → Producer::send() back-pressures the app.
+    //     No builder ever grows past a sendable frame size (the fix for the 5s
+    //     produceTimeout tail).
+    // Unlike Aeron's ManyToOneRingBuffer, this ring both supports ABORT and
+    // dispatches the handler inline (no std::function).
     return ring_.controlledRead(
         [this, nowNs](
             int32_t                              msgTypeId,
@@ -1175,9 +1191,11 @@ int ProducerImpl::drainRing(int64_t nowNs) {
         {
             const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
             if (msgTypeId == kMsgFlush) {
-                for (auto& up : partitions_) up->flushRequested = true;
-                globalFlushPending_.store(false, std::memory_order_relaxed);
-                return ControlledAction::CONTINUE;
+                // F12: only dirty partitions have anything to flush (O(dirty)).
+                for (const uint32_t slot : dirty_) partitions_[slot]->flushRequested = true;
+                globalFlushPending_.store(false, std::memory_order_relaxed);  // pre-existing latch (F8b)
+                lastDrainStop_ = DrainStop::FlushToken;
+                return ControlledAction::BREAK;  // flush at this boundary, then drain on
             }
 
             if (msgTypeId == kMsgTier2Batch) {
@@ -1190,6 +1208,7 @@ int ProducerImpl::drainRing(int64_t nowNs) {
                 recordsSent_ += static_cast<uint64_t>(entry->recordCount);
                 entry->enqueuedNs = nowNs;
                 ps.pendingTier2Entries.push_back(std::move(*entry));
+                markDirty_(ps);
                 return ControlledAction::CONTINUE;
             }
 
@@ -1213,10 +1232,13 @@ int ProducerImpl::drainRing(int64_t nowNs) {
             if (sz < static_cast<std::size_t>(kRecHeaderSize) + valueLen)
                 return ControlledAction::CONTINUE;
 
-            return appendRecord_(topicId, partition, p + kRecKeyBytesOff, keyLen,
-                                 p + kRecValBytesOff, valueLen, flags, ackHandle, nowNs);
+            const ControlledAction a =
+                appendRecord_(topicId, partition, p + kRecKeyBytesOff, keyLen,
+                              p + kRecValBytesOff, valueLen, flags, ackHandle, nowNs);
+            if (a == ControlledAction::ABORT) lastDrainStop_ = DrainStop::Blocked;
+            return a;
         },
-        /*messageCountLimit=*/1);
+        messageLimit);
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,18 +1311,19 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
             return ControlledAction::ABORT;
         }
     }
-    // Normal-path backpressure: ABORT when full AND at maxInFlight (Ring: the hub
-    // flushes between drained records, so a full builder with window room is sent
-    // before the next record).  Direct (Task 14): no flush runs between sends —
-    // the pass flushes at its end — so a full builder ABORTs regardless of the
-    // window; otherwise it would grow past batchBytes into an oversized frame.
-    if (!frameCapped && ps.builderBytes >= effCap &&
-        (mode_ == IngressMode::Direct || !canFlight_(ps))) {
+    // Normal-path backpressure: a full builder ABORTs, regardless of the window.
+    // No flush runs between appends in either mode (F12: Ring drains a whole pass
+    // and the hub flushes once after it; Direct (Task 14) flushes at the end of
+    // the owner's pass) — so without this a builder would grow past batchBytes
+    // into an oversized frame.  Ring: the ABORT ends the drain pass, the hub
+    // flushes the full builder and drains again; if the window is full too, the
+    // record stays in the ring (back-pressure).
+    if (!frameCapped && ps.builderBytes >= effCap) {
         return ControlledAction::ABORT;
     }
-    // Task 14 fix1 M2: Direct enforces batchRecords too (no flush runs between
-    // sends, so the builder must stop at the record cap itself).
-    if (mode_ == IngressMode::Direct && cfg_.batchRecords > 0 && ps.builder &&
+    // Task 14 fix1 M2 / F12: batchRecords is enforced at append time too, in
+    // both modes (no flush runs between appends).
+    if (cfg_.batchRecords > 0 && ps.builder &&
         ps.builder->recordCount() >= cfg_.batchRecords) {
         return ControlledAction::ABORT;
     }
@@ -1359,6 +1382,7 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     // fix2: the batch clock is the EARLIEST record's acceptance time (a deferred
     // record carries its own; Kafka accumulator semantics).
     if (index == 0 || nowNs < ps.batchStartNs) ps.batchStartNs = nowNs;
+    markDirty_(ps);  // F12: no-throw (capacity reserved with the partition)
     if (wantAck) {
         if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
         while (ps.batchAckCount < index) pushAck_(ps, 0);
@@ -1700,8 +1724,19 @@ int ProducerImpl::flushBatches(
 
     int flushed = 0;
 
-    for (auto& up : partitions_) {
-        PartitionState& ps = *up;
+    // F12: walk ONLY the dirty partitions (O(dirty), not O(partitions)), compacting
+    // the list in place: a partition with no work left after its visit leaves the
+    // list (dirty=false); one still holding records / Tier-2 batches (linger not
+    // expired, window full, transport back-pressure) stays for the next cycle.
+    // Indexed (never iterators/references into dirty_): user callbacks fired by a
+    // send below can only APPEND to it (markDirty_ — no reallocation, capacity is
+    // reserved), and those late entries are carried over after the walk.
+    const std::size_t walkEnd = dirty_.size();
+    std::size_t keep = 0;
+    for (std::size_t di = 0; di < walkEnd; ++di) {
+        const uint32_t slot = dirty_[di];
+        PartitionState& ps = *partitions_[slot];
+        ++flushVisits_;
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
         //
         // CB-5 A1 FIX: Tier-2 entries must NEVER be dispatched while a
@@ -1755,21 +1790,34 @@ int ProducerImpl::flushBatches(
         // CB-5 A1: skip Tier-2 entirely if a Tier-1 batch is still pending
         // (either not triggered, blocked by maxInFlight, or send failed).
         // This enforces strict submission order: no T2 can jump ahead of T1.
-        if (tier1Pending) continue;
+        if (!tier1Pending) {
+            while (!ps.pendingTier2Entries.empty()) {
+                // maxInFlight guard (shared with Tier-1 for this partition).
+                if (!canFlight_(ps)) break;
 
-        while (!ps.pendingTier2Entries.empty()) {
-            // maxInFlight guard (shared with Tier-1 for this partition).
-            if (!canFlight_(ps)) break;
+                Tier2Entry& entry = ps.pendingTier2Entries.front();
 
-            Tier2Entry& entry = ps.pendingTier2Entries.front();
-
-            if (!encodeAndSendTier2(ps, entry, nowNs, sessionId, sink)) {
-                break; // back-pressure: keep the entry, retry next cycle (no drop)
+                if (!encodeAndSendTier2(ps, entry, nowNs, sessionId, sink)) {
+                    break; // back-pressure: keep the entry, retry next cycle (no drop)
+                }
+                ++flushed;
+                ps.pendingTier2Entries.pop_front();
             }
-            ++flushed;
-            ps.pendingTier2Entries.pop_front();
+        }
+
+        // F12: still has work -> stays dirty; otherwise leaves the list.  Re-read
+        // the state (a callback fired above may have reset this partition).
+        if ((ps.builder && ps.builder->recordCount() > 0) || !ps.pendingTier2Entries.empty()) {
+            dirty_[keep++] = slot;
+        } else {
+            ps.dirty          = false;
+            ps.flushRequested = false;
         }
     }
+    // Entries appended during the walk (callbacks) slide down behind the kept ones.
+    const std::size_t total = dirty_.size();
+    for (std::size_t di = walkEnd; di < total; ++di) dirty_[keep++] = dirty_[di];
+    dirty_.resize(keep);  // shrink only: never allocates
 
     return flushed;
 }

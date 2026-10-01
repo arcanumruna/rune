@@ -163,6 +163,12 @@ struct PartitionState {
     // Force-flush flag (set by flush() call from app thread, read here).
     bool flushRequested = false;
 
+    // F12: this partition is on its producer's dirty list (ProducerImpl::dirty_)
+    // — it has (or recently had) builder records / queued Tier-2 batches, so
+    // flushBatches must examine it.  Cleared lazily by the flush walk once the
+    // partition has no work left.  Owner/duty thread only.
+    bool dirty = false;
+
     // Task 14 fix2: records of THIS partition waiting in the producer's
     // DeferredArena (owner thread only).  >0 gates this partition's Direct
     // sends (per-partition order) without touching any other partition.
@@ -591,20 +597,36 @@ public:
 
     // ---- Agent-thread API (single-writer) ------------------------------------
 
-    /// Drain SEND_RECORD ring messages, append to builders.
-    /// Does NOT flush — call flushBatches() after.  Applies a drain gate: if any
-    /// partition is at batchBytes AND at maxInFlight, returns 0 without reading so
-    /// the producer ring back-pressures the app (bounds every builder to a
-    /// sendable size).
+    /// Drain up to `messageLimit` ring messages, appending records to builders.
+    /// Does NOT flush — call flushBatches() after.  The drain stops EARLY (see
+    /// lastDrainStop()) at a batch boundary that only a flush can resolve:
+    ///   * a flush() token (consumed — records after it must not join the
+    ///     batches it flushes);
+    ///   * a record its partition cannot take yet (builder at batchBytes /
+    ///     batchRecords / the frame cap, or a Tier-2 batch queued ahead of it):
+    ///     the record stays UNCONSUMED in the ring (ABORT, in-order
+    ///     back-pressure), so no builder ever grows past a sendable frame.
     /// nowNs: current time (NanoClock, sampled once per doWork cycle).
-    /// Returns count of records drained.
-    int drainRing(int64_t nowNs);
+    /// Returns the number of ring messages consumed.
+    int drainRing(int64_t nowNs, int messageLimit = 1);
+
+    /// F12: why the last drainRing() stopped (duty thread only).
+    enum class DrainStop : uint8_t {
+        Drained,    ///< ring empty or messageLimit reached (Direct: always)
+        FlushToken, ///< consumed a flush() token: flush now, then drain on
+        Blocked,    ///< a record waits for a flush (ABORT; left in the ring)
+    };
+    [[nodiscard]] DrainStop lastDrainStop() const noexcept { return lastDrainStop_; }
 
     /// Sink concept: `bool operator()(int32_t topicId, int32_t partition,
     /// int32_t ingressStreamId, const uint8_t* buf, std::size_t len) const`.
     /// Explicitly instantiated in ProducerImpl.cpp for SendFn (tests, cold
     /// paths), agent::AgentProduceSink (production) and CountingSink (benches);
     /// no std::function is built or called on the production flush path.
+    ///
+    /// F12: examines ONLY the dirty partitions (those with builder records or
+    /// queued Tier-2 batches) — O(dirty), never O(partitions); a partition
+    /// leaves the dirty list once it has no work left.
     template <class Sink>
     int flushBatches(int64_t nowNs, int64_t sessionId, const Sink& sink);
 
@@ -770,6 +792,9 @@ public:
     /// Apply passes run so far.
     [[nodiscard]] uint64_t debugDeferPasses() const noexcept { return deferPasses_; }
     [[nodiscard]] std::size_t debugDeferPartitionCap() const noexcept { return deferPartitionCap_; }
+    /// F12: partitions examined by flushBatches so far (owner/duty thread; a
+    /// plain counter — the per-cycle flush must scale with dirty partitions).
+    [[nodiscard]] uint64_t debugFlushVisits() const noexcept { return flushVisits_; }
 
     // ---- Global flush flag (written by app thread, read by agent) -------------
     // Set by submitFlush(); cleared by flushBatches() after processing.
@@ -785,6 +810,15 @@ private:
     // ---- Agent-side helpers --------------------------------------------------
 
     PartitionState& getOrCreatePartition(int32_t topicId, int32_t partition);
+
+    /// F12: put `ps` on the dirty list (idempotent).  Never allocates: dirty_'s
+    /// capacity is reserved with the partition table (each slot appears once).
+    void markDirty_(PartitionState& ps) noexcept {
+        if (!ps.dirty) {
+            ps.dirty = true;
+            dirty_.push_back(ps.slotIndex);
+        }
+    }
 
     /// Closed state for this producer's ingress mode (Direct: owner-thread bool;
     /// Ring: the ring trailer's closed word).
@@ -885,6 +919,7 @@ private:
     // Single-writer (agent thread): no atomics needed per shared-nothing law.
     uint64_t framesSent_  = 0; // total Aeron frames offered to transport
     uint64_t recordsSent_ = 0; // total records drained from the ring
+    uint64_t flushVisits_ = 0; // F12: partitions examined by flushBatches (debugFlushVisits)
 
     // ---- Own ring buffer (MPSC: many app threads write, one agent thread reads)
     // ProducerImpl owns its ring so SEND_RECORD messages are separate from the
@@ -899,6 +934,11 @@ private:
     // their PartitionState (stable address; slotIndex == position).
     detail::FlatIndexMap                          partitionIndex_;
     std::vector<std::unique_ptr<PartitionState>>  partitions_;
+    // F12: slots of the partitions with flush work (PartitionState::dirty), in
+    // the order they became dirty.  capacity() >= partitions_.size() always
+    // (reserved in getOrCreatePartition), so markDirty_ never allocates.
+    std::vector<uint32_t>                         dirty_;
+    DrainStop                                     lastDrainStop_ = DrainStop::Drained;
 
     // Encode scratch buffers (reused per batch — zero per-flush heap allocation).
     // batchScratch_: RecordBatch bytes (cleared + refilled by buildInto()).

@@ -92,12 +92,18 @@ int main() {
     std::thread agent([&]{
         for (;;) {
             int work = 0;
+            // F12: same loop as ProducerHub::drainAndFlush — drain a whole pass,
+            // flush once (dirty partitions only), re-drain only at a boundary.
+            int budget = 256;
             for (int it = 0; it < 256; ++it) {
                 const int64_t nowNs = wallNs();
-                const int d = impl.drainRing(nowNs);
+                const int d = impl.drainRing(nowNs, budget);
                 const int f = flush(nowNs);
                 work += d + f;
-                if (d == 0) break;
+                budget -= d;
+                const auto stop = impl.lastDrainStop();
+                if (budget <= 0 || stop == ProducerImpl::DrainStop::Drained) break;
+                if (stop == ProducerImpl::DrainStop::Blocked && f == 0) break;
             }
             // idle flush so linger-based flushes still fire when the ring is empty
             flush(wallNs());
