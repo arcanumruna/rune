@@ -228,6 +228,66 @@ void ClientGateway::enqueueOrBestEffort_(Session&       session,
 }
 
 // ---------------------------------------------------------------------------
+// F19: pushRecords_ — send one Records push frame on the session's egress.
+// Real egress → rune::node::sendRecordsFrame (tryClaim fast path for one-MTU
+// frames, unchanged; vectored [fixed | batch] offer above it; TooLarge above
+// maxMessageLength).  Null egress (injectTestSession) → the test capture hook
+// (treated as sent); no hook → Retry.
+// ---------------------------------------------------------------------------
+rune::node::RecordsSendResult ClientGateway::pushRecords_(Session& session, const pc::Records& rec)
+{
+    if (session.egress) [[likely]]
+        return rune::node::sendRecordsFrame(*session.egress, rec, scratch_.data(), scratch_.size());
+    if (!onEgressFrame_) return {rune::node::RecordsSendKind::Retry, -1};
+    captureTestRecordsFrame_(session, rec);
+    return {rune::node::RecordsSendKind::Sent, 1};
+}
+
+void ClientGateway::captureTestRecordsFrame_(Session& session, const pc::Records& rec)
+{
+    const std::size_t frameLen = rec.encodedSize();
+    if (frameLen <= scratch_.size()) {
+        onEgressFrame_(session.sessionId, scratch_.data(), rec.encode(scratch_.data()));
+        return;
+    }
+    std::vector<uint8_t> frame(frameLen);   // test-only: frame larger than scratch_
+    onEgressFrame_(session.sessionId, frame.data(), rec.encode(frame.data()));
+}
+
+// ---------------------------------------------------------------------------
+// F19: failPushSubscriptionTooLarge_ — the next stored batch of `sub` can never
+// be delivered on this session's egress publication (frame > maxMessageLength).
+// Fail the subscription ONCE, explicitly, and park it AT the batch — nextOffset
+// is NOT advanced, so nothing is lost silently; pushSubscriptions() skips it
+// (no spin) until the client unsubscribes.  The error (F15 S3 m-f convention:
+// correlationId 0, subscription named in the message) is owed until sent.
+// ---------------------------------------------------------------------------
+void ClientGateway::failPushSubscriptionTooLarge_(Subscription& sub, Session& session,
+                                                  std::size_t frameLen)
+{
+    if (sub.failed) return;
+    sub.failed         = true;
+    sub.errorOwed      = true;
+    sub.failedFrameLen = frameLen;
+    spdlog::error("ClientGateway: push sub={} (topicId={} partition={}) failed at offset={}: "
+                  "Records frame {} B exceeds the egress maxMessageLength {} B — "
+                  "MessageTooLarge, subscription parked (cursor not advanced)",
+                  sub.subscriptionId, sub.topicId, sub.partition, sub.nextOffset, frameLen,
+                  session.egress ? session.egress->maxMessageLength() : 0);
+    trySendOwedPushError_(sub, session);
+}
+
+void ClientGateway::trySendOwedPushError_(Subscription& sub, Session& session)
+{
+    static_assert(rune::node::kPushTooLargeErrorMaxBytes <= kScratchSize);
+    const std::size_t n = rune::node::encodePushTooLargeError(
+        scratch_.data(), sub.sessionId, sub.subscriptionId, sub.topicId, sub.partition,
+        sub.nextOffset, sub.failedFrameLen,
+        session.egress ? session.egress->maxMessageLength() : 0);
+    if (offerBytes_(&session, scratch_.data(), n) > 0) sub.errorOwed = false;
+}
+
+// ---------------------------------------------------------------------------
 // G0.1: sendRespReliable_ — encode a ProduceResponse into scratch_ and route it
 // through enqueueOrBestEffort_.  Returns false only on an encode error.
 // ---------------------------------------------------------------------------
@@ -2496,9 +2556,12 @@ void ClientGateway::pushSubscriptions()
         // gateway must NOT also push them (that would double-deliver).  Internal
         // partitions (topicId < 0) are not worker-owned, so keep gateway-pushing them.
         if (perWorkerEgressActive_ && sub.topicId >= 0) continue;
-
         // Find the owning session.
         Session* session = sessions_.find(sub.sessionId);
+        if (sub.failed) [[unlikely]] {   // F19: parked at an undeliverable batch
+            if (sub.errorOwed && session) trySendOwedPushError_(sub, *session);
+            continue;
+        }
         if (!session) {
             // Session gone — subscription will be reaped; skip this cycle.
             continue;
@@ -2719,8 +2782,9 @@ void ClientGateway::pushSubscriptions()
                 // Without advancing nextOffset, the next pushSubscriptions() cycle
                 // re-reads from the same offset, re-encounters the same corrupt
                 // batch, and stalls permanently (the subscription can never advance
-                // past it).  This is the mid-chunk analogue of the GB-5p1 fix
-                // applied to the too-large/u16-overflow branches below.
+                // past it).  (F19: an oversize batch is NOT skipped like this —
+                // it is undeliverable, not corrupt: the subscription is failed
+                // explicitly and parked at it.)
                 //
                 // A corrupt batch in a recovered log should be unreachable
                 // (recover() drops torn tails), but if it occurs (e.g. a bug
@@ -2801,35 +2865,14 @@ void ClientGateway::pushSubscriptions()
                 }
             }
 
-            // Encode Records{subscriptionId, topicId, partition, baseOffset, batchBytes}.
-            // The batch bytes are a zero-copy span into the chunk.
-            const std::size_t needed =
-                pc::Records::BODY_FIXED + pc::MessageHeader::ENCODED_SIZE + 2u + batchSize;
-
-            // GB-5 Fix #1: on skip of a genuinely-unsendable batch, advance BOTH
-            // chunkPos AND sub.nextOffset so the subscription makes forward progress.
-            // Without this fix the subscription stalls permanently at the oversized
-            // batch, losing all subsequent records.
-            // This must NOT apply to normal (sendable) batches or back-pressured
-            // batches — only to batches that can never be encoded/sent.
-            if (needed > kScratchSize) {
-                // Batch too large for scratch — skip (should not happen: u16 cap = 65535).
-                spdlog::warn("ClientGateway: push sub={} batch too large ({} > {}); skipping, advancing nextOffset",
-                             subId, needed, kScratchSize);
-                chunkPos += batchSize;
-                sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
-                continue;
-            }
-
-            // Also guard: Records uses a u16 length prefix for recordBatch.
-            if (batchSize > 65535u) {
-                spdlog::warn("ClientGateway: push sub={} batchSize {} exceeds u16 max; skipping, advancing nextOffset",
-                             subId, batchSize);
-                chunkPos += batchSize;
-                sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
-                continue;
-            }
-
+            // Records{subscriptionId, topicId, partition, baseOffset, batchBytes}:
+            // the batch bytes are a zero-copy span into the chunk.
+            //
+            // F19: no size guard here — the Records var field has a u32 length and
+            // pushRecords_ delivers any frame up to the egress maxMessageLength
+            // (tryClaim fast path / vectored offer).  A larger frame is answered
+            // with an explicit error and the subscription parks AT the batch —
+            // never skipped silently.
             pc::Records rec;
             rec.sessionId      = sub.sessionId;
             rec.correlationId  = 0;  // push; no correlation
@@ -2839,44 +2882,12 @@ void ClientGateway::pushSubscriptions()
             rec.baseOffset     = baseOffset;
             rec.recordBatch    = std::span<const uint8_t>(batchPtr, batchSize);
 
-            const std::size_t encoded = rec.encode(scratch_.data());
-
-            // Push via tryClaim (no offer-spin — single writer, no blocking).
-            //
-            // Guard: test sessions (injectTestSession) have a null egress shared_ptr.
-            // Dereferencing a null shared_ptr is UB/crash.  Mirror the sendTo() pattern:
-            // fire onEgressFrame_ and treat as a successful send (pos=1) so nextOffset
-            // advances.  Without this guard the fixture crashes at the *session->egress
-            // dereference for every group push subscription on a test session.
-            int64_t pos = -1;
-            if (!session->egress) {
-                // Null-egress path: invoke the test capture hook (if installed).
-                if (onEgressFrame_) {
-                    onEgressFrame_(session->sessionId, scratch_.data(), encoded);
-                    pos = 1; // treat as sent — advance nextOffset
-                }
-                // No hook: leave pos=-1 → back-pressured (subscription retries next cycle).
-            } else {
-                aeron::ExclusivePublication& pub = *session->egress;
-                auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
-                aeron::concurrent::AtomicBuffer atomicBuf(
-                    mutableBuf, static_cast<aeron::util::index_t>(encoded));
-                if (encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
-                    // Single-fragment fast path.
-                    aeron::concurrent::logbuffer::BufferClaim claim;
-                    pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
-                    if (pos > 0) {
-                        claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
-                                                static_cast<aeron::util::index_t>(encoded));
-                        claim.commit();
-                    }
-                } else {
-                    // Batch larger than one MTU fragment: offer() fragments it; the
-                    // client's egress FragmentAssembler reassembles.  (Without this a
-                    // normal RecordBatch was silently skipped on UDP → reads stalled.)
-                    pos = pub.offer(atomicBuf, 0, static_cast<aeron::util::index_t>(encoded));
-                }
+            const rune::node::RecordsSendResult sent = pushRecords_(*session, rec);
+            if (sent.kind == rune::node::RecordsSendKind::TooLarge) [[unlikely]] {
+                failPushSubscriptionTooLarge_(sub, *session, rec.encodedSize());
+                break;
             }
+            const int64_t pos = sent.position;
 
             if (pos > 0) {
                 // SUCCESS: advance nextOffset exactly past this batch.
@@ -3223,6 +3234,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             auto subIt = subscriptions_.find(ret.subscriptionId);
             if (subIt == subscriptions_.end()) return;
             Subscription& sub = subIt->second;
+            if (sub.failed) [[unlikely]] return;   // F19: parked — never push past the failed batch
 
             // Iterate whole record batches in the chunk — mirrors the inline
             // pushSubscriptions() loop exactly.
@@ -3347,30 +3359,9 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                     }
                 }
 
-                // Guard: batch too large for scratch.
-                const std::size_t needed =
-                    pc::Records::BODY_FIXED + pc::MessageHeader::ENCODED_SIZE
-                    + 2u + batchSize;
-                if (needed > kScratchSize) {
-                    spdlog::warn(
-                        "ClientGateway: push (worker) sub={} batch too large "
-                        "({} > {}); skipping",
-                        ret.subscriptionId, needed, kScratchSize);
-                    chunkPos += batchSize;
-                    sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
-                    continue;
-                }
-                if (batchSize > 65535u) {
-                    spdlog::warn(
-                        "ClientGateway: push (worker) sub={} batchSize {} > u16 max; "
-                        "skipping",
-                        ret.subscriptionId, batchSize);
-                    chunkPos += batchSize;
-                    sub.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
-                    continue;
-                }
-
-                // Encode Records frame.
+                // Records frame (zero-copy batch span).  F19: any size up to the
+                // egress maxMessageLength is delivered; above it the subscription
+                // is failed explicitly and parked AT the batch (no silent skip).
                 pc::Records rec;
                 rec.sessionId      = ret.sessionId;
                 rec.correlationId  = 0;
@@ -3381,41 +3372,12 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 rec.recordBatch    =
                     std::span<const uint8_t>(batchPtr, batchSize);
 
-                const std::size_t encoded = rec.encode(scratch_.data());
-
-                // tryClaim / null-egress path — identical to inline pushSubscriptions.
-                int64_t pos = -1;
-                if (!session->egress) {
-                    if (onEgressFrame_) {
-                        onEgressFrame_(session->sessionId, scratch_.data(), encoded);
-                        pos = 1;
-                    }
-                } else {
-                    aeron::ExclusivePublication& pub = *session->egress;
-                    auto* mutableBuf = const_cast<uint8_t*>(scratch_.data());
-                    aeron::concurrent::AtomicBuffer atomicBuf(
-                        mutableBuf, static_cast<aeron::util::index_t>(encoded));
-                    if (encoded <= static_cast<std::size_t>(pub.maxPayloadLength())) {
-                        // Single-fragment fast path.
-                        aeron::concurrent::logbuffer::BufferClaim claim;
-                        pos = pub.tryClaim(
-                            static_cast<aeron::util::index_t>(encoded), claim);
-                        if (pos > 0) {
-                            claim.buffer().putBytes(
-                                claim.offset(), atomicBuf, 0,
-                                static_cast<aeron::util::index_t>(encoded));
-                            claim.commit();
-                        }
-                    } else {
-                        // Batch larger than one MTU fragment: offer() fragments it
-                        // across the term buffer; the client's egress FragmentAssembler
-                        // reassembles.  WITHOUT this a normal-sized RecordBatch
-                        // (encoded > maxPayloadLength ≈ MTU) was silently skipped on
-                        // UDP and never delivered — real-network reads stalled.
-                        pos = pub.offer(atomicBuf, 0,
-                                        static_cast<aeron::util::index_t>(encoded));
-                    }
+                const rune::node::RecordsSendResult sent = pushRecords_(*session, rec);
+                if (sent.kind == rune::node::RecordsSendKind::TooLarge) [[unlikely]] {
+                    failPushSubscriptionTooLarge_(sub, *session, rec.encodedSize());
+                    break;
                 }
+                const int64_t pos = sent.position;
 
                 if (pos > 0) {
                     sub.nextOffset =

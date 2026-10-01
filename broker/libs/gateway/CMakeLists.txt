@@ -173,6 +173,7 @@ if(BUILD_TESTING)
                 tests/integration/GatewaySubscribeTest.cpp)
             target_link_libraries(rune_gateway_subscribe_tests PRIVATE
                 rune_gateway
+                rune_node   # F19: worker-return push path (WorkerPool)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_subscribe_tests

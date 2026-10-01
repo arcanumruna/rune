@@ -79,6 +79,7 @@
 #include <rune_protocol_internal_sbe/TailKind.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
+#include <rune/node/RecordsPush.h>
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
 #include <rune/storage/Log.h>
@@ -86,6 +87,7 @@
 #include <rune/storage/ProducePath.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
 #include <rune/codec/Validator.h>
 #include <rune/codec/Serialize.h>
@@ -306,6 +308,16 @@ public:
         // shared-nothing).  nullptr → fall back to the shared MDC pub
         // (workerEgress_) for broadcast/replication.
         aeron::ExclusivePublication* egressPub = nullptr;
+        /// F19 push state.  Live: pushing.  ErrorOwed: the next batch's Records
+        /// frame exceeds the egress maxMessageLength — the cursor is parked AT
+        /// it and one ErrorResponse{MessageTooLarge, correlationId 0, message
+        /// naming the subscription} is owed (retried each pass until sent).
+        /// Failed: the error was sent; parked until Unsubscribe (no reads, no
+        /// spin).  A same-id re-Subscribe keeps the state (one error per sub).
+        enum class PushState : uint8_t { Live, ErrorOwed, Failed };
+        PushState pushState = PushState::Live;
+        /// ErrorOwed/Failed: the undeliverable Records frame size (named in the error).
+        std::size_t failedFrameLen = 0;
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -1446,6 +1458,22 @@ private:
         return pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
     }
 
+    // F19: send the owed ErrorResponse{MessageTooLarge} for a subscription
+    // parked at an undeliverable batch (cursor == that batch's offset).
+    // ErrorOwed → Failed on success; stays ErrorOwed (retried next pass, same
+    // as back-pressured Records) otherwise.  Returns 1 if sent.  Cold path.
+    // correlationId 0 + a message naming subscription/topic/partition/offset
+    // (encodePushTooLargeError — the F15 S3 m-f convention).
+    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub) {
+        static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
+        const std::size_t n = encodePushTooLargeError(
+            egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
+            s.nextOffset, s.failedFrameLen, pub->maxMessageLength());
+        if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) return 0;
+        s.pushState = WorkerSubscription::PushState::Failed;
+        return 1;
+    }
+
     int pushOwnedSubscriptions_(int64_t /*nowNs*/) {
         using namespace rune::protocol::batch;
         namespace pc = rune::protocol::client;
@@ -1460,6 +1488,12 @@ private:
             aeron::ExclusivePublication* egressPub = s.egressPub;
             if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
             if (!egressPub) continue;  // nowhere to send yet
+
+            if (s.pushState != WorkerSubscription::PushState::Live) [[unlikely]] {
+                if (s.pushState == WorkerSubscription::PushState::ErrorOwed)
+                    work += sendPushTooLarge_(s, egressPub);
+                continue;   // parked AT the undeliverable batch
+            }
 
             // HW bound (read_uncommitted).  Worker owns the replica → live HW.
             auto* rep = subReplica_(s);
@@ -1525,16 +1559,25 @@ private:
                 rec.baseOffset     = baseOffset;
                 rec.recordBatch    = std::span<const uint8_t>(bp, batchSize);
 
-                const std::size_t needed =
-                    pc::MessageHeader::ENCODED_SIZE + pc::Records::BODY_FIXED + 4u + batchSize;
-                if (needed > egressScratch_.size()) {  // unencodable — skip forward
-                    pos += batchSize;
-                    s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
-                    continue;
+                // F19: any frame up to the egress maxMessageLength is delivered
+                // (tryClaim fast path / vectored [fixed | batch] offer — zero
+                // copy of the batch).  Above it: fail this subscription
+                // explicitly and park AT the batch — never skip forward.
+                const RecordsSendResult sent =
+                    sendRecordsFrame(*egressPub, rec, egressScratch_.data(), egressScratch_.size());
+                if (sent.kind == RecordsSendKind::TooLarge) [[unlikely]] {
+                    spdlog::error("Worker {}: push sub={} (topicId={} partition={}) failed at "
+                                  "offset={}: Records frame {} B exceeds the egress "
+                                  "maxMessageLength {} B — MessageTooLarge, subscription parked "
+                                  "(cursor not advanced)",
+                                  workerId_, s.subscriptionId, s.topicId, s.partition, baseOffset,
+                                  rec.encodedSize(), egressPub->maxMessageLength());
+                    s.pushState      = WorkerSubscription::PushState::ErrorOwed;
+                    s.failedFrameLen = rec.encodedSize();
+                    work += sendPushTooLarge_(s, egressPub);
+                    break;
                 }
-
-                const std::size_t encoded = rec.encode(egressScratch_.data());
-                const int64_t r = sendEncodedToPub_(egressPub, egressScratch_.data(), encoded);
+                const int64_t r = sent.position;
                 if (r > 0) {
                     s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                     pos += batchSize;
@@ -2592,10 +2635,11 @@ private:
     std::vector<WorkerSubscription> subs_;
 
     // read-rework T3/T4 (I3): per-worker encode scratch for the in-worker push
-    // loop.  Holds one encoded Records frame (header + one whole record batch).
+    // loop.  Holds one encoded single-fragment Records frame (tryClaim fast
+    // path), or just the 52-byte fixed part of a larger frame whose batch bytes
+    // go out zero-copy in a vectored offer (F19: the scratch size no longer
+    // bounds the deliverable batch size — the egress maxMessageLength does).
     // Reused every push; NO per-batch heap allocation on the read hot path.
-    // Sized like the gateway's push scratch (68 KiB: 50-byte header + up to a
-    // 65535-byte u16-capped batch, rounded up).
     static constexpr std::size_t kEgressScratchSize = 68 * 1024;
     // Max whole batches pushed per subscription per doWork cycle (fairness).
     static constexpr int         kPushBatchesPerSubPerCycle = 1024;

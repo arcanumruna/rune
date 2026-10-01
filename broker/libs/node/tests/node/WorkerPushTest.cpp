@@ -15,6 +15,8 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/Protocol.h>
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -26,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,6 +48,9 @@ protected:
     std::shared_ptr<aeron::Aeron> aeron_;
     std::string aeronDir_;
 
+    // Driver term length (UDP).  maxMessageLength = term / 8.
+    virtual int32_t termBufferBytes() const { return 64 * 1024; }
+
     void SetUp() override {
         startDriver();
         aeron::Context ctx; ctx.aeronDir(aeronDir_);
@@ -62,7 +68,7 @@ protected:
         // stamped the heartbeat synchronously before the driver thread starts.
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir_;
-        cfg.termBufferBytes = 64 * 1024;
+        cfg.termBufferBytes = termBufferBytes();
         try {
             driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
         } catch (const std::exception& e) {
@@ -296,6 +302,193 @@ TEST_F(WorkerPushFixture, NoEgressWiredIsInertNoCrash) {
     ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
     EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 0);
     std::filesystem::remove_all(dir);
+}
+
+
+// ===========================================================================
+// F19 (REGRESSION): per-worker egress (shard mode) skipped any batch whose
+// Records frame exceeded the 68 KiB egressScratch_ and advanced the cursor —
+// silent consumer data loss — and a frame between maxPayload and the scratch
+// but above the publication's maxMessageLength threw out of doWork.
+//
+// Fixed: deliverable frames go out as a vectored offer (header from scratch +
+// batch bytes zero-copy from the log view); a frame above maxMessageLength
+// answers ONE ErrorResponse{MessageTooLarge, correlationId = 0, message naming
+// the subscription/topic/partition/offset}
+// and parks that subscription (cursor not advanced; others unaffected);
+// back-pressure keeps the retry-from-same-cursor semantics.
+// ===========================================================================
+struct F19Egress {
+    struct Rec { int64_t subId; int64_t baseOffset; std::vector<uint8_t> bytes; };
+    struct Err { int64_t sessionId; int64_t correlationId; int16_t code; std::string message; };
+    std::vector<Rec> records;
+    std::vector<Err> errors;
+    aeron::FragmentAssembler fa;
+    F19Egress()
+        : fa([this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                    aeron::util::index_t len, aeron::Header&) {
+              const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+              const auto  n = static_cast<std::size_t>(len);
+              if (auto r = pc::Records::decode(p, n))
+                  records.push_back({r->subscriptionId, r->baseOffset,
+                                     {r->recordBatch.begin(), r->recordBatch.end()}});
+              else if (auto e = pc::ErrorResponse::decode(p, n))
+                  errors.push_back({e->sessionId, e->correlationId, e->code, std::string(e->message)});
+          }) {}
+    [[nodiscard]] std::size_t recordsFor(int64_t subId) const {
+        std::size_t c = 0;
+        for (const auto& r : records) c += (r.subId == subId);
+        return c;
+    }
+};
+
+// Append one batch whose single record value is `valueBytes` long at the log's
+// LEO; returns the exact stored bytes.  Built once per size and restamped
+// (baseOffset, bytes 0..7, is not CRC-covered); appended without fsync (the
+// page cache is visible to readers) to keep the 1 MiB cases fast.
+static std::vector<uint8_t> f19AppendSized(rune::storage::Log& log, std::size_t valueBytes) {
+    static std::map<std::size_t, std::vector<uint8_t>> built;
+    const int64_t base = log.logEndOffset();
+    auto& tmpl = built[valueBytes];
+    if (tmpl.empty()) {
+        std::string value(valueBytes, '\0');
+        for (std::size_t i = 0; i < valueBytes; ++i)
+            value[i] = static_cast<char>((i * 31u) & 0xffu);
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", value, 1000);
+        tmpl = b.build();
+    }
+    std::vector<uint8_t> bytes = tmpl;
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
+    log.appendNoSync(bytes.data(), bytes.size(), base);   // page cache: visible to readers
+    return bytes;
+}
+
+// 16 MiB UDP term → maxMessageLength 2 MiB: a 1 MiB batch is deliverable.
+class WorkerLargeBatchPushRegression : public WorkerPushFixture {
+protected:
+    int32_t termBufferBytes() const override { return 16 * 1024 * 1024; }
+};
+
+TEST_F(WorkerLargeBatchPushRegression, OneMiBBatchDeliveredIntactThenSmallBatch) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    const auto big   = f19AppendSized(log, 1024 * 1024);   // offset 0
+    const auto small = f19AppendSized(log, 16);            // offset 1
+
+    const char* control = "127.0.0.1:24910";
+    WorkerEgress eg(aeron_, control, 3101);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, "127.0.0.1:24911", 3101);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.recordsFor(1) >= 2 || !c.errors.empty();
+    }, 10s)) << "received " << c.records.size() << "/2 (1 MiB batch skipped = F19)";
+    ASSERT_TRUE(c.errors.empty());
+    ASSERT_EQ(c.recordsFor(1), 2u);
+    EXPECT_EQ(c.records[0].baseOffset, 0);
+    EXPECT_EQ(c.records[0].bytes, big) << "1 MiB batch not byte-identical after reassembly";
+    EXPECT_EQ(c.records[1].baseOffset, 1);
+    EXPECT_EQ(c.records[1].bytes, small);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 2);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(WorkerLargeBatchPushRegression, BackPressuredLargeOfferRetriesWithoutLoss) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 256LL * 1024 * 1024);
+    constexpr int kBatches = 12;
+    std::vector<std::vector<uint8_t>> stored;
+    for (int i = 0; i < kBatches; ++i) stored.push_back(f19AppendSized(log, 1024 * 1024));
+
+    const char* control = "127.0.0.1:24920";
+    WorkerEgress eg(aeron_, control, 3102);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, "127.0.0.1:24921", 3102);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+
+    // Drive the worker WITHOUT polling the subscriber: flow control closes the
+    // window and the 1 MiB offers back-pressure.
+    for (int i = 0; i < 4 * kBatches; ++i) w.doWork(1);
+    EXPECT_LT(w.subscriptionsForTest()[0].nextOffset, kBatches)
+        << "back-pressure never happened (test precondition)";
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.recordsFor(1) >= static_cast<std::size_t>(kBatches) || !c.errors.empty();
+    }, 20s)) << "received " << c.records.size() << "/" << kBatches;
+    ASSERT_TRUE(c.errors.empty());
+    ASSERT_EQ(c.recordsFor(1), static_cast<std::size_t>(kBatches));
+    for (int i = 0; i < kBatches; ++i) {
+        EXPECT_EQ(c.records[i].baseOffset, i) << "gap/dup/reorder at " << i;
+        EXPECT_EQ(c.records[i].bytes, stored[i]) << "batch " << i << " corrupted";
+    }
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, kBatches);
+    std::filesystem::remove_all(dir);
+}
+
+// 64 KiB UDP term → maxMessageLength 8 KiB: a 16 KiB batch cannot be delivered.
+class WorkerOversizePushRegression : public WorkerPushFixture {};
+
+TEST_F(WorkerOversizePushRegression, AboveMaxMessageLengthAnswersErrorNoSilentAdvance) {
+    auto dirA = tempLogDir();
+    auto dirB = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 64LL * 1024 * 1024);
+    rune::storage::Log logB(dirB.string(), 64LL * 1024 * 1024);
+    f19AppendSized(logA, 16 * 1024);   // A@0: frame > 8 KiB max message
+    f19AppendSized(logA, 16);          // A@1: behind the undeliverable batch
+    f19AppendSized(logB, 16);          // B: another subscription, must flow
+    f19AppendSized(logB, 16);
+
+    const char* control = "127.0.0.1:24930";
+    WorkerEgress eg(aeron_, control, 3103);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, "127.0.0.1:24931", 3103);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &logA)));
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(2, 10, 1, 0, &logB)));
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return !c.errors.empty() && c.recordsFor(2) >= 2;
+    }, 10s)) << "errors=" << c.errors.size() << " sub2 records=" << c.recordsFor(2);
+    ASSERT_EQ(c.errors.size(), 1u);
+    EXPECT_EQ(c.errors[0].correlationId, 0)
+        << "a subscription id must never be sent as a correlationId (collides with ping ids)";
+    EXPECT_NE(c.errors[0].message.find("subscription 1 topic 10 partition 0 offset 0"), std::string::npos)
+        << "message must name the subscription; got: " << c.errors[0].message;
+    EXPECT_EQ(c.errors[0].sessionId, 4201);
+    EXPECT_EQ(c.errors[0].code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+
+    // Parked: no delivery past the failed batch, no second error, cursor stays.
+    for (int i = 0; i < 200; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); }
+    EXPECT_EQ(c.recordsFor(1), 0u);
+    EXPECT_EQ(c.errors.size(), 1u) << "exactly one error, no spin";
+    for (const auto& s : w.subscriptionsForTest()) {
+        if (s.subscriptionId == 1) EXPECT_EQ(s.nextOffset, 0) << "silent advance past undelivered batch";
+        if (s.subscriptionId == 2) EXPECT_EQ(s.nextOffset, 2);
+    }
+    std::filesystem::remove_all(dirA);
+    std::filesystem::remove_all(dirB);
 }
 
 } // namespace

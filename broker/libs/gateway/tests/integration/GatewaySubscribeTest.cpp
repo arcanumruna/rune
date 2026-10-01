@@ -23,6 +23,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/PingMessages.h>
@@ -45,6 +46,8 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -241,6 +244,7 @@ public:
 
         for (int i = 0; i < maxIter && clock::now() < deadline; ++i) {
             if (gw_) gw_->doWork(nowNs());
+            if (pool_) pool_->doWork(nowNs());   // F19: worker-return push path
             if (clientSub && clientAsm) {
                 clientSub->poll(clientAsm->handler(), 10);
             }
@@ -375,6 +379,9 @@ public:
 
     std::unique_ptr<ClientGateway> gw_;
     std::unique_ptr<TopicRegistry> registry_;
+    // F19: when set, pump() also drives the WorkerPool (same thread) so the
+    // gateway's worker-return push path (PushRead → handleWorkerReturn_) runs.
+    rune::node::WorkerPool*        pool_ = nullptr;
     std::shared_ptr<aeron::Aeron>  aeron_;
 
 private:
@@ -1651,6 +1658,264 @@ TEST_F(GatewaySubscribeFixture, MC5_MidChunkCorruptBatchSkip_ForwardProgress)
             << "MC5: duplicate Records detected";
     }
 }
+
+
+// ===========================================================================
+// F19 (REGRESSION): a stored record batch larger than ~64 KiB was never
+// delivered to push consumers — both gateway push paths (inline + worker-return)
+// skipped it behind a stale u16 guard / the 68 KiB scratch and ADVANCED the
+// subscription's nextOffset with no error (silent consumer data loss).
+//
+// Fixed contract:
+//   - any batch whose Records frame fits the egress publication's
+//     maxMessageLength is delivered intact (vectored offer: header from scratch
+//     + the batch bytes zero-copy from the log; Aeron fragments, the client's
+//     FragmentAssembler reassembles);
+//   - a frame above maxMessageLength answers that subscription ONE
+//     ErrorResponse{MessageTooLarge, correlationId = 0, message naming the
+//     subscription/topic/partition/offset} (F15 S3 m-f: a subscription id
+//     shares no namespace with client correlation ids) and parks
+//     it (cursor NOT advanced, no further pushes, no repeated errors); other
+//     subscriptions are unaffected;
+//   - back-pressure on a large offer keeps today's retry semantics (cursor not
+//     advanced; the same batch is re-offered; nothing lost or duplicated).
+//
+// Each scenario runs on the inline path (no WorkerPool) and on the worker-return
+// path (a 1-worker WorkerPool pumped on the test thread).
+// ===========================================================================
+class GatewayLargeBatchPushRegression
+    : public GatewaySubscribeFixture,
+      public ::testing::WithParamInterface<bool /*workerPool*/> {
+public:
+    void SetUp() override {
+        GatewaySubscribeFixture::SetUp();
+        // The passive test client sends no keepalives; session liveness is not
+        // under test, and multi-MiB pushes under TSan/Debug can outlast the
+        // 10 s default idle timeout (the session would be reaped mid-drain).
+        gw_ = std::make_unique<ClientGateway>(aeron_, "aeron:ipc", kIngressStream, kThisNodeId,
+                                              /*sessionTimeoutNs=*/std::numeric_limits<int64_t>::max() / 2);
+        gw_->setTopicRegistry(registry_.get());
+        if (GetParam()) {
+            ownedPool_ = std::make_unique<rune::node::WorkerPool>(
+                1, rune::metadata::ShardRouter(1));
+            gw_->setWorkerPool(ownedPool_.get());
+            pool_ = ownedPool_.get();
+        }
+    }
+    void TearDown() override {
+        pool_ = nullptr;
+        GatewaySubscribeFixture::TearDown();   // gateway first, then the pool
+        ownedPool_.reset();
+    }
+
+    // Everything the gateway pushes to one client egress stream.
+    struct Egress {
+        std::vector<pc::SubscribeResponse> subResps;
+        struct Rec { int64_t subId; int64_t baseOffset; std::vector<uint8_t> bytes; };
+        std::vector<Rec> records;
+        struct Err { int64_t correlationId; int16_t code; std::string message; };
+        std::vector<Err> errors;
+        aeron::FragmentAssembler fa;
+        Egress()
+            : fa([this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                        aeron::util::index_t len, aeron::Header&) {
+                  const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+                  const auto  n = static_cast<std::size_t>(len);
+                  if (auto r = pc::Records::decode(p, n)) {
+                      records.push_back({r->subscriptionId, r->baseOffset,
+                                         {r->recordBatch.begin(), r->recordBatch.end()}});
+                  } else if (auto sr = pc::SubscribeResponse::decode(p, n)) {
+                      subResps.push_back(*sr);
+                  } else if (auto e = pc::ErrorResponse::decode(p, n)) {
+                      errors.push_back({e->correlationId, e->code, std::string(e->message)});
+                  }
+              }) {}
+        [[nodiscard]] std::size_t recordsFor(int64_t subId) const {
+            std::size_t c = 0;
+            for (const auto& r : records) c += (r.subId == subId);
+            return c;
+        }
+    };
+
+    struct Conn {
+        std::shared_ptr<aeron::Publication>  ingress;
+        std::shared_ptr<aeron::Subscription> egressSub;
+        int64_t sid = 0;
+    };
+
+    Conn connect(const std::string& egressCh, int32_t egressStream, Egress& eg) {
+        Conn c;
+        const int64_t pr = aeron_->addPublication("aeron:ipc", kIngressStream);
+        const int64_t sr = aeron_->addSubscription(egressCh, egressStream);
+        pump([&]() {
+            if (!c.ingress)   c.ingress   = aeron_->findPublication(pr);
+            if (!c.egressSub) c.egressSub = aeron_->findSubscription(sr);
+            return c.ingress && c.egressSub && c.ingress->isConnected();
+        }, nullptr, nullptr, kPumpIter, "F19 resolve");
+        pc::ConnectRequest req;
+        req.correlationId  = 1;
+        req.egressStreamId = egressStream;
+        req.clientVersion  = 1;
+        req.egressChannel  = egressCh;
+        offerBounded(*c.ingress, scratch_, req.encode(scratch_), "F19 Connect");
+        std::optional<pc::ConnectResponse> resp;
+        aeron::FragmentAssembler fa([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
+                                        aeron::util::index_t l, aeron::Header&) {
+            if (auto d = pc::ConnectResponse::decode(
+                    reinterpret_cast<const uint8_t*>(b.buffer() + o), static_cast<std::size_t>(l)))
+                resp = *d;
+        });
+        pump([&]() { return resp.has_value(); }, c.egressSub.get(), &fa, kPumpIter, "F19 ConnResp");
+        c.sid = resp ? resp->assignedSessionId : 0;
+        (void)eg;
+        return c;
+    }
+
+    int64_t subscribe(Conn& c, Egress& eg, int32_t partition, int64_t corr) {
+        const std::size_t before = eg.subResps.size();
+        sendSubscribe(*c.ingress, c.sid, corr, kTopicIdA, partition, 1, /*from*/0, /*iso*/0);
+        pump([&]() { return eg.subResps.size() > before; }, c.egressSub.get(), &eg.fa,
+             kPumpIter, "F19 SubResp");
+        EXPECT_EQ(eg.subResps.back().errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+        return eg.subResps.back().subscriptionId;
+    }
+
+    // Append one batch whose single record value is `valueBytes` long; returns
+    // the exact stored bytes.  Built once per size and restamped (baseOffset,
+    // bytes 0..7, is not CRC-covered); appended without fsync (page cache is
+    // visible to readers) so a dozen 1 MiB appends never idle the test session
+    // past its timeout.
+    std::vector<uint8_t> appendSized(int32_t partition, std::size_t valueBytes) {
+        rune::storage::Log* log = registry_->log(kTopicIdA, partition);
+        const int64_t base = log->logEndOffset();
+        auto& tmpl = built_[valueBytes];
+        if (tmpl.empty()) {
+            std::string value(valueBytes, '\0');
+            for (std::size_t i = 0; i < valueBytes; ++i)
+                value[i] = static_cast<char>((i * 31u) & 0xffu);
+            rune::protocol::RecordBatchBuilder b(0, 1000);
+            b.append("k", value, 1000);
+            tmpl = b.build();
+        }
+        std::vector<uint8_t> bytes = tmpl;
+        for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
+        log->appendNoSync(bytes.data(), bytes.size(), base);   // page cache: visible to readers
+        return bytes;
+    }
+    std::map<std::size_t, std::vector<uint8_t>> built_;
+
+    std::unique_ptr<rune::node::WorkerPool> ownedPool_;
+};
+
+TEST_P(GatewayLargeBatchPushRegression, OneMiBBatchDeliveredIntactThenSmallBatch)
+{
+    Egress eg;
+    Conn c = connect("aeron:ipc", kEgressBase + 70, eg);   // IPC: 64 MiB term → 8 MiB max message
+    const int64_t subId = subscribe(c, eg, kPartitionA0, 70);
+
+    const auto big   = appendSized(kPartitionA0, 1024 * 1024);   // offset 0, ~1 MiB
+    const auto small = appendSized(kPartitionA0, 16);            // offset 1
+
+    pump([&]() { return eg.recordsFor(subId) >= 2 || !eg.errors.empty(); },
+         c.egressSub.get(), &eg.fa, kPumpIter, "F19 1MiB+small");
+
+    ASSERT_TRUE(eg.errors.empty()) << "unexpected ErrorResponse code=" << eg.errors[0].code;
+    ASSERT_EQ(eg.recordsFor(subId), 2u) << "the 1 MiB batch was skipped (F19 silent loss)";
+    EXPECT_EQ(eg.records[0].baseOffset, 0);
+    EXPECT_EQ(eg.records[0].bytes, big) << "1 MiB batch not byte-identical after reassembly";
+    EXPECT_EQ(eg.records[1].baseOffset, 1);
+    EXPECT_EQ(eg.records[1].bytes, small);
+    EXPECT_EQ(gw_->subscriptionNextOffsetForTest(subId), 2);
+}
+
+TEST_P(GatewayLargeBatchPushRegression, AboveMaxMessageLengthAnswersErrorNoSilentAdvance)
+{
+    Egress eg;
+    // 64 KiB IPC term → maxMessageLength = 8 KiB.
+    Conn c = connect("aeron:ipc?term-length=65536", kEgressBase + 71, eg);
+    const int64_t subBig   = subscribe(c, eg, kPartitionA0, 71);
+    const int64_t subOther = subscribe(c, eg, kPartitionA1, 72);
+
+    appendSized(kPartitionA0, 16 * 1024);     // offset 0 on A0: frame > 8 KiB max message
+    appendSized(kPartitionA0, 16);            // offset 1 on A0: behind the undeliverable batch
+    appendSized(kPartitionA1, 16);            // A1: other subscription, must flow
+    appendSized(kPartitionA1, 16);
+
+    pump([&]() { return !eg.errors.empty() && eg.recordsFor(subOther) >= 2; },
+         c.egressSub.get(), &eg.fa, kPumpIter, "F19 too-large error");
+
+    ASSERT_EQ(eg.errors.size(), 1u);
+    EXPECT_EQ(eg.errors[0].correlationId, 0)
+        << "a subscription id must never be sent as a correlationId (collides with ping ids)";
+    const std::string want = "subscription " + std::to_string(subBig) + " topic " +
+                             std::to_string(kTopicIdA) + " partition " +
+                             std::to_string(kPartitionA0) + " offset 0";
+    EXPECT_NE(eg.errors[0].message.find(want), std::string::npos)
+        << "message must name the subscription; got: " << eg.errors[0].message;
+    EXPECT_EQ(eg.errors[0].code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(eg.recordsFor(subOther), 2u) << "other subscription must be unaffected";
+
+    // Parked: more cycles push nothing for subBig, send no second error, and the
+    // cursor stays AT the undeliverable batch (never advanced past it silently).
+    for (int i = 0; i < 200; ++i) {
+        gw_->doWork(nowNs());
+        if (pool_) pool_->doWork(nowNs());
+        c.egressSub->poll(eg.fa.handler(), 64);
+    }
+    EXPECT_EQ(eg.recordsFor(subBig), 0u) << "nothing may be delivered past the failed batch";
+    EXPECT_EQ(eg.errors.size(), 1u) << "exactly one error, no spin";
+    EXPECT_EQ(gw_->subscriptionNextOffsetForTest(subBig), 0)
+        << "cursor advanced past an undelivered batch (silent loss)";
+}
+
+TEST_P(GatewayLargeBatchPushRegression, BackPressuredLargeOfferRetriesWithoutLoss)
+{
+    Egress eg;
+    // 16 MiB IPC term → 2 MiB max message, 8 MiB publication window: a dozen
+    // 1 MiB frames cannot all fit while the client is not polling.
+    Conn c = connect("aeron:ipc?term-length=16777216", kEgressBase + 72, eg);
+    const int64_t subId = subscribe(c, eg, kPartitionA0, 73);
+
+    constexpr int kBatches = 12;
+    std::vector<std::vector<uint8_t>> stored;
+    for (int i = 0; i < kBatches; ++i) stored.push_back(appendSized(kPartitionA0, 1024 * 1024));
+
+    // Drive the gateway without draining the egress: the window fills and the
+    // offer back-pressures.
+    for (int i = 0; i < 4 * kBatches; ++i) {
+        gw_->doWork(nowNs());
+        if (pool_) pool_->doWork(nowNs());
+    }
+    const int64_t cursorUnderBp = gw_->subscriptionNextOffsetForTest(subId);
+    EXPECT_LT(cursorUnderBp, kBatches) << "back-pressure never happened (test precondition)";
+
+    // Drain: the client polls a full window per cycle (pump()'s 10-fragment
+    // poll would take ~750 cycles per 1 MiB frame — on the Debug worker-return
+    // path, which re-reads a 2 MiB chunk per retry, long enough to idle the
+    // session past its timeout).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{15};
+        while (eg.recordsFor(subId) < static_cast<std::size_t>(kBatches) && eg.errors.empty() &&
+               std::chrono::steady_clock::now() < deadline) {
+            gw_->doWork(nowNs());
+            if (pool_) pool_->doWork(nowNs());
+            c.egressSub->poll(eg.fa.handler(), 8192);
+        }
+    }
+
+    ASSERT_TRUE(eg.errors.empty());
+    ASSERT_EQ(eg.recordsFor(subId), static_cast<std::size_t>(kBatches));
+    for (int i = 0; i < kBatches; ++i) {
+        EXPECT_EQ(eg.records[i].baseOffset, i) << "gap/dup/reorder at " << i;
+        EXPECT_EQ(eg.records[i].bytes, stored[i]) << "batch " << i << " corrupted";
+    }
+    EXPECT_EQ(gw_->subscriptionNextOffsetForTest(subId), kBatches);
+}
+
+INSTANTIATE_TEST_SUITE_P(Paths, GatewayLargeBatchPushRegression, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& i) {
+                             return i.param ? std::string("WorkerReturn") : std::string("Inline");
+                         });
 
 } // namespace
 } // namespace rune::gateway

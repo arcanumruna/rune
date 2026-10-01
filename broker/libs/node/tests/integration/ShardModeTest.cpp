@@ -1,6 +1,7 @@
 // ShardModeTest.cpp — in-process shard mode over REAL Aeron UDP: raw wire client
 // → gateway (Connect) → worker shard ingress (Produce) → worker replication plane
 // → ProduceResponse.  Legacy default must build no shard runtime.
+#include <algorithm>
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
@@ -118,6 +119,29 @@ int64_t logEndOffsetAfterStop(const fs::path& dataDir) {
 }
 
 } // namespace
+
+// REGRESSION (found in the F19 gate): ShardPorts::discover drew the per-node
+// single ports (consensus/client/replication) AFTER the per-worker base blocks
+// without excluding them — an ephemeral single could land inside a block, and
+// BrokerNode refused to start ("port collision: clientPort and workerRepl[w1]").
+// Every discovered port must be distinct.
+TEST(ShardPortsRegression, DiscoverYieldsPairwiseDisjointPorts) {
+    constexpr int kNodes = 3, kWorkers = 4;
+    for (int round = 0; round < 300; ++round) {
+        const auto p = ShardPorts::discover(kNodes, kWorkers);
+        std::vector<int> all;
+        for (int i = 0; i < kNodes; ++i) {
+            all.push_back(p.cons[i]); all.push_back(p.client[i]); all.push_back(p.repl[i]);
+            for (int w = 0; w < kWorkers; ++w) {
+                all.push_back(p.ib[i] + w); all.push_back(p.rb[i] + w); all.push_back(p.eg[i] + w);
+            }
+        }
+        auto sorted = all;
+        std::sort(sorted.begin(), sorted.end());
+        ASSERT_EQ(std::adjacent_find(sorted.begin(), sorted.end()), sorted.end())
+            << "round " << round << ": two roles share a port";
+    }
+}
 
 TEST(ShardMode, SingleNodeProduceRoundTripOnWorkerShard) {
     TmpDir dir{"n0"}, cdir{"client"};
