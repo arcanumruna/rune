@@ -3580,7 +3580,8 @@ private:
     // have not been latched off; token routed as RouteKind::Hint; <= 1 in
     // flight per partition (RcState) and <= kMaxRcHintsInFlight per worker
     // (m1: fsyncs keep their headroom in the shared io cap); SQ / cap full →
-    // skipped this pass.  Otherwise a synchronous MADV_WILLNEED (counted).
+    // skipped this pass (RcHint::Skipped: not counted as issued, no re-request
+    // backoff consumed — r3-2).  Otherwise a synchronous MADV_WILLNEED (counted).
     // m8: a hint does not pin its segment (fsyncs do): io-wq resolves the fd
     // when it runs, so a hint on a closed-and-reused fd advises an unrelated
     // file — benign for WILLNEED (a wasted read-ahead, never a correctness
@@ -3642,6 +3643,7 @@ private:
             if (sl.hint && sl.hint->log == log) { sl.rc->onHintCompleted(); return; }
     }
     std::vector<RcSlot>   rcSlots_;
+    std::size_t           rcWalkStart_ = 0;   // r3-1: rcAdvanceAll_'s round-robin start slot
     // Review I-2: read_committed PushReads held while their partition's RC
     // state builds — answered on Ready (or unanswered on ownership loss).
     // Each owes one return: counted in reservedAckSlots_(), capped, reserved.
@@ -3768,9 +3770,21 @@ private:
         return rc;
     }
     // Per pass, every owned user partition (state-driven: no role-op hooks).
+    // Fix round 4 (r3-1): the walk starts one slot later each pass (round-robin
+    // cursor, no allocation), so the kMaxRcHintsInFlight hint slots rotate over
+    // the building partitions — every one is first in line once per
+    // rcSlots_.size() passes, not only the first ones in a fixed order.
     int rcAdvanceAll_() {
+        const std::size_t n = rcSlots_.size();
+        if (n == 0) return 0;
+        if (rcWalkStart_ >= n) rcWalkStart_ = 0;
         int work = 0;
-        for (auto& sl : rcSlots_) work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+        for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
+            RcSlot& sl = rcSlots_[i];
+            work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+            if (++i == n) i = 0;
+        }
+        if (++rcWalkStart_ == n) rcWalkStart_ = 0;
         return work;
     }
     // §2.3 produce gate: the RC state for an idempotent / transactional batch,

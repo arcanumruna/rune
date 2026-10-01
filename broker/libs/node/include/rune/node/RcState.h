@@ -259,6 +259,8 @@ public:
     [[nodiscard]] uint64_t    nonResidentSteps() const noexcept { return nonResidentSteps_; }
     [[nodiscard]] uint64_t    readAheadRequests() const noexcept { return readAheadRequests_; }
     [[nodiscard]] uint64_t    readAheadSkippedInFlight() const noexcept { return readAheadSkippedInFlight_; }
+    /// r3-2: requests the issuer skipped (cap / SQ full) — not issued, retried next pass.
+    [[nodiscard]] uint64_t    readAheadSkippedByIssuer() const noexcept { return readAheadSkippedByIssuer_; }
     /// N2: mincore failures (each fell back to treating the window as resident).
     [[nodiscard]] uint64_t    probeErrors() const noexcept { return probeErrors_; }
     /// N8: cold growths of the residency vector (an oversized batch).
@@ -334,6 +336,10 @@ private:
     // Request read-ahead of [from, to) of the segment.  At most one async hint
     // in flight per partition (RR1-4): while one is, the request is skipped —
     // its completion re-arms the next pass.  Returns true if issued.
+    // Fix round 4 (r3-2 / m5): a hint the issuer SKIPPED (per-worker cap / SQ
+    // full) was never issued — not counted, the front is not advanced, and
+    // false is returned so no re-request backoff is consumed: it is retried on
+    // the next pass.
     bool requestReadAhead_(Scanning& s, const rune::storage::Log::SegmentBytes& m, std::size_t from, std::size_t to) {
         if (to <= from) return false;
         if (hintInFlight_) { ++readAheadSkippedInFlight_; return false; }
@@ -346,8 +352,9 @@ private:
         RcHint out = RcHint::Done;
         if (readAheadFn_ != nullptr) out = readAheadFn_(readAheadCtx_, req);
         else                         syncWillNeed(req);
-        hintInFlight_ = out == RcHint::InFlight;
         if (profile_) profile_->hintNs += clock_() - t0;
+        if (out == RcHint::Skipped) { ++readAheadSkippedByIssuer_; return false; }
+        hintInFlight_ = out == RcHint::InFlight;
         ++readAheadRequests_;
         if (to > s.readAheadTo) s.readAheadTo = to;
         return true;
@@ -478,6 +485,7 @@ private:
     StepProfile*     profile_      = nullptr;
     uint64_t    readAheadRequests_        = 0;
     uint64_t    readAheadSkippedInFlight_ = 0;
+    uint64_t    readAheadSkippedByIssuer_ = 0;
     uint64_t    residencyGrowths_         = 0;
     uint64_t    scanSteps_        = 0;
     std::size_t maxStepBytes_     = 0;
