@@ -771,6 +771,29 @@ TEST(HandleLifetime, ClientCloseDrainsProducersBeforeTeardownRegression) {
     EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Closed);
 }
 
+// The producer-registered-right-before-close() case on its own: no other
+// producer keeps the drain pending, so only ring order (the drain command
+// queued BEHIND the registration) gets its record drained.  RED (mutation):
+// applying the drain directly on the Invoker owner settles it before the
+// registration is adopted — the record completes Closed.
+TEST(HandleLifetime, ClientCloseDrainsAProducerRegisteredJustBeforeRegression) {
+    Rig r(cfgFor(5436));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    TestCq cq(*r.client);
+    auto late = r.client->producer(ackCfg());  // registration still in the command ring
+    auto rec  = cq.send(late, topic, rc::Key(uint64_t{2}), kVal);
+    ASSERT_TRUE(rec.accepted());
+    {
+        GatewayPump pump(r.gw);
+        r.client->close();
+        pump.stop();
+    }
+    ASSERT_TRUE(rec.ready());
+    EXPECT_EQ(rec.status(), OpStatus::Ok) << rec.describe();
+    EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+}
+
 // closeImmediately() — and the Client destructor — discard instead: every
 // accepted record completes Closed exactly once, nothing is flushed.
 TEST(HandleLifetime, ClientCloseImmediatelyAndDestructorDiscardRegression) {
