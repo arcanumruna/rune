@@ -97,6 +97,10 @@ public:
     // ── Expose the committed map (read-only) for delta derivation. ────────────
     const AssignmentMap& committedMap() const noexcept { return committed_; }
 
+    // ── Bumped on every committed-map mutation (install / restore).  Lets a
+    //    consumer rebuild derived state (the RoutingImage) only on change. ────
+    [[nodiscard]] uint64_t committedVersion() const noexcept { return committedVersion_; }
+
     // ── MVCC revert: discard pending records with pos > toCommittedPos. ───────
     // Used when a commit is lost (e.g. leader failover).  The committed map is
     // untouched — only uncommitted speculation in pending_ is pruned.
@@ -123,6 +127,9 @@ private:
     std::vector<PendingEntry> pending_;
 
     int64_t committedPos_ = -1;
+
+    // See committedVersion().
+    uint64_t committedVersion_ = 0;
 
     // Count of records skipped due to unknown recordVersion (handleLoss).
     uint64_t lossCount_ = 0;
@@ -176,6 +183,7 @@ void MetadataStateMachine::restore(Reader& r)
     // Full reset — pending discarded, committed cleared
     committed_.clear();
     pending_.clear();
+    ++committedVersion_;
 
     committedPos_ = r.readInt64();
     const int32_t count = r.readInt32();

@@ -191,12 +191,17 @@ public:
     }
     [[nodiscard]] std::uint64_t cleanerAckedGenForTest() const noexcept { return cleanerAckedGen_; }
 
+    /// Test-only (this agent's thread): duty cycles run / routing images published.
+    [[nodiscard]] std::uint64_t cyclesForTest() const noexcept { return cycles_; }
+    [[nodiscard]] std::uint64_t routingImagePublishesForTest() const noexcept { return routingImagePublishes_; }
+
     // Halt on an invariant violation (BrokerNode wires it; called once).
     void setFatalHook(std::function<void(const std::string&)> hook) { fatalHook_ = std::move(hook); }
 
 private:
     int doWorkImpl_(int64_t nowNs) {
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
+        ++cycles_;
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);
 
@@ -374,13 +379,15 @@ private:
                 }
             }
 
-            // Rebuild RoutingImage and push to gateway each cycle.
-            // This is cheap (shared_ptr swap + array copy) and done on the
-            // duty-cycle thread — no cross-thread synchronisation needed.
-            // The image is captured by the gateway's doWork on the SAME thread,
-            // so there is no cross-thread race on routingImage_.
+            // Rebuild the RoutingImage and push it to the gateway WHEN ITS INPUTS
+            // CHANGE (MetadataService::routingVersion(): committed map or the
+            // topic+node config) — Task 11: never per cycle (a heap allocation +
+            // an O(partitions) rebuild on every runtime cycle, which under fused
+            // placement is every worker-0 pass).  Done on the duty-cycle thread —
+            // the gateway reads the image on the SAME thread (no race).
             //
-            // BOOTSTRAP FIX (MD1-13): publish a RoutingImage on every duty cycle.
+            // BOOTSTRAP FIX (MD1-13): a RoutingImage is published from the very
+            // first duty cycle (the first cycle always builds).
             //
             // Two-path strategy:
             //
@@ -402,13 +409,17 @@ private:
             //   If buildStaticRoutingImage() returns null (no topics configured,
             //   or BalancerError), leave routingImage_ null → Path B (pre-MD1
             //   cluster-leader fallback) serves the produce.
-            if (gateway_) {
+            const std::uint64_t routingVersion = metadataService_->routingVersion();
+            if (gateway_ && (!routingBuilt_ || routingVersion != routingVersionBuilt_)) {
+                routingBuilt_        = true;
+                routingVersionBuilt_ = routingVersion;
                 const auto& cmap = metadataService_->committedMap();
                 if (!cmap.empty()) {
                     // Steady state: use the committed assignment map.
                     auto img = rune::metadata::RoutingImage::buildFromMap(
                         cmap, rune::metadata::gpidOf);
                     gateway_->setRoutingImageSnapshot(std::move(img));
+                    ++routingImagePublishes_;
                     // Signal that committed metadata is available.
                     // GR-4 (per-partition NotLeader defence) and GR-5 (ISR gate)
                     // only activate in steady state so that the bootstrap window
@@ -421,6 +432,7 @@ private:
                     auto img = metadataService_->buildStaticRoutingImage();
                     if (img) {
                         gateway_->setRoutingImageSnapshot(std::move(img));
+                        ++routingImagePublishes_;
                     }
                     // committedMetadataReady_ remains false → GR-4 / GR-5 suppressed.
                     // If null (no topics / BalancerError): leave routingImage_ null too.
@@ -865,6 +877,10 @@ private:
         }
         return work;
     }
+    std::uint64_t                                      cycles_                = 0;
+    std::uint64_t                                      routingImagePublishes_ = 0;
+    bool                                               routingBuilt_          = false;
+    std::uint64_t                                      routingVersionBuilt_   = 0;
     bool                                               fatalReported_ = false;
     bool                                               storageFailureReported_ = false;
     void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {

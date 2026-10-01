@@ -61,6 +61,7 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
         // If pos is already committed, install directly.
         if (recordPos <= committedPos_) {
             committed_.put(rec->topicId, rec->partition, pa);
+            ++committedVersion_;
         } else {
             // Queue as pending
             pending_.push_back(PendingEntry{
@@ -121,6 +122,7 @@ void MetadataStateMachine::flushPending(int64_t upToPos)
     for (auto& e : pending_) {
         if (e.pos <= upToPos) {
             committed_.put(e.topicId, e.partition, e.assignment);
+            ++committedVersion_;
         } else {
             // Move back to the kept region
             pending_[kept++] = std::move(e);

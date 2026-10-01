@@ -124,6 +124,7 @@ public:
         }
         liveNodes_ = liveNodes;
         assigned_  = false;
+        ++routingInputsEpoch_;
     }
 
     /// Set the commit-quorum failover floor handed to the DynamicBalancer.  A
@@ -171,7 +172,7 @@ public:
         for (const auto& ts : configuredTopics_) {
             if (ts.topicId == spec.topicId) { present = true; break; }
         }
-        if (!present) configuredTopics_.push_back(spec);
+        if (!present) { configuredTopics_.push_back(spec); ++routingInputsEpoch_; }
 
         // (2) Emit the initial assignment for this topic (leader-only).
         if (!replica_) return;
@@ -644,7 +645,9 @@ public:
 
         const rune::replication::Offset hw = replica_->highWatermark();
 
-        // Reset state.
+        // Reset state.  The fresh MSM restarts its committed version at 0: fold
+        // the old one into the epoch so routingVersion() never repeats a value.
+        routingInputsEpoch_ += msm_.committedVersion() + 1;
         msm_ = rune::metadata::MetadataStateMachine{};
         lastApplied_ = -1;
 
@@ -720,6 +723,14 @@ public:
     [[nodiscard]]
     const rune::metadata::AssignmentMap& committedMap() const noexcept {
         return msm_.committedMap();
+    }
+
+    /// Changes (strictly increases) whenever an input of the RoutingImage changes:
+    /// the committed assignment map, or the topic + node configuration the
+    /// bootstrap (static) image is built from.  Equal value => the image built
+    /// last time is still exact — the runtime rebuilds only on change.
+    [[nodiscard]] uint64_t routingVersion() const noexcept {
+        return routingInputsEpoch_ + msm_.committedVersion();
     }
 
     // -----------------------------------------------------------------------
@@ -839,6 +850,7 @@ private:
     int32_t                               selfId_;
 
     rune::metadata::MetadataStateMachine  msm_;
+    uint64_t                              routingInputsEpoch_ = 0;   // see routingVersion()
 
     // Last log offset we have read batches from.  Initialized to -1 (nothing applied).
     rune::replication::Offset lastApplied_ = -1;

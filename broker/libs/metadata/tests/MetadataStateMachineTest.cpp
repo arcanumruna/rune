@@ -955,3 +955,30 @@ TEST(MetadataStateMachine, UnknownRecordVersionIsHandleLossNotCrash) {
     EXPECT_EQ(msm.lossCount(), 1u);
     EXPECT_EQ(msm.committedMap().size(), 0);
 }
+
+// Task 11: the runtime rebuilds the RoutingImage only when committedVersion()
+// moves — so it must move on EVERY committed-map change and never otherwise.
+TEST(MetadataStateMachineRegression, CommittedVersionMovesOnlyOnCommittedMapChange)
+{
+    MetadataStateMachine msm;
+    const uint64_t v0 = msm.committedVersion();
+    auto [cbuf, csz] = encodeCreate(1, 2, 1);
+    msm.apply(cbuf.data(), csz, /*pos=*/0);
+    auto [ubuf, usz] = encodeUpdate({1, 0, 7, {7}, {7}, 1, 1});
+    msm.apply(ubuf.data(), usz, /*pos=*/5);
+    EXPECT_EQ(msm.committedVersion(), v0) << "pending (uncommitted) records change nothing";
+    msm.commit(5);
+    const uint64_t v1 = msm.committedVersion();
+    EXPECT_GT(v1, v0) << "commit installed an assignment";
+    msm.commit(5);
+    EXPECT_EQ(msm.committedVersion(), v1) << "idempotent commit: no change";
+    auto [u2, u2sz] = encodeUpdate({1, 1, 3, {3}, {3}, 1, 1});
+    msm.apply(u2.data(), u2sz, /*pos=*/3);                    // at/below committedPos: installs directly
+    const uint64_t v2 = msm.committedVersion();
+    EXPECT_GT(v2, v1);
+    VecSnapshotWriter w;
+    msm.snapshot(w);
+    VecSnapshotReader r(w.data());
+    msm.restore(r);
+    EXPECT_GT(msm.committedVersion(), v2) << "restore replaces the committed map";
+}

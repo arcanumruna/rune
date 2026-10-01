@@ -758,3 +758,35 @@ TEST(ShardModeFusedRegression, StartFailureStillClosesTheRuntimeDriver) {
     stopper.join();
     EXPECT_TRUE(runtimeDriverClosed(cfg)) << "runtime driver leaked after a failed start";
 }
+
+// Bounded runtime duty cycle (Task 11: under fused placement every runtime cycle
+// is part of worker 0's pass).  The routing image is rebuilt + republished only
+// when its inputs change (committed assignment map / topic+node config) — never
+// once per cycle (a heap allocation + an O(partitions) rebuild per cycle).
+TEST(ShardModeFusedRegression, RoutingImageIsRepublishedOnlyWhenItsInputsChange) {
+    for (const bool fused : {true, false}) {
+        SCOPED_TRACE(fused ? "fused" : "thread");
+        TmpDir dir{"rimg"};
+        const auto ports = ShardPorts::discover(1, 1);
+        BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, fused)};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10'000ms));
+        // Condition wait: the committed assignment map has landed and the steady-
+        // state image is published (publish count stops moving across a cycle).
+        uint64_t before = 0;
+        ASSERT_TRUE(eventually([&] {
+            const uint64_t a = node.onControlThreadForTest([&] { return node.routingImagePublishesForTest(); });
+            const uint64_t b = node.onControlThreadForTest([&] { return node.routingImagePublishesForTest(); });
+            before = b;
+            return a > 0 && a == b;
+        })) << "the routing image is republished on every runtime cycle";
+        uint64_t cycles0 = node.onControlThreadForTest([&] { return node.runtimeCyclesForTest(); });
+        uint64_t cycles = cycles0;
+        for (int i = 0; i < 2'000 && cycles - cycles0 < 200; ++i)   // >= 200 more runtime cycles
+            cycles = node.onControlThreadForTest([&] { return node.runtimeCyclesForTest(); });
+        ASSERT_GE(cycles - cycles0, 200u);
+        EXPECT_EQ(node.onControlThreadForTest([&] { return node.routingImagePublishesForTest(); }), before)
+            << "no input changed — no rebuild";
+        node.stop();
+    }
+}

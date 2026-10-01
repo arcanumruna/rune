@@ -414,6 +414,15 @@ public:
         return agentRunner_ && agentRunner_->isRunning();
     }
 
+    /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
+    /// runtime duty cycles run / routing-image publishes so far.
+    [[nodiscard]] uint64_t runtimeCyclesForTest() const noexcept {
+        return runtimeAgent_ ? runtimeAgent_->cyclesForTest() : 0;
+    }
+    [[nodiscard]] uint64_t routingImagePublishesForTest() const noexcept {
+        return runtimeAgent_ ? runtimeAgent_->routingImagePublishesForTest() : 0;
+    }
+
     /// Test-only: return the MetadataService (for assignment() queries in tests).
     /// Non-null after start() if metadata service construction succeeded.
     /// NOT safe for concurrent use — call only when duty cycle is between
