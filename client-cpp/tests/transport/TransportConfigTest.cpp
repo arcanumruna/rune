@@ -9,9 +9,14 @@ using rune::client::transport::TransportConfig;
 using rune::client::transport::validate;
 using rune::client::transport::applyEnvOverrides;
 
-TEST(TransportConfig, DefaultsAreValidAndMtuIsEightKiB) {
+// F12: the default MTU is Aeron's 1408 (fits a 1500-byte path unfragmented);
+// 8 KiB jumbo is opt-in only (project rule: jumbo MTU never the default).
+TEST(TransportConfig, DefaultsAreValidAndMtuIsAeronDefaultRegression) {
     TransportConfig c;
-    EXPECT_EQ(c.mtuLength, 8192u);
+    EXPECT_EQ(c.mtuLength, 1408u);
+    EXPECT_EQ(c.mtuLength, rune::client::transport::kAeronDefaultMtuLength);
+    EXPECT_EQ(rune::client::transport::kJumboMtuLength, 8192u);
+    EXPECT_EQ(c.rcvInitialWindowLength, 0u);
     EXPECT_EQ(c.socketSndBufBytes, 2u * 1024 * 1024);
     EXPECT_EQ(c.socketRcvBufBytes, 2u * 1024 * 1024);
     EXPECT_EQ(c.driverIdleStrategy, "sleep-ns");
@@ -43,11 +48,15 @@ TEST(TransportConfig, RejectsTermLengthNotPowerOfTwoOrOutOfRange) {
 }
 
 TEST(TransportConfig, RejectsSocketBufferSmallerThanMtu) {
-    TransportConfig c; c.socketSndBufBytes = 4096;
-    EXPECT_TRUE(validate(c).has_value());
+    TransportConfig c;
+    c.mtuLength = 8192;  // opt-in jumbo: a 4 KiB socket buffer cannot hold one datagram
+    c.socketSndBufBytes = 4096;
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("socketSndBufBytes"), std::string::npos);
     c.socketSndBufBytes = 0;  // 0 = OS default, allowed
     c.socketRcvBufBytes = 4096;
-    EXPECT_TRUE(validate(c).has_value());
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("socketRcvBufBytes"), std::string::npos);
 }
 
 TEST(TransportConfig, EnvOverridesMtuSocketBuffersAndIdle) {
@@ -55,22 +64,97 @@ TEST(TransportConfig, EnvOverridesMtuSocketBuffersAndIdle) {
     ::setenv("RUNE_AERON_SOCKET_BUFFER_BYTES", "4194304", 1);
     ::setenv("RUNE_CLIENT_AERON_DRIVER_IDLE", "backoff", 1);
     TransportConfig c;
-    applyEnvOverrides(c);
+    const auto warnings = applyEnvOverrides(c);
     ::unsetenv("RUNE_CLIENT_AERON_MTU");
     ::unsetenv("RUNE_AERON_SOCKET_BUFFER_BYTES");
     ::unsetenv("RUNE_CLIENT_AERON_DRIVER_IDLE");
+    EXPECT_TRUE(warnings.empty());
     EXPECT_EQ(c.mtuLength, 16384u);
     EXPECT_EQ(c.socketSndBufBytes, 4194304u);
     EXPECT_EQ(c.socketRcvBufBytes, 4194304u);
     EXPECT_EQ(c.driverIdleStrategy, "backoff");
 }
 
-TEST(TransportConfig, MalformedEnvIsIgnored) {
+TEST(TransportConfig, EnvOverridesMtuSocketBuffersAndIdleWarnNothing) {
+    ::setenv("RUNE_CLIENT_AERON_MTU", "8192", 1);
+    ::setenv("RUNE_AERON_SOCKET_BUFFER_BYTES", "0", 1);  // 0 = OS default: valid
+    TransportConfig c;
+    const auto w = applyEnvOverrides(c);
+    ::unsetenv("RUNE_CLIENT_AERON_MTU");
+    ::unsetenv("RUNE_AERON_SOCKET_BUFFER_BYTES");
+    EXPECT_TRUE(w.empty());
+    EXPECT_EQ(c.mtuLength, 8192u);
+    EXPECT_EQ(c.socketSndBufBytes, 0u);
+    EXPECT_EQ(c.socketRcvBufBytes, 0u);
+}
+
+// F12: a malformed value is not applied AND is reported (never silently dropped).
+TEST(TransportConfig, MalformedEnvIsReportedNotSilentlyDroppedRegression) {
     ::setenv("RUNE_CLIENT_AERON_MTU", "8k", 1);
     TransportConfig c;
-    applyEnvOverrides(c);
+    const auto w = applyEnvOverrides(c);
     ::unsetenv("RUNE_CLIENT_AERON_MTU");
-    EXPECT_EQ(c.mtuLength, 8192u);
+    EXPECT_EQ(c.mtuLength, 1408u);
+    ASSERT_EQ(w.size(), 1u);
+    EXPECT_NE(w[0].find("RUNE_CLIENT_AERON_MTU"), std::string::npos);
+    EXPECT_NE(w[0].find("8k"), std::string::npos);
+}
+
+// F12: "-1" used to parse (strtoull) as ULLONG_MAX == the "unset" sentinel and
+// vanish silently; any other negative wrapped to a huge buffer and was APPLIED.
+// Negative values are now rejected with a warning and never applied.
+TEST(TransportConfig, NegativeSocketBufferEnvIsRejectedRegression) {
+    for (const char* bad : {"-1", "-5", "+4096", " 4096", "4096 ", "99999999999999999999999"}) {
+        ::setenv("RUNE_AERON_SOCKET_BUFFER_BYTES", bad, 1);
+        TransportConfig c;
+        const auto w = applyEnvOverrides(c);
+        ::unsetenv("RUNE_AERON_SOCKET_BUFFER_BYTES");
+        EXPECT_EQ(c.socketSndBufBytes, 2u * 1024 * 1024) << bad;
+        EXPECT_EQ(c.socketRcvBufBytes, 2u * 1024 * 1024) << bad;
+        ASSERT_EQ(w.size(), 1u) << bad;
+        EXPECT_NE(w[0].find("RUNE_AERON_SOCKET_BUFFER_BYTES"), std::string::npos) << bad;
+    }
+}
+
+TEST(TransportConfig, UnsetOrEmptyEnvIsNotAWarning) {
+    ::setenv("RUNE_CLIENT_AERON_MTU", "", 1);
+    ::unsetenv("RUNE_AERON_SOCKET_BUFFER_BYTES");
+    TransportConfig c;
+    const auto w = applyEnvOverrides(c);
+    ::unsetenv("RUNE_CLIENT_AERON_MTU");
+    EXPECT_TRUE(w.empty());
+    EXPECT_EQ(c.mtuLength, 1408u);
+}
+
+// F12: Aeron's driver refuses to start when the receiver window exceeds the
+// socket's SO_RCVBUF (aeron_driver.c "Window length greater than socket
+// SO_RCVBUF") — validate() says so up front, against the 128 KiB default window
+// or the configured one.
+TEST(TransportConfig, RejectsSocketRcvBufBelowReceiveWindowRegression) {
+    TransportConfig c;
+    c.socketRcvBufBytes = 64u * 1024;  // >= MTU, but below the 128 KiB window
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("receive window"), std::string::npos) << *validate(c);
+    EXPECT_NE(validate(c)->find("131072"), std::string::npos) << *validate(c);
+    c.socketRcvBufBytes = 128u * 1024;
+    EXPECT_FALSE(validate(c).has_value());
+    c.socketRcvBufBytes = 0;  // OS default: not checkable here, allowed
+    EXPECT_FALSE(validate(c).has_value());
+
+    c.rcvInitialWindowLength = 512u * 1024;  // configured window
+    c.socketRcvBufBytes      = 256u * 1024;
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("rcvInitialWindowLength"), std::string::npos) << *validate(c);
+    c.socketRcvBufBytes = 512u * 1024;
+    EXPECT_FALSE(validate(c).has_value());
+}
+
+TEST(TransportConfig, RejectsReceiveWindowBelowMtu) {
+    TransportConfig c;
+    c.mtuLength              = 8192;
+    c.rcvInitialWindowLength = 4096;
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("rcvInitialWindowLength"), std::string::npos);
 }
 
 // Regression (Task 6 review I1): the Aeron C++ client sends a driver keepalive

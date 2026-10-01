@@ -26,6 +26,10 @@
 //   RUNE_BENCH_WARMUP    warmup records discarded before timing (default 100000)
 //   RUNE_BENCH_MODE      void | acked (default void)
 //   RUNE_BENCH_WINDOW    acked mode: max outstanding records (default 200000)
+//   RUNE_BENCH_MTU       client Aeron MTU (default 8192 = transport::kJumboMtuLength,
+//                        OPT-IN jumbo: the bench runs on loopback / a jumbo-capable
+//                        path; the library default is Aeron's 1408).  The library's
+//                        RUNE_CLIENT_AERON_MTU env override still wins over this.
 //   Producer knobs via ProducerConfig::fromEnv():
 //     RUNE_ACKS RUNE_LINGER_US RUNE_BATCH_BYTES RUNE_BATCH_RECORDS RUNE_MAX_IN_FLIGHT
 
@@ -124,6 +128,10 @@ int main() {
     cfg.egressChannel   = egress;
     cfg.egressStreamId  = static_cast<int32_t>(envI64("RUNE_EGRESS_STREAM", 2));
     cfg.dataDir         = dataDir;
+    // F12: the library default MTU is now Aeron's 1408 (jumbo is opt-in).  This
+    // bench measured its numbers with the old 8 KiB default, so it opts in
+    // explicitly (RUNE_BENCH_MTU to change).
+    cfg.mtuBytes        = static_cast<std::size_t>(envI64("RUNE_BENCH_MTU", 8192));
     {   // RUNE_IDLE_MODE: busyspin | lowlatency (default) | balanced
         const std::string im = envStr("RUNE_IDLE_MODE", "lowlatency");
         cfg.idleMode = (im == "busyspin") ? IdleMode::BusySpin

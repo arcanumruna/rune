@@ -151,8 +151,14 @@ struct ClientConfig {
     std::size_t termBufferBytes = 4u * 1024 * 1024;
 
     // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
-    // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win.
-    std::size_t mtuBytes          = 8192;
+    // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win; a
+    // malformed env value is logged once at construction and not applied.
+    // mtuBytes: Aeron's default 1408 (fits a 1500-byte path unfragmented).  8192
+    // (transport::kJumboMtuLength) is OPT-IN for paths that carry jumbo datagrams
+    // end to end (loopback, jumbo-frame LANs) — never the default.
+    // socketBufferBytes: 0 = OS default; otherwise >= Aeron's 128 KiB receive
+    // window (the driver refuses a smaller SO_RCVBUF; validated at start).
+    std::size_t mtuBytes          = 1408;
     std::size_t socketBufferBytes = 2u * 1024 * 1024;  // SO_SNDBUF and SO_RCVBUF
 
     // M2 FIX [CB-5]: subscribe-request timeout — if a SubscribeResponse does

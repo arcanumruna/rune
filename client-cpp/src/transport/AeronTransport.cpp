@@ -493,6 +493,9 @@ void AeronTransport::startEmbeddedDriver() {
     if (cfg_.socketRcvBufBytes > 0) {
         aeron_driver_context_set_socket_so_rcvbuf(driverCtx_, cfg_.socketRcvBufBytes);
     }
+    if (cfg_.rcvInitialWindowLength > 0) {  // 0 = Aeron's default (validate() checks either)
+        aeron_driver_context_set_rcv_initial_window_length(driverCtx_, cfg_.rcvInitialWindowLength);
+    }
 
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {
         aeron_driver_context_close(driverCtx_);

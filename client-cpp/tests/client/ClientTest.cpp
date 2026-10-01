@@ -57,6 +57,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <future>
@@ -1132,4 +1133,36 @@ TEST(Client, ThreadModeRunnerBlockingSendDoesNotStallRegression) {
            "(agentLivenessTimeoutMs=60s would otherwise make this take minutes)";
 
     h.client->close();
+}
+
+// ---------------------------------------------------------------------------
+// F12: ClientConfig -> transport mapping (toAgentConfig).  No driver needed.
+// ---------------------------------------------------------------------------
+TEST(ClientConfigMapping, MtuAndSocketBuffersMapToTransportRegression) {
+    ::unsetenv("RUNE_CLIENT_AERON_MTU");
+    ::unsetenv("RUNE_AERON_SOCKET_BUFFER_BYTES");
+    rune::client::ClientConfig def;
+    EXPECT_EQ(def.mtuBytes, 1408u) << "jumbo MTU must stay opt-in, never the default";
+    const auto a = rune::client::toAgentConfig(def);
+    EXPECT_EQ(a.transport.mtuLength, 1408u);
+    EXPECT_EQ(a.transport.socketSndBufBytes, def.socketBufferBytes);
+    EXPECT_EQ(a.transport.socketRcvBufBytes, def.socketBufferBytes);
+
+    rune::client::ClientConfig jumbo;
+    jumbo.mtuBytes          = 8192;
+    jumbo.socketBufferBytes = 4u * 1024 * 1024;
+    const auto b = rune::client::toAgentConfig(jumbo);
+    EXPECT_EQ(b.transport.mtuLength, 8192u);
+    EXPECT_EQ(b.transport.socketSndBufBytes, 4u * 1024 * 1024);
+    EXPECT_EQ(b.transport.socketRcvBufBytes, 4u * 1024 * 1024);
+    EXPECT_FALSE(rune::client::transport::validate(b.transport).has_value());
+}
+
+TEST(ClientConfigMapping, EnvMtuOverridesClientConfig) {
+    ::setenv("RUNE_CLIENT_AERON_MTU", "4096", 1);
+    rune::client::ClientConfig c;
+    c.mtuBytes = 8192;
+    const auto a = rune::client::toAgentConfig(c);
+    ::unsetenv("RUNE_CLIENT_AERON_MTU");
+    EXPECT_EQ(a.transport.mtuLength, 4096u);
 }

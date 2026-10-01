@@ -79,7 +79,11 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
                                     ? transport::DriverMode::Invoker
                                     : transport::DriverMode::Thread;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
-    transport::applyEnvOverrides(acfg.transport);
+    // F12: malformed env values are reported (once per Client construction —
+    // this runs once per Client, never per cycle), not silently dropped.
+    for (const std::string& w : transport::applyEnvOverrides(acfg.transport)) {
+        std::fprintf(stderr, "%s\n", w.c_str());
+    }
 
     return acfg;
 }

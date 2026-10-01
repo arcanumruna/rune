@@ -7,11 +7,15 @@
 // at start() with a clear message instead of an opaque aeron_driver_init error.
 #pragma once
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string>
+#include <system_error>
+#include <vector>
 
 namespace rune::client::transport {
 
@@ -25,6 +29,17 @@ enum class DriverMode : uint8_t {
 inline constexpr std::size_t kAeronDataHeaderLength    = 32;     // AERON_DATA_HEADER_LENGTH
 inline constexpr std::size_t kAeronMaxUdpPayloadLength = 65504;  // AERON_MAX_UDP_PAYLOAD_LENGTH
 inline constexpr std::size_t kAeronFrameAlignment      = 32;     // AERON_LOGBUFFER_FRAME_ALIGNMENT
+/// Aeron's default MTU (AERON_MTU_LENGTH_DEFAULT): one datagram fits a standard
+/// 1500-byte Ethernet path (IP + UDP headers included) without IP fragmentation.
+inline constexpr std::size_t kAeronDefaultMtuLength    = 1408;
+/// Opt-in "jumbo" MTU for paths that carry it end to end (loopback, jumbo-frame
+/// LANs) — NEVER the default (project rule: jumbo MTU stays opt-in).
+inline constexpr std::size_t kJumboMtuLength           = 8192;
+/// Aeron's default receiver initial window (AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT,
+/// aeron_driver_context.c).  The driver refuses to start when the window exceeds
+/// the socket's SO_RCVBUF (aeron_driver.c: "Window length greater than socket
+/// SO_RCVBUF").
+inline constexpr std::size_t kAeronDefaultRcvWindowLength = 128u * 1024;
 inline constexpr std::size_t kMinTermLength            = 64u * 1024;
 inline constexpr std::size_t kMaxTermLength            = 1024u * 1024 * 1024;
 /// Liveness floor: 2x the Aeron C++ client's fixed 500 ms driver keepalive
@@ -45,15 +60,23 @@ struct TransportConfig {
     /// Term buffer length of every log buffer on this driver: power of two in
     /// [64 KiB, 1 GiB].  Default 4 MiB.
     std::size_t termBufferLength = 4u * 1024 * 1024;
-    /// UDP MTU of every publication on this driver (Aeron default 1408).  8 KiB:
-    /// measured 2026-09-30, 70% of all datagrams on the bench box were 1.4 KB
-    /// client produce fragments; 8 KiB halved datagrams and cut p50 2-3x.
+    /// UDP MTU of every publication on this driver.  Default: Aeron's 1408, which
+    /// fits a standard 1500-byte path without IP fragmentation.
+    /// Opt-in jumbo (kJumboMtuLength = 8 KiB) ONLY where the whole path carries
+    /// it (loopback, jumbo-frame LANs): measured 2026-09-30 on the bench box, 70%
+    /// of all datagrams were 1.4 KB client produce fragments and 8 KiB halved
+    /// datagrams and cut p50 2-3x — but on a 1500-byte path an 8 KiB datagram is
+    /// IP-fragmented (one lost fragment loses the datagram).
     /// Multiple of 32 in (32, 65504].  Env: RUNE_CLIENT_AERON_MTU.
-    std::size_t mtuLength = 8192;
+    std::size_t mtuLength = kAeronDefaultMtuLength;
     /// SO_SNDBUF / SO_RCVBUF of the driver's UDP sockets (0 = OS default).
     /// Env: RUNE_AERON_SOCKET_BUFFER_BYTES (sets both, as before).
     std::size_t socketSndBufBytes = 2u * 1024 * 1024;
     std::size_t socketRcvBufBytes = 2u * 1024 * 1024;
+    /// Receiver initial window (0 = Aeron's default, kAeronDefaultRcvWindowLength
+    /// = 128 KiB).  Must be >= mtuLength, and <= socketRcvBufBytes when that is
+    /// set (the driver refuses to start otherwise).
+    std::size_t rcvInitialWindowLength = 0;
     /// Thread-mode driver idle strategy (Aeron name: sleep-ns, backoff, noop, ...).
     /// Env: RUNE_CLIENT_AERON_DRIVER_IDLE.  Unused in Invoker mode.
     std::string driverIdleStrategy = "sleep-ns";
@@ -83,6 +106,20 @@ struct TransportConfig {
     if (c.socketRcvBufBytes != 0 && c.socketRcvBufBytes < c.mtuLength) {
         return "socketRcvBufBytes must be 0 (OS default) or >= mtuLength";
     }
+    const std::size_t window =
+        c.rcvInitialWindowLength != 0 ? c.rcvInitialWindowLength : kAeronDefaultRcvWindowLength;
+    if (window < c.mtuLength) {
+        return "rcvInitialWindowLength (" + std::to_string(window) +
+               ") must be >= mtuLength (" + std::to_string(c.mtuLength) + ")";
+    }
+    if (c.socketRcvBufBytes != 0 && c.socketRcvBufBytes < window) {
+        return "socketRcvBufBytes (" + std::to_string(c.socketRcvBufBytes) +
+               ") is below the Aeron receive window (" + std::to_string(window) +
+               (c.rcvInitialWindowLength != 0 ? ", rcvInitialWindowLength" : ", Aeron default") +
+               "): the media driver refuses to start with a window larger than SO_RCVBUF. "
+               "Raise socketBufferBytes / RUNE_AERON_SOCKET_BUFFER_BYTES to >= the window, "
+               "or 0 for the OS default";
+    }
     if (c.clientLivenessTimeoutNs < kMinClientLivenessTimeoutNs) {
         return "clientLivenessTimeoutNs must be >= 1000000000 (1 s = 2x the Aeron client's "
                "500 ms driver keepalive; lower values time out a healthy client): " +
@@ -95,26 +132,51 @@ struct TransportConfig {
     return std::nullopt;
 }
 
+/// Parses a non-negative decimal byte count.  nullopt (and a reason in *why) for
+/// anything else: empty, sign ("-1" is NOT wrapped to SIZE_MAX), suffix ("8k"),
+/// whitespace, overflow.
+[[nodiscard]] inline std::optional<std::size_t> parseEnvSize(const char* v, std::string* why) {
+    const char* end = v + std::strlen(v);
+    unsigned long long x = 0;
+    const auto [ptr, ec] = std::from_chars(v, end, x, 10);  // no sign, no spaces
+    if (ec == std::errc::result_out_of_range) {
+        if (why) *why = "out of range";
+        return std::nullopt;
+    }
+    if (ec != std::errc{} || ptr != end || v == end) {
+        if (why) *why = "not a non-negative decimal integer";
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(x);
+}
+
 /// Environment overrides win over code configuration (the historical semantics
-/// of RUNE_AERON_SOCKET_BUFFER_BYTES).  Malformed values are ignored.
-inline void applyEnvOverrides(TransportConfig& c) {
-    auto readSize = [](const char* name, std::size_t& out) {
+/// of RUNE_AERON_SOCKET_BUFFER_BYTES).  A malformed value is NOT applied — and is
+/// never dropped silently: it is returned as one warning line per variable for
+/// the caller to log (Client logs them once, at construction — never per cycle).
+/// An unset or empty variable is simply absent (no warning).
+[[nodiscard]] inline std::vector<std::string> applyEnvOverrides(TransportConfig& c) {
+    std::vector<std::string> warnings;
+    auto readSize = [&warnings](const char* name) -> std::optional<std::size_t> {
         const char* v = std::getenv(name);
-        if (v == nullptr || *v == '\0') return;
-        char* end = nullptr;
-        const unsigned long long x = std::strtoull(v, &end, 10);
-        if (end != nullptr && *end == '\0') out = static_cast<std::size_t>(x);
+        if (v == nullptr || *v == '\0') return std::nullopt;
+        std::string why;
+        auto x = parseEnvSize(v, &why);
+        if (!x) {
+            warnings.push_back(std::string("rune-client: ignoring ") + name + "=\"" + v +
+                               "\": " + why + " (keeping the configured value)");
+        }
+        return x;
     };
-    readSize("RUNE_CLIENT_AERON_MTU", c.mtuLength);
-    std::size_t sock = static_cast<std::size_t>(-1);
-    readSize("RUNE_AERON_SOCKET_BUFFER_BYTES", sock);
-    if (sock != static_cast<std::size_t>(-1)) {
-        c.socketSndBufBytes = sock;
-        c.socketRcvBufBytes = sock;
+    if (const auto mtu = readSize("RUNE_CLIENT_AERON_MTU")) c.mtuLength = *mtu;
+    if (const auto sock = readSize("RUNE_AERON_SOCKET_BUFFER_BYTES")) {
+        c.socketSndBufBytes = *sock;  // 0 = OS default, as before
+        c.socketRcvBufBytes = *sock;
     }
     if (const char* v = std::getenv("RUNE_CLIENT_AERON_DRIVER_IDLE"); v != nullptr && *v != '\0') {
         c.driverIdleStrategy = v;
     }
+    return warnings;
 }
 
 } // namespace rune::client::transport
