@@ -247,17 +247,10 @@ public:
     // Non-owning: BrokerNode owns the WorkerReplicationTransport lifetime.
     // Must be called BEFORE the worker's AgentRunner starts.
     //
-    // Task 6: stores a (ctx, poll-trampoline) pair so doWork can call poll()
-    // without std::function and without virtual dispatch on the hot path.
-    // The trampoline is a plain function pointer; ctx is the typed transport
-    // pointer erased to void*.  This mirrors WorkerReplicationTransportImpl's
-    // own trampoline_ / ctx_ idiom and WorkerIngress::poll exactly.
-    //
-    // Production path: takes WorkerReplicationTransport* (AeronPubRegistry alias).
-    // Test-seam: setReplicationTransportForTest<T> accepts any Impl<T> without
-    // requiring AeronPubRegistry — used by unit tests that inject a
-    // WorkerReplicationTransportImpl<SharedFakePubRegistry>.  Zero overhead:
-    // trampoline is a non-capturing lambda → plain function pointer.
+    // Production path: takes WorkerReplicationTransport* (AeronPubRegistry
+    // alias); doWork polls it by a DIRECT call (pollReplTransport_, Task 11 fix 3).
+    // Test seam: setReplicationTransportForTest<T> accepts any Impl<T> (e.g. a
+    // SharedFakePubRegistry) through a (ctx, fn*) trampoline — tests only.
     // -----------------------------------------------------------------------
     void setReplicationTransport(WorkerReplicationTransport* transport) noexcept {
         // Task 11 fix 3 (m-a): production is polled through the TYPED pointer — a

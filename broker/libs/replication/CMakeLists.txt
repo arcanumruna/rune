@@ -19,9 +19,12 @@ if(aeron_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
-# AeronPartitionTransport — compiled separately only when aeron is available.
-# Consumers that want the real transport link rune_replication_aeron.
-# The base rune_replication library remains Aeron-free (pure + InMemoryTransport).
+# AeronPartitionTransport — part of rune_replication when aeron is available
+# (Task 11 fix 2).  rune_replication_aeron is kept as a consumer-facing INTERFACE
+# name.  Layering note (review m-d): its .cpp includes node HEADERS (header-
+# inline ReplicaRegistry/WorkerPool routing), a replication→node header
+# inversion that used to be confined to rune_replication_aeron; no node symbols
+# are linked (nm-verified).
 # ---------------------------------------------------------------------------
 if(aeron_FOUND)
     # Task 11 fix 2 (B2): AeronPartitionTransport is compiled INTO rune_replication
