@@ -22,6 +22,7 @@
 
 #include <rune/node/NodeConfig.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/DriverPumpAgent.h>
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
@@ -40,6 +41,7 @@
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
+#include <rune/node/AdminControlPlane.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -414,6 +416,15 @@ public:
         return agentRunner_ && agentRunner_->isRunning();
     }
 
+    /// Test/bench-only: override the runtime's slow-tick interval (ns; 0 = every
+    /// cycle).  Set before start().  Default: placement decides (fused 10 ms).
+    void setSlowTickIntervalForTest(int64_t ns) noexcept { slowTickIntervalOverrideNs_ = ns; }
+
+    /// Test-only: the concrete consensus agent the runtime drives (never Generic).
+    [[nodiscard]] NodeRuntimeAgent::ConsensusKind runtimeConsensusKindForTest() const noexcept {
+        return runtimeAgent_ ? runtimeAgent_->consensusKind() : NodeRuntimeAgent::ConsensusKind::Generic;
+    }
+
     /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
     /// runtime duty cycles run / routing-image publishes so far.
     [[nodiscard]] uint64_t runtimeCyclesForTest() const noexcept {
@@ -719,6 +730,11 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>  schemaReplica_;
     std::unique_ptr<SchemaRegistry>                       schemaRegistry_;
     std::unique_ptr<AdminWorkerAgent>                     adminWorkerAgent_;
+    // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
+    friend class AdminControlPlane;
+    int serviceAdminControl_();
+    AdminControlPlane                                     adminControl_{*this};
+    int64_t                                               slowTickIntervalOverrideNs_ = -1;
     // Task 8a: last leadership state posted to the admin role ring (control thread).
     bool                                                  adminLastLeader_ = false;
     int32_t                                               adminLastEpoch_  = -1;

@@ -1877,6 +1877,11 @@ void BrokerNode::buildGateway() {
     // worker-0 pass — its O(partitions) failover/rebalance scan becomes an Aeron
     // slow tick.  Thread placement: every cycle (unchanged).
     if (config_.fused()) runtimeAgent_->setSlowTickIntervalNs(NodeRuntimeAgent::kSlowTickIntervalNs);
+    // Test/bench-only override of the fused slow-tick interval (ABAB proof of
+    // the slow tick: 0 = scan every cycle, the pre-slow-tick behaviour).
+    if (slowTickIntervalOverrideNs_ >= 0) runtimeAgent_->setSlowTickIntervalNs(slowTickIntervalOverrideNs_);
+    // Task 11 fix 1: leadership handed to the gateway as a value each cycle.
+    runtimeAgent_->setSelfId(config_.nodeId);
 
     // -----------------------------------------------------------------------
     // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.
@@ -1893,105 +1898,9 @@ void BrokerNode::buildGateway() {
     //      originating session's egress via gateway_->sendControlFrame.
     // No cross-thread mutation: TopicRegistry + gateway egress are touched ONLY
     // here on the control thread; the admin thread touches ONLY its replica.
-    if (adminWorkerAgent_) {
-        runtimeAgent_->setAdminControlHook(
-            [this](int64_t /*nowNs*/) -> int {
-                int work = 0;
-                auto* agent = adminWorkerAgent_.get();
-                if (!agent) return 0;
-
-                // (1) Post a role event on a leadership-state change.
-                const bool leaderNow = this->isLeader();
-                const int32_t epochNow = static_cast<int32_t>(this->leadershipTermId());
-                if (leaderNow != adminLastLeader_ || epochNow != adminLastEpoch_) {
-                    AdminRoleMsg rm;
-                    rm.leader   = leaderNow;
-                    rm.epoch    = epochNow;
-                    rm.leaderId = static_cast<int32_t>(this->leaderId());
-                    if (encodeAdminRole(agent->roleRing(), rm)) {
-                        adminLastLeader_ = leaderNow;
-                        adminLastEpoch_  = epochNow;
-                        ++work;
-                    }
-                    // else: ring full (impossible for 1-deep role churn) → retry next cycle
-                }
-
-                // (1b) Task 10 fix 3 / I1: schema-log storage failure (admin →
-                //      control ring) → the same halt path as every other log.
-                work += agent->failureRing().drain(
-                    [this](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b,
-                           aeron::util::index_t off, aeron::util::index_t len) {
-                        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-                        int32_t e = 0;
-                        std::memcpy(&e, p, 4);
-                        onStorageFailure_(std::string(reinterpret_cast<const char*>(p) + 4,
-                                                      static_cast<std::size_t>(len) - 4), e);
-                    }, 4);
-
-                // (2) Drain create-topic requests (admin → control).
-                work += agent->createReqRing().drain(
-                    [this, agent](int32_t /*tid*/,
-                                  aeron::concurrent::AtomicBuffer& b,
-                                  aeron::util::index_t off,
-                                  aeron::util::index_t len) {
-                        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-                        CreateTopicReqMsg req =
-                            decodeCreateTopicReq(p, static_cast<std::size_t>(len));
-                        int32_t id = -1;
-                        if (topicRegistry_) {
-                            rune::node::TopicSpec spec;
-                            spec.name           = req.name;
-                            spec.partitionCount = req.partitionCount;
-                            spec.topicId        = -1;  // registry assigns
-                            try {
-                                id = topicRegistry_->createTopic(spec);
-                                // Task 8b (SINGLE-NODE): make the runtime topic
-                                // produce/consume-capable by creating its user
-                                // PartitionReplica(s) NOW, on this same control
-                                // thread that owns TopicRegistry / replicaRegistry_
-                                // / replTransport_ / MetadataService (no new
-                                // cross-thread mutation).  The authoritative spec
-                                // (assigned id + all fields, dirs/logs already
-                                // created by createTopic) is read back from the
-                                // registry and replayed through the boot path.
-                                if (id >= 0) {
-                                    const rune::node::TopicSpec* authSpec =
-                                        topicRegistry_->topic(id);
-                                    if (authSpec) {
-                                        (void)createRuntimeUserReplicas(*authSpec);
-                                    }
-                                }
-                            } catch (const std::exception& ex) {
-                                spdlog::error("BrokerNode: admin createTopic('{}') failed: {}",
-                                              req.name, ex.what());
-                                id = -1;
-                            }
-                        }
-                        CreateTopicReplyMsg reply;
-                        reply.ticket  = req.ticket;
-                        reply.topicId = id;
-                        // Reply ring is 1-deep in flight (one DDL at a time) → never full.
-                        (void)encodeCreateTopicReply(agent->replyRing(), reply);
-                    }, 8);
-
-                // (3) Drain response frames (admin → control) → session egress.
-                work += agent->egressRing().drain(
-                    [this](int32_t /*tid*/,
-                           aeron::concurrent::AtomicBuffer& b,
-                           aeron::util::index_t off,
-                           aeron::util::index_t len) {
-                        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-                        const auto n = static_cast<std::size_t>(len);
-                        if (n < 8) return;
-                        int64_t session;
-                        std::memcpy(&session, p, 8);
-                        if (gateway_)
-                            (void)gateway_->sendControlFrame(session, p + 8, n - 8);
-                    }, 16);
-
-                return work;
-            });
-    }
+    // Direct (non-virtual, no std::function) call from the runtime duty cycle:
+    // under fused placement it runs on every worker-0 pass (§1a.5, Task 11 fix 1).
+    if (adminWorkerAgent_) runtimeAgent_->setAdminControl(&adminControl_);
 
     // Select the runtime/gateway idle strategy (RUNE_RUNTIME_IDLE).  BusySpin →
     // the consensus+gateway thread never parks → sub-100µs produce/ack round-trips
@@ -2531,6 +2440,13 @@ void BrokerNode::stop() {
     // closes it after the runtime client closes (step 5).
     stopStartupPump_();
     if (config_.fused() && nodeDriver_) nodeDriver_->bindPumpThread();
+    // From here to step 5 nothing pumps the fused runtime driver/client: no
+    // invoke() ever runs again (so no inter-service timeout can fire) and close
+    // drains the CnC ring.  Never add a resolve on aeron_ to this teardown.
+    // NOTE (fused): the "stop X BEFORE the main agent runner" orderings below
+    // describe thread placement; under fused placement the runtime already
+    // stopped with worker 0 in 1a.  Both orders are safe (AdminWorker is async;
+    // a cleaner swap is enqueued only after the segment is renamed on disk).
 
     // 1b-admin. Task 6: stop AdminWorker thread BEFORE the main agent runner.
     //     The AdminWorker calls appendDurable which uses the schema replica.
@@ -2672,6 +2588,110 @@ void BrokerNode::startEmbeddedDriver() {
     nodeDriver_ = std::make_unique<EmbeddedDriver>(
         std::move(dcfg), config_.fused() ? DriverMode::Invoker : DriverMode::Threaded);
 }
+
+// ---------------------------------------------------------------------------
+// BrokerNode::serviceAdminControl_ — the schema DDL control plane, one runtime
+// duty cycle (Task 8a RULING-2 B).  Runs on the CONTROL (runtime) thread via
+// AdminControlPlane::doWork — a direct call, never std::function / virtual.
+// ---------------------------------------------------------------------------
+int BrokerNode::serviceAdminControl_() {
+    int work = 0;
+    auto* agent = adminWorkerAgent_.get();
+    if (!agent) return 0;
+
+    // (1) Post a role event on a leadership-state change.
+    const bool leaderNow = this->isLeader();
+    const int32_t epochNow = static_cast<int32_t>(this->leadershipTermId());
+    if (leaderNow != adminLastLeader_ || epochNow != adminLastEpoch_) {
+        AdminRoleMsg rm;
+        rm.leader   = leaderNow;
+        rm.epoch    = epochNow;
+        rm.leaderId = static_cast<int32_t>(this->leaderId());
+        if (encodeAdminRole(agent->roleRing(), rm)) {
+            adminLastLeader_ = leaderNow;
+            adminLastEpoch_  = epochNow;
+            ++work;
+        }
+        // else: ring full (impossible for 1-deep role churn) → retry next cycle
+    }
+
+    // (1b) Task 10 fix 3 / I1: schema-log storage failure (admin →
+    //      control ring) → the same halt path as every other log.
+    work += agent->failureRing().drain(
+        [this](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b,
+               aeron::util::index_t off, aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            int32_t e = 0;
+            std::memcpy(&e, p, 4);
+            onStorageFailure_(std::string(reinterpret_cast<const char*>(p) + 4,
+                                          static_cast<std::size_t>(len) - 4), e);
+        }, 4);
+
+    // (2) Drain create-topic requests (admin → control).
+    work += agent->createReqRing().drain(
+        [this, agent](int32_t /*tid*/,
+                      aeron::concurrent::AtomicBuffer& b,
+                      aeron::util::index_t off,
+                      aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            CreateTopicReqMsg req =
+                decodeCreateTopicReq(p, static_cast<std::size_t>(len));
+            int32_t id = -1;
+            if (topicRegistry_) {
+                rune::node::TopicSpec spec;
+                spec.name           = req.name;
+                spec.partitionCount = req.partitionCount;
+                spec.topicId        = -1;  // registry assigns
+                try {
+                    id = topicRegistry_->createTopic(spec);
+                    // Task 8b (SINGLE-NODE): make the runtime topic
+                    // produce/consume-capable by creating its user
+                    // PartitionReplica(s) NOW, on this same control
+                    // thread that owns TopicRegistry / replicaRegistry_
+                    // / replTransport_ / MetadataService (no new
+                    // cross-thread mutation).  The authoritative spec
+                    // (assigned id + all fields, dirs/logs already
+                    // created by createTopic) is read back from the
+                    // registry and replayed through the boot path.
+                    if (id >= 0) {
+                        const rune::node::TopicSpec* authSpec =
+                            topicRegistry_->topic(id);
+                        if (authSpec) {
+                            (void)createRuntimeUserReplicas(*authSpec);
+                        }
+                    }
+                } catch (const std::exception& ex) {
+                    spdlog::error("BrokerNode: admin createTopic('{}') failed: {}",
+                                  req.name, ex.what());
+                    id = -1;
+                }
+            }
+            CreateTopicReplyMsg reply;
+            reply.ticket  = req.ticket;
+            reply.topicId = id;
+            // Reply ring is 1-deep in flight (one DDL at a time) → never full.
+            (void)encodeCreateTopicReply(agent->replyRing(), reply);
+        }, 8);
+
+    // (3) Drain response frames (admin → control) → session egress.
+    work += agent->egressRing().drain(
+        [this](int32_t /*tid*/,
+               aeron::concurrent::AtomicBuffer& b,
+               aeron::util::index_t off,
+               aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto n = static_cast<std::size_t>(len);
+            if (n < 8) return;
+            int64_t session;
+            std::memcpy(&session, p, 8);
+            if (gateway_)
+                (void)gateway_->sendControlFrame(session, p + 8, n - 8);
+        }, 16);
+
+    return work;
+}
+
+int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
 
 // ---------------------------------------------------------------------------
 // BrokerNode::stopStartupPump_ — fused only: stop + JOIN the interim runtime

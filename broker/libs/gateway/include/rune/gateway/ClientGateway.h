@@ -138,6 +138,8 @@ public:
     // @param pump                     Startup resolve pump for the ingress subscription (spec §3.6):
     //                                 an invoker driver + conductor (fused runtime) is pumped by the
     //                                 constructing thread; the default pump sleep-polls a threaded driver.
+    //                                 Production fused placement uses the default pump (BrokerNode's
+    //                                 interim runner services the runtime driver during start()).
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
@@ -340,6 +342,13 @@ public:
     void setCommittedMetadataReady(bool ready) noexcept {
         committedMetadataReady_ = ready;
     }
+
+    // Task 11 fix 1: this node's leadership for the current duty cycle, pushed
+    // by the runtime agent (same thread) right after consensus runs.  Once set,
+    // doWork() reads it instead of calling the LeaderView std::function every
+    // cycle (no indirect call, no std::string build on followers).  Unset (-1):
+    // the LeaderView callable is used (gateway-only tests).
+    void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
 
     [[nodiscard]]
     bool committedMetadataReady() const noexcept {
@@ -1208,6 +1217,7 @@ private:
     //   Empty until wired in (no routing image = no redirects).
     std::shared_ptr<const rune::metadata::RoutingImage> routingImage_;
     bool                                                 committedMetadataReady_ = false;
+    int8_t                                               localLeader_ = -1;   // see setLocalLeadership()
     std::unordered_map<int32_t, std::string>             nodeEndpointMap_;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).

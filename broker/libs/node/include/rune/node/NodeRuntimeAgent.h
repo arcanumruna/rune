@@ -26,6 +26,8 @@
 // state happen on the single AgentRunner thread. No locking needed; no per-cycle heap.
 
 #include <rune/consensus/ConsensusAgent.h>  // defines rune::consensus::Agent
+#include <rune/node/AdminControlPlane.h>
+#include <rune/node/NodeConsensusAgent.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
@@ -59,7 +61,9 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 namespace rune::node {
@@ -105,7 +109,7 @@ public:
                      TransactionCoordinationService*     txnService      = nullptr,
                      MetadataService*                    metadataService = nullptr,
                      WorkerPool*                         workerPool      = nullptr) noexcept
-        : consensus_(consensusAgent)
+        : consensus_(ConsensusRef::of(consensusAgent))
         , election_(election)
         , bridge_(bridge)
         , transport_(transport)
@@ -123,7 +127,7 @@ public:
                      GroupCoordinationService*      groupService    = nullptr,
                      TransactionCoordinationService* txnService     = nullptr,
                      MetadataService*                metadataService = nullptr) noexcept
-        : consensus_(consensusAgent)
+        : consensus_(ConsensusRef::of(consensusAgent))
         , election_(nullptr)
         , bridge_(nullptr)
         , transport_(nullptr)
@@ -149,12 +153,22 @@ public:
     //     egress via gateway->sendControlFrame.
     //   - roleRing (control → admin): posted here on leadership change.
     //
-    // BrokerNode wires this lambda; it runs on THIS (control) thread every cycle.
+    // BrokerNode wires its concrete AdminControlPlane; it runs on THIS (control)
+    // thread every cycle as a DIRECT call (Task 11 fix 1: no std::function /
+    // virtual on the duty cycle — under fused placement it is worker 0's pass).
     // Non-owning; single-writer (control thread).  Null when no admin plane.
     // -----------------------------------------------------------------------
-    void setAdminControlHook(std::function<int(int64_t)> hook) noexcept {
-        adminControlHook_ = std::move(hook);
-    }
+    void setAdminControl(AdminControlPlane* control) noexcept { adminControl_ = control; }
+
+    /// This node's id: enables the per-cycle leadership hand-off to the gateway
+    /// (BrokerNode sets it; unset = the gateway keeps its LeaderView callable).
+    void setSelfId(int32_t selfId) noexcept { selfId_ = selfId; }
+
+    // Task 11 fix 1: which concrete consensus agent this runtime drives.  Single
+    // / Multi = a direct (final-class) call per cycle; Generic = virtual, only for
+    // test doubles.  BrokerNode always builds Single or Multi.
+    enum class ConsensusKind : uint8_t { Single, Multi, Generic };
+    [[nodiscard]] ConsensusKind consensusKind() const noexcept { return consensus_.kind; }
 
     // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
     // drives (internal partitions; all partitions without a WorkerPool) whose
@@ -212,7 +226,11 @@ private:
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
         ++cycles_;
         // 1. Consensus (Election + IngressRing drain).
-        int work = consensus_.doWork(nowNs);
+        int work = consensus_.doWork(nowNs);   // direct call (Single / Multi), never virtual in BrokerNode
+        // Task 11 fix 1: hand the gateway this cycle's leadership as a plain value
+        // (was a per-cycle std::function LeaderView — which also built a
+        // std::string on followers).  Same value BrokerNode::isLeader() reads.
+        if (gateway_ && selfId_ >= 0) gateway_->setLocalLeadership(isLocalLeader_());
 
         // 1b. Task 10 fix 3 (I2a): fan ownership out BEFORE anything this cycle
         //     can route ops (bridge role ops, transport poll, gateway), and free
@@ -307,8 +325,7 @@ private:
                     !std::equal(eligBuf_.begin(), eligBuf_.begin() + n,
                                 prevEligBuf_.begin());
                 // TEMP control-plane churn diagnostic (RUNE_CTRL_LOG=1).
-                static const bool kCtrlLog = ::getenv("RUNE_CTRL_LOG") != nullptr;
-                if (kCtrlLog) {
+                if (ctrlLog_) {
                     const int32_t curLeader = election_->leaderMemberId();
                     const int64_t curTerm   = (int64_t)election_->leadershipTermId();
                     if (changed || curLeader != dbgLastLeader_ || curTerm != dbgLastTerm_) {
@@ -336,7 +353,9 @@ private:
                     // only — no access to live worker-owned state.
                     //
                     // CONVERGENCE (time-independent): we run the refresh + idempotent
-                    // reassign EVERY duty cycle, not only on an eligible-set change.
+                    // reassign on EVERY scan (every duty cycle under thread placement;
+                    // every slow tick — and the very next cycle after any emit —
+                    // under fused placement), not only on an eligible-set change.
                     // A returned replica's position becomes visible some cycles AFTER
                     // it re-enters the eligible set (the leader must observe its next
                     // fetch), so a one-shot on-change reassign would miss the
@@ -380,7 +399,7 @@ private:
                     const std::size_t emitted =
                         metadataService_->reassignDeadPartitionLeaders(
                             eligibleScratch_, maxPref);
-                    if (kCtrlLog && emitted > 0)
+                    if (ctrlLog_ && emitted > 0)
                         std::fprintf(stderr,
                             "[CTRL] t=%lldms REASSIGN emitted=%zu records "
                             "(maxPref=%d eligN=%zu) — a partition leader was deemed "
@@ -427,8 +446,7 @@ private:
             //   or BalancerError), leave routingImage_ null → Path B (pre-MD1
             //   cluster-leader fallback) serves the produce.
             const std::uint64_t routingVersion = metadataService_->routingVersion();
-            if (gateway_ && (!routingBuilt_ || routingVersion != routingVersionBuilt_)) {
-                routingBuilt_        = true;
+            if (gateway_ && routingVersion != routingVersionBuilt_) {
                 routingVersionBuilt_ = routingVersion;
                 const auto& cmap = metadataService_->committedMap();
                 if (!cmap.empty()) {
@@ -527,8 +545,8 @@ private:
         //      and posts leadership role events to the admin thread.  Runs BEFORE
         //      gateway_->doWork so any DDL response frame enqueued via
         //      sendControlFrame is flushed on the egress this same cycle.
-        if (adminControlHook_) {
-            work += adminControlHook_(nowNs);
+        if (adminControl_) {
+            work += adminControl_->doWork(nowNs);
         }
 
         // 6. Gateway.
@@ -819,7 +837,28 @@ private:
     // Control-thread-only: refs whose owning worker's ingress was full.
     std::vector<void*>                                 pendingTestTasks_;
 
-    rune::consensus::Agent&                            consensus_;
+    // Concrete consensus agent + construction-time tag (Task 11 fix 1).
+    struct ConsensusRef {
+        ConsensusKind                    kind    = ConsensusKind::Generic;
+        rune::consensus::ConsensusAgent* single  = nullptr;
+        NodeConsensusAgent*              multi   = nullptr;
+        rune::consensus::Agent*          generic = nullptr;
+        static ConsensusRef of(rune::consensus::Agent& a) noexcept {
+            ConsensusRef r;
+            if (auto* m = dynamic_cast<NodeConsensusAgent*>(&a)) { r.kind = ConsensusKind::Multi; r.multi = m; }
+            else if (auto* c = dynamic_cast<rune::consensus::ConsensusAgent*>(&a)) { r.kind = ConsensusKind::Single; r.single = c; }
+            else r.generic = &a;
+            return r;
+        }
+        int doWork(int64_t nowNs) const {
+            if (kind == ConsensusKind::Multi) [[likely]] return multi->doWork(nowNs);    // final → direct
+            if (kind == ConsensusKind::Single) return single->doWork(nowNs);             // final → direct
+            return generic->doWork(nowNs);                                               // test doubles only
+        }
+    };
+    static_assert(std::is_final_v<NodeConsensusAgent> && std::is_final_v<rune::consensus::ConsensusAgent>,
+                  "the runtime's consensus call must be devirtualised (final classes)");
+    ConsensusRef                                       consensus_;
     rune::consensus::Election*                         election_;   // non-owning; null when no bridge
     // Allocation-free eligible-set tracking for bidirectional leadership rebalance.
     // Fixed stack buffers reused every duty cycle (no per-cycle heap); a heap vector
@@ -845,7 +884,22 @@ private:
     MetadataService*                                   metadataService_; // non-owning; null-safe (MD1)
     WorkerPool*                                        workerPool_;      // non-owning; null = pre-E1 path
     // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
-    std::function<int(int64_t)>                        adminControlHook_;
+    AdminControlPlane*                                 adminControl_ = nullptr;
+    int32_t                                            selfId_       = -1;
+    // == BrokerNode::isLeader(), evaluated on this (owning) thread.
+    [[nodiscard]] bool isLocalLeader_() const noexcept {
+        if (consensus_.kind == ConsensusKind::Multi) return consensus_.multi->leaderId() == selfId_;
+        if (!election_) return false;
+        using rune::consensus::ElectionState;
+        const int32_t c = election_->stateCode();
+        return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
+               c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
+               c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
+               c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
+               c == static_cast<int32_t>(ElectionState::Closed);
+    }
+    // RUNE_CTRL_LOG temp diagnostic — read once at construction (not per scan).
+    const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;
     StorageFailureHook                                 storageFailureHook_;
     std::function<void(const std::string&)>            fatalHook_;
 
@@ -897,8 +951,9 @@ private:
     rune::consensus::SlowTick                          failoverTick_;
     std::uint64_t                                      cycles_                = 0;
     std::uint64_t                                      routingImagePublishes_ = 0;
-    bool                                               routingBuilt_          = false;
-    std::uint64_t                                      routingVersionBuilt_   = 0;
+    // routingVersion() of the image last published; UINT64_MAX = none yet
+    // (routingVersion() starts at 0, so the first cycle always builds).
+    std::uint64_t                                      routingVersionBuilt_   = UINT64_MAX;
     bool                                               fatalReported_ = false;
     bool                                               storageFailureReported_ = false;
     void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {

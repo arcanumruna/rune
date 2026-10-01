@@ -37,6 +37,8 @@ public:
     // @param streamId     The stream this node listens on.
     // @param ingressRing  Ring to write decoded frames into.
     // @param pump         Startup resolve pump (default: sleep-poll a threaded driver).
+    //                     (Production fused placement services the runtime driver from
+    //                     an interim runner and uses the default pump — BrokerNode.)
     AeronIngress(std::shared_ptr<aeron::Aeron> aeron,
                  const std::string&            channel,
                  int32_t                       streamId,

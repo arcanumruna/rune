@@ -649,6 +649,8 @@ TEST(ShardModeFusedRegression, SingleNodeRunsRuntimeOnWorkerZero) {
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms)) << "consensus must run inside worker 0's loop";
     EXPECT_FALSE(node.runtimeThreadStartedForTest());
+    EXPECT_EQ(node.runtimeConsensusKindForTest(), NodeRuntimeAgent::ConsensusKind::Single)
+        << "worker 0's pass must call the concrete consensus agent (no virtual dispatch)";
     {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
@@ -695,6 +697,8 @@ TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
     n0.start(); n1.start(); n2.start();
     ASSERT_TRUE(n0.awaitLeader(15'000ms)) << "consensus over UDP between three fused runtimes";
     EXPECT_FALSE(n0.runtimeThreadStartedForTest());
+    EXPECT_EQ(n0.runtimeConsensusKindForTest(), NodeRuntimeAgent::ConsensusKind::Multi)
+        << "worker 0's pass must call the concrete consensus agent (no virtual dispatch)";
     {
         ShardTestClient c(cdir.path);
         const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);

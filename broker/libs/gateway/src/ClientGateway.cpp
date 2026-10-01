@@ -375,8 +375,10 @@ int ClientGateway::doWork(int64_t nowNs) {
     // With leaderView_: rebuild fires exactly once on the first duty cycle after
     // the node becomes leader (wasLeader_ flips false→true). Losing leadership
     // resets wasLeader_ so the next election fires another rebuild.
-    if (leaderView_) {
-        const bool leader = leaderView_().isLeader;
+    if (localLeader_ >= 0 || leaderView_) {
+        // Task 11 fix 1: the runtime pushes this cycle's leadership as a value
+        // (no per-cycle std::function call); gateway-only tests use leaderView_.
+        const bool leader = localLeader_ >= 0 ? localLeader_ == 1 : leaderView_().isLeader;
         if (leader && !wasLeader_) {
             // Follower→Leader: rebuild PSM from all partition Logs.
             rebuildProducerStateFromLogs();

@@ -105,6 +105,8 @@ public:
     /// \param pump  Startup resolve pump (spec §3.6): an invoker driver +
     ///        conductor (fused runtime) is pumped by this thread between probes;
     ///        the default pump sleep-polls a threaded driver.
+    ///        Production fused placement uses the default pump (the runtime driver
+    ///        is serviced by BrokerNode's interim startup runner).
     AeronPartitionTransport(std::shared_ptr<aeron::Aeron> aeron,
                             const std::string&             ingressChannel,
                             int32_t                        ingressStreamId,
