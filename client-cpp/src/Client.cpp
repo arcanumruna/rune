@@ -1615,14 +1615,24 @@ TopicHandle Client::topic(const std::string& name) const noexcept {
 // ---------------------------------------------------------------------------
 
 Producer Client::producer(ProducerConfig cfg) {
-    return producerWithRingCap_(cfg, producer::kDefaultProducerRingCap);
+    // Task 14 (spec §4.1): in Invoker mode the owner thread IS the duty-cycle
+    // thread — the producer appends straight into its partition builders (Direct
+    // ingress); the ring hop (CAS + copy into a ring this same thread drains) is
+    // pure overhead there.  Thread mode keeps the MPSC ring (unchanged).
+    if (cfg_.runnerMode == RunnerMode::Invoker) {
+        return producerWithRingCap_(cfg, producer::kDirectProducerRingCap, /*direct=*/true);
+    }
+    return producerWithRingCap_(cfg, producer::kDefaultProducerRingCap, /*direct=*/false);
 }
 
 Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
-    return producerWithRingCap_(cfg, ringCap);
+    // A RING-ingress producer in either runner mode: the seam that keeps the ring
+    // paths (heartbeat wait, ring back-pressure, foreign app threads) testable
+    // against an Invoker client too.
+    return producerWithRingCap_(cfg, ringCap, /*direct=*/false);
 }
 
-Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
+Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
     // ProducerImpl owns its own ring buffer; shares the correlationId counter.
     auto impl = std::make_shared<producer::ProducerImpl>(
         cfg,
@@ -1649,6 +1659,17 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     // test can see a stale heartbeat race a real steady_clock read.
     if (cfg_.nanoClock != nullptr) {
         impl->setClockForTesting(cfg_.nanoClock);
+    }
+
+    // Task 14: Direct ingress reuses the SAME pump hook + duty-thread binding as
+    // setPumpFn() above (one mechanism): the owner (== dutyThreadId_ in Invoker
+    // mode) is the only thread allowed to send; a back-pressured blocking send
+    // pumps through pumpTrampoline_, which declines inside a duty cycle (an ack
+    // callback) so sendBlocking throws rather than re-entering.  The append clock
+    // is seeded from the duty-cycle clock (records sent before the producer's
+    // first pass get a real batchStartNs for linger / delivery timeout).
+    if (direct) {
+        impl->enableDirectIngress({dutyThreadId_, &Client::pumpTrampoline_, this, now()});
     }
 
     // Shared-nothing registration: producer() may be called from any app thread,

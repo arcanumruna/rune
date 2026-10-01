@@ -98,6 +98,11 @@ inline constexpr uint8_t kFlagWantAck = 0x01;
 // agent's drain cadence.
 inline constexpr int32_t kDefaultProducerRingCap = 32 * 1024 * 1024; // 32 MiB
 
+// Task 14: a Direct-ingress (RunnerMode::Invoker) producer never writes a record
+// into its ring — it only keeps the ring's trailer words (closed / heartbeat), so
+// the ring is the smallest power of two instead of 32 MiB per producer.
+inline constexpr int32_t kDirectProducerRingCap = 1024;
+
 // Per-partition ack-ring capacity (entries; MUST be a power of two).  Holds the
 // PendingAck handles of outstanding (sent, not-yet-acked) records for one
 // partition at their record index so ProduceResponse can fan out baseOffset+i.  Sized to comfortably exceed
@@ -322,18 +327,61 @@ public:
         dutyThreadId_ = dutyThreadId;
     }
 
+    /// Task 14 (spec §4.1): ingress mode.
+    ///   Ring (default): app threads hand records to the duty-cycle thread
+    ///     through this producer's MPSC ring (Thread mode — the runner drains it).
+    ///   Direct (RunnerMode::Invoker): the owner thread IS the duty-cycle thread,
+    ///     so trySubmit() appends straight into the partition builder — no ring,
+    ///     no CAS, no second copy.  The records of one pass accumulate and leave
+    ///     at the end of the pass (flushBatches), one frame per partition.
+    enum class IngressMode : uint8_t { Ring, Direct };
+    /// Direct ingress is the SAME pump hook / duty-thread binding as setPumpFn()
+    /// (one mechanism, not two): `owner` becomes dutyThreadId_ (the only thread
+    /// allowed to send; others get WrongThread), `pump`/`pumpCtx` become
+    /// pumpFn_/pumpCtx_ (sendBlocking's way to run the owner's duty cycle; null
+    /// = nothing can drain, so a back-pressured blocking send throws).
+    struct DirectIngress {
+        std::thread::id owner;
+        PumpFn          pump    = nullptr;
+        void*           pumpCtx = nullptr;
+        int64_t         nowNs   = 0;  ///< duty-cycle clock now: the append clock until the first pass
+    };
+    /// Set once, before any send(), by the thread that creates the producer.
+    void enableDirectIngress(const DirectIngress& d) noexcept {
+        setPumpFn(d.pump, d.pumpCtx, d.owner);
+        mode_      = IngressMode::Direct;
+        lastNowNs_ = d.nowNs;
+    }
+    [[nodiscard]] IngressMode ingressMode() const noexcept { return mode_; }
+
     /// fix1 minor 9: publish the ring's consumer-liveness heartbeat ONCE per
     /// duty cycle (called by ProducerHub::drainAndFlush before its drainRing()
     /// retry loop), not once per drainRing() call (which can run up to 256x/cycle
     /// per producer) — a relaxed store either way (see M2ORingBuffer), just
     /// cheaper to do it once.
-    void publishHeartbeat(int64_t nowNs) noexcept { ring_.consumerHeartbeatTime(nowNs); }
+    /// Task 14: no-op for a Direct producer (nobody waits on its ring).
+    void publishHeartbeat(int64_t nowNs) noexcept {
+        if (mode_ != IngressMode::Direct) ring_.consumerHeartbeatTime(nowNs);
+    }
 
     /// fix1 C2/I3: mark this producer's ring closed. Called by Client::closeImpl_
     /// on every still-registered producer WHILE the Client is fully valid (before
     /// the pump hook's context, `this` Client, can ever dangle). Idempotent;
     /// safe to call from the duty-cycle thread only (matches close()'s contract).
-    void markRingClosed() noexcept { ring_.closed(true); }
+    ///
+    /// Task 14: a Direct producer has no ring traffic, and its closed state is
+    /// PURE OWNER-THREAD state (a plain bool, no atomic): written here by
+    /// closeImpl_ (Invoker: the owner thread, or the destroying thread after the
+    /// app stopped driving — the same contract as doWork()), and by producer()'s
+    /// lost-the-close-race path before the producer is handed to anyone.  Read
+    /// only by the owner thread (trySubmit decides WrongThread first).
+    void markRingClosed() noexcept {
+        if (mode_ == IngressMode::Direct) {
+            directClosed_ = true;
+        } else {
+            ring_.closed(true);
+        }
+    }
 
     /// Write a flush trigger into the ring.  Zero-alloc.
     void submitFlush() noexcept;
@@ -580,6 +628,25 @@ private:
 
     PartitionState& getOrCreatePartition(int32_t topicId, int32_t partition);
 
+    /// Closed state for this producer's ingress mode (Direct: owner-thread bool;
+    /// Ring: the ring trailer's closed word).
+    [[nodiscard]] bool closed_() const noexcept {
+        return mode_ == IngressMode::Direct ? directClosed_ : ring_.closed();
+    }
+    /// Task 14: trySubmit's Direct path (owner thread; no ring, no atomic).
+    SendResult tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
+                                std::span<const uint8_t> value, int64_t ackHandle) noexcept;
+
+    /// One record into its partition builder — the single append path shared by
+    /// the ring drain (Ring) and trySubmit (Direct).  Owner/duty thread only.
+    /// ABORT = back-pressure: the record was NOT appended (builder at its cap and
+    /// the window full, or — Direct, where no flush runs between sends — builder
+    /// at its cap at all; or the frame-cap pre-flight).  Ownership of a wantAck
+    /// handle passes to the producer only on CONTINUE.
+    rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
+        const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
+        uint8_t flags, uint64_t ackHandle, int64_t nowNs);
+
     /// Double a partition's ack-ring, preserving live entries [ackTail, ackHead).
     /// Called only on overflow (deep single-partition pipeline); steady state
     /// never reallocs.
@@ -717,6 +784,13 @@ private:
     // calling thread BEFORE pumpFn_ is ever invoked, so a non-duty thread
     // never touches pumpCtx_ (the Client) at all.
     std::thread::id dutyThreadId_{};
+
+    // ---- Task 14: ingress mode (set once before any send; owner thread only) --
+    IngressMode mode_      = IngressMode::Ring;
+    bool        directClosed_ = false;  // Direct only: see markRingClosed()
+    // Duty-cycle clock of the last drainRing()/flushBatches() (Direct appends
+    // stamp batchStartNs with it — the clock is sampled per pass, never per send).
+    int64_t     lastNowNs_ = 0;
 };
 
 } // namespace rune::client::producer

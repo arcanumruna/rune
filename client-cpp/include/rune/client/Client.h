@@ -577,7 +577,9 @@ private:
     }
 
     /// Shared implementation of producer() / testProducerWithRingCap().
-    Producer producerWithRingCap_(ProducerConfig cfg, int32_t ringCap);
+    /// direct = Task 14 Direct ingress (Invoker producer(): owner-thread appends,
+    /// no ring hop); false = Ring ingress (Thread mode, and the ring test seam).
+    Producer producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct);
 
     /// fix1 C1: run a user callback, catching and counting/logging any escaping
     /// exception instead of letting it unwind into a noexcept frame
