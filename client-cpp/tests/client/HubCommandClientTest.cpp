@@ -330,11 +330,10 @@ TEST(HubCommandClient, RingFullUnsubscribeStillStopsDispatchRegression) {
     EXPECT_EQ(sub.position(), 1) << "position() final after finished()";
 }
 
-// C1(b) / F8c C7: the destructor under a FULL command ring never waits.  In
-// Invoker mode releasing a handle is duty work (the doWork() contract — here
-// the off-owner destroy: the owner is not pumping meanwhile), applied directly
-// even off the owner thread: the subscription is unsubscribed at once and its
-// handler never runs again.
+// C1(b): the destructor under a full ring blocks only until the duty thread
+// makes progress, then dispatch is stopped.  F8c C7 fix round 1 (I-2): an
+// Invoker-mode release off the owner thread goes through the command ring
+// (never touches duty state) — the owner keeps pumping concurrently here.
 TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
     HubRig r(3986);
     r.connect();
@@ -344,13 +343,21 @@ TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
         [&](const rc::Record&) { got.fetch_add(1); }));
     ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub->subscriptionId() > 0; }));
 
-    std::atomic<int> fullHits{0};
-    r.client.testSetHubCommandRingFullHook([&] { fullHits.fetch_add(1); });
+    std::atomic<int> ev{kPending};
+    r.client.testSetHubCommandRingFullHook([&] { signal(ev, kFull); });
     r.client.testFillCommandRing();
-    std::thread t([&] { sub.reset(); });  // returns without any duty progress
+    std::atomic<bool> destroyed{false};
+    std::thread t([&] {
+        sub.reset();
+        destroyed.store(true);
+        signal(ev, kNoFull);
+    });
+    if (waitEvent(ev) != kFull) {
+        t.join();
+        FAIL() << "the destructor never met the full ring";
+    }
+    ASSERT_TRUE(r.drive([&] { return destroyed.load() && !r.gw.unsubscribed.empty(); }));
     t.join();
-    EXPECT_EQ(fullHits.load(), 0) << "the release never waited on the full ring";
-    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }));
     r.gw.pushRecords(r.gw.subscribed[0], 0, 2);
     r.settle();
     EXPECT_EQ(got.load(), 0) << "the destroyed subscription's handler must never run";

@@ -2450,6 +2450,15 @@ void Client::applyProducerCommand_(const detail::HubCommand& cmd) {
 // whichever detaches LAST frees the impl.  The duty side detaches when it
 // reaps a released impl that nothing references any more (end of a duty
 // cycle), or when Client close hands every still-held impl back.
+//
+// Known gap (review m1 — test seam only): a registration stranded behind an
+// ABANDONED close drain (an orphaned command-ring claim that unblock() cannot
+// clear — impossible in-process outside the testClaim* seams) is never adopted
+// and so never handed back: its duty share is never detached.  A handle that
+// outlives the Client then sees !dutyDetached() and its release calls the
+// release hook — i.e. it TOUCHES THE DEAD Client (use-after-free), it does not
+// merely leak.  Accepted for the crash-only shutdown path (fix5); a later fix
+// can mark such impls in their own ring word when the drain is abandoned.
 
 detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
     // I1: this thread runs this Client's close(): it owns every duty structure
@@ -2459,12 +2468,10 @@ detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
         return detail::HubSubmit::Accepted;
     }
     const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
-    if (cfg_.runnerMode == RunnerMode::Invoker || onDuty) {
-        // Invoker mode: duty work on whichever thread (the owner, or the
-        // off-owner destroy pattern: same contract as doWork(), never
-        // concurrently with doWork()/close() elsewhere) — never a ring nobody
-        // drains.  Thread-mode runner (a callback): the duty state is ours
-        // until close() joins this thread, even once it closed the ring.
+    if (onDuty) {
+        // The duty thread itself — the Invoker owner (in or outside a cycle) or
+        // a Thread-mode runner callback (the duty state is ours until close()
+        // joins this thread, even once it closed the ring): apply it here.
         if (cfg_.runnerMode == RunnerMode::Invoker && agent_.commandRingClosed()) {
             return detail::HubSubmit::Closed;  // closed: the hand-back owns it
         }
@@ -2474,17 +2481,43 @@ detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
         applyRelease_(cmd, agent_.commandRingTail(), /*closing=*/false);
         return detail::HubSubmit::Accepted;
     }
-    // Any other thread: a lifecycle command — guaranteed delivery (a full
-    // ring is waited out on the runner's progress), FIFO behind this handle's
-    // own ops.  Closed: close() is in progress elsewhere and hands it back.
+    // Any other thread (spec §3.3): a lifecycle command on the command ring —
+    // FIFO behind this handle's own ops; it never touches duty state itself
+    // (the Invoker owner may be pumping right now).  A full ring is waited out
+    // on the consumer's progress.  Closed: close() is in progress elsewhere
+    // and hands the impl back.
+    //
+    // F8c C7 fix round 1 (I-2): Invoker mode has no runner — if NOBODY drains
+    // (the documented join-then-destroy: the owner stopped pumping), waiting
+    // for room would never end.  The bound is the Invoker liveness contract
+    // itself: the owner must call doWork() at least every
+    // aeronClientLivenessTimeoutNs (else the Aeron client closes itself), so a
+    // command-ring head that has not moved for that long has no pumper.  The
+    // handle then lets go of its share without a release; the impl stays with
+    // the duty side and Client close (handBackAll_) frees it.  Thread mode: the
+    // runner always drains — no bound needed.
     aeron::concurrent::BackoffIdleStrategy idle(
         10, 20, std::chrono::duration<long, std::nano>(1'000),
         std::chrono::duration<long, std::nano>(100'000));
+    const bool invoker = cfg_.runnerMode == RunnerMode::Invoker;
+    std::int64_t lastHead  = invoker ? agent_.commandRingHead() : 0;
+    auto         lastMoved = std::chrono::steady_clock::now();
     for (;;) {
         const auto r = agent_.submitHubCommand(cmd);
         if (r == agent::ClientAgent::Submit::Accepted) return detail::HubSubmit::Accepted;
         if (r == agent::ClientAgent::Submit::Closed) return detail::HubSubmit::Closed;
         if (testHubCommandRingFullHook_) [[unlikely]] testHubCommandRingFullHook_();
+        if (invoker) {
+            const std::int64_t head = agent_.commandRingHead();
+            const auto         t    = std::chrono::steady_clock::now();
+            if (head != lastHead) {
+                lastHead  = head;
+                lastMoved = t;
+            } else if (std::chrono::duration_cast<std::chrono::nanoseconds>(t - lastMoved).count() >=
+                       cfg_.aeronClientLivenessTimeoutNs) {
+                return detail::HubSubmit::Closed;  // no pumper: the close hand-back frees it
+            }
+        }
         idle.idle(0);
     }
 }

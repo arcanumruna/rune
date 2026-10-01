@@ -578,45 +578,118 @@ TEST(HandleLifetime, HandleDestroyedInsideOwnCallbackDefersFreeRegression) {
 }
 
 // ===========================================================================
-// Invoker off-owner destroy: release is duty work, never waits
+// Invoker off-owner destroy: through the ring, bounded by the liveness contract
 // ===========================================================================
 
 // The Client is driven on a worker and its handles are destroyed on main after
-// the worker joined (the documented off-owner destroy), with the command ring
-// FULL: each release applies directly (duty work — nobody else pumps), never
-// waits for ring room, and the Client's destruction (also off-owner) frees
-// every impl exactly once.  RED (round-1 design / parent semantics for a
-// full ring): a release through the ring would wait forever.
+// the worker joined (the documented join-then-destroy).  Each release goes
+// through the command ring (spec §3.3; F8c C7 fix round 1, I-2) — never
+// touching duty state off the owner — and the Client's own (off-owner)
+// destruction applies / hands back every impl: each freed exactly once.  With
+// the command ring FULL nobody can ever drain it: the release gives up after
+// the Invoker liveness bound (aeronClientLivenessTimeoutNs — the owner must
+// pump at least that often) instead of waiting forever, and close frees the
+// impl.  RED (mutation): an unbounded wait hangs (watchdog).
 TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
-    Watchdog wd("Invoker off-owner handle destroy with a full command ring");
-    FreeHook hook;
-    std::unique_ptr<rc::Client>               client;
-    std::optional<rc::Producer>               p;
-    std::optional<rc::TransactionalProducer>  tp;
-    std::optional<rc::Subscription>           sub;
-    std::optional<rc::GroupConsumer>          gc;
-    std::thread owner([&] {
-        client = std::make_unique<rc::Client>(cfgFor(5416));
-        const auto topic = client->topic("t");
-        p.emplace(client->producer(ackCfg()));
-        tp.emplace(client->transactionalProducer("tx-offowner"));
-        sub.emplace(client->subscribe(topic, 0, {}, &noopRecords));
-        gc.emplace(client->subscribeGroup("g-offowner", {"t"}));
-        for (int i = 0; i < 10; ++i) client->doWork();  // adopt the ring registrations
-        client->testFillCommandRing();
-    });
-    owner.join();
-    p.reset();
-    tp.reset();
-    sub.reset();
-    gc.reset();
-    EXPECT_EQ(totalFrees(), 0) << "the duty side's share is let go by a duty cycle or the close";
-    client.reset();  // off-owner close: drains the full ring, hands back / frees
-    EXPECT_EQ(totalFrees(), 4);
-    for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer, rcd::HandleKind::Subscription,
-                         rcd::HandleKind::GroupConsumer}) {
-        EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
+    Watchdog wd("Invoker off-owner handle destroy");
+    for (const bool fullRing : {false, true}) {
+        SCOPED_TRACE(fullRing ? "full command ring" : "ring with room");
+        FreeHook hook;
+        std::unique_ptr<rc::Client>               client;
+        std::optional<rc::Producer>               p;
+        std::optional<rc::TransactionalProducer>  tp;
+        std::optional<rc::Subscription>           sub;
+        std::optional<rc::GroupConsumer>          gc;
+        rc::ClientConfig cfg = cfgFor(fullRing ? 5416 : 5438);
+        cfg.aeronClientLivenessTimeoutNs = 1'000'000'000LL;  // the no-pumper bound (1 s)
+        std::thread owner([&] {
+            client = std::make_unique<rc::Client>(cfg);
+            const auto topic = client->topic("t");
+            p.emplace(client->producer(ackCfg()));
+            tp.emplace(client->transactionalProducer("tx-offowner"));
+            sub.emplace(client->subscribe(topic, 0, {}, &noopRecords));
+            gc.emplace(client->subscribeGroup("g-offowner", {"t"}));
+            for (int i = 0; i < 10; ++i) client->doWork();  // adopt the ring registrations
+            if (fullRing) client->testFillCommandRing();
+        });
+        owner.join();
+        const auto t0 = std::chrono::steady_clock::now();
+        p.reset();
+        tp.reset();
+        sub.reset();
+        gc.reset();
+        const auto took = std::chrono::steady_clock::now() - t0;
+        if (fullRing) {
+            EXPECT_LT(took, std::chrono::seconds(20)) << "each release bounded by the liveness timeout";
+        } else {
+            EXPECT_LT(took, std::chrono::seconds(1)) << "accepted onto the ring at once";
+        }
+        EXPECT_EQ(totalFrees(), 0) << "nothing frees an impl off the owner";
+        client.reset();  // off-owner close: drains / hands back, frees each impl once
+        EXPECT_EQ(totalFrees(), 4);
+        for (const auto k : {rcd::HandleKind::Producer, rcd::HandleKind::TxnProducer,
+                             rcd::HandleKind::Subscription, rcd::HandleKind::GroupConsumer}) {
+            EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
+        }
     }
+}
+
+// I-2: handles owned by a worker thread are destroyed while the Invoker owner
+// keeps pumping (records flowing to the subscription, the group / txn
+// producers registered): each release travels the command ring and is applied
+// by the owner — no duty state is touched off the owner (TSan), each impl is
+// freed exactly once, and the subscription's handler never runs once its
+// release was applied.  RED (pre-fix, TSan): the worker applied the release
+// directly — data races with the owner's duty cycle.
+TEST(HandleLifetime, InvokerOffOwnerReleaseWhileOwnerPumpsRegression) {
+    Watchdog wd("Invoker off-owner release while the owner pumps");
+    FreeHook hook;
+    Rig r(cfgFor(5440));
+    r.connect();
+    const auto topic = r.client->topic("t");
+    std::atomic<int>  delivered{0};
+    std::atomic<int>  stage{0};  // 1: handles created; 2: destroy now; 3: destroyed
+    std::thread worker([&] {
+        std::optional<rc::Subscription>          sub(r.client->subscribe(
+            topic, 0, rc::SubscribeOptions{rc::From::earliest()},
+            [&](const rc::Record&) { delivered.fetch_add(1); }));
+        std::optional<rc::TransactionalProducer> tp(r.client->transactionalProducer("tx-worker"));
+        std::optional<rc::GroupConsumer>         gc(r.client->subscribeGroup("g-worker", {"t"}));
+        stage.store(1);
+        while (stage.load() != 2) std::this_thread::yield();
+        sub.reset();  // concurrently with the owner's doWork() below
+        tp.reset();
+        gc.reset();
+        stage.store(3);
+    });
+    ASSERT_TRUE(r.drive([&] { return stage.load() == 1 && !r.gw.subscribed.empty(); }));
+    ASSERT_TRUE(r.drive([&] { return r.client->testSubscriptionImplsHeld() == 1 &&
+                                     r.client->testTxnProducerCount() == 1 &&
+                                     r.client->testGroupImplsHeld() == 1; }));
+    int64_t next = 0;
+    r.gw.pushRecords(r.gw.subscribed[0], next, 4);
+    next += 4;
+    ASSERT_TRUE(r.drive([&] { return delivered.load() >= 4; }));
+    stage.store(2);
+    // Keep records flowing while the worker destroys its handles.
+    ASSERT_TRUE(r.drive([&] {
+        if (stage.load() != 3) {
+            r.gw.pushRecords(r.gw.subscribed[0], next, 1);
+            ++next;
+        }
+        return stage.load() == 3 && totalFrees() == 3;
+    }));
+    worker.join();
+    EXPECT_EQ(frees(rcd::HandleKind::Subscription), 1);
+    EXPECT_EQ(frees(rcd::HandleKind::TxnProducer), 1);
+    EXPECT_EQ(frees(rcd::HandleKind::GroupConsumer), 1);
+    const int after = delivered.load();
+    r.gw.pushRecords(r.gw.subscribed[0], next, 3);
+    for (int i = 0; i < 2'000; ++i) r.doWork(), r.gw.pump();
+    EXPECT_EQ(delivered.load(), after) << "a handler ran after its release was applied";
+    r.client->closeImmediately();
+    r.client.reset();
+    EXPECT_EQ(totalFrees(), 3) << "no impl freed twice";
 }
 
 // ===========================================================================
