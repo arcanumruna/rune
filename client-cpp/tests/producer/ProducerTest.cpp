@@ -302,7 +302,6 @@ struct AgentHarness {
     std::unique_ptr<ProduceGateway>   gw;
 
     rprod::ProducerHub    hub;
-    std::atomic<int64_t>  nextCorrId_ {1};
 
     explicit AgentHarness(int32_t ingressStream, int32_t egressStream,
                            int32_t ringCap = 512 * 1024)
@@ -351,7 +350,7 @@ struct AgentHarness {
     /// Create and register a producer with the hub.
     Producer makeProducer(ProducerConfig pcfg = {}) {
         auto impl = std::make_shared<rprod::ProducerImpl>(
-            pcfg, nextCorrId_);
+            pcfg);
         hub.add(impl);
         return Producer(std::move(impl));
     }
@@ -1383,7 +1382,7 @@ TEST(Producer, RingFullDropAndRecover) {
     pcfg.maxInFlight = 4;
 
     // Use an impl directly so we can call submitSendRecord and inspect the return value.
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, h.nextCorrId_, 4 * 1024);
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, 4 * 1024);
     h.hub.add(impl);
     Producer p(impl);
 

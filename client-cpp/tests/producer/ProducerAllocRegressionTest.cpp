@@ -46,8 +46,7 @@ int pump(ProducerImpl& impl, const ProducerImpl::SendFn& sink) {
 // Regression: every acked batch allocated a std::map node + a std::vector frame
 // copy (BatchInfo.wireFrame).  Steady state must allocate nothing.
 TEST(ProducerAllocRegression, SteadyStateAckedFlushAllocatesNothingRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(4), corr);
+    ProducerImpl impl(ackCfg(4));
     int64_t lastCorr = 0;
     const ProducerImpl::SendFn sink = [&lastCorr](int32_t, int32_t, int32_t, const uint8_t* b,
                                                   std::size_t n) {
@@ -74,8 +73,7 @@ TEST(ProducerAllocRegression, SteadyStateAckedFlushAllocatesNothingRegression) {
 // value) reallocated in steady state — the intermittent 1-allocation failure of
 // SteadyStateAckedFlushAllocatesNothingRegression.  Deterministic here: sizes jitter by 2 bytes.
 TEST(ProducerAllocRegression, FrameSizeJitterDoesNotReallocateSlotRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(1), corr);  // one slot: every frame reuses it
+    ProducerImpl impl(ackCfg(1));  // one slot: every frame reuses it
     int64_t lastCorr = 0;
     const ProducerImpl::SendFn sink = [&lastCorr](int32_t, int32_t, int32_t, const uint8_t* b,
                                                   std::size_t n) {
@@ -100,10 +98,9 @@ TEST(ProducerAllocRegression, FrameSizeJitterDoesNotReallocateSlotRegression) {
 // Regression guard: acks=None void sends (no ack handle, no in-flight slot) must
 // not allocate in steady state either.
 TEST(ProducerAllocRegression, AcksNoneVoidSteadyStateAllocatesNothingRegression) {
-    std::atomic<int64_t> corr{1};
     ProducerConfig cfg = ackCfg(4);
     cfg.acks = Acks::None;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     const ProducerImpl::SendFn sink = [](int32_t, int32_t, int32_t, const uint8_t*, std::size_t) {
         return true;
     };

@@ -46,7 +46,6 @@
 #include <rune/client/producer/InFlightRing.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
-#include <atomic>
 #include <thread>
 #include <chrono>
 #include <cstddef>
@@ -382,7 +381,6 @@ public:
     /// Construct a ProducerImpl with its own ring buffer.
     /// ringCap: power-of-two usable capacity in bytes (default 256 KiB).
     explicit ProducerImpl(ProducerConfig cfg,
-                          std::atomic<int64_t>& nextCorrId,
                           int32_t ringCap = kDefaultProducerRingCap);
 
     /// Frees (without firing) every ack handle still owned by this producer.
@@ -796,10 +794,6 @@ public:
     /// plain counter — the per-cycle flush must scale with dirty partitions).
     [[nodiscard]] uint64_t debugFlushVisits() const noexcept { return flushVisits_; }
 
-    // ---- Global flush flag (written by app thread, read by agent) -------------
-    // Set by submitFlush(); cleared by flushBatches() after processing.
-    std::atomic<bool> globalFlushPending_ {false};
-
 private:
     // ---- Ring write helpers --------------------------------------------------
 
@@ -912,8 +906,13 @@ private:
     bool    frameCapped_ = false;
     int32_t effCap_      = 0;
 
-    // Shared correlationId counter (also used by Client for ping).
-    std::atomic<int64_t>& nextCorrId_;
+    // F8c C0: a flush() requested ON the duty thread (inside a callback) while
+    // the ring is full cannot wait for ring room (it would wait on itself).  It
+    // is recorded here instead and consumed by the next flushBatches() pass.
+    // Duty-thread state only: written by submitFlush() on the duty thread and
+    // read/cleared by flushBatches() on the same thread.  (Replaces the
+    // cross-thread std::atomic<bool> globalFlushPending_ latch.)
+    bool dutyFlushPending_ = false;
 
     // ---- Instrumentation counters (agent-thread only — plain uint64_t) -------
     // Single-writer (agent thread): no atomics needed per shared-nothing law.

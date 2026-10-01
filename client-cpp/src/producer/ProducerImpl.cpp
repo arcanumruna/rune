@@ -279,10 +279,8 @@ int32_t ringTotalBytes(int32_t cap) noexcept {
 // ---------------------------------------------------------------------------
 
 ProducerImpl::ProducerImpl(ProducerConfig cfg,
-                            std::atomic<int64_t>& nextCorrId,
                             int32_t ringCap)
     : cfg_(cfg)
-    , nextCorrId_(nextCorrId)
     , ringBuf_(makeRingBuffer(static_cast<std::size_t>(ringTotalBytes(ringCap)),
                               kRingAlignment))
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(ringCap)))
@@ -944,9 +942,39 @@ void ProducerImpl::submitFlush() noexcept {
         }
         return;
     }
-    globalFlushPending_.store(true, std::memory_order_release);
-    // Write a kMsgFlush with zero payload to wake the agent ring drain.
-    writeToRing(kMsgFlush, nullptr, 0);
+    // F8c C0 (shared-nothing): the flush request reaches the duty thread ONLY as
+    // a kMsgFlush ring token — ring order is the synchronisation, no atomic
+    // latch.  The token must never be lost to a full ring:
+    //   * duty thread (a flush() from an ack/batch-ack callback): it cannot wait
+    //     for room (it is the consumer) — record it in duty-owned state; the
+    //     next flushBatches() pass flushes every builder (the old latch's
+    //     semantics, without the cross-thread flag);
+    //   * any other thread: back off until the ring accepts the token (the
+    //     duty cycle drains the ring, so room appears), the producer is closed,
+    //     or the ring consumer's heartbeat goes stale for agentLivenessTimeoutMs
+    //     (the same failure detector send() uses; flush() is noexcept, so a
+    //     wedged runner is logged, not thrown).
+    if (writeToRing(kMsgFlush, nullptr, 0)) return;
+    if (std::this_thread::get_id() == dutyThreadId_) {
+        dutyFlushPending_ = true;
+        return;
+    }
+    aeron::concurrent::BackoffIdleStrategy idle(
+        100, 10, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    const int64_t startNs    = clock_();
+    const int64_t livenessNs = cfg_.agentLivenessTimeoutMs * 1'000'000LL;
+    while (!writeToRing(kMsgFlush, nullptr, 0)) {
+        if (closed_()) return;
+        idle.idle(0);
+        if (clock_() - std::max(ring_.consumerHeartbeatTime(), startNs) > livenessNs) {
+            std::fprintf(stderr,
+                "rune-client: Producer::flush: ring full and the runner stopped draining for "
+                "> agentLivenessTimeoutMs; flush request dropped (records still flush on "
+                "linger / batch size)\n");
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,7 +1228,6 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
             if (msgTypeId == kMsgFlush) {
                 // F12: only dirty partitions have anything to flush (O(dirty)).
                 for (const uint32_t slot : dirty_) partitions_[slot]->flushRequested = true;
-                globalFlushPending_.store(false, std::memory_order_relaxed);  // pre-existing latch (F8b)
                 lastDrainStop_ = DrainStop::FlushToken;
                 return ControlledAction::BREAK;  // flush at this boundary, then drain on
             }
@@ -1718,16 +1745,11 @@ int ProducerImpl::flushBatches(
     if (sessionId == 0) return 0;
 
     const int64_t lingerNs = cfg_.lingerUs * 1000LL;
-    // Consume the global-flush latch atomically: read-and-clear.  Relying on the
-    // drainRing kMsgFlush token to clear it (the old design) left the flag stuck
-    // TRUE forever whenever submitFlush()'s token write hit a full ring — which
-    // forced a flush on every drained record and destroyed batching.  Clearing it
-    // here makes one flushBatches cycle consume the flush; no token dependence.
-    // Task 14: Direct never sets the latch (submitFlush marks the partitions on
-    // the owner thread) — no atomic RMW on its duty-cycle path.
-    const bool globalFlush = (mode_ == IngressMode::Direct)
-        ? false
-        : globalFlushPending_.exchange(false, std::memory_order_acq_rel);
+    // F8c C0: a duty-thread flush() that met a full ring (see submitFlush) is
+    // consumed here, read-and-clear, by ONE pass — duty-thread state, no atomic.
+    // Every other flush() reaches the duty thread as a kMsgFlush ring token.
+    const bool globalFlush = dutyFlushPending_;
+    dutyFlushPending_ = false;
 
     int flushed = 0;
 

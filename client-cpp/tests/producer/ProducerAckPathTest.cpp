@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using rune::client::Acks;
@@ -80,8 +81,7 @@ const std::vector<uint8_t> kVal(16, 0x11);
 } // namespace
 
 TEST(ProducerInFlight, BatchCorrIdsAreTaggedAndAddressDirectly) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
     ASSERT_TRUE(impl.submitSendRecord(3, 0, Key(uint64_t{1}), kVal, false, 0));
@@ -101,8 +101,7 @@ TEST(ProducerInFlight, BatchCorrIdsAreTaggedAndAddressDirectly) {
 }
 
 TEST(ProducerInFlight, OutOfOrderAckNeverOverwritesALiveSlot) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(2), corr);
+    ProducerImpl impl(ackCfg(2));
     Capture cap;
     const auto sink = cap.fn();
     for (uint64_t k = 0; k < 3; ++k) {
@@ -120,10 +119,9 @@ TEST(ProducerInFlight, OutOfOrderAckNeverOverwritesALiveSlot) {
 }
 
 TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {
-    std::atomic<int64_t> corr{1};
     ProducerHub hub;
-    auto a = std::make_shared<ProducerImpl>(ackCfg(4), corr);
-    auto b = std::make_shared<ProducerImpl>(ackCfg(4), corr);
+    auto a = std::make_shared<ProducerImpl>(ackCfg(4));
+    auto b = std::make_shared<ProducerImpl>(ackCfg(4));
     hub.add(a);
     hub.add(b);
     EXPECT_EQ(a->ordinal(), 0u);
@@ -144,8 +142,7 @@ TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {
 // failing it, then resolved the wire corrId OK on a late ack).  Each record
 // completes exactly once, with the failure.
 TEST(ProducerInFlight, TimedOutBatchLateOkAckCompletesNothingRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(4, /*lingerUs=*/1'000'000), corr);
+    ProducerImpl impl(ackCfg(4, /*lingerUs=*/1'000'000));
     Capture cap;
     const auto sink = cap.fn();
     std::vector<int64_t> results[2];
@@ -185,8 +182,7 @@ TEST(ProducerInFlight, TimedOutBatchLateOkAckCompletesNothingRegression) {
 // stay at the oldest live batch's slice start, and the ack ring must never grow
 // over many out-of-order cycles (> kAckRingCapacity total ack entries).
 TEST(ProducerInFlight, OutOfOrderAcksKeepAckTailAtOldestLiveRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(2, /*lingerUs=*/1'000'000), corr);
+    ProducerImpl impl(ackCfg(2, /*lingerUs=*/1'000'000));
     Capture cap;
     const auto sink = cap.fn();
     long completed = 0;
@@ -245,8 +241,7 @@ ProducerConfig noneCfg(int32_t maxInFlight) {
 // (Kafka acks=0): the record's ack completes when its batch is handed to the
 // transport, with offset -1 ("sent, offset unknown"); nothing is retained.
 TEST(ProducerAcks, AcksNoneRetainsNoAckRingEntriesRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(noneCfg(8), corr);
+    ProducerImpl impl(noneCfg(8));
     Capture cap;
     const auto sink = cap.fn();
     long fired = 0;
@@ -279,8 +274,7 @@ TEST(ProducerAcks, AcksNoneRetainsNoAckRingEntriesRegression) {
 // retransmitting.  Under acks=None Tier-2 behaves like Tier-1: wire id 0, no
 // slot, the future resolves -1 once the frame is handed to the transport.
 TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(noneCfg(/*maxInFlight=*/2), corr);
+    auto impl = std::make_shared<ProducerImpl>(noneCfg(/*maxInFlight=*/2));
     Capture cap;
     const auto sink = cap.fn();
     constexpr int kBatches = 200;
@@ -327,10 +321,8 @@ TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
 // (a) Two ProducerImpl instances must draw different, non-negative producerIds
 // — neither may be the old shared magic-stub value.
 TEST(ProducerSequence, TwoInstancesGetUniqueProducerIdsRegression) {
-    std::atomic<int64_t> corr1{1};
-    std::atomic<int64_t> corr2{1};
-    ProducerImpl p1(ackCfg(8), corr1);
-    ProducerImpl p2(ackCfg(8), corr2);
+    ProducerImpl p1(ackCfg(8));
+    ProducerImpl p2(ackCfg(8));
 
     constexpr int64_t kLegacyStubProducerId =
         static_cast<int64_t>(0x4352554E'4543422DULL); // old "RUNECB-" magic stub
@@ -355,8 +347,7 @@ TEST(ProducerSequence, TwoInstancesGetUniqueProducerIdsRegression) {
 // where it was across many batches, so nothing is ever stamped/tracked that a
 // lost frame could turn into an undetectable gap.
 TEST(ProducerAcks, AcksNoneAlwaysNonIdempotentSequenceNeverAdvancesRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(noneCfg(8), corr);
+    ProducerImpl impl(noneCfg(8));
     Capture cap;
     const auto sink = cap.fn();
 
@@ -384,8 +375,7 @@ TEST(ProducerAcks, AcksNoneAlwaysNonIdempotentSequenceNeverAdvancesRegression) {
 // and advance the partition's idempotent sequence normally (i.e. the acks=None
 // fix above must not regress the idempotent path).
 TEST(ProducerAcks, AcksLeaderStampsInstanceIdAndAdvancesSequenceGuard) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
 
@@ -426,8 +416,7 @@ void flushAsOneBatch(ProducerImpl& impl, const ProducerImpl::SendFn& sink) {
 // Regression (Review Focus 3): the ack ring stored only ack-wanting records, so a
 // batch [void, cb, void, cb] resolved the callbacks with base+0 and base+1.
 TEST(ProducerAcks, MixedVoidAndCallbackRecordsGetTheirOwnOffsetsRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8, /*lingerUs=*/1'000'000'000), corr);
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/1'000'000'000));
     Capture cap;
     const auto sink = cap.fn();
     std::vector<int64_t> got;
@@ -446,8 +435,7 @@ TEST(ProducerAcks, MixedVoidAndCallbackRecordsGetTheirOwnOffsetsRegression) {
 
 // Review Focus 4: a duplicate ack (retransmit dedup / second publisher) fires once.
 TEST(ProducerAcks, DuplicateBatchAckFiresCallbacksOnceRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
     int fired = 0;
@@ -461,8 +449,7 @@ TEST(ProducerAcks, DuplicateBatchAckFiresCallbacksOnceRegression) {
 }
 
 TEST(ProducerAcks, BatchAckReportsPartitionSequenceAndCount) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8, 1'000'000'000), corr);
+    ProducerImpl impl(ackCfg(8, 1'000'000'000));
     std::vector<rune::client::BatchAck> acks;
     impl.onBatchAck([&](const rune::client::BatchAck& a) { acks.push_back(a); });
     Capture cap;
@@ -486,8 +473,7 @@ TEST(ProducerAcks, BatchAckReportsPartitionSequenceAndCount) {
 }
 
 TEST(ProducerAcks, BrokerErrorFailsEveryRecordAndReportsTheCode) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8, 1'000'000'000), corr);
+    ProducerImpl impl(ackCfg(8, 1'000'000'000));
     std::vector<rune::client::BatchAck> acks;
     impl.onBatchAck([&](const rune::client::BatchAck& a) { acks.push_back(a); });
     Capture cap;
@@ -506,8 +492,7 @@ TEST(ProducerAcks, BrokerErrorFailsEveryRecordAndReportsTheCode) {
 }
 
 TEST(ProducerAcks, CloseFailsRecordsStillInTheRing) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     auto [h, fut] = impl.registerFuture();
     ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h));  // never drained
     impl.failAllPending("Client closed");
@@ -516,8 +501,7 @@ TEST(ProducerAcks, CloseFailsRecordsStillInTheRing) {
 }
 
 TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentRecordsAndDropsThem) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
     int64_t got = 0;
@@ -537,8 +521,7 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentRecordsAndDropsThem) {
 // session) past the delivery deadline is failed AND dropped (the per-record map
 // deadline that used to time it out no longer exists).
 TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThemRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(ackCfg(8), corr);
+    auto impl = std::make_shared<ProducerImpl>(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
     rune::client::BatchBuilder bb(impl, 1, 0);
@@ -595,8 +578,7 @@ void sendOne(ProducerImpl& impl, const ProducerImpl::SendFn& sink, int32_t parti
 // actually sending 32767 batches, then drives the SAME delivery-timeout path
 // as DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression below.
 TEST(ProducerSequence, EpochOverflowRotatesToFreshProducerIdRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
     const auto sink = cap.fn();
 
@@ -627,8 +609,7 @@ TEST(ProducerSequence, EpochOverflowRotatesToFreshProducerIdRegression) {
 }
 
 TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
     const auto sink = cap.fn();
     sendOne(impl, sink, 0);
@@ -648,8 +629,7 @@ TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegr
 }
 
 TEST(ProducerSequence, DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
     const auto sink = cap.fn();
     sendOne(impl, sink, 0);
@@ -671,8 +651,7 @@ TEST(ProducerSequence, DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression) {
 }
 
 TEST(ProducerSequence, AckedBatchesKeepEpochAndSequenceRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
     const auto sink = cap.fn();
     for (int i = 0; i < 4; ++i) {
@@ -691,8 +670,7 @@ TEST(ProducerSequence, AckedBatchesKeepEpochAndSequenceRegression) {
 // the later same-epoch batches it strands (rejected out-of-sequence) must not
 // bump again.
 TEST(ProducerSequence, BrokerRejectionBumpsEpochOnceRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(ackCfg(8), corr);
+    ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
     const auto sink = cap.fn();
     sendOne(impl, sink, 0);
@@ -704,4 +682,61 @@ TEST(ProducerSequence, BrokerRejectionBumpsEpochOnceRegression) {
     ASSERT_EQ(cap.frames.size(), 3u);
     EXPECT_EQ(cap.frames[2].epoch, static_cast<int16_t>(e0 + 1));
     EXPECT_EQ(cap.frames[2].baseSequence, 0);
+}
+
+// ---------------------------------------------------------------------------
+// F8c C0: flush() reaches the duty thread only through the producer ring (the
+// cross-thread std::atomic<bool> globalFlushPending_ latch is gone).  A flush
+// requested while the ring is FULL must still flush every record accepted
+// before it — never be silently lost.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int32_t kTinyRing = 4 * 1024;
+/// Fills the producer ring (no drain) with void records; returns how many fit.
+int fillRing(ProducerImpl& impl) {
+    int n = 0;
+    while (impl.submitSendRecord(1, 0, Key(uint64_t{7}), kVal, false, 0)) ++n;
+    return n;
+}
+} // namespace
+
+// App thread (Thread mode: not the duty thread): flush() with a full ring waits
+// for ring room instead of dropping the request.  Deterministic: the flusher
+// either has written its token or is still retrying when the duty side drains;
+// join() then orders it, and the next pass must emit ONE batch of every record.
+TEST(ProducerFlushRing, AppThreadFlushOnFullRingIsNotLostRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/1'000'000'000), kTinyRing);  // linger never expires
+    Capture cap;
+    const auto sink = cap.fn();
+    const int n = fillRing(impl);
+    ASSERT_GT(n, 4);
+    std::thread flusher([&] { impl.submitFlush(); });  // ring full: cannot write yet
+    drainAll(impl);                                    // duty side makes room
+    flusher.join();                                    // token is in the ring now
+    drainAll(impl);
+    impl.flushBatches(kNow, 42, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "flush() on a full ring was lost";
+    EXPECT_EQ(cap.frames[0].records, n);
+}
+
+// Duty thread (a flush() from an ack/batch-ack callback) with a full ring: it
+// cannot wait for room (it IS the consumer), so the request is kept in
+// duty-owned state and the next flushBatches() pass flushes the builders.
+TEST(ProducerFlushRing, DutyThreadFlushOnFullRingIsNotLostRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/1'000'000'000), kTinyRing);
+    impl.setPumpFn(nullptr, nullptr, std::this_thread::get_id());  // this thread = duty thread
+    Capture cap;
+    const auto sink = cap.fn();
+    const int n = fillRing(impl);
+    ASSERT_GT(n, 4);
+    impl.submitFlush();  // ring full, on the duty thread: must neither block nor be lost
+    drainAll(impl);
+    impl.flushBatches(kNow, 42, sink);
+    ASSERT_EQ(cap.frames.size(), 1u) << "duty-thread flush() on a full ring was lost";
+    EXPECT_EQ(cap.frames[0].records, n);
+    // Consumed by that one pass: a later record lingers again (no stuck flag).
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{7}), kVal, false, 0));
+    drainAll(impl);
+    impl.flushBatches(kNow, 42, sink);
+    EXPECT_EQ(cap.frames.size(), 1u) << "the duty-thread flush request must be consumed once";
 }

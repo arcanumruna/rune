@@ -24,8 +24,7 @@ ALLOWLIST (path relative to the repo root):
                is still a violation.
   * SLICE-B  — TEMPORARY: sites owned by F8a slice B (Client::mtx_ and the
                Client/ClientAgent/AeronTransport lifecycle atomics, the
-               TransactionalProducerImpl mutexes, nextCorrId_, ProducerImpl's
-               globalFlushPending_).  Each entry is an EXACT MULTISET of
+               TransactionalProducerImpl mutexes, nextCorrId_).  Each entry is an EXACT MULTISET of
                (kind, normalized snippet) -> count for that file: ANY difference
                fails — a new site, and also a removed one (which must then be
                removed from the allowlist).  Slice B deletes these entries.
@@ -99,13 +98,6 @@ SLICE_B = {
         ("atomic", "std::atomic"): 1,
         ("lock", "std::lock_guard"): 12,
         ("mutex", "std::mutex"): 12,
-    },
-    "include/rune/client/producer/ProducerImpl.h": {
-        ("atomic", "std::atomic"): 3,
-        ("include", "#include <atomic>"): 1,
-    },
-    "src/producer/ProducerImpl.cpp": {
-        ("atomic", "std::atomic"): 1,
     },
     "include/rune/client/agent/ClientAgent.h": {
         ("atomic", "std::atomic"): 3,

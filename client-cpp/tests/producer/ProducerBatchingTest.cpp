@@ -199,7 +199,6 @@ struct BatchingHarness {
     std::unique_ptr<BatchGateway>     gw;
 
     rprod::ProducerHub    hub;
-    std::atomic<int64_t>  nextCorrId_{1};
 
     explicit BatchingHarness(int32_t ingressStream, int32_t egressStream,
                               int32_t ringCap = 2 * 1024 * 1024)
@@ -244,7 +243,7 @@ struct BatchingHarness {
     }
 
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_);
+        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
         hub.add(impl);
         return Producer(std::move(impl));
     }
@@ -576,7 +575,6 @@ struct CapHarness {
     std::unique_ptr<CapGateway>       gw;
 
     rprod::ProducerHub    hub;
-    std::atomic<int64_t>  nextCorrId_{1};
 
     explicit CapHarness(int32_t ingressStream, int32_t egressStream,
                         int32_t ringCap = 4 * 1024 * 1024)
@@ -621,7 +619,7 @@ struct CapHarness {
     }
 
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_);
+        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
         hub.add(impl);
         return Producer(std::move(impl));
     }

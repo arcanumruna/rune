@@ -65,8 +65,7 @@ int main() {
               << " batchBytes=" << cfg.batchBytes << " batchRecords=" << cfg.batchRecords
               << " maxInFlight=" << cfg.maxInFlight << "\n";
 
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(cfg, corr, ringCap);
+    ProducerImpl impl(cfg, ringCap);
 
     const bool concrete = std::getenv("ACCUM_SINK") == nullptr ||
                           std::string(std::getenv("ACCUM_SINK")) != "function";

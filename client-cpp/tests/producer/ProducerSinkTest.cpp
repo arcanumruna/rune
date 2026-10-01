@@ -43,8 +43,7 @@ int pump(ProducerImpl& impl, const Sink& sink) {
 } // namespace
 
 TEST(ProducerSink, ConcreteSinkSeesEveryFrame) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(immediateCfg(), corr);
+    ProducerImpl impl(immediateCfg());
     uint64_t frames = 0, bytes = 0;
     const CountingSink sink{&frames, &bytes};
     const std::vector<uint8_t> v(100, 0x5A);
@@ -57,8 +56,7 @@ TEST(ProducerSink, ConcreteSinkSeesEveryFrame) {
 }
 
 TEST(ProducerSink, ThousandPartitionsKeepTheirOwnStreams) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(immediateCfg(), corr);
+    ProducerImpl impl(immediateCfg());
     for (int32_t p = 0; p < 1000; ++p) impl.updateIngressRoute(7, p, 5000 + p);
     std::map<int32_t, int32_t> streamByPartition;
     const ProducerImpl::SendFn sink = [&](int32_t, int32_t p, int32_t stream, const uint8_t*,

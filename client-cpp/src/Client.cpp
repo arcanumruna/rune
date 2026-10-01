@@ -1713,11 +1713,9 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 }
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
-    // ProducerImpl owns its own ring buffer; shares the correlationId counter.
-    auto impl = std::make_shared<producer::ProducerImpl>(
-        cfg,
-        nextCorrId_,
-        ringCap);
+    // ProducerImpl owns its own ring buffer (its batch correlation ids are
+    // self-tagged — batchcorr — so it takes no shared counter).
+    auto impl = std::make_shared<producer::ProducerImpl>(cfg, ringCap);
 
     // fix1 C1: wire the pump hook in BOTH runner modes — a back-pressured
     // blocking send() must never wait on a ring consumer that IS the calling

@@ -266,7 +266,6 @@ struct CB3AgentHarness {
     std::unique_ptr<CB3Gateway>       gw;
 
     rprod::ProducerHub    hub;
-    std::atomic<int64_t>  nextCorrId_ {1};
 
     explicit CB3AgentHarness(int32_t ingressStream, int32_t egressStream,
                               int32_t ringCap = 512 * 1024)
@@ -311,7 +310,7 @@ struct CB3AgentHarness {
     }
 
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_);
+        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
         hub.add(impl);
         return Producer(std::move(impl));
     }
@@ -944,7 +943,6 @@ TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
     cfg.session.keepaliveIntervalNs = 10'000'000'000LL;
 
     rprod::ProducerHub    hub;
-    std::atomic<int64_t>  nextCorrId_ {1};
 
     auto agent = std::make_unique<rca::ClientAgent>(cfg);
     agent->setProducerDrainFn(
@@ -980,7 +978,7 @@ TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
     pcfg.batchBytes  = 64*1024;
     pcfg.maxInFlight = 1;        // KEY: only 1 in-flight per partition
 
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_);
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
     hub.add(impl);
     Producer p(impl);
 
@@ -1082,7 +1080,6 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
     cfg.ringCapacity              = 4096; // 4 KiB ring
 
     rprod::ProducerHub   hub;
-    std::atomic<int64_t> nextCorrId_ {1};
 
     auto agent = std::make_unique<rca::ClientAgent>(cfg);
     agent->setProducerDrainFn([](int64_t,int64_t,rca::ClientAgent::SendFn){return 0;});
@@ -1099,7 +1096,7 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
     pcfg.maxInFlight      = 4;
     pcfg.produceTimeoutMs = 30'000; // long timeout — should NOT be reached
 
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_, 4 * 1024);
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, 4 * 1024);
     hub.add(impl);
     Producer p(impl);
 
@@ -1116,7 +1113,11 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
     }
     // The Tier-2 token is only 8 bytes (a Tier2Entry* travels the ring), so it can
     // still fit in the tail the 80-byte records leave; top the ring off with the
-    // smallest messages (8-byte flush tokens) so it is truly full.
+    // smallest messages (8-byte flush tokens) so it is truly full.  F8c C0: an
+    // app-thread flush() on a full ring now waits for ring room (the request is
+    // never dropped); nothing drains here, so this thread poses as the duty
+    // thread, whose flush() on a full ring never waits.
+    impl->setPumpFn(nullptr, nullptr, std::this_thread::get_id());
     for (int i = 0; i < 1'000; ++i) impl->submitFlush();
 
     // Now try a Tier-2 batch — ring should be full → fail immediately.
@@ -1161,7 +1162,6 @@ TEST(BatchBuilder, RingFullTier1FutureFailsFast) {
     cfg.ringCapacity              = 4096;
 
     rprod::ProducerHub   hub;
-    std::atomic<int64_t> nextCorrId_ {1};
     auto agent = std::make_unique<rca::ClientAgent>(cfg);
     agent->setProducerDrainFn([](int64_t,int64_t,rca::ClientAgent::SendFn){return 0;});
     agent->setProduceResponseFn([](int64_t,int64_t){});
@@ -1175,7 +1175,7 @@ TEST(BatchBuilder, RingFullTier1FutureFailsFast) {
     pcfg.batchBytes       = 64 * 1024;
     pcfg.maxInFlight      = 4;
     pcfg.produceTimeoutMs = 30'000; // long — must NOT be reached
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, nextCorrId_, 4 * 1024);
+    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, 4 * 1024);
     hub.add(impl);
     Producer p(impl);
 

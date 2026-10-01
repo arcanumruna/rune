@@ -65,13 +65,12 @@ rc::ProducerConfig cfgOf(rc::Acks acks, int64_t lingerUs, int32_t maxInFlight = 
 
 // N partitions, all created and flushed clean (one record each).
 struct Rig {
-    std::atomic<int64_t>          corr{1};
     std::shared_ptr<ProducerImpl> impl;
     ProducerHub                   hub;
     int64_t                       now = 1'000'000'000;
 
     Rig(const rc::ProducerConfig& cfg, int32_t partitions, bool direct) {
-        impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024 * 1024);
+        impl = std::make_shared<ProducerImpl>(cfg, 4 * 1024 * 1024);
         if (direct) impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, now});
         hub.add(impl);
     }

@@ -101,8 +101,7 @@ struct Rig {
 // ---------------------------------------------------------------------------
 
 TEST(DirectIngress, SendAppendsWithoutTheRing) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr, /*ringCap=*/4 * 1024);  // the ring could hold ~60 records
+    ProducerImpl impl(voidCfg(), /*ringCap=*/4 * 1024);  // the ring could hold ~60 records
     impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     EXPECT_EQ(impl.ingressMode(), ProducerImpl::IngressMode::Direct);
     uint64_t frames = 0, bytes = 0;
@@ -117,14 +116,12 @@ TEST(DirectIngress, SendAppendsWithoutTheRing) {
 }
 
 TEST(DirectIngress, DefaultIsRingIngress) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr, 4 * 1024);
+    ProducerImpl impl(voidCfg(), 4 * 1024);
     EXPECT_EQ(impl.ingressMode(), ProducerImpl::IngressMode::Ring);
 }
 
 TEST(DirectIngress, OffOwnerThreadIsRejected) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr);
+    ProducerImpl impl(voidCfg());
     impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     rc::SendResult r = rc::SendResult::Ok;
     std::thread other([&] { r = impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, 0); });
@@ -133,8 +130,7 @@ TEST(DirectIngress, OffOwnerThreadIsRejected) {
 }
 
 TEST(DirectIngress, TrySendAllocatesNothing) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr);
+    ProducerImpl impl(voidCfg());
     impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     uint64_t frames = 0, bytes = 0;
     const CountingSink sink{&frames, &bytes};
@@ -155,10 +151,9 @@ TEST(DirectIngress, TrySendAllocatesNothing) {
 // reports BackPressured even when the in-flight window has room, so no frame is
 // ever bigger than one batch.
 TEST(DirectIngress, FullBuilderBackPressuresUntilThePassFlushesRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.batchBytes = 256;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     int accepted = 0;
     while (accepted < 10'000 &&
@@ -181,10 +176,9 @@ TEST(DirectIngress, FullBuilderBackPressuresUntilThePassFlushesRegression) {
 // A bare Direct producer with no pump hook has no one to drain it: a back-pressured
 // blocking send cannot wait for anybody and must throw, never hang.
 TEST(DirectIngress, BlockingSendWithoutPumpThrowsInsteadOfHangingRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.batchBytes = 256;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     rc::SendResult r = rc::SendResult::Ok;
     for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) {
@@ -195,8 +189,7 @@ TEST(DirectIngress, BlockingSendWithoutPumpThrowsInsteadOfHangingRegression) {
 }
 
 TEST(DirectIngress, ClosedProducerReportsClosedRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr);
+    ProducerImpl impl(voidCfg());
     impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
     impl.markRingClosed();
     EXPECT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, 0), rc::SendResult::Closed);
@@ -394,8 +387,7 @@ int32_t builderRecords(const ProducerImpl& impl, int32_t partition) {
 // from that callback used to land in the already-sent builder, get "sent" (-1)
 // immediately, and then be wiped by the reset.
 TEST(DirectIngress, DirectSendFromAcksNoneCallbackIsNotDroppedRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr);
+    ProducerImpl impl(voidCfg());
     impl.enableDirectIngress(ownerDirect());
     uint64_t frames = 0, bytes = 0;
     const CountingSink sink{&frames, &bytes};
@@ -423,11 +415,10 @@ TEST(DirectIngress, DirectSendFromAcksNoneCallbackIsNotDroppedRegression) {
 // resets the builder: a retry from the failure callback used to be discarded
 // (and its PendingAck leaked).
 TEST(DirectIngress, DirectRetryFromTimeoutCallbackIsNotDroppedRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.acks = rc::Acks::Leader;
     cfg.deliveryTimeoutMs = 10;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress(ownerDirect(1'000));
     bool retryFired = false;
     rc::SendResult retryR = rc::SendResult::Closed;
@@ -454,11 +445,10 @@ TEST(DirectIngress, DirectRetryFromTimeoutCallbackIsNotDroppedRegression) {
 // partitions_ (here: sweepTimedOut) used to push_back -> reallocate -> leave the
 // walk on a dangling iterator.  100 fresh partitions force the reallocation.
 TEST(DirectIngress, DirectSendToNewPartitionFromSweepCallbackRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.acks = rc::Acks::Leader;
     cfg.deliveryTimeoutMs = 10;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress(ownerDirect(1'000));
     constexpr int kFresh = 100;
     int acceptedButNotApplied = 0;
@@ -483,10 +473,9 @@ TEST(DirectIngress, DirectSendToNewPartitionFromSweepCallbackRegression) {
 // to hold a reference into ackRing across complete()).  Sends from those
 // callbacks are deferred and applied after the walk — not dropped by it.
 TEST(DirectIngress, DirectSendFromFailAllPendingCallbackIsDeferredRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.acks = rc::Acks::Leader;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress(ownerDirect());
     constexpr int kFresh = 50;
     int acceptedButNotApplied = 0;
@@ -515,12 +504,11 @@ TEST(DirectIngress, DirectSendFromFailAllPendingCallbackIsDeferredRegression) {
 // Deferred records already queued when failAllPending runs are "accepted" too:
 // they are failed and dropped with everything else (never applied afterwards).
 TEST(DirectIngress, FailAllPendingFailsDeferredRecordsRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.acks = rc::Acks::Leader;
     cfg.maxInFlight = 1;
     cfg.batchBytes = 256;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress(ownerDirect());
     uint64_t frames = 0, bytes = 0;
     const CountingSink sink{&frames, &bytes};
@@ -550,8 +538,7 @@ TEST(DirectIngress, FailAllPendingFailsDeferredRecordsRegression) {
 // Drained deferred records keep submission order across partitions (partition
 // slots are created in the order the deferred sends were made).
 TEST(DirectIngress, DeferredRecordsDrainInSubmissionOrderRegression) {
-    std::atomic<int64_t> corr{1};
-    ProducerImpl impl(voidCfg(), corr);
+    ProducerImpl impl(voidCfg());
     impl.enableDirectIngress(ownerDirect());
     uint64_t frames = 0, bytes = 0;
     const CountingSink sink{&frames, &bytes};
@@ -569,10 +556,9 @@ TEST(DirectIngress, DeferredRecordsDrainInSubmissionOrderRegression) {
 
 // M2: batchRecords is enforced in Direct mode too (no flush runs between sends).
 TEST(DirectIngress, DirectBatchRecordsCapBackPressuresRegression) {
-    std::atomic<int64_t> corr{1};
     rc::ProducerConfig cfg = voidCfg();
     cfg.batchRecords = 5;
-    ProducerImpl impl(cfg, corr);
+    ProducerImpl impl(cfg);
     impl.enableDirectIngress(ownerDirect());
     for (int i = 0; i < 5; ++i) ASSERT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, 0), rc::SendResult::Ok);
     EXPECT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, 0), rc::SendResult::BackPressured);
@@ -686,11 +672,10 @@ namespace {
 // A bare Direct producer with a frame-capturing sink: every frame's records
 // (value marker byte) are recorded per partition, in send order.
 struct Fx {
-    std::atomic<int64_t> corr{1};
     ProducerImpl         impl;
     std::map<int32_t, std::string> sent;  // partition -> marker bytes in wire order
     ProducerImpl::SendFn sink;
-    explicit Fx(rc::ProducerConfig cfg) : impl(cfg, corr) {
+    explicit Fx(rc::ProducerConfig cfg) : impl(cfg) {
         impl.enableDirectIngress(ownerDirect());
         sink = [this](int32_t, int32_t part, int32_t, const uint8_t* buf, std::size_t len) {
             const auto pv = rc::codec::decodeProduce(buf, len);
@@ -969,8 +954,7 @@ TEST(DirectIngress, UnknownPartitionDeferralsShareAnAggregateCapRegression) {
 // 4: a Tier-2 batch rejected because its partition still has deferred records
 // (or is unaddressable) says so — not "ring full".
 TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(stallCfg(), corr);
+    auto impl = std::make_shared<ProducerImpl>(stallCfg());
     impl->enableDirectIngress(ownerDirect());
     rc::Producer p(impl);
     const rc::TopicHandle topic{1, 4};
@@ -1012,8 +996,7 @@ TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
 // A Tier-2 batch on a closed Direct producer says "closed" (not a stale
 // reason left over from an earlier reject, nor "ring full").
 TEST(DirectIngress, Tier2RejectAfterCloseSaysClosedRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(stallCfg(), corr);
+    auto impl = std::make_shared<ProducerImpl>(stallCfg());
     impl->enableDirectIngress(ownerDirect());
     rc::Producer p(impl);
     const rc::TopicHandle topic{1, 4};
@@ -1035,8 +1018,7 @@ TEST(DirectIngress, Tier2RejectAfterCloseSaysClosedRegression) {
 // thread" — decided from the returned reason, no producer member is read
 // (TSan: the owner thread keeps rejecting / sending concurrently).
 TEST(DirectIngress, Tier2FromForeignThreadSaysWrongThreadRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(stallCfg(), corr);
+    auto impl = std::make_shared<ProducerImpl>(stallCfg());
     impl->enableDirectIngress(ownerDirect());
     rc::Producer p(impl);
     const rc::TopicHandle topic{1, 4};

@@ -64,8 +64,7 @@ TEST(ProducerSend, VoidSendNeverDropsOnFullRingRegression) {
     // consumer, and a loaded CI/TSan run can lag it enough to trip the default
     // 1 s liveness window, turning a slow-but-fine drain into a spurious throw.
     cfg.agentLivenessTimeoutMs = 30'000;
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, /*ringCap=*/4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(cfg, /*ringCap=*/4 * 1024);
     Producer p(impl);
     constexpr uint64_t kRecords = 2000;
     std::thread drainer([&] {  // plays the runner thread
@@ -96,8 +95,7 @@ TEST(ProducerSend, VoidSendNeverDropsOnFullRingRegression) {
 TEST(ProducerSend, VoidSendThrowsWhenTheRunnerStopsDrainingRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 5;
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(cfg, 4 * 1024);
     // Injected clock: +1 ms per read, so liveness expires after a few back-offs.
     impl->setClockForTesting(+[]() noexcept -> int64_t {
         static int64_t t = 0;
@@ -109,8 +107,7 @@ TEST(ProducerSend, VoidSendThrowsWhenTheRunnerStopsDrainingRegression) {
 }
 
 TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), 4 * 1024);
     Producer p(impl);
     uint64_t ok = 0;
     SendResult last = SendResult::Ok;
@@ -126,8 +123,7 @@ TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
 }
 
 TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDroppedRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg());
     Producer p(impl);
     const std::vector<uint8_t> tooBig(Producer::kMaxSendValueBytes + 1, 0);
     EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), tooBig), SendResult::ValueTooLarge);
@@ -140,10 +136,9 @@ TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDroppedRegression) {
 // ring's maxMsgLength must map to ValueTooLarge (not BackPressured) — otherwise
 // sendBlocking would retry it forever (nothing ever makes room for it).
 TEST(ProducerSend, ValueLargerThanRingMaxMsgLengthIsValueTooLargeNotBackPressuredRegression) {
-    std::atomic<int64_t> corr{1};
     // Smallest usable ring: 64 B usable capacity -> maxMsgLength = 64/8 = 8 B,
     // far smaller than kMaxSendValueBytes.
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/64);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), /*ringCap=*/64);
     Producer p(impl);
     const std::vector<uint8_t> val(32, 0x11); // fits kMaxSendValueBytes, not this ring
     EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), val), SendResult::ValueTooLarge);
@@ -154,13 +149,12 @@ TEST(ProducerSend, ValueLargerThanRingMaxMsgLengthIsValueTooLargeNotBackPressure
 // not report 0 work while a real record waits right past the wrap — drainRing
 // must continue into it within the SAME call.
 TEST(ProducerSend, RingWrapPaddingDoesNotReportIdleRegression) {
-    std::atomic<int64_t> corr{1};
     // 48-byte records (38-byte header + 2-byte value, aligned to 8): a 512 B
     // ring holds exactly 10 (480 B) before the 11th hits real back-pressure
     // (not the wrap case this test targets). Draining 5 reopens total capacity
     // but leaves only 32 B contiguous to the physical buffer end, so the next
     // send pads that remainder and wraps to offset 0 — the scenario under test.
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/512);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), /*ringCap=*/512);
     Producer p(impl);
     const std::vector<uint8_t> val(2, 0x22);
     for (uint64_t i = 0; i < 10; ++i) {
@@ -206,8 +200,7 @@ TEST(ProducerSend, RingWrapPaddingDoesNotReportIdleRegression) {
 // a duty-cycle callback) is used instead of idling/waiting on the heartbeat —
 // the blocking send succeeds immediately, with no liveness-timeout wait at all.
 TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -237,8 +230,7 @@ TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
 // FAST with std::runtime_error, never spin and never silently wait out the
 // liveness timeout.
 TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -267,8 +259,7 @@ TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
 TEST(ProducerSend, NonDutyThreadNeverInvokesPumpHookFallsBackToHeartbeatWaitRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 5;
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(cfg, 4 * 1024);
     impl->setClockForTesting(+[]() noexcept -> int64_t {
         static int64_t t = 0;
         return t += 1'000'000;
@@ -296,8 +287,7 @@ TEST(ProducerSend, NonDutyThreadNeverInvokesPumpHookFallsBackToHeartbeatWaitRegr
 // closed word before sendBlocking could ever call a (potentially dangling)
 // pumpFn_/pumpCtx_.
 TEST(ProducerSend, ClosedRingNeverInvokesThePumpHookRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -325,8 +315,7 @@ TEST(ProducerSend, ClosedRingNeverInvokesThePumpHookRegression) {
 // topic — it fires with -1 (the same "not accepted" signal failUnsubmitted
 // uses on back-pressure), consistent with every other invalid-input path.
 TEST(ProducerSend, CallbackSendOnInvalidTopicInvokesCallbackWithMinusOneRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg());
     Producer p(impl);
     bool called = false;
     int64_t got = 0;
@@ -343,8 +332,7 @@ TEST(ProducerSend, CallbackSendOnInvalidTopicInvokesCallbackWithMinusOneRegressi
 // string covered both). The want_future_t overload surfaces the reason as the
 // rejected future's exception message, so it is observable here.
 TEST(ProducerSend, FailUnsubmittedReasonIsDistinctPerSendResultRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -381,8 +369,7 @@ TEST(ProducerSend, FailUnsubmittedReasonIsDistinctPerSendResultRegression) {
 TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 60'000; // would hang ~a minute if the in-loop check regressed
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(cfg, 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -452,8 +439,7 @@ TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
 //      see the fix5 report), and the count check below fails in any build.
 // ---------------------------------------------------------------------------
 TEST(ProducerSend, AppThreadFailUnsubmittedNeverRacesDutyThreadCounterRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), 4 * 1024);
     Producer p(impl);
 
     // 1. Committed callback-sends: completed later by the duty thread (counted).
