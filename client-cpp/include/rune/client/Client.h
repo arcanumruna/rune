@@ -466,7 +466,7 @@ public:
 
     /// Open a typed topic: getTopicSchemaAndWait(name), then the EXACT-
     /// fingerprint gate on THIS thread (TypedTopic::fromSchema).  No thread is
-    /// spawned (the old std::async continuation is gone); the per-topic schema
+    /// spawned (the old async-task continuation is gone); the per-topic schema
     /// cache is written by the duty thread when it handles the response.
     template <class T>
     [[nodiscard]] TypedTopic<T> openTopicAndWait(std::string_view name,
@@ -1019,7 +1019,14 @@ private:
     // still running in Thread mode).
     uint64_t callbackExceptions_ = 0;
     std::thread::id ownerThread_;           // constructing thread (Invoker owner)
-    std::thread::id dutyThreadId_;          // thread running dutyCycle(): owner or runner
+    // Thread running dutyCycle(): the owner (Invoker), or the runner (Thread),
+    // which writes its OWN id as its first action and only then publishes the
+    // start latch (F8c C8, spec §3.4); the constructor returns only after
+    // reading that record, so every other reader is ordered after the write.
+    std::thread::id dutyThreadId_;
+    // F8c C8 test hook: dutyThreadId_ as the runner saw it right before its
+    // first duty cycle.  Written once by the runner; read only after the join.
+    std::thread::id runnerStartSawDutyId_;
     // Built ONCE: the txn producers' send paths (no per-cycle std::function build).
     std::function<bool(int32_t, const uint8_t*, std::size_t)> txnSendFn_;
 
@@ -1169,6 +1176,16 @@ public:
             std::abort();
         }
 #endif
+    }
+    /// F8c C8: the duty-thread id.  Any thread, once the constructor returned
+    /// (the start latch orders the runner's write before the return).
+    [[nodiscard]] std::thread::id testDutyThreadId() const noexcept { return dutyThreadId_; }
+    /// F8c C8: the runner's id (Thread mode) — the constructing/closing thread only.
+    [[nodiscard]] std::thread::id testRunnerThreadId() const noexcept { return runnerThread_.get_id(); }
+    /// F8c C8: dutyThreadId_ as the runner read it before its first duty cycle.
+    /// Only after close() (the join orders the runner's write).
+    [[nodiscard]] std::thread::id testRunnerStartSawDutyId() const noexcept {
+        return runnerStartSawDutyId_;
     }
     [[nodiscard]] std::string testCurrentLeaderChannel() const {
         return agent_.seedSession().currentLeaderChannel;

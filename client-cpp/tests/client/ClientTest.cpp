@@ -1231,3 +1231,39 @@ TEST(ClientLifecycle, CloseStopsAgentOnlyAfterRunnerJoinRegression) {
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
+
+// ---------------------------------------------------------------------------
+// F8c C8 (spec §3.4): the runner start latch.  The runner writes dutyThreadId_
+// (its own id) as its first action, then publishes one record on a stack-local
+// OneToOneRingBuffer; the constructor returns only after reading that record.
+//   * App side: the moment the constructor returns, dutyThreadId_ IS the
+//     runner's id, and reading it is ordered after the runner's write (TSan).
+//   * Runner side: before its first duty cycle the runner sees its own id.
+// RED by mutation: (a) the constructor not waiting for the record -> stale id
+// (the owner's) and a TSan race; (b) the runner publishing before writing its
+// id -> TSan race.  No sleeps; nothing waits on time.
+// ---------------------------------------------------------------------------
+TEST(ClientLifecycle, RunnerSeesDutyThreadIdBeforeFirstCycleRegression) {
+    for (int i = 0; i < 20; ++i) {
+        const std::string dir = uniqueDir();
+        ClientConfig cfg;
+        cfg.gatewayChannel  = "aeron:ipc";
+        cfg.gatewayStreamId = 992;
+        cfg.egressChannel   = "aeron:ipc";
+        cfg.egressStreamId  = 993;
+        cfg.dataDir         = dir;
+        cfg.runnerMode      = RunnerMode::Thread;
+        auto client = std::make_unique<Client>(cfg);
+        // Read immediately — no pump, no wait: the latch alone must order it.
+        const std::thread::id duty   = client->testDutyThreadId();
+        const std::thread::id runner = client->testRunnerThreadId();
+        ASSERT_NE(runner, std::thread::id{});
+        ASSERT_NE(runner, std::this_thread::get_id());
+        ASSERT_EQ(duty, runner) << "iteration " << i;
+        client->close();  // joins the runner: its start observation is now visible
+        ASSERT_EQ(client->testRunnerStartSawDutyId(), runner) << "iteration " << i;
+        client.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+}

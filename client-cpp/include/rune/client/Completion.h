@@ -1,6 +1,6 @@
 #pragma once
 // Completion.h — F8c: the result of an asynchronous client operation, without
-// std::future / std::promise (spec 2026-10-01-f8c-no-futures-design.md §2.1).
+// futures or promises (spec 2026-10-01-f8c-no-futures-design.md §2.1).
 //
 // Every asynchronous operation takes an app-chosen Token and a target:
 //   * a Completions& queue (rune/client/Completions.h) that the owning app

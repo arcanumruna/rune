@@ -18,6 +18,7 @@
 //     Completions back (producer-close).
 
 #include <rune/client/Client.h>
+#include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
 #include <rune/client/producer/ProducerImpl.h>
@@ -34,7 +35,6 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
-#include <future>  // runner start handshake (I1) — replaced by the start latch in F8c C8
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -54,6 +54,10 @@ thread_local const Client* tClosing = nullptr;
 // threads may draw the same value; each call has its own fresh queue, and the
 // I3 quarantine makes cross-queue delivery impossible, so this is hygiene).
 thread_local Token tWaitToken = 0;
+// F8c C8: the runner start latch (spec §3.4) — one empty record on a
+// stack-local OneToOneRingBuffer of the smallest useful capacity.
+constexpr std::size_t   kStartLatchCapacity = 64;
+constexpr std::int32_t  kStartLatchMsgType  = 1;
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -220,19 +224,40 @@ Client::Client(ClientConfig cfg)
     dutyThreadId_ = ownerThread_;
     nextSweepNs_  = now() + kSweepIntervalMs * 1'000'000LL;
     if (cfg_.runnerMode == RunnerMode::Thread) {
-        // dutyThreadId_ is written BEFORE the runner runs its first duty cycle: the
-        // runner blocks on `go` until the write is done, and set_value() → wait()
-        // is a happens-before edge, so the runner's reads (submitRegistration_ /
-        // ~Client from a callback) never race the write.  App threads see it via
-        // the Client's construction (they cannot hold the Client earlier).
-        std::promise<void> go;
-        std::future<void>  goF = go.get_future();
-        runnerThread_ = std::thread([this, goF = std::move(goF)]() mutable {
-            goF.wait();
+        // F8c C8 (spec §3.4): the runner start latch — a stack-local 1-record
+        // OneToOneRingBuffer.  The runner writes dutyThreadId_ (its OWN id) as
+        // its first action, then publishes one record, then producer-closes the
+        // ring as its LAST touch of it.  This thread spins until it has read the
+        // record AND seen the producer-closed word: the acquire reads order the
+        // runner's dutyThreadId_ write before every later read of it (app
+        // threads hold the Client only after this constructor returns), and the
+        // closed word proves the runner is done with the stack buffer (write()
+        // stores the tail AFTER the record header, so returning on the record
+        // alone would let that store land in a dead frame).  No timeout: the
+        // runner's very first statements publish, so the wait ends as soon as
+        // the thread runs — liveness does not depend on any time window.
+        alignas(64) std::uint8_t startRingBuf[kStartLatchCapacity +
+                                              detail::OneToOneRingBuffer::trailerLength()] = {};
+        detail::OneToOneRingBuffer startRing(startRingBuf, sizeof(startRingBuf));
+        runnerThread_ = std::thread([this, &startRing]() {
+            dutyThreadId_ = std::this_thread::get_id();
+            if (!startRing.writeWith(kStartLatchMsgType, 0,
+                                     [](aeron::concurrent::AtomicBuffer&, aeron::util::index_t) {})) {
+                std::abort();  // unreachable: an empty ring of capacity 64 takes one empty record
+            }
+            startRing.producerClose();  // the runner never touches `startRing` again
+            runnerStartSawDutyId_ = dutyThreadId_;
             runLoop();
         });
-        dutyThreadId_ = runnerThread_.get_id();
-        go.set_value();
+        bool started = false;
+        aeron::concurrent::YieldingIdleStrategy idle;
+        for (;;) {
+            started = started ||
+                      startRing.read([](std::int32_t, aeron::concurrent::AtomicBuffer&,
+                                        aeron::util::index_t, aeron::util::index_t) {}, 1) == 1;
+            if (started && startRing.producerClosed()) break;
+            idle.idle();
+        }
     }
 }
 
@@ -399,7 +424,7 @@ void Client::closeImpl_() {
 
 
     // M2 FIX: clear the seed session's redirect latch on close so it does not
-    // latch.  Safe as a plain write: the runner thread was joined above, so this
+    // startRing.  Safe as a plain write: the runner thread was joined above, so this
     // runs single-threaded (no concurrent agent-thread access) — Task 1.1.
     redirectPending() = false;
 

@@ -93,7 +93,7 @@ public:
 
     /// F8c C3: build a typed topic from a GetTopicSchema completion (spec
     /// §2.5), on the CALLER's thread — the replacement for openTopic's
-    /// std::async continuation.  `client` is the Client the op was issued on
+    /// async-task continuation.  `client` is the Client the op was issued on
     /// (any type with producer(): a template, so this header does not include
     /// Client.h).  Throws std::runtime_error unless the completion is Ok AND
     /// the descriptor's fingerprint equals T::kFingerprint exactly.
