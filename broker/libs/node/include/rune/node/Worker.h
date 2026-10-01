@@ -67,6 +67,7 @@
 #include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
+#include <rune/node/RcState.h>
 #include <rune/node/ReturnFifo.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerReturnCodec.h>
@@ -84,6 +85,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/ProducePath.h>
+#include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -355,22 +357,50 @@ public:
 
     // -----------------------------------------------------------------------
     // F15 S4 (design note §2.1-§2.4, Option B): worker-owned read_committed
-    // state.  RED STUBS — behaviour-preserving; the real state lands with S4.
+    // state (RcState per owned user partition).  Test seams (worker thread or
+    // single-threaded tests only).
     // -----------------------------------------------------------------------
     static constexpr int kRcNone     = -1;   ///< no RC state for the partition
     static constexpr int kRcUnbuilt  = 0;
     static constexpr int kRcScanning = 1;
     static constexpr int kRcReady    = 2;
-    [[nodiscard]] std::size_t rcOpenTxnsForTest(int32_t, int32_t) const { return 0; }
-    [[nodiscard]] std::vector<rune::transaction::AbortedTxnRange> rcAbortedRangesForTest(int32_t, int32_t) const {
-        return {};
+    [[nodiscard]] std::size_t rcOpenTxnsForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->tracker().openCount() : 0;
     }
-    [[nodiscard]] int rcStatusForTest(int32_t, int32_t) const { return kRcNone; }
-    [[nodiscard]] uint64_t rcScanPassesForTest(int32_t, int32_t) const { return 0; }
-    [[nodiscard]] std::size_t rcMaxPassBytesForTest() const { return 0; }
-    [[nodiscard]] std::size_t rcTrackerCapacityForTest(int32_t, int32_t) const { return 0; }
-    [[nodiscard]] uint64_t rcTrackerGrowthsForTest(int32_t, int32_t) const { return 0; }
-    void setRcScanBytesPerPass(int32_t) noexcept {}
+    [[nodiscard]] std::vector<rune::transaction::AbortedTxnRange> rcAbortedRangesForTest(int32_t topicId,
+                                                                                         int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->aborted().ranges() : std::vector<rune::transaction::AbortedTxnRange>{};
+    }
+    [[nodiscard]] int rcStatusForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->statusCode() : kRcNone;
+    }
+    [[nodiscard]] uint64_t rcScanPassesForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->scanSteps() : 0;
+    }
+    [[nodiscard]] std::size_t rcMaxPassBytesForTest() const {
+        std::size_t m = 0;
+        for (const auto& sl : rcSlots_) m = std::max(m, sl.rc->maxStepBytes());
+        return m;
+    }
+    [[nodiscard]] std::size_t rcTrackerCapacityForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->tracker().capacity() : 0;
+    }
+    [[nodiscard]] uint64_t rcTrackerGrowthsForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->tracker().growths() : 0;
+    }
+    /// Per-pass RC build budget (bytes per advance step).  Startup / tests only
+    /// (before the runner starts).  Default RcState::kDefaultScanBytesPerPass.
+    void setRcScanBytesPerPass(int32_t n) noexcept {
+        rcScanBytesPerPass_ = n >= 1 ? n : RcState::kDefaultScanBytesPerPass;
+    }
+    /// Per-partition open-txn capacity reserved at ownership apply (rcOpenTxnCapacity).
+    void setRcOpenTxnCapacity(std::size_t n) noexcept { rcOpenTxnCapacity_ = n >= 1 ? n : 1; }
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
 
@@ -530,6 +560,9 @@ public:
         // shared-nothing).  nullptr → fall back to the shared MDC pub
         // (workerEgress_) for broadcast/replication.
         aeron::ExclusivePublication* egressPub = nullptr;
+        /// F15 S4: the partition's RC state (this worker's), re-resolved on every
+        /// ownership apply and Subscribe — null when not owned / internal.
+        RcState* rc = nullptr;
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -1011,6 +1044,7 @@ public:
                 if (!replica) continue;
                 work += replica->doWork(nowNs);
             }
+            work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         }
 
         // Task 6: per-worker replication transport poll — inline dispatch.
@@ -1098,6 +1132,7 @@ private:
         for (auto* replica : owned_) {
             if (replica) work += replica->doWork(nowNs);
         }
+        work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         // 4b. follower flushes raised by the replicas (shard replicas run with
         //     setExternalFollowerFlush) → io backend, never an inline fsync.
         for (auto* replica : owned_) {
@@ -1573,6 +1608,7 @@ private:
                 s.registryId           = op.targetReplicaId();
                 s.incarnation          = op.incarnation();
                 s.active               = true;   // re-subscribe (passed the guard) re-activates
+                s.rc                   = rcOf_(subReplica_(s));
                 return;
             }
         }
@@ -1590,6 +1626,7 @@ private:
         s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
         s.registryId           = op.targetReplicaId();
         s.incarnation          = op.incarnation();
+        s.rc                   = rcOf_(subReplica_(s));
         subs_.push_back(s);
     }
 
@@ -1665,9 +1702,9 @@ private:
     // egressScratch_).  No locks/atomics.
     //
     // Bound: read_uncommitted → HW (replica->highWatermark(), or LEO passthrough).
-    // read_committed (LSO/aborted-txn) is NOT yet applied here — that txn state is
-    // gateway-owned; this path is HW-bounded (read_uncommitted) until it migrates.
-    // Control batches are skipped (never delivered to clients).
+    // read_committed → the LSO of this worker's own RC state (F15 §2.4, K1);
+    // aborted transactional batches are skipped.  Control batches are skipped
+    // (never delivered to clients).
     //
     // Inert until Subscribe ops populate subs_ AND a WorkerEgress is wired, so it
     // is a no-op in the pre-I3b configuration (gateway still owns push).
@@ -1709,11 +1746,20 @@ private:
             if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
             if (!egressPub) continue;  // nowhere to send yet
 
-            // HW bound (read_uncommitted).  Worker owns the replica → live HW.
+            // Bound: the live HW (the worker owns the replica); read_committed
+            // (F15 §2.4, K1): the LSO of THIS worker's RC state — read on the
+            // thread that appends, so it can never lag a txn's first batch (K2).
+            // Not Ready (§2.3): skip this subscription this pass.
             auto* rep = subReplica_(s);
             if (s.incarnation != 0 && !rep) continue;   // not owned (defensive: active implies owned)
-            const int64_t bound = rep ? rep->highWatermark()
-                                      : s.logPtr->logEndOffset();
+            int64_t bound = rep ? rep->highWatermark()
+                                : s.logPtr->logEndOffset();
+            const RcState* rc = nullptr;
+            if (s.isolation == kIsolationReadCommitted && rep != nullptr && s.topicId >= 0) [[unlikely]] {
+                rc = rcServe_(rep, s.rc);
+                if (rc == nullptr) continue;
+                bound = rc->lso(bound);
+            }
             if (s.nextOffset >= bound) continue;
 
             rune::storage::LogReadView view;
@@ -1736,7 +1782,10 @@ private:
                 int64_t baseOffset = 0;
                 for (int i = 0; i < 8; ++i)
                     baseOffset |= (static_cast<int64_t>(bp[kBaseOffsetOffset + i]) << (i * 8));
-                if (baseOffset >= bound) break;  // reached the HW bound
+                int32_t lastDelta = 0;
+                for (int i = 0; i < 4; ++i)
+                    lastDelta |= (static_cast<int32_t>(bp[kLastOffsetDeltaOffset + i]) << (i * 8));
+                if (baseOffset + lastDelta >= bound) break;  // reached the HW / LSO bound
 
                 uint32_t lengthField = 0;
                 for (int i = 0; i < 4; ++i)
@@ -1762,6 +1811,20 @@ private:
                     pos += batchSize;
                     s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                     continue;
+                }
+                // F15 §2.4: read_committed skips aborted transactional batches
+                // (only TRANSACTIONAL batches pay the lookup).  R-2: a group sub
+                // whose isolation carrier has not arrived stops AT it instead.
+                if (rc != nullptr && (attrs & kTxnAttrBit) != 0) [[unlikely]] {
+                    int64_t pid = 0;
+                    for (int i = 0; i < 8; ++i)
+                        pid |= (static_cast<int64_t>(bp[kProducerIdOffset + i]) << (i * 8));
+                    if (rc->isAborted(pid, baseOffset)) {
+                        if (s.isGroup && !s.groupCarrierReceived) break;
+                        pos += batchSize;
+                        s.nextOffset = baseOffset + static_cast<int64_t>(lastDelta) + 1;
+                        continue;
+                    }
                 }
 
                 pc::Records rec;
@@ -1862,6 +1925,21 @@ private:
             ret.deferAck  = false;
             enqueueReturn_(ret);
             return;
+        }
+
+        // F15 §2.3 produce gate: an idempotent / transactional batch is taken
+        // only while this partition's RC (and producer) state is Ready — one
+        // inline build step first; else NotLeader (retriable, log untouched).
+        // pid -1 batches skip it (the same branch as the PSM check).
+        RcState* rc = nullptr;
+        if (op.producerId() >= 0 && replica != nullptr && topicId >= 0) [[unlikely]] {
+            rc = rcGate_(replica);
+            if (rc == nullptr) {
+                ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+                ret.deferAck  = false;
+                enqueueReturn_(ret);
+                return;
+            }
         }
 
         // Task 10 round 5: the min-ISR admission gate for acks=all lives HERE, on
@@ -2018,6 +2096,11 @@ private:
             replica->onLeaderLogAppended();
         }
 
+        // F15 §2.1 (C1): the RC update is in the SAME invocation as the append —
+        // independent of the ack, the ProduceResult and the session.
+        if (rc != nullptr && (txnAttrs_(tail, tailLen) & kTxnAttrBit) != 0) [[unlikely]]
+            rc->onTxnBatch(op.producerId(), base);
+
         // F15 I-A: this worker answers the produce itself (immediately, after
         // its fsync, or when the HW passes it) — the final result is final, the
         // gateway never parks it.
@@ -2128,8 +2211,37 @@ private:
             return;
         }
 
-        // Only read if there are records available (within the HW-bound).
-        if (nextOffset < hwBound) {
+        // F15 §2.4 (I-B): the read_committed decision for the GATEWAY push path
+        // is made HERE, on the owning worker, from its own RC state and live HW
+        // (L5).  The gateway's HW snapshot (op.hwBound) only ever loosens the
+        // request; the worker tightens the answer:
+        //   read_uncommitted: bound = min(op.hwBound, live HW)
+        //   read_committed:   bound = min(op.hwBound, LSO(live HW)) — nothing
+        //                     (empty chunk, cursor unchanged, notReady echoed)
+        //                     while the RC state is not Ready (§2.3).
+        // Internal partitions (topicId < 0) carry no transactional batches (§1):
+        // HW-bounded only.  Replication-less partitions: op.hwBound.
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        int64_t bound = hwBound;
+        const RcState* rc = nullptr;
+        if (replica != nullptr) {
+            const int64_t liveHw = replica->highWatermark();
+            bound = std::min(bound, liveHw);
+            if (op.isolation() == kIsolationReadCommitted && topicId >= 0) {
+                rc = rcServe_(replica, rcOf_(replica));
+                if (rc == nullptr) [[unlikely]] {
+                    ret.setPushRcNotReady(true);
+                    ret.setPushEffectiveBound(-1);
+                    enqueueReturn_(std::move(ret));
+                    return;
+                }
+                bound = std::min(bound, rc->lso(liveHw));
+            }
+        }
+        ret.setPushEffectiveBound(bound);
+
+        // Only read if there are records available (within the bound).
+        if (nextOffset < bound) {
             try {
                 // kMaxPushReadChunkBytes is mirrored by ClientGateway.  Gateway
                 // sets hwBound before enqueuing.
@@ -2159,9 +2271,60 @@ private:
             } catch (...) {
                 spdlog::warn("Worker {}: log->read threw unknown exception", workerId_);
             }
+            if (ret.errorCode == 0 && !ret.chunk.empty())
+                clampPushChunk_(ret, bound, rc, op.isGroup() != 0 && op.groupCarrierReceived() == 0);
         }
 
         enqueueReturn_(std::move(ret));   // chunk moved (never copied) into the FIFO if queued
+    }
+
+    // F15 §2.4 (I-B) + addendum R-2: clamp a PushRead chunk to `bound` (batches
+    // with lastOffset < bound only), strip control batches and — read_committed
+    // (rc != null) — aborted transactional batches, compacting in place (no
+    // allocation; one attribute check per batch in the walk the read needs
+    // anyway).  newNextOffset = past the last batch EXAMINED (copied or
+    // stripped), so the gateway never re-reads a stripped batch (R-1).
+    // preCarrier (TX-6b, R-2): a group sub whose isolation carrier has not
+    // arrived is CUT at its first aborted batch instead — the batch stays
+    // ahead of the cursor until the true isolation is known — and the cut is
+    // echoed as the effective bound (the gateway parks there until the carrier).
+    static void clampPushChunk_(WorkerReturn& ret, int64_t bound, const RcState* rc, bool preCarrier) {
+        using rune::protocol::RecordBatchReader;
+        namespace b = rune::protocol::batch;
+        std::vector<uint8_t>& c = ret.chunk;
+        const std::size_t n = c.size();
+        std::size_t rd = 0, wr = 0;
+        int64_t next = ret.newNextOffset;
+        while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= n) {
+            RecordBatchReader r(c.data() + rd, n - rd);
+            const int32_t total = r.totalLength();
+            if (total <= 0 || rd + static_cast<std::size_t>(total) > n) break;
+            const int64_t base = r.baseOffset();
+            const int64_t last = base + r.lastOffsetDelta();
+            if (last >= bound) break;                                  // the HW / LSO bound
+            const auto attrs = static_cast<uint16_t>(r.attributes());
+            if ((attrs & static_cast<uint16_t>(b::kAttrControl)) != 0) {   // markers: never delivered
+                rd += static_cast<std::size_t>(total);
+                next = last + 1;
+                continue;
+            }
+            if (rc != nullptr && (attrs & kTxnAttrBit) != 0 && rc->isAborted(r.producerId(), base)) [[unlikely]] {
+                if (preCarrier) {                                      // R-2: cut, never strip
+                    ret.setPushEffectiveBound(base);
+                    break;
+                }
+                rd += static_cast<std::size_t>(total);
+                next = last + 1;
+                continue;
+            }
+            if (wr != rd) std::memmove(c.data() + wr, c.data() + rd, static_cast<std::size_t>(total));
+            wr += static_cast<std::size_t>(total);
+            rd += static_cast<std::size_t>(total);
+            next = last + 1;
+        }
+        if (wr == 0) std::vector<uint8_t>().swap(c);   // empty: release the read buffer
+        else         c.resize(wr);                       // shrink only: no reallocation
+        ret.newNextOffset = next;
     }
 
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
@@ -2587,6 +2750,13 @@ private:
             const rune::replication::Offset base = replica->appendControlBatch(markerSpan, /*acksAll=*/true);
             if (base >= 0) {
                 ret.baseOffset = base;
+                // F15 §2.1 step 2: the RC update in the same invocation as the
+                // marker append (Ready: applied; Scanning: tail list).
+                if (RcState* rc = rcOf_(replica)) {
+                    rune::transaction::ControlMarkerPayload mp;
+                    if (rune::transaction::ControlMarker::extract(tail, 0, mp, tailLen))
+                        rc->onMarker(mp.producerId, base, mp.controlType == rune::transaction::ControlType::Commit);
+                }
                 // N2 (minor): keep append()'s flush request on the worker — a
                 // Strict-tier marker joins this pass's coalesced durable flush
                 // (submitCoalescedFlushes_), exactly like a Strict produce.
@@ -3259,6 +3429,109 @@ private:
     [[nodiscard]] bool ownsIncarnation_(uint32_t id, uint32_t inc) const noexcept {
         return inc != 0 && id < ownedInc_.size() && ownedInc_[id] == inc;
     }
+    // -----------------------------------------------------------------------
+    // F15 S4 (design note §2.1-§2.4): worker-owned read_committed state.
+    //
+    // One RcState per owned USER partition (topicId >= 0; internal partitions
+    // never carry transactional batches, §1), created COLD when ownership is
+    // applied and pre-reserved there (addendum m5: no allocation on the
+    // produce path).  A still-owned replica keeps its state across ownership
+    // changes (same pointer + incarnation).  rcById_ gives O(1) lookup for
+    // registered replicas (dense by registry id, like ownedPtr_); unregistered
+    // ones (incarnation 0: unit rigs / passthrough) are found by a scan of the
+    // small slot vector.  Worker thread only.
+    // -----------------------------------------------------------------------
+    struct RcSlot {
+        rune::replication::PartitionReplica* replica = nullptr;
+        uint32_t                             inc     = 0;
+        std::unique_ptr<RcState>             rc;
+    };
+    std::vector<RcSlot>   rcSlots_;
+    std::vector<RcState*> rcById_;
+    int32_t     rcScanBytesPerPass_ = RcState::kDefaultScanBytesPerPass;
+    std::size_t rcOpenTxnCapacity_  = rune::transaction::LsoTracker::kDefaultOpenTxnCapacity;
+    static constexpr uint16_t kTxnAttrBit = static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional);
+    static constexpr uint8_t  kIsolationReadCommitted = 1;
+
+    [[nodiscard]] RcState* rcOf_(const rune::replication::PartitionReplica* r) const noexcept {
+        if (r == nullptr) return nullptr;
+        if (r->incarnation() != 0) {
+            const uint32_t id = r->registryId();
+            return (id < rcById_.size() && ownsIncarnation_(id, r->incarnation())) ? rcById_[id] : nullptr;
+        }
+        for (const auto& sl : rcSlots_) if (sl.replica == r) return sl.rc.get();
+        return nullptr;
+    }
+    [[nodiscard]] const RcState* rcFor_(int32_t topicId, int32_t partition) const noexcept {
+        return rcOf_(findOwnedReplica_(topicId, partition));
+    }
+    // Cold (ownership apply): carry still-owned states, create + reserve new
+    // ones, drop the rest; re-resolve every subscription's cached pointer.
+    void rebuildRcSlots_() {
+        std::vector<RcSlot> next;
+        next.reserve(owned_.size());
+        for (auto* r : owned_) {
+            if (r == nullptr || r->topicId() < 0) continue;
+            bool dup = false;
+            for (const auto& n : next) dup = dup || n.replica == r;
+            if (dup) continue;
+            RcSlot slot;
+            slot.replica = r;
+            slot.inc     = r->incarnation();
+            for (auto& old : rcSlots_) {
+                if (old.replica == r && old.inc == slot.inc && old.rc) { slot.rc = std::move(old.rc); break; }
+            }
+            if (!slot.rc) {
+                slot.rc = std::make_unique<RcState>();
+                slot.rc->reserve(rcOpenTxnCapacity_);
+            }
+            next.push_back(std::move(slot));
+        }
+        rcSlots_ = std::move(next);
+        rcById_.assign(ownedInc_.size(), nullptr);
+        for (auto& sl : rcSlots_)
+            if (sl.inc != 0 && sl.replica->registryId() < rcById_.size()) rcById_[sl.replica->registryId()] = sl.rc.get();
+        for (auto& sub : subs_) sub.rc = rcOf_(subReplica_(sub));
+    }
+    [[nodiscard]] static RcFacts rcFacts_(const rune::replication::PartitionReplica* r) noexcept {
+        RcFacts f;
+        f.leader               = r->role() == rune::replication::Role::Leader;
+        f.leaderComplete       = r->isLeaderComplete();
+        f.logGeneration        = r->logGeneration();
+        f.leadershipGeneration = r->leadershipGeneration();
+        f.epoch                = static_cast<int32_t>(r->epoch());
+        return f;
+    }
+    // One §2.3 driver step for one partition.
+    std::size_t rcAdvance_(rune::replication::PartitionReplica* r, RcState& rc) {
+        return rc.advance(rcFacts_(r), r->isDiskBacked() ? r->log() : nullptr, rcScanBytesPerPass_);
+    }
+    // §2.4: the RC state to serve read_committed from — only if Ready AND still
+    // valid for the replica's live role / generations (a demotion can land
+    // between the per-pass driver and this read).  nullptr → serve nothing.
+    [[nodiscard]] const RcState* rcServe_(const rune::replication::PartitionReplica* r, RcState* rc) noexcept {
+        if (rc == nullptr || !rc->revalidate(rcFacts_(r))) return nullptr;
+        return rc;
+    }
+    // Per pass, every owned user partition (state-driven: no role-op hooks).
+    int rcAdvanceAll_() {
+        int work = 0;
+        for (auto& sl : rcSlots_) work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+        return work;
+    }
+    // §2.3 produce gate: the RC state for an idempotent / transactional batch,
+    // after one inline build step if it is not Ready; nullptr → refuse NotLeader.
+    [[nodiscard]] RcState* rcGate_(rune::replication::PartitionReplica* r) {
+        RcState* rc = rcOf_(r);
+        if (rc == nullptr) return nullptr;
+        if (!rc->revalidate(rcFacts_(r))) (void)rcAdvance_(r, *rc);
+        return rc->ready() ? rc : nullptr;
+    }
+    [[nodiscard]] static uint16_t txnAttrs_(const uint8_t* batch, uint32_t len) noexcept {
+        if (batch == nullptr || len < static_cast<uint32_t>(rune::protocol::batch::kRecordBatchOverhead)) return 0;
+        return static_cast<uint16_t>(rune::protocol::RecordBatchReader(batch, len).attributes());
+    }
+
     // F15 §3.1 (I1): the OWNING worker is the role authority for a produce — one
     // load + compare on the hot replica line (BM_WorkerRoleGate).  A null replica
     // is a replication-less partition (passthrough): nothing to gate.
@@ -3376,6 +3649,7 @@ private:
     // then ignored on completion (epoch / identity mismatch) (M2).
     void rebuildFlushSlots_() {
         rebuildOwnedIndex_();
+        rebuildRcSlots_();
         std::vector<LogFlushSlot> next;
         next.reserve(owned_.size());
         for (auto* replica : owned_) {
@@ -4163,6 +4437,16 @@ private:
             enqueueReturn_(ret);
             return 1;
         }
+        // F15 §2.3 produce gate (see executeProduceWire_).
+        RcState* rc = nullptr;
+        if (msg.producerId >= 0 && replica != nullptr && msg.topicId >= 0) [[unlikely]] {
+            rc = rcGate_(replica);
+            if (rc == nullptr) {
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                enqueueReturn_(ret);
+                return 1;
+            }
+        }
 
         // Zero-copy: handleProduceBatch now takes a READ-ONLY view and the log
         // restamps the base offset in place via pwritev — no mutable local copy.
@@ -4239,6 +4523,11 @@ private:
         if (replica) {
             replica->onLeaderLogAppended();
         }
+
+        // F15 §2.1 (C1): RC update in the same invocation as the append; a
+        // duplicate retry was registered with its original.
+        if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]]
+            rc->onTxnBatch(msg.producerId, outcome.baseOffset);
 
         if (asyncStrict) {
             // Park on the coalesced fsync (submitCoalescedFlushes_ stamps the token

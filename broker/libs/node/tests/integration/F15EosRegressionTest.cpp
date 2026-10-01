@@ -2554,6 +2554,10 @@ namespace {
         (void)log.append(big, 0);                          // stored under a bigger config
         const auto small = batchAt(0);
         (void)log2.append(small, 0);
+        // The replicas learn the appends made underneath them (LEO / HW): the
+        // owning worker bounds a PushRead by its live HW (F15 S4, §2.4).
+        rep.onLeaderLogAppended();
+        rep2.onLeaderLogAppended();
         Worker w(0, 1 << 20, 1 << 16, 64, 64);             // now: 8 KiB return max message
         w.setOwnedDirect(Worker::OwnedSet{&rep, &rep2});
         (void)w.tryEnqueueOp(pushReadOp(&rep, 7, 0, 1));
@@ -3133,7 +3137,10 @@ TEST(TxnRcRegression, RetentionDuringBuildCompletes) {
     ASSERT_TRUE(R.log->enqueueDeletedSegment(segs[1]));
     EXPECT_TRUE(R.runUntilReady(static_cast<int>(total / 1024) + 32)) << "the build is stuck after retention";
     EXPECT_GT(R.log->logStartOffset(), 0) << "precondition: retention ran";
-    EXPECT_EQ(R.open(), 0u) << "the deleted txn batch is gone with its segment";
+    // The txn at 0 has no marker yet: it stays open (its LSO holds data back)
+    // although retention deleted its first batch — the coordinator's marker
+    // closes it.
+    EXPECT_EQ(R.open(), 1u);
 }
 
 TEST(TxnRcRegression, EpochBumpSameLogKeepsReady) {
