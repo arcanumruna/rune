@@ -139,6 +139,24 @@ Client::Client(ClientConfig cfg)
         agent_.setForwardProduceResponses(true);  // txn producers consume raw ProduceResponses
     });
 
+    // F8a: subscriber / group-consumer commands from app threads, applied on the
+    // duty thread (or by close()'s final drain) by the hub that owns the state.
+    agent_.setHubCommandFn([this](const detail::HubCommand& cmd) {
+        using Op = detail::HubCommand::Op;
+        if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
+            const auto snap = agent_.stateAndSessionId();
+            const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe)
+                ? nextCorrId_.fetch_add(1, std::memory_order_relaxed) : 0;
+            subscriberHub_.applyCommand(
+                cmd, unsubCorrId, snap.sessionId,
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                });
+        } else {
+            groupConsumerHub_.applyCommand(cmd);
+        }
+    });
+
     // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
     // on the duty-cycle thread without any extra lock.
     agent_.setMetadataResponseFn([this](const codec::MetadataResponseDecoded& resp) {
@@ -1779,56 +1797,74 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
 
     // Snapshot the current session id (coherent pair — same as ping()).
-    const auto snap    = agent_.stateAndSessionId();
-    const int64_t sessId = snap.sessionId;
+    const auto snap = agent_.stateAndSessionId();
 
-    // Build the shared impl.
+    // Build the impl.  Its immutable fields are written HERE, before the
+    // SubscribeAdd command is committed to the agent ring (which publishes them
+    // to the duty thread); every other field is duty-thread owned from then on.
     auto impl = std::make_shared<SubscriptionImpl>();
     impl->correlationId = corrId;
     impl->topicId       = topic.topicId;
     impl->partition     = partition;
     impl->handler       = std::move(handler);
-    impl->active.store(true, std::memory_order_relaxed);
-    impl->subscriptionId.store(0, std::memory_order_relaxed);
-    impl->nextOffset.store(0, std::memory_order_relaxed);
 
-    // Build the unsubscribe callback: submits Unsubscribe via the agent ring.
-    // Capture the agent_ by reference (safe: Client owns the agent and outlives
-    // any Subscription the app can hold — same lifetime guarantee as producers).
-    auto unsubFn = [this](int64_t subId) {
-        const int64_t corrId2 = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-        const auto s = agent_.stateAndSessionId();
-        subscriberHub_.sendUnsubscribe(
-            subId,
-            s.sessionId,
-            corrId2,
-            [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
-                return agent_.submitSend(buf, len);
-            });
-    };
-
-    // Register + submit Subscribe (encodes and writes to the ring).
-    // M2 FIX: pass a deadline so sweepTimedOut() can fail this subscribe if
+    // M2 FIX: a deadline so sweepTimedOut() can fail this subscribe if
     // SubscribeResponse never arrives (mirrors produce-ack timeout sweep).
     const auto subscribeDL = std::chrono::steady_clock::now() +
                              std::chrono::milliseconds(cfg_.subscribeTimeoutMs);
 
-    subscriberHub_.registerSubscribe(
-        impl,
-        sessId,
-        corrId,
-        topic.topicId,
-        partition,
-        partitionKnown,
-        opts.from.toWire(),
-        static_cast<uint8_t>(opts.isolation),
-        keyBytes,
-        subscribeDL,
-        [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
-            return agent_.submitSend(buf, len);
-        });
+    // F8a: encode on this thread (pure), then hand the request to the duty
+    // thread, which registers it as pending and sends the Subscribe frame.
+    auto req = subscriber::SubscriberHub::makeSubscribeRequest(
+        impl, snap.sessionId, partitionKnown, opts.from.toWire(),
+        static_cast<uint8_t>(opts.isolation), keyBytes, subscribeDL);
 
-    return Subscription(std::move(impl), std::move(unsubFn));
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::SubscribeAdd;
+    cmd.handle = reinterpret_cast<uint64_t>(req.get());
+    switch (hubCommandTrampoline_(this, cmd)) {  // throws: req frees itself
+    case detail::HubSubmit::Accepted:
+        (void)req.release();      // the duty thread owns it now
+        break;
+    case detail::HubSubmit::Closed:
+        impl->status.close();     // never submitted (req freed): born finished
+        break;
+    case detail::HubSubmit::ClosedAfterSubmit:
+        (void)req.release();      // indeterminate ownership: leak, never free
+        impl->status.close();
+        break;
+    }
+
+    return Subscription(std::move(impl), &Client::hubCommandTrampoline_, this);
+}
+
+// ---------------------------------------------------------------------------
+// F8a: hubCommandTrampoline_ — the HubCommandSink bound to every handle
+// ---------------------------------------------------------------------------
+
+detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd) {
+    auto* self = static_cast<Client*>(ctx);
+    if (self->stopped_.load(std::memory_order_seq_cst)) return detail::HubSubmit::Closed;
+    try {
+        // Bounded back-pressure exactly like producer registration: Invoker
+        // owner pumps the duty cycle, Thread-mode app threads park while the
+        // runner drains; from a duty-cycle callback / non-owner Invoker thread
+        // a FULL ring throws instead (never a silent drop).
+        self->submitRegistration_([&] { return self->agent_.submitHubCommand(cmd); }, [] {});
+    } catch (const std::logic_error&) {
+        // close() won the race before the submit: nothing was written.
+        if (self->stopped_.load(std::memory_order_seq_cst)) return detail::HubSubmit::Closed;
+        throw;
+    }
+    // Same post-submit seq_cst RMW re-check as producerWithRingCap_ (fix3 C1):
+    // succeeds => close()'s exchange (and its final ring drain, which applies
+    // hub commands) is ordered after our commit, so the command WILL be applied.
+    bool expectedNotStopped = false;
+    if (!self->stopped_.compare_exchange_strong(expectedNotStopped, false,
+                                                std::memory_order_seq_cst)) {
+        return detail::HubSubmit::ClosedAfterSubmit;
+    }
+    return detail::HubSubmit::Accepted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1844,7 +1880,8 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
     // responses to be misrouted (all share correlationId=0 and are matched
     // by state to the first consumer in the matching state).
     // For multi-group support, add per-consumer correlationId tracking (CG-6).
-    if (!groupConsumerHub_.empty()) {
+    // F8a: an app-side flag — the hub is duty-thread owned and never read here.
+    if (groupSubscribed_) {
         throw std::logic_error(
             "subscribeGroup: only one GroupConsumer per Client is supported. "
             "Use a separate Client instance for each consumer group. "
@@ -1865,13 +1902,35 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
         }
     }
 
-    impl->state  = GroupConsumerState::Unjoined;
-    impl->active.store(true, std::memory_order_relaxed);
+    impl->state = GroupConsumerState::Unjoined;
 
-    // Register with the hub — thread-safe cold path (under addMtx_).
-    groupConsumerHub_.add(impl);
+    // F8a: register through the agent ring — the duty thread adopts the impl
+    // into the single-owner hub list and frees the holder.
+    auto* holder = new std::shared_ptr<GroupConsumerImpl>(impl);
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::GroupAdd;
+    cmd.handle = reinterpret_cast<uint64_t>(holder);
+    detail::HubSubmit r = detail::HubSubmit::Closed;
+    try {
+        r = hubCommandTrampoline_(this, cmd);
+    } catch (...) {
+        delete holder;  // never submitted
+        throw;
+    }
+    switch (r) {
+    case detail::HubSubmit::Accepted:
+        groupSubscribed_ = true;
+        break;
+    case detail::HubSubmit::Closed:
+        delete holder;            // never submitted
+        impl->status.close();     // born finished
+        break;
+    case detail::HubSubmit::ClosedAfterSubmit:
+        impl->status.close();     // indeterminate holder ownership: leak, never free
+        break;
+    }
 
-    return GroupConsumer(std::move(impl));
+    return GroupConsumer(std::move(impl), &Client::hubCommandTrampoline_, this);
 }
 
 // ---------------------------------------------------------------------------

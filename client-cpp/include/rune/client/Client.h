@@ -511,8 +511,8 @@ public:
     ///   - subscribeGroup() is called on the APP thread (setup phase, before
     ///     connect() or right after — same contract as producer()).
     ///   - onAssigned / onRevoked / onRecords callbacks fire on the RUNNER thread.
-    ///   - commit() / commitSync() are wait-free from the APP thread.
-    ///   - close() on the handle is safe from any thread.
+    ///   - commit() / commitSync() / close() on the handle are commands for
+    ///     the duty thread (agent command ring; F8a — no shared state).
     ///
     /// topicNames are resolved against ClientConfig::topics.  Topics not found
     /// in the static list are silently skipped (topicId lookup fails).
@@ -612,6 +612,12 @@ private:
     /// the ring in real time, so the caller falls back to its heartbeat-bounded
     /// wait instead.
     static producer::PumpResult pumpTrampoline_(void* ctx) noexcept;
+
+    /// F8a: HubCommandSink bound to every Subscription / GroupConsumer handle
+    /// (ctx = this).  Submits the command on the agent ring with
+    /// submitRegistration_'s bounded back-pressure, plus the same post-submit
+    /// close() re-check as producer() (see detail::HubSubmit).
+    static detail::HubSubmit hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd);
 
     /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
     /// between attempts — this thread IS the ring's consumer; thread mode parks
@@ -764,12 +770,15 @@ private:
     std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnProducers_;
 
     // ---- CB-4: SubscriberHub -------------------------------------------------
-    // Owned by Client.  subscribe() / onEgressFrame() / close() all access it.
+    // Duty-thread owned (F8a): subscribe()/unsubscribe() reach it via the agent ring.
     subscriber::SubscriberHub subscriberHub_;
 
     // ---- CG-5: GroupConsumerHub ---------------------------------------------
-    // Owned by Client.  subscribeGroup() / onEgressFrame() / close() access it.
+    // Duty-thread owned (F8a): subscribeGroup() registers through the agent ring.
     group::GroupConsumerHub groupConsumerHub_;
+    // subscribeGroup()'s one-group-per-Client guard (app side; setup phase —
+    // the hub itself is duty-thread owned and is never read by an app thread).
+    bool groupSubscribed_ = false;
 
     // ---- CB-5 B: data-op leader-redirect state -------------------------------
     // Task 1.1: the redirect latch (redirectPending) and the current-leader

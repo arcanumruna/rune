@@ -34,6 +34,7 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <rune/client/detail/FlatIndexMap.h>
+#include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
 #include <atomic>
@@ -254,10 +255,17 @@ public:
     /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
     bool submitRegisterTxnProducer(void* holder) noexcept;
 
+    /// F8a: hand a subscriber / group-consumer command to the duty thread
+    /// (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty thread drains it
+    /// and invokes the hub-command hook.  Returns false if the ring is full.
+    bool submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept;
+
     /// close() path, single-threaded (runner joined / Invoker owner): drain the
     /// WHOLE command ring once, adopting producer + txn-producer registrations
-    /// through their hooks (so their holders are freed and the owner can fail
-    /// them) and dropping every other command (sends carry no completion).
+    /// and applying F8a hub commands through their hooks (so their holders are
+    /// freed and the owner can fail them — a commitSync promise or subscribe
+    /// still in the ring is never stranded) and dropping every other command
+    /// (sends carry no completion).
     ///
     /// fix5 Important-2(c): always terminates. If the drain makes no progress
     /// for kCloseDrainUnblockAfterYields consecutive yields (stuck behind a
@@ -422,6 +430,13 @@ public:
         txnProducerRegisterFn_ = std::move(fn);
     }
 
+    /// F8a: hook invoked (duty thread, or close()'s drain) for every drained
+    /// kMsgHubCommand.  Set before start().  Cold path (control-plane commands).
+    using HubCommandFn = std::function<void(const ::rune::client::detail::HubCommand&)>;
+    void setHubCommandFn(HubCommandFn fn) noexcept {
+        hubCommandFn_ = std::move(fn);
+    }
+
     // -------------------------------------------------------------------------
     // Observers
     // -------------------------------------------------------------------------
@@ -532,6 +547,7 @@ private:
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
     static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
+    static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
@@ -673,6 +689,7 @@ private:
     ProduceResendFn    produceResendFn_;    // Task 1.4: fired on session-connect (multi-node)
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
     ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
+    HubCommandFn       hubCommandFn_;          // F8a subscriber / group-consumer commands
 
     // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
     // wait loop (see testSetCloseDrainYieldHook()). Empty by default.

@@ -22,6 +22,8 @@
 
 #include <rune/protocol/client/MessageHeader.h>
 
+#include <rune/client/detail/HubCommand.h>
+
 namespace rune::client::agent::ring_msg {
 
 namespace pc = ::rune::protocol::client;
@@ -83,6 +85,59 @@ struct RegisterProducer {
             pc::detail::getLE64(buf,
                                 static_cast<int>(pc::MessageHeader::ENCODED_SIZE)));
         return msg;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// HubCommandMsg — F8a: an app-thread subscriber / group-consumer operation for
+// the duty thread (see detail::HubCommand for the ops and payload ownership).
+//
+// Frame layout (all little-endian):
+//   [0..23]  MessageHeader (blockLength=32, templateId=2, schemaId=121)
+//   [24..25] op     : uint16
+//   [26..31] reserved (zero)
+//   [32..39] handle : uint64   (process-local pointer / identity; never leaves the process)
+//   [40..47] a      : int64
+//   [48..55] b      : int64
+// ---------------------------------------------------------------------------
+struct HubCommandMsg {
+    static constexpr uint16_t    TEMPLATE_ID  = 2;
+    static constexpr uint16_t    BODY_FIXED   = 32;
+    static constexpr std::size_t ENCODED_SIZE =
+        pc::MessageHeader::ENCODED_SIZE + BODY_FIXED;  // 56
+
+    static std::size_t encode(const ::rune::client::detail::HubCommand& c, uint8_t* buf) noexcept {
+        pc::MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kInternalSchemaId;
+        hdr.version       = kInternalVersion;
+        hdr.sessionId     = 0;
+        hdr.correlationId = 0;
+        hdr.encode(buf);
+        constexpr int B = static_cast<int>(pc::MessageHeader::ENCODED_SIZE);
+        pc::detail::putLE16(buf, B + 0, static_cast<uint16_t>(c.op));
+        for (int i = 2; i < 8; ++i) buf[B + i] = 0;
+        pc::detail::putLE64(buf, B + 8,  static_cast<int64_t>(c.handle));
+        pc::detail::putLE64(buf, B + 16, c.a);
+        pc::detail::putLE64(buf, B + 24, c.b);
+        return ENCODED_SIZE;
+    }
+
+    static std::optional<::rune::client::detail::HubCommand>
+    decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = pc::MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        if (hdrOpt->schemaId   != kInternalSchemaId) return std::nullopt;
+        if (hdrOpt->templateId != TEMPLATE_ID)       return std::nullopt;
+        if (avail < ENCODED_SIZE)                    return std::nullopt;
+        constexpr int B = static_cast<int>(pc::MessageHeader::ENCODED_SIZE);
+        ::rune::client::detail::HubCommand c;
+        c.op     = static_cast<::rune::client::detail::HubCommand::Op>(pc::detail::getLE16(buf, B + 0));
+        c.handle = static_cast<uint64_t>(pc::detail::getLE64(buf, B + 8));
+        c.a      = pc::detail::getLE64(buf, B + 16);
+        c.b      = pc::detail::getLE64(buf, B + 24);
+        return c;
     }
 };
 

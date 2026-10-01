@@ -82,18 +82,27 @@ alloc-free handoff). The agent drains, accumulates records into per-
 `Subscription` + `SubscribeOptions`. `From` selects the start offset —
 `Earliest` (wire `-2`), `Latest`/LEO (`-1`), or explicit `Offset`. `Isolation`
 is passed through (read-uncommitted / LEO frontier for now). The `RecordHandler`
-fires on the agent thread with zero-copy spans; `position()` is an atomic the
-agent updates after each delivered record (eventually-consistent reads
-elsewhere). `unsubscribe()` / RAII dtor are safe from any thread — they enqueue
-an Unsubscribe command; the real routing removal happens on the agent thread.
+fires on the agent thread with zero-copy spans. F8a (shared-nothing): the
+`SubscriberHub` and all agent-side subscription state are owned by the duty
+thread; `subscribe()`/`unsubscribe()`/RAII dtor send `HubCommand`s on the agent
+command ring, and `position()`/`subscriptionId()`/`active()` drain a
+per-subscription `StatusRing` the agent publishes to (once per Records frame +
+lifecycle changes; eventually consistent). The handle is owned by one thread at
+a time and may outlive its Client (closed status ring ⇒ it never touches the
+Client again).
 
 ### 2.3 Group consumer (`group/`)
 `GroupConsumer` runs the full join/sync/stable/rejoin state machine, heartbeat,
 record routing, and the auto-commit duty cycle **on the runner thread**. App
 threads only register `onAssigned`/`onRevoked`/`onRecords` (setup) and call
-`commit()` (wait-free: atomic flag + position snapshot), `commitSync()` (returns
-a future resolved on `OffsetCommitResponse`), and `close()`. Registration uses
-the same atomic-COW `GroupConsumerHub` pattern.
+`commit()`, `commitSync()` (returns a future the duty thread resolves on
+`OffsetCommitResponse`), and `close()` — each a `HubCommand` on the agent ring
+(F8a: no atomics, no mutex). `subscribeGroup()` registers through the ring too
+(`GroupAdd`); the `GroupConsumerHub` list is duty-thread owned.
+
+The no-atomics/no-mutex law is enforced by `scripts/check_no_atomics_or_mutexes.py`
+(ctest `NoAtomicsOrMutexesOutsideAllowlistRegression`): only `M2ORingBuffer`'s own
+memory ordering is exempt, plus temporary capped "SLICE-B" entries.
 
 ---
 

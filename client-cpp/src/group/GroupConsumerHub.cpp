@@ -19,9 +19,10 @@
 //   check if (topicId, partition) is in its assignment map.
 //   If found: fire cbRecords, advance position.
 //
-// Wait-free contract:
-//   snapshot_.load(acquire) once per hot-path call, then iterate.
-//   No locks on runner thread. Cold path (add()) under addMtx_.
+// F8a shared-nothing contract:
+//   impls_ and every duty-side impl field are owned by the duty thread.  App
+//   threads reach the hub only via applyCommand() (HubCommands drained from the
+//   agent ring).  No locks, no atomics.
 
 #include <rune/client/group/GroupConsumerHub.h>
 #include <rune/client/codec/DataCodec.h>
@@ -37,6 +38,9 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <future>
+#include <memory>
+#include <stdexcept>
 
 namespace rune::client::group {
 
@@ -68,23 +72,81 @@ static void ensureBuf(GroupConsumerImpl& impl, std::size_t needed) {
 }
 
 // ---------------------------------------------------------------------------
-// add() — cold path, app thread
+// add() / applyCommand() — duty thread (cold path)
 // ---------------------------------------------------------------------------
 
 void GroupConsumerHub::add(std::shared_ptr<GroupConsumerImpl> impl) {
-    std::lock_guard<std::mutex> lk(addMtx_);
+    if (impl) impls_.push_back(std::move(impl));
+}
 
-    // Load the current live list.
-    const ImplList* cur = snapshot_.load(std::memory_order_acquire);
+GroupConsumerImpl* GroupConsumerHub::find_(uint64_t handle) const noexcept {
+    for (const auto& impl : impls_) {
+        if (reinterpret_cast<uint64_t>(impl.get()) == handle) return impl.get();
+    }
+    return nullptr;
+}
 
-    // Allocate a new list = current + new impl.
-    auto* next = new ImplList(*cur);
-    next->push_back(std::move(impl));
+/*static*/
+void GroupConsumerHub::finish_(GroupConsumerImpl& impl, const char* why) {
+    impl.active = false;
+    if (impl.commitSyncPromise) {
+        try {
+            impl.commitSyncPromise->set_exception(
+                std::make_exception_ptr(std::runtime_error(why)));
+        } catch (...) {}
+        impl.commitSyncPromise.reset();
+    }
+    impl.status.close();
+}
 
-    // Publish (release) and retain old pointer for safe deferred free.
-    snapshot_.store(next, std::memory_order_release);
-    owned_.push_back(next);
-    // (owned_ now holds the old cur too from a prior add, or from constructor.)
+void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd) {
+    using Op = detail::HubCommand::Op;
+    switch (cmd.op) {
+    case Op::GroupAdd: {
+        auto* holder = reinterpret_cast<std::shared_ptr<GroupConsumerImpl>*>(cmd.handle);
+        if (holder) {
+            add(std::move(*holder));
+            delete holder;
+        }
+        break;
+    }
+    case Op::GroupCommit: {
+        GroupConsumerImpl* impl = find_(cmd.handle);
+        if (impl && impl->active) impl->commitRequested = true;
+        break;
+    }
+    case Op::GroupCommitSync: {
+        std::unique_ptr<std::promise<void>> prom(
+            reinterpret_cast<std::promise<void>*>(static_cast<uintptr_t>(cmd.a)));
+        GroupConsumerImpl* impl = find_(cmd.handle);
+        if (!impl || !impl->active) {
+            if (prom) {
+                try {
+                    prom->set_exception(std::make_exception_ptr(
+                        std::runtime_error("GroupConsumer closed")));
+                } catch (...) {}
+            }
+            break;
+        }
+        if (impl->commitSyncPromise) {
+            // Already one in flight — fail the old one and replace.
+            try {
+                impl->commitSyncPromise->set_exception(std::make_exception_ptr(
+                    std::runtime_error("commitSync() superseded by a newer call")));
+            } catch (...) {}
+        }
+        impl->commitSyncPromise = std::move(prom);
+        impl->commitRequested   = true;  // send the commit promptly
+        break;
+    }
+    case Op::GroupClose: {
+        GroupConsumerImpl* impl = find_(cmd.handle);
+        if (impl && impl->active) finish_(*impl, "GroupConsumer closed");
+        break;
+    }
+    default:
+        break;  // not a group op
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,15 +458,14 @@ int GroupConsumerHub::doWork(int64_t nowNs,
                               const SendFn& sendFn)
 {
     int work = 0;
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
     const auto now = std::chrono::steady_clock::now();
 
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
 
-        // ---- Drain pending commit() requests (wait-free acquire) ------------
-        if (impl->commitRequested.exchange(false, std::memory_order_acq_rel)) {
+        // ---- Drain pending commit() / commitSync() requests --------------------
+        if (impl->commitRequested) {
+            impl->commitRequested = false;
             if (impl->state == GroupConsumerState::Stable) {
                 sendOffsetCommit(*impl, sessionId, sendFn);
                 ++work;
@@ -471,10 +532,8 @@ int GroupConsumerHub::doWork(int64_t nowNs,
 
 void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
 {
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
         // Check if this (topicId, partition) is in the assignment.
@@ -529,10 +588,8 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
     auto opt = rpc::JoinGroupResponse::decode(buf, len);
     if (!opt) return;
 
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Joining) continue;
 
         // Match by groupId is implicit: only one consumer per hub is in
@@ -570,10 +627,8 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
     auto opt = rpc::SyncGroupResponse::decode(buf, len);
     if (!opt) return;
 
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Syncing) continue;
 
         const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
@@ -629,10 +684,8 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
     auto opt = rpc::HeartbeatResponse::decode(buf, len);
     if (!opt) return;
 
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
         const auto ec = static_cast<rpc::ErrorCode>(
@@ -664,16 +717,13 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
     auto opt = rpc::OffsetCommitResponse::decode(buf, len);
     if (!opt) return;
 
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
 
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
-
-        // Resolve any pending commitSync promise (cold path under lock).
-        std::lock_guard<std::mutex> lk(impl->commitSyncMtx);
-        if (impl->commitSyncPending) {
-            try { impl->commitSyncPromise.set_value(); } catch (...) {}
-            impl->commitSyncPending = false;
+        // Resolve any pending commitSync promise (duty-thread owned; no lock).
+        if (impl->commitSyncPromise) {
+            try { impl->commitSyncPromise->set_value(); } catch (...) {}
+            impl->commitSyncPromise.reset();
         }
         // Only one consumer can have a pending commitSync for this response.
         break;
@@ -690,10 +740,8 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
     auto opt = rpc::OffsetFetchResponse::decode(buf, len);
     if (!opt) return;
 
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
         // (#1a) Seed positions from committed offsets.
@@ -728,10 +776,8 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
     auto opt = rpc::Assign::decode(buf, len);
     if (!opt) return;
 
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
         // Update generationId if the Assign carries a newer one.
@@ -761,10 +807,8 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
 
 void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 {
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
 
         if (impl->state == GroupConsumerState::Unjoined  ||
             impl->state == GroupConsumerState::Rejoining) {
@@ -779,10 +823,8 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 
 void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
 {
-    const ImplList* list = snapshot_.load(std::memory_order_acquire);
-
-    for (auto& impl : *list) {
-        if (!impl->active.load(std::memory_order_acquire)) continue;
+    for (auto& impl : impls_) {
+        if (!impl->active) continue;
 
         // Fire revoked for everything. fix1 C1: catch/count/log.
         if (!impl->assignment.empty() && impl->cbRevoked) {
@@ -820,19 +862,13 @@ void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
             if (len > 0) sendFn(0, impl->sendBuf.data(), len);
         }
 
-        impl->active.store(false, std::memory_order_release);
-
-        // Resolve any pending commitSync with an error.
-        std::lock_guard<std::mutex> lk(impl->commitSyncMtx);
-        if (impl->commitSyncPending) {
-            try {
-                impl->commitSyncPromise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("Client closed")));
-            } catch (...) {}
-            impl->commitSyncPending = false;
-        }
+        // Inactive + fail any pending commitSync + close the status ring.
+        finish_(*impl, "Client closed");
     }
+
+    // Consumers already closed by their handle still get their ring closed
+    // (idempotent) — every handle must learn the Client is gone.
+    for (auto& impl : impls_) impl->status.close();
 
     (void)sessionId; (void)sendFn;
 }

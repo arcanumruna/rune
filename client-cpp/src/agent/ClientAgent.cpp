@@ -209,6 +209,16 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 }
                 break;
 
+            case kMsgHubCommand:
+                // F8a: subscriber / group-consumer command, applied by the hub
+                // that owns the state — on THIS (duty) thread.
+                if (hubCommandFn_) {
+                    const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                    auto cmd = ring_msg::HubCommandMsg::decode(p, static_cast<std::size_t>(len));
+                    if (cmd) hubCommandFn_(*cmd);
+                }
+                break;
+
             default:
                 // Unknown command: drop silently.
                 break;
@@ -400,12 +410,21 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
         const int n = ring_.read(
             [this](std::int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset, aeron::util::index_t len) {
+                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                if (msgTypeId == kMsgHubCommand) {
+                    // F8a: adopt/apply so heap payloads (subscribe requests,
+                    // commitSync promises, group registrations) are owned and
+                    // then finished by the close path — never stranded.
+                    if (!hubCommandFn_) return;
+                    auto cmd = ring_msg::HubCommandMsg::decode(p, static_cast<std::size_t>(len));
+                    if (cmd) hubCommandFn_(*cmd);
+                    return;
+                }
                 const ProducerRegisterFn* fn =
                     (msgTypeId == kMsgRegisterProducer)      ? &producerRegisterFn_
                     : (msgTypeId == kMsgRegisterTxnProducer) ? &txnProducerRegisterFn_
                                                              : nullptr;
                 if (fn == nullptr || !*fn) return;  // sends / lifecycle: dropped
-                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
                 auto msg = ring_msg::RegisterProducer::decode(p, static_cast<std::size_t>(len));
                 if (msg) (*fn)(reinterpret_cast<void*>(msg->handle));
             },
@@ -456,6 +475,12 @@ void ClientAgent::testFillCommandRing() {
     for (std::size_t len = scratch.size(); len >= 1; len /= 2) {
         while (writeCommand(kMsgTestNoop, scratch.data(), len)) {}
     }
+}
+
+bool ClientAgent::submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept {
+    uint8_t buf[ring_msg::HubCommandMsg::ENCODED_SIZE];
+    const std::size_t n = ring_msg::HubCommandMsg::encode(cmd, buf);
+    return writeCommand(kMsgHubCommand, buf, n);
 }
 
 bool ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {

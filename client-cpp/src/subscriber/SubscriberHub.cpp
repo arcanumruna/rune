@@ -2,11 +2,11 @@
 //
 // CB-4 — SubscriberHub: subscription routing + record dispatch.
 //
-// Threading model recap (see header for full details):
-//   mtx_ guards the routing tables on the CONTROL PLANE.
-//   Record dispatch (hot path) acquires mtx_ only to look up and copy the
-//   shared_ptr, then RELEASES the lock before calling the handler.
-//   No lock is held during RecordBatchReader iteration or handler invocation.
+// F8a threading recap (see header for full details): every table and every
+// agent-side SubscriptionImpl field is owned by the duty thread.  App threads
+// reach the hub only through HubCommands drained from the agent ring
+// (applyCommand), and learn duty-side state only through each subscription's
+// StatusRing.  No mutex, no atomics.
 
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/protocol/RecordBatch.h>
@@ -20,105 +20,136 @@
 namespace rune::client::subscriber {
 
 // ---------------------------------------------------------------------------
-// registerSubscribe — app thread
+// Status publication helpers — duty thread
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::registerSubscribe(
-        std::shared_ptr<SubscriptionImpl>             impl,
-        int64_t                                       sessionId,
-        int64_t                                       correlationId,
-        int32_t                                       topicId,
-        int32_t                                       partition,
-        uint8_t                                       partitionKnown,
-        int64_t                                       fromOffset,
-        uint8_t                                       isolation,
-        std::span<const uint8_t>                      keyBytes,
-        std::chrono::steady_clock::time_point         deadline,
-        const SendFn&                                  submitFn)
+void SubscriberHub::publishStatus_(SubscriptionImpl& impl)
 {
-    // ---- Encode the Subscribe frame -----------------------------------------
-    // Max frame size: header(24) + fixed(~30) + key(≤16) = ~70 bytes.
-    // Use a stack buffer for zero-alloc encoding.
-    uint8_t frameBuf[256]{};
+    const SubscriptionStatus st{impl.subscriptionId, impl.nextOffset};
+    impl.statusDirty = !impl.status.tryPublish(st) && !impl.status.closed();
+}
 
+void SubscriberHub::finish_(SubscriptionImpl& impl)
+{
+    impl.active = false;
+    if (impl.status.closed()) return;
+    // Final snapshot (uses the ring's reserve — always fits), THEN close: an
+    // app thread that observes closed() and drains afterwards sees it.
+    (void)impl.status.publishFinal(SubscriptionStatus{impl.subscriptionId, impl.nextOffset});
+    impl.statusDirty = false;
+    impl.status.close();
+}
+
+// ---------------------------------------------------------------------------
+// makeSubscribeRequest — app thread, pure (no hub state)
+// ---------------------------------------------------------------------------
+
+std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
+        std::shared_ptr<SubscriptionImpl>     impl,
+        int64_t                               sessionId,
+        uint8_t                               partitionKnown,
+        int64_t                               fromOffset,
+        uint8_t                               isolation,
+        std::span<const uint8_t>              keyBytes,
+        std::chrono::steady_clock::time_point deadline)
+{
+    // Max frame size: header(24) + fixed(~30) + key(≤16) = ~70 bytes.
+    uint8_t frameBuf[256]{};
     const std::size_t frameLen = codec::encodeSubscribe(
         frameBuf, sizeof(frameBuf),
-        topicId,
-        partition,
+        impl->topicId,
+        impl->partition,
         partitionKnown,
         fromOffset,
         isolation,
         keyBytes,
         sessionId,
-        correlationId);
+        impl->correlationId);
 
-    // ---- Register the impl under correlationId (control-plane lock) ---------
-    // Store the encoded Subscribe frame alongside the impl so it can be
-    // re-stamped + resent on a leader redirect (CB-5 B).
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        PendingSub ps;
-        ps.impl     = impl;
-        ps.deadline = deadline;
-        if (frameLen > 0) {
-            ps.subscribeFrame.assign(frameBuf, frameBuf + frameLen);
-        }
-        pendingByCorrelation_.emplace(correlationId, std::move(ps));
-    }
-
-    // ---- Submit to the agent ring -------------------------------------------
-    // If submission fails (ring full), we leave the impl registered; it will
-    // be cleaned up by deactivateAll() on close or by a timeout sweep.
-    // Stream id 0 = default ingress stream; Task 1.3 will supply the correct
-    // coordinator/session stream id here once per-session routing is wired.
-    if (frameLen > 0) {
-        submitFn(0, frameBuf, frameLen);
-    }
+    auto req = std::make_unique<SubscribeRequest>();
+    req->impl     = std::move(impl);
+    req->deadline = deadline;
+    if (frameLen > 0) req->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
+    return req;
 }
 
 // ---------------------------------------------------------------------------
-// sendUnsubscribe — any thread
+// applyCommand / adoptSubscribe / unsubscribe — duty thread
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::sendUnsubscribe(
-        int64_t subscriptionId,
-        int64_t sessionId,
-        int64_t correlationId,
-        const SendFn& submitFn)
+void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
+                                 int64_t                   unsubCorrId,
+                                 int64_t                   sessionId,
+                                 const SendFn&             submitFn)
 {
-    // subscriptionId == 0 means the SubscribeResponse has not arrived yet.
-    // Still encode and send — the broker will ignore an Unsubscribe for an
-    // unknown id, which is harmless.
-
-    // Remove from activeById_ under lock so the agent thread won't dispatch
-    // further records for this subscription after unsubscribe() returns.
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        activeById_.erase(subscriptionId);
-        // Also clean up from pending (if unsubscribed before SubscribeResponse).
-        // We cannot easily correlate from subscriptionId back to correlationId
-        // here — just leave the pending entry; it will be skipped on
-        // onSubscribeResponse because active == false.
-    }
-
-    if (subscriptionId == 0) {
-        return; // No valid id to unsubscribe on the broker side yet.
-    }
-
-    uint8_t frameBuf[64]{};
-    const std::size_t frameLen = codec::encodeUnsubscribe(
-        frameBuf, sizeof(frameBuf),
-        subscriptionId,
-        sessionId,
-        correlationId);
-
-    if (frameLen > 0) {
-        submitFn(0, frameBuf, frameLen);
+    switch (cmd.op) {
+    case detail::HubCommand::Op::SubscribeAdd:
+        adoptSubscribe(std::unique_ptr<SubscribeRequest>(
+                           reinterpret_cast<SubscribeRequest*>(cmd.handle)),
+                       submitFn);
+        break;
+    case detail::HubCommand::Op::Unsubscribe:
+        unsubscribe(cmd.a, unsubCorrId, sessionId, submitFn);
+        break;
+    default:
+        break;  // not a subscriber op
     }
 }
 
+void SubscriberHub::adoptSubscribe(std::unique_ptr<SubscribeRequest> req,
+                                   const SendFn&                     submitFn)
+{
+    if (!req || !req->impl) return;
+    SubscribeRequest& r = *req;
+    const int64_t corrId = r.impl->correlationId;
+
+    // The frame is sent from the request's own storage, which the map now owns
+    // (no copy, no extra allocation on the duty thread).
+    auto [it, inserted] = pendingByCorrelation_.emplace(corrId, std::move(req));
+    if (!inserted) return;  // duplicate correlationId: impossible (unique counter)
+
+    // Stream id 0 = default ingress stream.  A failed submit (ring full) leaves
+    // the entry pending; the timeout sweep / close path finishes it.
+    const auto& frame = it->second->subscribeFrame;
+    if (!frame.empty() && submitFn) {
+        (void)submitFn(0, frame.data(), frame.size());
+    }
+}
+
+void SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
+                                int64_t       unsubCorrId,
+                                int64_t       sessionId,
+                                const SendFn& submitFn)
+{
+    // Still pending (SubscribeResponse not yet seen): keep the entry so the
+    // late response runs the CB-5 A2 path (Unsubscribe with the real id), but
+    // finish it for the app now.
+    if (auto pit = pendingByCorrelation_.find(subscribeCorrId);
+        pit != pendingByCorrelation_.end()) {
+        if (pit->second->impl) finish_(*pit->second->impl);
+        return;
+    }
+
+    // Bound: find it by its correlationId (cold path; a handful of entries).
+    for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
+        if (it->second->correlationId != subscribeCorrId) continue;
+        const int64_t subId = it->first;
+        finish_(*it->second);
+        activeById_.erase(it);
+
+        uint8_t frameBuf[64]{};
+        const std::size_t frameLen = codec::encodeUnsubscribe(
+            frameBuf, sizeof(frameBuf), subId, sessionId, unsubCorrId);
+        if (frameLen > 0 && submitFn) {
+            (void)submitFn(0, frameBuf, frameLen);
+        }
+        return;
+    }
+    // Unknown: already finished (timed out / failed / A2) — nothing to do.
+}
+
 // ---------------------------------------------------------------------------
-// onSubscribeResponse — agent thread
+// onSubscribeResponse — duty thread
 // ---------------------------------------------------------------------------
 
 void SubscriberHub::onSubscribeResponse(
@@ -127,97 +158,69 @@ void SubscriberHub::onSubscribeResponse(
         int64_t                             sessionId,
         const SendFn&                       submitFn)
 {
-    std::shared_ptr<SubscriptionImpl> impl;
-    bool needUnsubscribe = false;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = pendingByCorrelation_.find(rsp.correlationId);
-        if (it == pendingByCorrelation_.end()) {
-            return; // unknown correlationId — race with close/unsubscribe; safe
-        }
-        impl = std::move(it->second.impl);
-        pendingByCorrelation_.erase(it);
+    auto it = pendingByCorrelation_.find(rsp.correlationId);
+    if (it == pendingByCorrelation_.end()) {
+        return; // unknown correlationId — race with close/timeout; safe
+    }
+    std::shared_ptr<SubscriptionImpl> impl = std::move(it->second->impl);
+    pendingByCorrelation_.erase(it);
+    if (!impl) return;
 
-        // Store the broker-assigned subscriptionId regardless of active state,
-        // so that any pending unsubscribe() on the app thread that already ran
-        // (setting active=false before this response) can now find the id.
-        impl->subscriptionId.store(rsp.subscriptionId, std::memory_order_release);
+    // Store the broker-assigned subscriptionId regardless of active state.
+    impl->subscriptionId = rsp.subscriptionId;
 
-        if (!impl->active.load(std::memory_order_acquire)) {
-            // CB-5 A2 FIX: unsubscribe() ran before SubscribeResponse arrived.
-            // The earlier sendUnsubscribe() call sent subscriptionId=0 (no-op on
-            // broker side).  Now that we know the real id, send a proper Unsubscribe.
-            // Do NOT insert into activeById_ — the impl is already logically dead.
-            needUnsubscribe = true;
-        } else {
-            // Move to the active routing table.
-            activeById_.emplace(rsp.subscriptionId, impl);
+    if (!impl->active) {
+        // CB-5 A2 FIX: unsubscribe() ran before SubscribeResponse arrived.  Now
+        // that we know the real id, send a proper Unsubscribe.  Do NOT insert
+        // into activeById_ — the impl is already logically dead (its status
+        // ring was closed by unsubscribe()).
+        if (submitFn) {
+            uint8_t frameBuf[64]{};
+            const std::size_t frameLen = codec::encodeUnsubscribe(
+                frameBuf, sizeof(frameBuf), rsp.subscriptionId, sessionId, unsubCorrId);
+            if (frameLen > 0) {
+                (void)submitFn(0, frameBuf, frameLen);
+            }
         }
+        return;
     }
 
-    if (needUnsubscribe && submitFn) {
-        // Encode + send an Unsubscribe with the now-known subscriptionId.
-        uint8_t frameBuf[64]{};
-        const std::size_t frameLen = codec::encodeUnsubscribe(
-            frameBuf, sizeof(frameBuf),
-            rsp.subscriptionId,
-            sessionId,
-            unsubCorrId);
-        if (frameLen > 0) {
-            submitFn(0, frameBuf, frameLen);
-        }
-    }
+    // Bind: lifecycle snapshot (uses the reserve — always fits).
+    (void)impl->status.publishFinal(SubscriptionStatus{impl->subscriptionId, impl->nextOffset});
+    impl->statusDirty = false;
+    activeById_.emplace(rsp.subscriptionId, std::move(impl));
 }
 
 // ---------------------------------------------------------------------------
-// onRecords — agent thread
+// onRecords — duty thread (hot path: map lookup + handler; one publish/frame)
 // ---------------------------------------------------------------------------
 
 void SubscriberHub::onRecords(const codec::RecordsView& rv)
 {
-    // ---- Look up the subscription (acquire lock for the pointer copy only) --
-    std::shared_ptr<SubscriptionImpl> impl;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = activeById_.find(rv.subscriptionId);
-        if (it == activeById_.end()) {
-            return; // unknown / already-removed subscription
-        }
-        impl = it->second; // copy the shared_ptr; will release lock immediately
+    auto it = activeById_.find(rv.subscriptionId);
+    if (it == activeById_.end()) {
+        return; // unknown / already-removed subscription
     }
-
-    // ---- Check active flag (no lock held) -----------------------------------
-    if (!impl->active.load(std::memory_order_acquire)) {
-        return; // unsubscribed after the look-up; drop
-    }
+    SubscriptionImpl& impl = *it->second;
+    if (!impl.active) return;
 
     // ---- Decode the RecordBatch and dispatch per record ---------------------
-    // RecordBatchReader iterates the batch in zero-copy fashion.
     // The spans are views into the Aeron fragment buffer, which is valid for
     // the duration of this call (i.e. during the RecordHandler callback).
     const auto& rb = rv.recordBatch;
     if (rb.empty()) return;
 
     rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
-
-    // Validate (CRC + bounds).
     if (!reader.ensureValid()) {
-        // Malformed batch — drop (never crash).
-        return;
+        return; // Malformed batch — drop (never crash).
     }
 
-    // forEach calls fn(key, value, absoluteOffset, timestamp) per record.
-    // key and value are string_views into the Aeron buffer — zero-copy.
+    const int64_t before = impl.nextOffset;
     reader.forEach([&](std::string_view keyView,
                        std::string_view valView,
                        int64_t          absOffset,
                        int64_t          timestamp)
     {
-        // Re-check active before each record (handler could theoretically
-        // unsubscribe a sibling subscription, but not THIS one from within
-        // the handler — defensive check anyway).
-        if (!impl->active.load(std::memory_order_acquire)) return;
-
         Record rec;
         rec.offset    = absOffset;
         rec.timestamp = timestamp;
@@ -226,11 +229,11 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
         rec.value = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(valView.data()), valView.size());
 
-        // Invoke the handler (agent thread; must not block). fix1 C1: this runs
-        // inside the noexcept ClientAgent::doWork chain (Client::onEgressFrame ->
-        // SubscriberHub::onRecords) — a throwing handler must never escape it.
+        // Invoke the handler (duty thread; must not block). fix1 C1: this runs
+        // inside the noexcept ClientAgent::doWork chain — a throwing handler
+        // must never escape it.
         try {
-            impl->handler(rec);
+            impl.handler(rec);
         } catch (const std::exception& e) {
             ++callbackExceptions_;
             std::fprintf(stderr,
@@ -243,10 +246,11 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
                 "(caught; the duty cycle continues)\n");
         }
 
-        // Update offset tracking: nextOffset = absOffset + 1.
-        // Release store so app-thread reads via position() are consistent.
-        impl->nextOffset.store(absOffset + 1, std::memory_order_release);
+        impl.nextOffset = absOffset + 1;
     });
+
+    // One status snapshot per Records frame (not per record).
+    if (impl.nextOffset != before || impl.statusDirty) publishStatus_(impl);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,20 +259,18 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
 
 void SubscriberHub::deactivateAll()
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-
-    for (auto& [corrId, ps] : pendingByCorrelation_) {
-        if (ps.impl) ps.impl->active.store(false, std::memory_order_release);
+    for (auto& [corrId, req] : pendingByCorrelation_) {
+        if (req && req->impl) finish_(*req->impl);
     }
     for (auto& [subId, impl] : activeById_) {
-        impl->active.store(false, std::memory_order_release);
+        finish_(*impl);
     }
     pendingByCorrelation_.clear();
     activeById_.clear();
 }
 
 // ---------------------------------------------------------------------------
-// resendPending — agent thread (CB-5 B leader-redirect resend)
+// resendPending — duty thread (CB-5 B leader-redirect resend)
 // ---------------------------------------------------------------------------
 
 int SubscriberHub::resendPending(
@@ -283,11 +285,10 @@ int SubscriberHub::resendPending(
     constexpr std::size_t kHeaderSessionIdOff = 8;
 
     int resent = 0;
-    std::lock_guard<std::mutex> lk(mtx_);
-    for (auto& [corrId, ps] : pendingByCorrelation_) {
-        if (!ps.impl) continue;
-        if (!ps.impl->active.load(std::memory_order_acquire)) continue; // unsubscribed
-        auto& frame = ps.subscribeFrame;
+    for (auto& [corrId, req] : pendingByCorrelation_) {
+        if (!req || !req->impl) continue;
+        if (!req->impl->active) continue; // unsubscribed
+        auto& frame = req->subscribeFrame;
         if (frame.size() < kHeaderSessionIdOff + 8) continue;
 
         const uint64_t u = static_cast<uint64_t>(newSessionId);
@@ -303,7 +304,6 @@ int SubscriberHub::resendPending(
 
 bool SubscriberHub::hasPending() const
 {
-    std::lock_guard<std::mutex> lk(mtx_);
     return !pendingByCorrelation_.empty();
 }
 
@@ -313,26 +313,13 @@ bool SubscriberHub::hasPending() const
 
 void SubscriberHub::failPendingSubscribes(const std::string& reason)
 {
-    // Collect the impls to fail under the lock, then deactivate outside.
-    std::vector<std::shared_ptr<SubscriptionImpl>> toFail;
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (auto& [corrId, ps] : pendingByCorrelation_) {
-            if (ps.impl) {
-                // Mark inactive so a late SubscribeResponse / Records push is
-                // treated as an already-unsubscribed response and dropped.
-                ps.impl->active.store(false, std::memory_order_release);
-                toFail.push_back(ps.impl);
-            }
-        }
-        pendingByCorrelation_.clear();
+    // Finishing the impl (inactive + closed status ring) is the error signal:
+    // the app's Subscription::active() turns false.  No unsubscribe frame is
+    // needed — the broker never bound the id.
+    for (auto& [corrId, req] : pendingByCorrelation_) {
+        if (req && req->impl) finish_(*req->impl);
     }
-    // Note: SubscriptionImpl does not currently hold a promise / future — the
-    // Subscription handle is the app's only reference.  Marking active=false
-    // is the error signal; the app polls subscriptionId() / active.  This
-    // mirrors the deactivateAll() semantics (no unsubscribe frame needed — the
-    // broker never bound the id).  If a future per-subscribe promise is added
-    // (Milestone-C), resolve it with an exception here.
+    pendingByCorrelation_.clear();
     (void)reason;
 }
 
@@ -342,34 +329,34 @@ void SubscriberHub::failPendingSubscribes(const std::string& reason)
 
 void SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now)
 {
-    std::lock_guard<std::mutex> lk(mtx_);
     for (auto it = pendingByCorrelation_.begin();
          it != pendingByCorrelation_.end(); )
     {
-        if (now >= it->second.deadline) {
-            if (it->second.impl) {
-                it->second.impl->active.store(false, std::memory_order_release);
-            }
+        if (now >= it->second->deadline) {
+            if (it->second->impl) finish_(*it->second->impl);
             it = pendingByCorrelation_.erase(it);
         } else {
             ++it;
         }
     }
+
+    // F8a: retry snapshots a near-full status ring refused earlier.
+    for (auto& [subId, impl] : activeById_) {
+        if (impl->statusDirty) publishStatus_(*impl);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostics
+// Diagnostics (duty thread / quiescent tests)
 // ---------------------------------------------------------------------------
 
 std::size_t SubscriberHub::pendingCount() const
 {
-    std::lock_guard<std::mutex> lk(mtx_);
     return pendingByCorrelation_.size();
 }
 
 std::size_t SubscriberHub::activeCount() const
 {
-    std::lock_guard<std::mutex> lk(mtx_);
     return activeById_.size();
 }
 

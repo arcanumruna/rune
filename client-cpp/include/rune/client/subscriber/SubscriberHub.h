@@ -2,51 +2,47 @@
 //
 // CB-4 — SubscriberHub: manages all active subscriptions.
 //
-// Threading model:
-//   - The routing table (pendingByCorrelation_ + activeById_) is guarded by
-//     mtx_ — a control-plane mutex.  It is NEVER held during record dispatch;
-//     the dispatch hot path is lock-free (the impl's atomic active flag is
-//     checked before calling the handler).
-//
-//   - subscribe() [app thread]: encodes the Subscribe frame, registers
-//     the impl keyed by correlationId (under mtx_), submits via the agent
-//     ring, and returns the Subscription immediately.  Records begin flowing
-//     once the SubscribeResponse binds the subscriptionId.
-//
-//   - onSubscribeResponse() [agent thread]: moves the pending entry from
-//     pendingByCorrelation_ to activeById_, storing the broker-assigned
-//     subscriptionId.
-//
-//   - onRecords() [agent thread]: looks up the Subscription by subscriptionId,
-//     checks active flag, decodes the RecordBatch via RecordBatchReader, and
-//     calls the handler once per record.  Updates nextOffset after each record.
-//     Lock is NOT held during handler dispatch.
-//
-//   - unsubscribe() [app/any thread]: sends Unsubscribe frame; the hub
-//     removes the entry from activeById_ on the agent thread when the frame
-//     has been processed (or on the next Records look-up for an inactive sub).
-//
-// Design choice (from the brief): routing table lives under a mutex (control-
-// plane).  The record-dispatch hot path does NOT take the mutex; it copies the
-// shared_ptr out under lock then drops the lock before calling the handler.
+// Threading model (F8a — shared-nothing, no mutex, no atomics):
+//   - The hub and every table in it are OWNED by the duty thread (the Thread-
+//     mode runner, or the Invoker owner).  Every method below except the static
+//     makeSubscribeRequest() runs on that thread only.
+//   - App-thread API calls never touch the hub: Client::subscribe() builds a
+//     SubscribeRequest (makeSubscribeRequest, a pure function) and hands it to
+//     the duty thread as a HubCommand{SubscribeAdd} on the agent command ring;
+//     Subscription::unsubscribe() sends HubCommand{Unsubscribe}.  The duty
+//     thread applies them via applyCommand().
+//   - Duty-thread state the app needs (subscriptionId, resume position,
+//     liveness) is PUBLISHED to each subscription's StatusRing; the app-side
+//     Subscription handle drains it.  Invariant: whenever the hub drops a
+//     subscription (unsubscribed, timed out, failed, closed) it publishes the
+//     final snapshot and closes that ring.
+//   - Record dispatch (onRecords) is a plain map lookup + handler call; one
+//     status publish per Records frame (never per record).
 
 #pragma once
 
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/detail/HubCommand.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 namespace rune::client::subscriber {
+
+/// App-thread -> duty-thread hand-off for one subscribe() call (heap-allocated
+/// by the app thread, ownership passed through the agent command ring).
+struct SubscribeRequest {
+    std::shared_ptr<SubscriptionImpl>     impl;
+    std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
+    std::chrono::steady_clock::time_point deadline;        // M2: subscribe-request timeout
+};
 
 class SubscriberHub {
 public:
@@ -65,56 +61,58 @@ public:
     SubscriberHub& operator=(SubscriberHub&&) = delete;
 
     // -------------------------------------------------------------------------
-    // App-thread API
+    // App thread: build the duty-thread hand-off (pure — touches no hub state)
     // -------------------------------------------------------------------------
 
-    /// Build and submit a Subscribe message.
+    /// Encode the Subscribe frame for `impl` (stack-encoded, then copied into
+    /// the request) and package it with the subscribe-request deadline.  The
+    /// caller hands the returned request to the duty thread as
+    /// HubCommand{SubscribeAdd, handle = request.release()}.
     ///
-    /// Encodes the Subscribe frame, registers the impl under correlationId
-    /// (mutex-guarded), and writes the frame to the agent ring via submitFn.
-    ///
-    /// Returns the Subscription handle immediately.  The broker-assigned
-    /// subscriptionId will be bound asynchronously when SubscribeResponse arrives.
-    ///
-    /// Parameters:
-    ///   impl         — shared subscription state (created by Client::subscribe())
-    ///   sessionId    — current session id
-    ///   correlationId— unique id for this subscribe request
-    ///   topicId      — topic id
-    ///   partition    — partition number
-    ///   fromOffset   — wire-encoded From value (see From::toWire())
-    ///   isolation    — isolation byte
-    ///   keyBytes     — key bytes (zero-copy span; valid only during this call)
+    ///   fromOffset     — wire-encoded From value (see From::toWire())
+    ///   isolation      — isolation byte
+    ///   keyBytes       — key bytes (valid only during this call)
     ///   partitionKnown — 1 if partition is explicit, 0 if resolved from key
-    ///   deadline     — subscribe-request timeout (M2: sweepTimedOut fails it if no response)
-    ///   submitFn     — calls agent_.submitSend(frame, len)
-    void registerSubscribe(std::shared_ptr<SubscriptionImpl>             impl,
-                           int64_t                                       sessionId,
-                           int64_t                                       correlationId,
-                           int32_t                                       topicId,
-                           int32_t                                       partition,
-                           uint8_t                                       partitionKnown,
-                           int64_t                                       fromOffset,
-                           uint8_t                                       isolation,
-                           std::span<const uint8_t>                      keyBytes,
-                           std::chrono::steady_clock::time_point         deadline,
-                           const SendFn&                                  submitFn);
+    ///   deadline       — subscribe-request timeout (sweepTimedOut fails it)
+    [[nodiscard]] static std::unique_ptr<SubscribeRequest>
+    makeSubscribeRequest(std::shared_ptr<SubscriptionImpl>     impl,
+                         int64_t                               sessionId,
+                         uint8_t                               partitionKnown,
+                         int64_t                               fromOffset,
+                         uint8_t                               isolation,
+                         std::span<const uint8_t>              keyBytes,
+                         std::chrono::steady_clock::time_point deadline);
 
-    /// Submit an Unsubscribe frame for a given subscriptionId.
-    ///
-    /// Called from Subscription::unsubscribe() (any thread).
-    /// Marks the impl inactive and writes Unsubscribe to the agent ring.
-    /// The routing entry will be cleaned up on the next agent-thread access.
-    void sendUnsubscribe(int64_t subscriptionId,
-                         int64_t sessionId,
-                         int64_t correlationId,
-                         const SendFn& submitFn);
+    // -------------------------------------------------------------------------
+    // Duty thread: commands drained from the agent ring
+    // -------------------------------------------------------------------------
+
+    /// Apply one subscriber HubCommand (SubscribeAdd / Unsubscribe).
+    /// `unsubCorrId` is a fresh correlationId for an Unsubscribe frame (used
+    /// only by Op::Unsubscribe on a bound subscription).  Ops that are not
+    /// subscriber ops are ignored.
+    void applyCommand(const detail::HubCommand& cmd,
+                      int64_t                   unsubCorrId,
+                      int64_t                   sessionId,
+                      const SendFn&             submitFn);
+
+    /// Adopt a SubscribeRequest: register it as pending (keyed by its
+    /// correlationId) and send its Subscribe frame.
+    void adoptSubscribe(std::unique_ptr<SubscribeRequest> req, const SendFn& submitFn);
+
+    /// Unsubscribe the subscription whose Subscribe correlationId is
+    /// `subscribeCorrId`.  Bound: drop the routing entry, send Unsubscribe
+    /// (unsubCorrId), close its status ring.  Still pending: mark it inactive
+    /// and close its status ring; the late SubscribeResponse then triggers the
+    /// CB-5 A2 Unsubscribe with the real id.  Unknown: no-op.
+    void unsubscribe(int64_t subscribeCorrId, int64_t unsubCorrId,
+                     int64_t sessionId, const SendFn& submitFn);
 
     // -------------------------------------------------------------------------
     // Agent-thread callbacks (called from ClientAgent's egress observer)
     // -------------------------------------------------------------------------
 
-    /// Called on the agent thread when a SubscribeResponse arrives.
+    /// Called on the duty thread when a SubscribeResponse arrives.
     ///
     /// Binds the broker-assigned subscriptionId to the pending impl, and moves
     /// the entry from pendingByCorrelation_ to activeById_.
@@ -139,9 +137,9 @@ public:
     /// (Aeron guarantees the fragment buffer is live for the callback duration).
     void onRecords(const codec::RecordsView& rv);
 
-    /// Fail / deactivate all active subscriptions (called on close).
-    /// Marks all impls inactive.  No Unsubscribe frames are sent (transport
-    /// is shutting down anyway).
+    /// Fail / deactivate all subscriptions (called on close, after the duty
+    /// thread is gone).  Publishes each final snapshot and closes each status
+    /// ring.  No Unsubscribe frames are sent (transport is shutting down).
     void deactivateAll();
 
     /// M2 FIX [CB-5]: Fail all PENDING (unbound) subscriptions with a clear
@@ -158,6 +156,8 @@ public:
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.
     /// Called from Client::sweepTimeouts() on the runner thread.
+    /// F8a: also re-publishes any status snapshot a near-full status ring
+    /// refused earlier (the app drained since), so position() converges.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
     /// CB-5 B: resend every PENDING Subscribe frame after a leader redirect +
@@ -195,18 +195,12 @@ public:
     }
 
 private:
-    // ---- Routing tables (guarded by mtx_) ------------------------------------
-    mutable std::mutex mtx_;
+    // ---- Routing tables (duty-thread owned; no lock) ---------------------------
 
     // Pending subscriptions: Subscribe sent, SubscribeResponse not yet received.
-    // Key: correlationId.  Stores the impl plus the encoded Subscribe frame so
-    // the frame can be re-stamped + resent on a leader redirect (CB-5 B).
-    struct PendingSub {
-        std::shared_ptr<SubscriptionImpl>     impl;
-        std::vector<uint8_t>                  subscribeFrame; // encoded Subscribe (for redirect resend)
-        std::chrono::steady_clock::time_point deadline;       // M2: subscribe-request timeout
-    };
-    std::map<int64_t, PendingSub> pendingByCorrelation_;
+    // Key: correlationId.  The request keeps the encoded Subscribe frame so it
+    // can be re-stamped + resent on a leader redirect (CB-5 B).
+    std::map<int64_t, std::unique_ptr<SubscribeRequest>> pendingByCorrelation_;
 
     // Active subscriptions: SubscribeResponse received, subscriptionId bound.
     // Key: subscriptionId.
@@ -214,6 +208,12 @@ private:
 
     // fix1 C1 / fix2 minor-5: plain counter, written only on the agent thread.
     uint64_t callbackExceptions_ = 0;
+
+    /// Publish impl's current snapshot (ordinary update; a refusal marks it
+    /// dirty for the sweep to retry).
+    static void publishStatus_(SubscriptionImpl& impl);
+    /// Mark impl finished: inactive, final snapshot, status ring closed.
+    static void finish_(SubscriptionImpl& impl);
 };
 
 } // namespace rune::client::subscriber

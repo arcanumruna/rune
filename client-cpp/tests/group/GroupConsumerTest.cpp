@@ -78,7 +78,11 @@
 
 #include <gtest/gtest.h>
 
+#include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/M2ORingBuffer.h>
+
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -96,6 +100,15 @@ namespace rpc = rune::protocol::client;
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
+
+/// F8a: a HubCommandSink that applies the command to the hub synchronously —
+/// the single-threaded stand-in for "agent ring -> duty thread" (the test
+/// thread IS the duty thread in these hub-level tests).
+static rune::client::detail::HubSubmit directSink(void* ctx,
+                                                  const rune::client::detail::HubCommand& cmd) {
+    static_cast<GroupConsumerHub*>(ctx)->applyCommand(cmd);
+    return rune::client::detail::HubSubmit::Accepted;
+}
 
 static constexpr int32_t kTopicId    = 42;
 static constexpr int32_t kPartition  = 0;
@@ -306,7 +319,7 @@ protected:
         impl_->cfg.sessionTimeoutMs     = 30000;
         impl_->cfg.autoCommitIntervalMs = 5000;
         impl_->cfg.autoCommit           = true;
-        impl_->active.store(true, std::memory_order_relaxed);
+        impl_->active = true;
         impl_->state = GroupConsumerState::Unjoined;
         hub_->add(impl_);
     }
@@ -435,7 +448,7 @@ TEST_F(GroupConsumerHubTest, CommitEnqueuedAndSent) {
     impl_->assignment[tp] = 7;
 
     // Enqueue commit.
-    impl_->commitRequested.store(true, std::memory_order_release);
+    impl_->commitRequested = true;
 
     // doWork should drain the request and send OffsetCommit.
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -454,7 +467,7 @@ TEST_F(GroupConsumerHubTest, CommitEnqueuedAndSent) {
     EXPECT_TRUE(found) << "Expected OffsetCommit frame to be sent";
 
     // commitRequested must be cleared.
-    EXPECT_FALSE(impl_->commitRequested.load(std::memory_order_acquire));
+    EXPECT_FALSE(impl_->commitRequested);
 }
 
 // ---------------------------------------------------------------------------
@@ -464,13 +477,9 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesOnOffsetCommitResponse) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
 
     // Arm commitSync.
-    std::promise<void> prom;
-    auto fut = prom.get_future();
-    {
-        std::lock_guard<std::mutex> lk(impl_->commitSyncMtx);
-        impl_->commitSyncPromise = std::move(prom);
-        impl_->commitSyncPending = true;
-    }
+    auto prom = std::make_unique<std::promise<void>>();
+    auto fut = prom->get_future();
+    impl_->commitSyncPromise = std::move(prom);
 
     // Inject OffsetCommitResponse.
     auto ocr = makeOffsetCommitResponse();
@@ -480,9 +489,8 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesOnOffsetCommitResponse) {
     ASSERT_EQ(fut.wait_for(100ms), std::future_status::ready);
     EXPECT_NO_THROW(fut.get());
 
-    // Pending flag cleared.
-    std::lock_guard<std::mutex> lk(impl_->commitSyncMtx);
-    EXPECT_FALSE(impl_->commitSyncPending);
+    // Pending promise consumed.
+    EXPECT_FALSE(impl_->commitSyncPromise);
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +603,7 @@ TEST_F(GroupConsumerHubTest, CloseDeactivates_NoDispatchAfterClose) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
 
     // Close the consumer.
-    impl_->active.store(false, std::memory_order_release);
+    impl_->active = false;
 
     // Records should not be delivered to an inactive consumer.
     codec::RecordsView rv;
@@ -612,7 +620,7 @@ TEST_F(GroupConsumerHubTest, CloseDeactivates_NoDispatchAfterClose) {
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnClose) {
     // Create a GroupConsumer handle.
-    GroupConsumer gc(impl_);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
 
     bringToStable(*hub_, sink_, kTopicId, kPartition);
 
@@ -737,7 +745,7 @@ TEST_F(GroupConsumerHubTest, PositionNotRegressOnNewRecords) {
 // 19. GroupConsumer_CloseIsIdempotent
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, GroupConsumer_CloseIsIdempotent) {
-    GroupConsumer gc(impl_);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
     EXPECT_TRUE(gc.active());
 
     gc.close();
@@ -752,7 +760,7 @@ TEST_F(GroupConsumerHubTest, GroupConsumer_CloseIsIdempotent) {
 // 20. GroupConsumer_MoveSemantics
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, GroupConsumer_MoveSemantics) {
-    GroupConsumer gc1(impl_);
+    GroupConsumer gc1(impl_, &directSink, hub_.get());
     EXPECT_TRUE(gc1.active());
 
     GroupConsumer gc2(std::move(gc1));
@@ -761,7 +769,7 @@ TEST_F(GroupConsumerHubTest, GroupConsumer_MoveSemantics) {
 
     gc2.close();
     EXPECT_FALSE(gc2.active());
-    EXPECT_FALSE(impl_->active.load(std::memory_order_acquire));
+    EXPECT_FALSE(impl_->active);
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +889,7 @@ TEST_F(GroupConsumerHubTest, OffsetFetchSeedsPosition) {
     EXPECT_EQ(impl_->assignment.at(tp), 10000);
 
     // Now trigger manual commit.
-    impl_->commitRequested.store(true, std::memory_order_release);
+    impl_->commitRequested = true;
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     hub_->doWork(nowNs, kSessionId, sink_.fn());
@@ -941,7 +949,7 @@ TEST_F(GroupConsumerHubTest, ResumeAfterReconnectPreservesCommittedOffset) {
 
     // Commit must use 500, not 0.
     sink_.clear();
-    impl_->commitRequested.store(true, std::memory_order_release);
+    impl_->commitRequested = true;
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     hub_->doWork(nowNs, kSessionId, sink_.fn());
@@ -1058,7 +1066,7 @@ TEST_F(GroupConsumerHubTest, SubscribeGroupEndToEnd) {
 
     // ---- Step 6: commit() → OffsetCommit sent with offset=103.
     sink_.clear();
-    impl_->commitRequested.store(true, std::memory_order_release);
+    impl_->commitRequested = true;
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     hub_->doWork(nowNs, kSessionId, sink_.fn());
@@ -1134,7 +1142,7 @@ TEST_F(GroupConsumerHubTest, MultiGroupGuard_OneConsumerPerHub) {
     impl2->groupId  = "group-2";
     impl2->topicIds = {kTopicId + 1};
     impl2->cfg      = impl_->cfg;
-    impl2->active.store(true, std::memory_order_relaxed);
+    impl2->active = true;
     impl2->state = GroupConsumerState::Unjoined;
     hub_->add(impl2);
 
@@ -1162,7 +1170,7 @@ TEST_F(GroupConsumerHubTest, CommitScratchReused) {
 
     // First commit.
     sink_.clear();
-    impl_->commitRequested.store(true, std::memory_order_release);
+    impl_->commitRequested = true;
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     hub_->doWork(nowNs, kSessionId, sink_.fn());
@@ -1175,7 +1183,7 @@ TEST_F(GroupConsumerHubTest, CommitScratchReused) {
 
     // Second commit: scratch is cleared and repopulated.
     sink_.clear();
-    impl_->commitRequested.store(true, std::memory_order_release);
+    impl_->commitRequested = true;
     const int64_t nowNs2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     hub_->doWork(nowNs2, kSessionId, sink_.fn());
@@ -1184,52 +1192,188 @@ TEST_F(GroupConsumerHubTest, CommitScratchReused) {
 }
 
 // ---------------------------------------------------------------------------
-// 28. TwoThreadCommitDoWork_NoRace (#6 — real 2-thread TSan test)
-//     Runs commit() from one thread and doWork() from another concurrently.
-//     Must complete without races under TSan (compile with -fsanitize=thread).
-//     The test self-terminates after N iterations.
+// 28. TwoThreadCommitDoWork_NoRaceRegression (#6 / F8a — real 2-thread TSan test)
+//     An app thread calls commit() / commitSync() on a GroupConsumer handle
+//     whose sink writes HubCommands onto a real M2O ring; a duty thread drains
+//     that ring into the hub, runs doWork(), and answers the OffsetCommit.  The
+//     only memory the two threads share is the rings (command ring + the impl's
+//     status ring) — TSan proves there is no other.  No sleeps: both loops end
+//     on conditions.
 // ---------------------------------------------------------------------------
-TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRace) {
-    bringToStable(*hub_, sink_, kTopicId, kPartition);
+namespace {
+struct GroupRingChannel {
+    static constexpr int32_t kCap = 64 * 1024;
+    std::unique_ptr<uint8_t[]> mem{
+        new uint8_t[kCap + rune::client::detail::M2ORingBuffer::trailerLength()]()};
+    rune::client::detail::M2ORingBuffer ring{
+        mem.get(),
+        static_cast<std::size_t>(kCap + rune::client::detail::M2ORingBuffer::trailerLength())};
 
-    // Seed position so commits go through.
+    static rune::client::detail::HubSubmit fn(void* ctx, const rune::client::detail::HubCommand& c) {
+        auto* self = static_cast<GroupRingChannel*>(ctx);
+        while (!self->ring.writeWith(1, sizeof(c), [&](aeron::concurrent::AtomicBuffer& b,
+                                                      aeron::util::index_t at) {
+            std::memcpy(b.buffer() + at, &c, sizeof(c));
+        })) {
+            std::this_thread::yield();
+        }
+        return rune::client::detail::HubSubmit::Accepted;
+    }
+    void drainInto(GroupConsumerHub& hub) {
+        ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at,
+                      aeron::util::index_t) {
+            rune::client::detail::HubCommand c;
+            std::memcpy(&c, b.buffer() + at, sizeof(c));
+            hub.applyCommand(c);
+        });
+    }
+};
+} // namespace
+
+TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
     auto ofr = makeOffsetFetchResponse(kTopicId, kPartition, 5);
     hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
 
+    GroupRingChannel ch;
+    GroupConsumer gc(impl_, &GroupRingChannel::fn, &ch);
     constexpr int kIterations = 500;
-    std::atomic<int> appDone{0};
+    std::atomic<bool> appDone{false};   // test-harness flags only
+    std::atomic<int>  commitsSent{0};
 
-    // App thread: call commit() in a tight loop.
-    std::thread appThread([&]() {
-        for (int i = 0; i < kIterations; ++i) {
-            impl_->commitRequested.store(true, std::memory_order_release);
-            // Busy-yield; no sleep — maximise interleaving for TSan.
-            std::this_thread::yield();
-        }
-        appDone.store(1, std::memory_order_release);
-    });
-
-    // Runner thread: call doWork() in a tight loop until app is done.
-    // Uses a local send sink that does nothing (avoids output races).
-    std::atomic<int> runnerSent{0};
-    std::thread runnerThread([&]() {
-        SendFn noopSend = [&](int32_t, const uint8_t*, std::size_t) -> bool {
-            runnerSent.fetch_add(1, std::memory_order_relaxed);
+    std::thread duty([&]() {
+        SendFn send = [&](int32_t, const uint8_t* b, std::size_t n) -> bool {
+            if (n >= 4 && (static_cast<uint16_t>(b[2]) | (static_cast<uint16_t>(b[3]) << 8)) ==
+                              static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
+                commitsSent.fetch_add(1, std::memory_order_relaxed);
+            }
             return true;
         };
-        while (appDone.load(std::memory_order_acquire) == 0 ||
-               impl_->commitRequested.load(std::memory_order_acquire)) {
+        const auto ocr = makeOffsetCommitResponse();
+        while (!appDone.load(std::memory_order_acquire)) {
+            ch.drainInto(*hub_);
             const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            hub_->doWork(nowNs, kSessionId, noopSend);
+            hub_->doWork(nowNs, kSessionId, send);
+            // Play the broker: acknowledge an in-flight commitSync.
+            if (impl_->commitSyncPromise) hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
             std::this_thread::yield();
         }
     });
 
-    appThread.join();
-    runnerThread.join();
+    for (int i = 0; i < kIterations; ++i) gc.commit();
+    auto fut = gc.commitSync();
+    EXPECT_NO_THROW(fut.get()) << "the duty thread resolves the promise it owns";
+    gc.close();
+    while (!impl_->status.closed()) std::this_thread::yield();  // duty applied close
+    EXPECT_FALSE(gc.active());
+    appDone.store(true, std::memory_order_release);
+    duty.join();
 
-    // Some commits must have gone through (runner consumed the flag at least once).
-    EXPECT_GT(runnerSent.load(std::memory_order_relaxed), 0)
-        << "Runner must have sent at least one OffsetCommit";
+    EXPECT_GT(commitsSent.load(), 0) << "commit commands must reach the wire";
+    EXPECT_FALSE(impl_->active);
+}
+
+// ---------------------------------------------------------------------------
+// F8a regressions — the handle never writes duty-owned state.
+// ---------------------------------------------------------------------------
+namespace {
+struct CapturingGroupSink {
+    std::vector<rune::client::detail::HubCommand> cmds;
+    int calls = 0;
+    static rune::client::detail::HubSubmit fn(void* ctx, const rune::client::detail::HubCommand& c) {
+        auto* self = static_cast<CapturingGroupSink*>(ctx);
+        ++self->calls;
+        self->cmds.push_back(c);
+        return rune::client::detail::HubSubmit::Accepted;
+    }
+};
+} // namespace
+
+TEST_F(GroupConsumerHubTest, CommitAndCloseAreCommandsNotSharedWritesRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    CapturingGroupSink cap;
+    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap);
+
+    gc.commit();
+    ASSERT_EQ(cap.cmds.size(), 1u);
+    EXPECT_EQ(cap.cmds[0].op, rune::client::detail::HubCommand::Op::GroupCommit);
+    EXPECT_FALSE(impl_->commitRequested) << "app thread wrote no duty-owned field";
+    hub_->applyCommand(cap.cmds[0]);
+    EXPECT_TRUE(impl_->commitRequested);
+
+    auto fut = gc.commitSync();
+    ASSERT_EQ(cap.cmds.size(), 2u);
+    EXPECT_FALSE(impl_->commitSyncPromise) << "the promise travels in the command";
+    hub_->applyCommand(cap.cmds[1]);
+    ASSERT_TRUE(impl_->commitSyncPromise);
+
+    gc.close();
+    EXPECT_FALSE(gc.active()) << "handle-local: inactive at once";
+    EXPECT_TRUE(impl_->active) << "duty-owned flag untouched until the command is applied";
+    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready);
+    ASSERT_EQ(cap.cmds.size(), 3u);
+    hub_->applyCommand(cap.cmds[2]);
+    EXPECT_FALSE(impl_->active);
+    EXPECT_TRUE(impl_->status.closed());
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(fut.get(), std::runtime_error);
+
+    gc.close();  // idempotent
+    EXPECT_EQ(cap.calls, 3);
+}
+
+TEST_F(GroupConsumerHubTest, CommitSyncSupersededFailsOlderFutureRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    auto f1 = gc.commitSync();
+    auto f2 = gc.commitSync();
+    ASSERT_EQ(f1.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(f1.get(), std::runtime_error);
+    EXPECT_NE(f2.wait_for(0ms), std::future_status::ready);
+    auto ocr = makeOffsetCommitResponse();
+    hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
+    ASSERT_EQ(f2.wait_for(0ms), std::future_status::ready);
+    EXPECT_NO_THROW(f2.get());
+}
+
+// A commitSync for a consumer the hub does not hold (never adopted / foreign)
+// is failed, never stranded.
+TEST_F(GroupConsumerHubTest, CommitSyncForUnknownConsumerFailsNeverStrandsRegression) {
+    auto other = std::make_shared<GroupConsumerImpl>();  // never added to hub_
+    GroupConsumer gc(other, &directSink, hub_.get());
+    auto f = gc.commitSync();
+    ASSERT_EQ(f.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(f.get(), std::runtime_error);
+}
+
+// After the Client closes (closeAll), a surviving handle never touches the
+// sink (the possibly-destroyed Client) again and fails commitSync at once.
+TEST_F(GroupConsumerHubTest, HandleNeverTouchesClientAfterCloseAllRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    CapturingGroupSink cap;
+    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap);
+    EXPECT_TRUE(gc.active());
+
+    hub_->closeAll(kSessionId, sink_.fn());
+    EXPECT_FALSE(gc.active());
+    gc.commit();
+    auto f = gc.commitSync();
+    ASSERT_EQ(f.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(f.get(), std::runtime_error);
+    gc.close();
+    EXPECT_EQ(cap.calls, 0);
+}
+
+// GroupAdd: the duty thread adopts the impl and frees the heap holder.
+TEST(GroupConsumerHubCommand, GroupAddAdoptsAndFreesHolderRegression) {
+    GroupConsumerHub hub;
+    auto impl = std::make_shared<GroupConsumerImpl>();
+    EXPECT_TRUE(hub.empty());
+    rune::client::detail::HubCommand c;
+    c.op     = rune::client::detail::HubCommand::Op::GroupAdd;
+    c.handle = reinterpret_cast<uint64_t>(new std::shared_ptr<GroupConsumerImpl>(impl));
+    hub.applyCommand(c);
+    EXPECT_FALSE(hub.empty());
+    EXPECT_EQ(impl.use_count(), 2) << "hub + local; the holder was freed";
 }
