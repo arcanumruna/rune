@@ -1005,6 +1005,21 @@ void BrokerNode::buildWorkerPool() {
     }
 
     if (config_.shardMode()) {
+        // Spec §3.1 never-block: a shard has no inline-fsync fallback, so the
+        // selected io backend MUST accept submissions (Task 10 fix 1 / C1).
+        for (int32_t i = 0; i < wc; ++i) {
+            if (!workerPool_->worker(i).ioAcceptsSubmissions()) {
+                const char* v = std::getenv(kIoBackendEnv);
+                throw std::runtime_error(
+                    "BrokerNode[" + std::to_string(config_.nodeId) + "]: " + kIoBackendEnv + "=" +
+                    (v ? v : "") + " selects an io backend that cannot accept submissions; shard "
+                    "mode requires a working async-durability backend (unset it, or use 'portable'"
+#if defined(__linux__)
+                    " or 'uring'"
+#endif
+                    ") — refusing to start");
+            }
+        }
         // Self-contained worker shards (spec §3.1): each worker's client ingress,
         // record egress and plane are attached in attachShardRuntimes_() on its
         // OWN client, after the long startup phases (fix round 1 I2).
@@ -1152,6 +1167,25 @@ void BrokerNode::buildWorkerPool() {
 //   Effect: followers degrade to accept locally (empty endpoint path in BR-5).
 //   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
 // ---------------------------------------------------------------------------
+void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
+    if (haltRaised_) return;
+    haltRaised_ = true;
+    spdlog::critical("BrokerNode[{}]: STORAGE FAILURE — fsync failed on {} (errno={}: {}). "
+                     "The log is permanently failed; HALTING the broker (exit {}). Restart "
+                     "recovery truncates to the last valid batch; replication re-heals it.",
+                     config_.nodeId, logDir, err, std::strerror(err), kExitStorageFailure);
+    if (haltHandler_) {
+        haltHandler_(haltCtx_, kExitStorageFailure);
+        return;
+    }
+    // No owner-installed handler: stop through the normal path from a helper
+    // thread (stop() joins this runtime thread), then exit with the code.
+    std::thread([this] {
+        stop();
+        std::_Exit(kExitStorageFailure);
+    }).detach();
+}
+
 void BrokerNode::buildGateway() {
     if (startupPhaseHookForTest_) startupPhaseHookForTest_("build-gateway");   // test-only fault injection
     // Capture config_ by value (immutable after construction).
@@ -1188,6 +1222,11 @@ void BrokerNode::buildGateway() {
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
+        // fsyncgate fail-stop: worker StorageFailure signals (and the gateway's
+        // own flushDirtyLogs) land here on the runtime thread → halt.
+        gateway_->setStorageFailureHandler([this](const std::string& dir, int err) {
+            onStorageFailure_(dir, err);
+        });
 
         // Wire in the ReplicaRegistry (GR-4). Non-owning pointer; replicaRegistry_
         // outlives the gateway (gateway_ is destroyed before replicaRegistry_ in stop()).

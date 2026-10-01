@@ -77,7 +77,7 @@ TEST(UringDurabilityTest, SubmitThenReapCompletesForRealFd) {
 
     EXPECT_EQ(got.token, tok);
     EXPECT_EQ(got.errorCode, 0) << "unexpected fsync error";
-    EXPECT_EQ(got.flushBoundary, 5);
+    EXPECT_EQ(got.flushBoundary, 0) << "io_uring does not track boundaries (I2: match by token)";
 
     ::close(fd);
     ::unlink(path);
@@ -157,8 +157,9 @@ TEST(UringDurabilityTest, GroupCommit) {
                 if (tokens[j] == c.token) {
                     EXPECT_EQ(c.errorCode, 0)
                         << "unexpected fsync error for token " << c.token;
-                    EXPECT_EQ(c.flushBoundary, boundaries[j])
-                        << "wrong flushBoundary for token " << c.token;
+                    EXPECT_EQ(c.flushBoundary, 0)
+                        << "io_uring reports no boundary (I2) for token " << c.token
+                        << " (submitted " << boundaries[j] << ")";
                     tokens[j] = kNoToken;  // mark seen
                     ++reaped;
                     break;
@@ -207,7 +208,7 @@ TEST(UringDurabilityTest, AckOnlyAfterCompletion) {
 
     EXPECT_EQ(got.token, tok);
     EXPECT_EQ(got.errorCode, 0);
-    EXPECT_EQ(got.flushBoundary, 8);
+    EXPECT_EQ(got.flushBoundary, 0) << "io_uring does not track boundaries (I2: match by token)";
 
     ::close(fd);
     ::unlink(path);

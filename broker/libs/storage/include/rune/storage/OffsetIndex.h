@@ -20,7 +20,7 @@ public:
     // CP-10: msync only the written prefix (entries_ * kEntrySize) instead of the
     // full over-provisioned 8 MiB mapping.  The untouched tail is zero-filled and
     // never dirtied, so syncing it is pure waste on every seal / durable append.
-    void sync() { file_->sync(static_cast<size_t>(entries_) * static_cast<size_t>(kEntrySize)); }
+    [[nodiscard]] int sync() { return file_->sync(static_cast<size_t>(entries_) * static_cast<size_t>(kEntrySize)); }
     /// Rescan the mmap to count valid entries written by a previous process.
     /// Call after opening an existing index file (e.g. after recover() renames
     /// .index.tmp → .index and reopens from the canonical path).

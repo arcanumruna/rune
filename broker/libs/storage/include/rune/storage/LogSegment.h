@@ -10,6 +10,20 @@
 #include <unistd.h>
 namespace rune::storage {
 
+/// Per-Log storage health + inline-fsync accounting, owned by the Log and shared
+/// (by pointer) with each of its segments.  Single owner thread (the Log's writer).
+///   syncCalls      — every inline LogSegment::sync (test visibility: a shard loop
+///                    must make none).
+///   failedErrno    — fsyncgate fail-stop: the FIRST fsync/msync error of any kind
+///                    on this log (inline or async).  Sticky — never clears; a later
+///                    "successful" fsync cannot vouch for pages the kernel dropped.
+///   faultForTest   — test-only: while non-zero every inline sync fails with it.
+struct LogStorageState {
+    uint64_t syncCalls    = 0;
+    int      failedErrno  = 0;
+    int      faultForTest = 0;
+};
+
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.
 ///
 /// Durability policy:
@@ -78,7 +92,25 @@ public:
     /// Called automatically by append() (durable-by-default).
     /// External callers (e.g. group-commit) may call this explicitly after
     /// batching multiple appendNoSync() calls.
+    /// Throws std::system_error on ANY failure (stream flush, fsync, index msync)
+    /// and marks the owning Log permanently failed (LogStorageState::failedErrno).
+    /// On an already-failed log it throws without touching the disk.
     void sync();
+
+    /// Wire the owning Log's storage state (set by Log when it installs the segment).
+    void setStorageState(LogStorageState* s) noexcept { storage_ = s; }
+
+    /// M1: async flushes in flight on this segment's fd.  The owning Log never
+    /// closes (destroys) a segment while this is > 0 — it is retired and closed
+    /// on the completion that unpins it.  Owner thread only.
+    void     pinFlush() noexcept { ++flushPins_; }
+    uint32_t unpinFlush() noexcept { return flushPins_ > 0 ? --flushPins_ : 0; }
+    [[nodiscard]] uint32_t flushPins() const noexcept { return flushPins_; }
+
+    /// Push the libc fstream buffer to the page cache (write(2), no fsync).  Used
+    /// by a deferred (async) seal before the fd is handed to the io backend.
+    /// Returns 0 or EIO.
+    [[nodiscard]] int flushBufferedToPageCache() noexcept;
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
 
@@ -183,6 +215,8 @@ private:
     int64_t baseOffset_; int32_t indexIntervalBytes_;
     int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
     std::string logPath_; std::fstream log_;
+    LogStorageState* storage_ = nullptr;  // owning Log's health/accounting (may be null)
+    uint32_t flushPins_ = 0;              // M1: async flushes in flight on fd_
     int fd_ = -1;   // POSIX fd for fdatasync — mirrors log_ (write path uses fstream)
     std::unique_ptr<OffsetIndex> index_;
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;

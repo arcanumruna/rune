@@ -175,6 +175,7 @@ public:
         , io_(ioSubmitDepth, ioComplDepth)
     {
         durablePending_.reserve(kDurablePendingReserve);
+        initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
         pendingAcksAll_.reserve(kPendingAcksAllReserve);
         retOverflow_.reserve(kRetOverflowReserve);
@@ -202,8 +203,9 @@ public:
     // unit tests. At RUNTIME, ownership changes arrive as a SetOwnership ring op
     // (executeSetOwnership_ from the wire) applied on the worker's own thread —
     // never a cross-thread write to owned_.
-    void setOwnedDirect(OwnedSet set) noexcept {
+    void setOwnedDirect(OwnedSet set) {
         owned_ = std::move(set);
+        rebuildFlushSlots_();
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
@@ -565,25 +567,50 @@ public:
         return io_submitCount_;
     }
 
-    // Task 10 (spec §3.1 never-block) test hooks — owner thread / single-threaded
-    // tests only.  Background (non-ack) flushes: follower flush + owned-log sync.
-    [[nodiscard]] std::size_t bgFlushInFlightForTest() const noexcept { return bgFlushCount_; }
+    // Task 10 (spec §3.1 never-block / fail-stop) test hooks — owner thread or
+    // single-threaded tests only.
+    [[nodiscard]] std::size_t bgFlushInFlightForTest() const noexcept { return bgInFlight_; }
     [[nodiscard]] uint64_t    bgFlushSubmitsForTest() const noexcept { return bgFlushSubmits_; }
     [[nodiscard]] uint64_t    bgFlushErrorsForTest() const noexcept { return bgFlushErrors_; }
+    [[nodiscard]] uint64_t    bgFlushDeferredForTest() const noexcept { return bgFlushDeferred_; }
+    [[nodiscard]] uint64_t    sealSubmitsForTest() const noexcept { return sealSubmits_; }
+    [[nodiscard]] uint64_t    storageFailureSignalsForTest() const noexcept { return storageFailureSignals_; }
+    [[nodiscard]] std::size_t flushSlotCountForTest() const noexcept { return slots_.size(); }
     /// Completions drained from io_ by reapDurableCompletions_ (any token).
     [[nodiscard]] uint64_t    ioCompletionsReapedForTest() const noexcept { return ioCompletionsReaped_; }
-    /// Submits a Follower-kind background flush; returns its token, or kNoToken
-    /// when it was coalesced into one already in flight / deferred.
+    /// Token whose completion fired the most recent durable (Strict) ack.
+    [[nodiscard]] CompletionToken durableAckTokenForTest() const noexcept { return durableAckToken_; }
+    [[nodiscard]] std::size_t durablePendingCountForTest() const noexcept { return durablePending_.size(); }
+    [[nodiscard]] int64_t     reservedAckSlotsForTest() const noexcept { return reservedAckSlots_(); }
+    /// -1 when this worker has no flush slot for `log`.
+    [[nodiscard]] int64_t lastSyncedLeoForTest(const rune::storage::Log* log) noexcept {
+        const LogFlushSlot* slot = slotOf_(log);
+        return slot ? slot->lastSyncedLeo : -1;
+    }
+    /// Hold io completions in the backend (no reap) so tests deliver them.
+    void setReapPausedForTest(bool on) noexcept { reapPausedForTest_ = on; }
+    /// Every reaped completion is rewritten to carry `err` (0 = off).
+    void forceFlushErrorForTest(int err) noexcept { forcedFlushErrorForTest_ = err; }
+    /// Requests a background flush of an OWNED log; returns its token, or
+    /// kNoToken when coalesced into one already in flight / deferred.
     CompletionToken submitBgFlushForTest(rune::storage::Log* log) {
-        const uint64_t before = bgFlushSubmits_;
-        submitBgFlush_(log, BgFlushKind::Follower);
-        return bgFlushSubmits_ != before ? bgFlush_[bgFlushCount_ - 1].token : kNoToken;
+        LogFlushSlot* slot = slotOf_(log);
+        if (!slot) return kNoToken;
+        return requestBgFlush_(*slot) ? slot->bgToken : kNoToken;
     }
     [[nodiscard]] CompletionToken durablePendingTokenForTest(std::size_t i) const {
         return durablePending_.at(i).token;
     }
     /// Routes a completion exactly as a real reap does (token routing first).
     void deliverCompletionForTest(const FlushCompletion& c) { (void)onFlushCompletion_(c); }
+    /// Feeds one client Produce frame to the worker-ingress handler.
+    int handleIngressFrameForTest(const uint8_t* data, std::size_t len, int64_t nowNs) {
+        return handleWorkerIngressFrame_(data, len, nowNs);
+    }
+    [[nodiscard]] const char* ioBackendNameForTest() const noexcept { return io_.name(); }
+    /// False when RUNE_IO_BACKEND selects a backend that cannot submit — shard
+    /// mode refuses to start on such a worker (BrokerNode).
+    [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
 
     // Task 7: test accessor — true if a Validator is installed for the given topic.
     // Worker-thread only; call only from single-threaded tests.
@@ -732,8 +759,11 @@ public:
                 work += replica->log()->drainCleanerSwaps();
                 work += replica->log()->drainRetentionDeletes();
                 work += replica->log()->drainStagingRenamesDone();
+                // fsyncgate: any inline sync failure on this log → fail-stop.
+                checkStorageFailure_(replica->log());
             }
         }
+        work += flushPendingSignals_();
 
         // E5.1.3 (d) R7 fix: time-based Log::sync on owned user-partition logs.
         //
@@ -766,8 +796,7 @@ private:
         // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
         // into ret_ later: reserve for every one of them (G-A6, never drop).
         if (retOverflow_.empty() &&
-            ret_.freeSlotsForMsgSize(ackSlotBytes_) >
-                static_cast<int64_t>(pendingAcksAll_.size() + durablePending_.size())) {
+            ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
             work += pollWorkerIngress_(nowNs);
         }
         work += submitCoalescedFlushes_();
@@ -780,8 +809,9 @@ private:
         // 4b. follower flushes raised by the replicas (shard replicas run with
         //     setExternalFollowerFlush) → io backend, never an inline fsync.
         for (auto* replica : owned_) {
-            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked())
-                submitBgFlush_(replica->log(), BgFlushKind::Follower);
+            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
+                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
+            }
         }
         // 5. fire due produce acks.
         work += flushOwedAcksAll_(nowNs);
@@ -789,14 +819,15 @@ private:
         work += reapDurableCompletions_();
         // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
         work += pushOwnedSubscriptions_(nowNs);
-        for (auto* replica : owned_) {
-            if (replica && replica->isDiskBacked()) {
-                work += replica->log()->drainCleanerSwaps();
-                work += replica->log()->drainRetentionDeletes();
-                work += replica->log()->drainStagingRenamesDone();
-            }
+        for (auto& slot : slots_) {
+            work += slot.log->drainCleanerSwaps();
+            work += slot.log->drainRetentionDeletes();
+            work += slot.log->drainStagingRenamesDone();
+            if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);   // async roll seals
+            checkStorageFailure_(slot.log);
         }
         work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
+        work += flushPendingSignals_();
         return work;
     }
 
@@ -901,7 +932,12 @@ private:
 
         int work = 0;
         for (rune::storage::Log* log : dirtyThisCycle_) {
-            CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
+            // Async roll seals first: a Strict entry may live in a segment sealed
+            // this pass, and its ack waits for that seal (onFlushCompletion_).
+            LogFlushSlot* slot = slotOf_(log);
+            if (slot) work += submitPendingSeals_(*slot);
+            CompletionToken t = submitActive_(log, RouteKind::Durable, slot ? slot->epoch : 0,
+                                              /*pin=*/slot != nullptr);
             if (t == kNoToken) {
                 // Submit ring full — back-pressure: ack all pending entries for
                 // this log with Internal error immediately.  Never drop; never
@@ -955,50 +991,73 @@ private:
     // never reach the produce-ack matching below.  Completions are always drained
     // (also when durablePending_ is empty) so background tokens are retired.
     int reapDurableCompletions_() {
+        if (reapPausedForTest_) [[unlikely]] return 0;
         int fired = 0;
         io_.reap([&](const FlushCompletion& c) {
             ++ioCompletionsReaped_;
-            fired += onFlushCompletion_(c);
+            if (forcedFlushErrorForTest_ != 0) [[unlikely]] {
+                FlushCompletion forced = c;
+                forced.errorCode = forcedFlushErrorForTest_;
+                fired += onFlushCompletion_(forced);
+            } else {
+                fired += onFlushCompletion_(c);
+            }
         });
-        return fired + retryBgFlushes_();
+        return fired;
     }
 
-    // One completion: background token → retired (returns 1); otherwise group-
-    // commit semantics: token T with flushBoundary B covers EVERY pending entry
-    // with the same token whose lastOffset <= B.  token==0 entries never match.
+    // One completion.  Token routing first: a Background / Seal token is retired
+    // here and never reaches produce-ack matching.  Durable entries match by
+    // TOKEN ONLY (I2): an entry is stamped with T after its append and the
+    // fdatasync covers every write issued before the submit — the completion's
+    // flushBoundary is informational and never gates an ack.
     int onFlushCompletion_(const FlushCompletion& c) {
-        if (retireBgFlush_(c)) return 1;
+        TokenRoute r;
+        const bool routed = routeTake_(c.token, r);
+        LogFlushSlot* slot = routed ? liveSlot_(r) : nullptr;
+        // M1: release the segment pin taken at submit (only while this worker
+        // still owns the log — a purged slot's log may belong to another worker).
+        if (routed && r.seg && slot) r.log->unpinSegmentFlush(r.seg);
+
+        if (routed && r.kind != RouteKind::Durable) {
+            if (r.kind == RouteKind::Background) {
+                if (slot && slot->bgToken == c.token) { slot->bgToken = kNoToken; if (bgInFlight_) --bgInFlight_; }
+                if (c.errorCode != 0) ++bgFlushErrors_;
+            } else if (slot && slot->sealsInFlight > 0) {
+                --slot->sealsInFlight;
+            }
+            if (!slot) return 1;                               // purged (M2): ignored safely
+            if (c.errorCode != 0) { failLog_(slot->log, c.errorCode); return 1; }   // fail-stop, no retry
+            if (r.kind == RouteKind::Background) {
+                if (slot->bgLeo > slot->lastSyncedLeo) slot->lastSyncedLeo = slot->bgLeo;
+                if (slot->bgAgain) { slot->bgAgain = false; (void)requestBgFlush_(*slot); }
+            } else {
+                fireSealGated_(*slot);
+            }
+            return 1;
+        }
+
+        // Durable token (or an unrouted one: synthetic / already-retired).
+        if (c.errorCode != 0) {
+            rune::storage::Log* failed = routed ? r.log : nullptr;
+            for (const auto& e : durablePending_)
+                if (!failed && e.token == c.token && !e.awaitSeal) failed = e.logPtr;
+            if (failed) failLog_(failed, c.errorCode);
+            return 1;
+        }
         int fired = 0;
         for (std::size_t i = 0; i < durablePending_.size(); ) {
             auto& entry = durablePending_[i];
-            if (entry.token != kNoToken &&
-                entry.token == c.token &&
-                entry.lastOffset <= c.flushBoundary) {
-                if (c.errorCode != 0) {
-                    // fsync failure: ack with a non-OK error code — never ack OK.
-                    spdlog::error("Worker {}: IoBackend fsync completion error={} "
-                                  "for token={} lastOffset={}; acking Internal error",
-                                  workerId_, c.errorCode, c.token, entry.lastOffset);
-                    entry.ret.errorCode = static_cast<int16_t>(6); // Internal
-                    enqueueReturn_(entry.ret);
-                } else if (entry.thenAwaitHw) {
-                    // Shard Strict acks=all: durable locally — now the HW gate.
-                    entry.ret.errorCode = 0;
-                    PendingAcksAll pending;
-                    pending.replica    = entry.thenAwaitHw;
-                    pending.lastOffset = entry.lastOffset;
-                    pending.deadlineNs = entry.deadlineNs;
-                    pending.ret        = std::move(entry.ret);
-                    pendingAcksAll_.push_back(std::move(pending));
-                } else {
-                    entry.ret.errorCode = 0; // OK
-                    enqueueReturn_(entry.ret);
+            if (entry.token != kNoToken && entry.token == c.token && !entry.awaitSeal) {
+                if (sealsOutstanding_(entry.logPtr)) {
+                    entry.awaitSeal = true;                     // durable in its active segment;
+                    ++i;                                        // fires once the seals complete
+                    continue;
                 }
-                // Erase by swap-with-back + pop (O(1), order irrelevant for acks).
+                fireDurable_(entry);
                 durablePending_[i] = std::move(durablePending_.back());
                 durablePending_.pop_back();
                 ++fired;
-                // Do NOT advance i — the swapped entry needs to be checked.
             } else {
                 ++i;
             }
@@ -1407,6 +1466,13 @@ private:
             return;
         }
 
+        // fsyncgate fail-stop: a failed log refuses every produce.
+        if (log->storageFailed()) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+            enqueueReturn_(ret);
+            return;
+        }
+
         // Zero-copy restamp append: the base offset is assigned from the log's end
         // offset and patched into the batch header via pwritev (LE64 at bytes
         // [0..7], before the CRC region) — the ring frame is NOT mutated, so
@@ -1788,6 +1854,7 @@ private:
                 owned_.push_back(reinterpret_cast<rune::replication::PartitionReplica*>(pval));
             }
         }
+        rebuildFlushSlots_();   // cold: carry still-owned slots, purge the rest (M2)
     }
 
     // -------------------------------------------------------------------
@@ -2240,6 +2307,9 @@ private:
         /// moves to pendingAcksAll_ (HW gate) instead of firing.  null = fire.
         rune::replication::PartitionReplica* thenAwaitHw = nullptr;
         int64_t                 deadlineNs = 0;       ///< acks=all deadline (thenAwaitHw only)
+        /// Its token completed, but an async roll seal on the same log was still
+        /// outstanding: fires when the seals complete (fireSealGated_).
+        bool                    awaitSeal  = false;
     };
     std::vector<DurablePending> durablePending_;
 
@@ -2383,12 +2453,8 @@ private:
     // Worker-thread only — no atomic needed.
     int64_t lastSyncNs_ = 0;
 
-    // Per-log LEO at its last successful sync.  syncOwnedLogs_ skips (and returns
-    // NO work for) any log whose logEndOffset has not advanced since — otherwise a
-    // time-based sync of an idle log reported work>0 every interval, resetting the
-    // worker's backoff idle so it never parked (phantom work → CPU-hogging spin,
-    // starving nothing to do).  Worker-thread only.
-    std::unordered_map<rune::storage::Log*, int64_t> lastSyncedLeo_;
+    // Per-log LEO at its last successful sync lives in LogFlushSlot::lastSyncedLeo
+    // (Task 10 fix 1 / I3: fixed per-owned-log slots, no hot-path map insert).
 
     // Task 7: per-worker topic → Validator map.
     //
@@ -2439,93 +2505,218 @@ private:
     uint32_t workerRunSeq_ = 0;
 
     // -----------------------------------------------------------------------
-    // Task 10 — background (non-ack) flushes through io_ (spec §3.1 never-block).
+    // Task 10 (spec §3.1 never-block) — per-owned-log flush slots + token routing.
     //
-    // Shard mode never calls Log::sync on the loop: the follower flush and the
-    // time-based owned-log sync are io_ submissions tracked in this FIXED table
-    // (no allocation).  At most one in flight per (log, kind); a request for a
-    // (log, kind) already in flight sets `again` and is resubmitted when that
-    // one retires (covers the newer data, no per-pass retry spin).  A refused
-    // submit (ring / table full) goes to bgRetry_ and is retried each reap.
-    // Only fdatasync of the active .log fd: Log::recover rebuilds the .index
-    // from the .log, so the .index msync is not a durability point.
+    // ONE slot per owned disk log (fixed set, rebuilt cold on an ownership
+    // change; a worker-local Log*→slot open-addressing map gives O(1) lookup):
+    //   * the background flush (replica requests: follower flush, txn marker,
+    //     reconcile; and the 10 ms owned-log sync) — at most ONE in flight per
+    //     log, plus a "dirty again" bit when newer data arrives meanwhile;
+    //   * lastSyncedLeo — advanced by ANY successful background flush, so a
+    //     follower flush also satisfies the time-based sync (no double fsync);
+    //   * sealsInFlight — async roll seals (Log::setDeferSealSync); Strict acks
+    //     on the log wait until every seal has completed;
+    //   * failureReported — fail-stop signalled once.
+    // Every io_ token is ROUTED (open-addressing table sized ≥ 2× the io depth,
+    // so it never fills): Durable (Strict / produce acks), Background or Seal,
+    // with the segment it pinned (M1: the fd outlives the flush).  A Background
+    // or Seal token is retired by routing and can never reach produce-ack
+    // matching.  A refused background submit is NOT retried per pass: the next
+    // owned-log sync interval re-requests it (LEO > lastSyncedLeo).
+    // fsync errors are FAIL-STOP (fsyncgate): never retried.
+    // Only fdatasync of the .log fd: Log::recover rebuilds the .index from the
+    // .log, so the .index msync is not a durability point.
     // Worker-thread only (shared-nothing).
     // -----------------------------------------------------------------------
-    enum class BgFlushKind : uint8_t { Follower, OwnedLogSync };
-    struct BgFlush {
-        CompletionToken     token = kNoToken;
-        rune::storage::Log* log   = nullptr;
-        int64_t             leo   = 0;       ///< LEO at submit (OwnedLogSync bookkeeping)
-        BgFlushKind         kind  = BgFlushKind::Follower;
-        bool                again = false;   ///< re-requested while in flight
+    struct LogFlushSlot {
+        rune::storage::Log*                  log     = nullptr;
+        rune::replication::PartitionReplica* replica = nullptr;
+        uint32_t        epoch           = 0;          ///< identity across rebuilds (M2)
+        CompletionToken bgToken         = kNoToken;   ///< background flush in flight
+        int64_t         bgLeo           = 0;          ///< LEO covered by bgToken
+        bool            bgAgain         = false;      ///< newer data requested meanwhile
+        int64_t         lastSyncedLeo   = 0;
+        uint32_t        sealsInFlight   = 0;
+        bool            failureReported = false;
     };
-    static constexpr std::size_t kMaxBgFlushes = 256;
-    std::array<BgFlush, kMaxBgFlushes> bgFlush_{};
-    std::size_t                        bgFlushCount_ = 0;
-    std::array<BgFlush, kMaxBgFlushes> bgRetry_{};
-    std::size_t                        bgRetryCount_ = 0;
-    uint64_t                           bgFlushSubmits_ = 0;
-    uint64_t                           bgFlushErrors_  = 0;
-    uint64_t                           ioCompletionsReaped_ = 0;
+    std::vector<LogFlushSlot> slots_;
+    uint32_t                  slotEpochSeq_ = 0;
+    // Log* → slots_ index (open addressing, capacity pow2 ≥ 2×slots).
+    std::vector<std::pair<rune::storage::Log*, uint32_t>> slotIndex_;
+    std::size_t               slotIndexMask_ = 0;
 
-    void queueBgRetry_(rune::storage::Log* log, BgFlushKind kind) noexcept {
-        for (std::size_t i = 0; i < bgRetryCount_; ++i)
-            if (bgRetry_[i].log == log && bgRetry_[i].kind == kind) return;
-        if (bgRetryCount_ < kMaxBgFlushes) {
-            bgRetry_[bgRetryCount_++] = BgFlush{kNoToken, log, 0, kind, false};
-        } else {
-            // More distinct (log, kind) pairs than the table holds: the owned-log
-            // sync re-requests every dirty log next interval (LEO > last synced).
-            spdlog::warn("Worker {}: background flush retry table full; deferring", workerId_);
+    enum class RouteKind : uint8_t { Durable, Background, Seal };
+    struct TokenRoute {
+        CompletionToken            token = kNoToken;   ///< kNoToken = empty bucket
+        rune::storage::Log*        log   = nullptr;
+        rune::storage::LogSegment* seg   = nullptr;     ///< pinned segment (unpin on completion)
+        uint32_t                   epoch = 0;
+        RouteKind                  kind  = RouteKind::Durable;
+    };
+    std::vector<TokenRoute> routes_;
+    std::size_t             routeMask_ = 0;
+
+    std::size_t bgInFlight_     = 0;
+    uint64_t    bgFlushSubmits_ = 0;
+    uint64_t    bgFlushErrors_  = 0;
+    uint64_t    bgFlushDeferred_ = 0;
+    uint64_t    sealSubmits_    = 0;
+    uint64_t    ioCompletionsReaped_ = 0;
+    uint64_t    storageFailureSignals_ = 0;
+    CompletionToken durableAckToken_ = kNoToken;     ///< token whose completion fired the last durable ack
+    bool        reapPausedForTest_ = false;
+    int         forcedFlushErrorForTest_ = 0;
+    std::vector<WorkerReturn> pendingSignals_;       ///< StorageFailure signals awaiting ring space (cold)
+
+    static std::size_t pow2AtLeast_(std::size_t n) noexcept {
+        std::size_t p = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+    static std::size_t ptrHash_(const void* p) noexcept {
+        return static_cast<std::size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull);
+    }
+    LogFlushSlot* slotOf_(const rune::storage::Log* log) noexcept {
+        if (slotIndex_.empty() || log == nullptr) return nullptr;
+        for (std::size_t i = ptrHash_(log) & slotIndexMask_;; i = (i + 1) & slotIndexMask_) {
+            if (slotIndex_[i].first == log) return &slots_[slotIndex_[i].second];
+            if (slotIndex_[i].first == nullptr) return nullptr;
         }
     }
-    // Returns true iff an io_ submission was made.
-    bool submitBgFlush_(rune::storage::Log* log, BgFlushKind kind) noexcept {
-        for (std::size_t i = 0; i < bgFlushCount_; ++i) {
-            if (bgFlush_[i].log == log && bgFlush_[i].kind == kind) {
-                bgFlush_[i].again = true;   // coalesce; resubmitted on retire
-                return false;
+    // Cold: called on every ownership change (setOwnedDirect / SetOwnership op).
+    // Slots for logs still owned are carried over (in-flight state intact);
+    // slots for logs no longer owned are purged — their in-flight tokens are
+    // then ignored on completion (epoch / identity mismatch) (M2).
+    void rebuildFlushSlots_() {
+        std::vector<LogFlushSlot> next;
+        next.reserve(owned_.size());
+        for (auto* replica : owned_) {
+            if (!replica || !replica->isDiskBacked()) continue;
+            rune::storage::Log* log = replica->log();
+            if (!log) continue;
+            bool dup = false;
+            for (const auto& n : next) dup = dup || n.log == log;
+            if (dup) continue;
+            if (LogFlushSlot* old = slotOf_(log)) {
+                LogFlushSlot carried = *old;
+                carried.replica = replica;
+                next.push_back(carried);
+            } else {
+                LogFlushSlot fresh;
+                fresh.log = log; fresh.replica = replica; fresh.epoch = ++slotEpochSeq_;
+                next.push_back(fresh);
             }
         }
-        if (bgFlushCount_ == kMaxBgFlushes) { queueBgRetry_(log, kind); return false; }
-        const CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
-        if (t == kNoToken) { queueBgRetry_(log, kind); return false; }
-        bgFlush_[bgFlushCount_++] = BgFlush{t, log, log->logEndOffset(), kind, false};
-        ++bgFlushSubmits_;
+        slots_ = std::move(next);
+        const std::size_t cap = pow2AtLeast_(2 * slots_.size() + 2);
+        slotIndex_.assign(cap, {nullptr, 0u});
+        slotIndexMask_ = cap - 1;
+        bgInFlight_ = 0;
+        for (uint32_t s = 0; s < slots_.size(); ++s) {
+            std::size_t i = ptrHash_(slots_[s].log) & slotIndexMask_;
+            while (slotIndex_[i].first != nullptr) i = (i + 1) & slotIndexMask_;
+            slotIndex_[i] = {slots_[s].log, s};
+            if (slots_[s].bgToken != kNoToken) ++bgInFlight_;
+        }
+    }
+
+    void initRoutes_(std::size_t ioDepth) {
+        const std::size_t cap = 2 * pow2AtLeast_(ioDepth < 2 ? 2 : ioDepth);
+        routes_.assign(cap, TokenRoute{});
+        routeMask_ = cap - 1;
+    }
+    bool routeInsert_(const TokenRoute& r) noexcept {
+        for (std::size_t n = 0, i = static_cast<std::size_t>(r.token) & routeMask_; n <= routeMask_;
+             ++n, i = (i + 1) & routeMask_) {
+            if (routes_[i].token == kNoToken) { routes_[i] = r; return true; }
+        }
+        return false;   // impossible: in-flight tokens ≤ io depth ≤ capacity / 2
+    }
+    // Find + remove (backward-shift deletion keeps probe chains intact).
+    bool routeTake_(CompletionToken t, TokenRoute& out) noexcept {
+        if (t == kNoToken) return false;
+        std::size_t i = static_cast<std::size_t>(t) & routeMask_;
+        for (std::size_t n = 0;; ++n, i = (i + 1) & routeMask_) {
+            if (n > routeMask_ || routes_[i].token == kNoToken) return false;
+            if (routes_[i].token == t) break;
+        }
+        out = routes_[i];
+        std::size_t hole = i;
+        for (std::size_t j = (i + 1) & routeMask_; routes_[j].token != kNoToken; j = (j + 1) & routeMask_) {
+            const std::size_t home = static_cast<std::size_t>(routes_[j].token) & routeMask_;
+            // Move j into the hole iff its home is not in the cyclic range (hole, j].
+            const bool inRange = (hole <= j) ? (home > hole && home <= j) : (home > hole || home <= j);
+            if (!inRange) { routes_[hole] = routes_[j]; hole = j; }
+        }
+        routes_[hole] = TokenRoute{};
         return true;
     }
-    int retryBgFlushes_() noexcept {
-        if (bgRetryCount_ == 0) return 0;
-        const std::size_t n = bgRetryCount_;
-        bgRetryCount_ = 0;   // re-queues land at indices already processed
-        int submitted = 0;
-        for (std::size_t i = 0; i < n; ++i)
-            submitted += submitBgFlush_(bgRetry_[i].log, bgRetry_[i].kind) ? 1 : 0;
-        return submitted;    // only real submissions count as work (no phantom work)
+    // A route is still meaningful only while this worker owns the same slot.
+    LogFlushSlot* liveSlot_(const TokenRoute& r) noexcept {
+        LogFlushSlot* slot = slotOf_(r.log);
+        return (slot && slot->epoch == r.epoch) ? slot : nullptr;
     }
-    // Token routing: a background token is retired HERE and never reaches the
-    // produce-ack matching.  Returns true iff c belonged to a background flush.
-    bool retireBgFlush_(const FlushCompletion& c) noexcept {
-        for (std::size_t i = 0; i < bgFlushCount_; ++i) {
-            if (bgFlush_[i].token != c.token) continue;
-            const BgFlush f = bgFlush_[i];
-            bgFlush_[i] = bgFlush_[--bgFlushCount_];
-            if (c.errorCode != 0) {
-                ++bgFlushErrors_;
-                if (bgFlushErrors_ == 1 || (bgFlushErrors_ & 1023u) == 0)
-                    spdlog::error("Worker {}: background fsync failed errno={} (errors={}) — retrying",
-                                  workerId_, c.errorCode, bgFlushErrors_);
-                queueBgRetry_(f.log, f.kind);
-                return true;
-            }
-            if (f.kind == BgFlushKind::OwnedLogSync) {
-                int64_t& last = lastSyncedLeo_[f.log];
-                if (f.leo > last) last = f.leo;
-            }
-            if (f.again) (void)submitBgFlush_(f.log, f.kind);
-            return true;
+
+    // Pin the active segment (only for a log this worker owns a slot for — the
+    // pin is released on the completion through that slot) and submit its fd.
+    // kNoToken on back-pressure.
+    CompletionToken submitActive_(rune::storage::Log* log, RouteKind kind, uint32_t epoch,
+                                  bool pin = true) noexcept {
+        rune::storage::LogSegment* seg = log->activeSegmentForFlush();
+        if (pin) seg->pinFlush();
+        const CompletionToken t = io_.submit(seg->logFd(), log->flushBoundary());
+        if (t == kNoToken) { if (pin) log->unpinSegmentFlush(seg); return kNoToken; }
+        if (!pin) seg = nullptr;
+        if (!routeInsert_(TokenRoute{t, log, seg, epoch, kind})) {
+            spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
         }
-        return false;
+        return t;
+    }
+
+    // Async roll seals queued by the log (shard mode).  A refused submit leaves
+    // the seal queued (still pinned) for the next pass.
+    int submitPendingSeals_(LogFlushSlot& slot) noexcept {
+        int n = 0;
+        rune::storage::Log* log = slot.log;
+        while (log->pendingSealCount() > 0 && !log->storageFailed()) {
+            rune::storage::LogSegment* seg = log->frontPendingSeal();
+            const CompletionToken t = io_.submit(seg->logFd(), 0);
+            if (t == kNoToken) break;
+            log->popPendingSeal();   // the seal's pin now belongs to the route
+            if (!routeInsert_(TokenRoute{t, log, seg, slot.epoch, RouteKind::Seal})) {
+                spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
+            }
+            ++slot.sealsInFlight;
+            ++sealSubmits_;
+            ++n;
+        }
+        return n;
+    }
+
+    // Request a background flush of `slot`'s log.  Returns true iff submitted now.
+    bool requestBgFlush_(LogFlushSlot& slot) noexcept {
+        rune::storage::Log* log = slot.log;
+        if (log->storageFailed()) return false;                   // fail-stop: never again
+        if (slot.bgToken != kNoToken) {                           // coalesce
+            if (log->logEndOffset() > slot.bgLeo) slot.bgAgain = true;
+            return false;
+        }
+        const CompletionToken t = submitActive_(log, RouteKind::Background, slot.epoch);
+        if (t == kNoToken) {
+            // Back-pressure (io in-flight depth): no retry table, no per-pass
+            // spin — the next owned-log sync interval re-requests it.
+            ++bgFlushDeferred_;
+            if (bgFlushDeferred_ == 1 || (bgFlushDeferred_ & 1023u) == 0)
+                spdlog::warn("Worker {}: background flush deferred (io back-pressure, total={})",
+                             workerId_, bgFlushDeferred_);
+            return false;
+        }
+        slot.bgToken = t;
+        slot.bgLeo   = log->logEndOffset();
+        slot.bgAgain = false;
+        ++bgInFlight_;
+        ++bgFlushSubmits_;
+        return true;
     }
 
     // Shard-mode replacement for syncOwnedLogs_: same 10 ms gate and the same
@@ -2535,16 +2726,121 @@ private:
         if (nowNs - lastSyncNs_ < kWorkerSyncIntervalNs) return 0;
         lastSyncNs_ = nowNs;
         int n = 0;
-        for (auto* replica : owned_) {
-            if (!replica || !replica->isDiskBacked()) continue;
-            rune::storage::Log* log = replica->log();
-            if (!log) continue;
-            const auto it = lastSyncedLeo_.find(log);
-            const int64_t last = (it == lastSyncedLeo_.end()) ? 0 : it->second;
-            if (log->logEndOffset() <= last) continue;      // unchanged: no phantom work
-            if (submitBgFlush_(log, BgFlushKind::OwnedLogSync)) ++n;
+        for (auto& slot : slots_) {
+            if (slot.log->storageFailed()) continue;
+            if (slot.log->logEndOffset() <= slot.lastSyncedLeo) continue;   // unchanged: no phantom work
+            if (requestBgFlush_(slot)) ++n;
         }
         return n;
+    }
+
+    bool sealsOutstanding_(rune::storage::Log* log) noexcept {
+        LogFlushSlot* slot = slotOf_(log);
+        if (!slot) return false;
+        return slot->sealsInFlight > 0 || log->pendingSealCount() > 0;
+    }
+    void fireDurable_(DurablePending& entry) {
+        durableAckToken_ = entry.token;
+        if (entry.thenAwaitHw) {
+            // Shard Strict acks=all: durable locally — now the HW gate.  (M4: for
+            // a single-ISR Strict log, HW / consumer visibility can precede the
+            // fsync in shard mode — Kafka semantics; the PRODUCER ack never does.)
+            entry.ret.errorCode = 0;
+            PendingAcksAll pending;
+            pending.replica    = entry.thenAwaitHw;
+            pending.lastOffset = entry.lastOffset;
+            pending.deadlineNs = entry.deadlineNs;
+            pending.ret        = std::move(entry.ret);
+            pendingAcksAll_.push_back(std::move(pending));
+        } else {
+            entry.ret.errorCode = 0; // OK
+            enqueueReturn_(entry.ret);
+        }
+    }
+    void fireSealGated_(LogFlushSlot& slot) {
+        if (sealsOutstanding_(slot.log)) return;
+        for (std::size_t i = 0; i < durablePending_.size(); ) {
+            auto& entry = durablePending_[i];
+            if (entry.awaitSeal && entry.logPtr == slot.log) {
+                fireDurable_(entry);
+                durablePending_[i] = std::move(durablePending_.back());
+                durablePending_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // ---- fsyncgate fail-stop -------------------------------------------------
+    void enqueueSignal_(const WorkerReturn& r) {
+        const std::size_t n = sbe::MessageHeader::encodedLength() +
+                              sbe::WorkerReturn::computeLength(r.chunk.size());
+        aeron::util::index_t idx = -1;
+        try { idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n); } catch (...) { idx = -1; }
+        if (idx < 0) { pendingSignals_.push_back(r); return; }   // retried next pass, never dropped
+        encodeReturnSbe_(r, idx, n);
+        ret_.commit(idx);
+    }
+    int flushPendingSignals_() {
+        if (pendingSignals_.empty()) return 0;
+        std::vector<WorkerReturn> again;
+        again.swap(pendingSignals_);
+        for (const auto& r : again) enqueueSignal_(r);
+        return static_cast<int>(again.size() - pendingSignals_.size());
+    }
+    // The FIRST fsync error on a log: the log is permanently failed, every
+    // durable/acks=all ack pending on it fails with StorageError (never OK),
+    // and the runtime is signalled once to halt the broker.
+    void failLog_(rune::storage::Log* log, int err) {
+        if (!log) return;
+        log->markStorageFailed(err);
+        const int16_t code = static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+        for (std::size_t i = 0; i < durablePending_.size(); ) {
+            if (durablePending_[i].logPtr == log) {
+                durablePending_[i].ret.errorCode = code;
+                enqueueReturn_(durablePending_[i].ret);
+                durablePending_[i] = std::move(durablePending_.back());
+                durablePending_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
+            auto* r = pendingAcksAll_[i].replica;
+            if (r && r->isDiskBacked() && r->log() == log) {
+                pendingAcksAll_[i].ret.errorCode = code;
+                enqueueReturn_(pendingAcksAll_[i].ret);
+                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
+                pendingAcksAll_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        LogFlushSlot* slot = slotOf_(log);
+        if (slot && slot->failureReported) return;
+        if (slot) slot->failureReported = true;
+        const int e = log->storageErrno();
+        spdlog::critical("Worker {}: fsync FAILED on {} (errno={}) — log permanently failed; "
+                         "signalling the runtime to halt the broker", workerId_, log->dir(), e);
+        WorkerReturn sig;
+        sig.type      = WorkerReturn::Type::StorageFailure;
+        sig.errorCode = static_cast<int16_t>(e);
+        if (slot && slot->replica) {
+            sig.topicId   = slot->replica->topicId();
+            sig.partition = static_cast<int32_t>(slot->replica->partitionId());
+        }
+        const std::string& dir = log->dir();
+        sig.chunk.assign(dir.begin(), dir.end());
+        ++storageFailureSignals_;
+        enqueueSignal_(sig);
+    }
+    // Any inline sync failure (legacy Log::sync / durable append / seal) marks
+    // the log failed in storage; this cold check turns it into the fail-stop.
+    void checkStorageFailure_(rune::storage::Log* log) {
+        if (!log->storageFailed()) [[likely]] return;
+        LogFlushSlot* slot = slotOf_(log);
+        if (slot && slot->failureReported) return;
+        failLog_(log, log->storageErrno());
     }
 
     // -----------------------------------------------------------------------
@@ -2573,28 +2869,24 @@ private:
         lastSyncNs_ = nowNs;
 
         int synced = 0;
-        for (auto* replica : owned_) {
-            if (!replica || !replica->isDiskBacked()) continue;
-            rune::storage::Log* log = replica->log();
-            if (!log) continue;
+        for (auto& slot : slots_) {
+            rune::storage::Log* log = slot.log;
+            if (log->storageFailed()) continue;
             // Skip logs with no new appends since their last sync — syncing an
             // unchanged log is a no-op fdatasync that must NOT count as work (else
             // the backoff idle never parks on an otherwise-idle worker).
             const int64_t leo = log->logEndOffset();
-            int64_t& lastLeo = lastSyncedLeo_[log];
-            if (leo <= lastLeo) continue;
+            if (leo <= slot.lastSyncedLeo) continue;
             try {
                 log->sync();
-                lastLeo = leo;
+                slot.lastSyncedLeo = leo;
                 ++synced;
             } catch (const std::exception& ex) {
-                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw for "
-                              "topicId={} partition={}: {}; log may be dirty",
-                              workerId_, replica->topicId(), replica->partitionId(), ex.what());
-            } catch (...) {
-                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw unknown exception "
-                              "for topicId={} partition={}",
-                              workerId_, replica->topicId(), replica->partitionId());
+                // fsyncgate: the log is now permanently failed (LogSegment::sync);
+                // fail-stop it (pending acks failed, runtime signalled to halt).
+                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() failed for {}: {}",
+                              workerId_, log->dir(), ex.what());
+                checkStorageFailure_(log);
             }
         }
         return synced;
@@ -2755,6 +3047,13 @@ private:
     // Never drops an ack: errors return error acks on ret_; acks=all go to
     // pendingAcksAll_ for deferred fire.
     // -----------------------------------------------------------------------
+    // Acks already owed that will fire into ret_ later: acks=all parked on HW and,
+    // in shard mode, Strict acks parked on their fsync (G-A6 reservation).
+    [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
+        return static_cast<int64_t>(pendingAcksAll_.size()) +
+               (shardMode_ ? static_cast<int64_t>(durablePending_.size()) : 0);
+    }
+
     int pollWorkerIngress_(int64_t nowNs) {
         if (!workerIngress_ || !workerIngress_->resolved()) return 0;
 
@@ -2765,9 +3064,7 @@ private:
         // acks already parked in pendingAcksAll_ (they fire into ret_ later).  This
         // bounds pendingAcksAll_ by ret_ capacity while allowing acks=all pipelining.
         const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
-        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) +
-                                  static_cast<int64_t>(pendingAcksAll_.size()) +
-                                  (shardMode_ ? static_cast<int64_t>(durablePending_.size()) : 0);
+        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) + reservedAckSlots_();
         const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
         const int32_t K = static_cast<int32_t>(
             std::min(static_cast<int64_t>(desiredFragmentLimit_), available));

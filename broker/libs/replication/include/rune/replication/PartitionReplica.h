@@ -542,11 +542,20 @@ public:
     [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
     [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
 
-    /// Shard mode (spec §3.1 never-block): the owning worker performs the
-    /// time-gated follower flush asynchronously through its io backend; doWork
-    /// only raises a request.  Set before the replica is driven; legacy = false.
-    void setExternalFollowerFlush(bool on) noexcept { externalFollowerFlush_ = on; }
-    /// Worker side: consume a pending follower-flush request (true once per request).
+    /// Shard mode (spec §3.1 never-block): this replica never fsyncs inline.
+    /// The time-gated follower flush, the direct append() (txn markers) and the
+    /// reconcile append become page-cache writes plus a flush REQUEST that the
+    /// owning worker submits to its io backend; the disk log's roll seal is
+    /// deferred to the worker too (Log::setDeferSealSync).  Set before the
+    /// replica is driven; legacy = false (inline fsyncs, unchanged).
+    void setExternalFollowerFlush(bool on) noexcept {
+        externalFollowerFlush_ = on;
+        if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
+    }
+    /// Leader-epoch checkpoint writes (the one accepted synchronous disk write
+    /// on a shard loop — see checkpointEpochs_).
+    [[nodiscard]] uint64_t epochCheckpointWritesForTest() const noexcept { return epochCheckpointWrites_; }
+    /// Worker side: consume a pending flush request (true once per request).
     [[nodiscard]] bool takeFollowerFlushRequest() noexcept {
         const bool r = followerFlushRequested_;
         followerFlushRequested_ = false;
@@ -797,6 +806,8 @@ private:
     bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
     int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
     bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
+    uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
+    void checkpointEpochs_();
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
     // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
     // throughput bottleneck: appends (LEO growth), applies (follower push-apply),

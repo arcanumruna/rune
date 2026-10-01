@@ -13,6 +13,10 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cerrno>
+#include <condition_variable>
+#include <cstdlib>
+#include <mutex>
 #include <filesystem>
 #include <memory>
 #include <string_view>
@@ -473,4 +477,73 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
         EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve";
     }
     node.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Task 10 fix 1 — fsyncgate fail-stop + io backend selection, end to end.
+// ---------------------------------------------------------------------------
+namespace {
+struct HaltCapture {
+    std::mutex m;
+    std::condition_variable cv;
+    int code = 0;
+    static void handler(void* ctx, int exitCode) noexcept {
+        auto* self = static_cast<HaltCapture*>(ctx);
+        { std::lock_guard<std::mutex> g(self->m); self->code = exitCode; }
+        self->cv.notify_all();
+    }
+    int await(std::chrono::milliseconds cap) {
+        std::unique_lock<std::mutex> l(m);
+        cv.wait_for(l, cap, [this] { return code != 0; });
+        return code;
+    }
+};
+} // namespace
+
+TEST(ShardModeRegression, StorageFailureHaltsBrokerWithExitCode) {
+    // A background fsync error on a shard's log: the log is permanently failed,
+    // the worker signals the runtime over its return ring, the runtime halts the
+    // broker with kExitStorageFailure (the test hook replaces the real exit), and
+    // the failed partition refuses every later produce with StorageError.
+    TmpDir dir{"halt"}, cdir{"client"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    HaltCapture halt;
+    node.setHaltHandler(&HaltCapture::handler, &halt);
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ShardTestClient c(cdir.path);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(2)));
+    ASSERT_TRUE(node.onOwnerThreadForTest(0, 0, [&node](rune::replication::PartitionReplica*) {
+        node.workerForTest(0)->forceFlushErrorForTest(EIO);
+        return true;
+    }));
+    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 9001, 0, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(c.awaitProduceResponse(9001).has_value());
+    EXPECT_EQ(halt.await(10'000ms), BrokerNode::kExitStorageFailure)
+        << "the next background fsync fails → the broker is halted with EX_IOERR";
+    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 9002, 0, 0, 1, makeBatch(1)));
+    const auto refused = c.awaitProduceResponse(9002);
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_EQ(refused->errorCode, static_cast<uint16_t>(pc::ErrorCode::StorageError));
+    node.stop();
+}
+
+TEST(ShardModeRegression, RefusesIoBackendThatCannotSubmit) {
+    TmpDir dir{"iobk"};
+    const auto ports = ShardPorts::discover(1, 1);
+    ::setenv("RUNE_IO_BACKEND", "bogus", 1);
+    {
+        BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+        try {
+            node.start();
+            ADD_FAILURE() << "shard mode must refuse a backend that cannot submit";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string_view(e.what()).find("RUNE_IO_BACKEND"), std::string_view::npos) << e.what();
+        }
+        node.stop();
+    }
+    ::unsetenv("RUNE_IO_BACKEND");
 }

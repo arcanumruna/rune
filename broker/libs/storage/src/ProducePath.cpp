@@ -43,6 +43,16 @@ ProduceOutcome handleProduceBatch(
     ProduceOutcome out;
 
     // -------------------------------------------------------------------------
+    // 0. fsyncgate fail-stop: a log whose fsync ever failed refuses EVERY
+    //    produce — including idempotent duplicates (checked before the dedup
+    //    gate, so a retry of a batch whose durability failed is never acked OK).
+    // -------------------------------------------------------------------------
+    if (log.storageFailed()) [[unlikely]] {
+        out.error = pc::ErrorCode::StorageError;
+        return out;
+    }
+
+    // -------------------------------------------------------------------------
     // 1. Batch size / header sanity guards.
     //    (Caller already checked batchLen > 0; we re-check here for safety.)
     // -------------------------------------------------------------------------

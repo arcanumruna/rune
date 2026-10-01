@@ -244,6 +244,20 @@ public:
     void stop();
 
     // -----------------------------------------------------------------------
+    // fsyncgate fail-stop (Task 10 fix 1; Kafka LogDirFailure / PostgreSQL
+    // data_sync_retry=off).  When any log's fsync fails, the runtime logs
+    // critical and HALTS the broker with kExitStorageFailure.  The process
+    // owner (main) installs a HaltHandler before start(): it is called ONCE on
+    // the runtime thread and must stop the node through the normal stop path
+    // (from another thread) and exit with exitCode.  Without a handler the
+    // node stops itself on a helper thread and _Exit()s with the code.
+    // Restart recovery truncates the torn tail; replication re-heals it.
+    // -----------------------------------------------------------------------
+    static constexpr int kExitStorageFailure = 74;   // EX_IOERR
+    using HaltHandler = void (*)(void* ctx, int exitCode);
+    void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
+
+    // -----------------------------------------------------------------------
     // Observers (thread-safe: atomic reads)
     // -----------------------------------------------------------------------
 
@@ -419,6 +433,10 @@ public:
     /// Self-contained worker shards (spec §3.1): number of per-worker invoker
     /// drivers built (0 in legacy mode).  Startup/stop-time state (no worker access).
     [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept { return shardDrivers_.size(); }
+    /// Worker w (owned by its own thread — touch only inside onOwnerThreadForTest).
+    [[nodiscard]] Worker* workerForTest(int32_t w) const noexcept {
+        return workerPool_ && w >= 0 && w < workerPool_->workerCount() ? &workerPool_->worker(w) : nullptr;
+    }
 
     /// Test-only fault injection: called (on the start() thread) at named startup
     /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
@@ -673,6 +691,10 @@ private:
     std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
     std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
+    HaltHandler                                  haltHandler_ = nullptr;
+    void*                                        haltCtx_     = nullptr;
+    bool                                         haltRaised_  = false;   // runtime thread only
+    void onStorageFailure_(const std::string& logDir, int err);
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

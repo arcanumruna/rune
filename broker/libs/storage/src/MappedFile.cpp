@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdexcept>
+#include <cerrno>
 namespace rune::storage {
 MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault)
     : path_(std::move(path)), size_(initialBytes), writable_(writable) {
@@ -42,16 +43,17 @@ void MappedFile::resize(size_t newBytes) {
         throw std::runtime_error("ftruncate failed: " + path_);
     mapNow();
 }
-void MappedFile::sync() { if (data_) ::msync(data_, size_, MS_SYNC); }
-void MappedFile::sync(size_t bytes) {
-    if (!data_) return;
+int MappedFile::sync() { if (data_ && ::msync(data_, size_, MS_SYNC) != 0) return errno; return 0; }
+int MappedFile::sync(size_t bytes) {
+    if (!data_) return 0;
     // Round the sync length up to a page boundary and clamp to the mapping size
     // so we never msync past the mapping.  Syncing only the written prefix avoids
     // walking the ~2048 zero pages of the over-provisioned 8 MiB index.
     static const size_t kPage = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
     size_t aligned = bytes == 0 ? kPage : ((bytes + kPage - 1) / kPage) * kPage;
     if (aligned > size_) aligned = size_;
-    ::msync(data_, aligned, MS_SYNC);
+    if (::msync(data_, aligned, MS_SYNC) != 0) return errno;
+    return 0;
 }
 MappedFile::~MappedFile() { if (data_) ::munmap(data_, size_); if (fd_>=0) ::close(fd_); }
 } // namespace rune::storage

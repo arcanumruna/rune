@@ -2871,11 +2871,28 @@ void ClientGateway::pushSubscriptions()
 //
 // Single-writer: duty-cycle thread only.
 // ---------------------------------------------------------------------------
+void ClientGateway::raiseStorageFailure_(const std::string& logDir, int err)
+{
+    spdlog::critical("ClientGateway: STORAGE FAILURE on {} (errno={}) — fsync failed; "
+                     "halting the broker (fail-stop)", logDir, err);
+    if (storageFailureRaised_) return;
+    storageFailureRaised_ = true;
+    if (storageFailureHandler_) storageFailureHandler_(logDir, err);
+}
+
 void ClientGateway::drainWorkerReturns_()
 {
     using namespace rune::protocol::batch;
 
     workerPool_->drainAllReturns([this](rune::node::WorkerReturn ret) {
+
+        // ===================================================================
+        // StorageFailure (fsyncgate fail-stop) — halt the broker.
+        // ===================================================================
+        if (ret.type == rune::node::WorkerReturn::Type::StorageFailure) [[unlikely]] {
+            raiseStorageFailure_(std::string(ret.chunk.begin(), ret.chunk.end()), ret.errorCode);
+            return;
+        }
 
         // ===================================================================
         // ProduceResult
@@ -3473,6 +3490,9 @@ void ClientGateway::flushDirtyLogs()
             spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw unknown exception; "
                           "log stays dirty (durability NOT achieved)");
         }
+        // fsyncgate: an fsync failure is never retried — the log is permanently
+        // failed (LogSegment::sync) and the broker halts.
+        if (!synced && log->storageFailed()) raiseStorageFailure_(log->dir(), log->storageErrno());
         if (!synced) stillDirty.insert(log);
     }
     dirtyLogs_ = std::move(stillDirty);

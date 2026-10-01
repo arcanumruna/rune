@@ -5,6 +5,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <cerrno>
+#include <system_error>
 namespace rune::storage {
 
 namespace {
@@ -56,7 +58,7 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
     for (int64_t b : bases)
-        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        install_(b, std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_));
     logEndOffset_ = activeSegment().nextOffset();
     // #5 non-blocking append: preallocate the active segment's blocks so hot-path
     // O_APPEND pwrite()s never stall on block allocation (append-p99 tail).
@@ -102,7 +104,23 @@ void Log::maybeRoll() {
         // write is fsync'd exactly once — at seal time — so Log::sync()
         // after a roll means "all no-sync writes since last sync are on disk
         // across all segment boundaries".
-        activeSegment().sync();
+        if (deferSealSync_ && pendingSealCount_ < kMaxPendingSeals) {
+            // Shard mode (spec §3.1): no inline fsync on the loop.  Push the
+            // buffered bytes to the page cache, pin the sealed segment (its fd
+            // must outlive the async flush — M1) and queue it; the owning worker
+            // fdatasyncs it through its io backend, and Strict acks on this log
+            // wait until every pending seal has completed.
+            LogSegment& sealed = activeSegment();
+            if (const int e = sealed.flushBufferedToPageCache(); e != 0) {
+                markStorageFailed(e);
+                throw std::system_error(e, std::generic_category(), "Log seal flush " + dir_);
+            }
+            sealed.pinFlush();
+            pendingSeals_[pendingSealCount_++] = &sealed;
+        } else {
+            // Legacy (or > kMaxPendingSeals seals outstanding): inline seal fsync.
+            activeSegment().sync();
+        }
         int64_t base = logEndOffset_;
         // Install the NEXT segment.  Adopts the background-pre-provisioned staging
         // segment (ZERO syscalls: in-memory rebase; the staging→<base> disk rename
@@ -252,7 +270,7 @@ void Log::installNextSegment(int64_t base) {
         std::unique_ptr<LogSegment> seg(prepared);
         const int64_t stagingSeq = seg->stagingSeq();
         seg->adoptAsActive(base);            // in-memory only
-        segments_[base] = std::move(seg);
+        install_(base, std::move(seg));
         // Enqueue the deferred rename (single-slot-safe SPSC; rolls are rare so
         // the small ring never fills).  If it somehow can't be enqueued, do the
         // rename synchronously as a fallback (still correct, just slower).
@@ -270,8 +288,8 @@ void Log::installNextSegment(int64_t base) {
         // bg cycle).  Correctness fallback: synchronous create.  A build in
         // progress will publish a segment that the NEXT roll consumes; we do NOT
         // touch preprovInFlight_ here.
-        segments_[base] = std::make_unique<LogSegment>(
-            dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        install_(base, std::make_unique<LogSegment>(
+            dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_));
     }
 }
 
@@ -414,6 +432,7 @@ int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // being written to the (possibly freshly-started) active segment.
     // This ensures the incremental counter tracks batches that land on the
     // current active segment, NOT the batch that caused the roll.
+    throwIfFailed_();
     maybeRoll();
     logEndOffset_ = activeSegment().append(data, len, lastOffset);
     // Update incremental largestTimestamp AFTER the write (and after any roll)
@@ -435,6 +454,7 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     // is full; the new segment starts empty (no prior un-flushed data to lose).
     // The caller (gateway doWork) calls sync() once after the ingress batch.
     // CP-8: same post-roll update pattern as append() above.
+    throwIfFailed_();
     maybeRoll();
     logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
@@ -452,6 +472,7 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     // page cache without any mutable copy of `batch`.  maybeRoll() runs first;
     // the base offset is read AFTER the roll so it matches the segment the batch
     // actually lands in.
+    throwIfFailed_();
     maybeRoll();
     const int64_t base       = logEndOffset_;
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
@@ -549,7 +570,63 @@ int64_t Log::recover() {
     publishSealedSnapshot();
     return next;
 }
-void Log::sync() { ++syncCalls_; activeSegment().sync(); }
+void Log::sync() { activeSegment().sync(); }   // throws + marks failed on error (LogSegment::sync)
+
+void Log::throwIfFailed_() const {
+    if (storage_.failedErrno != 0) [[unlikely]]
+        throw std::system_error(storage_.failedErrno, std::generic_category(),
+                                "Log append refused: storage failed (" + dir_ + ")");
+}
+
+void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
+    seg->setStorageState(&storage_);
+    auto it = segments_.find(base);
+    if (it != segments_.end()) {
+        retire_(std::move(it->second));
+        it->second = std::move(seg);
+    } else {
+        segments_.emplace(base, std::move(seg));
+    }
+}
+
+Log::SegMap::iterator Log::erase_(SegMap::iterator it) {
+    retire_(std::move(it->second));
+    return segments_.erase(it);
+}
+
+void Log::retire_(std::unique_ptr<LogSegment> seg) {
+    if (!seg) return;
+    // A pending (un-submitted) seal on a removed segment is dropped from the
+    // queue — the data it covered is gone (truncate) or already superseded.
+    for (std::size_t i = 0; i < pendingSealCount_; ) {
+        if (pendingSeals_[i] == seg.get()) {
+            seg->unpinFlush();
+            for (std::size_t j = i + 1; j < pendingSealCount_; ++j) pendingSeals_[j - 1] = pendingSeals_[j];
+            --pendingSealCount_;
+        } else {
+            ++i;
+        }
+    }
+    if (seg->flushPins() > 0) retiredSegments_.push_back(std::move(seg));   // M1: fd stays open
+    // else: destroyed here (fd closed) — no flush in flight on it.
+}
+
+void Log::popPendingSeal() noexcept {
+    if (pendingSealCount_ == 0) return;
+    for (std::size_t j = 1; j < pendingSealCount_; ++j) pendingSeals_[j - 1] = pendingSeals_[j];
+    --pendingSealCount_;
+}
+
+void Log::unpinSegmentFlush(LogSegment* seg) noexcept {
+    if (!seg || seg->unpinFlush() != 0) return;
+    for (std::size_t i = 0; i < retiredSegments_.size(); ++i) {
+        if (retiredSegments_[i].get() == seg) {
+            retiredSegments_[i] = std::move(retiredSegments_.back());
+            retiredSegments_.pop_back();   // closes the fd: no flush in flight any more
+            return;
+        }
+    }
+}
 std::vector<int64_t> Log::segmentBaseOffsets() const {
     std::vector<int64_t> v; for (auto& [b, _] : segments_) v.push_back(b); return v;
 }
@@ -566,13 +643,13 @@ void Log::truncateTo(int64_t truncateOffset) {
         std::string ipath = indexPathForLog(lpath);
         std::filesystem::remove(lpath);
         std::filesystem::remove(ipath);
-        it = segments_.erase(it);
+        it = erase_(it);
     }
 
     if (segments_.empty()) {
         // Re-create a fresh segment at truncateOffset (or 0 if negative).
         int64_t base = std::max<int64_t>(0, truncateOffset);
-        segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        install_(base, std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_));
         logEndOffset_ = base;
         return;
     }
@@ -646,8 +723,7 @@ void Log::truncateTo(int64_t truncateOffset) {
 
     // Rebuild the active segment from disk.
     int64_t base = seg.baseOffset();
-    segments_.erase(base);
-    segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_);
+    install_(base, std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_));
     // Re-run recover to rebuild the index and set nextOffset correctly.
     // Use the segment's actual nextOffset_ (derived from the physically truncated
     // file) rather than hard-coding truncateOffset, so that LEO and the segment's
@@ -657,8 +733,9 @@ void Log::truncateTo(int64_t truncateOffset) {
 }
 
 void Log::reloadSegments() {
-    // Destroy all in-memory segments (closes open file handles).
-    segments_.clear();
+    // Destroy all in-memory segments (closes open file handles; pinned ones are
+    // retired until their in-flight flush completes — M1).
+    for (auto it = segments_.begin(); it != segments_.end(); ) it = erase_(it);
     // Re-discover segment files on disk (same logic as the constructor).
     std::vector<int64_t> bases;
     for (auto& e : std::filesystem::directory_iterator(dir_))
@@ -667,7 +744,7 @@ void Log::reloadSegments() {
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
     for (int64_t b : bases)
-        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_);
+        install_(b, std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes, indexMaxBytes_));
     // Run recover() to rebuild indices and set nextOffset_ for each segment.
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();
@@ -698,14 +775,14 @@ void Log::reloadSegment(int64_t baseOffset) {
     const std::string logPath = logPathForBase(baseOffset);
     if (!std::filesystem::exists(logPath)) {
         // Cleaner emptied + deleted this segment; drop it from the map.
-        segments_.erase(it);
+        erase_(it);
         return;
     }
 
     // Reconstruct just this segment (closes the old fd via unique_ptr reset) and
     // recover() it so its in-memory index reflects the rewritten bytes.
-    it->second = std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_);
-    it->second->recover();
+    install_(baseOffset, std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_));
+    segments_[baseOffset]->recover();
 }
 
 int Log::deleteOldSegments(int64_t retainBytes) {
@@ -714,7 +791,7 @@ int Log::deleteOldSegments(int64_t retainBytes) {
         auto it = segments_.begin();
         std::string base = it->second->logPath();
         std::string idx = indexPathForLog(base);
-        segments_.erase(it);
+        erase_(it);
         std::filesystem::remove(base);
         std::filesystem::remove(idx);
         ++deleted;
@@ -801,7 +878,7 @@ int Log::drainRetentionDeletes() {
         if (it != segments_.end()) {
             // Erase the in-memory segment (closes the file descriptor).
             // The .log file is already renamed to .deleted on disk; no file I/O here.
-            segments_.erase(it);
+            erase_(it);
             ++count;
         }
         // If base is not in segments_ (e.g. idempotent retry), that is fine.

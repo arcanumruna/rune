@@ -598,6 +598,15 @@ public:
     bool sendControlFrame(int64_t sessionId, const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
+    // fsyncgate fail-stop (Task 10 fix 1): invoked on THIS duty-cycle thread when
+    // a worker signals StorageFailure over its return ring, or when the gateway's
+    // own flushDirtyLogs sync fails.  BrokerNode wires it to its halt path.
+    // Cold path (std::function is fine).  Called at most once.
+    // -----------------------------------------------------------------------
+    using StorageFailureHandler = std::function<void(const std::string& logDir, int err)>;
+    void setStorageFailureHandler(StorageFailureHandler h) { storageFailureHandler_ = std::move(h); }
+
+    // -----------------------------------------------------------------------
     // CG-4 test / introspection hooks — not used in production code paths.
     // -----------------------------------------------------------------------
 
@@ -1221,6 +1230,9 @@ private:
     // gateway); raw pointer equality is the correct identity key.
     static constexpr int64_t kGroupCommitIntervalNs = 10LL * 1'000'000LL; // 10 ms
     std::unordered_set<rune::storage::Log*> dirtyLogs_;
+    StorageFailureHandler storageFailureHandler_;
+    bool                  storageFailureRaised_ = false;
+    void raiseStorageFailure_(const std::string& logDir, int err);
     int64_t                                 lastFlushNs_ = 0;
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription

@@ -273,6 +273,10 @@ struct WorkerReturn {
     enum class Type : uint8_t {
         ProduceResult,   ///< result of a Produce op
         PushReadResult,  ///< result of a PushRead op
+        /// fsyncgate fail-stop (Task 10 fix 1): a log's fsync failed.  topicId /
+        /// partition name it, errorCode = errno, chunk = the log directory.  The
+        /// runtime logs critical and halts the broker (kExitStorageFailure).
+        StorageFailure = 3,   ///< == sbe ReturnType::STORAGE_FAILURE
     };
 
     Type    type = Type::ProduceResult;

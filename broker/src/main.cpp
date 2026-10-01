@@ -29,6 +29,15 @@ using namespace std::chrono_literals;
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_stop{false};
 static std::atomic<bool> g_frDump{false};   // SIGUSR1 → dump flight-recorder report mid-run
+static std::atomic<int>  g_exitCode{0};     // non-zero: halt requested by the broker (fail-stop)
+
+// fsyncgate fail-stop: BrokerNode calls this ONCE on its runtime thread when a
+// log's fsync failed.  Same mechanism as a signal: the main loop below stops the
+// node through the normal stop path, then exits with the code (74, EX_IOERR).
+static void haltHandler(void* /*ctx*/, int exitCode) noexcept {
+    g_exitCode.store(exitCode, std::memory_order_release);
+    g_stop.store(true, std::memory_order_release);
+}
 
 static void sighandler(int /*sig*/) noexcept {
     g_stop.store(true, std::memory_order_release);
@@ -117,6 +126,7 @@ int main() {
 
     // Construct and start the broker node.
     rune::node::BrokerNode node{std::move(*cfg)};
+    node.setHaltHandler(&haltHandler, nullptr);
     try {
         node.start();
     } catch (const std::exception& ex) {
@@ -167,10 +177,15 @@ int main() {
         }
     }
 
-    spdlog::info("rune-broker: shutdown signal received — stopping");
+    const int exitCode = g_exitCode.load(std::memory_order_acquire);
+    if (exitCode != 0) {
+        spdlog::critical("rune-broker: HALTING on storage failure — stopping (exit {})", exitCode);
+    } else {
+        spdlog::info("rune-broker: shutdown signal received — stopping");
+    }
     node.stop();
     // Threads are joined + quiesced now → drain rings and write the final report.
     frReport("shutdown");
     spdlog::info("rune-broker: stopped");
-    return 0;
+    return exitCode;
 }
