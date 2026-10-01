@@ -106,7 +106,9 @@ struct AbortedTxnRange {
 // then a forward scan while lastOffset <= off + maxSpan_ (maxSpan_ = the widest
 // range seen): any range covering `off` has lastOffset = firstOffset + span <=
 // off + maxSpan_.  O(log R + k), k = ranges whose marker lies in
-// [off, off + maxSpan_] — the aborted txns overlapping the batch.  It was O(R).
+// [off, off + maxSpan_].  Review m7: maxSpan_ is the GLOBAL widest range, so
+// one long-running aborted txn widens every lookup's window (degrading toward
+// O(R)); always correct, never worse than the former O(R) scan.
 //
 // pruneBelow(logStartOffset) drops ranges entirely below the log start (cold,
 // retention).  reserve() pre-reserves; growth beyond it is cold and counted.

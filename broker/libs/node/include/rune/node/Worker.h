@@ -360,6 +360,10 @@ public:
     // state (RcState per owned user partition).  Test seams (worker thread or
     // single-threaded tests only).
     // -----------------------------------------------------------------------
+    /// Review I-2: read_committed PushReads held while their partition's RC
+    /// state builds (each owes one return; beyond this → notReady fallback).
+    static constexpr std::size_t kMaxHeldPushReads = 1024;
+    [[nodiscard]] std::size_t heldPushReadsForTest() const noexcept { return heldPushReads_.size(); }
     static constexpr int kRcNone     = -1;   ///< no RC state for the partition
     static constexpr int kRcUnbuilt  = 0;
     static constexpr int kRcScanning = 1;
@@ -1055,6 +1059,7 @@ public:
                 work += replica->doWork(nowNs);
             }
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+            work += serveHeldPushReads_();
         }
 
         // Task 6: per-worker replication transport poll — inline dispatch.
@@ -1143,6 +1148,7 @@ private:
             if (replica) work += replica->doWork(nowNs);
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+        work += serveHeldPushReads_();
         // 4b. follower flushes raised by the replicas (shard replicas run with
         //     setExternalFollowerFlush) → io backend, never an inline fsync.
         for (auto* replica : owned_) {
@@ -1765,7 +1771,8 @@ private:
             int64_t bound = rep ? rep->highWatermark()
                                 : s.logPtr->logEndOffset();
             const RcState* rc = nullptr;
-            if (s.isolation == kIsolationReadCommitted && rep != nullptr && s.topicId >= 0) [[unlikely]] {
+            if (s.isolation == kIsolationReadCommitted && s.topicId >= 0) [[unlikely]] {
+                if (rep == nullptr) continue;   // review m5: no replica → no RC state → fail closed
                 rc = rcServe_(rep, s.rc);
                 if (rc == nullptr) continue;
                 bound = rc->lso(bound);
@@ -2194,29 +2201,66 @@ private:
     // The gateway iterates the chunk, encodes Records frames, and sends them.
     // No tail for PushRead ops.
     // -------------------------------------------------------------------
+    // F15 S4 fix round 1 (I-2): the scalars of one PushRead — from the op, or
+    // from a read HELD while its partition's RC state builds.
+    struct PushReadArgs {
+        int64_t subscriptionId = 0;
+        int64_t sessionId      = 0;
+        int32_t topicId        = 0;
+        int32_t partition      = 0;
+        int64_t nextOffset     = 0;
+        int64_t hwBound        = 0;
+        uint8_t isolation      = 0;
+        bool    isGroup        = false;
+        bool    carrier        = true;
+        uint32_t targetReplicaId = 0;
+        uint32_t incarnation     = 0;
+        rune::replication::PartitionReplica* replica = nullptr;
+        rune::storage::Log*                  logPtr  = nullptr;
+    };
     void executePushReadWire_(sbe::WorkerOp& op) {
         RUNE_FR_SPAN_READ(rune_fr::Site::ReadEncodePush,
                           static_cast<uint32_t>(op.sessionId()));
         ++pushReads_;
-        const int32_t topicId    = op.topicId();
-        const int32_t partition  = op.partition();
-        const int64_t nextOffset = op.nextOffset();
-        const int64_t hwBound    = op.hwBound();
+        PushReadArgs a;
+        a.subscriptionId  = op.subscriptionId();
+        a.sessionId       = op.sessionId();
+        a.topicId         = op.topicId();
+        a.partition       = op.partition();
+        a.nextOffset      = op.nextOffset();
+        a.hwBound         = op.hwBound();
+        a.isolation       = op.isolation();
+        a.isGroup         = op.isGroup() != 0;
+        a.carrier         = op.groupCarrierReceived() != 0;
+        a.targetReplicaId = op.targetReplicaId();
+        a.incarnation     = op.incarnation();
+        a.replica         = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        a.logPtr          = getLogFromWire_(op);
+        servePushRead_(a, /*mayHold=*/true);
+    }
+
+    void servePushRead_(const PushReadArgs& a, bool mayHold) {
+        const int32_t topicId    = a.topicId;
+        const int32_t partition  = a.partition;
+        const int64_t nextOffset = a.nextOffset;
+        const int64_t hwBound    = a.hwBound;
         WorkerReturn ret;
         ret.type                 = WorkerReturn::Type::PushReadResult;
-        ret.subscriptionId       = op.subscriptionId();
-        ret.sessionId            = op.sessionId(); // gateway needs this to find the session
+        ret.subscriptionId       = a.subscriptionId;
+        ret.sessionId            = a.sessionId; // gateway needs this to find the session
         ret.readTopicId          = topicId;
         ret.readPartition        = partition;
         ret.newNextOffset        = nextOffset; // will be advanced by gateway on success
         ret.hwBound              = hwBound;
-        ret.isolation            = op.isolation();
-        ret.isGroup              = op.isGroup() != 0;
-        ret.groupCarrierReceived = op.groupCarrierReceived() != 0;
+        ret.isolation            = a.isolation;
+        ret.isGroup              = a.isGroup;
+        ret.groupCarrierReceived = a.carrier;
 
-        rune::storage::Log* log = getLogFromWire_(op);
+        rune::storage::Log* log = a.logPtr;
         if (!log) {
-            // No log: return empty chunk (gateway will skip this subscription).
+            // No log: an UNANSWERED read (review I-1) — the gateway re-issues it
+            // and never parks the subscription on it.
+            ret.setPushEffectiveBound(-1);
             enqueueReturn_(ret);
             return;
         }
@@ -2226,20 +2270,30 @@ private:
         // (L5).  The gateway's HW snapshot (op.hwBound) only ever loosens the
         // request; the worker tightens the answer:
         //   read_uncommitted: bound = min(op.hwBound, live HW)
-        //   read_committed:   bound = min(op.hwBound, LSO(live HW)) — nothing
-        //                     (empty chunk, cursor unchanged, notReady echoed)
-        //                     while the RC state is not Ready (§2.3).
+        //   read_committed:   bound = min(op.hwBound, LSO(live HW)).  While the
+        //                     RC state is not Ready (§2.3) the read is HELD here
+        //                     and answered once it is (review I-2, addendum R-3
+        //                     "or RC readiness": one outstanding read per
+        //                     subscription, no gateway re-issue per cycle).
+        //                     Hold capacity exhausted → an unanswered notReady
+        //                     result (the gateway backs off in cycles).
         // Internal partitions (topicId < 0) carry no transactional batches (§1):
-        // HW-bounded only.  Replication-less partitions: op.hwBound.
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        // HW-bounded only.  A replication-less partition has no RC state: its
+        // read_committed fails CLOSED (review m5) — nothing, answered at the cursor.
+        auto* replica = a.replica;
         int64_t bound = hwBound;
         const RcState* rc = nullptr;
         if (replica != nullptr) {
             const int64_t liveHw = replica->highWatermark();
             bound = std::min(bound, liveHw);
-            if (op.isolation() == kIsolationReadCommitted && topicId >= 0) {
+            if (a.isolation == kIsolationReadCommitted && topicId >= 0) {
                 rc = rcServe_(replica, rcOf_(replica));
                 if (rc == nullptr) [[unlikely]] {
+                    if (mayHold && rcOf_(replica) != nullptr && heldPushReads_.size() < kMaxHeldPushReads &&
+                        owedCapAllows_(0)) {
+                        heldPushReads_.push_back(a);   // reserved: never allocates
+                        return;
+                    }
                     ret.setPushRcNotReady(true);
                     ret.setPushEffectiveBound(-1);
                     enqueueReturn_(std::move(ret));
@@ -2247,6 +2301,10 @@ private:
                 }
                 bound = std::min(bound, rc->lso(liveHw));
             }
+        } else if (a.isolation == kIsolationReadCommitted && topicId >= 0) [[unlikely]] {
+            ret.setPushEffectiveBound(nextOffset);
+            enqueueReturn_(std::move(ret));
+            return;
         }
         ret.setPushEffectiveBound(bound);
 
@@ -2282,7 +2340,7 @@ private:
                 spdlog::warn("Worker {}: log->read threw unknown exception", workerId_);
             }
             if (ret.errorCode == 0 && !ret.chunk.empty())
-                clampPushChunk_(ret, bound, rc, op.isGroup() != 0 && op.groupCarrierReceived() == 0);
+                clampPushChunk_(ret, bound, rc, a.isGroup && !a.carrier);
         }
 
         enqueueReturn_(std::move(ret));   // chunk moved (never copied) into the FIFO if queued
@@ -3457,6 +3515,41 @@ private:
         std::unique_ptr<RcState>             rc;
     };
     std::vector<RcSlot>   rcSlots_;
+    // Review I-2: read_committed PushReads held while their partition's RC
+    // state builds — answered on Ready (or unanswered on ownership loss).
+    // Each owes one return: counted in reservedAckSlots_(), capped, reserved.
+    std::vector<PushReadArgs> heldPushReads_ = [] { std::vector<PushReadArgs> v; v.reserve(kMaxHeldPushReads); return v; }();
+    // Per pass, after the RC driver: answer the held reads whose partition is
+    // Ready; unanswered (re-issue) when this worker no longer owns it.
+    int serveHeldPushReads_() {
+        if (heldPushReads_.empty()) [[likely]] return 0;
+        int n = 0;
+        for (std::size_t i = 0; i < heldPushReads_.size(); ) {
+            PushReadArgs& h = heldPushReads_[i];
+            rune::replication::PartitionReplica* r = nullptr;
+            if (h.incarnation != 0) {
+                if (ownsIncarnation_(h.targetReplicaId, h.incarnation)) r = ownedPtr_[h.targetReplicaId];
+            } else {
+                for (const auto& sl : rcSlots_) if (sl.replica == h.replica) { r = sl.replica; break; }
+            }
+            RcState* rc = r != nullptr ? rcOf_(r) : nullptr;
+            const bool owned = rc != nullptr;
+            if (owned && !rc->revalidate(rcFacts_(r))) { ++i; continue; }   // still building: keep holding
+            PushReadArgs a = h;
+            heldPushReads_[i] = heldPushReads_.back();
+            heldPushReads_.pop_back();
+            if (owned) {
+                a.replica = r;
+                if (r->isDiskBacked()) a.logPtr = r->log();
+                servePushRead_(a, /*mayHold=*/false);
+            } else {
+                a.logPtr = nullptr;   // never read a log this worker no longer owns
+                servePushRead_(a, false);   // → unanswered: the gateway re-issues to the new owner
+            }
+            ++n;
+        }
+        return n;
+    }
     std::vector<RcState*> rcById_;
     int32_t     rcScanBytesPerPass_ = RcState::kDefaultScanBytesPerPass;
     std::size_t rcOpenTxnCapacity_  = rune::transaction::LsoTracker::kDefaultOpenTxnCapacity;
@@ -3496,6 +3589,7 @@ private:
             if (!slot.rc) {
                 slot.rc = std::make_unique<RcState>();
                 slot.rc->reserve(rcOpenTxnCapacity_);
+                slot.rc->setResidencyProbe(rcProbeFn_, rcProbeCtx_);
             }
             next.push_back(std::move(slot));
         }
@@ -3610,6 +3704,7 @@ private:
             ret.subscriptionId = op.subscriptionId();
             ret.readTopicId    = op.topicId();
             ret.readPartition  = op.partition();
+            ret.setPushEffectiveBound(-1);   // review I-1: UNANSWERED — never parks the sub
             enqueueReturn_(ret);
             return;
         }
@@ -4324,6 +4419,7 @@ private:
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
                static_cast<int64_t>(durablePending_.size()) +
+               static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
                strictFactsOwed_;   // TEMPORARY (S5): owed Strict facts-only returns
     }
 
