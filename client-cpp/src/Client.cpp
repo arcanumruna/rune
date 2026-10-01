@@ -34,6 +34,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <future>  // runner start handshake (I1) — replaced by the start latch in F8c C8
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -330,12 +331,14 @@ void Client::closeImpl_() {
     // for any edge where deactivateAll was not yet called).
     subscriberHub_.failPendingSubscribes("Client closed");
 
-    // Fail any still-pending producer acks (futures/callbacks) BEFORE returning.
-    // producerHub_.failAll() calls ProducerImpl::failAllPending on every registered
-    // producer — this resolves every pending future/callback with an error so they
-    // never hang.  MUST be called after agent_.stop() so the agent thread is no
-    // longer in drainAndFlush / onProduceResponse (no concurrent access to the ack rings).
-    producerHub_.failAll("Client closed");
+    // F8c C6/C6a: every producer completes everything it accepted with Closed,
+    // exactly once — in its ring (drained to the frozen tail: a record claimed
+    // before closeAllRings() but committed after it is still read; fix5 bound),
+    // builders, the Tier-2 queue, the deferred arena, in flight — and a pending
+    // begin-close token completes Closed.  Before the registry hand-back
+    // (closeCqRegistry_, below), so no producer completion is a stale drop.
+    // After agent_.stop(): nothing else touches the producers.
+    producerHub_.closeFinalAll(OpStatus::Closed, agent_.closeDrainUnblockAfterYields());
 
     // TX-5 / F8c C5: every pending txn op completes Closed (its completion
     // reaches its queue before the registry hand-back below), and each
@@ -563,14 +566,15 @@ void Client::releaseCq_(Completions& q) noexcept {
     // can still have later ops of this queue in that drain: they are dropped as
     // stale by the generation check (misdelivery would need 32 generation wraps
     // of this one slot within a single drain — not reachable in practice).
+    const uint64_t prodIssued = q.producerIssued_;  // C6: producer-op accounting
     if (tClosing == this) {
-        applyCqRelease_(ref, ring);
+        applyCqRelease_(ref, ring, prodIssued);
         return;
     }
     if (std::this_thread::get_id() == dutyThreadId_) {
         // Thread-mode runner: every op it issues is applied directly.
         if (cfg_.runnerMode == RunnerMode::Thread) {
-            applyCqRelease_(ref, ring);
+            applyCqRelease_(ref, ring, prodIssued);
             return;
         }
         // I3' (fix round 3): the Invoker owner, inside or between cycles.  Its
@@ -582,14 +586,14 @@ void Client::releaseCq_(Completions& q) noexcept {
         // state only; nobody waits.
         const std::int64_t fence = q.issueFence_;
         if (agent_.commandRingHead() >= fence) {
-            applyCqRelease_(ref, ring);
+            applyCqRelease_(ref, ring, prodIssued);
         } else {
             // Never allocates: reserved to kMaxCqs in the constructor (one entry
             // per registry slot at most).  A deferred release keeps its slot (and
             // ring) until the drain passes the fence, so the registry can report
             // "full" meanwhile — bounded by that drain; a late op completes into
             // this queue's own (unpolled) ring, never into another queue.
-            deferredReleases_.push_back(DeferredRelease{ring, fence, ref});
+            deferredReleases_.push_back(DeferredRelease{ring, fence, ref, prodIssued});
         }
         return;
     }
@@ -597,6 +601,7 @@ void Client::releaseCq_(Completions& q) noexcept {
     cmd.op     = detail::HubCommand::Op::CqRelease;
     cmd.handle = reinterpret_cast<uint64_t>(ring);
     cmd.a      = ref;
+    cmd.b      = static_cast<int64_t>(prodIssued);
     aeron::concurrent::BackoffIdleStrategy idle(
         10, 20, std::chrono::duration<long, std::nano>(1'000),
         std::chrono::duration<long, std::nano>(100'000));
@@ -621,7 +626,7 @@ int Client::applyDeferredReleases_(bool all) noexcept {
     for (std::size_t i = 0; i < deferredReleases_.size(); ++i) {
         const DeferredRelease d = deferredReleases_[i];
         if (all || head >= d.fence) {
-            applyCqRelease_(d.ref, d.ring);  // every op it fenced has been applied (counted)
+            applyCqRelease_(d.ref, d.ring, d.prodIssued);  // every op it fenced has been applied (counted)
             ++n;
         } else {
             deferredReleases_[keep++] = d;
@@ -652,26 +657,67 @@ void Client::applyCqAdd_(detail::CompletionRing* ring) {
         (void)ring->deliver(reg, {});
         return;
     }
-    cqSlots_[idx].ring = ring;
+    cqSlots_[idx].ring          = ring;
+    cqSlots_[idx].prodDelivered = 0;  // C6: a fresh owner's producer-op count
     reg.value = makeCqRef(idx, cqSlots_[idx].gen);
     (void)ring->deliver(reg, {});
 }
 
-void Client::applyCqRelease_(CqRef ref, detail::CompletionRing* ring) {
+void Client::applyCqRelease_(CqRef ref, detail::CompletionRing* ring, uint64_t prodIssued) {
     const uint32_t idx = cqRefIndex(ref);
     if (ref != kNoCqRef && idx < cqSlots_.size() && cqSlots_[idx].ring == ring &&
         cqSlots_[idx].gen == cqRefGen(ref)) {
         CqSlot& slot = cqSlots_[idx];
         slot.ring = nullptr;
         slot.gen  = static_cast<uint8_t>((slot.gen + 1) & kCqRefGenMask);
-        if (slot.targets == 0) {
-            freeCqSlot_(idx);
-        } else {
-            slot.quarantined = true;  // recycled when its last pending op completes
-        }
+        // Quarantined until no pinned op targets it (I3) AND every producer op
+        // its owner issued has been delivered or dropped here (C6) — so a
+        // stale completion can never match a recycled slot.
+        slot.quarantined = true;
+        slot.prodIssued  = prodIssued;
+        maybeRecycleCqSlot_(idx);
     }
     // An accepted release always transfers the ring to this side (§3.3 (a)).
     delete ring;
+}
+
+void Client::maybeRecycleCqSlot_(uint32_t idx) noexcept {
+    CqSlot& slot = cqSlots_[idx];
+    if (!slot.quarantined || slot.targets != 0 || slot.prodDelivered < slot.prodIssued) return;
+    slot.quarantined   = false;
+    slot.prodDelivered = 0;
+    slot.prodIssued    = 0;
+    freeCqSlot_(idx);
+}
+
+void Client::producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c) noexcept {
+    static_cast<Client*>(ctx)->producerCqDeliver_(ref, c);
+}
+
+void Client::producerCqDeliver_(CqRef ref, const Completion& c) noexcept {
+    // Duty thread (or the closing thread).  One producer completion: a per-
+    // record / Tier-2 ack (one producer op) or a BatchAck (reserved0 credit
+    // units, each one producer op).
+    const uint32_t idx = cqRefIndex(ref);
+    if (idx >= cqSlots_.size()) {
+        ++staleCqDrops_;
+        return;
+    }
+    CqSlot& slot = cqSlots_[idx];
+    const uint64_t ops = c.op == OpKind::BatchAck ? c.reserved0 : 1u;
+    if (slot.ring != nullptr && slot.gen == cqRefGen(ref)) {
+        (void)slot.ring->deliver(c, {});
+        slot.prodDelivered += ops;
+        return;
+    }
+    // Released: dropped.  If the slot is quarantined for THIS generation (the
+    // one released just before its gen was bumped), count it so the slot can
+    // be recycled once every producer op of that owner is accounted for.
+    ++staleCqDrops_;
+    if (slot.quarantined && ((cqRefGen(ref) + 1) & kCqRefGenMask) == slot.gen) {
+        slot.prodDelivered += ops;
+        maybeRecycleCqSlot_(idx);
+    }
 }
 
 void Client::pinCqSlot_(DutyTarget& t) noexcept {
@@ -740,10 +786,8 @@ void Client::deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t
     }
     if (t.counted && idx < cqSlots_.size()) {  // I3: this op no longer pins its slot
         CqSlot& slot = cqSlots_[idx];
-        if (--slot.targets == 0 && slot.quarantined) {
-            slot.quarantined = false;
-            freeCqSlot_(idx);
-        }
+        --slot.targets;
+        maybeRecycleCqSlot_(idx);
     }
 }
 
@@ -1521,7 +1565,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
         const auto snap = agent_.stateAndSessionId();
         if (snap.state == session::SessionState::Disconnected) {
             redirectPending() = false;
-            producerHub_.failAll("Redirect reconnect failed: endpoint unreachable");
+            producerHub_.failAll(OpStatus::SessionLost);  // redirect reconnect failed: no answer possible
             subscriberHub_.failPendingSubscribes(
                 "Redirect reconnect failed: endpoint unreachable");
             if (cbError_) {
@@ -1829,7 +1873,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // so the subscribe side and reconnect-pending latch are clean.
                 const std::string retargetReason =
                     "Redirect retarget failed for endpoint: " + newEndpoint;
-                producerHub_.failPending(opt->correlationId, retargetReason);
+                producerHub_.failPending(opt->correlationId);  // DeliveryFailed
                 subscriberHub_.failPendingSubscribes("Redirect retarget failed");
                 redirectPending() = false;
                 if (cbError_) {
@@ -2200,6 +2244,19 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
     // without ever touching `this` from a non-duty thread.
     impl->setPumpFn(&Client::pumpTrampoline_, this, dutyThreadId_);
 
+    // F8c C6/C6a: ack delivery into the completion-queue registry, the close
+    // token's generic delivery, the begin-close / closeImmediately issue path
+    // and the blocking close() — plain function pointers + `this`.
+    {
+        producer::ProducerImpl::Hooks hk;
+        hk.ctx        = this;
+        hk.cqDeliver  = &Client::producerCqDeliverTrampoline_;
+        hk.sink       = detail::CompletionSink{&Client::deliverTrampoline_, this};
+        hk.issueClose = &Client::issueProducerCloseTrampoline_;
+        hk.andWait    = &Client::andWaitTrampoline_;
+        impl->setHooks(hk);
+    }
+
     // fix1 I4: clock coherence — when an injected clock is configured, the ring's
     // heartbeat writer (the duty cycle, via dutyCycle(now())) and its reader
     // (sendBlocking's liveness check) must agree on "now", or an injected-clock
@@ -2248,6 +2305,94 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
     }
 
     return Producer(std::move(impl));
+}
+
+OpResult Client::issueProducerCloseTrampoline_(void* ctx, producer::ProducerImpl& impl,
+                                              const CompletionTarget* target, Token token) {
+    return static_cast<Client*>(ctx)->issueProducerClose_(impl, target, token);
+}
+
+OpResult Client::issueProducerClose_(producer::ProducerImpl& impl, const CompletionTarget* target,
+                                     Token token) {
+    using Op = detail::HubCommand::Op;
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
+
+    detail::HubCommand cmd;
+    cmd.handle = reinterpret_cast<uint64_t>(&impl);
+    Completions*     q = nullptr;
+    detail::OpTarget t;
+    if (target == nullptr) {
+        // closeImmediately: the intake closes now (idempotent; it may already
+        // be closed by a begin-close whose drain this aborts).
+        cmd.op = Op::ProducerCloseNow;
+        (void)impl.closeIntake();
+    } else {
+        if (token > kMaxToken) return OpResult::InvalidArgument;
+        if (target->cq == nullptr && target->handler.fn == nullptr) return OpResult::InvalidArgument;
+        q = target->cq;
+        if (q != nullptr) {
+            if (q->client_ != this) return OpResult::InvalidArgument;
+            if (!q->onOwnerThread()) return OpResult::WrongThread;
+            const uint32_t r  = q->reservationFor(OpKind::ProducerClose);
+            const OpResult rr = q->reserve(r);
+            if (rr != OpResult::Accepted) return rr;
+            t.reservedBytes = r;
+            t.cqRef         = q->cqRef_;
+        } else {
+            t.handler = target->handler;
+        }
+        // The linearization point: the intake's tail-bit CAS.  Lost = already
+        // closed (a second begin-close, closeImmediately, the failure path or
+        // Client close): no completion.
+        if (!impl.closeIntake()) {
+            if (q != nullptr) q->unreserve(t.reservedBytes);
+            return OpResult::Closed;
+        }
+        cmd.op = Op::ProducerBeginClose;
+        cmd.a  = static_cast<int64_t>(token);
+        detail::encodeTarget(t, cmd);
+    }
+    auto unreserve = [&] { if (q != nullptr) q->unreserve(t.reservedBytes); };
+    if (agent_.commandRingClosed()) {
+        // The Client is closing: its close completes every record (and the
+        // intake is closed either way).
+        unreserve();
+        return OpResult::Closed;
+    }
+    if (onDuty) {  // the Invoker owner (in or outside a cycle) / a runner callback
+        applyProducerCommand_(cmd);
+        return OpResult::Accepted;
+    }
+    // A lifecycle command: guaranteed delivery — a full ring is waited out on
+    // the runner's progress (it drains the ring), never a time bound.
+    aeron::concurrent::BackoffIdleStrategy idle(
+        10, 20, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    for (;;) {
+        const auto r = agent_.submitHubCommand(cmd);
+        if (r == agent::ClientAgent::Submit::Accepted) {
+            if (q != nullptr) q->issueFence_ = agent_.commandRingTail();  // I3'
+            return OpResult::Accepted;
+        }
+        if (r == agent::ClientAgent::Submit::Closed) break;
+        idle.idle(0);
+    }
+    unreserve();
+    return OpResult::Closed;
+}
+
+void Client::applyProducerCommand_(const detail::HubCommand& cmd) {
+    // The impl is alive: the issuing handle (or the hub, which adopted it
+    // through the ring ahead of this command) holds it.
+    auto* impl = reinterpret_cast<producer::ProducerImpl*>(cmd.handle);
+    if (cmd.op == detail::HubCommand::Op::ProducerBeginClose) {
+        detail::HubCommand pinned = cmd;
+        pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+        impl->applyBeginClose(detail::decodeTarget(pinned), static_cast<Token>(cmd.a), now());
+        return;
+    }
+    impl->applyCloseImmediately(OpStatus::Closed);
 }
 
 producer::PumpResult Client::pumpTrampoline_(void* ctx) {
@@ -2423,7 +2568,12 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
         applyCqAdd_(reinterpret_cast<detail::CompletionRing*>(cmd.handle));
         return;
     case Op::CqRelease:
-        applyCqRelease_(static_cast<CqRef>(cmd.a), reinterpret_cast<detail::CompletionRing*>(cmd.handle));
+        applyCqRelease_(static_cast<CqRef>(cmd.a), reinterpret_cast<detail::CompletionRing*>(cmd.handle),
+                        static_cast<uint64_t>(cmd.b));
+        return;
+    case Op::ProducerBeginClose:
+    case Op::ProducerCloseNow:
+        applyProducerCommand_(cmd);
         return;
     case Op::ClientSetCallback:
         applySetCallback_(static_cast<int>(cmd.a), reinterpret_cast<void*>(cmd.handle));

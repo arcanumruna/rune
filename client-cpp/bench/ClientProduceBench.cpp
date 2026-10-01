@@ -6,7 +6,8 @@
 //   BM_ProduceRTT
 //     Produces a single 64-byte record (Tier-1 auto-batch, Acks::Leader) and
 //     waits for the ProduceResponse.  Measures wall-clock of
-//     producer.send(…,want_future).get() per iteration.
+//     producer.trySend(…, cq, token) + cq.waitFor(token) per iteration (F8c C6:
+//     a polled completion, yielding idle — no future / condvar).
 //     Gate: p99 < 100µs.
 //
 //   BM_SubscribeDeliveryLatency
@@ -29,6 +30,7 @@
 //   - Subscribe delivery: gap from produce-ack to first RecordHandler call.
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -368,18 +370,35 @@ struct BenchFixture {
         auto p = client->producer(pcfg);
         Key key(uint64_t{0});
         const std::vector<uint8_t> wval = {'w','a','r','m'};
+        cq = std::make_unique<Completions>(*client);
 
         for (int i = 0; i < kWarmupIter; ++i) {
-            auto wf = p.send(th, key, std::span<const uint8_t>(wval), want_future);
-            const auto wdl = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(kOpTimeoutMs);
-            if (wf.wait_until(wdl) != std::future_status::ready)
-                throw std::runtime_error("BenchFixture: warm-up produce timed out");
-            wf.get();
+            if (ackedSend(p, th, key, std::span<const uint8_t>(wval)) < 0)
+                throw std::runtime_error("BenchFixture: warm-up produce failed / timed out");
         }
     }
 
+    std::unique_ptr<Completions> cq;  // F8c C6: the bench thread's ack queue
+    Token                        nextToken = 1;
+
+    /// One acked send, waited by polling `cq` (yielding idle).  Returns the
+    /// offset, or -1 on failure / timeout.
+    int64_t ackedSend(Producer& p, const TopicHandle& t, const Key& k, std::span<const uint8_t> v) {
+        const Token tok = nextToken++;
+        SendResult r;
+        while ((r = p.trySend(t, k, v, *cq, tok)) == SendResult::BackPressured) std::this_thread::yield();
+        if (r != SendResult::Ok) return -1;
+        int64_t off = -1;
+        const auto w = cq->waitFor(tok, std::chrono::milliseconds(kOpTimeoutMs),
+                                   [&](const Completion& c, std::span<const uint8_t>) {
+                                       off = c.status == OpStatus::Ok ? c.value : -1;
+                                   },
+                                   NoPump{}, aeron::concurrent::YieldingIdleStrategy{});
+        return w == Completions::Wait::Done ? off : -1;
+    }
+
     ~BenchFixture() {
+        cq.reset();
         if (client) { client->close(); client.reset(); }
         if (gw)     { gw->stop(); gw.reset(); }
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
@@ -416,19 +435,8 @@ static void BM_ProduceRTT(benchmark::State& state) {
         state.ResumeTiming();
 
         const auto t0 = std::chrono::steady_clock::now();
-        auto fut = p.send(g_fixture->th, kKey,
-                          std::span<const uint8_t>(kVal),
-                          want_future);
-
-        const auto dl = t0 + std::chrono::milliseconds(kOpTimeoutMs);
-        if (fut.wait_until(dl) != std::future_status::ready) {
-            state.SkipWithError("ProduceRTT: future timed out");
-            break;
-        }
-        try {
-            (void)fut.get();
-        } catch (const std::exception& ex) {
-            state.SkipWithError(ex.what());
+        if (g_fixture->ackedSend(p, g_fixture->th, kKey, std::span<const uint8_t>(kVal)) < 0) {
+            state.SkipWithError("ProduceRTT: produce failed or timed out");
             break;
         }
         const auto t1 = std::chrono::steady_clock::now();
@@ -581,19 +589,9 @@ static void BM_SubscribeDeliveryLatency(benchmark::State& state) {
 
         // Produce: gateway will send ProduceResponse (stamps ackNs) then
         // push RecordBatch (triggers delivery).
-        auto fut = p.send(g_fixture->th, kKey,
-                          std::span<const uint8_t>(kVal),
-                          want_future);
-
-        // Wait for produce ack.
-        const auto dl = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kOpTimeoutMs);
-        if (fut.wait_until(dl) != std::future_status::ready) {
-            state.SkipWithError("SubscribeDelivery: produce timed out");
+        if (g_fixture->ackedSend(p, g_fixture->th, kKey, std::span<const uint8_t>(kVal)) < 0) {
+            state.SkipWithError("SubscribeDelivery: produce failed or timed out");
             break;
-        }
-        try { (void)fut.get(); } catch (const std::exception& ex) {
-            state.SkipWithError(ex.what()); break;
         }
 
         // Wait for delivery.

@@ -5,44 +5,21 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/producer/BatchBuilder.h>
+#include <rune/client/Completions.h>
 
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace rune::client {
 
 namespace {
-// fix1 minor 13: a distinct failUnsubmitted() reason per SendResult, instead
-// of one generic "back-pressure or invalid value" string for every case.
-const char* sendFailureReason(SendResult r) noexcept {
+SendResult mapReserve(OpResult r) noexcept {
     switch (r) {
-    case SendResult::Ok:            return "producer send accepted"; // unreachable (caller checks Ok first)
-    case SendResult::BackPressured: return "producer send ring full — back-pressure (retry)";
-    case SendResult::ValueTooLarge: return "producer send rejected — value too large for this producer's ring";
-    case SendResult::InvalidTopic:  return "producer send rejected — invalid topic handle";
-    case SendResult::WrongThread:   return "producer send rejected — wrong thread (ClientShard)";
-    case SendResult::WrongShard:    return "producer send rejected — wrong shard (ClientShard)";
-    case SendResult::Closed:        return "producer send rejected — client closed";
-    }
-    return "producer send not accepted";
-}
-
-// Task 14 fix1/fix4: Direct (Invoker) ingress reasons, from the reason the
-// submit RETURNED (never from producer member state).
-const char* rejectReason(SendResult r, producer::RejectReason why) noexcept {
-    using producer::RejectReason;
-    switch (why) {
-    case RejectReason::DeferredFull:
-        return "producer send rejected — deferred buffer full (send from inside the producer's "
-               "own duty-cycle callback; raise ProducerConfig::directDeferredBytes or retry later)";
-    case RejectReason::PartitionDeferred:
-        return "producer send rejected — its partition still has deferred records (sends made "
-               "from a duty-cycle callback) that cannot be sent yet — back-pressure (retry)";
-    case RejectReason::Unaddressable:
-        return "producer send rejected — unaddressable partition (the producer's partition table "
-               "is full)";
-    default:
-        return sendFailureReason(r);
+    case OpResult::QueueFull:   return SendResult::QueueFull;
+    case OpResult::Closed:      return SendResult::Closed;
+    case OpResult::WrongThread: return SendResult::WrongThread;
+    default:                    return SendResult::InvalidArgument;
     }
 }
 } // namespace
@@ -84,12 +61,34 @@ Producer::Producer(std::shared_ptr<producer::ProducerImpl> impl) noexcept
 // Hot path — void send (ZERO per-send heap allocation)
 // ---------------------------------------------------------------------------
 
+// F8c C6: the batch-ack credit unit every send reserves when batchAcksTo() is
+// bound (cold: only producers bound to a batch-ack queue reach this).
+namespace {
+[[nodiscard]] SendResult reserveBatchUnit(Completions& bq) noexcept {
+    if (!bq.onOwnerThread()) return SendResult::WrongThread;
+    const OpResult r = bq.reserve(producer::kAckRecordBytes);
+    return r == OpResult::Accepted ? SendResult::Ok : mapReserve(r);
+}
+} // namespace
+
 SendResult Producer::trySend(TopicHandle            topic,
                              const Key&             key,
                              std::span<const uint8_t> value) noexcept
 {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
-    return impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value, 0);
+    Completions* bq = impl_->batchAckCq();
+    if (bq == nullptr) [[likely]] {
+        return impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value, 0);
+    }
+    const SendResult u = reserveBatchUnit(*bq);
+    if (u != SendResult::Ok) return u;
+    const SendResult r = impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value, 0);
+    if (r == SendResult::Ok) {
+        ++bq->producerIssued_;
+    } else {
+        bq->unreserve(producer::kAckRecordBytes);
+    }
+    return r;
 }
 
 void Producer::send(TopicHandle            topic,
@@ -99,6 +98,17 @@ void Producer::send(TopicHandle            topic,
     if (!impl_ || !topic.valid()) {
         throw std::invalid_argument("Producer::send: invalid topic handle");
     }
+    if (impl_->batchAckCq() != nullptr) [[unlikely]] {
+        // Credit-reserving path: retry back-pressure only (QueueFull is the
+        // caller's to resolve — it must poll its queue).
+        producer::ProducerImpl::BlockingWait w = impl_->beginBlockingWait();
+        for (;;) {
+            const SendResult r = trySend(topic, key, value);
+            if (r == SendResult::Ok) return;
+            producer::ProducerImpl::throwForSendResult(r);  // QueueFull included: poll it
+            impl_->blockingWaitStep(w);
+        }
+    }
     const int32_t part = key.partition(topic.partitionCount);
     const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, 0);
     if (r == SendResult::Ok) [[likely]] return;
@@ -106,61 +116,102 @@ void Producer::send(TopicHandle            topic,
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in ack paths
+// Opt-in ack paths (F8c C6: tagged tokens, zero allocation)
 // ---------------------------------------------------------------------------
 
-void Producer::send(TopicHandle              topic,
-                    const Key&               key,
-                    std::span<const uint8_t> value,
-                    std::function<void(int64_t)> callback)
-{
-    if (!impl_ || !topic.valid()) {
-        // fix1 I8: never destroy the callback uncalled — fire it with -1 (the
-        // same "not accepted" signal failUnsubmitted uses below), consistent
-        // with every other invalid-input path reporting rather than dropping.
-        if (callback) callback(-1);
-        return;
+SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                             Completions& cq, Token token) noexcept {
+    if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
+    if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx ||
+        cq.ring_ == nullptr) {
+        return SendResult::InvalidArgument;
     }
-    const int32_t part   = key.partition(topic.partitionCount);
-    const int64_t ackHandle = impl_->registerCallback(std::move(callback));
-    // Back-pressure / rejection: if the send ring is full (or the value/topic is
-    // invalid) the record never reaches the agent, so the ack would never arrive
-    // — fail the pending callback immediately (callback fires with offset=-1)
-    // rather than stranding it forever.
-    producer::RejectReason why = producer::RejectReason::None;
-    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle, &why);
-    if (r != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, rejectReason(r, why));
+    // Owner check in EVERY build (review m8): the credit counters are the
+    // owner thread's plain state; a foreign thread must never touch them.
+    if (!cq.onOwnerThread()) return SendResult::WrongThread;
+    const OpResult rr = cq.reserve(producer::kAckRecordBytes);
+    if (rr != OpResult::Accepted) return mapReserve(rr);
+    Completions* bq = impl_->batchAckCq();
+    if (bq != nullptr) [[unlikely]] {
+        const SendResult u = reserveBatchUnit(*bq);
+        if (u != SendResult::Ok) {
+            cq.unreserve(producer::kAckRecordBytes);
+            return u;
+        }
     }
+    const uint64_t h = producer::ackhandle::forCq(cq.cqRef_, token);
+    const SendResult r = impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value,
+                                          static_cast<int64_t>(h));
+    if (r == SendResult::Ok) [[likely]] {
+        ++cq.producerIssued_;
+        if (bq != nullptr) ++bq->producerIssued_;
+        return r;
+    }
+    // Rejected: no completion will ever arrive — return the credit here.
+    cq.unreserve(producer::kAckRecordBytes);
+    if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
+    return r;
 }
 
-std::future<int64_t> Producer::send(TopicHandle              topic,
-                                     const Key&               key,
-                                     std::span<const uint8_t> value,
-                                     want_future_t)
-{
-    if (!impl_ || !topic.valid()) {
-        std::promise<int64_t> p;
-        p.set_exception(std::make_exception_ptr(
-            std::runtime_error("Producer: invalid topic handle")));
-        return p.get_future();
+SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                             AckToken token) noexcept {
+    if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
+    if (token.token > kMaxToken) return SendResult::InvalidArgument;
+    Completions* bq = impl_->batchAckCq();
+    if (bq != nullptr) [[unlikely]] {
+        const SendResult u = reserveBatchUnit(*bq);
+        if (u != SendResult::Ok) return u;
     }
-    const int32_t part = key.partition(topic.partitionCount);
-    auto [ackHandle, fut] = impl_->registerFuture();
-    // Back-pressure / rejection: if the send ring is full (or the value/topic is
-    // invalid) the record never reaches the agent, so the ack would never
-    // arrive and future.get() would hang forever. Reject the future
-    // immediately with a specific error instead of stranding it.
-    producer::RejectReason why = producer::RejectReason::None;
-    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle, &why);
-    if (r != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, rejectReason(r, why));
+    const uint64_t h = producer::ackhandle::forHandler(token.token);
+    const SendResult r = impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value,
+                                          static_cast<int64_t>(h));
+    if (bq != nullptr) {
+        if (r == SendResult::Ok) ++bq->producerIssued_;
+        else bq->unreserve(producer::kAckRecordBytes);
     }
-    return std::move(fut);
+    return r;
 }
 
-void Producer::onBatchAck(std::function<void(const BatchAck&)> cb) {
-    if (impl_) impl_->onBatchAck(std::move(cb));
+namespace {
+// The blocking forms: retry BackPressured with the void send()'s waiting rules
+// (sendBlocking decides pump / wait / throw); everything else is final.
+template <class Try>
+void sendRetrying(producer::ProducerImpl& impl, Try&& attempt) {
+    producer::ProducerImpl::BlockingWait w = impl.beginBlockingWait();
+    for (;;) {
+        const SendResult r = attempt();
+        if (r == SendResult::Ok) return;
+        producer::ProducerImpl::throwForSendResult(r);  // QueueFull: only the caller can poll
+        impl.blockingWaitStep(w);
+    }
+}
+} // namespace
+
+void Producer::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, Completions& cq,
+                    Token token) {
+    if (!impl_ || !topic.valid()) throw std::invalid_argument("Producer::send: invalid topic handle");
+    sendRetrying(*impl_, [&] { return trySend(topic, key, value, cq, token); });
+}
+
+void Producer::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token) {
+    if (!impl_ || !topic.valid()) throw std::invalid_argument("Producer::send: invalid topic handle");
+    sendRetrying(*impl_, [&] { return trySend(topic, key, value, token); });
+}
+
+void Producer::onAck(AckFn fn, void* ctx) noexcept {
+    if (impl_) impl_->setOnAck(fn, ctx);
+}
+
+void Producer::onBatchAck(BatchAckFn fn, void* ctx) {
+    if (impl_) impl_->setOnBatchAck(fn, ctx);
+}
+
+void Producer::batchAcksTo(Completions& cq) {
+    if (!impl_) return;
+    if (cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx || cq.cqRef_ == kNoCqRef) {
+        throw std::logic_error("Producer::batchAcksTo: the queue is not registered with this producer's Client");
+    }
+    impl_->setBatchAckCq(&cq, cq.cqRef_);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +238,49 @@ BatchBuilder Producer::batch(TopicHandle topic, const Key& key) {
 
 void Producer::flush() noexcept {
     if (impl_) impl_->submitFlush();
+}
+
+// ---------------------------------------------------------------------------
+// F8c C6a: close
+// ---------------------------------------------------------------------------
+
+OpResult Producer::close(const CompletionTarget& target, Token token) {
+    if (!impl_) return OpResult::InvalidArgument;
+    return impl_->beginClose(target, token);
+}
+
+OpStatus Producer::close() { return closeAndWait(std::chrono::nanoseconds::max()); }
+
+OpStatus Producer::closeAndWait(std::chrono::nanoseconds timeout) {
+    if (!impl_) return OpStatus::Closed;
+    if (impl_->clientClosed()) return OpStatus::Closed;  // never touch a gone Client
+    const auto& hk = impl_->hooks();
+    if (hk.andWait == nullptr) {
+        throw std::logic_error("Producer::close(): no Client to wait on (use close(target, token))");
+    }
+    struct IssueCtx {
+        producer::ProducerImpl* impl;
+        OpResult                last = OpResult::InvalidArgument;
+    } ic{impl_.get()};
+    const detail::AndWaitIssue issue = [](void* c, const CompletionTarget& t, Token tok) {
+        auto* x = static_cast<IssueCtx*>(c);
+        x->last = x->impl->beginClose(t, tok);
+        return x->last;
+    };
+    try {
+        const Completion c = hk.andWait(hk.ctx, "Producer::close()", timeout, issue, &ic, nullptr);
+        return c.status;
+    } catch (const std::runtime_error&) {
+        // The intake was already closed (second close / closeImmediately /
+        // Client closed): nothing to wait for.
+        if (ic.last == OpResult::Closed) return OpStatus::Closed;
+        throw;
+    }
+}
+
+OpResult Producer::closeImmediately() {
+    if (!impl_) return OpResult::InvalidArgument;
+    return impl_->closeImmediately();
 }
 
 // ---------------------------------------------------------------------------

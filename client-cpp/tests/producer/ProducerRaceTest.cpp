@@ -235,15 +235,17 @@ TEST(ProducerRace, ConnectThenImmediateFirstProduceSingleIteration) {
 
     auto p = client->producer(pcfg);
 
+    test_support::TestCq cqP(*client);
+
     TopicHandle th{0, 1};
     Key key(uint64_t{42});
     const std::vector<uint8_t> val = {0xAB, 0xCD};
 
-    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady(kFutureTimeout))
         << "first produce future timed out";
-    ASSERT_NO_THROW(fut.get())
+    ASSERT_NO_THROW(fut.offset())
         << "first produce after connect failed";
 
     gwStop.store(true, std::memory_order_release);
@@ -327,16 +329,18 @@ TEST(ProducerRace, ConnectThenImmediateFirstProduceTightLoop) {
 
         auto p = client->producer(pcfg); // RACE POINT: push_back while runner iterates
 
+        test_support::TestCq cqP(*client);
+
         TopicHandle th{0, 1};
         Key key(uint64_t{static_cast<uint64_t>(iter)});
         const std::vector<uint8_t> val = {static_cast<uint8_t>(iter & 0xFF)};
 
-        auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+        auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
         // 3. Wait for the ack.
-        ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(fut.waitReady(kFutureTimeout))
             << "first produce future timed out at iter " << iter;
-        ASSERT_NO_THROW(fut.get())
+        ASSERT_NO_THROW(fut.offset())
             << "first produce after connect failed at iter " << iter;
 
         // Teardown.

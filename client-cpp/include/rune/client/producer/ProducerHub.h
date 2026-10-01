@@ -103,6 +103,8 @@ public:
                 if (stop == ProducerImpl::DrainStop::Blocked && flushed == 0) break;
             }
             work += impl->retransmitStalled(nowNs, sink);
+            // F8c C6a: a closing producer's begin-close completion / deadline.
+            if (!impl->lifeOpen()) [[unlikely]] work += impl->closeDuty(nowNs);
         }
         return work;
     }
@@ -111,8 +113,20 @@ public:
     /// ordinal (O(1)); non-batch ids (transactional / control) are ignored.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset);
 
-    /// Fail all pending acks on close.
-    void failAll(const std::string& reason);
+    /// Fail every pending ack with `st` (redirect-reconnect failure:
+    /// SessionLost; the producers stay open).
+    void failAll(OpStatus st);
+
+    /// Client close (after closeAllRings): every producer completes everything
+    /// it accepted with `st` exactly once, draining its closed ring to the
+    /// frozen tail (bounded by the close-drain unblock rule).
+    void closeFinalAll(OpStatus st, int stalledYieldsBeforeUnblock);
+
+    /// F8c C6a: the duty-thread failure tail-close of every producer (T15:
+    /// the Aeron client closed under a shard).  Idempotent.
+    void failCloseAll(OpStatus st) {
+        for (auto& impl : producers_) impl->failClose(st);
+    }
 
     /// fix1 C2/I3: mark every registered producer's ring closed. Called by
     /// Client::closeImpl_ while the Client (and its pump-hook contexts) are
@@ -124,11 +138,11 @@ public:
     }
 
     /// Fail every record of the in-flight batch with this wire correlationId
-    /// (forwards to ProducerImpl::failBatch; non-batch ids are ignored).
-    /// Used by the Redirect retarget-failure path to fail ONLY the produce that
-    /// triggered the redirect, leaving all other pending produces intact so the
-    /// client session can continue serving other partitions.
-    void failPending(int64_t corrId, const std::string& reason);
+    /// (DeliveryFailed; forwards to ProducerImpl::failBatch; non-batch ids are
+    /// ignored).  Used by the Redirect retarget-failure path to fail ONLY the
+    /// produce that triggered the redirect, leaving all other pending produces
+    /// intact so the client session can continue serving other partitions.
+    void failPending(int64_t corrId);
 
     /// Sweep timed-out acks (called from Client::sweepTimeouts).
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);

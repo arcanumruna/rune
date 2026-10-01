@@ -1,5 +1,6 @@
 // tests/producer/ProducerAckPathTest.cpp — in-flight ring + ack path on a bare
 // ProducerImpl (no Aeron, injected clock, bounded pumps).
+#include "../support/AckLedger.h"
 #include "../support/AllocCounter.h"
 
 #include <rune/client/Key.h>
@@ -15,13 +16,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
 
 using rune::client::Acks;
+using rune::client::AckToken;
 using rune::client::Key;
+using rune::client::OpResult;
+using rune::client::OpStatus;
+using test_support::AckLedger;
 using rune::client::ProducerConfig;
 using namespace rune::client::producer;
 namespace rcc = rune::client::codec;
@@ -145,12 +149,10 @@ TEST(ProducerInFlight, TimedOutBatchLateOkAckCompletesNothingRegression) {
     ProducerImpl impl(ackCfg(4, /*lingerUs=*/1'000'000));
     Capture cap;
     const auto sink = cap.fn();
-    std::vector<int64_t> results[2];
+    AckLedger L;
+    L.attach(impl);
     for (int r = 0; r < 2; ++r) {
-        const int64_t id = impl.registerCallback([&results, r](int64_t off) {
-            results[r].push_back(off);
-        });
-        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(r)), kVal, true, id));
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(r)), kVal, true, AckLedger::hi(r + 1)));
     }
     // One batch holding both ack-wanting records (linger holds, then flush).
     pump(impl, sink);
@@ -165,15 +167,16 @@ TEST(ProducerInFlight, TimedOutBatchLateOkAckCompletesNothingRegression) {
     impl.retransmitStalled(late, sink);
     EXPECT_FALSE(impl.hasInFlight());
     for (int r = 0; r < 2; ++r) {
-        ASSERT_EQ(results[r].size(), 1u) << "record " << r << " must fail exactly once";
-        EXPECT_EQ(results[r][0], -1);
+        ASSERT_EQ(L.times(r + 1), 1) << "record " << r << " must fail exactly once";
+        EXPECT_EQ(L.value(r + 1), -1);
+        EXPECT_EQ(L.status(r + 1), OpStatus::DeliveryFailed);
     }
 
     // The broker's late OK ack for the given-up batch arrives.
     impl.onProduceResponse(wire, 100);
     for (int r = 0; r < 2; ++r) {
-        EXPECT_EQ(results[r].size(), 1u) << "late OK ack must not complete record " << r;
-        EXPECT_EQ(results[r][0], -1);
+        EXPECT_EQ(L.times(r + 1), 1) << "late OK ack must not complete record " << r;
+        EXPECT_EQ(L.value(r + 1), -1);
     }
 }
 
@@ -185,13 +188,12 @@ TEST(ProducerInFlight, OutOfOrderAcksKeepAckTailAtOldestLiveRegression) {
     ProducerImpl impl(ackCfg(2, /*lingerUs=*/1'000'000));
     Capture cap;
     const auto sink = cap.fn();
-    long completed = 0;
+    AckLedger L;
+    L.attach(impl);
+    rune::client::Token next = 1;
     auto sendBatch = [&](int records) {
         for (int i = 0; i < records; ++i) {
-            const int64_t id = impl.registerCallback([&completed](int64_t off) {
-                if (off >= 0) ++completed;
-            });
-            ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(i)), kVal, true, id));
+            ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(i)), kVal, true, AckLedger::hi(next++)));
         }
         pump(impl, sink);            // linger holds the records in one builder
         impl.submitFlush();
@@ -223,7 +225,10 @@ TEST(ProducerInFlight, OutOfOrderAcksKeepAckTailAtOldestLiveRegression) {
         ASSERT_EQ(ps->ackTail, ps->ackHead) << "cycle " << c;
         ASSERT_EQ(ps->ackRing.size(), ringCap) << "ack ring grew at cycle " << c;
     }
+    long completed = 0;
+    for (const auto& r : L.recs) completed += r.value >= 0 ? 1 : 0;
     EXPECT_EQ(completed, 1 + 3L * kCycles);
+    EXPECT_TRUE(L.noneDuplicated());
     EXPECT_FALSE(impl.hasInFlight());
 }
 
@@ -244,16 +249,13 @@ TEST(ProducerAcks, AcksNoneRetainsNoAckRingEntriesRegression) {
     ProducerImpl impl(noneCfg(8));
     Capture cap;
     const auto sink = cap.fn();
-    long fired = 0;
-    long nonMinusOne = 0;
+    AckLedger L;
+    L.attach(impl);
+    rune::client::Token next = 1;
     constexpr int kCycles = 6'000;  // 3 ack records/cycle -> 18'000 > kAckRingCapacity
     for (int c = 0; c < kCycles; ++c) {
         for (int i = 0; i < 3; ++i) {
-            const int64_t h = impl.registerCallback([&](int64_t off) {
-                ++fired;
-                if (off != -1) ++nonMinusOne;
-            });
-            ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(i)), kVal, true, h));
+            ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(i)), kVal, true, AckLedger::hi(next++)));
         }
         pump(impl, sink);
         const PartitionState* ps = impl.partitionState(1, 0);
@@ -262,7 +264,10 @@ TEST(ProducerAcks, AcksNoneRetainsNoAckRingEntriesRegression) {
         ASSERT_EQ(ps->ackRing.size(), static_cast<std::size_t>(kAckRingCapacity))
             << "ack ring grew at cycle " << c;
     }
-    EXPECT_EQ(fired, 3L * kCycles);
+    long nonMinusOne = 0;
+    for (const auto& r : L.recs) nonMinusOne += (r.value != -1 || r.status != OpStatus::Ok) ? 1 : 0;
+    EXPECT_EQ(static_cast<long>(L.recs.size()), 3L * kCycles);
+    EXPECT_TRUE(L.noneDuplicated());
     EXPECT_EQ(nonMinusOne, 0);
     EXPECT_FALSE(impl.hasInFlight());
     for (const Frame& f : cap.frames) EXPECT_EQ(f.corrId, 0) << "acks=None frames carry no batch id";
@@ -278,13 +283,13 @@ TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
     Capture cap;
     const auto sink = cap.fn();
     constexpr int kBatches = 200;
-    std::vector<std::future<int64_t>> futs;
-    futs.reserve(kBatches);
+    AckLedger L;
+    L.attach(*impl);
     for (int i = 0; i < kBatches; ++i) {
         rune::client::BatchBuilder bb(impl, 1, 0);
         bb.add(kVal);
         bb.add(kVal);
-        futs.push_back(bb.send());
+        ASSERT_EQ(bb.send(AckToken{static_cast<rune::client::Token>(i + 1)}), OpResult::Accepted);
     }
     pump(*impl, sink);
     ASSERT_EQ(cap.frames.size(), static_cast<std::size_t>(kBatches))
@@ -295,8 +300,9 @@ TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
         // F5: acks=None batches are non-idempotent — baseSequence is always the
         // "unset" sentinel -1, never a real (tracked) partition sequence.
         EXPECT_EQ(cap.frames[i].baseSequence, -1);
-        ASSERT_EQ(futs[i].wait_for(std::chrono::seconds(0)), std::future_status::ready) << i;
-        EXPECT_EQ(futs[i].get(), -1);
+        ASSERT_EQ(L.times(i + 1), 1) << i;
+        EXPECT_EQ(L.value(i + 1), -1);
+        EXPECT_EQ(L.status(i + 1), OpStatus::Ok);
     }
     // Far past produce + delivery timeouts: nothing is resent or failed.
     const int64_t late = kNow + 60'000LL * 1'000'000LL;
@@ -419,18 +425,19 @@ TEST(ProducerAcks, MixedVoidAndCallbackRecordsGetTheirOwnOffsetsRegression) {
     ProducerImpl impl(ackCfg(8, /*lingerUs=*/1'000'000'000));
     Capture cap;
     const auto sink = cap.fn();
-    std::vector<int64_t> got;
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, false, 0));           // record 0
-    const int64_t h1 = impl.registerCallback([&](int64_t off) { got.push_back(off); });
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h1));           // record 1
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, false, 0));           // record 2
-    const int64_t h3 = impl.registerCallback([&](int64_t off) { got.push_back(off); });
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h3));           // record 3
+    AckLedger L;
+    L.attach(impl);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, false, 0));                  // record 0
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));    // record 1
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, false, 0));                  // record 2
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(3)));    // record 3
     flushAsOneBatch(impl, sink);
     ASSERT_EQ(cap.frames.size(), 1u);
     ASSERT_EQ(cap.frames[0].records, 4);
     impl.onProduceResponse(cap.frames[0].corrId, 100);
-    EXPECT_EQ(got, (std::vector<int64_t>{101, 103}));
+    ASSERT_EQ(L.recs.size(), 2u);
+    EXPECT_EQ(L.value(1), 101);
+    EXPECT_EQ(L.value(3), 103);
 }
 
 // Review Focus 4: a duplicate ack (retransmit dedup / second publisher) fires once.
@@ -438,20 +445,21 @@ TEST(ProducerAcks, DuplicateBatchAckFiresCallbacksOnceRegression) {
     ProducerImpl impl(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
-    int fired = 0;
-    const int64_t h = impl.registerCallback([&](int64_t) { ++fired; });
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h));
+    AckLedger L;
+    L.attach(impl);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));
     pump(impl, sink);
     ASSERT_EQ(cap.frames.size(), 1u);
     impl.onProduceResponse(cap.frames[0].corrId, 7);
     impl.onProduceResponse(cap.frames[0].corrId, 7);
-    EXPECT_EQ(fired, 1);
+    EXPECT_EQ(L.times(1), 1);
 }
 
 TEST(ProducerAcks, BatchAckReportsPartitionSequenceAndCount) {
     ProducerImpl impl(ackCfg(8, 1'000'000'000));
-    std::vector<rune::client::BatchAck> acks;
-    impl.onBatchAck([&](const rune::client::BatchAck& a) { acks.push_back(a); });
+    AckLedger L;
+    L.attachBatches(impl);
+    const auto& acks = L.batchAcks;
     Capture cap;
     const auto sink = cap.fn();
     for (int i = 0; i < 3; ++i) ASSERT_TRUE(impl.submitSendRecord(4, 2, Key(uint64_t{9}), kVal, false, 0));
@@ -474,18 +482,23 @@ TEST(ProducerAcks, BatchAckReportsPartitionSequenceAndCount) {
 
 TEST(ProducerAcks, BrokerErrorFailsEveryRecordAndReportsTheCode) {
     ProducerImpl impl(ackCfg(8, 1'000'000'000));
-    std::vector<rune::client::BatchAck> acks;
-    impl.onBatchAck([&](const rune::client::BatchAck& a) { acks.push_back(a); });
+    AckLedger L;
+    L.attach(impl);
+    L.attachBatches(impl);
+    const auto& acks = L.batchAcks;
     Capture cap;
     const auto sink = cap.fn();
-    std::vector<int64_t> got;
     for (int i = 0; i < 2; ++i) {
-        const int64_t h = impl.registerCallback([&](int64_t off) { got.push_back(off); });
-        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h));
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(i + 1)));
     }
     flushAsOneBatch(impl, sink);
     impl.onProduceResponse(cap.frames[0].corrId, /*-MinIsrViolation*/ -10);
-    EXPECT_EQ(got, (std::vector<int64_t>{-1, -1}));
+    ASSERT_EQ(L.recs.size(), 2u);
+    for (int i = 1; i <= 2; ++i) {
+        EXPECT_EQ(L.value(i), -1);
+        EXPECT_EQ(L.status(i), OpStatus::BrokerError);
+        EXPECT_EQ(L.last.at(i).ec, 10);
+    }
     ASSERT_EQ(acks.size(), 1u);
     EXPECT_EQ(acks[0].errorCode, 10);
     EXPECT_EQ(acks[0].baseOffset, -1);
@@ -493,26 +506,29 @@ TEST(ProducerAcks, BrokerErrorFailsEveryRecordAndReportsTheCode) {
 
 TEST(ProducerAcks, CloseFailsRecordsStillInTheRing) {
     ProducerImpl impl(ackCfg(8));
-    auto [h, fut] = impl.registerFuture();
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h));  // never drained
-    impl.failAllPending("Client closed");
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    AckLedger L;
+    L.attach(impl);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));  // never drained
+    impl.failAllPending(OpStatus::Closed);
+    ASSERT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.status(1), OpStatus::Closed);
 }
 
 TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentRecordsAndDropsThem) {
     ProducerImpl impl(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
-    int64_t got = 0;
-    const int64_t h = impl.registerCallback([&](int64_t off) { got = off; });
-    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, h));
+    AckLedger L;
+    L.attach(impl);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));
     drainAll(impl);
     impl.flushBatches(kNow, /*sessionId=*/0, sink);  // no session: nothing is sent
     ASSERT_TRUE(cap.frames.empty());
     impl.sweepTimedOut(std::chrono::steady_clock::time_point{
         std::chrono::nanoseconds{kNow + 10'000'000'000LL}});  // deliveryTimeoutMs = 10 s
-    EXPECT_EQ(got, -1);
+    ASSERT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.value(1), -1);
+    EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
     impl.flushBatches(kNow + 10'000'000'001LL, 42, sink);
     EXPECT_TRUE(cap.frames.empty()) << "expired records are dropped, never sent after failing";
 }
@@ -524,16 +540,18 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThemRegressi
     auto impl = std::make_shared<ProducerImpl>(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
+    AckLedger L;
+    L.attach(*impl);
     rune::client::BatchBuilder bb(impl, 1, 0);
     bb.add(kVal);
-    auto fut = bb.send();
+    ASSERT_EQ(bb.send(AckToken{1}), OpResult::Accepted);
     drainAll(*impl);
     impl->flushBatches(kNow, /*sessionId=*/0, sink);
     ASSERT_TRUE(cap.frames.empty());
     impl->sweepTimedOut(std::chrono::steady_clock::time_point{
         std::chrono::nanoseconds{kNow + 10'000'000'000LL}});
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
     impl->flushBatches(kNow + 10'000'000'001LL, 42, sink);
     EXPECT_TRUE(cap.frames.empty());
 }
@@ -618,7 +636,7 @@ TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegr
     ASSERT_EQ(cap.frames.size(), 3u);
     const int16_t e0 = cap.frames[0].epoch;
     EXPECT_EQ(cap.frames[1].baseSequence, 1);
-    impl.failAllPending("Redirect reconnect failed");  // releases 3 in-flight batches
+    impl.failAllPending(OpStatus::SessionLost);  // releases 3 in-flight batches
     sendOne(impl, sink, 0);
     sendOne(impl, sink, 1);
     ASSERT_EQ(cap.frames.size(), 5u);

@@ -31,6 +31,8 @@ enum class OpKind : uint8_t {
     InitTransactions, SendOffsets, CommitTransaction, AbortTransaction,  // txn
     SubscribeBound,                                                      // optional (§2.6)
     ListTopics,                                                          // client control (C3: listTopics())
+    BatchAck,       ///< producer per-batch acknowledgement (C6: Producer::batchAcksTo; see batchAckOf())
+    ProducerClose,  ///< producer begin-close (C6a: Producer::close(target, token))
 };
 
 enum class OpStatus : uint8_t {

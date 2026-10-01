@@ -137,6 +137,8 @@ public:
         case OpKind::Send:
         case OpKind::Tier2Batch:
         case OpKind::Flush:
+        case OpKind::BatchAck:
+        case OpKind::ProducerClose:
             return detail::CompletionRing::completionRecordBytes(0);
         case OpKind::Ping:
             // The echo, or the error text of a failed ping, whichever is longer.
@@ -285,6 +287,8 @@ public:
 
 private:
     friend class Client;
+    friend class Producer;      // C6: per-record / batch-ack credit + producer-op accounting
+    friend class BatchBuilder;  // C6: Tier-2 ack credit
 
     void moveFrom_(Completions& o) noexcept {
         cfg_            = o.cfg_;
@@ -300,6 +304,7 @@ private:
         owner_          = o.owner_;
         cqRef_          = std::exchange(o.cqRef_, kNoCqRef);
         issueFence_     = o.issueFence_;
+        producerIssued_ = o.producerIssued_;
     }
     /// The §3.3 release (out of line: it talks to the Client).
     void release_() noexcept;
@@ -332,7 +337,9 @@ private:
 
     void consumeCredit_(const Completion& c) noexcept {
         reservedTotal_ -= c.reservedBytes;
-        --outstanding_;
+        // C6: one BatchAck record returns the credit of every record of its
+        // batch (reserved0 = how many reservations it covers).
+        outstanding_ -= (c.op == OpKind::BatchAck) ? c.reserved0 : 1u;
     }
 
     // Copy a completion read from the ring into the stash (FIFO).  The stash is
@@ -402,6 +409,13 @@ private:
     std::thread::id owner_;              // the constructing thread
     CqRef           cqRef_  = kNoCqRef;  // duty-assigned at registration
     std::int64_t    issueFence_ = 0;     // I3': command-ring tail after its last ring-submitted op (owner)
+    /// C6: producer completions (per-record / Tier-2 acks, batch-ack credit
+    /// units) accepted for this queue so far — owner-thread state.  They reach
+    /// the duty side through the PRODUCER ring, not the command ring, so the
+    /// I3' fence cannot order them against this queue's release: the release
+    /// carries this count and the duty side quarantines the slot until it has
+    /// delivered (or dropped) exactly this many producer completions.
+    std::uint64_t   producerIssued_ = 0;
 };
 
 /// Where an op's single completion goes (spec §2.1): a Completions queue the

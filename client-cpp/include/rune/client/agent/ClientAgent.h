@@ -442,6 +442,8 @@ public:
     /// can reach the unblock path without a million real yields. Set before
     /// close(); single-threaded.
     void testSetCloseDrainUnblockAfterYields(int n) noexcept { closeDrainUnblockAfterYields_ = n; }
+    /// The close-drain yield cap (also used by the producers' closed-ring drain, C6a).
+    [[nodiscard]] int closeDrainUnblockAfterYields() const noexcept { return closeDrainUnblockAfterYields_; }
     /// fix5 Important-2(c): number of times drainRegistrationsForClose() has
     /// called M2ORingBuffer::unblock() (owner / post-join reads only).
     [[nodiscard]] int testCloseDrainUnblockCalls() const noexcept { return closeDrainUnblockCalls_; }

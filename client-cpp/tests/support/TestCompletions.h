@@ -11,6 +11,8 @@
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
+#include <rune/client/producer/BatchBuilder.h>
+#include <rune/client/producer/Producer.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 
@@ -37,6 +39,14 @@ class PendingOp {
 public:
     PendingOp() = default;
     PendingOp(TestCq* cq, rune::client::Token t, rune::client::OpResult r) : cq_(cq), t_(t), issued_(r) {}
+    PendingOp(TestCq* cq, rune::client::Token t, rune::client::SendResult r)
+        : cq_(cq), t_(t),
+          issued_(r == rune::client::SendResult::Ok ? rune::client::OpResult::Accepted
+                                                    : rune::client::OpResult::BackPressured),
+          sendResult_(r) {}
+
+    /// F8c C6: the SendResult of a producer send issued through TestCq::send().
+    [[nodiscard]] rune::client::SendResult sendResult() const noexcept { return sendResult_; }
 
     [[nodiscard]] rune::client::OpResult issued() const noexcept { return issued_; }
     [[nodiscard]] bool accepted() const noexcept { return issued_ == rune::client::OpResult::Accepted; }
@@ -54,6 +64,12 @@ public:
     /// Completed with anything but Ok (polls first).
     [[nodiscard]] bool failed() const { return ready() && status() != rune::client::OpStatus::Ok; }
     [[nodiscard]] std::vector<uint8_t> bytes() const { return outcome().payload; }
+    /// A producer send / Tier-2 batch: the offset of an Ok completion (throws
+    /// like the old future get() otherwise).
+    [[nodiscard]] int64_t offset() const {
+        check();
+        return outcome().c.value;
+    }
     [[nodiscard]] std::string describe() const;
 
     // ---- future-like accessors (throw std::runtime_error like the old get()) --
@@ -94,9 +110,10 @@ public:
     }
 
 private:
-    TestCq*                cq_ = nullptr;
-    rune::client::Token    t_  = 0;
-    rune::client::OpResult issued_ = rune::client::OpResult::InvalidArgument;
+    TestCq*                  cq_ = nullptr;
+    rune::client::Token      t_  = 0;
+    rune::client::OpResult   issued_ = rune::client::OpResult::InvalidArgument;
+    rune::client::SendResult sendResult_ = rune::client::SendResult::Ok;
 };
 
 class TestCq {
@@ -108,6 +125,18 @@ public:
     PendingOp issue(Issue&& f) {
         const rune::client::Token t = ++next_;
         return PendingOp(this, t, f(q_, t));
+    }
+
+    /// F8c C6: an acked producer send whose completion arrives in this queue.
+    PendingOp send(rune::client::Producer& p, rune::client::TopicHandle t, const rune::client::Key& k,
+                   std::span<const uint8_t> v) {
+        const rune::client::Token tok = ++next_;
+        return PendingOp(this, tok, p.trySend(t, k, v, q_, tok));
+    }
+    /// F8c C6: a Tier-2 batch whose completion arrives in this queue.
+    PendingOp send(rune::client::BatchBuilder& b) {
+        const rune::client::Token tok = ++next_;
+        return PendingOp(this, tok, b.send(q_, tok));
     }
 
     int drain() {

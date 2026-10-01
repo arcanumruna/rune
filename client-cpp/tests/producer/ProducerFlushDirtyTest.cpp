@@ -4,6 +4,7 @@
 // Bare ProducerImpl + ProducerHub, injected clock, counting / capturing sinks,
 // no Aeron.  "Visits" = ProducerImpl::debugFlushVisits(): partitions examined by
 // flushBatches.
+#include "../support/AckLedger.h"
 #include "../support/AllocCounter.h"
 
 #include <rune/client/Key.h>
@@ -308,7 +309,9 @@ TEST(ProducerFlushDirty, FlushFromCallbackMidWalkLeavesNoStaleFlagRegression) {
     // Partition 0 is walked first (plain record); partition 1's acks=None
     // "sent" callback fires inside the same walk and calls flush().
     ASSERT_EQ(r.send(0), rc::SendResult::Ok);
-    const int64_t h = r.impl->registerCallback([&r](int64_t) { r.impl->submitFlush(); });
+    test_support::ScriptedAcks S;
+    S.attach(*r.impl);
+    const int64_t h = S.cb([&r](int64_t) { r.impl->submitFlush(); });
     ASSERT_EQ(r.impl->trySubmit(kTopic, 1, rc::Key(uint64_t{7}), kVal, h), rc::SendResult::Ok);
     r.impl->submitFlush();
     r.cycle(sink);

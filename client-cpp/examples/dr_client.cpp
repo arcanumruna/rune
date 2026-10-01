@@ -107,6 +107,7 @@
 // Exit code: 0 on success, 1 on workload assertion failure, 2 on exception.
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -132,6 +133,24 @@
 
 using namespace std::chrono_literals;
 using namespace rune::client;
+
+// F8c C6: one acked send waited on a Completions (examples only — the library
+// deliberately offers no per-record *AndWait sugar).  false = rejected or the
+// wait timed out (`out.status` = Timeout then; the op still completes later).
+static bool sendAndWaitAck(Completions& cq, Producer& p, const TopicHandle& th, const Key& key,
+                           std::span<const uint8_t> v, Token t, int timeoutMs, Completion& out) {
+    for (;;) {
+        const SendResult r = p.trySend(th, key, v, cq, t);
+        if (r == SendResult::Ok) break;
+        if (r == SendResult::QueueFull) { (void)cq.poll([](const Completion&, std::span<const uint8_t>) {}); continue; }
+        if (r != SendResult::BackPressured) { out.status = OpStatus::Closed; return false; }
+        std::this_thread::yield();
+    }
+    const auto w = cq.waitFor(t, std::chrono::milliseconds(timeoutMs),
+                              [&](const Completion& c, std::span<const uint8_t>) { out = c; });
+    if (w != Completions::Wait::Done) { out.status = OpStatus::Timeout; return false; }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Env helpers
@@ -212,6 +231,7 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
     pcfg.maxInFlight      = 16;
     pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
     auto p = c.producer(pcfg);
+    Completions cq(c);
 
     const int64_t interNs =
         (rateHz > 0) ? static_cast<int64_t>(1'000'000'000LL / rateHz) : 0;
@@ -233,29 +253,31 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 
         Key key(effKey);
         const int32_t part = key.partition(partitionCount);
-        auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-        if (fut.wait_until(deadline) != std::future_status::ready) {
+        Completion done;
+        const bool waited = sendAndWaitAck(cq, p, th, key, std::span<const uint8_t>(val),
+                                           static_cast<Token>(seq) + 1, timeoutMs, done);
+        if (!waited && done.status == OpStatus::Timeout) {
             // MD1 Fix 7c: log the timeout but continue (same resilience as the
             // exception path below — individual timeouts must not abort the batch).
             std::cerr << "CLIENT: FAIL produce cid=" << cid << " seq=" << seq
                       << " TIMEOUT\n";
             continue;
         }
-        try {
-            const int64_t offset = fut.get();
+        if (waited && done.status == OpStatus::Ok) {
+            const int64_t offset = done.value;
             std::cout << "PRODUCED cid=" << cid << " key=" << keyIdx
                       << " seq=" << seq << " part=" << part << " offset=" << offset << "\n";
             std::cout.flush();
             ++acked;
-        } catch (const std::exception& ex) {
+        } else {
+            const std::string why = "produce failed (status=" + std::to_string(static_cast<int>(done.status)) +
+                                    " errorCode=" + std::to_string(done.errorCode) + ")";
             // MD1 Fix 7c: log the failure but continue the produce loop.
             // A single-record failure (e.g. NotLeader / dead partition leader
             // in Phase-1 availability tests) must not abort the entire batch;
             // the alive partitions must still get their records.
             std::cerr << "CLIENT: FAIL produce cid=" << cid << " seq=" << seq
-                      << ": " << ex.what() << "\n";
+                      << ": " << why << "\n";
             continue;
         }
     }

@@ -334,12 +334,14 @@ TEST(Redirect, ProduceRedirectFollow) {
     pcfg.produceTimeoutMs = 12'000; // 12 s — accommodate redirect round-trip
 
     auto p  = client->producer(pcfg);
+
+    test_support::TestCq cqP(*client);
     auto th = client->topic("inventory");
     ASSERT_TRUE(th.valid()) << "topic 'inventory' must be valid";
 
     Key key(uint64_t{42});
     const std::vector<uint8_t> val = {0xDE, 0xAD, 0xBE, 0xEF};
-    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     // Pump gateway until the future resolves.
     // Flow:
@@ -351,7 +353,7 @@ TEST(Redirect, ProduceRedirectFollow) {
     bool done = false;
     for (int i = 0; i < kPumpMax; ++i) {
         gw->poll(16);
-        if (fut.wait_for(0s) == std::future_status::ready) {
+        if (fut.ready()) {
             done = true;
             break;
         }
@@ -364,7 +366,7 @@ TEST(Redirect, ProduceRedirectFollow) {
         << gw->connectsSeen << " Connect(s))";
 
     int64_t baseOffset = -1;
-    ASSERT_NO_THROW({ baseOffset = fut.get(); })
+    ASSERT_NO_THROW({ baseOffset = fut.offset(); })
         << "Produce future must not throw after redirect-follow";
 
     EXPECT_GE(baseOffset, RedirectGateway::kBaseOffset)
@@ -670,13 +672,14 @@ TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 15000;
     auto p = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("t");
 
     Key key(uint64_t{1});
     const std::vector<uint8_t> val = {0xAA};
 
     // Send first produce (will be redirected by gateway)
-    auto fut1 = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut1 = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     // Pump until gateway sends the Redirect (produce #1 seen) AND the client
     // has entered Connecting state (i.e. sessionId() == 0).
@@ -695,7 +698,7 @@ TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
 
     // --- Submit new Produce and Subscribe DURING the reconnect window ---
     // These must NOT go out with sessionId=0; they must be held.
-    auto fut2 = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut2 = cqP.send(p, th, key, std::span<const uint8_t>(val));
     SubscribeOptions opts;
     opts.from = From::earliest();
     opts.isolation = Isolation::ReadUncommitted;
@@ -705,8 +708,8 @@ TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
     bool fut1Done = false, fut2Done = false, subBound = false;
     for (int i = 0; i < kPumpMax * 2; ++i) {
         gw->poll(16);
-        if (!fut1Done && fut1.wait_for(0s) == std::future_status::ready) fut1Done = true;
-        if (!fut2Done && fut2.wait_for(0s) == std::future_status::ready) fut2Done = true;
+        if (!fut1Done && fut1.ready()) fut1Done = true;
+        if (!fut2Done && fut2.ready()) fut2Done = true;
         if (!subBound && sub.subscriptionId() != 0) subBound = true;
         if (fut1Done && fut2Done && subBound) break;
         std::this_thread::sleep_for(kPumpSleep);
@@ -716,8 +719,8 @@ TEST(Redirect, M1SendsDuringReconnectWindowHeldNotSessionId0) {
     ASSERT_TRUE(fut2Done) << "New-during-reconnect produce future must resolve";
     ASSERT_TRUE(subBound) << "New-during-reconnect subscribe must bind";
 
-    ASSERT_NO_THROW({ fut1.get(); }) << "fut1 must not throw";
-    ASSERT_NO_THROW({ fut2.get(); }) << "fut2 must not throw";
+    ASSERT_NO_THROW({ fut1.offset(); }) << "fut1 must not throw";
+    ASSERT_NO_THROW({ fut2.offset(); }) << "fut2 must not throw";
 
     // Key M1 assertion: no frame was emitted with sessionId==0
     // The gateway would have seen a Produce with sessionId=0 if the guard
@@ -898,13 +901,14 @@ TEST(Redirect, M2DeadEndpointProduceFutureFails_SubscribeDoesNotHang) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 30000;
     auto p = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("t");
 
     Key key(uint64_t{1});
     const std::vector<uint8_t> val = {0xBB};
 
     // Submit a Produce and a Subscribe — both will get Redirect to dead endpoint
-    auto prodFut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto prodFut = cqP.send(p, th, key, std::span<const uint8_t>(val));
     SubscribeOptions opts;
     opts.from = From::earliest();
     opts.isolation = Isolation::ReadUncommitted;
@@ -920,7 +924,7 @@ TEST(Redirect, M2DeadEndpointProduceFutureFails_SubscribeDoesNotHang) {
     bool prodFailed = false, subDeactivated = false;
     for (int i = 0; i < kPumpMax * 4; ++i) {
         gw->poll(16);
-        if (!prodFailed && prodFut.wait_for(0s) == std::future_status::ready)
+        if (!prodFailed && prodFut.ready())
             prodFailed = true;
         if (!subDeactivated && !sub.active())
             subDeactivated = true;
@@ -942,7 +946,7 @@ TEST(Redirect, M2DeadEndpointProduceFutureFails_SubscribeDoesNotHang) {
 
     // Verify produce future threw (not resolved with a value)
     bool prodThrew = false;
-    try { prodFut.get(); } catch (...) { prodThrew = true; }
+    try { prodFut.offset(); } catch (...) { prodThrew = true; }
     EXPECT_TRUE(prodThrew) << "Produce future must throw on dead-endpoint redirect";
 
     client->close();
@@ -1082,18 +1086,19 @@ TEST(Redirect, M2bMaxRedirectsExhaustedFailsCleanly) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 20000;
     auto p = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("t");
     Key key(uint64_t{1});
     const std::vector<uint8_t> val = {0xCC};
 
-    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     // Pump until the future resolves (either error or value).
     // The gateway always redirects, so after kMaxRedirects the frame is failed.
     bool done = false;
     for (int i = 0; i < kPumpMax * 6; ++i) {
         gw->poll(16);
-        if (fut.wait_for(0s) == std::future_status::ready) { done = true; break; }
+        if (fut.ready()) { done = true; break; }
         std::this_thread::sleep_for(kPumpSleep);
     }
 
@@ -1101,7 +1106,7 @@ TEST(Redirect, M2bMaxRedirectsExhaustedFailsCleanly) {
 
     // The future must throw (redirect exhausted, not a valid offset).
     bool threw = false;
-    try { fut.get(); } catch (...) { threw = true; }
+    try { fut.offset(); } catch (...) { threw = true; }
     EXPECT_TRUE(threw) << "Produce future must throw when kMaxRedirects is exhausted";
 
     // The gateway must have seen > kMaxRedirects produce attempts

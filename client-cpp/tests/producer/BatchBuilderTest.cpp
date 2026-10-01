@@ -21,6 +21,7 @@
 // Harness reuses the ProducerTest.cpp AgentHarness / ProduceGateway pattern.
 // Bounded, unique temp dirs, injected clock where relevant, no busy-spin.
 
+#include "../support/AckLedger.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerImpl.h>
@@ -69,7 +70,45 @@ using rc::Producer;
 using rc::BatchBuilder;
 using rc::ProducerConfig;
 using rc::Acks;
-using rc::want_future;
+using rc::AckToken;
+using rc::OpResult;
+using rc::OpStatus;
+using rc::SendResult;
+
+namespace {
+// F8c C6 test shim: the old future-shaped assertions over an AckToken ledger
+// (test-only; the API itself has no futures).  wait_for(...) is ready once the
+// token completed (or was never accepted); get() returns the offset of an Ok
+// completion and throws otherwise.
+struct TokFut {
+    test_support::AckLedger* L = nullptr;
+    rc::Token                t = 0;
+    bool                     accepted = false;
+    template <class D>
+    std::future_status wait_for(D) const {
+        return (!accepted || L->times(t) != 0) ? std::future_status::ready : std::future_status::timeout;
+    }
+    int64_t get() const {
+        if (!accepted) throw std::runtime_error("send not accepted");
+        if (L->times(t) == 0) throw std::logic_error("token still pending");
+        if (L->status(t) != OpStatus::Ok) throw std::runtime_error("send failed");
+        return L->value(t);
+    }
+};
+struct TokSender {
+    test_support::AckLedger L;
+    rc::Token               next = 1;
+    void attach(rc::Producer& p) { p.onAck(&test_support::AckLedger::onAck, &L); }
+    TokFut fut(rc::BatchBuilder& bb) {
+        const rc::Token t = next++;
+        return TokFut{&L, t, bb.send(AckToken{t}) == OpResult::Accepted};
+    }
+    TokFut fut(rc::Producer& p, rc::TopicHandle topic, const rc::Key& key, std::span<const uint8_t> v) {
+        const rc::Token t = next++;
+        return TokFut{&L, t, p.trySend(topic, key, v, AckToken{t}) == SendResult::Ok};
+    }
+};
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -309,10 +348,14 @@ struct CB3AgentHarness {
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
     }
 
+    TokSender tok;  // F8c C6: every harness producer acks into this ledger
+
     Producer makeProducer(ProducerConfig pcfg = {}) {
         auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
         hub.add(impl);
-        return Producer(std::move(impl));
+        Producer p(std::move(impl));
+        tok.attach(p);
+        return p;
     }
 
     bool connect(int limit = kPumpMax) {
@@ -370,7 +413,7 @@ TEST(BatchBuilder, AtomicBatchContiguousOffsets) {
     for (int i = 0; i < kK; ++i) {
         bb.add(std::span<const uint8_t>(val));
     }
-    auto fut = bb.send();
+    auto fut = h.tok.fut(bb);
 
     // Pump until the future resolves.
     bool done = false;
@@ -431,7 +474,7 @@ TEST(BatchBuilder, SingleAppendAtomicity) {
     for (int i = 0; i < kK; ++i) {
         bb.add(std::span<const uint8_t>(val));
     }
-    auto fut = bb.send();
+    auto fut = h.tok.fut(bb);
 
     bool done = false;
     for (int i = 0; i < kPumpMax; ++i) {
@@ -506,7 +549,7 @@ TEST(BatchBuilder, AddAfterSendGuard) {
     bb.add(std::span<const uint8_t>(val));
 
     // First send() must succeed (future resolves).
-    auto fut = bb.send();
+    auto fut = h.tok.fut(bb);
 
     // add() after send() must throw.
     EXPECT_THROW(bb.add(std::span<const uint8_t>(val)), std::logic_error)
@@ -560,7 +603,7 @@ TEST(BatchBuilder, BinaryValues) {
     bb.add(std::span<const uint8_t>(bigVal2));
     bb.add(std::span<const uint8_t>(binVal4));
 
-    auto fut = bb.send();
+    auto fut = h.tok.fut(bb);
 
     bool done = false;
     for (int i = 0; i < kPumpMax; ++i) {
@@ -619,24 +662,23 @@ TEST(BatchBuilder, Tier1Tier2SamePartitionOrdered) {
 
     // Tier-1 send: fire-and-forget (auto-batch; future for tracking).
     // Use a callback to get Tier-1 baseOffset.
-    std::atomic<int64_t> t1Offset{-1};
     const std::vector<uint8_t> t1Val = {0x11, 0x22, 0x33};
-    p.send(topic, key, std::span<const uint8_t>(t1Val),
-           [&](int64_t off) { t1Offset.store(off, std::memory_order_release); });
+    auto t1Fut = h.tok.fut(p, topic, key, std::span<const uint8_t>(t1Val));
+    ASSERT_TRUE(t1Fut.accepted);
 
     // Tier-2 send: explicit batch.
     auto bb = p.batch(topic, key);
     const std::vector<uint8_t> t2Val = {0xAA, 0xBB};
     bb.add(std::span<const uint8_t>(t2Val));
     bb.add(std::span<const uint8_t>(t2Val));
-    auto t2Fut = bb.send();
+    auto t2Fut = h.tok.fut(bb);
 
     // Pump until both resolve.
     bool t1done = false, t2done = false;
     for (int i = 0; i < kPumpMax; ++i) {
         h.agent->doWork(monoNs());
         h.gw->poll();
-        if (t1Offset.load(std::memory_order_acquire) >= 0) t1done = true;
+        if (t1Fut.wait_for(0s) == std::future_status::ready) t1done = true;
         if (t2Fut.wait_for(0s) == std::future_status::ready) t2done = true;
         if (t1done && t2done) break;
         std::this_thread::sleep_for(kPumpSleep);
@@ -645,7 +687,7 @@ TEST(BatchBuilder, Tier1Tier2SamePartitionOrdered) {
     ASSERT_TRUE(t1done) << "Tier-1 callback must fire";
     ASSERT_TRUE(t2done) << "Tier-2 future must resolve";
 
-    const int64_t t1Base = t1Offset.load();
+    const int64_t t1Base = t1Fut.get();
     const int64_t t2Base = t2Fut.get();
 
     EXPECT_GE(t1Base, 1000LL) << "T1 base must be gateway-assigned";
@@ -693,17 +735,17 @@ TEST(BatchBuilder, IdempotentSeqContinuity) {
     // Expected baseSequences: 0, 1, 3, 4, 7 (gap-free across both tiers).
 
     // T1-a: 1 record.
-    auto fut1a = p.send(topic, key, std::span<const uint8_t>(val), want_future);
+    auto fut1a = h.tok.fut(p, topic, key, std::span<const uint8_t>(val));
 
     // T2-a: 2 records.
     {
         auto bb = p.batch(topic, key);
         bb.add(std::span<const uint8_t>(val));
         bb.add(std::span<const uint8_t>(val));
-        auto fut2a = bb.send();
+        auto fut2a = h.tok.fut(bb);
 
         // T1-b: 1 record.
-        auto fut1b = p.send(topic, key, std::span<const uint8_t>(val), want_future);
+        auto fut1b = h.tok.fut(p, topic, key, std::span<const uint8_t>(val));
 
         // T2-b: 3 records.
         {
@@ -711,10 +753,10 @@ TEST(BatchBuilder, IdempotentSeqContinuity) {
             bb2.add(std::span<const uint8_t>(val));
             bb2.add(std::span<const uint8_t>(val));
             bb2.add(std::span<const uint8_t>(val));
-            auto fut2b = bb2.send();
+            auto fut2b = h.tok.fut(bb2);
 
             // T1-c: 1 record.
-            auto fut1c = p.send(topic, key, std::span<const uint8_t>(val), want_future);
+            auto fut1c = h.tok.fut(p, topic, key, std::span<const uint8_t>(val));
 
             // Wait for all to resolve.
             bool all = false;
@@ -981,6 +1023,8 @@ TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
     auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
     hub.add(impl);
     Producer p(impl);
+    TokSender tok;
+    tok.attach(p);
 
     auto topic = makeTopic(30, 1);
     Key  key(uint64_t{0});
@@ -992,13 +1036,13 @@ TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
     gw->holdAcks = true;
 
     // Submit T1 (Tier-1 auto-batch).
-    auto fut1 = p.send(topic, key, std::span<const uint8_t>(t1val), want_future);
+    auto fut1 = tok.fut(p, topic, key, std::span<const uint8_t>(t1val));
 
     // Submit T2 (Tier-2 explicit batch) AFTER T1.
     auto bb = p.batch(topic, key);
     bb.add(std::span<const uint8_t>(t2val));
     bb.add(std::span<const uint8_t>(t2val));
-    auto fut2 = bb.send();
+    auto fut2 = tok.fut(bb);
 
     // Pump for a while: only T1 should be sent (maxInFlight=1, acks held).
     for (int i = 0; i < 300; ++i) {
@@ -1120,20 +1164,17 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
     impl->setPumpFn(nullptr, nullptr, std::this_thread::get_id());
     for (int i = 0; i < 1'000; ++i) impl->submitFlush();
 
-    // Now try a Tier-2 batch — ring should be full → fail immediately.
+    // Now try a Tier-2 batch — ring should be full → rejected synchronously
+    // (F8c C6: BackPressured, no completion ever; the batch stays intact).
+    TokSender tok;
+    tok.attach(p);
     auto bb = p.batch(topic, key);
     bb.add(std::span<const uint8_t>(val));
-    auto fut2 = bb.send();
-
-    // Future must be immediately ready (ring-full fail-fast).
-    const auto status = fut2.wait_for(0ms);
-    EXPECT_EQ(status, std::future_status::ready)
-        << "Tier-2 ring-full must fail the future IMMEDIATELY (not via timeout)";
-
-    if (status == std::future_status::ready) {
-        EXPECT_THROW({ fut2.get(); }, std::runtime_error)
-            << "Ring-full Tier-2 must throw std::runtime_error";
-    }
+    EXPECT_EQ(bb.send(AckToken{1}), OpResult::BackPressured)
+        << "Tier-2 ring-full must be rejected IMMEDIATELY (not via timeout)";
+    EXPECT_EQ(tok.L.times(1), 0) << "a rejected batch never completes";
+    EXPECT_THROW(bb.add(std::span<const uint8_t>(val)), std::logic_error)
+        << "the batch is encoded: no more records, but send() may be retried";
 
     // Cleanup.
     agent->stop();
@@ -1190,24 +1231,14 @@ TEST(BatchBuilder, RingFullTier1FutureFailsFast) {
             key, std::span<const uint8_t>(val), /*wantAck=*/false, /*corrId=*/0);
     }
 
-    // Tier-1 future send on a full ring → future must be READY immediately.
-    auto fut = p.send(topic, key, std::span<const uint8_t>(val),
-                      rune::client::want_future_t{});
-    const auto status = fut.wait_for(0ms);
-    EXPECT_EQ(status, std::future_status::ready)
-        << "Tier-1 ring-full must reject the future IMMEDIATELY, not hang";
-    if (status == std::future_status::ready) {
-        EXPECT_THROW({ fut.get(); }, std::runtime_error)
-            << "Ring-full Tier-1 future must throw std::runtime_error";
-    }
-
-    // Callback overload on a full ring → callback must fire with offset=-1.
-    std::atomic<int64_t> cbOffset{0};
-    std::atomic<bool>    cbFired{false};
-    p.send(topic, key, std::span<const uint8_t>(val),
-           [&](int64_t off){ cbOffset.store(off); cbFired.store(true); });
-    EXPECT_TRUE(cbFired.load()) << "Ring-full callback must fire (not be stranded)";
-    EXPECT_EQ(cbOffset.load(), -1) << "Ring-full callback must signal error (-1)";
+    // Tier-1 token send on a full ring → rejected IMMEDIATELY (F8c C6: the
+    // SendResult, never a stranded token: a rejected send never completes).
+    TokSender tok;
+    tok.attach(p);
+    EXPECT_EQ(p.trySend(topic, key, std::span<const uint8_t>(val), AckToken{1}), SendResult::BackPressured)
+        << "Tier-1 ring-full must be rejected IMMEDIATELY, not hang";
+    hub.failAll(OpStatus::Closed);  // completes every ACCEPTED record (the void ones)
+    EXPECT_EQ(tok.L.times(1), 0) << "the rejected token never completes";
 
     agent->stop();
     try { std::filesystem::remove_all(agentDir); } catch (...) {}

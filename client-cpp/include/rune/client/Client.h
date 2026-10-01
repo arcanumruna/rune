@@ -618,7 +618,20 @@ private:
     void registerCq_(Completions& q);
     void releaseCq_(Completions& q) noexcept;
     void applyCqAdd_(detail::CompletionRing* ring);
-    void applyCqRelease_(CqRef ref, detail::CompletionRing* ring);
+    void applyCqRelease_(CqRef ref, detail::CompletionRing* ring, uint64_t prodIssued);
+    /// F8c C6: a slot whose last pin / producer completion is gone returns to
+    /// the free ring.
+    void maybeRecycleCqSlot_(uint32_t idx) noexcept;
+    /// F8c C6: producer::ProducerImpl::Hooks — duty-side delivery of one
+    /// producer completion to registry slot `ref` (generation check + the
+    /// producer-op accounting above), and the begin-close / closeImmediately
+    /// issue path.
+    static void producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c) noexcept;
+    void producerCqDeliver_(CqRef ref, const Completion& c) noexcept;
+    static OpResult issueProducerCloseTrampoline_(void* ctx, producer::ProducerImpl& impl,
+                                                  const CompletionTarget* target, Token token);
+    OpResult issueProducerClose_(producer::ProducerImpl& impl, const CompletionTarget* target, Token token);
+    void applyProducerCommand_(const detail::HubCommand& cmd);
     /// close(): hand every registered queue back (producer-close; §3.3 (b)).
     void closeCqRegistry_();
     /// I3: count / uncount a pending op's target slot; recycle a free slot.
@@ -888,12 +901,20 @@ private:
         uint8_t                 gen  = 0;
         bool                    quarantined = false;  // released, still targeted (I3)
         uint32_t                targets     = 0;      // pending ops that target this slot
+        // F8c C6: producer completions (per-record / Tier-2 acks, BatchAck credit
+        // units) delivered to THIS generation, and — once released — how many
+        // its owner issued.  Producer ops travel the producer ring, not the
+        // command ring, so they cannot be pinned before the release: the slot
+        // stays quarantined until prodDelivered == prodIssued.
+        uint64_t                prodDelivered = 0;
+        uint64_t                prodIssued    = 0;  // valid while quarantined
     };
     /// I3': an Invoker-owner release fenced on the command ring tail.
     struct DeferredRelease {
         detail::CompletionRing* ring  = nullptr;
         std::int64_t            fence = 0;
         CqRef                   ref   = kNoCqRef;
+        uint64_t                prodIssued = 0;  // C6: the owner's producer-op count
     };
     std::vector<DeferredRelease> deferredReleases_;  // duty-thread owned
     std::vector<CqSlot>   cqSlots_;

@@ -1,6 +1,7 @@
 // tests/client/InvokerClientTest.cpp — Client in RunnerMode::Invoker against the
 // single-threaded InvokerGateway.  The test thread is the only thread: every drive
 // loop is iteration-capped and advances an injected clock instead of sleeping.
+#include "../support/AckLedger.h"
 #include "../support/TestCompletions.h"
 #include "../support/InvokerGateway.h"
 
@@ -60,8 +61,6 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     return c;
 }
 
-template <class F>
-bool ready(F& f) { return f.wait_for(0s) == std::future_status::ready; }
 
 struct Rig {
     rc::Client                   client;  // constructed first: owns the driver
@@ -102,10 +101,11 @@ TEST(InvokerClient, ConnectsAndProducesWithNoThreads) {
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
     auto p = r.client.producer(pcfg);
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                      rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return ready(fut); }));
-    EXPECT_EQ(fut.get(), 100);
+    test_support::TestCq cq(r.client);
+    auto fut = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(fut.accepted());
+    ASSERT_TRUE(r.drive([&] { return fut.ready(); }));
+    EXPECT_EQ(fut.offset(), 100);
 }
 
 TEST(InvokerClient, NothingProgressesUnlessTheOwnerCallsDoWork) {
@@ -132,13 +132,14 @@ TEST(InvokerClient, InjectedClockDrivesRetransmitAndDeliveryTimeout) {
     pcfg.produceTimeoutMs = 50;
     pcfg.deliveryTimeoutMs = 120;
     auto p = r.client.producer(pcfg);
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                      rc::want_future);
+    test_support::TestCq cq(r.client);
+    auto fut = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(fut.accepted());
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 2; }, 1'000, 1'000'000))
         << "retransmit after produceTimeoutMs of INJECTED time";
-    ASSERT_TRUE(r.drive([&] { return ready(fut); }, 1'000, 1'000'000));
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(r.drive([&] { return fut.ready(); }, 1'000, 1'000'000));
+    EXPECT_EQ(fut.status(), rc::OpStatus::DeliveryFailed);
 }
 
 // Regression: transactionalProducer() pushed into a mutex-guarded vector that the
@@ -193,15 +194,16 @@ TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
         pcfg.acks = rc::Acks::Leader;
         pcfg.lingerUs = 0;
         auto p = client.producer(pcfg);
-        auto fut = p.send(client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                          rc::want_future);
-        auto tp    = client.transactionalProducer("tx-close");
         test_support::TestCq cq(client);
+        auto fut = cq.send(p, client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+        ASSERT_TRUE(fut.accepted());
+        auto tp    = client.transactionalProducer("tx-close");
         auto initF = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
         ASSERT_TRUE(initF.accepted()) << initF.describe();
         client.close();
-        ASSERT_TRUE(ready(fut)) << "produce future must be failed by close(), not hang";
-        EXPECT_THROW(fut.get(), std::runtime_error);
+        ASSERT_TRUE(fut.ready()) << "the produce token must be completed by close(), not hang";
+        EXPECT_EQ(fut.status(), rc::OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(fut.token()), 1);
         ASSERT_TRUE(initF.ready()) << "txn initTransactions must be completed by close()";
         EXPECT_EQ(initF.status(), rc::OpStatus::Closed);
         EXPECT_EQ(cq.timesCompleted(initF.token()), 1);
@@ -284,11 +286,10 @@ TEST(InvokerClient, AckThenConnectResponseInOnePollDoesNotResendRegression) {
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
     auto p  = r.client.producer(pcfg);
-    auto fx = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+    test_support::TestCq cq(r.client);
+    auto fx = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
-    auto fy = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+    auto fy = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 2; }));
     const auto X = r.gw.produced[0];
     const auto Y = r.gw.produced[1];
@@ -309,11 +310,11 @@ TEST(InvokerClient, AckThenConnectResponseInOnePollDoesNotResendRegression) {
         for (const auto& pr : r.gw.produced) k += (pr.corrId == corr) ? 1 : 0;
         return k;
     };
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && ready(fx); }));
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && fx.ready(); }));
     ASSERT_TRUE(r.drive([&] { return countCorr(Y.corrId) >= 2; }))
         << "the redirected batch Y is resent after the reconnect";
     EXPECT_EQ(countCorr(X.corrId), 1) << "acked batch X must not be resent";
-    EXPECT_EQ(fx.get(), 100);
+    EXPECT_EQ(fx.offset(), 100);
 }
 
 // I5 coverage.
@@ -349,10 +350,10 @@ TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
     auto p   = r.client.producer(pcfg);
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                      rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return ready(fut); }));
-    EXPECT_EQ(fut.get(), 100);
+    test_support::TestCq cq(r.client);
+    auto fut = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(r.drive([&] { return fut.ready(); }));
+    EXPECT_EQ(fut.offset(), 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -365,22 +366,25 @@ TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
 TEST(InvokerClient, DestroyInvokerClientOffOwnerThreadTearsDownRegression) {
     const rc::ClientConfig c = invokerCfg(3770, 3771);
     std::unique_ptr<rc::Client> client;
-    std::future<int64_t> fut;
+    test_support::AckLedger     L;  // the ack handler runs on the closing thread (main)
+    rc::SendResult              sent = rc::SendResult::Closed;
     std::thread a([&] {
         client = std::make_unique<rc::Client>(c);
         rc::ProducerConfig pcfg;
         pcfg.acks = rc::Acks::Leader;
         pcfg.lingerUs = 0;
         auto p = client->producer(pcfg);
-        fut = p.send(client->topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+        p.onAck(&test_support::AckLedger::onAck, &L);
+        sent = p.trySend(client->topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                         rc::AckToken{1});
         for (int i = 0; i < 100; ++i) client->doWork();
     });
     a.join();
+    ASSERT_EQ(sent, rc::SendResult::Ok);
     ASSERT_TRUE(std::filesystem::exists(c.dataDir + "/aeron"));
     client.reset();  // NOT the owner thread
-    ASSERT_TRUE(ready(fut));
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_EQ(L.times(1), 1) << "the produce token is completed by the teardown";
+    EXPECT_EQ(L.status(1), rc::OpStatus::Closed);
     EXPECT_FALSE(std::filesystem::exists(c.dataDir + "/aeron")) << "embedded driver not stopped";
 }
 
@@ -438,8 +442,8 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     pcfg.lingerUs = 0;
     auto p = r.client.producer(pcfg);
     r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader1");
-    auto fx = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+    test_support::TestCq cq(r.client);
+    auto fx = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
     ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && !r.gw.produced.empty(); }));
     for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // settle
     const auto X = r.gw.produced.front();
@@ -455,12 +459,11 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     // A second leader session connects; X's ack precedes its ConnectResponse.
     r.gw.ackBeforeNextConnect.push_back(X);
     r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader2");
-    auto fy = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && ready(fx); }));
+    auto fy = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && fx.ready(); }));
     for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // let any resend land
     EXPECT_EQ(countCorr(X.corrId), base) << "acked batch X must not be re-driven by the resend fn";
-    EXPECT_EQ(fx.get(), 100);
+    EXPECT_EQ(fx.offset(), 100);
 }
 
 // ---------------------------------------------------------------------------

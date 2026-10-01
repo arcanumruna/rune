@@ -78,6 +78,15 @@ struct HubCommand {
         TxnSendOffsets  = 33,
         /// d = 1 commit / 0 abort.
         TxnEnd          = 34,
+
+        // ---- Producer (F8c C6a) -------------------------------------------------
+        /// handle = producer::ProducerImpl* (kept alive by the hub / the issuing
+        /// handle); a = Token, b / c = the completion target (encodeTarget).  The
+        /// issuer already closed the intake (tail bit): the duty side drains.
+        ProducerBeginClose = 40,
+        /// handle = producer::ProducerImpl*: closeImmediately (no completion of
+        /// its own; a pending begin-close token completes Closed).
+        ProducerCloseNow   = 41,
     };
 
     Op       op     = Op::SubscribeAdd;
@@ -117,7 +126,8 @@ enum class SendResult : uint8_t { Accepted, Retry, Fatal };
 /// for a full ring.
 [[nodiscard]] constexpr bool isLifecycle(HubCommand::Op op) noexcept {
     return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose ||
-           op == HubCommand::Op::CqRelease;
+           op == HubCommand::Op::CqRelease || op == HubCommand::Op::ProducerBeginClose ||
+           op == HubCommand::Op::ProducerCloseNow;
 }
 
 /// Plain function pointer + opaque context (no std::function, no virtual):

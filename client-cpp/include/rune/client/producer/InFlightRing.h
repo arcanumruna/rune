@@ -50,6 +50,7 @@ struct InFlightBatch {
     int32_t  attempts          = 0;
     int32_t  redirectCount     = 0;
     int16_t  producerEpoch     = 0;  ///< epoch the frame was stamped with (unresolved-sequence bump)
+    bool     tier2             = false;  ///< F8c C6: a Tier-2 batch (ONE ack: op Tier2Batch; 1 credit unit)
     std::vector<uint8_t> wireFrame;  ///< encoded Produce frame; capacity reused
 };
 

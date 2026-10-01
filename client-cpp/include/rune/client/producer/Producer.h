@@ -11,11 +11,14 @@
 //   into per-(topicId,partition) RecordBatchBuilders, and flushes batches when
 //   linger elapsed OR batchBytes reached OR flush() requested.
 //
-// Acks:
-//   void send(...)              — fire-and-forget; no ack tracking.
-//   send(..., callback)         — opt-in callback; allocates a correlationId entry.
-//   send(..., want_future_tag)  — opt-in future; allocates a promise.
-//   (Per-send heap allowed ONLY on callback/future paths, NEVER on void path.)
+// Acks (F8c C6 — no futures, no per-send heap on ANY path):
+//   void send(...) / trySend(...)          — fire-and-forget; no ack tracking.
+//   trySend(..., Completions& cq, Token t) — one Completion{op=Send} into `cq`
+//                                            (credit reserved at issue).
+//   trySend(..., AckToken{t})              — the producer's onAck(fn, ctx) handler,
+//                                            called on the duty thread.
+//   The token travels in the record's 64-bit ack slot (no PendingAck, no
+//   std::function, no allocation): exactly one completion per accepted send.
 //
 // Idempotence:
 //   Each partition carries a monotonic baseSequence stamped into the batch header.
@@ -40,18 +43,20 @@
 //   auto topic = client.topic("orders");          // returns TopicHandle
 //   auto p     = client.producer({.acks=Acks::Leader, .lingerUs=1000});
 //   p.send(topic, Key(orderId), valueSpan);       // fast path: zero alloc
-//   auto f = p.send(topic, Key(orderId), val, want_future); // opt-in ack
+//   Completions cq(client);
+//   p.trySend(topic, Key(orderId), val, cq, token); // opt-in ack: zero alloc
+//   cq.poll([](const Completion& c, auto) { /* c.token, c.value = offset */ });
 
 #pragma once
 
+#include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/BatchBuilder.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <future>
 #include <memory>
 #include <span>
 
@@ -59,6 +64,8 @@ namespace rune::client {
 
 // Forward-declare the implementation class (PIMPL — impl lives in Producer.cpp).
 namespace producer { class ProducerImpl; }
+class Completions;
+struct CompletionTarget;
 
 // ---------------------------------------------------------------------------
 // Acks — acknowledgement policy for produced batches.
@@ -114,10 +121,29 @@ struct ProducerConfig {
 };
 
 // ---------------------------------------------------------------------------
-// want_future_t — tag type for the future-returning send() overload.
+// F8c C6 — per-record / Tier-2 ack targets (no std::function, no allocation).
 // ---------------------------------------------------------------------------
-struct want_future_t {};
-inline constexpr want_future_t want_future{};
+
+/// The producer's ack handler (Producer::onAck): a plain function pointer +
+/// context, called on the DUTY thread (the Thread-mode runner, or the Invoker
+/// owner inside doWork(); the closing thread for the Closed completions
+/// Client::close() delivers) once per AckToken send / Tier-2 batch:
+///   Ok             baseOffset = the record's offset (acks=None: -1, "handed to
+///                  the transport, offset unknown")
+///   BrokerError    errorCode = the broker's ErrorCode, baseOffset = -1
+///   DeliveryFailed delivery timeout / redirect budget exhausted / a deferred
+///                  record that could not be applied, baseOffset = -1
+///   SessionLost    the redirect reconnect failed (no answer possible)
+///   Closed         Producer::closeImmediately() / Client::close()
+/// It must not block (it runs inside the duty cycle).  `ctx` must outlive
+/// every op that targets it.
+using AckFn = void (*)(void* ctx, Token token, int64_t baseOffset, OpStatus status,
+                       uint16_t errorCode) noexcept;
+
+/// Tag for the onAck-handler target: trySend(topic, key, value, AckToken{t}).
+struct AckToken {
+    Token token = 0;
+};
 
 // ---------------------------------------------------------------------------
 // BatchAck — one acknowledged (or failed) produce batch (spec §4.3).  Records of
@@ -134,6 +160,11 @@ inline constexpr want_future_t want_future{};
 // broker rejection) bumps the producer epoch and restarts every partition's
 // sequence at 0, so the failed batch never leaves a permanent sequence gap.
 // ---------------------------------------------------------------------------
+//
+// F8c C6: EVERY accepted record is reported in exactly one BatchAck — including
+// records that never reached the wire (failed while still in the producer ring,
+// a builder, the Tier-2 queue or the deferred arena: baseSequence = -1,
+// errorCode = kClientFailure).  A Tier-2 batch is one BatchAck.
 struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
     int32_t topicId      = 0;
@@ -143,6 +174,26 @@ struct BatchAck {
     int32_t recordCount  = 0;
     int16_t errorCode    = 0;   ///< 0 OK; >0 broker ErrorCode; kClientFailure
 };
+
+/// Per-batch handler (Producer::onBatchAck): called on the duty thread, one
+/// call per batch.  Must not block.
+using BatchAckFn = void (*)(void* ctx, const BatchAck& ack) noexcept;
+
+/// A BatchAck delivered into a Completions (Producer::batchAcksTo) is a
+/// Completion with op == OpKind::BatchAck: token = topicId << 32 | partition,
+/// value = baseOffset, aux = baseSequence << 32 | recordCount, errorCode = the
+/// BatchAck errorCode (kClientFailure as 0xFFFF), status = Ok / BrokerError /
+/// DeliveryFailed / SessionLost / Closed.  This decodes it.
+[[nodiscard]] inline BatchAck batchAckOf(const Completion& c) noexcept {
+    BatchAck a;
+    a.topicId      = static_cast<int32_t>(static_cast<uint32_t>(c.token >> 32));
+    a.partition    = static_cast<int32_t>(static_cast<uint32_t>(c.token));
+    a.baseOffset   = c.value;
+    a.baseSequence = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(c.aux) >> 32));
+    a.recordCount  = static_cast<int32_t>(static_cast<uint32_t>(c.aux));
+    a.errorCode    = static_cast<int16_t>(c.errorCode);
+    return a;
+}
 
 // ---------------------------------------------------------------------------
 // SendResult — outcome of a non-blocking send (spec §4.3: back-pressure is
@@ -156,8 +207,12 @@ enum class SendResult : uint8_t {
     InvalidTopic,   ///< TopicHandle not valid
     WrongThread,    ///< ClientShard only (later tasks): producer used off its owner thread
     WrongShard,     ///< ClientShard only (later tasks): partition owned by another shard
-    Closed,         ///< this producer's Client has been closed (producer outlived it, or
-                    ///< send() raced a concurrent close())
+    Closed,         ///< this producer's intake is closed: Producer::close() /
+                    ///< closeImmediately(), or its Client was closed (producer outlived
+                    ///< it, or send() raced a concurrent close())
+    QueueFull,      ///< F8c C6: the target Completions has no credit — poll() it, then retry
+    InvalidArgument,///< F8c C6: token > kMaxToken, or the Completions is not registered
+                    ///< with this producer's Client
 };
 
 // ---------------------------------------------------------------------------
@@ -277,33 +332,52 @@ public:
     /// sends report BackPressured.
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
-    // ---- Opt-in ack paths (may allocate per send) ----------------------------
+    // ---- Opt-in ack paths (F8c C6: ZERO per-send allocation) ----------------
 
-    /// Send with callback.  The callback fires on the agent thread with the
-    /// broker's baseOffset when the ProduceResponse arrives.
-    /// acks=None: fires with -1 once the record's batch is handed to the transport.
-    /// Under acks=None that -1 carries NO success/failure information (nothing is
-    /// acknowledged); use onBatchAck() and its errorCode for per-batch outcome.
-    /// Allocates one PendingAck whose ownership travels to the duty-cycle thread
-    /// inside the SEND_RECORD (no map, no lock).
-    void send(TopicHandle              topic,
-              const Key&               key,
-              std::span<const uint8_t> value,
-              std::function<void(int64_t /*baseOffset*/)> callback);
+    /// Send with a polled completion: exactly one Completion{op = Send,
+    /// value = the record's offset (Ok) or -1, status, errorCode} arrives in
+    /// `cq` for an accepted (Ok) send; nothing for any other result.  The
+    /// record's ack credit is reserved on `cq` first (QueueFull: poll(), then
+    /// retry).  `cq` must be registered with this producer's Client
+    /// (InvalidArgument otherwise, or for token > kMaxToken) and used on its
+    /// owner thread (WrongThread otherwise — checked in every build).  Statuses
+    /// as for AckFn.  acks=None: Ok with value -1 when handed to the transport.
+    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                     Completions& cq, Token token) noexcept;
 
-    /// Send with future.  Returns a future that resolves with the broker's
-    /// baseOffset (or throws on error / timeout).
-    /// acks=None: resolves with -1 once the record's batch is handed to the
-    /// transport — no success/failure information (see onBatchAck()'s errorCode).  Allocates one PendingAck (ownership travels through the ring).
-    std::future<int64_t> send(TopicHandle              topic,
-                               const Key&               key,
-                               std::span<const uint8_t> value,
-                               want_future_t);
+    /// Send whose completion goes to the onAck() handler (duty thread).
+    /// InvalidArgument for token > kMaxToken.  Without a handler installed the
+    /// completion is dropped (the record is still sent and tracked).
+    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                     AckToken token) noexcept;
 
-    /// Per-batch acknowledgement callback (one call per batch, not per record).
-    /// Setup-phase: call before the first send(); fires on the duty-cycle thread
-    /// (the runner in thread mode, the app thread inside doWork() in invoker mode).
-    void onBatchAck(std::function<void(const BatchAck&)> cb);
+    /// Blocking-on-back-pressure forms (the void send() rules: Invoker owner
+    /// pumps, other threads back off; QueueFull is NOT retried here — it
+    /// throws std::runtime_error, since only the caller can poll its queue).
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, Completions& cq,
+              Token token);
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token);
+
+    /// Setup phase (before the first AckToken send): the per-record ack
+    /// handler.  See AckFn.
+    void onAck(AckFn fn, void* ctx) noexcept;
+
+    /// Setup phase (before the first send): per-batch acknowledgements to a
+    /// handler on the duty thread (one call per batch, not per record).
+    /// Exclusive with batchAcksTo().  Throws std::logic_error after a send or
+    /// when batchAcksTo() was called.
+    void onBatchAck(BatchAckFn fn, void* ctx);
+
+    /// Setup phase (before the first send): per-batch acknowledgements into
+    /// `cq` as op == OpKind::BatchAck completions (decode with batchAckOf()).
+    /// Credit: EVERY send on this producer (void and acked, Tier-1 and
+    /// Tier-2) then reserves one completion record on `cq` and returns
+    /// QueueFull when it has none — so the producer's sends must be made on
+    /// `cq`'s owner thread, and `cq` must outlive them.  One BatchAck record
+    /// returns the credit of all the records of its batch.  Throws
+    /// std::logic_error after a send, on a second call, when onBatchAck() was
+    /// set, or for a queue not registered with this producer's Client.
+    void batchAcksTo(Completions& cq);
 
     // ---- Tier-2: explicit atomic batch ---------------------------------------
 
@@ -331,6 +405,47 @@ public:
     /// linger / batch size).  Called from a duty-cycle callback it never waits
     /// (the next flush pass flushes all).
     void flush() noexcept;
+
+    // ---- Close (F8c C6a) --------------------------------------------------------
+
+    /// Begin-close (non-blocking).  Closes this producer's intake SYNCHRONOUSLY
+    /// (the producer ring's tail-bit close, linearizable with every send; Invoker
+    /// / Direct mode: owner-local) — once this returns, every later send gets
+    /// SendResult::Closed.  The duty side then drains: it consumes the producer
+    /// ring up to the closed tail (a record claimed before the close but
+    /// committed after it is still read and sent), flushes every batch at once
+    /// (no linger), and waits for every accepted record to complete.  The token
+    /// then completes (op = ProducerClose):
+    ///   Ok      every accepted record completed (with its own status);
+    ///   Timeout deliveryTimeoutMs passed first (the remaining records still
+    ///           complete, each with its own status);
+    ///   Closed  closeImmediately() / Client::close() intervened.
+    /// OpResult: Accepted (exactly one completion follows); Closed (the intake
+    /// was already closed — a second begin-close, closeImmediately() or Client
+    /// close — no completion); QueueFull / InvalidArgument / WrongThread as for
+    /// any token op.
+    OpResult close(const CompletionTarget& target, Token token);
+
+    /// Blocking close: begin-close + wait for its token (Invoker owner pumps
+    /// doWork(); a Thread-mode app thread polls under an idle strategy; from a
+    /// duty-cycle callback: std::logic_error).  Returns the token's status (Ok /
+    /// Timeout / Closed), or Closed at once when the intake was already closed.
+    OpStatus close();
+    /// close() with a bound on the wait: throws std::runtime_error when the wait
+    /// times out (the drain continues; its records still complete).
+    OpStatus closeAndWait(std::chrono::nanoseconds timeout);
+
+    /// Close now: stops the intake and completes everything not yet
+    /// acknowledged — in the ring (including records claimed before the close
+    /// and committed after it), builders, the Tier-2 queue, the deferred arena,
+    /// in flight — with Closed, exactly once; a pending begin-close token
+    /// completes Closed.  No flush, no wait (Thread mode: applied by the runner
+    /// shortly after).  Idempotent.  Accepted, or Closed (the Client is closed:
+    /// its close completes everything), or WrongThread (Invoker, off the owner).
+    /// NOTE (F8c C7): the handle destructor will call this once handles are
+    /// move-only; today Producer is copyable, so destroying a copy does not
+    /// close the producer.
+    OpResult closeImmediately();
 
     // ---- Instrumentation counters (agent-thread written, caller-read after sync)
     //

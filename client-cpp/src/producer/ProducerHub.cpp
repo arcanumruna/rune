@@ -42,15 +42,19 @@ void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset) {
     if (o < producers_.size()) producers_[o]->onProduceResponse(correlationId, baseOffset);
 }
 
-void ProducerHub::failAll(const std::string& reason) {
-    for (auto& impl : producers_) {
-        impl->failAllPending(reason);
+void ProducerHub::failAll(OpStatus st) {
+    for (std::size_t i = 0; i < producers_.size(); ++i) producers_[i]->failAllPending(st);
+}
+
+void ProducerHub::closeFinalAll(OpStatus st, int stalledYieldsBeforeUnblock) {
+    for (std::size_t i = 0; i < producers_.size(); ++i) {
+        producers_[i]->closeFinal(st, stalledYieldsBeforeUnblock);
     }
 }
 
-void ProducerHub::failPending(int64_t corrId, const std::string& reason) {
+void ProducerHub::failPending(int64_t corrId) {
     for (auto& impl : producers_) {
-        impl->failBatch(corrId, reason);
+        impl->failBatch(corrId);
     }
 }
 

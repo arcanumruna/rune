@@ -11,6 +11,7 @@
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/CountingSink.h>
+#include <rune/client/Completions.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
@@ -605,14 +606,18 @@ void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
     }
 }
 
-uint64_t ProducerImpl::takeDeferredHandle_(std::size_t off) noexcept {
+uint64_t ProducerImpl::takeDeferredHandle_(std::size_t off, bool* tier2, int32_t* recordCount) noexcept {
     const DeferredHdr* h = deferred_.hdr(off);
     const uint8_t* p = deferred_.payload(off);
     if (h->type == kMsgTier2Batch) {
         std::unique_ptr<Tier2Entry> e(
             reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
+        if (tier2 != nullptr) *tier2 = true;
+        if (recordCount != nullptr) *recordCount = e->recordCount;
         return e->ackHandle;
     }
+    if (tier2 != nullptr) *tier2 = false;
+    if (recordCount != nullptr) *recordCount = 1;
     return (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
 }
 
@@ -660,7 +665,14 @@ void ProducerImpl::applyDeferred_() noexcept {
     // more records fail than fit, the rest of the pass keeps its records
     // (applied by the next pass).
     static constexpr std::size_t kMaxLost = 16;
-    std::array<uint64_t, kMaxLost> lost{};
+    struct Lost {
+        uint64_t handle      = 0;
+        int32_t  topicId     = 0;
+        int32_t  partition   = 0;
+        int32_t  recordCount = 1;
+        bool     tier2       = false;
+    };
+    std::array<Lost, kMaxLost> lost{};
     std::size_t lostN = 0;
     const std::size_t end = deferred_.tail();
     std::size_t w = 0;
@@ -672,7 +684,7 @@ void ProducerImpl::applyDeferred_() noexcept {
         const bool lostFull = (lostN == kMaxLost);
         bool keep = lostFull || (ps != nullptr && ps->deferBlockedPass == deferPass_);
         bool applied = false;
-        uint64_t lostHandle = 0;
+        Lost lostRec{0, h->topicId, h->partition, 1, false};
         const char* lostWhat = nullptr;
         if (!keep && h->type == kMsgTier2Batch) {
             std::unique_ptr<Tier2Entry> e(reinterpret_cast<Tier2Entry*>(
@@ -687,7 +699,9 @@ void ProducerImpl::applyDeferred_() noexcept {
                 recordsSent_ += static_cast<uint64_t>(rc);
                 applied = true;
             } catch (...) {
-                lostHandle = e->ackHandle;
+                lostRec.handle      = e->ackHandle;
+                lostRec.tier2       = true;
+                lostRec.recordCount = e->recordCount;
                 lostWhat = "(Tier-2 batch) could not be queued";
             }
         } else if (!keep) {
@@ -705,7 +719,7 @@ void ProducerImpl::applyDeferred_() noexcept {
                 else applied = true;
             } catch (...) {
                 // nothing committed (appendRecord_ ordering): we own the handle
-                lostHandle = (flags & kFlagWantAck) ? handle : 0u;
+                lostRec.handle = (flags & kFlagWantAck) ? handle : 0u;
                 lostWhat = "could not be applied";
             }
         }
@@ -739,7 +753,7 @@ void ProducerImpl::applyDeferred_() noexcept {
         if (w < r) deferred_.writeFiller(w, r);  // stale gap: one dead record
         if (lostWhat != nullptr) {
             noteDeferredLoss_(lostWhat);  // counter + stderr only: no user code
-            if (lostHandle != 0) lost[lostN++] = lostHandle;
+            lost[lostN++] = lostRec;      // F8c C6: completed (and batch-acked) after the slide
         }
     }
     // No push can happen during the pass (no user code runs in it), so [end,
@@ -751,7 +765,10 @@ void ProducerImpl::applyDeferred_() noexcept {
     // The arena is compact and consistent again: now user code may run (it may
     // flush, send — deferred, inDuty_ is still set — or close the producer).
     for (std::size_t i = 0; i < lostN; ++i) {
-        PendingAck::complete(lost[i], -1, "deferred send could not be applied", &callbackExceptions_);
+        const Lost& l = lost[i];
+        emitUnsentBatchAck_(l.topicId, l.partition, l.recordCount, OpStatus::DeliveryFailed, 1);
+        completeHandle_(l.handle, l.tier2 ? OpKind::Tier2Batch : OpKind::Send, -1,
+                        l.tier2 ? l.recordCount : 0, OpStatus::DeliveryFailed, 0);
     }
 }
 
@@ -789,17 +806,20 @@ bool ProducerImpl::debugArenaConsistent() noexcept {
     return true;
 }
 
-void ProducerImpl::failDeferred_(const std::string& reason) {
+void ProducerImpl::failDeferred_(OpStatus st) {
     const bool prevScan = deferScanning_;
     deferScanning_ = true;  // callbacks below may push: never compact under our offsets
     const std::size_t end = deferred_.tail();  // only those deferred before the call
     for (std::size_t r = 0; r < end; r += deferred_.sizeAt(r)) {
         if (deferred_.hdr(r)->type == 0) continue;
         const DeferredHdr h = *deferred_.hdr(r);
-        const uint64_t handle = takeDeferredHandle_(r);
+        bool tier2 = false;
+        int32_t rc = 1;
+        const uint64_t handle = takeDeferredHandle_(r, &tier2, &rc);
         unaccountDeferred_(h);
         deferred_.kill(r);
-        if (handle != 0) PendingAck::complete(handle, -1, reason, &callbackExceptions_);
+        emitUnsentBatchAck_(h.topicId, h.partition, rc, st, 1);
+        completeHandle_(handle, tier2 ? OpKind::Tier2Batch : OpKind::Send, -1, tier2 ? rc : 0, st, 0);
     }
     deferScanning_ = prevScan;
 }
@@ -813,12 +833,15 @@ void ProducerImpl::expireDeferred_(int64_t nowNs, int64_t deliveryNs) {
         const DeferredHdr* hp = deferred_.hdr(r);
         if (hp->type == 0 || nowNs - hp->submitNs < deliveryNs) continue;
         const DeferredHdr h = *hp;
-        const uint64_t handle = takeDeferredHandle_(r);
+        bool tier2 = false;
+        int32_t rc = 1;
+        const uint64_t handle = takeDeferredHandle_(r, &tier2, &rc);
         unaccountDeferred_(h);
         deferred_.kill(r);
+        emitUnsentBatchAck_(h.topicId, h.partition, rc, OpStatus::DeliveryFailed, 1);
         if (handle != 0) {
-            PendingAck::complete(handle, -1, "produce delivery timed out (never sent)",
-                                 &callbackExceptions_);
+            completeHandle_(handle, tier2 ? OpKind::Tier2Batch : OpKind::Send, -1, tier2 ? rc : 0,
+                            OpStatus::DeliveryFailed, 0);
         } else {
             ++deferredTimedOutVoid_;
             const uint64_t n = deferredTimedOutVoid_;
@@ -832,92 +855,94 @@ void ProducerImpl::expireDeferred_(int64_t nowNs, int64_t deliveryNs) {
     deferScanning_ = prevScan;
 }
 
+void ProducerImpl::throwForSendResult(SendResult r) {
+    switch (r) {
+    case SendResult::Ok:
+    case SendResult::BackPressured:
+        return;
+    case SendResult::ValueTooLarge:
+        throw std::length_error("Producer::send: value exceeds Producer::kMaxSendValueBytes "
+                                 "or this producer's ring maxMsgLength");
+    case SendResult::InvalidTopic:
+        throw std::invalid_argument("Producer::send: invalid topic handle");
+    case SendResult::WrongThread:
+        throw std::logic_error("Producer::send: invoker-mode producer used off its owner thread");
+    case SendResult::WrongShard:
+        throw std::logic_error("Producer::send: partition owned by another shard");
+    case SendResult::Closed:
+        // fix1 C2: consistent with producer()-after-close (Client::producer()
+        // throws logic_error("client closed") once stopped_ is set).  F8c C6a:
+        // also a producer whose intake was closed (close / closeImmediately).
+        throw std::logic_error("Producer::send: client closed (or this producer was closed)");
+    case SendResult::QueueFull:
+        throw std::runtime_error("Producer::send: completion queue has no credit (poll it)");
+    case SendResult::InvalidArgument:
+        throw std::invalid_argument("Producer::send: invalid token or completion queue");
+    }
+}
+
+ProducerImpl::BlockingWait ProducerImpl::beginBlockingWait() const {
+    return BlockingWait{aeron::concurrent::BackoffIdleStrategy(
+                            100, 10, std::chrono::duration<long, std::nano>(1'000),
+                            std::chrono::duration<long, std::nano>(100'000)),
+                        clock_()};
+}
+
+void ProducerImpl::blockingWaitStep(BlockingWait& w) {
+    const int64_t livenessNs = cfg_.agentLivenessTimeoutMs * 1'000'000LL;
+    // fix1 C2/I3: re-check closed every iteration, BEFORE the pump attempt —
+    // decided immediately, never by waiting out agentLivenessTimeoutMs, and
+    // the (possibly by-now-dangling) pump context is never touched once closed.
+    if (closed_()) {
+        throw std::logic_error("Producer::send: client closed (or this producer was closed)");
+    }
+    if (mode_ == IngressMode::Direct && pumpFn_ == nullptr) {
+        // Task 14: a Direct producer is drained ONLY by its owner's duty cycle
+        // (this thread — off-owner callers got WrongThread above).  With no
+        // pump hook nothing can ever make room: fail fast, never wait.
+        throw std::runtime_error(
+            "Producer::send: back-pressured and no duty cycle to pump (direct ingress "
+            "without a pump hook) — use trySend instead");
+    }
+    // fix2 Important-2: NotOwner is decided HERE, by comparing the calling
+    // thread against the duty-thread id copied in by setPumpFn(), BEFORE
+    // ever calling pumpFn_ — so a thread that is not the duty thread never
+    // dereferences pumpCtx_ (the Client), and can never race a concurrent
+    // Client destruction on that thread.
+    if (pumpFn_ != nullptr && std::this_thread::get_id() == dutyThreadId_) {
+        // fix1 C1: DeclinedInCycle means pumping would re-enter the agent's own
+        // poll (we ARE the duty-cycle thread, already mid-cycle) — fail fast.
+        // fix3 M2: covers two conditions (inside a duty-cycle callback, or the
+        // Thread-mode runner itself outside its cycle) — the message says so.
+        if (pumpFn_(pumpCtx_) == PumpResult::DeclinedInCycle) {
+            throw std::runtime_error(
+                "Producer::send: back-pressured, and pumping the duty cycle from here is "
+                "not safe right now (already inside a duty-cycle callback, or this is the "
+                "duty-cycle thread itself outside any cycle) — use trySend instead");
+        }
+        return;  // pumped: retry immediately (no idle)
+    }
+    // NotOwner (no hook wired, or a genuinely separate thread): the
+    // heartbeat-bounded wait.
+    w.idle.idle(0);
+    const int64_t nowNs = clock_();
+    if (closed_()) {
+        throw std::logic_error("Producer::send: client closed (or this producer was closed)");
+    }
+    if (nowNs - std::max(ring_.consumerHeartbeatTime(), w.startNs) > livenessNs) {
+        throw std::runtime_error(
+            "Producer::send: back-pressured and the runner stopped draining for "
+            "> agentLivenessTimeoutMs (client closed?)");
+    }
+}
+
 void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition, const Key& key,
                                 std::span<const uint8_t> value) {
-    aeron::concurrent::BackoffIdleStrategy idle(
-        100, 10, std::chrono::duration<long, std::nano>(1'000),
-        std::chrono::duration<long, std::nano>(100'000));
-    const int64_t startNs    = clock_();
-    const int64_t livenessNs = cfg_.agentLivenessTimeoutMs * 1'000'000LL;
+    BlockingWait w = beginBlockingWait();
     for (;;) {
-        switch (r) {
-        case SendResult::Ok:            return;
-        case SendResult::BackPressured: break;
-        case SendResult::ValueTooLarge:
-            throw std::length_error("Producer::send: value exceeds Producer::kMaxSendValueBytes "
-                                     "or this producer's ring maxMsgLength");
-        case SendResult::InvalidTopic:
-            throw std::invalid_argument("Producer::send: invalid topic handle");
-        case SendResult::WrongThread:
-            throw std::logic_error("Producer::send: invoker-mode producer used off its owner thread");
-        case SendResult::WrongShard:
-            throw std::logic_error("Producer::send: partition owned by another shard");
-        case SendResult::Closed:
-            // fix1 C2: consistent with producer()-after-close (Client::producer()
-            // throws logic_error("client closed") once stopped_ is set).
-            throw std::logic_error("Producer::send: client closed");
-        }
-        // fix1 C2/I3: re-check closed every iteration, BEFORE the pump attempt —
-        // decided immediately, never by waiting out agentLivenessTimeoutMs, and
-        // the (possibly by-now-dangling) pump context is never touched once closed.
-        if (closed_()) {
-            throw std::logic_error("Producer::send: client closed");
-        }
-        bool pumped = false;
-        if (mode_ == IngressMode::Direct && pumpFn_ == nullptr) {
-            // Task 14: a Direct producer is drained ONLY by its owner's duty cycle
-            // (this thread — off-owner callers got WrongThread above).  With no
-            // pump hook nothing can ever make room: fail fast, never wait.
-            throw std::runtime_error(
-                "Producer::send: back-pressured and no duty cycle to pump (direct ingress "
-                "without a pump hook) — use trySend instead");
-        }
-        // fix2 Important-2: NotOwner is decided HERE, by comparing the calling
-        // thread against the duty-thread id copied in by setPumpFn(), BEFORE
-        // ever calling pumpFn_ — so a thread that is not the duty thread never
-        // dereferences pumpCtx_ (the Client), and can never race a concurrent
-        // Client destruction on that thread. The duty thread itself cannot race
-        // the destructor (Thread mode joins the runner before teardown; Invoker
-        // mode's owner thread IS the one destroying it in the off-owner-thread
-        // pattern).
-        if (pumpFn_ != nullptr && std::this_thread::get_id() == dutyThreadId_) {
-            // fix1 C1: a 2-way result from here (NotOwner is pre-decided above).
-            // DeclinedInCycle means pumping would re-enter the agent's own poll
-            // (we ARE the duty-cycle thread, already mid-cycle) — fail fast,
-            // never spin, never wait on a heartbeat that is literally this same
-            // stalled call.
-            const PumpResult pr = pumpFn_(pumpCtx_);
-            if (pr == PumpResult::DeclinedInCycle) {
-                // fix3 M2: this covers TWO distinct conditions (see
-                // Client::pumpTrampoline_) — already inside a duty-cycle
-                // callback (the common case; pumping would recursively
-                // re-enter the agent's own poll), or this is the Thread-mode
-                // runner thread itself calling from outside its own cycle (not
-                // reachable in practice — the runner's whole body IS the cycle
-                // loop — but never assumed safe). The message deliberately
-                // does not claim "inside a callback" specifically, since that
-                // would be inaccurate for the second case.
-                throw std::runtime_error(
-                    "Producer::send: back-pressured, and pumping the duty cycle from here is "
-                    "not safe right now (already inside a duty-cycle callback, or this is the "
-                    "duty-cycle thread itself outside any cycle) — use trySend instead");
-            }
-            pumped = (pr == PumpResult::Pumped);
-        }
-        // else: NotOwner (no hook wired, or a genuinely separate thread) — falls
-        // back to the heartbeat-bounded wait below, same as "no hook wired".
-        if (!pumped) {
-            idle.idle(0);
-            const int64_t nowNs = clock_();
-            if (closed_()) {
-                throw std::logic_error("Producer::send: client closed");
-            }
-            if (nowNs - std::max(ring_.consumerHeartbeatTime(), startNs) > livenessNs) {
-                throw std::runtime_error(
-                    "Producer::send: back-pressured and the runner stopped draining for "
-                    "> agentLivenessTimeoutMs (client closed?)");
-            }
-        }
+        if (r == SendResult::Ok) return;
+        throwForSendResult(r);  // every non-retryable result throws
+        blockingWaitStep(w);
         r = trySubmit(topicId, partition, key, value, 0);
     }
 }
@@ -987,9 +1012,9 @@ void ProducerImpl::submitFlush() noexcept {
 
 RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
                                      int32_t partition,
-                                     int64_t ackHandle,
+                                     uint64_t ackHandle,
                                      int32_t recordCount,
-                                     std::vector<uint8_t> batchBytes)
+                                     std::vector<uint8_t>& batchBytes)
 {
     if (mode_ == IngressMode::Direct) {
         // Task 14: queue straight onto the partition (owner thread only — the same
@@ -1004,10 +1029,12 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
             auto entry = std::make_unique<Tier2Entry>();
             entry->topicId     = topicId;
             entry->partition   = partition;
-            entry->ackHandle   = static_cast<uint64_t>(ackHandle);
+            entry->ackHandle   = ackHandle;
             entry->recordCount = recordCount;
             entry->batchBytes  = std::move(batchBytes);
-            return deferTier2_(entry);  // not None: caller fails the handle; entry freed here
+            const RejectReason why = deferTier2_(entry);
+            if (why != RejectReason::None) batchBytes = std::move(entry->batchBytes);  // C6: retryable
+            return why;
         }
         if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) {
             return RejectReason::PartitionDeferred;  // its deferred records must go first
@@ -1022,11 +1049,16 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
         Tier2Entry e;
         e.topicId     = topicId;
         e.partition   = partition;
-        e.ackHandle   = static_cast<uint64_t>(ackHandle);
+        e.ackHandle   = ackHandle;
         e.recordCount = recordCount;
         e.enqueuedNs  = lastNowNs_;
         e.batchBytes  = std::move(batchBytes);
-        ps.pendingTier2Entries.push_back(std::move(e));  // may throw: nothing changed yet
+        try {
+            ps.pendingTier2Entries.push_back(std::move(e));
+        } catch (...) {
+            batchBytes = std::move(e.batchBytes);  // nothing changed: the caller keeps the batch
+            throw;
+        }
         markDirty_(ps);
         if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
         recordsSent_ += static_cast<uint64_t>(recordCount);
@@ -1036,7 +1068,7 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
     auto entry = std::make_unique<Tier2Entry>();
     entry->topicId     = topicId;
     entry->partition   = partition;
-    entry->ackHandle   = static_cast<uint64_t>(ackHandle);
+    entry->ackHandle   = ackHandle;
     entry->recordCount = recordCount;
     entry->batchBytes  = std::move(batchBytes);
     uint8_t tok[kT2TokenSize];
@@ -1044,7 +1076,8 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
     if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) {
         // F8c fix round 1 (review m1): a close that landed after the pre-check
         // above is reported as Closed, not back-pressure (the claim failed on
-        // the ring's closed bit).  The caller fails the handle either way.
+        // the ring's closed bit).  C6: the caller keeps the batch (retryable).
+        batchBytes = std::move(entry->batchBytes);
         return ring_.closed() ? RejectReason::Closed : RejectReason::BackPressured;
     }
     entry.release();  // ownership now travels through the ring
@@ -1052,61 +1085,52 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
 }
 
 // ---------------------------------------------------------------------------
-// App-thread: opt-in ack registration (allocates one PendingAck; its address is
-// the ack handle whose ownership travels through the ring — no map, no lock)
+// F8c C6: ack targets
 // ---------------------------------------------------------------------------
 
-void PendingAck::complete(uint64_t handle, int64_t offset, std::string_view error,
-                          uint64_t* exceptionCounter) noexcept {
-    std::unique_ptr<PendingAck> pa(reinterpret_cast<PendingAck*>(static_cast<uintptr_t>(handle)));
-    if (!pa) return;
-    try {
-        if (pa->kind == Kind::Callback) {
-            if (pa->callback) pa->callback(error.empty() ? offset : -1);
-        } else if (error.empty()) {
-            pa->promise.set_value(offset);
-        } else {
-            pa->promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(std::string(error))));
-        }
-    } catch (const std::exception& e) {
-        // fix2 minor: a throwing user callback must not escape the duty cycle
-        // — caught, counted, and logged instead of silently swallowed.
-        if (exceptionCounter) ++*exceptionCounter;
-        std::fprintf(stderr,
-            "rune-client: producer ack callback threw: %s (caught; the duty cycle continues)\n",
-            e.what());
-    } catch (...) {
-        if (exceptionCounter) ++*exceptionCounter;
-        std::fprintf(stderr,
-            "rune-client: producer ack callback threw a non-std::exception "
-            "(caught; the duty cycle continues)\n");
+void ProducerImpl::setOnBatchAck(BatchAckFn fn, void* ctx) {
+    if (batchAckCq_ != nullptr) {
+        throw std::logic_error("Producer::onBatchAck: batchAcksTo() already set (exclusive)");
     }
+    batchAckFn_  = fn;
+    batchAckCtx_ = ctx;
 }
 
-int64_t ProducerImpl::registerCallback(std::function<void(int64_t)> cb) {
-    auto* pa = new PendingAck{};
-    pa->kind = PendingAck::Kind::Callback;
-    pa->callback = std::move(cb);
-    return static_cast<int64_t>(reinterpret_cast<uintptr_t>(pa));
+void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
+    if (batchAckCq_ != nullptr) throw std::logic_error("Producer::batchAcksTo: already set");
+    if (batchAckFn_ != nullptr) {
+        throw std::logic_error("Producer::batchAcksTo: onBatchAck() already set (exclusive)");
+    }
+    // Every record must carry exactly one credit unit, so no record may have
+    // been accepted before the queue is bound (setup phase).  Ring: nothing
+    // ever claimed (the tail word, a ring word any thread may read); Direct:
+    // the owner's own counters.
+    const bool sentBefore = mode_ == IngressMode::Direct
+                                ? (recordsSent_ != 0 || !deferred_.empty())
+                                : (ring_.tailPosition() != 0);
+    if (sentBefore) throw std::logic_error("Producer::batchAcksTo: called after a send (setup phase only)");
+    batchAckCqRef_ = ref;
+    batchAckCq_    = cq;
 }
 
-std::pair<int64_t, std::future<int64_t>> ProducerImpl::registerFuture() {
-    auto* pa = new PendingAck{};
-    pa->kind = PendingAck::Kind::Future;
-    auto fut = pa->promise.get_future();
-    return {static_cast<int64_t>(reinterpret_cast<uintptr_t>(pa)), std::move(fut)};
-}
-
-void ProducerImpl::failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept {
-    // fix3 I3: this runs on the APP thread — called only from Producer::send's
-    // callback/future overloads and BatchBuilder::send(), all app-thread APIs
-    // — and this producer's ring is MPSC, so MULTIPLE DIFFERENT app threads
-    // can legitimately call this concurrently on the SAME ProducerImpl.
-    // callbackExceptions_ is a plain, duty-thread-ONLY counter (see its doc);
-    // counting here would race both the duty thread and other app threads on
-    // a non-atomic variable. Log only on this path — never count.
-    PendingAck::complete(static_cast<uint64_t>(ackHandle), -1, reason, nullptr);
+void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
+                                   uint16_t errorCode) noexcept {
+    if (h == 0) return;
+    const Token t = ackhandle::token(h);
+    if (ackhandle::isCq(h)) {
+        if (hooks_.cqDeliver == nullptr) return;  // bare rig: no registry
+        Completion c;
+        c.token         = t;
+        c.value         = value;
+        c.aux           = aux;
+        c.op            = op;
+        c.status        = st;
+        c.errorCode     = errorCode;
+        c.reservedBytes = kAckRecordBytes;
+        hooks_.cqDeliver(hooks_.ctx, ackhandle::cqRef(h), c);
+        return;
+    }
+    if (onAckFn_ != nullptr) onAckFn_(onAckCtx_, t, value, st, errorCode);  // noexcept by type
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1235,11 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
     // Task 14: a Direct producer's records were appended by trySubmit already;
     // its ring never carries anything — skip the ring's head/tail reads entirely.
     if (mode_ == IngressMode::Direct) return 0;
+    // F8c C6a: closeImmediately / failure path / Client close — every record
+    // read from the closed ring completes with the Discarding status.
+    if (const auto* dc = std::get_if<LifeDiscarding>(&life_)) [[unlikely]] {
+        return discardRing_(dc->status, messageLimit);
+    }
 
     // F12: drain up to messageLimit messages in ONE pass; ProducerHub flushes
     // once after it (not once per record).  The pass stops early at a batch
@@ -1554,6 +1583,7 @@ bool ProducerImpl::encodeAndSend(
         b.baseSequence      = batchSeq;
         b.producerEpoch     = producerEpoch_;
         b.ingressStreamId   = ps.ingressStreamId;
+        b.tier2             = false;
         keepFrame(b.wireFrame, encodeScratch_.data(), written);
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
             earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
@@ -1563,7 +1593,8 @@ bool ProducerImpl::encodeAndSend(
         // acks=None: no response is awaited (the wire id is 0 — see onProduceResponse),
         // so the batch's acks complete now, "sent, offset unknown" (-1), and its
         // ack-ring slice is reclaimed immediately — nothing is retained.
-        emitBatchAck_(ps, batchSeq, batchRecords, -1, 0);
+        emitBatchAck_(ps.topicId, ps.partition, batchSeq, batchRecords, -1, 0, OpStatus::Ok,
+                      static_cast<uint32_t>(batchRecords));
         completeSentUnacked_(ps);
     }
 
@@ -1698,14 +1729,14 @@ bool ProducerImpl::encodeAndSendTier2(
         ps.nextBaseSequence += entry.recordCount;  // advance ONLY on success
     }
     if (!awaitAck) {
-        emitBatchAck_(ps, batchSeq, entry.recordCount, -1, 0);
+        emitBatchAck_(ps.topicId, ps.partition, batchSeq, entry.recordCount, -1, 0, OpStatus::Ok, 1);
         const uint64_t h = entry.ackHandle;
         entry.ackHandle = 0;
-        PendingAck::complete(h, -1, {}, &callbackExceptions_);  // "sent, offset unknown"
+        completeHandle_(h, OpKind::Tier2Batch, -1, entry.recordCount, OpStatus::Ok, 0);  // "sent, offset unknown"
     } else {
         if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
         const uint64_t slice = ps.ackHead;
-        ps.ackRing[ps.ackHead & ps.ackMask] = entry.ackHandle;  // record 0 -> the batch future
+        ps.ackRing[ps.ackHead & ps.ackMask] = entry.ackHandle;  // record 0 -> the batch's token
         ++ps.ackHead;
         entry.ackHandle = 0;  // ownership moved to the ack ring
         InFlightBatch& ib = ps.inflight.claim(ordinal_, ps.slotIndex);
@@ -1725,6 +1756,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.baseSequence      = batchSeq;
         ib.producerEpoch     = producerEpoch_;
         ib.ingressStreamId   = ps.ingressStreamId;
+        ib.tier2             = true;
         keepFrame(ib.wireFrame, encodeScratch_.data(), written);
         verifyClaimedCorrId_(ps, ib, wireCorrId);  // always on (not an assert)
     }
@@ -1757,7 +1789,9 @@ int ProducerImpl::flushBatches(
     // F8c C0: a duty-thread flush() that met a full ring (see submitFlush) is
     // consumed here, read-and-clear, by ONE pass — duty-thread state, no atomic.
     // Every other flush() reaches the duty thread as a kMsgFlush ring token.
-    const bool globalFlush = dutyFlushPending_;
+    // F8c C6a: once the intake is closed nothing more can join a batch — flush
+    // every builder at once (no linger).
+    const bool globalFlush = dutyFlushPending_ || flushAll_;
     dutyFlushPending_ = false;
 
     int flushed = 0;
@@ -1875,12 +1909,16 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
     if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
     // DR-BUG-5: a negative baseOffset is the -errorCode sentinel for the whole batch.
     const int16_t ec = baseOffset < 0 ? static_cast<int16_t>(-baseOffset) : int16_t{0};
-    emitBatchAck_(ps, b->baseSequence, b->recordCount, baseOffset, ec);
+    const uint32_t units = b->tier2 ? 1u : static_cast<uint32_t>(b->recordCount);
     if (ec == 0) {
-        completeSlice_(ps, b->ackStart, b->ackCount, baseOffset, {});
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, baseOffset, 0,
+                      OpStatus::Ok, units);
+        completeSlice_(ps, b->ackStart, b->ackCount, baseOffset, OpStatus::Ok, 0, b->tier2, b->recordCount);
     } else {
-        const std::string err = "produce rejected by broker (errorCode=" + std::to_string(ec) + ")";
-        completeSlice_(ps, b->ackStart, b->ackCount, -1, err);
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                      OpStatus::BrokerError, units);
+        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
         onUnresolvedSequence_(b->producerEpoch);  // rejected: its sequences were never written
     }
     ps.inflight.release(*b);
@@ -1897,7 +1935,7 @@ void ProducerImpl::verifyClaimedCorrId_(PartitionState& ps, InFlightBatch& b, in
                  "(topic=%d part=%d); failing the batch\n",
                  static_cast<long long>(wireCorrId), static_cast<long long>(b.corrId),
                  ps.topicId, ps.partition);
-    failBatch_(ps, b, "internal error: batch correlation id mismatch");
+    failBatch_(ps, b, OpStatus::DeliveryFailed);  // internal error: batch correlation id mismatch
 }
 
 void ProducerImpl::reclaimAckRing_(PartitionState& ps) noexcept {
@@ -1916,15 +1954,21 @@ void ProducerImpl::pushAck_(PartitionState& ps, uint64_t handle) {
 }
 
 void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount,
-                                  int64_t baseOffset, std::string_view error) noexcept {
+                                  int64_t baseOffset, OpStatus st, uint16_t errorCode, bool tier2,
+                                  int32_t recordCount) noexcept {
+    const bool ok = st == OpStatus::Ok;
     for (int32_t i = 0; i < ackCount; ++i) {
+        // Copy + zero the slot BEFORE the delivery: a handler may send (deferred
+        // in Direct mode) — never hold a reference into ackRing across user code.
         uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
         const uint64_t h = slot;
         slot = 0;
         if (h == 0) continue;
+        const int64_t value = ok ? baseOffset + (tier2 ? 0 : i) : -1;
         RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete, static_cast<uint32_t>(h),
-                                 static_cast<double>(baseOffset + i));
-        PendingAck::complete(h, baseOffset + i, error, &callbackExceptions_);
+                                 static_cast<double>(value));
+        completeHandle_(h, tier2 ? OpKind::Tier2Batch : OpKind::Send, value, tier2 ? recordCount : 0,
+                        st, errorCode);
     }
 }
 
@@ -1934,7 +1978,7 @@ void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
         uint64_t& slot = ps.ackRing[(ps.batchAckStart + static_cast<uint64_t>(i)) & ps.ackMask];
         const uint64_t h = slot;
         slot = 0;
-        if (h != 0) PendingAck::complete(h, -1, {}, &callbackExceptions_);
+        completeHandle_(h, OpKind::Send, -1, 0, OpStatus::Ok, 0);  // "sent, offset unknown"
     }
     // The builder slice is always the newest one and acks=None never has an
     // in-flight slice, so the slice is reclaimed by rewinding the head.
@@ -1943,36 +1987,54 @@ void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
     reclaimAckRing_(ps);
 }
 
-void ProducerImpl::emitBatchAck_(const PartitionState& ps, int32_t baseSequence,
-                                 int32_t recordCount, int64_t baseOffset, int16_t errorCode) {
-    if (!batchAckCb_ && !collectBatchAcks_) return;
-    const BatchAck a{ps.topicId, ps.partition, errorCode == 0 ? baseOffset : -1,
-                     baseSequence, recordCount, errorCode};
-    if (batchAckCb_) {
-        // fix2 minor: a throwing user callback must not escape the duty cycle
-        // — caught, counted, and logged instead of silently swallowed.
-        try {
-            batchAckCb_(a);
-        } catch (const std::exception& e) {
-            ++callbackExceptions_;
-            std::fprintf(stderr,
-                "rune-client: producer onBatchAck callback threw: %s (caught; the duty "
-                "cycle continues)\n", e.what());
-        } catch (...) {
-            ++callbackExceptions_;
-            std::fprintf(stderr,
-                "rune-client: producer onBatchAck callback threw a non-std::exception "
-                "(caught; the duty cycle continues)\n");
-        }
+void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence,
+                                 int32_t recordCount, int64_t baseOffset, int16_t errorCode,
+                                 OpStatus st, uint32_t units) noexcept {
+    if (batchAckFn_ != nullptr) {
+        const BatchAck a{topicId, partition, errorCode == 0 ? baseOffset : -1, baseSequence,
+                         recordCount, errorCode};
+        batchAckFn_(batchAckCtx_, a);  // noexcept by type
+        return;
     }
-    if (collectBatchAcks_) completedAcks_.push_back(a);
+    if (batchAckCqRef_ == kNoCqRef || hooks_.cqDeliver == nullptr || units == 0) return;
+    Completion c;
+    c.token = (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 32) |
+              static_cast<uint32_t>(partition);
+    c.value = errorCode == 0 ? baseOffset : -1;
+    c.aux   = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(baseSequence)) << 32) |
+                                   static_cast<uint32_t>(recordCount));
+    c.op            = OpKind::BatchAck;
+    c.status        = st;
+    c.errorCode     = static_cast<uint16_t>(errorCode);
+    c.reservedBytes = units * kAckRecordBytes;  // the credit of every record it covers
+    c.reserved0     = units;
+    hooks_.cqDeliver(hooks_.ctx, batchAckCqRef_, c);
 }
 
-void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason) {
-    emitBatchAck_(ps, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure);
-    completeSlice_(ps, b.ackStart, b.ackCount, -1, reason);
+void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st) {
+    emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure,
+                  st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount));
+    completeSlice_(ps, b.ackStart, b.ackCount, -1, st, 0, b.tier2, b.recordCount);
     onUnresolvedSequence_(b.producerEpoch);  // outcome at the broker unknown
     ps.inflight.release(b);
+    reclaimAckRing_(ps);
+}
+
+void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st) {
+    if (!ps.builder || ps.builder->recordCount() == 0) return;
+    const int32_t n = ps.builder->recordCount();
+    emitUnsentBatchAck_(ps.topicId, ps.partition, n, st, static_cast<uint32_t>(n));
+    if (ps.batchAckCount > 0) {
+        completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1, st, 0, false, 0);
+        ps.ackHead = ps.batchAckStart;  // reclaim the unsent (newest) slice
+    }
+    ps.batchAckCount = 0;
+    const int64_t resetWall = wallNs();
+    ps.builder->reset(0, resetWall);
+    ps.builderBaseWallNs = resetWall;
+    ps.builderBytes      = 0;
+    ps.batchStartNs      = 0;
+    ps.flushRequested    = false;
     reclaimAckRing_(ps);
 }
 
@@ -1996,12 +2058,14 @@ void ProducerImpl::onUnresolvedSequence_(int16_t batchEpoch) noexcept {
                  static_cast<long long>(producerId_), static_cast<int>(producerEpoch_));
 }
 
-void ProducerImpl::failBatch(int64_t corrId, const std::string& reason) {
+void ProducerImpl::failBatch(int64_t corrId) {
     const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return;
     const uint32_t s = batchcorr::slot(corrId);
     if (s >= partitions_.size()) return;
-    if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) failBatch_(*partitions_[s], *b, reason);
+    if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) {
+        failBatch_(*partitions_[s], *b, OpStatus::DeliveryFailed);
+    }
 }
 
 void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
@@ -2017,7 +2081,7 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             if (nowNs - b.firstSendNs >= deliveryNs) {
-                failBatch_(ps, b, "produce delivery timed out (no ProduceResponse)");
+                failBatch_(ps, b, OpStatus::DeliveryFailed);  // no ProduceResponse in time
             }
         });
         // Records never sent (no session / no route) past the delivery deadline are
@@ -2025,27 +2089,18 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
         // could still be written later.
         if (ps.builder && ps.builder->recordCount() > 0 && ps.batchStartNs != 0 &&
             nowNs - ps.batchStartNs >= deliveryNs) {
-            if (ps.batchAckCount > 0) {
-                completeSlice_(ps, ps.batchAckStart, ps.batchAckCount, -1,
-                               "produce delivery timed out (never sent)");
-                ps.ackHead = ps.batchAckStart;  // reclaim the unsent (newest) slice
-            }
-            ps.batchAckCount = 0;
-            const int64_t resetWall = wallNs();
-            ps.builder->reset(0, resetWall);
-            ps.builderBaseWallNs = resetWall;
-            ps.builderBytes      = 0;
-            ps.batchStartNs      = 0;
-            ps.flushRequested    = false;
-            reclaimAckRing_(ps);
+            failBuilder_(ps, OpStatus::DeliveryFailed);  // never sent
         }
         // Tier-2 batches never sent past the deadline: same rule (FIFO, so the
-        // expired ones are at the front).
+        // expired ones are at the front).  Popped BEFORE the delivery (a handler
+        // may queue another Tier-2 batch — deferred in Direct mode).
         while (!ps.pendingTier2Entries.empty() &&
                nowNs - ps.pendingTier2Entries.front().enqueuedNs >= deliveryNs) {
-            PendingAck::complete(ps.pendingTier2Entries.front().ackHandle, -1,
-                                 "produce delivery timed out (never sent)", &callbackExceptions_);
+            const uint64_t h  = ps.pendingTier2Entries.front().ackHandle;
+            const int32_t  rc = ps.pendingTier2Entries.front().recordCount;
             ps.pendingTier2Entries.pop_front();
+            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, OpStatus::DeliveryFailed, 1);
+            completeHandle_(h, OpKind::Tier2Batch, -1, rc, OpStatus::DeliveryFailed, 0);
         }
     }
 }
@@ -2068,7 +2123,7 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
                     "(topic=%d part=%d); giving up\n",
                     static_cast<long long>(b.corrId), b.attempts,
                     static_cast<long long>(cfg_.deliveryTimeoutMs), ps.topicId, ps.partition);
-                failBatch_(ps, b, "produce delivery timed out (no ProduceResponse)");
+                failBatch_(ps, b, OpStatus::DeliveryFailed);  // no ProduceResponse in time
                 return;
             }
             if (nowNs >= b.attemptDeadlineNs &&
@@ -2111,7 +2166,7 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     InFlightBatch* b = ps.inflight.find(corrId);
     if (b == nullptr) return false;
     if (b->redirectCount >= kMaxRedirects) {
-        failBatch_(ps, *b, "Redirect exhausted: max redirect attempts reached");
+        failBatch_(ps, *b, OpStatus::DeliveryFailed);  // redirect budget exhausted
         return false;
     }
     ++b->redirectCount;
@@ -2127,7 +2182,7 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             if (b.redirectCount >= kMaxRedirects) {
-                failBatch_(ps, b, "Redirect exhausted: max redirect attempts reached");
+                failBatch_(ps, b, OpStatus::DeliveryFailed);  // redirect budget exhausted
                 return;
             }
             restampSessionId(b.wireFrame, newSessionId);
@@ -2157,87 +2212,272 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     return resent;
 }
 
-template <class OnHandle>
-void ProducerImpl::drainAppRingHandles_(OnHandle&& onHandle) {
-    // Records still in the app->agent ring (single consumer: we are it).  A
-    // padding record at the wrap reads as 0 messages, so stop after two empty
-    // passes; hard-capped so concurrent writers cannot keep us here.
-    auto h = [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
-                 aeron::util::index_t len) {
-        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
-        if (type == kMsgSendRecord && len >= kRecHeaderSize && (p[kRecFlagsOff] & kFlagWantAck)) {
-            onHandle(static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)));
-        } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
-            std::unique_ptr<Tier2Entry> e(
-                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
-            if (e) onHandle(e->ackHandle);
-        }
-    };
-    int empty = 0;
-    for (int pass = 0; pass < 64 && empty < 2; ++pass) {
-        empty = (ring_.read(h, INT_MAX) == 0) ? empty + 1 : 0;
-    }
+int ProducerImpl::discardRing_(OpStatus st, int limit) {
+    // Records still in the app->agent ring (single consumer: we are it) are
+    // completed with `st` and never sent.  Tier-2 entries are freed.  The
+    // handle is read and the record consumed BEFORE any user code runs.
+    return ring_.read(
+        [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+            aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            if (type == kMsgSendRecord && len >= kRecHeaderSize) {
+                const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck)
+                                       ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
+                const int32_t tid  = readLE32(p, kRecTopicIdOff);
+                const int32_t part = readLE32(p, kRecPartOff);
+                emitUnsentBatchAck_(tid, part, 1, st, 1);
+                completeHandle_(h, OpKind::Send, -1, 0, st, 0);
+            } else if (type == kMsgTier2Batch && len >= kT2TokenSize) {
+                std::unique_ptr<Tier2Entry> e(
+                    reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0))));
+                if (!e) return;
+                const uint64_t h  = e->ackHandle;
+                const int32_t  rc = e->recordCount;
+                const int32_t  tid = e->topicId, part = e->partition;
+                e.reset();
+                emitUnsentBatchAck_(tid, part, rc, st, 1);
+                completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, 0);
+            }
+            // kMsgFlush: nothing to complete.
+        },
+        limit);
 }
 
-void ProducerImpl::failAllPending(const std::string& reason) {
+void ProducerImpl::failAllPending(OpStatus st) {
     const DutyScope duty(*this);  // fix1 C1: sends from these callbacks are deferred
-    drainAppRingHandles_([&](uint64_t handle) {
-        PendingAck::complete(handle, -1, reason, &callbackExceptions_);
-    });
-    failDeferred_(reason);  // records deferred before this call were accepted: fail them too
-    // Everything the producer accepted: in-flight slices + the current builder slice.
-    for (auto& up : partitions_) {
-        PartitionState& ps = *up;
-        ps.inflight.forEachLive([&](InFlightBatch& b) {
-            emitBatchAck_(ps, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure);
-            onUnresolvedSequence_(b.producerEpoch);  // released with an unknown outcome
-            ps.inflight.release(b);
-        });
-        for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
-            // fix1 C1(d): copy + zero the slot BEFORE the callback — never hold a
-            // reference into ackRing across user code (a growAckRing would free it).
-            const uint64_t h = ps.ackRing[i & ps.ackMask];
-            ps.ackRing[i & ps.ackMask] = 0;
-            if (h != 0) PendingAck::complete(h, -1, reason, &callbackExceptions_);
+    // Records committed to the app ring so far (Ring mode; a closed ring's
+    // later commits are completed by the Discarding drain / closeFinal).
+    if (mode_ == IngressMode::Ring) {
+        for (int pass = 0; pass < 64; ++pass) {
+            if (discardRing_(st, INT_MAX) == 0) break;
         }
-        ps.ackTail = ps.ackHead;
-        ps.batchAckCount = 0;
-        for (Tier2Entry& e : ps.pendingTier2Entries) {
-            PendingAck::complete(e.ackHandle, -1, reason, &callbackExceptions_);
-        }
-        ps.pendingTier2Entries.clear();
-        if (ps.builder) {
-            const int64_t resetWall = wallNs();
-            ps.builder->reset(0, resetWall);
-            ps.builderBaseWallNs = resetWall;
+    }
+    failDeferred_(st);  // records deferred before this call were accepted: fail them too
+    // Everything the producer accepted: in-flight batches + the current builder
+    // + queued Tier-2 batches.  Indexed walk: a handler may append partitions
+    // (Ring mode sends from a handler only write the ring; Direct ones defer).
+    for (std::size_t i = 0; i < partitions_.size(); ++i) {
+        PartitionState& ps = *partitions_[i];
+        ps.inflight.forEachLive([&](InFlightBatch& b) { failBatch_(ps, b, st); });
+        failBuilder_(ps, st);
+        while (!ps.pendingTier2Entries.empty()) {
+            const uint64_t h  = ps.pendingTier2Entries.front().ackHandle;
+            const int32_t  rc = ps.pendingTier2Entries.front().recordCount;
+            ps.pendingTier2Entries.pop_front();
+            emitUnsentBatchAck_(ps.topicId, ps.partition, rc, st, 1);
+            completeHandle_(h, OpKind::Tier2Batch, -1, rc, st, 0);
         }
         ps.builderBytes   = 0;
         ps.batchStartNs   = 0;
         ps.flushRequested = false;
+        reclaimAckRing_(ps);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F8c C6a: close
+// ---------------------------------------------------------------------------
+
+bool ProducerImpl::closeIntake() noexcept {
+    if (mode_ == IngressMode::Direct) {
+        if (directClosed_) return false;  // owner-thread state (callers are the owner)
+        directClosed_ = true;
+        return true;
+    }
+    return ring_.close();  // C1 tail bit: linearizable with every claim, idempotent
+}
+
+bool ProducerImpl::clientClosed() const noexcept {
+    // Ring: the consumer-finished ring word (closeFinal sets it last, release);
+    // Direct: owner-thread state (callers are the owner).
+    return mode_ == IngressMode::Direct ? clientClosedDirect_ : ring_.consumerFinished();
+}
+
+OpResult ProducerImpl::beginClose(const CompletionTarget& target, Token token) {
+    if (mode_ == IngressMode::Direct && std::this_thread::get_id() != dutyThreadId_) {
+        return OpResult::WrongThread;
+    }
+    // The Client is closed (its close completed everything): never touch the
+    // hooks' context, which may be gone.
+    if (clientClosed()) return OpResult::Closed;
+    if (hooks_.issueClose != nullptr) return hooks_.issueClose(hooks_.ctx, *this, &target, token);
+    // Bare rig (no Client): the caller IS the duty thread; handler targets only.
+    if (token > kMaxToken || target.cq != nullptr || target.handler.fn == nullptr) {
+        return OpResult::InvalidArgument;
+    }
+    if (!closeIntake()) return OpResult::Closed;
+    detail::OpTarget t;
+    t.handler = target.handler;
+    applyBeginClose(t, token, lastNowNs_);
+    return OpResult::Accepted;
+}
+
+OpResult ProducerImpl::closeImmediately() {
+    if (mode_ == IngressMode::Direct && std::this_thread::get_id() != dutyThreadId_) {
+        return OpResult::WrongThread;
+    }
+    if (clientClosed()) return OpResult::Closed;
+    if (hooks_.issueClose != nullptr) return hooks_.issueClose(hooks_.ctx, *this, nullptr, 0);
+    applyCloseImmediately(OpStatus::Closed);  // bare rig: the caller IS the duty thread
+    return OpResult::Accepted;
+}
+
+void ProducerImpl::applyBeginClose(const detail::OpTarget& target, Token token, int64_t nowNs) {
+    if (!lifeOpen()) {
+        // Unreachable through the intake CAS (only its winner applies a begin-
+        // close); kept total: the token still completes exactly once.
+        Completion c;
+        c.token  = token;
+        c.op     = OpKind::ProducerClose;
+        c.status = OpStatus::Closed;
+        hooks_.sink.deliver(target, c);
+        return;
+    }
+    LifeDraining d;
+    d.target     = target;
+    d.token      = token;
+    d.deadlineNs = nowNs + cfg_.deliveryTimeoutMs * 1'000'000LL;
+    life_        = d;
+    flushAll_    = true;  // nothing more can join a batch: flush every builder at once
+    (void)closeDuty(nowNs);
+}
+
+void ProducerImpl::applyCloseImmediately(OpStatus st) {
+    (void)closeIntake();  // idempotent: the failure path may be the first closer
+    if (discarding()) return;
+    const bool         wasDraining = draining();
+    const LifeDraining d = wasDraining ? std::get<LifeDraining>(life_) : LifeDraining{};
+    life_     = LifeDiscarding{st};
+    flushAll_ = true;
+    failAllPending(st);
+    if (wasDraining) {
+        Completion c;
+        c.token  = d.token;
+        c.op     = OpKind::ProducerClose;
+        c.status = OpStatus::Closed;
+        hooks_.sink.deliver(d.target, c);
+    }
+}
+
+bool ProducerImpl::fullyDrained_() const noexcept {
+    if (mode_ == IngressMode::Ring && ring_.headPosition() < ring_.tailPosition()) return false;
+    if (!deferred_.empty()) return false;
+    for (const auto& up : partitions_) {
+        const PartitionState& ps = *up;
+        if ((ps.builder && ps.builder->recordCount() > 0) || !ps.pendingTier2Entries.empty() ||
+            !ps.inflight.empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int ProducerImpl::closeDuty(int64_t nowNs) {
+    if (!draining()) return 0;
+    const LifeDraining d = std::get<LifeDraining>(life_);
+    OpStatus st;
+    if (fullyDrained_()) {
+        st = OpStatus::Ok;
+    } else if (nowNs >= d.deadlineNs) {
+        st = OpStatus::Timeout;
+    } else {
+        return 0;
+    }
+    life_ = LifeClosed{};  // before user code: the handler may close again (a no-op)
+    Completion c;
+    c.token  = d.token;
+    c.op     = OpKind::ProducerClose;
+    c.status = st;
+    hooks_.sink.deliver(d.target, c);
+    return 1;
+}
+
+void ProducerImpl::closeFinal(OpStatus st, int stalledYieldsBeforeUnblock) {
+    applyCloseImmediately(st);
+    if (mode_ != IngressMode::Ring) {
+        clientClosedDirect_ = true;
+        return;
+    }
+    // Drain the closed ring up to its frozen tail: a record claimed before the
+    // close but committed after it is still read (and completed `st`) — the
+    // fix5 close drain (ClientAgent::drainRegistrationsForClose) rule: wait on
+    // progress, then Aeron's unblock() after a yield cap; stop only when
+    // unblock() cannot make progress (a hang is the worse failure).
+    const int64_t target = ring_.tailPosition();
+    int stalled = 0;
+    int failedUnblocks = 0;
+    while (ring_.headPosition() < target) {
+        const int64_t before = ring_.headPosition();
+        const int n = discardRing_(st, INT_MAX);
+        if (n > 0 || ring_.headPosition() != before) {
+            stalled = 0;
+            failedUnblocks = 0;
+            continue;
+        }
+        if (++stalled >= stalledYieldsBeforeUnblock) {
+            stalled = 0;
+            if (ring_.unblock()) {
+                failedUnblocks = 0;
+                continue;
+            }
+            if (++failedUnblocks >= 3) {
+                std::fprintf(stderr,
+                             "rune-client: producer close: ring blocked by an unrecoverable claim at "
+                             "position %lld; records behind it are lost\n",
+                             static_cast<long long>(ring_.headPosition()));
+                break;
+            }
+        }
+        std::this_thread::yield();
+    }
+    // Nobody reads this ring again (release): a Producer that outlives its
+    // Client sees it and never touches the hooks' (gone) context.
+    ring_.consumerFinish();
+}
+
+aeron::util::index_t ProducerImpl::testClaimSendRecord(int32_t topicId, int32_t partition,
+                                                       const Key& key, std::span<const uint8_t> value,
+                                                       uint64_t ackHandle) noexcept {
+    try {
+        const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + value.size();
+        const aeron::util::index_t idx = ring_.tryClaim(kMsgSendRecord, totalLen);
+        if (idx < 0) return idx;
+        uint8_t* dst = ring_.base() + idx;
+        writeLE32(dst, kRecTopicIdOff, topicId);
+        writeLE32(dst, kRecPartOff, partition);
+        dst[kRecKeyLenOff] = static_cast<uint8_t>(key.size());
+        std::memset(dst + kRecKeyBytesOff, 0, Key::kMaxInline);
+        if (key.size() > 0) std::memcpy(dst + kRecKeyBytesOff, key.bytes().data(), key.size());
+        dst[kRecFlagsOff] = ackHandle != 0 ? kFlagWantAck : 0u;
+        writeLE64(dst, kRecCorrIdOff, static_cast<int64_t>(ackHandle));
+        writeLE32u(dst, kRecValLenOff, static_cast<uint32_t>(value.size()));
+        if (!value.empty()) std::memcpy(dst + kRecValBytesOff, value.data(), value.size());
+        return idx;
+    } catch (...) {
+        return -1;
     }
 }
 
 ProducerImpl::~ProducerImpl() {
     // Last owner gone (no other thread can reach this producer): free every
-    // handle still owned here WITHOUT invoking user callbacks (their captures may
-    // already be dead) — a future's promise is destroyed, so its get() throws
-    // broken_promise, exactly as when the old ack map was destroyed.
-    auto discard = [](uint64_t h) {
-        delete reinterpret_cast<PendingAck*>(static_cast<uintptr_t>(h));
-    };
+    // Tier-2 entry still owned here WITHOUT completing anything (a handler's
+    // context may already be dead).  Ack handles are plain tokens: nothing to free.
     try {
-        drainAppRingHandles_(discard);
+        for (int pass = 0; pass < 64; ++pass) {
+            const int n = ring_.read(
+                [](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+                    if (type == kMsgTier2Batch && len >= kT2TokenSize) {
+                        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+                        delete reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(p, 0)));
+                    }
+                },
+                INT_MAX);
+            if (n == 0) break;
+        }
     } catch (...) {}
     for (std::size_t r = 0; r < deferred_.tail(); r += deferred_.sizeAt(r)) {  // fix1/2: arena
-        if (deferred_.hdr(r)->type != 0) discard(takeDeferredHandle_(r));
-    }
-    for (auto& up : partitions_) {
-        PartitionState& ps = *up;
-        for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
-            uint64_t& h = ps.ackRing[i & ps.ackMask];
-            if (h != 0) { discard(h); h = 0; }
-        }
-        for (Tier2Entry& e : ps.pendingTier2Entries) discard(e.ackHandle);
+        if (deferred_.hdr(r)->type != 0) (void)takeDeferredHandle_(r);  // frees a Tier-2 entry
     }
 }
 

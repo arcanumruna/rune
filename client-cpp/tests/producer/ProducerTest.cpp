@@ -29,6 +29,7 @@
 //   - Injected clock for linger tests: pass synthetic nowNs to doWork().
 //   - No background runner thread in these tests: we drive doWork() directly.
 
+#include "../support/AckLedger.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -77,7 +78,10 @@ using rc::TopicHandle;
 using rc::Producer;
 using rc::ProducerConfig;
 using rc::Acks;
-using rc::want_future;
+using rc::AckToken;
+using rc::OpStatus;
+using rc::SendResult;
+using test_support::AckLedger;
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -613,21 +617,24 @@ TEST(Producer, AckFutureResolvesWithOffset) {
     Key  key(uint64_t{0});
 
     const std::vector<uint8_t> val = {0x01, 0x02, 0x03};
-    auto fut = p.send(topic, key, std::span<const uint8_t>(val), want_future);
+    AckLedger L;
+    p.onAck(&AckLedger::onAck, &L);
+    ASSERT_EQ(p.trySend(topic, key, std::span<const uint8_t>(val), AckToken{1}), SendResult::Ok);
 
     bool done = false;
     for (int i = 0; i < kPumpMax; ++i) {
         h.agent->doWork(monoNs());
         h.gw->poll();
-        if (fut.wait_for(0s) == std::future_status::ready) {
+        if (L.times(1) != 0) {
             done = true;
             break;
         }
         std::this_thread::sleep_for(kPumpSleep);
     }
 
-    ASSERT_TRUE(done) << "Future must resolve within timeout";
-    const int64_t baseOffset = fut.get();
+    ASSERT_TRUE(done) << "The ack token must complete within timeout";
+    ASSERT_EQ(L.status(1), OpStatus::Ok);
+    const int64_t baseOffset = L.value(1);
     EXPECT_GE(baseOffset, 100LL)
         << "baseOffset must be the gateway-assigned value (>=100)";
 }
@@ -651,24 +658,25 @@ TEST(Producer, AckCallbackFires) {
     auto topic = makeTopic(7, 1);
     Key  key(uint64_t{0});
 
-    std::atomic<int64_t> cbOffset {-1};
+    AckLedger L;
+    p.onAck(&AckLedger::onAck, &L);
     const std::vector<uint8_t> val = {0xAB};
-    p.send(topic, key, std::span<const uint8_t>(val),
-           [&](int64_t offset) { cbOffset.store(offset, std::memory_order_release); });
+    p.send(topic, key, std::span<const uint8_t>(val), AckToken{7});
 
     bool fired = false;
     for (int i = 0; i < kPumpMax; ++i) {
         h.agent->doWork(monoNs());
         h.gw->poll();
-        if (cbOffset.load(std::memory_order_acquire) >= 0) {
+        if (L.times(7) != 0) {
             fired = true;
             break;
         }
         std::this_thread::sleep_for(kPumpSleep);
     }
 
-    ASSERT_TRUE(fired) << "Callback must fire when ProduceResponse arrives";
-    EXPECT_GE(cbOffset.load(), 100LL);
+    ASSERT_TRUE(fired) << "The onAck handler must fire when ProduceResponse arrives";
+    EXPECT_EQ(L.times(7), 1);
+    EXPECT_GE(L.value(7), 100LL);
 }
 
 // ===========================================================================
@@ -723,10 +731,10 @@ TEST(Producer, MaxInFlightBound) {
     // Stop gateway from replying — broker goes silent.
     h.gw->replyAcks = false;
 
-    // Send 3 messages (each with a future to register the corrId).
-    std::vector<std::future<int64_t>> futs;
+    // Send 3 messages (each with an ack token).
     for (int i = 0; i < 3; ++i) {
-        futs.push_back(p.send(topic, key, std::span<const uint8_t>(val), want_future));
+        ASSERT_EQ(p.trySend(topic, key, std::span<const uint8_t>(val), AckToken{static_cast<rc::Token>(i + 1)}),
+                  SendResult::Ok);
     }
     p.flush();
 
@@ -1031,12 +1039,13 @@ TEST(Producer, CloseWithPendingFuture) {
     auto topic = makeTopic(15, 1);
     const std::vector<uint8_t> val = {0x01};
     // Submitted but never drained (no doWork): the record sits in the producer ring.
-    auto fut = p.send(topic, Key(uint64_t{0}), std::span<const uint8_t>(val), want_future);
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::timeout);
-    h.hub.failAll("Client closed");
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::ready)
-        << "close must fail futures whose records are still in the ring";
-    EXPECT_THROW({ fut.get(); }, std::runtime_error);
+    AckLedger L;
+    p.onAck(&AckLedger::onAck, &L);
+    ASSERT_EQ(p.trySend(topic, Key(uint64_t{0}), std::span<const uint8_t>(val), AckToken{1}), SendResult::Ok);
+    ASSERT_EQ(L.times(1), 0);
+    h.hub.failAll(OpStatus::Closed);
+    ASSERT_EQ(L.times(1), 1) << "close must complete tokens whose records are still in the ring";
+    EXPECT_EQ(L.status(1), OpStatus::Closed);
 }
 
 // ===========================================================================
@@ -1066,11 +1075,12 @@ TEST(Producer, ProduceAckTimeout) {
     h.gw->replyAcks = false;
 
     const std::vector<uint8_t> val = {0xAB};
-    auto fut = p.send(topic, key, std::span<const uint8_t>(val), want_future);
+    AckLedger L;
+    p.onAck(&AckLedger::onAck, &L);
+    ASSERT_EQ(p.trySend(topic, key, std::span<const uint8_t>(val), AckToken{1}), SendResult::Ok);
 
     // Must be pending initially.
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::timeout)
-        << "Future must be pending before timeout";
+    ASSERT_EQ(L.times(1), 0) << "The token must be pending before timeout";
 
     // Wait past the timeout, calling sweepTimedOut() periodically.
     const auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -1082,16 +1092,15 @@ TEST(Producer, ProduceAckTimeout) {
         // Simulate the Client's sweepTimeouts() calling hub.sweepTimedOut().
         h.hub.sweepTimedOut(std::chrono::steady_clock::now());
 
-        if (fut.wait_for(0s) == std::future_status::ready) {
+        if (L.times(1) != 0) {
             resolved = true;
             break;
         }
         std::this_thread::sleep_for(20ms);
     }
 
-    ASSERT_TRUE(resolved) << "Future must be resolved by timeout sweep (not hang)";
-    EXPECT_THROW({ fut.get(); }, std::runtime_error)
-        << "Timed-out future must throw std::runtime_error";
+    ASSERT_TRUE(resolved) << "The token must be completed by the timeout sweep (not hang)";
+    EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed) << "Timed-out send completes DeliveryFailed";
 }
 
 // ===========================================================================
@@ -1117,12 +1126,10 @@ TEST(Producer, ProduceAckTimeoutCallback) {
 
     h.gw->replyAcks = false;
 
-    std::atomic<int64_t> cbOffset{-999}; // sentinel: -999 = not fired
+    AckLedger L;
+    p.onAck(&AckLedger::onAck, &L);
     const std::vector<uint8_t> val = {0xBB};
-    p.send(topic, key, std::span<const uint8_t>(val),
-           [&](int64_t offset) {
-               cbOffset.store(offset, std::memory_order_release);
-           });
+    p.send(topic, key, std::span<const uint8_t>(val), AckToken{1});
 
     // Pump past the timeout.
     const auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -1130,14 +1137,13 @@ TEST(Producer, ProduceAckTimeoutCallback) {
         h.agent->doWork(monoNs());
         h.gw->poll();
         h.hub.sweepTimedOut(std::chrono::steady_clock::now());
-        if (cbOffset.load(std::memory_order_acquire) != -999) break;
+        if (L.times(1) != 0) break;
         std::this_thread::sleep_for(20ms);
     }
 
-    EXPECT_NE(cbOffset.load(std::memory_order_acquire), -999LL)
-        << "Callback must fire on timeout (not hang)";
-    EXPECT_EQ(cbOffset.load(std::memory_order_acquire), -1LL)
-        << "Timed-out callback must receive offset=-1 (error signal)";
+    ASSERT_EQ(L.times(1), 1) << "The handler must fire on timeout (not hang)";
+    EXPECT_EQ(L.value(1), -1LL) << "Timed-out ack carries offset=-1";
+    EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
 }
 
 // ===========================================================================

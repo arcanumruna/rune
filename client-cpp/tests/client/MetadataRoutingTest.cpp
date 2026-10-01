@@ -387,10 +387,11 @@ TEST(MetadataRouting, RealRedirectFrameUpdatesCacheZeroRtt) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 20000;
     auto p  = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("t");
     Key key(uint64_t{7});
     const std::vector<uint8_t> val = {0x01};
-    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     // Drive until the redirect is processed and the cache flips to node 1.
     int metaReqAtFlip = -1;
@@ -450,9 +451,10 @@ TEST(MetadataRouting, KeyedProduceResolvesPartitionLeaderEndpoint) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 20000;
     auto p  = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("t");
     const std::vector<uint8_t> val = {0x02};
-    auto fut = p.send(th, key0, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key0, std::span<const uint8_t>(val));
 
     EXPECT_TRUE(rig.drive([&] { return client->testRouteEndpoint(1, key0) == leaderEp; }))
         << "after redirect, keyed produce must route to the new partition leader's endpoint";
@@ -496,11 +498,12 @@ TEST(MetadataRouting, BackgroundRefreshWithBackoffOnNoProgress) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 20000;
     auto p  = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("t2");
     ASSERT_TRUE(th.valid());
     Key key(uint64_t{9});
     const std::vector<uint8_t> val = {0x03};
-    (void)p.send(th, key, std::span<const uint8_t>(val), want_future);
+    (void)cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     // Pump up to ~4 s; a background refresh (2nd MetadataRequest) must appear.
     bool refreshed = false;
