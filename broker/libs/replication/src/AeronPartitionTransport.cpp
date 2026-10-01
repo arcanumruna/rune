@@ -259,12 +259,10 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
             "AeronPartitionTransport::enqueueFetchResponse: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++outboundRingFullCount_;
         return false;
     }
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
     if (idx < 0) {                          // full ring → back-pressure, nothing committed
-        ++outboundRingFullCount_;
         return false;
     }
     char* slot = reinterpret_cast<char*>(outboundRing_.base() + idx);
@@ -287,8 +285,8 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     }
     // Advance the flyweight position so the frame is well-formed (commit uses frameLen).
     enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
-    outboundRing_.commit(idx);
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    outboundRing_.commit(idx);   // FR mark first: it can never trail the drain
     return true;
 }
 
@@ -324,25 +322,23 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
             "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++outboundRingFullCount_;
         return false;
     }
-    // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: bump the
-    // counter and return false WITHOUT committing (nothing claimed, no torn record).
+    // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: return
+    // false WITHOUT committing (nothing claimed, no torn record).
     // The caller treats the skipped send as retriable (the follower re-fetches).
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
     if (idx < 0) {
-        ++outboundRingFullCount_;
         return false;
     }
     isbe::OutboundFrame enc;
     enc.wrapAndApplyHeader(reinterpret_cast<char*>(outboundRing_.base() + idx), 0, frameLen);
     enc.targetNodeId(targetNodeId);
     enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
-    outboundRing_.commit(idx);
     // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
-    // corr = monotonic enqueue seq; pairs 1:1 with ReplOutDrain (FIFO ring).
+    // corr = the record's ring offset; pairs with the ReplOutDrain at that offset.
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    outboundRing_.commit(idx);   // FR mark first: it can never trail the drain
     return true;
 }
 

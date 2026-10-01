@@ -268,8 +268,8 @@ private:
     // ManyToOneRingBuffer via IngressRing — MPSC, lock-free).  The CONTROL thread
     // drains the ring in poll() and does the actual peers_/pub offers.
     //
-    // Back-pressure: on a full ring, enqueueOutbound() returns false and bumps
-    // outboundRingFullCount_ — the send is skipped (NOT silently "succeeded").
+    // Back-pressure: on a full ring, enqueueOutbound() returns false — the send
+    // is skipped (NOT silently "succeeded") and the worker caller sees it.
     // Replication sends are retriable (follower re-requests / leader re-responds
     // next cycle), so skip-and-retry is the correct policy here.
     // -----------------------------------------------------------------------
@@ -368,9 +368,8 @@ private:
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
 
-    // Back-pressure observability: bumped when the outbound ring is full and a
-    // (retriable) send had to be skipped. Control-thread reads for logging.
-    uint64_t outboundRingFullCount_ = 0;
+    // (F16: the write-only outboundRingFullCount_ was removed — several worker
+    // threads bumped it unsynchronised; back-pressure is the false return.)
 
     // F16: traffic counters + FR receive sequence — per instance, written only by
     // the thread that polls this transport (no process-wide globals, no atomics).

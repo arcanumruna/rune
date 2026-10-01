@@ -193,13 +193,13 @@ TEST(O2ORingBuffer, TooLargeMessageThrows) {
 // volatile load.  Those are inline-asm fences TSan cannot see, so without the
 // ring's TSan annotations every handoff (and the consumer's zeroing of freed
 // space that the producer then reuses) was reported as a data race.  A small
-// ring forces many wraps, exercising both edges.  Functionally: every message
+// ring forces many wraps — with padding records — exercising every edge.  Functionally: every message
 // arrives once, in order, intact.
 TEST(O2ORingBufferRegression, CrossThreadPayloadHandoffIsOrdered) {
     Backing b(4096);
     O2ORingBuffer ring(b.bytes.data(), b.bytes.size());
     constexpr std::uint32_t kN = 50'000;
-    constexpr std::size_t   kLen = 48;
+    constexpr std::size_t   kLen = 40;   // 48 B records don't divide 4096 → padding on wrap
 
     std::thread producer([&] {
         for (std::uint32_t i = 0; i < kN; ++i) {

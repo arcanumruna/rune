@@ -241,6 +241,7 @@ private:
         const aeron::util::index_t mask = capacity - 1;
 
         std::int64_t head = m_buffer.getInt64Volatile(headCachePositionIndex);
+        RUNE_TSAN_ACQUIRE(m_buffer.buffer() + headCachePositionIndex);   // cache written by another producer
 
         std::int64_t tail;
         std::int64_t newTail;
@@ -260,6 +261,8 @@ private:
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
                     return INSUFFICIENT_CAPACITY;
                 }
+
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headCachePositionIndex);
 
                 m_buffer.putInt64Ordered(headCachePositionIndex, head);
             }
@@ -285,6 +288,8 @@ private:
                         newTail = tail; // claim no space; only pad to the buffer end
                     }
 
+                    RUNE_TSAN_RELEASE(m_buffer.buffer() + headCachePositionIndex);
+
                     m_buffer.putInt64Ordered(headCachePositionIndex, head);
                 }
 
@@ -298,6 +303,7 @@ private:
             std::atomic_thread_fence(std::memory_order_release);
             m_buffer.putInt32(RD::RecordDescriptor::typeOffset(tailIndex),
                               RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+            RUNE_TSAN_RELEASE(m_buffer.buffer() + tailIndex);
             m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), padding);
         }
 

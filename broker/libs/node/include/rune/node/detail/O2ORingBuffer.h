@@ -365,6 +365,7 @@ private:
             std::atomic_thread_fence(std::memory_order_release);
             m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                               RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+            RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
             m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), padding);
         }
 
