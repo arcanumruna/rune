@@ -69,6 +69,9 @@ if(BUILD_TESTING)
         tests/node/SchemaCodecSmokeTest.cpp
         tests/node/SchemaRegistryTest.cpp
         tests/node/AdminWorkerTest.cpp
+        tests/node/SignalControlTest.cpp
+        tests/node/LeaderObserverTest.cpp
+        tests/node/OwnerThreadTestTaskTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node

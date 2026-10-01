@@ -101,6 +101,19 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # F9a guard (user law 2026-10-01): no std::atomic / mutex / lock /
+    # thread_local in production code (libs/**, src/**; test code excluded)
+    # outside scripts/atomics_allowlist.txt — ring-buffer internals, the
+    # LogCleaner channel, and TEMPORARY slice-B / unscoped entries.  Stale
+    # allowlist entries fail too, so converted sites must leave the list.
+    add_test(NAME NoAtomicsGuardSelfTestRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics.py --selftest)
+    add_test(NAME NoAtomicsOrMutexesOutsideAllowlistRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # gtest_discover_tests() defaults to running each test binary with
@@ -158,6 +171,19 @@ if(aeron_FOUND)
     # libuuid (needed by aeron's embedded driver on Linux) is linked PUBLIC on
     # rune_node so it propagates here and to the node test targets. See
     # libs/node/CMakeLists.txt.
+endif()
+
+# F9a fix round 1: real process-directed signal delivery to the broker binary
+# (spawn rune_broker, kill(pid, SIGINT/SIGTERM), expect a clean exit 0).
+if(BUILD_TESTING)
+    find_package(GTest REQUIRED)
+    add_executable(rune_broker_process_tests tests/process/BrokerProcessSignalTest.cpp)
+    target_link_libraries(rune_broker_process_tests PRIVATE GTest::gtest_main)
+    target_compile_definitions(rune_broker_process_tests PRIVATE
+        RUNE_BROKER_BIN="$<TARGET_FILE:rune_broker>")
+    add_dependencies(rune_broker_process_tests rune_broker)
+    include(GoogleTest)
+    gtest_discover_tests(rune_broker_process_tests PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # ── rune_role — standalone Aeron node-role counter reader ────────────────────

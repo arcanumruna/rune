@@ -242,12 +242,16 @@ void AeronPartitionTransport::sendReconcileResponse(
     enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
 }
 
-// FR trace correlation (F16, shared-nothing):
-//   ReplOutEnqueue/ReplOutDrain: corr = the record's ring offset — tryClaim and
-//   read report the same encodedMsgOffset(recordIndex), and an offset is reused
-//   only after the ring wraps, so each enqueue pairs exactly with the next drain
-//   at that offset.  No cross-thread counter (enqueue runs on several workers).
-//   ReplFragRecv: corr = inRecvSeq_, a per-transport member (polling thread only).
+// FR trace correlation (F9a: no file-static / atomic sequence counters).
+//   Outbound (worker → control, many-to-one ring): ReplOutEnqueue and
+//   ReplOutDrain are both marked with the record's RING SLOT OFFSET (the
+//   tryClaim() index == the offset drain() hands the handler).  A slot is reused
+//   only after the consumer passed it, so an in-flight enqueue/drain pair is
+//   unique by slot — exact pairing even with several producer workers (the old
+//   shared fetch_add counter needed an atomic and could interleave with claims).
+//   Inbound (control → worker): ReplFragRecv uses inRecvSeq_, a per-transport
+//   control-thread-owned counter (was a file static shared by every in-process
+//   node's control thread); pairs FIFO with the worker's ReplWorkerOpRun seq.
 
 // ---------------------------------------------------------------------------
 // enqueueFetchResponse — WORKER-thread side, ZERO-COPY (#2b).
@@ -305,8 +309,10 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     }
     // Advance the flyweight position so the frame is well-formed (commit uses frameLen).
     enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
+    // FR mark BEFORE commit: once committed the consumer may drain + free the slot
+    // and a later claim may reuse it, so marking after would mis-pair the slot.
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
-    outboundRing_.commit(idx);   // FR mark first: it can never trail the drain
+    outboundRing_.commit(idx);
     return true;
 }
 
@@ -318,8 +324,9 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
 // skipped (replication is retriable; caller re-drives next cycle). Never blocks.
 // ---------------------------------------------------------------------------
 
-// Per-second transport rate diagnostic (RUNE_FS_LOG).  The flag is read-only
-// after static init; the counters are per-transport members (F16).
+// Per-second transport rate diagnostic (RUNE_FS_LOG).  The enable flag is
+// immutable after static init; the counters are per-transport control-thread
+// members (F9a: they were file statics shared by every in-process node).
 static const bool g_txRateLog = [] { const char* e = std::getenv("RUNE_FS_LOG");
                                      return e == nullptr || e[0] != '0'; }();
 
@@ -356,9 +363,10 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
     enc.targetNodeId(targetNodeId);
     enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
     // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
-    // corr = the record's ring offset; pairs with the ReplOutDrain at that offset.
+    // corr = ring slot offset; pairs 1:1 with ReplOutDrain (same slot).  Marked
+    // BEFORE commit (after commit the slot may already be drained and reused).
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
-    outboundRing_.commit(idx);   // FR mark first: it can never trail the drain
+    outboundRing_.commit(idx);
     return true;
 }
 
@@ -388,8 +396,8 @@ int AeronPartitionTransport::drainOutbound()
         const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
         const std::size_t wlen = pv.size();
         // Control-clock: frame drained from the outbound ring + offered to peer(s).
-        // corr = monotonic drain seq; k-th drain == k-th enqueue (FIFO) → the gap
-        // ReplOutEnqueue(k)→ReplOutDrain(k) is the EXACT worker→control handoff.
+        // corr = ring slot offset == the enqueue's tryClaim index → the gap
+        // ReplOutEnqueue(slot)→ReplOutDrain(slot) is the EXACT worker→control handoff.
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
         ++txOutDrained_;
 

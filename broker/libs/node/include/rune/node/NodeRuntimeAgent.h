@@ -38,6 +38,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
+#include <rune/node/LeaderObserver.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
@@ -170,6 +171,9 @@ public:
     enum class ConsensusKind : uint8_t { Single, Multi, Generic };
     [[nodiscard]] ConsensusKind consensusKind() const noexcept { return consensus_.kind; }
 
+    /// F9a: the control-thread → observer leadership ring.  Set before start.
+    void setLeaderObserver(LeaderObserver* o) noexcept { leaderObserver_ = o; }
+
     // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
     // drives (internal partitions; all partitions without a WorkerPool) whose
     // log fsync failed are reported here ONCE → BrokerNode halts (exit 74).
@@ -236,6 +240,9 @@ private:
             if (groupService_) groupService_->setLocalLeadership(leader);   // fix 2 (B1)
             if (txnService_)   txnService_->setLocalLeadership(leader);     // fix 2 (B1)
         }
+        // 1a. F9a: publish the leadership view to the observer thread (ring,
+        //     only on change) right after the consensus step made it current.
+        if (leaderObserver_) leaderObserver_->publishOnControl();
 
         // 1b. Task 10 fix 3 (I2a): fan ownership out BEFORE anything this cycle
         //     can route ops (bridge role ops, transport poll, gateway), and free
@@ -612,13 +619,24 @@ public:
     // F1: TEST-ONLY owner-thread hook — producer side (TEST thread).
     //
     // Offer a ring-carried OwnerThreadTestTask ref (see OwnerThreadTestTask.h)
-    // to the CONTROL thread over testTaskRing_ (SPSC: single producer = the test
-    // thread, serialised by BrokerNode; single consumer = this control thread).
-    // Returns false if the ring is full (caller fails loudly).
+    // to the CONTROL thread over testTaskRing_ (F9a: a many-to-one ControlRing,
+    // so any number of test threads may offer with NO lock; single consumer =
+    // this control thread).  Returns false if the ring is full (caller fails
+    // loudly).
     // -----------------------------------------------------------------------
-    [[nodiscard]] bool offerOwnerThreadTestTask(void* ref) {
-        return testTaskRing_.write(reinterpret_cast<const uint8_t*>(&ref),
-                                   sizeof(ref), kTestTaskMsgTypeId);
+    /// Shutdown (the controller, AFTER the runtime's AgentRunner was joined):
+    /// skip every test task still queued so no test thread waits forever.
+    void skipQueuedOwnerThreadTestTasks() noexcept {
+        for (void* ref : pendingTestTasks_) skipOwnerThreadTestTask(ref);
+        pendingTestTasks_.clear();
+        (void)testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            skipOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)));
+        });
+    }
+
+    [[nodiscard]] bool offerOwnerThreadTestTask(void* ref) noexcept {
+        return testTaskRing_.offer(kTestTaskMsgTypeId,
+                                   static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(ref)));
     }
 
     // -----------------------------------------------------------------------
@@ -788,11 +806,9 @@ private:
     int drainOwnerThreadTestTasks_() {
         int work = 0;
         if (!pendingTestTasks_.empty()) work += retryPendingOwnerThreadTestTasks_();
-        work += testTaskRing_.drain(
-            [this](int32_t /*typeId*/, aeron::concurrent::AtomicBuffer& buf,
-                   aeron::util::index_t off, aeron::util::index_t /*len*/) {
-                void* ref = nullptr;
-                std::memcpy(&ref, buf.buffer() + off, sizeof(ref));
+        work += testTaskRing_.poll(
+            [this](int32_t /*typeId*/, std::int64_t a, std::int64_t /*b*/) {
+                void* ref = reinterpret_cast<void*>(static_cast<std::uintptr_t>(a));
                 // Keep FIFO behind held ones; hold (never drop) on a full ingress.
                 if (!pendingTestTasks_.empty() || !dispatchOwnerThreadTestTask_(ref)) {
                     pendingTestTasks_.push_back(ref);
@@ -837,8 +853,9 @@ private:
     }
 
     static constexpr int32_t kTestTaskMsgTypeId = 0x7E57;  // F1 test-task ring msg
-    // test thread → control thread (SPSC).  Small: tests enqueue one task at a time.
-    OneToOneByteRing                                   testTaskRing_{4096};
+    // test thread(s) → control thread (many-to-one, F9a: replaces the SPSC ring
+    // + BrokerNode's test-side mutex).  Small: tests enqueue one task at a time.
+    rune::consensus::ControlRing<4096>                 testTaskRing_;
     // Control-thread-only: refs whose owning worker's ingress was full.
     std::vector<void*>                                 pendingTestTasks_;
 
@@ -898,6 +915,7 @@ private:
     }
     // RUNE_CTRL_LOG temp diagnostic — read once at construction (not per scan).
     const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;
+    LeaderObserver*                                    leaderObserver_ = nullptr;  // F9a, non-owning
     StorageFailureHook                                 storageFailureHook_;
     std::function<void(const std::string&)>            fatalHook_;
 

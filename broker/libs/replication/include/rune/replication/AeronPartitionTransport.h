@@ -472,7 +472,7 @@ private:
     int64_t  txFragsRecv_  = 0;   ///< fragments received
     int64_t  txOutDrained_ = 0;   ///< outbound messages drained to Aeron
     uint32_t inRecvSeq_    = 0;   ///< FR ReplFragRecv correlation
-
+    // (F9a 29f9aec made the same file-static → per-instance move; one set.)
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.

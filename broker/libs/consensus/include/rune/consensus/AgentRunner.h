@@ -4,22 +4,38 @@
 // Faithful C++ port of io.aeron.concurrent.AgentRunner.
 // Spawns exactly ONE std::thread; calls:
 //
-//     while (running_) {
+//     for (;;) {
 //         int w = agent_.doWork(clock_.nowNs());
+//         if (stop command drained from the control ring) break;
 //         idle_.idle(w);      // ← backoff when w==0; NEVER a bare busy-spin
 //     }
 //
 // start()  — spawn the thread (idempotent: no-op if already started)
-// stop()   — set stop flag; does NOT join
+// stop()   — post a Stop COMMAND on the runner's control ring; does NOT join
 // join()   — wait for the thread to exit (must call stop() first or the thread
 //            will run indefinitely)
+//
+// F9a (no atomics): Agrona's AgentRunner uses a volatile `isRunning` flag.  We
+// deliberately do NOT: the controlling thread sends Stop over a ControlRing
+// (rune::consensus::ControlRing — the memory ordering lives inside the ring
+// implementation) and the agent thread drains it every duty cycle, after
+// doWork() and before idling (plus once before the first doWork()).  join()
+// provides the happens-before for everything read after the thread exits.
+//
+// Thread ownership:
+//   - started_/stopSent_/running_ : CONTROLLER-owned (the thread that calls
+//     start()/stop()/join()/isRunning()).  The controller role may move between
+//     threads only across a happens-before edge (e.g. a std::thread start or
+//     join — ShardModeTest stops a node from a helper thread it then joins).
+//   - stopRing_                   : producer = controller, consumer = agent thread.
+//   - everything inside run()     : agent-thread-owned.
 //
 // Source reference: AgentRunner.java (Agrona)
 
 #include <rune/consensus/NanoClock.h>
 #include <rune/consensus/IdleStrategy.h>
+#include <rune/consensus/ControlRing.h>
 
-#include <atomic>
 #include <thread>
 #include <memory>
 #include <cassert>
@@ -81,18 +97,24 @@ public:
 
     /// Spawn the agent thread.  Idempotent: subsequent calls are no-ops.
     void start() {
-        bool expected = false;
-        if (!started_.compare_exchange_strong(expected, true,
-                std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            return; // already started
-        }
-        running_.store(true, std::memory_order_release);
-        thread_ = std::thread([this]() { run(); });
+        if (started_) return; // already started (controller-owned flag)
+        started_ = true;
+        running_ = true;
+        thread_  = std::thread([this]() { run(); });
     }
 
-    /// Signal the agent thread to stop.  Does NOT join.
+    /// Ask the agent thread to stop: posts ONE Stop command on the control ring.
+    /// Does NOT join.  Idempotent; a stop() before start() is a no-op (matching
+    /// the old flag semantics, where start() re-armed the flag).
     void stop() noexcept {
-        running_.store(false, std::memory_order_release);
+        if (!started_ || stopSent_) {
+            running_ = false;
+            return;
+        }
+        // The ring is empty except for this one command (stopSent_ guards
+        // repeats), so the offer cannot fail on capacity.
+        stopSent_ = stopRing_.offer(kStopCmd);
+        running_  = false;
     }
 
     /// Block until the agent thread exits.  Must call stop() first or this
@@ -109,17 +131,29 @@ public:
         join();
     }
 
-    bool isRunning() const noexcept {
-        return running_.load(std::memory_order_acquire);
-    }
+    /// CONTROLLER view: true between start() and stop().
+    bool isRunning() const noexcept { return running_; }
 
 private:
+    static constexpr std::int32_t kStopCmd = 1;
+
+    /// Agent thread: drain the control ring; true once Stop has been seen.
+    bool stopRequested_() noexcept {
+        bool stop = false;
+        stopRing_.poll([&stop](std::int32_t type, std::int64_t, std::int64_t) noexcept {
+            if (type == kStopCmd) stop = true;
+        });
+        return stop;
+    }
+
     void run() {
         setCurrentThreadName(agent_.name());
         idle_.reset();
-        while (running_.load(std::memory_order_acquire)) {
+        if (stopRequested_()) return;          // stopped before the first cycle
+        for (;;) {
             const int64_t now = clock_.nowNs();
             const int     w   = agent_.doWork(now);
+            if (stopRequested_()) break;       // checked BEFORE idling
             idle_.idle(w); // backs off when w==0; never a bare busy-spin
         }
     }
@@ -128,9 +162,13 @@ private:
     IdleStrategy& idle_;
     NanoClock&    clock_;
 
-    std::atomic<bool> started_{false};
-    std::atomic<bool> running_{false};
-    std::thread       thread_;
+    // Controller-owned (see header comment).
+    bool started_  = false;
+    bool stopSent_ = false;
+    bool running_  = false;
+    // controller → agent thread.  One command ever travels on it.
+    ControlRing<256> stopRing_;
+    std::thread      thread_;
 };
 
 } // namespace rune::consensus

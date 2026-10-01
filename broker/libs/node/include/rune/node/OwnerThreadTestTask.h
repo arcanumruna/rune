@@ -25,26 +25,40 @@
 //           thread) → the owning worker runs it inside its duty cycle.
 //
 // Production code only ever moves an opaque pointer (the ring-carried ref) and
-// calls runOwnerThreadTestTask(); it never touches any synchronisation.  ALL the
-// synchronisation (the cancel CAS + std::promise/future completion) lives in the
-// TEST-OWNED task object below, which is shared-owned (std::shared_ptr) by the
-// test thread and the ring-carried ref so neither side can dangle.
+// calls runOwnerThreadTestTask().  The task object is shared-owned
+// (std::shared_ptr) by the test thread and the ring-carried ref so neither side
+// can dangle.
 //
-// Timeout safety: if the owner has not STARTED the task by the deadline, the test
-// thread cancels it (Pending→Cancelled CAS) and throws — the owner will later see
-// Cancelled and skip it, so the callable (which typically captures test locals by
-// reference) is never invoked after the test frame unwinds.  If the owner already
-// started it, the test waits for completion (the callable is short) before
-// returning, for the same reason.
+// F9a (no atomics, no mutex, no std::promise/future — user ruling 2026-10-01):
+//   - The run-or-skip DECISION is made by the OWNER alone, from immutable data:
+//     the deadline (submit time + timeout) is fixed before the ref is enqueued
+//     (the ring publishes it).  Owner reaches the task at/after the deadline →
+//     it SKIPS (never invokes the callable); before → it runs it.
+//   - Every outcome travels to the test thread as an EVENT on the task's own
+//     ControlRing (owner = sole producer, test = sole consumer):
+//       Started   → posted BEFORE the callable runs;
+//       Completed → posted AFTER the result / exception was stored in the task
+//                   (the ring commit publishes those plain fields);
+//       Skipped   → the deadline had passed; the callable never runs.
+//
+// Timeout safety: the test thread waits for Completed or Skipped with NO bound
+// of its own (the ctest timeout is the only bound).  It therefore never unwinds
+// while the callable could still run against its frame — there is no window in
+// which a timed-out test returns and the owner starts the callable later.
+// Precondition (BrokerNode::onOwnerThreadForTest): the node's control thread is
+// running for the whole call (the calling test thread is started after start()
+// and finishes before stop()).
 
-#include <atomic>
+#include <rune/consensus/ControlRing.h>
+
 #include <chrono>
 #include <cstdint>
 #include <exception>
-#include <future>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -63,9 +77,17 @@ public:
     using ExecFn = void (*)(OwnerThreadTestTask&,
                             rune::replication::PartitionReplica*) noexcept;
 
+    using Clock = std::chrono::steady_clock;
+
+    /// Owner → test events (on events_).
+    static constexpr std::int32_t kStartedEvent   = 1;
+    static constexpr std::int32_t kSkippedEvent   = 2;
+    static constexpr std::int32_t kCompletedEvent = 3;
+
     OwnerThreadTestTask(Target target, std::int32_t topicId, std::int32_t partition,
-                        ExecFn exec) noexcept
-        : exec_(exec), topicId_(topicId), partition_(partition), target_(target) {}
+                        ExecFn exec, Clock::time_point deadline) noexcept
+        : exec_(exec), deadline_(deadline), topicId_(topicId), partition_(partition),
+          target_(target) {}
 
     ~OwnerThreadTestTask() = default;  // shared_ptr (make_shared<Impl>) deletes via the concrete type
     OwnerThreadTestTask(const OwnerThreadTestTask&)            = delete;
@@ -74,33 +96,39 @@ public:
     [[nodiscard]] Target       target()    const noexcept { return target_; }
     [[nodiscard]] std::int32_t topicId()   const noexcept { return topicId_; }
     [[nodiscard]] std::int32_t partition() const noexcept { return partition_; }
+    [[nodiscard]] Clock::time_point deadline() const noexcept { return deadline_; }
 
-    /// OWNER side: run the task unless the test already cancelled it.
+    /// OWNER side: run the task if its deadline has not passed, else skip it.
     void runOnOwner(rune::replication::PartitionReplica* replica) noexcept {
-        State expected = State::Pending;
-        if (!state_.compare_exchange_strong(expected, State::Running,
-                                            std::memory_order_acq_rel)) {
-            return;  // cancelled by the test thread (timed out) — never invoke
+        if (Clock::now() >= deadline_) {
+            (void)events_.offer(kSkippedEvent);      // <= 3 events per task: never full
+            return;                                   // callable never invoked
         }
-        exec_(*this, replica);
+        (void)events_.offer(kStartedEvent);
+        exec_(*this, replica);                        // stores result / exception
+        (void)events_.offer(kCompletedEvent);         // publishes them (ring commit)
     }
 
-    /// TEST side: cancel if the owner has not started it.  true = cancelled
-    /// (owner will never invoke the callable); false = owner is running / ran it.
-    [[nodiscard]] bool tryCancel() noexcept {
-        State expected = State::Pending;
-        return state_.compare_exchange_strong(expected, State::Cancelled,
-                                              std::memory_order_acq_rel);
+    /// OWNER side, shutdown: report the task as skipped without running it.
+    void skipOnOwner() noexcept { (void)events_.offer(kSkippedEvent); }
+
+    /// TEST side (sole consumer): drain events; returns the last terminal event
+    /// seen (Completed / Skipped) or 0 if none yet.
+    [[nodiscard]] std::int32_t pollTerminal() noexcept {
+        std::int32_t t = 0;
+        events_.poll([&t](std::int32_t type, std::int64_t, std::int64_t) noexcept {
+            if (type == kCompletedEvent || type == kSkippedEvent) t = type;
+        });
+        return t;
     }
 
 private:
-    enum class State : std::uint8_t { Pending, Running, Cancelled };
-
-    ExecFn             exec_;
-    std::int32_t       topicId_;
-    std::int32_t       partition_;
-    Target             target_;
-    std::atomic<State> state_{State::Pending};
+    ExecFn                            exec_;
+    const Clock::time_point           deadline_;   // immutable; published by the ring
+    std::int32_t                      topicId_;
+    std::int32_t                      partition_;
+    Target                            target_;
+    rune::consensus::ControlRing<256> events_;     // owner → test
 };
 
 /// The ring carries a raw pointer to a HEAP-allocated shared_ptr holder (one
@@ -111,6 +139,13 @@ using OwnerThreadTestTaskRef = std::shared_ptr<OwnerThreadTestTask>;
 [[nodiscard]] inline const OwnerThreadTestTask&
 ownerThreadTestTaskOf(void* ref) noexcept {
     return **static_cast<OwnerThreadTestTaskRef*>(ref);
+}
+
+/// Owner side, shutdown: skip the ring-carried task and release the ring's ref.
+inline void skipOwnerThreadTestTask(void* ref) noexcept {
+    auto* holder = static_cast<OwnerThreadTestTaskRef*>(ref);
+    (*holder)->skipOnOwner();
+    delete holder;
 }
 
 /// Owner side: run the ring-carried task on THIS thread, then release the
@@ -148,10 +183,15 @@ class OwnerThreadTestTaskImpl final : public OwnerThreadTestTask {
 public:
     using R = typename OwnerTaskResult<F, T>::type;
 
-    OwnerThreadTestTaskImpl(std::int32_t topicId, std::int32_t partition, F f)
-        : OwnerThreadTestTask(T, topicId, partition, &exec), f_(std::move(f)) {}
+    OwnerThreadTestTaskImpl(std::int32_t topicId, std::int32_t partition, F f,
+                            OwnerThreadTestTask::Clock::time_point deadline)
+        : OwnerThreadTestTask(T, topicId, partition, &exec, deadline), f_(std::move(f)) {}
 
-    std::future<R> future() { return promise_.get_future(); }
+    /// TEST side, only after kCompletedEvent was drained: the result (or rethrow).
+    R take() {
+        if (error_) std::rethrow_exception(error_);
+        if constexpr (!std::is_void_v<R>) return std::move(*result_);
+    }
 
 private:
     R invoke_(rune::replication::PartitionReplica* replica) {
@@ -171,44 +211,49 @@ private:
         }
     }
 
+    // OWNER side: store the outcome in plain fields; runOnOwner's Completed
+    // event (ring commit) publishes them to the test thread.
     static void exec(OwnerThreadTestTask& self,
                      rune::replication::PartitionReplica* replica) noexcept {
         auto& me = static_cast<OwnerThreadTestTaskImpl&>(self);
         try {
             if constexpr (std::is_void_v<R>) {
                 me.invoke_(replica);
-                me.promise_.set_value();
             } else {
-                me.promise_.set_value(me.invoke_(replica));
+                me.result_.emplace(me.invoke_(replica));
             }
         } catch (...) {
-            try { me.promise_.set_exception(std::current_exception()); } catch (...) {}
+            me.error_ = std::current_exception();
         }
     }
 
-    F               f_;
-    std::promise<R> promise_;
+    using Stored = std::conditional_t<std::is_void_v<R>, bool, R>;
+
+    F                     f_;
+    std::optional<Stored> result_;   // owner writes before Completed; test reads after
+    std::exception_ptr    error_;    // ditto
 };
 
 } // namespace detail
 
-/// TEST side: wait for the owner to run the task.  On timeout, cancel it if the
-/// owner has not started it (then throw); if the owner is mid-run, wait for it
-/// (never unwind while the callable may still reference the caller's frame).
-template <class R>
-R awaitOwnerThreadTestTask(OwnerThreadTestTask& task, std::future<R>& fut,
-                           std::chrono::milliseconds timeout) {
-    if (fut.wait_for(timeout) != std::future_status::ready) {
-        if (task.tryCancel()) {
-            throw std::runtime_error(
-                "onOwnerThreadForTest: owner thread did not run the task within " +
-                std::to_string(timeout.count()) + "ms (topicId=" +
-                std::to_string(task.topicId()) + ", partition=" +
-                std::to_string(task.partition()) + ")");
-        }
-        fut.wait();
+/// TEST side: wait (no bound of its own — see header) for the owner's terminal
+/// event.  Completed → the result (or the callable's exception); Skipped → the
+/// task reached the owner after its deadline and never ran → throw.
+template <class Impl>
+auto awaitOwnerThreadTestTask(Impl& task, std::chrono::milliseconds timeout) {
+    std::int32_t t = task.pollTerminal();
+    while (t == 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds{50});
+        t = task.pollTerminal();
     }
-    return fut.get();
+    if (t == OwnerThreadTestTask::kSkippedEvent) {
+        throw std::runtime_error(
+            "onOwnerThreadForTest: owner thread did not run the task within " +
+            std::to_string(timeout.count()) + "ms (topicId=" +
+            std::to_string(task.topicId()) + ", partition=" +
+            std::to_string(task.partition()) + ")");
+    }
+    return task.take();
 }
 
 } // namespace rune::node
