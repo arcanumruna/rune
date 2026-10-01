@@ -90,7 +90,8 @@ public:
     /// synchronous hint (counted).
     [[nodiscard]] bool asyncHints() const noexcept {
 #if defined(__linux__)
-        return kind_ == IoBackendKind::Uring;
+        // RR2-1: only where the kernel supports IORING_OP_FADVISE (probed).
+        return kind_ == IoBackendKind::Uring && uring_->fadviseSupported();
 #else
         return false;
 #endif

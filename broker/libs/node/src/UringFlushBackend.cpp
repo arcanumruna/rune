@@ -172,6 +172,24 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
     cqTail_       = reinterpret_cast<uint32_t*>(cqBase + params.cq_off.tail);
     cqRingMask_   = reinterpret_cast<uint32_t*>(cqBase + params.cq_off.ring_mask);
     cqes_         = reinterpret_cast<struct io_uring_cqe*>(cqBase + params.cq_off.cqes);
+
+    // F15 S4 fix round 3 (RR2-1): IORING_OP_FADVISE exists from kernel 5.6 —
+    // the same release as IORING_REGISTER_PROBE.  A failing probe (older
+    // kernel, restricted ring, seccomp) or an unsupported opcode → no async
+    // hints: the worker uses the synchronous hint instead (never a hint that
+    // fails forever and stalls a read_committed build).
+    fadviseSupported_ = probeOpcode_(IORING_OP_FADVISE);
+}
+
+bool UringFlushBackend::probeOpcode_(uint8_t opcode) noexcept {
+    constexpr unsigned kOps = 256;
+    alignas(struct io_uring_probe) unsigned char buf[sizeof(struct io_uring_probe) +
+                                                     kOps * sizeof(struct io_uring_probe_op)] = {};
+    auto* probe = reinterpret_cast<struct io_uring_probe*>(buf);
+    const long rc = ::syscall(__NR_io_uring_register, ringFd_, IORING_REGISTER_PROBE, probe, kOps);
+    if (rc < 0) return false;
+    if (opcode > probe->last_op) return false;
+    return (probe->ops[opcode].flags & IO_URING_OP_SUPPORTED) != 0;
 }
 
 // ---------------------------------------------------------------------------

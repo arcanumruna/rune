@@ -96,6 +96,9 @@ public:
     // [off, off + len) of fd.  kNoToken when the SQ / in-flight cap is full
     // (the caller skips this pass).  Same reap path; route the token.
     [[nodiscard]] CompletionToken submitFadvise(int fd, int64_t off, uint32_t len, int advice) noexcept;
+    /// RR2-1: IORING_OP_FADVISE is supported by this kernel / ring (probed at
+    /// construction with IORING_REGISTER_PROBE; a failing probe = unsupported).
+    [[nodiscard]] bool fadviseSupported() const noexcept { return fadviseSupported_; }
 
     // reap — worker side (non-blocking).
     //
@@ -148,6 +151,9 @@ private:
     // Depth actually allocated for the SQ ring (== sqRingSize_).
     std::size_t submitDepth_{0};
 
+
+    bool fadviseSupported_{false};
+    bool probeOpcode_(uint8_t opcode) noexcept;
 
     // Internal helper called by submit() after token allocation.
     CompletionToken submitWithToken(int fd, int64_t flushBoundary,
