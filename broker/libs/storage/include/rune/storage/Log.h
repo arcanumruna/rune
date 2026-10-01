@@ -103,6 +103,9 @@ public:
     /// callers may batch appends and call sync() once — but MUST NOT advance
     /// the high-watermark past an offset before sync() returns for that offset.
     void sync();
+    /// Test hook: number of synchronous sync() calls made on this log (spec §3.1:
+    /// a shard loop must never make one — its flushes go through the io backend).
+    [[nodiscard]] uint64_t syncCallsForTest() const noexcept { return syncCalls_; }
     /// Truncate all records with baseOffset >= truncateOffset.
     /// The log's logEndOffset is reset to truncateOffset.
     /// Segments entirely beyond truncateOffset are deleted.
@@ -298,6 +301,7 @@ private:
     void publishSealedSnapshot();
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
+    uint64_t syncCalls_ = 0;   ///< syncCallsForTest (single owner thread)
     /// CP-8 incremental largestTimestamp: running max of maxTimestamp() across all
     /// batches appended to the ACTIVE segment since the last roll.  Reset to 0 at
     /// each roll (after publishSealedSnapshot captures it for the newly-sealed

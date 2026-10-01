@@ -1522,9 +1522,15 @@ int PartitionReplica::doWork(int64_t nowNs)
         && nowNs - lastFollowerSyncNs_ >= kFollowerFlushIntervalNs) {
         followerApplyDirty_ = false;
         lastFollowerSyncNs_ = nowNs;
-        RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
-                             static_cast<uint32_t>(cfg_.partitionId));
-        onLog([&](auto& L){ L.sync(); });
+        if (externalFollowerFlush_) {
+            // Shard mode: the owning worker submits it to its io backend (never
+            // blocks the shard loop).  Raised at most once per interval.
+            followerFlushRequested_ = true;
+        } else {
+            RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
+                                 static_cast<uint32_t>(cfg_.partitionId));
+            onLog([&](auto& L){ L.sync(); });
+        }
         ++work;
     }
 

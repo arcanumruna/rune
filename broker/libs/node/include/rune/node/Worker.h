@@ -90,6 +90,7 @@
 #include <rune/codec/Serialize.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -564,6 +565,26 @@ public:
         return io_submitCount_;
     }
 
+    // Task 10 (spec §3.1 never-block) test hooks — owner thread / single-threaded
+    // tests only.  Background (non-ack) flushes: follower flush + owned-log sync.
+    [[nodiscard]] std::size_t bgFlushInFlightForTest() const noexcept { return bgFlushCount_; }
+    [[nodiscard]] uint64_t    bgFlushSubmitsForTest() const noexcept { return bgFlushSubmits_; }
+    [[nodiscard]] uint64_t    bgFlushErrorsForTest() const noexcept { return bgFlushErrors_; }
+    /// Completions drained from io_ by reapDurableCompletions_ (any token).
+    [[nodiscard]] uint64_t    ioCompletionsReapedForTest() const noexcept { return ioCompletionsReaped_; }
+    /// Submits a Follower-kind background flush; returns its token, or kNoToken
+    /// when it was coalesced into one already in flight / deferred.
+    CompletionToken submitBgFlushForTest(rune::storage::Log* log) {
+        const uint64_t before = bgFlushSubmits_;
+        submitBgFlush_(log, BgFlushKind::Follower);
+        return bgFlushSubmits_ != before ? bgFlush_[bgFlushCount_ - 1].token : kNoToken;
+    }
+    [[nodiscard]] CompletionToken durablePendingTokenForTest(std::size_t i) const {
+        return durablePending_.at(i).token;
+    }
+    /// Routes a completion exactly as a real reap does (token routing first).
+    void deliverCompletionForTest(const FlushCompletion& c) { (void)onFlushCompletion_(c); }
+
     // Task 7: test accessor — true if a Validator is installed for the given topic.
     // Worker-thread only; call only from single-threaded tests.
     [[nodiscard]] bool hasValidatorForTest(int32_t topicId) const noexcept {
@@ -742,8 +763,11 @@ private:
         work += static_cast<int>(drainIngress_());
         // 3. client ingress → append (G-A6 gate unchanged).
         work += flushRetOverflow_();
+        // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
+        // into ret_ later: reserve for every one of them (G-A6, never drop).
         if (retOverflow_.empty() &&
-            ret_.freeSlotsForMsgSize(ackSlotBytes_) > static_cast<int64_t>(pendingAcksAll_.size())) {
+            ret_.freeSlotsForMsgSize(ackSlotBytes_) >
+                static_cast<int64_t>(pendingAcksAll_.size() + durablePending_.size())) {
             work += pollWorkerIngress_(nowNs);
         }
         work += submitCoalescedFlushes_();
@@ -752,6 +776,12 @@ private:
         if (replTransportCtx_) work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);
         for (auto* replica : owned_) {
             if (replica) work += replica->doWork(nowNs);
+        }
+        // 4b. follower flushes raised by the replicas (shard replicas run with
+        //     setExternalFollowerFlush) → io backend, never an inline fsync.
+        for (auto* replica : owned_) {
+            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked())
+                submitBgFlush_(replica->log(), BgFlushKind::Follower);
         }
         // 5. fire due produce acks.
         work += flushOwedAcksAll_(nowNs);
@@ -766,7 +796,7 @@ private:
                 work += replica->log()->drainStagingRenamesDone();
             }
         }
-        work += syncOwnedLogs_(nowNs);   // made asynchronous in Task 10
+        work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
         return work;
     }
 
@@ -919,48 +949,60 @@ private:
     // Shared-nothing: io_, durablePending_, and ret_ are all owned by this
     // worker thread.  No locks, no atomics outside the SPSC ring internals.
     // -----------------------------------------------------------------------
+    //
+    // Task 10 token routing: every completion is offered to the background-flush
+    // table FIRST (retireBgFlush_); a background token is retired there and can
+    // never reach the produce-ack matching below.  Completions are always drained
+    // (also when durablePending_ is empty) so background tokens are retired.
     int reapDurableCompletions_() {
-        if (durablePending_.empty()) {
-            // Fast path: nothing pending — still drain completions to keep the
-            // completion ring from filling (the flusher may emit completions
-            // even for submits that were not strict-tier, though in practice
-            // this doesn't happen; the drain is cheap either way).
-            return io_.reap([](const FlushCompletion&) {});
-        }
-
         int fired = 0;
         io_.reap([&](const FlushCompletion& c) {
-            // Group-commit semantics: a completion with token T and flushBoundary B
-            // covers EVERY pending entry with the same token whose lastOffset <= B.
-            // Entries with token==0 (not yet submitted) are never matched here.
-            for (std::size_t i = 0; i < durablePending_.size(); ) {
-                auto& entry = durablePending_[i];
-                if (entry.token != 0 &&
-                    entry.token == c.token &&
-                    entry.lastOffset <= c.flushBoundary) {
-                    if (c.errorCode != 0) {
-                        // fsync failure: ack with a non-OK error code — never ack OK.
-                        spdlog::error("Worker {}: IoBackend fsync completion error={} "
-                                      "for token={} lastOffset={}; acking Internal error",
-                                      workerId_, c.errorCode, c.token, entry.lastOffset);
-                        entry.ret.errorCode = static_cast<int16_t>(6); // Internal
-                        // No replica unhealthy-flag exists on PartitionReplica yet
-                        // (noted for Task 9 wiring); log the error here so it is
-                        // observable without silently swallowing the failure.
-                    } else {
-                        entry.ret.errorCode = 0; // OK
-                    }
-                    enqueueReturn_(entry.ret);
-                    // Erase by swap-with-back + pop (O(1), order irrelevant for acks).
-                    durablePending_[i] = std::move(durablePending_.back());
-                    durablePending_.pop_back();
-                    ++fired;
-                    // Do NOT advance i — the swapped entry needs to be checked.
-                } else {
-                    ++i;
-                }
-            }
+            ++ioCompletionsReaped_;
+            fired += onFlushCompletion_(c);
         });
+        return fired + retryBgFlushes_();
+    }
+
+    // One completion: background token → retired (returns 1); otherwise group-
+    // commit semantics: token T with flushBoundary B covers EVERY pending entry
+    // with the same token whose lastOffset <= B.  token==0 entries never match.
+    int onFlushCompletion_(const FlushCompletion& c) {
+        if (retireBgFlush_(c)) return 1;
+        int fired = 0;
+        for (std::size_t i = 0; i < durablePending_.size(); ) {
+            auto& entry = durablePending_[i];
+            if (entry.token != kNoToken &&
+                entry.token == c.token &&
+                entry.lastOffset <= c.flushBoundary) {
+                if (c.errorCode != 0) {
+                    // fsync failure: ack with a non-OK error code — never ack OK.
+                    spdlog::error("Worker {}: IoBackend fsync completion error={} "
+                                  "for token={} lastOffset={}; acking Internal error",
+                                  workerId_, c.errorCode, c.token, entry.lastOffset);
+                    entry.ret.errorCode = static_cast<int16_t>(6); // Internal
+                    enqueueReturn_(entry.ret);
+                } else if (entry.thenAwaitHw) {
+                    // Shard Strict acks=all: durable locally — now the HW gate.
+                    entry.ret.errorCode = 0;
+                    PendingAcksAll pending;
+                    pending.replica    = entry.thenAwaitHw;
+                    pending.lastOffset = entry.lastOffset;
+                    pending.deadlineNs = entry.deadlineNs;
+                    pending.ret        = std::move(entry.ret);
+                    pendingAcksAll_.push_back(std::move(pending));
+                } else {
+                    entry.ret.errorCode = 0; // OK
+                    enqueueReturn_(entry.ret);
+                }
+                // Erase by swap-with-back + pop (O(1), order irrelevant for acks).
+                durablePending_[i] = std::move(durablePending_.back());
+                durablePending_.pop_back();
+                ++fired;
+                // Do NOT advance i — the swapped entry needs to be checked.
+            } else {
+                ++i;
+            }
+        }
         return fired;
     }
 
@@ -2194,6 +2236,10 @@ private:
         int64_t                 lastOffset = 0;
         rune::storage::Log*     logPtr     = nullptr; ///< which log (for coalescing)
         WorkerReturn            ret;
+        /// Shard Strict acks=all (Task 10): after the fsync completes the ack
+        /// moves to pendingAcksAll_ (HW gate) instead of firing.  null = fire.
+        rune::replication::PartitionReplica* thenAwaitHw = nullptr;
+        int64_t                 deadlineNs = 0;       ///< acks=all deadline (thenAwaitHw only)
     };
     std::vector<DurablePending> durablePending_;
 
@@ -2391,6 +2437,115 @@ private:
     // from the ingress ring — pairs 1:1 (FIFO) with the control thread's
     // ReplFragRecv seq to measure the exact control→worker handoff latency.
     uint32_t workerRunSeq_ = 0;
+
+    // -----------------------------------------------------------------------
+    // Task 10 — background (non-ack) flushes through io_ (spec §3.1 never-block).
+    //
+    // Shard mode never calls Log::sync on the loop: the follower flush and the
+    // time-based owned-log sync are io_ submissions tracked in this FIXED table
+    // (no allocation).  At most one in flight per (log, kind); a request for a
+    // (log, kind) already in flight sets `again` and is resubmitted when that
+    // one retires (covers the newer data, no per-pass retry spin).  A refused
+    // submit (ring / table full) goes to bgRetry_ and is retried each reap.
+    // Only fdatasync of the active .log fd: Log::recover rebuilds the .index
+    // from the .log, so the .index msync is not a durability point.
+    // Worker-thread only (shared-nothing).
+    // -----------------------------------------------------------------------
+    enum class BgFlushKind : uint8_t { Follower, OwnedLogSync };
+    struct BgFlush {
+        CompletionToken     token = kNoToken;
+        rune::storage::Log* log   = nullptr;
+        int64_t             leo   = 0;       ///< LEO at submit (OwnedLogSync bookkeeping)
+        BgFlushKind         kind  = BgFlushKind::Follower;
+        bool                again = false;   ///< re-requested while in flight
+    };
+    static constexpr std::size_t kMaxBgFlushes = 256;
+    std::array<BgFlush, kMaxBgFlushes> bgFlush_{};
+    std::size_t                        bgFlushCount_ = 0;
+    std::array<BgFlush, kMaxBgFlushes> bgRetry_{};
+    std::size_t                        bgRetryCount_ = 0;
+    uint64_t                           bgFlushSubmits_ = 0;
+    uint64_t                           bgFlushErrors_  = 0;
+    uint64_t                           ioCompletionsReaped_ = 0;
+
+    void queueBgRetry_(rune::storage::Log* log, BgFlushKind kind) noexcept {
+        for (std::size_t i = 0; i < bgRetryCount_; ++i)
+            if (bgRetry_[i].log == log && bgRetry_[i].kind == kind) return;
+        if (bgRetryCount_ < kMaxBgFlushes) {
+            bgRetry_[bgRetryCount_++] = BgFlush{kNoToken, log, 0, kind, false};
+        } else {
+            // More distinct (log, kind) pairs than the table holds: the owned-log
+            // sync re-requests every dirty log next interval (LEO > last synced).
+            spdlog::warn("Worker {}: background flush retry table full; deferring", workerId_);
+        }
+    }
+    // Returns true iff an io_ submission was made.
+    bool submitBgFlush_(rune::storage::Log* log, BgFlushKind kind) noexcept {
+        for (std::size_t i = 0; i < bgFlushCount_; ++i) {
+            if (bgFlush_[i].log == log && bgFlush_[i].kind == kind) {
+                bgFlush_[i].again = true;   // coalesce; resubmitted on retire
+                return false;
+            }
+        }
+        if (bgFlushCount_ == kMaxBgFlushes) { queueBgRetry_(log, kind); return false; }
+        const CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
+        if (t == kNoToken) { queueBgRetry_(log, kind); return false; }
+        bgFlush_[bgFlushCount_++] = BgFlush{t, log, log->logEndOffset(), kind, false};
+        ++bgFlushSubmits_;
+        return true;
+    }
+    int retryBgFlushes_() noexcept {
+        if (bgRetryCount_ == 0) return 0;
+        const std::size_t n = bgRetryCount_;
+        bgRetryCount_ = 0;   // re-queues land at indices already processed
+        int submitted = 0;
+        for (std::size_t i = 0; i < n; ++i)
+            submitted += submitBgFlush_(bgRetry_[i].log, bgRetry_[i].kind) ? 1 : 0;
+        return submitted;    // only real submissions count as work (no phantom work)
+    }
+    // Token routing: a background token is retired HERE and never reaches the
+    // produce-ack matching.  Returns true iff c belonged to a background flush.
+    bool retireBgFlush_(const FlushCompletion& c) noexcept {
+        for (std::size_t i = 0; i < bgFlushCount_; ++i) {
+            if (bgFlush_[i].token != c.token) continue;
+            const BgFlush f = bgFlush_[i];
+            bgFlush_[i] = bgFlush_[--bgFlushCount_];
+            if (c.errorCode != 0) {
+                ++bgFlushErrors_;
+                if (bgFlushErrors_ == 1 || (bgFlushErrors_ & 1023u) == 0)
+                    spdlog::error("Worker {}: background fsync failed errno={} (errors={}) — retrying",
+                                  workerId_, c.errorCode, bgFlushErrors_);
+                queueBgRetry_(f.log, f.kind);
+                return true;
+            }
+            if (f.kind == BgFlushKind::OwnedLogSync) {
+                int64_t& last = lastSyncedLeo_[f.log];
+                if (f.leo > last) last = f.leo;
+            }
+            if (f.again) (void)submitBgFlush_(f.log, f.kind);
+            return true;
+        }
+        return false;
+    }
+
+    // Shard-mode replacement for syncOwnedLogs_: same 10 ms gate and the same
+    // "unchanged log = no work" rule, but each due log is an io_ submission.
+    int syncOwnedLogsAsync_(int64_t nowNs) {
+        if (lastSyncNs_ == 0) { lastSyncNs_ = nowNs; return 0; }
+        if (nowNs - lastSyncNs_ < kWorkerSyncIntervalNs) return 0;
+        lastSyncNs_ = nowNs;
+        int n = 0;
+        for (auto* replica : owned_) {
+            if (!replica || !replica->isDiskBacked()) continue;
+            rune::storage::Log* log = replica->log();
+            if (!log) continue;
+            const auto it = lastSyncedLeo_.find(log);
+            const int64_t last = (it == lastSyncedLeo_.end()) ? 0 : it->second;
+            if (log->logEndOffset() <= last) continue;      // unchanged: no phantom work
+            if (submitBgFlush_(log, BgFlushKind::OwnedLogSync)) ++n;
+        }
+        return n;
+    }
 
     // -----------------------------------------------------------------------
     // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.
@@ -2611,7 +2766,8 @@ private:
         // bounds pendingAcksAll_ by ret_ capacity while allowing acks=all pipelining.
         const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
         const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) +
-                                  static_cast<int64_t>(pendingAcksAll_.size());
+                                  static_cast<int64_t>(pendingAcksAll_.size()) +
+                                  (shardMode_ ? static_cast<int64_t>(durablePending_.size()) : 0);
         const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
         const int32_t K = static_cast<int32_t>(
             std::min(static_cast<int64_t>(desiredFragmentLimit_), available));
@@ -2738,6 +2894,10 @@ private:
         // was hardcoded to 1, so RUNE_TOPICS tier=strict was silently ignored on the
         // per-worker ingress path.)
         const uint8_t durabilityTier = replica ? replica->durabilityTier() : 1;
+        // Task 10 (spec §3.1): shard mode never fsyncs inline on the loop.  Strict
+        // appends page-cache only and acks from its own io_ completion (then the
+        // HW gate for acks=all).
+        const bool asyncStrict = shardMode_ && durabilityTier == 2;
 
         // Call the shared produce helper.
         rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
@@ -2745,7 +2905,7 @@ private:
             msg.topicId, msg.partition,
             msg.producerId, msg.producerEpoch, msg.baseSequence,
             *log, psm_,
-            acksAll, isrSize, minIsr, durabilityTier);
+            acksAll, isrSize, minIsr, asyncStrict ? uint8_t{1} : durabilityTier);
 
         ret.baseOffset  = outcome.baseOffset;
         ret.lastOffset  = outcome.lastOffset;
@@ -2766,6 +2926,28 @@ private:
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
             replica->onLeaderLogAppended();
+        }
+
+        if (asyncStrict) {
+            // Park on the coalesced fsync (submitCoalescedFlushes_ stamps the token
+            // this pass).  A duplicate retry is parked too: its original may still
+            // be awaiting its own fsync, and a Strict ack is never sent before the
+            // data it acknowledges is durable.
+            const int64_t lastOff = outcome.isDuplicate
+                ? outcome.baseOffset + static_cast<int64_t>(outcome.recordCount) - 1
+                : outcome.lastOffset;
+            ret.errorCode = 0;
+            DurablePending dp;
+            dp.token       = kNoToken;
+            dp.lastOffset  = lastOff;
+            dp.logPtr      = log;
+            dp.ret         = std::move(ret);
+            dp.thenAwaitHw = acksAll ? replica : nullptr;
+            dp.deadlineNs  = nowNs + ackTimeoutNs_;
+            durablePending_.push_back(std::move(dp));
+            if (std::find(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), log) == dirtyThisCycle_.end())
+                dirtyThisCycle_.push_back(log);
+            return 1;
         }
 
         if (!acksAll || outcome.isDuplicate) {

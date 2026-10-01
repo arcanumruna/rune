@@ -542,6 +542,17 @@ public:
     [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
     [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
 
+    /// Shard mode (spec §3.1 never-block): the owning worker performs the
+    /// time-gated follower flush asynchronously through its io backend; doWork
+    /// only raises a request.  Set before the replica is driven; legacy = false.
+    void setExternalFollowerFlush(bool on) noexcept { externalFollowerFlush_ = on; }
+    /// Worker side: consume a pending follower-flush request (true once per request).
+    [[nodiscard]] bool takeFollowerFlushRequest() noexcept {
+        const bool r = followerFlushRequested_;
+        followerFlushRequested_ = false;
+        return r;
+    }
+
     /// Task 9: test accessor — exposes the internal epoch cache for restart-
     /// durability tests.  Disk-backed only (memory-backed partitions have no
     /// checkpoint; their epoch cache is always rebuilt from scratch on restart).
@@ -785,6 +796,8 @@ private:
     int64_t lastKnownNowNs_ = 0;   ///< most-recent doWork() clock, for message handlers
     bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
     int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
+    bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
+    bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
     // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
     // throughput bottleneck: appends (LEO growth), applies (follower push-apply),
     // pushes sent, fast-acks received, HW advance.
