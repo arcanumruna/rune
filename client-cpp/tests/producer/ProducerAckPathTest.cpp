@@ -161,31 +161,79 @@ TEST(ProducerInFlight, ReusedOrdinalDropsStaleResponseOfPreviousProducerRegressi
         impls.push_back(std::make_unique<ProducerImpl>(ackCfg(4), 1024));
         hub.add(impls.back().get());
     }
+    // One batch of `p` on slot 0, acked by its own response unless `ack` is false.
+    rune::client::Token next = 1;
+    auto sendOne = [&](ProducerImpl& p, AckLedger& L, bool ack, rune::client::Token& tok) -> int64_t {
+        tok = next++;
+        Capture cap;
+        EXPECT_TRUE(p.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(tok)));
+        pump(p, cap.fn());
+        EXPECT_EQ(cap.frames.size(), 1u);
+        if (cap.frames.empty()) return 0;
+        (void)L;
+        return cap.frames[0].corrId;
+    };
+
+    // (i) the previous producer was long-lived: its sequences are already past
+    //     2^26 (the round-1 generation window) when it is released.
     ProducerImpl& old = *impls[9];
-    Capture capOld;
-    ASSERT_TRUE(old.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));
-    pump(old, capOld.fn());
-    ASSERT_EQ(capOld.frames.size(), 1u);
-    const int64_t staleCorr = capOld.frames[0].corrId;  // its response is still "in the network"
+    old.testRebaseSequences((uint64_t{1} << 26) + 5);
+    AckLedger Lold;
+    Lold.attach(old);
+    rune::client::Token oldTok = 0;
+    const int64_t staleCorr = sendOne(old, Lold, false, oldTok);  // its response is still "in the network"
     hub.remove(&old);
 
-    auto fresh = std::make_unique<ProducerImpl>(ackCfg(4), 1024);
+    std::unique_ptr<ProducerImpl> cur = std::make_unique<ProducerImpl>(ackCfg(4), 1024);
     AckLedger L;
-    L.attach(*fresh);
-    hub.add(fresh.get());
-    ASSERT_EQ(fresh->ordinal(), 9u) << "the released ordinal is reused";
-    Capture capNew;
-    ASSERT_TRUE(fresh->submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(2)));
-    pump(*fresh, capNew.fn());
-    ASSERT_EQ(capNew.frames.size(), 1u);
-    EXPECT_NE(capNew.frames[0].corrId, staleCorr) << "a new incarnation, a new sequence range";
+    L.attach(*cur);
+    hub.add(cur.get());
+    ASSERT_EQ(cur->ordinal(), 9u) << "the released ordinal is reused";
+    for (int b = 0; b < 8; ++b) {  // round 1: batch 5 of the next generation equalled the stale id
+        rune::client::Token t = 0;
+        const int64_t c = sendOne(*cur, L, true, t);
+        EXPECT_NE(c, staleCorr) << "batch " << b;
+        hub.onProduceResponse(staleCorr, 111);  // the previous producer's late answer
+        EXPECT_EQ(L.times(t), 0) << "a stale response completed another producer's record (batch " << b << ")";
+        hub.onProduceResponse(c, 222 + b);
+        ASSERT_EQ(L.times(t), 1);
+        EXPECT_EQ(L.status(t), OpStatus::Ok);
+        EXPECT_EQ(L.value(t), 222 + b) << "its own offset";
+    }
 
-    hub.onProduceResponse(staleCorr, 111);  // the previous producer's late answer
-    EXPECT_EQ(L.times(2), 0) << "a stale response completed another producer's record";
-    hub.onProduceResponse(capNew.frames[0].corrId, 222);
-    ASSERT_EQ(L.times(2), 1);
-    EXPECT_EQ(L.status(2), OpStatus::Ok);
-    EXPECT_EQ(L.value(2), 222) << "its own offset";
+    // (ii) the same ordinal reused 70 times (> the round-1 64-generation wrap)
+    //      while the very first stale response is still outstanding.
+    std::vector<std::unique_ptr<ProducerImpl>> gone;
+    hub.remove(cur.get());
+    gone.push_back(std::move(cur));
+    cur = std::make_unique<ProducerImpl>(ackCfg(4), 1024);  // X: one batch, never answered
+    AckLedger Lx;
+    Lx.attach(*cur);
+    hub.add(cur.get());
+    rune::client::Token xTok = 0;
+    const int64_t stale2 = sendOne(*cur, Lx, false, xTok);
+    std::vector<std::unique_ptr<AckLedger>> ledgers;  // outlive their producers' last handler call
+    for (int r = 0; r < 70; ++r) {  // ONE reuse per iteration
+        hub.remove(cur.get());
+        gone.push_back(std::move(cur));
+        cur = std::make_unique<ProducerImpl>(ackCfg(4), 1024);
+        ledgers.push_back(std::make_unique<AckLedger>());
+        AckLedger& Lr = *ledgers.back();
+        Lr.attach(*cur);
+        hub.add(cur.get());
+        ASSERT_EQ(cur->ordinal(), 9u);
+        rune::client::Token t = 0;
+        const int64_t c = sendOne(*cur, Lr, true, t);
+        EXPECT_NE(c, staleCorr) << "reuse " << r;
+        EXPECT_NE(c, stale2) << "reuse " << r;
+        hub.onProduceResponse(staleCorr, 111);
+        hub.onProduceResponse(stale2, 333);  // X's late answer
+        EXPECT_EQ(Lr.times(t), 0) << "reuse " << r << ": a stale response completed a new record";
+        hub.onProduceResponse(c, 7);
+        EXPECT_EQ(Lr.times(t), 1);
+    }
+    EXPECT_EQ(Lold.times(oldTok), 0) << "the original record was never completed by a stranger";
+    EXPECT_EQ(Lx.times(xTok), 0);
 }
 
 TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {

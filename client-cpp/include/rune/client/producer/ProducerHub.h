@@ -237,7 +237,7 @@ private:
     ImplList active_;                     // m2: the live producers, dense (every duty walk)
     std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)
     std::size_t freeHead_ = 0;            // next freeOrdinals_ entry to reuse
-    std::vector<uint32_t> generations_;   // per ordinal, bumped on reuse (I-1)
+    std::vector<uint64_t> nextBase_;      // per ordinal: the next incarnation's sequence base (F2)
 };
 
 } // namespace rune::client::producer

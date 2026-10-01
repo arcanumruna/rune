@@ -889,14 +889,27 @@ public:
 
     /// Ordinal inside the owning ProducerHub; encoded into batch correlation ids.
     void setOrdinal(uint32_t o) noexcept { ordinal_ = o; }
-    /// F8c C7 fix round 1 (I-1): the ordinal plus its generation (ProducerHub
-    /// bumps it on reuse): every partition's in-flight sequence starts in the
-    /// generation's range, so a late response for a previous producer on this
-    /// ordinal never matches one of this producer's batches.
-    void setOrdinal(uint32_t o, uint32_t generation) noexcept {
+    /// F8c C7 fix round 2 (F2): the ordinal plus its sequence base — past the
+    /// highest sequence any previous producer on this ordinal used (the hub
+    /// carries it forward) — so a late response for a previous incarnation
+    /// never matches one of this producer's batches.
+    void setOrdinal(uint32_t o, uint64_t seqBase) noexcept {
         ordinal_ = o;
-        seqBase_ = static_cast<uint64_t>(generation & batchcorr::kGenMask) << batchcorr::kGenShift;
+        seqBase_ = seqBase;
         for (auto& up : partitions_) up->inflight.rebase(seqBase_);  // created before adoption
+    }
+    /// Cold (ProducerHub::remove): one past the highest sequence any of this
+    /// producer's partitions ever claimed (at least its own base).
+    [[nodiscard]] uint64_t sequenceEnd() const noexcept {
+        uint64_t end = seqBase_;
+        for (const auto& up : partitions_) end = up->inflight.endSeq() > end ? up->inflight.endSeq() : end;
+        return end;
+    }
+    /// Test seam (F2): start every partition's sequences at `base` (before the
+    /// producer's first batch) — stands in for a long-lived producer.
+    void testRebaseSequences(uint64_t base) noexcept {
+        seqBase_ = base;
+        for (auto& up : partitions_) up->inflight.rebase(base);
     }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
 
@@ -1148,7 +1161,7 @@ private:
     // In-flight batches live in each PartitionState::inflight ring; a batch
     // correlation id encodes (ordinal_, partition slot, ring sequence).
     uint32_t ordinal_ = 0;
-    uint64_t seqBase_ = 0;  // F8c C7 fix round 1 (I-1): the ordinal generation's sequence base
+    uint64_t seqBase_ = 0;  // F8c C7 F2: the ordinal's carried-forward sequence base
     // Lower bound of every live batch's attemptDeadlineNs: retransmitStalled()
     // returns in O(1) until it passes (spec §1a.5; replaces the ordered map front).
     int64_t earliestAttemptDeadlineNs_ = INT64_MAX;

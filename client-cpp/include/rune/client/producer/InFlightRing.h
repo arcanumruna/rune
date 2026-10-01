@@ -23,15 +23,14 @@ inline constexpr int      kOrdinalShift = 50;
 inline constexpr int      kSlotShift    = 32;
 inline constexpr uint32_t kMaxOrdinal   = (1u << 12) - 1;
 inline constexpr uint32_t kMaxSlot      = (1u << 18) - 1;
-/// F8c C7 fix round 1 (I-1): an ordinal reused by a new producer gets a new
-/// GENERATION, folded into the top bits of its per-partition sequences (the
-/// rings start at gen << kGenShift).  A late ProduceResponse of the previous
-/// producer on that ordinal carries the previous generation's sequence range
-/// and never matches a batch of the new one (exact corrId compare) — unless
-/// the old producer sent 2^26 batches on one partition, or the same ordinal is
-/// reused 64 times while a response is still outstanding.  Zero hot-path cost.
-inline constexpr int      kGenShift     = 26;
-inline constexpr uint32_t kGenMask      = (1u << (32 - kGenShift)) - 1;  // 64 generations
+// F8c C7 fix round 2 (F2): an ordinal reused by a new producer CARRIES ITS
+// SEQUENCES FORWARD — the new incarnation's rings start past the highest
+// sequence the previous one ever used on any partition (ProducerHub::remove
+// records it).  A late ProduceResponse of a previous incarnation carries a
+// sequence below that base and never matches a batch of the new one (exact
+// corrId compare) — the only residual is the inherent 32-bit wrap (2^32
+// batches on one slot while a response is still outstanding), the same bound
+// one producer already relies on against itself.  Zero hot-path cost.
 
 [[nodiscard]] constexpr int64_t make(uint32_t ordinal, uint32_t slot, uint32_t seq) noexcept {
     return kTag | (static_cast<int64_t>(ordinal & kMaxOrdinal) << kOrdinalShift) |
@@ -80,13 +79,13 @@ public:
     [[nodiscard]] bool full() const noexcept {
         return head_ - tail_ >= static_cast<uint64_t>(mask_) + 1;
     }
-    /// F8c C7 fix round 1 (I-1): start the sequence at `base` (the ordinal
-    /// generation's range).  Only before the first claim.
+    /// F8c C7 fix round 2 (F2): start the sequence at `base` (the ordinal's
+    /// carried-forward range).  Only before the first claim.
     void rebase(uint64_t base) noexcept {
-        if (head_ == tail_ && live_ == 0 && head_ < (uint64_t{1} << batchcorr::kGenShift)) {
-            head_ = tail_ = base;
-        }
+        if (!claimed_) head_ = tail_ = base;
     }
+    /// The sequence after the last one this ring ever claimed (cold).
+    [[nodiscard]] uint64_t endSeq() const noexcept { return head_; }
     /// Sequence the next claim() will use (encode the frame before offering it).
     [[nodiscard]] uint32_t nextSeq() const noexcept { return static_cast<uint32_t>(head_); }
 
@@ -95,6 +94,7 @@ public:
         InFlightBatch& b = slots_[head_ & mask_];
         b.corrId = batchcorr::make(ordinal, partitionSlot, static_cast<uint32_t>(head_));
         ++head_;
+        claimed_ = true;
         ++live_;
         return b;
     }
@@ -133,6 +133,7 @@ private:
     uint64_t head_ = 0;
     uint64_t tail_ = 0;
     uint32_t live_ = 0;
+    bool     claimed_ = false;  // F2: rebase only before the first claim
 };
 
 } // namespace rune::client::producer

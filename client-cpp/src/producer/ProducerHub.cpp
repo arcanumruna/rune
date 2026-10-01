@@ -37,12 +37,11 @@ void ProducerHub::add(ProducerImpl* impl)
             freeHead_ = 0;
         }
         producers_[ord] = impl;
-        ++generations_[ord];  // I-1: the new incarnation's sequence range
     } else {
         throw std::length_error("ProducerHub: at most 4096 live producers per client");
     }
-    if (generations_.size() <= ord) generations_.resize(ord + 1, 0);
-    impl->setOrdinal(ord, generations_[ord]);
+    if (nextBase_.size() <= ord) nextBase_.resize(ord + 1, 0);
+    impl->setOrdinal(ord, nextBase_[ord]);  // F2: past every sequence a previous incarnation used
     active_.push_back(impl);  // m2: walks visit only the live producers
 }
 
@@ -51,6 +50,9 @@ void ProducerHub::remove(ProducerImpl* impl) noexcept
     const uint32_t ord = impl->ordinal();
     if (ord >= producers_.size() || producers_[ord] != impl) return;
     producers_[ord] = nullptr;
+    // F2: the next producer on this ordinal starts past every sequence this one
+    // ever used (cold: once per released producer).
+    if (nextBase_.size() > ord) nextBase_[ord] = impl->sequenceEnd() + 1;
     for (std::size_t i = 0; i < active_.size(); ++i) {
         if (active_[i] == impl) {
             active_[i] = active_.back();

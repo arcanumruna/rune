@@ -1191,7 +1191,7 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     ps->ackRing.assign(kAckRingCapacity, 0);  // preallocated ONCE (zero per-batch alloc)
     ps->ackMask = kAckRingCapacity - 1;
     ps->inflight = InFlightRing(static_cast<uint32_t>(cfg_.maxInFlight > 0 ? cfg_.maxInFlight : 1));
-    ps->inflight.rebase(seqBase_);  // F8c C7 fix round 1 (I-1)
+    ps->inflight.rebase(seqBase_);  // F8c C7 F2: the ordinal's carried-forward base
     if (partitions_.size() >= maxPartitions_) {
         throw std::length_error("ProducerImpl: more than 262144 partitions");
     }
