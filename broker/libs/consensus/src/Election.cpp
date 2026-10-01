@@ -87,7 +87,7 @@ Election::Election(bool             isNodeStartup,
     rankedPositions_.assign(threshold, 0);
 
     // Election.java:147: ctx.electionStateCounter().setRelease(INIT.code())
-    stateCode_.store(code(ElectionState::Init), std::memory_order_release);
+    stateCode_ = code(ElectionState::Init);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ Election::Election(bool             isNodeStartup,
 // ---------------------------------------------------------------------------
 
 ElectionState Election::state()    const noexcept { return state_; }
-int32_t       Election::stateCode() const noexcept { return stateCode_.load(std::memory_order_acquire); }
+int32_t       Election::stateCode() const noexcept { return stateCode_; }
 Term          Election::leadershipTermId()       const noexcept { return leadershipTermId_; }
 Term          Election::candidateTermId()        const noexcept { return candidateTermId_; }
 Term          Election::logLeadershipTermId()    const noexcept { return logLeadershipTermId_; }
@@ -1117,7 +1117,7 @@ void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
     state_ = next;
 
     // Election.java:1433: electionStateCounter.setRelease(newState.code())
-    stateCode_.store(code(next), std::memory_order_release);
+    stateCode_ = code(next);
 
     // Election.java:1434-1436: reset timers
     timeOfLastStateChangeNs_ = nowNs;

@@ -6,7 +6,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -56,14 +55,10 @@ NodeStateFile::NodeStateFile(std::string path, int fileSyncLevel)
         // Initialise a fresh file:
         //   candidateTermId = NULL_VALUE (-1), timestamp = 0, logPosition = 0.
         // Write logPosition and timestamp as plain stores first, then
-        // candidateTermId with release ordering — same discipline as an update.
-        // (On a fresh file there are no concurrent readers, but we apply the
-        // same fence discipline for correctness by construction.)
+        // candidateTermId — same write order as an update (single owner thread).
         *slotAt(kLogPositionOffset) = 0;
         *slotAt(kTimestampOffset)   = 0;
-        // Release store so any reader that sees NULL_VALUE also sees 0/0.
-        std::atomic_ref<int64_t>(*slotAt(kCandidateTermIdOffset))
-            .store(NULL_VALUE, std::memory_order_release);
+        *slotAt(kCandidateTermIdOffset) = NULL_VALUE;
 
         syncFile();
     }
@@ -88,11 +83,8 @@ NodeStateFile::~NodeStateFile() {
 // Mirrors Java NodeStateFile.java:362-365:
 //   buffer.getLongVolatile(candidateTermIdOffset)
 Term NodeStateFile::candidateTermId() const {
-    // atomic_ref requires a non-const reference; cast away const on the pointer
-    // (the mapping is PROT_READ|PROT_WRITE and the data itself is not const).
-    int64_t& slot = *const_cast<int64_t*>(slotAt(kCandidateTermIdOffset));
-    return static_cast<Term>(
-        std::atomic_ref<int64_t>(slot).load(std::memory_order_acquire));
+    // F9a: plain load — the mapping is consensus-thread-owned (see header).
+    return static_cast<Term>(*slotAt(kCandidateTermIdOffset));
 }
 
 int64_t NodeStateFile::candidateTermTimestamp() const {
@@ -110,23 +102,20 @@ int64_t NodeStateFile::candidateTermLogPosition() const {
 // Mirrors Java NodeStateFile.java:258-264 (updateCandidateTermId):
 //   buffer.putLong(logPositionOffset, logPosition);   // plain
 //   buffer.putLong(timestampOffset, timestampMs);      // plain
-//   buffer.putLongVolatile(candidateTermIdOffset, id); // release
+//   buffer.putLongVolatile(candidateTermIdOffset, id); // last (plain here, F9a)
 //   syncFile(mappedFile);
 void NodeStateFile::updateCandidateTermId(
     int64_t candidateTermId, int64_t logPosition, int64_t timestampMs)
 {
-    // Write order matters: logPosition and timestamp BEFORE the new
-    // candidateTermId, so a reader that acquires the new id always sees
-    // up-to-date metadata.
+    // Aeron's write order: logPosition and timestamp BEFORE the new
+    // candidateTermId.
     *slotAt(kLogPositionOffset) = logPosition;
     *slotAt(kTimestampOffset)   = timestampMs;
 
-    // RELEASE store — the memory_order_release fence ensures the two plain
-    // stores above are visible to any thread that subsequently does an
-    // acquire-load of candidateTermId.
-    // Mirrors Java's putLongVolatile (volatile write = release in JMM).
-    std::atomic_ref<int64_t>(*slotAt(kCandidateTermIdOffset))
-        .store(candidateTermId, std::memory_order_release);
+    // Aeron writes candidateTermId LAST (putLongVolatile).  The mapping has a
+    // single owner thread (F9a), so a plain store keeps the order that matters
+    // to the owner; persistence is msync's job (syncFile below).
+    *slotAt(kCandidateTermIdOffset) = candidateTermId;
 
     syncFile();
 }

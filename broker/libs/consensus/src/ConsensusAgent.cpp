@@ -53,7 +53,7 @@ int ConsensusAgent::doWork(int64_t nowNs) {
             // test's "exactly N processed" assertion works even for unknown
             // templateIds (which onFragment silently ignores — the ring read
             // still happened).
-            messagesProcessed_.fetch_add(1, std::memory_order_release);
+            ++messagesProcessed_;
         },
         ConsensusAdapter::FRAGMENT_LIMIT);
 

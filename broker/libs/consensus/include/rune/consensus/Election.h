@@ -37,7 +37,6 @@
 #include <rune/consensus/Types.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -47,8 +46,9 @@ namespace rune::consensus {
 // Election — runs the Aeron Cluster election state machine.
 //
 // Single-threaded: doWork() and all onXxx() handlers must be called from the
-// same thread (ConsensusAgent duty-cycle loop). The stateCode_ atomic is written
-// with release and may be read by observer threads.
+// same thread (ConsensusAgent duty-cycle loop).  F9a: stateCode_ is a plain
+// duty-cycle-owned field; observer threads learn the leader view from the
+// LeaderObserver ring (rune::node::LeaderObserver), never by reading Election.
 class Election {
 public:
     // Election.java:110-149  constructor
@@ -103,8 +103,8 @@ public:
     // Election.java:1385 state()
     ElectionState state() const noexcept;
 
-    // Read the atomic state code (release-written on each transition).
-    // Mirrors ctx.electionStateCounter().setRelease(newState.code()).
+    // State code (written on each transition).  Duty-cycle thread only (F9a).
+    // Mirrors ctx.electionStateCounter() — observers get it via a ring snapshot.
     int32_t stateCode() const noexcept;
 
     Term    leadershipTermId()         const noexcept;
@@ -368,8 +368,9 @@ private:
     // Election.java:105  private ElectionState state = INIT;
     ElectionState state_ = ElectionState::Init;
 
-    // §6.9 AtomicCounter equivalent — release-written on each state transition.
-    std::atomic<int32_t> stateCode_{0}; // Init.code() == 0
+    // §6.9 electionStateCounter equivalent — written on each state transition.
+    // Duty-cycle-owned plain field (F9a: no atomics).
+    int32_t stateCode_{0}; // Init.code() == 0
 
     // Timeout configuration (injected, not read from ctx)
     int64_t electionTimeoutNs_         = 0;
