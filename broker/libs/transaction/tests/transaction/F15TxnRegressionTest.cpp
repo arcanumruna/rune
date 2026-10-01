@@ -476,3 +476,50 @@ TEST(TxnPidBlockRegression, ResetGateDropsAnEarlierLoadsLimit) {
     a.commitLimit(2000);
     EXPECT_EQ(a.allocate(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// F15 S4 (design note §2.2): AbortedTxnIndex in marker (lastOffset) order with
+// an O(log R + k) lookup.  Structure / model tests (no base behaviour to RED:
+// they pin the new lookup against a brute-force reference under churn).
+// ---------------------------------------------------------------------------
+TEST(AbortedTxnIndexRegression, LookupMatchesReferenceUnderChurn) {
+    std::mt19937_64 rng(1515);
+    AbortedTxnIndex idx;
+    std::vector<AbortedTxnRange> ref;
+    int64_t marker = 0;
+    for (int i = 0; i < 2000; ++i) {
+        marker += 1 + static_cast<int64_t>(rng() % 5);
+        const int64_t span = static_cast<int64_t>(rng() % 300);        // long + short txns interleave
+        const int64_t pid  = static_cast<int64_t>(rng() % 16);
+        idx.onAbortMarker(pid, std::max<int64_t>(0, marker - span), marker);
+        ref.push_back({pid, std::max<int64_t>(0, marker - span), marker});
+    }
+    for (int q = 0; q < 20000; ++q) {
+        const int64_t pid = static_cast<int64_t>(rng() % 16);
+        const int64_t off = static_cast<int64_t>(rng() % static_cast<uint64_t>(marker + 10));
+        bool want = false;
+        for (const auto& r : ref) want = want || (r.producerId == pid && r.contains(off));
+        ASSERT_EQ(idx.isAborted(pid, off), want) << "pid=" << pid << " off=" << off;
+    }
+}
+
+TEST(AbortedTxnIndexRegression, OutOfOrderInsertKeepsMarkerOrderAndPruneDropsBelowLogStart) {
+    AbortedTxnIndex idx;
+    idx.reserve(4);
+    idx.onAbortMarker(1, 0, 10);
+    idx.onAbortMarker(2, 20, 30);
+    idx.onAbortMarker(3, 12, 15);                                     // out of order (cold)
+    ASSERT_EQ(idx.size(), 3u);
+    EXPECT_EQ(idx.ranges()[1].lastOffset, 15);
+    EXPECT_TRUE(idx.isAborted(3, 13));
+    EXPECT_TRUE(idx.isAborted(2, 25));
+    EXPECT_FALSE(idx.isAborted(1, 11));
+    EXPECT_EQ(idx.growths(), 0u);
+    idx.pruneBelow(16);                                               // markers 10 and 15 are gone
+    ASSERT_EQ(idx.size(), 1u);
+    EXPECT_FALSE(idx.isAborted(1, 5));
+    EXPECT_TRUE(idx.isAborted(2, 20));
+    idx.clear();
+    EXPECT_FALSE(idx.isAborted(2, 20));
+    EXPECT_EQ(idx.capacity(), 4u) << "clear keeps the reservation";
+}

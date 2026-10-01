@@ -97,12 +97,29 @@ struct AbortedTxnRange {
 // Accumulates AbortedTxnRange entries from ABORT control markers.
 // Provides fast "is this data batch aborted?" lookup.
 //
-// Single-writer. No locks. O(ranges) per lookup — in practice the number of
-// aborted ranges that span any given read window is tiny (bounded by
-// max-open-txns at any time).
+// Storage (F15 design note §2.2): ranges are kept in lastOffset order — the
+// order ABORT markers are appended on a partition (single appender, L1), so an
+// append is an O(1) push at the back; an out-of-order insert (tests, a
+// cross-boundary replay) is placed by binary search (cold).
+//
+// isAborted(pid, off): binary search for the first range with lastOffset >= off,
+// then a forward scan while lastOffset <= off + maxSpan_ (maxSpan_ = the widest
+// range seen): any range covering `off` has lastOffset = firstOffset + span <=
+// off + maxSpan_.  O(log R + k), k = ranges whose marker lies in
+// [off, off + maxSpan_] — the aborted txns overlapping the batch.  It was O(R).
+//
+// pruneBelow(logStartOffset) drops ranges entirely below the log start (cold,
+// retention).  reserve() pre-reserves; growth beyond it is cold and counted.
+// Single-writer. No locks.
 // ---------------------------------------------------------------------------
 class AbortedTxnIndex {
 public:
+    /// Default per-partition reserved ranges (cold growth beyond, counted).
+    static constexpr std::size_t kDefaultReservedRanges = 256;
+
+    /// Pre-reserve room for `n` ranges (cold; never shrinks).
+    void reserve(std::size_t n) { ranges_.reserve(n); }
+
     /// Record an aborted transaction.
     ///
     /// Called when an ABORT control marker is found in the log for `producerId`.
@@ -111,27 +128,36 @@ public:
     /// `abortMarkerOffset` = baseOffset of the ABORT control batch.
     void onAbortMarker(ProducerId producerId,
                        int64_t    firstDataOffset,
-                       int64_t    abortMarkerOffset) noexcept;
+                       int64_t    abortMarkerOffset);
 
     /// Returns true if the data batch with the given producerId and baseOffset
     /// falls within any recorded aborted transaction range.
     [[nodiscard]] bool isAborted(ProducerId producerId,
                                   int64_t    batchBaseOffset) const noexcept;
 
-    /// All recorded aborted ranges (ordered by firstOffset ascending).
+    /// Drop every range whose ABORT marker lies below `logStartOffset` (its
+    /// data is gone with it).  Cold (retention).
+    void pruneBelow(int64_t logStartOffset);
+
+    /// All recorded aborted ranges (ordered by lastOffset — marker order).
     [[nodiscard]] const std::vector<AbortedTxnRange>& ranges() const noexcept {
         return ranges_;
     }
 
     /// Number of recorded aborted transactions.
     [[nodiscard]] std::size_t size() const noexcept { return ranges_.size(); }
+    /// Reserved capacity (ranges).
+    [[nodiscard]] std::size_t capacity() const noexcept { return ranges_.capacity(); }
+    /// Cold growths beyond the reserved capacity.
+    [[nodiscard]] uint64_t growths() const noexcept { return growths_; }
 
-    /// Clear all ranges (e.g. after log truncation in tests).
-    void clear() noexcept { ranges_.clear(); }
+    /// Clear all ranges (capacity kept).
+    void clear() noexcept { ranges_.clear(); maxSpan_ = 0; }
 
 private:
-    // Sorted by firstOffset ascending for efficient range queries.
-    std::vector<AbortedTxnRange> ranges_;
+    std::vector<AbortedTxnRange> ranges_;   ///< sorted by lastOffset ascending
+    int64_t  maxSpan_ = 0;                  ///< max(lastOffset - firstOffset) over ranges_
+    uint64_t growths_ = 0;
 };
 
 // ---------------------------------------------------------------------------
