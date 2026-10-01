@@ -49,8 +49,22 @@ struct ShardPorts {
     static ShardPorts discover(int nodes, int workers) {
         ShardPorts p;
         auto blocks = freeUdpPortBlocks(3 * nodes, workers);
+        // The blocks are released before the single ports are probed, so the OS
+        // can hand one of them back: a single port inside a worker block makes
+        // start() refuse ("port collision with co-located peer"), a test-only
+        // flake under the parallel heavy tier.  Skip ports inside any block.
+        auto single = [&blocks, workers, &p] {
+            for (;;) {
+                const uint16_t port = freeUdpPort();
+                bool clash = false;
+                for (const uint16_t b : blocks) clash |= port >= b && port < b + workers;
+                for (const auto* v : {&p.cons, &p.client, &p.repl})
+                    for (const uint16_t q : *v) clash |= port == q;
+                if (!clash) return port;
+            }
+        };
         for (int i = 0; i < nodes; ++i) {
-            p.cons.push_back(freeUdpPort()); p.client.push_back(freeUdpPort()); p.repl.push_back(freeUdpPort());
+            p.cons.push_back(single()); p.client.push_back(single()); p.repl.push_back(single());
             p.ib.push_back(blocks[3 * i]); p.rb.push_back(blocks[3 * i + 1]); p.eg.push_back(blocks[3 * i + 2]);
         }
         return p;
