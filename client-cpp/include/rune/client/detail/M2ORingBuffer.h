@@ -126,6 +126,18 @@ public:
         return loadAcquire64_(m_consumerFinishedIndex) != 0;
     }
 
+    /// Test seam (fix5 / F8c fix round 1): turn a claim returned by tryClaim()
+    /// into a HEADER-LESS claim (length + type words zeroed) — the state of a
+    /// writer that won the tail CAS but never wrote its record header.  Uses
+    /// the ring's own release stores, so a concurrently polling consumer
+    /// (TSan) sees a well-defined value.
+    void testZeroClaimHeader(aeron::util::index_t claimIndex) noexcept {
+        namespace RD = aeron::concurrent::ringbuffer;
+        const aeron::util::index_t recordIndex = claimIndex - RD::RecordDescriptor::HEADER_LENGTH;
+        storeRelease32_(RD::RecordDescriptor::typeOffset(recordIndex), 0);
+        storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), 0);
+    }
+
     /// tryClaim() result when the ring is closed (INSUFFICIENT_CAPACITY is -2).
     static constexpr aeron::util::index_t kClaimClosed = -3;
 

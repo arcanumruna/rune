@@ -426,7 +426,7 @@ public:
     /// into a HEADER-LESS claim (length + type words zeroed) — the state of a
     /// writer that won the tail CAS but never wrote its record header.
     void testZeroClaimHeader(aeron::util::index_t claimIndex) noexcept {
-        std::memset(ring_.base() + claimIndex - 8, 0, 8);
+        ring_.testZeroClaimHeader(claimIndex);
     }
     /// fix3 I1: called (if set) every time drainRegistrationsForClose() yields
     /// waiting on an uncommitted claim — lets a test commit the claim
