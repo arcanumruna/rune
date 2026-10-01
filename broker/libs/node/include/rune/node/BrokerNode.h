@@ -303,6 +303,9 @@ public:
     /// out (SchemaFanout).  Ring full → admin-owned backlog, retried every
     /// doWork.  A descriptor that can never fit the ring is refused loudly.
     void postSchemaUpdate(int32_t topicId, const std::vector<uint8_t>& blob) {
+        // Unreachable by construction (static_assert in AdminChannels.h: every
+        // descriptor the request ring can deliver fits one SchemaUpdate); kept
+        // as a loud backstop rather than a silent tryClaim throw.
         if (schemaUpdateWireLen(blob.size()) > static_cast<std::size_t>(failureRing_.maxMsgLength()))
             [[unlikely]] {
             spdlog::error("AdminWorkerAgent: SchemaUpdate for topicId={} ({} B descriptor) "
@@ -339,7 +342,7 @@ private:
     OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
     // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized like
     // the other blob-carrying admin rings so a descriptor fits one message.
-    OneToOneByteRing failureRing_{kAdminRequestRingBytes};
+    OneToOneByteRing failureRing_{kAdminToControlRingBytes};
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
 
@@ -840,6 +843,7 @@ private:
     // F3 round 6, item 3: control-thread-owned SchemaUpdate fan-out (the
     // control thread is the single producer of every worker ingress ring).
     SchemaFanout                                 schemaFanout_;
+    uint64_t                                     adminToControlRejects_ = 0;   // control thread only
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
     HaltHandler                                  haltHandler_ = nullptr;
     void*                                        haltCtx_     = nullptr;

@@ -2048,15 +2048,22 @@ void BrokerNode::buildGateway() {
                            aeron::util::index_t off, aeron::util::index_t len) {
                         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
                         const auto  n = static_cast<std::size_t>(len);
-                        if (tid == kA2cSchemaUpdate) {
-                            SchemaUpdateMsg m = decodeSchemaUpdate(p, n);
-                            schemaFanout_.post(m.topicId, std::move(m.blob));
-                            return;
+                        // F3 round 7, item 3: explicit per-type dispatch; an
+                        // unknown/short frame is logged (rate-limited) and skipped.
+                        const A2cDispatch d = dispatchAdminToControl(tid, p, n,
+                            [this](int32_t e, std::string_view dir) {
+                                onStorageFailure_(std::string(dir), e);
+                            },
+                            [this](SchemaUpdateMsg m) {
+                                schemaFanout_.post(m.topicId, std::move(m.blob));
+                            });
+                        if ((d == A2cDispatch::Unknown || d == A2cDispatch::Malformed) &&
+                            adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                            spdlog::error("BrokerNode[{}]: admin→control frame skipped ({} type={} "
+                                          "len={}; rejects={})", config_.nodeId,
+                                          d == A2cDispatch::Unknown ? "unknown" : "malformed",
+                                          tid, n, adminToControlRejects_);
                         }
-                        int32_t e = 0;
-                        std::memcpy(&e, p, 4);
-                        onStorageFailure_(std::string(reinterpret_cast<const char*>(p) + 4,
-                                                      n - 4), e);
                     }, 16);
                 // Control thread = the single producer of every worker ring.
                 if (workerPool_) work += schemaFanout_.pump(*workerPool_);

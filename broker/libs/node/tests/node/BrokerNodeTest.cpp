@@ -20,6 +20,10 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include "support/TestWorkerCount.h"
+#include "support/ShardTestClient.h"
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
+#include <rune/metadata/ShardRouter.h>
 
 #include <gtest/gtest.h>
 
@@ -1371,6 +1375,122 @@ TEST(BrokerNodeRegression, HeterogeneousFollowerDropIsBoundedRegression) {
     EXPECT_LE(extra, 12u) << "drops must be bounded by the re-serve cadence, not the cycle count";
     EXPECT_EQ(follower.logEndOffset(), 0) << "the unfittable batch is never applied";
 
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 7, item 1: the REAL production SchemaUpdate path end to end on a
+// live single-node BrokerNode (2 workers): a client DefineTopic(validate=true)
+// → gateway → admin thread commits it to __topic_schemas → pushValidators →
+// AdminWorkerAgent::postSchemaUpdate (admin→control ring, kA2cSchemaUpdate) →
+// control-thread hook type dispatch → schemaFanout_.pump → EVERY worker's
+// ingress ring → each worker installs the Validator on ITS OWN thread.
+// Then a non-conforming produce is rejected (SchemaValidationFailed) and a
+// conforming one is accepted.  Every wait is condition-driven and bounded.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> charactersValue(bool conforming) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+    auto le64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+    le16(12); le16(1);                         // blockLength (int64 + int32), version
+    le64(1);                                   // id
+    le32(conforming ? 1u : 99u);               // enum type: 99 is NOT in {0,1,2}
+    const std::string_view name = "Alice";
+    le32(static_cast<uint32_t>(name.size()));
+    b.insert(b.end(), name.begin(), name.end());
+    return b;
+}
+std::vector<uint8_t> charactersBatch(bool conforming) {
+    const auto v = charactersValue(conforming);
+    rune::protocol::RecordBatchBuilder bb(0, 1000);
+    bb.append(std::string_view{}, std::string_view(reinterpret_cast<const char*>(v.data()), v.size()), 1000);
+    return bb.build();
+}
+} // namespace
+
+TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegression) {
+    const fs::path dir = makeTempDataDir("schema_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerCount = 2;
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const auto desc = rune::codec::DescriptorBuilder("characters")
+        .add("id",   rune::codec::PrimType::Int64)
+        .add("type", rune::codec::PrimType::Enum, 1, false, {0, 1, 2})
+        .add("name", rune::codec::PrimType::String)
+        .build();
+    const std::vector<uint8_t> blob = rune::codec::serialize(desc);
+    constexpr uint32_t kParts = 8;              // spread partitions over both workers
+    std::optional<rune::protocol::client::DefineTopicResponse> def;
+    for (int a = 0; a < 50 && !(def && def->errorCode == 0); ++a)   // admin leadership settling
+        def = client.defineTopic(gw, stream, sid, "characters", kParts, /*validate=*/true, blob);
+    ASSERT_TRUE(def.has_value());
+    ASSERT_EQ(def->errorCode, 0);
+    const int32_t topicId = def->topicId;
+    ASSERT_GE(topicId, 0);
+
+    // Condition-driven: EVERY worker has the validator.  Each probe runs ON the
+    // owning worker's thread (owner-thread test task) — worker state is never
+    // read cross-thread.  Partition p of the topic is owned by
+    // ShardRouter(2).workerForPartition(topicId, p); cover every worker.
+    rune::metadata::ShardRouter router(2);
+    std::map<int32_t, int32_t> probePartitionForWorker;
+    for (int32_t p = 0; p < static_cast<int32_t>(kParts); ++p)
+        probePartitionForWorker.emplace(router.workerForPartition(topicId, p), p);
+    ASSERT_EQ(probePartitionForWorker.size(), 2u) << "test setup: partitions must span both workers";
+    for (auto [w, p] : probePartitionForWorker) {
+        bool installed = false;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (!installed && std::chrono::steady_clock::now() < deadline) {
+            if (rune::node::test::hasReplica(node, topicId, p)) {
+                installed = node.onOwnerThreadForTest(topicId, p,
+                    [&node, w = w, topicId](rune::replication::PartitionReplica&) {
+                        return node.workerForTest(w)->hasValidatorForTest(topicId);
+                    });
+            }
+            if (!installed) std::this_thread::sleep_for(5ms);   // poll interval, not correctness
+        }
+        // Fatal: the produce phase below is meaningless without validators
+        // (and a long wait would also outlive the client session's keepalive).
+        ASSERT_TRUE(installed) << "worker " << w << " never installed the validator";
+    }
+
+    // Produce: non-conforming rejected, conforming accepted (retry only while
+    // leadership of the runtime topic settles: NotLeader).
+    namespace pc = rune::protocol::client;
+    int64_t nextCorr = 1'000'000;   // unique per produce (never reuse a correlation id)
+    auto produceSettled = [&](const std::vector<uint8_t>& batch, int32_t partition) -> int16_t {
+        for (int a = 0; a < 200; ++a) {
+            const int64_t corr = ++nextCorr;
+            if (!client.produce(gw, stream, sid, corr, topicId, partition, 0, batch)) continue;
+            auto ack = client.awaitProduceResponse(corr);
+            if (!ack) continue;
+            if (ack->errorCode != static_cast<int16_t>(pc::ErrorCode::NotLeader)) return ack->errorCode;
+            std::this_thread::sleep_for(20ms);
+        }
+        return -999;
+    };
+    for (auto [w, p] : probePartitionForWorker) {
+        EXPECT_EQ(produceSettled(charactersBatch(false), p),
+                  static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed))
+            << "worker " << w << ": a non-conforming record must be rejected";
+        EXPECT_EQ(produceSettled(charactersBatch(true), p), 0)
+            << "worker " << w << ": a conforming record must be accepted";
+    }
+
+    node.stop();
     std::error_code ec; fs::remove_all(dir, ec);
 }
 

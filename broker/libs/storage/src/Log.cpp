@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <new>
 #include <fstream>
 #include <spdlog/spdlog.h>
 #include <cerrno>
@@ -875,13 +876,21 @@ void Log::reloadSegments() {
     int64_t next = 0;
     for (auto& [base, seg] : newSegments) next = seg->recover();
 
-    // Everything succeeded — now it is safe to replace.  The OLD generation
-    // is removed via erase_ (T10: a segment with a flush in flight is RETIRED,
-    // keeping its fd open until the flush completes — M1) and the new one is
-    // installed via install_ (wires the shared storage-failure state).  None
-    // of these steps throws, so segments_ is never observably empty/partial.
-    for (auto it = segments_.begin(); it != segments_.end(); ) it = erase_(it);
-    for (auto& [b, seg] : newSegments) install_(b, std::move(seg));
+    // Everything succeeded — now replace the generation with NO step that can
+    // throw once the old generation is touched (F3 round 7):
+    //   1. Allocate first: retiring a pinned old segment pushes onto
+    //      retiredSegments_ (T10 M1: its fd stays open until the in-flight
+    //      flush completes) — reserve that capacity up front.  A bad_alloc
+    //      here propagates with segments_ (the old generation) UNTOUCHED.
+    //   2. Retire every old segment (push_back into reserved capacity +
+    //      fixed-array pending-seal bookkeeping: no allocation, no throw).
+    //   3. Install the new generation with std::map::swap (noexcept).  Every
+    //      new segment already carries the storage-failure state (set before
+    //      its recover() above), which is all install_ would add.
+    if (reloadAllocFaultForTest_) [[unlikely]] throw std::bad_alloc();
+    retiredSegments_.reserve(retiredSegments_.size() + segments_.size());
+    for (auto& [b, seg] : segments_) retire_(std::move(seg));
+    segments_.swap(newSegments);   // old (now all-null) entries die with newSegments
     logEndOffset_ = next;
 }
 

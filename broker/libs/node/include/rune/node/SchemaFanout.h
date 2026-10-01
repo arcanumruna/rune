@@ -20,7 +20,6 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -45,7 +44,7 @@ public:
                 op.type             = WorkerOp::Type::SchemaUpdate;
                 op.topicId          = p.topicId;
                 op.schemaUpdateBlob = p.blob;   // copy: one per worker (cold path)
-                noteEnqueueThread_();
+                if (enqueueHookForTest_) [[unlikely]] enqueueHookForTest_(enqueueHookCtx_);
                 const EnqueueResult r = pool.worker(p.nextWorker).tryEnqueueOp(std::move(op));
                 if (r.full()) break;            // back-pressure: retry next cycle
                 if (r.tooLarge()) [[unlikely]] {
@@ -69,11 +68,13 @@ public:
     }
 
     // ---- test hooks (read on the control thread or after it joined) ----
-    [[nodiscard]] std::size_t     pendingForTest() const noexcept { return pending_.size(); }
-    [[nodiscard]] uint64_t        enqueuedForTest() const noexcept { return enqueued_; }
-    [[nodiscard]] uint64_t        tooLargeDropsForTest() const noexcept { return tooLargeDrops_; }
-    [[nodiscard]] std::thread::id enqueueThreadForTest() const noexcept { return enqueueThread_; }
-    [[nodiscard]] bool            sawForeignThreadForTest() const noexcept { return foreignThread_; }
+    /// F3 round 7, item 5: called right before every worker-ring enqueue.
+    /// nullptr in production (one predicted branch, no thread-id lookup).
+    using EnqueueHook = void (*)(void* ctx) noexcept;
+    void setEnqueueHookForTest(EnqueueHook h, void* ctx) noexcept { enqueueHookForTest_ = h; enqueueHookCtx_ = ctx; }
+    [[nodiscard]] std::size_t pendingForTest() const noexcept { return pending_.size(); }
+    [[nodiscard]] uint64_t    enqueuedForTest() const noexcept { return enqueued_; }
+    [[nodiscard]] uint64_t    tooLargeDropsForTest() const noexcept { return tooLargeDrops_; }
 
 private:
     struct Pending {
@@ -81,17 +82,12 @@ private:
         std::vector<uint8_t> blob;
         int32_t              nextWorker;
     };
-    void noteEnqueueThread_() noexcept {
-        const auto id = std::this_thread::get_id();
-        if (enqueueThread_ == std::thread::id{}) enqueueThread_ = id;
-        else if (enqueueThread_ != id) foreignThread_ = true;
-    }
 
     std::vector<Pending> pending_;
     uint64_t             enqueued_      = 0;
     uint64_t             tooLargeDrops_ = 0;
-    std::thread::id      enqueueThread_{};
-    bool                 foreignThread_ = false;
+    EnqueueHook          enqueueHookForTest_ = nullptr;
+    void*                enqueueHookCtx_     = nullptr;
 };
 
 } // namespace rune::node

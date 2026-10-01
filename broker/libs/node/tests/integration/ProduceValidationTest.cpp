@@ -424,6 +424,18 @@ TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegress
     rune::metadata::ShardRouter router(2);
     rune::node::WorkerPool pool(2, router, /*ingressRingBytes=*/1 << 20);
     rune::node::SchemaFanout fanout;
+    // Test-only thread-identity capture (null in production — item 5 of round 7).
+    struct EnqueueThreads {
+        std::thread::id first{};
+        bool            foreign = false;
+        static void hook(void* ctx) noexcept {
+            auto* t = static_cast<EnqueueThreads*>(ctx);
+            const auto id = std::this_thread::get_id();
+            if (t->first == std::thread::id{}) t->first = id;
+            else if (t->first != id) t->foreign = true;
+        }
+    } threads;
+    fanout.setEnqueueHookForTest(&EnqueueThreads::hook, &threads);
 
     // No std::atomic / mutex (Rune rule): completion is the message count the
     // control thread drains off the ring (ring-only synchronisation).
@@ -468,11 +480,11 @@ TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegress
     }
 
     EXPECT_EQ(fanout.enqueuedForTest(), static_cast<uint64_t>(kTopics * 2));
-    EXPECT_EQ(fanout.enqueueThreadForTest(), controlId)
+    EXPECT_EQ(threads.first, controlId)
         << "SchemaUpdate must be enqueued into worker rings by the CONTROL thread";
-    EXPECT_NE(fanout.enqueueThreadForTest(), adminId)
+    EXPECT_NE(threads.first, adminId)
         << "the admin thread must never produce into a worker SPSC ring";
-    EXPECT_FALSE(fanout.sawForeignThreadForTest()) << "every enqueue on one thread";
+    EXPECT_FALSE(threads.foreign) << "every enqueue on one thread";
     for (int w = 0; w < 2; ++w) {
         for (int t = 0; t < kTopics; ++t)
             EXPECT_TRUE(pool.worker(w).hasValidatorForTest(100 + t)) << "worker " << w << " topic " << t;
@@ -520,6 +532,55 @@ TEST(ProduceValidationRegression, SchemaFanoutRetriesOnFullDropsTooLargeRegressi
     (void)fanout.pump(pool);
     EXPECT_EQ(fanout.pendingForTest(), 0u) << "TooLarge is dropped (error names the size)";
     EXPECT_EQ(fanout.tooLargeDropsForTest(), 1u);
+}
+
+// F3 round 7, item 3: the admin→control ring is dispatched on the message
+// type EXPLICITLY.  Before: any non-SchemaUpdate frame was decoded as a
+// storage failure — an unknown type (or a <4-byte frame) would have been
+// misread as an fsync failure and HALTED the broker.
+TEST(ProduceValidationRegression, AdminToControlDispatchIsExplicitRegression) {
+    int failures = 0, schemas = 0;
+    int32_t gotErr = 0; std::string gotDir; int32_t gotTopic = -1;
+    auto onFailure = [&](int32_t e, std::string_view d) { ++failures; gotErr = e; gotDir = d; };
+    auto onSchema  = [&](rune::node::SchemaUpdateMsg m) { ++schemas; gotTopic = m.topicId; };
+
+    std::vector<uint8_t> fail(4 + 3);
+    const int32_t eio = 5; std::memcpy(fail.data(), &eio, 4); std::memcpy(fail.data() + 4, "dir", 3);
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cStorageFailure, fail.data(), fail.size(),
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::StorageFailure);
+    EXPECT_EQ(failures, 1); EXPECT_EQ(gotErr, 5); EXPECT_EQ(gotDir, "dir");
+
+    std::vector<uint8_t> su(4 + 2, 0x7); const int32_t tid = 42; std::memcpy(su.data(), &tid, 4);
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cSchemaUpdate, su.data(), su.size(),
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::SchemaUpdate);
+    EXPECT_EQ(schemas, 1); EXPECT_EQ(gotTopic, 42);
+
+    // Unknown type: skipped — NEVER treated as a storage failure.
+    EXPECT_EQ(rune::node::dispatchAdminToControl(99, fail.data(), fail.size(), onFailure, onSchema),
+              rune::node::A2cDispatch::Unknown);
+    // Short frames: rejected, never decoded.
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cStorageFailure, fail.data(), 3,
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::Malformed);
+    EXPECT_EQ(rune::node::dispatchAdminToControl(rune::node::kA2cSchemaUpdate, su.data(), 3,
+                                                 onFailure, onSchema),
+              rune::node::A2cDispatch::Malformed);
+    EXPECT_EQ(failures, 1) << "no halt from an unknown/short frame";
+    EXPECT_EQ(schemas, 1);
+}
+
+// F3 round 7, item 4: the largest descriptor the request ring can deliver
+// (DefineTopic with empty name/key) actually round-trips through BOTH rings.
+TEST(ProduceValidationRegression, MaxDescriptorFitsBothAdminRingsRegression) {
+    rune::node::OneToOneByteRing request(rune::node::kAdminRequestRingBytes);
+    rune::node::OneToOneByteRing a2c(rune::node::kAdminToControlRingBytes);
+    rune::node::DefineTopicMsg m;
+    m.blob.assign(rune::node::kMaxDescriptorViaRequestRing, 0x5A);
+    EXPECT_TRUE(rune::node::encodeDefineTopic(request, m));
+    EXPECT_TRUE(rune::node::encodeSchemaUpdate(a2c, 1, m.blob))
+        << "a descriptor accepted by the request ring must fit the admin->control ring";
 }
 
 } // namespace rune::node::test

@@ -1577,6 +1577,38 @@ TEST(LogRegression, FailedRollKeepsOldActiveSegmentAndRetrySucceeds) {
 // EXACTLY as it was before the call (the old, still-open segments remain
 // fully usable), never partially cleared and never missing its active entry.
 // ---------------------------------------------------------------------------
+// F3 round 7, item 2: reloadSegments' install step must be no-throw.  Round
+// 6 erased the old generation (retire_ → retiredSegments_.push_back) and then
+// emplaced the new one segment by segment: a bad_alloc in between left
+// segments_ EMPTY.  Now every allocation (retiredSegments_ reserve) happens
+// BEFORE the old generation is touched and the install is a no-throw swap.
+// A test-only allocation fault at that point must leave the log intact.
+TEST(LogRegression, ReloadSegmentsAllocFailureLeavesLogIntactRegression) {
+    auto dir = makeTempDir("rune_f3r7_reload_alloc");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/256);
+    int64_t off = 0;
+    for (int i = 0; i < 30; ++i) {
+        RecordBatchBuilder b(off, 9900 + i); b.append("k", "v" + std::to_string(i), 9900 + i);
+        off = log.append(b.build(), off);
+    }
+    const auto basesBefore = log.segmentBaseOffsets();
+    ASSERT_GT(basesBefore.size(), 2u);
+    const int64_t leoBefore = log.logEndOffset();
+
+    log.setReloadAllocFaultForTest(true);
+    EXPECT_THROW(log.reloadSegments(), std::bad_alloc);
+    EXPECT_EQ(log.segmentBaseOffsets(), basesBefore) << "segments_ must be untouched";
+    EXPECT_EQ(log.logEndOffset(), leoBefore);
+    RecordBatchBuilder b(off, 9999); b.append("k", "still-alive", 9999);
+    EXPECT_EQ(log.append(b.build(), off), off + 1) << "old active segment still usable";
+
+    log.setReloadAllocFaultForTest(false);
+    EXPECT_NO_THROW(log.reloadSegments());
+    EXPECT_EQ(log.logEndOffset(), off + 1);
+    std::filesystem::remove_all(dir);
+}
+
 TEST(LogRegression, ReloadSegmentsFailureLeavesLogIntactRegression) {
     auto dir = makeTempDir("rune_f3r2_reload_fail");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);

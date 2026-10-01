@@ -143,6 +143,9 @@ public:
     /// the log (truncate / retention / reload) is closed when this reaches 0.
     void unpinSegmentFlush(LogSegment* seg) noexcept;
     [[nodiscard]] std::size_t retiredSegmentsForTest() const noexcept { return retiredSegments_.size(); }
+    /// F3 round 7: make reloadSegments' pre-install allocation step throw
+    /// std::bad_alloc (tests the strong guarantee of the no-throw install).
+    void setReloadAllocFaultForTest(bool on) noexcept { reloadAllocFaultForTest_ = on; }
     /// Pending (un-submitted) async seals dropped because their segment was
     /// removed (truncate / retention / reload).  The owning worker fails its
     /// seal-gated durable entries retriably when this changes.
@@ -376,6 +379,7 @@ private:
     /// M1: segments removed from segments_ while an async flush was in flight on
     /// their fd.  Destroyed (fd closed) by unpinSegmentFlush.  Rare, cold.
     std::vector<std::unique_ptr<LogSegment>> retiredSegments_;
+    bool reloadAllocFaultForTest_ = false;   // F3 r7: test-only (cold path)
     uint32_t ownerTag_ = UINT32_MAX;
     using SegMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
     /// Wire `seg` into this log (storage state) and store it at `base`, retiring
