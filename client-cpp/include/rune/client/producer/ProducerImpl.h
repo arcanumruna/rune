@@ -515,7 +515,7 @@ public:
         if (mode_ == IngressMode::Direct) {
             directClosed_ = true;
         } else {
-            ring_.closed(true);
+            ring_.close();  // F8c C1(a): linearizable with every tryClaim()
         }
     }
 

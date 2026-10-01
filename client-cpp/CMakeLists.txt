@@ -504,6 +504,12 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         endif()
     endif()
 
+    # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
+    add_executable(rune_m2o_claim_bench
+        bench/M2OClaimBench.cpp
+    )
+    target_link_libraries(rune_m2o_claim_bench PRIVATE rune_client_producer)
+
     # F12 — per-duty-cycle producer cost vs partition count (in-process, no Aeron)
     add_executable(rune_producer_flush_scaling_bench
         bench/ProducerFlushScalingBench.cpp

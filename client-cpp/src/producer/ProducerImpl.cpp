@@ -393,11 +393,14 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
 
 SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
                                         std::span<const uint8_t> value, int64_t ackHandle) noexcept {
-    // fix1 C2/I3: closed is a terminal state, checked first — a Producer whose
-    // Client has gone through close() never reaches submitSendRecord(), and
-    // (critically) sendBlocking() never gets far enough to touch the pump hook's
-    // context (which may by then be a destroyed Client).
-    if (ring_.closed()) return SendResult::Closed;
+    // fix1 C2/I3 + F8c C1(a): closed is a terminal state, decided by the claim
+    // itself — the ring's closed bit lives in the tail word tryClaim() CASes, so
+    // a send is either accepted before Client::closeImpl_ closed the ring (and
+    // drained by its close path) or rejected Closed, never accepted after it
+    // (the old separate pre-check could pass just before the close).  No extra
+    // load on the hot path: the rejected claim is told apart from back-pressure
+    // only on the (cold) failure branch below.  sendBlocking() still checks
+    // closed_() before ever touching the pump hook's context.
     if (value.size() > rune::client::Producer::kMaxSendValueBytes) return SendResult::ValueTooLarge;
     // fix1 minor 11: a value that can NEVER fit this ring (maxMsgLength is a
     // function of ringCap, which can be far smaller than kMaxSendValueBytes —
@@ -406,9 +409,10 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
     // so BackPressured here would livelock sendBlocking's retry loop forever.
     const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + value.size();
     if (totalLen > static_cast<std::size_t>(ring_.maxMsgLength())) return SendResult::ValueTooLarge;
-    return submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle)
-               ? SendResult::Ok
-               : SendResult::BackPressured;
+    if (submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle)) [[likely]] {
+        return SendResult::Ok;
+    }
+    return ring_.closed() ? SendResult::Closed : SendResult::BackPressured;
 }
 
 SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,

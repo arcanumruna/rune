@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <stdexcept>
 #include <vector>
 
@@ -169,7 +170,7 @@ TEST(M2ORingBuffer, ControlledReadContinuesPastWrapPaddingInTheSameCallRegressio
 TEST(M2ORingBuffer, ClosedDefaultsFalseAndIsSticky) {
     Ring r(512);
     EXPECT_FALSE(r.ring.closed());
-    r.ring.closed(true);
+    r.ring.close();
     EXPECT_TRUE(r.ring.closed());
 }
 
@@ -303,4 +304,91 @@ TEST(M2ORingBuffer, UnblockHeaderlessClaimWithNothingBehindReturnsFalse) {
     std::memset(r.ring.base() + orphan - 8, 0, 8);
     EXPECT_FALSE(r.ring.unblock());
     EXPECT_NE(r.ring.headPosition(), r.ring.tailPosition());
+}
+
+// ---------------------------------------------------------------------------
+// F8c C1(a): linearizable close — the closed flag is the top bit of the tail
+// word that tryClaim() already CASes, so every claim is totally ordered with
+// the close: a claim that won its CAS before the close is drained (even if it
+// commits afterwards), a claim after it fails with kClaimClosed.
+// ---------------------------------------------------------------------------
+
+// Deterministic single-thread contract.
+TEST(M2ORingBuffer, M2OClaimAfterCloseIsRejectedRegression) {
+    Ring r(512);
+    ASSERT_TRUE(r.writeOne(1));
+    const auto pending = r.ring.tryClaim(kMsgTypeId, kPayloadLen);  // claimed, not committed
+    ASSERT_GE(pending, 0);
+    const std::int64_t tailBefore = r.ring.tailPosition();
+    EXPECT_TRUE(r.ring.close()) << "the first close() closes";
+    EXPECT_FALSE(r.ring.close()) << "close() is idempotent";
+    EXPECT_TRUE(r.ring.closed());
+    EXPECT_EQ(r.ring.tailPosition(), tailBefore) << "the closed bit is not part of the position";
+    EXPECT_EQ(r.ring.tryClaim(kMsgTypeId, kPayloadLen), M2ORingBuffer::kClaimClosed);
+    EXPECT_FALSE(r.writeOne(3)) << "write() after close must be rejected";
+    std::memset(r.ring.base() + pending, 2, kPayloadLen);
+    r.ring.commit(pending);  // the pre-close claim commits AFTER the close
+    EXPECT_EQ(readAll(r.ring), (std::vector<uint8_t>{1, 2}))
+        << "a claim made before the close is drained";
+    EXPECT_EQ(r.ring.headPosition(), r.ring.tailPosition()) << "fully drained";
+}
+
+// N writers vs a closer (the consumer), 1000 iterations (run under TSan too):
+// every accepted claim is drained, in per-writer order with no gap, and every
+// claim attempted after the close is rejected.  The close point varies per
+// iteration; no sleeps — every wait is on another thread's progress.
+TEST(M2ORingBuffer, M2OCloseLinearizesWithClaimsRegression) {
+    constexpr int kWriters = 4;
+    constexpr int kIterations = 1000;
+    struct Rec { uint32_t writer; uint32_t seq; };
+    for (int it = 0; it < kIterations; ++it) {
+        Ring r(4096);
+        uint32_t accepted[kWriters] = {};
+        bool     sawClosed[kWriters] = {};
+        std::vector<std::thread> ws;
+        for (int w = 0; w < kWriters; ++w) {
+            ws.emplace_back([&r, &accepted, &sawClosed, w] {
+                for (;;) {
+                    const auto idx = r.ring.tryClaim(kMsgTypeId, sizeof(Rec));
+                    if (idx == M2ORingBuffer::kClaimClosed) { sawClosed[w] = true; return; }
+                    if (idx < 0) continue;  // full: the consumer is draining
+                    const Rec rec{static_cast<uint32_t>(w), accepted[w]};
+                    std::memcpy(r.ring.base() + idx, &rec, sizeof rec);
+                    r.ring.commit(idx);
+                    ++accepted[w];
+                }
+            });
+        }
+        uint32_t seen[kWriters] = {};
+        bool inOrder = true;
+        auto drain = [&] {
+            return r.ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                   aeron::util::index_t) {
+                Rec rec;
+                std::memcpy(&rec, b.buffer() + off, sizeof rec);
+                if (rec.writer >= kWriters || rec.seq != seen[rec.writer]) inOrder = false;
+                else ++seen[rec.writer];
+            });
+        };
+        const int closeAfter = (it * 37) % 400;  // vary the close point
+        int consumed = 0;
+        while (consumed < closeAfter) consumed += drain();
+        ASSERT_TRUE(r.ring.close());
+        // The close froze the tail: no claim can move it any more.  Close drain:
+        // every claim that won its CAS before the close commits (its writer is
+        // live), so the head reaches that frozen tail.
+        const std::int64_t frozenTail = r.ring.tailPosition();
+        while (r.ring.headPosition() < frozenTail) drain();
+        for (auto& t : ws) t.join();
+        ASSERT_EQ(r.ring.tailPosition(), frozenTail)
+            << "iteration " << it << ": a claim succeeded after close()";
+        ASSERT_TRUE(inOrder) << "iteration " << it;
+        for (int w = 0; w < kWriters; ++w) {
+            ASSERT_TRUE(sawClosed[w]) << "iteration " << it << " writer " << w;
+            ASSERT_EQ(seen[w], accepted[w])
+                << "iteration " << it << " writer " << w
+                << ": an accepted claim was not drained (claim after close?)";
+        }
+        ASSERT_EQ(r.ring.tryClaim(kMsgTypeId, sizeof(Rec)), M2ORingBuffer::kClaimClosed);
+    }
 }
