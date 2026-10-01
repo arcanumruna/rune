@@ -30,6 +30,7 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/transaction/ControlMarker.h>
 
 #include <Aeron.h>
 #include <gtest/gtest.h>
@@ -209,7 +210,8 @@ TEST(ShardNonBlockingRegression, OwnedLogSyncIsAsyncAndIdleLogIsNotResubmitted) 
 
 TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
     StrictShard s;
-    const auto marker = batchAt(0);
+    // A real control batch (F15 N2: appendControlBatch refuses non-markers).
+    const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);
     WorkerOp op;
     op.type = WorkerOp::Type::AppendControlRecord; op.topicId = 1; op.partition = 0;
     op.replica = s.leader.get(); op.logPtr = s.log.get();
@@ -1705,12 +1707,11 @@ struct MarkerRig {
         pool.worker(0).drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
     }
 };
+// A REAL txn marker (control batch) for `pid`.  F15 N2: markers are appended
+// as control batches (appendControlBatch), which refuses anything else — the
+// old stand-in (a data batch with the pid stamped in) is no longer a marker.
 std::vector<uint8_t> txnBatch(int64_t pid) {
-    rune::protocol::RecordBatchBuilder b(0, 1000);
-    b.append("k", "v", 1000);
-    auto v = b.build();
-    for (int i = 0; i < 8; ++i) v[43 + i] = static_cast<uint8_t>(pid >> (8 * i));
-    return v;
+    return rune::transaction::ControlMarker::build(pid, 0, rune::transaction::ControlType::Abort, 0);
 }
 } // namespace
 
