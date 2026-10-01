@@ -67,6 +67,10 @@
            endOffset→oleFollowerLeo); RECONCILE_FETCH_REQ reuses the fr* scalars. -->
       <validValue name="OFFSETS_FOR_LEADER_EPOCH_RESP">15</validValue>
       <validValue name="RECONCILE_FETCH_REQ">16</validValue>
+      <!-- F15 (m1, handled in step S9): control → every worker, the runtime's
+           min-ISR admission policy (retried until delivered; latest supersedes).
+           18 stays free. -->
+      <validValue name="SET_ADMISSION_POLICY">17</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -93,9 +97,11 @@
     <enum name="ReturnType" encodingType="uint8">
       <validValue name="PRODUCE_RESULT">0</validValue>
       <validValue name="PUSH_READ_RESULT">1</validValue>
-      <!-- Post-ack, fire-and-forget worker → runtime notification (spec §3.4):
-           PSM mirror + transaction LSO bookkeeping; never on the ack path. -->
-      <validValue name="PRODUCE_NOTIFY">2</validValue>
+      <!-- Retired (F15): was PRODUCE_NOTIFY, the post-ack PSM/LSO notification of
+           the self-contained-shards spec §3.4.  Under F15 Option B the owning
+           worker keeps its own read_committed state, so it is never emitted.
+           The value stays reserved so 3..6 keep their meaning. -->
+      <validValue name="RESERVED_2">2</validValue>
       <!-- Worker → runtime fail-stop signal (fsyncgate): a log's fsync failed;
            the log is permanently failed and the runtime halts the broker.
            topicId/partition name the log, errorCode carries errno, chunk the dir. -->
@@ -113,6 +119,15 @@
            marker ACTUALLY landed at (authoritative; never pre-computed), or
            errorCode != 0 when the append itself failed (e.g. min-ISR gate). -->
       <validValue name="CONTROL_RECORD_APPENDED">6</validValue>
+    </enum>
+
+    <!-- F15: TxnReturn::kind -->
+    <enum name="TxnReturnKind" encodingType="uint8">
+      <!-- the marker identified by token is committed (HW > its offset), or
+           errorCode != 0 (e.g. NotLeader: the marker task re-drives). -->
+      <validValue name="CONTROL_RECORD_COMMITTED">1</validValue>
+      <!-- reserved for F15-FU1 (hanging-transaction safety net); never emitted yet. -->
+      <validValue name="TXN_HANGING">2</validValue>
     </enum>
   </types>
 
@@ -258,6 +273,22 @@
   <sbe:message name="OutboundFrame" id="5" description="worker→control outbound ring envelope">
     <field name="targetNodeId" id="1" type="int32"/>
     <data  name="payload"      id="2" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- TxnReturn (worker → control over the SAME return ring as WorkerReturn,  -->
+  <!-- discriminated by template id).  F15 design note §7: a small fixed block -->
+  <!-- so the ProduceResult carrier (WorkerReturn) never grows.  Ids 1-5 are   -->
+  <!-- taken (4 = FlushCompletion).                                            -->
+  <!-- ====================================================================== -->
+  <sbe:message name="TxnReturn" id="6" description="worker→control transactional return">
+    <field name="kind"        id="1" type="TxnReturnKind"/>
+    <field name="topicId"     id="2" type="int32"/>
+    <field name="partition"   id="3" type="int32"/>
+    <field name="incarnation" id="4" type="uint32"/>
+    <field name="leaderEpoch" id="5" type="int32"/>
+    <field name="token"       id="6" type="int64"/>
+    <field name="errorCode"   id="7" type="int16"/>
   </sbe:message>
 
 </sbe:messageSchema>

@@ -93,6 +93,7 @@
 
 
 #include "MessageHeader.h"
+#include "TxnReturnKind.h"
 #include "TailKind.h"
 #include "OpType.h"
 #include "ReturnType.h"

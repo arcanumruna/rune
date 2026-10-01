@@ -35,7 +35,7 @@ public:
     {
         PRODUCE_RESULT = static_cast<std::uint8_t>(0),
         PUSH_READ_RESULT = static_cast<std::uint8_t>(1),
-        PRODUCE_NOTIFY = static_cast<std::uint8_t>(2),
+        RESERVED_2 = static_cast<std::uint8_t>(2),
         STORAGE_FAILURE = static_cast<std::uint8_t>(3),
         OWNERSHIP_ACK = static_cast<std::uint8_t>(4),
         CONTROL_RECORD_REFUSED = static_cast<std::uint8_t>(5),
@@ -49,7 +49,7 @@ public:
         {
             case static_cast<std::uint8_t>(0): return PRODUCE_RESULT;
             case static_cast<std::uint8_t>(1): return PUSH_READ_RESULT;
-            case static_cast<std::uint8_t>(2): return PRODUCE_NOTIFY;
+            case static_cast<std::uint8_t>(2): return RESERVED_2;
             case static_cast<std::uint8_t>(3): return STORAGE_FAILURE;
             case static_cast<std::uint8_t>(4): return OWNERSHIP_ACK;
             case static_cast<std::uint8_t>(5): return CONTROL_RECORD_REFUSED;
@@ -66,7 +66,7 @@ public:
         {
             case PRODUCE_RESULT: return "PRODUCE_RESULT";
             case PUSH_READ_RESULT: return "PUSH_READ_RESULT";
-            case PRODUCE_NOTIFY: return "PRODUCE_NOTIFY";
+            case RESERVED_2: return "RESERVED_2";
             case STORAGE_FAILURE: return "STORAGE_FAILURE";
             case OWNERSHIP_ACK: return "OWNERSHIP_ACK";
             case CONTROL_RECORD_REFUSED: return "CONTROL_RECORD_REFUSED";

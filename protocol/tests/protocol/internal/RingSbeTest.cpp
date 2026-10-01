@@ -10,6 +10,8 @@
 #include <rune_protocol_internal_sbe/OpType.h>
 #include <rune_protocol_internal_sbe/ReturnType.h>
 #include <rune_protocol_internal_sbe/TailKind.h>
+#include <rune_protocol_internal_sbe/TxnReturn.h>
+#include <rune_protocol_internal_sbe/TxnReturnKind.h>
 
 #include <gtest/gtest.h>
 #include <array>
@@ -185,11 +187,13 @@ TEST(RingSbe, SessionAnnounceCarriesEgressChannelAndStream) {
     EXPECT_EQ(std::string(p, len), ch);
 }
 
-TEST(RingSbe, ProduceNotifyReturnTypeRoundTrips) {
+TEST(RingSbe, Reserved2ReturnTypeRoundTrips) {
+    // F15: PRODUCE_NOTIFY(2) is retired as RESERVED_2 (never emitted); the value
+    // stays reserved so 3..6 keep their meaning and an old frame still decodes.
     std::array<char, 512> buf{};
     sbe::WorkerReturn enc;
     enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
-    enc.returnType(sbe::ReturnType::Value::PRODUCE_NOTIFY)
+    enc.returnType(sbe::ReturnType::Value::RESERVED_2)
        .sessionId(0).correlationId(0).partition(3).baseOffset(1234).lastOffset(1240)
        .errorCode(0).deferAck(0).replica(0).producerId(55).producerEpoch(1)
        .baseSequence(10).recordCount(7).topicId(2).batchAttrs(0x10).enqueuedAtNs(0)
@@ -197,8 +201,8 @@ TEST(RingSbe, ProduceNotifyReturnTypeRoundTrips) {
        .isolation(0).isGroup(0).groupCarrierReceived(0);
     enc.putChunk(nullptr, 0);
     auto dec = decodeAt<sbe::WorkerReturn>(buf.data(), buf.size());
-    EXPECT_EQ(dec.returnType(), sbe::ReturnType::Value::PRODUCE_NOTIFY);
-    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::PRODUCE_NOTIFY), 2);
+    EXPECT_EQ(dec.returnType(), sbe::ReturnType::Value::RESERVED_2);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::RESERVED_2), 2);
     EXPECT_EQ(dec.producerId(), 55);
     EXPECT_EQ(dec.baseOffset(), 1234);
     EXPECT_EQ(dec.batchAttrs(), 0x10);
@@ -298,4 +302,41 @@ TEST(RingSbe, ControlRecordAppendedCarriesIdentityAndOffsetRegression) {
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::RECONCILE_FETCH_REQ), 16);
     EXPECT_EQ(sbe::OpType::get(15), sbe::OpType::Value::OFFSETS_FOR_LEADER_EPOCH_RESP);
     EXPECT_EQ(sbe::OpType::get(16), sbe::OpType::Value::RECONCILE_FETCH_REQ);
+}
+
+// ---------------------------------------------------------------------------
+// F15 §7: TxnReturn (template 6) — a separate small fixed block on the return
+// ring so the ProduceResult carrier (WorkerReturn) never grows.
+// ---------------------------------------------------------------------------
+TEST(RingSbe, TxnReturnRoundTripsRegression) {
+    EXPECT_EQ(sbe::TxnReturn::sbeTemplateId(), 6);
+    EXPECT_EQ(sbe::TxnReturn::sbeSchemaId(), sbe::WorkerReturn::sbeSchemaId());
+    EXPECT_EQ(sbe::TxnReturn::sbeBlockLength(), 1 + 4 + 4 + 4 + 4 + 8 + 2);
+    EXPECT_EQ(static_cast<int>(sbe::TxnReturnKind::Value::CONTROL_RECORD_COMMITTED), 1);
+    EXPECT_EQ(static_cast<int>(sbe::TxnReturnKind::Value::TXN_HANGING), 2);
+    std::array<char, 64> buf{};
+    sbe::TxnReturn enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.kind(sbe::TxnReturnKind::Value::CONTROL_RECORD_COMMITTED)
+       .topicId(3).partition(7).incarnation(0xABCDu).leaderEpoch(42)
+       .token(0x0102030405060708LL).errorCode(2);
+    auto dec = decodeAt<sbe::TxnReturn>(buf.data(), buf.size());
+    EXPECT_EQ(dec.kind(), sbe::TxnReturnKind::Value::CONTROL_RECORD_COMMITTED);
+    EXPECT_EQ(dec.topicId(), 3);
+    EXPECT_EQ(dec.partition(), 7);
+    EXPECT_EQ(dec.incarnation(), 0xABCDu);
+    EXPECT_EQ(dec.leaderEpoch(), 42);
+    EXPECT_EQ(dec.token(), 0x0102030405060708LL);
+    EXPECT_EQ(dec.errorCode(), 2);
+}
+
+TEST(RingSbe, SetAdmissionPolicyOpTypeIs17Regression) {
+    // F15 m1: the op value is reserved now; its handling lands in step S9.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::SET_ADMISSION_POLICY), 17);
+}
+
+TEST(RingSbe, WorkerReturnLayoutUnchangedRegression) {
+    // The ProduceResult carrier must not grow (F15 §7).
+    EXPECT_EQ(sbe::WorkerReturn::sbeTemplateId(), 2);
+    EXPECT_EQ(sbe::WorkerReturn::sbeBlockLength(), 123);
 }
