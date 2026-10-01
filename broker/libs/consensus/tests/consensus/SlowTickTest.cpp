@@ -32,3 +32,12 @@ TEST(SlowTickRegression, ZeroIntervalIsEveryCycle) {
         t.done(now, 0);
     }
 }
+
+// Review m1: interval 0 must be EVERY cycle even when the clock has not advanced
+// since an emitting cycle (deadline now+1 would skip it) — thread placement is
+// exactly the pre-slow-tick behaviour.
+TEST(SlowTickRegression, ZeroIntervalRunsEveryCycleOnAnUnadvancedClock) {
+    SlowTick t;
+    t.done(500, /*work=*/2);
+    EXPECT_TRUE(t.due(500)) << "same nanosecond, interval 0: still due";
+}

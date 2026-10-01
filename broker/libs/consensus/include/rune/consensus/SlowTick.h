@@ -16,7 +16,7 @@ struct SlowTick {
     int64_t intervalNs = 0;
     int64_t deadlineNs = std::numeric_limits<int64_t>::min();   // due on the first cycle
 
-    [[nodiscard]] bool due(int64_t nowNs) const noexcept { return nowNs >= deadlineNs; }
+    [[nodiscard]] bool due(int64_t nowNs) const noexcept { return intervalNs == 0 || nowNs >= deadlineNs; }
     void done(int64_t nowNs, int work) noexcept { deadlineNs = work > 0 ? nowNs + 1 : nowNs + intervalNs; }
 };
 
