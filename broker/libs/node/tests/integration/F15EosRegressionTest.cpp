@@ -916,6 +916,10 @@ struct LegacyAcksRig {
 static_assert(!rune::gateway::ExposesRole<rune::gateway::GatewayReplicaView>,
               "the gateway must not be able to read the worker-owned role");
 static_assert(rune::gateway::ExposesRole<PartitionReplica>, "the guard's detector works");
+// Review m4: no raw-pointer getter that would let routingPtr()->role() bypass it.
+template <typename V> concept ExposesRoutingPtr = requires(const V& v) { v.routingPtr(); };
+static_assert(!ExposesRoutingPtr<rune::gateway::GatewayReplicaView>,
+              "the routing pointer is stamped into the op, never returned");
 
 TEST(TxnRoleGateRegression, SelfDemotionFailsParkedAcks) {
     // onFetchRequest with a higher epoch demotes the replica with no op and no

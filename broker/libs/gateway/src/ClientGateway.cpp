@@ -1198,6 +1198,47 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // Single-writer: called only from onFragment → doWork duty-cycle thread.
 // Zero heap allocation on hot path: restampScratch_ is a reusable member array.
 // ---------------------------------------------------------------------------
+// F15 S2: the gateway-mirror facts of one successful worker append (idempotent
+// PSM update, LsoTracker feed for TRANSACTIONAL batches, dirty-log mark).  From a
+// facts-only return (deferAck) or an immediate final result.  TEMPORARY: S4
+// moves the LSO and S5 the PSM onto the owning worker.
+void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
+{
+    // Success: TX-2 idempotent PSM update.
+    if (ret.producerId >= 0) {
+        const int32_t lastSeqInBatch =
+            ret.baseSequence + ret.recordCount - 1;
+        producerStateManager_.update(
+            ret.topicId, ret.producerId, ret.partition,
+            ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
+            ret.baseOffset);
+
+        // TX-4 Task 9: Feed LsoTracker for transactional data batches.
+        constexpr uint16_t kTransactionalBit = 0x10u;
+        if (ret.batchAttrs & kTransactionalBit) {
+            getTxnState(ret.topicId, ret.partition)
+                .lsoTracker.onProduceBatch(ret.producerId, ret.baseOffset);
+        }
+    }
+
+    // Mark log dirty for group-commit fsync.
+    //
+    // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
+    // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
+    // calls syncOwnedLogs_() which drives Log::sync on the owning thread.
+    // The gateway must NOT call Log::sync on worker-owned logs (that would
+    // race with the worker's own appends/sync — TSan race R7).
+    // Internal partitions (topicId < 0) remain on the gateway sync path.
+    const bool workerOwnedLog = perWorkerIngressActive_ && (ret.topicId >= 0);
+    if (!workerOwnedLog && topicRegistry_) {
+        rune::storage::Log* log =
+            topicRegistry_->log(ret.topicId, ret.partition);
+        if (log) {
+            dirtyLogs_.insert(log);
+        }
+    }
+}
+
 void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
                                        rune::protocol::client::ErrorCode code)
 {
@@ -1660,7 +1701,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.type         = rune::node::WorkerOp::Type::Produce;
         op.topicId      = msg.topicId;
         op.partition    = partition;
-        op.replica      = replica.routingPtr();
+        replica.stampRouting(op);
         op.logPtr       = log;
         op.sessionId    = msg.sessionId;
         op.correlationId = msg.correlationId;
@@ -3097,6 +3138,16 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
             RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
                                  static_cast<uint32_t>(ret.correlationId));
+            // F15 S2 fix round 1 (review C1) — TEMPORARY, deleted by S4 (LSO on
+            // W) and S5 (PSM on W): a facts-only return (deferAck == true) is
+            // emitted by the owning worker AT APPEND for a produce whose answer
+            // it parks (acks=all / Strict).  Apply the PSM / LSO / dirty-log
+            // facts now — whatever the session state — and answer nothing: the
+            // final result follows when the worker's waiter fires.
+            if (ret.deferAck) {
+                applyProduceFacts_(ret);
+                return;
+            }
             Session* session = sessions_.find(ret.sessionId);
             if (!session) {
                 // Session gone — drop result silently.
@@ -3119,39 +3170,9 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 return;
             }
 
-            // Success: TX-2 idempotent PSM update.
-            if (ret.producerId >= 0) {
-                const int32_t lastSeqInBatch =
-                    ret.baseSequence + ret.recordCount - 1;
-                producerStateManager_.update(
-                    ret.topicId, ret.producerId, ret.partition,
-                    ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
-                    ret.baseOffset);
-
-                // TX-4 Task 9: Feed LsoTracker for transactional data batches.
-                constexpr uint16_t kTransactionalBit = 0x10u;
-                if (ret.batchAttrs & kTransactionalBit) {
-                    getTxnState(ret.topicId, ret.partition)
-                        .lsoTracker.onProduceBatch(ret.producerId, ret.baseOffset);
-                }
-            }
-
-            // Mark log dirty for group-commit fsync.
-            //
-            // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
-            // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
-            // calls syncOwnedLogs_() which drives Log::sync on the owning thread.
-            // The gateway must NOT call Log::sync on worker-owned logs (that would
-            // race with the worker's own appends/sync — TSan race R7).
-            // Internal partitions (topicId < 0) remain on the gateway sync path.
-            const bool workerOwnedLog = perWorkerIngressActive_ && (ret.topicId >= 0);
-            if (!workerOwnedLog && topicRegistry_) {
-                rune::storage::Log* log =
-                    topicRegistry_->log(ret.topicId, ret.partition);
-                if (log) {
-                    dirtyLogs_.insert(log);
-                }
-            }
+            // Success: the append facts (no-op for a final result that follows a
+            // facts-only return — the worker strips its producerId / attrs).
+            applyProduceFacts_(ret);
 
             // F15 I-A: every ProduceResult from a worker is FINAL.  The owning
             // worker answers acks=all itself — parked on W until the HW passes

@@ -34,9 +34,12 @@ public:
 
     explicit operator bool() const noexcept { return replica_ != nullptr; }
 
-    /// Opaque routing pointer for WorkerOp::replica (the worker re-resolves it
-    /// from its own ownership table; the control thread never reads through it).
-    [[nodiscard]] rune::replication::PartitionReplica* routingPtr() const noexcept { return replica_; }
+    /// Stamp the routing pointer into a WorkerOp (`op.replica`).  The worker
+    /// re-resolves it from its own ownership table; the control thread never
+    /// reads through it — so it is written, never returned (review m4: a getter
+    /// would let `view.routingPtr()->role()` bypass the no-role() guard).
+    template <typename Op>
+    void stampRouting(Op& op) const noexcept { op.replica = replica_; }
     [[nodiscard]] uint32_t registryId()  const noexcept { return id_; }
     [[nodiscard]] uint32_t incarnation() const noexcept { return incarnation_; }
     /// The control plane's last ROUTED role for this incarnation (a hint).
@@ -55,7 +58,9 @@ public:
     /// ONLY for the inline append path, where the control thread IS the owner
     /// (no worker pool, or a gateway-owned internal partition in shard mode):
     /// the full replica, live state included.  Never call it for a partition a
-    /// worker owns (routesToWorker_).
+    /// worker owns (routesToWorker_).  The one remaining raw accessor: its sole
+    /// caller is the inline branch of ClientGateway::handleProduce (grep-pinned
+    /// by review; a type-level restriction would need a split view type).
     [[nodiscard]] rune::replication::PartitionReplica* controlOwned() const noexcept { return replica_; }
 
 private:

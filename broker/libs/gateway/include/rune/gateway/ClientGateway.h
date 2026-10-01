@@ -979,6 +979,8 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+    /// F15 S2 (TEMPORARY until S4/S5): apply a worker append's gateway-mirror facts.
+    void applyProduceFacts_(const rune::node::WorkerReturn& ret);
     /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
     void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
                             rune::protocol::client::ErrorCode code);

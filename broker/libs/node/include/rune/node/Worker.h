@@ -144,7 +144,10 @@ public:
     static constexpr std::size_t kDirtySetReserve = 64;
 
     // Pre-reserve capacity for the acks=all pending-ack list (worker ingress path).
-    static constexpr std::size_t kPendingAcksAllReserve = 256;
+    // F15 S2: every gateway-routed acks=all parks here too (I-A) — at least the
+    // gateway's old kMaxPendingAcks (1024) so the default config does not grow
+    // where it used not to.  S3 adds the static bound.
+    static constexpr std::size_t kPendingAcksAllReserve = 1024;
 
     // Pre-reserve capacity for the overflow ack queue (G-A6: acks that could not
     // be written to ret_ in the same cycle — flushed before next ingress poll).
@@ -1586,12 +1589,20 @@ private:
         // the gateway's old pendingAcks_ cap is gone).  No slot → retriable
         // NotLeader with the log untouched (a retry is always safe).
         const bool acksAll = op.deferAck() != 0 && replica != nullptr;
-        if (acksAll && !ackReservationAvailable_()) [[unlikely]] {
+        // A produce whose answer is PARKED (acks=all on the HW, Strict on its
+        // fsync) also emits an append-time facts-only return (see below): it
+        // needs TWO return slots — the facts now, the final answer later.
+        const bool parks = acksAll || (op.durabilityTier() == 2 && log->isDiskBacked());
+        if (parks && !ackReservationAvailable_(/*returnsNow=*/1)) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
             if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
-                spdlog::warn("Worker {}: acks=all produce refused NotLeader — return-ring reservation "
+                spdlog::warn("Worker {}: parked (acks=all / Strict) produce refused NotLeader — return-ring reservation "
                              "exhausted (owed={}, total refused={})", workerId_, reservedAckSlots_(),
                              acksAllRefusedNoReservation_);
+            // NotLeader: the only retriable "nothing was appended, retry"
+            // code the client protocol has without a protocol change (review
+            // m11: MinIsrViolation would misreport the ISR; a dedicated
+            // back-pressure code is a protocol change).
             ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
             ret.deferAck  = false;
             enqueueReturn_(ret);
@@ -1711,10 +1722,26 @@ private:
         }
 
         // F15 I-A: this worker answers the produce itself (immediately, after
-        // its fsync, or when the HW passes it) — the result is final, the
+        // its fsync, or when the HW passes it) — the final result is final, the
         // gateway never parks it.
         ret.deferAck = false;
-        const int32_t ackMinIsr = !replica ? 1 : (op.minIsr() > 0 ? op.minIsr() : replica->minIsr());
+        if (parks) [[unlikely]] {
+            // TEMPORARY (F15 S2 fix round 1, review C1; DELETED by S4 — LSO on
+            // W — and S5 — PSM on W): until then the gateway still mirrors the
+            // idempotent PSM, the LsoTracker and the dirty-log set for
+            // gateway-received produces.  They must learn the append NOW, in the
+            // same invocation as the append and before any ack decision — not
+            // with the final answer, which comes a replication RTT later or as
+            // an error that carries no facts.  WorkerReturn::deferAck == true
+            // means "facts only, no answer".  The final result then carries no
+            // facts (producerId -1, no attrs): never applied twice.
+            WorkerReturn facts = ret;
+            facts.deferAck  = true;
+            facts.errorCode = 0;
+            enqueueReturn_(facts);   // slot reserved above (ackReservationAvailable_(1))
+            ret.producerId = -1;
+            ret.batchAttrs = 0;
+        }
 
         // E3 Task 5: Strict durability tier — defer ack until fsync completion is reaped.
         // Only applicable to disk-backed logs (memory logs have no fd to fsync).
@@ -1739,7 +1766,7 @@ private:
             dp.deadlineNs  = passNowNs_ + ackTimeoutNs_;
             dp.replica     = replica;
             dp.logGen      = replica ? replica->logGeneration() : 0;
-            dp.minIsr      = ackMinIsr;
+            dp.minIsr      = acksAll ? (op.minIsr() > 0 ? op.minIsr() : replica->minIsr()) : 1;
             durablePending_.push_back(std::move(dp));
 
             // Record this log as dirty for this cycle (dedup).
@@ -1761,7 +1788,7 @@ private:
             pending.lastOffset = ret.lastOffset;
             pending.deadlineNs = passNowNs_ + ackTimeoutNs_;
             pending.logGen     = replica->logGeneration();
-            pending.minIsr     = ackMinIsr;
+            pending.minIsr     = op.minIsr() > 0 ? op.minIsr() : replica->minIsr();
             pending.ret        = std::move(ret);
             pendingAcksAll_.push_back(std::move(pending));
             return;
@@ -3537,9 +3564,11 @@ private:
 
     // F15 S2 (R-4c): one more owed ack (fires into ret_ later) still fits the
     // G-A6 return-ring reservation — the same rule the shard-ingress poll uses.
-    [[nodiscard]] bool ackReservationAvailable_() const noexcept {
+    // `returnsNow` = extra returns the caller enqueues right away (the
+    // append-time facts-only return) on top of the owed answer.
+    [[nodiscard]] bool ackReservationAvailable_(int64_t returnsNow = 0) const noexcept {
         return ret_.freeSlotsForMsgSize(ackSlotBytes_) >
-               reservedAckSlots_() + static_cast<int64_t>(retOverflow_.size());
+               reservedAckSlots_() + static_cast<int64_t>(retOverflow_.size()) + returnsNow;
     }
 
     // -----------------------------------------------------------------------
