@@ -2279,3 +2279,158 @@ TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) 
         }
     }
 }
+
+// ============================================================================
+// F15 S3 fix round 1 (review I-1, I-2, m1; owed-cap ruling).
+// ============================================================================
+TEST(ReturnOverflowRegression, ShardIngressOversizeBatchRejectedMessageTooLarge) {
+    // Shard / per-worker ingress had no batch-size guard: a batch bounded only
+    // by Aeron's max message (term / 8, up to 16 MiB) was appended, and its
+    // later PushRead could exceed the return ring (halt, crash loop).  Now it is
+    // answered MessageTooLarge (non-retriable, as the gateway does) and never
+    // appended; a batch at the limit still appends.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 20);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    const auto over = produceFrame(1, 9, bigBatch(Worker::kMaxProduceBatchBytes + 1024), /*acks=*/0, 1, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(over.data(), over.size(), 1), 1);
+    auto rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(log.logEndOffset(), 0) << "an oversize batch must never be stored";
+    const auto atLimit = produceFrame(1, 10, bigBatch(Worker::kMaxProduceBatchBytes - 4096), /*acks=*/0, 1, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(atLimit.data(), atLimit.size(), 2), 1);
+    rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0);
+    EXPECT_EQ(log.logEndOffset(), 1);
+}
+
+TEST(ReturnOverflowRegression, PushReadChunkCutAtWholeBatches) {
+    // Review I-2: Log::read returns more than fits the return ring's max
+    // message (8 KiB here) — the chunk is cut at whole batches: no halt, an
+    // exact cut, the next read resumes at the next batch, every byte delivered
+    // once and in order.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 20, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    for (const std::size_t kb : {3u, 6u, 3u}) {
+        WorkerOp p = produceOp(&rep, static_cast<int64_t>(kb));
+        p.recordBatchBytes = bigBatch(kb * 1024);
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(p)));
+    }
+    int64_t now = 1;
+    w.doWork(++now);
+    (void)drainAll(w);
+    ASSERT_EQ(log.logEndOffset(), 3);
+    const auto whole = log.read(0, 1 << 20);
+    std::vector<uint8_t> delivered;
+    std::vector<std::size_t> sizes;
+    int64_t next = 0;
+    for (int i = 0; i < 6 && next < 3; ++i) {
+        ASSERT_TRUE(w.tryEnqueueOp(pushReadOp(&rep, 7, next, 3)));
+        w.doWork(++now);
+        std::vector<WorkerReturn> rets = drainAll(w);
+        ASSERT_EQ(rets.size(), 1u);
+        const auto& c = rets[0].chunk;
+        ASSERT_FALSE(c.empty()) << "no progress at offset " << next;
+        // Whole batches only: walk them and advance the cursor past the last.
+        std::size_t pos = 0;
+        while (pos < c.size()) {
+            rune::protocol::RecordBatchReader r(c.data() + pos, c.size() - pos);
+            ASSERT_GT(r.totalLength(), 0);
+            ASSERT_LE(pos + static_cast<std::size_t>(r.totalLength()), c.size()) << "a cut inside a batch";
+            next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(r.totalLength());
+        }
+        sizes.push_back(c.size());
+        delivered.insert(delivered.end(), c.begin(), c.end());
+    }
+    EXPECT_EQ(next, 3);
+    ASSERT_EQ(sizes.size(), 3u) << "each read must be cut to exactly one batch here (8 KiB max message)";
+    EXPECT_EQ(delivered, whole) << "every byte delivered once, in order";
+}
+
+TEST(ReturnOverflowRegression, BoundHoldsUnderWorstCaseMix) {
+    // Review m1: owed waiters at the cap + an op burst into a full ring + the
+    // HW firing every waiter, with the control thread not draining: the FIFO
+    // stays within its static bound (no halt), and once drained every answer
+    // arrives exactly once (acks=leader answers in order).
+    TmpDir d;
+    Log log(d.path.string(), 256LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 24, 1 << 20, 64, 64);   // 1 MiB return ring
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setAckSlotBytes(64);                    // reserve by the real ProduceResult size
+    w.setIngressDrainLimit(Worker::kMaxIngressDrainLimit);
+    int64_t now = 1;
+    const int owed = static_cast<int>(w.maxOwedReturns()) - 1;
+    for (int i = 0; i < owed; ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, 100'000 + i)));
+    std::vector<WorkerReturn> answers;
+    for (int p = 0; p < 8; ++p) { w.doWork(++now); collectAnswers(w, answers); }
+    ASSERT_TRUE(answers.empty()) << "precondition: every acks=all parked";
+    ASSERT_EQ(w.reservedAckSlotsForTest(), owed);
+    constexpr int kBurst = 12'000;            // > the 1 MiB ring's ~6.9k ProduceResults
+    for (int i = 0; i < kBurst; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 1 + i)));
+    std::size_t maxFifo = 0;
+    for (int p = 0; p < 4; ++p) { w.doWork(++now); maxFifo = std::max(maxFifo, w.retFifoSizeForTest()); }
+    followerCaughtUp(rep, now);               // HW passes every parked waiter
+    for (int p = 0; p < 4; ++p) { w.doWork(++now); maxFifo = std::max(maxFifo, w.retFifoSizeForTest()); }
+    EXPECT_GE(maxFifo, static_cast<std::size_t>(owed)) << "the mix must actually stress the FIFO";
+    EXPECT_LE(maxFifo, Worker::kRetFifoBound);
+    drainUntil(w, answers, static_cast<std::size_t>(kBurst + owed), now);
+    ASSERT_EQ(answers.size(), static_cast<std::size_t>(kBurst + owed));
+    std::vector<WorkerReturn> leader;
+    std::size_t firedOk = 0;
+    for (auto& a : answers) {
+        if (a.correlationId >= 100'000) firedOk += a.errorCode == 0 ? 1u : 0u;
+        else leader.push_back(a);
+    }
+    EXPECT_EQ(firedOk, static_cast<std::size_t>(owed));
+    EXPECT_TRUE(correlationsAscending(leader));
+}
+
+TEST(ReturnOverflowRegression, ConfiguredOwedCapBoundsParkedWaiters) {
+    // Owed-cap ruling: RUNE_WORKER_MAX_OWED_RETURNS (here 256) bounds the
+    // parked waiters on both paths, and every cap refusal is counted.
+    {
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+        Worker w(0, 1 << 22);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        w.setMaxOwedReturns(256);
+        ASSERT_EQ(w.maxOwedReturns(), 256u);
+        constexpr int kTotal = 400;
+        for (int i = 0; i < kTotal; ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, i + 1)));
+        std::vector<WorkerReturn> answers;
+        int64_t now = 1;
+        for (int p = 0; p < 4; ++p) { w.doWork(++now); collectAnswers(w, answers); }
+        const int64_t parked = w.reservedAckSlotsForTest();
+        EXPECT_LE(parked, 256);
+        EXPECT_EQ(parked + static_cast<int64_t>(answers.size()), kTotal);
+        for (const auto& a : answers) EXPECT_EQ(a.errorCode, kNotLeader);
+        EXPECT_EQ(w.owedCapThrottlesForTest(), answers.size()) << "every cap refusal is counted";
+    }
+    {
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+        Worker w(0, 1 << 20);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        w.setWorkerIngress(nullptr, true);
+        w.setMaxOwedReturns(256);
+        for (int i = 0; i < 256; ++i) ASSERT_EQ(ingressAcksAll(w, i + 1, 1), 1);
+        EXPECT_EQ(w.ingressPollBudgetForTest(), 0) << "the shard poll budget ignores the configured cap";
+    }
+}

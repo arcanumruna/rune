@@ -428,6 +428,11 @@ struct NodeConfig {
     //     (~160 B).  Default 256.  The old code reserved 2×maxMsgLength per ack,
     //     capping produce intake at ~4 frames/cycle on a multi-MB return ring.
     int32_t workerAckSlotBytes           = 256;
+    //   - workerMaxOwedReturns: F15 S3 static cap on a worker's owed returns
+    //     (parked acks=all + Strict acks awaiting fsync + owed facts), the G-A6
+    //     reservation (RUNE_WORKER_MAX_OWED_RETURNS, default 4096, valid
+    //     [256, 8192]; out of range refuses to start).
+    int32_t workerMaxOwedReturns         = 4096;
     //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
     //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
     //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to

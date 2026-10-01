@@ -95,6 +95,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -203,6 +204,19 @@ public:
     [[nodiscard]] bool returnRingCoversMaxPushChunk() const {
         return static_cast<std::size_t>(ret_.maxMsgLength()) >= maxPushReadResultBytes();
     }
+
+    // F15 S3 fix round 1 — RED stubs (behaviour-preserving).
+    static constexpr std::size_t kMaxProduceBatchBytes  = 8u * 1024u * 1024u;
+    static constexpr std::size_t kMinOwedReturns        = 256;
+    static constexpr std::size_t kMaxOwedReturnsCeiling = 8192;
+    [[nodiscard]] static std::optional<std::string> validateRingConfig(
+        std::size_t /*returnRingBytes*/, std::size_t /*ingressRingBytes*/, bool /*shardMode*/,
+        std::size_t /*aeronTermBufferBytes*/, int64_t /*maxOwedReturns*/) {
+        return std::nullopt;
+    }
+    void setMaxOwedReturns(std::size_t /*n*/) noexcept {}
+    [[nodiscard]] std::size_t maxOwedReturns() const noexcept { return kMaxOwedReturns; }
+    [[nodiscard]] uint64_t owedCapThrottlesForTest() const noexcept { return 0; }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the

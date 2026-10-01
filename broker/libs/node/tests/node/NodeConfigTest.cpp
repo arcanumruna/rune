@@ -1390,6 +1390,22 @@ TEST(NodeConfig, IoRingDepthsAllThreeOverridden) {
     EXPECT_EQ(res.config->memoryLogRingBytes,    4 * 1024 * 1024);
 }
 
+// F15 S3 fix round 1 (owed-cap ruling): RUNE_WORKER_MAX_OWED_RETURNS.
+TEST(ReturnOverflowRegression, MaxOwedReturnsParsedFromEnv) {
+    auto res0 = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res0.config.has_value()) << res0.error;
+    EXPECT_EQ(res0.config->workerMaxOwedReturns, 4096);
+    auto base = base1node();
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "8192";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerMaxOwedReturns, 8192);
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "20000";   // parsed; the range is enforced at start()
+    auto res2 = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res2.config.has_value()) << res2.error;
+    EXPECT_EQ(res2.config->workerMaxOwedReturns, 20000);
+}
+
 TEST(NodeConfig, WorkerRingBytesDefaultValues) {
     // No overrides — both per-worker ring byte capacities carry the 32 MiB default.
     auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
