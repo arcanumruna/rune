@@ -88,6 +88,10 @@ struct ProducerConfig {
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.
     int64_t agentLivenessTimeoutMs = 1000; // void send(): back-pressured with no ring-consumer
                                            // heartbeat for this long => throw (runner gone)
+    int32_t directDeferredBytes = 256 * 1024; // Invoker (Direct ingress) only: room for sends made
+                                              // from callbacks the producer fires mid-duty-work
+                                              // (deferred, applied after the walk). Clamped up
+                                              // to fit one max-size record. See send()'s docs.
 
     /// Build a ProducerConfig from environment variables, falling back to
     /// sane defaults for any variable that is not set.
@@ -230,6 +234,23 @@ public:
     ///                          than agentLivenessTimeoutMs (a wedged runner,
     ///                          NOT a closed Client).
     /// Zero allocation when accepted.
+    ///
+    /// **Invoker mode (Direct ingress, Task 14) — burst room.**  There is no
+    /// producer ring: send()/trySend() append straight into the partition's
+    /// builder on the owner thread, and the records of one duty-cycle pass leave
+    /// at the end of the pass.  The room for a burst between two doWork() calls
+    /// is therefore ONE builder per partition (batchBytes, and batchRecords if
+    /// set) — a full builder reports BackPressured even when the in-flight
+    /// window has room (void send() then pumps one duty cycle and retries).
+    /// Sends made from a callback the producer fires inside its OWN duty work
+    /// (an ack callback, onBatchAck, a delivery-timeout failure) are DEFERRED
+    /// into a preallocated owner-thread buffer (ProducerConfig::
+    /// directDeferredBytes) and applied, in submission order, right after that
+    /// work; while deferred records are queued, later sends queue behind them
+    /// (order).  When that buffer is full: trySend() returns BackPressured, a
+    /// void send() inside the duty cycle throws std::runtime_error, and the
+    /// callback/future overloads fail with a distinct "deferred buffer full"
+    /// reason.  Only the owner thread may send (others get WrongThread).
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
     // ---- Opt-in ack paths (may allocate per send) ----------------------------
@@ -294,6 +315,12 @@ public:
     /// Total records accepted by send() / batch-add since this producer was
     /// created.
     uint64_t recordsSent() const noexcept;
+
+    /// Test hook: user ack-callback / onBatchAck exceptions caught on the
+    /// duty-cycle thread (see ProducerImpl::testCallbackExceptionCount() for
+    /// the read-safety contract: the owner thread in Invoker mode; after
+    /// close() in Thread mode).
+    [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept;
 
 private:
     std::shared_ptr<producer::ProducerImpl> impl_;

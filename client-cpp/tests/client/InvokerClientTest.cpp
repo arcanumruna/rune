@@ -456,18 +456,24 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
 }
 
 // ---------------------------------------------------------------------------
-// Task 13: void send() never drops. In Invoker mode the owner thread IS the
-// producer ring's only consumer, so a blocking send() must not wait on a
-// consumer that is itself — Client::producer() wires ProducerImpl's pump hook
-// (setPumpFn) to this Client for exactly that reason. See also
-// ProducerSendTest.cpp for the hook's gating logic tested in isolation.
+// Task 13: void send() never drops — RING-SEAM tests.
+//
+// Since Task 14, Client::producer() in Invoker mode returns a DIRECT-ingress
+// producer (no ring; see tests/producer/DirectIngressTest.cpp for the Direct
+// versions of these scenarios).  The tests below deliberately use
+// Client::testProducerWithRingCap(), which returns a RING-ingress producer in
+// either runner mode, to keep the ring paths covered on an Invoker client: the
+// pump hook (setPumpFn) when the owner thread is the ring's only consumer, the
+// ring's closed word, and the consumer-heartbeat wait for a foreign app thread.
+// They are prefixed "RingSeam" for that reason.  See also ProducerSendTest.cpp
+// for the hook's gating logic tested in isolation.
 // ---------------------------------------------------------------------------
 
 // Regression: owner thread, outside any duty-cycle callback, back-pressured on
 // a full producer ring — the blocking send() must pump this Client's OWN duty
 // cycle (not wait on the heartbeat of a consumer that is this very thread) and
 // succeed, with no runner thread ever existing.
-TEST(InvokerClient, BlockingSendPumpsOwnDutyCycleWhenBackPressuredRegression) {
+TEST(InvokerClient, RingSeamBlockingSendPumpsOwnDutyCycleWhenBackPressuredRegression) {
     Rig r(invokerCfg(3780, 3781));
     rc::ProducerConfig pcfg;
     pcfg.acks     = rc::Acks::None;
@@ -499,7 +505,7 @@ TEST(InvokerClient, BlockingSendPumpsOwnDutyCycleWhenBackPressuredRegression) {
 // (onConnected fires on the duty-cycle thread, with inDutyCycle_ set) must
 // fail fast with std::runtime_error, never pump (which would re-enter the
 // agent's own poll) and never spin waiting out the liveness timeout.
-TEST(InvokerClient, BlockingSendFromDutyCycleCallbackThrowsRegression) {
+TEST(InvokerClient, RingSeamBlockingSendFromDutyCycleCallbackThrowsRegression) {
     Rig r(invokerCfg(3782, 3783));
     bool threwInCallback = false;
     bool ranAtAll        = false;
@@ -528,7 +534,7 @@ TEST(InvokerClient, BlockingSendFromDutyCycleCallbackThrowsRegression) {
 // Regression (fix1 C1): same scenario, but the handler does NOT catch. The
 // process must survive (Client::invokeUserCallback_ catches around the
 // callback dispatch), and the exception count must reflect it.
-TEST(InvokerClient, BlockingSendFromCallbackDoesNotTerminateInvokerRegression) {
+TEST(InvokerClient, RingSeamBlockingSendFromCallbackDoesNotTerminateInvokerRegression) {
     Rig r(invokerCfg(3784, 3785));
     bool ran = false;
     r.client.onConnected([&](int64_t) {
@@ -558,7 +564,7 @@ TEST(InvokerClient, BlockingSendFromCallbackDoesNotTerminateInvokerRegression) {
 // accept.
 // ---------------------------------------------------------------------------
 
-TEST(InvokerClient, SendAfterClientCloseReturnsClosedRegression) {
+TEST(InvokerClient, RingSeamSendAfterClientCloseReturnsClosedRegression) {
     Rig r(invokerCfg(3786, 3787));
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::None;
@@ -582,7 +588,7 @@ TEST(InvokerClient, SendAfterClientCloseReturnsClosedRegression) {
 // touches the pump hook's context (the destroyed Client) — no UAF. No ASan
 // build exists in this repo; this relies on TSan (run separately) plus a clean
 // pass here for the use-after-free proof.
-TEST(InvokerClient, ProducerOutlivesClientNoUseAfterFreeRegression) {
+TEST(InvokerClient, RingSeamProducerOutlivesClientNoUseAfterFreeRegression) {
     auto cfg = invokerCfg(3788, 3789);
     auto client = std::make_unique<rc::Client>(cfg);
     rc::ProducerConfig pcfg;
@@ -637,7 +643,7 @@ TEST(InvokerClient, ProducerOutlivesClientNoUseAfterFreeRegression) {
 // -> yield -> park, capped at 100 us/park), so it throws quickly. The test's
 // own wait is bounded by a plain iteration cap (yields, no sleep) — ample
 // either way.
-TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingRegression) {
+TEST(InvokerClient, RingSeamHeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingRegression) {
     rc::ClientConfig c = invokerCfg(3790, 3791);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
     c.nanoClock = &fakeNowMt;
@@ -733,7 +739,7 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
 // through the ring's closed word (SendResult::Closed -> std::logic_error)
 // instead of waiting out 60 real seconds; the thread catches everything so a
 // logic_error can never terminate the process.
-TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegression) {
+TEST(InvokerClient, RingSeamHeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegression) {
     rc::ClientConfig c = invokerCfg(3792, 3793);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
     c.nanoClock = &fakeNowMt;

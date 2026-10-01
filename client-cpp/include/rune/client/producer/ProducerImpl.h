@@ -216,6 +216,75 @@ struct PendingAck {
 };
 
 // ---------------------------------------------------------------------------
+// DeferredFifo — Task 14 fix1 C1: Direct-ingress sends made while the producer
+// is inside its OWN duty work (a user callback it fires mid-walk / mid-reset)
+// are queued here and applied after that work completes, in submission order.
+//
+// NOT a cross-thread ring: a plain single-owner (Invoker owner thread) byte FIFO
+// — no atomics, no locks.  Preallocated once (enableDirectIngress); push() never
+// allocates.  Records are [u32 payloadLen][i32 type][payload], 8-byte aligned.
+// When a push does not fit contiguously at the end but fits in total, the live
+// bytes are compacted to the front (memmove; cold path — callback bursts only).
+// Full: push() returns nullptr (the caller reports back-pressure).
+// ---------------------------------------------------------------------------
+class DeferredFifo {
+public:
+    static constexpr std::size_t kHeader = 8;
+    static constexpr std::size_t align8(std::size_t n) noexcept { return (n + 7u) & ~std::size_t{7}; }
+
+    void init(std::size_t capacity) {
+        buf_.assign(align8(capacity), 0);
+        head_ = tail_ = 0;
+        count_ = 0;
+    }
+    [[nodiscard]] bool empty() const noexcept { return count_ == 0; }
+    [[nodiscard]] uint32_t count() const noexcept { return count_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return buf_.size(); }
+
+    /// Payload pointer for a new record of `len` bytes, or nullptr when full.
+    uint8_t* push(int32_t type, uint32_t len) noexcept {
+        const std::size_t need = align8(kHeader + len);
+        if (need > buf_.size() - (tail_ - head_)) return nullptr;
+        if (tail_ + need > buf_.size()) {
+            std::memmove(buf_.data(), buf_.data() + head_, tail_ - head_);
+            tail_ -= head_;
+            head_ = 0;
+        }
+        uint8_t* h = buf_.data() + tail_;
+        std::memcpy(h, &len, 4);
+        std::memcpy(h + 4, &type, 4);
+        tail_ += need;
+        ++count_;
+        return h + kHeader;
+    }
+    struct Front {
+        int32_t        type;
+        const uint8_t* payload;  ///< valid until the next push() or pop()
+        uint32_t       len;
+    };
+    [[nodiscard]] Front front() const noexcept {
+        const uint8_t* h = buf_.data() + head_;
+        Front f{};
+        std::memcpy(&f.len, h, 4);
+        std::memcpy(&f.type, h + 4, 4);
+        f.payload = h + kHeader;
+        return f;
+    }
+    void pop() noexcept {
+        uint32_t len = 0;
+        std::memcpy(&len, buf_.data() + head_, 4);
+        head_ += align8(kHeader + len);
+        if (--count_ == 0) head_ = tail_ = 0;
+    }
+
+private:
+    std::vector<uint8_t> buf_;
+    std::size_t          head_  = 0;
+    std::size_t          tail_  = 0;
+    uint32_t             count_ = 0;
+};
+
+// ---------------------------------------------------------------------------
 // PumpResult — fix1 C1: outcome of ProducerImpl's pump hook (see PumpFn below).
 // A 3-way result so a back-pressured blocking send() never waits on itself AND
 // never silently spins forever when pumping would re-enter the agent's own poll:
@@ -320,7 +389,9 @@ public:
     /// Client's destruction (the duty thread itself cannot race the destructor:
     /// the runner is joined before teardown in Thread mode, and the owner IS
     /// the destroyer in the Invoker off-owner-thread-destroy pattern).
-    using PumpFn = PumpResult (*)(void* ctx) noexcept;
+    /// Task 14 fix1 I2: NOT noexcept — an exception thrown by the pumped duty
+    /// cycle propagates out of send() exactly as it would out of doWork().
+    using PumpFn = PumpResult (*)(void* ctx);
     void setPumpFn(PumpFn fn, void* ctx, std::thread::id dutyThreadId) noexcept {
         pumpFn_ = fn;
         pumpCtx_ = ctx;
@@ -347,12 +418,19 @@ public:
         int64_t         nowNs   = 0;  ///< duty-cycle clock now: the append clock until the first pass
     };
     /// Set once, before any send(), by the thread that creates the producer.
-    void enableDirectIngress(const DirectIngress& d) noexcept {
-        setPumpFn(d.pump, d.pumpCtx, d.owner);
-        mode_      = IngressMode::Direct;
-        lastNowNs_ = d.nowNs;
-    }
+    /// Preallocates the deferred buffer (cfg.directDeferredBytes, clamped up to
+    /// hold one max-size record) — the only allocation; may throw bad_alloc.
+    void enableDirectIngress(const DirectIngress& d);
     [[nodiscard]] IngressMode ingressMode() const noexcept { return mode_; }
+
+    /// Task 14 fix1: true when the last Direct trySubmit/submitTier2Batch on the
+    /// owner thread was rejected because the DEFERRED buffer was full (a send
+    /// from a callback fired inside the producer's own duty work) — lets the
+    /// callback/future overloads report a distinct reason.  Owner thread only;
+    /// never written in Ring mode.
+    [[nodiscard]] bool lastRejectWasDeferredFull() const noexcept { return lastRejectDeferredFull_; }
+    /// Diagnostics / tests (owner thread): records + Tier-2 tokens deferred.
+    [[nodiscard]] uint32_t deferredCount() const noexcept { return deferred_.count(); }
 
     /// fix1 minor 9: publish the ring's consumer-liveness heartbeat ONCE per
     /// duty cycle (called by ProducerHub::drainAndFlush before its drainRing()
@@ -791,6 +869,39 @@ private:
     // Duty-cycle clock of the last drainRing()/flushBatches() (Direct appends
     // stamp batchStartNs with it — the clock is sampled per pass, never per send).
     int64_t     lastNowNs_ = 0;
+
+    // ---- Task 14 fix1 C1: re-entrancy deferral (duty/owner thread only) -------
+    // inDuty_ is set (RAII, nesting-safe) while this producer walks / resets its
+    // own partition state and fires user callbacks from it: flushBatches,
+    // retransmitStalled, onProduceResponse, sweepTimedOut, failAllPending,
+    // failBatch, retryRedirectedProduce, resendAll*.  A Direct send made while it
+    // is set (or while older deferred records are still queued — order) goes to
+    // deferred_ and is applied by applyDeferred_() when the OUTERMOST scope ends.
+    bool         inDuty_ = false;
+    bool         lastRejectDeferredFull_ = false;
+    DeferredFifo deferred_;
+
+    struct DutyScope {
+        ProducerImpl& p;
+        bool          prev;
+        explicit DutyScope(ProducerImpl& pi) noexcept : p(pi), prev(pi.inDuty_) { p.inDuty_ = true; }
+        ~DutyScope() {
+            if (!prev) {
+                if (!p.deferred_.empty()) p.applyDeferred_();
+                p.inDuty_ = false;
+            }
+        }
+        DutyScope(const DutyScope&) = delete;
+        DutyScope& operator=(const DutyScope&) = delete;
+    };
+    /// Applies (in submission order) the deferred records present on entry
+    /// through appendRecord_; stops at the first ABORT (the rest stay queued
+    /// for the next scope end).  Records deferred by callbacks fired from here
+    /// wait for the next scope end.  Never throws: a record that cannot be
+    /// applied (exception) is failed via its handle and dropped.
+    void applyDeferred_() noexcept;
+    /// failAllPending: fail + drop every record deferred before the call.
+    void failDeferred_(const std::string& reason);
 };
 
 } // namespace rune::client::producer

@@ -26,6 +26,17 @@ const char* sendFailureReason(SendResult r) noexcept {
     }
     return "producer send not accepted";
 }
+
+// Task 14 fix1: Direct (Invoker) ingress — a send made from a callback the
+// producer fired inside its own duty work is deferred; when that deferred
+// buffer is full the rejection gets its own reason (not "ring full").
+const char* rejectReason(const producer::ProducerImpl& impl, SendResult r) noexcept {
+    if (r == SendResult::BackPressured && impl.lastRejectWasDeferredFull()) {
+        return "producer send rejected — deferred buffer full (send from inside the producer's "
+               "own duty-cycle callback; raise ProducerConfig::directDeferredBytes or retry later)";
+    }
+    return sendFailureReason(r);
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -110,7 +121,7 @@ void Producer::send(TopicHandle              topic,
     // rather than stranding it forever.
     const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle);
     if (r != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, sendFailureReason(r));
+        impl_->failUnsubmitted(ackHandle, rejectReason(*impl_, r));
     }
 }
 
@@ -133,7 +144,7 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
     // immediately with a specific error instead of stranding it.
     const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle);
     if (r != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, sendFailureReason(r));
+        impl_->failUnsubmitted(ackHandle, rejectReason(*impl_, r));
     }
     return std::move(fut);
 }
@@ -174,6 +185,10 @@ void Producer::flush() noexcept {
 
 uint64_t Producer::framesSent() const noexcept {
     return impl_ ? impl_->framesSent() : 0u;
+}
+
+uint64_t Producer::testCallbackExceptionCount() const noexcept {
+    return impl_ ? impl_->testCallbackExceptionCount() : 0u;
 }
 
 uint64_t Producer::recordsSent() const noexcept {

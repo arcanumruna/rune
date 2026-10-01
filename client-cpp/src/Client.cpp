@@ -672,6 +672,7 @@ int Client::dutyCycle(int64_t nowNs) {
         explicit InCycle(bool& f) : flag(f), prev(f) { flag = true; }
         ~InCycle() { flag = prev; }
     } inCycle(inDutyCycle_);
+    if (testDutyCycleHook_ != nullptr) [[unlikely]] testDutyCycleHook_();
 
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
     //    ProduceResponses are decoded and buffered, not dispatched through hooks.
@@ -1730,13 +1731,28 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         // second. A leak at shutdown, racing close(), is the safe choice —
         // UAF/double-free is not. `impl` itself is NOT leaked (the local
         // variable is still alive and is returned below via Producer).
+        //
+        // Task 14 fix1 M5 — the related accepted edge for DIRECT producers:
+        // if close()'s drainRegistrationsForClose() stopped at an
+        // un-unblockable claim (a header-less stalled end-of-buffer wrap; see
+        // ClientAgent.cpp) while this producer's registration sat behind it
+        // AND this CAS still succeeded (close() had not started yet when we
+        // committed), the producer is never adopted, so closeAllRings() never
+        // marks it closed — and its pump hook context (`this`) dangles once the
+        // Client is destroyed. A later back-pressured blocking send() on the
+        // owner thread would then call into a destroyed Client. It needs a
+        // writer stalled for the whole close-drain cap concurrently with this
+        // call; marking every created producer closed through a Client-owned
+        // registry would remove it, but producer() runs on any thread and that
+        // registry would need a lock or atomics (forbidden), so it is accepted
+        // and documented instead, like the leak above.
         impl->markRingClosed();
     }
 
     return Producer(std::move(impl));
 }
 
-producer::PumpResult Client::pumpTrampoline_(void* ctx) noexcept {
+producer::PumpResult Client::pumpTrampoline_(void* ctx) {
     auto* self = static_cast<Client*>(ctx);
     // fix2 Important-2: ProducerImpl::sendBlocking only ever calls this hook
     // when std::this_thread::get_id() == the dutyThreadId_ it copied from
@@ -1753,6 +1769,9 @@ producer::PumpResult Client::pumpTrampoline_(void* ctx) noexcept {
     }
     if (self->cfg_.runnerMode == RunnerMode::Invoker) {
         // The owner thread, outside any cycle: safe to drive one ourselves.
+        // Task 14 fix1 I2: an exception from the cycle propagates out of
+        // send() unchanged, exactly as out of doWork(); dutyCycle's InCycle
+        // guard restores inDutyCycle_ on the way out.
         (void)self->dutyCycle(self->now());
         return producer::PumpResult::Pumped;
     }

@@ -406,10 +406,32 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
     if (directClosed_) return SendResult::Closed;
     if (value.size() > rune::client::Producer::kMaxSendValueBytes) return SendResult::ValueTooLarge;
     const auto kb = key.bytes();
+    const uint8_t flags = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
+    lastRejectDeferredFull_ = false;
+    // Task 14 fix1 C1: inside this producer's own duty work (a callback it fired
+    // mid-walk / mid-reset) — or behind records already deferred (submission
+    // order) — the record is DEFERRED, applied when that work completes.
+    if (inDuty_ || !deferred_.empty()) [[unlikely]] {
+        uint8_t* d = deferred_.push(kMsgSendRecord,
+                                    static_cast<uint32_t>(kRecHeaderSize + value.size()));
+        if (d == nullptr) {
+            lastRejectDeferredFull_ = true;
+            return SendResult::BackPressured;
+        }
+        writeLE32(d, kRecTopicIdOff, topicId);
+        writeLE32(d, kRecPartOff, partition);
+        d[kRecKeyLenOff] = static_cast<uint8_t>(kb.size());
+        std::memset(d + kRecKeyBytesOff, 0, Key::kMaxInline);
+        if (!kb.empty()) std::memcpy(d + kRecKeyBytesOff, kb.data(), kb.size());
+        d[kRecFlagsOff] = flags;
+        writeLE64(d, kRecCorrIdOff, ackHandle);
+        writeLE32u(d, kRecValLenOff, static_cast<uint32_t>(value.size()));
+        if (!value.empty()) std::memcpy(d + kRecValBytesOff, value.data(), value.size());
+        return SendResult::Ok;  // the handle (if any) is owned by the producer now
+    }
     try {
         const auto a = appendRecord_(topicId, partition, kb.data(), static_cast<uint8_t>(kb.size()),
-                                     value.data(), static_cast<uint32_t>(value.size()),
-                                     ackHandle != 0 ? kFlagWantAck : uint8_t{0},
+                                     value.data(), static_cast<uint32_t>(value.size()), flags,
                                      static_cast<uint64_t>(ackHandle), lastNowNs_);
         if (a == rune::client::detail::ControlledAction::ABORT) return SendResult::BackPressured;
     } catch (const std::length_error&) {
@@ -417,9 +439,93 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
         // caller still owns the ack handle): a partition this producer can never
         // address — reported, never retried as back-pressure.
         return SendResult::InvalidTopic;
+    } catch (...) {
+        // fix1 M1: anything else (bad_alloc growing a builder / the ack ring) —
+        // nothing was committed (appendRecord_'s ordering), the caller still owns
+        // the handle: "not accepted right now".
+        return SendResult::BackPressured;
     }
     RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientAppSend, static_cast<uint32_t>(ackHandle));
     return SendResult::Ok;
+}
+
+void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
+    // Clamp: the buffer must always fit one max-size record, or a deferred send
+    // of a legal value could never be accepted (livelock as back-pressure).
+    constexpr std::size_t kMinDeferred = DeferredFifo::align8(
+        DeferredFifo::kHeader + static_cast<std::size_t>(kRecHeaderSize) +
+        rune::client::Producer::kMaxSendValueBytes);
+    const std::size_t want = cfg_.directDeferredBytes > 0
+                                 ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
+    deferred_.init(std::max(want, kMinDeferred));
+    setPumpFn(d.pump, d.pumpCtx, d.owner);
+    mode_      = IngressMode::Direct;
+    lastNowNs_ = d.nowNs;
+}
+
+void ProducerImpl::applyDeferred_() noexcept {
+    using rune::client::detail::ControlledAction;
+    // Runs at the end of the OUTERMOST DutyScope: no walk over partitions_ /
+    // ackRing / a builder is in progress.  inDuty_ is still set, so a callback
+    // fired from here (a failure completion) defers again (picked up next time).
+    uint32_t budget = deferred_.count();
+    while (budget-- > 0 && !deferred_.empty()) {
+        const DeferredFifo::Front f = deferred_.front();
+        if (f.type == kMsgTier2Batch) {
+            std::unique_ptr<Tier2Entry> e(
+                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(f.payload, 0))));
+            deferred_.pop();
+            try {
+                PartitionState& ps = getOrCreatePartition(e->topicId, e->partition);
+                e->enqueuedNs = lastNowNs_;
+                const int32_t rc = e->recordCount;
+                ps.pendingTier2Entries.push_back(std::move(*e));
+                if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
+                recordsSent_ += static_cast<uint64_t>(rc);
+            } catch (...) {
+                const uint64_t h = e->ackHandle;
+                e->ackHandle = 0;
+                PendingAck::complete(h, -1, "deferred Tier-2 batch could not be queued",
+                                     &callbackExceptions_);
+            }
+            continue;
+        }
+        const uint8_t* p = f.payload;
+        const uint8_t  flags  = p[kRecFlagsOff];
+        const uint64_t handle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
+        bool failed = false;
+        try {
+            const auto a = appendRecord_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff),
+                                         p + kRecKeyBytesOff, p[kRecKeyLenOff],
+                                         p + kRecValBytesOff, readLE32u(p, kRecValLenOff),
+                                         flags, handle, lastNowNs_);
+            if (a == ControlledAction::ABORT) return;  // head-of-line: keep order, retry later
+        } catch (...) {
+            failed = true;  // nothing committed (appendRecord_ ordering): we own the handle
+        }
+        deferred_.pop();
+        if (failed && (flags & kFlagWantAck) && handle != 0) {
+            PendingAck::complete(handle, -1, "deferred send could not be applied",
+                                 &callbackExceptions_);
+        }
+    }
+}
+
+void ProducerImpl::failDeferred_(const std::string& reason) {
+    uint32_t n = deferred_.count();  // only those deferred before the call
+    while (n-- > 0 && !deferred_.empty()) {
+        const DeferredFifo::Front f = deferred_.front();
+        uint64_t handle = 0;
+        if (f.type == kMsgTier2Batch) {
+            std::unique_ptr<Tier2Entry> e(
+                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(f.payload, 0))));
+            handle = e->ackHandle;
+        } else if (f.payload[kRecFlagsOff] & kFlagWantAck) {
+            handle = static_cast<uint64_t>(readLE64(f.payload, kRecCorrIdOff));
+        }
+        deferred_.pop();  // pop BEFORE the callback: it may push (and compact)
+        if (handle != 0) PendingAck::complete(handle, -1, reason, &callbackExceptions_);
+    }
 }
 
 void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition, const Key& key,
@@ -541,6 +647,23 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
         // state the ring drain's kMsgTier2Batch branch would touch).  Closed (or a
         // foreign thread): not accepted, the caller fails the handle.
         if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return false;
+        lastRejectDeferredFull_ = false;
+        if (inDuty_ || !deferred_.empty()) {
+            // fix1 C1: deferred like a Tier-1 record (same order, same full policy).
+            auto entry = std::make_unique<Tier2Entry>();
+            entry->topicId     = topicId;
+            entry->partition   = partition;
+            entry->ackHandle   = static_cast<uint64_t>(ackHandle);
+            entry->recordCount = recordCount;
+            entry->batchBytes  = std::move(batchBytes);
+            uint8_t* d = deferred_.push(kMsgTier2Batch, kT2TokenSize);
+            if (d == nullptr) {
+                lastRejectDeferredFull_ = true;
+                return false;  // caller fails the handle; entry (and bytes) freed here
+            }
+            writeLE64(d, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.release())));
+            return true;
+        }
         PartitionState& ps = getOrCreatePartition(topicId, partition);
         Tier2Entry e;
         e.topicId     = topicId;
@@ -795,6 +918,13 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     using rune::client::detail::ControlledAction;
     PartitionState& ps = getOrCreatePartition(topicId, partition);
 
+    // Task 14 fix1 I1: a record must never overtake a Tier-2 batch queued before
+    // it on the same partition.  flushBatches sends Tier-1 before Tier-2, so a
+    // record appended while a Tier-2 entry waits (e.g. window full) would leave
+    // first.  Hold it (ABORT: Ring keeps it in the ring, Direct back-pressures /
+    // keeps it deferred) until the Tier-2 queue is empty.
+    if (!ps.pendingTier2Entries.empty()) return ControlledAction::ABORT;
+
     // Effective per-frame cap: use maxFrameBytes when it is a tighter bound
     // than batchBytes (i.e. maxFrameBytes > 0 and < batchBytes).  Zero-cost
     // on the normal path (maxFrameBytes >= batchBytes): the min-style compare
@@ -855,6 +985,12 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
         (mode_ == IngressMode::Direct || !canFlight_(ps))) {
         return ControlledAction::ABORT;
     }
+    // Task 14 fix1 M2: Direct enforces batchRecords too (no flush runs between
+    // sends, so the builder must stop at the record cap itself).
+    if (mode_ == IngressMode::Direct && cfg_.batchRecords > 0 && ps.builder &&
+        ps.builder->recordCount() >= cfg_.batchRecords) {
+        return ControlledAction::ABORT;
+    }
 
     // Create the builder ONCE per partition; reused (reset in place) across
     // batches so there is no per-batch heap allocation.
@@ -863,26 +999,26 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
         ps.builder = std::make_unique<rune::protocol::RecordBatchBuilder>(0, baseWall);
         ps.builderBaseWallNs = baseWall;
     }
-    if (ps.builder->recordCount() == 0) {
-        ps.builderBytes = 0;
-        ps.batchStartNs = nowNs;
-        // I1 FIX: do NOT re-sample wallNs() here.  builderBaseWallNs already
-        // equals the builder's actual baseTimestamp (set at construction above
-        // and at the reset(0, resetWall) in encodeAndSend), so the pre-flight
-        // tsDelta is computed against the SAME base the builder encodes with.
-        // Re-sampling here made the base newer than the builder's, under-counting
-        // tsDelta by up to a varlong byte and compounding the frame-cap overshoot.
-    }
+    // I1 FIX (frame cap): builderBaseWallNs is never re-sampled here — it already
+    // equals the builder's actual baseTimestamp (set at construction above and at
+    // the reset(0, resetWall) in encodeAndSend), so the pre-flight tsDelta is
+    // computed against the SAME base the builder encodes with.
+    const int32_t index = ps.builder->recordCount();  // this record's offsetDelta
 
     // Per-record acks at the record's OWN index (spec §4.3): the slice of a
     // batch is aligned with its records, void records hold 0.  Zeros are
-    // back-filled lazily so batches without callbacks cost nothing.  The
-    // handle's ownership passed to this thread with the ring commit.
-    if ((flags & kFlagWantAck) && ackHandle != 0) {
-        const int32_t index = ps.builder->recordCount();  // this record's offsetDelta
-        if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
-        while (ps.batchAckCount < index) pushAck_(ps, 0);
-        pushAck_(ps, ackHandle);
+    // back-filled lazily so batches without callbacks cost nothing.
+    //
+    // Task 14 fix1 M1: exception safety.  Everything that can throw (builder
+    // creation above, ack-ring growth here, the builder append below) happens
+    // BEFORE anything is committed; the ack slots are reserved first and only
+    // written after the append succeeded.  So on a throw the record is not in
+    // the builder AND the handle is not in the ack ring — the caller still owns
+    // it (exactly once).
+    const bool wantAck = (flags & kFlagWantAck) && ackHandle != 0;
+    if (wantAck) {
+        const uint64_t need = static_cast<uint64_t>(index - ps.batchAckCount) + 1u;
+        while (ps.ackHead - ps.ackTail + need > ps.ackRing.size()) growAckRing(ps);
     }
 
     // I2: a single record whose own wire contribution exceeds the frame cap
@@ -905,6 +1041,14 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     const std::string_view vv(reinterpret_cast<const char*>(valBytes),
                               static_cast<std::size_t>(valueLen));
     ps.builder->append(kv, vv, wallNs());
+
+    // ---- committed: nothing below throws (ack slots reserved above) ----------
+    if (index == 0) ps.batchStartNs = nowNs;
+    if (wantAck) {
+        if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
+        while (ps.batchAckCount < index) pushAck_(ps, 0);
+        pushAck_(ps, ackHandle);
+    }
     // Track the TRUE encoded WIRE size (fixed batch header + accumulated
     // record bodies), not just value bytes — so the batch flushes at
     // batchBytes of WIRE and never overshoots the broker's max produce
@@ -1217,6 +1361,7 @@ int ProducerImpl::flushBatches(
     const Sink& sink)
 {
     lastNowNs_ = nowNs;  // Task 14: the pass clock Direct appends stamp batches with
+    const DutyScope duty(*this);  // fix1 C1: callbacks below (acks=None, batch acks) defer sends
 
     // M1 FIX [CB-5]: Do NOT emit any frame while the session is not established
     // (sessionId == 0 means Connecting / post-forceReconnect window).  Records
@@ -1320,6 +1465,7 @@ int ProducerImpl::flushBatches(
 
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
 {
+    const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(correlationId) || batchcorr::ordinal(correlationId) != ordinal_) return;
     const uint32_t s = batchcorr::slot(correlationId);
     if (s >= partitions_.size()) return;
@@ -1450,6 +1596,7 @@ void ProducerImpl::onUnresolvedSequence_(int16_t batchEpoch) noexcept {
 }
 
 void ProducerImpl::failBatch(int64_t corrId, const std::string& reason) {
+    const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return;
     const uint32_t s = batchcorr::slot(corrId);
     if (s >= partitions_.size()) return;
@@ -1459,6 +1606,8 @@ void ProducerImpl::failBatch(int64_t corrId, const std::string& reason) {
 void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
     const int64_t nowNs =
         std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    lastNowNs_ = nowNs;  // the duty-cycle clock (Client passes its own now)
+    const DutyScope duty(*this);  // fix1 C1: failure callbacks below defer their retries
     const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
@@ -1501,6 +1650,7 @@ template <class Sink>
 int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
 {
     if (nowNs < earliestAttemptDeadlineNs_) return 0;  // O(1) on the happy path
+    const DutyScope duty(*this);  // fix1 C1: failBatch_ callbacks below
     const int64_t deliveryNs = cfg_.deliveryTimeoutMs * 1'000'000LL;
     const int64_t attemptNs  = cfg_.produceTimeoutMs * 1'000'000LL;
     int64_t nextEarliest = INT64_MAX;
@@ -1549,6 +1699,7 @@ inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noe
 
 bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
 {
+    const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return false;
     const uint32_t s = batchcorr::slot(corrId);
     if (s >= partitions_.size()) return false;
@@ -1566,6 +1717,7 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
 
 int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
 {
+    const DutyScope duty(*this);  // fix1 C1
     int resent = 0;
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
@@ -1587,6 +1739,7 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
 
 int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
 {
+    const DutyScope duty(*this);  // fix1 C1
     int resent = 0;
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
@@ -1623,9 +1776,11 @@ void ProducerImpl::drainAppRingHandles_(OnHandle&& onHandle) {
 }
 
 void ProducerImpl::failAllPending(const std::string& reason) {
+    const DutyScope duty(*this);  // fix1 C1: sends from these callbacks are deferred
     drainAppRingHandles_([&](uint64_t handle) {
         PendingAck::complete(handle, -1, reason, &callbackExceptions_);
     });
+    failDeferred_(reason);  // records deferred before this call were accepted: fail them too
     // Everything the producer accepted: in-flight slices + the current builder slice.
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
@@ -1635,11 +1790,11 @@ void ProducerImpl::failAllPending(const std::string& reason) {
             ps.inflight.release(b);
         });
         for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
-            uint64_t& h = ps.ackRing[i & ps.ackMask];
-            if (h != 0) {
-                PendingAck::complete(h, -1, reason, &callbackExceptions_);
-                h = 0;
-            }
+            // fix1 C1(d): copy + zero the slot BEFORE the callback — never hold a
+            // reference into ackRing across user code (a growAckRing would free it).
+            const uint64_t h = ps.ackRing[i & ps.ackMask];
+            ps.ackRing[i & ps.ackMask] = 0;
+            if (h != 0) PendingAck::complete(h, -1, reason, &callbackExceptions_);
         }
         ps.ackTail = ps.ackHead;
         ps.batchAckCount = 0;
@@ -1669,6 +1824,17 @@ ProducerImpl::~ProducerImpl() {
     try {
         drainAppRingHandles_(discard);
     } catch (...) {}
+    while (!deferred_.empty()) {  // fix1 C1: deferred records / Tier-2 tokens
+        const DeferredFifo::Front f = deferred_.front();
+        if (f.type == kMsgTier2Batch) {
+            std::unique_ptr<Tier2Entry> e(
+                reinterpret_cast<Tier2Entry*>(static_cast<uintptr_t>(readLE64(f.payload, 0))));
+            discard(e->ackHandle);
+        } else if (f.payload[kRecFlagsOff] & kFlagWantAck) {
+            discard(static_cast<uint64_t>(readLE64(f.payload, kRecCorrIdOff)));
+        }
+        deferred_.pop();
+    }
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
         for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {

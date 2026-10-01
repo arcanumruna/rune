@@ -261,6 +261,10 @@ public:
     void testSetBeforeRegistrationSubmitHook(std::function<void()> fn) {
         testBeforeRegistrationSubmitHook_ = std::move(fn);
     }
+    /// Task 14 fix1 I2 test hook (owner thread, Invoker): fn runs at the top of
+    /// every dutyCycle(), inside its in-cycle guard (nullptr = none). A throwing
+    /// fn simulates a duty cycle that throws.
+    void testSetDutyCycleHook(void (*fn)()) noexcept { testDutyCycleHook_ = fn; }
     /// Test hook (duty-cycle thread only): install a partition route as metadata would.
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
@@ -613,7 +617,7 @@ private:
     /// its owner thread): NotOwner — a genuinely separate thread may still drain
     /// the ring in real time, so the caller falls back to its heartbeat-bounded
     /// wait instead.
-    static producer::PumpResult pumpTrampoline_(void* ctx) noexcept;
+    static producer::PumpResult pumpTrampoline_(void* ctx);  // fix1 I2: may throw (dutyCycle)
 
     /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
     /// between attempts — this thread IS the ring's consumer; thread mode parks
@@ -701,6 +705,9 @@ private:
     std::atomic<bool> stopped_   {false};
     // fix5: see testSetBeforeRegistrationSubmitHook(). Empty by default.
     std::function<void()> testBeforeRegistrationSubmitHook_;
+    // Task 14 fix1 I2 test hook: called at the top of every dutyCycle() (inside
+    // the in-cycle guard). Plain function pointer, duty-cycle thread only.
+    void (*testDutyCycleHook_)() = nullptr;
     std::thread       runnerThread_;
 
     // ---- Callback-contract guard (FIX F4) ------------------------------------
