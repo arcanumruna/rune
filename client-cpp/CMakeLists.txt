@@ -52,6 +52,15 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+    # F8c C7: move-only handles — no std::shared_ptr / weak_ptr / make_shared in
+    # src/ or include/ except the Aeron transport objects (exact allowlist).
+    add_test(NAME NoSharedPtrInPublicHandlesGuardSelfTestRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --selftest)
+    add_test(NAME NoSharedPtrInPublicHandlesGuardRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
