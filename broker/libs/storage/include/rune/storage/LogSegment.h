@@ -140,6 +140,10 @@ public:
     /// Used by the async flusher (IoBackend) to call fdatasync off the worker
     /// hot path without the worker calling sync() directly.
     int logFd() const noexcept { return fd_; }
+    /// F15 S4 fix round 2 (N1): a Log-wide monotonic install generation (set by
+    /// Log::install_) — the segment's identity, never reused (no pointer ABA).
+    uint64_t installGen() const noexcept { return installGen_; }
+    void setInstallGen(uint64_t g) noexcept { installGen_ = g; }
 
     /// #5 non-blocking append: preallocate `bytes` of disk blocks for the .log
     /// WITHOUT changing the file size, so subsequent O_APPEND pwrite()s never stall
@@ -226,6 +230,7 @@ private:
     uint32_t flushPins_ = 0;              // M1: async flushes in flight on fd_
     int fd_ = -1;   // POSIX fd for fdatasync — mirrors log_ (write path uses fstream)
     std::unique_ptr<OffsetIndex> index_;
+    uint64_t installGen_ = 0;
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())

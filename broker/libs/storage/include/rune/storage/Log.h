@@ -166,13 +166,15 @@ public:
     [[nodiscard]] int64_t nextSegmentBaseAfter(int64_t offset) const noexcept;
     /// F15 S4 fix round 1: the segment whose base is exactly `segmentBase` —
     /// its written bytes as an untouched read-only mapping (see
-    /// LogSegment::mappedBytes) and an identity that changes when the segment
-    /// object is replaced (a compaction swap).  {} / nullptr id when absent or
-    /// empty.  Owner (append) thread only.
+    /// LogSegment::mappedBytes), its .log fd (async read-ahead hints), and its
+    /// install generation — a Log-wide monotonic identity that changes when the
+    /// segment object is replaced (a compaction swap) and is never reused (N1).
+    /// {} / gen 0 when absent.  Owner (append) thread only.
     struct SegmentBytes {
         const uint8_t* data = nullptr;
         std::size_t    size = 0;
-        const void*    id   = nullptr;
+        uint64_t       gen  = 0;
+        int            fd   = -1;
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
@@ -403,6 +405,7 @@ private:
     /// publishSealedSnapshot() call consumes it so it does not persist past recovery.
     std::map<int64_t, int64_t> recoveryMaxTimestamps_;
     SegMap segments_;
+    uint64_t segInstallGen_ = 0;   ///< F15 S4 N1: segment install generation
 
     // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
     // Written exclusively on the append thread; read safely on the cleaner thread

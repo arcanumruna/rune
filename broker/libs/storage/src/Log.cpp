@@ -580,6 +580,7 @@ void Log::throwIfFailed_() const {
 
 void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
     seg->setStorageState(&storage_);
+    seg->setInstallGen(++segInstallGen_);   // F15 S4 N1: identity, never reused
     auto it = segments_.find(base);
     if (it != segments_.end()) {
         retire_(std::move(it->second));
@@ -636,7 +637,8 @@ Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
     const auto it = segments_.find(segmentBase);
     if (it == segments_.end()) return {};
     SegmentBytes b;
-    b.id = it->second.get();
+    b.gen = it->second->installGen();
+    b.fd  = it->second->logFd();
     const LogReadView v = it->second->mappedBytes();
     b.data = v.data;
     b.size = v.len;
