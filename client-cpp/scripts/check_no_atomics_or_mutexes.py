@@ -27,7 +27,8 @@ ALLOWLIST (path relative to the repo root):
                TransactionalProducerImpl mutexes, nextCorrId_).  Each entry is an EXACT MULTISET of
                (kind, normalized snippet) -> count for that file: ANY difference
                fails — a new site, and also a removed one (which must then be
-               removed from the allowlist).  Slice B deletes these entries.
+               removed from the allowlist).  EMPTY since F8c C5 (the last
+               entries, TransactionalProducerImpl, were removed).
 
 The script self-tests its detector and the allowlist logic against synthetic
 fixtures before scanning (--selftest runs only that), so a regex change that
@@ -77,20 +78,10 @@ RING_FILES = {
 # path -> {(kind, normalized snippet): count}.  Regenerate a file's entry with
 # `--dump PATH` after a deliberate slice-B change (the reviewer sees the diff).
 SLICE_B = {
-    # F8c C2/C3 removed every Client / ClientAgent entry (stopped_,
-    # connectCalled_, nextCorrId_, disconnectedFired_, mtx_ and the PendingX
-    # maps, ClientAgent::snapshot_).  What remains is the transactional
-    # producer (F8c C5).
-    "include/rune/client/producer/TransactionalProducerImpl.h": {
-        ("atomic", "std::atomic"): 3,
-        ("include", "#include <atomic>"): 1,
-        ("include", "#include <mutex>"): 1,
-        ("mutex", "std::mutex"): 2,
-    },
-    "src/producer/TransactionalProducerImpl.cpp": {
-        ("lock", "std::lock_guard"): 12,
-        ("mutex", "std::mutex"): 12,
-    },
+    # F8c C2/C3 removed every Client / ClientAgent entry and F8c C5 the last
+    # two (TransactionalProducerImpl's atomics, mutexes and lock_guards: its
+    # state is duty-owned, commands arrive on the agent command ring).  The
+    # allowlist stays as a mechanism (empty: any new site fails).
 }
 
 # PERMANENT per-thread state (F8c fix round 1, controller ruling): a

@@ -196,12 +196,15 @@ TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
         auto fut = p.send(client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
                           rc::want_future);
         auto tp    = client.transactionalProducer("tx-close");
-        auto initF = tp.initTransactions();
+        test_support::TestCq cq(client);
+        auto initF = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(initF.accepted()) << initF.describe();
         client.close();
         ASSERT_TRUE(ready(fut)) << "produce future must be failed by close(), not hang";
         EXPECT_THROW(fut.get(), std::runtime_error);
-        ASSERT_TRUE(ready(initF)) << "txn initTransactions future must be failed by close()";
-        EXPECT_THROW(initF.get(), std::runtime_error);
+        ASSERT_TRUE(initF.ready()) << "txn initTransactions must be completed by close()";
+        EXPECT_EQ(initF.status(), rc::OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(initF.token()), 1);
         // Adoption == the ring holder was consumed and freed (no leak).
         EXPECT_EQ(client.testProducerCount(), 1u);
         EXPECT_EQ(client.testTxnProducerCount(), 1u);
@@ -863,22 +866,21 @@ TEST(InvokerClient, TxnProducerRegisteredAfterCloseDrainSelfClosesRegression) {
     EXPECT_EQ(r.client.testTxnProducerCount(), 0u) << "the drain ran before the submit";
 
     // Every operation must report the close promptly — never hang, never
-    // silently accept.
-    auto initF = tp.initTransactions();
-    ASSERT_TRUE(ready(initF)) << "initTransactions() must fail at once, not wait forever";
-    EXPECT_THROW(initF.get(), std::runtime_error);
+    // silently accept: rejected synchronously (no completion will follow).
+    int calls = 0;
+    const rc::CompletionHandler h{[](void* c, const rc::Completion&, std::span<const uint8_t>) noexcept {
+                                      ++*static_cast<int*>(c);
+                                  },
+                                  &calls};
+    EXPECT_EQ(tp.initTransactions(h, 1), rc::OpResult::Closed);
     tp.beginTransaction();
     EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
                  std::logic_error);
-    auto offF = tp.sendOffsetsToTransaction({}, "g");
-    ASSERT_TRUE(ready(offF));
-    EXPECT_THROW(offF.get(), std::runtime_error);
-    auto commitF = tp.commitTransaction();
-    ASSERT_TRUE(ready(commitF));
-    EXPECT_THROW(commitF.get(), std::runtime_error);
-    auto abortF = tp.abortTransaction();
-    ASSERT_TRUE(ready(abortF));
-    EXPECT_THROW(abortF.get(), std::runtime_error);
+    EXPECT_EQ(tp.sendOffsetsToTransaction({}, "g", h, 2), rc::OpResult::Closed);
+    EXPECT_EQ(tp.commitTransaction(h, 3), rc::OpResult::Closed);
+    EXPECT_EQ(tp.abortTransaction(h, 4), rc::OpResult::Closed);
+    EXPECT_THROW(tp.commitTransactionAndWait(1s), std::runtime_error);
+    EXPECT_EQ(calls, 0);
 }
 
 // The ADOPTED path is symmetric too: a txn producer that close() adopted and
@@ -890,9 +892,13 @@ TEST(InvokerClient, TxnProducerOpsAfterCloseFailPromptlyRegression) {
     auto tp = r.client.transactionalProducer("tx-adopted");
     r.client.close();
     EXPECT_EQ(r.client.testTxnProducerCount(), 1u) << "adopted by close()'s drain";
-    auto commitF = tp.commitTransaction();
-    ASSERT_TRUE(ready(commitF)) << "must fail at once, not wait forever";
-    EXPECT_THROW(commitF.get(), std::runtime_error);
+    int calls = 0;
+    const rc::CompletionHandler h{[](void* c, const rc::Completion&, std::span<const uint8_t>) noexcept {
+                                      ++*static_cast<int*>(c);
+                                  },
+                                  &calls};
+    EXPECT_EQ(tp.commitTransaction(h, 1), rc::OpResult::Closed) << "must be rejected at once, not wait forever";
+    EXPECT_EQ(calls, 0);
     EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
                  std::logic_error);
 }

@@ -859,3 +859,95 @@ TEST(HubCommandClient, OversizeSubscribeFrameFailsAtSubscribeRegression) {
     auto ok = subscribeT(r.client);
     ASSERT_TRUE(r.drive([&] { return ok.subscriptionId() > 0; }));
 }
+
+// ===========================================================================
+// F8c C5 — transactional producer on completion tokens (Client level)
+// ===========================================================================
+namespace {
+const std::vector<uint8_t> kTxnVal{1, 2, 3};
+}
+
+// Client close completes EVERY outstanding txn token Closed, exactly once,
+// whatever its phase (InitProducerId in flight, two-phase sendOffsets, an
+// EndTxn waiting for its records, another queued behind it): CQ targets
+// before the queue is handed back (finished()), handler targets after.  Later
+// ops are rejected synchronously.  Both runner modes.
+TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
+    {
+        SCOPED_TRACE("Invoker");
+        HubRig r(4016);
+        auto tp = r.client.transactionalProducer("tx-close-all");
+        r.connect();
+        r.gw.initPidReply = true;
+        auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+        ASSERT_TRUE(init.ok()) << init.describe();
+        r.gw.initPidReply = false;  // from here the coordinator never answers
+        tp.beginTransaction();
+        tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+        auto offs = r.cq.issue([&](rc::Completions& q, rc::Token t) {
+            return tp.sendOffsetsToTransaction({{{1, 0}, 5}}, "g", q, t);
+        });
+        auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+        auto abort  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.abortTransaction(q, t); });
+        auto init2  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        HandlerLedger led;
+        ASSERT_EQ(tp.initTransactions(led.handler(), 99), rc::OpResult::Accepted);
+        for (auto* op : {&offs, &commit, &abort, &init2}) ASSERT_TRUE(op->accepted()) << op->describe();
+        ASSERT_TRUE(r.drive([&] {
+            return r.gw.addPartitions >= 1 && r.gw.addOffsets >= 1 && r.gw.initPids >= 3;
+        })) << "the requests never reached the coordinator";
+        r.settle(200);
+        for (auto* op : {&offs, &commit, &abort, &init2}) EXPECT_FALSE(op->ready()) << op->describe();
+        EXPECT_EQ(led.times, 0);
+
+        r.client.close();
+        for (auto* op : {&offs, &commit, &abort, &init2}) {
+            ASSERT_TRUE(op->ready()) << "stranded by close()";
+            EXPECT_EQ(op->status(), rc::OpStatus::Closed);
+            EXPECT_EQ(r.cq.timesCompleted(op->token()), 1);
+        }
+        EXPECT_TRUE(r.cq.q().finished());
+        EXPECT_EQ(led.times, 1);
+        EXPECT_EQ(led.last.status, rc::OpStatus::Closed);
+        EXPECT_EQ(tp.commitTransaction(led.handler(), 100), rc::OpResult::Closed);
+        EXPECT_EQ(led.times, 1);
+    }
+    {
+        SCOPED_TRACE("Thread");
+        rc::Client client(hubCfg(4018, 4019, rc::RunnerMode::Thread));
+        test_support::TestCq cq(client);
+        auto tp = client.transactionalProducer("tx-close-thread");
+        auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(init.accepted()) << init.describe();
+        EXPECT_FALSE(init.ready()) << "never connected: nothing answers it";
+        client.close();
+        ASSERT_TRUE(init.ready());
+        EXPECT_EQ(init.status(), rc::OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(init.token()), 1);
+        EXPECT_TRUE(cq.q().finished());
+    }
+}
+
+// F14 end to end: InitProducerId answered NotCoordinator re-discovers the
+// coordinator through a MetadataRequest, then retries; a following
+// ConcurrentTransactions backs off and retries; then Ok.
+TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
+    HubRig r(4020);
+    auto tp = r.client.transactionalProducer("tx-nc");
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 1; }));
+    r.settle(200);
+    const int mdBefore = r.gw.metadataRequests;
+    r.gw.initPidReply = true;
+    r.gw.initPidCodes = {static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                         static_cast<int16_t>(rune::protocol::client::ErrorCode::ConcurrentTransactions)};
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); })) << "never retried after NotCoordinator";
+    EXPECT_EQ(init.status(), rc::OpStatus::Ok) << init.describe();
+    EXPECT_EQ(init.outcome().c.value, 4242);
+    EXPECT_EQ(r.gw.initPids, 3) << "NotCoordinator -> re-discover -> retry -> 27 -> retry";
+    EXPECT_EQ(r.gw.metadataRequests, mdBefore + 1) << "NotCoordinator must re-discover (one MetadataRequest)";
+    EXPECT_EQ(tp.producerId(), 4242);
+    EXPECT_EQ(r.cq.timesCompleted(init.token()), 1);
+}

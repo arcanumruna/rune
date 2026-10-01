@@ -1,37 +1,27 @@
 // tests/producer/TransactionalProducerTest.cpp
 //
-// TX-5 — Tier-3 TransactionalProducer unit tests.
+// TX-5 / F8c C5 / F14 — Tier-3 TransactionalProducer unit tests.
 //
-// Test strategy: in-process mock gateway over Aeron IPC (same pattern as
-// ProducerTest.cpp).  The gateway decodes wire frames and feeds responses.
-// Tests drive doWork() directly (no background runner).
+// Test strategy: the TransactionalProducerImpl is the duty-side state machine.
+// The rig plays the duty thread on the test thread: the handle's sinks apply
+// every command synchronously (applyCommand), completions go to handler
+// targets recorded in a ledger (exactly-once counts per token), doWork() is
+// driven explicitly with an injected duty clock (no sleeps), the frames the
+// impl sends are captured, and broker responses are fed back by hand.
 //
-// Test matrix:
-//   1. InitTransactionsAcquiresPidEpoch
-//        initTransactions() emits InitProducerId → response → pid/epoch stored.
-//   2. IdempotentRetryReusesBaseSequence (IMPORTANT 3 fix)
-//        Two sends to the same partition: assert actual baseSequence values on
-//        the wire (0 and 1).  Feed a NotLeader ProduceResponse to trigger a
-//        retry; verify the retry carries the ORIGINAL baseSequence=0.
-//   3. BeginSendNewPartitionEmitsAddPartitions
-//        beginTransaction() + send to a new partition → AddPartitionsToTxn
-//        emitted exactly once for that partition.
-//   4. SendOffsetsToTransactionEmitsAddOffsetsThenTxnOffsetCommit
-//        sendOffsetsToTransaction() emits AddOffsetsToTxn then TxnOffsetCommit.
-//   5. CommitTransactionEmitsEndTxnCommit
-//        commitTransaction() emits EndTxn(commit=1).
-//   6. AbortTransactionEmitsEndTxnAbort
-//        abortTransaction() emits EndTxn(commit=0).
-//   7. ProducerFencedSurfacesError
-//        InitProducerIdResponse{ProducerFenced} → future throws;
-//        producerId remains -1.
-//   8. GroupConsumerReadCommittedConfig
-//        GroupConfig{isolation=ReadCommitted} stores isolation=ReadCommitted
-//        and the impl's cfg carries isolation=1.
-//   9. GroupConsumerReadCommittedHub — hub preserves isolation config.
-//  10. GroupConsumerReadCommittedWireIsolation (IMPORTANT 4 fix)
-//        After SyncGroupResponse, a ReadCommitted group consumer emits
-//        Subscribe frames with isolation=1 on the wire.
+// Test matrix (ported TX-5 tests, now on completion tokens):
+//   InitTransactionsAcquiresPidEpoch, IdempotentRetryReusesBaseSequence,
+//   BeginSendNewPartitionEmitsAddPartitions, SendOffsetsToTransaction...,
+//   CommitTransactionEmitsEndTxnCommit, AbortTransactionEmitsEndTxnAbort,
+//   EndTxnDeferredUntilAllProduceBatchesAcked, CommitFailsWhenProduceBatchTimesOut,
+//   BeginTransactionClearsPoisonFlag, SendOnInvalidTopicThrowsRegression,
+//   and the read_committed group-consumer config tests.
+// F8c C5 (spec §5): InitTxnFencedCompletesFencedRegression,
+//   CommitAbortCompleteOnceRegression, SendOffsetsTwoPhaseCompletesOnceRegression
+//   (TxnCloseCompletesAllClosedRegression is Client-level: InvokerClientTest).
+// F14: one ConcurrentTransactions (27) retry regression per request type,
+//   AddPartitions-error gating, NotCoordinator re-discovery, EndTxn retried
+//   until 0/19/17/18, the op deadline as the only bound.
 
 #include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/producer/TransactionalProducerImpl.h>
@@ -49,14 +39,11 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <future>
 #include <map>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -66,203 +53,229 @@ using namespace rune::client::producer;
 namespace rpc = rune::protocol::client;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Frame helpers
 // ---------------------------------------------------------------------------
 
 static constexpr int64_t kSessionId = 7777;
 
-/// Peek the templateId from an encoded frame (bytes [2..3] LE).
+static constexpr int16_t ecOf(rpc::ErrorCode e) { return static_cast<int16_t>(e); }
+
 static uint16_t peekTemplate(const std::vector<uint8_t>& buf) {
     if (buf.size() < 4) return 0;
     return static_cast<uint16_t>(buf[2]) | (static_cast<uint16_t>(buf[3]) << 8);
 }
 
-/// Build an InitProducerIdResponse frame.
-static std::vector<uint8_t> makeInitProducerIdResponse(
-    int64_t corrId, int64_t pid, int16_t epoch, int16_t errorCode = 0)
-{
+static std::vector<uint8_t> makeInitProducerIdResponse(int64_t corrId, int64_t pid, int16_t epoch,
+                                                       int16_t errorCode = 0) {
     rpc::InitProducerIdResponse msg;
     msg.sessionId     = kSessionId;
     msg.correlationId = corrId;
     msg.producerId    = pid;
     msg.producerEpoch = epoch;
     msg.errorCode     = errorCode;
-
     std::vector<uint8_t> buf(rpc::InitProducerIdResponse::ENCODED_SIZE);
     msg.encode(buf.data());
     return buf;
 }
 
-/// Build an AddPartitionsToTxnResponse frame (all-OK).
-static std::vector<uint8_t> makeAddPartitionsToTxnResponse(int64_t corrId)
-{
+/// AddPartitionsToTxnResponse: errorCode != 0 adds one failed result.
+static std::vector<uint8_t> makeAddPartitionsToTxnResponse(int64_t corrId, int16_t errorCode = 0) {
     rpc::AddPartitionsToTxnResponse msg;
     msg.sessionId     = kSessionId;
     msg.correlationId = corrId;
-    // empty results = OK
-
-    const std::size_t sz = rpc::AddPartitionsToTxnResponse::encodedSizeFor(0);
-    std::vector<uint8_t> buf(sz);
-    msg.encode(buf.data(), {});
+    std::vector<rpc::TxnPartitionResult> res;
+    if (errorCode != 0) res.push_back(rpc::TxnPartitionResult{0, 0, errorCode});
+    std::vector<uint8_t> buf(rpc::AddPartitionsToTxnResponse::encodedSizeFor(res.size()));
+    msg.encode(buf.data(), std::span<const rpc::TxnPartitionResult>(res));
     return buf;
 }
 
-/// Build an AddOffsetsToTxnResponse frame.
-static std::vector<uint8_t> makeAddOffsetsToTxnResponse(int64_t corrId,
-                                                          int16_t errorCode = 0)
-{
+static std::vector<uint8_t> makeAddOffsetsToTxnResponse(int64_t corrId, int16_t errorCode = 0) {
     rpc::AddOffsetsToTxnResponse msg;
     msg.sessionId     = kSessionId;
     msg.correlationId = corrId;
     msg.errorCode     = errorCode;
-
     std::vector<uint8_t> buf(rpc::AddOffsetsToTxnResponse::ENCODED_SIZE);
     msg.encode(buf.data());
     return buf;
 }
 
-/// Build a TxnOffsetCommitResponse frame (empty results = OK).
-static std::vector<uint8_t> makeTxnOffsetCommitResponse(int64_t corrId)
-{
+/// TxnOffsetCommitResponse: errorCode != 0 adds one failed result.
+static std::vector<uint8_t> makeTxnOffsetCommitResponse(int64_t corrId, int16_t errorCode = 0) {
     rpc::TxnOffsetCommitResponse msg;
     msg.sessionId     = kSessionId;
     msg.correlationId = corrId;
-
-    const std::size_t sz = rpc::TxnOffsetCommitResponse::encodedSizeFor(0);
-    std::vector<uint8_t> buf(sz);
-    msg.encode(buf.data(), {});
+    std::vector<rpc::TxnPartitionResult> res;
+    if (errorCode != 0) res.push_back(rpc::TxnPartitionResult{42, 0, errorCode});
+    std::vector<uint8_t> buf(rpc::TxnOffsetCommitResponse::encodedSizeFor(res.size()));
+    msg.encode(buf.data(), std::span<const rpc::TxnPartitionResult>(res));
     return buf;
 }
 
-/// Build an EndTxnResponse frame.
-static std::vector<uint8_t> makeEndTxnResponse(int64_t corrId, int16_t errorCode = 0)
-{
+static std::vector<uint8_t> makeEndTxnResponse(int64_t corrId, int16_t errorCode = 0) {
     rpc::EndTxnResponse msg;
     msg.sessionId     = kSessionId;
     msg.correlationId = corrId;
     msg.errorCode     = errorCode;
-
     std::vector<uint8_t> buf(rpc::EndTxnResponse::ENCODED_SIZE);
     msg.encode(buf.data());
     return buf;
 }
 
-/// Build a ProduceResponse frame.
-static std::vector<uint8_t> makeProduceResponse(int64_t corrId,
-                                                  int16_t errorCode = 0,
-                                                  int64_t baseOffset = 0)
-{
+static std::vector<uint8_t> makeProduceResponse(int64_t corrId, int16_t errorCode = 0,
+                                                int64_t baseOffset = 0) {
     rpc::ProduceResponse msg;
     msg.sessionId     = kSessionId;
     msg.correlationId = corrId;
     msg.errorCode     = errorCode;
     msg.partition     = 0;
     msg.baseOffset    = baseOffset;
-
     std::vector<uint8_t> buf(rpc::ProduceResponse::ENCODED_SIZE);
     msg.encode(buf.data());
     return buf;
 }
 
+static int64_t corrIdOf(const std::vector<uint8_t>& f) {
+    auto h = rpc::MessageHeader::decode(f.data(), f.size());
+    return h ? h->correlationId : 0;
+}
+
 // ---------------------------------------------------------------------------
-// CaptureSink — captures frames sent by the impl.
+// CaptureSink — the frames the impl sends.
 // ---------------------------------------------------------------------------
 struct CaptureSink {
     std::vector<std::vector<uint8_t>> frames;
     bool returnOk = true;
 
-    // Task 1.2 unified all hub SendFns to (int32_t ingressStreamId, buf, len).
-    // The stream id is captured but not asserted here (txn produce routing is
-    // Task 3.2); the txn impl passes streamId=0 on the current path.
-    std::function<bool(int32_t, const uint8_t*, std::size_t)> fn() {
-        return [this](int32_t /*ingressStreamId*/, const uint8_t* buf,
-                      std::size_t len) -> bool {
+    TransactionalProducerImpl::SendFn fn() {
+        return [this](int32_t, const uint8_t* buf, std::size_t len) -> bool {
             if (returnOk) frames.emplace_back(buf, buf + len);
             return returnOk;
         };
     }
-
     void clear() { frames.clear(); }
-
-    uint16_t templateId(std::size_t i) const {
-        if (i >= frames.size()) return 0;
-        return peekTemplate(frames[i]);
+    uint16_t templateId(std::size_t i) const { return i < frames.size() ? peekTemplate(frames[i]) : 0; }
+    [[nodiscard]] int count(rpc::TemplateId t) const {
+        int n = 0;
+        for (const auto& f : frames) n += peekTemplate(f) == static_cast<uint16_t>(t) ? 1 : 0;
+        return n;
+    }
+    /// The last frame of template `t` (empty if none).
+    [[nodiscard]] std::vector<uint8_t> last(rpc::TemplateId t) const {
+        for (std::size_t i = frames.size(); i-- > 0;) {
+            if (peekTemplate(frames[i]) == static_cast<uint16_t>(t)) return frames[i];
+        }
+        return {};
     }
 };
 
 // ---------------------------------------------------------------------------
-// TransactionalProducerTest fixture
+// TxnRig — the test thread plays the duty thread.
 // ---------------------------------------------------------------------------
-class TransactionalProducerTest : public ::testing::Test {
-protected:
-    int64_t nextCorrId{1};  // duty-owned (single test thread)
-
-    std::shared_ptr<TransactionalProducerImpl> makeImpl(
-        const std::string& txnId = "test-txn-id",
-        ProducerConfig cfg = {})
-    {
-        cfg.acks = Acks::All;
-        return std::make_shared<TransactionalProducerImpl>(
-            txnId, cfg, nextCorrId, /*txnTimeoutMs=*/60'000);
+struct TxnLedger {
+    struct Entry { int times = 0; Completion c{}; std::string text; };
+    std::map<Token, Entry> e;
+    static void on(void* ctx, const Completion& c, std::span<const uint8_t> p) noexcept {
+        auto& x = static_cast<TxnLedger*>(ctx)->e[c.token];
+        ++x.times;
+        x.c = c;
+        x.text.assign(reinterpret_cast<const char*>(p.data()), p.size());
     }
 };
 
-// ===========================================================================
-// Test 1: InitTransactionsAcquiresPidEpoch
-//   initTransactions() emits InitProducerId; response stores pid/epoch.
-// ===========================================================================
-TEST_F(TransactionalProducerTest, InitTransactionsAcquiresPidEpoch)
-{
+struct TxnOp {
+    TxnLedger* l = nullptr;
+    Token      t = 0;
+    OpResult   r = OpResult::InvalidArgument;
+    [[nodiscard]] bool ready() const { return l->e.count(t) != 0; }
+    [[nodiscard]] int  times() const { return ready() ? l->e.at(t).times : 0; }
+    [[nodiscard]] OpStatus status() const { return l->e.at(t).c.status; }
+    [[nodiscard]] const Completion& c() const { return l->e.at(t).c; }
+};
+
+struct TxnRig {
+    int64_t   nextCorrId = 1;  // the Client's duty-owned counter
+    int64_t   now        = 1'000'000'000;
+    int       rediscovers = 0;
+    TxnLedger ledger;
+    Token     nextToken = 0;
     CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
+    std::shared_ptr<TransactionalProducerImpl> impl;
+    TransactionalProducer tp;
 
-    // Before init: producerId is -1.
-    EXPECT_EQ(tp.producerId(), TransactionalProducerImpl::kNoPid);
+    explicit TxnRig(const std::string& txnId = "test-txn-id", ProducerConfig cfg = {})
+        : impl(makeImpl(txnId, cfg, nextCorrId)),
+          tp(impl, &TxnRig::hubSink, this, {}, &TxnRig::opSink, nullptr) {
+        impl->setRediscoverHook([](void* ctx) noexcept { ++static_cast<TxnRig*>(ctx)->rediscovers; }, this);
+    }
+    ~TxnRig() {
+        for (const auto& [t, x] : ledger.e) EXPECT_EQ(x.times, 1) << "token " << t << " completed " << x.times;
+    }
 
-    // App thread: enqueue initTransactions.
-    auto fut = tp.initTransactions();
+    static std::shared_ptr<TransactionalProducerImpl> makeImpl(const std::string& id, ProducerConfig cfg,
+                                                               int64_t& corr) {
+        cfg.acks = Acks::All;
+        return std::make_shared<TransactionalProducerImpl>(id, cfg, corr, /*txnTimeoutMs=*/60'000);
+    }
+    static rune::client::detail::HubSubmit hubSink(void* ctx, const rune::client::detail::HubCommand& c) {
+        auto* r = static_cast<TxnRig*>(ctx);
+        r->impl->applyCommand(c, r->now);
+        return rune::client::detail::HubSubmit::Accepted;
+    }
+    static OpResult opSink(void* ctx, rune::client::detail::HubCommand& c, const CompletionTarget& target,
+                           Token token, OpKind) {
+        if (target.handler.fn == nullptr) return OpResult::InvalidArgument;
+        rune::client::detail::OpTarget t;
+        t.handler = target.handler;
+        c.a = static_cast<int64_t>(token);
+        rune::client::detail::encodeTarget(t, c);
+        return hubSink(ctx, c) == rune::client::detail::HubSubmit::Accepted ? OpResult::Accepted
+                                                                            : OpResult::Closed;
+    }
 
-    // Agent: doWork sends InitProducerId.
-    int work = impl->doWork(kSessionId, sink.fn());
-    ASSERT_GE(work, 1) << "doWork must send at least one frame";
-    ASSERT_GE(sink.frames.size(), 1u);
-    EXPECT_EQ(sink.templateId(0),
-              static_cast<uint16_t>(rpc::TemplateId::InitProducerId))
-        << "First frame must be InitProducerId (templateId 45)";
+    CompletionHandler handler() { return CompletionHandler{&TxnLedger::on, &ledger}; }
+    TxnOp init() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.initTransactions(handler(), t)}; }
+    TxnOp commit() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.commitTransaction(handler(), t)}; }
+    TxnOp abort() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.abortTransaction(handler(), t)}; }
+    TxnOp sendOffsets(const std::map<TopicPartitionKey, int64_t>& o, const std::string& g) {
+        const Token t = ++nextToken;
+        return TxnOp{&ledger, t, tp.sendOffsetsToTransaction(o, g, handler(), t)};
+    }
 
-    // Decode the InitProducerId to get correlationId.
-    auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-    ASSERT_TRUE(opt.has_value()) << "InitProducerId must decode successfully";
-    const int64_t corrId = opt->correlationId;
-    EXPECT_GT(corrId, 0);
+    int doWork() { return impl->doWork(now, kSessionId, sink.fn()); }
+    /// doWork() n times; returns how many frames of `t` were sent meanwhile.
+    int cycles(int n, rpc::TemplateId t) {
+        const int before = sink.count(t);
+        for (int i = 0; i < n; ++i) doWork();
+        return sink.count(t) - before;
+    }
 
-    // Also verify transactionalId is encoded correctly.
-    const std::string txnIdStr(
-        reinterpret_cast<const char*>(opt->transactionalId.data()),
-        opt->transactionalId.size());
-    EXPECT_EQ(txnIdStr, "test-txn-id");
-
-    // Simulate broker response: InitProducerIdResponse{pid=42, epoch=1}.
-    auto resp = makeInitProducerIdResponse(corrId, /*pid=*/42, /*epoch=*/1);
-    impl->onInitProducerIdResponse(resp.data(), resp.size());
-
-    // Future must resolve.
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::ready)
-        << "initTransactions() future must resolve after response";
-    EXPECT_NO_THROW(fut.get());
-
-    // Producer identity stored.
-    EXPECT_EQ(tp.producerId(), 42);
-    EXPECT_EQ(tp.producerEpoch(), 1);
-}
+    /// Acquire (pid, epoch) through a full InitProducerId round trip.
+    void acquire(int64_t pid = 42, int16_t epoch = 0) {
+        auto op = init();
+        ASSERT_EQ(op.r, OpResult::Accepted);
+        doWork();
+        const auto f = sink.last(rpc::TemplateId::InitProducerId);
+        ASSERT_FALSE(f.empty());
+        auto resp = makeInitProducerIdResponse(corrIdOf(f), pid, epoch);
+        impl->onInitProducerIdResponse(resp.data(), resp.size());
+        ASSERT_TRUE(op.ready());
+        ASSERT_EQ(op.status(), OpStatus::Ok);
+        sink.clear();
+    }
+    /// Answer the outstanding AddPartitions OK (after a doWork that sent it).
+    void addPartitionsOk() {
+        const auto f = sink.last(rpc::TemplateId::AddPartitionsToTxn);
+        ASSERT_FALSE(f.empty()) << "no AddPartitionsToTxn was sent";
+        auto resp = makeAddPartitionsToTxnResponse(corrIdOf(f));
+        impl->onAddPartitionsToTxnResponse(resp.data(), resp.size());
+    }
+};
 
 // ---------------------------------------------------------------------------
-// Decode baseSequence from a Produce wire frame's embedded RecordBatch.
-// RecordBatch layout: baseSequence is at kBaseSequenceOffset=53 within the batch.
+// Produce-frame helpers
 // ---------------------------------------------------------------------------
-static int32_t decodeBaseSeqFromProduce(const std::vector<uint8_t>& frame)
-{
+static int32_t decodeBaseSeqFromProduce(const std::vector<uint8_t>& frame) {
     using namespace rune::protocol::batch;
     auto popt = rune::client::codec::decodeProduce(frame.data(), frame.size());
     if (!popt) return -999;
@@ -270,17 +283,13 @@ static int32_t decodeBaseSeqFromProduce(const std::vector<uint8_t>& frame)
     if (rb.size() < static_cast<std::size_t>(kBaseSequenceOffset + 4)) return -999;
     const uint8_t* d = rb.data();
     return static_cast<int32_t>(
-        static_cast<uint32_t>(d[kBaseSequenceOffset])       |
-       (static_cast<uint32_t>(d[kBaseSequenceOffset + 1]) << 8) |
-       (static_cast<uint32_t>(d[kBaseSequenceOffset + 2]) << 16) |
-       (static_cast<uint32_t>(d[kBaseSequenceOffset + 3]) << 24));
+        static_cast<uint32_t>(d[kBaseSequenceOffset]) |
+        (static_cast<uint32_t>(d[kBaseSequenceOffset + 1]) << 8) |
+        (static_cast<uint32_t>(d[kBaseSequenceOffset + 2]) << 16) |
+        (static_cast<uint32_t>(d[kBaseSequenceOffset + 3]) << 24));
 }
 
-// ---------------------------------------------------------------------------
-// Collect correlationIds from all Produce frames in a sink.
-// ---------------------------------------------------------------------------
-static std::vector<int64_t> collectProduceCorrIds(const CaptureSink& sink)
-{
+static std::vector<int64_t> collectProduceCorrIds(const CaptureSink& sink) {
     std::vector<int64_t> ids;
     for (const auto& f : sink.frames) {
         if (peekTemplate(f) != static_cast<uint16_t>(rpc::TemplateId::Produce)) continue;
@@ -290,421 +299,360 @@ static std::vector<int64_t> collectProduceCorrIds(const CaptureSink& sink)
     return ids;
 }
 
-// ===========================================================================
-// Test 2: IdempotentRetryReusesBaseSequence
-//
-//   Part A — Wire sequence values:
-//     Two successive sends to the same (topic,partition).  Each gets a distinct
-//     baseSequence (0 and 1).  Verify by decoding the embedded RecordBatch.
-//
-//   Part B — Genuine retry:
-//     Feed a ProduceResponse with errorCode=NotLeader for the first send.
-//     The impl must re-send the SAME wire frame with the SAME baseSequence (0).
-//     A new fresh batch would use baseSequence=2 — any sequence != 0 is a bug.
-// ===========================================================================
-TEST_F(TransactionalProducerTest, IdempotentRetryReusesBaseSequence)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
-
-    // ---- Acquire producer identity -------------------------------------------
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        ASSERT_GE(sink.frames.size(), 1u);
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, 99, 0);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
-        sink.clear();
-    }
-
-    tp.beginTransaction();
-
-    TopicHandle topic{1, 1};
-    Key key(uint64_t{0});
-    const std::vector<uint8_t> val = {0xAA, 0xBB};
-
-    // ---- Part A: two sends produce baseSeq 0 and 1 on the wire --------------
-
-    tp.send(topic, key, std::span<const uint8_t>(val)); // first  → baseSeq 0
-    tp.send(topic, key, std::span<const uint8_t>(val)); // second → baseSeq 1
-    impl->doWork(kSessionId, sink.fn());
-
-    // Filter produce frames.
-    std::vector<int32_t> seqsSeen;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
-            seqsSeen.push_back(decodeBaseSeqFromProduce(f));
-        }
-    }
-    ASSERT_EQ(seqsSeen.size(), 2u)
-        << "Expected 2 Produce frames (one per send to the same partition)";
-    EXPECT_EQ(seqsSeen[0], 0) << "First send must have baseSequence=0";
-    EXPECT_EQ(seqsSeen[1], 1) << "Second send must have baseSequence=1";
-
-    // Grab correlationIds for the two sends.
-    auto corrIds = collectProduceCorrIds(sink);
-    ASSERT_EQ(corrIds.size(), 2u);
-    const int64_t firstCorrId  = corrIds[0];
-    const int64_t secondCorrId = corrIds[1];
-    EXPECT_NE(firstCorrId, 0) << "Produce must use a real correlationId (not 0)";
-    EXPECT_NE(secondCorrId, 0);
-    EXPECT_NE(firstCorrId, secondCorrId) << "Each send must get a unique correlationId";
-
-    // Acknowledge second send (success) — nothing interesting about it.
-    {
-        auto ackResp = makeProduceResponse(secondCorrId, 0, /*baseOffset=*/1);
-        impl->onProduceResponse(ackResp.data(), ackResp.size(), sink.fn());
-    }
-
-    // ---- Part B: retriable error on first send → retry must reuse baseSeq=0 --
-
-    sink.clear();
-
-    // Simulate NotLeader (errorCode=2) for the first send.
-    {
-        const int16_t kNotLeader = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
-        auto errResp = makeProduceResponse(firstCorrId, kNotLeader);
-        impl->onProduceResponse(errResp.data(), errResp.size(), sink.fn());
-    }
-
-    // The impl must have re-sent the same wire frame (same corrId, same baseSeq=0).
-    ASSERT_GE(sink.frames.size(), 1u)
-        << "A retry Produce must be emitted on retriable error";
-    const int32_t retryBaseSeq = decodeBaseSeqFromProduce(sink.frames[0]);
-    EXPECT_EQ(retryBaseSeq, 0)
-        << "Retry MUST reuse the ORIGINAL baseSequence=0 (not a fresh 2). "
-           "A mismatch here means Critical-1 is broken: the retry allocated a "
-           "new sequence, defeating broker dedup.";
-
-    // The retried frame must use the SAME correlationId as the original.
-    auto retryOpt = rpc::Produce::decode(sink.frames[0].data(), sink.frames[0].size());
-    ASSERT_TRUE(retryOpt.has_value());
-    EXPECT_EQ(retryOpt->correlationId, firstCorrId)
-        << "Retry must carry the ORIGINAL correlationId so the response can be matched";
-
-    // producerId must still be valid (no fencing on retriable error).
-    EXPECT_EQ(tp.producerId(), 99LL)
-        << "producerId must remain valid after a retriable NotLeader error";
-}
+static const TopicHandle kTopic{5, 1};
+static const std::vector<uint8_t> kVal = {0xDE, 0xAD};
 
 // ===========================================================================
-// Test 3: BeginSendNewPartitionEmitsAddPartitions
-//   beginTransaction() + send to a new (topic,partition) → AddPartitionsToTxn
-//   emitted exactly once for that partition.
+// Ported TX-5 tests
 // ===========================================================================
-TEST_F(TransactionalProducerTest, BeginSendNewPartitionEmitsAddPartitions)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
 
-    // Acquire pid.
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, 55, 2);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        fut.get();
-        sink.clear();
-    }
+TEST(TransactionalProducerTest, InitTransactionsAcquiresPidEpoch) {
+    TxnRig r;
+    EXPECT_EQ(r.tp.producerId(), TransactionalProducerImpl::kNoPid);
 
-    tp.beginTransaction();
-    EXPECT_TRUE(tp.transactionActive());
-
-    // First send to (topicId=10, partition=0) → must trigger AddPartitionsToTxn.
-    TopicHandle topic{10, 1};
-    Key key(uint64_t{0});
-    const std::vector<uint8_t> val = {0x01};
-
-    tp.send(topic, key, std::span<const uint8_t>(val));
-
-    // Agent processes: should emit AddPartitionsToTxn + Produce.
-    impl->doWork(kSessionId, sink.fn());
-
-    // Find AddPartitionsToTxn frame.
-    bool foundAddParts = false;
-    int64_t addPartsCorr = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::AddPartitionsToTxn)) {
-            foundAddParts = true;
-            auto opt = rpc::AddPartitionsToTxn::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            addPartsCorr = opt->correlationId;
-            // Verify it carries the correct pid/epoch/txnId.
-            EXPECT_EQ(opt->producerId, 55);
-            EXPECT_EQ(opt->producerEpoch, 2);
-            const std::string txnStr(
-                reinterpret_cast<const char*>(opt->transactionalId.data()),
-                opt->transactionalId.size());
-            EXPECT_EQ(txnStr, "test-txn-id");
-            // Verify partition is in the list.
-            EXPECT_GE(opt->partitions.size(), 1u);
-            break;
-        }
-    }
-    EXPECT_TRUE(foundAddParts)
-        << "AddPartitionsToTxn must be emitted on first send to a new partition";
-
-    // Simulate response.
-    if (foundAddParts && addPartsCorr != 0) {
-        auto resp = makeAddPartitionsToTxnResponse(addPartsCorr);
-        impl->onAddPartitionsToTxnResponse(resp.data(), resp.size());
-    }
-
-    sink.clear();
-
-    // Second send to the same partition → NO AddPartitionsToTxn (already added).
-    tp.send(topic, key, std::span<const uint8_t>(val));
-    impl->doWork(kSessionId, sink.fn());
-
-    for (const auto& f : sink.frames) {
-        EXPECT_NE(peekTemplate(f),
-                  static_cast<uint16_t>(rpc::TemplateId::AddPartitionsToTxn))
-            << "AddPartitionsToTxn must NOT be emitted again for the same partition";
-    }
-}
-
-// ===========================================================================
-// Test 4: SendOffsetsToTransactionEmitsAddOffsetsThenTxnOffsetCommit
-//   sendOffsetsToTransaction() emits AddOffsetsToTxn then TxnOffsetCommit.
-// ===========================================================================
-TEST_F(TransactionalProducerTest, SendOffsetsToTransactionEmitsAddOffsetsThenTxnOffsetCommit)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
-
-    // Acquire pid.
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, 77, 0);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        fut.get();
-        sink.clear();
-    }
-
-    tp.beginTransaction();
-
-    // Submit sendOffsetsToTransaction.
-    std::map<TopicPartitionKey, int64_t> offsets;
-    offsets[{42, 0}] = 100;
-    offsets[{42, 1}] = 200;
-
-    auto fut = tp.sendOffsetsToTransaction(offsets, "my-consumer-group");
-
-    // doWork → should emit AddOffsetsToTxn.
-    impl->doWork(kSessionId, sink.fn());
-
-    bool foundAddOffsets = false;
-    int64_t addOffsetCorr = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::AddOffsetsToTxn)) {
-            foundAddOffsets = true;
-            auto opt = rpc::AddOffsetsToTxn::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            addOffsetCorr = opt->correlationId;
-            EXPECT_EQ(opt->producerId, 77);
-            const std::string grpStr(
-                reinterpret_cast<const char*>(opt->groupId.data()),
-                opt->groupId.size());
-            EXPECT_EQ(grpStr, "my-consumer-group");
-            break;
-        }
-    }
-    EXPECT_TRUE(foundAddOffsets) << "AddOffsetsToTxn must be emitted";
-
-    // Simulate AddOffsetsToTxnResponse → triggers TxnOffsetCommit.
-    if (addOffsetCorr != 0) {
-        auto resp = makeAddOffsetsToTxnResponse(addOffsetCorr);
-        sink.clear();
-        impl->onAddOffsetsToTxnResponse(resp.data(), resp.size(), kSessionId, sink.fn());
-    }
-
-    // Now TxnOffsetCommit should have been sent.
-    bool foundTxnOC = false;
-    int64_t txnOCCorr = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::TxnOffsetCommit)) {
-            foundTxnOC = true;
-            auto opt = rpc::TxnOffsetCommit::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            txnOCCorr = opt->correlationId;
-            EXPECT_EQ(opt->producerId, 77);
-            EXPECT_EQ(opt->entries.size(), 2u);
-            break;
-        }
-    }
-    EXPECT_TRUE(foundTxnOC) << "TxnOffsetCommit must be emitted after AddOffsetsToTxnResponse";
-
-    // Simulate TxnOffsetCommitResponse → future resolved.
-    if (txnOCCorr != 0) {
-        auto resp = makeTxnOffsetCommitResponse(txnOCCorr);
-        impl->onTxnOffsetCommitResponse(resp.data(), resp.size());
-    }
-
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::ready)
-        << "sendOffsetsToTransaction future must resolve";
-    EXPECT_NO_THROW(fut.get());
-}
-
-// ===========================================================================
-// Test 5: CommitTransactionEmitsEndTxnCommit
-//   commitTransaction() emits EndTxn(commit=1).
-// ===========================================================================
-TEST_F(TransactionalProducerTest, CommitTransactionEmitsEndTxnCommit)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
-
-    // Acquire pid.
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, 88, 1);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        fut.get();
-        sink.clear();
-    }
-
-    tp.beginTransaction();
-
-    // Commit the transaction.
-    auto commitFut = tp.commitTransaction();
-
-    // doWork → EndTxn(commit=1).
-    impl->doWork(kSessionId, sink.fn());
-
-    bool foundEndTxn = false;
-    int64_t endTxnCorr = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-            foundEndTxn = true;
-            auto opt = rpc::EndTxn::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            endTxnCorr = opt->correlationId;
-            EXPECT_EQ(opt->producerId, 88);
-            EXPECT_EQ(opt->producerEpoch, 1);
-            EXPECT_EQ(opt->commit, uint8_t{1}) << "commit=1 means COMMIT";
-            const std::string txnStr(
-                reinterpret_cast<const char*>(opt->transactionalId.data()),
-                opt->transactionalId.size());
-            EXPECT_EQ(txnStr, "test-txn-id");
-            break;
-        }
-    }
-    EXPECT_TRUE(foundEndTxn) << "EndTxn(commit=1) must be emitted";
-
-    // Simulate EndTxnResponse.
-    if (endTxnCorr != 0) {
-        auto resp = makeEndTxnResponse(endTxnCorr, 0);
-        impl->onEndTxnResponse(resp.data(), resp.size());
-    }
-
-    ASSERT_EQ(commitFut.wait_for(0s), std::future_status::ready)
-        << "commitTransaction future must resolve";
-    EXPECT_NO_THROW(commitFut.get());
-
-    // After commit, txnActive must be false.
-    EXPECT_FALSE(tp.transactionActive());
-}
-
-// ===========================================================================
-// Test 6: AbortTransactionEmitsEndTxnAbort
-//   abortTransaction() emits EndTxn(commit=0).
-// ===========================================================================
-TEST_F(TransactionalProducerTest, AbortTransactionEmitsEndTxnAbort)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
-
-    // Acquire pid.
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, 66, 0);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        fut.get();
-        sink.clear();
-    }
-
-    tp.beginTransaction();
-
-    // Abort.
-    auto abortFut = tp.abortTransaction();
-    impl->doWork(kSessionId, sink.fn());
-
-    bool foundEndTxn = false;
-    int64_t endTxnCorr = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-            foundEndTxn = true;
-            auto opt = rpc::EndTxn::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            endTxnCorr = opt->correlationId;
-            EXPECT_EQ(opt->commit, uint8_t{0}) << "commit=0 means ABORT";
-            break;
-        }
-    }
-    EXPECT_TRUE(foundEndTxn) << "EndTxn(commit=0) must be emitted for abort";
-
-    if (endTxnCorr != 0) {
-        auto resp = makeEndTxnResponse(endTxnCorr, 0);
-        impl->onEndTxnResponse(resp.data(), resp.size());
-    }
-
-    ASSERT_EQ(abortFut.wait_for(0s), std::future_status::ready)
-        << "abortTransaction future must resolve";
-    EXPECT_NO_THROW(abortFut.get());
-    EXPECT_FALSE(tp.transactionActive());
-}
-
-// ===========================================================================
-// Test 7: ProducerFencedSurfacesError
-//   InitProducerIdResponse{ProducerFenced} → future throws; producerId stays -1.
-// ===========================================================================
-TEST_F(TransactionalProducerTest, ProducerFencedSurfacesError)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
-
-    auto fut = tp.initTransactions();
-    impl->doWork(kSessionId, sink.fn());
-
-    ASSERT_GE(sink.frames.size(), 1u);
-    auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
+    auto op = r.init();
+    ASSERT_EQ(op.r, OpResult::Accepted);
+    ASSERT_GE(r.doWork(), 1);
+    ASSERT_GE(r.sink.frames.size(), 1u);
+    EXPECT_EQ(r.sink.templateId(0), static_cast<uint16_t>(rpc::TemplateId::InitProducerId));
+    auto opt = rpc::InitProducerId::decode(r.sink.frames[0].data(), r.sink.frames[0].size());
     ASSERT_TRUE(opt.has_value());
+    EXPECT_GT(opt->correlationId, 0);
+    EXPECT_EQ(opt->sessionId, kSessionId) << "the session is stamped at send time";
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(opt->transactionalId.data()),
+                          opt->transactionalId.size()),
+              "test-txn-id");
+    EXPECT_FALSE(op.ready());
 
-    // Respond with ProducerFenced (errorCode 18).
-    const int16_t kProducerFenced = static_cast<int16_t>(rpc::ErrorCode::ProducerFenced);
-    auto resp = makeInitProducerIdResponse(opt->correlationId, -1, 0, kProducerFenced);
-    impl->onInitProducerIdResponse(resp.data(), resp.size());
-
-    ASSERT_EQ(fut.wait_for(0s), std::future_status::ready)
-        << "Future must be resolved (as failure) on ProducerFenced";
-
-    EXPECT_THROW({ fut.get(); }, std::runtime_error)
-        << "ProducerFenced must surface as std::runtime_error";
-
-    // producerId must remain -1 (not acquired).
-    EXPECT_EQ(tp.producerId(), TransactionalProducerImpl::kNoPid)
-        << "producerId must remain -1 after ProducerFenced";
+    auto resp = makeInitProducerIdResponse(opt->correlationId, 42, 1);
+    r.impl->onInitProducerIdResponse(resp.data(), resp.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_EQ(op.c().value, 42) << "value = producerId";
+    EXPECT_EQ(op.c().aux, 1) << "aux = producerEpoch";
+    EXPECT_EQ(r.tp.producerId(), 42);
+    EXPECT_EQ(r.tp.producerEpoch(), 1);
 }
+
+// Two sends to one partition carry baseSequence 0 and 1; a retriable produce
+// error re-sends the SAME frame (same baseSequence, same correlationId).
+TEST(TransactionalProducerTest, IdempotentRetryReusesBaseSequence) {
+    TxnRig r;
+    r.acquire(99, 0);
+    r.tp.beginTransaction();
+    const Key key(uint64_t{0});
+    r.tp.send(TopicHandle{1, 1}, key, std::span<const uint8_t>(kVal));
+    r.tp.send(TopicHandle{1, 1}, key, std::span<const uint8_t>(kVal));
+    r.doWork();  // AddPartitionsToTxn first (F14 gate)
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();  // now the data
+
+    std::vector<int32_t> seqs;
+    for (const auto& f : r.sink.frames) {
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) seqs.push_back(decodeBaseSeqFromProduce(f));
+    }
+    ASSERT_EQ(seqs.size(), 2u);
+    EXPECT_EQ(seqs[0], 0);
+    EXPECT_EQ(seqs[1], 1);
+    const auto ids = collectProduceCorrIds(r.sink);
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_NE(ids[0], ids[1]);
+    {
+        auto ack = makeProduceResponse(ids[1], 0, 1);
+        r.impl->onProduceResponse(ack.data(), ack.size());
+    }
+    r.sink.clear();
+    {
+        auto err = makeProduceResponse(ids[0], ecOf(rpc::ErrorCode::NotLeader));
+        r.impl->onProduceResponse(err.data(), err.size());
+    }
+    r.doWork();  // the retry goes out on the next cycle
+    const auto retry = r.sink.last(rpc::TemplateId::Produce);
+    ASSERT_FALSE(retry.empty()) << "a retriable error must re-send";
+    EXPECT_EQ(decodeBaseSeqFromProduce(retry), 0) << "the retry MUST reuse baseSequence 0";
+    EXPECT_EQ(corrIdOf(retry), ids[0]) << "the retry carries the ORIGINAL correlationId";
+    EXPECT_EQ(r.tp.producerId(), 99) << "no fencing on a retriable error";
+}
+
+// The first send to a new partition emits AddPartitionsToTxn exactly once; its
+// record is produced only once that is OK (F14).
+TEST(TransactionalProducerTest, BeginSendNewPartitionEmitsAddPartitions) {
+    TxnRig r;
+    r.acquire(55, 2);
+    r.tp.beginTransaction();
+    EXPECT_TRUE(r.tp.transactionActive());
+
+    const Key key(uint64_t{0});
+    r.tp.send(TopicHandle{10, 1}, key, std::span<const uint8_t>(kVal));
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 1);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::Produce), 0) << "data before its AddPartitions result";
+    const auto ap = r.sink.last(rpc::TemplateId::AddPartitionsToTxn);
+    auto opt = rpc::AddPartitionsToTxn::decode(ap.data(), ap.size());
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->producerId, 55);
+    EXPECT_EQ(opt->producerEpoch, 2);
+    EXPECT_GE(opt->partitions.size(), 1u);
+
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::Produce), 1);
+
+    r.sink.clear();
+    r.tp.send(TopicHandle{10, 1}, key, std::span<const uint8_t>(kVal));
+    r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 0) << "not again for the same partition";
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::Produce), 1);
+}
+
+TEST(TransactionalProducerTest, SendOffsetsToTransactionEmitsAddOffsetsThenTxnOffsetCommit) {
+    TxnRig r;
+    r.acquire(77, 0);
+    r.tp.beginTransaction();
+    std::map<TopicPartitionKey, int64_t> offsets{{{42, 0}, 100}, {{42, 1}, 200}};
+    auto op = r.sendOffsets(offsets, "my-consumer-group");
+    ASSERT_EQ(op.r, OpResult::Accepted);
+    r.doWork();
+    const auto ao = r.sink.last(rpc::TemplateId::AddOffsetsToTxn);
+    ASSERT_FALSE(ao.empty());
+    auto aopt = rpc::AddOffsetsToTxn::decode(ao.data(), ao.size());
+    ASSERT_TRUE(aopt.has_value());
+    EXPECT_EQ(aopt->producerId, 77);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(aopt->groupId.data()), aopt->groupId.size()),
+              "my-consumer-group");
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::TxnOffsetCommit), 0);
+
+    auto resp = makeAddOffsetsToTxnResponse(aopt->correlationId);
+    r.impl->onAddOffsetsToTxnResponse(resp.data(), resp.size());
+    r.doWork();
+    const auto oc = r.sink.last(rpc::TemplateId::TxnOffsetCommit);
+    ASSERT_FALSE(oc.empty()) << "TxnOffsetCommit after AddOffsetsToTxnResponse";
+    auto oopt = rpc::TxnOffsetCommit::decode(oc.data(), oc.size());
+    ASSERT_TRUE(oopt.has_value());
+    EXPECT_EQ(oopt->producerId, 77);
+    EXPECT_EQ(oopt->entries.size(), 2u);
+    EXPECT_FALSE(op.ready());
+
+    auto done = makeTxnOffsetCommitResponse(oopt->correlationId);
+    r.impl->onTxnOffsetCommitResponse(done.data(), done.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+}
+
+TEST(TransactionalProducerTest, CommitTransactionEmitsEndTxnCommit) {
+    TxnRig r;
+    r.acquire(88, 1);
+    r.tp.beginTransaction();
+    auto op = r.commit();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty());
+    auto opt = rpc::EndTxn::decode(et.data(), et.size());
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->producerId, 88);
+    EXPECT_EQ(opt->producerEpoch, 1);
+    EXPECT_EQ(opt->commit, uint8_t{1});
+    auto resp = makeEndTxnResponse(opt->correlationId, 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_FALSE(r.tp.transactionActive());
+}
+
+TEST(TransactionalProducerTest, AbortTransactionEmitsEndTxnAbort) {
+    TxnRig r;
+    r.acquire(66, 0);
+    r.tp.beginTransaction();
+    auto op = r.abort();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty());
+    auto opt = rpc::EndTxn::decode(et.data(), et.size());
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->commit, uint8_t{0});
+    auto resp = makeEndTxnResponse(opt->correlationId, 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_FALSE(r.tp.transactionActive());
+}
+
+// F8c C5 (was ProducerFencedSurfacesError): InitProducerId{ProducerFenced}
+// completes the init Fenced — and every other pending op of the producer
+// too — exactly once; producerId stays -1.
+TEST(TransactionalProducerTest, InitTxnFencedCompletesFencedRegression) {
+    TxnRig r;
+    auto init = r.init();
+    auto other = r.sendOffsets({{{1, 0}, 5}}, "g");  // no pid yet: BrokerError(19) at once
+    ASSERT_TRUE(other.ready());
+    EXPECT_EQ(other.status(), OpStatus::BrokerError);
+    EXPECT_EQ(other.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::InvalidTxnState));
+    auto commit = r.commit();
+    r.doWork();
+    EXPECT_TRUE(commit.ready()) << "EndTxn without a producerId completes at once";
+    const auto f = r.sink.last(rpc::TemplateId::InitProducerId);
+    ASSERT_FALSE(f.empty());
+    auto init2 = r.init();  // a second init in flight
+    r.doWork();
+    auto resp = makeInitProducerIdResponse(corrIdOf(f), -1, 0, ecOf(rpc::ErrorCode::ProducerFenced));
+    r.impl->onInitProducerIdResponse(resp.data(), resp.size());
+    ASSERT_TRUE(init.ready());
+    EXPECT_EQ(init.status(), OpStatus::Fenced);
+    ASSERT_TRUE(init2.ready()) << "every pending op completes on fencing";
+    EXPECT_EQ(init2.status(), OpStatus::Fenced);
+    // A late response for the fenced request is ignored (exactly once).
+    r.impl->onInitProducerIdResponse(resp.data(), resp.size());
+    EXPECT_EQ(init.times(), 1);
+    EXPECT_EQ(r.tp.producerId(), TransactionalProducerImpl::kNoPid);
+    EXPECT_EQ(r.impl->testPendingRequests(), 0u);
+}
+
+// TX-6b: EndTxn is deferred until every in-flight Produce batch is acked.
+TEST(TransactionalProducerTest, EndTxnDeferredUntilAllProduceBatchesAcked) {
+    TxnRig r;
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    const Key key(uint64_t{0});
+    r.tp.send(kTopic, key, std::span<const uint8_t>(kVal));
+    r.tp.send(kTopic, key, std::span<const uint8_t>(kVal));
+    auto commit = r.commit();
+    r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "AddPartitions not even answered";
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();
+    const auto ids = collectProduceCorrIds(r.sink);
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "EndTxn BEFORE the batches were acked";
+    EXPECT_FALSE(commit.ready());
+    EXPECT_EQ(r.cycles(3, rpc::TemplateId::EndTxn), 0);
+    {
+        auto ack = makeProduceResponse(ids[0], 0, 0);
+        r.impl->onProduceResponse(ack.data(), ack.size());
+    }
+    EXPECT_EQ(r.cycles(1, rpc::TemplateId::EndTxn), 0) << "one batch still in flight";
+    {
+        auto ack = makeProduceResponse(ids[1], 0, 1);
+        r.impl->onProduceResponse(ack.data(), ack.size());
+    }
+    ASSERT_EQ(r.cycles(1, rpc::TemplateId::EndTxn), 1) << "every batch acked: EndTxn now";
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    auto opt = rpc::EndTxn::decode(et.data(), et.size());
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->commit, uint8_t{1});
+    EXPECT_EQ(opt->producerId, 42);
+    auto resp = makeEndTxnResponse(opt->correlationId, 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_FALSE(r.tp.transactionActive());
+}
+
+// TX-6b: a batch that times out (duty clock — no sleep) poisons the txn; the
+// commit completes DeliveryFailed and no EndTxn is ever sent.
+TEST(TransactionalProducerTest, CommitFailsWhenProduceBatchTimesOut) {
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;
+    TxnRig r("timeout-txn-id", cfg);
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 1);
+    // The commit is applied just before the batch's deadline passes.
+    r.now += 15'000'000;  // 15 ms
+    auto commit = r.commit();
+    r.now += 10'000'000;  // the batch (20 ms) expired; the commit (20 ms from now-10) not yet
+    r.sink.clear();
+    r.doWork();
+    r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "commit marker over lost data";
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::DeliveryFailed);
+    EXPECT_FALSE(r.tp.transactionActive());
+}
+
+// TX-6b stuck-latch: beginTransaction() clears the poison of an abandoned txn,
+// so the next transaction commits normally.  A refused EndTxn offer is
+// re-offered (never a lost / failed abort).
+TEST(TransactionalProducerTest, BeginTransactionClearsPoisonFlag) {
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;
+    TxnRig r("poison-reset-txn-id", cfg);
+    r.acquire(42, 0);
+
+    // TXN-1: a batch times out (poison) and the txn is abandoned via abort,
+    // whose first EndTxn offer the transport refuses.
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();
+    r.now += 40'000'000;
+    r.doWork();  // the batch expires: poisoned
+    r.sink.clear();
+    r.sink.returnOk = false;
+    auto abort = r.abort();
+    r.doWork();  // EndTxn(abort) refused by the transport
+    EXPECT_FALSE(abort.ready()) << "a refused offer is retried, not failed";
+    EXPECT_FALSE(r.tp.transactionActive()) << "the abort decided the transaction";
+    r.sink.returnOk = true;
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty()) << "the refused EndTxn was never re-offered";
+    auto resp = makeEndTxnResponse(corrIdOf(et), 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    r.sink.clear();
+
+    // Dirty again: begin, send, time out — no EndTxn.
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();
+    r.now += 40'000'000;
+    r.doWork();  // poisoned again, txn still active
+    r.sink.clear();
+
+    // TXN-2: begin MUST clear the poison.
+    r.tp.beginTransaction();
+    EXPECT_TRUE(r.tp.transactionActive());
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    auto commit = r.commit();
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();
+    const auto ids = collectProduceCorrIds(r.sink);
+    ASSERT_EQ(ids.size(), 1u);
+    auto ack = makeProduceResponse(ids[0], 0, 10);
+    r.impl->onProduceResponse(ack.data(), ack.size());
+    r.sink.clear();
+    r.doWork();
+    const auto et2 = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et2.empty()) << "beginTransaction() did not clear the poison (stuck latch)";
+    auto opt = rpc::EndTxn::decode(et2.data(), et2.size());
+    ASSERT_TRUE(opt.has_value());
+    EXPECT_EQ(opt->commit, uint8_t{1});
+    auto resp2 = makeEndTxnResponse(opt->correlationId, 0);
+    r.impl->onEndTxnResponse(resp2.data(), resp2.size());
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_FALSE(r.tp.transactionActive());
+}
+
+// fix1 I8: an invalid topic is never silently dropped — it throws.
+TEST(TransactionalProducerTest, SendOnInvalidTopicThrowsRegression) {
+    TxnRig r;
+    EXPECT_THROW(r.tp.send(TopicHandle{}, Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
+                 std::invalid_argument);
+}
+
 
 // ===========================================================================
 // Test 8: GroupConsumerReadCommittedConfig
@@ -926,452 +874,383 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     }
 }
 
+
 // ===========================================================================
-// Test 12: TX-6b EndTxnDeferredUntilAllProduceBatchesAcked
-//
-//   The bug (pre-fix): commitTransaction() / EndTxn could be sent to the broker
-//   while Produce batches were still in-flight (pendingProduceBatches_ non-empty).
-//   The broker would write the commit control marker BETWEEN data batches — at
-//   offset N, with more data at N+1 — re-opening the txn in LsoTracker so the
-//   LSO never advanced and a read_committed consumer would see only records that
-//   landed before the marker.
-//
-//   The fix (TX-6b): doWork() defers EndTxn processing while pendingSends_ OR
-//   pendingProduceBatches_ is non-empty, re-queuing the command for the next tick.
-//
-//   Wire-order assertion:
-//     Given: 2 sends in-flight (pendingProduceBatches_ has 2 entries).
-//     When:  commitTransaction() is enqueued.
-//     Then:  doWork() must NOT emit EndTxn (deferred).
-//     When:  both ProduceResponses are fed (batches acked).
-//     Then:  doWork() MUST emit EndTxn (all batches clear).
-//
-//   RED (without fix): EndTxn is emitted immediately while batches are in-flight.
-//   GREEN (with fix):  EndTxn is emitted only after all batches are acked.
+// F8c C5 — exactly-once
 // ===========================================================================
-TEST_F(TransactionalProducerTest, EndTxnDeferredUntilAllProduceBatchesAcked)
-{
-    CaptureSink sink;
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
 
-    // ---- Acquire producer identity ------------------------------------------
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        ASSERT_GE(sink.frames.size(), 1u);
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, /*pid=*/42, /*epoch=*/0);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
-        sink.clear();
+// commit and abort each complete exactly once: through a 27 retry, and with
+// duplicate / late responses ignored.
+TEST(TransactionalProducerTest, CommitAbortCompleteOnceRegression) {
+    for (const bool doCommit : {true, false}) {
+        SCOPED_TRACE(doCommit ? "commit" : "abort");
+        TxnRig r;
+        r.acquire();
+        r.tp.beginTransaction();
+        auto op = doCommit ? r.commit() : r.abort();
+        ASSERT_EQ(op.r, OpResult::Accepted);
+        r.doWork();
+        const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::EndTxn));
+        ASSERT_NE(corr, 0);
+        auto busy = makeEndTxnResponse(corr, ecOf(rpc::ErrorCode::ConcurrentTransactions));
+        r.impl->onEndTxnResponse(busy.data(), busy.size());
+        EXPECT_FALSE(op.ready()) << "27 is retriable, not a completion";
+        ASSERT_EQ(r.cycles(2, rpc::TemplateId::EndTxn), 1) << "re-sent after the backoff";
+        auto ok = makeEndTxnResponse(corr, 0);
+        r.impl->onEndTxnResponse(ok.data(), ok.size());
+        r.impl->onEndTxnResponse(ok.data(), ok.size());     // duplicate
+        r.impl->onEndTxnResponse(busy.data(), busy.size()); // late
+        r.doWork();
+        ASSERT_TRUE(op.ready());
+        EXPECT_EQ(op.status(), OpStatus::Ok);
+        EXPECT_EQ(op.times(), 1);
+        EXPECT_EQ(r.cycles(4, rpc::TemplateId::EndTxn), 0) << "nothing re-sent after completion";
+        EXPECT_EQ(r.impl->testPendingOps(), 0u);
     }
+}
 
-    tp.beginTransaction();
-
-    TopicHandle topic{5, 1};
-    Key key(uint64_t{0});
-    const std::vector<uint8_t> val = {0xDE, 0xAD};
-
-    // ---- Enqueue 2 sends + commit BEFORE any doWork so they're all pending ----
-    tp.send(topic, key, std::span<const uint8_t>(val)); // send #1
-    tp.send(topic, key, std::span<const uint8_t>(val)); // send #2
-    auto commitFut = tp.commitTransaction();             // EndTxn enqueued
-
-    // ---- First doWork: drains sends, queues produce batches in-flight ---------
-    // The sends are drained into Produce frames and stored in pendingProduceBatches_.
-    // The EndTxn command should be re-queued (deferred) because batches are in-flight.
-    impl->doWork(kSessionId, sink.fn());
-
-    // Collect all Produce corrIds from this cycle.
-    std::vector<int64_t> produceCorrIds;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
-            auto opt = rpc::Produce::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            produceCorrIds.push_back(opt->correlationId);
-        }
-    }
-    ASSERT_EQ(produceCorrIds.size(), 2u)
-        << "Both Produce frames must be sent in the first doWork cycle";
-
-    // ---- CRITICAL assertion: EndTxn must NOT be in the first doWork output ----
-    // With the bug (pre-fix): EndTxn would appear here (before batches acked).
-    // With the fix:           EndTxn is deferred; not present.
-    {
-        bool endTxnSentEarly = false;
-        for (const auto& f : sink.frames) {
-            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-                endTxnSentEarly = true;
-                break;
-            }
-        }
-        EXPECT_FALSE(endTxnSentEarly)
-            << "TX-6b BUG: EndTxn was sent BEFORE all in-flight Produce batches were "
-               "acked (pendingProduceBatches_ non-empty).  commitTransaction() must "
-               "flush all batches first (Kafka semantics).";
-    }
-
-    // Commit future must NOT be ready yet (EndTxn not sent, response not received).
-    EXPECT_NE(commitFut.wait_for(0s), std::future_status::ready)
-        << "commitTransaction() future must not resolve while Produce batches "
-           "are still in-flight";
-
-    sink.clear();
-
-    // ---- Second doWork: still deferred (no acks yet) -------------------------
-    // Simulate another tick without acks — EndTxn must still not be sent.
-    impl->doWork(kSessionId, sink.fn());
-    {
-        bool endTxnStillDeferred = true;
-        for (const auto& f : sink.frames) {
-            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-                endTxnStillDeferred = false;
-                break;
-            }
-        }
-        EXPECT_TRUE(endTxnStillDeferred)
-            << "EndTxn must remain deferred after a second doWork tick with no acks";
-    }
-    sink.clear();
-
-    // ---- Ack the first Produce batch -----------------------------------------
-    {
-        auto ack = makeProduceResponse(produceCorrIds[0], /*errorCode=*/0, /*baseOffset=*/0);
-        impl->onProduceResponse(ack.data(), ack.size(), sink.fn());
-    }
-    // Still one batch in-flight — EndTxn must remain deferred.
-    impl->doWork(kSessionId, sink.fn());
-    {
-        bool endTxnAfterFirstAck = false;
-        for (const auto& f : sink.frames) {
-            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-                endTxnAfterFirstAck = true;
-                break;
-            }
-        }
-        EXPECT_FALSE(endTxnAfterFirstAck)
-            << "EndTxn must NOT be sent after only the first of two Produce batches "
-               "is acked (second batch still in-flight)";
-    }
-    sink.clear();
-
-    // ---- Ack the second Produce batch ----------------------------------------
-    {
-        auto ack = makeProduceResponse(produceCorrIds[1], /*errorCode=*/0, /*baseOffset=*/1);
-        impl->onProduceResponse(ack.data(), ack.size(), sink.fn());
-    }
-
-    // ---- Third doWork: all batches acked → EndTxn MUST be sent ---------------
-    impl->doWork(kSessionId, sink.fn());
-
-    bool endTxnSent = false;
-    int64_t endTxnCorrId = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-            endTxnSent = true;
-            auto opt = rpc::EndTxn::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            endTxnCorrId = opt->correlationId;
-            EXPECT_EQ(opt->commit, uint8_t{1})
-                << "EndTxn must be a COMMIT (commit=1)";
-            EXPECT_EQ(opt->producerId, 42)
-                << "EndTxn must carry the correct producerId";
-            break;
-        }
-    }
-    ASSERT_TRUE(endTxnSent)
-        << "TX-6b FIX NOT EFFECTIVE: EndTxn was never sent even after all "
-           "Produce batches were acked.";
-
-    // ---- Feed EndTxnResponse → commitTransaction() future must resolve --------
-    {
-        auto resp = makeEndTxnResponse(endTxnCorrId, /*errorCode=*/0);
-        impl->onEndTxnResponse(resp.data(), resp.size());
-    }
-
-    ASSERT_EQ(commitFut.wait_for(0s), std::future_status::ready)
-        << "commitTransaction() future must resolve after EndTxnResponse";
-    EXPECT_NO_THROW(commitFut.get());
-    EXPECT_FALSE(tp.transactionActive());
+// sendOffsets is two-phase (AddOffsetsToTxn -> TxnOffsetCommit) and completes
+// exactly once — never at phase 1, never twice on duplicates.
+TEST(TransactionalProducerTest, SendOffsetsTwoPhaseCompletesOnceRegression) {
+    TxnRig r;
+    r.acquire(77, 3);
+    r.tp.beginTransaction();
+    auto op = r.sendOffsets({{{42, 0}, 9}}, "grp");
+    r.doWork();
+    const int64_t ao = corrIdOf(r.sink.last(rpc::TemplateId::AddOffsetsToTxn));
+    ASSERT_NE(ao, 0);
+    auto aoOk = makeAddOffsetsToTxnResponse(ao);
+    r.impl->onAddOffsetsToTxnResponse(aoOk.data(), aoOk.size());
+    EXPECT_FALSE(op.ready()) << "phase 1 is not the completion";
+    r.impl->onAddOffsetsToTxnResponse(aoOk.data(), aoOk.size());  // duplicate: ignored
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::TxnOffsetCommit), 1) << "phase 2 started exactly once";
+    const int64_t oc = corrIdOf(r.sink.last(rpc::TemplateId::TxnOffsetCommit));
+    // A commit waits for the offsets (they are part of the transaction).
+    auto commit = r.commit();
+    EXPECT_EQ(r.cycles(2, rpc::TemplateId::EndTxn), 0) << "EndTxn before the offsets landed";
+    auto ocOk = makeTxnOffsetCommitResponse(oc);
+    r.impl->onTxnOffsetCommitResponse(ocOk.data(), ocOk.size());
+    r.impl->onTxnOffsetCommitResponse(ocOk.data(), ocOk.size());  // duplicate
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_EQ(op.times(), 1);
+    EXPECT_EQ(r.cycles(1, rpc::TemplateId::EndTxn), 1) << "now the EndTxn";
+    auto et = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)), 0);
+    r.impl->onEndTxnResponse(et.data(), et.size());
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
 }
 
 // ===========================================================================
-// Test 13: TX-6b CommitFailsWhenProduceBatchTimesOut
-//
-//   Follow-up to Test 12 (flush-before-commit).  Test 12 proves EndTxn is
-//   deferred while a batch is in-flight.  This test proves the ESCAPE path is
-//   safe: if an in-flight Produce batch is never acked and its produceTimeout
-//   expires, sweepTimedOut() drops it — but the deferred EndTxnCommit must then
-//   FAIL with an exception, NOT be sent.  Otherwise a commit control marker
-//   would be written over data that never became durable (the exact bug TX-6b
-//   set out to prevent, just triggered by timeout instead of a race).
-//
-//   RED (without poison flag): the dropped batch unblocks the deferral and
-//   EndTxn(commit=1) is emitted; commitFut resolves successfully.
-//   GREEN (with txnFailed_):   no EndTxn is emitted; commitFut throws.
+// F14 — ConcurrentTransactions (27) is retriable for every txn request
 // ===========================================================================
-TEST_F(TransactionalProducerTest, CommitFailsWhenProduceBatchTimesOut)
-{
-    CaptureSink sink;
-    ProducerConfig cfg;
-    cfg.produceTimeoutMs = 20;  // expire in-flight batches quickly
-    auto impl = makeImpl("timeout-txn-id", cfg);
-    TransactionalProducer tp(impl);
 
-    // ---- Acquire producer identity ------------------------------------------
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        ASSERT_GE(sink.frames.size(), 1u);
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, /*pid=*/42, /*epoch=*/0);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
-        sink.clear();
+// InitProducerId: 27 -> re-sent after min(2^attempt, cap) duty cycles (1, 2,
+// 4, ...) — counted in cycles, no wall clock — then Ok.
+TEST(TransactionalProducerTest, InitProducerIdRetriesConcurrentTransactionsRegression) {
+    TxnRig r;
+    auto op = r.init();
+    r.doWork();
+    const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::InitProducerId));
+    auto busy = makeInitProducerIdResponse(corr, -1, 0, ecOf(rpc::ErrorCode::ConcurrentTransactions));
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        SCOPED_TRACE(attempt);
+        r.impl->onInitProducerIdResponse(busy.data(), busy.size());
+        ASSERT_FALSE(op.ready()) << "27 must not complete the op";
+        const int wait = 1 << attempt;
+        EXPECT_EQ(r.cycles(wait - 1, rpc::TemplateId::InitProducerId), 0) << "re-sent before its backoff";
+        ASSERT_EQ(r.cycles(1, rpc::TemplateId::InitProducerId), 1) << "not re-sent after 2^" << attempt << " cycles";
+        EXPECT_EQ(corrIdOf(r.sink.last(rpc::TemplateId::InitProducerId)), corr) << "the retained frame";
     }
+    auto ok = makeInitProducerIdResponse(corr, 4242, 7);
+    r.impl->onInitProducerIdResponse(ok.data(), ok.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+    EXPECT_EQ(r.tp.producerId(), 4242);
+}
 
-    tp.beginTransaction();
-
-    TopicHandle topic{5, 1};
-    Key key(uint64_t{0});
-    const std::vector<uint8_t> val = {0xDE, 0xAD};
-
-    // One send + commit, all enqueued before any doWork.
-    tp.send(topic, key, std::span<const uint8_t>(val));
-    auto commitFut = tp.commitTransaction();
-
-    // First doWork: drains the send into a Produce frame (in-flight), defers EndTxn.
-    impl->doWork(kSessionId, sink.fn());
-    {
-        int produceCount = 0;
-        bool endTxnEarly = false;
-        for (const auto& f : sink.frames) {
-            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) ++produceCount;
-            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) endTxnEarly = true;
+// The backoff is capped (kRetryBackoffCapCycles) and the op's own deadline
+// is the only time bound: 27 forever -> Timeout, exactly once.
+TEST(TransactionalProducerTest, ConcurrentTransactionsRetryIsBoundedOnlyByTheOpDeadlineRegression) {
+    TxnRig r;
+    auto op = r.init();
+    r.doWork();
+    const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::InitProducerId));
+    auto busy = makeInitProducerIdResponse(corr, -1, 0, ecOf(rpc::ErrorCode::ConcurrentTransactions));
+    int resends = 0;
+    for (int attempt = 0; attempt < 14; ++attempt) {
+        r.impl->onInitProducerIdResponse(busy.data(), busy.size());
+        int waited = 0;
+        while (r.cycles(1, rpc::TemplateId::InitProducerId) == 0) {
+            ASSERT_LE(++waited, static_cast<int>(TransactionalProducerImpl::kRetryBackoffCapCycles))
+                << "backoff beyond the cap";
         }
-        ASSERT_EQ(produceCount, 1) << "the send must produce one in-flight batch";
-        ASSERT_FALSE(endTxnEarly) << "EndTxn must be deferred while the batch is in-flight";
+        ++resends;
     }
-    sink.clear();
+    EXPECT_EQ(resends, 14);
+    EXPECT_FALSE(op.ready()) << "no wall-clock bound: still retrying";
+    r.now += ProducerConfig{}.produceTimeoutMs * 1'000'000LL;  // the op's deadline
+    r.doWork();
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Timeout);
+    EXPECT_EQ(r.impl->testPendingRequests(), 0u);
+    EXPECT_EQ(r.cycles(2'048, rpc::TemplateId::InitProducerId), 0) << "nothing after the timeout";
+}
 
-    // ---- Never ack the batch.  Wait past produceTimeoutMs, then tick doWork. --
-    // sweepTimedOut() runs at the END of doWork, so the first post-timeout tick
-    // drops the batch and sets txnFailed_ (the EndTxn is still deferred this
-    // cycle because the batch is dropped after the command queue is processed).
-    // The next tick observes txnFailed_ and fails the commit.
-    std::this_thread::sleep_for(40ms);
-    impl->doWork(kSessionId, sink.fn());  // sweeps + poisons
-    sink.clear();
-    impl->doWork(kSessionId, sink.fn());  // observes poison, fails commit
+TEST(TransactionalProducerTest, AddPartitionsRetriesConcurrentTransactionsRegression) {
+    TxnRig r;
+    r.acquire();
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::AddPartitionsToTxn));
+    ASSERT_NE(corr, 0);
+    auto busy = makeAddPartitionsToTxnResponse(corr, ecOf(rpc::ErrorCode::ConcurrentTransactions));
+    r.impl->onAddPartitionsToTxnResponse(busy.data(), busy.size());
+    EXPECT_EQ(r.cycles(4, rpc::TemplateId::Produce), 0) << "no data while AddPartitions is retried";
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 2) << "27 re-sent the AddPartitions";
+    r.impl->onAddPartitionsToTxnResponse(busy.data(), busy.size());
+    ASSERT_EQ(r.cycles(2, rpc::TemplateId::AddPartitionsToTxn), 1);
+    r.addPartitionsOk();
+    EXPECT_EQ(r.cycles(1, rpc::TemplateId::Produce), 1) << "the record after its AddPartitions OK";
+}
 
-    // ---- CRITICAL: EndTxn must NOT be sent (would commit over lost data) ------
-    {
-        bool endTxnSent = false;
-        for (const auto& f : sink.frames) {
-            if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-                endTxnSent = true;
-                break;
-            }
+TEST(TransactionalProducerTest, AddOffsetsRetriesConcurrentTransactionsRegression) {
+    TxnRig r;
+    r.acquire();
+    r.tp.beginTransaction();
+    auto op = r.sendOffsets({{{42, 0}, 1}}, "g");
+    r.doWork();
+    const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::AddOffsetsToTxn));
+    auto busy = makeAddOffsetsToTxnResponse(corr, ecOf(rpc::ErrorCode::ConcurrentTransactions));
+    r.impl->onAddOffsetsToTxnResponse(busy.data(), busy.size());
+    EXPECT_FALSE(op.ready());
+    ASSERT_EQ(r.cycles(1, rpc::TemplateId::AddOffsetsToTxn), 1) << "27 re-sent the AddOffsets";
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::TxnOffsetCommit), 0);
+    auto ok = makeAddOffsetsToTxnResponse(corr);
+    r.impl->onAddOffsetsToTxnResponse(ok.data(), ok.size());
+    ASSERT_EQ(r.cycles(1, rpc::TemplateId::TxnOffsetCommit), 1);
+    auto done = makeTxnOffsetCommitResponse(corrIdOf(r.sink.last(rpc::TemplateId::TxnOffsetCommit)));
+    r.impl->onTxnOffsetCommitResponse(done.data(), done.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+}
+
+TEST(TransactionalProducerTest, TxnOffsetCommitRetriesConcurrentTransactionsRegression) {
+    TxnRig r;
+    r.acquire();
+    r.tp.beginTransaction();
+    auto op = r.sendOffsets({{{42, 0}, 1}}, "g");
+    r.doWork();
+    auto ok = makeAddOffsetsToTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::AddOffsetsToTxn)));
+    r.impl->onAddOffsetsToTxnResponse(ok.data(), ok.size());
+    r.doWork();
+    const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::TxnOffsetCommit));
+    ASSERT_NE(corr, 0);
+    auto busy = makeTxnOffsetCommitResponse(corr, ecOf(rpc::ErrorCode::ConcurrentTransactions));
+    r.impl->onTxnOffsetCommitResponse(busy.data(), busy.size());
+    EXPECT_FALSE(op.ready()) << "27 must not complete the op";
+    ASSERT_EQ(r.cycles(1, rpc::TemplateId::TxnOffsetCommit), 1) << "27 re-sent the TxnOffsetCommit";
+    auto done = makeTxnOffsetCommitResponse(corr);
+    r.impl->onTxnOffsetCommitResponse(done.data(), done.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+}
+
+// EndTxn is retried until 0 / 19 / 17 / 18: 27, and anything else (10
+// MinIsrViolation, 6 Internal), is retried; 19 completes BrokerError, 18
+// completes Fenced.
+TEST(TransactionalProducerTest, EndTxnRetriesConcurrentTransactionsUntilTerminalRegression) {
+    struct Case { int16_t terminal; OpStatus expect; };
+    for (const Case cs : {Case{0, OpStatus::Ok},
+                          Case{ecOf(rpc::ErrorCode::InvalidTxnState), OpStatus::BrokerError},
+                          Case{ecOf(rpc::ErrorCode::ProducerFenced), OpStatus::Fenced},
+                          Case{ecOf(rpc::ErrorCode::InvalidProducerEpoch), OpStatus::Fenced}}) {
+        SCOPED_TRACE(cs.terminal);
+        TxnRig r;
+        r.acquire();
+        r.tp.beginTransaction();
+        auto op = r.commit();
+        r.doWork();
+        const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::EndTxn));
+        for (const int16_t ec : {ecOf(rpc::ErrorCode::ConcurrentTransactions),
+                                 ecOf(rpc::ErrorCode::MinIsrViolation), ecOf(rpc::ErrorCode::Internal),
+                                 ecOf(rpc::ErrorCode::ConcurrentTransactions)}) {
+            auto resp = makeEndTxnResponse(corr, ec);
+            r.impl->onEndTxnResponse(resp.data(), resp.size());
+            ASSERT_FALSE(op.ready()) << "EndTxn completed on retriable code " << ec;
+            int waited = 0;
+            while (r.cycles(1, rpc::TemplateId::EndTxn) == 0) ASSERT_LE(++waited, 64);
         }
-        EXPECT_FALSE(endTxnSent)
-            << "TX-6b BUG: EndTxn(commit) was sent after an in-flight Produce batch "
-               "timed out without a durable ACK — the commit marker would be written "
-               "over data that never landed (flush-before-commit invariant broken).";
+        auto fin = makeEndTxnResponse(corr, cs.terminal);
+        r.impl->onEndTxnResponse(fin.data(), fin.size());
+        ASSERT_TRUE(op.ready());
+        EXPECT_EQ(op.status(), cs.expect);
+        if (cs.expect == OpStatus::BrokerError) EXPECT_EQ(op.c().errorCode, static_cast<uint16_t>(cs.terminal));
+        EXPECT_EQ(r.cycles(64, rpc::TemplateId::EndTxn), 0);
     }
-
-    // ---- The commit future must resolve with an EXCEPTION --------------------
-    ASSERT_EQ(commitFut.wait_for(0s), std::future_status::ready)
-        << "commitTransaction() future must resolve (with an exception) once the "
-           "txn is poisoned by a timed-out batch";
-    EXPECT_THROW(commitFut.get(), std::runtime_error)
-        << "commitTransaction() must throw when a data batch was not durably acked";
-    EXPECT_FALSE(tp.transactionActive())
-        << "the poisoned txn must no longer be active";
 }
 
 // ===========================================================================
-// Test 14: TX-6b BeginTransactionClearsPoisonFlag  (stuck-latch regression)
-//
-//   The stuck-latch scenario (without the fix):
-//     1. TXN-1 is active.  A Produce batch times out → sweepTimedOut() sets
-//        txnFailed_=true.  No commitTransaction() is called, so the EndTxn
-//        poison-check path (which already resets txnFailed_) is never reached.
-//     2. The app abandons TXN-1 (e.g. catches an error and retries).
-//     3. beginTransaction() is called for TXN-2.  Without the fix,
-//        beginTransaction() does NOT clear txnFailed_ — it is still true.
-//     4. TXN-2 sends a record that is promptly acked.
-//     5. commitTransaction() runs: txnFailed_=true && cmd==EndTxnCommit →
-//        SPURIOUS poison exception.  Producer must be reconstructed to recover.
-//
-//   With the fix:
-//     beginTransaction() resets txnFailed_=false (and addedPartitions_), so
-//     TXN-2's commit succeeds normally.
-//
-//   RED trigger: remove the `txnFailed_ = false` line from beginTransaction().
-//   GREEN criterion: TXN-2's commit resolves successfully + EndTxn(commit=1)
-//     was emitted on the wire.
-//
-//   The test also validates the EndTxn send-failure branch fix: the impl
-//   aborts TXN-1 via a failing send (sink.returnOk=false during EndTxn), which
-//   exercises the else-branch added by Fix 2.  Without Fix 2, txnActive_ would
-//   remain true after the send failure, leaving the producer wedged.
+// F14 — AddPartitions errors are no longer ignored
 // ===========================================================================
-TEST_F(TransactionalProducerTest, BeginTransactionClearsPoisonFlag)
-{
-    CaptureSink sink;
-    ProducerConfig cfg;
-    cfg.produceTimeoutMs = 20;  // expire in-flight batches quickly
-    auto impl = makeImpl("poison-reset-txn-id", cfg);
-    TransactionalProducer tp(impl);
 
-    // ---- Acquire producer identity ------------------------------------------
-    {
-        auto fut = tp.initTransactions();
-        impl->doWork(kSessionId, sink.fn());
-        ASSERT_GE(sink.frames.size(), 1u);
-        auto opt = rpc::InitProducerId::decode(sink.frames[0].data(), sink.frames[0].size());
-        ASSERT_TRUE(opt.has_value());
-        auto resp = makeInitProducerIdResponse(opt->correlationId, /*pid=*/42, /*epoch=*/0);
-        impl->onInitProducerIdResponse(resp.data(), resp.size());
-        ASSERT_EQ(fut.wait_for(0s), std::future_status::ready);
-        sink.clear();
+// A non-retriable AddPartitions error: the partition's records are NEVER
+// produced, later records for it are dropped, and a commit fails
+// (BrokerError with that code) instead of writing a marker over them; other
+// partitions are unaffected; the next transaction starts clean.
+TEST(TransactionalProducerTest, AddPartitionsErrorGatesPartitionDataRegression) {
+    TxnRig r;
+    r.acquire();
+    r.tp.beginTransaction();
+    const TopicHandle bad{9, 1};
+    const TopicHandle good{5, 1};
+    r.tp.send(bad, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.tp.send(good, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 2);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::Produce), 0) << "data before AddPartitions OK";
+    int64_t badCorr = 0, goodCorr = 0;
+    for (const auto& f : r.sink.frames) {
+        if (peekTemplate(f) != static_cast<uint16_t>(rpc::TemplateId::AddPartitionsToTxn)) continue;
+        auto ap = rpc::AddPartitionsToTxn::decode(f.data(), f.size());
+        ASSERT_TRUE(ap.has_value());
+        (ap->partitions[0].topicId == bad.topicId ? badCorr : goodCorr) = ap->correlationId;
     }
+    auto refused = makeAddPartitionsToTxnResponse(badCorr, ecOf(rpc::ErrorCode::UnknownTopic));
+    r.impl->onAddPartitionsToTxnResponse(refused.data(), refused.size());
+    auto okResp = makeAddPartitionsToTxnResponse(goodCorr);
+    r.impl->onAddPartitionsToTxnResponse(okResp.data(), okResp.size());
+    r.sink.clear();
+    r.tp.send(bad, Key(uint64_t{0}), std::span<const uint8_t>(kVal));  // dropped: partition refused
+    auto commit = r.commit();
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 1) << "only the accepted partition's record";
+    auto pv = rune::client::codec::decodeProduce(r.sink.last(rpc::TemplateId::Produce).data(),
+                                                 r.sink.last(rpc::TemplateId::Produce).size());
+    ASSERT_TRUE(pv.has_value());
+    EXPECT_EQ(pv->topicId, good.topicId);
+    EXPECT_EQ(r.impl->testWaitingRecords(), 0u);
+    auto ack = makeProduceResponse(collectProduceCorrIds(r.sink)[0], 0, 0);
+    r.impl->onProduceResponse(ack.data(), ack.size());
+    r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "a commit marker over a refused partition";
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::BrokerError);
+    EXPECT_EQ(commit.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic));
 
-    // ---- TXN-1: produce a batch, let it time out (sets txnFailed_) ----------
-    // We do NOT call commitTransaction() here — the app abandons TXN-1 without
-    // going through the poison-check path, so txnFailed_ is left dirty.
-    tp.beginTransaction();
-
-    TopicHandle topic{5, 1};
-    Key key(uint64_t{0});
-    const std::vector<uint8_t> val = {0xDE, 0xAD};
-
-    tp.send(topic, key, std::span<const uint8_t>(val));
-    // NO commitTransaction() — batch will just time out.
-
-    // First doWork: drains the send into an in-flight batch.
-    impl->doWork(kSessionId, sink.fn());
-    sink.clear();
-
-    // Wait for the batch to time out, then tick doWork to run sweepTimedOut().
-    // After this tick: txnFailed_=true (set by sweepTimedOut), txnActive_=true.
-    std::this_thread::sleep_for(40ms);
-    impl->doWork(kSessionId, sink.fn());  // sweeps expired batch → txnFailed_=true
-    sink.clear();
-
-    // txnActive_ is still true (no EndTxn was issued).  Now the app "abandons"
-    // TXN-1: exercises the EndTxn send-failure path (Fix 2) by attempting an
-    // abort with a failing transport.  This leaves txnActive_=false (with Fix 2).
-    {
-        sink.returnOk = false;  // make the EndTxn send fail
-        auto abortFut = tp.abortTransaction();
-        impl->doWork(kSessionId, sink.fn());  // EndTxn send fails → else-branch
-        sink.returnOk = true;
-
-        // With Fix 2: txnActive_=false, txnFailed_=false after the else-branch.
-        // The abort future must be resolved (with exception: send failed).
-        ASSERT_EQ(abortFut.wait_for(0s), std::future_status::ready)
-            << "TXN-1 abort: future must resolve after EndTxn send failure";
-        EXPECT_THROW(abortFut.get(), std::runtime_error)
-            << "TXN-1 abort: must throw on transport send failure";
-        // Fix 2 guarantees txnActive_ is false now.
-        EXPECT_FALSE(tp.transactionActive())
-            << "TXN-1: txnActive_ must be false after EndTxn send failure (Fix 2)";
-        sink.clear();
-    }
-
-    // Now deliberately SET txnFailed_ again to simulate it being dirty —
-    // the only way to do this in the in-process harness is to begin a new txn,
-    // send + timeout again, without issuing any EndTxn.
-    tp.beginTransaction();
-    tp.send(topic, key, std::span<const uint8_t>(val));
-    impl->doWork(kSessionId, sink.fn());   // Produce in-flight
-    sink.clear();
-    std::this_thread::sleep_for(40ms);
-    impl->doWork(kSessionId, sink.fn());   // sweepTimedOut → txnFailed_=true (again)
-    sink.clear();
-    // txnFailed_=true, txnActive_=true — this is the stuck-latch state.
-
-    // ---- TXN-2: beginTransaction() MUST clear txnFailed_ --------------------
-    // Without Fix 1 (beginTransaction reset), txnFailed_ stays true.
-    // With Fix 1, txnFailed_ is cleared and the subsequent healthy commit works.
-    tp.beginTransaction();
-    EXPECT_TRUE(tp.transactionActive());
-
-    tp.send(topic, key, std::span<const uint8_t>(val));
-    auto commitFut2 = tp.commitTransaction();
-
-    // First doWork for TXN-2: emits Produce, defers EndTxn.
-    impl->doWork(kSessionId, sink.fn());
-
-    std::vector<int64_t> prodCorrIds;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) {
-            auto opt = rpc::Produce::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            prodCorrIds.push_back(opt->correlationId);
-        }
-    }
-    ASSERT_EQ(prodCorrIds.size(), 1u) << "TXN-2: exactly one Produce frame expected";
-    sink.clear();
-
-    // Ack the Produce batch.
-    {
-        auto ack = makeProduceResponse(prodCorrIds[0], /*errorCode=*/0, /*baseOffset=*/10);
-        impl->onProduceResponse(ack.data(), ack.size(), sink.fn());
-    }
-    sink.clear();
-
-    // Next doWork: all batches acked → EndTxn(commit=1) MUST be emitted.
-    // Without Fix 1: txnFailed_=true → EndTxn is NOT sent; commitFut2 fails with
-    // "commit aborted — a data batch was not durably acknowledged" (spurious).
-    impl->doWork(kSessionId, sink.fn());
-
-    bool endTxnSent = false;
-    int64_t endTxnCorrId = 0;
-    for (const auto& f : sink.frames) {
-        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::EndTxn)) {
-            endTxnSent = true;
-            auto opt = rpc::EndTxn::decode(f.data(), f.size());
-            ASSERT_TRUE(opt.has_value());
-            endTxnCorrId = opt->correlationId;
-            EXPECT_EQ(opt->commit, uint8_t{1})
-                << "TXN-2: EndTxn must be a COMMIT — not a stuck-poison refusal";
-            break;
-        }
-    }
-    ASSERT_TRUE(endTxnSent)
-        << "TXN-2: EndTxn(commit=1) must be emitted. "
-           "FAIL here = beginTransaction() did NOT clear txnFailed_ (stuck-latch).";
-
-    // Feed EndTxnResponse → commit future must resolve successfully.
-    {
-        auto resp = makeEndTxnResponse(endTxnCorrId, /*errorCode=*/0);
-        impl->onEndTxnResponse(resp.data(), resp.size());
-    }
-
-    ASSERT_EQ(commitFut2.wait_for(0s), std::future_status::ready)
-        << "TXN-2: commit future must resolve after EndTxnResponse";
-    EXPECT_NO_THROW(commitFut2.get())
-        << "TXN-2: commit must SUCCEED — beginTransaction() cleared txnFailed_ (Fix 1). "
-           "A throw here means the stuck-poison latch was NOT fixed.";
-    EXPECT_FALSE(tp.transactionActive())
-        << "TXN-2: txn must be inactive after successful commit";
+    // The next transaction starts clean: the partition is added again.
+    r.sink.clear();
+    r.tp.beginTransaction();
+    r.tp.send(bad, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 1);
+    r.addPartitionsOk();
+    EXPECT_EQ(r.cycles(1, rpc::TemplateId::Produce), 1);
 }
 
 // ===========================================================================
-// Task 13 fix1 I8: TransactionalProducer::send on an invalid topic must never
-// be silently dropped — it throws (TransactionalProducer has no callback to
-// report through, unlike Producer::send's opt-in overloads).
+// F14 — NotCoordinator: re-discover, then retry
 // ===========================================================================
-TEST_F(TransactionalProducerTest, SendOnInvalidTopicThrowsRegression)
-{
-    auto impl = makeImpl();
-    TransactionalProducer tp(impl);
-    const std::vector<uint8_t> val{1, 2, 3};
-    EXPECT_THROW(tp.send(TopicHandle{}, Key(uint64_t{1}), std::span<const uint8_t>(val)),
-                 std::invalid_argument);
+
+// NotCoordinator never just re-sends into the same (loading / moved)
+// coordinator: it asks the Client to re-discover (once per generation, however
+// many requests wait), waits for the re-discovery, then backs off and re-sends.
+// For every request type.
+TEST(TransactionalProducerTest, NotCoordinatorRediscoversThenRetriesRegression) {
+    TxnRig r;
+    const int16_t nc = ecOf(rpc::ErrorCode::NotCoordinator);
+    // InitProducerId
+    auto init = r.init();
+    r.doWork();
+    const int64_t ic = corrIdOf(r.sink.last(rpc::TemplateId::InitProducerId));
+    auto ncInit = makeInitProducerIdResponse(ic, -1, 0, nc);
+    r.impl->onInitProducerIdResponse(ncInit.data(), ncInit.size());
+    EXPECT_EQ(r.rediscovers, 1);
+    EXPECT_EQ(r.cycles(2'048, rpc::TemplateId::InitProducerId), 0) << "re-sent before the re-discovery";
+    r.impl->onCoordinatorRediscovered();
+    ASSERT_EQ(r.cycles(2, rpc::TemplateId::InitProducerId), 1) << "not re-sent after the re-discovery";
+    auto ok = makeInitProducerIdResponse(ic, 5, 0);
+    r.impl->onInitProducerIdResponse(ok.data(), ok.size());
+    ASSERT_TRUE(init.ready());
+    EXPECT_EQ(init.status(), OpStatus::Ok);
+
+    // AddPartitions + AddOffsets wait on ONE re-discovery.
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    auto offs = r.sendOffsets({{{42, 0}, 1}}, "g");
+    r.doWork();
+    const int64_t apc = corrIdOf(r.sink.last(rpc::TemplateId::AddPartitionsToTxn));
+    const int64_t aoc = corrIdOf(r.sink.last(rpc::TemplateId::AddOffsetsToTxn));
+    auto ncAp = makeAddPartitionsToTxnResponse(apc, nc);
+    auto ncAo = makeAddOffsetsToTxnResponse(aoc, nc);
+    r.impl->onAddPartitionsToTxnResponse(ncAp.data(), ncAp.size());
+    r.impl->onAddOffsetsToTxnResponse(ncAo.data(), ncAo.size());
+    EXPECT_EQ(r.rediscovers, 2) << "one re-discovery request per generation";
+    r.sink.clear();
+    EXPECT_EQ(r.cycles(64, rpc::TemplateId::AddPartitionsToTxn), 0);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::AddOffsetsToTxn), 0);
+    r.impl->onCoordinatorRediscovered();
+    r.cycles(2, rpc::TemplateId::AddPartitionsToTxn);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::AddPartitionsToTxn), 1);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::AddOffsetsToTxn), 1);
+    r.addPartitionsOk();
+    auto aoOk = makeAddOffsetsToTxnResponse(aoc);
+    r.impl->onAddOffsetsToTxnResponse(aoOk.data(), aoOk.size());
+    r.doWork();
+    // TxnOffsetCommit
+    const int64_t occ = corrIdOf(r.sink.last(rpc::TemplateId::TxnOffsetCommit));
+    ASSERT_NE(occ, 0);
+    auto ncOc = makeTxnOffsetCommitResponse(occ, nc);
+    r.impl->onTxnOffsetCommitResponse(ncOc.data(), ncOc.size());
+    EXPECT_EQ(r.rediscovers, 3);
+    EXPECT_EQ(r.cycles(64, rpc::TemplateId::TxnOffsetCommit), 0);
+    r.impl->onCoordinatorRediscovered();
+    ASSERT_EQ(r.cycles(4, rpc::TemplateId::TxnOffsetCommit), 1);
+    auto ocOk = makeTxnOffsetCommitResponse(occ);
+    r.impl->onTxnOffsetCommitResponse(ocOk.data(), ocOk.size());
+    ASSERT_TRUE(offs.ready());
+    EXPECT_EQ(offs.status(), OpStatus::Ok);
+    // Ack the record, then EndTxn hits a loading coordinator.
+    for (int64_t id : collectProduceCorrIds(r.sink)) {
+        auto a = makeProduceResponse(id, 0, 0);
+        r.impl->onProduceResponse(a.data(), a.size());
+    }
+    auto commit = r.commit();
+    r.doWork();
+    const int64_t ec = corrIdOf(r.sink.last(rpc::TemplateId::EndTxn));
+    ASSERT_NE(ec, 0);
+    auto ncEt = makeEndTxnResponse(ec, nc);
+    r.impl->onEndTxnResponse(ncEt.data(), ncEt.size());
+    EXPECT_EQ(r.rediscovers, 4);
+    EXPECT_EQ(r.cycles(64, rpc::TemplateId::EndTxn), 0);
+    r.impl->onCoordinatorRediscovered();
+    ASSERT_EQ(r.cycles(8, rpc::TemplateId::EndTxn), 1);
+    auto etOk = makeEndTxnResponse(ec, 0);
+    r.impl->onEndTxnResponse(etOk.data(), etOk.size());
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
 }
+
+// A request in flight when the session changes gets no answer on the old
+// one: it is re-sent, re-stamped, on the new session (same correlationId).
+TEST(TransactionalProducerTest, InFlightRequestIsResentOnANewSessionRegression) {
+    TxnRig r;
+    auto op = r.init();
+    r.doWork();
+    const auto first = r.sink.last(rpc::TemplateId::InitProducerId);
+    r.sink.clear();
+    r.impl->doWork(r.now, kSessionId + 1, r.sink.fn());
+    const auto again = r.sink.last(rpc::TemplateId::InitProducerId);
+    ASSERT_FALSE(again.empty()) << "not re-sent on the new session";
+    auto h = rpc::MessageHeader::decode(again.data(), again.size());
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->sessionId, kSessionId + 1);
+    EXPECT_EQ(h->correlationId, corrIdOf(first));
+    auto ok = makeInitProducerIdResponse(h->correlationId, 1, 0);
+    r.impl->onInitProducerIdResponse(ok.data(), ok.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+}
+

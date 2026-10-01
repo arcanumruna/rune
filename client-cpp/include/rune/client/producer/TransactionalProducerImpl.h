@@ -1,91 +1,115 @@
 // include/rune/client/producer/TransactionalProducerImpl.h
 //
-// TX-5 (fix-round 1) — TransactionalProducerImpl: agent-side state for Tier-3
-// transactional produce + idempotent-by-default sequencing.
+// TX-5 / F8c C5 / F14 — TransactionalProducerImpl: the DUTY-side state of a
+// Tier-3 transactional producer (idempotent-by-default sequencing).
 //
-// Threading model (DR-BUG-1 discipline):
-//   App threads:  submit commands via cmdQueue_ / pendingSends_ (mutex-guarded cold path).
-//   Agent thread: drain queues, emit protocol frames, resolve futures/callbacks.
-//   No lock on the hot frame encode/send path (single-writer: agent).
+// Threading (F8c C5 — shared-nothing; no atomics, no mutex, no future):
+//   * EVERY field below is owned by the duty thread (the Thread-mode runner,
+//     or the Invoker owner inside doWork()).  App threads never touch it:
+//     the TransactionalProducer handle hands each operation to the duty thread
+//     as a detail::HubCommand (Txn*) through the agent command ring — or
+//     applies it directly when called ON the duty thread — and the duty thread
+//     calls applyCommand().  Payloads (a send record, a sendOffsets map) travel
+//     as heap holders whose ownership passes with the command.
+//   * Results reach the app as completions (rune/client/Completion.h) through
+//     the CompletionSink (the Client's completion-queue registry); producer
+//     identity / txn state reach app threads only through `status` (a
+//     StatusRing the duty thread publishes into; the handle drains it).
 //
-// Idempotent sequence (CRITICAL 1 fix):
-//   Once producerId >= 0, every TxnPartitionState carries a monotonic nextBaseSequence
-//   stamped into the RecordBatch.  Produce frames are sent with a real correlationId
-//   and acks=cfg_.acks so the broker returns a ProduceResponse.  On success the
-//   sequence advances.  On retriable error the SAME in-flight batch (same wire
-//   frame, same baseSequence) is re-sent unchanged — the broker deduplicates via
-//   (producerId, partition, baseSequence).  On OutOfOrderSequence or
-//   InvalidProducerEpoch/ProducerFenced the producer is fenced.
+// F14 (broker F15 design §11) — retriable coordinator errors:
+//   * every pending txn request is a retained descriptor TxnRequest
+//     {kind, encoded frame, attempt, state}, owned by the duty thread;
+//   * ConcurrentTransactions (27) on InitProducerId / AddPartitionsToTxn /
+//     AddOffsetsToTxn / TxnOffsetCommit / EndTxn: re-sent after
+//     min(2^attempt, kRetryBackoffCapCycles) duty cycles (no wall-clock sleep;
+//     the only time bound is the op's own deadline);
+//   * NotCoordinator (14): re-discover the coordinator (the Client sends a
+//     MetadataRequest), then — once a MetadataResponse arrived — back off and
+//     re-send (also while a new coordinator is still loading);
+//   * EndTxn is retried until it gets 0 (Ok), 19 (InvalidTxnState ->
+//     BrokerError) or 17 / 18 (fenced);
+//   * AddPartitionsToTxn errors are no longer ignored: a record for partition p
+//     is produced only after p's AddPartitions result is OK; a non-retriable
+//     error poisons the transaction (its records are dropped, a commit fails).
+//   * A request whose session changed while it was in flight is re-sent on the
+//     new session (re-stamped; same correlationId — every txn request is
+//     idempotent at the coordinator, produce batches dedup by sequence).
 //
-// Fencing:
-//   On any response with errorCode ∈ {InvalidProducerEpoch, ProducerFenced},
-//   producerId_ is reset to -1 and all pending futures are failed with a
-//   ProducerFenced error.  The caller MUST call initTransactions() again.
-//
-// Timeout sweep:
-//   doWork() sweeps both pendingOps_ and pendingProduceBatches_ for expired
-//   deadlines.  Expired ops fail their futures with a timeout error.  Expired
-//   in-flight produce batches are silently dropped (no caller future to fail —
-//   the batch will not be retried and a subsequent EndTxn or abort is expected
-//   to clean up the transaction).
+// Fencing: ProducerFenced / InvalidProducerEpoch (and OutOfOrderSequence on a
+// produce) reset the identity; every pending op completes OpStatus::Fenced.
 
 #pragma once
 
-#include <rune/client/producer/TransactionalProducer.h>
-#include <rune/client/producer/ProducerImpl.h>    // ProducerConfig, PartitionState helpers
+#include <rune/client/Completion.h>
+#include <rune/client/Key.h>
+#include <rune/client/producer/Producer.h>    // ProducerConfig, Acks
+#include <rune/client/producer/TransactionalProducer.h>  // TopicPartitionKey
+#include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/OpTarget.h>
+#include <rune/client/detail/StatusRing.h>
 
 #include <rune/protocol/client/TxnMessages.h>
-#include <rune/protocol/RecordBatch.h>
 
-#include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
-#include <future>
 #include <map>
-#include <memory>
-#include <mutex>
-#include <set>
 #include <span>
 #include <string>
-#include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace rune::client::producer {
 
+/// A transactional send handed to the duty thread (HubCommand::TxnSend, d).
+struct TxnSendRecord {
+    int32_t              topicId   = 0;
+    int32_t              partition = 0;
+    Key                  key;
+    std::vector<uint8_t> value;
+};
+
+/// sendOffsetsToTransaction()'s payload (HubCommand::TxnSendOffsets, d).
+struct TxnOffsetsPayload {
+    std::string                                        groupId;
+    std::map<rune::client::TopicPartitionKey, int64_t> offsets;
+};
+
+/// Duty thread -> app handle snapshot.
+struct TxnStatus {
+    int64_t producerId    = -1;
+    int16_t producerEpoch = 0;
+    uint8_t txnActive     = 0;
+    uint8_t pad[5]{};
+};
+
 // ---------------------------------------------------------------------------
-// TxnPartitionState — per-(topicId,partition) accumulator for txn producer.
-//   Shares the idempotent sequence numbering with Tier-1.
+// TxnPartitionState — per-(topicId, partition) sequencing + the F14 gate.
 // ---------------------------------------------------------------------------
 struct TxnPartitionState {
     int32_t topicId          = 0;
     int32_t partition        = 0;
     int32_t nextBaseSequence = 0;  // monotonic idempotent seq
-    bool    addedToTxn       = false; // true once AddPartitionsToTxn was emitted
+    /// F14: in the current transaction.  Records wait until Added.
+    enum class Add : uint8_t { NotAdded, Adding, Added, Failed };
+    Add                       add = Add::NotAdded;
+    std::deque<TxnSendRecord> waiting;  // not yet produced (FIFO)
 
     TxnPartitionState() = default;
     TxnPartitionState(int32_t tid, int32_t p) : topicId(tid), partition(p) {}
 };
 
-// ---------------------------------------------------------------------------
-// PendingTxnOp — a pending async operation (future-backed).
-// ---------------------------------------------------------------------------
-struct PendingTxnOp {
-    enum class Kind { InitProducerId, EndTxn, SendOffsets };
-    Kind                 kind;
-    std::promise<void>   promise;
-    std::chrono::steady_clock::time_point deadline;
-};
-
-// ---------------------------------------------------------------------------
-// TransactionalProducerImpl — internal state owned behind TransactionalProducer.
-//
-// Agent thread drives all sends; app thread enqueues via submitXxx() methods.
-// ---------------------------------------------------------------------------
 class TransactionalProducerImpl {
 public:
-    static constexpr int64_t kNoPid = -1;
+    static constexpr int64_t  kNoPid = -1;
+    /// F14: the retry backoff cap, in duty cycles.
+    static constexpr uint32_t kRetryBackoffCapCycles = 1024;
+
+    using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
+    /// Asks the Client to re-discover the transaction coordinator (send a
+    /// MetadataRequest); onCoordinatorRediscovered() reports the answer.
+    using RediscoverFn = void (*)(void* ctx) noexcept;
 
     explicit TransactionalProducerImpl(
         std::string transactionalId,
@@ -95,228 +119,187 @@ public:
 
     ~TransactionalProducerImpl() = default;
 
-    // Non-copyable / non-movable.
     TransactionalProducerImpl(const TransactionalProducerImpl&) = delete;
     TransactionalProducerImpl& operator=(const TransactionalProducerImpl&) = delete;
     TransactionalProducerImpl(TransactionalProducerImpl&&) = delete;
     TransactionalProducerImpl& operator=(TransactionalProducerImpl&&) = delete;
 
-    // ---- App-thread: submit commands (wait-free ring writes) ----------------
+    // ---- Wiring (before the impl is published to the duty thread) -----------
+    void setCompletionSink(detail::CompletionSink sink) noexcept { completions_ = sink; }
+    void setRediscoverHook(RediscoverFn fn, void* ctx) noexcept { rediscover_ = fn; rediscoverCtx_ = ctx; }
 
-    /// Submit InitProducerId request. Returns a future resolved on response.
-    std::future<void> submitInitTransactions();
+    // ---- Duty thread ----------------------------------------------------------
 
-    /// Mark beginTransaction (local state change — no wire message).
-    void beginTransaction();
+    /// Apply one Txn* HubCommand (takes ownership of its payload).  `nowNs`:
+    /// the duty clock (an op's deadline starts here).  After failAll() every
+    /// command is discarded (its op completes Closed).
+    void applyCommand(const detail::HubCommand& cmd, int64_t nowNs);
 
-    /// Submit a transactional send (enqueues SEND_RECORD to ring).
-    /// Auto AddPartitionsToTxn is emitted by the agent on first send to a partition.
-    void submitSend(int32_t topicId,
-                    int32_t partition,
-                    const Key& key,
-                    std::span<const uint8_t> value);
+    /// A Txn* command for a producer the duty side does not hold (or after
+    /// close): free its payload, complete its op Closed.
+    static void discardCommand(const detail::HubCommand& cmd, const detail::CompletionSink& sink);
 
-    /// Submit sendOffsetsToTransaction: emits AddOffsetsToTxn + TxnOffsetCommit.
-    std::future<void> submitSendOffsets(
-        const std::map<rune::client::TopicPartitionKey, int64_t>& offsets,
-        const std::string& groupId);
+    /// True for the Txn* HubCommand ops.
+    [[nodiscard]] static bool isTxnOp(detail::HubCommand::Op op) noexcept;
 
-    /// Submit EndTxn(commit).  Returns future resolved on EndTxnResponse.
-    std::future<void> submitCommit();
+    /// One duty cycle: deadlines, re-sends, AddPartitions, produce, EndTxn.
+    /// `sessionId` 0 = not connected (nothing is sent; deadlines still run).
+    int doWork(int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
 
-    /// Submit EndTxn(abort).  Returns future resolved on EndTxnResponse.
-    std::future<void> submitAbort();
-
-    // ---- Accessors (may be called from any thread — atomic reads) -----------
-
-    [[nodiscard]] int64_t producerId() const noexcept {
-        return producerId_.load(std::memory_order_acquire);
-    }
-    [[nodiscard]] int16_t producerEpoch() const noexcept {
-        return producerEpoch_.load(std::memory_order_acquire);
-    }
-    [[nodiscard]] bool transactionActive() const noexcept {
-        return txnActive_.load(std::memory_order_acquire);
-    }
-
-    // ---- Agent-thread: duty cycle ------------------------------------------
-
-    /// Drain the command ring and process pending frames.
-    /// sendFn: (ingressStreamId, buf, len) -> bool.
-    ///   ingressStreamId=0 = default ingress stream.
-    ///   Matches ClientAgent::SendFn so Task 1.3 can route txn frames to
-    ///   the coordinator session without an adapter at every call site.
-    /// Returns work count.
-    int doWork(int64_t sessionId,
-               const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
-
-    /// Called when InitProducerIdResponse (templateId 46) arrives.
     void onInitProducerIdResponse(const uint8_t* buf, std::size_t len);
-
-    /// Called when AddPartitionsToTxnResponse (templateId 48) arrives.
     void onAddPartitionsToTxnResponse(const uint8_t* buf, std::size_t len);
-
-    /// Called when AddOffsetsToTxnResponse (templateId 50) arrives.
-    void onAddOffsetsToTxnResponse(const uint8_t* buf, std::size_t len,
-                                    int64_t sessionId,
-                                    std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
-
-    /// Called when TxnOffsetCommitResponse (templateId 52) arrives.
+    void onAddOffsetsToTxnResponse(const uint8_t* buf, std::size_t len);
     void onTxnOffsetCommitResponse(const uint8_t* buf, std::size_t len);
-
-    /// Called when EndTxnResponse (templateId 54) arrives.
     void onEndTxnResponse(const uint8_t* buf, std::size_t len);
+    /// ProduceResponse for a txn produce: Ok removes the batch; a retriable
+    /// error re-sends the SAME frame (same baseSequence) on the next cycle;
+    /// OutOfOrderSequence / fencing errors fence.
+    void onProduceResponse(const uint8_t* buf, std::size_t len);
 
-    /// Called when ProduceResponse (templateId 17) arrives for a txn produce.
-    /// On success: removes in-flight batch, future resolved if any.
-    /// On retriable error: re-sends the same wire frame (same baseSequence).
-    /// On fencing error: calls handleFencing().
-    void onProduceResponse(const uint8_t* buf, std::size_t len,
-                           std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
+    /// F14: a MetadataResponse arrived — requests waiting for coordinator
+    /// re-discovery back off and re-send.
+    void onCoordinatorRediscovered() noexcept { ++discoveryGen_; }
 
-    /// Fail all pending ops (called on close). Also markClosed(reason).
-    void failAll(const std::string& reason);
+    /// Client close: every pending op completes Closed, every request / batch
+    /// / waiting record is dropped, the status channel is finished.  Later
+    /// commands are discarded.
+    void failAll();
 
-    /// fix5 (txn symmetry with ProducerImpl::markRingClosed): any thread. Fails
-    /// every queued-but-undrained command and drops queued sends, and makes
-    /// every LATER submit fail at once — command futures with
-    /// std::runtime_error(reason), submitSend() with std::logic_error("client
-    /// closed") — instead of queueing work no duty cycle will ever process.
-    /// Touches only the two app-facing queues, under their existing mutexes
-    /// (the closed flags are plain bools guarded by those same mutexes — no new
-    /// atomic); duty-thread state (pendingOps_ etc.) is left to failAll().
-    void markClosed(const std::string& reason);
+    // ---- Duty-thread reads (a duty-cycle callback; tests) ---------------------
+    [[nodiscard]] int64_t producerIdDuty() const noexcept { return producerId_; }
+    [[nodiscard]] int16_t producerEpochDuty() const noexcept { return producerEpoch_; }
+    [[nodiscard]] bool    transactionActiveDuty() const noexcept { return txnActive_; }
+    [[nodiscard]] bool    closedDuty() const noexcept { return closed_; }
+
+    // ---- Test hooks (duty thread) ---------------------------------------------
+    [[nodiscard]] std::size_t testPendingRequests() const noexcept { return reqs_.size(); }
+    [[nodiscard]] std::size_t testPendingOps() const noexcept { return ops_.size(); }
+    [[nodiscard]] std::size_t testInFlightBatches() const noexcept { return batches_.size(); }
+    [[nodiscard]] std::size_t testWaitingRecords() const noexcept;
+    /// The correlationId of the (single) pending request of `kind` (0: none).
+    [[nodiscard]] int64_t testRequestCorrId(uint8_t kind) const noexcept;
+
+    // ---- App side ---------------------------------------------------------------
+    /// Duty -> app snapshots (producer id / epoch / txn active).  Closed by
+    /// failAll(); abandoned by the Client when the registration was refused.
+    detail::StatusRing<TxnStatus, 256> status;
+    /// App-owned: the latest snapshot drained by the handle (one app thread).
+    TxnStatus appStatusCache{};
+
+    /// The F14 request kinds (testRequestCorrId's `kind`).
+    enum class ReqKind : uint8_t { InitProducerId, AddPartitions, AddOffsets, TxnOffsetCommit, EndTxn };
 
 private:
-    // ---- Internal command types in the ring ---------------------------------
-    // We reuse the same ring as the Tier-1 ProducerImpl for SEND_RECORD.
-    // Additional commands are queued in a separate atomic command queue (cold path).
+    // ---- F14 retained request descriptor (duty thread) -----------------------
+    struct TxnRequest {
+        struct Unsent {};                                    // offered on the next cycle
+        struct InFlight { int64_t sessionId = 0; };          // offered; awaiting its response
+        struct Backoff { uint32_t cyclesLeft = 0; };         // 27 / transient: wait N cycles
+        struct AwaitCoordinator { uint64_t discoveryGen = 0; };  // 14: wait for re-discovery
+        using State = std::variant<Unsent, InFlight, Backoff, AwaitCoordinator>;
 
-    // ---- Internal helpers (agent thread) ------------------------------------
+        ReqKind              kind = ReqKind::InitProducerId;
+        int64_t              corrId = 0;
+        std::vector<uint8_t> frame;    // encoded; sessionId re-stamped at each (re)send
+        uint32_t             attempt = 0;
+        uint64_t             opId = 0;  // the user op it serves (0: AddPartitions)
+        rune::client::TopicPartitionKey tp{};  // AddPartitions
+        int64_t              deadlineNs = 0;   // AddPartitions (ops carry their own)
+        State                state = Unsent{};
+    };
 
-    TxnPartitionState& getOrCreatePartition(int32_t topicId, int32_t partition);
+    // ---- User ops (one completion each; duty thread) ------------------------
+    struct UserOp {
+        struct Init { int64_t corrId = 0; };
+        struct AddOffsets { int64_t corrId = 0; };
+        struct CommitOffsets { int64_t corrId = 0; };
+        struct AwaitData {};                     // EndTxn: waiting for every record to be acked
+        struct Ending { int64_t corrId = 0; };   // EndTxn sent
+        using Phase = std::variant<Init, AddOffsets, CommitOffsets, AwaitData, Ending>;
 
-    // TX-6 ordering fix: drain pending transactional sends (Produce frames).
-    // Called from doWork() BEFORE the command queue so data batches always
-    // precede an EndTxn on the ordered publication.  Accumulates into `work`.
-    void drainPendingSends(int64_t sessionId,
-                           const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn,
-                           int& work);
+        uint64_t          id = 0;
+        OpKind            kind = OpKind::InitTransactions;
+        detail::OpTarget  target{};
+        Token             token = 0;
+        int64_t           deadlineNs = 0;
+        bool              commit = false;        // EndTxn
+        TxnOffsetsPayload offsets;               // SendOffsets
+        Phase             phase = Init{};
+    };
 
-    bool sendInitProducerId(int64_t sessionId, int64_t corrId,
-                            const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+    // ---- In-flight produce batches (retained for idempotent re-send) ---------
+    struct InFlightBatch {
+        int32_t              topicId = 0;
+        int32_t              partition = 0;
+        int32_t              baseSequence = 0;
+        std::vector<uint8_t> wireFrame;          // sessionId re-stamped on (re)send
+        int32_t              retryCount = 0;
+        static constexpr int kMaxRetries = 5;
+        int64_t              deadlineNs = 0;     // duty clock
+        int64_t              sentSessionId = 0;  // 0: not on the wire (re-sent next cycle)
+    };
 
-    bool sendAddPartitionsToTxn(int64_t sessionId, int64_t corrId,
-                                 const std::vector<rune::protocol::client::TxnTopicPartition>& parts,
-                                 const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+    enum class Verdict : uint8_t { Ok, Retry, Rediscover, Fenced, Fail };
+    [[nodiscard]] static Verdict classify_(ReqKind kind, int16_t errorCode) noexcept;
 
-    bool sendEndTxn(int64_t sessionId, int64_t corrId, bool commit,
-                    const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
+    // ---- helpers ----------------------------------------------------------------
+    void complete_(UserOp& op, OpStatus st, uint16_t errorCode = 0, std::string_view text = {});
+    void completeAndErase_(uint64_t opId, OpStatus st, uint16_t errorCode = 0, std::string_view text = {});
+    UserOp*     findOp_(uint64_t id) noexcept;
+    TxnRequest* findReq_(int64_t corrId) noexcept;
+    void eraseReq_(int64_t corrId) noexcept;
+    void eraseReqsOf_(uint64_t opId) noexcept;
+    int64_t addRequest_(ReqKind kind, uint64_t opId, int64_t deadlineNs);  // encodes; Unsent
+    bool encode_(TxnRequest& r, const UserOp* op);
+    void retry_(TxnRequest& r, Verdict v);
+    void handleFencing_();
+    void poison_(uint16_t errorCode);
+    void resetTxn_();
+    void publishStatus_();
+    TxnPartitionState& partition_(int32_t topicId, int32_t partition);
+    void produce_(TxnPartitionState& ps, TxnSendRecord& rec, int64_t nowNs, int64_t sessionId,
+                  const SendFn& sendFn, int& work);
+    bool sendFrame_(std::vector<uint8_t>& frame, int64_t sessionId, const SendFn& sendFn);
+    void sweep_(int64_t nowNs);
+    bool dataSettled_() const noexcept;
+    void gateEndTxn_(int64_t nowNs);
 
-    bool sendAddOffsetsToTxn(int64_t sessionId, int64_t corrId,
-                              std::span<const uint8_t> groupIdSpan,
-                              const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
-
-    bool sendTxnOffsetCommit(int64_t sessionId, int64_t corrId,
-                              std::span<const uint8_t> groupIdSpan,
-                              const std::vector<rune::protocol::client::TxnOffsetCommitEntry>& entries,
-                              const std::function<bool(int32_t, const uint8_t*, std::size_t)>& sendFn);
-
-    void handleFencing(int16_t errorCode);
-
-    // Sweep pendingOps_ for expired deadlines; fail those futures with timeout.
-    void sweepTimedOut();
-
-    // ---- State (agent-thread writes; some atomics for app-thread reads) -----
-
+    // ---- configuration --------------------------------------------------------
     std::string    transactionalId_;
     ProducerConfig cfg_;
     int32_t        transactionTimeoutMs_;
+    int64_t&       nextCorrId_;  // the Client's duty-owned correlation counter
 
-    // Shared correlationId counter with other client ops (F8c C3: the
-    // Client's duty-owned plain counter — drawn only on the duty thread, in
-    // doWork() and the response handlers).
-    int64_t& nextCorrId_;
+    detail::CompletionSink completions_{};
+    RediscoverFn           rediscover_    = nullptr;
+    void*                  rediscoverCtx_ = nullptr;
 
-    // Idempotent producer identity (acquired via InitProducerId).
-    // Stored atomically so accessors can read from any thread.
-    std::atomic<int64_t> producerId_     {kNoPid};
-    std::atomic<int16_t> producerEpoch_  {0};
+    // ---- duty-thread state ------------------------------------------------------
+    int64_t  producerId_    = kNoPid;
+    int16_t  producerEpoch_ = 0;
+    bool     txnActive_     = false;
+    /// TX-6b: a record of the current txn will never be durable (a batch
+    /// dropped, an AddPartitions refused): a commit must fail.  failCode_: the
+    /// broker error (0: a delivery failure).
+    bool     txnFailed_     = false;
+    uint16_t failCode_      = 0;
+    bool     closed_        = false;
 
-    // Transaction state (agent-thread only; atomic for app-thread read).
-    std::atomic<bool>    txnActive_      {false};
+    uint64_t nextOpId_      = 1;
+    uint64_t discoveryGen_  = 0;
+    uint64_t rediscoverRequestedGen_ = ~uint64_t{0};
+    int64_t  lastSessionId_ = 0;
+    int64_t  lastNowNs_     = 0;
 
-    // TX-6b: set when an in-flight Produce batch of the current transaction is
-    // dropped without a durable ACK (produceTimeout expiry or retry exhaustion).
-    // A pending EndTxnCommit MUST NOT be sent once this is true — the
-    // flush-before-commit invariant is violated, so the commit is failed with an
-    // exception instead (matching Kafka: a failed send poisons commitTransaction()).
-    // Agent-thread only; cleared when a new transaction begins.
-    bool                 txnFailed_      {false};
-
-    // Partitions added to the current transaction (agent-thread only).
-    std::set<rune::client::TopicPartitionKey> addedPartitions_;
-
-    // Per-(topicId,partition) sequence state (agent-thread only).
+    std::vector<UserOp>     ops_;   // apply order
+    std::vector<TxnRequest> reqs_;  // creation order
     std::map<rune::client::TopicPartitionKey, TxnPartitionState> partitions_;
+    std::map<int64_t, InFlightBatch> batches_;  // corrId -> in-flight batch
 
-    // Pending send records: app thread appends, agent thread drains.
-    struct SendRecord {
-        int32_t              topicId;
-        int32_t              partition;
-        Key                  key;
-        std::vector<uint8_t> value;
-    };
+    TxnStatus statusLast_{};
+    bool      statusDirty_ = false;
 
-    // SendOffsets state: waiting for AddOffsetsToTxn response before TxnOffsetCommit.
-    struct PendingOffsetOp {
-        std::string                                       groupId;
-        std::map<rune::client::TopicPartitionKey, int64_t> offsets;
-        int64_t                                           corrId = 0;
-        std::promise<void>                                promise;
-    };
-    std::unique_ptr<PendingOffsetOp> pendingOffsetOp_;
-
-    // Pending async ops keyed by correlationId (agent-thread only).
-    std::map<int64_t, PendingTxnOp> pendingOps_;
-
-    // In-flight produce batches keyed by correlationId (agent-thread only).
-    // Retained so that on retry the SAME wire frame (same baseSequence) can be
-    // re-sent without rebuilding the batch.
-    struct InFlightBatch {
-        int32_t              topicId;
-        int32_t              partition;
-        int32_t              baseSequence; // the sequence stamped in the batch header
-        std::vector<uint8_t> wireFrame;    // encoded Produce frame bytes for re-send
-        int32_t              retryCount = 0;
-        static constexpr int kMaxRetries = 5;
-        std::chrono::steady_clock::time_point deadline; // set at send time; swept by sweepTimedOut()
-    };
-    std::map<int64_t, InFlightBatch> pendingProduceBatches_; // corrId → in-flight batch
-
-    // Encode scratch buffers (agent-thread; no alloc on hot path).
-    std::vector<uint8_t> encodeScratch_;
     std::vector<uint8_t> batchScratch_;
-
-    // Command queue from app thread → agent thread (mutex-guarded cold path).
-    // Commands: InitTransactions, EndTxn(commit), EndTxn(abort), SendOffsets.
-    enum class CmdKind { InitTransactions, EndTxnCommit, EndTxnAbort, SendOffsets, SendRecord };
-    struct Command {
-        CmdKind kind = CmdKind::InitTransactions;
-        // for SendOffsets:
-        std::string                                       groupId;
-        std::map<rune::client::TopicPartitionKey, int64_t> offsets;
-        std::promise<void>                                promise;
-    };
-    std::mutex           cmdMtx_;
-    std::vector<Command> cmdQueue_;    // app threads push, agent drains
-    bool                 cmdsClosed_ = false;  // fix5: guarded by cmdMtx_
-    std::string          closedReason_;        // fix5: guarded by cmdMtx_
-
-    // Pending sends queue (separate from cmdQueue_ to avoid extra lock on send path).
-    std::mutex               pendingSendsMtx_;
-    std::vector<SendRecord>  pendingSends_;
-    bool                     sendsClosed_ = false;  // fix5: guarded by pendingSendsMtx_
 };
 
 } // namespace rune::client::producer

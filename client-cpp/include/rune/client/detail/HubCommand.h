@@ -63,6 +63,21 @@ struct HubCommand {
         /// a (0 onConnected, 1 onDisconnected, 2 onError); ownership passes to
         /// the duty thread, which installs it and frees the holder (C3).
         ClientSetCallback = 22,
+
+        // ---- TransactionalProducer (F8c C5) ------------------------------------
+        // handle = TransactionalProducerImpl* (identity; resolved against the
+        // Client's own list on the ring path, never dereferenced unless found).
+        // Token ops: a = Token, b / c = completion target (encodeTarget).
+        /// InitProducerId.
+        TxnInit         = 30,
+        /// beginTransaction (no completion).
+        TxnBegin        = 31,
+        /// d = heap producer::TxnSendRecord* (ownership passes; no completion).
+        TxnSend         = 32,
+        /// d = heap producer::TxnOffsetsPayload* (ownership passes).
+        TxnSendOffsets  = 33,
+        /// d = 1 commit / 0 abort.
+        TxnEnd          = 34,
     };
 
     Op       op     = Op::SubscribeAdd;

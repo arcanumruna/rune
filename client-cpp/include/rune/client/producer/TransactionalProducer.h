@@ -2,65 +2,66 @@
 //
 // TX-5 — Tier-3 Transactional Producer API.
 //
-// Threading model (mirrors ProducerHub DR-BUG-1 discipline):
+// Threading model (F8c C5 — shared-nothing; no atomics, no mutex, no future):
 //   All transactional state (producerId, epoch, transaction-in-progress flag,
-//   addedPartitions set) is owned by TransactionalProducerImpl and accessed
-//   ONLY on the agent/runner thread via the duty cycle.  App threads enqueue
-//   commands via a lock-free ring (same ManyToOneRingBuffer discipline as
-//   ProducerImpl).
-//
-//   Hot-path rule: send/commit hot path is wait-free: the app thread writes a
-//   compact token into the ring and returns.  The agent thread processes the
-//   ring, emits InitProducerId/AddPartitionsToTxn/EndTxn/TxnOffsetCommit wire
-//   frames, and resolves futures/callbacks.  NO lock, NO per-op heap alloc on
-//   the hot path.
+//   per-partition sequences, pending requests) is owned by the DUTY thread
+//   (TransactionalProducerImpl).  This handle hands every operation to it as a
+//   command on the agent command ring (or applies it directly when called on
+//   the duty thread: the Invoker owner, a Thread-mode runner callback).
+//   Results come back as completion tokens (rune/client/Completion.h): into a
+//   Completions the calling thread owns and polls, or to a CompletionHandler
+//   called on the duty thread.  Exactly-once: an op either returns a
+//   non-Accepted OpResult (no completion ever) or completes exactly once.
 //
 // Idempotent-by-default (implemented):
 //   Once InitProducerIdResponse arrives the producer has a real (producerId,
-//   epoch).  Thereafter every send stamps a monotonically increasing baseSequence
-//   per (topic, partition) into the RecordBatch header and sends with a real
-//   correlationId so a ProduceResponse is received.  The encoded wire frame is
-//   retained in-flight.  On a retriable error (NotLeader etc.) the SAME stored
-//   wire frame is re-sent byte-for-byte — same baseSequence, same corrId — so
-//   the broker can deduplicate if the original was already accepted.  On
-//   OutOfOrderSequence / InvalidProducerEpoch / ProducerFenced the producer
-//   is fenced (producerId reset to -1; all pending futures fail).
+//   epoch).  Thereafter every send stamps a monotonically increasing
+//   baseSequence per (topic, partition) and is retained in flight; a retriable
+//   produce error re-sends the SAME frame (same baseSequence) so the broker
+//   deduplicates.  OutOfOrderSequence / InvalidProducerEpoch / ProducerFenced
+//   fence the producer: pending ops complete OpStatus::Fenced and the app MUST
+//   initTransactions() again.
 //
 // Tier-3 transactional lifecycle:
-//   initTransactions()              → send InitProducerId(transactionalId)
-//                                      → on response: store pid/epoch
-//   beginTransaction()              → set txnActive = true
-//   send(topic, key, value)         → first send to a partition emits
-//                                      AddPartitionsToTxn; stamps pid/epoch/seq
-//   sendOffsetsToTransaction(...)   → AddOffsetsToTxn + TxnOffsetCommit
-//   commitTransaction()             → EndTxn(commit)
-//   abortTransaction()              → EndTxn(abort)
+//   initTransactions(target, t)     -> InitProducerId(transactionalId)
+//   beginTransaction()              -> the transaction is active
+//   send(topic, key, value)         -> the first send to a partition emits
+//                                      AddPartitionsToTxn; its records are
+//                                      produced only once that is OK (F14)
+//   sendOffsetsToTransaction(...)   -> AddOffsetsToTxn, then TxnOffsetCommit
+//   commitTransaction(target, t)    -> EndTxn(commit) once every record is acked
+//   abortTransaction(target, t)     -> EndTxn(abort)
 //
-// Error handling:
-//   ProducerFenced / InvalidProducerEpoch in any response → the error is
-//   surfaced to the caller via a std::runtime_error exception on the future
-//   or a callback with a negative offset; the caller MUST re-initTransactions.
+// Coordinator errors (F14): ConcurrentTransactions (27) is retried after
+// min(2^attempt, cap) duty cycles; NotCoordinator (14) re-discovers the
+// coordinator and then retries; EndTxn is retried until 0 / 19 / 17 / 18.  The
+// only time bound is the op's deadline (ProducerConfig::produceTimeoutMs of
+// duty time -> OpStatus::Timeout).
 //
 // Usage:
 //   auto tp = client.transactionalProducer("my-txn-id", {.acks=Acks::All});
-//   tp.initTransactions().get();   // blocks until pid/epoch acquired
+//   tp.initTransactionsAndWait();
 //   tp.beginTransaction();
 //   tp.send(topic, key, value);
-//   tp.commitTransaction().get();  // blocks until EndTxn acked
+//   tp.commitTransactionAndWait();
 
 #pragma once
 
+#include <rune/client/Completion.h>
+#include <rune/client/Completions.h>             // CompletionTarget
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
-#include <rune/client/producer/Producer.h>       // Acks, ProducerConfig, want_future_t
+#include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/OpTarget.h>
+#include <rune/client/producer/Producer.h>       // Acks, ProducerConfig
 
+#include <chrono>
 #include <cstdint>
-#include <functional>
-#include <future>
 #include <map>
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 
 namespace rune::client {
 
@@ -85,76 +86,101 @@ struct TopicPartitionKey {
 // ---------------------------------------------------------------------------
 // TransactionalProducer — user-facing handle for the Tier-3 transactional API.
 //
-// Shared_ptr semantics (same as Producer): cheap to copy.
+// Copies share one impl (shared_ptr).  The status accessors (producerId /
+// producerEpoch / transactionActive) drain ONE status channel: call them
+// from one app thread (or a duty-cycle callback, which reads the live state).
+// A handle may outlive its Client: after close every op returns Closed.
 // ---------------------------------------------------------------------------
 class TransactionalProducer {
 public:
-    /// Constructed by Client::transactionalProducer() — not for direct use.
-    explicit TransactionalProducer(
-        std::shared_ptr<producer::TransactionalProducerImpl> impl) noexcept;
+    static constexpr std::chrono::nanoseconds kDefaultWaitTimeout = std::chrono::seconds(60);
 
-    // Copyable / movable (shared_ptr semantics).
+    /// Constructed by Client::transactionalProducer() (tests: their own
+    /// sinks).  `sink` carries the no-completion commands (begin / send),
+    /// `opSink` the token ops, `waitSink` the *AndWait sugar; `dutyThread` is
+    /// the Thread-mode runner (calls from it read the duty state directly).
+    TransactionalProducer(std::shared_ptr<producer::TransactionalProducerImpl> impl,
+                          detail::HubCommandSink sink, void* sinkCtx,
+                          std::thread::id dutyThread = {},
+                          detail::TargetedOpSink opSink = nullptr,
+                          detail::AndWaitSink waitSink = nullptr) noexcept;
+
     TransactionalProducer(const TransactionalProducer&) = default;
     TransactionalProducer& operator=(const TransactionalProducer&) = default;
     TransactionalProducer(TransactionalProducer&&) = default;
     TransactionalProducer& operator=(TransactionalProducer&&) = default;
-
     ~TransactionalProducer() = default;
 
-    // ---- Tier-3 transactional lifecycle (return futures for sync usage) ------
+    // ---- Token ops (exactly one completion after Accepted) --------------------
+    // Synchronous rejections (no completion): Closed (the Client / producer is
+    // closed), InvalidArgument (token > kMaxToken, no target, a Completions of
+    // another Client), WrongThread (Invoker off the owner, a Completions off
+    // its owner), QueueFull, BackPressured (command ring full).
+    // Completion statuses: Ok, BrokerError (errorCode, payload = text),
+    // Fenced, Timeout (produceTimeoutMs of duty time), Closed; a commit whose
+    // records were not all durably acked: DeliveryFailed.
 
-    /// Send InitProducerId(transactionalId) to the broker.
-    /// Resolved when InitProducerIdResponse arrives with a valid (pid, epoch).
-    /// Throws std::runtime_error on broker error (including ProducerFenced).
-    std::future<void> initTransactions();
+    /// InitProducerId.  Ok: value = producerId, aux = producerEpoch.
+    OpResult initTransactions(CompletionTarget target, Token token);
+    /// sendOffsetsToTransaction: AddOffsetsToTxn then TxnOffsetCommit.
+    OpResult sendOffsetsToTransaction(const std::map<TopicPartitionKey, int64_t>& offsets,
+                                      const std::string& groupId, CompletionTarget target, Token token);
+    /// EndTxn(commit) once every record of the transaction is acked.
+    OpResult commitTransaction(CompletionTarget target, Token token);
+    /// EndTxn(abort).
+    OpResult abortTransaction(CompletionTarget target, Token token);
 
-    /// Mark the start of a transaction.  Must be called after initTransactions()
-    /// and before any transactional send.  Idempotent if already in a txn.
+    // ---- *AndWait: cold-path blocking forms (throw std::runtime_error on any
+    //      non-Ok outcome or wait timeout; std::logic_error from a callback) ---
+    void initTransactionsAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    void sendOffsetsToTransactionAndWait(const std::map<TopicPartitionKey, int64_t>& offsets,
+                                         const std::string& groupId,
+                                         std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+
+    // ---- No-completion commands ------------------------------------------------
+
+    /// Mark the start of a transaction (a command for the duty thread).  A
+    /// no-op once closed.
     void beginTransaction();
 
-    /// Transactional send.
-    ///   - Automatically emits AddPartitionsToTxn on the first send to a new
-    ///     (topic, partition) within this transaction.
-    ///   - Stamps producerId / producerEpoch / baseSequence from the stored
-    ///     idempotent producer identity.
-    void send(TopicHandle            topic,
-              const Key&             key,
-              std::span<const uint8_t> value);
+    /// Transactional send (a command for the duty thread).  The first send to
+    /// a partition within a transaction emits AddPartitionsToTxn; the record
+    /// is produced once that is OK.  Throws std::invalid_argument (invalid
+    /// topic), std::logic_error("client closed") once closed, and — like a
+    /// registration — std::runtime_error / std::logic_error when the command
+    /// ring stays full (or is full inside a callback).
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
-    /// Send offsets to the transaction coordinator (consume-transform-produce
-    /// pattern).  Emits AddOffsetsToTxn then TxnOffsetCommit to the broker.
-    /// Resolved when TxnOffsetCommitResponse arrives with all-OK.
-    std::future<void> sendOffsetsToTransaction(
-        const std::map<TopicPartitionKey, int64_t>& offsets,
-        const std::string& groupId);
+    // ---- Accessors (eventually consistent; see the class comment) -------------
 
-    /// Commit the current transaction (EndTxn with commit=1).
-    /// Resolved when EndTxnResponse arrives with errorCode==0.
-    /// Throws std::runtime_error on failure (including ProducerFenced).
-    std::future<void> commitTransaction();
-
-    /// Abort the current transaction (EndTxn with commit=0).
-    /// Resolved when EndTxnResponse arrives with errorCode==0.
-    std::future<void> abortTransaction();
-
-    // ---- Accessors -----------------------------------------------------------
-
-    /// Current producerId (from InitProducerIdResponse).  -1 if not yet acquired.
+    /// Current producerId (from InitProducerIdResponse).  -1 if not acquired.
     [[nodiscard]] int64_t producerId() const noexcept;
-
-    /// Current producerEpoch (from InitProducerIdResponse).  0 if not yet acquired.
+    /// Current producerEpoch.  0 if not acquired.
     [[nodiscard]] int16_t producerEpoch() const noexcept;
-
-    /// True if a transaction is in progress (between beginTransaction and commit/abort).
+    /// True while a transaction is in progress (beginTransaction .. EndTxn).
     [[nodiscard]] bool transactionActive() const noexcept;
 
-    /// Access raw impl (for hub wiring — not user API).
+    /// Access raw impl (hub wiring / tests — not user API).
     [[nodiscard]] std::shared_ptr<producer::TransactionalProducerImpl> impl() const noexcept {
         return impl_;
     }
 
 private:
+    [[nodiscard]] bool onDutyThread_() const noexcept {
+        return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
+    }
+    [[nodiscard]] bool finished_() const noexcept;
+    OpResult issue_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op);
+    void andWait_(const char* what, std::chrono::nanoseconds timeout, detail::AndWaitIssue issue, void* ctx);
+
     std::shared_ptr<producer::TransactionalProducerImpl> impl_;
+    detail::HubCommandSink sink_     = nullptr;
+    void*                  sinkCtx_  = nullptr;
+    std::thread::id        dutyThread_{};
+    detail::TargetedOpSink opSink_   = nullptr;
+    detail::AndWaitSink    waitSink_ = nullptr;
 };
 
 } // namespace rune::client

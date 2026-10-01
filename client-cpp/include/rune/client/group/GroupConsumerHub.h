@@ -15,7 +15,7 @@
 //   onJoinGroupResponse(...)        — state machine: Joining → Syncing
 //   onSyncGroupResponse(...)        — state machine: Syncing → Stable
 //   onHeartbeatResponse(...)        — state machine: Stable → Rejoining (on error)
-//   onOffsetCommitResponse(...)     — resolve commitSync promise
+//   onOffsetCommitResponse(...)     — complete the pending commitSync (F8c C4)
 //   onAssign(...)                   — inline assignment update (Assign frame 44)
 //   closeAll()                      — deactivate all consumers on Client::close()
 

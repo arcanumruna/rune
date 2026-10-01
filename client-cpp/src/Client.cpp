@@ -202,9 +202,6 @@ Client::Client(ClientConfig cfg)
     txnSendFn_ = [this](int32_t streamId, const uint8_t* buf, std::size_t len) -> bool {
         return agent_.offerToPartition(/*topicId=*/0, /*partition=*/0, streamId, buf, len);
     };
-    txnControlSendFn_ = [this](int32_t, const uint8_t* buf, std::size_t len) -> bool {
-        return agent_.submitSend(buf, len);
-    };
 
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).
 
@@ -351,12 +348,13 @@ void Client::closeImpl_() {
     // longer in drainAndFlush / onProduceResponse (no concurrent access to the ack rings).
     producerHub_.failAll("Client closed");
 
-    // TX-5: fail all pending txn producer ops.  No lock: the runner was joined
-    // above (Thread mode) or this is the owner thread (Invoker mode).
-    // fix5: failAll() also markClosed()s each one (the txn analogue of
-    // closeAllRings() above), so later operations fail at once, never hang.
+    // TX-5 / F8c C5: every pending txn op completes Closed (its completion
+    // reaches its queue before the registry hand-back below), and each
+    // producer's status channel is finished, so later operations are rejected
+    // Closed at once, never hang.  No lock: the runner was joined above
+    // (Thread mode) or this is the owner thread (Invoker mode).
     for (auto& tp : txnProducers_) {
-        tp->failAll("Client closed");
+        tp->failAll();
     }
 
     // M2 FIX: clear the seed session's redirect latch on close so it does not
@@ -1413,7 +1411,7 @@ int Client::routeBufferedAcks_() {
 int Client::producerDuty_(int64_t nowNs) {
     const int64_t sessionId = agent_.seedSession().machine.sessionId();
     int work = producerHub_.drainAndFlush(nowNs, sessionId, agent::AgentProduceSink{&agent_});
-    for (auto& tp : txnProducers_) work += tp->doWork(sessionId, txnSendFn_);
+    for (auto& tp : txnProducers_) work += tp->doWork(nowNs, sessionId, txnSendFn_);
     return work;
 }
 
@@ -2053,7 +2051,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
     case codec::TemplateId::ProduceResponse: {
         for (auto& tp : txnProducers_) {
-            tp->onProduceResponse(buf, len, txnControlSendFn_);
+            tp->onProduceResponse(buf, len);
         }
         break;
     }
@@ -2073,11 +2071,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::AddOffsetsToTxnResponse: {
-        if (!txnProducers_.empty()) {
-            const auto snap = agent_.stateAndSessionId();
-            for (auto& tp : txnProducers_) {
-                tp->onAddOffsetsToTxnResponse(buf, len, snap.sessionId, txnControlSendFn_);
-            }
+        for (auto& tp : txnProducers_) {
+            tp->onAddOffsetsToTxnResponse(buf, len);
         }
         break;
     }
@@ -2396,6 +2391,10 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
         groupConsumerHub_.applyCommandDirect(pinned, now());
         return;
     }
+    if (producer::TransactionalProducerImpl::isTxnOp(cmd.op)) {
+        applyTxnCommand_(cmd, /*direct=*/true);
+        return;
+    }
     if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit) {
         groupConsumerHub_.applyCommandDirect(cmd, now());
         return;
@@ -2428,6 +2427,10 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
         return;
     default:
         break;
+    }
+    if (producer::TransactionalProducerImpl::isTxnOp(cmd.op)) {  // F8c C5
+        applyTxnCommand_(cmd, /*direct=*/false);
+        return;
     }
     if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
         // F8c C3: the Subscribe correlationId comes from the duty-owned counter
@@ -2475,7 +2478,7 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
                    cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
-                   cmd.op == Op::GroupCommit)) {
+                   cmd.op == Op::GroupCommit || cmd.op == Op::TxnBegin || cmd.op == Op::TxnSend)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
     }
@@ -2592,20 +2595,26 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
         transactionalId,
         cfg,
         nextCorrId_);
+    // F8c C5: its completions go through the completion-queue registry; F14:
+    // NotCoordinator asks this Client to re-discover the coordinator.  Both
+    // are set before the impl is published to the duty thread (the ring).
+    impl->setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
+    impl->setRediscoverHook(&Client::rediscoverTrampoline_, this);
 
     // Shared-nothing registration through the agent ring (like producer()): the
     // duty-cycle thread adopts it into txnProducers_ — no mutex, no per-cycle copy.
     // F8c C2: linearized against close() by the ring (see producerWithRingCap_):
-    // Closed = never written — free the holder and self-close the producer so
-    // every later operation fails at once instead of queueing work no duty
-    // cycle will ever process.
+    // Closed = never written — free the holder and abandon the producer's
+    // status channel so every later operation is rejected Closed at once
+    // instead of queueing work no duty cycle will ever process.
     auto* holder = new std::shared_ptr<producer::TransactionalProducerImpl>(impl);
     if (!submitRegistration_([&] { return agent_.submitRegisterTxnProducer(holder); },
                              [&] { delete holder; })) {
         delete holder;
-        impl->markClosed("Client closed");
+        impl->status.abandon();
     }
-    return TransactionalProducer(std::move(impl));
+    return TransactionalProducer(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
+                                 &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
 // ---------------------------------------------------------------------------
@@ -2752,6 +2761,47 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // and disarm any pending refresh (we just refreshed).
     metadataBackoffNs_     = kMetadataBackoffInitNs;
     nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
+
+    // F14: a fresh cluster view — txn requests waiting for the coordinator to
+    // be re-discovered (NotCoordinator) back off and re-send.
+    for (auto& tp : txnProducers_) tp->onCoordinatorRediscovered();
+}
+
+void Client::rediscoverTrampoline_(void* ctx) noexcept {
+    // F14: NotCoordinator -> re-discover the coordinator (== the consensus
+    // leader today, F15 §5.1): ask for a fresh cluster view now.  Not
+    // connected: the MetadataRequest sent on the next ConnectResponse{OK}
+    // answers it instead.
+    auto* self = static_cast<Client*>(ctx);
+    const auto& m = self->agent_.seedSession().machine;
+    if (m.state() == session::SessionState::Connected && m.sessionId() != 0) {
+        self->sendMetadataRequest(m.sessionId());
+    }
+}
+
+producer::TransactionalProducerImpl* Client::findTxn_(uint64_t handle) const noexcept {
+    for (const auto& tp : txnProducers_) {
+        if (reinterpret_cast<uint64_t>(tp.get()) == handle) return tp.get();
+    }
+    return nullptr;
+}
+
+void Client::applyTxnCommand_(const detail::HubCommand& cmd, bool direct) {
+    using Op = detail::HubCommand::Op;
+    detail::HubCommand c = cmd;
+    // I3: a token op's target is pinned when it is applied (before anything
+    // can complete it).  Begin / Send carry no target.
+    if (c.op == Op::TxnInit || c.op == Op::TxnSendOffsets || c.op == Op::TxnEnd) pinCommandTarget_(c);
+    // Ring path: resolve the identity against the duty-owned list (never
+    // dereference an unknown one).  Direct path: the caller's handle holds
+    // the impl for the whole call (it may still be awaiting adoption).
+    producer::TransactionalProducerImpl* impl =
+        direct ? reinterpret_cast<producer::TransactionalProducerImpl*>(c.handle) : findTxn_(c.handle);
+    if (impl == nullptr) {
+        producer::TransactionalProducerImpl::discardCommand(c, detail::CompletionSink{&Client::deliverTrampoline_, this});
+        return;
+    }
+    impl->applyCommand(c, now());
 }
 
 // ---------------------------------------------------------------------------

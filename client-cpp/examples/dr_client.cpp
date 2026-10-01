@@ -507,13 +507,11 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
 
     auto tp = c.transactionalProducer(txnId, pcfg);
 
-    // initTransactions
-    auto initFut = tp.initTransactions();
-    if (initFut.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready) {
-        std::cerr << "CLIENT: FAIL txn initTransactions TIMEOUT\n";
-        return 1;
-    }
-    try { initFut.get(); } catch (const std::exception& ex) {
+    // initTransactions (F8c C5: cold-path blocking form; the op itself is
+    // bounded by produceTimeoutMs of duty time)
+    try {
+        tp.initTransactionsAndWait(std::chrono::milliseconds(timeoutMs * 2));
+    } catch (const std::exception& ex) {
         std::cerr << "CLIENT: FAIL txn initTransactions: " << ex.what() << "\n";
         return 1;
     }
@@ -539,26 +537,16 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
 
     // commit or abort
     const std::string outcome = doCommit ? "committed" : "aborted";
-    if (doCommit) {
-        auto fut = tp.commitTransaction();
-        if (fut.wait_for(std::chrono::milliseconds(timeoutMs * 2)) != std::future_status::ready) {
-            std::cerr << "CLIENT: FAIL txn commitTransaction TIMEOUT\n";
-            return 1;
+    try {
+        if (doCommit) {
+            tp.commitTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
+        } else {
+            tp.abortTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
         }
-        try { fut.get(); } catch (const std::exception& ex) {
-            std::cerr << "CLIENT: FAIL txn commitTransaction: " << ex.what() << "\n";
-            return 1;
-        }
-    } else {
-        auto fut = tp.abortTransaction();
-        if (fut.wait_for(std::chrono::milliseconds(timeoutMs * 2)) != std::future_status::ready) {
-            std::cerr << "CLIENT: FAIL txn abortTransaction TIMEOUT\n";
-            return 1;
-        }
-        try { fut.get(); } catch (const std::exception& ex) {
-            std::cerr << "CLIENT: FAIL txn abortTransaction: " << ex.what() << "\n";
-            return 1;
-        }
+    } catch (const std::exception& ex) {
+        std::cerr << "CLIENT: FAIL txn " << (doCommit ? "commitTransaction" : "abortTransaction")
+                  << ": " << ex.what() << "\n";
+        return 1;
     }
 
     std::cout << "TXNRESULT txn_id=" << txnId << " cid=" << cid

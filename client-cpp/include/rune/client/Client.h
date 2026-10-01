@@ -643,6 +643,12 @@ private:
                                          detail::AndWaitIssue issue, void* issueCtx, std::string* text);
     /// I3: pin the completion target a command carries (re-encoded counted).
     void pinCommandTarget_(detail::HubCommand& cmd) noexcept;
+    /// F8c C5: route one Txn* command to its producer (ring: resolved against
+    /// txnProducers_; direct: the caller's handle holds the impl).
+    void applyTxnCommand_(const detail::HubCommand& cmd, bool direct);
+    [[nodiscard]] producer::TransactionalProducerImpl* findTxn_(uint64_t handle) const noexcept;
+    /// F14: NotCoordinator -> send a MetadataRequest (duty thread).
+    static void rediscoverTrampoline_(void* ctx) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,
@@ -928,7 +934,6 @@ private:
     std::thread::id dutyThreadId_;          // thread running dutyCycle(): owner or runner
     // Built ONCE: the txn producers' send paths (no per-cycle std::function build).
     std::function<bool(int32_t, const uint8_t*, std::size_t)> txnSendFn_;
-    std::function<bool(int32_t, const uint8_t*, std::size_t)> txnControlSendFn_;
 
     // ---- CB-2: ProducerHub + topic registry ----------------------------------
     // Hub is owned by Client and wired into the agent before start().

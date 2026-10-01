@@ -15,6 +15,7 @@
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/TxnMessages.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -22,6 +23,7 @@
 #include <Subscription.h>
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <set>
 #include <span>
@@ -106,6 +108,13 @@ struct InvokerGateway {
     int defines = 0;
     int schemaGets = 0;
     std::vector<int64_t> subscribeCorrIds;  // correlationIds of the Subscribes received
+    // F8c C5 / F14: transactional requests.  Counted always; InitProducerId is
+    // answered when replyInitPid: the next code of initPidCodes (popped), or
+    // OK{initPid, epoch 0} once it is empty.  Others are never answered.
+    bool                initPidReply = false;
+    std::deque<int16_t> initPidCodes;
+    int64_t             initPid = 4242;
+    int initPids = 0, addPartitions = 0, addOffsets = 0, txnOffsetCommits = 0, endTxns = 0;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -365,6 +374,28 @@ private:
             send(0, out.data(), n);
             return;
         }
+        case rcc::TemplateId::InitProducerId: {
+            ++initPids;
+            const auto ip = rp::InitProducerId::decode(buf, len);
+            if (!ip || !initPidReply) return;
+            rp::InitProducerIdResponse rsp;
+            rsp.sessionId     = ip->sessionId;
+            rsp.correlationId = ip->correlationId;
+            if (!initPidCodes.empty()) {
+                rsp.errorCode = initPidCodes.front();
+                initPidCodes.pop_front();
+            }
+            rsp.producerId    = rsp.errorCode == 0 ? initPid : -1;
+            rsp.producerEpoch = 0;
+            std::vector<uint8_t> out(rp::InitProducerIdResponse::ENCODED_SIZE);
+            const std::size_t n = rsp.encode(out.data());
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::AddPartitionsToTxn: ++addPartitions; return;
+        case rcc::TemplateId::AddOffsetsToTxn:    ++addOffsets; return;
+        case rcc::TemplateId::TxnOffsetCommit:    ++txnOffsetCommits; return;
+        case rcc::TemplateId::EndTxn:             ++endTxns; return;
         case rcc::TemplateId::Unsubscribe: {
             const auto uv = rcc::decodeUnsubscribe(buf, len);
             if (uv) unsubscribed.push_back(uv->subscriptionId);
