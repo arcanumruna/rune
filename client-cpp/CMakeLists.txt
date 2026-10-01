@@ -969,6 +969,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerFlushDirtyTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
+            tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/shard/ShardConfigTest.cpp
             tests/client/HubCommandClientTest.cpp
