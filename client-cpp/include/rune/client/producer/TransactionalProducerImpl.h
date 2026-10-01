@@ -41,11 +41,24 @@
 //     sendOffsets / commit only InTransaction, abort in InTransaction /
 //     AbortableError, init only Uninitialized; FatalError -> Fenced);
 //   * a poisoned transaction (refused AddPartitions, lost / out-of-order
-//     batch, failed offsets, a timed-out commit / abort) goes AbortableError:
-//     commit completes with the error, the app must abort — EndTxn(abort) is
-//     sent — and the local transaction state resets ONLY on EndTxn's final
-//     answer, never when it is created;
-//   * fencing (17 / 18), and 19 on EndTxn, is FatalError: terminal.
+//     batch, failed offsets) goes AbortableError: commit completes with the
+//     error, the app must abort — EndTxn(abort) is sent — and the local
+//     transaction state resets ONLY on EndTxn's final answer, never when it
+//     is created;
+//   * fix round 2: a transaction that never started (no AddPartitions /
+//     AddOffsets acknowledged OK) ends locally with no EndTxn (B-1); a commit
+//     / abort that times out is IN DOUBT and stays Committing / Aborting — the
+//     app retries the same direction, which re-sends EndTxn (B-2, Kafka); a
+//     sequence gap (lost batch, OutOfOrderSequence) makes the abort bump the
+//     epoch with an InitProducerId after EndTxn(abort) and restart every
+//     sequence (B-3, KIP-360 — the client InitProducerId frame carries no
+//     pid / epoch, so the bump relies on the coordinator bumping the epoch of
+//     an existing transactionalId, which F15 does);
+//   * fencing (17 / 18), 19 on EndTxn, and a non-retriable InitProducerId
+//     error are FatalError: terminal.
+//   Abortable here but fatal in Kafka: 19 / unknown codes on AddPartitions,
+//   AddOffsets, TxnOffsetCommit (converges via abort).  A client-synthesized
+//   19 (misuse) and the broker's 19 share the code: check state().
 
 #pragma once
 
@@ -233,7 +246,8 @@ private:
         struct CommitOffsets { int64_t corrId = 0; };
         struct AwaitData {};                     // EndTxn: waiting for every record to be acked
         struct Ending { int64_t corrId = 0; };   // EndTxn sent
-        using Phase = std::variant<Init, AddOffsets, CommitOffsets, AwaitData, Ending>;
+        struct Bumping { int64_t corrId = 0; };  // KIP-360: InitProducerId after EndTxn(abort)
+        using Phase = std::variant<Init, AddOffsets, CommitOffsets, AwaitData, Ending, Bumping>;
 
         uint64_t          id = 0;
         OpKind            kind = OpKind::InitTransactions;
@@ -243,6 +257,8 @@ private:
         bool              commit = false;        // EndTxn
         TxnOffsetsPayload offsets;               // SendOffsets
         Phase             phase = Init{};
+        /// m5: abort calls that joined this pending abort (same completion).
+        std::vector<std::pair<detail::OpTarget, Token>> joiners;
     };
 
     // ---- In-flight produce batches (retained for idempotent re-send) ---------
@@ -265,10 +281,22 @@ private:
     struct SUninitialized {};
     struct SInitializing { uint64_t opId = 0; };
     struct SReady {};
-    struct SInTransaction {};
-    struct SCommitting { uint64_t opId = 0; };
-    struct SAborting { uint64_t opId = 0; };
-    struct SAbortableError { OpStatus status = OpStatus::BrokerError; uint16_t errorCode = 0; };
+    // `started` (B-1, Kafka transactionStarted): an AddPartitions / AddOffsets
+    // was ACKNOWLEDGED OK — a transaction that never started ends locally,
+    // no EndTxn.  `opId` 0 in Committing / Aborting (B-2, Kafka m1): the end
+    // op timed out in doubt — the producer stays there and the app retries
+    // the same direction.  `endSent`: EndTxn went out (the data settled).
+    // `bumpEpoch` (B-3, KIP-360): a sequence gap (lost batch / OOS) — after
+    // EndTxn(abort), InitProducerId bumps the epoch and sequences restart.
+    struct SInTransaction { bool started = false; };
+    struct SCommitting { uint64_t opId = 0; bool started = false; bool endSent = false; };
+    struct SAborting { uint64_t opId = 0; bool started = false; bool endSent = false; bool bumpEpoch = false; };
+    struct SAbortableError {
+        OpStatus status = OpStatus::BrokerError;
+        uint16_t errorCode = 0;
+        bool     started = false;
+        bool     bumpEpoch = false;
+    };
     struct SFatalError { uint16_t errorCode = 0; };
     using TxnSm = std::variant<SUninitialized, SInitializing, SReady, SInTransaction, SCommitting,
                                SAborting, SAbortableError, SFatalError>;
@@ -285,8 +313,12 @@ private:
     bool encode_(TxnRequest& r, const UserOp* op);
     void retry_(TxnRequest& r, Verdict v);
     void enterFatal_(uint16_t errorCode, uint64_t exceptOpId = 0);
-    void poison_(OpStatus st, uint16_t errorCode);
+    void poison_(OpStatus st, uint16_t errorCode, bool bumpEpoch = false);
     void finishTxn_();
+    void markStarted_() noexcept;
+    /// The end op `opId` is done on the broker (EndTxn Ok, or a txn that never
+    /// started): bump the epoch first when required (abort), else Ready + Ok.
+    void endDone_(uint64_t opId, int64_t nowNs);
     void dropWaiting_() noexcept;
     void refuse_(const detail::HubCommand& cmd, OpKind kind, OpStatus st, uint16_t code, std::string_view why);
     void publishStatus_();

@@ -89,8 +89,12 @@ struct TopicPartitionKey {
 //   Uninitialized -> Initializing -> Ready -> InTransaction
 //     -> CommittingTransaction | AbortingTransaction -> Ready
 //   AbortableError: the transaction failed (a refused AddPartitions, a lost
-//     batch, failed offsets, a timed-out commit / abort): commit completes
-//     with that error; the app MUST abortTransaction().
+//     batch, failed offsets): commit completes with that error; the app MUST
+//     abortTransaction().
+//   A commit / abort that times out stays Committing / Aborting (in doubt):
+//     retry the SAME call (abort is refused while committing).  A transaction
+//     with nothing added ends locally (no EndTxn).  Commit's total wait can
+//     reach ~2x transactionOpTimeoutMs (data wait + EndTxn's own budget).
 //   FatalError: fenced (17 / 18) or InvalidTxnState on EndTxn — terminal:
 //     every op completes Fenced, no network op is ever sent again.
 // ---------------------------------------------------------------------------

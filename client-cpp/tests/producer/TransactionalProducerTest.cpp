@@ -263,6 +263,39 @@ struct TxnRig {
         ASSERT_EQ(op.status(), OpStatus::Ok);
         sink.clear();
     }
+    /// begin + one record fully added and acked: a STARTED transaction (an
+    /// AddPartitions acknowledged OK — B-1: only those send an EndTxn).
+    void startTxn(TopicHandle topic = TopicHandle{5, 1}) {
+        tp.beginTransaction();
+        const std::vector<uint8_t> v{0x5A};
+        tp.send(topic, Key(uint64_t{0}), std::span<const uint8_t>(v));
+        doWork();
+        addPartitionsOk();
+        doWork();
+        for (const auto& f : sink.frames) {
+            if (peekTemplate(f) != static_cast<uint16_t>(rpc::TemplateId::Produce)) continue;
+            rpc::ProduceResponse a;
+            a.sessionId = kSessionId;
+            a.correlationId = corrIdOf(f);
+            std::vector<uint8_t> b(rpc::ProduceResponse::ENCODED_SIZE);
+            a.encode(b.data());
+            impl->onProduceResponse(b.data(), b.size());
+        }
+        sink.clear();
+    }
+    /// Answer the KIP-360 epoch-bump InitProducerId (after a doWork that sent it).
+    void bumpOk(int64_t pid, int16_t epoch) {
+        const auto f = sink.last(rpc::TemplateId::InitProducerId);
+        ASSERT_FALSE(f.empty()) << "no epoch-bump InitProducerId was sent";
+        rpc::InitProducerIdResponse m;
+        m.sessionId = kSessionId;
+        m.correlationId = corrIdOf(f);
+        m.producerId = pid;
+        m.producerEpoch = epoch;
+        std::vector<uint8_t> b(rpc::InitProducerIdResponse::ENCODED_SIZE);
+        m.encode(b.data());
+        impl->onInitProducerIdResponse(b.data(), b.size());
+    }
     /// Answer the outstanding AddPartitions OK (after a doWork that sent it).
     void addPartitionsOk() {
         const auto f = sink.last(rpc::TemplateId::AddPartitionsToTxn);
@@ -444,7 +477,7 @@ TEST(TransactionalProducerTest, SendOffsetsToTransactionEmitsAddOffsetsThenTxnOf
 TEST(TransactionalProducerTest, CommitTransactionEmitsEndTxnCommit) {
     TxnRig r;
     r.acquire(88, 1);
-    r.tp.beginTransaction();
+    r.startTxn();  // B-1: a started transaction (an EndTxn is sent)
     auto op = r.commit();
     r.doWork();
     const auto et = r.sink.last(rpc::TemplateId::EndTxn);
@@ -464,7 +497,7 @@ TEST(TransactionalProducerTest, CommitTransactionEmitsEndTxnCommit) {
 TEST(TransactionalProducerTest, AbortTransactionEmitsEndTxnAbort) {
     TxnRig r;
     r.acquire(66, 0);
-    r.tp.beginTransaction();
+    r.startTxn();  // B-1: a started transaction (an EndTxn is sent)
     auto op = r.abort();
     r.doWork();
     const auto et = r.sink.last(rpc::TemplateId::EndTxn);
@@ -518,7 +551,7 @@ TEST(TransactionalProducerTest, InitTxnFencedCompletesFencedRegression) {
 TEST(TransactionalProducerTest, FencedProducerRefusesInitRegression) {
     TxnRig r;
     r.acquire();
-    r.tp.beginTransaction();
+    r.startTxn();  // B-1: a started transaction (an EndTxn is sent)
     auto commit = r.commit();
     r.doWork();
     auto fenced = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)),
@@ -621,6 +654,11 @@ TEST(TransactionalProducerTest, CommitFailsWhenProduceBatchTimesOut) {
     EXPECT_TRUE(r.tp.transactionActive()) << "reset only on EndTxn's final answer";
     auto ok = makeEndTxnResponse(corrIdOf(et), 0);
     r.impl->onEndTxnResponse(ok.data(), ok.size());
+    // Fix round 2 (B-3, KIP-360): the lost batch left a sequence gap — the
+    // abort completes only after the epoch bump.
+    EXPECT_FALSE(abort.ready());
+    r.doWork();
+    r.bumpOk(42, 1);
     ASSERT_TRUE(abort.ready());
     EXPECT_EQ(abort.status(), OpStatus::Ok);
     EXPECT_EQ(r.tp.state(), TxnState::Ready);
@@ -685,6 +723,8 @@ TEST(TransactionalProducerTest, PoisonedTransactionMustBeAbortedBeforeTheNextReg
     EXPECT_EQ(r.impl->testRefusedBegins(), refusedBegins + 2);
     auto okAbort = makeEndTxnResponse(corrIdOf(et), 0);
     r.impl->onEndTxnResponse(okAbort.data(), okAbort.size());
+    r.doWork();
+    r.bumpOk(42, 1);  // B-3: the lost batch's sequence gap — epoch bumped
     ASSERT_TRUE(abort.ready());
     EXPECT_EQ(abort.status(), OpStatus::Ok);
     EXPECT_EQ(r.tp.state(), TxnState::Ready);
@@ -813,7 +853,7 @@ TEST(TransactionalProducerTest, SendOutsideATransactionIsRefusedRegression) {
     EXPECT_TRUE(r.sink.frames.empty()) << "a record outside a transaction reached the wire";
     EXPECT_EQ(r.impl->testRefusedSends(), 1u);
     EXPECT_EQ(r.impl->testWaitingRecords(), 0u);
-    r.tp.beginTransaction();
+    r.startTxn();  // B-1: a started transaction (an EndTxn is sent)
     auto commit = r.commit();
     r.doWork();
     ASSERT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1);
@@ -828,35 +868,174 @@ TEST(TransactionalProducerTest, SendOutsideATransactionIsRefusedRegression) {
     EXPECT_EQ(commit.status(), OpStatus::Ok);
 }
 
-// Fix round 1 (C-1): an EndTxn that times out leaves the producer
-// AbortableError (in doubt — never Ready with an open broker transaction):
-// begin is refused, abort is retriable and sends EndTxn(abort).
-TEST(TransactionalProducerTest, EndTxnTimeoutLeavesAbortableErrorRegression) {
+// Fix round 2 (B-2, Kafka m1 — supersedes round 1's "EndTxn timeout ->
+// AbortableError"): an EndTxn that times out is IN DOUBT — the producer stays
+// Committing (never Ready over an open transaction, never an abort that could
+// contradict a commit that landed).  abort and begin are refused; the app
+// retries commitTransaction, which re-sends EndTxn(commit) for the same
+// transaction (the F15 broker answers a same-direction retry 0).  The same
+// holds for an in-doubt abort (stays Aborting; retry abort).
+TEST(TransactionalProducerTest, EndTxnTimeoutStaysInDoubtAndIsRetriedRegression) {
+    for (const bool commitDir : {true, false}) {
+        SCOPED_TRACE(commitDir ? "commit" : "abort");
+        TxnRig r;
+        r.acquire();
+        r.startTxn();
+        auto first = commitDir ? r.commit() : r.abort();
+        r.doWork();
+        ASSERT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1);  // never answered
+        r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
+        r.doWork();
+        ASSERT_TRUE(first.ready());
+        EXPECT_EQ(first.status(), OpStatus::Timeout);
+        const TxnState inDoubt = commitDir ? TxnState::CommittingTransaction : TxnState::AbortingTransaction;
+        EXPECT_EQ(r.tp.state(), inDoubt) << "in doubt: never Ready / AbortableError";
+        EXPECT_TRUE(r.tp.transactionActive());
+        r.tp.beginTransaction();
+        EXPECT_EQ(r.impl->testRefusedBegins(), 1u);
+        if (commitDir) {
+            auto abort = r.abort();  // Kafka: COMMITTING -> ABORTING is invalid
+            ASSERT_TRUE(abort.ready());
+            EXPECT_EQ(abort.status(), OpStatus::BrokerError);
+        }
+        EXPECT_EQ(r.cycles(64, rpc::TemplateId::EndTxn), 0) << "re-sent before the app retried";
+        auto retry = commitDir ? r.commit() : r.abort();
+        ASSERT_EQ(retry.r, OpResult::Accepted);
+        r.doWork();
+        ASSERT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 2) << "the retry re-sends EndTxn";
+        const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+        EXPECT_EQ(rpc::EndTxn::decode(et.data(), et.size())->commit, commitDir ? uint8_t{1} : uint8_t{0})
+            << "the same direction";
+        auto ok = makeEndTxnResponse(corrIdOf(et), 0);
+        r.impl->onEndTxnResponse(ok.data(), ok.size());
+        ASSERT_TRUE(retry.ready());
+        EXPECT_EQ(retry.status(), OpStatus::Ok);
+        EXPECT_EQ(r.tp.state(), TxnState::Ready);
+    }
+}
+
+// Fix round 2 (B-1, Kafka transactionStarted): a transaction in which nothing
+// was ever added (no AddPartitions / AddOffsets acknowledged) ends LOCALLY —
+// no EndTxn (the coordinator answers 19 for a non-Ongoing transaction, which
+// is fatal).  Also an abort after the only AddPartitions was refused.
+TEST(TransactionalProducerTest, EmptyTransactionSendsNoEndTxnRegression) {
     TxnRig r;
     r.acquire();
     r.tp.beginTransaction();
     auto commit = r.commit();
     r.doWork();
-    ASSERT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1);  // never answered
-    r.now += ProducerConfig{}.transactionOpTimeoutMs * 1'000'000LL;
-    r.doWork();
     ASSERT_TRUE(commit.ready());
-    EXPECT_EQ(commit.status(), OpStatus::Timeout);
-    EXPECT_EQ(r.tp.state(), TxnState::AbortableError);
-    EXPECT_TRUE(r.tp.transactionActive());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
+    EXPECT_EQ(r.tp.state(), TxnState::Ready);
     r.tp.beginTransaction();
-    EXPECT_EQ(r.impl->testRefusedBegins(), 1u);
+    auto abort = r.abort();
+    r.doWork();
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+    // The only partition refused: never started -> local abort.
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    auto refused = makeAddPartitionsToTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::AddPartitionsToTxn)),
+                                                  ecOf(rpc::ErrorCode::UnknownTopic));
+    r.impl->onAddPartitionsToTxnResponse(refused.data(), refused.size());
+    ASSERT_EQ(r.tp.state(), TxnState::AbortableError);
+    auto abort2 = r.abort();
+    r.doWork();
+    ASSERT_TRUE(abort2.ready());
+    EXPECT_EQ(abort2.status(), OpStatus::Ok);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "an EndTxn for a transaction that never started";
+    EXPECT_EQ(r.tp.state(), TxnState::Ready);
+}
+
+// Fix round 2 (B-3, KIP-360): a batch lost to its deadline leaves a sequence
+// gap on the broker.  The abort then bumps the epoch (InitProducerId after
+// EndTxn(abort)) and restarts every sequence, so the next transaction on that
+// partition is NOT poisoned: its record goes out at baseSequence 0 under the
+// bumped epoch and commits.
+TEST(TransactionalProducerTest, LostBatchAbortBumpsEpochAndRestartsSequencesRegression) {
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;
+    TxnRig r("bump-txn-id", cfg);
+    r.acquire(42, 0);
+    r.startTxn(kTopic);  // seq 0 acked
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();  // seq 1 in flight — never acked
+    r.now += 40'000'000;
+    r.doWork();  // lost: a gap at seq 1
+    ASSERT_EQ(r.tp.state(), TxnState::AbortableError);
     r.sink.clear();
     auto abort = r.abort();
     r.doWork();
-    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
-    ASSERT_FALSE(et.empty());
-    EXPECT_EQ(rpc::EndTxn::decode(et.data(), et.size())->commit, uint8_t{0});
-    auto ok = makeEndTxnResponse(corrIdOf(et), 0);
-    r.impl->onEndTxnResponse(ok.data(), ok.size());
+    auto okAbort = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)), 0);
+    r.impl->onEndTxnResponse(okAbort.data(), okAbort.size());
+    EXPECT_FALSE(abort.ready()) << "the abort waits for the epoch bump";
+    EXPECT_EQ(r.tp.state(), TxnState::AbortingTransaction);
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::InitProducerId), 1) << "no KIP-360 epoch bump";
+    r.bumpOk(42, 1);
     ASSERT_TRUE(abort.ready());
     EXPECT_EQ(abort.status(), OpStatus::Ok);
     EXPECT_EQ(r.tp.state(), TxnState::Ready);
+    EXPECT_EQ(r.tp.producerEpoch(), 1);
+    r.sink.clear();
+
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    auto commit = r.commit();
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();
+    const auto pf = r.sink.last(rpc::TemplateId::Produce);
+    ASSERT_FALSE(pf.empty());
+    EXPECT_EQ(decodeBaseSeqFromProduce(pf), 0) << "the sequence restarts under the bumped epoch";
+    auto pv = rpc::Produce::decode(pf.data(), pf.size());
+    ASSERT_TRUE(pv.has_value());
+    EXPECT_EQ(pv->producerEpoch, 1);
+    auto ack = makeProduceResponse(corrIdOf(pf), 0, 0);
+    r.impl->onProduceResponse(ack.data(), ack.size());
+    r.doWork();
+    auto okCommit = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)), 0);
+    r.impl->onEndTxnResponse(okCommit.data(), okCommit.size());
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok) << "the next transaction on that partition is not poisoned";
+}
+
+// Fix round 2 (m5): abort while an abort is pending joins it — one EndTxn,
+// both tokens complete with its result, exactly once.
+TEST(TransactionalProducerTest, AbortWhileAbortingJoinsThePendingAbortRegression) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    auto a1 = r.abort();
+    auto a2 = r.abort();
+    EXPECT_FALSE(a2.ready()) << "joined, not refused";
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 1);
+    auto ok = makeEndTxnResponse(corrIdOf(r.sink.last(rpc::TemplateId::EndTxn)), 0);
+    r.impl->onEndTxnResponse(ok.data(), ok.size());
+    for (auto* op : {&a1, &a2}) {
+        ASSERT_TRUE(op->ready());
+        EXPECT_EQ(op->status(), OpStatus::Ok);
+        EXPECT_EQ(op->times(), 1);
+    }
+}
+
+// Fix round 2 (m3, Kafka InitProducerIdHandler): a non-retriable
+// InitProducerId error is fatal — init is not retried into a zombie.
+TEST(TransactionalProducerTest, NonRetriableInitProducerIdErrorIsFatalRegression) {
+    TxnRig r;
+    auto init = r.init();
+    r.doWork();
+    auto bad = makeInitProducerIdResponse(corrIdOf(r.sink.last(rpc::TemplateId::InitProducerId)), -1, 0,
+                                          ecOf(rpc::ErrorCode::Internal));
+    r.impl->onInitProducerIdResponse(bad.data(), bad.size());
+    ASSERT_TRUE(init.ready());
+    EXPECT_EQ(init.status(), OpStatus::BrokerError);
+    EXPECT_EQ(r.tp.state(), TxnState::FatalError);
+    auto again = r.init();
+    ASSERT_TRUE(again.ready());
+    EXPECT_EQ(again.status(), OpStatus::Fenced);
 }
 
 // Fix round 1 (I-4): EndTxn gets its own transactionOpTimeoutMs budget from
@@ -1134,7 +1313,7 @@ TEST(TransactionalProducerTest, CommitAbortCompleteOnceRegression) {
         SCOPED_TRACE(doCommit ? "commit" : "abort");
         TxnRig r;
         r.acquire();
-        r.tp.beginTransaction();
+        r.startTxn();  // B-1: a started transaction (an EndTxn is sent)
         auto op = doCommit ? r.commit() : r.abort();
         ASSERT_EQ(op.r, OpResult::Accepted);
         r.doWork();
@@ -1318,7 +1497,7 @@ TEST(TransactionalProducerTest, EndTxnRetriesConcurrentTransactionsUntilTerminal
         SCOPED_TRACE(cs.terminal);
         TxnRig r;
         r.acquire();
-        r.tp.beginTransaction();
+        r.startTxn();
         auto op = r.commit();
         r.doWork();
         const int64_t corr = corrIdOf(r.sink.last(rpc::TemplateId::EndTxn));

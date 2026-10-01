@@ -161,7 +161,7 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
             ++refusedBegins_;  // Kafka: begin only in Ready (the next sends / end op are refused)
             return;
         }
-        state_ = SInTransaction{};
+        state_ = SInTransaction{};  // not started until an AddPartitions / AddOffsets is OK
         publishStatus_();
         return;
     }
@@ -226,18 +226,10 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
     case Op::TxnEnd: {
         const bool commit = cmd.d != 0;
         const OpKind kind = commit ? OpKind::CommitTransaction : OpKind::AbortTransaction;
-        const bool inTxn  = std::holds_alternative<SInTransaction>(state_);
         if (const auto* ae = std::get_if<SAbortableError>(&state_); ae != nullptr && commit) {
             // Kafka: a failed transaction can only be aborted.
             refuse_(cmd, kind, ae->status, ae->errorCode,
                     "commitTransaction: the transaction failed — abortTransaction() it");
-            return;
-        }
-        const bool abortable = std::holds_alternative<SAbortableError>(state_);
-        if (!(inTxn || (!commit && abortable))) {
-            refuse_(cmd, kind, OpStatus::BrokerError, kStateErr,
-                    commit ? "commitTransaction: no transaction in progress"
-                           : "abortTransaction: no transaction to abort");
             return;
         }
         UserOp op;
@@ -249,12 +241,49 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
         op.deadlineNs = opDeadline_(nowNs);
         op.phase      = UserOp::AwaitData{};  // TX-6: EndTxn only once the data settled
         const uint64_t id = op.id;
-        ops_.push_back(std::move(op));
         if (commit) {
-            state_ = SCommitting{id};
+            if (const auto* it = std::get_if<SInTransaction>(&state_)) {
+                const bool started = it->started;
+                ops_.push_back(std::move(op));
+                state_ = SCommitting{id, started, false};
+            } else if (auto* c = std::get_if<SCommitting>(&state_); c != nullptr && c->opId == 0) {
+                // B-2 (Kafka m1): the in-doubt commit is retried — EndTxn(commit)
+                // is re-sent against the same transaction.
+                ops_.push_back(std::move(op));
+                c->opId = id;
+            } else {
+                refuse_(cmd, kind, OpStatus::BrokerError, kStateErr,
+                        "commitTransaction: no transaction to commit (or a commit is in progress)");
+                return;
+            }
         } else {
-            dropWaiting_();  // aborted records are never produced
-            state_ = SAborting{id};
+            if (auto* a = std::get_if<SAborting>(&state_)) {
+                if (a->opId != 0) {
+                    // m5: joins the pending abort (one EndTxn, the same completion).
+                    if (UserOp* pending = findOp_(a->opId)) {
+                        pending->joiners.emplace_back(detail::decodeTarget(cmd), static_cast<Token>(cmd.a));
+                        return;
+                    }
+                }
+                ops_.push_back(std::move(op));  // B-2: the in-doubt abort is retried
+                a->opId = id;
+            } else if (const auto* it = std::get_if<SInTransaction>(&state_)) {
+                const bool started = it->started;
+                ops_.push_back(std::move(op));
+                dropWaiting_();  // aborted records are never produced
+                state_ = SAborting{id, started, false, false};
+            } else if (const auto* ae = std::get_if<SAbortableError>(&state_)) {
+                const bool started = ae->started;
+                const bool bump    = ae->bumpEpoch;
+                ops_.push_back(std::move(op));
+                dropWaiting_();
+                state_ = SAborting{id, started, false, bump};
+            } else {
+                // Includes Committing (Kafka: COMMITTING -> ABORTING is invalid).
+                refuse_(cmd, kind, OpStatus::BrokerError, kStateErr,
+                        "abortTransaction: no transaction to abort (or it is committing)");
+                return;
+            }
         }
         publishStatus_();
         return;
@@ -305,8 +334,12 @@ void TransactionalProducerImpl::complete_(UserOp& op, OpStatus st, uint16_t erro
         c.value = producerId_;
         c.aux   = producerEpoch_;
     }
-    completions_.deliver(op.target, c,
-                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+    const std::span<const uint8_t> payload(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    completions_.deliver(op.target, c, payload);
+    for (const auto& [target, token] : op.joiners) {  // m5: aborts that joined this one
+        c.token = token;
+        completions_.deliver(target, c, payload);
+    }
 }
 
 void TransactionalProducerImpl::completeAndErase_(uint64_t opId, OpStatus st, uint16_t errorCode,
@@ -459,26 +492,55 @@ void TransactionalProducerImpl::dropWaiting_() noexcept {
     for (auto& [k, ps] : partitions_) ps.waiting.clear();
 }
 
-void TransactionalProducerImpl::poison_(OpStatus st, uint16_t errorCode) {
+void TransactionalProducerImpl::poison_(OpStatus st, uint16_t errorCode, bool bumpEpoch) {
     // The transaction can no longer commit: AbortableError (the app aborts).
-    if (std::holds_alternative<SInTransaction>(state_)) {
-        state_ = SAbortableError{st, errorCode};
+    if (const auto* it = std::get_if<SInTransaction>(&state_)) {
+        state_ = SAbortableError{st, errorCode, it->started, bumpEpoch};
         dropWaiting_();
         publishStatus_();
         return;
     }
     if (const auto* c = std::get_if<SCommitting>(&state_)) {
+        if (c->endSent) return;  // the data settled before EndTxn: nothing left to poison
         const uint64_t id = c->opId;
-        const UserOp*  op = findOp_(id);
-        if (op != nullptr && std::holds_alternative<UserOp::Ending>(op->phase)) return;  // already decided
-        state_ = SAbortableError{st, errorCode};
+        state_ = SAbortableError{st, errorCode, c->started, bumpEpoch};
         dropWaiting_();
         publishStatus_();
         // TX-6b: never a commit marker over this data — the commit fails and
         // the app must abort (which sends EndTxn(abort)).
-        completeAndErase_(id, st, errorCode, "commitTransaction: the transaction failed — abortTransaction() it");
+        if (id != 0) {
+            completeAndErase_(id, st, errorCode, "commitTransaction: the transaction failed — abortTransaction() it");
+        }
+        return;
     }
-    // Aborting / AbortableError / others: the abort proceeds; first error kept.
+    // The first error is kept; a sequence gap still requires the epoch bump.
+    if (auto* ae = std::get_if<SAbortableError>(&state_)) ae->bumpEpoch = ae->bumpEpoch || bumpEpoch;
+    if (auto* a = std::get_if<SAborting>(&state_)) a->bumpEpoch = a->bumpEpoch || bumpEpoch;
+}
+
+void TransactionalProducerImpl::markStarted_() noexcept {
+    if (auto* it = std::get_if<SInTransaction>(&state_)) it->started = true;
+    else if (auto* c = std::get_if<SCommitting>(&state_)) c->started = true;
+    else if (auto* a = std::get_if<SAborting>(&state_)) a->started = true;
+    else if (auto* ae = std::get_if<SAbortableError>(&state_)) ae->started = true;
+}
+
+void TransactionalProducerImpl::endDone_(uint64_t opId, int64_t nowNs) {
+    if (const auto* a = std::get_if<SAborting>(&state_); a != nullptr && a->bumpEpoch) {
+        // B-3 (KIP-360): the aborted transaction left a sequence gap — bump
+        // the epoch (InitProducerId for this transactionalId) and restart
+        // every sequence before Ready.  The abort completes after the bump.
+        UserOp* op = findOp_(opId);
+        if (op != nullptr) {
+            op->deadlineNs = opDeadline_(nowNs);
+            const int64_t dl   = op->deadlineNs;
+            const int64_t corr = addRequest_(ReqKind::InitProducerId, opId, dl);
+            if (UserOp* o = findOp_(opId)) o->phase = UserOp::Bumping{corr};
+            return;
+        }
+    }
+    finishTxn_();  // the final answer: only now is the transaction closed locally
+    completeAndErase_(opId, OpStatus::Ok);
 }
 
 void TransactionalProducerImpl::finishTxn_() {
@@ -603,11 +665,20 @@ bool TransactionalProducerImpl::dataSettled_() const noexcept {
 
 void TransactionalProducerImpl::gateEndTxn_(int64_t nowNs) {
     uint64_t id = 0;
-    if (const auto* c = std::get_if<SCommitting>(&state_)) id = c->opId;
-    else if (const auto* a = std::get_if<SAborting>(&state_)) id = a->opId;
-    if (id == 0) return;
+    bool started = false;
+    bool* endSent = nullptr;
+    if (auto* c = std::get_if<SCommitting>(&state_)) { id = c->opId; started = c->started; endSent = &c->endSent; }
+    else if (auto* a = std::get_if<SAborting>(&state_)) { id = a->opId; started = a->started; endSent = &a->endSent; }
+    if (id == 0) return;  // none, or in doubt (waiting for the app's retry)
     UserOp* op = findOp_(id);
     if (op == nullptr || !std::holds_alternative<UserOp::AwaitData>(op->phase) || !dataSettled_()) return;
+    if (!started) {
+        // B-1 (Kafka): nothing was ever added — no EndTxn (the coordinator
+        // would answer 19 for a transaction that is not Ongoing).  End locally.
+        endDone_(id, nowNs);
+        return;
+    }
+    *endSent = true;
     // I-4: EndTxn's retry budget starts now (the data wait does not consume it).
     op->deadlineNs = opDeadline_(nowNs);
     const int64_t deadline = op->deadlineNs;
@@ -629,18 +700,15 @@ void TransactionalProducerImpl::sweep_(int64_t nowNs) {
         if (const auto* in = std::get_if<SInitializing>(&state_); in != nullptr && in->opId == expired) {
             state_ = SUninitialized{};  // init may be retried
             publishStatus_();
-        } else if (const auto* c = std::get_if<SCommitting>(&state_); c != nullptr && c->opId == expired) {
-            // In doubt (EndTxn may or may not have landed): never Ready with an
-            // open broker transaction — the app aborts (retriable).
-            state_ = SAbortableError{OpStatus::Timeout, 0};
-            dropWaiting_();
-            publishStatus_();
-        } else if (const auto* a = std::get_if<SAborting>(&state_); a != nullptr && a->opId == expired) {
-            state_ = SAbortableError{OpStatus::Timeout, 0};  // abort again
-            publishStatus_();
+        } else if (auto* c = std::get_if<SCommitting>(&state_); c != nullptr && c->opId == expired) {
+            // B-2 (Kafka m1): in doubt (EndTxn may or may not have landed) —
+            // stay Committing; the app retries commitTransaction (abort refused).
+            c->opId = 0;
+        } else if (auto* a = std::get_if<SAborting>(&state_); a != nullptr && a->opId == expired) {
+            a->opId = 0;  // in doubt: stay Aborting; the app retries abortTransaction
         }
         completeAndErase_(expired, OpStatus::Timeout);
-        if (kind == OpKind::SendOffsets) poison_(OpStatus::Timeout, 0);  // offsets in doubt
+        if (kind == OpKind::SendOffsets) poison_(OpStatus::Timeout, 0, false);  // offsets in doubt
     }
     // AddPartitions past its deadline: the partition is refused, the txn poisoned.
     for (std::size_t i = 0; i < reqs_.size();) {
@@ -650,7 +718,7 @@ void TransactionalProducerImpl::sweep_(int64_t nowNs) {
             ps.add = TxnPartitionState::Add::Failed;
             ps.waiting.clear();
             reqs_.erase(reqs_.begin() + static_cast<std::ptrdiff_t>(i));
-            poison_(OpStatus::DeliveryFailed, 0);
+            poison_(OpStatus::DeliveryFailed, 0, false);  // never produced: no sequence gap
         } else {
             ++i;
         }
@@ -665,7 +733,7 @@ void TransactionalProducerImpl::sweep_(int64_t nowNs) {
             ++it;
         }
     }
-    if (lost) poison_(OpStatus::DeliveryFailed, 0);
+    if (lost) poison_(OpStatus::DeliveryFailed, 0, /*bumpEpoch=*/true);  // a sequence gap
 }
 
 int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
@@ -718,7 +786,7 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
                 r.kind       = ReqKind::AddPartitions;
                 r.corrId     = nextCorrId_++;
                 r.tp         = k;
-                r.deadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
+                r.deadlineNs = opDeadline_(nowNs);  // m7: a coordinator op (27 retries)
                 (void)encode_(r, nullptr);
                 reqs_.push_back(std::move(r));
                 ++work;
@@ -765,14 +833,20 @@ void TransactionalProducerImpl::onInitProducerIdResponse(const uint8_t* buf, std
     TxnRequest* r = findReq_(opt->correlationId);
     if (r == nullptr || r->kind != ReqKind::InitProducerId) return;
     const uint64_t opId = r->opId;
+    const UserOp*  op   = findOp_(opId);
+    const bool     bump = op != nullptr && std::holds_alternative<UserOp::Bumping>(op->phase);
     switch (const Verdict v = classify_(ReqKind::InitProducerId, opt->errorCode)) {
     case Verdict::Ok:
         eraseReq_(opt->correlationId);
         producerId_    = opt->producerId;
         producerEpoch_ = opt->producerEpoch;
-        for (auto& [k, ps] : partitions_) ps.nextBaseSequence = 0;  // a fresh identity
-        state_ = SReady{};
-        publishStatus_();  // published BEFORE the completion: the app reads it after
+        for (auto& [k, ps] : partitions_) ps.nextBaseSequence = 0;  // a fresh / bumped epoch
+        if (bump) {
+            finishTxn_();  // KIP-360: the abort is complete under the bumped epoch
+        } else {
+            state_ = SReady{};
+            publishStatus_();  // published BEFORE the completion: the app reads it after
+        }
         completeAndErase_(opId, OpStatus::Ok);
         return;
     case Verdict::Retry:
@@ -784,11 +858,11 @@ void TransactionalProducerImpl::onInitProducerIdResponse(const uint8_t* buf, std
         enterFatal_(static_cast<uint16_t>(opt->errorCode));
         return;
     case Verdict::Fail:
+        // m3 (Kafka InitProducerIdHandler): anything not retriable is fatal.
         eraseReq_(opt->correlationId);
-        state_ = SUninitialized{};  // init may be retried
-        publishStatus_();
+        enterFatal_(static_cast<uint16_t>(opt->errorCode), /*except=*/opId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode),
-                          "InitProducerId failed");
+                          bump ? "InitProducerId (epoch bump) failed (fatal)" : "InitProducerId failed (fatal)");
         return;
     }
 }
@@ -807,6 +881,7 @@ void TransactionalProducerImpl::onAddPartitionsToTxnResponse(const uint8_t* buf,
     case Verdict::Ok:
         eraseReq_(opt->correlationId);
         partition_(tp.topicId, tp.partition).add = TxnPartitionState::Add::Added;  // produced next cycle
+        markStarted_();  // B-1: the transaction exists on the coordinator now
         return;
     case Verdict::Retry:
     case Verdict::Rediscover:
@@ -823,7 +898,7 @@ void TransactionalProducerImpl::onAddPartitionsToTxnResponse(const uint8_t* buf,
         TxnPartitionState& ps = partition_(tp.topicId, tp.partition);
         ps.add = TxnPartitionState::Add::Failed;
         ps.waiting.clear();
-        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec));
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec), false);
         return;
     }
     }
@@ -838,6 +913,7 @@ void TransactionalProducerImpl::onAddOffsetsToTxnResponse(const uint8_t* buf, st
     switch (const Verdict v = classify_(ReqKind::AddOffsets, opt->errorCode)) {
     case Verdict::Ok: {
         eraseReq_(opt->correlationId);
+        markStarted_();  // B-1: AddOffsetsToTxn OK — the transaction is started
         UserOp* op = findOp_(opId);
         if (op == nullptr) return;
         // Phase 2: the TxnOffsetCommit carrying the offsets.
@@ -857,7 +933,7 @@ void TransactionalProducerImpl::onAddOffsetsToTxnResponse(const uint8_t* buf, st
         eraseReq_(opt->correlationId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode),
                           "AddOffsetsToTxn failed");
-        poison_(OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode));
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode), false);
         return;
     }
 }
@@ -902,7 +978,7 @@ void TransactionalProducerImpl::onTxnOffsetCommitResponse(const uint8_t* buf, st
     case Verdict::Fail:
         eraseReq_(opt->correlationId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(ec), "TxnOffsetCommit failed");
-        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec));
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec), false);
         return;
     }
 }
@@ -916,8 +992,7 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
     switch (const Verdict v = classify_(ReqKind::EndTxn, opt->errorCode)) {
     case Verdict::Ok:
         eraseReq_(opt->correlationId);
-        finishTxn_();  // the final answer: only now is the transaction closed locally
-        completeAndErase_(opId, OpStatus::Ok);
+        endDone_(opId, lastNowNs_);  // Ready (or the KIP-360 epoch bump first)
         return;
     case Verdict::Retry:
     case Verdict::Rediscover:
@@ -954,14 +1029,14 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
     if (ec == kOutOfOrderSequence) {
         // M-2: a sequence error, not a fence — the transaction is abortable.
         batches_.erase(it);
-        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec));
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec), /*bumpEpoch=*/true);
         return;
     }
     InFlightBatch& ib = it->second;
     if (ib.retryCount >= InFlightBatch::kMaxRetries) {
         // Exhausted: this data never became durable — the txn must abort (TX-6b).
         batches_.erase(it);
-        poison_(OpStatus::DeliveryFailed, 0);
+        poison_(OpStatus::DeliveryFailed, 0, /*bumpEpoch=*/true);  // a sequence gap
         return;
     }
     ++ib.retryCount;
