@@ -120,6 +120,17 @@ public:
     /// The producer will deliver nothing more (release).  Idempotent.
     void producerClose() noexcept { ring_.producerClose(); }
 
+    /// F8c fix round 2 (I5): the two halves of a last-one-frees hand-off of
+    /// the ring between the duty side (Client close) and its owner.  The
+    /// producer side closes, then detaches; the consumer side (a release that
+    /// found the Client closing) detaches.  Exactly one call returns true:
+    /// that caller deletes the ring.  Nobody waits.
+    [[nodiscard]] bool producerCloseAndDetach() noexcept {
+        ring_.producerClose();
+        return ring_.detachProducer();
+    }
+    [[nodiscard]] bool consumerDetach() noexcept { return ring_.detachConsumer(); }
+
     /// Credit-contract violations so far.  Producer-side state: read it on the
     /// duty thread, or after the duty thread is gone.
     [[nodiscard]] std::uint64_t lostCompletions() const noexcept { return lostCompletions_; }

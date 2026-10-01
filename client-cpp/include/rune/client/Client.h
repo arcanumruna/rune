@@ -571,6 +571,7 @@ private:
         CompletionHandler handler{};          // fn != nullptr: the callback form
         uint32_t          reservedBytes = 0;  // CQ form: the issuer's reservation
         CqRef             cqRef = kNoCqRef;   // CQ form: registry reference
+        bool              counted = false;    // CQ form: pins its slot (I3 quarantine)
     };
 
     /// One pending control op (duty-thread owned; cold path).
@@ -623,6 +624,9 @@ private:
     void applyCqRelease_(CqRef ref, detail::CompletionRing* ring);
     /// close(): hand every registered queue back (producer-close; §3.3 (b)).
     void closeCqRegistry_();
+    /// I3: count / uncount a pending op's target slot; recycle a free slot.
+    void pinCqSlot_(DutyTarget& t) noexcept;
+    void freeCqSlot_(uint32_t idx) noexcept;
     /// Deliver one completion to its target (duty thread / closing thread).
     void deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t> payload,
                   detail::CompletionRing::Overflow ov = detail::CompletionRing::Overflow::Truncate);
@@ -863,6 +867,8 @@ private:
     struct CqSlot {
         detail::CompletionRing* ring = nullptr;
         uint8_t                 gen  = 0;
+        bool                    quarantined = false;  // released, still targeted (I3)
+        uint32_t                targets     = 0;      // pending ops that target this slot
     };
     std::vector<CqSlot>   cqSlots_;
     std::vector<uint16_t> cqFree_;          // FIFO ring of released slots (I3)

@@ -105,6 +105,8 @@ PER_THREAD = {
 }
 for _rel, _ms in PER_THREAD.items():
     assert all(k[0] == "tls" for k in _ms), f"PER_THREAD entry {_rel} allows a non-tls construct"
+# n4: the two allowlists are merged per file — a shared key would silently drop one.
+assert not (set(PER_THREAD) & set(SLICE_B)), "PER_THREAD and SLICE_B must not share a file"
 
 CHAR_PREFIXES = {"L", "u", "U", "u8"}
 

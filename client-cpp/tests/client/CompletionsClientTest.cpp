@@ -188,7 +188,8 @@ TEST(CompletionsClient, StaleCqRefIsDroppedByGenerationRegression) {
     ASSERT_EQ(client.connect(*a, 1), rc::OpResult::Accepted);  // no gateway: pending
     client.doWork();
     ASSERT_EQ(client.testPendingControlOps(), 1u);
-    a.reset();  // owner = duty thread (Invoker): released directly, slot freed
+    a.reset();         // Invoker owner between cycles: a CqRelease command (ring order)
+    client.doWork();   // ... applied: unlinked (quarantined while the connect is pending)
     EXPECT_EQ(client.testRegisteredCqs(), 0u);
 
     rc::Completions b(client);
@@ -905,7 +906,11 @@ TEST(CompletionsClient, GenerationNeverWrapsOnAHotSlotRegression) {
     ASSERT_EQ(client.connect(*a, 1), rc::OpResult::Accepted);
     client.doWork();
     a.reset();
-    for (int i = 0; i < 31; ++i) rc::Completions tmp(client, tiny);
+    client.doWork();
+    for (int i = 0; i < 31; ++i) {
+        { rc::Completions tmp(client, tiny); }
+        client.doWork();  // the release is a ring command between cycles
+    }
     rc::Completions b(client, tiny);
     g_now += 200'000'000;
     for (int i = 0; i < 10 && client.testPendingControlOps() != 0; ++i) client.doWork();
@@ -920,8 +925,12 @@ TEST(CompletionsClient, GenerationNeverWrapsOnAHotSlotRegression) {
     // No (slot, generation) repeats within kMaxCqs x 32 registrations.
     std::vector<uint8_t> seen(1u << 15, 0);
     for (uint32_t i = 0; i < rc::kMaxCqs * 32 - 64; ++i) {
-        rc::Completions q(client, tiny);
-        const rc::CqRef r = q.cqRef();
+        rc::CqRef r = rc::kNoCqRef;
+        {
+            rc::Completions q(client, tiny);
+            r = q.cqRef();
+        }
+        client.doWork();  // the release is a ring command between cycles
         ASSERT_NE(r, rc::kNoCqRef);
         ASSERT_EQ(seen[r & 0x7FFF], 0) << "(slot, generation) " << r << " repeated after " << i;
         seen[r & 0x7FFF] = 1;
@@ -940,4 +949,148 @@ TEST(CompletionsClient, OversizeControlRecordIsRejectedNotRetriedForeverRegressi
     EXPECT_EQ(r.client.ping(big, q, 1), rc::OpResult::InvalidArgument);
     EXPECT_EQ(q.outstanding(), 0u);
     EXPECT_THROW((void)r.client.pingAndWait(big, std::chrono::seconds(2)), std::runtime_error);
+}
+
+// ===========================================================================
+// F8c C2+C3 fix round 2
+// ===========================================================================
+
+// I3 (absolute): with almost every registry slot held by long-lived queues the
+// free list holds only a few slots, so FIFO reuse alone repeats a (slot,
+// generation) pair within ~32 x free releases.  A released slot must stay out
+// of reuse while any pending op still targets it — however long the churn —
+// and be recycled once that op completed (its completion dropped).
+TEST(CompletionsClient, SlotNeverRecycledWhileAnOpTargetsItRegression) {
+    g_now = 1'000'000'000;
+    rc::ClientConfig c = cfgFor(5260, rc::RunnerMode::Invoker, &fakeNow);
+    c.connectTimeoutMs = 50;
+    rc::Client client(c);
+    rc::CompletionsConfig tiny;
+    tiny.capacityBytes  = 1024;
+    tiny.maxResultBytes = 64;
+    tiny.maxErrorText   = 64;
+    std::vector<std::unique_ptr<rc::Completions>> live;
+    for (uint32_t i = 0; i < rc::kMaxCqs - 4; ++i) live.push_back(std::make_unique<rc::Completions>(client, tiny));
+    auto a = std::make_unique<rc::Completions>(client, tiny);
+    const uint32_t slotA = rc::cqRefIndex(a->cqRef());
+    ASSERT_EQ(client.connect(*a, 1), rc::OpResult::Accepted);  // no gateway: stays pending
+    client.doWork();
+    a.reset();
+    client.doWork();  // the release is applied: slot A quarantined, not freed
+    for (int i = 0; i < 40'000; ++i) {
+        auto b = std::make_unique<rc::Completions>(client, tiny);
+        ASSERT_NE(rc::cqRefIndex(b->cqRef()), slotA)
+            << "slot A recycled after " << i << " cycles while its connect is still pending";
+        b.reset();
+        client.doWork();
+    }
+    rc::Completions b(client, tiny);
+    g_now += 200'000'000;  // the connect times out: its completion is dropped
+    for (int i = 0; i < 10 && client.testPendingControlOps() != 0; ++i) client.doWork();
+    ASSERT_EQ(client.testPendingControlOps(), 0u);
+    EXPECT_EQ(client.testStaleCqDrops(), 1u);
+    int n = 0;
+    b.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++n; });
+    EXPECT_EQ(n, 0);
+    EXPECT_EQ(b.outstanding(), 0u);
+    EXPECT_EQ(b.reservedBytes(), 0u);
+    bool reused = false;  // ... and slot A returns to service afterwards
+    for (int i = 0; i < 16 && !reused; ++i) {
+        auto q = std::make_unique<rc::Completions>(client, tiny);
+        reused = rc::cqRefIndex(q->cqRef()) == slotA;
+        q.reset();
+        client.doWork();
+    }
+    EXPECT_TRUE(reused) << "slot A was never recycled after its op completed";
+}
+
+namespace {
+/// A worker thread that owns a registered Completions; stopping it (RAII)
+/// joins the thread, whose exit destroys that queue (review CrossJoin).
+struct QueueWorker {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> registered{false};
+    std::thread       t;
+    explicit QueueWorker(rc::Client& c, rc::Completions* adopt = nullptr)
+        : t([this, &c, adopt] {
+              std::unique_ptr<rc::Completions> mine(adopt != nullptr ? adopt : new rc::Completions(c));
+              registered.store(true);
+              while (!stop.load()) std::this_thread::yield();
+          }) {}  // ~mine on exit: a release on THIS thread, racing close()
+    ~QueueWorker() {
+        stop.store(true);
+        t.join();
+    }
+};
+} // namespace
+
+// I5: a callable destroyed by close()'s final drain stops + joins a worker
+// whose exit releases ITS registered queue.  The worker is not the closer: its
+// release must not wait for a hand-back the closer (blocked in the join) never
+// reaches — last-one-frees handshake, nobody waits.
+TEST(CompletionsClient, NonCloserReleaseDuringCloseNeverWaitsRegression) {
+    Watchdog wd("close() joining a worker that releases its queue");
+    rc::detail::CompletionRing::testOnDestroy = &countRingFree;
+    g_ringsFreed.store(0);
+    {
+        rc::Client client(cfgFor(5262, rc::RunnerMode::Thread));
+        auto w = std::make_shared<QueueWorker>(client);
+        while (!w->registered.load()) std::this_thread::yield();
+        ASSERT_EQ(client.testRegisteredCqs(), 1u);
+        g_parkRunner.store(true);
+        g_runnerParked.store(false);
+        client.testSetDutyCycleHook(&parkRunnerHook);
+        while (!g_runnerParked.load()) std::this_thread::yield();
+        for (int i = 0; i < 200; ++i) client.onError([](const std::string&) {});
+        client.onError([keep = w](const std::string&) {});
+        client.onError([](const std::string&) {});  // the drain destroys `keep` -> joins the worker
+        w.reset();
+        std::thread unpark([&] {
+            rc::CompletionHandler h{&noopHandler, nullptr};
+            while (client.listTopics(h, 1) != rc::OpResult::Closed) std::this_thread::yield();
+            g_parkRunner.store(false);
+        });
+        client.close();
+        unpark.join();
+    }
+    EXPECT_EQ(g_ringsFreed.load(), 1) << "the worker's ring was leaked or freed twice";
+    rc::detail::CompletionRing::testOnDestroy = nullptr;
+}
+
+// I5, Invoker variant: the Client is destroyed off its owner; the drain joins a
+// worker that releases a queue registered on the owner thread.
+TEST(CompletionsClient, NonCloserReleaseDuringAnOffOwnerCloseNeverWaitsRegression) {
+    Watchdog wd("off-owner close() joining a worker that releases its queue");
+    rc::detail::CompletionRing::testOnDestroy = &countRingFree;
+    g_ringsFreed.store(0);
+    {
+        std::unique_ptr<rc::Client>      client;
+        std::shared_ptr<QueueWorker>     w;
+        std::thread owner([&] {
+            client = std::make_unique<rc::Client>(cfgFor(5264, rc::RunnerMode::Invoker));
+            w = std::make_shared<QueueWorker>(*client, new rc::Completions(*client));  // owner-registered
+        });
+        owner.join();
+        while (!w->registered.load()) std::this_thread::yield();
+        client->onError([keep = w](const std::string&) {});  // off-owner: a ring command
+        client->onError([](const std::string&) {});
+        w.reset();
+        client.reset();  // close() on main: the drain joins the worker
+    }
+    EXPECT_EQ(g_ringsFreed.load(), 1);
+    rc::detail::CompletionRing::testOnDestroy = nullptr;
+}
+
+// n2: *AndWait's issue loop on a FULL command ring ends at its deadline
+// (one budget for issue + wait) instead of retrying forever.
+TEST(CompletionsClient, AndWaitOnAFullCommandRingTimesOutRegression) {
+    Watchdog wd("pingAndWait on a full command ring");
+    Rig r(cfgFor(5266));
+    r.client.testFillCommandRing();
+    try {
+        (void)r.client.pingAndWait(std::vector<uint8_t>{1}, std::chrono::nanoseconds(0));
+        ADD_FAILURE() << "pingAndWait must throw";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("timed out (command ring full)"), std::string::npos) << e.what();
+    }
 }

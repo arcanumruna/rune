@@ -59,6 +59,7 @@ public:
         m_consumerHeartbeatIndex    = m_capacity + CONSUMER_HEARTBEAT_OFFSET;
         m_producerClosedIndex       = m_capacity + PRODUCER_CLOSED_OFFSET;
         m_consumerClosedIndex       = m_capacity + CONSUMER_CLOSED_OFFSET;
+        m_detachIndex               = m_capacity + DETACH_OFFSET;
     }
 
     OneToOneRingBuffer(const OneToOneRingBuffer&)            = delete;
@@ -219,6 +220,19 @@ public:
     [[nodiscard]] bool consumerClosed() const noexcept { return loadAcquire64_(m_consumerClosedIndex) != 0; }
     [[nodiscard]] bool closed() const noexcept { return producerClosed() || consumerClosed(); }
 
+    /// F8c fix round 2 (I5): last-one-frees ownership handshake on ONE word.
+    /// Each side detaches exactly once with one RMW; the call that finds the
+    /// OTHER side already detached returns true — its caller frees the ring.
+    /// Exactly one of the two calls returns true; neither side ever waits.
+    bool detachProducer() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedProducer, __ATOMIC_ACQ_REL) &
+                kDetachedConsumer) != 0;
+    }
+    bool detachConsumer() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedConsumer, __ATOMIC_ACQ_REL) &
+                kDetachedProducer) != 0;
+    }
+
     [[nodiscard]] std::int64_t producerPosition() const noexcept { return loadAcquire64_(m_tailPositionIndex); }
     [[nodiscard]] std::int64_t consumerPosition() const noexcept { return loadAcquire64_(m_headPositionIndex); }
 
@@ -251,6 +265,8 @@ public:
 private:
     static constexpr aeron::util::index_t CL = aeron::util::BitUtil::CACHE_LINE_LENGTH;
     // CL*0..CL*10: Aeron RingBufferDescriptor.  CL*12/CL*14: Rune extensions.
+    static constexpr std::int64_t kDetachedProducer = 1;
+    static constexpr std::int64_t kDetachedConsumer = 2;
     static constexpr aeron::util::index_t TAIL_POSITION_OFFSET       = CL * 2;
     static constexpr aeron::util::index_t HEAD_CACHE_POSITION_OFFSET = CL * 4;
     static constexpr aeron::util::index_t HEAD_POSITION_OFFSET       = CL * 6;
@@ -258,6 +274,7 @@ private:
     static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10;
     static constexpr aeron::util::index_t PRODUCER_CLOSED_OFFSET     = CL * 12;
     static constexpr aeron::util::index_t CONSUMER_CLOSED_OFFSET     = CL * 14;
+    static constexpr aeron::util::index_t DETACH_OFFSET              = CL * 15;  // spare line (F8c fix2)
     static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 16;
 
     template <typename F>
@@ -311,6 +328,7 @@ private:
     aeron::util::index_t m_consumerHeartbeatIndex    = 0;
     aeron::util::index_t m_producerClosedIndex       = 0;
     aeron::util::index_t m_consumerClosedIndex       = 0;
+    aeron::util::index_t m_detachIndex               = 0;
 };
 
 } // namespace rune::client::detail
