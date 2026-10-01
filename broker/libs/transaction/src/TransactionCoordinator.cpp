@@ -47,36 +47,10 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
             txnMap_[id] = meta;
             auto& m = txnMap_[id];
             // B2: recovered Prepare* needs marker resolution after failover.
-            if (m.state == TxnState::PrepareAbort || m.state == TxnState::PrepareCommit) {
-                m.markersPending = true;
-            }
-            // LIVENESS FIX (P5-5): a recovered Complete* means all side-effects
-            // (markers + offsets) were already durably applied before the Complete*
-            // record was persisted.  The only remaining step was the Empty reset,
-            // which crashed before it could be written.  Collapsing to Empty here
-            // makes the transactionalId immediately reusable — consistent with Kafka
-            // treating Complete* as transient.  We do NOT re-apply offsets or
-            // re-write markers (both already durable).
-            //
-            // For CompleteAbort we must also adopt any deferred pendingNewProducerId
-            // (NEW-1/A2 overflow path): completeTransaction would have swapped the
-            // identity before writing Empty, so we replicate that swap here to keep
-            // the recovered PID consistent with what completeTransaction would have
-            // produced.
-            if (m.state == TxnState::CompleteCommit || m.state == TxnState::CompleteAbort) {
-                if (m.state == TxnState::CompleteAbort && m.pendingNewProducerId >= 0) {
-                    m.producerId            = m.pendingNewProducerId;
-                    m.producerEpoch         = m.pendingNewProducerEpoch;
-                    m.pendingNewProducerId    = -1;
-                    m.pendingNewProducerEpoch = -1;
-                }
-                m.state          = TxnState::Empty;
-                m.partitions.clear();
-                m.pendingOffsets.clear();
-                m.txnStartNs     = 0;
-                m.fencingEpoch   = false;
-                m.markersPending = false;
-            }
+            // F15 §5.4: Complete* is the RESTING state (Kafka) — it is kept, so
+            // a same-direction EndTxn retry is answered OK after a restart; only
+            // a deferred overflow pid swap is adopted (NEW-1/A2).
+            adoptRecovered_(m);
             if (m.producerId > maxPid)            maxPid = m.producerId;
             if (m.pendingNewProducerId > maxPid)  maxPid = m.pendingNewProducerId;
         }
@@ -85,6 +59,24 @@ TransactionCoordinator::TransactionCoordinator(ProducerIdAllocator allocator,
         if (maxPid >= 0) {
             allocator_.reseedAtLeast(maxPid);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// adoptRecovered_ — recovery normalisation (constructor replay + reload()).
+// ---------------------------------------------------------------------------
+void TransactionCoordinator::adoptRecovered_(TransactionMetadata& m) noexcept
+{
+    if (m.state == TxnState::PrepareAbort || m.state == TxnState::PrepareCommit) {
+        m.markersPending = true;
+    }
+    if (m.state == TxnState::CompleteAbort && m.pendingNewProducerId >= 0) {
+        // The ABORT of the overflow fence resolved: the fresh pid is adopted
+        // (completeTransaction does the same before persisting CompleteAbort).
+        m.producerId              = m.pendingNewProducerId;
+        m.producerEpoch           = m.pendingNewProducerEpoch;
+        m.pendingNewProducerId    = -1;
+        m.pendingNewProducerEpoch = -1;
     }
 }
 
@@ -125,6 +117,11 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     // No transactional id → fresh producer, no state machine entry.
     if (!txnId.has_value() || txnId->empty()) {
         ProducerId pid   = allocator_.allocate();
+        if (pid < 0) {
+            // F15 I7: the next block's ceiling is not committed yet — retriable.
+            return { .producerId = -1, .producerEpoch = -1,
+                     .errorCode  = InitProducerIdResult::kConcurrentTransactions };
+        }
         return { .producerId = pid, .producerEpoch = 0, .errorCode = 0 };
     }
 
@@ -134,6 +131,10 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     if (meta == nullptr) {
         // Unknown txnId → create new metadata (Empty, epoch 0).
         ProducerId pid = allocator_.allocate();
+        if (pid < 0) {
+            return { .producerId = -1, .producerEpoch = -1,
+                     .errorCode  = InitProducerIdResult::kConcurrentTransactions };
+        }
         TransactionMetadata newMeta;
         newMeta.txnId             = id;
         newMeta.producerId        = pid;
@@ -147,14 +148,13 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         return { .producerId = pid, .producerEpoch = 0, .errorCode = 0 };
     }
 
-    // Known txnId — check if a Prepare* or Complete* is in flight.
+    // Known txnId — check if a Prepare* is in flight.
     // C3/C4: mirror Kafka — return kConcurrentTransactions instead of silently
     // bumping the epoch mid-Prepare*.  The new producer must retry until the
-    // in-flight transaction resolves.
+    // in-flight transaction resolves.  F15 §5.4: Complete* is the resting
+    // state and is treated like Empty (bump) — Kafka prepareIncrementProducerEpoch.
     if (meta->state == TxnState::PrepareCommit  ||
         meta->state == TxnState::PrepareAbort   ||
-        meta->state == TxnState::CompleteCommit ||
-        meta->state == TxnState::CompleteAbort  ||
         meta->state == TxnState::PrepareEpochFence) {
         return { .producerId    = meta->producerId,
                  .producerEpoch = meta->producerEpoch,
@@ -169,6 +169,11 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     if (meta->producerEpoch == INT16_MAX) {
         // Epoch space exhausted — allocate a fresh PID.
         newPid   = allocator_.allocate();
+        if (newPid < 0) {
+            // F15 I7: no committed pid block — retriable, nothing mutated.
+            return { .producerId = -1, .producerEpoch = -1,
+                     .errorCode  = InitProducerIdResult::kConcurrentTransactions };
+        }
         newEpoch = 0;
     } else {
         newEpoch = static_cast<ProducerEpoch>(meta->producerEpoch + 1);
@@ -213,13 +218,14 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
         return { .producerId = newPid, .producerEpoch = newEpoch, .errorCode = 0 };
     }
 
-    // State is Empty (or Dead — treat Dead as re-create).
+    // State is Empty, Complete* (F15 §5.4: resting state) or Dead.
     // Simply bump epoch and reset to Empty.
     meta->producerId         = newPid;
     meta->producerEpoch      = newEpoch;
     meta->txnTimeoutMs       = effectiveTimeout;
     meta->state              = TxnState::Empty;
     meta->partitions.clear();
+    meta->pendingOffsets.clear();
     meta->txnStartNs         = 0;
     meta->fencingEpoch       = false;
     meta->markersPending     = false;
@@ -249,16 +255,23 @@ AddPartitionsResult TransactionCoordinator::addPartitions(
         return { .errorCode = e };
     }
 
-    // Validate state: only Empty and Ongoing are valid for addPartitions.
-    if (meta->state != TxnState::Empty && meta->state != TxnState::Ongoing) {
+    // Validate state: Empty, Ongoing and (F15 §5.4) the resting Complete*.
+    const bool resting = meta->state == TxnState::Empty ||
+                         meta->state == TxnState::CompleteCommit ||
+                         meta->state == TxnState::CompleteAbort;
+    if (!resting && meta->state != TxnState::Ongoing) {
         return { .errorCode = AddPartitionsResult::kInvalidTransition };
     }
 
-    if (meta->state == TxnState::Empty) {
-        // Empty → Ongoing: record the transaction start time.
-        meta->state      = TxnState::Ongoing;
-        meta->txnStartNs = nowNs;
+    if (resting) {
+        // Empty / Complete* → Ongoing: a new transaction starts.
+        meta->state        = TxnState::Ongoing;
+        meta->txnStartNs   = nowNs;
+        meta->fencingEpoch = false;
+        meta->partitions.clear();
+        meta->pendingOffsets.clear();
     }
+    meta->coordinatorEpoch = coordinatorEpoch_;
 
     // Accumulate partitions (std::set deduplicates automatically).
     for (const auto& tp : partitions) {
@@ -295,9 +308,30 @@ EndTransactionResult TransactionCoordinator::endTransaction(
         return { .errorCode = e };
     }
 
-    // Only Ongoing transitions are valid here.
-    if (meta->state != TxnState::Ongoing) {
-        return { .errorCode = EndTransactionResult::kInvalidTransition };
+    // F15 §5.4 — the EndTxn idempotency table (Kafka handleEndTransaction).
+    switch (meta->state) {
+        case TxnState::Ongoing:
+            break;                                           // the transition below
+        case TxnState::PrepareCommit:
+        case TxnState::PrepareAbort: {
+            // The caller of an InitProducerId fence never ended this txn itself:
+            // it waits for the fence's abort to resolve (27, m2).
+            if (meta->fencingEpoch)
+                return { .errorCode = EndTransactionResult::kConcurrentTransactions };
+            const bool preparingCommit = meta->state == TxnState::PrepareCommit;
+            return { .errorCode = (commit == preparingCommit)
+                                      ? EndTransactionResult::kConcurrentTransactions   // retry: 27
+                                      : EndTransactionResult::kInvalidTransition };     // opposite: 19
+        }
+        case TxnState::CompleteCommit:
+            if (commit) return { .errorCode = EndTransactionResult::kOk, .alreadyComplete = true };
+            return { .errorCode = EndTransactionResult::kInvalidTransition };
+        case TxnState::CompleteAbort:
+            if (!commit) return { .errorCode = EndTransactionResult::kOk, .alreadyComplete = true };
+            return { .errorCode = meta->fencingEpoch ? EndTransactionResult::kInvalidPid          // 18
+                                                     : EndTransactionResult::kInvalidTransition }; // 19
+        default:                                             // Empty / Dead / PrepareEpochFence
+            return { .errorCode = EndTransactionResult::kInvalidTransition };
     }
 
     // Collect the partition set to return (P5-3 needs to write markers there).
@@ -310,7 +344,8 @@ EndTransactionResult TransactionCoordinator::endTransaction(
     }
     // Client-driven: markers will be written by the caller using the returned
     // partitions, NOT via the pending-markers path.
-    meta->markersPending = false;
+    meta->markersPending   = false;
+    meta->coordinatorEpoch = coordinatorEpoch_;
 
     // CRITICAL atomicity: PrepareCommit/PrepareAbort MUST be persisted+fsynced
     // to the log HERE, BEFORE any markers are written and BEFORE completeTransaction.
@@ -352,6 +387,7 @@ AddPartitionsResult TransactionCoordinator::addOffsetsToTxn(
     for (const auto& [tp, off] : offsets) {
         meta->pendingOffsets.push_back({group, tp, off});
     }
+    meta->coordinatorEpoch = coordinatorEpoch_;
 
     // Durable-before-visible: persist the updated metadata (including pendingOffsets)
     // BEFORE any OffsetStore write can occur.
@@ -402,36 +438,36 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
         // C2: NOW persist CompleteCommit as a distinct terminal record.  The
         // offsets are already durable in the OffsetStore, so this record makes the
         // commit visible only AFTER the offsets are safe (durable-before-visible).
-        meta->state = TxnState::CompleteCommit;
-        persistTransition(txnLog_, *meta, coordinatorEpoch_);
-
-        // Transition to Empty (ready for next txn, same epoch).
+        //
+        // F15 §5.4: CompleteCommit is the RESTING state (Kafka) — it keeps the
+        // producer epoch, so a same-direction EndTxn retry is answered OK; the
+        // next addPartitions moves it to Ongoing, InitProducerId bumps it.
         meta->pendingOffsets.clear();
         meta->partitions.clear();
-        meta->txnStartNs     = 0;
-        meta->fencingEpoch   = false;
-        meta->markersPending = false;
-        meta->state          = TxnState::Empty;
+        meta->txnStartNs       = 0;
+        meta->fencingEpoch     = false;
+        meta->markersPending   = false;
+        meta->coordinatorEpoch = coordinatorEpoch_;
+        meta->state            = TxnState::CompleteCommit;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
     }
 
     if (meta->state == TxnState::PrepareAbort) {
-        // C2: persist CompleteAbort before clearing.  The ABORT markers were
-        // stamped with the CURRENT producerId/epoch — for the NEW-1 overflow case
-        // that is still the OLD identity, matching the in-flight data.  We adopt the
-        // deferred new PID ONLY here, after the abort has been fully resolved.
-        meta->state = TxnState::CompleteAbort;
-        persistTransition(txnLog_, *meta, coordinatorEpoch_);
-
+        // The ABORT markers were stamped with the CURRENT producerId/epoch — for
+        // the NEW-1 overflow case that is still the OLD identity, matching the
+        // in-flight data.  The deferred new PID is adopted ONLY here, after the
+        // abort has been fully resolved.
+        //
         // F3: Discard pending consumer-group offsets — they must NEVER be written
         // to the OffsetStore on an aborted transaction (EOS invariant).
         meta->pendingOffsets.clear();
 
         meta->partitions.clear();
         meta->txnStartNs     = 0;
-        meta->fencingEpoch   = false;
         meta->markersPending = false;
+        // fencingEpoch is KEPT on the resting CompleteAbort (F15 §5.4: an EndTxn
+        // COMMIT after a fence's abort answers ProducerFenced, not InvalidTxnState).
         // NEW-1: adopt the deferred fresh PID (epoch 0) now that the OLD PID's ABORT
         // markers are done.  The OLD PID is thereby retired.
         if (meta->pendingNewProducerId >= 0) {
@@ -440,7 +476,9 @@ CompleteTransactionResult TransactionCoordinator::completeTransaction(
             meta->pendingNewProducerId    = -1;
             meta->pendingNewProducerEpoch = -1;
         }
-        meta->state          = TxnState::Empty;
+        // F15 §5.4: CompleteAbort is the RESTING state (Kafka).
+        meta->coordinatorEpoch = coordinatorEpoch_;
+        meta->state            = TxnState::CompleteAbort;
         persistTransition(txnLog_, *meta, coordinatorEpoch_);
         return { .errorCode = CompleteTransactionResult::kOk };
     }
@@ -461,8 +499,9 @@ int TransactionCoordinator::doWork(int64_t nowNs)
 
         int64_t timeoutNs = static_cast<int64_t>(meta.txnTimeoutMs) * 1'000'000LL;
         if (nowNs - meta.txnStartNs > timeoutNs) {
-            meta.state           = TxnState::PrepareAbort;
-            meta.markersPending  = true;   // B1: caller must write ABORT markers
+            meta.state            = TxnState::PrepareAbort;
+            meta.markersPending   = true;   // B1: caller must write ABORT markers
+            meta.coordinatorEpoch = coordinatorEpoch_;
             // Persist PrepareAbort to log (durable-before-markers ordering).
             persistTransition(txnLog_, meta, coordinatorEpoch_);
             ++work;
@@ -561,6 +600,14 @@ int TransactionCoordinator::validateEpochAndPid(const TransactionMetadata& meta,
                                                  ProducerId                  pid,
                                                  ProducerEpoch               epoch) const noexcept
 {
+    // F15 m2: an overflow fence handed the caller a NEW pid while the old txn's
+    // PrepareAbort (stamped with the OLD pid) resolves.  That caller must retry
+    // (ConcurrentTransactions), never be told its pid is invalid.
+    if ((meta.state == TxnState::PrepareAbort || meta.state == TxnState::PrepareCommit) &&
+        meta.pendingNewProducerId >= 0 &&
+        pid == meta.pendingNewProducerId && epoch == meta.pendingNewProducerEpoch) {
+        return AddPartitionsResult::kConcurrentTransactions;
+    }
     // PID mismatch: wrong producer for this txnId.
     if (pid != meta.producerId) {
         return AddPartitionsResult::kInvalidPid;

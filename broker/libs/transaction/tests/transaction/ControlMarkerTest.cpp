@@ -197,7 +197,7 @@ TEST(ControlMarkerTest, WriteMarkersCommitThreePartitions) {
     }
 
     // Coordinator must be in Empty state after completeTransaction.
-    EXPECT_EQ(coord.state(txnId), TxnState::Empty);
+    EXPECT_EQ(coord.state(txnId), TxnState::CompleteCommit);
 }
 
 TEST(ControlMarkerTest, WriteMarkersAbortThreePartitions) {
@@ -226,7 +226,7 @@ TEST(ControlMarkerTest, WriteMarkersAbortThreePartitions) {
         EXPECT_EQ(pl.controlType, ControlType::Abort);
     }
 
-    EXPECT_EQ(coord.state(txnId), TxnState::Empty);
+    EXPECT_EQ(coord.state(txnId), TxnState::CompleteAbort);
 }
 
 TEST(ControlMarkerTest, WriteMarkersOnePartition) {
@@ -249,7 +249,7 @@ TEST(ControlMarkerTest, WriteMarkersOnePartition) {
                                              true, 0, kNow, appendFn);
     EXPECT_EQ(count, 1);
     EXPECT_EQ(captureCount, 1);
-    EXPECT_EQ(coord.state(txnId), TxnState::Empty);
+    EXPECT_EQ(coord.state(txnId), TxnState::CompleteCommit);
 }
 
 TEST(ControlMarkerTest, WriteMarkersZeroPartitions) {
@@ -340,7 +340,7 @@ TEST(ControlMarkerTest, IntegrationCommitPath) {
     for (auto& [p, pl] : captured) {
         EXPECT_EQ(pl.controlType, ControlType::Commit);
     }
-    EXPECT_EQ(coord.state("integ-commit"), TxnState::Empty);
+    EXPECT_EQ(coord.state("integ-commit"), TxnState::CompleteCommit);
 }
 
 TEST(ControlMarkerTest, IntegrationAbortPath) {
@@ -365,7 +365,7 @@ TEST(ControlMarkerTest, IntegrationAbortPath) {
     for (auto& pl : captured) {
         EXPECT_EQ(pl.controlType, ControlType::Abort);
     }
-    EXPECT_EQ(coord.state("integ-abort"), TxnState::Empty);
+    EXPECT_EQ(coord.state("integ-abort"), TxnState::CompleteAbort);
 }
 
 TEST(ControlMarkerTest, IntegrationStateAfterCommit) {
@@ -379,7 +379,7 @@ TEST(ControlMarkerTest, IntegrationStateAfterCommit) {
                                  true, 0, kNow, appendFn);
 
     // After completeTransaction, state is Empty and another txn can start.
-    EXPECT_EQ(coord.state("state-after"), TxnState::Empty);
+    EXPECT_EQ(coord.state("state-after"), TxnState::CompleteCommit);
     auto ar = coord.addPartitions("state-after", ir.producerId, ir.producerEpoch,
                                    tps({tp("q", 0)}), kNow + 1);
     EXPECT_TRUE(ar.ok());
@@ -395,7 +395,7 @@ TEST(ControlMarkerTest, IntegrationStateAfterAbort) {
     ControlMarker::writeMarkers(coord, "state-abort", ir.producerId, ir.producerEpoch,
                                  false, 0, kNow, appendFn);
 
-    EXPECT_EQ(coord.state("state-abort"), TxnState::Empty);
+    EXPECT_EQ(coord.state("state-abort"), TxnState::CompleteAbort);
 }
 
 // ===========================================================================

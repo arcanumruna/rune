@@ -351,3 +351,81 @@ TEST(ControlBatchRegression, RebuildSpansEverySegment) {
     ASSERT_EQ(aborted.size(), 1u);
     EXPECT_TRUE(aborted.isAborted(7, 0));
 }
+
+// ===========================================================================
+// F15 S7 (§5.4) — the EndTxn idempotency table rows beyond the S0 tests, and
+// the I7 allocator gate at the coordinator layer.
+// ===========================================================================
+
+namespace {
+struct Begun {
+    TransactionCoordinator coord{ProducerIdAllocator{}, 60'000};
+    InitProducerIdResult ip;
+    explicit Begun(const std::string& id) {
+        ip = coord.initProducerId(id, 60'000, 0);
+        (void)coord.addPartitions(id, ip.producerId, ip.producerEpoch, {TopicPartition{"t", 0}}, 0);
+    }
+};
+} // namespace
+
+TEST(TxnEndTxnTableRegression, CompleteAbortSameDirectionOkOppositeInvalid) {
+    Begun b("t-ca");
+    ASSERT_TRUE(b.coord.endTransaction("t-ca", b.ip.producerId, b.ip.producerEpoch, false, 0).ok());
+    ASSERT_TRUE(b.coord.completeTransaction("t-ca").ok());
+    ASSERT_EQ(b.coord.state("t-ca"), TxnState::CompleteAbort);
+    const auto same = b.coord.endTransaction("t-ca", b.ip.producerId, b.ip.producerEpoch, false, 0);
+    EXPECT_TRUE(same.ok());
+    EXPECT_TRUE(same.alreadyComplete) << "no transition, no markers";
+    EXPECT_EQ(b.coord.endTransaction("t-ca", b.ip.producerId, b.ip.producerEpoch, true, 0).errorCode,
+              EndTransactionResult::kInvalidTransition);
+    EXPECT_EQ(b.coord.endTransaction("t-ca", b.ip.producerId, static_cast<ProducerEpoch>(b.ip.producerEpoch - 1), false, 0).errorCode,
+              EndTransactionResult::kInvalidProducerEpoch) << "stale epoch → 17 before the table";
+}
+
+TEST(TxnEndTxnTableRegression, FenceAbortCallerGetsConcurrentThenProducerFencedOnCommit) {
+    Begun b("t-f");
+    const auto fence = b.coord.initProducerId(std::string("t-f"), 60'000, 0);   // fences the Ongoing txn
+    ASSERT_TRUE(fence.ok());
+    ASSERT_EQ(b.coord.state("t-f"), TxnState::PrepareAbort);
+    EXPECT_EQ(b.coord.endTransaction("t-f", fence.producerId, fence.producerEpoch, true, 0).errorCode,
+              EndTransactionResult::kConcurrentTransactions) << "the fence caller never ended that txn";
+    EXPECT_EQ(b.coord.endTransaction("t-f", fence.producerId, fence.producerEpoch, false, 0).errorCode,
+              EndTransactionResult::kConcurrentTransactions);
+    ASSERT_TRUE(b.coord.completeTransaction("t-f").ok());
+    ASSERT_EQ(b.coord.state("t-f"), TxnState::CompleteAbort);
+    EXPECT_EQ(b.coord.endTransaction("t-f", fence.producerId, fence.producerEpoch, true, 0).errorCode,
+              EndTransactionResult::kInvalidPid) << "COMMIT after a fence's abort: ProducerFenced (18)";
+}
+
+TEST(TxnEndTxnTableRegression, CompleteIsRestingAndReusable) {
+    Begun b("t-r");
+    ASSERT_TRUE(b.coord.endTransaction("t-r", b.ip.producerId, b.ip.producerEpoch, true, 0).ok());
+    ASSERT_TRUE(b.coord.completeTransaction("t-r").ok());
+    ASSERT_EQ(b.coord.state("t-r"), TxnState::CompleteCommit);
+    EXPECT_EQ(b.coord.epochOf("t-r"), b.ip.producerEpoch) << "Complete* keeps the producer epoch";
+    // The next transaction: Complete* → Ongoing.
+    ASSERT_TRUE(b.coord.addPartitions("t-r", b.ip.producerId, b.ip.producerEpoch, {TopicPartition{"t", 1}}, 5).ok());
+    EXPECT_EQ(b.coord.state("t-r"), TxnState::Ongoing);
+    EXPECT_EQ(b.coord.partitionsOf("t-r").size(), 1u) << "the previous txn's partitions are gone";
+    ASSERT_TRUE(b.coord.endTransaction("t-r", b.ip.producerId, b.ip.producerEpoch, false, 0).ok());
+    ASSERT_TRUE(b.coord.completeTransaction("t-r").ok());
+    // InitProducerId treats Complete* like Empty: bump.
+    const auto re = b.coord.initProducerId(std::string("t-r"), 60'000, 0);
+    ASSERT_TRUE(re.ok()) << "Complete* must not answer ConcurrentTransactions";
+    EXPECT_EQ(re.producerEpoch, b.ip.producerEpoch + 1);
+    EXPECT_EQ(b.coord.state("t-r"), TxnState::Empty);
+}
+
+TEST(TxnPidBlockRegression, GatedAllocatorRefusesAboveTheCommittedCeiling) {
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000);
+    coord.allocator().commitLimit(2);                         // block [0, 2) committed
+    EXPECT_TRUE(coord.initProducerId(std::nullopt, 60'000, 0).ok());
+    EXPECT_TRUE(coord.initProducerId(std::string("a"), 60'000, 0).ok());
+    const auto refused = coord.initProducerId(std::string("b"), 60'000, 0);
+    EXPECT_EQ(refused.errorCode, InitProducerIdResult::kConcurrentTransactions) << "retriable, never pid -2";
+    EXPECT_FALSE(coord.metadata("b")) << "nothing created for a refused allocation";
+    coord.allocator().commitLimit(4);
+    const auto ok = coord.initProducerId(std::string("b"), 60'000, 0);
+    ASSERT_TRUE(ok.ok());
+    EXPECT_EQ(ok.producerId, 2);
+}

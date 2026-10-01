@@ -5,6 +5,9 @@
 // Bounded drivers with hard caps + ASSERT(done). No spin. Injected clock.
 // ---------------------------------------------------------------------------
 
+// F15 §5.4 (2026-10-01): Complete* is now the RESTING state (Kafka).  Tests that
+// asserted "Complete* → Empty" (the P5-5 collapse) assert the resting Complete*;
+// the not-wedged intent is unchanged (re-init bumps, addPartitions → Ongoing).
 #include <rune/transaction/TransactionCoordinator.h>
 #include <rune/transaction/TransactionLog.h>
 #include <rune/transaction/ControlMarker.h>
@@ -225,7 +228,7 @@ TEST_F(TxnCoordTest, ReInitOngoingThenCompleteResetsToEmpty)
     // P5-3 completes the abort markers.
     auto cr = coord_.completeTransaction("txn-1");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord_.state("txn-1"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-1"), TxnState::CompleteAbort);
     // Epoch is the new bumped epoch.
     EXPECT_EQ(coord_.epochOf("txn-1"), 1);
 }
@@ -388,7 +391,7 @@ TEST_F(TxnCoordTest, CompleteCommitTransitionsThenEmpty)
 
     auto cr = coord_.completeTransaction("txn-1");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord_.state("txn-1"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-1"), TxnState::CompleteCommit);
     // Epoch is unchanged after a commit.
     EXPECT_EQ(coord_.epochOf("txn-1"), r.producerEpoch);
 }
@@ -430,7 +433,7 @@ TEST_F(TxnCoordTest, CompleteAbortTransitionsThenEmpty)
 
     auto cr = coord_.completeTransaction("txn-1");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord_.state("txn-1"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-1"), TxnState::CompleteAbort);
 }
 
 TEST_F(TxnCoordTest, AfterCompleteAbortPartitionsCleared)
@@ -456,7 +459,7 @@ TEST_F(TxnCoordTest, EndTransactionWhenEmptyIsInvalidTransition)
     EXPECT_EQ(er.errorCode, EndTransactionResult::kInvalidTransition);
 }
 
-TEST_F(TxnCoordTest, EndTransactionWhenPrepareCommitIsInvalidTransition)
+TEST_F(TxnCoordTest, EndTransactionWhenPrepareCommitFollowsTheIdempotencyTable)
 {
     auto r = coord_.initProducerId("txn-1", kDefaultTimeoutMs, nowNs_);
     coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
@@ -464,9 +467,13 @@ TEST_F(TxnCoordTest, EndTransactionWhenPrepareCommitIsInvalidTransition)
     coord_.endTransaction("txn-1", r.producerId, r.producerEpoch, true, nowNs_);
     ASSERT_EQ(coord_.state("txn-1"), TxnState::PrepareCommit);
 
-    // Double commit.
+    // F15 §5.4 (Kafka): a same-direction retry while PrepareCommit is
+    // retriable (ConcurrentTransactions); the opposite direction is a client
+    // bug (InvalidTxnState).
     auto er = coord_.endTransaction("txn-1", r.producerId, r.producerEpoch,
                                     true, nowNs_);
+    EXPECT_EQ(er.errorCode, EndTransactionResult::kConcurrentTransactions);
+    er = coord_.endTransaction("txn-1", r.producerId, r.producerEpoch, false, nowNs_);
     EXPECT_EQ(er.errorCode, EndTransactionResult::kInvalidTransition);
 }
 
@@ -677,7 +684,7 @@ TEST_F(TxnCoordTest, FullCommitLifecycle)
     // Phase 5: complete (P5-3 has written the markers).
     auto cr = coord_.completeTransaction("txn-1");
     ASSERT_TRUE(cr.ok());
-    ASSERT_EQ(coord_.state("txn-1"), TxnState::Empty);
+    ASSERT_EQ(coord_.state("txn-1"), TxnState::CompleteCommit);
 
     // Phase 6: start next transaction with SAME pid/epoch.
     auto ar3 = coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
@@ -695,7 +702,7 @@ TEST_F(TxnCoordTest, FullAbortLifecycle)
     ASSERT_EQ(coord_.state("txn-1"), TxnState::PrepareAbort);
 
     coord_.completeTransaction("txn-1");
-    ASSERT_EQ(coord_.state("txn-1"), TxnState::Empty);
+    ASSERT_EQ(coord_.state("txn-1"), TxnState::CompleteAbort);
 
     // Start again with same pid/epoch.
     auto ar = coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
@@ -725,7 +732,7 @@ TEST_F(TxnCoordTest, FullLifecycleWithTimeoutAbort)
     // Complete the abort.
     auto cr = coord_.completeTransaction("txn-1");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord_.state("txn-1"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-1"), TxnState::CompleteAbort);
 
     // Can start a new txn.
     auto ar = coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
@@ -828,7 +835,7 @@ TEST_F(TxnCoordTest, ZombieCannotAddPartitionsAfterEpochBump)
 
     // Complete the abort started by the epoch bump.
     coord_.completeTransaction("txn-z");
-    ASSERT_EQ(coord_.state("txn-z"), TxnState::Empty);
+    ASSERT_EQ(coord_.state("txn-z"), TxnState::CompleteAbort);
 
     // Zombie P1 tries to add partitions — must be fenced.
     auto ar = coord_.addPartitions("txn-z", r1.producerId, r1.producerEpoch,
@@ -962,7 +969,7 @@ TEST(TxnCoordDurableTest, CompleteTransactionPersistedToLog)
     // Log must reflect Empty after complete.
     const auto* meta = log.metadata("txn-dur-complete");
     ASSERT_NE(meta, nullptr);
-    EXPECT_EQ(meta->state, TxnState::Empty);
+    EXPECT_EQ(meta->state, TxnState::CompleteCommit);
 }
 
 TEST(TxnCoordDurableTest, ReplayRebuildsMetadataOnConstruction)
@@ -1001,7 +1008,7 @@ TEST(TxnCoordDurableTest, ReplayRebuildsMetadataOnConstruction)
     // Can resolve the recovered transaction.
     auto cr = coord2.completeTransaction("txn-replay");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord2.state("txn-replay"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-replay"), TxnState::CompleteCommit);
 }
 
 // ===========================================================================
@@ -1050,7 +1057,7 @@ TEST(TxnCoordCrashSeamTest, RecoveredPrepareCommitIsResolvable)
     // Resolve.
     auto cr = coord2.completeTransaction("txn-cs-commit");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord2.state("txn-cs-commit"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-cs-commit"), TxnState::CompleteCommit);
 }
 
 TEST(TxnCoordCrashSeamTest, RecoveredPrepareAbortIsResolvable)
@@ -1089,7 +1096,7 @@ TEST(TxnCoordCrashSeamTest, RecoveredPrepareAbortIsResolvable)
 
     auto cr = coord2.completeTransaction("txn-cs-abort");
     EXPECT_TRUE(cr.ok());
-    EXPECT_EQ(coord2.state("txn-cs-abort"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-cs-abort"), TxnState::CompleteAbort);
 }
 
 // ===========================================================================
@@ -1190,7 +1197,7 @@ TEST_F(TxnCoordTest, FenceAbortResolvePendingWritesAbortMarkersToAllPartitions)
 
     EXPECT_EQ(total, 3)                     << "Expected 3 ABORT markers (one per partition)";
     EXPECT_EQ(captured.size(), 3u)          << "Expected markers on 3 distinct partitions";
-    EXPECT_EQ(coord_.state("txn-f"), TxnState::Empty) << "State must be Empty after resolve";
+    EXPECT_EQ(coord_.state("txn-f"), TxnState::CompleteAbort) << "State must be the resting CompleteAbort after resolve";
     for (auto& [part, pls] : captured) {
         ASSERT_EQ(pls.size(), 1u);
         EXPECT_EQ(pls[0].controlType, ControlType::Abort)
@@ -1245,7 +1252,7 @@ TEST_F(TxnCoordTest, TimeoutAbortResolvePendingWritesAbortMarkersToAllPartitions
 
     EXPECT_EQ(total, 3);
     EXPECT_EQ(captured.size(), 3u);
-    EXPECT_EQ(coord_.state("txn-t"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-t"), TxnState::CompleteAbort);
     for (auto& [part, pls] : captured) {
         ASSERT_EQ(pls.size(), 1u);
         EXPECT_EQ(pls[0].controlType, ControlType::Abort);
@@ -1281,7 +1288,7 @@ TEST_F(TxnCoordTest, TimeoutAbortNoPartitionLeftUnmarked)
     }
     // All states must be Empty.
     for (int i = 0; i < 4; ++i) {
-        EXPECT_EQ(coord_.state("txn-multi-" + std::to_string(i)), TxnState::Empty);
+        EXPECT_EQ(coord_.state("txn-multi-" + std::to_string(i)), TxnState::CompleteAbort);
     }
 }
 
@@ -1339,7 +1346,7 @@ TEST(TxnCoordAuditB2Test, RecoveredPrepareAbortResolvableWithPersistedEpochs)
     int total = ControlMarker::resolvePendingMarkers(coord2, appendFn);
 
     EXPECT_EQ(total, 2)           << "2 ABORT markers expected";
-    EXPECT_EQ(coord2.state("txn-b2-abort"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-b2-abort"), TxnState::CompleteAbort);
     // Verify marker epochs match what was persisted (NOT a new/live epoch).
     for (auto& [part, pls] : captured) {
         ASSERT_EQ(pls.size(), 1u);
@@ -1390,7 +1397,7 @@ TEST(TxnCoordAuditB2Test, RecoveredPrepareCommitResolvableWithPersistedEpochs)
     int total = ControlMarker::resolvePendingMarkers(coord2, appendFn);
 
     EXPECT_EQ(total, 1);
-    EXPECT_EQ(coord2.state("txn-b2-commit"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-b2-commit"), TxnState::CompleteCommit);
     for (auto& [part, pls] : captured) {
         ASSERT_EQ(pls.size(), 1u);
         EXPECT_EQ(pls[0].controlType,      ControlType::Commit);
@@ -1430,11 +1437,11 @@ TEST(TxnCoordAuditB2Test, RecoveryDoesNotDuplicateMarkersOnCompleteCommitState)
     TransactionLog log2(path);
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 5);
 
-    // State is now Empty (collapsed from CompleteCommit).
-    ASSERT_EQ(coord2.state("txn-c2-nodup"), TxnState::Empty);
+    // F15 §5.4: the recovered CompleteCommit is kept as the resting state.
+    ASSERT_EQ(coord2.state("txn-c2-nodup"), TxnState::CompleteCommit);
     auto pending = coord2.pendingMarkerTransactions();
     EXPECT_TRUE(pending.empty())
-        << "Collapsed CompleteCommit (now Empty) must NOT appear in pendingMarkerTransactions";
+        << "a recovered CompleteCommit must NOT appear in pendingMarkerTransactions";
 
     // No markers written on a resolve pass (Empty is not pending).
     int count = 0;
@@ -1597,7 +1604,7 @@ TEST(TxnCoordAuditNew1Test, EpochOverflowOngoingFenceAbortsUnderOldPid)
 
     // After resolution the txn returns to Empty and the coordinator ADOPTS the
     // fresh PID for the next transaction.
-    EXPECT_EQ(coord.state("txn-new1"), TxnState::Empty);
+    EXPECT_EQ(coord.state("txn-new1"), TxnState::CompleteAbort);
     EXPECT_EQ(coord.pidOf("txn-new1"), newPid)
         << "after the abort resolves, the coordinator adopts the fresh PID";
     EXPECT_EQ(coord.epochOf("txn-new1"), static_cast<ProducerEpoch>(0));
@@ -1675,13 +1682,13 @@ TEST_F(TxnCoordTest, ReInitWhileCompleteCommitReturnsConcurrentTransactions)
     }
     TransactionLog log2(path);
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0);
-    // Liveness fix: recovered CompleteCommit → Empty.
-    ASSERT_EQ(coord2.state("txn-cc"), TxnState::Empty);
+    // F15 §5.4: a recovered CompleteCommit stays the RESTING state (not wedged).
+    ASSERT_EQ(coord2.state("txn-cc"), TxnState::CompleteCommit);
 
     // re-init on Empty → succeeds (not kConcurrentTransactions).
     auto r2 = coord2.initProducerId("txn-cc", 60'000, 0LL);
     EXPECT_TRUE(r2.ok())
-        << "Recovered CompleteCommit must be collapsed to Empty; re-init must succeed";
+        << "a recovered (resting) CompleteCommit must not wedge re-init";
     EXPECT_NE(r2.errorCode, InitProducerIdResult::kConcurrentTransactions)
         << "txnId must NOT be wedged after CompleteCommit collapse";
 }
@@ -1699,7 +1706,7 @@ TEST_F(TxnCoordTest, ReInitAfterResolveSucceeds)
     // Resolve.
     auto appendFn = [](const TopicPartition&, const std::vector<uint8_t>&) {};
     coord_.completeTransaction("txn-after");
-    ASSERT_EQ(coord_.state("txn-after"), TxnState::Empty);
+    ASSERT_EQ(coord_.state("txn-after"), TxnState::CompleteAbort);
 
     // Now re-init must succeed.
     auto r2 = coord_.initProducerId("txn-after", kDefaultTimeoutMs, nowNs_);
@@ -1806,7 +1813,7 @@ TEST_F(TxnCoordTest, ReInitOngoingWritesAbortMarkersToAllPartitions_T1)
     EXPECT_EQ(captured.size(), 2u);
     EXPECT_TRUE(captured.contains(tp("a", 0)));
     EXPECT_TRUE(captured.contains(tp("b", 1)));
-    EXPECT_EQ(coord_.state("txn-t1-fence"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-t1-fence"), TxnState::CompleteAbort);
 }
 
 TEST_F(TxnCoordTest, TimeoutAbortWritesAbortMarkersToAllPartitions_T1)
@@ -1830,7 +1837,7 @@ TEST_F(TxnCoordTest, TimeoutAbortWritesAbortMarkersToAllPartitions_T1)
     MarkerMap captured;
     int total = ControlMarker::resolvePendingMarkers(coord_, makeCollector(captured));
     EXPECT_EQ(total, 3)   << "T1: 3 ABORT markers must be written";
-    EXPECT_EQ(coord_.state("txn-t1-timeout"), TxnState::Empty);
+    EXPECT_EQ(coord_.state("txn-t1-timeout"), TxnState::CompleteAbort);
     EXPECT_TRUE(captured.contains(tp("p0", 0)));
     EXPECT_TRUE(captured.contains(tp("p1", 1)));
     EXPECT_TRUE(captured.contains(tp("p2", 2)));
@@ -1871,14 +1878,14 @@ TEST(TxnCoordAuditT2Test, AddPartitionsWhenCompleteCommitIsInvalidTransition)
     }
     TransactionLog log2(path);
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2, 0);
-    // Liveness fix: recovered CompleteCommit → Empty.
-    ASSERT_EQ(coord2.state("txn-t2"), TxnState::Empty);
+    // F15 §5.4: a recovered CompleteCommit stays the RESTING state (not wedged).
+    ASSERT_EQ(coord2.state("txn-t2"), TxnState::CompleteCommit);
 
     // addPartitions on Empty is a valid transition (Empty→Ongoing).
     auto ar = coord2.addPartitions("txn-t2", /*pid=*/7, /*epoch=*/0,
                                     tps({tp("t", 0)}), 0LL);
     EXPECT_EQ(ar.errorCode, AddPartitionsResult::kOk)
-        << "addPartitions on a recovered CompleteCommit (now Empty) must succeed";
+        << "addPartitions on a recovered (resting) CompleteCommit must succeed (Complete* → Ongoing)";
 }
 
 // ===========================================================================
@@ -1908,8 +1915,8 @@ TEST(TxnCoordAuditC2Test, CompleteCommitPersistedAsDistinctRecord)
     coord.completeTransaction("txn-c2");
 
     // After completeTransaction, log reflects Empty (CompleteCommit then Empty).
-    EXPECT_EQ(log.metadata("txn-c2")->state, TxnState::Empty);
-    EXPECT_EQ(coord.state("txn-c2"), TxnState::Empty);
+    EXPECT_EQ(log.metadata("txn-c2")->state, TxnState::CompleteCommit);
+    EXPECT_EQ(coord.state("txn-c2"), TxnState::CompleteCommit);
 }
 
 TEST(TxnCoordAuditC2Test, CompleteAbortPersistedAsDistinctRecord)
@@ -1928,8 +1935,8 @@ TEST(TxnCoordAuditC2Test, CompleteAbortPersistedAsDistinctRecord)
 
     coord.completeTransaction("txn-c2b");
 
-    EXPECT_EQ(log.metadata("txn-c2b")->state, TxnState::Empty);
-    EXPECT_EQ(coord.state("txn-c2b"), TxnState::Empty);
+    EXPECT_EQ(log.metadata("txn-c2b")->state, TxnState::CompleteAbort);
+    EXPECT_EQ(coord.state("txn-c2b"), TxnState::CompleteAbort);
 }
 
 // ===========================================================================
@@ -2036,7 +2043,7 @@ TEST(TxnCoordAuditA2Test, CrashMidOverflowFenceAdoptsSameFreshPidOnRecovery)
     EXPECT_EQ(written, 2);
     for (const auto& pl : markers[tp("t", 0)]) EXPECT_EQ(pl.producerId, kOldPid);
 
-    EXPECT_EQ(coord2.state("txn-a2"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-a2"), TxnState::CompleteAbort);
     EXPECT_EQ(coord2.pidOf("txn-a2"), returnedFreshPid)
         << "recovery must adopt the SAME fresh pid the client was handed pre-crash";
     EXPECT_EQ(coord2.epochOf("txn-a2"), static_cast<ProducerEpoch>(0));
@@ -2063,11 +2070,11 @@ TEST(TxnCoordAuditA3StateTest, ReInitInCompleteAbortReturnsConcurrent)
     injectState(path, "txn-ca", 7, 2, TxnState::CompleteAbort);
     TransactionLog log2(path);
     TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
-    // Liveness fix: collapsed to Empty.
-    EXPECT_EQ(coord.state("txn-ca"), TxnState::Empty);
+    // F15 §5.4: a recovered CompleteAbort stays the RESTING state (not wedged).
+    EXPECT_EQ(coord.state("txn-ca"), TxnState::CompleteAbort);
     auto r = coord.initProducerId("txn-ca", 60'000, 0LL);
     EXPECT_TRUE(r.ok())
-        << "Recovered CompleteAbort must be collapsed to Empty; re-init must succeed";
+        << "a recovered (resting) CompleteAbort must not wedge re-init";
     EXPECT_NE(r.errorCode, InitProducerIdResult::kConcurrentTransactions)
         << "txnId must NOT be wedged after CompleteAbort collapse";
 }
@@ -2146,8 +2153,8 @@ TEST(TxnCoordAuditA6ResolveTest, InterleavedCommitAndAbortInOnePass)
     ASSERT_EQ(markers[tp("a", 0)].size(), 1u);
     EXPECT_EQ(markers[tp("c", 0)].front().controlType, ControlType::Commit);
     EXPECT_EQ(markers[tp("a", 0)].front().controlType, ControlType::Abort);
-    EXPECT_EQ(coord.state("txn-commit"), TxnState::Empty);
-    EXPECT_EQ(coord.state("txn-abort"), TxnState::Empty);
+    EXPECT_EQ(coord.state("txn-commit"), TxnState::CompleteCommit);
+    EXPECT_EQ(coord.state("txn-abort"), TxnState::CompleteAbort);
 }
 
 // #7 — resolvePendingMarkers with MANY pending txns (throughput/correctness).
@@ -2177,7 +2184,9 @@ TEST(TxnCoordAuditA7ResolveTest, ManyPendingResolvedCorrectly)
         ASSERT_EQ(markers[tp("p", i)].size(), 1u) << "i=" << i;
         EXPECT_EQ(markers[tp("p", i)].front().controlType,
                   (i % 2 == 0) ? ControlType::Commit : ControlType::Abort);
-        EXPECT_EQ(coord.state("txn-" + std::to_string(i)), TxnState::Empty);
+        // F15 §5.4: Complete* is the resting state.
+        EXPECT_EQ(coord.state("txn-" + std::to_string(i)),
+                  (i % 2 == 0) ? TxnState::CompleteCommit : TxnState::CompleteAbort);
     }
 }
 
@@ -2404,7 +2413,7 @@ TEST(TxnCoordRound2Residual2Test, OverflowFenceCrashReseedCombinedFlow)
     EXPECT_EQ(written, 1);
     EXPECT_EQ(markers[tp("t", 0)].front().producerId, kOldPid);
 
-    EXPECT_EQ(coord2.state("txn-r2"), TxnState::Empty);
+    EXPECT_EQ(coord2.state("txn-r2"), TxnState::CompleteAbort);
     EXPECT_EQ(coord2.pidOf("txn-r2"), kFreshPid)
         << "coordinator must adopt the persisted deferred fresh pid on recovery";
 
@@ -2442,7 +2451,7 @@ TEST(TxnCoordRound2Residual3Test, IdempotentReResolveNoDuplicateMarkers)
     MarkerMap markers1;
     int w1 = ControlMarker::resolvePendingMarkers(coord, makeCollector(markers1));
     EXPECT_EQ(w1, 2) << "two ABORT markers expected (one per partition)";
-    EXPECT_EQ(coord.state("txn-idem-re"), TxnState::Empty);
+    EXPECT_EQ(coord.state("txn-idem-re"), TxnState::CompleteAbort);
 
     // Simulate crash-and-reopen: the log now contains CompleteAbort (or Empty).
     // Re-open a new coordinator from the SAME log file.
@@ -2490,8 +2499,8 @@ TEST(TxnCoordRound2Residual4Test, AddPartitionsAcceptedInRecoveredCompleteAbort)
     injectState(path, "txn-rej-ca", 5, 0, TxnState::CompleteAbort);
     TransactionLog log2(path);
     TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
-    // Liveness fix: CompleteAbort → Empty.
-    ASSERT_EQ(coord.state("txn-rej-ca"), TxnState::Empty);
+    // F15 §5.4: CompleteAbort is the resting state.
+    ASSERT_EQ(coord.state("txn-rej-ca"), TxnState::CompleteAbort);
 
     auto ar = coord.addPartitions("txn-rej-ca", /*pid=*/5, /*epoch=*/0,
                                   tps({tp("t", 0)}), 0LL);
@@ -2672,7 +2681,7 @@ TEST(TxnCoordEosDurabilityTest, NormalCommitAppliesPendingOffsets)
     auto co = store.fetch("g", "in", 0);
     ASSERT_TRUE(co.has_value());
     EXPECT_EQ(*co, 7);
-    EXPECT_EQ(coord.state("ok-txn"), TxnState::Empty);
+    EXPECT_EQ(coord.state("ok-txn"), TxnState::CompleteCommit);
 }
 
 // ===========================================================================
@@ -2771,8 +2780,8 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteCommitCollapsedToEmpty_NotWedged)
 
     // KEY ASSERTION 1: state must be Empty (not CompleteCommit).
     ASSERT_TRUE(coord2.state("wedge-txn").has_value());
-    EXPECT_EQ(coord2.state("wedge-txn"), TxnState::Empty)
-        << "Recovered CompleteCommit MUST be collapsed to Empty (liveness fix)";
+    EXPECT_EQ(coord2.state("wedge-txn"), TxnState::CompleteCommit)
+        << "a recovered CompleteCommit stays the resting state (F15 §5.4)";
 
     // KEY ASSERTION 2: initProducerId must succeed (not kConcurrentTransactions).
     auto r2 = coord2.initProducerId("wedge-txn", 60'000, 100LL);
@@ -2783,7 +2792,7 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteCommitCollapsedToEmpty_NotWedged)
 
     // KEY ASSERTION 3: offsets NOT re-applied on recovery collapse (already in store).
     EXPECT_EQ(applyCount, 0)
-        << "Offsets must NOT be re-applied when collapsing CompleteCommit→Empty on recovery";
+        << "Offsets must NOT be re-applied when recovering a CompleteCommit";
 
     // KEY ASSERTION 4: the txnId is usable for a NEW transaction.
     auto addRes = coord2.addPartitions("wedge-txn", r2.producerId, r2.producerEpoch,
@@ -2820,8 +2829,8 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteAbortCollapsedToEmpty_NotWedged)
 
     // State must be Empty.
     ASSERT_TRUE(coord.state("abort-wedge").has_value());
-    EXPECT_EQ(coord.state("abort-wedge"), TxnState::Empty)
-        << "Recovered CompleteAbort MUST be collapsed to Empty";
+    EXPECT_EQ(coord.state("abort-wedge"), TxnState::CompleteAbort)
+        << "a recovered CompleteAbort stays the resting state (F15 §5.4)";
 
     // initProducerId must succeed.
     auto r = coord.initProducerId("abort-wedge", 60'000, 0LL);
@@ -2866,8 +2875,8 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteAbortWithPendingNewPid_AdoptsDefe
 
     // State must be Empty.
     ASSERT_TRUE(coord.state("overflow-abort-wedge").has_value());
-    EXPECT_EQ(coord.state("overflow-abort-wedge"), TxnState::Empty)
-        << "Recovered CompleteAbort+pendingNewPid MUST be collapsed to Empty";
+    EXPECT_EQ(coord.state("overflow-abort-wedge"), TxnState::CompleteAbort)
+        << "a recovered CompleteAbort+pendingNewPid stays the resting state, swap adopted";
 
     // The PID must be the DEFERRED fresh PID (not the old one), matching what
     // completeTransaction would have installed before writing Empty.
