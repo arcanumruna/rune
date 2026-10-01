@@ -602,9 +602,13 @@ TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
         << ") while no COMMIT marker exists";
     EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn may not start while the marker is unwritten";
     EXPECT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u) << "the LSO stays pinned at the open txn (correct)";
-    const uint64_t reads = T.m.w().pushReadsForTest();
     T.m.push(16, 100);
-    (void)reads;   // the LSO (== the open txn's first offset, 0) holds the read itself back
+    // Review m3: in THIS scenario the egress check is vacuous by construction —
+    // ISR {1} < minIsr 2 pins the served HW at 0, so nothing is readable under
+    // either isolation.  Stated explicitly (not hidden behind a `(void)`); the
+    // LSO pin itself is asserted above (rcOpenTxns == 1), and the four other
+    // retargeted tests carry the non-vacuous read_committed egress check.
+    EXPECT_EQ(T.m.r->highWatermark(), 0) << "min-ISR no longer pins the HW: make the egress check non-vacuous";
     EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received the open txn's batch";
     EXPECT_EQ(T.m.deliveredCount(rcSub), 0u);
 }
@@ -3358,4 +3362,104 @@ TEST(TxnRcRegression, OpenTxnHeldIssuesAtMostOnePushReadPerHwChange) {
     R.push(32, 300);
     EXPECT_LE(R.w().pushReadsForTest() - reads, 1u) << "more than one PushRead for one HW change";
     EXPECT_EQ(R.deliveredCount(sub), 0u) << "read_committed received data behind the open txn";
+    // Review m12: liveness after the park — the COMMIT releases the held data.
+    gatewayMarker(R, 7, /*commit=*/true, 400);
+    R.push(16, 500);
+    EXPECT_TRUE(R.delivered(sub, 0)) << "the committed txn batch was never delivered (stuck park)";
+    EXPECT_TRUE(R.delivered(sub, 1));
+    EXPECT_TRUE(R.delivered(sub, 2));
+}
+
+// ---- F15 S4 fix round 1 (review I-1, I-2, I-3) -------------------------------
+namespace {
+// Replace the owning worker's owned set (as a SetOwnership op would).
+void eosOwns(EosRig& R, std::vector<PartitionReplica*> owned, int64_t now) {
+    WorkerOp op;
+    op.type = WorkerOp::Type::SetOwnership;
+    op.ownedSet = std::move(owned);
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(op)));
+    R.runWorker(now);
+}
+// A residency probe: `blocked` calls report nothing resident, then at most
+// `grant` bytes per call (a slow device).
+struct SlowProbe {
+    int calls = 0;
+    int blocked = 0;
+    std::size_t grant = 0;
+    static std::size_t fn(void* c, const uint8_t*, std::size_t len) {
+        auto* p = static_cast<SlowProbe*>(c);
+        ++p->calls;
+        if (p->calls <= p->blocked) return 0;
+        return std::min(len, p->grant);
+    }
+};
+} // namespace
+
+TEST(TxnRcRegression, RefusedPushReadIsReissuedOnIdlePartition) {
+    // Review I-1: a PushRead the worker REFUSED (ownership not yet applied)
+    // answered nothing — the gateway must not park the subscription on it.
+    // Otherwise an idle partition's data below the HW is never delivered.
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(ingressData(R, sid, 1 + i, 2), 1);
+    R.runWorker(3);
+    eosOwns(R, {}, 4);                                     // the worker no longer owns the partition
+    const int64_t sub = R.subscribe(sid, /*read_uncommitted*/0);
+    ASSERT_GT(sub, 0);
+    R.push(4, 10);
+    ASSERT_EQ(R.deliveredCount(sub), 0u) << "precondition: the read was refused";
+    eosOwns(R, {R.r}, 20);                                 // ownership applied; no further produce
+    R.push(16, 30);
+    EXPECT_EQ(R.deliveredCount(sub), 3u) << "a refused PushRead parked the subscription: idle data never delivered";
+}
+
+TEST(TxnRcRegression, BuildingPartitionIssuesBoundedPushReads) {
+    // Review I-2 (addendum R-3, "or RC readiness"): while the partition's RC
+    // state builds, a read_committed subscription must not cost one PushRead
+    // per gateway cycle — at most one read is outstanding until Ready, then
+    // the data flows.
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    for (int i = 0; i < 64; ++i) appendAt(*R.r->log(), bigBatch(1000));
+    R.r->onLeaderLogAppended();
+    R.runWorker(2);
+    R.w().setRcScanBytesPerPass(1024);
+    // A new leadership on the same log: RC rebuilds from scratch (~64 passes).
+    R.r->becomeFollower(R.r->epoch(), 2);
+    R.r->becomeLeader(R.r->epoch() + 1, {1});
+    R.runWorker(50);                                       // the pass that sees the new leadership
+    ASSERT_NE(R.w().rcStatusForTest(0, 0), Worker::kRcReady) << "precondition: RC rebuilding";
+    const int64_t sub = R.subscribe(sid, /*read_committed*/1);
+    ASSERT_GT(sub, 0);
+    const uint64_t reads = R.w().pushReadsForTest();
+    int cycles = 0;
+    for (; cycles < 4096 && R.w().rcStatusForTest(0, 0) != Worker::kRcReady; ++cycles) R.push(1, 100 + cycles);
+    ASSERT_EQ(R.w().rcStatusForTest(0, 0), Worker::kRcReady);
+    ASSERT_GT(cycles, 16) << "precondition: the build took many cycles";
+    EXPECT_LE(R.w().pushReadsForTest() - reads, 2u) << "PushRead re-issued every cycle while RC builds";
+    R.push(64, 10'000);
+    EXPECT_EQ(R.deliveredCount(sub), 64u) << "data was not delivered once RC became Ready";
+}
+
+TEST(TxnRcRegression, BuildScanNeverReadsNonResidentBytes) {
+    // Controller cold-cache bench (BLOCKING): the build must never touch a page
+    // that is not resident (a synchronous disk read on the worker thread).
+    // With an injected residency probe that reports nothing resident, passes
+    // read nothing and never block; with a slow device (a little per pass) the
+    // build still completes — progress = completed reads (time-independent).
+    RcRig R;
+    R.append(txnBatch(7, 0, 0));
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    SlowProbe pr;
+    pr.blocked = 24;
+    pr.grant = 2048;
+    R.w->setRcResidencyProbeForTest(&SlowProbe::fn, &pr);
+    for (int i = 0; i < 16; ++i) R.pass();
+    EXPECT_GT(pr.calls, 0) << "the build never consulted the residency probe";
+    EXPECT_EQ(R.w->rcScannedBytesForTest(R.topic(), 0), 0u)
+        << "the build read bytes reported NOT resident (a blocking page fault on the worker)";
+    EXPECT_EQ(R.status(), Worker::kRcScanning);
+    ASSERT_TRUE(R.runUntilReady(8192)) << "the build did not complete on a slow device";
+    EXPECT_EQ(R.open(), 1u);
 }

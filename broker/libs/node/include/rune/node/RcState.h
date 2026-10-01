@@ -47,6 +47,11 @@
 
 namespace rune::node {
 
+/// F15 S4 fix round 1 (I-3 cold cache): how many bytes from `p` (up to `len`)
+/// are resident in memory, contiguous from `p`.  A plain function pointer +
+/// context (no std::function, no virtual).  nullptr = the default probe.
+using RcResidencyProbe = std::size_t (*)(void* ctx, const uint8_t* p, std::size_t len);
+
 /// The replica facts one advance() step reads (owner thread, plain loads).
 struct RcFacts {
     bool     leader               = false;
@@ -165,6 +170,9 @@ public:
     [[nodiscard]] uint64_t    scanSteps() const noexcept { return scanSteps_; }
     [[nodiscard]] std::size_t maxStepBytes() const noexcept { return maxStepBytes_; }
     [[nodiscard]] uint64_t    tailGrowths() const noexcept { return tailGrowths_; }
+    [[nodiscard]] uint64_t    scannedBytes() const noexcept { return scannedBytes_; }
+    /// RED stub (fix round 1): the residency probe is not consulted yet.
+    void setResidencyProbe(RcResidencyProbe, void*) noexcept {}
 
 private:
     [[nodiscard]] std::pair<uint64_t, uint64_t> builtFor_() const noexcept {
@@ -219,6 +227,7 @@ private:
             }
         }
         if (bytes > maxStepBytes_) maxStepBytes_ = bytes;
+        scannedBytes_ += bytes;
         if (s.cursor >= s.target) finish_(s);
         return bytes;
     }
@@ -237,6 +246,7 @@ private:
     uint64_t    scanSteps_    = 0;
     std::size_t maxStepBytes_ = 0;
     uint64_t    tailGrowths_  = 0;
+    uint64_t    scannedBytes_ = 0;
 };
 
 } // namespace rune::node

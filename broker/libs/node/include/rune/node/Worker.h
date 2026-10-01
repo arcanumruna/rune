@@ -401,6 +401,16 @@ public:
     }
     /// Per-partition open-txn capacity reserved at ownership apply (rcOpenTxnCapacity).
     void setRcOpenTxnCapacity(std::size_t n) noexcept { rcOpenTxnCapacity_ = n >= 1 ? n : 1; }
+    /// Bytes the RC build has read from the log (all steps).
+    [[nodiscard]] uint64_t rcScannedBytesForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->scannedBytes() : 0;
+    }
+    /// Test seam: the residency probe every RC build consults (I-3).
+    void setRcResidencyProbeForTest(RcResidencyProbe fn, void* ctx) {
+        rcProbeFn_ = fn; rcProbeCtx_ = ctx;
+        for (auto& sl : rcSlots_) sl.rc->setResidencyProbe(fn, ctx);
+    }
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
 
@@ -3450,6 +3460,8 @@ private:
     std::vector<RcState*> rcById_;
     int32_t     rcScanBytesPerPass_ = RcState::kDefaultScanBytesPerPass;
     std::size_t rcOpenTxnCapacity_  = rune::transaction::LsoTracker::kDefaultOpenTxnCapacity;
+    RcResidencyProbe rcProbeFn_  = nullptr;
+    void*            rcProbeCtx_ = nullptr;
     static constexpr uint16_t kTxnAttrBit = static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional);
     static constexpr uint8_t  kIsolationReadCommitted = 1;
 
