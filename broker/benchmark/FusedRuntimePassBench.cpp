@@ -11,6 +11,12 @@
 //   RuntimeDoWork — one NodeRuntimeAgent duty cycle (either placement)
 // Reported as counters (ns): pass_p50/p99/p999/max, rt_p50/p99/p999/max.
 //
+// Arg `tickUs` (fused only; ignored for thread placement): the runtime slow-tick
+// interval for the O(partitions) failover scan — 0 = every cycle (the pre-
+// ae07765 behaviour), 10000 = the production 10 ms.  ONE binary for the ABAB:
+//   --benchmark_filter='BM_ShardPassRuntimePlacement/fused:1/load:1/tickUs:(0|10000)'
+// (an empty/-1 arg would be the placement default; both values are explicit here).
+//
 // Local (Mac) numbers are indicative only; perf claims come from the k3s box.
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
@@ -103,16 +109,18 @@ void report(benchmark::State& state) {
     }
 }
 
-// Args: {fused (0/1), load (0 = idle, 1 = acks=1 produce round trips)}
+// Args: {fused (0/1), load (0 = idle, 1 = acks=1 produce round trips), tickUs}
 void BM_ShardPassRuntimePlacement(benchmark::State& state) {
     const bool fused = state.range(0) != 0;
     const bool load  = state.range(1) != 0;
+    const int64_t tickNs = state.range(2) * 1'000;
     spdlog::set_level(spdlog::level::warn);
     TmpDir dir{fused ? "fused" : "thread"}, cdir{"client"};
     const auto blocks = freeUdpPortBlocks(3, 1);
     const NodeConfig cfg = benchConfig(dir.path, fused, freeUdpPort(), freeUdpPort(), freeUdpPort(),
                                        blocks.at(0), blocks.at(1), blocks.at(2));
     BrokerNode node{cfg};
+    if (fused) node.setSlowTickIntervalForTest(tickNs);
     node.start();
     if (!node.awaitLeader(std::chrono::seconds{10})) { state.SkipWithError("no leader"); return; }
     ShardTestClient c(cdir.path);
@@ -148,8 +156,9 @@ void BM_ShardPassRuntimePlacement(benchmark::State& state) {
 }
 
 BENCHMARK(BM_ShardPassRuntimePlacement)
-    ->ArgNames({"fused", "load"})
-    ->Args({0, 0})->Args({1, 0})->Args({0, 1})->Args({1, 1})
+    ->ArgNames({"fused", "load", "tickUs"})
+    ->Args({0, 0, 0})->Args({1, 0, 0})->Args({1, 0, 10'000})
+    ->Args({0, 1, 0})->Args({1, 1, 0})->Args({1, 1, 10'000})
     ->Iterations(2000)
     ->Unit(benchmark::kMicrosecond)
     ->UseRealTime();
